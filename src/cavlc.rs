@@ -149,7 +149,11 @@ pub fn decode_residual_block(
     // precedes it (in scan order). The spec algorithm (§9.2.3.2) walks i
     // from TC-1 down to 0, accumulating run+1 each step.
     let coded_len = total_coeff as usize + zeros_left as usize;
-    debug_assert!(coded_len <= max_num_coeff);
+    if coded_len > max_num_coeff {
+        return Err(Error::invalid(format!(
+            "h264 cavlc: coded_len {coded_len} > max_num_coeff {max_num_coeff}"
+        )));
+    }
     let mut coded = [0i32; 16];
     let mut coeff_num: i32 = -1;
     for i in (0..total_coeff as usize).rev() {
