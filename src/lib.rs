@@ -1,32 +1,31 @@
 //! Pure-Rust H.264 / AVC (ITU-T H.264 | ISO/IEC 14496-10) decoder.
 //!
-//! Scope of v1:
+//! # What is decoded today
 //!
 //! * NAL unit framing in **both** Annex B (`00 00 [00] 01` start codes) and
-//!   AVCC length-prefixed form (used inside MP4 `mdat`).
-//! * Emulation-prevention byte stripping (`§7.4.1.1`).
-//! * Sequence Parameter Set parsing (`§7.3.2.1.1`) — profile, level, chroma
-//!   format, bit depth, frame size, picture order count type, frame
-//!   cropping, VUI presence flag.
-//! * Picture Parameter Set parsing (`§7.3.2.2`) — entropy coding mode,
-//!   slice group map, default reference index counts, weighted prediction,
-//!   deblocking control, transform-8×8 flag.
-//! * Slice header parsing (`§7.3.3`) — slice type, frame number, POC,
-//!   reference list overrides, prediction weight table skip, deblocking
-//!   override.
-//! * AVCDecoderConfigurationRecord parsing for MP4 `avcC` boxes
-//!   (`ISO/IEC 14496-15 §5.2.4.1`).
+//!   AVCC length-prefixed form (used inside MP4 `mdat`), emulation-prevention
+//!   byte stripping (§7.4.1.1), and `AVCDecoderConfigurationRecord` parsing
+//!   (ISO/IEC 14496-15 §5.2.4.1).
+//! * SPS / PPS / slice-header parsing (§7.3.2.1.1, §7.3.2.2, §7.3.3).
+//! * **I-slice** pixel reconstruction for **both CAVLC and CABAC** — intra
+//!   prediction, residual decode, 4×4 IDCT + Hadamard, optional deblocking.
+//!   The CABAC I-path covers I_16×16 and I_NxN; I_PCM inside CABAC is not
+//!   yet wired.
+//! * **CAVLC baseline P-slice** pixel reconstruction (§8.4) — P_L0_16×16 /
+//!   16×8 / 8×16, P_8×8 (all four sub-partition shapes) and P_8×8ref0,
+//!   P_Skip, plus intra-in-P macroblocks. Luma 6-tap half-pel + bilinear
+//!   quarter-pel MC; bilinear 1/8-pel chroma MC; edge-replicated
+//!   out-of-picture reads. A single-slot L0 reference (the previous frame
+//!   output) is retained across packets.
 //!
-//! Pixel reconstruction for I-slices is implemented for both CAVLC and
-//! CABAC entropy modes (intra prediction + residual decode + inverse
-//! transforms + optional deblocking). The CABAC path currently targets the
-//! common I_16×16 / I_NxN subset; I_PCM inside CABAC is not yet wired.
+//! # Out of scope (returns `Error::Unsupported`)
 //!
-//! Out of scope (returns `Error::Unsupported`):
-//! * **P / B slices** (`§8.4` motion-compensated prediction).
-//! * **Interlaced** coding / MBAFF (`§7.4.2.1.1` `frame_mbs_only_flag = 0`).
-//! * **8×8 transform** (`§8.5.13`), 4:2:2 / 4:4:4 chroma formats, bit depths
-//!   above 8.
+//! * CABAC P-slices.
+//! * B-slices, weighted prediction, bi-prediction.
+//! * Multi-reference DPB (`ref_idx_l0 > 0`), reference picture list
+//!   modification operations.
+//! * Interlaced coding / MBAFF / PAFF.
+//! * 8×8 transform (§8.5.13), 4:2:2 / 4:4:4 chroma, bit depths above 8.
 //! * Encoder.
 //!
 //! This crate has no runtime dependencies beyond `oxideav-core` and
