@@ -1,22 +1,22 @@
 [package]
 name = "oxideav-h264"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-h264"
+authors = ["Mark Karpeles"]
 description = "Pure-Rust H.264 / AVC (ITU-T H.264 | ISO/IEC 14496-10) decoder for oxideav"
 
 readme = "README.md"
-homepage.workspace = true
+homepage = "https://github.com/OxideAV/oxideav-h264"
 keywords = ["multimedia", "video", "h264", "avc", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
 
 [dev-dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
