@@ -45,6 +45,7 @@ pub mod decoder;
 pub mod intra_pred;
 pub mod mb;
 pub mod mb_type;
+pub mod motion;
 pub mod nal;
 pub mod picture;
 pub mod pps;

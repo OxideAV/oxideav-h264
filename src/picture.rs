@@ -5,7 +5,7 @@
 
 use oxideav_core::{frame::VideoPlane, PixelFormat, TimeBase, VideoFrame};
 
-use crate::mb_type::IMbType;
+use crate::mb_type::{IMbType, PMbType, PPartition};
 
 #[derive(Clone, Debug)]
 pub struct Picture {
@@ -28,7 +28,7 @@ pub struct Picture {
     pub last_mb_qp_delta_was_nonzero: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MbInfo {
     /// QP_Y for the macroblock (after slice_qp_delta + per-MB delta).
     pub qp_y: i32,
@@ -53,9 +53,45 @@ pub struct MbInfo {
     /// Parsed I-slice macroblock type (CABAC ctxIdxInc for `mb_type`
     /// §9.3.3.1.1.3 depends on whether the neighbour MB is `I_NxN` or not).
     pub mb_type_i: Option<IMbType>,
+    /// Parsed P-slice macroblock type. `None` for intra macroblocks.
+    pub mb_type_p: Option<PMbType>,
+    /// P-slice partition layout for inter macroblocks — cached here so
+    /// neighbour MV lookups don't re-parse `mb_type_p`.
+    pub p_partition: Option<PPartition>,
+    /// Per-4×4-sub-block list-0 motion vectors in quarter-pel units
+    /// (`mv[row*4+col]`). Zero for intra macroblocks.
+    pub mv_l0: [(i16, i16); 16],
+    /// Per-4×4-sub-block list-0 reference indices. `-1` for "no prediction"
+    /// (intra or not yet decoded); `0..` otherwise.
+    pub ref_idx_l0: [i8; 16],
     /// True when this macroblock is intra. For an I-slice all MBs are intra,
     /// but the field exists to support future P-slice deblocking edges.
     pub intra: bool,
+    /// True when this macroblock was `P_Skip` in a P-slice. Used by
+    /// deblocking and neighbour lookups so the zero-cbp P_Skip case can be
+    /// recognised without re-parsing.
+    pub skipped: bool,
+}
+
+impl Default for MbInfo {
+    fn default() -> Self {
+        Self {
+            qp_y: 0,
+            coded: false,
+            luma_nc: [0; 16],
+            cb_nc: [0; 4],
+            cr_nc: [0; 4],
+            intra4x4_pred_mode: [INTRA_DC_FAKE; 16],
+            intra_chroma_pred_mode: 0,
+            mb_type_i: None,
+            mb_type_p: None,
+            p_partition: None,
+            mv_l0: [(0, 0); 16],
+            ref_idx_l0: [-1; 16],
+            intra: false,
+            skipped: false,
+        }
+    }
 }
 
 /// Sentinel used as "intra mode unavailable for prediction" — see §8.3.1.1.
@@ -111,6 +147,19 @@ impl Picture {
     /// visible area via SPS frame cropping.
     pub fn into_video_frame(
         self,
+        visible_w: u32,
+        visible_h: u32,
+        pts: Option<i64>,
+        time_base: TimeBase,
+    ) -> VideoFrame {
+        self.to_video_frame(visible_w, visible_h, pts, time_base)
+    }
+
+    /// Non-consuming variant of [`Self::into_video_frame`] — used by the
+    /// decoder when it needs to both emit a frame and keep the picture
+    /// around as a reference for subsequent P-slice decodes.
+    pub fn to_video_frame(
+        &self,
         visible_w: u32,
         visible_h: u32,
         pts: Option<i64>,
