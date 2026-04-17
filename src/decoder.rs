@@ -1,20 +1,24 @@
 //! Front-end H.264 decoder.
 //!
-//! This first cut implements **bitstream framing + parameter-set parsing**:
-//!
 //! * Detects whether incoming packet bytes are Annex B (start-code) or AVCC
 //!   (length-prefixed) form. AVCC mode is selected when the codec parameters
 //!   carry a non-empty `extradata` matching an
 //!   AVCDecoderConfigurationRecord; otherwise Annex B framing is assumed and
 //!   start codes are scanned.
 //! * Walks NAL units and updates SPS / PPS tables.
-//! * Parses slice headers and runs the I-slice reconstruction pipeline for
-//!   both CAVLC and CABAC entropy modes (intra prediction, residual decode,
-//!   IDCT, optional deblocking).
+//! * Parses slice headers and runs the pixel reconstruction pipeline for:
+//!   - I-slices in CAVLC or CABAC entropy mode (§7.3.5 / §8.3 / §8.5).
+//!   - P-slices in CAVLC entropy mode (§8.4 motion compensation) —
+//!     P16×16 / P16×8 / P8×16 / P8×8 / P8x8ref0 / P_Skip with a
+//!     single-reference list 0. Intra-in-P macroblocks reuse the I-slice
+//!     intra path.
 //!
 //! Out of scope (returns `Error::Unsupported`):
-//! * P/B slices — §8.4 motion-compensated prediction.
-//! * DPB / reference management beyond keeping the most recent frame.
+//! * CABAC P-slices.
+//! * B-slices (bi-prediction, weighted prediction).
+//! * Multi-reference DPB / ref_idx > 0 / reference picture list modification.
+//! * Interlaced coding / MBAFF.
+//! * 8×8 transform, 4:2:2 / 4:4:4 chroma, bit depth > 8.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -27,6 +31,7 @@ use oxideav_core::{
 use crate::bitreader::BitReader;
 use crate::cabac::{engine::CabacDecoder, mb::decode_i_mb_cabac, tables::init_slice_contexts};
 use crate::mb::decode_i_slice_data;
+use crate::p_mb::{decode_p_slice_mb, decode_p_skip_mb};
 use crate::nal::{
     extract_rbsp, split_annex_b, split_length_prefixed, AvcConfig, NalHeader, NalUnitType,
 };
@@ -61,6 +66,9 @@ pub struct H264Decoder {
     last_slice_headers: Vec<SliceHeader>,
     /// Picture under construction — held across slices of a single frame.
     current_pic: Option<Picture>,
+    /// The most recently decoded picture, retained as the single L0
+    /// reference for subsequent P-slices. Cleared on IDR / reset.
+    last_reference: Option<Picture>,
 }
 
 impl H264Decoder {
@@ -77,6 +85,7 @@ impl H264Decoder {
             eof: false,
             last_slice_headers: Vec::new(),
             current_pic: None,
+            last_reference: None,
         }
     }
 
@@ -130,21 +139,28 @@ impl H264Decoder {
                     })?;
                 let sh = parse_slice_header(&header, &rbsp, &sps, &pps)?;
                 self.last_slice_headers.push(sh.clone());
-                if sh.slice_type != SliceType::I {
-                    // P/B slices remain unsupported in both entropy modes —
-                    // motion compensation (§8.4) is the missing piece, not
-                    // CABAC itself.
-                    return Err(Error::unsupported(format!(
-                        "h264: slice type {:?} (§8.4 motion compensation) — only I slices supported in v1",
-                        sh.slice_type
-                    )));
+                match sh.slice_type {
+                    SliceType::I => {}
+                    SliceType::P => {
+                        if pps.entropy_coding_mode_flag {
+                            return Err(Error::unsupported(
+                                "h264: CABAC P-slices not implemented — use CAVLC (entropy_coding_mode_flag=0) for P",
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(Error::unsupported(format!(
+                            "h264: slice type {:?} not implemented (only I + CAVLC P supported)",
+                            other
+                        )));
+                    }
                 }
                 if !sps.frame_mbs_only_flag {
                     return Err(Error::unsupported(
                         "h264: interlaced / MBAFF (§7.3.2.1.1 frame_mbs_only_flag=0) not supported",
                     ));
                 }
-                // I-slice macroblock layer decode (§7.3.5 / §8.3 / §8.5 / §9.2).
+                // Macroblock-layer decode (§7.3.5 / §8.3 / §8.4 / §8.5 / §9.2).
                 let mb_w = sps.pic_width_in_mbs();
                 let mb_h = sps.pic_height_in_map_units();
                 let mut pic = self
@@ -155,16 +171,39 @@ impl H264Decoder {
                     pic = Picture::new(mb_w, mb_h);
                 }
 
-                if pps.entropy_coding_mode_flag {
-                    // §9.3 CABAC slice-data loop.
-                    decode_cabac_i_slice(&rbsp, &sh, &sps, &pps, &mut pic)?;
-                } else {
-                    // The CAVLC slice_data starts immediately after the slice
-                    // header in the RBSP. We re-construct a BitReader pointing
-                    // at slice_data_bit_offset and continue from there.
-                    let mut br = BitReader::new(&rbsp);
-                    br.skip(sh.slice_data_bit_offset as u32)?;
-                    decode_i_slice_data(&mut br, &sh, &sps, &pps, &mut pic)?;
+                if sh.is_idr {
+                    // IDR — wipe any previously stored reference so no
+                    // future P-slice accidentally predicts from a stale
+                    // picture.
+                    self.last_reference = None;
+                }
+
+                match sh.slice_type {
+                    SliceType::I => {
+                        if pps.entropy_coding_mode_flag {
+                            decode_cabac_i_slice(&rbsp, &sh, &sps, &pps, &mut pic)?;
+                        } else {
+                            let mut br = BitReader::new(&rbsp);
+                            br.skip(sh.slice_data_bit_offset as u32)?;
+                            decode_i_slice_data(&mut br, &sh, &sps, &pps, &mut pic)?;
+                        }
+                    }
+                    SliceType::P => {
+                        let reference = self.last_reference.as_ref().ok_or_else(|| {
+                            Error::invalid(
+                                "h264 p-slice: no reference picture available (no prior IDR?)",
+                            )
+                        })?;
+                        if reference.mb_width != mb_w || reference.mb_height != mb_h {
+                            return Err(Error::invalid(
+                                "h264 p-slice: reference picture size mismatch",
+                            ));
+                        }
+                        let mut br = BitReader::new(&rbsp);
+                        br.skip(sh.slice_data_bit_offset as u32)?;
+                        decode_p_slice_data(&mut br, &sh, &sps, &pps, &mut pic, reference)?;
+                    }
+                    _ => unreachable!(),
                 }
 
                 // Optional in-loop deblocking — §8.7.
@@ -172,10 +211,12 @@ impl H264Decoder {
                     crate::deblock::deblock_picture(&mut pic, &pps, &sh);
                 }
 
-                // Crop and emit.
+                // Crop and emit a frame, then stash the decoded picture as
+                // the single L0 reference for subsequent P-slices.
                 let (vw, vh) = sps.visible_size();
-                let frame = pic.into_video_frame(vw, vh, self.pending_pts, self.pending_tb);
+                let frame = pic.to_video_frame(vw, vh, self.pending_pts, self.pending_tb);
                 self.ready_frames.push_back(frame);
+                self.last_reference = Some(pic);
             }
             NalUnitType::Aud
             | NalUnitType::Sei
@@ -205,6 +246,53 @@ impl H264Decoder {
     pub fn last_slice_headers(&self) -> &[SliceHeader] {
         &self.last_slice_headers
     }
+}
+
+/// CAVLC P-slice data loop — §7.3.4.
+///
+/// CAVLC P-slice syntax emits one `mb_skip_run` ue(v) before each coded
+/// macroblock (including the very first MB of the slice). The value is the
+/// number of `P_Skip` macroblocks that precede the next coded MB. The last
+/// "run" before the end of the slice is also emitted, letting the encoder
+/// trail a run of skipped MBs with no following coded MB.
+fn decode_p_slice_data(
+    br: &mut BitReader<'_>,
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    reference: &Picture,
+) -> Result<()> {
+    let mb_w = sps.pic_width_in_mbs();
+    let mb_h = sps.pic_height_in_map_units();
+    let total_mbs = mb_w * mb_h;
+    let mut mb_addr = sh.first_mb_in_slice;
+    if mb_addr >= total_mbs {
+        return Err(Error::invalid("h264 p-slice: first_mb_in_slice out of range"));
+    }
+    let mut prev_qp = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+
+    while mb_addr < total_mbs {
+        let skip_run = br.read_ue()?;
+        // Emit `skip_run` skipped MBs then one coded MB (if any remain).
+        for _ in 0..skip_run {
+            if mb_addr >= total_mbs {
+                break;
+            }
+            let mb_x = mb_addr % mb_w;
+            let mb_y = mb_addr / mb_w;
+            decode_p_skip_mb(mb_x, mb_y, pic, reference, prev_qp)?;
+            mb_addr += 1;
+        }
+        if mb_addr >= total_mbs {
+            break;
+        }
+        let mb_x = mb_addr % mb_w;
+        let mb_y = mb_addr / mb_w;
+        decode_p_slice_mb(br, sps, pps, sh, mb_x, mb_y, pic, reference, &mut prev_qp)?;
+        mb_addr += 1;
+    }
+    Ok(())
 }
 
 /// §9.3 CABAC entropy-coded I-slice data loop. Mirrors
@@ -310,13 +398,15 @@ impl Decoder for H264Decoder {
         // ready frame queue. SPS/PPS tables + AVCC config (length_size,
         // last_avc_config) are stream-level — they come from extradata or
         // out-of-band SPS/PPS NALs that won't be retransmitted post-seek,
-        // so they stay put. Note: current decoder only implements I
-        // slices, so there's no DPB / reference-picture list to wipe.
+        // so they stay put. The L0 reference picture is dropped too so
+        // the next P-slice sees a clean slate (it must be preceded by an
+        // IDR or another I-slice).
         self.pending_pts = None;
         self.ready_frames.clear();
         self.eof = false;
         self.last_slice_headers.clear();
         self.current_pic = None;
+        self.last_reference = None;
         Ok(())
     }
 }

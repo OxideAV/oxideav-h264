@@ -47,6 +47,7 @@ pub mod mb;
 pub mod mb_type;
 pub mod motion;
 pub mod nal;
+pub mod p_mb;
 pub mod picture;
 pub mod pps;
 pub mod slice;

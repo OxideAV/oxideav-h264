@@ -91,7 +91,24 @@ fn decode_one_mb(
     let mb_type = br.read_ue()?;
     let imb = decode_i_slice_mb_type(mb_type)
         .ok_or_else(|| Error::invalid(format!("h264 slice: bad I mb_type {mb_type}")))?;
+    decode_intra_mb_given_imb(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb)
+}
 
+/// Public entry for decoding an intra macroblock whose `mb_type` has
+/// already been parsed into an [`IMbType`]. Used by P-slice decode to reuse
+/// the intra reconstruction path when a `mb_type` >= 5 appears inside a P
+/// slice.
+pub fn decode_intra_mb_given_imb(
+    br: &mut BitReader<'_>,
+    sps: &Sps,
+    pps: &Pps,
+    sh: &SliceHeader,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    prev_qp: &mut i32,
+    imb: IMbType,
+) -> Result<()> {
     if matches!(imb, IMbType::IPcm) {
         return decode_pcm_mb(br, mb_x, mb_y, pic, *prev_qp);
     }
