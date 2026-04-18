@@ -32,18 +32,18 @@ use crate::slice::{SliceHeader, SliceType};
 use crate::transform::chroma_qp;
 
 // --- Table 8-16 — α / β indexed by IndexA / IndexB (§8.7.2.1). ---
-const ALPHA: [u8; 52] = [
+pub(crate) const ALPHA_TABLE: [u8; 52] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20,
     22, 25, 28, 32, 36, 40, 45, 50, 56, 63, 71, 80, 90, 101, 113, 127, 144, 162, 182, 203, 226,
     255, 255,
 ];
-const BETA: [u8; 52] = [
+pub(crate) const BETA_TABLE: [u8; 52] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 6, 6, 7, 7, 8, 8,
     9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18,
 ];
 
 // --- Table 8-15 — tC0[bS-1][IndexA] for bS ∈ {1, 2, 3} (§8.7.2.3). ---
-const TC0: [[u8; 52]; 3] = [
+pub(crate) const TC0_TABLE: [[u8; 52]; 3] = [
     [
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8, 9, 10, 11, 13,
@@ -57,6 +57,10 @@ const TC0: [[u8; 52]; 3] = [
         2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 23, 25,
     ],
 ];
+
+use ALPHA_TABLE as ALPHA;
+use BETA_TABLE as BETA;
+use TC0_TABLE as TC0;
 
 /// Apply deblocking to all edges in `pic`.
 ///
@@ -339,6 +343,30 @@ fn filter_mb_edge_horizontal(
 /// 4×4 sub-blocks `(p_mb, p_sub_col, p_sub_row)` ← → `(q_mb, q_sub_col,
 /// q_sub_row)`. `is_mb_edge` is true when the edge lies on an MB
 /// boundary (different macroblocks on each side).
+///
+/// Crate-public wrapper so the 10-bit deblocker ([`crate::deblock_hi`])
+/// can share the same bS-derivation logic without duplicating the MV /
+/// reference-mismatch branch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn derive_bs_for_edge(
+    pic: &Picture,
+    p_mb_x: u32,
+    p_mb_y: u32,
+    p_sub_col: usize,
+    p_sub_row: usize,
+    q_mb_x: u32,
+    q_mb_y: u32,
+    q_sub_col: usize,
+    q_sub_row: usize,
+    is_mb_edge: bool,
+    slice_type: SliceType,
+) -> u8 {
+    derive_bs(
+        pic, p_mb_x, p_mb_y, p_sub_col, p_sub_row, q_mb_x, q_mb_y, q_sub_col, q_sub_row,
+        is_mb_edge, true, slice_type,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn derive_bs(
     pic: &Picture,

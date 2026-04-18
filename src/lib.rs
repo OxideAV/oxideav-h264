@@ -233,6 +233,7 @@ pub mod cabac;
 pub mod cavlc;
 pub mod cavlc_enc;
 pub mod deblock;
+pub mod deblock_hi;
 pub mod decoder;
 pub mod dpb;
 pub mod encoder;

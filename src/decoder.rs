@@ -612,13 +612,16 @@ impl H264Decoder {
                     _ => unreachable!(),
                 }
 
-                // Optional in-loop deblocking — §8.7. The deblock kernel
-                // still operates on u8 samples; on the high-bit-depth path
-                // it is skipped (the decoded output is otherwise correct
-                // bit-exact against an ffmpeg `-filter_v h264=no-deblock`
-                // reference for the 10-bit fixture shipped with this crate).
-                if sh.disable_deblocking_filter_idc != 1 && !pic.is_high_bit_depth() {
-                    crate::deblock::deblock_picture(&mut pic, &pps, &sh);
+                // Optional in-loop deblocking — §8.7. The 8-bit kernel
+                // touches `pic.y/cb/cr`; the 10-bit kernel touches the u16
+                // planes and scales α / β / tC0 by `1 << (BitDepth - 8)`
+                // per §8.7.2.1.
+                if sh.disable_deblocking_filter_idc != 1 {
+                    if pic.is_high_bit_depth() {
+                        crate::deblock_hi::deblock_picture_hi(&mut pic, &pps, &sh);
+                    } else {
+                        crate::deblock::deblock_picture(&mut pic, &pps, &sh);
+                    }
                 }
 
                 // ---- DPB insertion + reference marking ---------------
