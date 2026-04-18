@@ -176,6 +176,24 @@
 //!   parsed and used as the window size when present; the old
 //!   `max_num_ref_frames` upper bound remains as a conservative
 //!   fallback for streams that don't carry the VUI field.
+//! * **PAFF I-slice decode** (§7.3.3 / §7.4.3 / §8.2.1 POC for fields)
+//!   — a slice header with `field_pic_flag = 1` is accepted for I-slices
+//!   in 4:2:0 / 8-bit / CAVLC, a [`picture::Picture::new_field`]
+//!   allocates a half-height buffer sized to `PicWidthInMbs ×
+//!   PicHeightInMapUnits`, the CAVLC I-slice MB loop reconstructs
+//!   directly into that buffer, and `queue_ready_frame` emits a
+//!   VideoFrame whose height is the field sample rows. Top and bottom
+//!   fields are returned as two separate VideoFrames in decode order;
+//!   downstream callers are responsible for pair-stacking back into a
+//!   full-height frame when the display layer expects progressive
+//!   output. POC derivation is unchanged — §8.2.1.1 type 0 yields
+//!   TopFieldOrderCnt or BottomFieldOrderCnt directly per field. The
+//!   paired-encoder side exposes an `H264EncoderOptions::paff_field`
+//!   knob that writes `frame_mbs_only_flag = 0` in the SPS and
+//!   `field_pic_flag = 1` / `bottom_field_flag` in the slice header.
+//!   MBAFF, PAFF P / B, PAFF CABAC, PAFF + 10-bit / 4:2:2 / 4:4:4, and
+//!   MBAFF mixed with PAFF in the same CVS all return
+//!   `Error::Unsupported`.
 //! * **Custom scaling lists** (§7.4.2.1.1.1 / §7.4.2.2) — the SPS and
 //!   PPS scaling-list matrices are parsed out of their zig-zag
 //!   coded form into raster order, resolved per Table 7-2 (PPS
@@ -203,7 +221,9 @@
 //!   path is parsed but the weights aren't yet applied to the MC output.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
-//! * Interlaced coding / MBAFF / PAFF.
+//! * MBAFF; PAFF for any slice type other than I; PAFF + MBAFF mixed
+//!   within the same coded video sequence. PAFF I-slice decode is
+//!   supported — see the PAFF bullet above.
 //! * `separate_colour_plane_flag = 1` (§7.4.2.1.1, three independent
 //!   colour planes) is rejected at slice entry with `Error::Unsupported`.
 //!   4:2:2 is supported for CAVLC I-slices only — 4:2:2 P / B and CABAC
