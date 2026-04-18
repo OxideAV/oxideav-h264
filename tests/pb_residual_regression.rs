@@ -1,15 +1,19 @@
-//! Narrowing regression for the P/B residual bit-exactness ceiling.
+//! Regression for the P/B residual bit-exactness ceiling.
 //!
 //! `testsrc_p_64x64.{es,yuv}` — a 3-frame 64×64 CAVLC Main-profile P clip
 //! generated from `testsrc` with no B-frames (`-bf 0`) and no scenecut so
 //! frames 1-2 are pure P. Every MB on row 3 decodes through
 //! [`decode_p16x16`] with `cbp_luma = 15`, and two MBs on row 2 are
-//! Intra_16×16 with `cbp_luma = 0` — the combination that triggers the
-//! open residual divergence (~95% match against ffmpeg's YUV, mb_y=3 only).
+//! Intra_16×16 with `cbp_luma = 0`.
 //!
-//! This test freezes the **current** match rate (≥ 94%) as a non-regression
-//! floor. When the upstream residual bug is fixed, raise the threshold to
-//! 99% and confirm all three dimensions (4:2:0 / 4:2:2 / 4:4:4) match.
+//! Root cause of the original divergence (§8.4.1.3.1 median MV
+//! prediction): an intra-coded neighbour is "available" with
+//! `refIdxLX = -1` and `mvLX = 0`, NOT "not available". The earlier
+//! implementation short-circuited `neighbour_mv_list` to `None` for
+//! intra neighbours, which in turn triggered the §6.4.11.7 C→D
+//! geometric-fallback incorrectly. The corrected predictor matches
+//! FFmpeg's `pred_motion` match_count path and yields bit-exact
+//! reconstruction on this fixture.
 //!
 //! Generated with:
 //!   ffmpeg -y -f lavfi -i testsrc=duration=1:size=64x64:rate=3 -vframes 3 \
@@ -76,10 +80,11 @@ fn ratio_match(a: &[u8], b: &[u8]) -> f64 {
     matched as f64 / a.len() as f64
 }
 
-/// Freeze the 4:2:0 testsrc P-slice floor. The current decoder hits ~95.7%
-/// on this fixture, versus 100% expected from ffmpeg's own decoder. See
-/// the module-level comment: the divergence is isolated to mb_y = 3 and
-/// correlates with Intra_16×16 (cbp_luma=0) neighbours in mb_y = 2.
+/// The 4:2:0 testsrc P-slice fixture must decode bit-exact — the
+/// §8.4.1.3.1 median MV predictor now treats intra neighbours as
+/// `(mvLX = 0, refIdxLX = -1)` (available, non-matching) instead of
+/// `None` (unavailable), so the earlier 95.7% ceiling caused by the
+/// incorrect C→D geometric-fallback on row 3 is gone.
 #[test]
 fn testsrc_p_decode_above_current_floor() {
     let es = read_fixture("tests/fixtures/testsrc_p_64x64.es");
@@ -91,13 +96,9 @@ fn testsrc_p_decode_above_current_floor() {
     let got = flatten_frames_yuv420(&frames, 3, 64, 64);
     assert_eq!(got.len(), ref_yuv.len(), "decoded length mismatch");
     let r = ratio_match(&got, &ref_yuv);
-    // Current floor is ~95.7%; the remaining ~4% is the open P/B residual
-    // divergence affecting mb_y = 3 when mb_y = 2 contains Intra_16x16
-    // (cbp_luma=0) neighbours. Raise to 0.99 once the upstream bug is
-    // fixed; test here locks the non-regression floor.
     assert!(
-        r >= 0.94,
-        "4:2:0 testsrc P-slice decode accuracy {:.3}% — below 94% floor",
+        (r - 1.0).abs() < f64::EPSILON,
+        "4:2:0 testsrc P-slice decode accuracy {:.3}% — expected 100%",
         r * 100.0
     );
 }

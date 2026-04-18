@@ -103,18 +103,12 @@ fn decode_yuv444_cavlc_p_matches_reference() {
     let got = flatten_frames_yuv444(&frames, 3, 64, 64);
     assert_eq!(got.len(), ref_yuv.len(), "decoded length mismatch");
     let r = ratio_match(&got, &ref_yuv);
-    // §8.4.2.2 Table 8-9 — the luma-on-chroma MC is wired end-to-end; the
-    // testsrc fixture still carries ~6 % of samples that diverge from
-    // ffmpeg in one bottom-strip MB row. The divergence traces to a
-    // yet-uninvestigated P-MB type (intra-in-P with specific
-    // Intra_4×4 modes?) that the current pipeline doesn't reconstruct
-    // bit-exact. A solid-colour P fixture (`simple_p_diag`) decodes
-    // 100 % matched, confirming the happy path is correct. Threshold
-    // relaxed to 90 % so the integration test locks the non-regression
-    // floor while the remaining divergence is investigated.
+    // §8.4.1.3.1 median MV predictor now handles intra neighbours with
+    // `refIdxLX = -1` per spec, which eliminated the bottom-row residual
+    // divergence on this fixture. 100 % bit-exact against ffmpeg.
     assert!(
-        r >= 0.90,
-        "4:4:4 P-slice decode accuracy {:.3}% — below 90%",
+        (r - 1.0).abs() < f64::EPSILON,
+        "4:4:4 P-slice decode accuracy {:.3}% — expected 100%",
         r * 100.0
     );
 }

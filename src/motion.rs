@@ -39,6 +39,15 @@ pub fn neighbour_mv(
 
 /// List-aware variant of [`neighbour_mv`] — `list == 0` reads
 /// `mv_l0`/`ref_idx_l0`, `list == 1` reads `mv_l1`/`ref_idx_l1`.
+///
+/// Returns `None` **only** when the neighbour is geometrically unavailable
+/// (outside picture or not yet decoded). Intra-coded or list-X-unused
+/// neighbours return `Some(((0, 0), -1))` — §8.4.1.3.1 defines those as
+/// "available with `refIdxLX = -1` and `mvLX = 0`". The `-1` sentinel makes
+/// the `ref_idx` match check in [`predict_mv_l0`] correctly fail for the
+/// current MB's actual `ref_idx >= 0`, which in turn prevents the C→D
+/// fallback from running when C is merely intra (the fallback is only for
+/// geometric unavailability per §6.4.11.7).
 pub fn neighbour_mv_list(
     pic: &Picture,
     mb_x: i32,
@@ -71,8 +80,11 @@ pub fn neighbour_mv_list(
         return None;
     }
     let info = pic.mb_info_at(mbx as u32, mby as u32);
-    if !info.coded || info.intra {
+    if !info.coded {
         return None;
+    }
+    if info.intra {
+        return Some(((0, 0), -1));
     }
     let idx = (row * 4 + col) as usize;
     let (ref_idx, mv) = if list == 0 {
@@ -81,7 +93,7 @@ pub fn neighbour_mv_list(
         (info.ref_idx_l1[idx], info.mv_l1[idx])
     };
     if ref_idx < 0 {
-        return None;
+        return Some(((0, 0), -1));
     }
     Some((mv, ref_idx))
 }
