@@ -28,7 +28,8 @@
 //!   so frames emerge in presentation order.
 //!
 //! Out of scope (returns `Error::Unsupported`):
-//! * Interlaced coding / MBAFF (P and B).
+//! * MBAFF / PAFF + CABAC, MBAFF / PAFF at 10-bit, PAFF at 4:2:2 /
+//!   4:4:4. MBAFF I/P/B and PAFF I/P/B at 4:2:0 / 8-bit CAVLC are wired.
 //! * 8×8 transform on the CABAC path, bit depth > 8.
 //! * Monochrome (`chroma_format_idc = 0`) and
 //!   `separate_colour_plane_flag = 1` are rejected at slice entry
@@ -231,8 +232,10 @@ impl H264Decoder {
                                 "h264: frame-mode slice under frame_mbs_only_flag=0 without MBAFF/PAFF not supported",
                             ));
                         }
-                        let mbaff_ok = sh.slice_type == SliceType::I
-                            && !pps.entropy_coding_mode_flag
+                        let mbaff_ok = matches!(
+                            sh.slice_type,
+                            SliceType::I | SliceType::P | SliceType::B
+                        ) && !pps.entropy_coding_mode_flag
                             && (sps.chroma_format_idc == 1
                                 || sps.chroma_format_idc == 2
                                 || sps.chroma_format_idc == 3)
@@ -241,21 +244,26 @@ impl H264Decoder {
                             && !sps.separate_colour_plane_flag;
                         if !mbaff_ok {
                             return Err(Error::unsupported(
-                                "h264: only MBAFF I-slice CAVLC 4:2:0/4:2:2/4:4:4 8-bit interlaced is wired (§7.3.4); \
-                                 MBAFF+P/B/CABAC/10-bit still reject",
+                                "h264: MBAFF wired for CAVLC I/P/B at 4:2:0/4:2:2/4:4:4 8-bit only (§7.3.4); \
+                                 MBAFF + CABAC / 10-bit still reject",
                             ));
                         }
                     } else {
-                        // PAFF field slice: only CAVLC I-slices in 4:2:0 / 8-bit
-                        // land on the field-reconstruction path below.
-                        if sh.slice_type != SliceType::I {
+                        // PAFF field slice: CAVLC I / P / B at 4:2:0 / 8-bit
+                        // land on the field-reconstruction path below. P / B
+                        // drive `build_list0_p` / `build_list1_b` built from
+                        // the DPB's prior field (or frame) references.
+                        if !matches!(
+                            sh.slice_type,
+                            SliceType::I | SliceType::P | SliceType::B
+                        ) {
                             return Err(Error::unsupported(
-                                "h264: PAFF (field_pic_flag=1) supports I-slices only",
+                                "h264: PAFF (field_pic_flag=1) supports I/P/B slices only",
                             ));
                         }
                         if pps.entropy_coding_mode_flag {
                             return Err(Error::unsupported(
-                                "h264: PAFF CABAC entropy decode not wired — CAVLC I-slice only",
+                                "h264: PAFF CABAC entropy decode not wired — CAVLC I/P/B only",
                             ));
                         }
                         if sps.chroma_format_idc != 1
@@ -896,6 +904,12 @@ impl H264Decoder {
 /// number of `P_Skip` macroblocks that precede the next coded MB. The last
 /// "run" before the end of the slice is also emitted, letting the encoder
 /// trail a run of skipped MBs with no following coded MB.
+///
+/// Under MBAFF (§7.3.4) `mb_field_decoding_flag` is emitted once per MB
+/// pair — at the first non-skipped MB in the pair, before its `mb_type`
+/// syntax. When every MB in a pair is skipped, the per-pair flag is
+/// inferred from the left-neighbour pair (spec §7.4.4, approximated here
+/// by leaving the default `false`).
 fn decode_p_slice_data(
     br: &mut BitReader<'_>,
     sh: &SliceHeader,
@@ -905,7 +919,11 @@ fn decode_p_slice_data(
     ref_list0: &[&Picture],
 ) -> Result<()> {
     let mb_w = sps.pic_width_in_mbs();
-    let mb_h = sps.pic_height_in_map_units();
+    let mb_h = if sh.field_pic_flag {
+        sps.pic_height_in_map_units()
+    } else {
+        sps.pic_height_in_mbs()
+    };
     let total_mbs = mb_w * mb_h;
     let mut mb_addr = sh.first_mb_in_slice;
     if mb_addr >= total_mbs {
@@ -914,27 +932,83 @@ fn decode_p_slice_data(
         ));
     }
     let mut prev_qp = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+    // MBAFF iterates in pair units of two MBs. `first_mb_in_slice` counts
+    // pairs, so multiply out to per-MB here and stride through both
+    // members of each pair before moving on.
+    let mbaff = pic.mbaff_enabled;
+    if mbaff {
+        mb_addr = sh.first_mb_in_slice * 2;
+    }
 
+    // §7.3.4 — `mb_skip_run` counts individual macroblocks (not pairs)
+    // even under MBAFF. `mb_field_decoding_flag` is emitted before the
+    // first coded MB of a pair; the spec gates on
+    // `(CurrMbAddr even) || (CurrMbAddr odd && prev_mb_skipped)`.
     while mb_addr < total_mbs {
         let skip_run = br.read_ue()?;
+        let prev_mb_skipped = skip_run > 0;
         for _ in 0..skip_run {
             if mb_addr >= total_mbs {
                 break;
             }
-            let mb_x = mb_addr % mb_w;
-            let mb_y = mb_addr / mb_w;
+            let (mb_x, mb_y) = addr_to_xy(mb_addr, mb_w, mbaff);
             decode_p_skip_mb(sh, mb_x, mb_y, pic, ref_list0, prev_qp)?;
+            if mbaff {
+                pic.mb_info_mut(mb_x, mb_y).mb_field_decoding_flag =
+                    mbaff_pair_field_flag(pic, mb_x, mb_y, mbaff);
+            }
             mb_addr += 1;
         }
         if mb_addr >= total_mbs {
             break;
         }
-        let mb_x = mb_addr % mb_w;
-        let mb_y = mb_addr / mb_w;
+        let (mb_x, mb_y) = addr_to_xy(mb_addr, mb_w, mbaff);
+        if mbaff {
+            let even = (mb_addr & 1) == 0;
+            if even || prev_mb_skipped {
+                let field = br.read_flag()?;
+                let pair_y = (mb_y / 2) * 2;
+                pic.mb_info_mut(mb_x, pair_y).mb_field_decoding_flag = field;
+                pic.mb_info_mut(mb_x, pair_y + 1).mb_field_decoding_flag = field;
+            }
+        }
         decode_p_slice_mb(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, &mut prev_qp)?;
         mb_addr += 1;
     }
     Ok(())
+}
+
+/// Map a raster `mb_addr` to `(mb_x, mb_y)` — under MBAFF the MB grid
+/// steps through pairs in raster order: MBs `2*pair_idx` and `2*pair_idx+1`
+/// sit at `(pair_x, 2*pair_y)` and `(pair_x, 2*pair_y+1)` respectively.
+fn addr_to_xy(mb_addr: u32, mb_w: u32, mbaff: bool) -> (u32, u32) {
+    if mbaff {
+        let pair_idx = mb_addr / 2;
+        let which = mb_addr & 1;
+        let pair_x = pair_idx % mb_w;
+        let pair_y = pair_idx / mb_w;
+        (pair_x, pair_y * 2 + which)
+    } else {
+        (mb_addr % mb_w, mb_addr / mb_w)
+    }
+}
+
+/// Per §7.4.4, when every MB in a pair is skipped the per-pair
+/// `mb_field_decoding_flag` is inferred from the left-neighbour pair.
+/// For uniformly-frame-coded or -field-coded MBAFF streams (the common
+/// case for synthetic testsrc fixtures) the left neighbour carries the
+/// right answer; otherwise we fall back to the current top-MB flag, which
+/// matches §7.4.4 when left is unavailable.
+fn mbaff_pair_field_flag(pic: &Picture, mb_x: u32, mb_y: u32, mbaff: bool) -> bool {
+    if !mbaff {
+        return false;
+    }
+    if mb_x > 0 {
+        pic.mb_info_at(mb_x - 1, mb_y).mb_field_decoding_flag
+    } else {
+        let pair_y = (mb_y / 2) * 2;
+        pic.mb_info_at(mb_x, pair_y).mb_field_decoding_flag
+    }
 }
 
 /// CAVLC P-slice data loop — 10-bit pipeline. Mirrors
@@ -1007,7 +1081,11 @@ fn decode_b_slice_data(
     ctx: &crate::b_mb::BSliceCtx<'_>,
 ) -> Result<()> {
     let mb_w = sps.pic_width_in_mbs();
-    let mb_h = sps.pic_height_in_map_units();
+    let mb_h = if sh.field_pic_flag {
+        sps.pic_height_in_map_units()
+    } else {
+        sps.pic_height_in_mbs()
+    };
     let total_mbs = mb_w * mb_h;
     let mut mb_addr = sh.first_mb_in_slice;
     if mb_addr >= total_mbs {
@@ -1016,23 +1094,39 @@ fn decode_b_slice_data(
         ));
     }
     let mut prev_qp = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+    let mbaff = pic.mbaff_enabled;
+    if mbaff {
+        mb_addr = sh.first_mb_in_slice * 2;
+    }
 
     while mb_addr < total_mbs {
         let skip_run = br.read_ue()?;
+        let prev_mb_skipped = skip_run > 0;
         for _ in 0..skip_run {
             if mb_addr >= total_mbs {
                 break;
             }
-            let mb_x = mb_addr % mb_w;
-            let mb_y = mb_addr / mb_w;
+            let (mb_x, mb_y) = addr_to_xy(mb_addr, mb_w, mbaff);
             decode_b_skip_mb(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, prev_qp)?;
+            if mbaff {
+                pic.mb_info_mut(mb_x, mb_y).mb_field_decoding_flag =
+                    mbaff_pair_field_flag(pic, mb_x, mb_y, mbaff);
+            }
             mb_addr += 1;
         }
         if mb_addr >= total_mbs {
             break;
         }
-        let mb_x = mb_addr % mb_w;
-        let mb_y = mb_addr / mb_w;
+        let (mb_x, mb_y) = addr_to_xy(mb_addr, mb_w, mbaff);
+        if mbaff {
+            let even = (mb_addr & 1) == 0;
+            if even || prev_mb_skipped {
+                let field = br.read_flag()?;
+                let pair_y = (mb_y / 2) * 2;
+                pic.mb_info_mut(mb_x, pair_y).mb_field_decoding_flag = field;
+                pic.mb_info_mut(mb_x, pair_y + 1).mb_field_decoding_flag = field;
+            }
+        }
         decode_b_slice_mb(
             br,
             sps,

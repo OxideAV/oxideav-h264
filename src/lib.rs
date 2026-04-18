@@ -175,29 +175,29 @@
 //!   `coded_block_pattern`, `mb_qp_delta`, and 4×4 residual coding.
 //!   `weighted_pred_flag = 1` is parsed but weights are not yet wired
 //!   on the CABAC path.
-//! * **MBAFF I-slice CAVLC** (§7.3.4, §6.4.9.4, §8.7.1.1) — 4:2:0 8-bit
-//!   pictures with `frame_mbs_only_flag = 0 &&
+//! * **MBAFF I/P/B-slice CAVLC** (§7.3.4, §6.4.9.4, §8.7.1.1) — 4:2:0
+//!   8-bit pictures with `frame_mbs_only_flag = 0 &&
 //!   mb_adaptive_frame_field_flag = 1` are decoded by a pair-granular
 //!   loop that reads `mb_field_decoding_flag` per pair and routes
 //!   sample writes through the field-stride helpers on
-//!   [`picture::Picture`]. The §6.4.9.4 same-polarity "above" lookup
-//!   is implemented via [`picture::Picture::mb_above_neighbour`], so
-//!   CAVLC `nC` prediction, intra-4×4 mode prediction and intra
-//!   neighbour samples all resolve to the correct previous-pair MB
-//!   for field-coded pairs. The MBAFF in-loop deblocker
-//!   ([`deblock::deblock_picture_mbaff`]) walks MB pairs and keys the
-//!   edge schedule on each pair's `mb_field_decoding_flag`: field-coded
-//!   pairs step vertical edges at `row_step = 2` through the
-//!   interleaved plane layout and skip the inside-pair top/bottom
-//!   boundary (§8.7.1.1). MBAFF also accepts the 4:2:2 and 4:4:4
-//!   chroma formats (ChromaArrayType ∈ {2, 3}) — the 4:2:2 8×16
-//!   intra-chroma path and the 4:4:4 three-plane path both route
-//!   their neighbour lookups and residual writes through the
-//!   field-aware [`picture::Picture::luma_row_stride_for_at`] /
-//!   [`picture::Picture::chroma_row_stride_for_at`] helpers, and
-//!   the MBAFF deblocker computes its per-band chroma edge schedule
-//!   from `chroma_format_idc`. MBAFF P/B/CABAC and MBAFF 10-bit are
-//!   still rejected.
+//!   [`picture::Picture`]. Under P / B slices the MBAFF-aware
+//!   CAVLC loop also implements the §7.3.4 "mb_skip_run / flag"
+//!   interleave — `mb_field_decoding_flag` is emitted at the first
+//!   coded MB of each pair (gated by `(CurrMbAddr even) ||
+//!   (odd && prev_mb_skipped)`) and the skip run counts individual
+//!   MBs. The §6.4.9.4 same-polarity "above" lookup is implemented
+//!   via [`picture::Picture::mb_above_neighbour`], so CAVLC `nC`
+//!   prediction, intra-4×4 mode prediction, intra neighbour samples
+//!   and the list-0 / list-1 MV predictors all resolve to the
+//!   correct previous-pair MB for field-coded pairs. The MBAFF
+//!   in-loop deblocker ([`deblock::deblock_picture_mbaff`]) walks
+//!   MB pairs and keys the edge schedule on each pair's
+//!   `mb_field_decoding_flag`: field-coded pairs step vertical edges
+//!   at `row_step = 2` through the interleaved plane layout and
+//!   skip the inside-pair top/bottom boundary (§8.7.1.1). MBAFF
+//!   also accepts the 4:2:2 and 4:4:4 chroma formats
+//!   (ChromaArrayType ∈ {2, 3}) for I-slice decode. MBAFF CABAC
+//!   and MBAFF 10-bit are still rejected.
 //! * **CABAC Main-profile B-slice** entropy decode (§9.3) —
 //!   `mb_skip_flag` (B bank), `mb_type` (Table 9-37 with the 48-value
 //!   inter + intra tree), `sub_mb_type` (Table 9-38 B column, 13 values),
@@ -321,14 +321,12 @@
 //!   path is parsed but the weights aren't yet applied to the MC output.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
-//! * MBAFF P/B, MBAFF CABAC, and MBAFF 10-bit — MBAFF I-slice CAVLC
-//!   in 4:2:0 / 4:2:2 / 4:4:4 8-bit IS wired (`frame_mbs_only_flag = 0
-//!   && mb_adaptive_frame_field_flag = 1` pictures decode via the
-//!   §7.3.4 MB-pair loop + §6.4.9.4 field-stride neighbour logic plus
-//!   the §8.7.1.1 MBAFF in-loop deblocker). PAFF I-slice decode is also
-//!   wired (see the PAFF bullet above); PAFF for non-I slice types and
-//!   PAFF + MBAFF mixed within the same CVS still return
-//!   `Error::Unsupported`.
+//! * MBAFF CABAC and MBAFF 10-bit — MBAFF I/P/B-slice CAVLC in 4:2:0
+//!   8-bit IS wired (MBAFF I also works at 4:2:2 / 4:4:4). PAFF
+//!   I/P/B-slice decode at 4:2:0 / 8-bit is wired through the same
+//!   field-picture path; PAFF CABAC, PAFF 10-bit, PAFF at alternate
+//!   chroma formats, and PAFF + MBAFF mixed within the same CVS all
+//!   still return `Error::Unsupported`.
 //! * `separate_colour_plane_flag = 1` (§7.4.2.1.1, three independent
 //!   colour planes) is rejected at slice entry with `Error::Unsupported`.
 //!   4:2:2 is supported for CAVLC I/P/B and CABAC I/P slices — CABAC
