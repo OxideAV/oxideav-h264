@@ -258,6 +258,16 @@ pub fn decode_i_mb_cabac(
     // --- intra4x4 modes (only for I_NxN) ---
     let mut intra4x4_modes = [INTRA_DC_FAKE; 16];
     if matches!(imb, IMbType::INxN) {
+        // CABAC's `transform_size_8x8_flag` (§9.3.3.1.1.10, ctxIdx 399..=401)
+        // isn't implemented in this crate yet. Refuse the macroblock when
+        // the PPS advertises 8×8 transform support so we don't silently
+        // desync the bitstream.
+        if pps.transform_8x8_mode_flag {
+            return Err(Error::unsupported(
+                "h264: CABAC transform_size_8x8_flag (§9.3.3.1.1.10) not yet supported — \
+                 use CAVLC to decode 8×8-transform bitstreams",
+            ));
+        }
         for blk in 0..16usize {
             let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
             let prev_flag = {

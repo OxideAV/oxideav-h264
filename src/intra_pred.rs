@@ -1,7 +1,9 @@
 //! Intra prediction — ITU-T H.264 §8.3.
 //!
-//! Three families:
+//! Four families:
 //! * Intra_4×4 (§8.3.1) — 9 modes, per 4×4 luma sub-block.
+//! * Intra_8×8 (§8.3.2, High Profile) — 9 modes over 8×8 luma blocks with
+//!   reference-sample low-pass filtering per §8.3.2.2.2.
 //! * Intra_16×16 (§8.3.3) — 4 modes (Vertical / Horizontal / DC / Plane).
 //! * Intra chroma 8×8 (§8.3.4) — 4 modes (DC / Horizontal / Vertical / Plane).
 //!
@@ -544,6 +546,341 @@ pub fn predict_intra_chroma(out: &mut [u8; 64], mode: IntraChromaMode, n: &Intra
     }
 }
 
+// ---------------------------------------------------------------------------
+// Intra_8×8 (§8.3.2) — High Profile.
+// ---------------------------------------------------------------------------
+
+/// Intra_8×8 prediction modes (§8.3.2.1, Table 8-3). Same numeric values as
+/// [`Intra4x4Mode`] but applied over an 8×8 block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Intra8x8Mode {
+    Vertical = 0,
+    Horizontal = 1,
+    Dc = 2,
+    DiagonalDownLeft = 3,
+    DiagonalDownRight = 4,
+    VerticalRight = 5,
+    HorizontalDown = 6,
+    VerticalLeft = 7,
+    HorizontalUp = 8,
+}
+
+impl Intra8x8Mode {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Vertical),
+            1 => Some(Self::Horizontal),
+            2 => Some(Self::Dc),
+            3 => Some(Self::DiagonalDownLeft),
+            4 => Some(Self::DiagonalDownRight),
+            5 => Some(Self::VerticalRight),
+            6 => Some(Self::HorizontalDown),
+            7 => Some(Self::VerticalLeft),
+            8 => Some(Self::HorizontalUp),
+            _ => None,
+        }
+    }
+}
+
+/// Neighbour samples needed by an Intra_8×8 prediction (§8.3.2.2.1). The
+/// prediction consumes:
+///
+/// * `top[0..=15]`   — the 16 samples of the row above (top + top-right).
+/// * `left[0..=7]`   — the 8 samples of the column to the left.
+/// * `top_left`      — the corner sample at (-1, -1).
+///
+/// The `top_right_available` flag mirrors the Intra_4×4 case: when false,
+/// `top[8..=15]` must be replicated from `top[7]` by the caller per
+/// §8.3.2.2.1 step 3.
+#[derive(Clone, Debug)]
+pub struct Intra8x8Neighbours {
+    pub top: [u8; 16],
+    pub left: [u8; 8],
+    pub top_left: u8,
+    pub top_available: bool,
+    pub left_available: bool,
+    pub top_left_available: bool,
+    pub top_right_available: bool,
+}
+
+/// Reference-sample low-pass filtering per §8.3.2.2.2. Produces the
+/// filtered references used by every Intra_8×8 prediction mode. Returns
+/// `(filt_top[0..=15], filt_left[0..=7], filt_top_left)` — same layout as
+/// the input neighbour struct but with the (1,2,1) filter applied.
+///
+/// The three corner rules from the spec:
+///
+/// * `p'[-1,-1] = (p[0,-1] + 2·p[-1,-1] + p[-1,0] + 2) >> 2` when both top
+///   and left are available.
+/// * `p'[-1,-1] = (3·p[-1,-1] + p[0,-1] + 2) >> 2` when only top available.
+/// * `p'[-1,-1] = (3·p[-1,-1] + p[-1,0] + 2) >> 2` when only left available.
+///
+/// The two last-sample rules:
+///
+/// * `p'[15,-1] = (p[14,-1] + 3·p[15,-1] + 2) >> 2` (top row's tail).
+/// * `p'[-1,7]  = (p[-1,6] + 3·p[-1,7] + 2) >> 2`   (left column's tail).
+fn filter_ref_8x8(n: &Intra8x8Neighbours) -> ([u8; 16], [u8; 8], u8) {
+    let mut ft = [0u8; 16];
+    let mut fl = [0u8; 8];
+    let ftl;
+
+    // Top row filtering: uses top_left + top[0..=15] as input samples.
+    if n.top_available {
+        // Position 0 uses top_left on the low side.
+        let tl_src = if n.top_left_available {
+            n.top_left
+        } else {
+            n.top[0]
+        };
+        ft[0] = ((tl_src as u32 + 2 * n.top[0] as u32 + n.top[1] as u32 + 2) >> 2) as u8;
+        for i in 1..15 {
+            ft[i] =
+                ((n.top[i - 1] as u32 + 2 * n.top[i] as u32 + n.top[i + 1] as u32 + 2) >> 2) as u8;
+        }
+        ft[15] = ((n.top[14] as u32 + 3 * n.top[15] as u32 + 2) >> 2) as u8;
+    }
+
+    // Left column filtering: uses top_left + left[0..=7].
+    if n.left_available {
+        let tl_src = if n.top_left_available {
+            n.top_left
+        } else {
+            n.left[0]
+        };
+        fl[0] = ((tl_src as u32 + 2 * n.left[0] as u32 + n.left[1] as u32 + 2) >> 2) as u8;
+        for i in 1..7 {
+            fl[i] = ((n.left[i - 1] as u32 + 2 * n.left[i] as u32 + n.left[i + 1] as u32 + 2) >> 2)
+                as u8;
+        }
+        fl[7] = ((n.left[6] as u32 + 3 * n.left[7] as u32 + 2) >> 2) as u8;
+    }
+
+    // Top-left corner filtering.
+    if n.top_left_available {
+        ftl = match (n.top_available, n.left_available) {
+            (true, true) => {
+                ((n.top[0] as u32 + 2 * n.top_left as u32 + n.left[0] as u32 + 2) >> 2) as u8
+            }
+            (true, false) => ((3 * n.top_left as u32 + n.top[0] as u32 + 2) >> 2) as u8,
+            (false, true) => ((3 * n.top_left as u32 + n.left[0] as u32 + 2) >> 2) as u8,
+            (false, false) => n.top_left,
+        };
+    } else {
+        ftl = 0;
+    }
+
+    (ft, fl, ftl)
+}
+
+/// Predict an 8×8 luma block. Writes the prediction into `out` (raster
+/// layout `row * 8 + col`). Callers must already have populated
+/// `n.top[8..=15]` with replicated `top[7]` samples when
+/// `top_right_available == false` (same convention as Intra_4×4).
+pub fn predict_intra_8x8(out: &mut [u8; 64], mode: Intra8x8Mode, n: &Intra8x8Neighbours) {
+    use Intra8x8Mode::*;
+    // Mode substitution follows §8.3.2.1 — a mode whose required neighbour
+    // is unavailable would be an invalid bitstream; but to be robust we fall
+    // back to DC so we never read out-of-range samples.
+    let mode = match mode {
+        Vertical if !n.top_available => Dc,
+        Horizontal if !n.left_available => Dc,
+        DiagonalDownLeft | VerticalLeft if !n.top_available => Dc,
+        DiagonalDownRight | VerticalRight | HorizontalDown
+            if !n.top_available || !n.left_available || !n.top_left_available =>
+        {
+            Dc
+        }
+        HorizontalUp if !n.left_available => Dc,
+        m => m,
+    };
+
+    let (ft, fl, ftl) = filter_ref_8x8(n);
+
+    // Helper — replicate top[7] into top[8..=15] when caller didn't. The
+    // filtering above consumed them so the helper isn't needed for ft[].
+
+    match mode {
+        Vertical => {
+            // p[x, y] = ft[x], x=0..=7, y=0..=7.
+            for y in 0..8 {
+                for x in 0..8 {
+                    out[y * 8 + x] = ft[x];
+                }
+            }
+        }
+        Horizontal => {
+            for y in 0..8 {
+                for x in 0..8 {
+                    out[y * 8 + x] = fl[y];
+                }
+            }
+        }
+        Dc => {
+            let dc: u32 = match (n.top_available, n.left_available) {
+                (true, true) => {
+                    (ft[0..8].iter().map(|&v| v as u32).sum::<u32>()
+                        + fl.iter().map(|&v| v as u32).sum::<u32>()
+                        + 8)
+                        >> 4
+                }
+                (true, false) => (ft[0..8].iter().map(|&v| v as u32).sum::<u32>() + 4) >> 3,
+                (false, true) => (fl.iter().map(|&v| v as u32).sum::<u32>() + 4) >> 3,
+                (false, false) => 128,
+            };
+            let v = dc.min(255) as u8;
+            for px in out.iter_mut() {
+                *px = v;
+            }
+        }
+        DiagonalDownLeft => {
+            // §8.3.2.2.4 — uses ft[0..=15] only.
+            for y in 0..8 {
+                for x in 0..8 {
+                    let v = if x == 7 && y == 7 {
+                        ((ft[14] as u32 + 3 * ft[15] as u32 + 2) >> 2) as u8
+                    } else {
+                        ((ft[x + y] as u32
+                            + 2 * ft[x + y + 1] as u32
+                            + ft[x + y + 2] as u32
+                            + 2)
+                            >> 2) as u8
+                    };
+                    out[y * 8 + x] = v;
+                }
+            }
+        }
+        DiagonalDownRight => {
+            // §8.3.2.2.5 — needs ft, fl, ftl.
+            // Build a linear "edge" array e[0..=16] indexed around the
+            // corner: e[7] = ftl, e[8..=15] = ft[0..=7], e[6..=-1] = fl[0..=7]
+            // (reversed). i.e. for k = x - y in -7..=7, the reference used
+            // is e[7 + k].
+            let mut e = [0u8; 16];
+            e[7] = ftl;
+            for i in 0..8 {
+                e[8 + i] = ft[i];
+            }
+            for i in 0..7 {
+                e[6 - i] = fl[i];
+            }
+            e[0] = fl[6]; // keep last of fl in e[0]; unused beyond -7 offset.
+            // For each position compute p[x,y] = (e[7 + k - 1] + 2*e[7 + k] +
+            // e[7 + k + 1] + 2) >> 2 with k = x - y.
+            for y in 0..8 {
+                for x in 0..8 {
+                    let k = x as i32 - y as i32;
+                    let idx = (7 + k) as usize;
+                    let l = e[idx - 1] as u32;
+                    let m = e[idx] as u32;
+                    let r = e[idx + 1] as u32;
+                    out[y * 8 + x] = ((l + 2 * m + r + 2) >> 2) as u8;
+                }
+            }
+        }
+        VerticalRight => {
+            // §8.3.2.2.6 — needs ft, fl, ftl.
+            // Build e[0..=15] where e[7] = ftl, e[8..=15] = ft[0..=7],
+            // e[0..=6] = fl[6..=0] (reversed).
+            let mut e = [0u8; 16];
+            e[7] = ftl;
+            for i in 0..8 {
+                e[8 + i] = ft[i];
+            }
+            for i in 0..7 {
+                e[6 - i] = fl[i];
+            }
+            for y in 0..8 {
+                for x in 0..8 {
+                    let zvr = 2 * x as i32 - y as i32;
+                    let v = if (0..=12).contains(&zvr) && zvr % 2 == 0 {
+                        let base = 7 + x as i32 - (y as i32 >> 1);
+                        let i = base as usize;
+                        ((e[i] as u32 + e[i + 1] as u32 + 1) >> 1) as u8
+                    } else if (0..=12).contains(&zvr) {
+                        let base = 7 + x as i32 - ((y as i32 + 1) >> 1);
+                        let i = base as usize;
+                        ((e[i] as u32 + 2 * e[i + 1] as u32 + e[i + 2] as u32 + 2) >> 2) as u8
+                    } else {
+                        // zvr < 0 — p[x,y] based on the left column.
+                        // zVR = -1, -2, -3, ..., -7.
+                        let k = -zvr - 1;
+                        let i = (6 - k) as usize;
+                        ((e[i] as u32 + 2 * e[i + 1] as u32 + e[i + 2] as u32 + 2) >> 2) as u8
+                    };
+                    out[y * 8 + x] = v;
+                }
+            }
+        }
+        HorizontalDown => {
+            // §8.3.2.2.7 — mirror of VerticalRight.
+            let mut e = [0u8; 16];
+            e[7] = ftl;
+            for i in 0..8 {
+                e[8 + i] = ft[i];
+            }
+            for i in 0..7 {
+                e[6 - i] = fl[i];
+            }
+            for y in 0..8 {
+                for x in 0..8 {
+                    let zhd = 2 * y as i32 - x as i32;
+                    let v = if (0..=12).contains(&zhd) && zhd % 2 == 0 {
+                        let base = 7 - (y as i32 - (x as i32 >> 1));
+                        let i = base as usize;
+                        ((e[i] as u32 + e[i - 1] as u32 + 1) >> 1) as u8
+                    } else if (0..=12).contains(&zhd) {
+                        let base = 7 - (y as i32 - ((x as i32 + 1) >> 1));
+                        let i = base as usize;
+                        ((e[i + 1] as u32 + 2 * e[i] as u32 + e[i - 1] as u32 + 2) >> 2) as u8
+                    } else {
+                        // zhd < 0 — p[x,y] based on top row.
+                        let k = -zhd - 1;
+                        let base = 8 + k;
+                        let i = base as usize;
+                        ((e[i] as u32 + 2 * e[i + 1] as u32 + e[i + 2] as u32 + 2) >> 2) as u8
+                    };
+                    out[y * 8 + x] = v;
+                }
+            }
+        }
+        VerticalLeft => {
+            // §8.3.2.2.8 — needs ft (with top-right replication) only.
+            for y in 0..8 {
+                for x in 0..8 {
+                    let i = x + (y >> 1);
+                    let v = if y % 2 == 0 {
+                        ((ft[i] as u32 + ft[i + 1] as u32 + 1) >> 1) as u8
+                    } else {
+                        ((ft[i] as u32 + 2 * ft[i + 1] as u32 + ft[i + 2] as u32 + 2) >> 2) as u8
+                    };
+                    out[y * 8 + x] = v;
+                }
+            }
+        }
+        HorizontalUp => {
+            // §8.3.2.2.9 — needs fl only.
+            for y in 0..8 {
+                for x in 0..8 {
+                    let zhu = x + 2 * y;
+                    let v = if zhu <= 12 && zhu % 2 == 0 {
+                        let i = y + (x >> 1);
+                        ((fl[i] as u32 + fl[i + 1] as u32 + 1) >> 1) as u8
+                    } else if zhu <= 11 {
+                        let i = y + (x >> 1);
+                        ((fl[i] as u32 + 2 * fl[i + 1] as u32 + fl[i + 2] as u32 + 2) >> 2) as u8
+                    } else if zhu == 13 {
+                        ((fl[6] as u32 + 3 * fl[7] as u32 + 2) >> 2) as u8
+                    } else {
+                        fl[7]
+                    };
+                    out[y * 8 + x] = v;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,5 +916,61 @@ mod tests {
         let mut out = [0u8; 256];
         predict_intra_16x16(&mut out, Intra16x16Mode::Dc, &n);
         assert!(out.iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn intra8x8_dc_neither_available() {
+        let n = Intra8x8Neighbours {
+            top: [0; 16],
+            left: [0; 8],
+            top_left: 0,
+            top_available: false,
+            left_available: false,
+            top_left_available: false,
+            top_right_available: false,
+        };
+        let mut out = [0u8; 64];
+        predict_intra_8x8(&mut out, Intra8x8Mode::Dc, &n);
+        assert!(out.iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn intra8x8_vertical_constant_top() {
+        // A constant top row must yield a constant prediction (the (1,2,1)
+        // reference filter preserves a flat signal modulo the corner rules).
+        let mut top = [100u8; 16];
+        // Ensure the filter's corner rules don't perturb a uniform top row.
+        // With top_left = 100, left_available = true, the filter is
+        // (p[-1,-1] + 2*p[0,-1] + p[1,-1] + 2) >> 2 = (100 + 200 + 100 + 2) >> 2 = 100.
+        // Also position 15: (p[14,-1] + 3*p[15,-1] + 2) >> 2 = (100 + 300 + 2) >> 2 = 100.
+        top[15] = 100;
+        let n = Intra8x8Neighbours {
+            top,
+            left: [100; 8],
+            top_left: 100,
+            top_available: true,
+            left_available: true,
+            top_left_available: true,
+            top_right_available: true,
+        };
+        let mut out = [0u8; 64];
+        predict_intra_8x8(&mut out, Intra8x8Mode::Vertical, &n);
+        assert!(out.iter().all(|&v| v == 100));
+    }
+
+    #[test]
+    fn intra8x8_horizontal_constant_left() {
+        let n = Intra8x8Neighbours {
+            top: [50; 16],
+            left: [50; 8],
+            top_left: 50,
+            top_available: true,
+            left_available: true,
+            top_left_available: true,
+            top_right_available: true,
+        };
+        let mut out = [0u8; 64];
+        predict_intra_8x8(&mut out, Intra8x8Mode::Horizontal, &n);
+        assert!(out.iter().all(|&v| v == 50));
     }
 }

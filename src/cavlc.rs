@@ -45,17 +45,38 @@ pub enum BlockKind {
     ChromaAc,
     /// 4:2:0 chroma DC block (4 coefficients).
     ChromaDc2x2,
+    /// One of the four 4×4-style CAVLC sub-blocks that together encode a
+    /// luma 8×8 residual (§7.3.5.3.2). Each sub-block decodes 16 coefficients
+    /// using the standard 4×4 VLC tables; the caller reassembles them into
+    /// the 8×8 raster via [`ZIGZAG_8X8_CAVLC`].
+    Luma8x8Sub,
 }
 
 impl BlockKind {
     pub fn max_num_coeff(self) -> usize {
         match self {
-            BlockKind::Luma4x4 | BlockKind::Luma16x16Dc => 16,
+            BlockKind::Luma4x4 | BlockKind::Luma16x16Dc | BlockKind::Luma8x8Sub => 16,
             BlockKind::Luma16x16Ac | BlockKind::ChromaAc => 15,
             BlockKind::ChromaDc2x2 => 4,
         }
     }
 }
+
+/// 8×8 CAVLC interleaved scan (§7.3.5.3.2). For CAVLC sub-block `j` (0..=3)
+/// and coefficient index `k` (0..=15), the 8×8 raster position (row * 8 +
+/// col) is `ZIGZAG_8X8_CAVLC[j * 16 + k]`. This is the same table as
+/// FFmpeg's `zigzag_scan8x8_cavlc`.
+#[rustfmt::skip]
+pub const ZIGZAG_8X8_CAVLC: [usize; 64] = [
+     0,  9, 17, 18, 12, 40, 27,  7,
+    35, 57, 29, 30, 58, 38, 53, 47,
+     1,  2, 24, 11, 19, 48, 20, 14,
+    42, 50, 22, 37, 59, 31, 60, 55,
+     8,  3, 32,  4, 26, 41, 13, 21,
+    49, 43, 15, 44, 52, 39, 61, 62,
+    16, 10, 25,  5, 33, 34,  6, 28,
+    56, 36, 23, 51, 45, 46, 54, 63,
+];
 
 /// Decoded residual block.
 #[derive(Clone, Debug)]
@@ -187,9 +208,39 @@ pub fn decode_residual_block(
                 block.coeffs[i] = coded[i];
             }
         }
+        BlockKind::Luma8x8Sub => {
+            // The caller reassembles the four sub-blocks into the 8×8 raster
+            // via `ZIGZAG_8X8_CAVLC`. At this layer we return the levels in
+            // coded-order so the caller can splice them at
+            // `ZIGZAG_8X8_CAVLC[sub_idx * 16 + k]`.
+            for i in 0..16 {
+                block.coeffs[i] = coded[i];
+            }
+        }
     }
 
     Ok(block)
+}
+
+/// Decode a single CAVLC sub-block of an 8×8 luma residual into the supplied
+/// 64-sample block. `sub` selects which quadrant (0=TL, 1=TR, 2=BL, 3=BR)
+/// is being decoded; `nc` is the predicted neighbour count (§9.2.1.1)
+/// computed against the 4×4 slot co-located with this quadrant.
+///
+/// Returns the sub-block's `total_coeff` so the caller can update its
+/// neighbour cache before decoding the next sub-block.
+pub fn decode_residual_8x8_sub(
+    br: &mut BitReader<'_>,
+    nc: i32,
+    sub: usize,
+    out: &mut [i32; 64],
+) -> Result<u8> {
+    let blk = decode_residual_block(br, nc, BlockKind::Luma8x8Sub)?;
+    for k in 0..16 {
+        let raster = ZIGZAG_8X8_CAVLC[sub * 16 + k];
+        out[raster] = blk.coeffs[k];
+    }
+    Ok(blk.total_coeff as u8)
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +426,11 @@ fn read_total_zeros(br: &mut BitReader<'_>, total_coeff: u32, kind: BlockKind) -
 // run_before (Table 9-10)
 // ---------------------------------------------------------------------------
 
+// Table 9-10 extended: for zerosLeft >= 7, runBefore values 0..6 use 3-bit
+// codes, 7..14 use prefixed lengths 4..11 ("n zeros then 1"), and 15+ continue
+// the same pattern by adding one more leading zero per unit. We enumerate up
+// to runBefore = 16 so a fully-scan-spanning zero run in a 16-coefficient
+// block (max zerosLeft) decodes without a table miss.
 const RUN_LEN: [&[u8]; 7] = [
     &[1, 1],
     &[1, 2, 2],
@@ -382,7 +438,7 @@ const RUN_LEN: [&[u8]; 7] = [
     &[2, 2, 2, 3, 3],
     &[2, 2, 3, 3, 3, 3],
     &[2, 3, 3, 3, 3, 3, 3],
-    &[3, 3, 3, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    &[3, 3, 3, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
 ];
 const RUN_BITS: [&[u8]; 7] = [
     &[1, 0],
@@ -391,7 +447,7 @@ const RUN_BITS: [&[u8]; 7] = [
     &[3, 2, 1, 1, 0],
     &[3, 2, 3, 2, 1, 0],
     &[3, 0, 1, 3, 2, 5, 4],
-    &[7, 6, 5, 4, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    &[7, 6, 5, 4, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
 ];
 
 fn read_run_before(br: &mut BitReader<'_>, zeros_left: u32) -> Result<u32> {

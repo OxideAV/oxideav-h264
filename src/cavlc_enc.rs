@@ -187,6 +187,11 @@ pub fn encode_residual_block(
             }
             (coded, 4usize)
         }
+        BlockKind::Luma8x8Sub => {
+            return Err(Error::unsupported(
+                "h264 encoder: 8×8 transform residual encoding not implemented",
+            ));
+        }
     };
 
     // Count non-zeros and their positions.

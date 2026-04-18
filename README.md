@@ -1,9 +1,10 @@
 # oxideav-h264
 
 Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
-oxideav. Decodes CAVLC + CABAC I-slices and CAVLC baseline P-slices;
-encodes a minimal Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED
-output stream. Zero C dependencies.
+oxideav. Decodes CAVLC + CABAC I-slices and CAVLC baseline P-slices,
+plus a partial CAVLC High-Profile Intra_8×8 / §8.5.13 inverse transform
+path; encodes a minimal Baseline-Profile, I-frame-only, Intra_16×16
+DC_PRED output stream. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -161,20 +162,49 @@ let pkt = enc.receive_packet()?;   // Annex B: SPS+PPS+IDR
 # Ok::<(), oxideav_core::Error>(())
 ```
 
+## Partially implemented — High Profile 8×8 transform (§8.5.13)
+
+The following pieces are implemented and unit-tested:
+
+- 8×8 inverse integer transform (`transform::idct_8x8`) and its 6-class
+  dequantisation (`transform::dequantize_8x8`) over the default flat-16
+  scaling list.
+- Nine Intra_8×8 prediction modes (§8.3.2) with reference-sample low-pass
+  filtering per §8.3.2.2.2.
+- CAVLC I-slice parsing of `transform_size_8x8_flag` and the four-way
+  interleaved 4×4-style CAVLC residual decode of 8×8 luma blocks
+  (§7.3.5.3.2) with per-sub-block `nC` neighbour prediction.
+
+Known gaps:
+
+- CABAC `transform_size_8x8_flag` (§9.3.3.1.1.10) is not wired. CABAC
+  streams with `transform_8x8_mode_flag = 1` in the PPS return
+  `Error::Unsupported`.
+- P-slice inter macroblocks with the flag set are not dispatched to
+  `idct_8x8` yet.
+- Custom scaling-list matrices are parsed and skipped — only the default
+  flat-16 list is used.
+- End-to-end bit-exact decode of real x264 `8x8dct=1:cabac=0` output is
+  not yet achieved; the integration test `tests/decode_8x8.rs` catches
+  an internal CAVLC bit-accounting desync and skips politely.
+
 ## Not supported
 
 Decoder surfaces `Error::Unsupported` (or `Error::InvalidData` when the
 bitstream claims a feature that isn't wired); encoder outright refuses:
 
 - **Decoder**: CABAC P-slices (baseline CAVLC P works — set
-  `entropy_coding_mode_flag = 0` at the external encoder).
-- **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_16×16 modes other
-  than DC, rate control, adaptive QP, mode decision, deblocking.
-- B-slices, bi-prediction, weighted prediction (both).
+  `entropy_coding_mode_flag = 0` at the external encoder). CABAC
+  I-slices with `transform_8x8_mode_flag = 1`.
+- **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16
+  modes other than DC, rate control, adaptive QP, mode decision,
+  deblocking.
+- B-slices, bi-prediction, implicit weighted bi-prediction (the
+  explicit P-slice form is supported).
 - Multi-reference DPB / `ref_idx_l0 > 0`, reference list modification
   operations (decoder).
 - Interlaced coding, MBAFF, PAFF, frame/field picture mixes.
-- 8×8 transform (`transform_8x8_mode_flag = 1`).
+- Inter 8×8 transform (`transform_8x8_mode_flag = 1` on P/B MBs).
 - 4:2:2 / 4:4:4 chroma, bit depths above 8, separate colour planes.
 - SI / SP slices.
 
@@ -192,6 +222,16 @@ fixture is missing so CI without ffmpeg still passes. Regenerate the
 fixtures locally with:
 
 ```shell
+# High Profile 8×8 DCT + CAVLC — regenerates tests/fixtures/h264_8x8_*.
+ffmpeg -y -f lavfi -i "mandelbrot=size=128x128:rate=24" -t 0.1 \
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -preset:v slow \
+    -coder 0 -x264-params "8x8dct=1:cabac=0:psy=0:trellis=0" \
+    -g 1 -bf 0 -refs 1 /tmp/h264_8x8.mp4
+ffmpeg -y -i /tmp/h264_8x8.mp4 -c:v copy -bsf:v h264_mp4toannexb \
+    -f h264 tests/fixtures/h264_8x8_intra.es
+ffmpeg -y -i /tmp/h264_8x8.mp4 -f rawvideo -pix_fmt yuv420p \
+    tests/fixtures/h264_8x8_intra.yuv
+
 # 64×64 baseline, every-frame I — exercises CAVLC + CABAC I-slice paths.
 ffmpeg -y -f lavfi -i "testsrc=size=64x64:rate=24:duration=0.1" \
     -pix_fmt yuv420p -c:v libx264 -profile:v baseline -preset:v slow \

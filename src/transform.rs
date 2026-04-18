@@ -7,6 +7,8 @@
 //! * §8.5.11 — inverse Hadamard 2×2 (4:2:0 chroma DC).
 //! * §8.5.12 — inverse 4×4 integer transform (§8.5.12.2 with the +(1<<5)
 //!   rounding offset for AC and the simple `>> 6` for DC-loaded blocks).
+//! * §8.5.13 — inverse 8×8 integer transform (§8.5.13.2) and its 6-class
+//!   dequantisation using the `normAdjust8x8` table (§8.5.12.1, Table 8-15).
 //! * §8.5 / §8.5.10 / §7.4.2.1 — dequantisation `c'[i,j] = c[i,j] * scale`.
 
 /// `v[m][n]` — Table 8-13. Indexed by (qp_y % 6, position class). The three
@@ -213,6 +215,193 @@ pub fn chroma_qp(qp_y: i32, chroma_qp_index_offset: i32) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 8×8 dequantisation + inverse transform (§8.5.13 — High Profile).
+// ---------------------------------------------------------------------------
+
+/// `normAdjust8x8(qP%6, m)` — Table 8-15. Six position classes for the 8×8
+/// block, indexed by the lookup table [`V8X8_POS_CLASS`].
+const V8X8_TABLE: [[i32; 6]; 6] = [
+    [20, 18, 32, 19, 25, 24],
+    [22, 19, 35, 21, 28, 26],
+    [26, 23, 42, 24, 33, 31],
+    [28, 25, 45, 26, 35, 33],
+    [32, 28, 51, 30, 40, 38],
+    [36, 32, 58, 34, 46, 43],
+];
+
+/// 16-entry sub-table mapping `((row & 3) << 2) | (col & 3)` to one of the
+/// six position classes of [`V8X8_TABLE`]. Matches FFmpeg's
+/// `ff_h264_dequant8_coeff_init_scan`; equivalent to the spec's Table
+/// 8-15 class assignment.
+const V8X8_POS_CLASS: [usize; 16] = [0, 3, 4, 3, 3, 1, 5, 1, 4, 5, 2, 5, 3, 1, 5, 1];
+
+/// Position class for an (row, col) pair in an 8×8 block.
+fn pos_class_8x8(row: usize, col: usize) -> usize {
+    V8X8_POS_CLASS[((row & 3) << 2) | (col & 3)]
+}
+
+/// Compute the flat 8×8 scaling factor `LevelScale8x8(qP%6, i, j)` from
+/// §8.5.12.1 for the default (flat-16) scaling list.
+///
+/// Custom scaling lists parsed from the PPS / SPS are not yet plumbed — the
+/// decoder uses the "flat" default weightScale = 16 for every position.
+fn level_scale_8x8(qp_mod6: usize, row: usize, col: usize) -> i32 {
+    // `weightScale8x8[i,j] = 16` for the flat default list, so
+    // LevelScale8x8 = normAdjust * 16.
+    V8X8_TABLE[qp_mod6][pos_class_8x8(row, col)] * 16
+}
+
+/// 8×8 zig-zag scan (frame coding, §8.5.6 Table 8-14). Maps coded-order
+/// index 0..=63 → raster index (`row * 8 + col`).
+#[rustfmt::skip]
+pub const ZIGZAG_8X8: [usize; 64] = [
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+/// Dequantise an 8×8 AC block in raster order per §8.5.12.1 (flat scaling
+/// list). Follows the reference decoder chain so the combined
+/// (dequant + [`idct_8x8`]) matches FFmpeg / JM bit-exactly:
+///
+/// * `c'[i,j] = (c[i,j] * LevelScale8x8(qP%6, i, j) + rnd) >> shift`
+///   with `shift = 6 - qP/6` and `rnd = 1 << (5 - qP/6)` when qP < 36;
+/// * `c'[i,j] = (c[i,j] * LevelScale8x8(qP%6, i, j)) << (qP/6 - 6)` when
+///   qP ≥ 36.
+///
+/// [`idct_8x8`] adds the spec's `32` rounding at DC and applies the final
+/// `>> 6` per sample. The two stages together reproduce the spec's
+/// `(TransformedResidual + 2^5) >> 6` semantics.
+pub fn dequantize_8x8(coeffs: &mut [i32; 64], qp: i32) {
+    let qp = qp.clamp(0, 51);
+    let qp6 = (qp / 6) as i32;
+    let qmod = (qp % 6) as usize;
+    if qp6 >= 6 {
+        let shift = (qp6 - 6) as u32;
+        for r in 0..8 {
+            for c in 0..8 {
+                let i = r * 8 + c;
+                coeffs[i] = (coeffs[i] * level_scale_8x8(qmod, r, c)) << shift;
+            }
+        }
+    } else {
+        let shift = (6 - qp6) as u32;
+        let round = 1i32 << (shift - 1);
+        for r in 0..8 {
+            for c in 0..8 {
+                let i = r * 8 + c;
+                coeffs[i] = (coeffs[i] * level_scale_8x8(qmod, r, c) + round) >> shift;
+            }
+        }
+    }
+}
+
+/// Inverse 8×8 integer transform as per §8.5.13.2.
+///
+/// Input: dequantised coefficient block in raster (`row * 8 + col`) order.
+/// Output: residual sample block in raster order, `(h + 32) >> 6`-rounded
+/// per sample and ready to be added to the prediction. The rounding is
+/// absorbed once via `block[0] += 32` at the start of the two-pass butterfly
+/// and applied as `>> 6` at the final stage — matches the JVT reference /
+/// FFmpeg's `ff_h264_idct8_add` pipeline.
+pub fn idct_8x8(coeffs: &mut [i32; 64]) {
+    // The spec rounds after the two-pass transform: (h + 32) >> 6. Adding
+    // 32 to the DC upfront is equivalent once both passes have completed
+    // (the butterfly below preserves the DC-only constant-shift property).
+    coeffs[0] = coeffs[0].wrapping_add(32);
+
+    // Pass 1 — operate columnwise (read block[i + k*8] for k=0..7 down a
+    // column, write back into the same column). Matches FFmpeg's first
+    // loop where `i` is the column index and `k*8` selects the row.
+    for i in 0..8 {
+        let c0 = coeffs[i];
+        let c1 = coeffs[i + 8];
+        let c2 = coeffs[i + 16];
+        let c3 = coeffs[i + 24];
+        let c4 = coeffs[i + 32];
+        let c5 = coeffs[i + 40];
+        let c6 = coeffs[i + 48];
+        let c7 = coeffs[i + 56];
+
+        let a0 = c0.wrapping_add(c4);
+        let a2 = c0.wrapping_sub(c4);
+        let a4 = (c2 >> 1).wrapping_sub(c6);
+        let a6 = (c6 >> 1).wrapping_add(c2);
+
+        let b0 = a0.wrapping_add(a6);
+        let b2 = a2.wrapping_add(a4);
+        let b4 = a2.wrapping_sub(a4);
+        let b6 = a0.wrapping_sub(a6);
+
+        let a1 = -c3 + c5 - c7 - (c7 >> 1);
+        let a3 = c1 + c7 - c3 - (c3 >> 1);
+        let a5 = -c1 + c7 + c5 + (c5 >> 1);
+        let a7 = c3 + c5 + c1 + (c1 >> 1);
+
+        let b1 = (a7 >> 2) + a1;
+        let b3 = a3 + (a5 >> 2);
+        let b5 = (a3 >> 2) - a5;
+        let b7 = a7 - (a1 >> 2);
+
+        coeffs[i] = b0.wrapping_add(b7);
+        coeffs[i + 56] = b0.wrapping_sub(b7);
+        coeffs[i + 8] = b2.wrapping_add(b5);
+        coeffs[i + 48] = b2.wrapping_sub(b5);
+        coeffs[i + 16] = b4.wrapping_add(b3);
+        coeffs[i + 40] = b4.wrapping_sub(b3);
+        coeffs[i + 24] = b6.wrapping_add(b1);
+        coeffs[i + 32] = b6.wrapping_sub(b1);
+    }
+
+    // Pass 2 — operate rowwise with final `>> 6`.
+    for i in 0..8 {
+        let base = i * 8;
+        let c0 = coeffs[base];
+        let c1 = coeffs[base + 1];
+        let c2 = coeffs[base + 2];
+        let c3 = coeffs[base + 3];
+        let c4 = coeffs[base + 4];
+        let c5 = coeffs[base + 5];
+        let c6 = coeffs[base + 6];
+        let c7 = coeffs[base + 7];
+
+        let a0 = c0.wrapping_add(c4);
+        let a2 = c0.wrapping_sub(c4);
+        let a4 = (c2 >> 1).wrapping_sub(c6);
+        let a6 = (c6 >> 1).wrapping_add(c2);
+
+        let b0 = a0.wrapping_add(a6);
+        let b2 = a2.wrapping_add(a4);
+        let b4 = a2.wrapping_sub(a4);
+        let b6 = a0.wrapping_sub(a6);
+
+        let a1 = -c3 + c5 - c7 - (c7 >> 1);
+        let a3 = c1 + c7 - c3 - (c3 >> 1);
+        let a5 = -c1 + c7 + c5 + (c5 >> 1);
+        let a7 = c3 + c5 + c1 + (c1 >> 1);
+
+        let b1 = (a7 >> 2) + a1;
+        let b3 = a3 + (a5 >> 2);
+        let b5 = (a3 >> 2) - a5;
+        let b7 = a7 - (a1 >> 2);
+
+        coeffs[base] = (b0 + b7) >> 6;
+        coeffs[base + 1] = (b2 + b5) >> 6;
+        coeffs[base + 2] = (b4 + b3) >> 6;
+        coeffs[base + 3] = (b6 + b1) >> 6;
+        coeffs[base + 4] = (b6 - b1) >> 6;
+        coeffs[base + 5] = (b4 - b3) >> 6;
+        coeffs[base + 6] = (b2 - b5) >> 6;
+        coeffs[base + 7] = (b0 - b7) >> 6;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +427,85 @@ mod tests {
         for &v in c.iter() {
             assert_eq!(v, v0);
         }
+    }
+
+    #[test]
+    fn idct8_zero_in_zero_out() {
+        let mut z = [0i32; 64];
+        idct_8x8(&mut z);
+        // DC is increased by 32 up-front then >> 6 at output: 32 >> 6 = 0.
+        assert!(z.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn idct8_pure_dc_constant() {
+        // A post-dequant DC coefficient of 64 should recover a flat block of
+        // sample value 1 (the two butterfly passes preserve constant, +32
+        // rounding aligns after >> 6). Matches FFmpeg's ff_h264_idct8_add
+        // output for the same input.
+        let mut c = [0i32; 64];
+        c[0] = 64;
+        idct_8x8(&mut c);
+        let v0 = c[0];
+        for &v in c.iter() {
+            assert_eq!(v, v0, "pure DC should produce a constant block");
+        }
+        // Constant = ((64 * 1 * 1) + 32) >> 6 = 96 >> 6 = 1 — the 1D transform
+        // of a pure-DC impulse is (1,1,...,1) per pass, so the 2D result is
+        // (1,1,...,1) * 64.
+        assert_eq!(v0, 1);
+    }
+
+    #[test]
+    fn idct8_linearity_small() {
+        // The transform is linear — 2× input = 2× output. Verify on a small
+        // random-ish coefficient pattern.
+        let mut c1 = [0i32; 64];
+        c1[0] = 128;
+        c1[1] = 32;
+        c1[8] = 16;
+        let mut c2 = c1;
+        for v in c2.iter_mut() {
+            *v *= 2;
+        }
+        idct_8x8(&mut c1);
+        idct_8x8(&mut c2);
+        // Because of the +32 rounding offset at DC plus >> 6, scaling isn't
+        // strictly 2× element-wise — but the difference must be bounded by
+        // 1 per sample. Check that relation holds.
+        for i in 0..64 {
+            let diff = c2[i] - 2 * c1[i];
+            assert!(
+                diff.abs() <= 2,
+                "non-linear 8×8 IDCT at pos {i}: c1={} c2={}",
+                c1[i],
+                c2[i]
+            );
+        }
+    }
+
+    #[test]
+    fn dequantize_8x8_flat_qp0() {
+        // Dequantising a flat-zero block should give flat zero.
+        let mut c = [0i32; 64];
+        dequantize_8x8(&mut c, 0);
+        assert!(c.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn dequantize_8x8_dc_matches_spec() {
+        // At qP = 0 with LevelScale8x8(0, 0, 0) = 20 * 16 = 320, and
+        // shift 6, rnd = 32: c' = (1 * 320 + 32) >> 6 = 352 >> 6 = 5.
+        let mut c = [0i32; 64];
+        c[0] = 1;
+        dequantize_8x8(&mut c, 0);
+        assert_eq!(c[0], 5, "qp=0 DC dequant should equal 5");
+        // At qP = 6 with shift = 0, rnd = 32, c' = (1*320 * 2 + 32) >> 6 but
+        // qp=6 hits the qp/6 = 1 branch (shift right 5, rnd 16):
+        // c' = (1*320 + 16) >> 5 = 10. (qp/6 == 1, 6 - 1 = 5 shift.)
+        let mut c = [0i32; 64];
+        c[0] = 1;
+        dequantize_8x8(&mut c, 6);
+        assert_eq!(c[0], 10);
     }
 }

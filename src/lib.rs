@@ -34,6 +34,31 @@
 //! to PSNR ≥ 28 dB for gradient content at QP 22 and ≥ 40 dB for solid
 //! content.
 //!
+//! # Partially implemented — High Profile 8×8 transform (§8.5.13)
+//!
+//! The 8×8 inverse integer transform ([`transform::idct_8x8`]) and its
+//! 6-class dequantisation ([`transform::dequantize_8x8`]) are fully wired,
+//! along with the nine Intra_8×8 prediction modes (§8.3.2,
+//! [`intra_pred::predict_intra_8x8`]) including reference-sample low-pass
+//! filtering. The CAVLC I-slice `transform_size_8x8_flag` path is parsed
+//! and dispatched to the 8×8 residual decoder which splits each 8×8 block
+//! into four interleaved 4×4-style CAVLC sub-blocks per §7.3.5.3.2.
+//!
+//! Known gaps in this session's 8×8 implementation:
+//!
+//! * CABAC `transform_size_8x8_flag` (§9.3.3.1.1.10, CtxIdx 399..=401) is
+//!   not wired — CABAC streams with `transform_8x8_mode_flag = 1` in the
+//!   PPS return `Error::Unsupported`.
+//! * P-slice inter macroblocks with `transform_size_8x8_flag = 1` are not
+//!   handled (the flag would be read AFTER `coded_block_pattern` and its
+//!   residual is not dispatched to [`transform::idct_8x8`] yet).
+//! * Custom scaling-list matrices (`seq_scaling_list_present_flag`,
+//!   `pic_scaling_matrix_present_flag`) are parsed and skipped — the
+//!   decoder uses the flat-16 default list for both 4×4 and 8×8 dequant.
+//! * The integration test at `tests/decode_8x8.rs` hits a CAVLC
+//!   bit-accounting desync on real x264 `8x8dct=1:cabac=0` output and
+//!   skips politely rather than reporting mismatched pixels.
+//!
 //! # Out of scope (returns `Error::Unsupported` or the encoder refuses)
 //!
 //! * CABAC P-slices (decode); any CABAC encoding; any P/B slice encoding.
@@ -43,7 +68,7 @@
 //! * Multi-reference DPB (`ref_idx_l0 > 0`), reference picture list
 //!   modification operations.
 //! * Interlaced coding / MBAFF / PAFF.
-//! * 8×8 transform (§8.5.13), 4:2:2 / 4:4:4 chroma, bit depths above 8.
+//! * 4:2:2 / 4:4:4 chroma, bit depths above 8.
 //! * Rate control, adaptive QP, mode decision (Intra4×4 / Plane / Vertical /
 //!   Horizontal), or any psychovisual tuning. The encoder always emits
 //!   Intra_16×16 with DC_PRED and a fixed QP.
