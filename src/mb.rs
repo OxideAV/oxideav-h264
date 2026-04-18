@@ -332,8 +332,16 @@ pub fn decode_intra_mb_given_imb(
 
     // Chroma reconstruction — per-format dispatch: 4:2:0 (the original
     // 8×8 chroma tile) vs 4:2:2 (8×16 chroma tile with the 2×4 DC
-    // Hadamard + 8 AC blocks per plane).
-    if sps.chroma_format_idc == 2 {
+    // Hadamard + 8 AC blocks per plane). Monochrome (`chroma_format_idc
+    // = 0`, §6.4.1) carries no chroma samples in the bitstream, so the
+    // dispatch is skipped entirely — `cbp_chroma` is 0 by construction
+    // (only mb_type values with chroma_class = 0 are valid, §7.4.5
+    // / Table 7-11) and the per-MB `intra_chroma_pred_mode` stays at
+    // its default. `separate_colour_plane_flag = 1` pictures route
+    // through this path per-plane (ChromaArrayType = 0, §7.4.2.1.1).
+    if sps.chroma_format_idc == 0 {
+        // Monochrome: no chroma residual, no chroma prediction.
+    } else if sps.chroma_format_idc == 2 {
         decode_chroma_422(
             br,
             sps,

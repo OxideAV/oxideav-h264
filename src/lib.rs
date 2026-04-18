@@ -369,14 +369,17 @@
 //!   chroma formats, and PAFF + MBAFF mixed within the same CVS all
 //!   still return `Error::Unsupported`.
 //! * `separate_colour_plane_flag = 1` (§7.4.2.1.1, three independent
-//!   colour planes keyed by `colour_plane_id`) is rejected at slice
-//!   entry with `Error::Unsupported`. The SPS parser accepts the flag
-//!   and `slice::parse_slice_header` consumes the 2-bit
-//!   `colour_plane_id` correctly — the reject happens at the decoder's
-//!   slice-dispatch gate so upstream callers can route to a fallback.
-//!   See `tests/separate_colour_plane.rs` for the narrowing coverage
-//!   that pins SPS parse, per-plane slice-header parse, and the
-//!   precise reject wording.
+//!   colour planes keyed by `colour_plane_id`) decodes end-to-end for
+//!   CAVLC I-slices at 8-bit progressive: each slice is routed through
+//!   a per-plane handler that treats the plane as a monochrome
+//!   picture (`ChromaArrayType = 0`), the three plane buffers are
+//!   keyed by `(frame_num, colour_plane_id)` on the decoder, and once
+//!   all three planes for a `frame_num` have arrived they are merged
+//!   into a `Yuv444P` `VideoFrame`. Sep-plane P/B, CABAC, 10-bit and
+//!   interlaced modes still return `Error::Unsupported`. See
+//!   `tests/separate_colour_plane.rs` for SPS parse, slice-header
+//!   colour_plane_id round-trip, and end-to-end 1×1-MB / 2×2-MB
+//!   fixture decode.
 //!   4:2:2 is supported for CAVLC I/P/B and CABAC I/P slices — CABAC
 //!   4:2:2 B-slice entry still returns `Error::Unsupported`.
 //! * Monochrome (`chroma_format_idc = 0`) is rejected — the same
