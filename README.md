@@ -140,8 +140,11 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
   2 (mark long-term unused), 3 (assign long-term index),
   4 (`MaxLongTermFrameIdx`), 5 (mark all unused — IDR-like),
   and 6 (tag current picture as long-term) — §8.2.5.4. Reference
-  picture list modification (RPLM) is parsed but non-identity
-  commands surface `Error::Unsupported` (planned follow-up).
+  picture list modification (RPLM, §7.3.3.1 / §8.2.4.3) is parsed
+  into the slice header and applied over the default-built
+  `RefPicList0` / `RefPicList1`: idc=0 (short-term subtract),
+  idc=1 (short-term add), and idc=2 (long-term select) all run
+  the §8.2.4.3.1 in-place reorder + truncate rule.
 
 ## What is encoded today
 
@@ -236,9 +239,6 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
 - **Implicit weighted bi-prediction** (`weighted_bipred_idc == 2`,
   §8.4.2.3.3) — explicit bipred and P-slice weighted prediction are
   supported.
-- Reference picture list modification (RPLM) — the identity form
-  (flag = 0) is accepted; non-trivial modification commands surface
-  `Error::Unsupported`.
 - `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 - Interlaced coding, MBAFF, PAFF, frame/field picture mixes.
 - Inter 8×8 transform (`transform_size_8x8_flag = 1` on P/B MBs).

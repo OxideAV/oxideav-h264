@@ -2,9 +2,10 @@
 //!
 //! Covers the fields needed to identify a slice and reach the start of
 //! `slice_data()` for a baseline-profile decoder. Reference picture list
-//! modification and decoded reference picture marking are parsed enough to
-//! skip past their syntax — a baseline I-slice decoder doesn't need their
-//! values.
+//! modification (§7.3.3.1) is fully parsed into [`SliceHeader::rplm_l0`] /
+//! [`SliceHeader::rplm_l1`] and applied by the decoder via
+//! [`crate::dpb::apply_rplm`]. Decoded reference picture marking is parsed
+//! into [`SliceHeader::mmco_commands`].
 //!
 //! Explicit weighted prediction (§7.3.3.2) for P-slices is parsed and the
 //! weight table is returned on the [`SliceHeader`]. B-slice bi-prediction is
@@ -15,7 +16,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
-use crate::dpb::MmcoCommand;
+use crate::dpb::{MmcoCommand, RplmCommand};
 use crate::nal::{NalHeader, NalUnitType};
 use crate::pps::Pps;
 use crate::sps::Sps;
@@ -130,6 +131,13 @@ pub struct SliceHeader {
     /// Parsed MMCO command list (§8.2.5.4), populated only when
     /// `adaptive_ref_pic_marking_mode_flag == true`.
     pub mmco_commands: Vec<MmcoCommand>,
+    /// Parsed `ref_pic_list_modification` commands for list 0 (§7.3.3.1).
+    /// Empty when `ref_pic_list_modification_flag_l0 == 0` or the slice
+    /// type has no list 0 (I / SI). Applied via
+    /// [`crate::dpb::apply_rplm`] on top of the default-built list.
+    pub rplm_l0: Vec<RplmCommand>,
+    /// Parsed `ref_pic_list_modification` commands for list 1 (B-slices).
+    pub rplm_l1: Vec<RplmCommand>,
 }
 
 /// Parse slice header. The active SPS and PPS must already be available.
@@ -213,10 +221,13 @@ pub fn parse_slice_header(
         }
     }
 
-    // Reference picture list modification (§7.3.3.1) — parse the flag and
-    // reject any non-identity modification (RPLM is not yet implemented).
+    // Reference picture list modification (§7.3.3.1). Commands are stored
+    // on the slice header and applied by the decoder over the default-
+    // built RefPicList0 / RefPicList1 via `dpb::apply_rplm`.
+    let mut rplm_l0: Vec<RplmCommand> = Vec::new();
+    let mut rplm_l1: Vec<RplmCommand> = Vec::new();
     if header.nal_unit_type != NalUnitType::SliceExtension {
-        reject_non_identity_ref_pic_list_modification(&mut br, slice_type)?;
+        parse_ref_pic_list_modification(&mut br, slice_type, &mut rplm_l0, &mut rplm_l1)?;
     }
 
     // Prediction weight table (§7.3.3.2). Present when explicit weighted
@@ -314,29 +325,69 @@ pub fn parse_slice_header(
         idr_long_term_reference_flag,
         adaptive_ref_pic_marking_mode_flag,
         mmco_commands,
+        rplm_l0,
+        rplm_l1,
     })
 }
 
-fn reject_non_identity_ref_pic_list_modification(
+/// Parse `ref_pic_list_modification` syntax (§7.3.3.1). The grammar is a
+/// per-list pair of `ref_pic_list_modification_flag_lX` followed by a loop
+/// of `(modification_of_pic_nums_idc, operand)` pairs terminated by
+/// `modification_of_pic_nums_idc == 3`. List 0 is parsed for every slice
+/// type except I / SI; list 1 only for B-slices.
+fn parse_ref_pic_list_modification(
     br: &mut BitReader<'_>,
     st: SliceType,
+    rplm_l0: &mut Vec<RplmCommand>,
+    rplm_l1: &mut Vec<RplmCommand>,
 ) -> Result<()> {
     let do_l0 = !matches!(st, SliceType::I | SliceType::SI);
     let do_l1 = matches!(st, SliceType::B);
     if do_l0 {
         let flag = br.read_flag()?;
         if flag {
-            return Err(Error::unsupported(
-                "h264 slice: reference picture list modification (RPLM) not yet supported",
-            ));
+            parse_rplm_loop(br, rplm_l0)?;
         }
     }
     if do_l1 {
         let flag = br.read_flag()?;
         if flag {
-            return Err(Error::unsupported(
-                "h264 slice: reference picture list modification (RPLM) not yet supported",
-            ));
+            parse_rplm_loop(br, rplm_l1)?;
+        }
+    }
+    Ok(())
+}
+
+/// Inner loop of `ref_pic_list_modification` — reads commands until the
+/// sentinel `modification_of_pic_nums_idc == 3` (§7.3.3.1 Table 7-9).
+fn parse_rplm_loop(br: &mut BitReader<'_>, out: &mut Vec<RplmCommand>) -> Result<()> {
+    loop {
+        let idc = br.read_ue()?;
+        match idc {
+            0 => {
+                let d = br.read_ue()?;
+                out.push(RplmCommand::ShortTermSubtract {
+                    abs_diff_pic_num_minus1: d,
+                });
+            }
+            1 => {
+                let d = br.read_ue()?;
+                out.push(RplmCommand::ShortTermAdd {
+                    abs_diff_pic_num_minus1: d,
+                });
+            }
+            2 => {
+                let n = br.read_ue()?;
+                out.push(RplmCommand::LongTerm {
+                    long_term_pic_num: n,
+                });
+            }
+            3 => break,
+            _ => {
+                return Err(Error::invalid(format!(
+                    "h264 slice: bad modification_of_pic_nums_idc {idc}"
+                )));
+            }
         }
     }
     Ok(())
@@ -548,6 +599,99 @@ mod tests {
         assert!(!t.chroma_l0[1].present);
         assert_eq!(t.chroma_l0[1].weight, [1 << 4, 1 << 4]);
         assert_eq!(t.chroma_l0[1].offset, [0, 0]);
+    }
+
+    /// A P-slice with `ref_pic_list_modification_flag_l0 = 1` and a mix of
+    /// idc=0 / idc=1 / idc=2 commands terminated by idc=3 round-trips
+    /// through the parser producing the matching [`RplmCommand`] list.
+    #[test]
+    fn rplm_parse_p_slice_all_idcs() {
+        let mut bw = BitWriter::new();
+        // ref_pic_list_modification_flag_l0 = 1.
+        bw.write_flag(true);
+        // idc=0 (subtract), delta=2.
+        bw.write_ue(0);
+        bw.write_ue(2);
+        // idc=1 (add), delta=0.
+        bw.write_ue(1);
+        bw.write_ue(0);
+        // idc=2 (long-term), long_term_pic_num = 4.
+        bw.write_ue(2);
+        bw.write_ue(4);
+        // idc=3 terminator.
+        bw.write_ue(3);
+        bw.write_rbsp_trailing_bits();
+        let buf = bw.finish();
+
+        let mut br = BitReader::new(&buf);
+        let mut l0 = Vec::new();
+        let mut l1 = Vec::new();
+        parse_ref_pic_list_modification(&mut br, SliceType::P, &mut l0, &mut l1).expect("parse");
+        assert_eq!(l0.len(), 3);
+        assert!(l1.is_empty());
+        assert_eq!(
+            l0[0],
+            RplmCommand::ShortTermSubtract {
+                abs_diff_pic_num_minus1: 2
+            }
+        );
+        assert_eq!(
+            l0[1],
+            RplmCommand::ShortTermAdd {
+                abs_diff_pic_num_minus1: 0
+            }
+        );
+        assert_eq!(
+            l0[2],
+            RplmCommand::LongTerm {
+                long_term_pic_num: 4
+            }
+        );
+    }
+
+    /// A B-slice parses both list flags + loops; if only `flag_l1` is set
+    /// the L0 output is empty and the L1 output carries commands.
+    #[test]
+    fn rplm_parse_b_slice_only_l1() {
+        let mut bw = BitWriter::new();
+        // ref_pic_list_modification_flag_l0 = 0.
+        bw.write_flag(false);
+        // ref_pic_list_modification_flag_l1 = 1.
+        bw.write_flag(true);
+        // idc=0 delta=0.
+        bw.write_ue(0);
+        bw.write_ue(0);
+        // idc=3.
+        bw.write_ue(3);
+        bw.write_rbsp_trailing_bits();
+        let buf = bw.finish();
+
+        let mut br = BitReader::new(&buf);
+        let mut l0 = Vec::new();
+        let mut l1 = Vec::new();
+        parse_ref_pic_list_modification(&mut br, SliceType::B, &mut l0, &mut l1).expect("parse");
+        assert!(l0.is_empty());
+        assert_eq!(l1.len(), 1);
+        assert_eq!(
+            l1[0],
+            RplmCommand::ShortTermSubtract {
+                abs_diff_pic_num_minus1: 0
+            }
+        );
+    }
+
+    /// I-slices have no RPLM syntax; the parser must not read any bits.
+    #[test]
+    fn rplm_parse_i_slice_is_noop() {
+        let buf = [0u8; 1];
+        let mut br = BitReader::new(&buf);
+        let before = br.bit_position();
+        let mut l0 = Vec::new();
+        let mut l1 = Vec::new();
+        parse_ref_pic_list_modification(&mut br, SliceType::I, &mut l0, &mut l1).expect("parse");
+        assert_eq!(br.bit_position(), before);
+        assert!(l0.is_empty());
+        assert!(l1.is_empty());
     }
 
     #[test]

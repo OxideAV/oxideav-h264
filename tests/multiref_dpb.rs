@@ -45,6 +45,8 @@ fn skeleton_slice(num_active_minus1: u32) -> SliceHeader {
         idr_long_term_reference_flag: false,
         adaptive_ref_pic_marking_mode_flag: false,
         mmco_commands: Vec::new(),
+        rplm_l0: Vec::new(),
+        rplm_l1: Vec::new(),
     }
 }
 

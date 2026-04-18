@@ -54,6 +54,8 @@ fn make_slice_with_luma_weight(lw: LumaWeight, cw: ChromaWeight) -> SliceHeader 
         idr_long_term_reference_flag: false,
         adaptive_ref_pic_marking_mode_flag: false,
         mmco_commands: Vec::new(),
+        rplm_l0: Vec::new(),
+        rplm_l1: Vec::new(),
     }
 }
 
@@ -228,6 +230,8 @@ fn p_skip_without_weight_table_is_plain_copy() {
         idr_long_term_reference_flag: false,
         adaptive_ref_pic_marking_mode_flag: false,
         mmco_commands: Vec::new(),
+        rplm_l0: Vec::new(),
+        rplm_l1: Vec::new(),
     };
 
     decode_p_skip_mb(&sh, 0, 0, &mut pic, &[&reference], 26).expect("p_skip");

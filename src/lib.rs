@@ -45,6 +45,13 @@
 //!   short-term past/future split around `CurrPicOrderCnt` with the
 //!   per-list ordering reversal, followed by ascending long-term
 //!   references.
+//! * **Reference picture list modification** (RPLM, §7.3.3.1 /
+//!   §8.2.4.3) — the per-slice `ref_pic_list_modification` commands
+//!   (idc = 0 short-term subtract, idc = 1 short-term add, idc = 2
+//!   long-term select) are parsed into [`slice::SliceHeader::rplm_l0`] /
+//!   [`slice::SliceHeader::rplm_l1`] and applied over the default-built
+//!   lists via [`dpb::apply_rplm`]. Both P- and B-slice list 0 / list 1
+//!   reordering are supported.
 //! * **POC output reordering** — the DPB's pending-output queue is
 //!   parameterised by a reorder window that the decoder bumps up to
 //!   `max_num_ref_frames` on the first B-slice. Pictures emerge in POC
@@ -99,9 +106,6 @@
 //!   supported.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
-//! * Reference picture list modification (RPLM, §7.4.3.1 / §8.2.4.3) —
-//!   only the identity (flag = 0) form is accepted; any non-trivial
-//!   RPLM command surfaces `Error::Unsupported`.
 //! * `pic_order_cnt_type == 1` (rarely used in practice) is the one
 //!   POC derivation mode not implemented.
 //! * Interlaced coding / MBAFF / PAFF.
