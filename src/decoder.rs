@@ -30,14 +30,16 @@
 //! Out of scope (returns `Error::Unsupported`):
 //! * Interlaced coding / MBAFF (P and B).
 //! * 8×8 transform on the CABAC path, bit depth > 8.
-//! * 4:2:2 chroma (`chroma_format_idc = 2`), monochrome
-//!   (`chroma_format_idc = 0`), and `separate_colour_plane_flag = 1`
-//!   are rejected at slice entry (§7.4.2.1.1 / §6.4.1). 4:4:4
-//!   (`chroma_format_idc = 3`) is supported for CAVLC I-slices only —
-//!   P / B / CABAC entry in 4:4:4 returns `Error::Unsupported`. See
-//!   [`crate::mb_444`] for the 4:4:4 CAVLC path and
-//!   [`crate::picture::chroma_plane_w`] / [`crate::picture::chroma_plane_h`]
-//!   for the format-aware sample-layout helpers.
+//! * Monochrome (`chroma_format_idc = 0`) and
+//!   `separate_colour_plane_flag = 1` are rejected at slice entry
+//!   (§7.4.2.1.1 / §6.4.1). 4:4:4 (`chroma_format_idc = 3`) and 4:2:2
+//!   (`chroma_format_idc = 2`) are supported for CAVLC I-slices only
+//!   — P / B / CABAC entry under those chroma formats returns
+//!   `Error::Unsupported`. See [`crate::mb_444`] for the 4:4:4 CAVLC
+//!   path, [`crate::mb::decode_chroma_422`] (private) for the 4:2:2
+//!   chroma pipeline, and [`crate::picture::chroma_plane_w`] /
+//!   [`crate::picture::chroma_plane_h`] for the format-aware
+//!   sample-layout helpers.
 //!
 //! Reference picture list modification (RPLM, §7.3.3.1 / §8.2.4.3) is
 //! parsed into [`crate::slice::SliceHeader::rplm_l0`] /

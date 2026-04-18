@@ -283,21 +283,37 @@ pub fn inv_hadamard_2x4_chroma_dc_scaled(dc: &mut [i32; 8], qp: i32, weight_scal
         dc[r * 2 + 1] = a - b;
     }
 
-    // FFmpeg `ff_h264_chroma422_dc_dequant_idct` reference form:
-    //   out = (hadamard_out * qmul + 128) >> 8
-    // where `qmul = V * w << (qp/6 + 2)` (see h264_ps `init_dequant4_coeff_table`).
-    // This is equivalent, for any qp and weight, to the spec's §8.5.11.2 dequant
-    // after the 2×4 Hadamard. Factor 256 in the shift comes from the Hadamard's
-    // factor-of-8 gain (3 bits) plus the spec's normalisation /32 (5 bits).
-    let qp = qp.clamp(0, 51);
-    let qp6 = (qp / 6) as u32;
-    let qmod = (qp % 6) as usize;
+    // Spec §8.5.11.2 / H.264 Amd 2 equations (8-328..8-330):
+    //   QP'_C,DC = QP'_C + 3
+    //   If QP'_C,DC >= 36:
+    //       dcC_ij = (f_ij * LevelScale(QP'_C,DC%6, 0, 0)) << (QP'_C,DC/6 - 6)
+    //   Else:
+    //       dcC_ij = (f_ij * LevelScale(QP'_C,DC%6, 0, 0) + 2^(5-QP'_C,DC/6))
+    //                >> (6 - QP'_C,DC/6)
+    //
+    // The +3 QP offset here is specific to ChromaArrayType==2 and accounts
+    // for the factor-of-2 extra Hadamard gain (2×4 vs 2×2). Without it the
+    // DC values come out ~1.38× too small, matching V_TABLE[(q+3)%6][0] /
+    // V_TABLE[q%6][0] on typical QPs. LevelScale4x4 in our code folds
+    // `weight_scale * V_TABLE[qmod][class]` so the full formula is the
+    // same shape as the 2×2 code path, with QP replaced by QP + 3 and one
+    // more right-shift absorbed into the shift constants.
+    let qp_dc = (qp + 3).clamp(0, 51);
+    let qp6 = (qp_dc / 6) as i32;
+    let qmod = (qp_dc % 6) as usize;
     let v = V_TABLE[qmod][0];
     let w = weight_scale_00 as i32;
-    let qmul: i64 = (v as i64) * (w as i64) << (qp6 + 2);
-    for x in dc.iter_mut() {
-        let y = ((*x as i64) * qmul + 128) >> 8;
-        *x = y as i32;
+    if qp_dc >= 36 {
+        let shift = (qp6 - 6) as u32;
+        for x in dc.iter_mut() {
+            *x = (*x * w * v) << shift;
+        }
+    } else {
+        let shift = (6 - qp6) as u32;
+        let round = 1i32 << (shift - 1);
+        for x in dc.iter_mut() {
+            *x = (*x * w * v + round) >> shift;
+        }
     }
 }
 

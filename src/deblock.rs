@@ -204,27 +204,36 @@ fn filter_mb_edge_vertical(
         );
     }
 
-    // Chroma — only on edges coincident with an 8-luma-sample boundary
-    // (edge_col ∈ {0, 8}) because chroma is 4:2:0 sub-sampled and the
-    // 8×8 chroma MB has just one mid-edge at luma offset 8.
+    // Chroma vertical edges. Chroma MB width is 8 for both 4:2:0 and
+    // 4:2:2, so the edge columns match 4:2:0 (edge_col ∈ {0, 8} in luma
+    // → chroma x ∈ {0, 4}). Chroma MB height differs: 8 for 4:2:0, 16
+    // for 4:2:2. For 4:2:0 we filter 8 rows (2 bands × 2 sub × 2-row
+    // chunks). For 4:2:2 we filter 16 rows (4 bands × 2 sub × 2-row
+    // chunks); each 4-row band under 4:2:2 corresponds to one luma
+    // segment because chroma y and luma y run at the same rate.
     if edge_col == 0 || edge_col == 8 {
+        let chroma_is_422 = pic.chroma_format_idc == 2;
+        let mb_height_c = pic.mb_height_chroma();
         for (plane_cb, qp_off) in [(true, cqp_off_cb), (false, cqp_off_cr)] {
             let qp_pc = chroma_qp(qp_p, qp_off);
             let qp_qc = chroma_qp(qp_q, qp_off);
             let qp_avg_c = (qp_pc + qp_qc + 1) >> 1;
             let c_base_x = (mb_x * 8) as usize + edge_col / 2;
-            let c_base_y = (mb_y * 8) as usize;
-            // Chroma is 4:2:0: 4 rows per segment pair in the MB;
-            // chroma's 8-sample MB height splits into two 4-row bands,
-            // each driven by the bS of the two luma segments it overlaps
-            // (segments 0+1 for top band, 2+3 for bottom band).
-            for band in 0..2usize {
-                let seg0 = band * 2;
-                // Top two chroma rows key on luma bS[seg0]; bottom two
-                // on luma bS[seg0+1] (§8.7.2.3 paragraph on chroma 4:2:0
-                // per-4-luma-row bS replication).
+            let c_base_y = (mb_y as usize) * mb_height_c;
+            let bands = if chroma_is_422 { 4 } else { 2 };
+            for band in 0..bands {
                 for sub in 0..2usize {
-                    let bs_here = bs[seg0 + sub] as i32;
+                    // Under 4:2:0 chroma y is half luma y, so each band
+                    // of 4 chroma rows spans luma segments seg0 and
+                    // seg0+1 — pick the right bS per 2-row chunk. Under
+                    // 4:2:2 chroma y matches luma y exactly, so each
+                    // 4-row band maps to one luma segment `band`.
+                    let bs_idx = if chroma_is_422 {
+                        band
+                    } else {
+                        band * 2 + sub
+                    };
+                    let bs_here = bs[bs_idx] as i32;
                     if bs_here == 0 {
                         continue;
                     }
@@ -293,13 +302,21 @@ fn filter_mb_edge_horizontal(
         );
     }
 
-    if edge_row == 0 || edge_row == 8 {
+    // Chroma horizontal edges. 4:2:0: chroma MB is 8 rows tall; edges
+    // align with luma edges at 0 and 8 only (every-other luma edge gets a
+    // matching chroma edge). 4:2:2: chroma MB is 16 rows tall — every
+    // luma horizontal edge has a matching chroma edge at the same y.
+    let chroma_is_422 = pic.chroma_format_idc == 2;
+    let chroma_edge_applies = chroma_is_422 || edge_row == 0 || edge_row == 8;
+    if chroma_edge_applies {
+        let mb_height_c = pic.mb_height_chroma();
         for (plane_cb, qp_off) in [(true, cqp_off_cb), (false, cqp_off_cr)] {
             let qp_pc = chroma_qp(qp_p, qp_off);
             let qp_qc = chroma_qp(qp_q, qp_off);
             let qp_avg_c = (qp_pc + qp_qc + 1) >> 1;
             let c_base_x = (mb_x * 8) as usize;
-            let c_base_y = (mb_y * 8) as usize + edge_row / 2;
+            let c_base_y = (mb_y as usize) * mb_height_c
+                + if chroma_is_422 { edge_row } else { edge_row / 2 };
             for band in 0..2usize {
                 let seg0 = band * 2;
                 for sub in 0..2usize {

@@ -159,6 +159,14 @@ fn decode_yuv422_iframe_matches_reference() {
         "4:2:2 decode accuracy {:.3}% — below 99%",
         ratio * 100.0
     );
+    // Bit-exact against ffmpeg on this fixture — §8.5.11.2 / §8.5.9
+    // (8-328)..(8-330) chroma DC dequant is the critical rung: the
+    // `QP'_C,DC = QP'_C + 3` offset is what makes the DC magnitudes
+    // line up with the ffmpeg reference.
+    assert_eq!(
+        got, ref_yuv,
+        "expected bit-exact 4:2:2 decode against x264-encoded reference"
+    );
 }
 
 #[test]
