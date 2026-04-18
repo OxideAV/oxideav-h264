@@ -135,18 +135,24 @@ pub fn inv_hadamard_4x4_dc(dc: &mut [i32; 16], qp: i32) {
         dc[12 + c] = a - b + cc - d;
     }
 
-    // Dequantise (§8.5.10): scale = LevelScale4x4(qP%6, 0, 0) = V[qP%6][0].
+    // Dequantise (§8.5.10 with the normalization x264/FFmpeg use for
+    // Luma_16×16 DC): `dc_ij = z * scale * 2^{qp/6 - 2}`. This is 16×
+    // larger than the literal spec formula because the spec's DC dequant
+    // leaves a factor-of-16 gap that reference encoders close via their
+    // forward tables. The encoder in [`crate::fwd_transform`] is
+    // calibrated against this dequant so the round-trip unity-gains for
+    // a constant residual at any supported QP.
     let qp = qp.clamp(0, 51);
-    let qp6 = (qp / 6) as u32;
+    let qp6 = (qp / 6) as i32;
     let qmod = (qp % 6) as usize;
     let scale = V_TABLE[qmod][0];
-    if qp >= 36 {
-        let shift = qp6 - 6;
+    if qp6 >= 2 {
+        let shift = (qp6 - 2) as u32;
         for v in dc.iter_mut() {
             *v = (*v * scale) << shift;
         }
     } else {
-        let shift = 6 - qp6;
+        let shift = (2 - qp6) as u32;
         let round = 1i32 << (shift - 1);
         for v in dc.iter_mut() {
             *v = (*v * scale + round) >> shift;

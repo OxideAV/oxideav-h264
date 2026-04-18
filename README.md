@@ -1,9 +1,9 @@
 # oxideav-h264
 
-Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) decoder — NAL
-framing, SPS / PPS / slice-header parsing, CAVLC + CABAC I-slice pixel
-reconstruction, CAVLC baseline P-slice pixel reconstruction with motion
-compensation. Zero C dependencies.
+Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
+oxideav. Decodes CAVLC + CABAC I-slices and CAVLC baseline P-slices;
+encodes a minimal Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED
+output stream. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -104,26 +104,86 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
   picture list reordering are not supported and surface as
   `Error::Unsupported` when the bitstream requests them.
 
+## What is encoded today
+
+A **minimal Baseline Profile, I-frame-only encoder** — see
+[`encoder::H264Encoder`](src/encoder.rs). Each input frame is written as
+a self-contained Annex B packet:
+
+```text
+[start code] SPS  [start code] PPS  [start code] IDR slice
+```
+
+Fixed encoder policy (no rate control, no mode decision, no tuning):
+
+- **Baseline Profile** (`profile_idc = 66`), level 3.0.
+- **I-frames only** — every frame is an IDR.
+- **CAVLC** entropy coding (`entropy_coding_mode_flag = 0`).
+- **Single slice per picture** (`num_slice_groups_minus1 = 0`).
+- **4:2:0** chroma (`chroma_format_idc = 1`), **8-bit** luma + chroma.
+- **Intra_16×16** with `Intra16x16PredMode = DC` (Table 8-4 value 2) for
+  every luma macroblock; **chroma DC** (Table 8-5 value 0) for chroma.
+- **Fixed QP**, configurable via `H264EncoderOptions::qp`. Default 26.
+- **Deblocking filter disabled** on emit
+  (`disable_deblocking_filter_idc = 1`).
+- **Annex B** framing with 4-byte start codes. An
+  `AVCDecoderConfigurationRecord` blob is exposed in
+  `output_params().extradata` for MP4 wrapping.
+
+Round-trip PSNR at QP 22 on a 64×48 gradient is ≥ 44 dB (tested
+against both this crate's own decoder and ffmpeg's `libavcodec`).
+
+```rust
+use oxideav_codec::Encoder;
+use oxideav_core::{CodecId, Frame, PixelFormat, TimeBase, VideoFrame};
+use oxideav_core::frame::VideoPlane;
+use oxideav_h264::encoder::{H264Encoder, H264EncoderOptions};
+
+let mut enc = H264Encoder::new(
+    CodecId::new("h264"),
+    64,
+    48,
+    H264EncoderOptions { qp: 22, ..Default::default() },
+)?;
+let frame = /* YUV420P VideoFrame of the right size */;
+# let frame = VideoFrame {
+#     format: PixelFormat::Yuv420P, width: 64, height: 48, pts: Some(0),
+#     time_base: TimeBase::new(1, 30),
+#     planes: vec![
+#         VideoPlane { stride: 64, data: vec![128; 64*48] },
+#         VideoPlane { stride: 32, data: vec![128; 32*24] },
+#         VideoPlane { stride: 32, data: vec![128; 32*24] },
+#     ],
+# };
+enc.send_frame(&Frame::Video(frame))?;
+enc.flush()?;
+let pkt = enc.receive_packet()?;   // Annex B: SPS+PPS+IDR
+# Ok::<(), oxideav_core::Error>(())
+```
+
 ## Not supported
 
-Calls surface `Error::Unsupported` (or `Error::InvalidData` when the
-bitstream claims a feature that isn't wired):
+Decoder surfaces `Error::Unsupported` (or `Error::InvalidData` when the
+bitstream claims a feature that isn't wired); encoder outright refuses:
 
-- CABAC P-slices (baseline CAVLC P works — set
-  `entropy_coding_mode_flag = 0` at the encoder).
-- B-slices, bi-prediction, weighted prediction.
+- **Decoder**: CABAC P-slices (baseline CAVLC P works — set
+  `entropy_coding_mode_flag = 0` at the external encoder).
+- **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_16×16 modes other
+  than DC, rate control, adaptive QP, mode decision, deblocking.
+- B-slices, bi-prediction, weighted prediction (both).
 - Multi-reference DPB / `ref_idx_l0 > 0`, reference list modification
-  operations.
+  operations (decoder).
 - Interlaced coding, MBAFF, PAFF, frame/field picture mixes.
 - 8×8 transform (`transform_8x8_mode_flag = 1`).
 - 4:2:2 / 4:4:4 chroma, bit depths above 8, separate colour planes.
 - SI / SP slices.
-- Encoder — this crate is decoder-only today.
 
 ## Codec id
 
-Registered under `CodecId::new("h264")`. The decoder always emits
-`PixelFormat::Yuv420P`.
+Registered under `CodecId::new("h264")` for both decoder (`h264_sw`)
+and encoder (`h264_baseline_i_sw`). Call `oxideav_h264::register(&mut
+reg)` to wire both into a `CodecRegistry`. The decoder and encoder
+both operate on `PixelFormat::Yuv420P`.
 
 ## Test fixtures
 

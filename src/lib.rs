@@ -1,4 +1,5 @@
-//! Pure-Rust H.264 / AVC (ITU-T H.264 | ISO/IEC 14496-10) decoder.
+//! Pure-Rust H.264 / AVC (ITU-T H.264 | ISO/IEC 14496-10) decoder + Baseline
+//! I-frame-only encoder.
 //!
 //! # What is decoded today
 //!
@@ -18,15 +19,25 @@
 //!   out-of-picture reads. A single-slot L0 reference (the previous frame
 //!   output) is retained across packets.
 //!
-//! # Out of scope (returns `Error::Unsupported`)
+//! # What is encoded today
 //!
-//! * CABAC P-slices.
+//! See [`encoder::H264Encoder`] — Baseline Profile, I-frames only,
+//! Intra_16×16 DC_PRED, CAVLC, single slice per frame, 4:2:0, 8-bit,
+//! fixed QP, deblocking disabled. The encoder and decoder round-trip
+//! to PSNR ≥ 28 dB for gradient content at QP 22 and ≥ 40 dB for solid
+//! content.
+//!
+//! # Out of scope (returns `Error::Unsupported` or the encoder refuses)
+//!
+//! * CABAC P-slices (decode); any CABAC encoding; any P/B slice encoding.
 //! * B-slices, weighted prediction, bi-prediction.
 //! * Multi-reference DPB (`ref_idx_l0 > 0`), reference picture list
 //!   modification operations.
 //! * Interlaced coding / MBAFF / PAFF.
 //! * 8×8 transform (§8.5.13), 4:2:2 / 4:4:4 chroma, bit depths above 8.
-//! * Encoder.
+//! * Rate control, adaptive QP, mode decision (Intra4×4 / Plane / Vertical /
+//!   Horizontal), or any psychovisual tuning. The encoder always emits
+//!   Intra_16×16 with DC_PRED and a fixed QP.
 //!
 //! This crate has no runtime dependencies beyond `oxideav-core` and
 //! `oxideav-codec`.
@@ -37,10 +48,14 @@
 #![allow(clippy::derivable_impls)]
 
 pub mod bitreader;
+pub mod bitwriter;
 pub mod cabac;
 pub mod cavlc;
+pub mod cavlc_enc;
 pub mod deblock;
 pub mod decoder;
+pub mod encoder;
+pub mod fwd_transform;
 pub mod intra_pred;
 pub mod mb;
 pub mod mb_type;
@@ -55,16 +70,27 @@ pub mod tables;
 pub mod transform;
 
 use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecCapabilities, CodecId};
+use oxideav_core::{CodecCapabilities, CodecId, PixelFormat};
 
 /// The canonical oxideav codec id for H.264 / AVC video.
 pub const CODEC_ID_STR: &str = "h264";
 
-/// Register this decoder with a codec registry.
+/// Register this crate's decoder and baseline I-only encoder with a codec
+/// registry. Both are registered under the same `"h264"` id; the registry's
+/// preference + priority logic picks one at resolve time.
 pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("h264_sw")
+    let dec_caps = CodecCapabilities::video("h264_sw")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(8192, 8192);
-    reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), caps, decoder::make_decoder);
+    reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), dec_caps, decoder::make_decoder);
+
+    // Encoder: Baseline I-only. The registered caps advertise
+    // `intra_only = true` and cap the output at level 3.0 maxima.
+    let enc_caps = CodecCapabilities::video("h264_baseline_i_sw")
+        .with_lossy(true)
+        .with_intra_only(true)
+        .with_max_size(720, 576)
+        .with_pixel_format(PixelFormat::Yuv420P);
+    reg.register_encoder_impl(CodecId::new(CODEC_ID_STR), enc_caps, encoder::make_encoder);
 }
