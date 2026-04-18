@@ -825,11 +825,12 @@ fn decode_inter_residual_chroma(
             }
             nc_arr[(br_row << 1) | br_col] = total_coeff as u8;
             let info = pic.mb_info_mut(mb_x, mb_y);
-            if plane_kind {
-                info.cb_nc = nc_arr;
+            let dst = if plane_kind {
+                &mut info.cb_nc
             } else {
-                info.cr_nc = nc_arr;
-            }
+                &mut info.cr_nc
+            };
+            dst[..4].copy_from_slice(&nc_arr);
         }
     }
     Ok(())

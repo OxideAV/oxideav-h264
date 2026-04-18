@@ -335,8 +335,8 @@ fn decode_pcm_mb(
     info.coded = true;
     info.intra = true;
     info.luma_nc = [16; 16];
-    info.cb_nc = [16; 4];
-    info.cr_nc = [16; 4];
+    info.cb_nc = [16; 16];
+    info.cr_nc = [16; 16];
     info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
     Ok(())
 }
@@ -709,11 +709,12 @@ fn decode_chroma(
             }
             nc_arr[(br_row << 1) | br_col] = total_coeff as u8;
             let info = pic.mb_info_mut(mb_x, mb_y);
-            if plane_kind {
-                info.cb_nc = nc_arr;
+            let dst = if plane_kind {
+                &mut info.cb_nc
             } else {
-                info.cr_nc = nc_arr;
-            }
+                &mut info.cr_nc
+            };
+            dst[..4].copy_from_slice(&nc_arr);
         }
     }
     Ok(())
