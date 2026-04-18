@@ -7,6 +7,40 @@ use oxideav_core::{frame::VideoPlane, PixelFormat, TimeBase, VideoFrame};
 
 use crate::mb_type::{IMbType, PMbType, PPartition};
 
+/// §6.4.1 — (SubWidthC, SubHeightC) for a given `chroma_format_idc`.
+/// Chroma plane sample dimensions are `PicWidthInSamplesL / SubWidthC`
+/// by `PicHeightInSamplesL / SubHeightC`.
+///
+/// | chroma_format_idc | meaning     | SubWidthC | SubHeightC |
+/// |-------------------|-------------|-----------|------------|
+/// | 0                 | monochrome  |     -     |     -      |
+/// | 1                 | 4:2:0       |     2     |     2      |
+/// | 2                 | 4:2:2       |     2     |     1      |
+/// | 3                 | 4:4:4       |     1     |     1      |
+pub fn chroma_subsampling(chroma_format_idc: u32) -> (u32, u32) {
+    match chroma_format_idc {
+        1 => (2, 2),
+        2 => (2, 1),
+        3 => (1, 1),
+        // Monochrome falls back to (2, 2) so the chroma stride math stays
+        // benign; callers must gate on `chroma_format_idc == 0` before
+        // touching chroma planes.
+        _ => (2, 2),
+    }
+}
+
+/// §6.4.1 — chroma plane width (luma width ÷ SubWidthC).
+pub fn chroma_plane_w(luma_w: u32, chroma_format_idc: u32) -> u32 {
+    let (sub_w, _) = chroma_subsampling(chroma_format_idc);
+    luma_w / sub_w
+}
+
+/// §6.4.1 — chroma plane height (luma height ÷ SubHeightC).
+pub fn chroma_plane_h(luma_h: u32, chroma_format_idc: u32) -> u32 {
+    let (_, sub_h) = chroma_subsampling(chroma_format_idc);
+    luma_h / sub_h
+}
+
 #[derive(Clone, Debug)]
 pub struct Picture {
     pub width: u32,
