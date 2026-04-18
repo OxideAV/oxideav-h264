@@ -270,6 +270,7 @@
 #![allow(clippy::derivable_impls)]
 
 pub mod b_mb;
+pub mod b_mb_hi;
 pub mod bitreader;
 pub mod bitwriter;
 pub mod cabac;

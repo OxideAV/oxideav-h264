@@ -614,6 +614,138 @@ pub fn direct_16x16_compensate_pub(
     }
 }
 
+/// Direct mode per-4×4 MV / ref_idx record. Used by the 10-bit B-slice path
+/// to derive direct MVs via the spatial or temporal rules without triggering
+/// any u8-plane sample writes. The caller takes responsibility for running
+/// motion compensation on the planes it cares about.
+#[derive(Clone, Copy, Debug)]
+pub struct DirectMv {
+    pub ref_idx_l0: i8,
+    pub ref_idx_l1: i8,
+    pub mv_l0: (i16, i16),
+    pub mv_l1: (i16, i16),
+    pub dir: PredDir,
+}
+
+impl DirectMv {
+    pub fn new(ref_idx_l0: i8, ref_idx_l1: i8, mv_l0: (i16, i16), mv_l1: (i16, i16)) -> Self {
+        Self {
+            ref_idx_l0,
+            ref_idx_l1,
+            mv_l0,
+            mv_l1,
+            dir: pick_bipred_dir(ref_idx_l0, ref_idx_l1),
+        }
+    }
+}
+
+/// Spatial-direct MV derivation (§8.4.1.2.2) for a whole 16×16 MB — returns
+/// a single DirectMv shared by every 4×4 block plus writes the MVs / refs
+/// into `pic.mb_info[mb_x, mb_y]` so subsequent neighbour lookups see them.
+pub fn direct_16x16_spatial_mvs_pub(
+    pic: &mut Picture,
+    mb_x: u32,
+    mb_y: u32,
+) -> DirectMv {
+    let (ri0, ri1) = direct_spatial_ref_idx(pic, mb_x, mb_y);
+    let (mv0, mv1) = direct_spatial_mvs(pic, mb_x, mb_y, ri0, ri1);
+    let d = DirectMv::new(ri0, ri1, mv0, mv1);
+    for rr in 0..4usize {
+        for cc in 0..4usize {
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            info.ref_idx_l0[rr * 4 + cc] = ri0;
+            info.ref_idx_l1[rr * 4 + cc] = ri1;
+            info.mv_l0[rr * 4 + cc] = mv0;
+            info.mv_l1[rr * 4 + cc] = mv1;
+        }
+    }
+    d
+}
+
+/// Spatial-direct MV derivation for a single 8×8 sub-MB at (sr0, sc0) within
+/// the MB. Mirrors [`direct_16x16_spatial_mvs_pub`] but scoped to the 2×2
+/// grid of 4×4 blocks under the sub-MB.
+pub fn direct_8x8_spatial_mvs_pub(
+    pic: &mut Picture,
+    mb_x: u32,
+    mb_y: u32,
+    sr0: usize,
+    sc0: usize,
+) -> DirectMv {
+    let (ri0, ri1) = direct_spatial_ref_idx(pic, mb_x, mb_y);
+    let (mv0, mv1) = direct_spatial_mvs(pic, mb_x, mb_y, ri0, ri1);
+    let d = DirectMv::new(ri0, ri1, mv0, mv1);
+    for rr in sr0..sr0 + 2 {
+        for cc in sc0..sc0 + 2 {
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            info.ref_idx_l0[rr * 4 + cc] = ri0;
+            info.ref_idx_l1[rr * 4 + cc] = ri1;
+            info.mv_l0[rr * 4 + cc] = mv0;
+            info.mv_l1[rr * 4 + cc] = mv1;
+        }
+    }
+    d
+}
+
+/// Temporal-direct MV derivation (§8.4.1.2.3) for a rect of 4×4 blocks at
+/// `(r0..r0+ph, c0..c0+pw)`. Writes per-4×4 MVs/refs into `pic.mb_info` but
+/// does not touch any plane samples; returns the per-4×4 MV grid so the
+/// caller can run MC on its chosen planes.
+#[allow(clippy::too_many_arguments)]
+pub fn direct_temporal_mvs_pub(
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    ph: usize,
+    pw: usize,
+    pic: &mut Picture,
+    ref_list1: &[&Picture],
+    ctx: &BSliceCtx<'_>,
+) -> Result<Vec<Vec<DirectMv>>> {
+    if ref_list1.is_empty() {
+        return Err(Error::invalid(
+            "h264 b-slice temporal-direct: empty RefPicList1",
+        ));
+    }
+    let ref_pic_col = ref_list1[0];
+    let pic1_poc = *ctx.list1_pocs.first().ok_or_else(|| {
+        Error::invalid("h264 b-slice temporal-direct: list1_pocs empty (DistScaleFactor input)")
+    })?;
+    let curr_poc = ctx.curr_poc;
+
+    let mut out: Vec<Vec<DirectMv>> = Vec::with_capacity(ph);
+    for rr in r0..r0 + ph {
+        let mut row_vec = Vec::with_capacity(pw);
+        for cc in c0..c0 + pw {
+            let col = colocated_block(ref_pic_col, mb_x, mb_y, rr, cc);
+            let (ri0, ri1, mv0, mv1) = if col.intra {
+                (0i8, 0i8, (0i16, 0i16), (0i16, 0i16))
+            } else {
+                let ri0 = ctx.list0_idx_for_poc(col.ref_poc).unwrap_or(0);
+                let ri1 = 0i8;
+                let l0_short = ctx
+                    .list0_short_term
+                    .get(ri0 as usize)
+                    .copied()
+                    .unwrap_or(true);
+                let long_term = !col.short_term_ref || !l0_short;
+                let (mv0, mv1) =
+                    temporal_scale_mv(col.mv, curr_poc, col.ref_poc, pic1_poc, long_term);
+                (ri0, ri1, mv0, mv1)
+            };
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            info.ref_idx_l0[rr * 4 + cc] = ri0;
+            info.ref_idx_l1[rr * 4 + cc] = ri1;
+            info.mv_l0[rr * 4 + cc] = mv0;
+            info.mv_l1[rr * 4 + cc] = mv1;
+            row_vec.push(DirectMv::new(ri0, ri1, mv0, mv1));
+        }
+        out.push(row_vec);
+    }
+    Ok(out)
+}
+
 /// Public wrapper for the 8×8 direct-mode sub-MB compensate helpers. Used
 /// from the CABAC `B_8x8` path when a sub-partition is `B_Direct_8x8`.
 #[allow(clippy::too_many_arguments)]
