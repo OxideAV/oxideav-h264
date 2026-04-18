@@ -230,14 +230,16 @@ impl H264Decoder {
                         }
                         let mbaff_ok = sh.slice_type == SliceType::I
                             && !pps.entropy_coding_mode_flag
-                            && sps.chroma_format_idc == 1
+                            && (sps.chroma_format_idc == 1
+                                || sps.chroma_format_idc == 2
+                                || sps.chroma_format_idc == 3)
                             && sps.bit_depth_luma_minus8 == 0
                             && sps.bit_depth_chroma_minus8 == 0
                             && !sps.separate_colour_plane_flag;
                         if !mbaff_ok {
                             return Err(Error::unsupported(
-                                "h264: only MBAFF I-slice CAVLC 4:2:0 8-bit interlaced is wired (§7.3.4); \
-                                 MBAFF+P/B/CABAC/chroma>420/10-bit still reject",
+                                "h264: only MBAFF I-slice CAVLC 4:2:0/4:2:2/4:4:4 8-bit interlaced is wired (§7.3.4); \
+                                 MBAFF+P/B/CABAC/10-bit still reject",
                             ));
                         }
                     } else {

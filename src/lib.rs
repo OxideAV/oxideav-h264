@@ -153,8 +153,15 @@
 //!   edge schedule on each pair's `mb_field_decoding_flag`: field-coded
 //!   pairs step vertical edges at `row_step = 2` through the
 //!   interleaved plane layout and skip the inside-pair top/bottom
-//!   boundary (§8.7.1.1). MBAFF P/B/CABAC and MBAFF with chroma > 4:2:0
-//!   or bit depth > 8 are still rejected.
+//!   boundary (§8.7.1.1). MBAFF also accepts the 4:2:2 and 4:4:4
+//!   chroma formats (ChromaArrayType ∈ {2, 3}) — the 4:2:2 8×16
+//!   intra-chroma path and the 4:4:4 three-plane path both route
+//!   their neighbour lookups and residual writes through the
+//!   field-aware [`picture::Picture::luma_row_stride_for_at`] /
+//!   [`picture::Picture::chroma_row_stride_for_at`] helpers, and
+//!   the MBAFF deblocker computes its per-band chroma edge schedule
+//!   from `chroma_format_idc`. MBAFF P/B/CABAC and MBAFF 10-bit are
+//!   still rejected.
 //! * **CABAC Main-profile B-slice** entropy decode (§9.3) —
 //!   `mb_skip_flag` (B bank), `mb_type` (Table 9-37 with the 48-value
 //!   inter + intra tree), `sub_mb_type` (Table 9-38 B column, 13 values),
@@ -278,8 +285,8 @@
 //!   path is parsed but the weights aren't yet applied to the MC output.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
-//! * MBAFF P/B, MBAFF CABAC, MBAFF chroma > 4:2:0, and MBAFF 10-bit —
-//!   MBAFF I-slice CAVLC 4:2:0 8-bit IS wired (`frame_mbs_only_flag = 0
+//! * MBAFF P/B, MBAFF CABAC, and MBAFF 10-bit — MBAFF I-slice CAVLC
+//!   in 4:2:0 / 4:2:2 / 4:4:4 8-bit IS wired (`frame_mbs_only_flag = 0
 //!   && mb_adaptive_frame_field_flag = 1` pictures decode via the
 //!   §7.3.4 MB-pair loop + §6.4.9.4 field-stride neighbour logic plus
 //!   the §8.7.1.1 MBAFF in-loop deblocker). PAFF I-slice decode is also

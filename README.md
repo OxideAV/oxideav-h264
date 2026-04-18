@@ -93,12 +93,12 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
   extra-edge pass is wired as a sibling entry point
   (`deblock::deblock_picture_mbaff`) — see the MBAFF section below.
 
-### MBAFF I-slice CAVLC (§7.3.4, §6.4.9.4)
+### MBAFF I-slice CAVLC (§7.3.4, §6.4.9.4, §8.7.1.1)
 
 - `frame_mbs_only_flag = 0` AND `mb_adaptive_frame_field_flag = 1`
-  pictures are accepted for **I-slice CAVLC in 4:2:0 8-bit** only.
-  `field_pic_flag = 1` (PAFF), P/B/MBAFF, CABAC/MBAFF, 10-bit/MBAFF
-  and 4:2:2/4:4:4/MBAFF all still return `Error::Unsupported`.
+  pictures are accepted for **I-slice CAVLC in 4:2:0 / 4:2:2 / 4:4:4
+  8-bit**. `field_pic_flag = 1` (PAFF), P/B/MBAFF, CABAC/MBAFF, and
+  10-bit/MBAFF all still return `Error::Unsupported`.
 - §7.3.4 MB-pair decode loop reads `mb_field_decoding_flag` once per
   pair; per-MB [`Picture::luma_off`] / [`Picture::chroma_off`] and
   [`Picture::luma_row_stride_for`] honour the field-interleaved sample
@@ -324,10 +324,10 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   field is emitted as its own `VideoFrame`. The encoder exposes a
   `H264EncoderOptions::paff_field` flag so round-trip tests can drive
   the PAFF path without an external PAFF-capable encoder.
-- **MBAFF I-slice CAVLC** is supported for 4:2:0 8-bit (§7.3.4 MB-pair
-  loop + §6.4.9.4 field-stride neighbour lookups + §8.7.1.1 MBAFF
-  deblock). MBAFF P/B, MBAFF CABAC, MBAFF chroma > 4:2:0, and MBAFF
-  10-bit still return `Error::Unsupported`.
+- **MBAFF I-slice CAVLC** is supported for 4:2:0 / 4:2:2 / 4:4:4 8-bit
+  (§7.3.4 MB-pair loop + §6.4.9.4 field-stride neighbour lookups +
+  §8.7.1.1 MBAFF deblock). MBAFF P/B, MBAFF CABAC, and MBAFF 10-bit
+  still return `Error::Unsupported`.
 - Inter 8×8 transform on B-slice MBs — CAVLC P-slice inter 8×8 is wired
   (see above); B-slice inter 8×8 is not yet.
 - 4:2:2 CAVLC I- and P-slice decode IS supported (§6.4.1

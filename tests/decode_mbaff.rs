@@ -145,3 +145,125 @@ fn decode_mbaff_iframe_matches_ffmpeg_reference() {
         "mbaff luma ±8 match {y_pct_loose:.2}% < 99%"
     );
 }
+
+/// MBAFF + 4:2:2 integration — regenerate with:
+///
+/// ```bash
+/// ffmpeg -y -f lavfi -i testsrc=duration=1:size=128x128:rate=25 -vframes 2 \
+///     -pix_fmt yuv422p -c:v libx264 -profile:v high422 -preset medium \
+///     -coder 0 -flags +ildct+ilme \
+///     -x264opts "interlaced=1:no-scenecut:8x8dct=0" /tmp/mbaff422.mp4 && \
+/// ffmpeg -y -i /tmp/mbaff422.mp4 -c:v copy -bsf:v h264_mp4toannexb -f h264 \
+///     tests/fixtures/mbaff_422_128x128.es && \
+/// ffmpeg -y -i /tmp/mbaff422.mp4 -pix_fmt yuv422p \
+///     tests/fixtures/mbaff_422_128x128.yuv
+/// ```
+#[test]
+fn decode_mbaff_422_iframe_matches_ffmpeg_reference() {
+    let es_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mbaff_422_128x128.es"
+    );
+    let yuv_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mbaff_422_128x128.yuv"
+    );
+    let es = match read_fixture(es_path) {
+        Some(d) => d,
+        None => return,
+    };
+    let yuv = match read_fixture(yuv_path) {
+        Some(d) => d,
+        None => return,
+    };
+
+    let frame = decode_first_iframe(&es);
+    assert_eq!(frame.width, 128);
+    assert_eq!(frame.height, 128);
+
+    let y_len = 128 * 128;
+    let c_len = 64 * 128; // 4:2:2 chroma is half-width × full-height
+    let ref_y = &yuv[0..y_len];
+    let ref_cb = &yuv[y_len..y_len + c_len];
+    let ref_cr = &yuv[y_len + c_len..y_len + c_len * 2];
+    let dec_y = &frame.planes[0].data;
+    let dec_cb = &frame.planes[1].data;
+    let dec_cr = &frame.planes[2].data;
+
+    let y_match_tight = count_within(dec_y, ref_y, 4);
+    let y_pct_tight = (y_match_tight as f64) * 100.0 / (ref_y.len() as f64);
+    let cb_match = count_within(dec_cb, ref_cb, 4);
+    let cb_pct = (cb_match as f64) * 100.0 / (ref_cb.len() as f64);
+    let cr_match = count_within(dec_cr, ref_cr, 4);
+    let cr_pct = (cr_match as f64) * 100.0 / (ref_cr.len() as f64);
+
+    eprintln!(
+        "mbaff-422: luma ±4 {y_pct_tight:.2}%, Cb ±4 {cb_pct:.2}%, Cr ±4 {cr_pct:.2}%"
+    );
+
+    assert!(
+        y_pct_tight >= 99.0,
+        "mbaff-422 luma ±4 match {y_pct_tight:.2}% < 99%"
+    );
+}
+
+/// MBAFF + 4:4:4 integration — regenerate with:
+///
+/// ```bash
+/// ffmpeg -y -f lavfi -i testsrc=duration=1:size=128x128:rate=25 -vframes 2 \
+///     -pix_fmt yuv444p -c:v libx264 -profile:v high444 -preset medium \
+///     -coder 0 -flags +ildct+ilme \
+///     -x264opts "interlaced=1:no-scenecut:8x8dct=0" /tmp/mbaff444.mp4 && \
+/// ffmpeg -y -i /tmp/mbaff444.mp4 -c:v copy -bsf:v h264_mp4toannexb -f h264 \
+///     tests/fixtures/mbaff_444_128x128.es && \
+/// ffmpeg -y -i /tmp/mbaff444.mp4 -pix_fmt yuv444p \
+///     tests/fixtures/mbaff_444_128x128.yuv
+/// ```
+#[test]
+fn decode_mbaff_444_iframe_matches_ffmpeg_reference() {
+    let es_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mbaff_444_128x128.es"
+    );
+    let yuv_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mbaff_444_128x128.yuv"
+    );
+    let es = match read_fixture(es_path) {
+        Some(d) => d,
+        None => return,
+    };
+    let yuv = match read_fixture(yuv_path) {
+        Some(d) => d,
+        None => return,
+    };
+
+    let frame = decode_first_iframe(&es);
+    assert_eq!(frame.width, 128);
+    assert_eq!(frame.height, 128);
+
+    let y_len = 128 * 128;
+    let c_len = 128 * 128; // 4:4:4 chroma planes match luma size
+    let ref_y = &yuv[0..y_len];
+    let ref_cb = &yuv[y_len..y_len + c_len];
+    let ref_cr = &yuv[y_len + c_len..y_len + c_len * 2];
+    let dec_y = &frame.planes[0].data;
+    let dec_cb = &frame.planes[1].data;
+    let dec_cr = &frame.planes[2].data;
+
+    let y_match_tight = count_within(dec_y, ref_y, 4);
+    let y_pct_tight = (y_match_tight as f64) * 100.0 / (ref_y.len() as f64);
+    let cb_match = count_within(dec_cb, ref_cb, 4);
+    let cb_pct = (cb_match as f64) * 100.0 / (ref_cb.len() as f64);
+    let cr_match = count_within(dec_cr, ref_cr, 4);
+    let cr_pct = (cr_match as f64) * 100.0 / (ref_cr.len() as f64);
+
+    eprintln!(
+        "mbaff-444: luma ±4 {y_pct_tight:.2}%, Cb ±4 {cb_pct:.2}%, Cr ±4 {cr_pct:.2}%"
+    );
+
+    assert!(
+        y_pct_tight >= 99.0,
+        "mbaff-444 luma ±4 match {y_pct_tight:.2}% < 99%"
+    );
+}
