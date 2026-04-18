@@ -31,12 +31,14 @@
 //!   `direct_spatial_mv_pred_flag = 0`).
 //! * Implicit weighted bi-prediction (`weighted_bipred_idc == 2`,
 //!   §8.4.2.3.3).
-//! * Reference picture list modification (RPLM) — only the identity
-//!   (flag = 0) form is accepted. Any non-trivial RPLM command surfaces
-//!   `Error::Unsupported`.
 //! * `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 //! * Interlaced coding / MBAFF (P and B).
 //! * 8×8 transform, 4:2:2 / 4:4:4 chroma, bit depth > 8.
+//!
+//! Reference picture list modification (RPLM, §7.3.3.1 / §8.2.4.3) is
+//! parsed into [`crate::slice::SliceHeader::rplm_l0`] /
+//! [`crate::slice::SliceHeader::rplm_l1`] and applied via
+//! [`crate::dpb::apply_rplm`] on top of the default-built lists.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -49,7 +51,7 @@ use oxideav_core::{
 use crate::b_mb::{decode_b_skip_mb, decode_b_slice_mb};
 use crate::bitreader::BitReader;
 use crate::cabac::{engine::CabacDecoder, mb::decode_i_mb_cabac, tables::init_slice_contexts};
-use crate::dpb::{derive_poc_type0, derive_poc_type2, Dpb, MmcoCommand, PocState};
+use crate::dpb::{apply_rplm, derive_poc_type0, derive_poc_type2, Dpb, MmcoCommand, PocState};
 use crate::mb::decode_i_slice_data;
 use crate::nal::{
     extract_rbsp, split_annex_b, split_length_prefixed, AvcConfig, NalHeader, NalUnitType,
@@ -330,7 +332,24 @@ impl H264Decoder {
                     SliceType::P => {
                         let dpb = self.dpb.as_mut().expect("DPB initialised above");
                         dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
-                        let ref_entries = dpb.build_list0_p(sh.num_ref_idx_l0_active_minus1);
+                        // Re-borrow immutably to build the list + apply RPLM.
+                        let dpb_ref: &Dpb = dpb;
+                        let default_list = dpb_ref.build_list0_p(sh.num_ref_idx_l0_active_minus1);
+                        let ref_entries = if sh.rplm_l0.is_empty() {
+                            default_list
+                        } else {
+                            // §7.4.3 CurrPicNum == frame_num for non-field
+                            // frames; MaxPicNum == MaxFrameNum.
+                            let curr_pic_num = sh.frame_num as i32;
+                            apply_rplm(
+                                default_list,
+                                &sh.rplm_l0,
+                                curr_pic_num,
+                                max_frame_num as i32,
+                                sh.num_ref_idx_l0_active_minus1,
+                                dpb_ref.frames_raw(),
+                            )?
+                        };
                         if ref_entries.is_empty() {
                             return Err(Error::invalid(
                                 "h264 p-slice: no reference picture available (no prior IDR?)",
@@ -351,8 +370,36 @@ impl H264Decoder {
                     SliceType::B => {
                         let dpb = self.dpb.as_mut().expect("DPB initialised above");
                         dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
-                        let l0_entries = dpb.build_list0_b(poc, sh.num_ref_idx_l0_active_minus1);
-                        let l1_entries = dpb.build_list1_b(poc, sh.num_ref_idx_l1_active_minus1);
+                        let dpb_ref: &Dpb = dpb;
+                        let default_l0 =
+                            dpb_ref.build_list0_b(poc, sh.num_ref_idx_l0_active_minus1);
+                        let default_l1 =
+                            dpb_ref.build_list1_b(poc, sh.num_ref_idx_l1_active_minus1);
+                        let curr_pic_num = sh.frame_num as i32;
+                        let l0_entries = if sh.rplm_l0.is_empty() {
+                            default_l0
+                        } else {
+                            apply_rplm(
+                                default_l0,
+                                &sh.rplm_l0,
+                                curr_pic_num,
+                                max_frame_num as i32,
+                                sh.num_ref_idx_l0_active_minus1,
+                                dpb_ref.frames_raw(),
+                            )?
+                        };
+                        let l1_entries = if sh.rplm_l1.is_empty() {
+                            default_l1
+                        } else {
+                            apply_rplm(
+                                default_l1,
+                                &sh.rplm_l1,
+                                curr_pic_num,
+                                max_frame_num as i32,
+                                sh.num_ref_idx_l1_active_minus1,
+                                dpb_ref.frames_raw(),
+                            )?
+                        };
                         if l0_entries.is_empty() || l1_entries.is_empty() {
                             return Err(Error::invalid(
                                 "h264 b-slice: empty RefPicList0/1 (no prior references?)",

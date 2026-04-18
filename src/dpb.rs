@@ -24,8 +24,9 @@
 //!
 //! The slice header's `num_ref_idx_l0_active_minus1` trims the final list
 //! to exactly `num_ref_idx_l0_active_minus1 + 1` entries. Reference picture
-//! list modification (§8.2.4.3) is **not** applied here — the slice header
-//! parser surfaces `Error::Unsupported` on non-identity RPLM commands.
+//! list modification (§8.2.4.3) is applied on top of the default-built
+//! list via [`apply_rplm`], driven by `ref_pic_list_modification` commands
+//! parsed out of the slice header.
 //!
 //! Reference-marking modes:
 //!
@@ -485,6 +486,14 @@ impl Dpb {
         self.frames.iter().filter(|f| f.used_for_reference)
     }
 
+    /// Raw slice of every stored reference-frame slot (including entries
+    /// whose `used_for_reference == false`). Exposed for
+    /// [`apply_rplm`], which needs to resolve commands against any picture
+    /// still in the DPB.
+    pub fn frames_raw(&self) -> &[RefFrame] {
+        &self.frames
+    }
+
     /// Mark the most recently inserted frame as already-output.
     pub fn mark_last_output(&mut self) {
         if let Some(last) = self.frames.last_mut() {
@@ -511,6 +520,150 @@ pub enum MmcoCommand {
     MarkAllUnused,
     /// Op 6 — tag the current picture as a long-term reference.
     AssignCurrentLongTerm { long_term_frame_idx: u32 },
+}
+
+// ---------------------------------------------------------------------------
+// Reference picture list modification — §7.3.3.1 / §8.2.4.3.
+// ---------------------------------------------------------------------------
+
+/// One `ref_pic_list_modification` command as parsed from the slice header
+/// (§7.3.3.1 Table 7-9). The `modification_of_pic_nums_idc == 3` end-of-
+/// list sentinel is consumed by the parser and is not represented here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RplmCommand {
+    /// `modification_of_pic_nums_idc == 0` — short-term reference,
+    /// subtract `abs_diff_pic_num_minus1 + 1` from `picNumPred` to obtain
+    /// the target `picNum` (§8.2.4.3.1).
+    ShortTermSubtract { abs_diff_pic_num_minus1: u32 },
+    /// `modification_of_pic_nums_idc == 1` — short-term reference,
+    /// add `abs_diff_pic_num_minus1 + 1` to `picNumPred`.
+    ShortTermAdd { abs_diff_pic_num_minus1: u32 },
+    /// `modification_of_pic_nums_idc == 2` — long-term reference,
+    /// selected by its `LongTermPicNum`.
+    LongTerm { long_term_pic_num: u32 },
+}
+
+/// Apply a sequence of `ref_pic_list_modification` commands to a default-
+/// built RefPicList (§8.2.4.3 / §8.2.4.3.1).
+///
+/// `default` is the list built by [`Dpb::build_list0_p`] /
+/// [`Dpb::build_list0_b`] / [`Dpb::build_list1_b`], already trimmed to
+/// `num_ref_idx_lX_active_minus1 + 1` entries. `curr_pic_num` is the
+/// current slice's `CurrPicNum` (= `frame_num` for frame coded pictures),
+/// and `max_pic_num` is `MaxPicNum` from §7.4.3 (= `MaxFrameNum` for
+/// frames, = `2 * MaxFrameNum` for fields — the caller picks).
+///
+/// The algorithm proceeds as §8.2.4.3.1: walk the commands in order,
+/// maintaining `picNumPred` (initially `CurrPicNum`). For each short-term
+/// command derive `picNumNoWrap` → `picNum` by adding/subtracting
+/// `max_pic_num` to land in `[0, max_pic_num)`, then locate the reference
+/// in the DPB's live short-term set (by `frame_num_wrap`, since
+/// `PicNum == FrameNumWrap` for frame-coded pictures). For long-term
+/// commands the target is located by `LongTermPicNum`. The picture is
+/// moved to position `refIdxLX` (which advances each command) and every
+/// entry at or below that position shifts down; a prior occurrence of the
+/// same picture higher in the list is then removed. The final list is
+/// truncated back to `num_ref_idx_lX_active_minus1 + 1`.
+pub fn apply_rplm<'a>(
+    default: Vec<&'a RefFrame>,
+    commands: &[RplmCommand],
+    curr_pic_num: i32,
+    max_pic_num: i32,
+    num_ref_idx_active_minus1: u32,
+    all_refs: &'a [RefFrame],
+) -> oxideav_core::Result<Vec<&'a RefFrame>> {
+    let want = (num_ref_idx_active_minus1 as usize) + 1;
+    let mut list: Vec<&'a RefFrame> = default;
+    // §8.2.4.3.1 picNumLXPred state — tracks the last short-term picNum
+    // selected, initialised to CurrPicNum at the start of each list's
+    // modification loop. Long-term commands do not update it.
+    let mut pic_num_pred = curr_pic_num;
+
+    for (ref_idx, cmd) in commands.iter().enumerate() {
+        let target: Option<&'a RefFrame> = match *cmd {
+            RplmCommand::ShortTermSubtract {
+                abs_diff_pic_num_minus1,
+            } => {
+                let delta = abs_diff_pic_num_minus1 as i32 + 1;
+                // §8.2.4.3.1 — compute picNumNoWrap with the subtract rule
+                // and wrap into [0, max_pic_num).
+                let mut no_wrap = pic_num_pred - delta;
+                if no_wrap < 0 {
+                    no_wrap += max_pic_num;
+                }
+                let pic_num = if no_wrap > curr_pic_num {
+                    no_wrap - max_pic_num
+                } else {
+                    no_wrap
+                };
+                pic_num_pred = no_wrap;
+                find_short_term_ref(all_refs, pic_num)
+            }
+            RplmCommand::ShortTermAdd {
+                abs_diff_pic_num_minus1,
+            } => {
+                let delta = abs_diff_pic_num_minus1 as i32 + 1;
+                let mut no_wrap = pic_num_pred + delta;
+                if no_wrap >= max_pic_num {
+                    no_wrap -= max_pic_num;
+                }
+                let pic_num = if no_wrap > curr_pic_num {
+                    no_wrap - max_pic_num
+                } else {
+                    no_wrap
+                };
+                pic_num_pred = no_wrap;
+                find_short_term_ref(all_refs, pic_num)
+            }
+            RplmCommand::LongTerm { long_term_pic_num } => {
+                find_long_term_ref(all_refs, long_term_pic_num)
+            }
+        };
+
+        let target = target.ok_or_else(|| {
+            oxideav_core::Error::invalid(
+                "h264 rplm: modification command references a picture not in the DPB",
+            )
+        })?;
+        // §8.2.4.3.1 — insert target at refIdx, shift the tail down,
+        // and drop any later duplicate of the same picture. RefFrame
+        // identity is established by pointer comparison against
+        // `all_refs`, which outlives the modified list.
+        if ref_idx > list.len() {
+            list.resize(ref_idx, target);
+        }
+        list.insert(ref_idx, target);
+        let target_ptr = target as *const RefFrame;
+        let mut seen_once = false;
+        list.retain(|f| {
+            let p = *f as *const RefFrame;
+            if p == target_ptr {
+                if seen_once {
+                    false
+                } else {
+                    seen_once = true;
+                    true
+                }
+            } else {
+                true
+            }
+        });
+    }
+
+    list.truncate(want);
+    Ok(list)
+}
+
+fn find_short_term_ref(all_refs: &[RefFrame], pic_num: i32) -> Option<&RefFrame> {
+    all_refs
+        .iter()
+        .find(|f| f.used_for_reference && f.short_term && f.frame_num_wrap == pic_num)
+}
+
+fn find_long_term_ref(all_refs: &[RefFrame], long_term_pic_num: u32) -> Option<&RefFrame> {
+    all_refs.iter().find(|f| {
+        f.used_for_reference && !f.short_term && f.long_term_frame_idx == Some(long_term_pic_num)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -822,5 +975,154 @@ mod tests {
         assert_eq!(out.len(), 1);
         let out2 = dpb.flush_all();
         assert_eq!(out2.len(), 2);
+    }
+
+    /// idc=0 subtract: CurrPicNum=5, delta=3 → picNum=2 moves to L0[0];
+    /// the remaining short-term refs shift down preserving order.
+    #[test]
+    fn rplm_idc0_moves_short_term_to_front() {
+        let mut dpb = Dpb::new(4, 4);
+        for fn_ in 0..4u32 {
+            dpb.insert_reference(dummy_pic(), fn_, fn_ as i32, fn_ as i32);
+        }
+        dpb.update_frame_num_wrap(4, 16);
+        let default = dpb.build_list0_p(3);
+        let pocs_before: Vec<i32> = default.iter().map(|f| f.poc).collect();
+        assert_eq!(pocs_before, vec![3, 2, 1, 0]);
+
+        let cmds = vec![RplmCommand::ShortTermSubtract {
+            abs_diff_pic_num_minus1: 2,
+        }];
+        let modified = apply_rplm(default, &cmds, 5, 16, 3, dpb.frames_raw()).expect("apply");
+        let pocs: Vec<i32> = modified.iter().map(|f| f.poc).collect();
+        assert_eq!(pocs, vec![2, 3, 1, 0]);
+    }
+
+    /// idc=1 add: select a short-term reference ahead of picNumPred in
+    /// picNum space. With a small MaxPicNum the wrap rule kicks in.
+    #[test]
+    fn rplm_idc1_moves_forward_short_term() {
+        let mut dpb = Dpb::new(4, 4);
+        // CurrPicNum=2, MaxPicNum=4. Post-wrap, PicNums 2, 3 become -2, -1
+        // (the "future" half). Live short-term refs: FrameNumWrap -2, -1,
+        // 0, 1. None has PicNum=3 in the pre-wrap sense — the spec's
+        // intent is that PicNum matches FrameNumWrap.
+        dpb.insert_reference(dummy_pic(), 2, -2, -2);
+        dpb.insert_reference(dummy_pic(), 3, -1, -1);
+        dpb.insert_reference(dummy_pic(), 0, 0, 0);
+        dpb.insert_reference(dummy_pic(), 1, 1, 1);
+        let default = dpb.build_list0_p(3);
+        // delta=3 → picNumNoWrap = 2+3 = 5 ≥ MaxPicNum(4) → 5-4 = 1.
+        // 1 > curr_pic_num(2)? no → picNum = 1. Matches frame_num_wrap = 1.
+        let cmds = vec![RplmCommand::ShortTermAdd {
+            abs_diff_pic_num_minus1: 2,
+        }];
+        let modified = apply_rplm(default, &cmds, 2, 4, 3, dpb.frames_raw()).expect("apply");
+        assert_eq!(modified[0].frame_num_wrap, 1);
+    }
+
+    /// idc=2: long-term ref identified by LongTermPicNum is moved to
+    /// position 0.
+    #[test]
+    fn rplm_idc2_moves_long_term() {
+        let mut dpb = Dpb::new(4, 4);
+        for fn_ in 0..3u32 {
+            dpb.insert_reference(dummy_pic(), fn_, fn_ as i32, fn_ as i32);
+        }
+        // update_frame_num_wrap with prev_ref=2 leaves all wraps = frame_num.
+        dpb.update_frame_num_wrap(2, 16);
+        // Promote frame_num=0 to long-term index 5 (CurrentFrameNum=3,
+        // pic_num_x = 3 - (2+1) = 0 → frame_num_wrap 0).
+        dpb.apply_mmco(
+            MmcoCommand::AssignLongTerm {
+                difference_of_pic_nums_minus1: 2,
+                long_term_frame_idx: 5,
+            },
+            3,
+            16,
+        )
+        .unwrap();
+        let default = dpb.build_list0_p(2);
+        // Default: short-term (descending FrameNumWrap) then long-term.
+        // frame_num=0 became long-term; short-term refs left are 1 and 2.
+        assert_eq!(default[2].long_term_frame_idx, Some(5));
+
+        let cmds = vec![RplmCommand::LongTerm {
+            long_term_pic_num: 5,
+        }];
+        let modified = apply_rplm(default, &cmds, 3, 16, 2, dpb.frames_raw()).expect("apply");
+        assert_eq!(modified[0].long_term_frame_idx, Some(5));
+        // Size is preserved (3 entries for num_ref_idx_l0_active_minus1=2).
+        assert_eq!(modified.len(), 3);
+    }
+
+    /// Mixed short-term commands — idc=0 then idc=1 exercises the
+    /// picNumPred running state across a pair of opposite-direction deltas.
+    #[test]
+    fn rplm_mixed_short_term_commands() {
+        let mut dpb = Dpb::new(4, 4);
+        for fn_ in 0..4u32 {
+            dpb.insert_reference(dummy_pic(), fn_, fn_ as i32, fn_ as i32);
+        }
+        dpb.update_frame_num_wrap(4, 16);
+        let default = dpb.build_list0_p(3);
+        // CurrPicNum=4, MaxPicNum=16.
+        // cmd0: idc=0 delta=2 → picNumNoWrap = 4-2 = 2 → picNum = 2.
+        //   Move ref with FrameNumWrap=2 to L0[0]. pred = 2.
+        // cmd1: idc=1 delta=1 → picNumNoWrap = 2+1 = 3 → picNum = 3.
+        //   Move ref with FrameNumWrap=3 to L0[1]. pred = 3.
+        let cmds = vec![
+            RplmCommand::ShortTermSubtract {
+                abs_diff_pic_num_minus1: 1,
+            },
+            RplmCommand::ShortTermAdd {
+                abs_diff_pic_num_minus1: 0,
+            },
+        ];
+        let modified = apply_rplm(default, &cmds, 4, 16, 3, dpb.frames_raw()).expect("apply");
+        let pocs: Vec<i32> = modified.iter().map(|f| f.poc).collect();
+        // Default was [3, 2, 1, 0]. After cmd0 → [2, 3, 1, 0]; after cmd1
+        // the ref with frame_num_wrap=3 moves to position 1 → [2, 3, 1, 0].
+        assert_eq!(pocs, vec![2, 3, 1, 0]);
+    }
+
+    /// A command shifts entries down and the list is then truncated back
+    /// to num_ref_idx_l0_active_minus1 + 1 = 2.
+    #[test]
+    fn rplm_truncates_to_active_count() {
+        let mut dpb = Dpb::new(4, 4);
+        for fn_ in 0..4u32 {
+            dpb.insert_reference(dummy_pic(), fn_, fn_ as i32, fn_ as i32);
+        }
+        dpb.update_frame_num_wrap(4, 16);
+        // Ask for just 2 active L0 entries. Default will already be the
+        // top two (frame_num 3, 2). Then an RPLM that moves frame_num=0
+        // (picNum = 0 = CurrPicNum - 5) to the front must truncate to 2.
+        let default = dpb.build_list0_p(1);
+        assert_eq!(default.len(), 2);
+        let cmds = vec![RplmCommand::ShortTermSubtract {
+            abs_diff_pic_num_minus1: 4,
+        }];
+        let modified = apply_rplm(default, &cmds, 5, 16, 1, dpb.frames_raw()).expect("apply");
+        assert_eq!(modified.len(), 2);
+        // frame_num=0 at position 0, the original top of the list shifted
+        // to position 1.
+        assert_eq!(modified[0].frame_num, 0);
+        assert_eq!(modified[1].frame_num, 3);
+    }
+
+    /// Commands referencing a picture not in the DPB surface
+    /// `Error::InvalidData` rather than silently succeeding.
+    #[test]
+    fn rplm_missing_picture_errors() {
+        let mut dpb = Dpb::new(4, 4);
+        dpb.insert_reference(dummy_pic(), 0, 0, 0);
+        dpb.insert_reference(dummy_pic(), 1, 1, 1);
+        let default = dpb.build_list0_p(1);
+        let cmds = vec![RplmCommand::LongTerm {
+            long_term_pic_num: 99,
+        }];
+        let res = apply_rplm(default, &cmds, 2, 16, 1, dpb.frames_raw());
+        assert!(res.is_err());
     }
 }
