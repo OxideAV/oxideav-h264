@@ -1,4 +1,4 @@
-//! H.264 **Baseline Profile, I-frames only** encoder.
+//! H.264 **Baseline Profile** encoder.
 //!
 //! Minimum viable encoder that can be driven through the
 //! [`oxideav_codec::Encoder`] trait and whose output is decodable by this
@@ -8,7 +8,14 @@
 //! # Advertised scope
 //!
 //! * Baseline Profile (profile_idc = 66), level 3.0.
-//! * I-frames only — every output frame is emitted as an IDR NAL.
+//! * Progressive path: I-frames only — every output frame is emitted as
+//!   an IDR NAL.
+//! * PAFF path (`paff_field = Some(..)`): the first encoded field is an
+//!   IDR I-slice at the selected parity; subsequent encoded fields at the
+//!   same parity are emitted as zero-residual P-slices (one `mb_skip_run`
+//!   covering every MB, no coded macroblock) referencing the prior I
+//!   field. This exercises the decoder's PAFF P path without needing a
+//!   full inter-prediction writer on the encoder side.
 //! * CAVLC entropy coding (entropy_coding_mode_flag = 0).
 //! * Single slice per picture (`num_slice_groups_minus1 = 0`).
 //! * 4:2:0 chroma, 8-bit luma / chroma, single colour plane.
@@ -74,9 +81,9 @@ pub struct H264EncoderOptions {
     pub sps_id: u32,
     /// PPS pic_parameter_set_id. Default 0.
     pub pps_id: u32,
-    /// `Some(false)` → emit the frame as a PAFF top-field I-slice
-    /// (§7.3.3 `field_pic_flag = 1`, `bottom_field_flag = 0`).
-    /// `Some(true)`  → emit as a PAFF bottom-field I-slice.
+    /// `Some(false)` → emit PAFF top-field slices (§7.3.3
+    /// `field_pic_flag = 1`, `bottom_field_flag = 0`).
+    /// `Some(true)`  → emit PAFF bottom-field slices.
     /// `None`        → emit as a progressive frame (default).
     ///
     /// The input [`VideoFrame`] is the field samples themselves — the
@@ -84,6 +91,14 @@ pub struct H264EncoderOptions {
     /// the SPS carries `frame_mbs_only_flag = 0` and
     /// `mb_adaptive_frame_field_flag = 0` so the slice's
     /// `field_pic_flag` bit is emitted.
+    ///
+    /// The first PAFF frame fed to the encoder is an IDR I-slice at the
+    /// selected parity. Subsequent PAFF frames become "all-skip" P
+    /// slices — a single `mb_skip_run = TotalMbs` ue(v) with no coded
+    /// macroblock, which decodes as a zero-MV copy of the prior I field
+    /// (§8.4.1.1 `P_Skip` with unavailable neighbours returns the zero
+    /// predictor). This is enough to drive the decoder's PAFF P path
+    /// end-to-end; it is not a reconstruction-quality inter encoder.
     pub paff_field: Option<bool>,
 }
 
@@ -193,6 +208,12 @@ impl H264Encoder {
                 "h264 encoder: expected 3 planes for YUV420P",
             ));
         }
+        // PAFF + `frame_num > 0` → emit an all-skip P-field referencing the
+        // prior I-field rather than a second IDR. Progressive mode always
+        // takes the I-only path.
+        if self.opts.paff_field.is_some() && self.frame_num > 0 {
+            return self.encode_paff_p_skip_field(frame);
+        }
 
         // Build the MB-aligned raw-sample buffer (padding replicate-edges
         // if width/height are not already multiples of 16).
@@ -234,9 +255,12 @@ impl H264Encoder {
         let l_stride = self.coded_width as usize;
         let c_stride = coded_cw;
 
-        // Build IDR slice RBSP.
+        // Build IDR slice RBSP. frame_num is 0 for the IDR.
         let mut slice_rbsp = BitWriter::new();
         self.write_slice_header(&mut slice_rbsp);
+        // The I-slice is always emitted with frame_num = 0 in this encoder
+        // (it is the IDR that opens the CVS); subsequent PAFF P-fields
+        // advance `self.frame_num` to drive the DPB on the decoder side.
         // nC neighbour state (§9.2.1.1) tracked per 4×4 luma block and per
         // 4×4 chroma block. Raster-indexed across the coded picture.
         let mut luma_nc = vec![0u8; (self.mb_width * 4 * self.mb_height * 4) as usize];
@@ -297,6 +321,88 @@ impl H264Encoder {
             keyframe: true,
             ..Default::default()
         };
+        self.packets.push_back(pkt);
+        self.frame_num = self.frame_num.wrapping_add(1);
+        Ok(())
+    }
+
+    /// PAFF P-field — §7.3.3 P-slice header + §7.3.4 one `mb_skip_run`
+    /// ue(v) equal to `TotalMbs`. The field carries no coded macroblock;
+    /// every MB is derived by the decoder as `P_Skip` (§8.4.1.1) which,
+    /// with both A and B neighbours unavailable on the first MB and all
+    /// subsequent MBs inheriting ref_idx = 0 / MV = (0, 0), copies the
+    /// prior I-field sample-for-sample. The caller-supplied [`VideoFrame`]
+    /// is ignored on this path — its role is exercising the decoder, not
+    /// rate-distortion.
+    fn encode_paff_p_skip_field(&mut self, _frame: &VideoFrame) -> Result<()> {
+        let bottom = self.opts.paff_field.expect("paff_field set by caller");
+        let total_mbs = self.mb_width * self.mb_height;
+
+        let mut slice_rbsp = BitWriter::new();
+        // §7.3.3 P-slice header. slice_type = 5 (single-type-per-picture
+        // variant of P), so `slice_type_raw % 5 == 0 == SliceType::P`.
+        slice_rbsp.write_ue(0); // first_mb_in_slice
+        slice_rbsp.write_ue(5); // slice_type = P
+        slice_rbsp.write_ue(self.opts.pps_id);
+        // frame_num — 4 bits (log2_max_frame_num_minus4 = 0). One P-field
+        // follows the IDR, so frame_num = 1.
+        slice_rbsp.write_bits(1, 4);
+        // field_pic_flag + bottom_field_flag (PAFF path always).
+        slice_rbsp.write_flag(true);
+        slice_rbsp.write_flag(bottom);
+        // pic_order_cnt_lsb — 4 bits. Pick 2 so the P-field's POC is
+        // strictly greater than the IDR's 0 (avoids a POC tie at the
+        // decoder's output reorder queue).
+        slice_rbsp.write_bits(2, 4);
+        // num_ref_idx_active_override_flag = 0 → inherit PPS default of
+        // num_ref_idx_l0_active_minus1 = 0.
+        slice_rbsp.write_flag(false);
+        // ref_pic_list_modification_flag_l0 = 0.
+        slice_rbsp.write_flag(false);
+        // dec_ref_pic_marking — non-IDR with nal_ref_idc != 0:
+        //   adaptive_ref_pic_marking_mode_flag = 0 (sliding window).
+        slice_rbsp.write_flag(false);
+        // slice_qp_delta — the slice data reads no mb_qp_delta so this
+        // value is inherited as QP for every implied P_Skip MB.
+        slice_rbsp.write_se(self.opts.qp - 26);
+        // disable_deblocking_filter_idc = 1 (disabled) — matches the IDR
+        // path and avoids the two boundary-offset se(v) fields.
+        slice_rbsp.write_ue(1);
+
+        // §7.3.4 slice_data() — single `mb_skip_run` covering every MB
+        // followed by the stop bit + alignment. No `mb_type` is ever
+        // parsed because the outer loop breaks on `mb_addr >= total_mbs`
+        // immediately after consuming the skip run.
+        slice_rbsp.write_ue(total_mbs);
+        slice_rbsp.write_rbsp_trailing_bits();
+        let rbsp = slice_rbsp.finish();
+
+        // NAL header: nal_ref_idc = 3 (reference picture), nal_unit_type = 1
+        // (SliceNonIdr). 0x61 = 0b0110_0001.
+        let nal_header = 0x61u8;
+        let mut slice_nal = Vec::with_capacity(1 + rbsp.len());
+        slice_nal.push(nal_header);
+        slice_nal.extend_from_slice(&rbsp);
+        let slice_ebsp = rbsp_to_ebsp(&slice_nal);
+
+        // P-fields after the IDR re-emit the slice only — SPS/PPS are
+        // cached by the decoder from the opening IDR packet. Include
+        // them anyway so the packet is self-contained (mirrors the IDR
+        // path's three-NAL layout and keeps the test harness happy when
+        // a downstream parser wants to re-read parameter sets).
+        let mut out =
+            Vec::with_capacity(slice_ebsp.len() + self.sps_nal.len() + self.pps_nal.len() + 12);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&self.sps_nal);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&self.pps_nal);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&slice_ebsp);
+
+        let mut pkt = Packet::new(0, _frame.time_base, out);
+        pkt.pts = _frame.pts;
+        pkt.dts = _frame.pts;
+        pkt.flags = PacketFlags::default();
         self.packets.push_back(pkt);
         self.frame_num = self.frame_num.wrapping_add(1);
         Ok(())
