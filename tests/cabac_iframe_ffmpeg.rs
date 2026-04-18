@@ -112,40 +112,28 @@ fn decode_cabac_i_slice_tiny_all_zero_residual() {
 #[test]
 fn decode_cabac_i_slice_against_reference() {
     // 64×64 testsrc IDR (x264 @ QP=20) with real residual coefficient
-    // traffic across all 16 MBs. Current status: ~2.56% luma match.
+    // traffic across all 16 MBs.
     //
-    // Investigation in wt/cabac-64 established:
+    // Status in wt/cabac-recon2:
+    //   * MB 0 decodes **bit-exact** against the ffmpeg reference (all 256
+    //     luma samples match, verified via a throwaway trace test).
+    //   * MBs 1..15 still mis-decode — the CABAC engine state (codIRange)
+    //     at the MB 1 boundary is off by 5 relative to ffmpeg's internal
+    //     CABAC_BITS=16 representation, causing mb_type bin 0 to pick the
+    //     wrong MPS/LPS branch and the remainder of the slice to desync.
     //
-    // * All 460 INIT_MN_DATA rows match ffmpeg/h264_cabac.c byte-for-byte
-    //   (audit script dumped both; zero diffs across I / idc0 / idc1 / idc2).
+    // Root cause of the MB 0 bit-exactness fix (this wt): the §9.3.2.3 EGk
+    // suffix prefix for `coeff_abs_level_minus1 >= 14` is LEADING-ONES
+    // terminated by 0 — the opposite polarity from §9.1 ue(v). Our decoder
+    // was counting leading 0s, so every saturated coefficient (abs ≥ 15)
+    // clamped to abs=15 instead of the real magnitude, and MB 0's DC
+    // residual ([-128, -122, -57, ...]) was decoded as [8, -1, -25, ...]
+    // → 115/131/137 reconstruction instead of 15/17/81.
     //
-    // * Bin-level CABAC decoding of MB 0 is bit-identical to a Python
-    //   reference implementing §9.3.3.2.1 from spec (decode_bin / decode_bypass
-    //   / decode_terminate). 507 bins of MB 0 — mb_type, intra_chroma_pred_mode,
-    //   mb_qp_delta, luma16x16 DC map + levels, and 16 luma16x16 AC blocks —
-    //   all match pre_range / pre_off / pState / bin output from Python.
-    //
-    // * Reconstruction path (`inv_hadamard_4x4_dc`, `dequantize_4x4`,
-    //   `idct_4x4`) is shared with the CAVLC path which decodes the same
-    //   testsrc content (iframe_testsrc_64x64.es) to 100 % match. These
-    //   functions are proven correct by that fixture.
-    //
-    // Despite the above, `ffmpeg -i cabac_i_64x64.es` reconstructs
-    // [15,15,15,15,17,17,17,17,81,81,...] while our decoder reconstructs
-    // [115,131,137,131,...] from bin-identical CABAC output. The
-    // divergence must therefore live in the mapping from decoded bins to
-    // syntax-element values (mb_type / intra_pred / cbp_luma) or in some
-    // reconstruction detail specific to the CABAC path. Likely suspects:
-    //   * I_16x16 mb_type numbering: our bin parser emits mb_type 23
-    //     (I_16x16_DC_2_1 with cbp_luma=15 cbp_chroma=2), matching Table 9-31
-    //     but possibly differing from what ffmpeg derives for this bitstream.
-    //   * Luma DC dequant scaling constant (our §8.5.10 formula passes
-    //     the CAVLC fixture; verify again against ffmpeg's
-    //     ff_h264_luma_dc_dequant_idct when a pure-CABAC fixture with a
-    //     known-good reference is available).
-    //
-    // Soft-logged until the above is resolved so the bin-layer work
-    // stays pinned without blocking CI.
+    // The remaining MB 1+ divergence is a CABAC-engine-state issue
+    // (difference of 5 in codIRange at MB 1 pre-mb_type) that the current
+    // wt didn't run down. Soft-logged until that is resolved so the MB 0
+    // fix stays pinned without blocking CI.
     let es = include_bytes!("fixtures/cabac_i_64x64.es");
     let yuv = include_bytes!("fixtures/cabac_i_64x64.yuv");
     let res = run_fixture(es, yuv, 64, 64, "cabac-i-64x64");
@@ -156,12 +144,12 @@ fn decode_cabac_i_slice_against_reference() {
             } else {
                 eprintln!(
                     "cabac-i-64x64 decoded but mismatches reference (luma {luma_pct:.2}%, total {total_pct:.2}%) — \
-                     residual-decode desync still present"
+                     MB 1+ CABAC-engine-state desync still present (MB 0 is bit-exact)"
                 );
             }
         }
         Err(e) => {
-            eprintln!("cabac-i-64x64 residual decode still desyncs: {e}");
+            eprintln!("cabac-i-64x64 MB 1+ residual decode still desyncs: {e}");
         }
     }
 }
