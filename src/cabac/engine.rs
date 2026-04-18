@@ -142,6 +142,52 @@ impl<'a> CabacDecoder<'a> {
         self.bit_pos / 8
     }
 
+    /// Read one byte-aligned PCM sample (§7.3.5.1 + §9.3.1.2). Must be called
+    /// only after the engine has been aligned to a byte boundary via
+    /// [`Self::align_to_byte_after_terminate_for_pcm`]. Advances `bit_pos` by
+    /// exactly 8 bits.
+    pub fn read_pcm_byte(&mut self) -> Result<u8> {
+        debug_assert_eq!(
+            self.bit_pos & 7,
+            0,
+            "read_pcm_byte requires byte alignment — call align_to_byte_after_terminate_for_pcm first"
+        );
+        let byte_idx = self.bit_pos >> 3;
+        if byte_idx >= self.bytes.len() {
+            return Err(Error::invalid("cabac: pcm read past end of stream"));
+        }
+        let v = self.bytes[byte_idx];
+        self.bit_pos += 8;
+        Ok(v)
+    }
+
+    /// Align the raw bit cursor to the next byte boundary ahead of raw I_PCM
+    /// sample bytes (§9.3.1.2). Unlike the CABAC engine's implicit
+    /// renormalisation, this does NOT touch `codIRange`/`codIOffset` — those
+    /// are re-seeded by [`Self::reinit_after_pcm`] after all PCM samples have
+    /// been consumed.
+    pub fn align_to_byte_for_pcm(&mut self) {
+        let rem = self.bit_pos & 7;
+        if rem != 0 {
+            self.bit_pos += 8 - rem;
+        }
+    }
+
+    /// Re-initialise the arithmetic engine per §9.3.1.2 after an I_PCM
+    /// macroblock: reset `codIRange = 0x01FE` and reload `codIOffset` from
+    /// the next 9 bits. The bit cursor must already be byte-aligned and
+    /// positioned immediately after the PCM samples.
+    pub fn reinit_after_pcm(&mut self) -> Result<()> {
+        debug_assert_eq!(
+            self.bit_pos & 7,
+            0,
+            "reinit_after_pcm requires byte alignment"
+        );
+        self.cod_i_range = 0x01FE;
+        self.cod_i_offset = self.read_bits(9)?;
+        Ok(())
+    }
+
     /// Read `n` (1..=9) bits MSB-first from `self.bytes` at `self.bit_pos`.
     fn read_bits(&mut self, n: u32) -> Result<u32> {
         debug_assert!(n <= 9, "CABAC engine only needs up to 9-bit reads");
@@ -398,6 +444,82 @@ mod tests {
             // No renormalization on terminate path — byte position unchanged.
             assert_eq!(dec.byte_position(), 1);
         }
+    }
+
+    #[test]
+    fn pcm_align_and_reinit_round_trip() {
+        // §9.3.1.2 I_PCM path:
+        // 1. Some regular / terminate bins are decoded (bit_pos advances
+        //    unpredictably during renormalisation).
+        // 2. align_to_byte_for_pcm rounds bit_pos UP to the next byte boundary.
+        // 3. read_pcm_byte reads 8-bit samples verbatim.
+        // 4. reinit_after_pcm resets codIRange and reloads a fresh 9-bit
+        //    codIOffset — no context state touched.
+        //
+        // Construct a buffer with:
+        //   - 9 init bits (all zeros → codIOffset = 0)
+        //   - 1 consumed bit (dummy — decode_terminate(0) will trigger a
+        //     renorm reading 1 bit, since codIRange drops below 256)
+        //   - pad bits (all zeros) up to the next byte boundary
+        //   - 3 raw PCM bytes: 0xAB, 0xCD, 0xEF
+        //   - 9 bits forming codIOffset = 0b110011010 = 410, then padding.
+        //
+        // Since we can't easily predict how many renorm bits the decode path
+        // consumes, the test instead drives the engine through the API
+        // directly: feed a fixed sequence, align after the engine's current
+        // bit_pos, read the PCM bytes, re-init, read another bin from the
+        // fresh offset.
+
+        // Prepare: initial buffer such that:
+        //   offset after init = 0 (9 zero bits).
+        //   One decode_bin call with ctx=(p_state_idx=0, val_mps=0) and all-
+        //     zero renorm bits gives us the MPS path (bin=0). codIRange goes
+        //     from 510 to 270, renorms to 540 (>=256 → no renorm loop).
+        //     bit_pos stays at 9.
+        //   One decode_terminate(), with codIOffset=0 < 268, returns 0 and
+        //     renormalises codIRange from 268 to 536 (>=256 → no loop).
+        //     bit_pos stays at 9 still.
+        // So after those two calls bit_pos = 9 (bit 9). align_to_byte_for_pcm
+        // moves it to 16 (byte 2).
+
+        // Build the stream: bytes [0..=1] = init + decoded bins.
+        //   byte 0 = 0b00000000 (bits 0..=7 = 0). 9-bit init uses bits 0..=8.
+        //   byte 1 bit 0 (bit 8 of stream) = 0 — that's init bit 9.
+        //   bits 9..=15 of stream: don't matter — the engine shouldn't read
+        //     them; align_to_byte_for_pcm skips them.
+        // We want bit_pos = 16 after align.
+        let mut bytes = vec![0x00u8, 0x00]; // init + aligned padding up to byte boundary
+                                            // PCM samples:
+        bytes.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        // Post-PCM, we re-init with 9 bits. Pick 0b110011010 = 410:
+        //   byte 0 of the new init region (the 6th byte) = 0b11001101 = 0xCD
+        //   next bit (high bit of 7th byte) = 0 → 0x00
+        bytes.push(0xCD);
+        bytes.push(0x00);
+        // Trailing slack so renorm reads during subsequent decodes don't run off.
+        bytes.extend(std::iter::repeat_n(0x00, 16));
+
+        let mut dec = CabacDecoder::new(&bytes, 0).unwrap();
+        assert_eq!(dec.cod_i_offset, 0);
+        assert_eq!(dec.byte_position(), 1);
+
+        // Consume the 9 init bits implicitly via `new`. Now align_to_byte_for_pcm
+        // should round bit_pos = 9 up to 16 (byte 2).
+        dec.align_to_byte_for_pcm();
+        assert_eq!(dec.byte_position(), 2);
+
+        // Read 3 PCM bytes verbatim.
+        assert_eq!(dec.read_pcm_byte().unwrap(), 0xAB);
+        assert_eq!(dec.read_pcm_byte().unwrap(), 0xCD);
+        assert_eq!(dec.read_pcm_byte().unwrap(), 0xEF);
+        assert_eq!(dec.byte_position(), 5);
+
+        // Re-init: reads 9 bits → codIOffset should be 0b110011010 = 410.
+        dec.reinit_after_pcm().unwrap();
+        assert_eq!(dec.cod_i_range, 0x01FE);
+        assert_eq!(dec.cod_i_offset, 410);
+        // After reinit, bit_pos = 5*8 + 9 = 49.
+        assert_eq!(dec.bit_pos, 49);
     }
 
     #[test]

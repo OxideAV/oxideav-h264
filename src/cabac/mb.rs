@@ -252,9 +252,7 @@ pub fn decode_i_mb_cabac(
         .ok_or_else(|| Error::invalid(format!("h264 cabac mb: bad I mb_type {mb_type_raw}")))?;
 
     if matches!(imb, IMbType::IPcm) {
-        return Err(Error::unsupported(
-            "h264: CABAC I_PCM macroblock (§7.3.5.1 / §9.3.1.2 re-init) not yet supported",
-        ));
+        return decode_pcm_mb_cabac(d, sps, mb_x, mb_y, pic, *prev_qp);
     }
 
     // --- intra4x4 modes (only for I_NxN) ---
@@ -399,6 +397,102 @@ pub fn decode_i_mb_cabac(
         qp_y,
     )?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// I_PCM — raw pixel bytes with a mid-slice CABAC re-init (§7.3.5.1 / §9.3.1.2).
+// ---------------------------------------------------------------------------
+
+/// Handle an I_PCM macroblock inside a CABAC slice.
+///
+/// Steps per §9.3.1.2:
+/// 1. Align the stream cursor to the next byte boundary (the skipped bits
+///    are `pcm_alignment_zero_bit`s — by spec they must be 0, but this
+///    decoder doesn't validate that value).
+/// 2. Read `256 × 2^(BitDepthY−8)` luma and `2 × MbWidthC × MbHeightC ×
+///    2^(BitDepthC−8)` chroma bytes verbatim into the reconstruction
+///    buffers. This crate is fixed at 8-bit 4:2:0 (MbWidthC =
+///    MbHeightC = 8), so the totals are 256 luma + 2 × 64 chroma = 384.
+/// 3. Re-seed the CABAC arithmetic engine (`codIRange = 0x01FE`,
+///    `codIOffset = read_bits(9)`) — the context state array is NOT
+///    touched.
+///
+/// Mirrors the CAVLC I_PCM path in [`crate::mb::decode_pcm_mb`] for the
+/// sample-write bookkeeping so deblocking and neighbour lookups behave
+/// identically regardless of entropy mode.
+fn decode_pcm_mb_cabac(
+    d: &mut CabacDecoder<'_>,
+    sps: &Sps,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    prev_qp: i32,
+) -> Result<()> {
+    // §9.3.1.2 step 1 — align to next byte boundary (pcm_alignment_zero_bit).
+    d.align_to_byte_for_pcm();
+
+    // §9.3.1.2 step 2 — raw luma + chroma bytes. This crate only supports
+    // 8-bit samples and chroma_format_idc ∈ {0 (monochrome), 1 (4:2:0)};
+    // reject anything else before touching the stream so a malformed or
+    // unsupported bitstream fails cleanly.
+    match sps.chroma_format_idc {
+        0 | 1 => {}
+        v => {
+            return Err(Error::unsupported(format!(
+                "h264: CABAC I_PCM with chroma_format_idc={v} not supported (only 4:2:0)"
+            )));
+        }
+    }
+
+    let lstride = pic.luma_stride();
+    let lo = pic.luma_off(mb_x, mb_y);
+    for r in 0..16 {
+        for c in 0..16 {
+            pic.y[lo + r * lstride + c] = d.read_pcm_byte()?;
+        }
+    }
+    if sps.chroma_format_idc != 0 {
+        let cstride = pic.chroma_stride();
+        let co = pic.chroma_off(mb_x, mb_y);
+        for r in 0..8 {
+            for c in 0..8 {
+                pic.cb[co + r * cstride + c] = d.read_pcm_byte()?;
+            }
+        }
+        for r in 0..8 {
+            for c in 0..8 {
+                pic.cr[co + r * cstride + c] = d.read_pcm_byte()?;
+            }
+        }
+    }
+
+    // §9.3.1.2 step 3 — re-initialise the arithmetic engine.
+    d.reinit_after_pcm()?;
+
+    // §9.3.3.1.1.3 — for CABAC neighbour derivations, an I_PCM MB is treated
+    // as coded and NOT as I_NxN. mb_type_i is left as None (the `I_NxN` check
+    // in `mb_type_i_ctx_idx_inc` then naturally returns `coded=true`).
+    // For intra_chroma_pred_mode neighbour derivation, I_PCM sets
+    // `intra_chroma_pred_mode = 0` per the spec so condTermFlag = 0.
+    // luma_nc/cb_nc/cr_nc are set to 16 mirroring the CAVLC path — any value
+    // >0 marks the sub-block as having non-zero residual for neighbour
+    // decisions. QP_Y is forced to the slice QP_Y (not inherited from
+    // prev_qp after this MB per §8.5).
+    let info = pic.mb_info_mut(mb_x, mb_y);
+    *info = MbInfo {
+        qp_y: prev_qp,
+        coded: true,
+        intra: true,
+        luma_nc: [16; 16],
+        cb_nc: [16; 4],
+        cr_nc: [16; 4],
+        intra4x4_pred_mode: [INTRA_DC_FAKE; 16],
+        intra_chroma_pred_mode: 0,
+        mb_type_i: Some(IMbType::IPcm),
+        ..Default::default()
+    };
+    pic.last_mb_qp_delta_was_nonzero = false;
     Ok(())
 }
 

@@ -10,14 +10,21 @@
 //! * SPS / PPS / slice-header parsing (§7.3.2.1.1, §7.3.2.2, §7.3.3).
 //! * **I-slice** pixel reconstruction for **both CAVLC and CABAC** — intra
 //!   prediction, residual decode, 4×4 IDCT + Hadamard, optional deblocking.
-//!   The CABAC I-path covers I_16×16 and I_NxN; I_PCM inside CABAC is not
-//!   yet wired.
+//!   The CABAC I-path covers I_16×16, I_NxN and I_PCM (with the mid-stream
+//!   arithmetic-engine re-init mandated by §9.3.1.2).
 //! * **CAVLC baseline P-slice** pixel reconstruction (§8.4) — P_L0_16×16 /
 //!   16×8 / 8×16, P_8×8 (all four sub-partition shapes) and P_8×8ref0,
 //!   P_Skip, plus intra-in-P macroblocks. Luma 6-tap half-pel + bilinear
 //!   quarter-pel MC; bilinear 1/8-pel chroma MC; edge-replicated
 //!   out-of-picture reads. A single-slot L0 reference (the previous frame
 //!   output) is retained across packets.
+//! * **Explicit weighted P-slice prediction** (§7.3.3.2 / §8.4.2.3.2) —
+//!   the slice's `pred_weight_table` is parsed when the PPS has
+//!   `weighted_pred_flag = 1`, and the per-reference (weight, offset,
+//!   log2_denom) triples are applied to the MC output before the residual
+//!   is added. List-0 only (the L1 side of the weight table is parsed for
+//!   bitstream conformance but unused; B-slice bi-prediction remains out
+//!   of scope).
 //!
 //! # What is encoded today
 //!
@@ -30,7 +37,9 @@
 //! # Out of scope (returns `Error::Unsupported` or the encoder refuses)
 //!
 //! * CABAC P-slices (decode); any CABAC encoding; any P/B slice encoding.
-//! * B-slices, weighted prediction, bi-prediction.
+//! * B-slices (bi-prediction). Implicit weighted bi-prediction
+//!   (`weighted_bipred_idc == 2`, §8.4.2.3.3) is not implemented either —
+//!   only the explicit P-slice form (§8.4.2.3.2) is supported today.
 //! * Multi-reference DPB (`ref_idx_l0 > 0`), reference picture list
 //!   modification operations.
 //! * Interlaced coding / MBAFF / PAFF.

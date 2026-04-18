@@ -69,9 +69,9 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
 - CAVLC entropy coding (§9.2): `coeff_token` with `nC` neighbour
   prediction, level + run decoding, zig-zag to raster mapping, 4×4
   blocks + Intra16×16 DC + chroma DC/AC.
-- CABAC entropy coding (§9.3) for the common I-slice subset — I_16×16
-  and I_NxN with full residual decode. I_PCM inside CABAC is not yet
-  wired.
+- CABAC entropy coding (§9.3) for the full I-slice set — I_16×16, I_NxN
+  and I_PCM (with the byte-align + arithmetic-engine re-init mandated by
+  §9.3.1.2). Residual decode is complete for intra blocks.
 - Intra prediction: Intra4×4 (all nine modes), Intra16×16 (Vertical /
   Horizontal / DC / Plane), chroma 8×8 intra.
 - Inverse transforms: 4×4 integer IDCT, 4×4 Hadamard for Intra16×16 DC,
