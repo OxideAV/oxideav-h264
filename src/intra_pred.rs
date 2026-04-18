@@ -161,20 +161,19 @@ pub fn predict_intra_4x4(out: &mut [u8; 16], mode: Intra4x4Mode, n: &Intra4x4Nei
             }
         }
         DiagonalDownLeft => {
-            // §8.3.1.2.4
+            // §8.3.1.2.4. For (x,y) != (3,3):
+            //   pred[x,y] = (top[x+y] + 2*top[x+y+1] + top[x+y+2] + 2) >> 2
+            // For (x,y) == (3,3):
+            //   pred[x,y] = (top[6] + 3*top[7] + 2) >> 2
             let t = &n.top;
-            // Pre-compute zHat ranks 0..=10 (only need 0..=6 effectively).
             let mut z = [0u8; 8];
-            // z[0] = (top[0]+2*top[1]+top[2]+2)>>2
-            for i in 0..7 {
-                let l = if i == 0 { t[0] as u32 } else { t[i - 1] as u32 };
-                let m = t[i] as u32;
-                let r = t[i + 1] as u32;
-                z[i] = (((l + 2 * m + r + 2) >> 2).min(255)) as u8;
+            for i in 0..6 {
+                let a = t[i] as u32;
+                let b = t[i + 1] as u32;
+                let c = t[i + 2] as u32;
+                z[i] = (((a + 2 * b + c + 2) >> 2).min(255)) as u8;
             }
-            // Last position uses (top[6] + 3*top[7] + 2) >> 2 per spec.
             z[7] = (((t[6] as u32 + 3 * t[7] as u32 + 2) >> 2).min(255)) as u8;
-            // pred[x,y] = z[x+y] for (x,y) != (3,3); pred[3,3] = special.
             for y in 0..4 {
                 for x in 0..4 {
                     let zi = if x == 3 && y == 3 { 7 } else { x + y };
@@ -209,24 +208,21 @@ pub fn predict_intra_4x4(out: &mut [u8; 16], mode: Intra4x4Mode, n: &Intra4x4Nei
             }
         }
         VerticalRight => {
-            // §8.3.1.2.6
+            // §8.3.1.2.6. e[] linearises the neighbour ring so the index
+            // arithmetic from the spec maps to a single array: e[4]=p[-1,-1],
+            // e[5..=8]=p[0..=3,-1], e[3..=0]=p[-1,0..=3]. Then zVR = 2x-y
+            // selects one of the five cases below.
             let mut e = [0u8; 9];
             e[4] = n.top_left;
             for i in 0..4 {
                 e[5 + i] = n.top[i];
                 e[3 - i] = n.left[i];
             }
-            // For each (x,y), zVR = 2x - y.
-            // If zVR is even and >=0: p = (e[4 + (x - (y>>1))] + e[5 + (x - (y>>1))] + 1) >> 1
-            // If zVR is odd and >=0: p = (e[3 + (x - (y>>1))] + 2*e[4 + (x - (y>>1))] + e[5 + (x - (y>>1))] + 2) >> 2
-            // If zVR == -1: p = (e[3] + 2*e[4] + e[5] + 2) >> 2 = (left[0] + 2*top_left + top[0] + 2) >> 2
-            // If zVR < -1: p = (e[?] + 2*e[?] + e[?] + 2) >> 2 with e indexed by left
             for y in 0..4 {
                 for x in 0..4 {
                     let zvr = 2 * x as i32 - y as i32;
                     let v;
                     if zvr == 0 || zvr == 2 || zvr == 4 || zvr == 6 {
-                        // even ≥ 0: avg of two samples
                         let i0 = (4 + x as i32 - (y as i32 >> 1)) as usize;
                         v = ((e[i0] as u32 + e[i0 + 1] as u32 + 1) >> 1) as u8;
                     } else if zvr == 1 || zvr == 3 || zvr == 5 {
@@ -236,11 +232,11 @@ pub fn predict_intra_4x4(out: &mut [u8; 16], mode: Intra4x4Mode, n: &Intra4x4Nei
                     } else if zvr == -1 {
                         v = ((e[3] as u32 + 2 * e[4] as u32 + e[5] as u32 + 2) >> 2) as u8;
                     } else {
-                        // zvr < -1 => -2 or -3 (when y=2,x=0 → -2; y=3,x=0 → -3)
-                        // Per spec, p = (e[2-y] + 2*e[3-y] + e[4-y] + 2) >> 2 for x=0
-                        // Equivalently i0 = 3 + zvr/? Use formula: for zvr=-2: i0=2; zvr=-3: i0=1
+                        // zVR == -2 at (0,2) → uses left[1], left[0], tl.
+                        // zVR == -3 at (0,3) → uses left[2], left[1], left[0].
+                        // Spec: pred = (p[-1,y-2x-1] + 2*p[-1,y-2x-2] + p[-1,y-2x-3] + 2) >> 2.
                         let off = (-zvr - 1) as usize;
-                        let i = 3 - off;
+                        let i = 4 - off;
                         v = ((e[i - 1] as u32 + 2 * e[i] as u32 + e[i + 1] as u32 + 2) >> 2) as u8;
                     }
                     out[y * 4 + x] = v;
@@ -299,8 +295,9 @@ pub fn predict_intra_4x4(out: &mut [u8; 16], mode: Intra4x4Mode, n: &Intra4x4Nei
         }
         HorizontalUp => {
             // §8.3.1.2.9 — needs left only.
+            // zHU = x + 2y. For zHU >= 6 the spec replicates left[3];
+            // the earlier impl wrongly averaged/filtered for zHU = 6 and 7.
             let l = &n.left;
-            // zHU = x + 2y
             for y in 0..4 {
                 for x in 0..4 {
                     let zhu = x + 2 * y;
@@ -314,9 +311,7 @@ pub fn predict_intra_4x4(out: &mut [u8; 16], mode: Intra4x4Mode, n: &Intra4x4Nei
                             ((l[yy] as u32 + 2 * l[yy + 1] as u32 + l[yy + 2] as u32 + 2) >> 2)
                                 as u8
                         }
-                        5 => ((l[2] as u32 + 2 * l[3] as u32 + l[3] as u32 + 2) >> 2) as u8,
-                        6 => ((l[2] as u32 + l[3] as u32 + 1) >> 1) as u8,
-                        7 => ((l[2] as u32 + 2 * l[3] as u32 + l[3] as u32 + 2) >> 2) as u8,
+                        5 => ((l[2] as u32 + 3 * l[3] as u32 + 2) >> 2) as u8,
                         _ => l[3],
                     };
                     out[y * 4 + x] = v;
@@ -1000,5 +995,74 @@ mod tests {
         let mut out = [0u8; 64];
         predict_intra_8x8(&mut out, Intra8x8Mode::Horizontal, &n);
         assert!(out.iter().all(|&v| v == 50));
+    }
+
+    #[test]
+    fn intra4x4_diagonal_down_left_spec_pred_0_0() {
+        // §8.3.1.2.4: pred[0,0] = (top[0] + 2*top[1] + top[2] + 2) >> 2.
+        // Earlier impl computed (3*top[0] + top[1] + 2) >> 2 which differed
+        // on non-uniform top rows.
+        let n = Intra4x4Neighbours {
+            top: [10, 100, 200, 40, 40, 40, 40, 40],
+            left: [0; 4],
+            top_left: 0,
+            top_available: true,
+            left_available: false,
+            top_left_available: false,
+            top_right_available: true,
+        };
+        let mut out = [0u8; 16];
+        predict_intra_4x4(&mut out, Intra4x4Mode::DiagonalDownLeft, &n);
+        // (10 + 200 + 200 + 2) >> 2 = 412 >> 2 = 103.
+        assert_eq!(out[0], 103);
+    }
+
+    #[test]
+    fn intra4x4_horizontal_up_replicates_bottom_for_high_zhu() {
+        // §8.3.1.2.9: for zHU >= 6 pred = p[-1,3]. Earlier impl used
+        // averaging / 3-tap filters for zHU == 6 and 7 which deviated
+        // from the spec on non-uniform left columns.
+        let n = Intra4x4Neighbours {
+            top: [0; 8],
+            left: [10, 20, 30, 200],
+            top_left: 0,
+            top_available: false,
+            left_available: true,
+            top_left_available: false,
+            top_right_available: false,
+        };
+        let mut out = [0u8; 16];
+        predict_intra_4x4(&mut out, Intra4x4Mode::HorizontalUp, &n);
+        // (x=0, y=3) zHU=6 → must be left[3] = 200.
+        assert_eq!(out[3 * 4 + 0], 200);
+        // (x=1, y=3) zHU=7 → must also be left[3] = 200.
+        assert_eq!(out[3 * 4 + 1], 200);
+        // (x=2, y=3) zHU=8, (x=3, y=3) zHU=9 → left[3] too.
+        assert_eq!(out[3 * 4 + 2], 200);
+        assert_eq!(out[3 * 4 + 3], 200);
+    }
+
+    #[test]
+    fn intra4x4_vertical_right_low_left_tail_uses_spec_indices() {
+        // §8.3.1.2.6: zVR=-2 at (0,2) uses p[-1,1], p[-1,0], p[-1,-1].
+        // Earlier impl used p[-1,2], p[-1,1], p[-1,0] (off-by-one),
+        // which diverged when top_left !≈ left[2].
+        let n = Intra4x4Neighbours {
+            top: [50; 8],
+            left: [10, 20, 30, 40],
+            top_left: 200,
+            top_available: true,
+            left_available: true,
+            top_left_available: true,
+            top_right_available: true,
+        };
+        let mut out = [0u8; 16];
+        predict_intra_4x4(&mut out, Intra4x4Mode::VerticalRight, &n);
+        // (x=0,y=2) zVR=-2: (left[1] + 2*left[0] + tl + 2) >> 2
+        //                 = (20 + 20 + 200 + 2) >> 2 = 242 >> 2 = 60.
+        assert_eq!(out[2 * 4 + 0], 60);
+        // (x=0,y=3) zVR=-3: (left[2] + 2*left[1] + left[0] + 2) >> 2
+        //                 = (30 + 40 + 10 + 2) >> 2 = 82 >> 2 = 20.
+        assert_eq!(out[3 * 4 + 0], 20);
     }
 }
