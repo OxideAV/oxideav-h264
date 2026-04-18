@@ -65,6 +65,9 @@ pub fn dequantize_4x4(coeffs: &mut [i32; 16], qp: i32) {
 /// The rounding keeps the low bits, avoiding the precision loss of
 /// multiplying a pre-rounded `(V * w) >> 4` factor into the coefficient.
 pub fn dequantize_4x4_scaled(coeffs: &mut [i32; 16], qp: i32, weight_scale: &[i16; 16]) {
+    // Clamp to the 8-bit QP range. High-bit-depth callers that need
+    // `qP > 51` use [`dequantize_4x4_scaled_ext`] which accepts the
+    // QP range extended by `QpBdOffset` (§7.4.2.1.1).
     let qp = qp.clamp(0, 51);
     // Flat fast-path: bit-exact reproduction of the flat-16 pipeline.
     // With weight_scale = FLAT_4X4 (all 16) the JM-style formula
@@ -150,6 +153,175 @@ pub fn idct_4x4(coeffs: &mut [i32; 16]) {
     // Spec: residual sample = (transformed + 32) >> 6.
     for v in coeffs.iter_mut() {
         *v = (*v + 32) >> 6;
+    }
+}
+
+/// Extended-QP variant of [`dequantize_4x4_scaled`] — accepts `qP`
+/// up to `51 + QpBdOffset` (§7.4.2.1.1). Used by the high-bit-depth
+/// decode path where `QpY' = QpY + QpBdOffsetY` may exceed 51.
+///
+/// Internal precision is widened to i64 to avoid the i32 overflow
+/// that occurs at `qP >= ~30` when coefficient magnitudes approach
+/// the 16-bit residual bound. The shift pattern mirrors the spec's
+/// §8.5.12.1 formula with an unbounded `qP/6` shift.
+pub fn dequantize_4x4_scaled_ext(coeffs: &mut [i32; 16], qp: i32, weight_scale: &[i16; 16]) {
+    let qp = qp.max(0);
+    let qp6 = (qp / 6) as i32;
+    let qmod = (qp % 6) as usize;
+    if weight_scale == &crate::scaling_list::FLAT_4X4 {
+        let shift = qp6 as u32;
+        for r in 0..4 {
+            for c in 0..4 {
+                let i = r * 4 + c;
+                let scale = V_TABLE[qmod][pos_class(r, c)] as i64;
+                coeffs[i] = ((coeffs[i] as i64 * scale) << shift) as i32;
+            }
+        }
+        return;
+    }
+    if qp6 >= 4 {
+        let shift = (qp6 - 4) as u32;
+        for r in 0..4 {
+            for c in 0..4 {
+                let i = r * 4 + c;
+                let w = weight_scale[i] as i64;
+                let v = V_TABLE[qmod][pos_class(r, c)] as i64;
+                coeffs[i] = ((coeffs[i] as i64 * w * v) << shift) as i32;
+            }
+        }
+    } else {
+        let shift = (4 - qp6) as u32;
+        let round = 1i64 << (shift - 1);
+        for r in 0..4 {
+            for c in 0..4 {
+                let i = r * 4 + c;
+                let w = weight_scale[i] as i64;
+                let v = V_TABLE[qmod][pos_class(r, c)] as i64;
+                coeffs[i] = ((coeffs[i] as i64 * w * v + round) >> shift) as i32;
+            }
+        }
+    }
+}
+
+/// Extended-QP variant of [`inv_hadamard_4x4_dc_scaled`]. Accepts
+/// `qP` up to `51 + QpBdOffset`. Same formula as the base variant
+/// but widened to i64 so the left shifts at high QP don't overflow.
+pub fn inv_hadamard_4x4_dc_scaled_ext(dc: &mut [i32; 16], qp: i32, weight_scale_00: i16) {
+    let mut tmp = [0i32; 16];
+    for r in 0..4 {
+        let a = dc[r * 4];
+        let b = dc[r * 4 + 1];
+        let c = dc[r * 4 + 2];
+        let d = dc[r * 4 + 3];
+        tmp[r * 4] = a + b + c + d;
+        tmp[r * 4 + 1] = a + b - c - d;
+        tmp[r * 4 + 2] = a - b - c + d;
+        tmp[r * 4 + 3] = a - b + c - d;
+    }
+    for c in 0..4 {
+        let a = tmp[c];
+        let b = tmp[4 + c];
+        let cc = tmp[8 + c];
+        let d = tmp[12 + c];
+        dc[c] = a + b + cc + d;
+        dc[4 + c] = a + b - cc - d;
+        dc[8 + c] = a - b - cc + d;
+        dc[12 + c] = a - b + cc - d;
+    }
+
+    let qp = qp.max(0);
+    let qp6 = (qp / 6) as i32;
+    let qmod = (qp % 6) as usize;
+    let v = V_TABLE[qmod][0] as i64;
+    if weight_scale_00 == 16 {
+        if qp6 >= 2 {
+            let shift = (qp6 - 2) as u32;
+            for x in dc.iter_mut() {
+                *x = ((*x as i64 * v) << shift) as i32;
+            }
+        } else {
+            let shift = (2 - qp6) as u32;
+            let round = 1i64 << (shift - 1);
+            for x in dc.iter_mut() {
+                *x = ((*x as i64 * v + round) >> shift) as i32;
+            }
+        }
+    } else {
+        let w = weight_scale_00 as i64;
+        if qp6 >= 6 {
+            let shift = (qp6 - 6) as u32;
+            for x in dc.iter_mut() {
+                *x = ((*x as i64 * w * v) << shift) as i32;
+            }
+        } else {
+            let shift = (6 - qp6) as u32;
+            let round = 1i64 << (shift - 1);
+            for x in dc.iter_mut() {
+                *x = ((*x as i64 * w * v + round) >> shift) as i32;
+            }
+        }
+    }
+}
+
+/// Extended-QP variant of [`inv_hadamard_2x2_chroma_dc_scaled`].
+pub fn inv_hadamard_2x2_chroma_dc_scaled_ext(dc: &mut [i32; 4], qp: i32, weight_scale_00: i16) {
+    let a = dc[0];
+    let b = dc[1];
+    let c = dc[2];
+    let d = dc[3];
+    let t0 = a + b;
+    let t1 = a - b;
+    let t2 = c + d;
+    let t3 = c - d;
+    dc[0] = t0 + t2;
+    dc[1] = t1 + t3;
+    dc[2] = t0 - t2;
+    dc[3] = t1 - t3;
+
+    let qp = qp.max(0);
+    let qp6 = (qp / 6) as u32;
+    let qmod = (qp % 6) as usize;
+    let v = V_TABLE[qmod][0] as i64;
+    if weight_scale_00 == 16 {
+        if qp >= 6 {
+            let shift = qp6 - 1;
+            for x in dc.iter_mut() {
+                *x = ((*x as i64 * v) << shift) as i32;
+            }
+        } else {
+            for x in dc.iter_mut() {
+                *x = ((*x as i64 * v) >> 1) as i32;
+            }
+        }
+    } else {
+        let w = weight_scale_00 as i64;
+        if qp >= 30 {
+            let shift = (qp6 - 5) as u32;
+            for x in dc.iter_mut() {
+                *x = ((*x as i64 * w * v) << shift) as i32;
+            }
+        } else {
+            let shift = (5 - qp6) as u32;
+            let round = 1i64 << (shift - 1);
+            for x in dc.iter_mut() {
+                *x = ((*x as i64 * w * v + round) >> shift) as i32;
+            }
+        }
+    }
+}
+
+/// Map a QP expressed in the nominal range `[-QpBdOffsetC..=51]` to
+/// a chroma QP via Table 7-2 (§7.4.2.1). For values below 30 the
+/// function is identity; above 30 it runs through `QP_CHROMA_TABLE`.
+/// QpBdOffsetC is applied by the caller after the table lookup (see
+/// [`crate::mb_hi`]).
+pub fn chroma_qp_hi(qpi: i32) -> i32 {
+    if qpi < 0 {
+        qpi
+    } else if qpi <= 51 {
+        QP_CHROMA_TABLE[qpi as usize]
+    } else {
+        qpi
     }
 }
 

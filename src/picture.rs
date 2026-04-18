@@ -51,12 +51,32 @@ pub struct Picture {
     /// 1 = 4:2:0 (default for existing code paths), 3 = 4:4:4. The
     /// chroma plane size, stride, and offset helpers key on this field.
     pub chroma_format_idc: u32,
-    /// Luma plane, raw stride == width.
+    /// Luma bit depth (`bit_depth_luma_minus8 + 8`, §7.4.2.1.1). Defaults
+    /// to 8. When set to 10, the high-bit-depth u16 planes
+    /// ([`Self::y16`] / [`Self::cb16`] / [`Self::cr16`]) hold the
+    /// reconstructed samples and the 8-bit `y / cb / cr` planes stay
+    /// zero-sized. All downstream emission honours this field.
+    pub bit_depth_y: u8,
+    /// Chroma bit depth. Must equal [`Self::bit_depth_y`] in the current
+    /// decoder since the high-bit-depth path only wires the 10-bit luma
+    /// = 10-bit chroma case.
+    pub bit_depth_c: u8,
+    /// Luma plane, raw stride == width. Holds 8-bit samples when
+    /// [`Self::bit_depth_y`] == 8; empty otherwise (the u16 planes own
+    /// the data).
     pub y: Vec<u8>,
     /// Cb plane, raw stride follows [`Self::chroma_stride`] (width / SubWidthC).
     pub cb: Vec<u8>,
     /// Cr plane, raw stride follows [`Self::chroma_stride`] (width / SubWidthC).
     pub cr: Vec<u8>,
+    /// 10-bit luma plane (used when [`Self::bit_depth_y`] > 8). Stored in
+    /// the range `0..=(1 << bit_depth_y) - 1` per §8.5 `Clip1Y`. Length
+    /// matches the 8-bit `y` shape when active. Empty in 8-bit mode.
+    pub y16: Vec<u16>,
+    /// 10-bit Cb plane. See [`Self::y16`].
+    pub cb16: Vec<u16>,
+    /// 10-bit Cr plane. See [`Self::y16`].
+    pub cr16: Vec<u16>,
     /// Per-macroblock state needed for predictor neighbour resolution and
     /// deblocking. Stored in raster order.
     pub mb_info: Vec<MbInfo>,
@@ -231,23 +251,82 @@ impl Picture {
     /// row/column — the helpers below scale the stride and per-MB
     /// offsets accordingly.
     pub fn new_with_format(mb_width: u32, mb_height: u32, chroma_format_idc: u32) -> Self {
+        Self::new_with_bit_depth(mb_width, mb_height, chroma_format_idc, 8, 8)
+    }
+
+    /// Allocate a picture at the given chroma format and bit depths.
+    /// When `bit_depth_y` is 8, the 8-bit planes are allocated and the
+    /// 10-bit companions stay empty; above 8, only the u16 planes are
+    /// populated with the mid-grey value `1 << (bit_depth - 1)`.
+    pub fn new_with_bit_depth(
+        mb_width: u32,
+        mb_height: u32,
+        chroma_format_idc: u32,
+        bit_depth_y: u8,
+        bit_depth_c: u8,
+    ) -> Self {
         let width = mb_width * 16;
         let height = mb_height * 16;
         let cw = chroma_plane_w(width, chroma_format_idc);
         let ch = chroma_plane_h(height, chroma_format_idc);
+        let luma_pixels = (width * height) as usize;
+        let chroma_pixels = (cw * ch) as usize;
+        let hi_y = bit_depth_y > 8;
+        let hi_c = bit_depth_c > 8;
+        let mid_y: u16 = 1 << (bit_depth_y - 1);
+        let mid_c: u16 = 1 << (bit_depth_c - 1);
         Self {
             width,
             height,
             mb_width,
             mb_height,
             chroma_format_idc,
-            y: vec![0u8; (width * height) as usize],
-            cb: vec![128u8; (cw * ch) as usize],
-            cr: vec![128u8; (cw * ch) as usize],
+            bit_depth_y,
+            bit_depth_c,
+            y: if hi_y { Vec::new() } else { vec![0u8; luma_pixels] },
+            cb: if hi_c {
+                Vec::new()
+            } else {
+                vec![128u8; chroma_pixels]
+            },
+            cr: if hi_c {
+                Vec::new()
+            } else {
+                vec![128u8; chroma_pixels]
+            },
+            y16: if hi_y {
+                vec![0u16; luma_pixels]
+            } else {
+                Vec::new()
+            },
+            cb16: if hi_c {
+                vec![mid_c; chroma_pixels]
+            } else {
+                Vec::new()
+            },
+            cr16: if hi_c {
+                vec![mid_c; chroma_pixels]
+            } else {
+                Vec::new()
+            },
             mb_info: vec![MbInfo::default(); (mb_width * mb_height) as usize],
             last_mb_qp_delta_was_nonzero: false,
             scaling_lists: crate::scaling_list::ScalingLists::flat(),
         }
+        // `mid_y` exists for future symmetry; luma recon always overwrites
+        // so there's no need to pre-fill the luma plane with grey.
+        .mid_y_reserved(mid_y)
+    }
+
+    fn mid_y_reserved(self, _mid_y: u16) -> Self {
+        self
+    }
+
+    /// True when this picture holds samples in the u16 high-bit-depth
+    /// planes. Downstream code keys on this to pick the u8 vs u16 emit
+    /// path without re-deriving from `bit_depth_y`.
+    pub fn is_high_bit_depth(&self) -> bool {
+        self.bit_depth_y > 8 || self.bit_depth_c > 8
     }
 
     /// Stride (bytes per row) of the luma plane.
@@ -343,6 +422,9 @@ impl Picture {
         pts: Option<i64>,
         time_base: TimeBase,
     ) -> VideoFrame {
+        if self.is_high_bit_depth() {
+            return self.to_video_frame_hi(visible_w, visible_h, pts, time_base);
+        }
         let (sub_w, sub_h) = chroma_subsampling(self.chroma_format_idc);
         let cw = visible_w.div_ceil(sub_w);
         let ch = visible_h.div_ceil(sub_h);
@@ -384,6 +466,69 @@ impl Picture {
                 VideoPlane {
                     stride: cw as usize,
                     data: cr_out,
+                },
+            ],
+        }
+    }
+
+    /// Emit a `Yuv420P10Le` / `Yuv444P10Le` frame by packing the u16
+    /// planes in little-endian order. Strides are reported in **bytes**
+    /// per `VideoPlane::stride` convention, i.e. `width * 2` for 10-bit.
+    fn to_video_frame_hi(
+        &self,
+        visible_w: u32,
+        visible_h: u32,
+        pts: Option<i64>,
+        time_base: TimeBase,
+    ) -> VideoFrame {
+        let (sub_w, sub_h) = chroma_subsampling(self.chroma_format_idc);
+        let cw = visible_w.div_ceil(sub_w);
+        let ch = visible_h.div_ceil(sub_h);
+        let l_stride = self.luma_stride();
+        let c_stride = self.chroma_stride();
+
+        let pack_row = |src: &[u16], dst: &mut Vec<u8>, w: usize| {
+            for &s in &src[..w] {
+                dst.push((s & 0xFF) as u8);
+                dst.push((s >> 8) as u8);
+            }
+        };
+
+        let mut y_bytes = Vec::with_capacity((visible_w * visible_h * 2) as usize);
+        for r in 0..visible_h as usize {
+            let off = r * l_stride;
+            pack_row(&self.y16[off..off + visible_w as usize], &mut y_bytes, visible_w as usize);
+        }
+        let mut cb_bytes = Vec::with_capacity((cw * ch * 2) as usize);
+        let mut cr_bytes = Vec::with_capacity((cw * ch * 2) as usize);
+        for r in 0..ch as usize {
+            let off = r * c_stride;
+            pack_row(&self.cb16[off..off + cw as usize], &mut cb_bytes, cw as usize);
+            pack_row(&self.cr16[off..off + cw as usize], &mut cr_bytes, cw as usize);
+        }
+
+        let format = match self.chroma_format_idc {
+            3 => PixelFormat::Yuv444P10Le,
+            _ => PixelFormat::Yuv420P10Le,
+        };
+        VideoFrame {
+            format,
+            width: visible_w,
+            height: visible_h,
+            pts,
+            time_base,
+            planes: vec![
+                VideoPlane {
+                    stride: (visible_w as usize) * 2,
+                    data: y_bytes,
+                },
+                VideoPlane {
+                    stride: (cw as usize) * 2,
+                    data: cb_bytes,
+                },
+                VideoPlane {
+                    stride: (cw as usize) * 2,
+                    data: cr_bytes,
                 },
             ],
         }
