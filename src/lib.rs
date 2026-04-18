@@ -35,17 +35,30 @@
 //!   P-slices). 12-bit / 14-bit, B slices at 10-bit, CABAC at 10-bit,
 //!   Intra_8×8 at 10-bit, and I_PCM at 10-bit all return
 //!   `Error::Unsupported`.
-//! * **4:4:4 CAVLC I-slice** decode (§6.4.1 Table 6-1, ChromaArrayType = 3)
+//! * **4:4:4 CAVLC I / P / B slices** (§6.4.1 Table 6-1, ChromaArrayType = 3)
 //!   — the chroma planes share the luma 16×16 dimensions, reuse the
 //!   Intra_4×4 / Intra_16×16 predictors (no chroma 8×8 modes), skip the
 //!   `intra_chroma_pred_mode` syntax element, and decode residuals as
-//!   three back-to-back luma-style block streams (I_16×16: DC Hadamard
-//!   + 16 AC 4×4; I_NxN: 16 × 4×4). The 4-bit CBP is mapped through
-//!   `golomb_to_intra4x4_cbp_gray` (FFmpeg `libavcodec/h264_cavlc.c`,
-//!   Table 9-4) and applied to all three planes. Each plane uses its
-//!   own QP (luma vs `chroma_qp_index_offset` /
-//!   `second_chroma_qp_index_offset`) and scaling list. Bit-exact
-//!   against ffmpeg on the 64×64 `iframe_yuv444_64x64` fixture.
+//!   three back-to-back luma-style block streams. The I path decodes
+//!   (I_16×16: DC Hadamard + 16 AC 4×4; I_NxN: 16 × 4×4) with the 4-bit
+//!   CBP mapped through `golomb_to_intra4x4_cbp_gray`. The P and B
+//!   paths add motion compensation through the §8.4.2.2.1 luma 6-tap /
+//!   bilinear filter applied to every plane (§8.4.2.2 Table 8-9 entry
+//!   for ChromaArrayType = 3 — the 4:2:0 chroma 1/8-pel bilinear is
+//!   replaced by the luma filter), and three plane-aligned 16 × 4×4
+//!   luma-style residual streams gated by a 4-bit inter CBP mapped via
+//!   `golomb_to_inter_cbp_gray` (FFmpeg table). Each plane uses its own
+//!   QP (luma vs `chroma_qp_index_offset` /
+//!   `second_chroma_qp_index_offset`) and scaling list (slots 0/1/2 for
+//!   intra, 3/4/5 for inter). The I-slice path is bit-exact against
+//!   ffmpeg on the 64×64 `iframe_yuv444_64x64` fixture; the P and B
+//!   paths decode the `yuv444_p_64x64` and `yuv444_b_64x64` fixtures at
+//!   ≥ 90 % / ≥ 80 % sample match respectively — the residual gap comes
+//!   from a pre-existing limitation of the P/B residual path that
+//!   affects the equivalent 4:2:0 testsrc fixture identically. Solid
+//!   colour P fixtures decode 100 % matched. CABAC under 4:4:4 returns
+//!   `Error::Unsupported`. 8×8 transform on the 4:4:4 inter path is
+//!   out of scope.
 //! * **4:2:2 CAVLC I-slice** decode (§6.4.1 Table 6-1, ChromaArrayType = 2)
 //!   — chroma planes are half-width / full-height relative to luma.
 //!   Each MB carries two 2×4 chroma DC Hadamard blocks (new

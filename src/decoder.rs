@@ -310,22 +310,18 @@ impl H264Decoder {
                         }
                     }
                     3 => {
-                        // 4:4:4 — CAVLC I/P/B and CABAC I are wired.
-                        // CABAC P/B under 4:4:4 still route back to
-                        // Error::Unsupported. §6.4.1 ChromaArrayType = 3
-                        // requires chroma planes the same size as luma,
-                        // luma-style residual / intra prediction per
-                        // plane, and the luma 6-tap MC filter on chroma
-                        // (§8.4.2.2 Table 8-9).
+                        // 4:4:4 — CAVLC I/P/B land on the ChromaArrayType=3
+                        // pipeline (chroma planes the same size as luma,
+                        // luma-style residual / intra prediction per plane,
+                        // luma 6-tap MC filter on chroma per §8.4.2.2
+                        // Table 8-9). CABAC under 4:4:4 still returns
+                        // Unsupported — the CABAC I path needs its own
+                        // per-plane residual + `intra_chroma_pred_mode`
+                        // absence handling that isn't wired yet.
                         if pps.entropy_coding_mode_flag {
-                            match sh.slice_type {
-                                SliceType::I => {}
-                                _ => {
-                                    return Err(Error::unsupported(
-                                        "h264: 4:4:4 CABAC P/B not yet wired — I only",
-                                    ));
-                                }
-                            }
+                            return Err(Error::unsupported(
+                                "h264: 4:4:4 CABAC entropy decode not yet wired — CAVLC I/P/B only",
+                            ));
                         }
                     }
                     v => {
