@@ -340,18 +340,25 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   — the chroma planes share luma dimensions, reuse the luma Intra_4×4 /
   Intra_16×16 predictors, and decode three back-to-back luma-style
   residual streams per MB; P / B / CABAC on 4:4:4 remain out of scope.
-- Bit depths above 10; 10-bit is supported for CAVLC I + P slices in
-  4:2:0 only (see the 10-bit section below). 12-bit / 14-bit return
-  `Error::Unsupported`. Separate colour planes are also rejected.
+- Bit depths above 10; 10-bit is supported for CAVLC I / P / B slices
+  and CABAC I-slice in 4:2:0 only (see the 10-bit section below).
+  12-bit / 14-bit return `Error::Unsupported`. Separate colour planes
+  are also rejected.
 - SI / SP slices.
 
-## 10-bit (High 10) CAVLC I + P decode
+## 10-bit (High 10) decode
 
-The decoder handles 10-bit CAVLC I- and P-slices in 4:2:0 end-to-end
-and emits `PixelFormat::Yuv420P10Le` frames (u16 samples packed
-little-endian). Bit-exact against ffmpeg on the `iframe_10bit_64x64`
-and `pframe_10bit_64x64` fixtures shipped under `tests/fixtures/`
-(100% match across every sample of the three-frame P-slice fixture).
+The decoder handles 10-bit CAVLC I / P / B slices and 10-bit CABAC
+I-slices in 4:2:0 end-to-end and emits `PixelFormat::Yuv420P10Le`
+frames (u16 samples packed little-endian). Bit-exact against ffmpeg
+on every `10bit_*_64x64` / `iframe_10bit_64x64` /
+`pframe_10bit_64x64` fixture shipped under `tests/fixtures/`:
+
+- `iframe_10bit_64x64`: 99% within ±4 LSB (deblock edge drift).
+- `pframe_10bit_64x64`: 100% bit-exact, three consecutive P-slices.
+- `10bit_cabac_i_64x64`: 100% bit-exact (CABAC I-slice).
+- `10bit_b_64x64`: 100% bit-exact across 6 frames (I / P / B mix
+  with `bf=2`, `no-weightb`).
 
 The high-bit-depth path runs alongside — not in place of — the 8-bit
 pipeline:
@@ -379,11 +386,12 @@ pipeline:
 - [`picture::Picture::to_video_frame`] packs the u16 planes as
   little-endian bytes for `Yuv420P10Le`.
 
-Out of scope at 10-bit (return `Error::Unsupported`): B-slices,
-CABAC, Intra_8×8 (`transform_size_8x8_flag = 1`), 4:2:2 / 4:4:4
+Out of scope at 10-bit (return `Error::Unsupported`): CABAC for P / B
+slices, Intra_8×8 (`transform_size_8x8_flag = 1`), 4:2:2 / 4:4:4
 chroma, and I_PCM. 12-bit and 14-bit profiles are rejected at slice
-entry. Explicit weighted P-slice prediction is supported; implicit
-weighted bipred is currently gated behind B-slice support.
+entry. Explicit weighted P-slice prediction is supported; explicit
+and implicit weighted bipred are supported on the 10-bit CAVLC B
+path.
 
 ## Codec id
 
@@ -479,6 +487,24 @@ ffmpeg -y -i /tmp/p_10bit.mp4 -c copy -bsf:v h264_mp4toannexb -f h264 \
     tests/fixtures/pframe_10bit_64x64.es
 ffmpeg -y -i /tmp/p_10bit.mp4 -f rawvideo -pix_fmt yuv420p10le \
     tests/fixtures/pframe_10bit_64x64.yuv
+
+# 10-bit (High 10) CABAC I-slice — 64×64 yuv420p10le IDR with -coder 1.
+ffmpeg -y -f lavfi -i testsrc=duration=1:size=64x64:rate=1 -vframes 1 \
+    -profile:v high10 -preset ultrafast -coder 1 -pix_fmt yuv420p10le \
+    /tmp/10bit_cabac_i.mp4
+ffmpeg -y -i /tmp/10bit_cabac_i.mp4 -c copy -bsf:v h264_mp4toannexb \
+    -f h264 tests/fixtures/10bit_cabac_i_64x64.es
+ffmpeg -y -i /tmp/10bit_cabac_i.mp4 -f rawvideo -pix_fmt yuv420p10le \
+    tests/fixtures/10bit_cabac_i_64x64.yuv
+
+# 10-bit (High 10) CAVLC B-slice — 6-frame yuv420p10le mix (bf=2, no-weightb).
+ffmpeg -y -f lavfi -i testsrc=duration=2:size=64x64:rate=6 -vframes 6 \
+    -profile:v high10 -preset ultrafast -coder 0 -bf 2 -pix_fmt yuv420p10le \
+    -x264-params "bframes=2:no-weightb=1" /tmp/10bit_b.mp4
+ffmpeg -y -i /tmp/10bit_b.mp4 -c copy -bsf:v h264_mp4toannexb \
+    -f h264 tests/fixtures/10bit_b_64x64.es
+ffmpeg -y -i /tmp/10bit_b.mp4 -f rawvideo -pix_fmt yuv420p10le \
+    tests/fixtures/10bit_b_64x64.yuv
 ```
 
 ## License
