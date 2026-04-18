@@ -446,8 +446,17 @@ fn read_level(
     };
 
     // §9.2.2.1 levelCode derivation.
+    //
+    // Pre-escape range spacing: prefix in 0..=13 plus sl=0 covers level_code 0..=13;
+    // prefix=14 with sl=0 uses a 4-bit suffix to cover [14, 29]; prefix>=15 takes
+    // the escape path (12-bit suffix) and adds +15 at sl=0 so its range picks up
+    // immediately after the prefix=14 block at [30, 4125]. Applying the +15 at
+    // prefix=14 too (as an earlier revision did) double-shifts the range and
+    // decodes level values off by one whole class — e.g. prefix=14,suffix=1,sl=0
+    // should give level_code 15 (→ level = -8 after the +2 first-non-T1 adjust)
+    // but instead yielded 30 (→ level = +17).
     let mut level_code: i32 = (level_prefix.min(15) << *suffix_length) as i32 + level_suffix;
-    if level_prefix >= 14 && *suffix_length == 0 {
+    if level_prefix >= 15 && *suffix_length == 0 {
         level_code += 15;
     }
     if level_prefix >= 15 {
