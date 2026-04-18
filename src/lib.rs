@@ -38,6 +38,30 @@
 //!   own QP (luma vs `chroma_qp_index_offset` /
 //!   `second_chroma_qp_index_offset`) and scaling list. Bit-exact
 //!   against ffmpeg on the 64×64 `iframe_yuv444_64x64` fixture.
+//! * **4:2:2 CAVLC I-slice** decode (§6.4.1 Table 6-1, ChromaArrayType = 2)
+//!   — chroma planes are half-width / full-height relative to luma.
+//!   Each MB carries two 2×4 chroma DC Hadamard blocks (new
+//!   [`cavlc::BlockKind::ChromaDc2x4`] with Table 9-5(e) coeff_token
+//!   and Table 9-9(c) total_zeros; nC is fixed at -2) plus 8 AC blocks
+//!   per plane laid out as 2 columns × 4 rows of 4×4 residuals. The
+//!   2×4 inverse Hadamard is a 2-point row butterfly stacked on a
+//!   4-point column Hadamard (§8.5.11.2); the accompanying DC dequant
+//!   uses `QP'_C,DC = QP'_C + 3` per H.264 Amd 2 equations (8-328) /
+//!   (8-329) / (8-330) — this +3 offset is the crucial detail that
+//!   lifts the DC magnitudes onto the AC-compatible scaled domain. The
+//!   chroma intra-prediction runs over an 8×16 tile (§8.3.4): DC mode
+//!   splits the tile into 8 independent 4×4 DC splats (FFmpeg's
+//!   `pred8x16_dc` recipe — top-left quadrant averages both neighbours,
+//!   right quadrants take only top, left quadrants only left, with a
+//!   corner-averaged variant for the inner corner of each 8×4 band);
+//!   Vertical / Horizontal replicate the edges across all 16 rows /
+//!   across each of the 16 left samples; Plane uses an 8-tap vertical
+//!   sum with the §8.3.4.4 gradient constants (`b = (17H+16)>>5`,
+//!   `c = (5V+32)>>6`). The §8.7.2.3 chroma deblock path was extended
+//!   to filter every 4-sample internal edge (8 columns of edges
+//!   vertically and 4 horizontal internal edges per MB vs. 4:2:0's
+//!   single mid-edge) per H.264 Amd 2 §8.7 chroma edge rules. Bit-exact
+//!   against ffmpeg on the 64×64 `iframe_yuv422_64x64` fixture.
 //! * **Spec-accurate §8.7 in-loop deblocking filter** — per-4-pixel-edge
 //!   boundary strength (bS) derivation distinguishing MB-edge vs internal
 //!   edges, intra/inter sides, non-zero residual, and MV/reference
@@ -180,12 +204,10 @@
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
 //! * Interlaced coding / MBAFF / PAFF.
-//! * 4:2:2 chroma (`chroma_format_idc = 2`) and
-//!   `separate_colour_plane_flag = 1` (§6.4.1 / §7.4.2.1.1) are
-//!   rejected at slice entry with `Error::Unsupported`. The chroma
-//!   4:2:2 pipeline needs a 2×4 chroma DC Hadamard and the extra
-//!   internal chroma horizontal edge in §8.7.2 that the 4:2:0 path
-//!   doesn't carry.
+//! * `separate_colour_plane_flag = 1` (§7.4.2.1.1, three independent
+//!   colour planes) is rejected at slice entry with `Error::Unsupported`.
+//!   4:2:2 is supported for CAVLC I-slices only — 4:2:2 P / B and CABAC
+//!   entry return `Error::Unsupported`.
 //! * Monochrome (`chroma_format_idc = 0`) is rejected — the same
 //!   helpers are wired but the MB-layer path assumes chroma planes
 //!   exist.

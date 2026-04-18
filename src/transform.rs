@@ -410,6 +410,85 @@ pub fn inv_hadamard_4x4_dc_scaled(dc: &mut [i32; 16], qp: i32, weight_scale_00: 
     }
 }
 
+/// 2×4 chroma DC inverse Hadamard + dequant — §8.5.11.2
+/// (ChromaArrayType == 2).
+///
+/// Input/output: 8 DC coefficients in coded order. The 2×4 DC array
+/// layout is:
+///
+/// ```text
+///   dc[0] dc[1]
+///   dc[2] dc[3]
+///   dc[4] dc[5]
+///   dc[6] dc[7]
+/// ```
+///
+/// Transform steps (FFmpeg `chroma422_dc_dequant_idct` reference):
+///
+/// 1. Row-side 2-pt butterfly on each of the 4 rows.
+/// 2. 4-pt Hadamard down each of the two resulting columns.
+/// 3. Dequantise each output by `w * V << (qp/6 - 2)` (left shift when
+///    qP >= 12) or `(w * V + rnd) >> (2 - qp/6)` (right shift
+///    otherwise). The 4:2:2 Hadamard's factor-of-8 gain costs 2 more
+///    right-shifts than the AC dequant path uses for a flat weight;
+///    this keeps the DC slot of the AC block in the same scaled
+///    domain as the AC coefficients so `res[0] = dc[i]` + `idct_4x4`
+///    produces the spec residual exactly.
+pub fn inv_hadamard_2x4_chroma_dc_scaled(dc: &mut [i32; 8], qp: i32, weight_scale_00: i16) {
+    let mut tmp = [0i32; 8];
+    // Column 4-pt Hadamard first (down each of the 2 columns).
+    for c in 0..2 {
+        let a = dc[c];        // row 0
+        let b = dc[2 + c];    // row 1
+        let cc = dc[4 + c];   // row 2
+        let d = dc[6 + c];    // row 3
+        tmp[c] = a + b + cc + d;
+        tmp[2 + c] = a + b - cc - d;
+        tmp[4 + c] = a - b - cc + d;
+        tmp[6 + c] = a - b + cc - d;
+    }
+    // Then row 2-pt butterfly.
+    for r in 0..4 {
+        let a = tmp[r * 2];
+        let b = tmp[r * 2 + 1];
+        dc[r * 2] = a + b;
+        dc[r * 2 + 1] = a - b;
+    }
+
+    // Spec §8.5.11.2 / H.264 Amd 2 equations (8-328..8-330):
+    //   QP'_C,DC = QP'_C + 3
+    //   If QP'_C,DC >= 36:
+    //       dcC_ij = (f_ij * LevelScale(QP'_C,DC%6, 0, 0)) << (QP'_C,DC/6 - 6)
+    //   Else:
+    //       dcC_ij = (f_ij * LevelScale(QP'_C,DC%6, 0, 0) + 2^(5-QP'_C,DC/6))
+    //                >> (6 - QP'_C,DC/6)
+    //
+    // The +3 QP offset here is specific to ChromaArrayType==2 and accounts
+    // for the factor-of-2 extra Hadamard gain (2×4 vs 2×2). Without it the
+    // DC values come out ~1.38× too small, matching V_TABLE[(q+3)%6][0] /
+    // V_TABLE[q%6][0] on typical QPs. LevelScale4x4 in our code folds
+    // `weight_scale * V_TABLE[qmod][class]` so the full formula is the
+    // same shape as the 2×2 code path, with QP replaced by QP + 3 and one
+    // more right-shift absorbed into the shift constants.
+    let qp_dc = (qp + 3).clamp(0, 51);
+    let qp6 = (qp_dc / 6) as i32;
+    let qmod = (qp_dc % 6) as usize;
+    let v = V_TABLE[qmod][0];
+    let w = weight_scale_00 as i32;
+    if qp_dc >= 36 {
+        let shift = (qp6 - 6) as u32;
+        for x in dc.iter_mut() {
+            *x = (*x * w * v) << shift;
+        }
+    } else {
+        let shift = (6 - qp6) as u32;
+        let round = 1i32 << (shift - 1);
+        for x in dc.iter_mut() {
+            *x = (*x * w * v + round) >> shift;
+        }
+    }
+}
+
 /// 2×2 chroma DC inverse Hadamard — §8.5.11.1.
 ///
 /// Input: 4 DC coefficients in raster (00, 01, 10, 11).

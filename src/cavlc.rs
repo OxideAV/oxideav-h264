@@ -45,6 +45,12 @@ pub enum BlockKind {
     ChromaAc,
     /// 4:2:0 chroma DC block (4 coefficients).
     ChromaDc2x2,
+    /// 4:2:2 chroma DC block (8 coefficients, arranged 2 cols × 4 rows).
+    /// Uses the dedicated Table 9-5(e) coeff_token VLC and the
+    /// 4:2:2-specific total_zeros table (spec §9.2.1.2, FFmpeg
+    /// `chroma422_dc_coeff_token_*`). CAVLC always uses `nC = -2` for
+    /// this block kind.
+    ChromaDc2x4,
     /// One of the four 4×4-style CAVLC sub-blocks that together encode a
     /// luma 8×8 residual (§7.3.5.3.2). Each sub-block decodes 16
     /// coefficients using the standard 4×4 VLC tables; the caller
@@ -59,6 +65,7 @@ impl BlockKind {
             BlockKind::Luma4x4 | BlockKind::Luma16x16Dc | BlockKind::Luma8x8Sub => 16,
             BlockKind::Luma16x16Ac | BlockKind::ChromaAc => 15,
             BlockKind::ChromaDc2x2 => 4,
+            BlockKind::ChromaDc2x4 => 8,
         }
     }
 }
@@ -212,6 +219,23 @@ pub fn decode_residual_block(
                 block.coeffs[i] = coded[i];
             }
         }
+        BlockKind::ChromaDc2x4 => {
+            // §8.5.11.2 defines a zig-zag scan that walks the 2×4 DC
+            // grid in coded order. The scan maps coded index k → (row,
+            // col) per FFmpeg's `ff_h264_chroma422_dc_scan`:
+            //
+            //   k: 0     1     2     3     4     5     6     7
+            //   rc: (0,0)(1,0)(0,1)(2,0)(3,0)(1,1)(2,1)(3,1)
+            //
+            // We emit the coefficients in spatial (row-major, r*2+c)
+            // order so the caller's Hadamard operates on the native
+            // 2×4 layout.
+            const CHROMA422_DC_INV_SCAN: [usize; 8] = [0, 2, 1, 4, 6, 3, 5, 7];
+            for k in 0..8 {
+                let rc = CHROMA422_DC_INV_SCAN[k];
+                block.coeffs[rc] = coded[k];
+            }
+        }
         BlockKind::Luma8x8Sub => {
             // Leave the result in coded order — the caller splices the
             // 16 coefficients into the 8×8 raster via
@@ -314,6 +338,19 @@ const CHROMA_DC_COEFF_TOKEN_LEN: [u8; 20] =
 const CHROMA_DC_COEFF_TOKEN_BITS: [u8; 20] =
     [1, 0, 0, 0, 7, 1, 0, 0, 4, 6, 1, 0, 3, 3, 2, 5, 2, 3, 2, 0];
 
+/// Chroma DC coeff_token for ChromaArrayType == 2 (4:2:2) — 9 rows
+/// (TC=0..=8) × 4 cols (T1). Sourced from FFmpeg
+/// `chroma422_dc_coeff_token_len` / `_bits` in `libavcodec/h264_cavlc.c`,
+/// which mirrors the H.264 spec's Table 9-5(e).
+const CHROMA_DC_422_COEFF_TOKEN_LEN: [u8; 36] = [
+    1, 0, 0, 0, 7, 2, 0, 0, 7, 7, 3, 0, 9, 7, 7, 5, 9, 9, 7, 6, 10, 10, 9, 7, 11, 11, 10, 7, 12, 12,
+    11, 10, 13, 12, 12, 11,
+];
+const CHROMA_DC_422_COEFF_TOKEN_BITS: [u8; 36] = [
+    1, 0, 0, 0, 15, 1, 0, 0, 14, 13, 1, 0, 7, 12, 11, 1, 6, 5, 10, 1, 7, 6, 4, 9, 7, 6, 5, 8, 7, 6,
+    5, 4, 7, 5, 4, 4,
+];
+
 fn nc_class(nc: i32) -> usize {
     if nc < 0 {
         // chroma 2x2 DC handled separately, this is only used as a guard.
@@ -334,6 +371,14 @@ pub fn read_coeff_token(br: &mut BitReader<'_>, nc: i32, kind: BlockKind) -> Res
     if matches!(kind, BlockKind::ChromaDc2x2) {
         let (idx, _) =
             lookup_in_table_pairs(br, &CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS)?;
+        return Ok(((idx / 4) as u32, (idx % 4) as u32));
+    }
+    if matches!(kind, BlockKind::ChromaDc2x4) {
+        let (idx, _) = lookup_in_table_pairs(
+            br,
+            &CHROMA_DC_422_COEFF_TOKEN_LEN,
+            &CHROMA_DC_422_COEFF_TOKEN_BITS,
+        )?;
         return Ok(((idx / 4) as u32, (idx % 4) as u32));
     }
     let cls = nc_class(nc);
@@ -414,11 +459,39 @@ const TOTAL_ZEROS_BITS: [&[u8]; 15] = [
 const CHROMA_DC_TOTAL_ZEROS_LEN: [[u8; 4]; 3] = [[1, 2, 3, 3], [1, 2, 2, 0], [1, 1, 0, 0]];
 const CHROMA_DC_TOTAL_ZEROS_BITS: [[u8; 4]; 3] = [[1, 1, 1, 0], [1, 1, 0, 0], [1, 0, 0, 0]];
 
+/// 4:2:2 chroma DC total_zeros (spec §9.2.3.1 Table 9-9(c), FFmpeg
+/// `chroma422_dc_total_zeros_*`). Row = total_coeff - 1 (0..=6). Each row
+/// has up to 8 entries since the DC block carries 8 coefficients.
+const CHROMA_DC_422_TOTAL_ZEROS_LEN: [&[u8]; 7] = [
+    &[1, 3, 3, 4, 4, 4, 5, 5],
+    &[3, 2, 3, 3, 3, 3, 3],
+    &[3, 3, 2, 2, 3, 3],
+    &[3, 2, 2, 2, 3],
+    &[2, 2, 2, 2],
+    &[2, 2, 1],
+    &[1, 1],
+];
+const CHROMA_DC_422_TOTAL_ZEROS_BITS: [&[u8]; 7] = [
+    &[1, 2, 3, 2, 3, 1, 1, 0],
+    &[0, 1, 1, 4, 5, 6, 7],
+    &[0, 1, 1, 2, 6, 7],
+    &[6, 0, 1, 2, 7],
+    &[0, 1, 2, 3],
+    &[0, 1, 1],
+    &[0, 1],
+];
+
 fn read_total_zeros(br: &mut BitReader<'_>, total_coeff: u32, kind: BlockKind) -> Result<u32> {
     let row = (total_coeff - 1) as usize;
     if matches!(kind, BlockKind::ChromaDc2x2) {
         let lens = &CHROMA_DC_TOTAL_ZEROS_LEN[row];
         let bits = &CHROMA_DC_TOTAL_ZEROS_BITS[row];
+        let (idx, _) = lookup_in_table_pairs(br, lens, bits)?;
+        return Ok(idx as u32);
+    }
+    if matches!(kind, BlockKind::ChromaDc2x4) {
+        let lens = CHROMA_DC_422_TOTAL_ZEROS_LEN[row];
+        let bits = CHROMA_DC_422_TOTAL_ZEROS_BITS[row];
         let (idx, _) = lookup_in_table_pairs(br, lens, bits)?;
         return Ok(idx as u32);
     }
