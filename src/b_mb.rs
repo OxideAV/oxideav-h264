@@ -47,7 +47,9 @@ use crate::picture::{MbInfo, Picture, INTRA_DC_FAKE};
 use crate::pps::Pps;
 use crate::slice::{ChromaWeight, LumaWeight, PredWeightTable, SliceHeader};
 use crate::sps::Sps;
-use crate::transform::{chroma_qp, dequantize_4x4, idct_4x4, inv_hadamard_2x2_chroma_dc};
+use crate::transform::{
+    chroma_qp, dequantize_4x4_scaled, idct_4x4, inv_hadamard_2x2_chroma_dc_scaled,
+};
 
 /// Per-slice context needed for temporal direct MV prediction (§8.4.1.2.3).
 ///
@@ -1445,7 +1447,9 @@ fn decode_inter_residual_luma(
         let blk = decode_residual_block(br, nc, BlockKind::Luma4x4)?;
         let mut residual = blk.coeffs;
         let total_coeff = blk.total_coeff;
-        dequantize_4x4(&mut residual, qp_y);
+        // §7.4.2.2 — Inter-Y 4×4 is slot 3.
+        let scale = *pic.scaling_lists.matrix_4x4(3);
+        dequantize_4x4_scaled(&mut residual, qp_y, &scale);
         idct_4x4(&mut residual);
         let lo = lo_mb + br_row * 4 * lstride + br_col * 4;
         for r in 0..4 {
@@ -1476,8 +1480,11 @@ fn decode_inter_residual_chroma(
         dc_cb[..4].copy_from_slice(&blk.coeffs[..4]);
         let blk = decode_residual_block(br, 0, BlockKind::ChromaDc2x2)?;
         dc_cr[..4].copy_from_slice(&blk.coeffs[..4]);
-        inv_hadamard_2x2_chroma_dc(&mut dc_cb, qpc);
-        inv_hadamard_2x2_chroma_dc(&mut dc_cr, qpc);
+        // B-slice chroma is inter → slots 4 (Cb) / 5 (Cr).
+        let w_cb = pic.scaling_lists.matrix_4x4(4)[0];
+        let w_cr = pic.scaling_lists.matrix_4x4(5)[0];
+        inv_hadamard_2x2_chroma_dc_scaled(&mut dc_cb, qpc, w_cb);
+        inv_hadamard_2x2_chroma_dc_scaled(&mut dc_cr, qpc, w_cr);
     }
     let cstride = pic.chroma_stride();
     let co = pic.chroma_off(mb_x, mb_y);
@@ -1494,7 +1501,10 @@ fn decode_inter_residual_chroma(
                 let ac = decode_residual_block(br, nc, BlockKind::ChromaAc)?;
                 total_coeff = ac.total_coeff;
                 res = ac.coeffs;
-                dequantize_4x4(&mut res, qpc);
+                // §7.4.2.2 — Inter-Cb/Cr (slots 4/5). B-slice chroma is inter.
+                let cat = if plane_kind { 4 } else { 5 };
+                let scale = *pic.scaling_lists.matrix_4x4(cat);
+                dequantize_4x4_scaled(&mut res, qpc, &scale);
             }
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);

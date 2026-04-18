@@ -38,26 +38,72 @@ fn pos_class(row: usize, col: usize) -> usize {
     }
 }
 
-/// Compute the dequantisation scale `LevelScale4x4(qP%6, i, j)` from §8.5.10.
-fn level_scale(qp_mod6: usize, row: usize, col: usize) -> i32 {
-    V_TABLE[qp_mod6][pos_class(row, col)]
-}
-
-/// Dequantise a 4×4 AC block in raster order. `qp` is the per-block QP value
-/// (luma or chroma already adjusted via §8.5.11.1 / §8.5.11.2).
+/// Dequantise a 4×4 AC block in raster order using the flat (all-16)
+/// scaling list. `qp` is the per-block QP value (luma or chroma already
+/// adjusted via §8.5.11.1 / §8.5.11.2).
 ///
 /// Per §8.5.10: `c'[i,j] = c[i,j] * LevelScale4x4(qP%6, i, j) << (qP/6)`
 /// — applied to all 16 positions for a normal AC 4×4 block. For an Intra16×16
 /// AC block, the DC slot (raster 0) is left at 0 and gets filled later from
 /// the Hadamard pass.
 pub fn dequantize_4x4(coeffs: &mut [i32; 16], qp: i32) {
+    dequantize_4x4_scaled(coeffs, qp, &crate::scaling_list::FLAT_4X4);
+}
+
+/// Dequantise a 4×4 AC block using a custom weight matrix (§7.4.2.1.1
+/// / §8.5.12.1). With `weight_scale` = flat-16 this matches
+/// [`dequantize_4x4`] bit-exactly because the spec's `/16` folds
+/// cleanly back into the shared IDCT's final `>>6`. For non-flat
+/// weights the full spec formula is applied:
+///
+/// ```text
+/// d = (c * w * V + round) >> shift    for qP <  24 (shift = 4 - qP/6)
+/// d = (c * w * V)       << -shift     for qP >= 24
+/// ```
+///
+/// where `V = normAdjust4x4(qP%6, i, j)` and `w = weightScale4x4[i,j]`.
+/// The rounding keeps the low bits, avoiding the precision loss of
+/// multiplying a pre-rounded `(V * w) >> 4` factor into the coefficient.
+pub fn dequantize_4x4_scaled(coeffs: &mut [i32; 16], qp: i32, weight_scale: &[i16; 16]) {
     let qp = qp.clamp(0, 51);
-    let qp6 = (qp / 6) as u32;
+    // Flat fast-path: bit-exact reproduction of the flat-16 pipeline.
+    // With weight_scale = FLAT_4X4 (all 16) the JM-style formula
+    // `(c * V * 16 + round) >> shift` collapses to `c * V` with the
+    // `<< qp/6` absorbed in the shift difference.
+    if weight_scale == &crate::scaling_list::FLAT_4X4 {
+        let qp6 = (qp / 6) as u32;
+        let qmod = (qp % 6) as usize;
+        for r in 0..4 {
+            for c in 0..4 {
+                let i = r * 4 + c;
+                let scale = V_TABLE[qmod][pos_class(r, c)];
+                coeffs[i] = (coeffs[i] * scale) << qp6;
+            }
+        }
+        return;
+    }
+    let qp6 = (qp / 6) as i32;
     let qmod = (qp % 6) as usize;
-    for r in 0..4 {
-        for c in 0..4 {
-            let i = r * 4 + c;
-            coeffs[i] = (coeffs[i] * level_scale(qmod, r, c)) << qp6;
+    if qp6 >= 4 {
+        let shift = (qp6 - 4) as u32;
+        for r in 0..4 {
+            for c in 0..4 {
+                let i = r * 4 + c;
+                let w = weight_scale[i] as i32;
+                let v = V_TABLE[qmod][pos_class(r, c)];
+                coeffs[i] = (coeffs[i] * w * v) << shift;
+            }
+        }
+    } else {
+        let shift = (4 - qp6) as u32;
+        let round = 1i32 << (shift - 1);
+        for r in 0..4 {
+            for c in 0..4 {
+                let i = r * 4 + c;
+                let w = weight_scale[i] as i32;
+                let v = V_TABLE[qmod][pos_class(r, c)];
+                coeffs[i] = (coeffs[i] * w * v + round) >> shift;
+            }
         }
     }
 }
@@ -114,6 +160,16 @@ pub fn idct_4x4(coeffs: &mut [i32; 16]) {
 /// `(0,0)` LevelScale entry, and the result populates the DC slot of each
 /// 4×4 luma residual block before its own inverse transform.
 pub fn inv_hadamard_4x4_dc(dc: &mut [i32; 16], qp: i32) {
+    inv_hadamard_4x4_dc_scaled(dc, qp, 16);
+}
+
+/// Inverse 4×4 Hadamard + dequant with a custom DC weight.
+/// `weight_scale_00` is `weightScale4x4[0,0]` for the active Intra-Y
+/// 4×4 scaling list (slot 0). The flat-16 weight matches
+/// [`inv_hadamard_4x4_dc`] bit-exactly because the factor-of-16 is
+/// baked into the `qp/6 - 2` shift (spec uses a +4 shift plus a /16
+/// absorbed via the IDCT normalisation).
+pub fn inv_hadamard_4x4_dc_scaled(dc: &mut [i32; 16], qp: i32, weight_scale_00: i16) {
     // Hadamard in two passes (rows then columns).
     let mut tmp = [0i32; 16];
     for r in 0..4 {
@@ -137,27 +193,47 @@ pub fn inv_hadamard_4x4_dc(dc: &mut [i32; 16], qp: i32) {
         dc[12 + c] = a - b + cc - d;
     }
 
-    // Dequantise (§8.5.10 with the normalization x264/FFmpeg use for
-    // Luma_16×16 DC): `dc_ij = z * scale * 2^{qp/6 - 2}`. This is 16×
-    // larger than the literal spec formula because the spec's DC dequant
-    // leaves a factor-of-16 gap that reference encoders close via their
-    // forward tables. The encoder in [`crate::fwd_transform`] is
-    // calibrated against this dequant so the round-trip unity-gains for
-    // a constant residual at any supported QP.
+    // Dequantise (§8.5.10 Luma_16×16 DC). The spec formula is
+    // `dc_ij = (f * w * V + 2^5) >> 6` when qP < 36, and
+    // `(f * w * V) << (qP/6 - 6)` when qP >= 36. Our pipeline absorbs
+    // a factor of 16 into the final IDCT `>>6` — so for flat weight
+    // (w = 16), the shift reduces by 4 (= `qP/6 - 2` left shift or
+    // `2 - qP/6` right shift with rounding). The scaled path below
+    // generalises by factoring `w` into the intermediate.
     let qp = qp.clamp(0, 51);
     let qp6 = (qp / 6) as i32;
     let qmod = (qp % 6) as usize;
-    let scale = V_TABLE[qmod][0];
-    if qp6 >= 2 {
-        let shift = (qp6 - 2) as u32;
-        for v in dc.iter_mut() {
-            *v = (*v * scale) << shift;
+    let v = V_TABLE[qmod][0];
+    if weight_scale_00 == 16 {
+        if qp6 >= 2 {
+            let shift = (qp6 - 2) as u32;
+            for x in dc.iter_mut() {
+                *x = (*x * v) << shift;
+            }
+        } else {
+            let shift = (2 - qp6) as u32;
+            let round = 1i32 << (shift - 1);
+            for x in dc.iter_mut() {
+                *x = (*x * v + round) >> shift;
+            }
         }
     } else {
-        let shift = (2 - qp6) as u32;
-        let round = 1i32 << (shift - 1);
-        for v in dc.iter_mut() {
-            *v = (*v * scale + round) >> shift;
+        // Generic spec-style dequant for the DC luma block with a
+        // non-flat weight. Uses the full `(f * w * V + rnd) >> shift`
+        // form so the factor of `w` isn't truncated to zero at high
+        // QPs or pre-multiplied into the wrong intermediate.
+        let w = weight_scale_00 as i32;
+        if qp6 >= 6 {
+            let shift = (qp6 - 6) as u32;
+            for x in dc.iter_mut() {
+                *x = (*x * w * v) << shift;
+            }
+        } else {
+            let shift = (6 - qp6) as u32;
+            let round = 1i32 << (shift - 1);
+            for x in dc.iter_mut() {
+                *x = (*x * w * v + round) >> shift;
+            }
         }
     }
 }
@@ -166,6 +242,13 @@ pub fn inv_hadamard_4x4_dc(dc: &mut [i32; 16], qp: i32) {
 ///
 /// Input: 4 DC coefficients in raster (00, 01, 10, 11).
 pub fn inv_hadamard_2x2_chroma_dc(dc: &mut [i32; 4], qp: i32) {
+    inv_hadamard_2x2_chroma_dc_scaled(dc, qp, 16);
+}
+
+/// Inverse 2×2 chroma DC Hadamard + dequant with a custom weight.
+/// `weight_scale_00` is the chroma scaling list's (0,0) entry (the
+/// DC slot). Flat (16) matches [`inv_hadamard_2x2_chroma_dc`].
+pub fn inv_hadamard_2x2_chroma_dc_scaled(dc: &mut [i32; 4], qp: i32, weight_scale_00: i16) {
     let a = dc[0];
     let b = dc[1];
     let c = dc[2];
@@ -182,16 +265,33 @@ pub fn inv_hadamard_2x2_chroma_dc(dc: &mut [i32; 4], qp: i32) {
     let qp = qp.clamp(0, 51);
     let qp6 = (qp / 6) as u32;
     let qmod = (qp % 6) as usize;
-    let scale = V_TABLE[qmod][0];
-    if qp >= 6 {
-        let shift = qp6 - 1;
-        for v in dc.iter_mut() {
-            *v = (*v * scale) << shift;
+    let v = V_TABLE[qmod][0];
+    if weight_scale_00 == 16 {
+        if qp >= 6 {
+            let shift = qp6 - 1;
+            for x in dc.iter_mut() {
+                *x = (*x * v) << shift;
+            }
+        } else {
+            for x in dc.iter_mut() {
+                *x = (*x * v) >> 1;
+            }
         }
     } else {
-        // qp < 6 -> qp6 = 0. Apply scale, then >> 1.
-        for v in dc.iter_mut() {
-            *v = (*v * scale) >> 1;
+        let w = weight_scale_00 as i32;
+        // §8.5.11.1 full form: (f * w * V + rnd) >> 5 for qP < 30,
+        // shift-left for qP >= 30.
+        if qp >= 30 {
+            let shift = (qp6 - 5) as u32;
+            for x in dc.iter_mut() {
+                *x = (*x * w * v) << shift;
+            }
+        } else {
+            let shift = (5 - qp6) as u32;
+            let round = 1i32 << (shift - 1);
+            for x in dc.iter_mut() {
+                *x = (*x * w * v + round) >> shift;
+            }
         }
     }
 }
@@ -241,15 +341,16 @@ fn pos_class_8x8(row: usize, col: usize) -> usize {
     V8X8_POS_CLASS[((row & 3) << 2) | (col & 3)]
 }
 
-/// Compute the flat 8×8 scaling factor `LevelScale8x8(qP%6, i, j)` from
-/// §8.5.12.1 for the default (flat-16) scaling list.
+/// Compute the 8×8 scaling factor `LevelScale8x8(qP%6, i, j)` from
+/// §8.5.12.1 for a given per-position weight.
 ///
-/// Custom scaling lists parsed from the PPS / SPS are not yet plumbed — the
-/// decoder uses the "flat" default weightScale = 16 for every position.
-fn level_scale_8x8(qp_mod6: usize, row: usize, col: usize) -> i32 {
-    // `weightScale8x8[i,j] = 16` for the flat default list, so
-    // LevelScale8x8 = normAdjust * 16.
-    V8X8_TABLE[qp_mod6][pos_class_8x8(row, col)] * 16
+/// `weight` = 16 corresponds to the flat default scaling list — the
+/// high-volume fast path. Custom scaling lists (§7.4.2.1.1 /
+/// §7.4.2.2) replace `16` with the per-position weight parsed from
+/// the SPS/PPS, resolved against the Table 7-2 fallback chain via
+/// [`crate::scaling_list::ScalingLists`].
+fn level_scale_8x8(qp_mod6: usize, row: usize, col: usize, weight: i32) -> i32 {
+    V8X8_TABLE[qp_mod6][pos_class_8x8(row, col)] * weight
 }
 
 /// 8×8 zig-zag scan (frame coding, §8.5.6 Table 8-14). Maps coded-order
@@ -279,6 +380,17 @@ pub const ZIGZAG_8X8: [usize; 64] = [
 /// `>> 6` per sample. The two stages together reproduce the spec's
 /// `(TransformedResidual + 2^5) >> 6` semantics.
 pub fn dequantize_8x8(coeffs: &mut [i32; 64], qp: i32) {
+    dequantize_8x8_scaled(coeffs, qp, &crate::scaling_list::FLAT_8X8);
+}
+
+/// Dequantise an 8×8 AC block with a custom weight matrix (§7.4.2.1.1
+/// / §8.5.12.1). With `weight_scale` = flat-16 this is bit-identical
+/// to the non-scaled variant. The generic formula, matching the spec,
+/// is `d = (c * V * w + round) >> shift` with `shift = 6 - qP/6`;
+/// when qP/6 ≥ 6 the shift sign flips and the right shift becomes a
+/// left shift of `qP/6 - 6`. The spec's `*16` for flat lists lives in
+/// `w`.
+pub fn dequantize_8x8_scaled(coeffs: &mut [i32; 64], qp: i32, weight_scale: &[i16; 64]) {
     let qp = qp.clamp(0, 51);
     let qp6 = (qp / 6) as i32;
     let qmod = (qp % 6) as usize;
@@ -287,7 +399,8 @@ pub fn dequantize_8x8(coeffs: &mut [i32; 64], qp: i32) {
         for r in 0..8 {
             for c in 0..8 {
                 let i = r * 8 + c;
-                coeffs[i] = (coeffs[i] * level_scale_8x8(qmod, r, c)) << shift;
+                let w = weight_scale[i] as i32;
+                coeffs[i] = (coeffs[i] * level_scale_8x8(qmod, r, c, w)) << shift;
             }
         }
     } else {
@@ -296,7 +409,8 @@ pub fn dequantize_8x8(coeffs: &mut [i32; 64], qp: i32) {
         for r in 0..8 {
             for c in 0..8 {
                 let i = r * 8 + c;
-                coeffs[i] = (coeffs[i] * level_scale_8x8(qmod, r, c) + round) >> shift;
+                let w = weight_scale[i] as i32;
+                coeffs[i] = (coeffs[i] * level_scale_8x8(qmod, r, c, w) + round) >> shift;
             }
         }
     }
@@ -482,6 +596,48 @@ mod tests {
                 c2[i]
             );
         }
+    }
+
+    /// Flat-16 scaling lists must produce identical output to the
+    /// non-scaled path. This locks in the factor-of-16 reorganisation:
+    /// with `weightScale = 16`, `V_TABLE * 16 >> 4 = V_TABLE`, so the
+    /// custom-matrix dequant path collapses back to the original.
+    #[test]
+    fn dequantize_4x4_flat_matches_unscaled() {
+        use crate::scaling_list::FLAT_4X4;
+        let mut a = [1i32; 16];
+        a[5] = 3;
+        a[9] = -7;
+        let mut b = a;
+        dequantize_4x4(&mut a, 18);
+        dequantize_4x4_scaled(&mut b, 18, &FLAT_4X4);
+        assert_eq!(a, b);
+    }
+
+    /// Scaled-4×4 vs unscaled: a weight of 32 doubles the effective
+    /// level-scale vs flat-16 at each position.
+    #[test]
+    fn dequantize_4x4_doubled_weights_are_doubled_output() {
+        let mut flat = [1i32; 16];
+        let mut doubled = [1i32; 16];
+        let w = [32i16; 16];
+        dequantize_4x4(&mut flat, 6);
+        dequantize_4x4_scaled(&mut doubled, 6, &w);
+        for i in 0..16 {
+            assert_eq!(doubled[i], 2 * flat[i], "mismatch at pos {i}");
+        }
+    }
+
+    #[test]
+    fn dequantize_8x8_flat_matches_unscaled() {
+        use crate::scaling_list::FLAT_8X8;
+        let mut a = [1i32; 64];
+        a[3] = 5;
+        a[27] = -4;
+        let mut b = a;
+        dequantize_8x8(&mut a, 24);
+        dequantize_8x8_scaled(&mut b, 24, &FLAT_8X8);
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -36,8 +36,8 @@ use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::tables::decode_cbp_intra;
 use crate::transform::{
-    chroma_qp, dequantize_4x4, dequantize_8x8, idct_4x4, idct_8x8, inv_hadamard_2x2_chroma_dc,
-    inv_hadamard_4x4_dc,
+    chroma_qp, dequantize_4x4_scaled, dequantize_8x8_scaled, idct_4x4, idct_8x8,
+    inv_hadamard_2x2_chroma_dc_scaled, inv_hadamard_4x4_dc_scaled,
 };
 
 /// Per-block (4×4) raster ordering of the residual blocks within a
@@ -379,7 +379,9 @@ fn decode_luma_intra_nxn(
             let blk = decode_residual_block(br, nc, BlockKind::Luma4x4)?;
             total_coeff = blk.total_coeff;
             residual = blk.coeffs;
-            dequantize_4x4(&mut residual, qp_y);
+            // §7.4.2.2 index 0 — Intra-Y 4×4.
+            let scale = *pic.scaling_lists.matrix_4x4(0);
+            dequantize_4x4_scaled(&mut residual, qp_y, &scale);
             idct_4x4(&mut residual);
         }
         let lo = lo_mb + br_row * 4 * lstride + br_col * 4;
@@ -451,7 +453,9 @@ fn decode_luma_intra_8x8(
                 let tc = decode_residual_8x8_sub(br, nc, sub, &mut residual)?;
                 pic.mb_info_mut(mb_x, mb_y).luma_nc[sr * 4 + sc] = tc;
             }
-            dequantize_8x8(&mut residual, qp_y);
+            // §7.4.2.2 — 8×8 intra-Y slot 0.
+            let scale = *pic.scaling_lists.matrix_8x8(0);
+            dequantize_8x8_scaled(&mut residual, qp_y, &scale);
             idct_8x8(&mut residual);
 
             // FFmpeg post-decode aggregation: collapse the 2×2 of
@@ -578,7 +582,10 @@ fn decode_luma_intra_16x16(
     let nc_dc = predict_nc_luma(pic, mb_x, mb_y, 0, 0);
     let dc_block = decode_residual_block(br, nc_dc, BlockKind::Luma16x16Dc)?;
     let mut dc = dc_block.coeffs;
-    inv_hadamard_4x4_dc(&mut dc, qp_y);
+    // §8.5.10 Luma_16×16 DC — use the Intra-Y 4×4 scaling list's
+    // (0,0) entry.
+    let w_dc = pic.scaling_lists.matrix_4x4(0)[0];
+    inv_hadamard_4x4_dc_scaled(&mut dc, qp_y, w_dc);
 
     let lstride = pic.luma_stride();
     let lo_mb = pic.luma_off(mb_x, mb_y);
@@ -591,7 +598,10 @@ fn decode_luma_intra_16x16(
             let ac = decode_residual_block(br, nc, BlockKind::Luma16x16Ac)?;
             total_coeff = ac.total_coeff;
             residual = ac.coeffs;
-            dequantize_4x4(&mut residual, qp_y);
+            // §7.4.2.2 — Intra-Y 4×4 slot 0 (AC coefficients of I_16×16
+            // share the intra-Y scaling list).
+            let scale = *pic.scaling_lists.matrix_4x4(0);
+            dequantize_4x4_scaled(&mut residual, qp_y, &scale);
         }
         // Insert DC sample at position 0 (already dequantised by the
         // Hadamard pass — it lives in the same scaled space as the AC
@@ -650,8 +660,12 @@ fn decode_chroma(
         for i in 0..4 {
             dc_cr[i] = blk.coeffs[i];
         }
-        inv_hadamard_2x2_chroma_dc(&mut dc_cb, qpc);
-        inv_hadamard_2x2_chroma_dc(&mut dc_cr, qpc);
+        // §8.5.11.1 — Intra chroma DC uses the (0,0) entry of the
+        // Intra-Cb (slot 1) and Intra-Cr (slot 2) 4×4 scaling lists.
+        let w_cb = pic.scaling_lists.matrix_4x4(1)[0];
+        let w_cr = pic.scaling_lists.matrix_4x4(2)[0];
+        inv_hadamard_2x2_chroma_dc_scaled(&mut dc_cb, qpc, w_cb);
+        inv_hadamard_2x2_chroma_dc_scaled(&mut dc_cr, qpc, w_cr);
     }
 
     let cstride = pic.chroma_stride();
@@ -676,7 +690,12 @@ fn decode_chroma(
                 let ac = decode_residual_block(br, nc, BlockKind::ChromaAc)?;
                 total_coeff = ac.total_coeff;
                 res = ac.coeffs;
-                dequantize_4x4(&mut res, qpc);
+                // §7.4.2.2 — Intra-Cb (slot 1) for the Cb plane,
+                // Intra-Cr (slot 2) for the Cr plane. The I-slice
+                // chroma path is always intra.
+                let cat = if plane_kind { 1 } else { 2 };
+                let scale = *pic.scaling_lists.matrix_4x4(cat);
+                dequantize_4x4_scaled(&mut res, qpc, &scale);
             }
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);

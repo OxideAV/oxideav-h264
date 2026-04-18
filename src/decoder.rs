@@ -29,7 +29,6 @@
 //! Out of scope (returns `Error::Unsupported`):
 //! * CABAC B-slices. (CABAC P-slices are wired; see
 //!   [`crate::cabac::p_mb`].)
-//! * `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 //! * Interlaced coding / MBAFF (P and B).
 //! * 8×8 transform, 4:2:2 / 4:4:4 chroma, bit depth > 8.
 //!
@@ -52,7 +51,10 @@ use crate::cabac::{
     engine::CabacDecoder, mb::decode_i_mb_cabac, p_mb::decode_p_mb_cabac,
     tables::init_slice_contexts,
 };
-use crate::dpb::{apply_rplm, derive_poc_type0, derive_poc_type2, Dpb, MmcoCommand, PocState};
+use crate::dpb::{
+    apply_rplm, derive_poc_type0, derive_poc_type1, derive_poc_type2, Dpb, MmcoCommand,
+    PocState, PocType1Params,
+};
 use crate::mb::decode_i_slice_data;
 use crate::nal::{
     extract_rbsp, split_annex_b, split_length_prefixed, AvcConfig, NalHeader, NalUnitType,
@@ -215,20 +217,28 @@ impl H264Decoder {
                 if pic.mb_width != mb_w || pic.mb_height != mb_h {
                     pic = Picture::new(mb_w, mb_h);
                 }
+                // §7.4.2.2 Table 7-2 — resolve the active scaling
+                // matrices (SPS + PPS, with fallback). Stored on the
+                // picture so every MB-level dequant call can index
+                // the per-category list without re-doing the fallback.
+                pic.scaling_lists =
+                    crate::scaling_list::ScalingLists::resolve(&sps, &pps);
 
                 // Lazily (re)create the DPB when we first see an SPS —
-                // its size depends on `max_num_ref_frames`. We size the
-                // output-reorder window from `max_num_ref_frames` unless
-                // the stream contains no B-slices, in which case POC order
-                // equals decode order and no buffering is required. Once a
-                // B-slice is observed we bump the reorder window so
-                // decode-order pictures delayed in the DPB can emerge in
-                // POC order. The VUI's `bitstream_restriction.max_num_reorder_frames`
-                // is the canonical source but we do not parse VUI yet —
-                // using `max_num_ref_frames` is a safe upper bound.
+                // its size depends on `max_num_ref_frames`. Size the
+                // output-reorder window from the VUI's
+                // `max_num_reorder_frames` (§E.2.1) when present — it is
+                // the spec-canonical bound. Falls back to
+                // `max_num_ref_frames` (over-conservative) otherwise.
+                // When no B-slice is in the stream the window collapses
+                // to 0 so frames emerge immediately.
                 let want_dpb_size = sps.max_num_ref_frames.max(1);
+                let vui_reorder = sps
+                    .vui
+                    .as_ref()
+                    .and_then(|v| v.max_num_reorder_frames);
                 let want_reorder = if sh.slice_type == SliceType::B {
-                    sps.max_num_ref_frames.max(1)
+                    vui_reorder.unwrap_or(sps.max_num_ref_frames).max(1)
                 } else {
                     0
                 };
@@ -297,9 +307,28 @@ impl H264Decoder {
                         p
                     }
                     1 => {
-                        return Err(Error::unsupported(
-                            "h264: pic_order_cnt_type == 1 not implemented",
-                        ));
+                        let (p, off) = derive_poc_type1(PocType1Params {
+                            delta_pic_order_always_zero_flag: sps
+                                .delta_pic_order_always_zero_flag,
+                            offset_for_non_ref_pic: sps.offset_for_non_ref_pic,
+                            offset_for_top_to_bottom_field: sps.offset_for_top_to_bottom_field,
+                            num_ref_frames_in_pic_order_cnt_cycle: sps
+                                .num_ref_frames_in_pic_order_cnt_cycle,
+                            offset_for_ref_frame: &sps.offset_for_ref_frame,
+                            max_frame_num,
+                            nal_ref_idc: header.nal_ref_idc,
+                            is_idr: sh.is_idr,
+                            frame_num: sh.frame_num,
+                            prev_frame_num: self.prev_frame_num,
+                            prev_frame_num_offset: self.prev_frame_num_offset,
+                            delta_pic_order_cnt: sh.delta_pic_order_cnt,
+                        });
+                        // §8.2.1.2 — every picture advances `prev_frame_num_offset`
+                        // (unlike type 2, which only updates on reference
+                        // pictures). This matches the spec's
+                        // "FrameNumOffset for the next picture" clause.
+                        self.prev_frame_num_offset = off;
+                        p
                     }
                     other => {
                         return Err(Error::invalid(format!(

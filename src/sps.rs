@@ -1,9 +1,11 @@
 //! Sequence Parameter Set (SPS) parsing — ITU-T H.264 §7.3.2.1.1.
 //!
 //! Only the fields needed to drive the decoder and report stream metadata
-//! are stored. VUI parameters are parsed only enough to skip over their
-//! syntax — full VUI extraction (timing, video signal, HRD) can be added
-//! later without API breakage.
+//! are stored. The VUI syntax is walked so the `bitstream_restriction`
+//! block at its tail can be reached; within VUI, aspect ratio / video
+//! signal / HRD / timing are parsed only far enough to advance the bit
+//! position, while [`VuiParameters::max_num_reorder_frames`] and
+//! [`VuiParameters::max_dec_frame_buffering`] are extracted.
 
 use oxideav_core::{Error, Result};
 
@@ -29,9 +31,21 @@ pub struct Sps {
     pub bit_depth_luma_minus8: u32,
     pub bit_depth_chroma_minus8: u32,
     pub qpprime_y_zero_transform_bypass_flag: bool,
-    /// Optional 6× scaling-list-present flags + lists; we record the
-    /// flags only and skip the contents (decoder uses default lists).
+    /// Set when the SPS carries custom scaling-list matrices (§7.4.2.1.1).
     pub seq_scaling_matrix_present_flag: bool,
+    /// 4×4 scaling lists captured from the SPS. Each entry is `Some`
+    /// when `seq_scaling_list_present_flag[i] = 1` AND a non-default
+    /// matrix was parsed; `None` means "inherit per Table 7-2 fallback
+    /// rule A" (fall back to the default matrix). The "use default
+    /// matrix" flag is distinguished from "not present" by carrying
+    /// the per-i16-positions default matrix literally (see
+    /// [`crate::scaling_list::DEFAULT_4X4_INTRA`] /
+    /// [`crate::scaling_list::DEFAULT_4X4_INTER`]).
+    pub seq_scaling_list_4x4: [Option<[i16; 16]>; 6],
+    /// 8×8 scaling lists from the SPS. Indexed 0 = intra-Y, 1 = inter-Y
+    /// for 4:2:0 (chroma 8×8 is only present for 4:4:4 — the extra
+    /// slots are captured but unused in this decoder).
+    pub seq_scaling_list_8x8: [Option<[i16; 64]>; 6],
 
     pub log2_max_frame_num_minus4: u32,
     pub pic_order_cnt_type: u32,
@@ -58,6 +72,28 @@ pub struct Sps {
     pub frame_crop_bottom_offset: u32,
 
     pub vui_parameters_present_flag: bool,
+    /// Parsed VUI parameters (§E.1.1) when `vui_parameters_present_flag`
+    /// is set. `None` otherwise. Currently only the fields the decoder
+    /// actually uses (bitstream restriction) are captured; other VUI
+    /// sub-structures are parsed just enough to reach the tail.
+    pub vui: Option<VuiParameters>,
+}
+
+/// Selected VUI parameters (§E.1.1). Most of VUI is discarded during
+/// parsing; this struct carries only the fields the decoder needs.
+#[derive(Clone, Debug, Default)]
+pub struct VuiParameters {
+    /// `bitstream_restriction_flag` — true when the block beyond it
+    /// (including the reorder / DPB sizing fields below) is present.
+    pub bitstream_restriction_flag: bool,
+    /// `max_num_reorder_frames` (§E.2.1). Drives the DPB output reorder
+    /// window so the decoder can emit pictures in POC order without
+    /// over-buffering when the encoder signals a tighter bound than
+    /// `max_num_ref_frames`.
+    pub max_num_reorder_frames: Option<u32>,
+    /// `max_dec_frame_buffering` (§E.2.1). Upper bound on DPB size the
+    /// encoder promises.
+    pub max_dec_frame_buffering: Option<u32>,
 }
 
 impl Sps {
@@ -137,6 +173,8 @@ pub fn parse_sps(header: &NalHeader, rbsp: &[u8]) -> Result<Sps> {
     let mut bit_depth_chroma_minus8 = 0;
     let mut qpprime_y_zero_transform_bypass_flag = false;
     let mut seq_scaling_matrix_present_flag = false;
+    let mut seq_scaling_list_4x4: [Option<[i16; 16]>; 6] = [None; 6];
+    let mut seq_scaling_list_8x8: [Option<[i16; 64]>; 6] = [None; 6];
 
     let high_profile = matches!(
         profile_idc,
@@ -159,8 +197,27 @@ pub fn parse_sps(header: &NalHeader, rbsp: &[u8]) -> Result<Sps> {
             for i in 0..count {
                 let present = br.read_flag()?;
                 if present {
-                    let size = if i < 6 { 16 } else { 64 };
-                    skip_scaling_list(&mut br, size)?;
+                    if i < 6 {
+                        let (mat, use_default) = parse_scaling_list_4x4(&mut br)?;
+                        // §7.4.2.1.1.1: `useDefaultScalingMatrixFlag`
+                        // means "use the spec's default matrix (Table
+                        // 7-3)". Resolving that default here lets the
+                        // downstream fallback-rule logic treat the
+                        // matrix uniformly.
+                        seq_scaling_list_4x4[i] = Some(if use_default {
+                            crate::scaling_list::default_4x4_for_index(i)
+                        } else {
+                            mat
+                        });
+                    } else {
+                        let (mat, use_default) = parse_scaling_list_8x8(&mut br)?;
+                        let slot = i - 6;
+                        seq_scaling_list_8x8[slot] = Some(if use_default {
+                            crate::scaling_list::default_8x8_for_index(slot)
+                        } else {
+                            mat
+                        });
+                    }
                 }
             }
         }
@@ -235,11 +292,13 @@ pub fn parse_sps(header: &NalHeader, rbsp: &[u8]) -> Result<Sps> {
         (0, 0, 0, 0)
     };
     let vui_parameters_present_flag = br.read_flag()?;
+    let mut vui: Option<VuiParameters> = None;
     if vui_parameters_present_flag {
-        // Skip VUI parameters — we only need the fact that they're present.
-        // The bit-pattern can be quite long; rather than re-implementing the
-        // full VUI grammar here, we deliberately stop parsing. Callers that
-        // need the VUI fields can re-parse from `vui_offset_bits()` later.
+        // §E.1.1 — walk the VUI grammar so the `bitstream_restriction`
+        // block at its tail can be reached. `parse_vui` is resilient: if
+        // any sub-block truncates unexpectedly we just stop and surface
+        // whatever was captured.
+        vui = Some(parse_vui(&mut br).unwrap_or_default());
     }
 
     // We deliberately do not enforce rbsp_trailing_bits: we may have stopped
@@ -263,6 +322,8 @@ pub fn parse_sps(header: &NalHeader, rbsp: &[u8]) -> Result<Sps> {
         bit_depth_chroma_minus8,
         qpprime_y_zero_transform_bypass_flag,
         seq_scaling_matrix_present_flag,
+        seq_scaling_list_4x4,
+        seq_scaling_list_8x8,
         log2_max_frame_num_minus4,
         pic_order_cnt_type,
         log2_max_pic_order_cnt_lsb_minus4,
@@ -284,6 +345,7 @@ pub fn parse_sps(header: &NalHeader, rbsp: &[u8]) -> Result<Sps> {
         frame_crop_top_offset,
         frame_crop_bottom_offset,
         vui_parameters_present_flag,
+        vui,
     })
 }
 
@@ -295,23 +357,141 @@ fn constraints(byte: u8) -> [bool; 8] {
     out
 }
 
-fn skip_scaling_list(br: &mut BitReader<'_>, size: u32) -> Result<()> {
-    // §7.3.2.1.1.1 — read `size` `se(v)` deltas; stop early if delta == 0
-    // and last_scale == 0 (would mean "use default", no further reads).
+/// Walk `vui_parameters()` (§E.1.1) just far enough to capture the
+/// `bitstream_restriction` block. The reader's cursor may end up past
+/// the end of the true VUI syntax — this is acceptable because the
+/// parent SPS parser does not require `rbsp_trailing_bits` alignment,
+/// and we deliberately return partial data on truncation.
+fn parse_vui(br: &mut BitReader<'_>) -> Result<VuiParameters> {
+    let mut out = VuiParameters::default();
+    if br.read_flag()? {
+        // aspect_ratio_info_present_flag
+        let aspect_ratio_idc = br.read_u32(8)?;
+        // §E.1.1 Table E-1 — idc == 255 means Extended_SAR.
+        if aspect_ratio_idc == 255 {
+            let _sar_w = br.read_u32(16)?;
+            let _sar_h = br.read_u32(16)?;
+        }
+    }
+    if br.read_flag()? {
+        // overscan_info_present_flag
+        let _overscan_appropriate_flag = br.read_flag()?;
+    }
+    if br.read_flag()? {
+        // video_signal_type_present_flag
+        let _video_format = br.read_u32(3)?;
+        let _video_full_range_flag = br.read_flag()?;
+        if br.read_flag()? {
+            let _colour_primaries = br.read_u32(8)?;
+            let _transfer_characteristics = br.read_u32(8)?;
+            let _matrix_coefficients = br.read_u32(8)?;
+        }
+    }
+    if br.read_flag()? {
+        // chroma_loc_info_present_flag
+        let _top = br.read_ue()?;
+        let _bot = br.read_ue()?;
+    }
+    if br.read_flag()? {
+        // timing_info_present_flag
+        let _num_units_in_tick = br.read_u32(32)?;
+        let _time_scale = br.read_u32(32)?;
+        let _fixed_frame_rate_flag = br.read_flag()?;
+    }
+    let nal_hrd_present = br.read_flag()?;
+    if nal_hrd_present {
+        skip_hrd_parameters(br)?;
+    }
+    let vcl_hrd_present = br.read_flag()?;
+    if vcl_hrd_present {
+        skip_hrd_parameters(br)?;
+    }
+    if nal_hrd_present || vcl_hrd_present {
+        let _low_delay_hrd_flag = br.read_flag()?;
+    }
+    let _pic_struct_present_flag = br.read_flag()?;
+    let bitstream_restriction_flag = br.read_flag()?;
+    out.bitstream_restriction_flag = bitstream_restriction_flag;
+    if bitstream_restriction_flag {
+        let _motion_vectors_over_pic_boundaries_flag = br.read_flag()?;
+        let _max_bytes_per_pic_denom = br.read_ue()?;
+        let _max_bits_per_mb_denom = br.read_ue()?;
+        let _log2_max_mv_length_horizontal = br.read_ue()?;
+        let _log2_max_mv_length_vertical = br.read_ue()?;
+        out.max_num_reorder_frames = Some(br.read_ue()?);
+        out.max_dec_frame_buffering = Some(br.read_ue()?);
+    }
+    Ok(out)
+}
+
+fn skip_hrd_parameters(br: &mut BitReader<'_>) -> Result<()> {
+    // §E.1.2 `hrd_parameters()`.
+    let cpb_cnt_minus1 = br.read_ue()?;
+    let _bit_rate_scale = br.read_u32(4)?;
+    let _cpb_size_scale = br.read_u32(4)?;
+    for _ in 0..=cpb_cnt_minus1 {
+        let _bit_rate_value_minus1 = br.read_ue()?;
+        let _cpb_size_value_minus1 = br.read_ue()?;
+        let _cbr_flag = br.read_flag()?;
+    }
+    let _initial_cpb_removal_delay_length_minus1 = br.read_u32(5)?;
+    let _cpb_removal_delay_length_minus1 = br.read_u32(5)?;
+    let _dpb_output_delay_length_minus1 = br.read_u32(5)?;
+    let _time_offset_length = br.read_u32(5)?;
+    Ok(())
+}
+
+/// §7.3.2.1.1.1 `scaling_list(scalingList, sizeOfScalingList,
+/// useDefaultScalingMatrixFlag)` for the 4×4 case. Returns `(matrix,
+/// use_default)`. The spec stores the list in zig-zag scan order; the
+/// output matrix is in raster (row-major) order so downstream dequant
+/// can index `row*4 + col` directly.
+fn parse_scaling_list_4x4(br: &mut BitReader<'_>) -> Result<([i16; 16], bool)> {
+    let mut list = [8i16; 16];
     let mut last_scale: i32 = 8;
     let mut next_scale: i32 = 8;
-    for j in 0..size {
+    let mut use_default = false;
+    for j in 0..16u32 {
         if next_scale != 0 {
             let delta = br.read_se()?;
             next_scale = (last_scale + delta + 256) & 0xFF;
-            // useDefaultScalingMatrixFlag = (j == 0 && next_scale == 0)
-            let _ = j;
+            if j == 0 && next_scale == 0 {
+                use_default = true;
+            }
         }
+        let val = if next_scale == 0 { last_scale } else { next_scale };
+        // §7.3.2.1.1.1 stores deltas in zig-zag scan order.
+        let raster = crate::scaling_list::ZIGZAG_4X4[j as usize];
+        list[raster] = val as i16;
         if next_scale != 0 {
             last_scale = next_scale;
         }
     }
-    Ok(())
+    Ok((list, use_default))
+}
+
+/// §7.3.2.1.1.1 for the 8×8 case.
+fn parse_scaling_list_8x8(br: &mut BitReader<'_>) -> Result<([i16; 64], bool)> {
+    let mut list = [8i16; 64];
+    let mut last_scale: i32 = 8;
+    let mut next_scale: i32 = 8;
+    let mut use_default = false;
+    for j in 0..64u32 {
+        if next_scale != 0 {
+            let delta = br.read_se()?;
+            next_scale = (last_scale + delta + 256) & 0xFF;
+            if j == 0 && next_scale == 0 {
+                use_default = true;
+            }
+        }
+        let val = if next_scale == 0 { last_scale } else { next_scale };
+        let raster = crate::transform::ZIGZAG_8X8[j as usize];
+        list[raster] = val as i16;
+        if next_scale != 0 {
+            last_scale = next_scale;
+        }
+    }
+    Ok((list, use_default))
 }
 
 #[cfg(test)]
@@ -362,6 +542,116 @@ mod tests {
         assert!(sps.frame_mbs_only_flag);
         assert_eq!(sps.coded_width(), 128);
         assert_eq!(sps.coded_height(), 96);
+    }
+
+    /// Build a VUI body with only `bitstream_restriction` set and walk it
+    /// through [`parse_vui`]. Confirms that `max_num_reorder_frames` /
+    /// `max_dec_frame_buffering` are captured and the skip-all path
+    /// through the rest of VUI doesn't mis-align the bit cursor.
+    /// Round-trip a High Profile SPS with a custom 4×4 scaling list
+    /// signalled for slot 0 (Intra-Y) — use the `useDefaultScalingMatrixFlag`
+    /// short-circuit (delta_0 = -8 → next_scale = 0) so only one
+    /// se(v) needs writing for that slot. The resolver should then
+    /// install `Default_4x4_Intra` at slot 0.
+    #[test]
+    fn parse_sps_with_custom_4x4_scaling_list() {
+        use crate::bitwriter::BitWriter;
+        let mut bw = BitWriter::new();
+        // seq_parameter_set_id = 0
+        bw.write_ue(0);
+        // chroma_format_idc = 1
+        bw.write_ue(1);
+        // bit_depth_luma_minus8
+        bw.write_ue(0);
+        // bit_depth_chroma_minus8
+        bw.write_ue(0);
+        // qpprime_y_zero_transform_bypass_flag
+        bw.write_flag(false);
+        // seq_scaling_matrix_present_flag = 1
+        bw.write_flag(true);
+        // Slot 0 (Intra-Y 4×4) present, delta_0 = -8 → next_scale=0,
+        // useDefaultScalingMatrixFlag = true. Parser halts the delta
+        // loop there per §7.3.2.1.1.1 (no more deltas read when
+        // next_scale == 0).
+        bw.write_flag(true);
+        bw.write_se(-8);
+        // Slots 1..=7 flag = 0 (not signalled).
+        for _ in 1..8 {
+            bw.write_flag(false);
+        }
+        // Rest of the SPS — minimal fields.
+        bw.write_ue(0); // log2_max_frame_num_minus4
+        bw.write_ue(2); // pic_order_cnt_type = 2
+        bw.write_ue(1); // max_num_ref_frames
+        bw.write_flag(false); // gaps_in_frame_num_value_allowed_flag
+        bw.write_ue(7); // pic_width_in_mbs_minus1
+        bw.write_ue(5); // pic_height_in_map_units_minus1
+        bw.write_flag(true); // frame_mbs_only_flag
+        bw.write_flag(true); // direct_8x8_inference
+        bw.write_flag(false); // frame_cropping_flag
+        bw.write_flag(false); // vui_parameters_present_flag
+        bw.write_rbsp_trailing_bits();
+        let body = bw.finish();
+
+        // Build a full SPS RBSP with profile=100 (High).
+        let mut rbsp = vec![100u8, 0, 30];
+        rbsp.extend_from_slice(&body);
+        let h = NalHeader::parse(0x67).unwrap();
+        let sps = parse_sps(&h, &rbsp).expect("parse");
+        assert!(sps.seq_scaling_matrix_present_flag);
+        // useDefaultScalingMatrixFlag resolved to Default_4x4_Intra.
+        assert_eq!(
+            sps.seq_scaling_list_4x4[0],
+            Some(crate::scaling_list::DEFAULT_4X4_INTRA)
+        );
+        for i in 1..6 {
+            assert_eq!(sps.seq_scaling_list_4x4[i], None);
+        }
+    }
+
+    #[test]
+    fn parse_vui_bitstream_restriction_only() {
+        use crate::bitwriter::BitWriter;
+        let mut bw = BitWriter::new();
+        // aspect_ratio_info_present_flag = 0
+        bw.write_flag(false);
+        // overscan_info_present_flag = 0
+        bw.write_flag(false);
+        // video_signal_type_present_flag = 0
+        bw.write_flag(false);
+        // chroma_loc_info_present_flag = 0
+        bw.write_flag(false);
+        // timing_info_present_flag = 0
+        bw.write_flag(false);
+        // nal_hrd_parameters_present_flag = 0
+        bw.write_flag(false);
+        // vcl_hrd_parameters_present_flag = 0
+        bw.write_flag(false);
+        // pic_struct_present_flag = 0
+        bw.write_flag(false);
+        // bitstream_restriction_flag = 1
+        bw.write_flag(true);
+        // motion_vectors_over_pic_boundaries_flag
+        bw.write_flag(true);
+        // max_bytes_per_pic_denom
+        bw.write_ue(2);
+        // max_bits_per_mb_denom
+        bw.write_ue(1);
+        // log2_max_mv_length_horizontal
+        bw.write_ue(10);
+        // log2_max_mv_length_vertical
+        bw.write_ue(10);
+        // max_num_reorder_frames
+        bw.write_ue(2);
+        // max_dec_frame_buffering
+        bw.write_ue(4);
+        let buf = bw.finish();
+
+        let mut br = BitReader::new(&buf);
+        let v = parse_vui(&mut br).expect("parse_vui");
+        assert!(v.bitstream_restriction_flag);
+        assert_eq!(v.max_num_reorder_frames, Some(2));
+        assert_eq!(v.max_dec_frame_buffering, Some(4));
     }
 
     #[test]

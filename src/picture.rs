@@ -26,6 +26,11 @@ pub struct Picture {
     /// derivation (§9.3.3.1.1.5). Separate from per-MB state because the
     /// spec keys on "the previous MB in decoding order", not any neighbour.
     pub last_mb_qp_delta_was_nonzero: bool,
+    /// Active scaling-list matrices for the current slice, resolved per
+    /// §7.4.2.2 Table 7-2. Set by the decoder at slice-entry time;
+    /// reset to flat on picture allocation. Referenced by the
+    /// dequant paths in `mb.rs` / `p_mb.rs` / `b_mb.rs` / `cabac/*.rs`.
+    pub scaling_lists: crate::scaling_list::ScalingLists,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +152,7 @@ impl Picture {
             cr: vec![128u8; (cw * ch) as usize],
             mb_info: vec![MbInfo::default(); (mb_width * mb_height) as usize],
             last_mb_qp_delta_was_nonzero: false,
+            scaling_lists: crate::scaling_list::ScalingLists::flat(),
         }
     }
 
