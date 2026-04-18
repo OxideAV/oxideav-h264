@@ -42,7 +42,25 @@
 //!   `iframe_10bit_64x64` (I-slice), `pframe_10bit_64x64` (three
 //!   P-slices), `10bit_cabac_i_64x64` (CABAC I, 100% match), and
 //!   `10bit_b_64x64` (6-frame I / P / B mix at 100% bit-exact). CABAC P /
-//!   B at 10-bit, Intra_8×8 at 10-bit, and I_PCM at 10-bit all return
+//!   B at 10-bit returns `Error::Unsupported`. **Intra_8×8 at 10-bit**
+//!   (`transform_size_8x8_flag = 1` on an I_NxN MB) decodes through the
+//!   same u16 intra-prediction + i64-widened 8×8 dequant /
+//!   inverse-transform chain and lands bit-exact on a 64×64 smptebars
+//!   IDR fixture (`iframe_10bit_8x8_64x64`). **I_PCM at 10-bit** reads
+//!   each raw sample as a `bit_depth`-wide unsigned integer straight
+//!   into the u16 planes (round-tripped end-to-end via a hand-crafted
+//!   single-MB fixture). **10-bit 4:2:2 (High 4:2:2, Yuv422P10Le)** and
+//!   **10-bit 4:4:4 (High 4:4:4, Yuv444P10Le)** are wired for CAVLC
+//!   I-slices: the 4:2:2 path reuses the 10-bit luma decode and runs
+//!   chroma through [`mb_hi_422`] (2×4 chroma DC Hadamard + 8 AC blocks
+//!   per plane through the i64-widened
+//!   `inv_hadamard_2x4_chroma_dc_scaled_ext`); the 4:4:4 path routes
+//!   the three planes through [`mb_hi_444`] as luma-style block
+//!   streams with per-plane QP (Table 7-2 via `chroma_qp_hi` +
+//!   `QpBdOffsetC`) and per-plane scaling lists. Both land 100 %
+//!   bit-exact against ffmpeg on the corresponding 64×64 fixtures
+//!   (`iframe_10bit_422_64x64` / `iframe_10bit_444_64x64`). CAVLC P/B
+//!   and CABAC under 4:2:2 / 4:4:4 at 10-bit still return
 //!   `Error::Unsupported`.
 //! * **12-bit + 14-bit (High 4:2:2 / High 4:4:4 Predictive CAVLC I)**
 //!   (§7.4.2.1.1 with `bit_depth_luma_minus8 ∈ {4, 6}`, 4:2:0 only for
@@ -370,6 +388,8 @@ pub mod intra_pred_hi;
 pub mod mb;
 pub mod mb_444;
 pub mod mb_hi;
+pub mod mb_hi_422;
+pub mod mb_hi_444;
 pub mod mb_type;
 pub mod motion;
 pub mod nal;
