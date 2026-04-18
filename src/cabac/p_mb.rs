@@ -604,17 +604,18 @@ fn decode_inter_residual_chroma(
     let mut dc_cb = [0i32; 4];
     let mut dc_cr = [0i32; 4];
     if cbp_chroma >= 1 {
-        let neigh = CbfNeighbours::none();
+        // §9.3.3.1.1.9 — chroma DC CBF neighbour per plane from
+        // MbInfo::chroma_dc_cbf (same as the I-slice path).
+        let neigh_cb_dc = p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
         let cb_coeffs =
-            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, false)?;
-        for i in 0..4 {
-            dc_cb[i] = cb_coeffs[i];
-        }
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, false)?;
+        for i in 0..4 { dc_cb[i] = cb_coeffs[i]; }
+        pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb_coeffs.iter().any(|&v| v != 0);
+        let neigh_cr_dc = p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
         let cr_coeffs =
-            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, false)?;
-        for i in 0..4 {
-            dc_cr[i] = cr_coeffs[i];
-        }
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, false)?;
+        for i in 0..4 { dc_cr[i] = cr_coeffs[i]; }
+        pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[1] = cr_coeffs.iter().any(|&v| v != 0);
         // CABAC P-slice chroma is inter.
         let w_cb = pic.scaling_lists.matrix_4x4(4)[0];
         let w_cr = pic.scaling_lists.matrix_4x4(5)[0];
@@ -632,7 +633,7 @@ fn decode_inter_residual_chroma(
             let mut res = [0i32; 16];
             let mut total_coeff = 0u32;
             if cbp_chroma == 2 {
-                let neigh = CbfNeighbours::none();
+                let neigh = p_chroma_ac_cbf_neighbours(pic, mb_x, mb_y, plane_kind, br_row, br_col, &nc_arr);
                 let ac =
                     decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, false)?;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
@@ -851,6 +852,57 @@ fn cbp_chroma_ctx_idx_incs(pic: &Picture, mb_x: u32, mb_y: u32) -> [u8; 2] {
     };
     let inc_any = (a_any as u8) + 2 * (b_any as u8);
     [inc_any, inc_any]
+}
+
+fn p_chroma_dc_cbf_neighbours(pic: &Picture, mb_x: u32, mb_y: u32, c: usize) -> CbfNeighbours {
+    let probe = |mx: u32, my: u32| -> Option<bool> {
+        let info = pic.mb_info_at(mx, my);
+        if !info.coded {
+            return None;
+        }
+        Some(info.chroma_dc_cbf[c])
+    };
+    let left = if mb_x > 0 { probe(mb_x - 1, mb_y) } else { None };
+    let above = if mb_y > 0 { probe(mb_x, mb_y - 1) } else { None };
+    CbfNeighbours { left, above }
+}
+
+fn p_chroma_ac_cbf_neighbours(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    plane_kind: bool,
+    br_row: usize,
+    br_col: usize,
+    already_decoded: &[u8; 4],
+) -> CbfNeighbours {
+    let left = if br_col > 0 {
+        Some(already_decoded[br_row * 2 + br_col - 1] != 0)
+    } else if mb_x > 0 {
+        let m = pic.mb_info_at(mb_x - 1, mb_y);
+        if m.coded {
+            let nc = if plane_kind { &m.cb_nc } else { &m.cr_nc };
+            Some(nc[br_row * 2 + 1] != 0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let above = if br_row > 0 {
+        Some(already_decoded[(br_row - 1) * 2 + br_col] != 0)
+    } else if mb_y > 0 {
+        let m = pic.mb_info_at(mb_x, mb_y - 1);
+        if m.coded {
+            let nc = if plane_kind { &m.cb_nc } else { &m.cr_nc };
+            Some(nc[2 + br_col] != 0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    CbfNeighbours { left, above }
 }
 
 fn cbf_neighbours_luma(
