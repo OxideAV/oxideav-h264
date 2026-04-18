@@ -47,7 +47,8 @@ use crate::pps::Pps;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::transform::{
-    chroma_qp, dequantize_4x4, idct_4x4, inv_hadamard_2x2_chroma_dc, inv_hadamard_4x4_dc,
+    chroma_qp, dequantize_4x4_scaled, idct_4x4, inv_hadamard_2x2_chroma_dc_scaled,
+    inv_hadamard_4x4_dc_scaled,
 };
 
 // ---------------------------------------------------------------------------
@@ -676,7 +677,9 @@ fn decode_luma_intra_nxn(
                 decode_residual_block_in_place(d, ctxs, BlockCat::Luma4x4, &neighbours, 16, true)?;
             residual = coeffs;
             total_coeff = coeffs.iter().filter(|&&v| v != 0).count() as u32;
-            dequantize_4x4(&mut residual, qp_y);
+            // §7.4.2.2 — Intra-Y 4×4 slot 0.
+            let scale = *pic.scaling_lists.matrix_4x4(0);
+            dequantize_4x4_scaled(&mut residual, qp_y, &scale);
             idct_4x4(&mut residual);
         }
         let lo = lo_mb + br_row * 4 * lstride + br_col * 4;
@@ -724,7 +727,9 @@ fn decode_luma_intra_16x16(
     let dc_coeffs =
         decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Dc, &dc_neigh, 16, true)?;
     let mut dc = dc_coeffs;
-    inv_hadamard_4x4_dc(&mut dc, qp_y);
+    // §8.5.10 — Luma_16×16 DC dequant with Intra-Y (slot 0) weight.
+    let w_dc = pic.scaling_lists.matrix_4x4(0)[0];
+    inv_hadamard_4x4_dc_scaled(&mut dc, qp_y, w_dc);
 
     let lstride = pic.luma_stride();
     let lo_mb = pic.luma_off(mb_x, mb_y);
@@ -744,7 +749,9 @@ fn decode_luma_intra_16x16(
             )?;
             residual = ac;
             total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
-            dequantize_4x4(&mut residual, qp_y);
+            // §7.4.2.2 — Intra-Y AC uses the intra-Y 4×4 list (slot 0).
+            let scale = *pic.scaling_lists.matrix_4x4(0);
+            dequantize_4x4_scaled(&mut residual, qp_y, &scale);
         }
         // Splice DC into slot 0.
         residual[0] = dc[br_row * 4 + br_col];
@@ -799,8 +806,11 @@ fn decode_chroma(
         for i in 0..4 {
             dc_cr[i] = cr[i];
         }
-        inv_hadamard_2x2_chroma_dc(&mut dc_cb, qpc);
-        inv_hadamard_2x2_chroma_dc(&mut dc_cr, qpc);
+        // §8.5.11.1 — CABAC I-slice chroma is intra.
+        let w_cb = pic.scaling_lists.matrix_4x4(1)[0];
+        let w_cr = pic.scaling_lists.matrix_4x4(2)[0];
+        inv_hadamard_2x2_chroma_dc_scaled(&mut dc_cb, qpc, w_cb);
+        inv_hadamard_2x2_chroma_dc_scaled(&mut dc_cr, qpc, w_cr);
     }
 
     let cstride = pic.chroma_stride();
@@ -820,7 +830,11 @@ fn decode_chroma(
                     decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, true)?;
                 res = ac;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
-                dequantize_4x4(&mut res, qpc);
+                // §7.4.2.2 — Intra chroma slots 1 (Cb) / 2 (Cr). CABAC
+                // I-slice chroma is always intra.
+                let cat = if plane_kind { 1 } else { 2 };
+                let scale = *pic.scaling_lists.matrix_4x4(cat);
+                dequantize_4x4_scaled(&mut res, qpc, &scale);
             }
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);

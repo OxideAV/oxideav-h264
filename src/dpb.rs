@@ -715,6 +715,81 @@ pub fn derive_poc_type0(
     (top_field_order_cnt, new_state)
 }
 
+/// Parameters for [`derive_poc_type1`] — bundled to avoid a
+/// lint-tripping arg-count and to mirror the spec's "SPS-supplied
+/// constants vs. per-picture header fields" split.
+#[derive(Clone, Copy, Debug)]
+pub struct PocType1Params<'a> {
+    pub delta_pic_order_always_zero_flag: bool,
+    pub offset_for_non_ref_pic: i32,
+    pub offset_for_top_to_bottom_field: i32,
+    pub num_ref_frames_in_pic_order_cnt_cycle: u32,
+    pub offset_for_ref_frame: &'a [i32],
+    pub max_frame_num: u32,
+    pub nal_ref_idc: u8,
+    pub is_idr: bool,
+    pub frame_num: u32,
+    pub prev_frame_num: u32,
+    pub prev_frame_num_offset: i32,
+    pub delta_pic_order_cnt: [i32; 2],
+}
+
+/// Derive `PicOrderCnt` for `pic_order_cnt_type == 1` — §8.2.1.2.
+///
+/// Returns `(PicOrderCnt, new_frame_num_offset)`. The spec's
+/// `TopFieldOrderCnt` and `BottomFieldOrderCnt` are computed and the
+/// frame-level `PicOrderCnt` is the minimum; this decoder is
+/// frame-mode-only so only that minimum is surfaced.
+pub fn derive_poc_type1(p: PocType1Params<'_>) -> (i32, i32) {
+    // §8.2.1.2 step 1: FrameNumOffset.
+    let frame_num_offset = if p.is_idr {
+        0
+    } else if p.prev_frame_num > p.frame_num {
+        p.prev_frame_num_offset + p.max_frame_num as i32
+    } else {
+        p.prev_frame_num_offset
+    };
+
+    // §8.2.1.2 step 2: absFrameNum, picOrderCntCycleCnt,
+    // frameNumInPicOrderCntCycle, expectedPicOrderCnt.
+    let mut abs_frame_num = if p.num_ref_frames_in_pic_order_cnt_cycle != 0 {
+        frame_num_offset + p.frame_num as i32
+    } else {
+        0
+    };
+    if p.nal_ref_idc == 0 && abs_frame_num > 0 {
+        abs_frame_num -= 1;
+    }
+
+    let mut expected_poc: i32 = 0;
+    if abs_frame_num > 0 {
+        let cycle_len = p.num_ref_frames_in_pic_order_cnt_cycle as i32;
+        let pic_order_cnt_cycle_cnt = (abs_frame_num - 1) / cycle_len;
+        let frame_num_in_pic_order_cnt_cycle = (abs_frame_num - 1) % cycle_len;
+        let expected_delta_per_cycle: i32 = p.offset_for_ref_frame.iter().sum();
+        expected_poc = pic_order_cnt_cycle_cnt * expected_delta_per_cycle;
+        for i in 0..=frame_num_in_pic_order_cnt_cycle as usize {
+            expected_poc += p.offset_for_ref_frame[i];
+        }
+    }
+    if p.nal_ref_idc == 0 {
+        expected_poc += p.offset_for_non_ref_pic;
+    }
+
+    // §8.2.1.2 step 3: frame-mode Top/Bottom FieldOrderCnt. The
+    // `delta_pic_order_always_zero_flag` forces the deltas to zero
+    // (the slice header skips them on that flag).
+    let (delta0, delta1) = if p.delta_pic_order_always_zero_flag {
+        (0, 0)
+    } else {
+        (p.delta_pic_order_cnt[0], p.delta_pic_order_cnt[1])
+    };
+    let top_field = expected_poc + delta0;
+    let bottom_field = top_field + p.offset_for_top_to_bottom_field + delta1;
+    let poc = top_field.min(bottom_field);
+    (poc, frame_num_offset)
+}
+
 /// Derive `PicOrderCnt` for `pic_order_cnt_type == 2` — §8.2.1.3.
 pub fn derive_poc_type2(
     frame_num: u32,
@@ -771,6 +846,115 @@ mod tests {
         state = s;
         let (p2, _s2) = derive_poc_type0(2, log2, state, false);
         assert_eq!(p2, max_lsb + 2);
+    }
+
+    /// §8.2.1.2 spec example: num_ref_frames_in_pic_order_cnt_cycle = 1
+    /// with offset_for_ref_frame = [2] gives a simple cadence where every
+    /// reference picture's POC is 2 × frame_num (assuming no non-ref
+    /// picture offset). Test the IDR anchor, a subsequent ref, and a
+    /// non-ref picture.
+    #[test]
+    fn poc_type1_simple_cycle() {
+        let offs = [2i32];
+        let base = PocType1Params {
+            delta_pic_order_always_zero_flag: true,
+            offset_for_non_ref_pic: -1,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 1,
+            offset_for_ref_frame: &offs,
+            max_frame_num: 16,
+            nal_ref_idc: 3,
+            is_idr: true,
+            frame_num: 0,
+            prev_frame_num: 0,
+            prev_frame_num_offset: 0,
+            delta_pic_order_cnt: [0, 0],
+        };
+        // IDR: absFrameNum = 0 → expectedPOC = 0 (nal_ref_idc=3 so no
+        // non-ref offset). POC = 0.
+        let (p0, off0) = derive_poc_type1(base);
+        assert_eq!(p0, 0);
+        assert_eq!(off0, 0);
+
+        // Second picture, ref, frame_num=1 → absFrameNum = 1,
+        // cycleCnt = 0, frameNumInCycle = 0, expectedPOC = 0+2 = 2.
+        let (p1, off1) = derive_poc_type1(PocType1Params {
+            is_idr: false,
+            frame_num: 1,
+            prev_frame_num: 0,
+            prev_frame_num_offset: off0,
+            ..base
+        });
+        assert_eq!(p1, 2);
+        assert_eq!(off1, 0);
+
+        // Third picture, non-ref, frame_num=2 → absFrameNum = 2, then
+        // minus 1 for non-ref = 1 → expectedPOC = 2, plus
+        // offset_for_non_ref_pic = -1 → POC = 1.
+        let (p2, off2) = derive_poc_type1(PocType1Params {
+            is_idr: false,
+            nal_ref_idc: 0,
+            frame_num: 2,
+            prev_frame_num: 1,
+            prev_frame_num_offset: off1,
+            ..base
+        });
+        assert_eq!(p2, 1);
+        assert_eq!(off2, 0);
+    }
+
+    /// Multi-entry cycle: offset_for_ref_frame = [1, 2, -1]. Walks
+    /// enough ref frames to wrap through the cycle once so the
+    /// `picOrderCntCycleCnt * expectedDelta` term activates.
+    #[test]
+    fn poc_type1_multi_cycle_wraps() {
+        let offs = [1i32, 2, -1];
+        let base = PocType1Params {
+            delta_pic_order_always_zero_flag: true,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 3,
+            offset_for_ref_frame: &offs,
+            max_frame_num: 16,
+            nal_ref_idc: 3,
+            is_idr: true,
+            frame_num: 0,
+            prev_frame_num: 0,
+            prev_frame_num_offset: 0,
+            delta_pic_order_cnt: [0, 0],
+        };
+        // IDR → POC 0.
+        let (p0, _off0) = derive_poc_type1(base);
+        assert_eq!(p0, 0);
+
+        // frame_num=1: absFrameNum=1, cycleCnt=0, in-cycle=0 → POC = offs[0] = 1.
+        let (p1, _) = derive_poc_type1(PocType1Params {
+            is_idr: false,
+            frame_num: 1,
+            prev_frame_num: 0,
+            ..base
+        });
+        assert_eq!(p1, 1);
+
+        // frame_num=3: absFrameNum=3, cycleCnt=(3-1)/3=0, in-cycle=(3-1)%3=2
+        // → POC = 0 + offs[0]+offs[1]+offs[2] = 1+2-1 = 2.
+        let (p3, _) = derive_poc_type1(PocType1Params {
+            is_idr: false,
+            frame_num: 3,
+            prev_frame_num: 2,
+            ..base
+        });
+        assert_eq!(p3, 2);
+
+        // frame_num=4: absFrameNum=4, cycleCnt=(4-1)/3=1, in-cycle=(4-1)%3=0
+        // expectedDelta = 1+2-1 = 2 → POC = 1*2 + offs[0] = 3.
+        let (p4, _) = derive_poc_type1(PocType1Params {
+            is_idr: false,
+            frame_num: 4,
+            prev_frame_num: 3,
+            ..base
+        });
+        assert_eq!(p4, 3);
     }
 
     #[test]

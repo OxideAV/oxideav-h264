@@ -35,6 +35,15 @@ pub struct Pps {
     // present in the bitstream after the basic fields.
     pub transform_8x8_mode_flag: bool,
     pub pic_scaling_matrix_present_flag: bool,
+    /// 4×4 scaling lists from the PPS (§7.4.2.2). `Some` slot means the
+    /// PPS signals a (custom or default) matrix for that index; `None`
+    /// means "fall back per Table 7-2" — either to the SPS matrix at
+    /// the same index or, when that is also absent, to the built-in
+    /// default for the block category.
+    pub pic_scaling_list_4x4: [Option<[i16; 16]>; 6],
+    /// 8×8 scaling lists from the PPS. Same fallback semantics as
+    /// [`Self::pic_scaling_list_4x4`].
+    pub pic_scaling_list_8x8: [Option<[i16; 64]>; 6],
     pub second_chroma_qp_index_offset: i32,
 }
 
@@ -99,18 +108,33 @@ pub fn parse_pps(header: &NalHeader, rbsp: &[u8], _sps: Option<&Sps>) -> Result<
     // Optional high-profile extensions if any RBSP data is left.
     let mut transform_8x8_mode_flag = false;
     let mut pic_scaling_matrix_present_flag = false;
+    let mut pic_scaling_list_4x4: [Option<[i16; 16]>; 6] = [None; 6];
+    let mut pic_scaling_list_8x8: [Option<[i16; 64]>; 6] = [None; 6];
     let mut second_chroma_qp_index_offset = chroma_qp_index_offset;
     if br.more_rbsp_data().unwrap_or(false) {
         transform_8x8_mode_flag = br.read_flag()?;
         pic_scaling_matrix_present_flag = br.read_flag()?;
         if pic_scaling_matrix_present_flag {
-            // We don't actually use the scaling lists; skip them.
             let count = 6 + if transform_8x8_mode_flag { 2 } else { 0 };
             for i in 0..count {
                 let present = br.read_flag()?;
                 if present {
-                    let size = if i < 6 { 16 } else { 64 };
-                    skip_scaling_list(&mut br, size)?;
+                    if i < 6 {
+                        let (mat, use_default) = parse_scaling_list_4x4(&mut br)?;
+                        pic_scaling_list_4x4[i] = Some(if use_default {
+                            crate::scaling_list::default_4x4_for_index(i)
+                        } else {
+                            mat
+                        });
+                    } else {
+                        let (mat, use_default) = parse_scaling_list_8x8(&mut br)?;
+                        let slot = i - 6;
+                        pic_scaling_list_8x8[slot] = Some(if use_default {
+                            crate::scaling_list::default_8x8_for_index(slot)
+                        } else {
+                            mat
+                        });
+                    }
                 }
             }
         }
@@ -136,6 +160,8 @@ pub fn parse_pps(header: &NalHeader, rbsp: &[u8], _sps: Option<&Sps>) -> Result<
         redundant_pic_cnt_present_flag,
         transform_8x8_mode_flag,
         pic_scaling_matrix_present_flag,
+        pic_scaling_list_4x4,
+        pic_scaling_list_8x8,
         second_chroma_qp_index_offset,
     })
 }
@@ -154,19 +180,54 @@ fn bits_for_max(mut n: u32) -> u32 {
     bits
 }
 
-fn skip_scaling_list(br: &mut BitReader<'_>, size: u32) -> Result<()> {
+/// §7.3.2.1.1.1 — 4×4 scaling list, PPS flavour. Identical to the SPS
+/// helper in [`crate::sps`]; duplicated locally so [`parse_pps`] does
+/// not take a cross-module dependency on a private `pub(crate)` item.
+fn parse_scaling_list_4x4(br: &mut BitReader<'_>) -> Result<([i16; 16], bool)> {
+    let mut list = [8i16; 16];
     let mut last_scale: i32 = 8;
     let mut next_scale: i32 = 8;
-    for _ in 0..size {
+    let mut use_default = false;
+    for j in 0..16u32 {
         if next_scale != 0 {
             let delta = br.read_se()?;
             next_scale = (last_scale + delta + 256) & 0xFF;
+            if j == 0 && next_scale == 0 {
+                use_default = true;
+            }
         }
+        let val = if next_scale == 0 { last_scale } else { next_scale };
+        let raster = crate::scaling_list::ZIGZAG_4X4[j as usize];
+        list[raster] = val as i16;
         if next_scale != 0 {
             last_scale = next_scale;
         }
     }
-    Ok(())
+    Ok((list, use_default))
+}
+
+/// §7.3.2.1.1.1 — 8×8 scaling list, PPS flavour.
+fn parse_scaling_list_8x8(br: &mut BitReader<'_>) -> Result<([i16; 64], bool)> {
+    let mut list = [8i16; 64];
+    let mut last_scale: i32 = 8;
+    let mut next_scale: i32 = 8;
+    let mut use_default = false;
+    for j in 0..64u32 {
+        if next_scale != 0 {
+            let delta = br.read_se()?;
+            next_scale = (last_scale + delta + 256) & 0xFF;
+            if j == 0 && next_scale == 0 {
+                use_default = true;
+            }
+        }
+        let val = if next_scale == 0 { last_scale } else { next_scale };
+        let raster = crate::transform::ZIGZAG_8X8[j as usize];
+        list[raster] = val as i16;
+        if next_scale != 0 {
+            last_scale = next_scale;
+        }
+    }
+    Ok((list, use_default))
 }
 
 #[cfg(test)]

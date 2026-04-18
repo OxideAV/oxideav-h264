@@ -55,9 +55,12 @@
 //!   references first (descending `FrameNumWrap`), then long-term
 //!   references (ascending `LongTermFrameIdx`) — and `ref_idx_l0 > 0`
 //!   indexes into it. Picture order count is derived for
-//!   `pic_order_cnt_type == 0` and `pic_order_cnt_type == 2`. Sliding-
-//!   window marking (§8.2.5.3) and MMCO operations 1 / 2 / 3 / 4 / 5 / 6
-//!   (§8.2.5.4) are implemented.
+//!   `pic_order_cnt_type == 0`, `== 1` (§8.2.1.2 — with
+//!   `offset_for_non_ref_pic`, `offset_for_top_to_bottom_field`, and the
+//!   per-reference `offset_for_ref_frame[]` cycle applied to the slice
+//!   header's `delta_pic_order_cnt[0..1]`), and `== 2` (§8.2.1.3).
+//!   Sliding-window marking (§8.2.5.3) and MMCO operations 1 / 2 / 3 / 4
+//!   / 5 / 6 (§8.2.5.4) are implemented.
 //! * **Explicit weighted P-slice prediction** (§7.3.3.2 / §8.4.2.3.2) —
 //!   the slice's `pred_weight_table` is parsed when the PPS has
 //!   `weighted_pred_flag = 1`, and the per-reference (weight, offset,
@@ -95,12 +98,25 @@
 //!   lists via [`dpb::apply_rplm`]. Both P- and B-slice list 0 / list 1
 //!   reordering are supported.
 //! * **POC output reordering** — the DPB's pending-output queue is
-//!   parameterised by a reorder window that the decoder bumps up to
-//!   `max_num_ref_frames` on the first B-slice. Pictures emerge in POC
-//!   order via `receive_frame`, letting a `I B B P B B …` decode-order
-//!   stream deliver frames in presentation order. The VUI's
-//!   `bitstream_restriction.max_num_reorder_frames` is not yet parsed;
-//!   the conservative `max_num_ref_frames` upper bound is used.
+//!   parameterised by a reorder window that the decoder bumps up on
+//!   the first B-slice. Pictures emerge in POC order via
+//!   `receive_frame`, letting a `I B B P B B …` decode-order stream
+//!   deliver frames in presentation order. The SPS VUI's
+//!   `bitstream_restriction.max_num_reorder_frames` (§E.2.1) is now
+//!   parsed and used as the window size when present; the old
+//!   `max_num_ref_frames` upper bound remains as a conservative
+//!   fallback for streams that don't carry the VUI field.
+//! * **Custom scaling lists** (§7.4.2.1.1.1 / §7.4.2.2) — the SPS and
+//!   PPS scaling-list matrices are parsed out of their zig-zag
+//!   coded form into raster order, resolved per Table 7-2 (PPS
+//!   overrides SPS; rule A falls back to `Default_4x4_Intra` /
+//!   `_Inter` or `Default_8x8_Intra` / `_Inter`; rule B inherits
+//!   from the previous slot), and applied by the 4×4 / 8×8 dequant
+//!   functions. Luma Intra_16×16 DC and chroma 2×2 DC also consume
+//!   the per-category `(0,0)` weight so the full §8.5.10 / §8.5.11.1
+//!   dequant chain honours non-flat matrices. Round-trips a
+//!   64×64 IDR encoded with x264 `cqmfile=` custom matrices to within
+//!   ±2 of the ffmpeg-decoded reference.
 //!
 //! # What is encoded today
 //!
@@ -116,15 +132,11 @@
 //!   (§9.3.3.1.1.10) and on **any** P-slice macroblocks — CAVLC I-slice
 //!   8×8 is wired and bit-exact (see above); the CABAC 8×8 flag is
 //!   parse-and-reject for now.
-//! * Custom scaling-list matrices — the SPS/PPS fields are parsed and
-//!   skipped, and only the flat-16 default list is used for 4×4 dequant.
 //! * CABAC B-slices (decode); any CABAC encoding; any P/B slice encoding.
 //!   CABAC P-slices are wired but weighted-P on the CABAC path and the
 //!   8×8 transform path are out of scope on this first pass.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
-//! * `pic_order_cnt_type == 1` (rarely used in practice) is the one
-//!   POC derivation mode not implemented.
 //! * Interlaced coding / MBAFF / PAFF.
 //! * 4:2:2 / 4:4:4 chroma, bit depths above 8.
 //! * Rate control, adaptive QP, mode decision (Intra4×4 / Plane / Vertical /
@@ -158,6 +170,7 @@ pub mod nal;
 pub mod p_mb;
 pub mod picture;
 pub mod pps;
+pub mod scaling_list;
 pub mod slice;
 pub mod sps;
 pub mod tables;
