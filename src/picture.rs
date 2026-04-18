@@ -71,6 +71,12 @@ pub struct MbInfo {
     /// prediction not used at this 4×4 location" (P macroblocks, L0-only
     /// B sub-partitions, intra MBs).
     pub ref_idx_l1: [i8; 16],
+    /// Per-4×4-sub-block absolute list-0 MVD components. Used by CABAC
+    /// §9.3.3.1.1.7 ctxIdxInc derivation (`absMvdComp_A + absMvdComp_B`).
+    /// Set on the partition's top-left 4×4 block and replicated into
+    /// every 4×4 block the partition covers so neighbour lookups into
+    /// adjacent partitions / MBs read the right summed magnitude.
+    pub mvd_l0_abs: [(u16, u16); 16],
     /// True when this macroblock is intra. For an I-slice all MBs are intra,
     /// but the field exists to support future P-slice deblocking edges.
     pub intra: bool,
@@ -97,6 +103,7 @@ impl Default for MbInfo {
             ref_idx_l0: [-1; 16],
             mv_l1: [(0, 0); 16],
             ref_idx_l1: [-1; 16],
+            mvd_l0_abs: [(0, 0); 16],
             intra: false,
             skipped: false,
         }

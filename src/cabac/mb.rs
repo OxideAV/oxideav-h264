@@ -182,41 +182,79 @@ fn cbp_chroma_ctx_idx_incs(pic: &Picture, mb_x: u32, mb_y: u32) -> [u8; 2] {
 /// conservative vs. the spec's shared per-slice state but yields correct
 /// decode for the reduced subset of streams we target (no residuals for
 /// the I_16x16/cbp_luma=0 fixture).
-fn build_residual_ctxs(
-    ctxs: &[CabacContext],
+/// Plan describing the ctxIdx backing each bin a residual decoder may read.
+///
+/// The 43-slot window (`coded_block_flag`, 16× `significant_coeff_flag`,
+/// 16× `last_significant_coeff_flag`, 10× `coeff_abs_level_minus1`) maps
+/// into specific indices of the slice-wide context array. After decode,
+/// callers use [`ResidualCtxPlan::scatter`] to propagate probability-state
+/// updates from the local window back to the slice-wide store so CABAC's
+/// adaptive contexts persist across blocks (§9.3).
+pub(crate) struct ResidualCtxPlan {
+    pub indices: [usize; 43],
+}
+
+impl ResidualCtxPlan {
+    /// Build the 43-entry ctxIdx plan for the given ctxBlockCat and the
+    /// neighbour-derived `coded_block_flag` increment.
+    pub fn new(cat: BlockCat, neighbours: &CbfNeighbours) -> Self {
+        let ctx_block_cat = cat.ctx_block_cat() as usize;
+        let cbf_inc = coded_block_flag_inc(neighbours) as usize;
+        let cbf_base = CTX_IDX_CODED_BLOCK_FLAG + ctx_block_cat * 4;
+        let sig_base = CTX_IDX_SIGNIFICANT_COEFF_FLAG + SIG_BASE_OFFSETS[ctx_block_cat];
+        let last_base = CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG + SIG_BASE_OFFSETS[ctx_block_cat];
+        let lvl_base = CTX_IDX_COEFF_ABS_LEVEL_MINUS1 + ctx_block_cat * 10;
+        let mut indices = [0usize; 43];
+        indices[0] = cbf_base + cbf_inc;
+        for i in 0..16 {
+            indices[1 + i] = sig_base + i;
+            indices[17 + i] = last_base + i;
+        }
+        for i in 0..10 {
+            indices[33 + i] = lvl_base + i;
+        }
+        Self { indices }
+    }
+
+    /// Materialise the 43-slot working window from the slice-wide array.
+    pub fn gather(&self, ctxs: &[CabacContext]) -> Vec<CabacContext> {
+        let n = ctxs.len();
+        self.indices
+            .iter()
+            .map(|&i| ctxs[i.min(n.saturating_sub(1))])
+            .collect()
+    }
+
+    /// Propagate post-decode context state back to the slice-wide array.
+    pub fn scatter(&self, ctxs: &mut [CabacContext], window: &[CabacContext]) {
+        let n = ctxs.len();
+        for (slot, &i) in window.iter().zip(self.indices.iter()) {
+            let idx = i.min(n.saturating_sub(1));
+            ctxs[idx] = *slot;
+        }
+    }
+}
+
+/// Decode one residual block through the shared plan, updating the
+/// slice-wide CABAC state in place. Wraps [`decode_residual_block_cabac`]
+/// with the gather/scatter plumbing so adaptive probabilities persist.
+pub(crate) fn decode_residual_block_in_place(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
     cat: BlockCat,
     neighbours: &CbfNeighbours,
-) -> Vec<CabacContext> {
-    let ctx_block_cat = cat.ctx_block_cat() as usize;
-    // Table 9-25: coded_block_flag has 4 ctxIdxInc slots per ctxBlockCat.
-    let cbf_inc = coded_block_flag_inc(neighbours) as usize;
-    let cbf_base = CTX_IDX_CODED_BLOCK_FLAG + ctx_block_cat * 4;
-    // Table 9-27 / 9-28 / 9-29: significant_coeff_flag /
-    // last_significant_coeff_flag / coeff_abs_level_minus1 have a fixed 15
-    // (or 14 for ChromaDc 4:2:0) ctxIdxInc values per ctxBlockCat.
-    // Baseline of 0 for ChromaDc (ctxBlockCat == 3) is 15*2 = 30; we just
-    // use ctxBlockCat*15 as a simple slot base.
-    let sig_base = CTX_IDX_SIGNIFICANT_COEFF_FLAG + ctx_block_cat * 15;
-    let last_base = CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG + ctx_block_cat * 15;
-    let lvl_base = CTX_IDX_COEFF_ABS_LEVEL_MINUS1 + ctx_block_cat * 10;
-
-    let mut out = Vec::with_capacity(43);
-    out.push(ctxs[cbf_base + cbf_inc]);
-    for i in 0..16 {
-        let idx = (sig_base + i).min(ctxs.len() - 1);
-        out.push(ctxs[idx]);
-    }
-    for i in 0..16 {
-        let idx = (last_base + i).min(ctxs.len() - 1);
-        out.push(ctxs[idx]);
-    }
-    for i in 0..10 {
-        let idx = (lvl_base + i).min(ctxs.len() - 1);
-        out.push(ctxs[idx]);
-    }
-    debug_assert_eq!(out.len(), 43);
-    out
+    max_num_coeff: usize,
+) -> Result<[i32; 16]> {
+    let plan = ResidualCtxPlan::new(cat, neighbours);
+    let mut window = plan.gather(ctxs);
+    let result = decode_residual_block_cabac(d, &mut window, cat, neighbours, max_num_coeff)?;
+    plan.scatter(ctxs, &window);
+    Ok(result)
 }
+
+/// §9.3.3.1.1.9 — cumulative per-ctxBlockCat base into the 61-slot
+/// significant/last coeff flag tables. Indexed by `BlockCat::ctx_block_cat()`.
+pub(crate) const SIG_BASE_OFFSETS: [usize; 5] = [0, 15, 29, 44, 47];
 
 fn coded_block_flag_inc(neighbours: &CbfNeighbours) -> u8 {
     let a = neighbours.left.unwrap_or(false) as u8;
@@ -232,7 +270,7 @@ fn coded_block_flag_inc(neighbours: &CbfNeighbours) -> u8 {
 pub fn decode_i_mb_cabac(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
-    _sh: &SliceHeader,
+    sh: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
     mb_x: u32,
@@ -250,7 +288,41 @@ pub fn decode_i_mb_cabac(
     };
     let imb = decode_i_slice_mb_type(mb_type_raw)
         .ok_or_else(|| Error::invalid(format!("h264 cabac mb: bad I mb_type {mb_type_raw}")))?;
+    decode_intra_mb_given_imb_cabac(d, ctxs, sh, sps, pps, mb_x, mb_y, pic, prev_qp, imb)
+}
 
+/// Decode an intra macroblock within a CABAC slice whose `mb_type` has
+/// already been parsed. Used by the P-slice path for intra-in-P
+/// macroblocks (`mb_type >= 5` in Table 7-13).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_intra_in_p_cabac(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    prev_qp: &mut i32,
+    imb: IMbType,
+) -> Result<()> {
+    decode_intra_mb_given_imb_cabac(d, ctxs, sh, sps, pps, mb_x, mb_y, pic, prev_qp, imb)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_intra_mb_given_imb_cabac(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    _sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    prev_qp: &mut i32,
+    imb: IMbType,
+) -> Result<()> {
     if matches!(imb, IMbType::IPcm) {
         return decode_pcm_mb_cabac(d, sps, mb_x, mb_y, pic, *prev_qp);
     }
@@ -543,14 +615,8 @@ fn decode_luma_intra_nxn(
         let mut total_coeff = 0u32;
         if has_residual {
             let neighbours = cbf_neighbours_luma(pic, mb_x, mb_y, br_row, br_col);
-            let mut local_ctxs = build_residual_ctxs(ctxs, BlockCat::Luma4x4, &neighbours);
-            let coeffs = decode_residual_block_cabac(
-                d,
-                &mut local_ctxs,
-                BlockCat::Luma4x4,
-                &neighbours,
-                16,
-            )?;
+            let coeffs =
+                decode_residual_block_in_place(d, ctxs, BlockCat::Luma4x4, &neighbours, 16)?;
             residual = coeffs;
             total_coeff = coeffs.iter().filter(|&&v| v != 0).count() as u32;
             dequantize_4x4(&mut residual, qp_y);
@@ -596,10 +662,7 @@ fn decode_luma_intra_16x16(
 
     // DC luma — always coded.
     let dc_neigh = cbf_neighbours_luma(pic, mb_x, mb_y, 0, 0);
-    let dc_coeffs = {
-        let mut local = build_residual_ctxs(ctxs, BlockCat::Luma16x16Dc, &dc_neigh);
-        decode_residual_block_cabac(d, &mut local, BlockCat::Luma16x16Dc, &dc_neigh, 16)?
-    };
+    let dc_coeffs = decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Dc, &dc_neigh, 16)?;
     let mut dc = dc_coeffs;
     inv_hadamard_4x4_dc(&mut dc, qp_y);
 
@@ -611,9 +674,8 @@ fn decode_luma_intra_16x16(
         let mut total_coeff = 0u32;
         if cbp_luma != 0 {
             let neighbours = cbf_neighbours_luma(pic, mb_x, mb_y, br_row, br_col);
-            let mut local = build_residual_ctxs(ctxs, BlockCat::Luma16x16Ac, &neighbours);
             let ac =
-                decode_residual_block_cabac(d, &mut local, BlockCat::Luma16x16Ac, &neighbours, 15)?;
+                decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Ac, &neighbours, 15)?;
             residual = ac;
             total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
             dequantize_4x4(&mut residual, qp_y);
@@ -663,13 +725,11 @@ fn decode_chroma(
     let mut dc_cr = [0i32; 4];
     if cbp_chroma >= 1 {
         let neigh = CbfNeighbours::none();
-        let mut local = build_residual_ctxs(ctxs, BlockCat::ChromaDc, &neigh);
-        let cb = decode_residual_block_cabac(d, &mut local, BlockCat::ChromaDc, &neigh, 4)?;
+        let cb = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4)?;
         for i in 0..4 {
             dc_cb[i] = cb[i];
         }
-        let mut local = build_residual_ctxs(ctxs, BlockCat::ChromaDc, &neigh);
-        let cr = decode_residual_block_cabac(d, &mut local, BlockCat::ChromaDc, &neigh, 4)?;
+        let cr = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4)?;
         for i in 0..4 {
             dc_cr[i] = cr[i];
         }
@@ -690,9 +750,7 @@ fn decode_chroma(
             let mut total_coeff = 0u32;
             if cbp_chroma == 2 {
                 let neigh = CbfNeighbours::none();
-                let mut local = build_residual_ctxs(ctxs, BlockCat::ChromaAc, &neigh);
-                let ac =
-                    decode_residual_block_cabac(d, &mut local, BlockCat::ChromaAc, &neigh, 15)?;
+                let ac = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15)?;
                 res = ac;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
                 dequantize_4x4(&mut res, qpc);
