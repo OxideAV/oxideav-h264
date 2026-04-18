@@ -33,7 +33,7 @@ use crate::slice::{ChromaWeight, LumaWeight, SliceHeader};
 use crate::sps::Sps;
 use crate::transform::{
     chroma_qp, dequantize_4x4_scaled, dequantize_8x8_scaled, idct_4x4, idct_8x8,
-    inv_hadamard_2x2_chroma_dc_scaled,
+    inv_hadamard_2x2_chroma_dc_scaled, inv_hadamard_2x4_chroma_dc_scaled,
 };
 
 /// Decode one coded P-slice macroblock at `(mb_x, mb_y)`. On return the
@@ -674,6 +674,11 @@ fn decode_inter_residual_chroma(
     cbp_chroma: u8,
     qp_y: i32,
 ) -> Result<()> {
+    // §8.5.11 ChromaArrayType dispatch — 4:2:2 uses a 2×4 chroma DC
+    // Hadamard and 8 AC blocks per plane instead of 4:2:0's 2×2 + 4.
+    if pic.chroma_format_idc == 2 {
+        return decode_inter_residual_chroma_422(br, pps, mb_x, mb_y, pic, cbp_chroma, qp_y);
+    }
     let qpc = chroma_qp(qp_y, pps.chroma_qp_index_offset);
     let mut dc_cb = [0i32; 4];
     let mut dc_cr = [0i32; 4];
@@ -733,6 +738,135 @@ fn decode_inter_residual_chroma(
         }
     }
     Ok(())
+}
+
+// 4:2:2 inter chroma residual (§8.5.11.2, §9.2.1.2 ChromaArrayType == 2).
+//
+// Same cbp_chroma encoding as 4:2:0 (0 = none, 1 = DC only, 2 = DC + AC),
+// but the plane is 8×16 samples = 2 cols × 4 rows of 4×4 AC blocks and
+// the chroma DC block is 2×4 (CAVLC kind `ChromaDc2x4`, nC = -2) fed
+// through `inv_hadamard_2x4_chroma_dc_scaled` with the Amendment-2
+// `QP'_C,DC = QP'_C + 3` offset baked in. For P-slices the chroma is
+// always inter → residual uses inter-Cb/Cr scaling slots 4/5.
+fn decode_inter_residual_chroma_422(
+    br: &mut BitReader<'_>,
+    pps: &Pps,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    cbp_chroma: u8,
+    qp_y: i32,
+) -> Result<()> {
+    let qpc_cb = chroma_qp(qp_y, pps.chroma_qp_index_offset);
+    let qpc_cr = chroma_qp(qp_y, pps.second_chroma_qp_index_offset);
+    let mut dc_cb = [0i32; 8];
+    let mut dc_cr = [0i32; 8];
+    if cbp_chroma >= 1 {
+        let blk = decode_residual_block(br, -2, BlockKind::ChromaDc2x4)?;
+        dc_cb.copy_from_slice(&blk.coeffs[..8]);
+        let blk = decode_residual_block(br, -2, BlockKind::ChromaDc2x4)?;
+        dc_cr.copy_from_slice(&blk.coeffs[..8]);
+        // P-slice chroma is inter → slot 4 (Cb) / slot 5 (Cr).
+        let w_cb = pic.scaling_lists.matrix_4x4(4)[0];
+        let w_cr = pic.scaling_lists.matrix_4x4(5)[0];
+        inv_hadamard_2x4_chroma_dc_scaled(&mut dc_cb, qpc_cb, w_cb);
+        inv_hadamard_2x4_chroma_dc_scaled(&mut dc_cr, qpc_cr, w_cr);
+    }
+    let cstride = pic.chroma_stride();
+    let co = pic.chroma_off(mb_x, mb_y);
+    for plane_cb in [true, false] {
+        let dc = if plane_cb { &dc_cb } else { &dc_cr };
+        let qpc = if plane_cb { qpc_cb } else { qpc_cr };
+        // 4:2:2 AC grid: 4 rows × 2 cols of 4×4 blocks decoded in
+        // row-major order so left/top neighbour NC lookups see
+        // already-published counts (§9.2.1.1).
+        let mut nc_arr = [0u8; 8];
+        for blk_row in 0..4usize {
+            for blk_col in 0..2usize {
+                let blk_idx = blk_row * 2 + blk_col;
+                let mut res = [0i32; 16];
+                let mut total_coeff = 0u32;
+                if cbp_chroma == 2 {
+                    let nc = predict_inter_nc_chroma_422(
+                        pic, mb_x, mb_y, plane_cb, blk_row, blk_col,
+                    );
+                    let ac = decode_residual_block(br, nc, BlockKind::ChromaAc)?;
+                    total_coeff = ac.total_coeff;
+                    res = ac.coeffs;
+                    let cat = if plane_cb { 4 } else { 5 };
+                    let scale = *pic.scaling_lists.matrix_4x4(cat);
+                    dequantize_4x4_scaled(&mut res, qpc, &scale);
+                }
+                res[0] = dc[blk_idx];
+                idct_4x4(&mut res);
+                let off_in_mb = blk_row * 4 * cstride + blk_col * 4;
+                let plane = if plane_cb { &mut pic.cb } else { &mut pic.cr };
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let base = plane[co + off_in_mb + r * cstride + c] as i32;
+                        plane[co + off_in_mb + r * cstride + c] =
+                            (base + res[r * 4 + c]).clamp(0, 255) as u8;
+                    }
+                }
+                nc_arr[blk_idx] = total_coeff as u8;
+                let info = pic.mb_info_mut(mb_x, mb_y);
+                let dst = if plane_cb {
+                    &mut info.cb_nc
+                } else {
+                    &mut info.cr_nc
+                };
+                dst[..8].copy_from_slice(&nc_arr);
+            }
+        }
+    }
+    Ok(())
+}
+
+// §9.2.1.1 neighbour-nC predictor for 4:2:2 chroma AC blocks in an
+// inter MB — the 2×4 block grid mirrors the intra 4:2:2 layout and
+// `MbInfo::{cb,cr}_nc[blk_row*2 + blk_col]` slots store the per-block
+// total_coeff so cross-MB left/top reads see the correct value.
+fn predict_inter_nc_chroma_422(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    cb: bool,
+    blk_row: usize,
+    blk_col: usize,
+) -> i32 {
+    let pick = |info: &MbInfo, idx: usize| -> u8 {
+        if cb {
+            info.cb_nc[idx]
+        } else {
+            info.cr_nc[idx]
+        }
+    };
+    let info_here = pic.mb_info_at(mb_x, mb_y);
+    let left = if blk_col > 0 {
+        Some(pick(info_here, blk_row * 2 + (blk_col - 1)))
+    } else if mb_x > 0 {
+        let info = pic.mb_info_at(mb_x - 1, mb_y);
+        if info.coded {
+            Some(pick(info, blk_row * 2 + 1))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let top = if blk_row > 0 {
+        Some(pick(info_here, (blk_row - 1) * 2 + blk_col))
+    } else if mb_y > 0 {
+        let info = pic.mb_info_at(mb_x, mb_y - 1);
+        if info.coded {
+            Some(pick(info, 3 * 2 + blk_col))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    crate::mb::nc_from_neighbours(left, top)
 }
 
 // ---------------------------------------------------------------------------
@@ -842,6 +976,28 @@ fn mc_chroma_partition(
     mv_y_q: i32,
     chroma_weight: Option<&ChromaWeight>,
 ) {
+    // §8.4.2.2.1 ChromaArrayType dispatch. 4:2:2 keeps the same
+    // horizontal chroma subsampling as 4:2:0 but the chroma height
+    // matches luma height; the 1/8-pel bilinear filter still applies
+    // but the MV y-component is divided by 4 (not 8) and its fraction
+    // is `(mvLX[1] & 3) << 1` so fractional vertical positions only
+    // span 0,2,4,6 (half the precision of 4:2:0).
+    if pic.chroma_format_idc == 2 {
+        mc_chroma_partition_422(
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            h,
+            w,
+            mv_x_q,
+            mv_y_q,
+            chroma_weight,
+        );
+        return;
+    }
     // Luma partition is (4h × 4w) samples at (mb*16 + r0*4, mb*16 + c0*4).
     // Chroma 4:2:0 — halve all coordinates; partition is (2h × 2w) samples.
     let pw = w * 2;
@@ -885,6 +1041,95 @@ fn mc_chroma_partition(
     }
     let stride = pic.chroma_stride();
     let off = pic.chroma_off(mb_x, mb_y) + r0 * 2 * stride + c0 * 2;
+    for rr in 0..ph {
+        for cc in 0..pw {
+            pic.cb[off + rr * stride + cc] = tmp_cb[rr * pw + cc];
+            pic.cr[off + rr * stride + cc] = tmp_cr[rr * pw + cc];
+        }
+    }
+}
+
+// 4:2:2 chroma motion compensation (§8.4.2.2.1 ChromaArrayType == 2).
+//
+// Chroma width is half of luma width (same as 4:2:0) but chroma height
+// equals luma height. Spec fractional derivation:
+//   xFracC = mvLX[0] & 7;
+//   yFracC = (mvLX[1] & 3) << 1;
+//   xIntC  = xA + (mvLX[0] >> 3);
+//   yIntC  = yA + (mvLX[1] >> 2);
+// The 1/8-pel bilinear chroma filter is unchanged — the caller
+// scales `yFracC` into the filter's 0..=7 range by shifting the
+// luma MV's lower 2 bits left by 1 (effectively passing
+// `mv_y_q << 1` to `chroma_mc`, which will do `& 7` internally).
+// `mv_y_q >> 3` would underflow relative to the `>> 2` the spec
+// wants, so the integer step is precomputed here.
+#[allow(clippy::too_many_arguments)]
+fn mc_chroma_partition_422(
+    pic: &mut Picture,
+    reference: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    h: usize,
+    w: usize,
+    mv_x_q: i32,
+    mv_y_q: i32,
+    chroma_weight: Option<&ChromaWeight>,
+) {
+    // Partition size in chroma samples: horizontally halved (SubWidthC=2),
+    // vertically unscaled (SubHeightC=1).
+    let pw = w * 2;
+    let ph = h * 4;
+    let mut tmp_cb = vec![0u8; pw * ph];
+    let mut tmp_cr = vec![0u8; pw * ph];
+    // Base chroma-sample origin — width halved, height matches luma.
+    let base_x = (mb_x as i32) * 8 + (c0 as i32) * 2;
+    let base_y = (mb_y as i32) * 16 + (r0 as i32) * 4;
+    let cstride = reference.chroma_stride();
+    let cw = (reference.width / 2) as i32;
+    let ch = reference.height as i32;
+    // `chroma_mc` consumes `mv_y_q` as a luma quarter-pel and does
+    // `int_y = base_y + (mv_y_q >> 3)`, `dy = mv_y_q & 7`. For 4:2:2
+    // the spec wants `int_y = base_y + (mv_y_q >> 2)` and
+    // `dy = (mv_y_q & 3) << 1`, which is exactly what feeding
+    // `mv_y_q << 1` reproduces: `(mv_y_q << 1) >> 3 == mv_y_q >> 2`
+    // and `(mv_y_q << 1) & 7 == (mv_y_q & 3) << 1`.
+    let mv_y_c = mv_y_q << 1;
+    chroma_mc(
+        &mut tmp_cb,
+        &reference.cb,
+        cstride,
+        cw,
+        ch,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_c,
+        pw,
+        ph,
+    );
+    chroma_mc(
+        &mut tmp_cr,
+        &reference.cr,
+        cstride,
+        cw,
+        ch,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_c,
+        pw,
+        ph,
+    );
+    if let Some(cw_entry) = chroma_weight {
+        apply_chroma_weight(&mut tmp_cb, cw_entry, 0);
+        apply_chroma_weight(&mut tmp_cr, cw_entry, 1);
+    }
+    let stride = pic.chroma_stride();
+    // Chroma MB is 8 wide × 16 tall — destination uses c0*2 horizontally
+    // (half luma) and r0*4 vertically (same as luma).
+    let off = pic.chroma_off(mb_x, mb_y) + r0 * 4 * stride + c0 * 2;
     for rr in 0..ph {
         for cc in 0..pw {
             pic.cb[off + rr * stride + cc] = tmp_cb[rr * pw + cc];

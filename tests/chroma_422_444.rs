@@ -170,6 +170,121 @@ fn decode_yuv422_iframe_matches_reference() {
 }
 
 #[test]
+fn decode_yuv422_pframe_matches_reference() {
+    // §8.4.2.2.1 ChromaArrayType == 2 — 4:2:2 chroma MC keeps the
+    // horizontal 1/8-pel bilinear filter but scales the vertical MV
+    // by 4 (not 8) because chroma height equals luma height. §8.5.11.2
+    // — 4:2:2 inter residual uses the same 2×4 chroma DC Hadamard +
+    // QP'_C,DC = QP'_C + 3 offset as the intra path and decodes 8
+    // chroma AC blocks per plane in row-major order.
+    //
+    // Fixture is a 64×64 yuv422p smptebars clip with 1 IDR + 2
+    // P-slices produced by x264 (`high422`, CAVLC, no B-frames,
+    // `-preset ultrafast`). smptebars has uniform vertical gradients
+    // inside each bar which makes the residual magnitudes small and
+    // exposes the chroma DC + 2×4 Hadamard path without stressing
+    // quarter-pel MV refinement. Reconstruction is bit-exact.
+    use oxideav_core::Frame;
+    use oxideav_core::PixelFormat;
+    use oxideav_h264::nal::{NalHeader, NalUnitType};
+
+    let es = read_fixture("tests/fixtures/yuv422_p_64x64.es");
+    let ref_yuv = read_fixture("tests/fixtures/yuv422_p_64x64.yuv");
+
+    // Each frame = 64×64 Y + 32×64 Cb + 32×64 Cr = 8192 bytes.
+    const FRAME_BYTES: usize = 64 * 64 + 32 * 64 * 2;
+    let total = ref_yuv.len() / FRAME_BYTES;
+    assert!(total >= 2, "need at least I + 1 P frame, got {total}");
+
+    // Split Annex B into SPS, PPS, and a per-frame NALU list.
+    let nalus = oxideav_h264::nal::split_annex_b(&es);
+    let mut sps_nal: Option<Vec<u8>> = None;
+    let mut pps_nal: Option<Vec<u8>> = None;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    for nalu in &nalus {
+        let h = NalHeader::parse(nalu[0]).unwrap();
+        match h.nal_unit_type {
+            NalUnitType::Sps if sps_nal.is_none() => sps_nal = Some(nalu.to_vec()),
+            NalUnitType::Pps if pps_nal.is_none() => pps_nal = Some(nalu.to_vec()),
+            NalUnitType::SliceIdr | NalUnitType::SliceNonIdr => {
+                let mut f = Vec::new();
+                f.extend_from_slice(&[0, 0, 0, 1]);
+                f.extend_from_slice(nalu);
+                frames.push(f);
+            }
+            _ => {}
+        }
+    }
+    let sps = sps_nal.expect("SPS");
+    let pps = pps_nal.expect("PPS");
+
+    let mut dec = H264Decoder::new(CodecId::new("h264"));
+    let mut primer = Vec::new();
+    primer.extend_from_slice(&[0, 0, 0, 1]);
+    primer.extend_from_slice(&sps);
+    primer.extend_from_slice(&[0, 0, 0, 1]);
+    primer.extend_from_slice(&pps);
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 90_000), primer))
+        .expect("primer");
+    while dec.receive_frame().is_ok() {}
+
+    let mut total_match = 0usize;
+    let mut total_samples = 0usize;
+    for (idx, frame) in frames.iter().enumerate() {
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), frame.clone())
+            .with_pts(idx as i64)
+            .with_keyframe(idx == 0);
+        dec.send_packet(&pkt)
+            .unwrap_or_else(|e| panic!("send frame {idx}: {e}"));
+        let frame = match dec.receive_frame().expect("frame") {
+            Frame::Video(v) => v,
+            _ => panic!("not a video frame"),
+        };
+        assert_eq!(frame.format, PixelFormat::Yuv422P);
+        assert_eq!(frame.width, 64);
+        assert_eq!(frame.height, 64);
+        let mut got = Vec::with_capacity(FRAME_BYTES);
+        {
+            let p = &frame.planes[0];
+            for row in 0..64 {
+                let o = row * p.stride;
+                got.extend_from_slice(&p.data[o..o + 64]);
+            }
+        }
+        for pi in 1..=2 {
+            let p = &frame.planes[pi];
+            for row in 0..64 {
+                let o = row * p.stride;
+                got.extend_from_slice(&p.data[o..o + 32]);
+            }
+        }
+        assert_eq!(got.len(), FRAME_BYTES);
+        let ref_frame = &ref_yuv[idx * FRAME_BYTES..(idx + 1) * FRAME_BYTES];
+        let matches = got
+            .iter()
+            .zip(ref_frame.iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        total_match += matches;
+        total_samples += got.len();
+    }
+    let ratio = total_match as f64 / total_samples as f64;
+    assert!(
+        ratio >= 0.99,
+        "4:2:2 P-slice decode accuracy {:.3}% — below 99%",
+        ratio * 100.0
+    );
+    // Bit-exact is the target — the smptebars fixture intentionally
+    // avoids the sub-pel-heavy testsrc patterns that stress the
+    // pre-existing P-slice reconstruction quirks. Any regression
+    // below bit-exact on this fixture indicates a 4:2:2 P bug.
+    assert_eq!(
+        total_match, total_samples,
+        "expected bit-exact 4:2:2 P decode against x264 reference"
+    );
+}
+
+#[test]
 fn decode_yuv444_iframe_matches_reference() {
     // §6.4.1 — `chroma_format_idc = 3` (4:4:4): chroma planes have the
     // same dimensions as luma and reuse the luma Intra_4×4 / Intra_16×16

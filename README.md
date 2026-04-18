@@ -329,13 +329,16 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   MBAFF deblock pass still return `Error::Unsupported`.
 - Inter 8×8 transform on B-slice MBs — CAVLC P-slice inter 8×8 is wired
   (see above); B-slice inter 8×8 is not yet.
-- 4:2:2 CAVLC I-slice decode IS supported (§6.4.1 ChromaArrayType == 2)
-  — half-width / full-height chroma planes, 2×4 chroma DC Hadamard
-  (§8.5.11.2 with the `QP'_C,DC = QP'_C + 3` dequant offset per Amd 2
-  equations 8-328..8-330), 8 chroma AC blocks per plane arranged in a
-  2×4 grid, 8×16 chroma intra prediction (§8.3.4), and the extra
-  internal chroma horizontal / vertical deblock edges (§8.7). P / B /
-  CABAC on 4:2:2 remain out of scope.
+- 4:2:2 CAVLC I- and P-slice decode IS supported (§6.4.1
+  ChromaArrayType == 2) — half-width / full-height chroma planes, 2×4
+  chroma DC Hadamard (§8.5.11.2 with the `QP'_C,DC = QP'_C + 3` dequant
+  offset per Amd 2 equations 8-328..8-330), 8 chroma AC blocks per
+  plane arranged in a 2×4 grid, 8×16 chroma intra prediction (§8.3.4),
+  and the extra internal chroma horizontal / vertical deblock edges
+  (§8.7). The P-slice path reuses the luma 6-tap + bilinear MC and
+  adds §8.4.2.2.1 ChromaArrayType == 2 vertical-MV scaling (divide by
+  4 instead of 8, since chroma height matches luma height) for chroma
+  MC. B-slices and CABAC on 4:2:2 remain out of scope.
 - 4:4:4 CAVLC I-slice decode IS supported (§6.4.1 ChromaArrayType == 3)
   — the chroma planes share luma dimensions, reuse the luma Intra_4×4 /
   Intra_16×16 predictors, and decode three back-to-back luma-style
