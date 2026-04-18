@@ -29,7 +29,12 @@
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * Interlaced coding / MBAFF (P and B).
-//! * 8×8 transform on the CABAC path, 4:2:2 / 4:4:4 chroma, bit depth > 8.
+//! * 8×8 transform on the CABAC path, bit depth > 8.
+//! * Non-4:2:0 chroma: `chroma_format_idc ∈ {0, 2, 3}` and
+//!   `separate_colour_plane_flag = 1` are rejected at slice entry
+//!   (§7.4.2.1.1 / §6.4.1). See [`crate::picture::chroma_plane_w`] /
+//!   [`crate::picture::chroma_plane_h`] for the format-aware helpers
+//!   reserved for future 4:2:2 / 4:4:4 work.
 //!
 //! Reference picture list modification (RPLM, §7.3.3.1 / §8.2.4.3) is
 //! parsed into [`crate::slice::SliceHeader::rplm_l0`] /
@@ -47,12 +52,12 @@ use oxideav_core::{
 use crate::b_mb::{decode_b_skip_mb, decode_b_slice_mb};
 use crate::bitreader::BitReader;
 use crate::cabac::{
-    b_mb::decode_b_mb_cabac, engine::CabacDecoder, mb::decode_i_mb_cabac,
-    p_mb::decode_p_mb_cabac, tables::init_slice_contexts,
+    b_mb::decode_b_mb_cabac, engine::CabacDecoder, mb::decode_i_mb_cabac, p_mb::decode_p_mb_cabac,
+    tables::init_slice_contexts,
 };
 use crate::dpb::{
-    apply_rplm, derive_poc_type0, derive_poc_type1, derive_poc_type2, Dpb, MmcoCommand,
-    PocState, PocType1Params,
+    apply_rplm, derive_poc_type0, derive_poc_type1, derive_poc_type2, Dpb, MmcoCommand, PocState,
+    PocType1Params,
 };
 use crate::mb::decode_i_slice_data;
 use crate::nal::{
@@ -204,6 +209,45 @@ impl H264Decoder {
                         "h264: interlaced / MBAFF (§7.3.2.1.1 frame_mbs_only_flag=0) not supported",
                     ));
                 }
+                // §7.4.2.1.1 — chroma format. The MB-layer pipeline below
+                // (intra prediction, inverse transforms, motion
+                // compensation, deblocking, CAVLC/CABAC residual) is
+                // wired for `chroma_format_idc = 1` (4:2:0) only; the
+                // chroma plane dimensions, DC transform size, per-MB
+                // block count, intra-mode set, sub-pel filter taps and
+                // deblock internal-edge layout all differ for
+                // `chroma_format_idc ∈ {2, 3}` and for
+                // `separate_colour_plane_flag = 1`. Fail fast so
+                // upstream callers can route to a C-free fallback
+                // (rather than produce silently-corrupt YUV).
+                if sps.separate_colour_plane_flag {
+                    return Err(Error::unsupported(
+                        "h264: separate_colour_plane_flag=1 (§7.4.2.1.1 three independent colour planes) not supported",
+                    ));
+                }
+                match sps.chroma_format_idc {
+                    0 => {
+                        return Err(Error::unsupported(
+                            "h264: chroma_format_idc=0 (monochrome, §6.4.1) not supported",
+                        ));
+                    }
+                    1 => {}
+                    2 => {
+                        return Err(Error::unsupported(
+                            "h264: chroma_format_idc=2 (4:2:2, §6.4.1) not supported — only 4:2:0",
+                        ));
+                    }
+                    3 => {
+                        return Err(Error::unsupported(
+                            "h264: chroma_format_idc=3 (4:4:4, §6.4.1) not supported — only 4:2:0",
+                        ));
+                    }
+                    v => {
+                        return Err(Error::unsupported(format!(
+                            "h264: chroma_format_idc={v} invalid (§7.4.2.1.1) / not supported"
+                        )));
+                    }
+                }
                 // Macroblock-layer decode (§7.3.5 / §8.3 / §8.4 / §8.5 / §9.2).
                 let mb_w = sps.pic_width_in_mbs();
                 let mb_h = sps.pic_height_in_map_units();
@@ -218,8 +262,7 @@ impl H264Decoder {
                 // matrices (SPS + PPS, with fallback). Stored on the
                 // picture so every MB-level dequant call can index
                 // the per-category list without re-doing the fallback.
-                pic.scaling_lists =
-                    crate::scaling_list::ScalingLists::resolve(&sps, &pps);
+                pic.scaling_lists = crate::scaling_list::ScalingLists::resolve(&sps, &pps);
 
                 // Lazily (re)create the DPB when we first see an SPS —
                 // its size depends on `max_num_ref_frames`. Size the
@@ -230,10 +273,7 @@ impl H264Decoder {
                 // When no B-slice is in the stream the window collapses
                 // to 0 so frames emerge immediately.
                 let want_dpb_size = sps.max_num_ref_frames.max(1);
-                let vui_reorder = sps
-                    .vui
-                    .as_ref()
-                    .and_then(|v| v.max_num_reorder_frames);
+                let vui_reorder = sps.vui.as_ref().and_then(|v| v.max_num_reorder_frames);
                 let want_reorder = if sh.slice_type == SliceType::B {
                     vui_reorder.unwrap_or(sps.max_num_ref_frames).max(1)
                 } else {
@@ -305,8 +345,7 @@ impl H264Decoder {
                     }
                     1 => {
                         let (p, off) = derive_poc_type1(PocType1Params {
-                            delta_pic_order_always_zero_flag: sps
-                                .delta_pic_order_always_zero_flag,
+                            delta_pic_order_always_zero_flag: sps.delta_pic_order_always_zero_flag,
                             offset_for_non_ref_pic: sps.offset_for_non_ref_pic,
                             offset_for_top_to_bottom_field: sps.offset_for_top_to_bottom_field,
                             num_ref_frames_in_pic_order_cnt_cycle: sps

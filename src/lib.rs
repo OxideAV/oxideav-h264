@@ -155,7 +155,13 @@
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
 //! * Interlaced coding / MBAFF / PAFF.
-//! * 4:2:2 / 4:4:4 chroma, bit depths above 8.
+//! * Non-4:2:0 chroma — `chroma_format_idc ∈ {0, 2, 3}` and
+//!   `separate_colour_plane_flag = 1` (§6.4.1 / §7.4.2.1.1) are
+//!   rejected at slice entry with `Error::Unsupported`. The
+//!   format-aware helpers [`picture::chroma_plane_w`] /
+//!   [`picture::chroma_plane_h`] / [`picture::chroma_subsampling`]
+//!   are wired for future 4:2:2 / 4:4:4 work.
+//! * Bit depths above 8.
 //! * Rate control, adaptive QP, mode decision (Intra4×4 / Plane / Vertical /
 //!   Horizontal), or any psychovisual tuning. The encoder always emits
 //!   Intra_16×16 with DC_PRED and a fixed QP.
