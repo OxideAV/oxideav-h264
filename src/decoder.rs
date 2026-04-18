@@ -209,11 +209,27 @@ impl H264Decoder {
                         // `decode_cabac_b_slice`; the old early-reject stays
                         // removed so both entropy modes share the same path.
                     }
-                    other => {
-                        return Err(Error::unsupported(format!(
-                            "h264: slice type {:?} not implemented",
-                            other
-                        )));
+                    SliceType::SI => {
+                        // SI-slice (§7.3.5 / §8.6.1). The CAVLC 4:2:0 / 8-bit
+                        // path is wired via `crate::si_mb::decode_si_slice_data`;
+                        // CABAC SI, interlaced SI, 4:2:2 / 4:4:4 / 10-bit SI
+                        // all still return Unsupported in the dispatch below.
+                        if pps.entropy_coding_mode_flag {
+                            return Err(Error::unsupported(
+                                "h264: SI-slice CABAC entropy decode not yet wired — CAVLC only",
+                            ));
+                        }
+                    }
+                    SliceType::SP => {
+                        // SP-slice (§7.3.5 / §8.6.2). Primary SP (`sp_for_switch_flag=0`)
+                        // with `QS == QP` decodes through the standard P-slice
+                        // path (`crate::sp_mb::decode_sp_slice_data`). Secondary
+                        // SP and `QS != QP` return Unsupported — see sp_mb docs.
+                        if pps.entropy_coding_mode_flag {
+                            return Err(Error::unsupported(
+                                "h264: SP-slice CABAC entropy decode not yet wired — CAVLC only",
+                            ));
+                        }
                     }
                 }
                 // §7.3.2.1.1 / §7.3.3: `frame_mbs_only_flag = 0` allows
@@ -783,7 +799,72 @@ impl H264Decoder {
                         // list pointers (§8.4.1.2.3).
                         pic.snapshot_ref_pocs(&list0_pocs, &list1_pocs);
                     }
-                    _ => unreachable!(),
+                    SliceType::SI => {
+                        // CAVLC SI decode — §7.3.5 / Table 7-12 / §8.6.1.
+                        // Only the CAVLC 4:2:0 / 8-bit path is wired; the
+                        // slice-entry gate above rejects CABAC SI and high-
+                        // bit-depth / 4:2:2 / 4:4:4 SI land on the generic
+                        // chroma-format gate later in this block.
+                        if sps.chroma_format_idc != 1 || high_bit_depth {
+                            return Err(Error::unsupported(
+                                "h264: SI-slice wired for CAVLC 4:2:0 / 8-bit only",
+                            ));
+                        }
+                        let mut br = BitReader::new(&rbsp);
+                        br.skip(sh.slice_data_bit_offset as u32)?;
+                        crate::si_mb::decode_si_slice_data(&mut br, &sh, &sps, &pps, &mut pic)?;
+                    }
+                    SliceType::SP => {
+                        // CAVLC SP decode — §7.3.5 / Table 7-13 (SP entries) /
+                        // §8.6.2. Primary SP with QS == QP only; the stream
+                        // must carry a prior reference picture (typically an
+                        // IDR or P-slice) so list 0 is non-empty.
+                        if sps.chroma_format_idc != 1 || high_bit_depth {
+                            return Err(Error::unsupported(
+                                "h264: SP-slice wired for CAVLC 4:2:0 / 8-bit only",
+                            ));
+                        }
+                        let dpb = self.dpb.as_mut().expect("DPB initialised above");
+                        dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
+                        let dpb_ref: &Dpb = dpb;
+                        let default_list =
+                            dpb_ref.build_list0_p(sh.num_ref_idx_l0_active_minus1);
+                        let ref_entries = if sh.rplm_l0.is_empty() {
+                            default_list
+                        } else {
+                            let curr_pic_num = sh.frame_num as i32;
+                            apply_rplm(
+                                default_list,
+                                &sh.rplm_l0,
+                                curr_pic_num,
+                                max_frame_num as i32,
+                                sh.num_ref_idx_l0_active_minus1,
+                                dpb_ref.frames_raw(),
+                            )?
+                        };
+                        if ref_entries.is_empty() {
+                            return Err(Error::invalid(
+                                "h264 sp-slice: no reference picture available (no prior IDR?)",
+                            ));
+                        }
+                        for rf in &ref_entries {
+                            if rf.pic.mb_width != mb_w || rf.pic.mb_height != mb_h {
+                                return Err(Error::invalid(
+                                    "h264 sp-slice: reference picture size mismatch",
+                                ));
+                            }
+                        }
+                        let list0: Vec<&Picture> =
+                            ref_entries.iter().map(|r| &r.pic).collect();
+                        let list0_pocs: Vec<i32> =
+                            ref_entries.iter().map(|r| r.poc).collect();
+                        let mut br = BitReader::new(&rbsp);
+                        br.skip(sh.slice_data_bit_offset as u32)?;
+                        crate::sp_mb::decode_sp_slice_data(
+                            &mut br, &sh, &sps, &pps, &mut pic, &list0,
+                        )?;
+                        pic.snapshot_ref_pocs(&list0_pocs, &[]);
+                    }
                 }
 
                 // Optional in-loop deblocking — §8.7. The 8-bit kernel

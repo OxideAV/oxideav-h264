@@ -312,6 +312,21 @@
 //!   MBAFF, PAFF P / B, PAFF CABAC, PAFF + 10-bit / 4:2:2 / 4:4:4, and
 //!   MBAFF mixed with PAFF in the same CVS all return
 //!   `Error::Unsupported`.
+//! * **SI / SP slice decode** (§7.3.5 / §7.4.5 Table 7-12 / Table 7-13
+//!   SP entries / §8.6) — CAVLC 4:2:0 / 8-bit pipeline only.
+//!   [`si_mb::decode_si_slice_data`] drives an SI-slice per-MB loop
+//!   that resolves Table 7-12 (`mb_type = 0` → SI as I_NxN; `mb_type
+//!   >= 1` re-indexes Table 7-11) and dispatches every macroblock
+//!   through the existing intra reconstruction helper. Primary SI
+//!   slices whose `QS == QP` land on the §8.6.1 identity dequant /
+//!   requant path; secondary SI (`QS != QP`) returns `Unsupported`.
+//!   [`sp_mb::decode_sp_slice_data`] drives an SP-slice per-MB loop
+//!   that mirrors the CAVLC P-slice syntax (`mb_skip_run` + coded MB)
+//!   and reuses the P-slice macroblock path. Primary SP
+//!   (`sp_for_switch_flag = 0`, `QS == QP`) is wired; secondary SP and
+//!   `QS != QP` return `Unsupported`. Integration coverage in
+//!   `tests/si_sp_slice.rs` builds hand-crafted 16×16 SI and
+//!   IDR-plus-SP streams and decodes them end-to-end via `H264Decoder`.
 //! * **Custom scaling lists** (§7.4.2.1.1.1 / §7.4.2.2) — the SPS and
 //!   PPS scaling-list matrices are parsed out of their zig-zag
 //!   coded form into raster order, resolved per Table 7-2 (PPS
@@ -398,7 +413,9 @@ pub mod b_mb_444;
 pub mod picture;
 pub mod pps;
 pub mod scaling_list;
+pub mod si_mb;
 pub mod slice;
+pub mod sp_mb;
 pub mod sps;
 pub mod tables;
 pub mod transform;
