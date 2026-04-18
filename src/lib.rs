@@ -79,6 +79,17 @@
 //!   vertically and 4 horizontal internal edges per MB vs. 4:2:0's
 //!   single mid-edge) per H.264 Amd 2 §8.7 chroma edge rules. Bit-exact
 //!   against ffmpeg on the 64×64 `iframe_yuv422_64x64` fixture.
+//! * **4:2:2 CAVLC P-slice** decode — the luma MC path is unchanged
+//!   (chroma format doesn't touch luma). Chroma MC follows §8.4.2.2.1
+//!   ChromaArrayType == 2: the horizontal 1/8-pel bilinear filter is
+//!   the same as 4:2:0 but the vertical MV is scaled by 4 (not 8)
+//!   because chroma height matches luma height. Chroma residual reuses
+//!   the intra 4:2:2 shape — 2×4 DC Hadamard (CAVLC `ChromaDc2x4`,
+//!   nC = -2, QP'_C,DC = QP'_C + 3) plus 8 inter AC blocks per plane
+//!   in row-major order with slots 4/5 of the inter scaling lists.
+//!   Bit-exact against ffmpeg on the 64×64 `yuv422_p_64x64` smptebars
+//!   fixture (1 IDR + 2 P-slices, `-preset ultrafast -coder 0`).
+//!   CABAC and B-slices under 4:2:2 still return `Error::Unsupported`.
 //! * **Spec-accurate §8.7 in-loop deblocking filter** — per-4-pixel-edge
 //!   boundary strength (bS) derivation distinguishing MB-edge vs internal
 //!   edges, intra/inter sides, non-zero residual, and MV/reference

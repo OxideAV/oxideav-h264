@@ -883,7 +883,7 @@ fn predict_nc_chroma(
     nc_from_neighbours(left, top)
 }
 
-fn nc_from_neighbours(left: Option<u8>, top: Option<u8>) -> i32 {
+pub(crate) fn nc_from_neighbours(left: Option<u8>, top: Option<u8>) -> i32 {
     match (left, top) {
         (Some(l), Some(t)) => (l as i32 + t as i32 + 1) >> 1,
         (Some(l), None) => l as i32,

@@ -32,10 +32,10 @@
 //! * 8×8 transform on the CABAC path, bit depth > 8.
 //! * Monochrome (`chroma_format_idc = 0`) and
 //!   `separate_colour_plane_flag = 1` are rejected at slice entry
-//!   (§7.4.2.1.1 / §6.4.1). 4:4:4 (`chroma_format_idc = 3`) and 4:2:2
-//!   (`chroma_format_idc = 2`) are supported for CAVLC I-slices only
-//!   — P / B / CABAC entry under those chroma formats returns
-//!   `Error::Unsupported`. See [`crate::mb_444`] for the 4:4:4 CAVLC
+//!   (§7.4.2.1.1 / §6.4.1). 4:4:4 (`chroma_format_idc = 3`) is wired
+//!   for CAVLC I-slices only; 4:2:2 (`chroma_format_idc = 2`) is
+//!   wired for CAVLC I and P slices. B-slices and CABAC entry under
+//!   those chroma formats still return `Error::Unsupported`. See [`crate::mb_444`] for the 4:4:4 CAVLC
 //!   path, [`crate::mb::decode_chroma_422`] (private) for the 4:2:2
 //!   chroma pipeline, and [`crate::picture::chroma_plane_w`] /
 //!   [`crate::picture::chroma_plane_h`] for the format-aware
@@ -290,20 +290,23 @@ impl H264Decoder {
                     }
                     1 => {}
                     2 => {
-                        // 4:2:2 — only CAVLC I-slices are wired so far.
+                        // 4:2:2 — CAVLC I and P slices are both wired.
                         // Chroma plane is w/2 × h (half-width, full-height);
                         // chroma DC uses a 2×4 Hadamard (§8.5.11.2), 8 AC
                         // blocks per plane, and intra prediction runs over
-                        // 8×16 tiles (§8.3.4). P/B and CABAC paths fall
-                        // through to Error::Unsupported below.
-                        if sh.slice_type != SliceType::I {
+                        // 8×16 tiles (§8.3.4). B-slices and CABAC still
+                        // route to Error::Unsupported; chroma MC y is
+                        // unscaled (§8.4.2.2.1 ChromaArrayType == 2) in
+                        // the P path.
+                        if matches!(sh.slice_type, SliceType::B | SliceType::SP | SliceType::SI)
+                        {
                             return Err(Error::unsupported(
-                                "h264: 4:2:2 (chroma_format_idc=2) supports I-slices only",
+                                "h264: 4:2:2 (chroma_format_idc=2) supports I/P slices only",
                             ));
                         }
                         if pps.entropy_coding_mode_flag {
                             return Err(Error::unsupported(
-                                "h264: 4:2:2 CABAC entropy decode not yet wired — CAVLC I-slice only",
+                                "h264: 4:2:2 CABAC entropy decode not yet wired — CAVLC I/P only",
                             ));
                         }
                     }
