@@ -309,8 +309,12 @@
 //!   paired-encoder side exposes an `H264EncoderOptions::paff_field`
 //!   knob that writes `frame_mbs_only_flag = 0` in the SPS and
 //!   `field_pic_flag = 1` / `bottom_field_flag` in the slice header.
-//!   MBAFF, PAFF P / B, PAFF CABAC, PAFF + 10-bit / 4:2:2 / 4:4:4, and
-//!   MBAFF mixed with PAFF in the same CVS all return
+//!   The encoder emits the first PAFF frame as an IDR I-field and each
+//!   subsequent PAFF frame as an all-skip P-field (one `mb_skip_run`
+//!   equal to `TotalMbs`, no coded MB) — `tests/paff_field_pic.rs`
+//!   exercises both paths end-to-end through the decoder.
+//!   PAFF CABAC, PAFF + 10-bit / 4:2:2 / 4:4:4, PAFF B with coded MBs,
+//!   and MBAFF mixed with PAFF in the same CVS all return
 //!   `Error::Unsupported`.
 //! * **SI / SP slice decode** (§7.3.5 / §7.4.5 Table 7-12 / Table 7-13
 //!   SP entries / §8.6) — CAVLC 4:2:0 / 8-bit pipeline only.
@@ -361,7 +365,14 @@
 //!   chroma formats, and PAFF + MBAFF mixed within the same CVS all
 //!   still return `Error::Unsupported`.
 //! * `separate_colour_plane_flag = 1` (§7.4.2.1.1, three independent
-//!   colour planes) is rejected at slice entry with `Error::Unsupported`.
+//!   colour planes keyed by `colour_plane_id`) is rejected at slice
+//!   entry with `Error::Unsupported`. The SPS parser accepts the flag
+//!   and `slice::parse_slice_header` consumes the 2-bit
+//!   `colour_plane_id` correctly — the reject happens at the decoder's
+//!   slice-dispatch gate so upstream callers can route to a fallback.
+//!   See `tests/separate_colour_plane.rs` for the narrowing coverage
+//!   that pins SPS parse, per-plane slice-header parse, and the
+//!   precise reject wording.
 //!   4:2:2 is supported for CAVLC I/P/B and CABAC I/P slices — CABAC
 //!   4:2:2 B-slice entry still returns `Error::Unsupported`.
 //! * Monochrome (`chroma_format_idc = 0`) is rejected — the same
