@@ -357,3 +357,111 @@ fn decode_paff_top_then_bottom_pair() {
     assert_eq!(top_out.format, PixelFormat::Yuv420P);
     assert_eq!(bot_out.format, PixelFormat::Yuv420P);
 }
+
+/// PAFF round-trip with a P-field following the I-field. The encoder's
+/// `paff_field = Some(_)` option now emits the opening field as an IDR
+/// I-slice and every subsequent field (same parity) as a zero-residual
+/// P-slice whose `mb_skip_run` covers every macroblock. The decoder
+/// must accept both packets, deliver two VideoFrames at field
+/// dimensions, and the P-field decode must equal the I-field decode
+/// sample-for-sample since every MB is a zero-MV copy of the IDR.
+#[test]
+fn roundtrip_paff_p_field_64x64_qp22() {
+    let src = make_field(64, 64, 0);
+    let mut enc = H264Encoder::new(
+        CodecId::new("h264"),
+        src.width,
+        src.height,
+        H264EncoderOptions {
+            qp: 22,
+            paff_field: Some(false),
+            ..Default::default()
+        },
+    )
+    .expect("encoder::new");
+
+    // First frame → IDR I-field.
+    enc.send_frame(&Frame::Video(src.clone())).expect("send I");
+    let i_pkt = enc.receive_packet().expect("recv I");
+    assert!(i_pkt.flags.keyframe, "first PAFF packet must be a keyframe");
+
+    // Second frame → all-skip P-field.
+    enc.send_frame(&Frame::Video(src.clone())).expect("send P");
+    let p_pkt = enc.receive_packet().expect("recv P");
+    assert!(
+        !p_pkt.flags.keyframe,
+        "PAFF P-field packet must not be flagged as a keyframe"
+    );
+
+    // Parse the P-field's slice header back and assert the P + field
+    // flags are correct.
+    let p_nalus = split_annex_b(&p_pkt.data);
+    let sps_nal = p_nalus
+        .iter()
+        .copied()
+        .find(|n| NalHeader::parse(n[0]).unwrap().nal_unit_type == NalUnitType::Sps)
+        .expect("SPS");
+    let pps_nal = p_nalus
+        .iter()
+        .copied()
+        .find(|n| NalHeader::parse(n[0]).unwrap().nal_unit_type == NalUnitType::Pps)
+        .expect("PPS");
+    let p_slice_nal = p_nalus
+        .iter()
+        .copied()
+        .find(|n| NalHeader::parse(n[0]).unwrap().nal_unit_type == NalUnitType::SliceNonIdr)
+        .expect("P slice");
+    let sps_header = NalHeader::parse(sps_nal[0]).unwrap();
+    let sps_rbsp = oxideav_h264::nal::extract_rbsp(&sps_nal[1..]);
+    let sps = oxideav_h264::sps::parse_sps(&sps_header, &sps_rbsp).unwrap();
+    let pps_header = NalHeader::parse(pps_nal[0]).unwrap();
+    let pps_rbsp = oxideav_h264::nal::extract_rbsp(&pps_nal[1..]);
+    let pps = oxideav_h264::pps::parse_pps(&pps_header, &pps_rbsp, None).unwrap();
+    let slice_header = NalHeader::parse(p_slice_nal[0]).unwrap();
+    let slice_rbsp = oxideav_h264::nal::extract_rbsp(&p_slice_nal[1..]);
+    let sh = parse_slice_header(&slice_header, &slice_rbsp, &sps, &pps).expect("parse P slice");
+    assert_eq!(
+        sh.slice_type,
+        oxideav_h264::slice::SliceType::P,
+        "PAFF second field must be slice_type = P"
+    );
+    assert!(sh.field_pic_flag, "P-field must carry field_pic_flag = 1");
+    assert!(
+        !sh.bottom_field_flag,
+        "top-parity P-field must carry bottom_field_flag = 0"
+    );
+    assert_eq!(sh.frame_num, 1, "P-field follows IDR → frame_num = 1");
+
+    // Round-trip decode.
+    let mut dec = H264Decoder::new(CodecId::new("h264"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 50), i_pkt.data.clone()).with_pts(0))
+        .expect("decode I-field");
+    let i_out = match dec.receive_frame().expect("I-field frame") {
+        Frame::Video(v) => v,
+        _ => panic!("expected video"),
+    };
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 50), p_pkt.data.clone()).with_pts(20_000))
+        .expect("decode P-field");
+    let p_out = match dec.receive_frame().expect("P-field frame") {
+        Frame::Video(v) => v,
+        _ => panic!("expected video"),
+    };
+
+    assert_eq!((p_out.width, p_out.height), (64, 64));
+    assert_eq!(p_out.format, PixelFormat::Yuv420P);
+
+    // All MBs skipped with zero MV → the P-field samples exactly equal
+    // the I-field samples. Allow zero tolerance across luma and chroma.
+    for plane_idx in 0..3 {
+        assert_eq!(
+            p_out.planes[plane_idx].data, i_out.planes[plane_idx].data,
+            "PAFF P-field plane {plane_idx} must be a bit-exact copy of the I-field"
+        );
+    }
+
+    // Sanity: the P-field reconstruction is also close to the source
+    // (bounded by the IDR reconstruction PSNR at QP 22).
+    let p = psnr(&src.planes[0].data, &p_out.planes[0].data);
+    eprintln!("paff p-field 64x64 qp22: luma psnr vs source = {:.2} dB", p);
+    assert!(p >= 26.0, "paff P-field luma psnr {:.2} < 26 dB", p);
+}

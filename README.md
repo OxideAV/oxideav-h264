@@ -318,14 +318,17 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   modes other than DC, rate control, adaptive QP, mode decision,
   deblocking.
 - `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
-- PAFF for non-I slice types, PAFF CABAC, PAFF chroma > 4:2:0, PAFF
-  10-bit, and PAFF + MBAFF mixed within a coded video sequence.
-  **PAFF I-slice CAVLC** IS supported (§7.3.3 `field_pic_flag = 1`):
-  top and bottom fields decode into half-height `Picture`s allocated
-  via `Picture::new_field`, POC derivation reuses §8.2.1.1, and each
-  field is emitted as its own `VideoFrame`. The encoder exposes a
-  `H264EncoderOptions::paff_field` flag so round-trip tests can drive
-  the PAFF path without an external PAFF-capable encoder.
+- PAFF CABAC, PAFF chroma > 4:2:0, PAFF 10-bit, and PAFF + MBAFF mixed
+  within a coded video sequence remain out of scope.
+  **PAFF I / P / B-slice CAVLC** at 4:2:0 / 8-bit IS supported (§7.3.3
+  `field_pic_flag = 1`): top and bottom fields decode into half-height
+  `Picture`s allocated via `Picture::new_field`, POC derivation reuses
+  §8.2.1.1, and each field is emitted as its own `VideoFrame`. The
+  encoder exposes a `H264EncoderOptions::paff_field` flag; the first
+  emitted PAFF frame is an IDR I-field and every subsequent PAFF frame
+  is an all-skip P-field (`mb_skip_run = TotalMbs`, no coded MB,
+  §8.4.1.1 `P_Skip` zero-MV) so round-trip tests can drive the PAFF P
+  path without shipping a full inter-prediction writer.
 - **MBAFF I-slice CAVLC** is supported for 4:2:0 / 4:2:2 / 4:4:4 8-bit
   (§7.3.4 MB-pair loop + §6.4.9.4 field-stride neighbour lookups +
   §8.7.1.1 MBAFF deblock). MBAFF P/B, MBAFF CABAC, and MBAFF 10-bit
