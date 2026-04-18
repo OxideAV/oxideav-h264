@@ -13,6 +13,17 @@
 //!   in-loop deblocking (§8.7). The CABAC I-path covers I_16×16, I_NxN and
 //!   I_PCM (with the mid-stream arithmetic-engine re-init mandated by
 //!   §9.3.1.2).
+//! * **4:4:4 CAVLC I-slice** decode (§6.4.1 Table 6-1, ChromaArrayType = 3)
+//!   — the chroma planes share the luma 16×16 dimensions, reuse the
+//!   Intra_4×4 / Intra_16×16 predictors (no chroma 8×8 modes), skip the
+//!   `intra_chroma_pred_mode` syntax element, and decode residuals as
+//!   three back-to-back luma-style block streams (I_16×16: DC Hadamard
+//!   + 16 AC 4×4; I_NxN: 16 × 4×4). The 4-bit CBP is mapped through
+//!   `golomb_to_intra4x4_cbp_gray` (FFmpeg `libavcodec/h264_cavlc.c`,
+//!   Table 9-4) and applied to all three planes. Each plane uses its
+//!   own QP (luma vs `chroma_qp_index_offset` /
+//!   `second_chroma_qp_index_offset`) and scaling list. Bit-exact
+//!   against ffmpeg on the 64×64 `iframe_yuv444_64x64` fixture.
 //! * **Spec-accurate §8.7 in-loop deblocking filter** — per-4-pixel-edge
 //!   boundary strength (bS) derivation distinguishing MB-edge vs internal
 //!   edges, intra/inter sides, non-zero residual, and MV/reference
@@ -155,12 +166,15 @@
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
 //! * Interlaced coding / MBAFF / PAFF.
-//! * Non-4:2:0 chroma — `chroma_format_idc ∈ {0, 2, 3}` and
+//! * 4:2:2 chroma (`chroma_format_idc = 2`) and
 //!   `separate_colour_plane_flag = 1` (§6.4.1 / §7.4.2.1.1) are
-//!   rejected at slice entry with `Error::Unsupported`. The
-//!   format-aware helpers [`picture::chroma_plane_w`] /
-//!   [`picture::chroma_plane_h`] / [`picture::chroma_subsampling`]
-//!   are wired for future 4:2:2 / 4:4:4 work.
+//!   rejected at slice entry with `Error::Unsupported`. The chroma
+//!   4:2:2 pipeline needs a 2×4 chroma DC Hadamard and the extra
+//!   internal chroma horizontal edge in §8.7.2 that the 4:2:0 path
+//!   doesn't carry.
+//! * Monochrome (`chroma_format_idc = 0`) is rejected — the same
+//!   helpers are wired but the MB-layer path assumes chroma planes
+//!   exist.
 //! * Bit depths above 8.
 //! * Rate control, adaptive QP, mode decision (Intra4×4 / Plane / Vertical /
 //!   Horizontal), or any psychovisual tuning. The encoder always emits
@@ -187,6 +201,7 @@ pub mod encoder;
 pub mod fwd_transform;
 pub mod intra_pred;
 pub mod mb;
+pub mod mb_444;
 pub mod mb_type;
 pub mod motion;
 pub mod nal;

@@ -127,23 +127,55 @@ fn yuv422_decode_returns_unsupported() {
 }
 
 #[test]
-fn yuv444_decode_returns_unsupported() {
-    // §6.4.1 — `chroma_format_idc = 3` (4:4:4) would need chroma to use
-    // the luma intra / transform / MC / deblock paths. Not wired yet —
-    // see the decoder module doc for the scoped-out list.
+fn decode_yuv444_iframe_matches_reference() {
+    // §6.4.1 — `chroma_format_idc = 3` (4:4:4): chroma planes have the
+    // same dimensions as luma and reuse the luma Intra_4×4 / Intra_16×16
+    // predictors plus the luma residual schedule (no chroma DC 2×2). The
+    // CAVLC I-slice path decodes three plane-aligned luma-style residual
+    // streams per macroblock. This test drives a 64×64 yuv444p IDR
+    // produced by x264 (`high444` profile) and asserts the reconstructed
+    // frame matches the ffmpeg-decoded reference byte-for-byte (or at
+    // worst ≥ 99% of the samples).
+    use oxideav_core::PixelFormat;
+    use oxideav_core::Frame;
     let es = read_fixture("tests/fixtures/iframe_yuv444_64x64.es");
+    let ref_yuv = read_fixture("tests/fixtures/iframe_yuv444_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));
-    let err = dec
-        .send_packet(&first_packet(&es))
-        .expect_err("4:4:4 must be rejected");
+    dec.send_packet(&first_packet(&es))
+        .expect("4:4:4 CAVLC I decode should succeed");
+    let frame = match dec.receive_frame().expect("frame") {
+        Frame::Video(v) => v,
+        _ => panic!("not a video frame"),
+    };
+    assert_eq!(frame.format, PixelFormat::Yuv444P);
+    assert_eq!(frame.width, 64);
+    assert_eq!(frame.height, 64);
+    assert_eq!(frame.planes.len(), 3);
+    // Reference fixture is raw yuv444p: 64×64 Y followed by 64×64 Cb then
+    // 64×64 Cr — all at stride 64.
+    assert_eq!(ref_yuv.len(), 64 * 64 * 3);
+    let mut got = Vec::with_capacity(64 * 64 * 3);
+    for p in &frame.planes {
+        for row in 0..64 {
+            let off = row * p.stride;
+            got.extend_from_slice(&p.data[off..off + 64]);
+        }
+    }
+    assert_eq!(got.len(), ref_yuv.len());
+    let matches = got
+        .iter()
+        .zip(ref_yuv.iter())
+        .filter(|(a, b)| a == b)
+        .count();
+    let ratio = matches as f64 / got.len() as f64;
     assert!(
-        matches!(err, Error::Unsupported(_)),
-        "expected Error::Unsupported, got {err:?}"
+        ratio >= 0.99,
+        "4:4:4 decode accuracy {:.3}% — below 99%",
+        ratio * 100.0
     );
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("4:4:4") || msg.contains("chroma_format_idc=3"),
-        "error message should mention 4:4:4, got: {msg}"
+    assert_eq!(
+        got, ref_yuv,
+        "expected bit-exact 4:4:4 decode against x264-encoded reference"
     );
 }
 

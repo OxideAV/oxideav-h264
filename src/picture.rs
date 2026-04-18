@@ -47,11 +47,15 @@ pub struct Picture {
     pub height: u32,
     pub mb_width: u32,
     pub mb_height: u32,
+    /// Chroma format of this picture's chroma planes (§6.4.1 Table 6-1).
+    /// 1 = 4:2:0 (default for existing code paths), 3 = 4:4:4. The
+    /// chroma plane size, stride, and offset helpers key on this field.
+    pub chroma_format_idc: u32,
     /// Luma plane, raw stride == width.
     pub y: Vec<u8>,
-    /// Cb plane, raw stride == width / 2.
+    /// Cb plane, raw stride follows [`Self::chroma_stride`] (width / SubWidthC).
     pub cb: Vec<u8>,
-    /// Cr plane, raw stride == width / 2.
+    /// Cr plane, raw stride follows [`Self::chroma_stride`] (width / SubWidthC).
     pub cr: Vec<u8>,
     /// Per-macroblock state needed for predictor neighbour resolution and
     /// deblocking. Stored in raster order.
@@ -78,10 +82,21 @@ pub struct MbInfo {
     /// in raster order within the MB (`row*4 + col`). Used by §9.2.1.1 to
     /// compute the predicted nC for the block to the right / below.
     pub luma_nc: [u8; 16],
-    /// Per-4×4 chroma Cb coefficient counts (4 entries: 2×2 sub-blocks).
-    pub cb_nc: [u8; 4],
-    /// Per-4×4 chroma Cr coefficient counts (4 entries).
-    pub cr_nc: [u8; 4],
+    /// Per-4×4 chroma Cb coefficient counts. For 4:2:0 the first 4 entries
+    /// (2×2 sub-blocks) are used; for 4:4:4 all 16 entries matter (the
+    /// chroma plane is the same size as luma and follows the luma 4×4
+    /// grid). Entries beyond the active count stay zero.
+    pub cb_nc: [u8; 16],
+    /// Per-4×4 chroma Cr coefficient counts. Same shape as
+    /// [`Self::cb_nc`] — 4 active entries in 4:2:0, 16 in 4:4:4.
+    pub cr_nc: [u8; 16],
+    /// Intra4x4 modes per chroma-Cb 4×4 sub-block — used in 4:4:4 for
+    /// `predict_intra4x4_mode_with`-style neighbour mode prediction on
+    /// the chroma plane. Unused in 4:2:0.
+    pub cb_intra4x4_pred_mode: [u8; 16],
+    /// Intra4x4 modes per chroma-Cr 4×4 sub-block. See
+    /// [`Self::cb_intra4x4_pred_mode`].
+    pub cr_intra4x4_pred_mode: [u8; 16],
     /// Intra4x4 modes per sub-block (16 entries) — used for mode prediction.
     /// For Intra16x16/PCM macroblocks, all entries are `INTRA_DC_FAKE` so
     /// neighbouring 4×4 blocks fall through to the DC fallback (per §8.3.1.1).
@@ -160,8 +175,10 @@ impl Default for MbInfo {
             qp_y: 0,
             coded: false,
             luma_nc: [0; 16],
-            cb_nc: [0; 4],
-            cr_nc: [0; 4],
+            cb_nc: [0; 16],
+            cr_nc: [0; 16],
+            cb_intra4x4_pred_mode: [INTRA_DC_FAKE; 16],
+            cr_intra4x4_pred_mode: [INTRA_DC_FAKE; 16],
             intra4x4_pred_mode: [INTRA_DC_FAKE; 16],
             intra_chroma_pred_mode: 0,
             mb_type_i: None,
@@ -188,16 +205,29 @@ impl Default for MbInfo {
 pub const INTRA_DC_FAKE: u8 = 2;
 
 impl Picture {
+    /// Allocate a 4:2:0 picture (backwards-compatible default). New call sites
+    /// that need a different chroma format must go through
+    /// [`Self::new_with_format`].
     pub fn new(mb_width: u32, mb_height: u32) -> Self {
+        Self::new_with_format(mb_width, mb_height, 1)
+    }
+
+    /// Allocate a picture with the chroma plane sized per §6.4.1 Table 6-1.
+    /// For `chroma_format_idc = 3` (4:4:4) the chroma planes match the
+    /// luma dimensions and each chroma MB occupies 16 samples per
+    /// row/column — the helpers below scale the stride and per-MB
+    /// offsets accordingly.
+    pub fn new_with_format(mb_width: u32, mb_height: u32, chroma_format_idc: u32) -> Self {
         let width = mb_width * 16;
         let height = mb_height * 16;
-        let cw = width / 2;
-        let ch = height / 2;
+        let cw = chroma_plane_w(width, chroma_format_idc);
+        let ch = chroma_plane_h(height, chroma_format_idc);
         Self {
             width,
             height,
             mb_width,
             mb_height,
+            chroma_format_idc,
             y: vec![0u8; (width * height) as usize],
             cb: vec![128u8; (cw * ch) as usize],
             cr: vec![128u8; (cw * ch) as usize],
@@ -211,8 +241,24 @@ impl Picture {
     pub fn luma_stride(&self) -> usize {
         self.width as usize
     }
+    /// Stride (bytes per row) of either chroma plane — `width / SubWidthC`
+    /// per §6.4.1. For 4:2:0 this equals `width / 2`; for 4:4:4 it equals
+    /// the luma width.
     pub fn chroma_stride(&self) -> usize {
-        (self.width / 2) as usize
+        let (sub_w, _) = chroma_subsampling(self.chroma_format_idc);
+        (self.width / sub_w) as usize
+    }
+    /// Width of a chroma macroblock in samples (16 / SubWidthC). 8 for 4:2:0,
+    /// 16 for 4:4:4. Drives the per-MB chroma `chroma_off` stride stride.
+    pub fn mb_width_chroma(&self) -> usize {
+        let (sub_w, _) = chroma_subsampling(self.chroma_format_idc);
+        16 / sub_w as usize
+    }
+    /// Height of a chroma macroblock in samples (16 / SubHeightC). 8 for
+    /// 4:2:0, 16 for 4:4:4.
+    pub fn mb_height_chroma(&self) -> usize {
+        let (_, sub_h) = chroma_subsampling(self.chroma_format_idc);
+        16 / sub_h as usize
     }
 
     /// Linear address of the top-left luma sample of `(mb_x, mb_y)`.
@@ -220,7 +266,9 @@ impl Picture {
         (mb_y as usize * 16) * self.luma_stride() + (mb_x as usize * 16)
     }
     pub fn chroma_off(&self, mb_x: u32, mb_y: u32) -> usize {
-        (mb_y as usize * 8) * self.chroma_stride() + (mb_x as usize * 8)
+        let mbw = self.mb_width_chroma();
+        let mbh = self.mb_height_chroma();
+        (mb_y as usize * mbh) * self.chroma_stride() + (mb_x as usize * mbw)
     }
 
     /// Get a mutable reference to a single MB's bookkeeping.
@@ -282,8 +330,9 @@ impl Picture {
         pts: Option<i64>,
         time_base: TimeBase,
     ) -> VideoFrame {
-        let cw = visible_w.div_ceil(2);
-        let ch = visible_h.div_ceil(2);
+        let (sub_w, sub_h) = chroma_subsampling(self.chroma_format_idc);
+        let cw = visible_w.div_ceil(sub_w);
+        let ch = visible_h.div_ceil(sub_h);
         let l_stride = self.luma_stride();
         let c_stride = self.chroma_stride();
 
@@ -300,8 +349,12 @@ impl Picture {
             cr_out.extend_from_slice(&self.cr[off..off + cw as usize]);
         }
 
+        let format = match self.chroma_format_idc {
+            3 => PixelFormat::Yuv444P,
+            _ => PixelFormat::Yuv420P,
+        };
         VideoFrame {
-            format: PixelFormat::Yuv420P,
+            format,
             width: visible_w,
             height: visible_h,
             pts,
