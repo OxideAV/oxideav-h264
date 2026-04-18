@@ -34,9 +34,10 @@
 //! * Monochrome (`chroma_format_idc = 0`) and
 //!   `separate_colour_plane_flag = 1` are rejected at slice entry
 //!   (§7.4.2.1.1 / §6.4.1). 4:4:4 (`chroma_format_idc = 3`) is wired
-//!   for CAVLC I-slices only; 4:2:2 (`chroma_format_idc = 2`) is
+//!   for CAVLC I/P/B + CABAC I/P; 4:2:2 (`chroma_format_idc = 2`) is
 //!   wired for CAVLC I/P/B and CABAC I/P slices. CABAC 4:2:2 B-slices
-//!   and 4:4:4 CABAC still return `Error::Unsupported`.
+//!   and CABAC 4:4:4 B-slice inter partitions still return
+//!   `Error::Unsupported`.
 //!   See [`crate::mb_444`] for the 4:4:4 CAVLC
 //!   path, [`crate::mb::decode_chroma_422`] (private) for the 4:2:2
 //!   chroma pipeline, and [`crate::picture::chroma_plane_w`] /
