@@ -26,7 +26,7 @@ use crate::cabac::mb::{
 use crate::cabac::residual::{BlockCat, CbfNeighbours};
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_SKIP_FLAG_P,
-    CTX_IDX_MB_TYPE_I, CTX_IDX_MB_TYPE_P, CTX_IDX_REF_IDX_L0, CTX_IDX_SUB_MB_TYPE_P,
+    CTX_IDX_MB_TYPE_INTRA_IN_P, CTX_IDX_MB_TYPE_P, CTX_IDX_REF_IDX_L0, CTX_IDX_SUB_MB_TYPE_P,
     CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
 };
 use crate::mb::LUMA_BLOCK_RASTER;
@@ -80,26 +80,15 @@ pub fn decode_p_mb_cabac(
         return Ok(true);
     }
 
-    // §9.3.3.1.1.3 — mb_type for P/SP. Bin 0 ctxIdxInc is independent of
-    // neighbours; subsequent bins within the P bank use fixed ctxIdxInc.
-    // Intra-in-P bins share the I-slice ctxIdxOffset (CTX_IDX_MB_TYPE_I).
+    // §9.3.3.1.1.3 — mb_type for P/SP. The 7-slot window at
+    // [CTX_IDX_MB_TYPE_P .. +7] holds both the inter prefix bank (ctxIdx
+    // 14..=17) and the intra-in-P suffix bank (ctxIdx 17..=20, offset 17 per
+    // FFmpeg's `decode_cabac_intra_mb_type(sl, 17, 0)`). These overlap at
+    // ctxIdx 17, but only one path executes per MB, so we pass the full
+    // contiguous slice plus an intra-offset to [`binarize::decode_mb_type_p`].
     let mb_type_raw = {
-        let (p_slice, i_slice) = if CTX_IDX_MB_TYPE_P < CTX_IDX_MB_TYPE_I {
-            // CTX_IDX_MB_TYPE_P (14) > CTX_IDX_MB_TYPE_I (3) in this crate,
-            // so this branch is unreachable — kept for clarity.
-            let (head, tail) = ctxs.split_at_mut(CTX_IDX_MB_TYPE_I);
-            (
-                &mut head[CTX_IDX_MB_TYPE_P..CTX_IDX_MB_TYPE_P + 7],
-                &mut tail[..8],
-            )
-        } else {
-            let (head, tail) = ctxs.split_at_mut(CTX_IDX_MB_TYPE_P);
-            (
-                &mut tail[..7],
-                &mut head[CTX_IDX_MB_TYPE_I..CTX_IDX_MB_TYPE_I + 8],
-            )
-        };
-        binarize::decode_mb_type_p(d, p_slice, i_slice)?
+        let slice = &mut ctxs[CTX_IDX_MB_TYPE_P..CTX_IDX_MB_TYPE_P + 7];
+        binarize::decode_mb_type_p(d, slice, CTX_IDX_MB_TYPE_INTRA_IN_P - CTX_IDX_MB_TYPE_P)?
     };
 
     match mb_type_raw {

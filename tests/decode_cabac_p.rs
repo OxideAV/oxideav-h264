@@ -87,12 +87,14 @@ fn decode_cabac_p_slices_against_reference() {
     dec.send_packet(&primer_pkt).expect("primer send_packet");
     while dec.receive_frame().is_ok() {}
 
-    // Drive every frame through the decoder. The IDR frame now hard-
-    // asserts bit-exact against the ffmpeg reference (CBF neighbour fix
-    // in `src/cabac/mb.rs` landed with the cabac-recon2 wt). P-slice
-    // residual contexts still use an aggregate neighbour derivation
-    // rather than the spec-correct per-8×8-bit cbp check, so frames 1..2
-    // are soft-logged.
+    // Drive every frame through the decoder. All three frames (IDR + 2 P)
+    // are now hard-asserted bit-exact (≥99% luma ±8 LSB match) against the
+    // ffmpeg reference. Frame 0 locked in with the §9.3.3.1.1.9 CBF
+    // neighbour fix (cabac-recon2 wt) and the per-8×8-bit CBP luma ctx fix
+    // (wt 5b818d8). Frames 1..2 locked in once `decode_mb_type_p` was
+    // rewired to the spec-correct bin tree (inter-first, `1` → intra) and
+    // the intra-in-P suffix was moved from ctxIdxOffset 3 to the
+    // spec-mandated 17 (see FFmpeg `decode_cabac_intra_mb_type(sl, 17, 0)`).
     let mut decoded_frames: Vec<Vec<u8>> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for (idx, frame) in frame_nalus.iter().enumerate() {
@@ -146,21 +148,22 @@ fn decode_cabac_p_slices_against_reference() {
         frame_nalus.len(),
         errors.len()
     );
-    // Frame 0 is an IDR (CABAC I-slice) and must decode bit-exact after
-    // the §9.3.3.1.1.9 CBF neighbour fix.
+    // All three frames (IDR + 2 P-slices) must decode bit-exact (≥99% luma
+    // ±8 LSB) after the CABAC P mb_type / intra-in-P ctxIdxOffset fix.
     assert!(
-        !luma_pcts.is_empty(),
-        "expected at least frame 0 to decode successfully"
+        errors.is_empty(),
+        "CABAC P decode errors: {errors:?}",
     );
-    assert!(
-        luma_pcts[0] >= 99.0,
-        "CABAC P fixture frame 0 (IDR) luma match {:.2}% < 99%",
-        luma_pcts[0]
+    assert_eq!(
+        decoded_frames.len(),
+        3,
+        "expected 3 decoded frames (IDR + 2 P), got {}",
+        decoded_frames.len()
     );
-    // Minimum acceptance for the remaining P frames: at least the decoder
-    // made it through CABAC slice-header + NAL parsing.
-    assert!(
-        !decoded_frames.is_empty() || !errors.is_empty(),
-        "decoder produced neither frames nor errors — pipeline wedged"
-    );
+    for (i, pct) in luma_pcts.iter().enumerate() {
+        assert!(
+            *pct >= 99.0,
+            "CABAC P fixture frame {i} luma match {pct:.2}% < 99%",
+        );
+    }
 }
