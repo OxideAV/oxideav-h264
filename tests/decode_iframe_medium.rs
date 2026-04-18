@@ -136,11 +136,9 @@ fn decode_preset_medium_nodbl_bit_exact() {
     );
 }
 
-/// Post-deblock match on the mission-specified fixture. The spec-accurate
-/// §8.7 implementation (per-edge bS derivation, chroma filtering, 8×8
-/// transform-aware internal edges) reaches ≥ 99.5 % bit-exact and
-/// ≥ 99.85 % within ±1 LSB. A real intra-pred regression would push this
-/// below the threshold as per-MB pred errors are tens of LSBs.
+/// Post-deblock match on the mission-specified fixture. With the correct
+/// Table 8-15 `tC0` lookup the §8.7 loop filter reproduces FFmpeg's output
+/// bit-exactly across all 24 576 samples (128×128 luma + 2×64×64 chroma).
 #[test]
 fn decode_preset_medium_matches_within_tolerance() {
     let es = match read_fixture("iframe_128x128_medium.es") {
@@ -166,13 +164,11 @@ fn decode_preset_medium_matches_within_tolerance() {
             .count()
     };
     let exact = within(dec_y, ref_y, 0) + within(dec_cb, ref_cb, 0) + within(dec_cr, ref_cr, 0);
-    let within_1 = within(dec_y, ref_y, 1) + within(dec_cb, ref_cb, 1) + within(dec_cr, ref_cr, 1);
-    let pct = within_1 as f64 * 100.0 / total as f64;
     let exact_pct = exact as f64 * 100.0 / total as f64;
-    eprintln!("preset-medium (deblock on): exact = {exact}/{total} = {exact_pct:.4}%, ±1 LSB = {within_1}/{total} = {pct:.4}%");
-    assert!(
-        pct >= 99.5,
-        "preset-medium (deblock) ±1 LSB match {pct:.4}% < 99.5%",
+    eprintln!("preset-medium (deblock on): exact = {exact}/{total} = {exact_pct:.4}%",);
+    assert_eq!(
+        exact, total,
+        "preset-medium (deblock on) not bit-exact: {exact}/{total} = {exact_pct:.4}%",
     );
 }
 
