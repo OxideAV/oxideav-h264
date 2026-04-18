@@ -8,8 +8,12 @@
 //! # Advertised scope
 //!
 //! * Baseline Profile (profile_idc = 66), level 3.0.
-//! * Progressive path: I-frames only — every output frame is emitted as
-//!   an IDR NAL.
+//! * Progressive path: IDR I-frame + optional CAVLC `P_L0_16×16` /
+//!   `P_Skip` P-frames referencing the previous reconstructed frame
+//!   (single-slot L0). Driven by
+//!   [`H264EncoderOptions::p_slice_interval`] — `0` keeps every output
+//!   an IDR (legacy behaviour); `N > 0` emits one IDR followed by
+//!   P-frames until the next interval boundary.
 //! * PAFF path (`paff_field = Some(..)`): the first encoded field is an
 //!   IDR I-slice at the selected parity; subsequent encoded fields at the
 //!   same parity are emitted as zero-residual P-slices (one `mb_skip_run`
@@ -19,7 +23,12 @@
 //! * CAVLC entropy coding (entropy_coding_mode_flag = 0).
 //! * Single slice per picture (`num_slice_groups_minus1 = 0`).
 //! * 4:2:0 chroma, 8-bit luma / chroma, single colour plane.
-//! * Intra_16×16 DC_PRED for every luma macroblock; chroma DC for chroma.
+//! * I-MB path: Intra_16×16 DC_PRED for every luma macroblock;
+//!   chroma DC for chroma.
+//! * P-MB path: `P_L0_16×16` with a single 16×16 partition, ref_idx = 0,
+//!   integer-pel ME via SAD over a ±16-pixel window; MVD = mv − §8.4.1.3
+//!   median predictor; 4×4 residual forward DCT + quant + CAVLC; inter
+//!   CBP via me(v); `P_Skip` when MVD = 0 and residual is all-zero.
 //! * Fixed QP (configurable, default = 26). No rate control, no adaptive QP.
 //! * Deblocking disabled on emit (`disable_deblocking_filter_idc = 1`).
 //! * Annex B framing with 4-byte start codes.
@@ -27,15 +36,21 @@
 //! # Packet layout
 //!
 //! Every `receive_packet()` returns a single self-contained packet shaped
-//! as:
+//! as one of:
 //!
 //! ```text
-//! [start code] [SPS NAL]
-//! [start code] [PPS NAL]
-//! [start code] [IDR slice NAL]
+//! IDR:
+//!   [start code] [SPS NAL]
+//!   [start code] [PPS NAL]
+//!   [start code] [IDR slice NAL]
+//!
+//! P-frame:
+//!   [start code] [SPS NAL]
+//!   [start code] [PPS NAL]
+//!   [start code] [non-IDR slice NAL]
 //! ```
 //!
-//! Every packet is a keyframe (`PacketFlags::keyframe = true`).
+//! IDR packets carry `PacketFlags::keyframe = true`; P packets do not.
 //!
 //! # Quantisation
 //!
@@ -66,6 +81,9 @@ use crate::intra_pred::{
     IntraChromaMode, IntraChromaNeighbours,
 };
 use crate::mb::LUMA_BLOCK_RASTER;
+use crate::mb_type::{PMbType, PPartition, ME_INTER_4_2_0};
+use crate::motion::{chroma_mc, luma_mc_plane, predict_mv_l0, predict_mv_pskip};
+use crate::picture::{MbInfo, Picture};
 use crate::tables::ME_INTRA_4_2_0;
 use crate::transform::{
     chroma_qp, dequantize_4x4, idct_4x4, inv_hadamard_2x2_chroma_dc, inv_hadamard_4x4_dc,
@@ -100,6 +118,14 @@ pub struct H264EncoderOptions {
     /// predictor). This is enough to drive the decoder's PAFF P path
     /// end-to-end; it is not a reconstruction-quality inter encoder.
     pub paff_field: Option<bool>,
+    /// Progressive P-slice cadence. When `0` (default), every output
+    /// frame is an IDR (legacy I-only behaviour). When `N > 0`, the
+    /// encoder emits an IDR every `N` frames and a CAVLC
+    /// `P_L0_16×16` / `P_Skip` P-slice for the frames in between,
+    /// referencing the previous reconstructed frame (single-slot L0).
+    /// Ignored on the PAFF path — PAFF still emits one IDR + all-skip P
+    /// fields as documented on [`Self::paff_field`].
+    pub p_slice_interval: u32,
 }
 
 impl Default for H264EncoderOptions {
@@ -109,11 +135,12 @@ impl Default for H264EncoderOptions {
             sps_id: 0,
             pps_id: 0,
             paff_field: None,
+            p_slice_interval: 0,
         }
     }
 }
 
-/// Baseline I-only H.264 encoder.
+/// Baseline H.264 encoder supporting IDR + CAVLC P-slices.
 pub struct H264Encoder {
     codec_id: CodecId,
     opts: H264EncoderOptions,
@@ -130,8 +157,16 @@ pub struct H264Encoder {
     pps_nal: Vec<u8>,
     output_params: CodecParameters,
     packets: VecDeque<Packet>,
-    /// Monotonic IDR frame number.
+    /// Slice-layer `frame_num` (§7.4.3) — advanced for every non-IDR
+    /// reference frame; reset to 0 at every IDR.
     frame_num: u32,
+    /// Count of frames emitted since the last IDR; when it hits
+    /// `p_slice_interval` the encoder rotates back to an IDR.
+    frames_since_idr: u32,
+    /// Reconstructed frame that sits in L0 for the *next* P-slice encode.
+    /// `None` before the first frame and whenever the next frame must be
+    /// an IDR.
+    ref_pic: Option<Picture>,
     eof: bool,
 }
 
@@ -184,6 +219,8 @@ impl H264Encoder {
             output_params,
             packets: VecDeque::new(),
             frame_num: 0,
+            frames_since_idr: 0,
+            ref_pic: None,
             eof: false,
         })
     }
@@ -213,6 +250,15 @@ impl H264Encoder {
         // takes the I-only path.
         if self.opts.paff_field.is_some() && self.frame_num > 0 {
             return self.encode_paff_p_skip_field(frame);
+        }
+        // Progressive P-slice cadence (ignored under PAFF).
+        if self.opts.paff_field.is_none()
+            && self.opts.p_slice_interval > 0
+            && self.frames_since_idr > 0
+            && self.frames_since_idr < self.opts.p_slice_interval
+            && self.ref_pic.is_some()
+        {
+            return self.encode_p_frame(frame);
         }
 
         // Build the MB-aligned raw-sample buffer (padding replicate-edges
@@ -322,7 +368,21 @@ impl H264Encoder {
             ..Default::default()
         };
         self.packets.push_back(pkt);
+        // IDR advances `frame_num` (the PAFF encoder keys on
+        // `frame_num > 0` to dispatch the all-skip P-field path, and the
+        // progressive P path reads the monotonic value unchanged). For
+        // the progressive encoder the next P-slice writes
+        // `frame_num = 1`; the IDR itself was written with `frame_num = 0`
+        // inline by `write_slice_header`.
         self.frame_num = self.frame_num.wrapping_add(1);
+        self.frames_since_idr = 1;
+        // Stash the reconstructed picture so the next P-frame can use it
+        // as its single L0 reference. A fresh `Picture` seeded with the
+        // sample buffers we just produced; `MbInfo.coded = true` (all
+        // intra) so MV predictor lookups walking into this picture return
+        // the "available, intra" answer defined by §8.4.1.3.1.
+        let pic = self.build_ref_picture_intra(rec_y, rec_cb, rec_cr);
+        self.ref_pic = Some(pic);
         Ok(())
     }
 
@@ -699,6 +759,722 @@ impl H264Encoder {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    // Reference-picture + P-slice encoding.
+    // -----------------------------------------------------------------
+
+    /// Wrap the IDR's reconstruction buffers into a [`Picture`] tagged
+    /// as a fully-intra frame so the next P-slice's MV predictor treats
+    /// every neighbour as "available, intra" (§8.4.1.3.1: `refIdxLX = -1`
+    /// with `mvLX = 0`). Chroma planes are copied as-is.
+    fn build_ref_picture_intra(&self, rec_y: Vec<u8>, rec_cb: Vec<u8>, rec_cr: Vec<u8>) -> Picture {
+        let mut pic = Picture::new_with_format(self.mb_width, self.mb_height, 1);
+        pic.y = rec_y;
+        pic.cb = rec_cb;
+        pic.cr = rec_cr;
+        for mb_y in 0..self.mb_height {
+            for mb_x in 0..self.mb_width {
+                let info = pic.mb_info_mut(mb_x, mb_y);
+                *info = MbInfo {
+                    qp_y: self.opts.qp,
+                    coded: true,
+                    intra: true,
+                    ..Default::default()
+                };
+            }
+        }
+        pic
+    }
+
+    /// Encode one progressive P-frame referencing the previous
+    /// reconstructed picture.
+    fn encode_p_frame(&mut self, frame: &VideoFrame) -> Result<()> {
+        let l_stride = self.coded_width as usize;
+        let coded_cw = (self.coded_width / 2) as usize;
+        let coded_ch = (self.coded_height / 2) as usize;
+
+        let y_src = plane_to_mb_aligned(
+            &frame.planes[0].data,
+            frame.planes[0].stride,
+            self.width as usize,
+            self.height as usize,
+            self.coded_width as usize,
+            self.coded_height as usize,
+        );
+        let cw = (self.width / 2) as usize;
+        let ch = (self.height / 2) as usize;
+        let cb_src = plane_to_mb_aligned(
+            &frame.planes[1].data,
+            frame.planes[1].stride,
+            cw,
+            ch,
+            coded_cw,
+            coded_ch,
+        );
+        let cr_src = plane_to_mb_aligned(
+            &frame.planes[2].data,
+            frame.planes[2].stride,
+            cw,
+            ch,
+            coded_cw,
+            coded_ch,
+        );
+
+        // The reference picture is consumed (replaced with a freshly
+        // reconstructed `Picture` below). Take it out, decode into a new
+        // sibling, then install the new one at the end.
+        let ref_pic = self.ref_pic.take().expect("encode_p_frame: ref_pic");
+        let mut cur = Picture::new_with_format(self.mb_width, self.mb_height, 1);
+
+        let mut slice_rbsp = BitWriter::new();
+        self.write_p_slice_header(&mut slice_rbsp);
+
+        // §7.3.4 CAVLC P-slice data loop — walk MBs in raster order. A
+        // contiguous run of P_Skip MBs is counted into `pending_skip_run`
+        // and flushed (as an ue(v)) right before the next coded MB, or at
+        // the very end of the slice. Picture-wide nC tables (§9.2.1.1) for
+        // coded-MB CAVLC neighbour prediction live on `cur.mb_info`.
+        let mut pending_skip_run: u32 = 0;
+        let mut last_qp = self.opts.qp;
+
+        for mb_y in 0..self.mb_height {
+            for mb_x in 0..self.mb_width {
+                // Integer-pel motion search (±16), SAD.
+                let (best_mv, best_sad) = integer_me_16x16(
+                    &y_src,
+                    &ref_pic.y,
+                    l_stride,
+                    mb_x,
+                    mb_y,
+                    self.coded_width as usize,
+                    self.coded_height as usize,
+                );
+                // Try P_Skip first: need the §8.4.1.1 skip predictor to
+                // match, and the resulting motion-compensated residual to
+                // quantise-to-zero.
+                let skip_mv = predict_mv_pskip(&cur, mb_x, mb_y);
+                let skip_ok = self.try_skip(
+                    &cur, &ref_pic, &y_src, &cb_src, &cr_src, mb_x, mb_y, skip_mv,
+                );
+                if skip_ok {
+                    pending_skip_run += 1;
+                    // Record the skip on the cur picture for neighbour
+                    // prediction (§8.4.1.1 ref_idx=0, mv=skip_mv; all
+                    // luma_nc entries remain zero).
+                    self.commit_skip_mb(&mut cur, &ref_pic, mb_x, mb_y, skip_mv, last_qp);
+                    continue;
+                }
+
+                // Non-skip coded MB: flush any pending skip run.
+                slice_rbsp.write_ue(pending_skip_run);
+                pending_skip_run = 0;
+
+                self.encode_p_mb(
+                    &mut slice_rbsp,
+                    &mut cur,
+                    &ref_pic,
+                    &y_src,
+                    &cb_src,
+                    &cr_src,
+                    mb_x,
+                    mb_y,
+                    best_mv,
+                    best_sad,
+                    &mut last_qp,
+                )?;
+            }
+        }
+        // Trailing skip run (if the tail of the slice is all skips).
+        slice_rbsp.write_ue(pending_skip_run);
+        slice_rbsp.write_rbsp_trailing_bits();
+        let rbsp = slice_rbsp.finish();
+
+        // NAL header: non-IDR, nal_ref_idc = 2 (reference). 0x41 =
+        // 0b0100_0001. Using nal_ref_idc = 2 distinguishes short-term
+        // reference from the IDR's nal_ref_idc = 3 without changing
+        // reference-picture marking semantics.
+        let nal_header = 0x41u8;
+        let mut slice_nal = Vec::with_capacity(1 + rbsp.len());
+        slice_nal.push(nal_header);
+        slice_nal.extend_from_slice(&rbsp);
+        let slice_ebsp = rbsp_to_ebsp(&slice_nal);
+
+        let mut out =
+            Vec::with_capacity(slice_ebsp.len() + self.sps_nal.len() + self.pps_nal.len() + 12);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&self.sps_nal);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&self.pps_nal);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&slice_ebsp);
+
+        let mut pkt = Packet::new(0, frame.time_base, out);
+        pkt.pts = frame.pts;
+        pkt.dts = frame.pts;
+        pkt.flags = PacketFlags::default();
+        self.packets.push_back(pkt);
+
+        self.frame_num = self.frame_num.wrapping_add(1);
+        self.frames_since_idr = self.frames_since_idr.saturating_add(1);
+        self.ref_pic = Some(cur);
+        Ok(())
+    }
+
+    /// §7.3.3 P-slice header (non-IDR) — single slice, single ref, no
+    /// weighted prediction, sliding-window DPB marking.
+    fn write_p_slice_header(&self, w: &mut BitWriter) {
+        w.write_ue(0); // first_mb_in_slice
+        w.write_ue(5); // slice_type = 5 (P, single-type-per-picture variant)
+        w.write_ue(self.opts.pps_id); // pic_parameter_set_id
+        // frame_num — 4 bits (log2_max_frame_num_minus4 = 0).
+        w.write_bits(self.frame_num & 0xF, 4);
+        // No field_pic_flag when frame_mbs_only_flag = 1 (progressive SPS).
+        // pic_order_cnt_lsb — 4 bits. Use `2 * frame_num` so each P-slice
+        // sits strictly above the IDR's POC 0.
+        w.write_bits((self.frame_num * 2) & 0xF, 4);
+        // num_ref_idx_active_override_flag = 0 — inherits the PPS's
+        // num_ref_idx_l0_default_active_minus1 = 0.
+        w.write_flag(false);
+        // ref_pic_list_modification_flag_l0 = 0.
+        w.write_flag(false);
+        // dec_ref_pic_marking — non-IDR:
+        //   adaptive_ref_pic_marking_mode_flag = 0 (sliding window).
+        w.write_flag(false);
+        // slice_qp_delta.
+        w.write_se(self.opts.qp - 26);
+        // disable_deblocking_filter_idc = 1.
+        w.write_ue(1);
+    }
+
+    /// P_Skip feasibility check (§8.4.1.1) — the implied MV comes from
+    /// `predict_mv_pskip`, ref_idx = 0, and the resulting motion
+    /// compensation must already be within the quant round-trip's
+    /// tolerance of the source (i.e. all residual blocks quantise to
+    /// zero).
+    fn try_skip(
+        &self,
+        cur: &Picture,
+        ref_pic: &Picture,
+        y_src: &[u8],
+        cb_src: &[u8],
+        cr_src: &[u8],
+        mb_x: u32,
+        mb_y: u32,
+        skip_mv: (i16, i16),
+    ) -> bool {
+        let _ = cur;
+        let qp_y = self.opts.qp;
+        let qpc = chroma_qp(qp_y, 0);
+        let l_stride = self.coded_width as usize;
+        let c_stride = (self.coded_width / 2) as usize;
+
+        // Motion-compensate luma 16×16 at integer-pel offset from the ref.
+        let mut pred_y = [0u8; 256];
+        luma_mc_plane(
+            &mut pred_y,
+            &ref_pic.y,
+            l_stride,
+            ref_pic.width as i32,
+            ref_pic.height as i32,
+            (mb_x as i32) * 16,
+            (mb_y as i32) * 16,
+            (skip_mv.0 as i32) * 1, // already quarter-pel (integer)
+            (skip_mv.1 as i32) * 1,
+            16,
+            16,
+        );
+        let y_off_mb = (mb_y as usize * 16) * l_stride + mb_x as usize * 16;
+        for br in 0..4usize {
+            for bc in 0..4usize {
+                let mut residual = [0i32; 16];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let src = y_src[y_off_mb + (br * 4 + r) * l_stride + (bc * 4 + c)] as i32;
+                        let p = pred_y[(br * 4 + r) * 16 + (bc * 4 + c)] as i32;
+                        residual[r * 4 + c] = src - p;
+                    }
+                }
+                forward_dct_4x4(&mut residual);
+                quantize_4x4_ac(&mut residual, qp_y);
+                for &v in residual.iter() {
+                    if v != 0 {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Chroma skip check — chroma MC at half-MV, DC Hadamard + AC both
+        // must quantise to zero.
+        let mut pred_cb = [0u8; 64];
+        let mut pred_cr = [0u8; 64];
+        let c_plane_w = (ref_pic.width / 2) as i32;
+        let c_plane_h = (ref_pic.height / 2) as i32;
+        chroma_mc(
+            &mut pred_cb,
+            &ref_pic.cb,
+            c_stride,
+            c_plane_w,
+            c_plane_h,
+            (mb_x as i32) * 8,
+            (mb_y as i32) * 8,
+            skip_mv.0 as i32,
+            skip_mv.1 as i32,
+            8,
+            8,
+        );
+        chroma_mc(
+            &mut pred_cr,
+            &ref_pic.cr,
+            c_stride,
+            c_plane_w,
+            c_plane_h,
+            (mb_x as i32) * 8,
+            (mb_y as i32) * 8,
+            skip_mv.0 as i32,
+            skip_mv.1 as i32,
+            8,
+            8,
+        );
+        let c_off_mb = (mb_y as usize * 8) * c_stride + mb_x as usize * 8;
+        for plane_is_cb in [true, false] {
+            let (src, pred) = if plane_is_cb {
+                (cb_src, &pred_cb)
+            } else {
+                (cr_src, &pred_cr)
+            };
+            let mut dc = [0i32; 4];
+            let mut ac: [[i32; 16]; 4] = [[0; 16]; 4];
+            for bi in 0..4usize {
+                let br = bi >> 1;
+                let bc = bi & 1;
+                let mut residual = [0i32; 16];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let s = src[c_off_mb + (br * 4 + r) * c_stride + (bc * 4 + c)] as i32;
+                        let p = pred[(br * 4 + r) * 8 + (bc * 4 + c)] as i32;
+                        residual[r * 4 + c] = s - p;
+                    }
+                }
+                forward_dct_4x4(&mut residual);
+                dc[bi] = residual[0];
+                residual[0] = 0;
+                ac[bi] = residual;
+                quantize_4x4_ac(&mut ac[bi], qpc);
+            }
+            forward_hadamard_2x2(&mut dc);
+            quantize_chroma_dc_2x2(&mut dc, qpc);
+            if dc.iter().any(|&v| v != 0) {
+                return false;
+            }
+            for b in ac.iter() {
+                if b.iter().any(|&v| v != 0) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Commit a P_Skip MB into the current picture: copies the MC
+    /// prediction into the reconstruction buffers and records the implied
+    /// MV / ref_idx on `MbInfo` so subsequent MVP lookups and chroma-nC
+    /// prediction see the right neighbour state.
+    fn commit_skip_mb(
+        &self,
+        cur: &mut Picture,
+        ref_pic: &Picture,
+        mb_x: u32,
+        mb_y: u32,
+        skip_mv: (i16, i16),
+        qp_y: i32,
+    ) {
+        let l_stride = self.coded_width as usize;
+        let c_stride = (self.coded_width / 2) as usize;
+        let mut pred_y = [0u8; 256];
+        luma_mc_plane(
+            &mut pred_y,
+            &ref_pic.y,
+            l_stride,
+            ref_pic.width as i32,
+            ref_pic.height as i32,
+            (mb_x as i32) * 16,
+            (mb_y as i32) * 16,
+            skip_mv.0 as i32,
+            skip_mv.1 as i32,
+            16,
+            16,
+        );
+        let y_off_mb = (mb_y as usize * 16) * l_stride + mb_x as usize * 16;
+        for r in 0..16 {
+            for c in 0..16 {
+                cur.y[y_off_mb + r * l_stride + c] = pred_y[r * 16 + c];
+            }
+        }
+        let mut pred_cb = [0u8; 64];
+        let mut pred_cr = [0u8; 64];
+        let c_plane_w = (ref_pic.width / 2) as i32;
+        let c_plane_h = (ref_pic.height / 2) as i32;
+        chroma_mc(
+            &mut pred_cb,
+            &ref_pic.cb,
+            c_stride,
+            c_plane_w,
+            c_plane_h,
+            (mb_x as i32) * 8,
+            (mb_y as i32) * 8,
+            skip_mv.0 as i32,
+            skip_mv.1 as i32,
+            8,
+            8,
+        );
+        chroma_mc(
+            &mut pred_cr,
+            &ref_pic.cr,
+            c_stride,
+            c_plane_w,
+            c_plane_h,
+            (mb_x as i32) * 8,
+            (mb_y as i32) * 8,
+            skip_mv.0 as i32,
+            skip_mv.1 as i32,
+            8,
+            8,
+        );
+        let c_off_mb = (mb_y as usize * 8) * c_stride + mb_x as usize * 8;
+        for r in 0..8 {
+            for c in 0..8 {
+                cur.cb[c_off_mb + r * c_stride + c] = pred_cb[r * 8 + c];
+                cur.cr[c_off_mb + r * c_stride + c] = pred_cr[r * 8 + c];
+            }
+        }
+        let info = cur.mb_info_mut(mb_x, mb_y);
+        *info = MbInfo {
+            qp_y,
+            coded: true,
+            intra: false,
+            skipped: true,
+            mb_type_p: Some(PMbType::Inter {
+                partition: PPartition::P16x16,
+            }),
+            p_partition: Some(PPartition::P16x16),
+            mv_l0: [skip_mv; 16],
+            ref_idx_l0: [0; 16],
+            ..Default::default()
+        };
+    }
+
+    /// Encode one P_L0_16×16 coded MB: mb_type, mvd, CBP, qp_delta,
+    /// residual (DC Hadamard + 16 AC for luma when cbp_luma = 0xF; chroma
+    /// DC Hadamard + 4 AC when cbp_chroma = 2; nothing if luma / chroma
+    /// residual fully quantised to zero).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_p_mb(
+        &self,
+        w: &mut BitWriter,
+        cur: &mut Picture,
+        ref_pic: &Picture,
+        y_src: &[u8],
+        cb_src: &[u8],
+        cr_src: &[u8],
+        mb_x: u32,
+        mb_y: u32,
+        best_mv: (i16, i16),
+        _best_sad: u32,
+        last_qp: &mut i32,
+    ) -> Result<()> {
+        let qp_y = self.opts.qp;
+        let qpc = chroma_qp(qp_y, 0);
+        let l_stride = self.coded_width as usize;
+        let c_stride = (self.coded_width / 2) as usize;
+        let _ = last_qp;
+
+        // MV predictor: ref_idx=0, P_L0_16×16 partition (br=bc=0, 4×4).
+        let pmv = predict_mv_l0(cur, mb_x, mb_y, 0, 0, 4, 4, 0);
+        let mvd = (
+            best_mv.0.wrapping_sub(pmv.0) as i32,
+            best_mv.1.wrapping_sub(pmv.1) as i32,
+        );
+
+        // Motion-compensate luma from reference at best_mv.
+        let mut pred_y = [0u8; 256];
+        luma_mc_plane(
+            &mut pred_y,
+            &ref_pic.y,
+            l_stride,
+            ref_pic.width as i32,
+            ref_pic.height as i32,
+            (mb_x as i32) * 16,
+            (mb_y as i32) * 16,
+            best_mv.0 as i32,
+            best_mv.1 as i32,
+            16,
+            16,
+        );
+        // Chroma MC.
+        let mut pred_cb = [0u8; 64];
+        let mut pred_cr = [0u8; 64];
+        let c_plane_w = (ref_pic.width / 2) as i32;
+        let c_plane_h = (ref_pic.height / 2) as i32;
+        chroma_mc(
+            &mut pred_cb,
+            &ref_pic.cb,
+            c_stride,
+            c_plane_w,
+            c_plane_h,
+            (mb_x as i32) * 8,
+            (mb_y as i32) * 8,
+            best_mv.0 as i32,
+            best_mv.1 as i32,
+            8,
+            8,
+        );
+        chroma_mc(
+            &mut pred_cr,
+            &ref_pic.cr,
+            c_stride,
+            c_plane_w,
+            c_plane_h,
+            (mb_x as i32) * 8,
+            (mb_y as i32) * 8,
+            best_mv.0 as i32,
+            best_mv.1 as i32,
+            8,
+            8,
+        );
+
+        // Forward 4×4 DCT + quant for each of the 16 luma AC blocks. For
+        // P-slice inter the 16×16 partition does NOT go through a DC
+        // Hadamard — every 4×4 is a plain Luma4x4 block and the CBP-luma
+        // 8×8 bits are set when any sub-block has a non-zero coefficient.
+        let y_off_mb = (mb_y as usize * 16) * l_stride + mb_x as usize * 16;
+        let mut luma_blocks: [[i32; 16]; 16] = [[0; 16]; 16];
+        for br in 0..4usize {
+            for bc in 0..4usize {
+                let mut residual = [0i32; 16];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let src = y_src[y_off_mb + (br * 4 + r) * l_stride + (bc * 4 + c)] as i32;
+                        let p = pred_y[(br * 4 + r) * 16 + (bc * 4 + c)] as i32;
+                        residual[r * 4 + c] = src - p;
+                    }
+                }
+                forward_dct_4x4(&mut residual);
+                quantize_4x4_ac(&mut residual, qp_y);
+                luma_blocks[br * 4 + bc] = residual;
+            }
+        }
+
+        // Compute cbp_luma (one bit per 8×8 sub-block).
+        let mut cbp_luma: u8 = 0;
+        for blk8 in 0..4u8 {
+            let br8 = (blk8 >> 1) as usize;
+            let bc8 = (blk8 & 1) as usize;
+            let mut nz = false;
+            for br_off in 0..2 {
+                for bc_off in 0..2 {
+                    let br = br8 * 2 + br_off;
+                    let bc = bc8 * 2 + bc_off;
+                    if luma_blocks[br * 4 + bc].iter().any(|&v| v != 0) {
+                        nz = true;
+                    }
+                }
+            }
+            if nz {
+                cbp_luma |= 1 << blk8;
+            }
+        }
+
+        // Chroma residual: DC Hadamard pass + 4 AC blocks per plane.
+        let c_off_mb = (mb_y as usize * 8) * c_stride + mb_x as usize * 8;
+        let mut cb_ac: [[i32; 16]; 4] = [[0; 16]; 4];
+        let mut cr_ac: [[i32; 16]; 4] = [[0; 16]; 4];
+        let mut cb_dc = [0i32; 4];
+        let mut cr_dc = [0i32; 4];
+        for plane_is_cb in [true, false] {
+            let (src, pred, ac_dst, dc_dst) = if plane_is_cb {
+                (cb_src, &pred_cb, &mut cb_ac, &mut cb_dc)
+            } else {
+                (cr_src, &pred_cr, &mut cr_ac, &mut cr_dc)
+            };
+            for bi in 0..4usize {
+                let br = bi >> 1;
+                let bc = bi & 1;
+                let mut residual = [0i32; 16];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let s = src[c_off_mb + (br * 4 + r) * c_stride + (bc * 4 + c)] as i32;
+                        let p = pred[(br * 4 + r) * 8 + (bc * 4 + c)] as i32;
+                        residual[r * 4 + c] = s - p;
+                    }
+                }
+                forward_dct_4x4(&mut residual);
+                dc_dst[bi] = residual[0];
+                residual[0] = 0;
+                ac_dst[bi] = residual;
+                quantize_4x4_ac(&mut ac_dst[bi], qpc);
+            }
+            forward_hadamard_2x2(dc_dst);
+            quantize_chroma_dc_2x2(dc_dst, qpc);
+        }
+        let chroma_dc_nz =
+            cb_dc.iter().any(|&v| v != 0) || cr_dc.iter().any(|&v| v != 0);
+        let chroma_ac_nz = cb_ac.iter().any(|b| b.iter().any(|&v| v != 0))
+            || cr_ac.iter().any(|b| b.iter().any(|&v| v != 0));
+        let cbp_chroma: u8 = if chroma_ac_nz {
+            2
+        } else if chroma_dc_nz {
+            1
+        } else {
+            0
+        };
+
+        // Write mb_type = 0 (P_L0_16×16).
+        w.write_ue(0);
+        // ref_idx_l0 omitted — num_ref_idx_l0_active_minus1 = 0, so the
+        // decoder infers ref_idx = 0 without consuming any bits.
+        // mvd_l0_x, mvd_l0_y.
+        w.write_se(mvd.0);
+        w.write_se(mvd.1);
+
+        // Inter CBP via me(v): find index in ME_INTER_4_2_0.
+        let cbp_value = ((cbp_chroma & 0x3) << 4) | (cbp_luma & 0xF);
+        let cbp_idx = ME_INTER_4_2_0
+            .iter()
+            .position(|&v| v == cbp_value)
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "h264 encoder: no me(v) inter CBP index for value {cbp_value}"
+                ))
+            })? as u32;
+        w.write_ue(cbp_idx);
+
+        // §7.3.5.1 — mb_qp_delta is present only when cbp_luma != 0 or
+        // cbp_chroma != 0. Our PPS has `transform_8x8_mode_flag = 0`, so
+        // no transform_size_8x8_flag.
+        if cbp_luma != 0 || cbp_chroma != 0 {
+            // Fixed QP → delta = 0 every time.
+            w.write_se(0);
+        }
+
+        // Luma residual: 16 Luma4x4 blocks. Order: for each of 4 8×8 sub-MBs,
+        // if cbp_luma bit set, emit its 4 child 4×4 blocks in raster order.
+        // §7.3.5.3 specifies inter 4×4 residuals use BlockKind::Luma4x4.
+        for blk8 in 0..4u8 {
+            if (cbp_luma >> blk8) & 1 == 0 {
+                continue;
+            }
+            let br8 = (blk8 >> 1) as usize;
+            let bc8 = (blk8 & 1) as usize;
+            for sub in 0..4usize {
+                let sub_br = sub >> 1;
+                let sub_bc = sub & 1;
+                let br = br8 * 2 + sub_br;
+                let bc = bc8 * 2 + sub_bc;
+                let nc = predict_inter_nc_luma_local(cur, mb_x, mb_y, br, bc);
+                let tc = encode_residual_block(
+                    w,
+                    &luma_blocks[br * 4 + bc],
+                    nc,
+                    BlockKind::Luma4x4,
+                )?;
+                cur.mb_info_mut(mb_x, mb_y).luma_nc[br * 4 + bc] = tc as u8;
+            }
+        }
+
+        // Chroma residual — chroma DC first (both Cb and Cr), then AC per
+        // plane if cbp_chroma == 2.
+        if cbp_chroma >= 1 {
+            let mut dcb = [0i32; 16];
+            let mut dcr = [0i32; 16];
+            dcb[..4].copy_from_slice(&cb_dc);
+            dcr[..4].copy_from_slice(&cr_dc);
+            encode_residual_block(w, &dcb, 0, BlockKind::ChromaDc2x2)?;
+            encode_residual_block(w, &dcr, 0, BlockKind::ChromaDc2x2)?;
+        }
+        if cbp_chroma == 2 {
+            for plane_is_cb in [true, false] {
+                for bi in 0..4usize {
+                    let br = bi >> 1;
+                    let bc = bi & 1;
+                    let nc = predict_inter_nc_chroma_local(cur, mb_x, mb_y, plane_is_cb, br, bc);
+                    let ac = if plane_is_cb { &cb_ac[bi] } else { &cr_ac[bi] };
+                    let tc = encode_residual_block(w, ac, nc, BlockKind::ChromaAc)?;
+                    let info = cur.mb_info_mut(mb_x, mb_y);
+                    if plane_is_cb {
+                        info.cb_nc[bi] = tc as u8;
+                    } else {
+                        info.cr_nc[bi] = tc as u8;
+                    }
+                }
+            }
+        }
+
+        // Local reconstruction: inverse quant + IDCT, re-inject chroma DC,
+        // add to MC prediction, clamp, write into `cur`.
+        // Luma.
+        for br in 0..4usize {
+            for bc in 0..4usize {
+                let mut res = luma_blocks[br * 4 + bc];
+                dequantize_4x4(&mut res, qp_y);
+                idct_4x4(&mut res);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let p = pred_y[(br * 4 + r) * 16 + (bc * 4 + c)] as i32;
+                        let v = p + res[r * 4 + c];
+                        cur.y[y_off_mb + (br * 4 + r) * l_stride + (bc * 4 + c)] =
+                            v.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        // Chroma.
+        let mut cb_dc_rec = cb_dc;
+        let mut cr_dc_rec = cr_dc;
+        inv_hadamard_2x2_chroma_dc(&mut cb_dc_rec, qpc);
+        inv_hadamard_2x2_chroma_dc(&mut cr_dc_rec, qpc);
+        for plane_is_cb in [true, false] {
+            let (rec, pred, ac, dc) = if plane_is_cb {
+                (cur.cb.as_mut_slice(), &pred_cb, &cb_ac, &cb_dc_rec)
+            } else {
+                (cur.cr.as_mut_slice(), &pred_cr, &cr_ac, &cr_dc_rec)
+            };
+            for bi in 0..4usize {
+                let br = bi >> 1;
+                let bc = bi & 1;
+                let mut res = ac[bi];
+                dequantize_4x4(&mut res, qpc);
+                res[0] = dc[bi];
+                idct_4x4(&mut res);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let p = pred[(br * 4 + r) * 8 + (bc * 4 + c)] as i32;
+                        let v = p + res[r * 4 + c];
+                        rec[c_off_mb + (br * 4 + r) * c_stride + (bc * 4 + c)] =
+                            v.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+
+        // MbInfo: mark inter, record MV + ref_idx + CBP + qp.
+        let info = cur.mb_info_mut(mb_x, mb_y);
+        info.qp_y = qp_y;
+        info.coded = true;
+        info.intra = false;
+        info.skipped = false;
+        info.mb_type_p = Some(PMbType::Inter {
+            partition: PPartition::P16x16,
+        });
+        info.p_partition = Some(PPartition::P16x16);
+        info.mv_l0 = [best_mv; 16];
+        info.ref_idx_l0 = [0; 16];
+        info.cbp_luma = cbp_luma;
+        info.cbp_chroma = cbp_chroma;
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +1608,156 @@ fn nc_from(left: Option<u8>, top: Option<u8>) -> i32 {
         (None, Some(t)) => t as i32,
         (None, None) => 0,
     }
+}
+
+/// Integer-pel motion estimation over the 16×16 luma macroblock at
+/// `(mb_x, mb_y)` against a ±16-pixel window of the reference plane.
+/// Returns `(mv, sad)` — `mv` is in quarter-pel units so downstream MC
+/// callers can read it unchanged; SAD is kept so callers can compare two
+/// alternatives (e.g. zero-MV vs best-search) without re-reading.
+fn integer_me_16x16(
+    src: &[u8],
+    ref_y: &[u8],
+    stride: usize,
+    mb_x: u32,
+    mb_y: u32,
+    coded_w: usize,
+    coded_h: usize,
+) -> ((i16, i16), u32) {
+    let mb_ox = mb_x as usize * 16;
+    let mb_oy = mb_y as usize * 16;
+    let search_radius: i32 = 16;
+    let mut best = (0i32, 0i32);
+    // Zero-MV first pass so an exactly-identical frame yields `P_Skip`.
+    let mut best_sad = sad_16x16(src, ref_y, stride, mb_ox, mb_oy, 0, 0, coded_w, coded_h);
+    // Full search over ±search_radius pixels.
+    for dy in -search_radius..=search_radius {
+        for dx in -search_radius..=search_radius {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let sad = sad_16x16(src, ref_y, stride, mb_ox, mb_oy, dx, dy, coded_w, coded_h);
+            if sad < best_sad {
+                best_sad = sad;
+                best = (dx, dy);
+            }
+        }
+    }
+    // Convert integer-pel (dx, dy) to quarter-pel MV by × 4.
+    (
+        ((best.0 * 4) as i16, (best.1 * 4) as i16),
+        best_sad,
+    )
+}
+
+fn sad_16x16(
+    src: &[u8],
+    ref_y: &[u8],
+    stride: usize,
+    mb_ox: usize,
+    mb_oy: usize,
+    dx: i32,
+    dy: i32,
+    coded_w: usize,
+    coded_h: usize,
+) -> u32 {
+    let mut sad: u32 = 0;
+    for r in 0..16i32 {
+        for c in 0..16i32 {
+            let sy = mb_oy as i32 + r;
+            let sx = mb_ox as i32 + c;
+            let ry = (sy + dy).clamp(0, coded_h as i32 - 1) as usize;
+            let rx = (sx + dx).clamp(0, coded_w as i32 - 1) as usize;
+            let s = src[sy as usize * stride + sx as usize] as i32;
+            let p = ref_y[ry * stride + rx] as i32;
+            sad += (s - p).unsigned_abs();
+        }
+    }
+    sad
+}
+
+/// Predict nC for an inter 4×4 luma block at `(br, bc)` within MB
+/// `(mb_x, mb_y)` using only the `cur` [`Picture`]'s MbInfo — mirrors
+/// [`crate::p_mb::predict_inter_nc_luma`] but bounded to the encoder's
+/// single-slice scope.
+fn predict_inter_nc_luma_local(
+    cur: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    br: usize,
+    bc: usize,
+) -> i32 {
+    let info_here = cur.mb_info_at(mb_x, mb_y);
+    let left = if bc > 0 {
+        Some(info_here.luma_nc[br * 4 + bc - 1])
+    } else if mb_x > 0 {
+        let info = cur.mb_info_at(mb_x - 1, mb_y);
+        if info.coded {
+            Some(info.luma_nc[br * 4 + 3])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let top = if br > 0 {
+        Some(info_here.luma_nc[(br - 1) * 4 + bc])
+    } else if mb_y > 0 {
+        let info = cur.mb_info_at(mb_x, mb_y - 1);
+        if info.coded {
+            Some(info.luma_nc[12 + bc])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    nc_from(left, top)
+}
+
+/// Same shape as [`predict_inter_nc_luma_local`] but for chroma 4×4
+/// sub-blocks (2×2 layout in 4:2:0).
+fn predict_inter_nc_chroma_local(
+    cur: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    cb: bool,
+    br: usize,
+    bc: usize,
+) -> i32 {
+    let pick = |info: &MbInfo, sub: usize| -> u8 {
+        if cb {
+            info.cb_nc[sub]
+        } else {
+            info.cr_nc[sub]
+        }
+    };
+    let info_here = cur.mb_info_at(mb_x, mb_y);
+    let left = if bc > 0 {
+        Some(pick(info_here, br * 2 + bc - 1))
+    } else if mb_x > 0 {
+        let info = cur.mb_info_at(mb_x - 1, mb_y);
+        if info.coded {
+            Some(pick(info, br * 2 + 1))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let top = if br > 0 {
+        Some(pick(info_here, (br - 1) * 2 + bc))
+    } else if mb_y > 0 {
+        let info = cur.mb_info_at(mb_x, mb_y - 1);
+        if info.coded {
+            Some(pick(info, 2 + bc))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    nc_from(left, top)
 }
 
 fn collect_intra16x16_neighbours(

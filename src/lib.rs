@@ -349,17 +349,34 @@
 //!
 //! # What is encoded today
 //!
-//! See [`encoder::H264Encoder`] — Baseline Profile, I-frames only,
-//! Intra_16×16 DC_PRED, CAVLC, single slice per frame, 4:2:0, 8-bit,
-//! fixed QP, deblocking disabled. The encoder and decoder round-trip
-//! to PSNR ≥ 28 dB for gradient content at QP 22 and ≥ 40 dB for solid
-//! content.
+//! See [`encoder::H264Encoder`] — Baseline Profile, CAVLC, single
+//! slice per frame, 4:2:0, 8-bit, fixed QP, deblocking disabled.
+//! Supported macroblock types:
+//!
+//! * Intra: `I_16×16` DC_PRED for every luma MB; chroma DC.
+//! * Inter (opt-in via `H264EncoderOptions::p_slice_interval > 0`):
+//!   `P_L0_16×16` with a single 16×16 partition and `ref_idx = 0`
+//!   (single-slot L0), integer-pel motion estimation via SAD search
+//!   over a ±16-pixel window, MVD = mv − §8.4.1.3 median predictor,
+//!   and `P_Skip` when MVD = 0 and the residual quantises to all-zero
+//!   (§8.4.1.1 skip derivation). Residual coding is 16 × 4×4 `Luma4x4`
+//!   blocks + chroma DC Hadamard + 4 × 4×4 `ChromaAc` per plane,
+//!   gated by an inter CBP me(v).
+//!
+//! The encoder and decoder round-trip to PSNR ≥ 28 dB for gradient
+//! content at QP 22 (I-only), ≥ 40 dB for solid content, and ≥ 30 dB
+//! on an IDR + 2 P-frame sequence at QP 26 (low-frequency gradient /
+//! low-motion pan).
 //!
 //! # Out of scope (returns `Error::Unsupported` or the encoder refuses)
 //!
-//! * Any CABAC encoding; any P/B slice encoding. CABAC I/P/B decode and
-//!   the CABAC 8×8 transform path are all wired; weighted-P on the CABAC
-//!   path is parsed but the weights aren't yet applied to the MC output.
+//! * Any CABAC encoding. CABAC I/P/B decode and the CABAC 8×8 transform
+//!   path are all wired; weighted-P on the CABAC path is parsed but the
+//!   weights aren't yet applied to the MC output.
+//! * B-slice encoding. CAVLC P-slice encoding is wired but constrained
+//!   to the P_L0_16×16 partition, single L0 reference, integer-pel ME
+//!   only (no sub-pel / quarter-pel refinement), no weighted prediction.
+//!   Multi-reference P is out of scope.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
 //! * MBAFF CABAC and MBAFF 10-bit — MBAFF I/P/B-slice CAVLC in 4:2:0
@@ -454,11 +471,13 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_max_size(8192, 8192);
     reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), dec_caps, decoder::make_decoder);
 
-    // Encoder: Baseline I-only. The registered caps advertise
-    // `intra_only = true` and cap the output at level 3.0 maxima.
-    let enc_caps = CodecCapabilities::video("h264_baseline_i_sw")
+    // Encoder: Baseline CAVLC IDR + P. The registered caps advertise
+    // `intra_only = false` (P-slice encoding is opt-in via
+    // `H264EncoderOptions::p_slice_interval`) and cap the output at
+    // level 3.0 maxima.
+    let enc_caps = CodecCapabilities::video("h264_baseline_sw")
         .with_lossy(true)
-        .with_intra_only(true)
+        .with_intra_only(false)
         .with_max_size(720, 576)
         .with_pixel_format(PixelFormat::Yuv420P);
     reg.register_encoder_impl(CodecId::new(CODEC_ID_STR), enc_caps, encoder::make_encoder);

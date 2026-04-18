@@ -6,10 +6,11 @@ CAVLC + CABAC B-slices (spatial + temporal direct + explicit weighted
 bipred + implicit weighted bipred); primary **SI / SP slices** decode
 through the CAVLC 4:2:0 / 8-bit path (`slice_qs_delta ==
 slice_qp_delta` — the §8.6 identity case); encodes a minimal
-Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED output stream. **High-Profile 8×8
-transform** is wired end-to-end on both the CAVLC path (§7.3.5.3.2,
-§8.5.13, bit-exact against libavcodec) and the CABAC path
-(§9.3.3.1.1.10 for the transform size flag + §9.3.3.1.1.9
+Baseline-Profile output stream with Intra_16×16 DC_PRED and CAVLC
+**P_L0_16×16 / P_Skip** inter macroblocks driven by integer-pel motion
+estimation. **High-Profile 8×8 transform** is wired end-to-end on both
+the CAVLC path (§7.3.5.3.2, §8.5.13, bit-exact against libavcodec) and
+the CABAC path (§9.3.3.1.1.10 for the transform size flag + §9.3.3.1.1.9
 ctxBlockCat = 5 for the 64-coefficient residual). Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
@@ -201,23 +202,32 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
 
 ## What is encoded today
 
-A **minimal Baseline Profile, I-frame-only encoder** — see
+A **minimal Baseline Profile encoder** — see
 [`encoder::H264Encoder`](src/encoder.rs). Each input frame is written as
 a self-contained Annex B packet:
 
 ```text
-[start code] SPS  [start code] PPS  [start code] IDR slice
+IDR:     [start code] SPS  [start code] PPS  [start code] IDR slice
+P-frame: [start code] SPS  [start code] PPS  [start code] non-IDR slice
 ```
 
 Fixed encoder policy (no rate control, no mode decision, no tuning):
 
 - **Baseline Profile** (`profile_idc = 66`), level 3.0.
-- **I-frames only** — every frame is an IDR.
+- **IDR + CAVLC P-slice cadence** — every frame is an IDR by default
+  (`p_slice_interval = 0`). Setting `H264EncoderOptions::p_slice_interval
+  = N` emits one IDR every `N` frames and CAVLC P-slices in between.
 - **CAVLC** entropy coding (`entropy_coding_mode_flag = 0`).
 - **Single slice per picture** (`num_slice_groups_minus1 = 0`).
 - **4:2:0** chroma (`chroma_format_idc = 1`), **8-bit** luma + chroma.
-- **Intra_16×16** with `Intra16x16PredMode = DC` (Table 8-4 value 2) for
-  every luma macroblock; **chroma DC** (Table 8-5 value 0) for chroma.
+- **I-macroblocks**: **Intra_16×16** with `Intra16x16PredMode = DC`
+  (Table 8-4 value 2); **chroma DC** (Table 8-5 value 0).
+- **P-macroblocks** (opt-in): `P_L0_16×16` with a single 16×16 partition
+  and `ref_idx = 0` (single-slot L0 referencing the previous
+  reconstructed frame); integer-pel motion estimation via SAD over a
+  ±16-pixel window; MVD = mv − §8.4.1.3 median predictor; inter CBP via
+  me(v); `P_Skip` when the MV predictor matches and the quantised
+  residual is all-zero (§8.4.1.1 `P_Skip` derivation).
 - **Fixed QP**, configurable via `H264EncoderOptions::qp`. Default 26.
 - **Deblocking filter disabled** on emit
   (`disable_deblocking_filter_idc = 1`).
@@ -225,8 +235,9 @@ Fixed encoder policy (no rate control, no mode decision, no tuning):
   `AVCDecoderConfigurationRecord` blob is exposed in
   `output_params().extradata` for MP4 wrapping.
 
-Round-trip PSNR at QP 22 on a 64×48 gradient is ≥ 44 dB (tested
-against both this crate's own decoder and ffmpeg's `libavcodec`).
+Round-trip PSNR: ≥ 44 dB on a 64×48 gradient IDR at QP 22, ≥ 30 dB on
+an IDR + 2 P-frame low-motion gradient at QP 26 (tested against this
+crate's decoder in `tests/encode_pframe_roundtrip.rs`).
 
 ```rust
 use oxideav_codec::Encoder;
@@ -314,9 +325,11 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   Weighted prediction on the CABAC P path is parsed but weights are
   not applied; encoders should disable weighted P for CABAC bitstreams
   fed into this decoder, or tolerate unweighted MC output.
-- **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16
-  modes other than DC, rate control, adaptive QP, mode decision,
-  deblocking.
+- **Encoder**: B-slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16 modes
+  other than DC, rate control, adaptive QP, mode decision, deblocking.
+  P-slices: only `P_L0_16×16` / `P_Skip` are emitted; no 16×8 / 8×16 /
+  8×8 partitions, no sub-pel motion estimation (integer-pel only), no
+  multi-reference, no weighted prediction.
 - `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 - PAFF CABAC, PAFF chroma > 4:2:0, PAFF 10-bit, and PAFF + MBAFF mixed
   within a coded video sequence remain out of scope.
@@ -484,7 +497,7 @@ dequant chain without needing an external 12/14-bit libx264 build
 ## Codec id
 
 Registered under `CodecId::new("h264")` for both decoder (`h264_sw`)
-and encoder (`h264_baseline_i_sw`). Call `oxideav_h264::register(&mut
+and encoder (`h264_baseline_sw`). Call `oxideav_h264::register(&mut
 reg)` to wire both into a `CodecRegistry`. The decoder and encoder
 both operate on `PixelFormat::Yuv420P`.
 
