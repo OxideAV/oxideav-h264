@@ -280,6 +280,8 @@ fn decode_b_inter_mb(
         let info = pic.mb_info_mut(mb_x, mb_y);
         info.qp_y = qp_y;
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
+        info.cbp_luma = cbp_luma;
+        info.cbp_chroma = cbp_chroma;
     }
     decode_inter_residual_luma(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
     decode_inter_residual_chroma(br, pps, mb_x, mb_y, pic, cbp_chroma, qp_y)?;

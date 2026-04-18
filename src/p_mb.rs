@@ -257,6 +257,8 @@ fn decode_p16x16(
         });
         info.p_partition = Some(PPartition::P16x16);
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
+        info.cbp_luma = cbp_luma;
+        info.cbp_chroma = cbp_chroma;
     }
 
     if transform_8x8 {
@@ -423,6 +425,8 @@ fn decode_two_partition_p(
         info.p_partition = Some(partition);
         info.mb_type_p = Some(PMbType::Inter { partition });
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
+        info.cbp_luma = cbp_luma;
+        info.cbp_chroma = cbp_chroma;
     }
 
     if transform_8x8 {
@@ -548,6 +552,8 @@ fn decode_p8x8(
         info.p_partition = Some(partition);
         info.mb_type_p = Some(PMbType::Inter { partition });
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
+        info.cbp_luma = cbp_luma;
+        info.cbp_chroma = cbp_chroma;
     }
 
     if transform_8x8 {

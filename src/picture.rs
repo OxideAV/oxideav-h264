@@ -118,6 +118,17 @@ pub struct MbInfo {
     /// §9.3.3.1.1.9 to derive the CBF ctxIdxInc for a neighbouring MB's
     /// chroma DC block.
     pub chroma_dc_cbf: [bool; 2],
+    /// `coded_block_pattern` luma nibble (one bit per 8×8 sub-block,
+    /// raster order: bit0 TL, bit1 TR, bit2 BL, bit3 BR). Needed by
+    /// §9.3.3.1.1.4 Table 9-39 so a neighbour MB's CBP-luma bit can be
+    /// consulted directly rather than reconstructed from 4×4 NNZ counts
+    /// (the latter conflates inter 8×8 transform with 4×4 residuals).
+    pub cbp_luma: u8,
+    /// `coded_block_pattern` chroma value in {0,1,2} per Table 7-16:
+    /// 0 = no chroma residual, 1 = chroma DC only, 2 = chroma DC+AC.
+    /// Consumed by the §9.3.3.1.1.4 chroma CBP ctxIdxInc derivation on
+    /// neighbour MBs.
+    pub cbp_chroma: u8,
 }
 
 impl Default for MbInfo {
@@ -146,6 +157,8 @@ impl Default for MbInfo {
             transform_8x8: false,
             luma16x16_dc_cbf: false,
             chroma_dc_cbf: [false; 2],
+            cbp_luma: 0,
+            cbp_chroma: 0,
         }
     }
 }

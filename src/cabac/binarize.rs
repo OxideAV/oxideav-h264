@@ -253,12 +253,13 @@ pub fn decode_mb_type_i(
 ///   * `ctxs[4..8]`  : chroma CBP contexts (ctxIdxOffset 77 .. 84, but
 ///     only 2 bins are decoded so we use 4 slots to cover both).
 ///
-/// `ctx_idx_inc_luma_a_b[i]` is the ctxIdxInc for luma sub-block i,
-/// derived from the A/B neighbour CBPs per §9.3.3.1.1.4.
-///
-/// `ctx_idx_inc_chroma_a_b[0]` selects the ctx for the "any chroma AC/DC"
-/// bin; `ctx_idx_inc_chroma_a_b[1]` selects the ctx for the "chroma AC"
-/// refinement bin.
+/// `luma_inc_of(i, decoded_bits)` returns the ctxIdxInc for luma sub-block
+/// i ∈ 0..4 (§9.3.3.1.1.4). The `decoded_bits` argument supplies the
+/// running 4-bit mask of already-decoded CBP luma bins so that
+/// sub-blocks with same-MB A/B neighbours can observe prior bits per
+/// Table 9-39's spatial neighbour derivation. Likewise
+/// `chroma_inc_of(bin_idx)` returns the chroma ctxIdxInc for bin 0 (any
+/// residual) and bin 1 (AC present).
 ///
 /// Returns the packed `coded_block_pattern` byte value: low 4 bits are the
 /// luma CBP (one bit per 8×8 sub-block) and bits [5:4] are the chroma CBP
@@ -267,19 +268,18 @@ pub fn decode_coded_block_pattern(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
     chroma_format_idc: u8,
-    ctx_idx_inc_luma_a_b: [u8; 4],
-    ctx_idx_inc_chroma_a_b: [u8; 2],
+    mut luma_inc_of: impl FnMut(usize, u8) -> u8,
+    mut chroma_inc_of: impl FnMut(usize) -> u8,
 ) -> Result<u32> {
-    if ctxs.len() < 8 {
+    if ctxs.len() < 12 {
         return Err(Error::invalid(
-            "cabac::binarize::decode_coded_block_pattern: need >=8 CBP ctxs",
+            "cabac::binarize::decode_coded_block_pattern: need >=12 CBP ctxs \
+             (luma 73..77 + chroma 77..85)",
         ));
     }
-    // Luma: 4 bins, one per 8×8 sub-block. The ctx slice for each bin is
-    // ctxs[0..4], indexed by the caller-supplied ctx_idx_inc.
     let mut cbp_luma: u32 = 0;
     for i in 0..4 {
-        let inc = ctx_idx_inc_luma_a_b[i] as usize;
+        let inc = luma_inc_of(i, cbp_luma as u8) as usize;
         if inc >= 4 {
             return Err(Error::invalid(
                 "cabac::binarize::decode_coded_block_pattern: luma ctx_idx_inc out of range",
@@ -288,11 +288,13 @@ pub fn decode_coded_block_pattern(
         let bin = d.decode_bin(&mut ctxs[inc])?;
         cbp_luma |= (bin as u32) << i;
     }
-    // Chroma: only present for 4:2:0 and 4:2:2 (chroma_format_idc 1 or 2).
     let cbp_chroma: u32 = if chroma_format_idc == 0 {
         0
     } else {
-        let inc0 = ctx_idx_inc_chroma_a_b[0] as usize;
+        // Chroma contexts occupy ctxs[4..12] (ctxIdxOffset 77..85).
+        // Bin 0 uses the first 4 entries (ctxs[4..8]); bin 1 uses the next
+        // 4 (ctxs[8..12]).
+        let inc0 = chroma_inc_of(0) as usize;
         if inc0 >= 4 {
             return Err(Error::invalid(
                 "cabac::binarize::decode_coded_block_pattern: chroma ctx_idx_inc[0] out of range",
@@ -302,13 +304,13 @@ pub fn decode_coded_block_pattern(
         if any == 0 {
             0
         } else {
-            let inc1 = ctx_idx_inc_chroma_a_b[1] as usize;
+            let inc1 = chroma_inc_of(1) as usize;
             if inc1 >= 4 {
                 return Err(Error::invalid(
                     "cabac::binarize::decode_coded_block_pattern: chroma ctx_idx_inc[1] out of range",
                 ));
             }
-            let ac = d.decode_bin(&mut ctxs[4 + inc1])?;
+            let ac = d.decode_bin(&mut ctxs[8 + inc1])?;
             1 + ac as u32
         }
     };

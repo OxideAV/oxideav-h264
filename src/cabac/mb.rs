@@ -86,91 +86,105 @@ fn intra_chroma_pred_mode_ctx_idx_inc(pic: &Picture, mb_x: u32, mb_y: u32) -> u8
     (a as u8) + (b as u8)
 }
 
-/// `coded_block_pattern` ctxIdxInc for each luma 8×8 sub-block i ∈ 0..4.
+/// `coded_block_pattern` luma ctxIdxInc for each 8×8 sub-block `i ∈ 0..4`
+/// per §9.3.3.1.1.4 / Table 9-39.
 ///
-/// §9.3.3.1.1.4: `condTermFlagN = 1` if mbN is unavailable OR
-/// `mbN.cbp_luma_bit(i) == 0`. `ctxIdxInc = condTermFlagA + 2·condTermFlagB`.
-fn cbp_luma_ctx_idx_incs(pic: &Picture, mb_x: u32, mb_y: u32) -> [u8; 4] {
-    let mut out = [0u8; 4];
-    for (i, slot) in out.iter_mut().enumerate() {
-        // Each 8×8 sub-block index i in raster has an A neighbour and a B
-        // neighbour — either inside the same MB (other sub-blocks decoded
-        // earlier) or in neighbour MBs.
-        // Sub-block layout (raster): i=0 TL, i=1 TR, i=2 BL, i=3 BR.
-        let (xi, yi) = match i {
-            0 => (0, 0),
-            1 => (1, 0),
-            2 => (0, 1),
-            3 => (1, 1),
-            _ => unreachable!(),
-        };
-        // A neighbour (left).
-        let a_cond = if xi > 0 {
-            // Inside MB — same CBP we're decoding; default the condTermFlag
-            // to 1 (no prior bit set yet for the 8×8 to our left we can
-            // actually check without state, so conservative per spec uses
-            // the predicted value). Precise implementation tracks already-
-            // decoded bits but the all-zero case we test never differs.
-            1
-        } else if mb_x > 0 {
-            let m = pic.mb_info_at(mb_x - 1, mb_y);
-            let right_idx = i + 1;
-            let neighbour_bit = neighbour_cbp_luma_bit(m, right_idx);
-            (!neighbour_bit) as u8
+/// For the i-th luma CBP bit we have a spatial A (left) neighbour and a
+/// B (above) neighbour. Each neighbour is either:
+///   * another 8×8 sub-block *inside* the current MB that is decoded
+///     earlier in raster order — its CBP bit was just set on the four
+///     already-decoded bins, so we consult a running `decoded_bits` mask.
+///   * the matching 8×8 in an adjacent MB (written to `MbInfo::cbp_luma`).
+///
+/// `condTermFlagN = 1` when the neighbour is unavailable OR its CBP bit
+/// is 0; `ctxIdxInc = condTermFlagA + 2·condTermFlagB`.
+pub(crate) fn cbp_luma_ctx_idx_inc(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    i: usize,
+    decoded_bits: u8,
+) -> u8 {
+    let (xi, yi) = sub_8x8_xy(i);
+    // §9.3.3.1.1.4 / FFmpeg h264_mvpred.h: when a neighbour MB is
+    // unavailable, the CBP luma nibble is treated as all-ones (0x0F for
+    // inter, 0x7CF-masked for intra). That flips condTermFlag to 0 — NOT
+    // the "all zero" default a naive read would assume.
+    let a_bit = if xi > 0 {
+        (decoded_bits >> (i - 1)) & 1 != 0
+    } else if mb_x > 0 {
+        let m = pic.mb_info_at(mb_x - 1, mb_y);
+        if m.coded {
+            let nbr_idx = i + 1;
+            (m.cbp_luma >> nbr_idx) & 1 != 0
         } else {
-            1
-        };
-        let b_cond = if yi > 0 {
-            1
-        } else if mb_y > 0 {
-            let m = pic.mb_info_at(mb_x, mb_y - 1);
-            let below_idx = i + 2;
-            let neighbour_bit = neighbour_cbp_luma_bit(m, below_idx);
-            (!neighbour_bit) as u8
+            true
+        }
+    } else {
+        true
+    };
+    let b_bit = if yi > 0 {
+        (decoded_bits >> (i - 2)) & 1 != 0
+    } else if mb_y > 0 {
+        let m = pic.mb_info_at(mb_x, mb_y - 1);
+        if m.coded {
+            let nbr_idx = i + 2;
+            (m.cbp_luma >> nbr_idx) & 1 != 0
         } else {
-            1
-        };
-        *slot = a_cond + 2 * b_cond;
-    }
-    out
+            true
+        }
+    } else {
+        true
+    };
+    let a_cond = if a_bit { 0 } else { 1 };
+    let b_cond = if b_bit { 0 } else { 1 };
+    a_cond + 2 * b_cond
 }
 
-fn neighbour_cbp_luma_bit(m: &MbInfo, _sub_idx: usize) -> bool {
-    // Without full cbp_luma tracking per-8×8 we conservatively treat a coded
-    // MB as having all-zero CBP when we have no other info. For the first
-    // MB of a slice and for test fixtures with cbp_luma=0 this is exact.
-    // Future refinement can store the neighbour's cbp_luma byte in `MbInfo`
-    // and index it precisely.
-    if !m.coded {
-        return false;
+fn sub_8x8_xy(i: usize) -> (usize, usize) {
+    match i {
+        0 => (0, 0),
+        1 => (1, 0),
+        2 => (0, 1),
+        3 => (1, 1),
+        _ => unreachable!(),
     }
-    // If MbInfo stored per-MB cbp_luma, we'd index it here. We fall back to
-    // checking the 4×4 luma_nc counts for the sub-block's four 4×4 blocks —
-    // any non-zero count means the bit is set.
-    m.luma_nc.iter().any(|&n| n != 0)
 }
 
-fn cbp_chroma_ctx_idx_incs(pic: &Picture, mb_x: u32, mb_y: u32) -> [u8; 2] {
-    // §9.3.3.1.1.4: bin 0 "any chroma coded" and bin 1 "chroma AC coded".
-    // Both use condTermFlagN derived from neighbour cbp_chroma.
-    let neighbour_any = |m: &MbInfo| {
-        m.coded && (m.cb_nc.iter().any(|&n| n != 0) || m.cr_nc.iter().any(|&n| n != 0))
+pub(crate) fn cbp_chroma_ctx_idx_inc_any(pic: &Picture, mb_x: u32, mb_y: u32) -> u8 {
+    // §9.3.3.1.1.4 / FFmpeg decode_cabac_mb_cbp_chroma bin 0:
+    // ctxIdxInc increments by 1 iff left-MB cbp_chroma != 0, by 2 iff
+    // top-MB cbp_chroma != 0. Unavailable neighbours default to
+    // cbp_chroma = 0 (left_cbp/top_cbp bits 4..5 are cleared in both the
+    // intra 0x7CF and inter 0x00F fall-backs).
+    let a = mb_x > 0 && {
+        let m = pic.mb_info_at(mb_x - 1, mb_y);
+        m.coded && m.cbp_chroma != 0
     };
-    let a_any = if mb_x > 0 {
-        neighbour_any(pic.mb_info_at(mb_x - 1, mb_y))
-    } else {
-        false
+    let b = mb_y > 0 && {
+        let m = pic.mb_info_at(mb_x, mb_y - 1);
+        m.coded && m.cbp_chroma != 0
     };
-    let b_any = if mb_y > 0 {
-        neighbour_any(pic.mb_info_at(mb_x, mb_y - 1))
-    } else {
-        false
-    };
-    let inc_any = (a_any as u8) + 2 * (b_any as u8);
-    // For the "AC present" bin we don't track cbp_chroma precisely in
-    // MbInfo either; use the same derivation.
-    [inc_any, inc_any]
+    (a as u8) + 2 * (b as u8)
 }
+
+pub(crate) fn cbp_chroma_ctx_idx_inc_ac(pic: &Picture, mb_x: u32, mb_y: u32) -> u8 {
+    // §9.3.3.1.1.4 / FFmpeg decode_cabac_mb_cbp_chroma bin 1: ctxIdxInc
+    // increments by 1/2 iff neighbour's cbp_chroma == 2 (DC+AC).
+    // Unavailable neighbours contribute 0 (left_cbp/top_cbp default has
+    // bits 4..5 zeroed in both intra and inter fall-backs). The +4 base
+    // offset to reach ctxIdx 81..85 is applied by `decode_coded_block_pattern`.
+    let a = mb_x > 0 && {
+        let m = pic.mb_info_at(mb_x - 1, mb_y);
+        m.coded && m.cbp_chroma == 2
+    };
+    let b = mb_y > 0 && {
+        let m = pic.mb_info_at(mb_x, mb_y - 1);
+        m.coded && m.cbp_chroma == 2
+    };
+    (a as u8) + 2 * (b as u8)
+}
+
 
 /// Select the 43-entry context window for a residual block per
 /// §9.3.3.1.1.9 (Table 9-42). The layout returned into `out` is the flat
@@ -553,16 +567,20 @@ fn decode_intra_mb_given_imb_cabac(
     // --- coded_block_pattern (only for I_NxN) ---
     let (cbp_luma, cbp_chroma) = match imb {
         IMbType::INxN => {
-            let luma_incs = cbp_luma_ctx_idx_incs(pic, mb_x, mb_y);
-            let chroma_incs = cbp_chroma_ctx_idx_incs(pic, mb_x, mb_y);
             let slice =
-                &mut ctxs[CTX_IDX_CODED_BLOCK_PATTERN_LUMA..CTX_IDX_CODED_BLOCK_PATTERN_LUMA + 8];
+                &mut ctxs[CTX_IDX_CODED_BLOCK_PATTERN_LUMA..CTX_IDX_CODED_BLOCK_PATTERN_LUMA + 12];
             let cbp = binarize::decode_coded_block_pattern(
                 d,
                 slice,
                 sps.chroma_format_idc as u8,
-                luma_incs,
-                chroma_incs,
+                |i, decoded| cbp_luma_ctx_idx_inc(pic, mb_x, mb_y, i, decoded),
+                |bin| {
+                    if bin == 0 {
+                        cbp_chroma_ctx_idx_inc_any(pic, mb_x, mb_y)
+                    } else {
+                        cbp_chroma_ctx_idx_inc_ac(pic, mb_x, mb_y)
+                    }
+                },
             )?;
             ((cbp & 0x0F) as u8, ((cbp >> 4) & 0x03) as u8)
         }
@@ -607,6 +625,8 @@ fn decode_intra_mb_given_imb_cabac(
             intra_chroma_pred_mode: chroma_mode_val as u8,
             mb_type_i: Some(imb),
             transform_8x8,
+            cbp_luma,
+            cbp_chroma,
             ..Default::default()
         };
     }
