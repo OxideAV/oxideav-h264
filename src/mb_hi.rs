@@ -13,20 +13,23 @@
 //! * Chroma QP table lookup is driven off `QpY + chroma_qp_index_offset`,
 //!   then shifted by `QpBdOffsetC` before dequant.
 //!
-//! Scope: 4:2:0, CAVLC, I-slice (I_NxN 4×4 transform and I_16x16).
-//! The 8×8 transform path for 10-bit is not yet wired — an I_NxN MB
-//! with `transform_size_8x8_flag = 1` returns `Error::Unsupported`.
-//! I_PCM at 10-bit is also not yet wired.
+//! Scope: 4:2:0 / 4:2:2 / 4:4:4, CAVLC, I-slice. Covers I_NxN (both
+//! `transform_size_8x8_flag = 0` and `1`), I_16x16, and I_PCM. The 4:4:4
+//! path routes through [`crate::mb_hi_444`] (three luma-style block
+//! streams, per-plane QP + scaling lists, no `intra_chroma_pred_mode`);
+//! the 4:2:2 path reuses the 10-bit luma decode and dispatches chroma
+//! into [`crate::mb_hi_422`] (2×4 chroma DC Hadamard + 8 AC blocks per
+//! plane).
 
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
-use crate::cavlc::{decode_residual_block, BlockKind};
-use crate::intra_pred::{Intra16x16Mode, Intra4x4Mode, IntraChromaMode};
+use crate::cavlc::{decode_residual_8x8_sub, decode_residual_block, BlockKind};
+use crate::intra_pred::{Intra16x16Mode, Intra4x4Mode, Intra8x8Mode, IntraChromaMode};
 use crate::intra_pred_hi::{
     predict_intra_16x16 as pred16_hi, predict_intra_4x4 as pred4_hi,
-    predict_intra_chroma as predc_hi, Intra16x16Neighbours16, Intra4x4Neighbours16,
-    IntraChromaNeighbours16,
+    predict_intra_8x8 as pred8_hi, predict_intra_chroma as predc_hi, Intra16x16Neighbours16,
+    Intra4x4Neighbours16, Intra8x8Neighbours16, IntraChromaNeighbours16,
 };
 use crate::mb::{predict_nc_luma, LUMA_BLOCK_RASTER};
 use crate::mb_type::{decode_i_slice_mb_type, IMbType};
@@ -36,8 +39,8 @@ use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::tables::decode_cbp_intra;
 use crate::transform::{
-    chroma_qp_hi, dequantize_4x4_scaled_ext, idct_4x4, inv_hadamard_2x2_chroma_dc_scaled_ext,
-    inv_hadamard_4x4_dc_scaled_ext,
+    chroma_qp_hi, dequantize_4x4_scaled_ext, dequantize_8x8_scaled_ext, idct_4x4, idct_8x8,
+    inv_hadamard_2x2_chroma_dc_scaled_ext, inv_hadamard_4x4_dc_scaled_ext,
 };
 
 /// Top-level entry for a 10-bit CAVLC I-slice. Walks every macroblock
@@ -99,7 +102,7 @@ pub fn decode_intra_mb_given_imb_hi(
     br: &mut BitReader<'_>,
     sps: &Sps,
     pps: &Pps,
-    _sh: &SliceHeader,
+    sh: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
@@ -109,8 +112,19 @@ pub fn decode_intra_mb_given_imb_hi(
     if matches!(imb, IMbType::IPcm) {
         return decode_pcm_mb_hi(br, sps, mb_x, mb_y, pic, *prev_qp);
     }
+    if sps.chroma_format_idc == 3 {
+        return crate::mb_hi_444::decode_intra_mb_hi_444(
+            br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb,
+        );
+    }
 
-    // Intra4x4 modes (transform_8x8 at 10-bit is scoped out for now).
+    // §7.3.5.1 — when the PPS enables the 8×8 transform and mb_type is
+    // I_NxN, `transform_size_8x8_flag` precedes the per-block intra mode
+    // syntax. Under an 8×8 transform the macroblock carries four
+    // Intra_8×8 modes (§8.3.2); under the default 4×4 it carries
+    // sixteen Intra_4×4 modes. The 4:2:2 branch shares this luma path
+    // with 4:2:0 — chroma sub-sampling only diverges at the chroma
+    // residual stage below.
     let mut transform_8x8 = false;
     let mut intra4x4_modes = [INTRA_DC_FAKE; 16];
     if matches!(imb, IMbType::INxN) {
@@ -118,26 +132,46 @@ pub fn decode_intra_mb_given_imb_hi(
             transform_8x8 = br.read_flag()?;
         }
         if transform_8x8 {
-            return Err(Error::unsupported(
-                "h264 10bit: Intra_8×8 (transform_size_8x8_flag=1) not yet wired",
-            ));
-        }
-        for blk in 0..16usize {
-            let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
-            let prev_flag = br.read_flag()?;
-            let predicted =
-                predict_intra4x4_mode_with(pic, mb_x, mb_y, br_row, br_col, &intra4x4_modes);
-            let mode = if prev_flag {
-                predicted
-            } else {
-                let rem = br.read_u32(3)? as u8;
-                if rem < predicted {
-                    rem
+            for blk8 in 0..4usize {
+                let br_row = (blk8 >> 1) * 2;
+                let br_col = (blk8 & 1) * 2;
+                let prev_flag = br.read_flag()?;
+                let predicted =
+                    predict_intra4x4_mode_with(pic, mb_x, mb_y, br_row, br_col, &intra4x4_modes);
+                let mode = if prev_flag {
+                    predicted
                 } else {
-                    rem + 1
+                    let rem = br.read_u32(3)? as u8;
+                    if rem < predicted {
+                        rem
+                    } else {
+                        rem + 1
+                    }
+                };
+                for dr in 0..2 {
+                    for dc in 0..2 {
+                        intra4x4_modes[(br_row + dr) * 4 + br_col + dc] = mode;
+                    }
                 }
-            };
-            intra4x4_modes[br_row * 4 + br_col] = mode;
+            }
+        } else {
+            for blk in 0..16usize {
+                let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
+                let prev_flag = br.read_flag()?;
+                let predicted =
+                    predict_intra4x4_mode_with(pic, mb_x, mb_y, br_row, br_col, &intra4x4_modes);
+                let mode = if prev_flag {
+                    predicted
+                } else {
+                    let rem = br.read_u32(3)? as u8;
+                    if rem < predicted {
+                        rem
+                    } else {
+                        rem + 1
+                    }
+                };
+                intra4x4_modes[br_row * 4 + br_col] = mode;
+            }
         }
     }
 
@@ -192,6 +226,7 @@ pub fn decode_intra_mb_given_imb_hi(
             intra4x4_pred_mode: intra4x4_modes,
             cbp_luma,
             cbp_chroma,
+            transform_8x8,
             ..Default::default()
         };
     }
@@ -210,6 +245,16 @@ pub fn decode_intra_mb_given_imb_hi(
             cbp_luma,
             qp_y_prime,
         )?,
+        IMbType::INxN if transform_8x8 => decode_luma_intra_8x8_hi(
+            br,
+            sps,
+            mb_x,
+            mb_y,
+            pic,
+            &intra4x4_modes,
+            cbp_luma,
+            qp_y_prime,
+        )?,
         IMbType::INxN => decode_luma_intra_nxn_hi(
             br,
             sps,
@@ -223,17 +268,33 @@ pub fn decode_intra_mb_given_imb_hi(
         IMbType::IPcm => unreachable!(),
     }
 
-    decode_chroma_hi(
-        br,
-        sps,
-        pps,
-        mb_x,
-        mb_y,
-        pic,
-        chroma_pred_mode,
-        cbp_chroma,
-        qp_y,
-    )?;
+    if sps.chroma_format_idc == 2 {
+        crate::mb_hi_422::decode_chroma_422_hi(
+            br,
+            sps,
+            pps,
+            sh,
+            mb_x,
+            mb_y,
+            pic,
+            chroma_pred_mode,
+            cbp_chroma,
+            qp_y,
+        )?;
+    } else {
+        decode_chroma_hi(
+            br,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            chroma_pred_mode,
+            cbp_chroma,
+            qp_y,
+        )?;
+    }
+    pic.mb_info_mut(mb_x, mb_y).intra_chroma_pred_mode = chroma_pred_mode as u8;
 
     Ok(())
 }
@@ -390,6 +451,139 @@ fn decode_luma_intra_16x16_hi(
         pic.mb_info_mut(mb_x, mb_y).luma_nc[br_row * 4 + br_col] = total_coeff as u8;
     }
     Ok(())
+}
+
+fn decode_luma_intra_8x8_hi(
+    br: &mut BitReader<'_>,
+    sps: &Sps,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    modes: &[u8; 16],
+    cbp_luma: u8,
+    qp_y_prime: i32,
+) -> Result<()> {
+    let bit_depth = (sps.bit_depth_luma_minus8 + 8) as u8;
+    let max_sample = (1u16 << bit_depth) - 1;
+    let lstride = pic.luma_stride();
+    let lo_mb = pic.luma_off(mb_x, mb_y);
+
+    for blk8 in 0..4usize {
+        let br8_row = blk8 >> 1;
+        let br8_col = blk8 & 1;
+        let mode_v = modes[(br8_row * 2) * 4 + br8_col * 2];
+        let mode = Intra8x8Mode::from_u8(mode_v)
+            .ok_or_else(|| Error::invalid(format!("h264 10bit mb: invalid intra8x8 mode {mode_v}")))?;
+        let neigh = collect_intra8x8_neighbours_hi(pic, mb_x, mb_y, br8_row, br8_col);
+        let mut pred = [0u16; 64];
+        pred8_hi(&mut pred, mode, &neigh, bit_depth);
+
+        let has_residual = (cbp_luma >> blk8) & 1 != 0;
+        let mut residual = [0i32; 64];
+        if has_residual {
+            let r0 = br8_row * 2;
+            let c0 = br8_col * 2;
+            // Per-sub-block NC tracking (same layout as the 8-bit
+            // [`decode_luma_intra_8x8`]) so in-MB neighbour lookups for
+            // sub-blocks 1..=3 pick up the freshly-decoded `total_coeff`.
+            let slots = [(r0, c0), (r0, c0 + 1), (r0 + 1, c0), (r0 + 1, c0 + 1)];
+            for (sub, &(sr, sc)) in slots.iter().enumerate() {
+                let nc = predict_nc_luma(pic, mb_x, mb_y, sr, sc);
+                let tc = decode_residual_8x8_sub(br, nc, sub, &mut residual)?;
+                pic.mb_info_mut(mb_x, mb_y).luma_nc[sr * 4 + sc] = tc;
+            }
+            let scale = *pic.scaling_lists.matrix_8x8(0);
+            dequantize_8x8_scaled_ext(&mut residual, qp_y_prime, &scale);
+            idct_8x8(&mut residual);
+
+            // Post-decode aggregation — match FFmpeg so neighbouring MBs
+            // see one representative nnz per 8×8.
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            let sum = info.luma_nc[r0 * 4 + c0] as u16
+                + info.luma_nc[r0 * 4 + c0 + 1] as u16
+                + info.luma_nc[(r0 + 1) * 4 + c0] as u16
+                + info.luma_nc[(r0 + 1) * 4 + c0 + 1] as u16;
+            info.luma_nc[r0 * 4 + c0] = sum.min(16) as u8;
+        }
+
+        let lo = lo_mb + (br8_row * 8) * lstride + br8_col * 8;
+        for r in 0..8 {
+            for c in 0..8 {
+                let v = pred[r * 8 + c] as i32 + residual[r * 8 + c];
+                pic.y16[lo + r * lstride + c] = v.clamp(0, max_sample as i32) as u16;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_intra8x8_neighbours_hi(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    br8_row: usize,
+    br8_col: usize,
+) -> Intra8x8Neighbours16 {
+    let lstride = pic.luma_stride();
+    let lo_mb = pic.luma_off(mb_x, mb_y);
+    let blk_tl = lo_mb + br8_row * 8 * lstride + br8_col * 8;
+
+    let top_avail = br8_row > 0 || mb_y > 0;
+    let mut top = [0u16; 16];
+    let mut top_right_available = false;
+    if top_avail {
+        let row_off = blk_tl - lstride;
+        for i in 0..8 {
+            top[i] = pic.y16[row_off + i];
+        }
+        // 8×8 top-right availability table (§6.4.11.4 applied to the
+        // 2×2 8×8 raster) — see the 8-bit twin in
+        // [`crate::mb::collect_intra8x8_neighbours`].
+        top_right_available = match (br8_row, br8_col) {
+            (0, 0) => mb_y > 0,
+            (0, 1) => {
+                mb_y > 0
+                    && mb_x + 1 < pic.mb_width
+                    && pic.mb_info_at(mb_x + 1, mb_y - 1).coded
+            }
+            (1, 0) => true,
+            _ => false,
+        };
+        if top_right_available {
+            for i in 0..8 {
+                top[8 + i] = pic.y16[row_off + 8 + i];
+            }
+        } else {
+            for i in 0..8 {
+                top[8 + i] = top[7];
+            }
+        }
+    }
+
+    let left_avail = br8_col > 0 || mb_x > 0;
+    let mut left = [0u16; 8];
+    if left_avail {
+        for i in 0..8 {
+            left[i] = pic.y16[blk_tl + i * lstride - 1];
+        }
+    }
+
+    let tl_avail = top_avail && left_avail;
+    let top_left = if tl_avail {
+        pic.y16[blk_tl - lstride - 1]
+    } else {
+        0
+    };
+
+    Intra8x8Neighbours16 {
+        top,
+        left,
+        top_left,
+        top_available: top_avail,
+        left_available: left_avail,
+        top_left_available: tl_avail,
+        top_right_available,
+    }
 }
 
 fn decode_chroma_hi(

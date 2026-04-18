@@ -371,9 +371,29 @@ impl H264Decoder {
                             "h264: bit_depth_luma != bit_depth_chroma not supported",
                         ));
                     }
-                    if sps.chroma_format_idc != 1 {
+                    // 10-bit: I/P/B under 4:2:0 (CAVLC + CABAC). 4:2:2 /
+                    // 4:4:4 at 10-bit are wired for CAVLC I-slices only;
+                    // the CAVLC P/B and CABAC paths still need their
+                    // chroma dispatch rewiring so they return
+                    // Error::Unsupported below.
+                    if sps.bit_depth_luma_minus8 == 2 && sps.chroma_format_idc != 1 {
+                        if pps.entropy_coding_mode_flag {
+                            return Err(Error::unsupported(
+                                "h264: 10-bit 4:2:2 / 4:4:4 CABAC not yet wired — CAVLC I only",
+                            ));
+                        }
+                        if sh.slice_type != SliceType::I {
+                            return Err(Error::unsupported(
+                                "h264: 10-bit 4:2:2 / 4:4:4 wired for I-slices only (P/B not yet audited)",
+                            ));
+                        }
+                    }
+                    if sps.chroma_format_idc != 1
+                        && sps.chroma_format_idc != 2
+                        && sps.chroma_format_idc != 3
+                    {
                         return Err(Error::unsupported(
-                            "h264: high-bit-depth decode only wired for 4:2:0 (chroma_format_idc=1)",
+                            "h264: high-bit-depth decode only wired for 4:2:0 / 4:2:2 / 4:4:4",
                         ));
                     }
                     match sh.slice_type {
@@ -384,12 +404,16 @@ impl H264Decoder {
                             ));
                         }
                     }
-                    // 10-bit: CAVLC I/P/B + CABAC I/P/B are wired.
                     // 12/14-bit: CAVLC I only — P/B and CABAC return
                     // Error::Unsupported while the rest of the pipeline
                     // (motion comp u16 filters, CABAC ctx clamps, etc.)
                     // is audited for higher `QpBdOffset`.
                     if sps.bit_depth_luma_minus8 > 2 {
+                        if sps.chroma_format_idc != 1 {
+                            return Err(Error::unsupported(
+                                "h264: 12/14-bit decode wired for 4:2:0 only",
+                            ));
+                        }
                         if pps.entropy_coding_mode_flag {
                             return Err(Error::unsupported(
                                 "h264: 12/14-bit CABAC not yet wired — CAVLC I only",

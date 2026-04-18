@@ -711,6 +711,7 @@ impl Picture {
         // words still carry full 14-bit samples (0..=16383).
         let format = match (self.chroma_format_idc, self.bit_depth_y) {
             (3, _) => PixelFormat::Yuv444P10Le,
+            (2, _) => PixelFormat::Yuv422P10Le,
             (_, 12) => PixelFormat::Yuv420P12Le,
             _ => PixelFormat::Yuv420P10Le,
         };

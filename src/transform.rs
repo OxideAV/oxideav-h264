@@ -489,6 +489,48 @@ pub fn inv_hadamard_2x4_chroma_dc_scaled(dc: &mut [i32; 8], qp: i32, weight_scal
     }
 }
 
+/// Extended-QP variant of [`inv_hadamard_2x4_chroma_dc_scaled`]. Accepts
+/// `qP` up to `51 + QpBdOffsetC` (so `qp + 3` reaches 66 at 10-bit); uses
+/// i64 intermediates so the `(qp_dc/6 - 6)` left shifts at high QP don't
+/// overflow the i32 range. Mirrors the 8-bit shift pattern otherwise.
+pub fn inv_hadamard_2x4_chroma_dc_scaled_ext(dc: &mut [i32; 8], qp: i32, weight_scale_00: i16) {
+    let mut tmp = [0i32; 8];
+    for c in 0..2 {
+        let a = dc[c];
+        let b = dc[2 + c];
+        let cc = dc[4 + c];
+        let d = dc[6 + c];
+        tmp[c] = a + b + cc + d;
+        tmp[2 + c] = a + b - cc - d;
+        tmp[4 + c] = a - b - cc + d;
+        tmp[6 + c] = a - b + cc - d;
+    }
+    for r in 0..4 {
+        let a = tmp[r * 2];
+        let b = tmp[r * 2 + 1];
+        dc[r * 2] = a + b;
+        dc[r * 2 + 1] = a - b;
+    }
+
+    let qp_dc = (qp + 3).max(0);
+    let qp6 = (qp_dc / 6) as i32;
+    let qmod = (qp_dc % 6) as usize;
+    let v = V_TABLE[qmod][0] as i64;
+    let w = weight_scale_00 as i64;
+    if qp_dc >= 36 {
+        let shift = (qp6 - 6) as u32;
+        for x in dc.iter_mut() {
+            *x = ((*x as i64 * w * v) << shift) as i32;
+        }
+    } else {
+        let shift = (6 - qp6) as u32;
+        let round = 1i64 << (shift - 1);
+        for x in dc.iter_mut() {
+            *x = ((*x as i64 * w * v + round) >> shift) as i32;
+        }
+    }
+}
+
 /// 2×2 chroma DC inverse Hadamard — §8.5.11.1.
 ///
 /// Input: 4 DC coefficients in raster (00, 01, 10, 11).
@@ -662,6 +704,39 @@ pub fn dequantize_8x8_scaled(coeffs: &mut [i32; 64], qp: i32, weight_scale: &[i1
                 let i = r * 8 + c;
                 let w = weight_scale[i] as i32;
                 coeffs[i] = (coeffs[i] * level_scale_8x8(qmod, r, c, w) + round) >> shift;
+            }
+        }
+    }
+}
+
+/// Extended-QP variant of [`dequantize_8x8_scaled`] — accepts `qP` up
+/// to `51 + QpBdOffset` (§7.4.2.1.1). Widens intermediates to i64 to
+/// survive the larger shifts at high QP, mirroring the 4×4
+/// [`dequantize_4x4_scaled_ext`]. Used by the 10-bit Intra_8×8 and the
+/// 10-bit P/B inter 8×8 residual paths.
+pub fn dequantize_8x8_scaled_ext(coeffs: &mut [i32; 64], qp: i32, weight_scale: &[i16; 64]) {
+    let qp = qp.max(0);
+    let qp6 = (qp / 6) as i32;
+    let qmod = (qp % 6) as usize;
+    if qp6 >= 6 {
+        let shift = (qp6 - 6) as u32;
+        for r in 0..8 {
+            for c in 0..8 {
+                let i = r * 8 + c;
+                let w = weight_scale[i] as i64;
+                let v = V8X8_TABLE[qmod][pos_class_8x8(r, c)] as i64;
+                coeffs[i] = ((coeffs[i] as i64 * v * w) << shift) as i32;
+            }
+        }
+    } else {
+        let shift = (6 - qp6) as u32;
+        let round = 1i64 << (shift - 1);
+        for r in 0..8 {
+            for c in 0..8 {
+                let i = r * 8 + c;
+                let w = weight_scale[i] as i64;
+                let v = V8X8_TABLE[qmod][pos_class_8x8(r, c)] as i64;
+                coeffs[i] = ((coeffs[i] as i64 * v * w + round) >> shift) as i32;
             }
         }
     }

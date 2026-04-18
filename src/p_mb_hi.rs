@@ -33,7 +33,7 @@ use crate::pps::Pps;
 use crate::slice::{ChromaWeight, LumaWeight, SliceHeader};
 use crate::sps::Sps;
 use crate::transform::{
-    chroma_qp_hi, dequantize_4x4_scaled_ext, idct_4x4, idct_8x8,
+    chroma_qp_hi, dequantize_4x4_scaled_ext, dequantize_8x8_scaled_ext, idct_4x4, idct_8x8,
     inv_hadamard_2x2_chroma_dc_scaled_ext,
 };
 
@@ -514,52 +514,6 @@ fn decode_inter_residual_luma_8x8_hi(
         }
     }
     Ok(())
-}
-
-/// Inline 8×8 dequant widened to i64 for the extended-QP range.
-/// Keeps the same LevelScale8x8 / shift pattern as
-/// [`crate::transform::dequantize_8x8_scaled`] but doesn't clamp the QP
-/// to 51. The `QP >= 36` branch is active at 10-bit once the caller adds
-/// `QpBdOffsetY = 12`.
-fn dequantize_8x8_scaled_ext(coeffs: &mut [i32; 64], qp: i32, weight_scale: &[i16; 64]) {
-    // Table 8-15 — normAdjust8x8(qP%6, m).
-    const V8X8_TABLE: [[i32; 6]; 6] = [
-        [20, 18, 32, 19, 25, 24],
-        [22, 19, 35, 21, 28, 26],
-        [26, 23, 42, 24, 33, 31],
-        [28, 25, 45, 26, 35, 33],
-        [32, 28, 51, 30, 40, 38],
-        [36, 32, 58, 34, 46, 43],
-    ];
-    const V8X8_POS_CLASS: [usize; 16] = [0, 3, 4, 3, 3, 1, 5, 1, 4, 5, 2, 5, 3, 1, 5, 1];
-    fn pos_class_8x8(row: usize, col: usize) -> usize {
-        V8X8_POS_CLASS[((row & 3) << 2) | (col & 3)]
-    }
-    let qp = qp.max(0);
-    let qp6 = (qp / 6) as i32;
-    let qmod = (qp % 6) as usize;
-    if qp6 >= 6 {
-        let shift = (qp6 - 6) as u32;
-        for r in 0..8 {
-            for c in 0..8 {
-                let i = r * 8 + c;
-                let w = weight_scale[i] as i64;
-                let v = V8X8_TABLE[qmod][pos_class_8x8(r, c)] as i64;
-                coeffs[i] = ((coeffs[i] as i64 * v * w) << shift) as i32;
-            }
-        }
-    } else {
-        let shift = (6 - qp6) as u32;
-        let round = 1i64 << (shift - 1);
-        for r in 0..8 {
-            for c in 0..8 {
-                let i = r * 8 + c;
-                let w = weight_scale[i] as i64;
-                let v = V8X8_TABLE[qmod][pos_class_8x8(r, c)] as i64;
-                coeffs[i] = ((coeffs[i] as i64 * v * w + round) >> shift) as i32;
-            }
-        }
-    }
 }
 
 fn decode_inter_residual_chroma_hi(

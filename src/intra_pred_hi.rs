@@ -59,6 +59,18 @@ pub struct Intra8x8Neighbours16 {
     pub top_right_available: bool,
 }
 
+/// 10-bit counterpart of [`crate::intra_pred::IntraChroma8x16Neighbours`].
+/// Holds 8 top samples and 16 left samples for 4:2:2 chroma prediction.
+#[derive(Clone, Debug)]
+pub struct IntraChroma8x16Neighbours16 {
+    pub top: [u16; 8],
+    pub left: [u16; 16],
+    pub top_left: u16,
+    pub top_available: bool,
+    pub left_available: bool,
+    pub top_left_available: bool,
+}
+
 #[inline]
 fn clip1(v: i32, max_sample: u16) -> u16 {
     v.clamp(0, max_sample as i32) as u16
@@ -483,6 +495,152 @@ pub fn predict_intra_chroma(
                 for x in 0..8 {
                     let p = (a + b * (x as i32 - 3) + c * (y as i32 - 3) + 16) >> 5;
                     out[y * 8 + x] = clip1(p, max_sample);
+                }
+            }
+        }
+    }
+}
+
+/// 10-bit 4:2:2 chroma (8×16) prediction — §8.3.4 ChromaArrayType == 2.
+/// Mirrors [`crate::intra_pred::predict_intra_chroma_8x16`] but operates
+/// on `u16` samples, clips to `(1 << bit_depth) - 1`, and uses
+/// `1 << (bit_depth - 1)` as the "no neighbour" DC fallback.
+pub fn predict_intra_chroma_8x16(
+    out: &mut [u16; 128],
+    mode: IntraChromaMode,
+    n: &IntraChroma8x16Neighbours16,
+    bit_depth: u8,
+) {
+    use IntraChromaMode::*;
+    let max_sample: u16 = (1u32 << bit_depth) as u16 - 1;
+    let mid: u32 = 1u32 << (bit_depth - 1);
+    let mode = match mode {
+        Vertical if !n.top_available => Dc,
+        Horizontal if !n.left_available => Dc,
+        Plane if !n.top_available || !n.left_available || !n.top_left_available => Dc,
+        m => m,
+    };
+    match mode {
+        Vertical => {
+            for y in 0..16 {
+                for x in 0..8 {
+                    out[y * 8 + x] = n.top[x];
+                }
+            }
+        }
+        Horizontal => {
+            for y in 0..16 {
+                for x in 0..8 {
+                    out[y * 8 + x] = n.left[y];
+                }
+            }
+        }
+        Dc => {
+            // FFmpeg `pred8x16_dc` layout: 4 bands of 4 rows, each band
+            // has a left quadrant and a right quadrant. See the 8-bit
+            // variant in [`crate::intra_pred`] for the mapping rationale.
+            let (dc0_top, dc1, dc0_left, dc2, dc3, dc4);
+            if n.top_available && n.left_available {
+                dc0_top = n.top[0..4].iter().map(|&v| v as u32).sum::<u32>();
+                dc1 = n.top[4..8].iter().map(|&v| v as u32).sum::<u32>();
+                dc0_left = n.left[0..4].iter().map(|&v| v as u32).sum::<u32>();
+                dc2 = n.left[4..8].iter().map(|&v| v as u32).sum::<u32>();
+                dc3 = n.left[8..12].iter().map(|&v| v as u32).sum::<u32>();
+                dc4 = n.left[12..16].iter().map(|&v| v as u32).sum::<u32>();
+            } else if n.top_available {
+                dc0_top = n.top[0..4].iter().map(|&v| v as u32).sum::<u32>();
+                dc1 = n.top[4..8].iter().map(|&v| v as u32).sum::<u32>();
+                dc0_left = dc0_top;
+                dc2 = dc0_top;
+                dc3 = dc0_top;
+                dc4 = dc0_top;
+            } else if n.left_available {
+                dc0_top = n.left[0..4].iter().map(|&v| v as u32).sum::<u32>();
+                dc1 = dc0_top;
+                dc0_left = dc0_top;
+                dc2 = n.left[4..8].iter().map(|&v| v as u32).sum::<u32>();
+                dc3 = n.left[8..12].iter().map(|&v| v as u32).sum::<u32>();
+                dc4 = n.left[12..16].iter().map(|&v| v as u32).sum::<u32>();
+            } else {
+                let v = clip1(mid as i32, max_sample);
+                for px in out.iter_mut() {
+                    *px = v;
+                }
+                return;
+            }
+            let quads: [[u16; 2]; 4] = if n.top_available && n.left_available {
+                [
+                    [
+                        clip1(((dc0_top + dc0_left + 4) >> 3) as i32, max_sample),
+                        clip1(((dc1 + 2) >> 2) as i32, max_sample),
+                    ],
+                    [
+                        clip1(((dc2 + 2) >> 2) as i32, max_sample),
+                        clip1(((dc1 + dc2 + 4) >> 3) as i32, max_sample),
+                    ],
+                    [
+                        clip1(((dc3 + 2) >> 2) as i32, max_sample),
+                        clip1(((dc1 + dc3 + 4) >> 3) as i32, max_sample),
+                    ],
+                    [
+                        clip1(((dc4 + 2) >> 2) as i32, max_sample),
+                        clip1(((dc1 + dc4 + 4) >> 3) as i32, max_sample),
+                    ],
+                ]
+            } else if n.top_available {
+                [
+                    [clip1(((dc0_top + 2) >> 2) as i32, max_sample), clip1(((dc1 + 2) >> 2) as i32, max_sample)],
+                    [clip1(((dc0_top + 2) >> 2) as i32, max_sample), clip1(((dc1 + 2) >> 2) as i32, max_sample)],
+                    [clip1(((dc0_top + 2) >> 2) as i32, max_sample), clip1(((dc1 + 2) >> 2) as i32, max_sample)],
+                    [clip1(((dc0_top + 2) >> 2) as i32, max_sample), clip1(((dc1 + 2) >> 2) as i32, max_sample)],
+                ]
+            } else {
+                [
+                    [clip1(((dc0_left + 2) >> 2) as i32, max_sample), clip1(((dc0_left + 2) >> 2) as i32, max_sample)],
+                    [clip1(((dc2 + 2) >> 2) as i32, max_sample), clip1(((dc2 + 2) >> 2) as i32, max_sample)],
+                    [clip1(((dc3 + 2) >> 2) as i32, max_sample), clip1(((dc3 + 2) >> 2) as i32, max_sample)],
+                    [clip1(((dc4 + 2) >> 2) as i32, max_sample), clip1(((dc4 + 2) >> 2) as i32, max_sample)],
+                ]
+            };
+            for band in 0..4usize {
+                for sub_row in 0..4usize {
+                    let y = band * 4 + sub_row;
+                    for x in 0..8 {
+                        out[y * 8 + x] = quads[band][x / 4];
+                    }
+                }
+            }
+        }
+        Plane => {
+            let top_at = |k: i32| -> i32 {
+                if k < 0 {
+                    n.top_left as i32
+                } else {
+                    n.top[k as usize] as i32
+                }
+            };
+            let left_at = |k: i32| -> i32 {
+                if k < 0 {
+                    n.top_left as i32
+                } else {
+                    n.left[k as usize] as i32
+                }
+            };
+            let mut h: i32 = top_at(4) - top_at(2);
+            for k in 2..=4i32 {
+                h += k * (top_at(3 + k) - top_at(3 - k));
+            }
+            let mut v: i32 = left_at(8) - left_at(6);
+            for k in 2..=8i32 {
+                v += k * (left_at(7 + k) - left_at(7 - k));
+            }
+            let b = (17 * h + 16) >> 5;
+            let c = (5 * v + 32) >> 6;
+            let a = 16 * ((n.left[15] as i32) + (n.top[7] as i32) + 1) - 7 * c - 3 * b;
+            for y in 0..16 {
+                for x in 0..8 {
+                    let pix = (a + b * (x as i32) + c * (y as i32)) >> 5;
+                    out[y * 8 + x] = clip1(pix, max_sample);
                 }
             }
         }
