@@ -300,17 +300,18 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   — the chroma planes share luma dimensions, reuse the luma Intra_4×4 /
   Intra_16×16 predictors, and decode three back-to-back luma-style
   residual streams per MB; P / B / CABAC on 4:4:4 remain out of scope.
-- Bit depths above 10; 10-bit is supported for CAVLC I-slices in
+- Bit depths above 10; 10-bit is supported for CAVLC I + P slices in
   4:2:0 only (see the 10-bit section below). 12-bit / 14-bit return
   `Error::Unsupported`. Separate colour planes are also rejected.
 - SI / SP slices.
 
-## 10-bit (High 10) CAVLC I-slice decode
+## 10-bit (High 10) CAVLC I + P decode
 
-The decoder handles 10-bit CAVLC I-slices in 4:2:0 end-to-end and emits
-`PixelFormat::Yuv420P10Le` frames (u16 samples packed little-endian).
-Bit-exact against ffmpeg on the `iframe_10bit_64x64` fixture shipped
-under `tests/fixtures/`.
+The decoder handles 10-bit CAVLC I- and P-slices in 4:2:0 end-to-end
+and emits `PixelFormat::Yuv420P10Le` frames (u16 samples packed
+little-endian). Bit-exact against ffmpeg on the `iframe_10bit_64x64`
+and `pframe_10bit_64x64` fixtures shipped under `tests/fixtures/`
+(100% match across every sample of the three-frame P-slice fixture).
 
 The high-bit-depth path runs alongside — not in place of — the 8-bit
 pipeline:
@@ -321,18 +322,28 @@ pipeline:
 - Intra prediction ([`intra_pred_hi`]) clips to `(1 << bit_depth) - 1`
   and uses `1 << (bit_depth - 1)` as the DC no-neighbour fallback
   (§8.3.1.2.3 / §8.3.3.3 / §8.3.4.2).
-- The residual pipeline ([`mb_hi`]) adds `QpBdOffsetY` to the decoded
-  `QpY` before dispatching through the i64-widened `dequantize_*_ext`
-  variants in [`transform`], and wraps `mb_qp_delta` modulo
-  `52 + QpBdOffsetY` per §7.4.5.
+- The residual pipeline ([`mb_hi`] / [`p_mb_hi`]) adds `QpBdOffsetY` to
+  the decoded `QpY` before dispatching through the i64-widened
+  `dequantize_*_ext` variants in [`transform`], and wraps `mb_qp_delta`
+  modulo `52 + QpBdOffsetY` per §7.4.5.
+- P-slice motion compensation ([`motion::luma_mc_hi`] /
+  [`motion::chroma_mc_hi`]) operates on the u16 planes with the same
+  6-tap half-pel + bilinear quarter-pel luma filter and bilinear 1/8-pel
+  chroma filter as the 8-bit path; the final Clip1 uses the per-plane
+  bit-depth max.
+- In-loop deblocking on the 10-bit path ([`deblock_hi`]) reads / writes
+  the u16 planes, scales `α` / `β` / `tC0` by `1 << (BitDepth - 8)` per
+  §8.7.2.1, and clips to the widened sample range. The §8.7.2 bS
+  derivation and edge schedule are shared with the 8-bit deblocker via
+  `deblock::derive_bs_for_edge`.
 - [`picture::Picture::to_video_frame`] packs the u16 planes as
   little-endian bytes for `Yuv420P10Le`.
 
-Out of scope at 10-bit (return `Error::Unsupported`): P/B slices,
+Out of scope at 10-bit (return `Error::Unsupported`): B-slices,
 CABAC, Intra_8×8 (`transform_size_8x8_flag = 1`), 4:2:2 / 4:4:4
-chroma, I_PCM, and in-loop deblocking (the 8.7 kernel still operates
-on u8 and is skipped on the high-bit-depth path). 12-bit and 14-bit
-profiles are rejected at slice entry.
+chroma, and I_PCM. 12-bit and 14-bit profiles are rejected at slice
+entry. Explicit weighted P-slice prediction is supported; implicit
+weighted bipred is currently gated behind B-slice support.
 
 ## Codec id
 
@@ -419,6 +430,15 @@ ffmpeg -y -i /tmp/10bit.mp4 -c copy -bsf:v h264_mp4toannexb -f h264 \
     tests/fixtures/iframe_10bit_64x64.es
 ffmpeg -y -i /tmp/10bit.mp4 -f rawvideo -pix_fmt yuv420p10le \
     tests/fixtures/iframe_10bit_64x64.yuv
+
+# 10-bit (High 10) CAVLC P-slice — 3-frame yuv420p10le clip (1 I + 2 P).
+ffmpeg -y -f lavfi -i testsrc=duration=1:size=64x64:rate=12 -vframes 3 \
+    -pix_fmt yuv420p10le -c:v libx264 -profile:v high10 -preset ultrafast \
+    -x264-params "bframes=0:keyint=3:no-scenecut=1" /tmp/p_10bit.mp4
+ffmpeg -y -i /tmp/p_10bit.mp4 -c copy -bsf:v h264_mp4toannexb -f h264 \
+    tests/fixtures/pframe_10bit_64x64.es
+ffmpeg -y -i /tmp/p_10bit.mp4 -f rawvideo -pix_fmt yuv420p10le \
+    tests/fixtures/pframe_10bit_64x64.yuv
 ```
 
 ## License

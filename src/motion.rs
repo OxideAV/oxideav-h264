@@ -494,6 +494,152 @@ pub fn luma_mc(
     }
 }
 
+/// High-bit-depth luma MC — mirrors [`luma_mc`] but reads `ref_pic.y16`
+/// and writes a u16 destination plane. The 6-tap / bilinear chains are
+/// identical (the filter kernel is bit-depth agnostic per §8.4.2.2.1);
+/// only the final clip bound changes to `(1 << bit_depth) - 1`.
+pub fn luma_mc_hi(
+    dst: &mut [u16],
+    ref_pic: &Picture,
+    base_x: i32,
+    base_y: i32,
+    mv_x_q: i32,
+    mv_y_q: i32,
+    part_w: usize,
+    part_h: usize,
+) {
+    let fx = mv_x_q & 3;
+    let fy = mv_y_q & 3;
+    let int_x = base_x + (mv_x_q >> 2);
+    let int_y = base_y + (mv_y_q >> 2);
+    let w = ref_pic.width as i32;
+    let h = ref_pic.height as i32;
+    let stride = ref_pic.luma_stride();
+    let src = &ref_pic.y16;
+    let max_sample: i32 = (1i32 << ref_pic.bit_depth_y) - 1;
+    let get = |y: i32, x: i32| -> i32 { src[clamp_ref(y, h) * stride + clamp_ref(x, w)] as i32 };
+
+    let half_h = |y: i32, x: i32| -> i32 {
+        luma_tap6(
+            get(y, x - 2),
+            get(y, x - 1),
+            get(y, x),
+            get(y, x + 1),
+            get(y, x + 2),
+            get(y, x + 3),
+        )
+    };
+    let half_v = |y: i32, x: i32| -> i32 {
+        luma_tap6(
+            get(y - 2, x),
+            get(y - 1, x),
+            get(y, x),
+            get(y + 1, x),
+            get(y + 2, x),
+            get(y + 3, x),
+        )
+    };
+    let half_h_raw = |y: i32, x: i32| -> i32 {
+        luma_tap6(
+            get(y, x - 2),
+            get(y, x - 1),
+            get(y, x),
+            get(y, x + 1),
+            get(y, x + 2),
+            get(y, x + 3),
+        )
+    };
+    let center_j = |y: i32, x: i32| -> i32 {
+        let r0 = half_h_raw(y - 2, x);
+        let r1 = half_h_raw(y - 1, x);
+        let r2 = half_h_raw(y, x);
+        let r3 = half_h_raw(y + 1, x);
+        let r4 = half_h_raw(y + 2, x);
+        let r5 = half_h_raw(y + 3, x);
+        luma_tap6(r0, r1, r2, r3, r4, r5)
+    };
+
+    let round_shift = |v: i32, shift: u32| -> u16 {
+        let bias = 1 << (shift - 1);
+        ((v + bias) >> shift).clamp(0, max_sample) as u16
+    };
+
+    for r in 0..part_h as i32 {
+        for c in 0..part_w as i32 {
+            let y = int_y + r;
+            let x = int_x + c;
+            let out: u16 = match (fx, fy) {
+                (0, 0) => get(y, x) as u16,
+                (1, 0) => {
+                    let g = get(y, x);
+                    let b = round_shift(half_h(y, x), 5) as i32;
+                    ((g + b + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (2, 0) => round_shift(half_h(y, x), 5),
+                (3, 0) => {
+                    let g = get(y, x + 1);
+                    let b = round_shift(half_h(y, x), 5) as i32;
+                    ((g + b + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (0, 1) => {
+                    let g = get(y, x);
+                    let h = round_shift(half_v(y, x), 5) as i32;
+                    ((g + h + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (0, 2) => round_shift(half_v(y, x), 5),
+                (0, 3) => {
+                    let g = get(y + 1, x);
+                    let h = round_shift(half_v(y, x), 5) as i32;
+                    ((g + h + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (2, 2) => round_shift(center_j(y, x), 10),
+                (1, 1) => {
+                    let b = round_shift(half_h(y, x), 5) as i32;
+                    let h = round_shift(half_v(y, x), 5) as i32;
+                    ((b + h + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (3, 1) => {
+                    let b = round_shift(half_h(y, x), 5) as i32;
+                    let h = round_shift(half_v(y, x + 1), 5) as i32;
+                    ((b + h + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (1, 3) => {
+                    let b = round_shift(half_h(y + 1, x), 5) as i32;
+                    let h = round_shift(half_v(y, x), 5) as i32;
+                    ((b + h + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (3, 3) => {
+                    let b = round_shift(half_h(y + 1, x), 5) as i32;
+                    let h = round_shift(half_v(y, x + 1), 5) as i32;
+                    ((b + h + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (2, 1) => {
+                    let b = round_shift(half_h(y, x), 5) as i32;
+                    let j = round_shift(center_j(y, x), 10) as i32;
+                    ((b + j + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (2, 3) => {
+                    let b = round_shift(half_h(y + 1, x), 5) as i32;
+                    let j = round_shift(center_j(y, x), 10) as i32;
+                    ((b + j + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (1, 2) => {
+                    let h = round_shift(half_v(y, x), 5) as i32;
+                    let j = round_shift(center_j(y, x), 10) as i32;
+                    ((h + j + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                (3, 2) => {
+                    let h = round_shift(half_v(y, x + 1), 5) as i32;
+                    let j = round_shift(center_j(y, x), 10) as i32;
+                    ((h + j + 1) >> 1).clamp(0, max_sample) as u16
+                }
+                _ => unreachable!(),
+            };
+            dst[r as usize * part_w + c as usize] = out;
+        }
+    }
+}
+
 /// Motion-compensate a rectangular chroma region (Cb or Cr) into `dst`.
 /// Chroma uses bilinear 1/8-pel interpolation (§8.4.2.2.2).
 ///
@@ -540,6 +686,53 @@ pub fn chroma_mc(
                 + 32)
                 >> 6;
             dst[r as usize * part_w + c as usize] = v.clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// High-bit-depth chroma MC — mirrors [`chroma_mc`] on u16 planes with a
+/// `max_sample` clip bound. The 1/8-pel bilinear recipe is unchanged.
+pub fn chroma_mc_hi(
+    dst: &mut [u16],
+    ref_plane: &[u16],
+    plane_stride: usize,
+    plane_w: i32,
+    plane_h: i32,
+    base_x: i32,
+    base_y: i32,
+    mv_x_q: i32,
+    mv_y_q: i32,
+    part_w: usize,
+    part_h: usize,
+    bit_depth: u8,
+) {
+    let dx = mv_x_q & 7;
+    let dy = mv_y_q & 7;
+    let int_x = base_x + (mv_x_q >> 3);
+    let int_y = base_y + (mv_y_q >> 3);
+    let max_sample: i32 = (1i32 << bit_depth) - 1;
+
+    for r in 0..part_h as i32 {
+        for c in 0..part_w as i32 {
+            let y0 = int_y + r;
+            let x0 = int_x + c;
+            let y1 = y0 + 1;
+            let x1 = x0 + 1;
+            let p00 =
+                ref_plane[clamp_ref(y0, plane_h) * plane_stride + clamp_ref(x0, plane_w)] as i32;
+            let p01 =
+                ref_plane[clamp_ref(y0, plane_h) * plane_stride + clamp_ref(x1, plane_w)] as i32;
+            let p10 =
+                ref_plane[clamp_ref(y1, plane_h) * plane_stride + clamp_ref(x0, plane_w)] as i32;
+            let p11 =
+                ref_plane[clamp_ref(y1, plane_h) * plane_stride + clamp_ref(x1, plane_w)] as i32;
+            let v = ((8 - dx) * (8 - dy) * p00
+                + dx * (8 - dy) * p01
+                + (8 - dx) * dy * p10
+                + dx * dy * p11
+                + 32)
+                >> 6;
+            dst[r as usize * part_w + c as usize] = v.clamp(0, max_sample) as u16;
         }
     }
 }
@@ -711,6 +904,43 @@ fn apply_weight_plane(dst: &mut [u8], weight: i32, offset: i32, log2_denom: u32)
         let x = *p as i32;
         let v = ((x * weight + round) >> log2_denom) + offset;
         *p = v.clamp(0, 255) as u8;
+    }
+}
+
+/// High-bit-depth variant of [`apply_luma_weight`] — same formula with
+/// `(1 << bit_depth) - 1` as the Clip1 bound. `offset` is interpreted in
+/// the same sample units as the destination (pre-scaled by the caller per
+/// §7.4.3.2 if the bit depth differs between parse and decode).
+pub fn apply_luma_weight_hi(dst: &mut [u16], w: &LumaWeight, bit_depth: u8) {
+    apply_weight_plane_hi(dst, w.weight, w.offset, w.log2_denom, bit_depth);
+}
+
+/// High-bit-depth variant of [`apply_chroma_weight`].
+pub fn apply_chroma_weight_hi(dst: &mut [u16], w: &ChromaWeight, plane_idx: usize, bit_depth: u8) {
+    apply_weight_plane_hi(
+        dst,
+        w.weight[plane_idx],
+        w.offset[plane_idx],
+        w.log2_denom,
+        bit_depth,
+    );
+}
+
+#[inline]
+fn apply_weight_plane_hi(dst: &mut [u16], weight: i32, offset: i32, log2_denom: u32, bit_depth: u8) {
+    let max_sample: i32 = (1i32 << bit_depth) - 1;
+    if log2_denom == 0 {
+        for p in dst.iter_mut() {
+            let x = *p as i32;
+            *p = (x * weight + offset).clamp(0, max_sample) as u16;
+        }
+        return;
+    }
+    let round = 1i32 << (log2_denom - 1);
+    for p in dst.iter_mut() {
+        let x = *p as i32;
+        let v = ((x * weight + round) >> log2_denom) + offset;
+        *p = v.clamp(0, max_sample) as u16;
     }
 }
 
