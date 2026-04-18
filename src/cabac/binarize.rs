@@ -655,6 +655,186 @@ pub fn decode_ref_idx_lx(
     }
 }
 
+/// §9.3.3.1.1.1 — `mb_skip_flag` for B slices. Same shape as
+/// [`decode_mb_skip_flag_p`] but reads from the B-slice skip-flag context
+/// bank (ctxIdxOffset 24 in Table 9-34). `ctx_idx_inc` is `condTermFlagA +
+/// condTermFlagB` where `condTermFlagN = 0` iff the neighbour is a B_Skip
+/// macroblock, `1` otherwise (per §9.3.3.1.1.1 B-slice variant).
+pub fn decode_mb_skip_flag_b(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    ctx_idx_inc: u8,
+) -> Result<bool> {
+    if ctxs.len() < 3 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_mb_skip_flag_b: need >=3 ctxs",
+        ));
+    }
+    let inc = (ctx_idx_inc as usize).min(2);
+    Ok(d.decode_bin(&mut ctxs[inc])? == 1)
+}
+
+/// Table 9-37 — `mb_type` for B slices. Returns the spec's raw mb_type
+/// value: 0..=22 for the Table 7-14 inter entries, 23..=47 for intra-in-B
+/// (map to Table 7-11 via subtracting 23), and 48 for I_PCM.
+///
+/// The bin tree matches ITU-T H.264 (07/2019) §9.3.2.5 / Table 9-37 — bin 0
+/// ctxIdxInc = `condTermFlagA + condTermFlagB` from the B-slice neighbour
+/// derivation; bins 1..=5 use fixed ctxIdxInc 3/4/5/5/5/5 within the B bank.
+/// The intra suffix dispatches through the I-slice bin tree
+/// ([`decode_mb_type_i`]) with ctxIdxOffset 32 (re-using the I-slice ctx
+/// bank for consistency with the shared context initialisation tables).
+pub fn decode_mb_type_b(
+    d: &mut CabacDecoder<'_>,
+    b_ctxs: &mut [CabacContext],
+    i_ctxs: &mut [CabacContext],
+    ctx_idx_inc_a_b: u8,
+) -> Result<u32> {
+    if b_ctxs.len() < 9 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_mb_type_b: need >=9 B mb_type ctxs",
+        ));
+    }
+    let inc0 = (ctx_idx_inc_a_b as usize).min(2);
+    // bin 0 — direct vs other.
+    let b0 = d.decode_bin(&mut b_ctxs[inc0])?;
+    if b0 == 0 {
+        return Ok(0);
+    }
+    // bin 1 — ctxIdxInc = 3 (16x16 single-dir vs other).
+    let b1 = d.decode_bin(&mut b_ctxs[3])?;
+    if b1 == 0 {
+        // bin 2 — ctxIdxInc = 5 selects B_L1_16x16 vs B_L0_16x16.
+        let b2 = d.decode_bin(&mut b_ctxs[5])?;
+        return Ok(if b2 == 0 { 1 } else { 2 });
+    }
+    // bin 2 — ctxIdxInc = 4.
+    let b2 = d.decode_bin(&mut b_ctxs[4])?;
+    if b2 == 0 {
+        // 3-bit tree with ctxIdxInc 5 per bin, values 3..=10.
+        let mut act_sym: u32 = 3;
+        if d.decode_bin(&mut b_ctxs[5])? == 1 {
+            act_sym += 4;
+        }
+        if d.decode_bin(&mut b_ctxs[5])? == 1 {
+            act_sym += 2;
+        }
+        if d.decode_bin(&mut b_ctxs[5])? == 1 {
+            act_sym += 1;
+        }
+        return Ok(act_sym);
+    }
+    // bin 2 == 1 — the 12-onward branch. JM's state machine encodes the
+    // irregular mapping: raw binary is read into a shifted accumulator and
+    // remapped for the three "collision" slots 11/22/23.
+    let mut act_sym: u32 = 12;
+    if d.decode_bin(&mut b_ctxs[5])? == 1 {
+        act_sym += 8;
+    }
+    if d.decode_bin(&mut b_ctxs[5])? == 1 {
+        act_sym += 4;
+    }
+    if d.decode_bin(&mut b_ctxs[5])? == 1 {
+        act_sym += 2;
+    }
+    if act_sym == 24 {
+        return Ok(11);
+    }
+    if act_sym == 26 {
+        return Ok(22);
+    }
+    if act_sym == 22 {
+        act_sym = 23;
+    }
+    if d.decode_bin(&mut b_ctxs[5])? == 1 {
+        act_sym += 1;
+    }
+    if act_sym <= 22 {
+        return Ok(act_sym);
+    }
+    // act_sym is 23 or 24 → intra-in-B. Consume the terminate bin (I_PCM
+    // path); otherwise dispatch to the I-slice mb_type bin decoder with a
+    // shifted offset.
+    let term = d.decode_terminate()?;
+    if term == 1 {
+        return Ok(48);
+    }
+    // Intra MB in B-slice: read the remaining I-slice mb_type bins. We
+    // already know this is NOT `I_NxN` (bin 0 of the I-slice decoder would
+    // be 0); simulate having already read bin 0 = 1 + terminate = 0 by
+    // decoding the remaining 5 bins directly.
+    if i_ctxs.len() < 8 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_mb_type_b: need >=8 I-slice mb_type ctxs",
+        ));
+    }
+    let b2i = d.decode_bin(&mut i_ctxs[3])?;
+    let cbp_luma = b2i as u32;
+    let b3i = d.decode_bin(&mut i_ctxs[4])?;
+    let cbp_chroma = if b3i == 0 {
+        0u32
+    } else {
+        let b4i = d.decode_bin(&mut i_ctxs[5])?;
+        1 + b4i as u32
+    };
+    let b5i = d.decode_bin(&mut i_ctxs[6])?;
+    let b6i = d.decode_bin(&mut i_ctxs[7])?;
+    let intra_pred_mode = (b5i as u32) * 2 + b6i as u32;
+    let i_raw = 1 + intra_pred_mode + 4 * cbp_chroma + 12 * cbp_luma;
+    // Return as B-slice mb_type offset — intra MBs live at 23..47 per Table
+    // 7-14 (Table 7-11 value + 23). I_PCM is already handled above.
+    Ok(23 + i_raw)
+}
+
+/// Table 9-38 — `sub_mb_type` for B slices. Returns the spec value
+/// (`0..=12`) for the 13 B sub-partitions. The bin tree is transcribed
+/// from ITU-T H.264 (07/2019) §9.3.3 / JM reference's
+/// `readB8_typeInfo_CABAC_b_slice` decision tree; ctxIdxInc for bins 0/1/2
+/// is 0/1/2, and all subsequent bins (3..5) share ctxIdxInc = 3.
+pub fn decode_sub_mb_type_b(d: &mut CabacDecoder<'_>, ctxs: &mut [CabacContext]) -> Result<u32> {
+    if ctxs.len() < 4 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_sub_mb_type_b: need >=4 B sub_mb_type ctxs",
+        ));
+    }
+    let b0 = d.decode_bin(&mut ctxs[0])?;
+    if b0 == 0 {
+        return Ok(0);
+    }
+    let b1 = d.decode_bin(&mut ctxs[1])?;
+    if b1 == 0 {
+        let b2 = d.decode_bin(&mut ctxs[3])?;
+        return Ok(1 + b2 as u32);
+    }
+    let b2 = d.decode_bin(&mut ctxs[2])?;
+    if b2 == 0 {
+        let mut act: u32 = 2;
+        if d.decode_bin(&mut ctxs[3])? == 1 {
+            act += 2;
+        }
+        if d.decode_bin(&mut ctxs[3])? == 1 {
+            act += 1;
+        }
+        return Ok(act + 1);
+    }
+    let b3 = d.decode_bin(&mut ctxs[3])?;
+    if b3 == 1 {
+        let mut act: u32 = 10;
+        if d.decode_bin(&mut ctxs[3])? == 1 {
+            act += 1;
+        }
+        return Ok(act + 1);
+    }
+    let mut act: u32 = 6;
+    if d.decode_bin(&mut ctxs[3])? == 1 {
+        act += 2;
+    }
+    if d.decode_bin(&mut ctxs[3])? == 1 {
+        act += 1;
+    }
+    Ok(act + 1)
+}
+
 /// §9.3.3.1.1.10 — `transform_size_8x8_flag`. Single regular-mode bin with
 /// `ctxIdxInc = condTermFlagA + condTermFlagB`.
 pub fn decode_transform_size_8x8_flag(

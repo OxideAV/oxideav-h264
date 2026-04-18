@@ -224,7 +224,12 @@ impl<'a> CabacDecoder<'a> {
         let mut cod_i_range = self.cod_i_range - r_lps;
 
         #[cfg(feature = "cabac-trace")]
-        let pre = (self.cod_i_range, self.cod_i_offset, ctx.p_state_idx, ctx.val_mps);
+        let pre = (
+            self.cod_i_range,
+            self.cod_i_offset,
+            ctx.p_state_idx,
+            ctx.val_mps,
+        );
 
         let bin_val;
         if self.cod_i_offset >= cod_i_range {

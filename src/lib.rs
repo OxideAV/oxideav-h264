@@ -49,6 +49,15 @@
 //!   `coded_block_pattern`, `mb_qp_delta`, and 4×4 residual coding.
 //!   `weighted_pred_flag = 1` is parsed but weights are not yet wired
 //!   on the CABAC path; `transform_size_8x8_flag = 1` is rejected.
+//! * **CABAC Main-profile B-slice** entropy decode (§9.3) —
+//!   `mb_skip_flag` (B bank), `mb_type` (Table 9-37 with the 48-value
+//!   inter + intra tree), `sub_mb_type` (Table 9-38 B column, 13 values),
+//!   `ref_idx_l0` + `ref_idx_l1`, `mvd_l0_{x,y}` + `mvd_l1_{x,y}` (UEGk
+//!   with list-specific neighbour magnitudes via the new `mvd_l1_abs`
+//!   `MbInfo` field), `coded_block_pattern`, `mb_qp_delta`, and 4×4
+//!   residual coding. Motion compensation, direct-mode (spatial + temporal)
+//!   MV derivation, and bipred blending all reuse the CAVLC B-slice
+//!   helpers. `transform_size_8x8_flag = 1` and MBAFF are rejected.
 //! * **Multi-reference DPB** (Annex C / §8.2.5) — [`dpb::Dpb`] holds up
 //!   to `sps.max_num_ref_frames` reconstructed reference frames. Each
 //!   P-slice builds a fresh `RefPicList0` (§8.2.4.2.1) — short-term
@@ -132,9 +141,9 @@
 //!   (§9.3.3.1.1.10) and on **any** P-slice macroblocks — CAVLC I-slice
 //!   8×8 is wired and bit-exact (see above); the CABAC 8×8 flag is
 //!   parse-and-reject for now.
-//! * CABAC B-slices (decode); any CABAC encoding; any P/B slice encoding.
-//!   CABAC P-slices are wired but weighted-P on the CABAC path and the
-//!   8×8 transform path are out of scope on this first pass.
+//! * Any CABAC encoding; any P/B slice encoding. CABAC I/P/B-slice
+//!   decode is wired; weighted-P on the CABAC path and the 8×8 transform
+//!   path are out of scope on this first pass.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
 //! * Interlaced coding / MBAFF / PAFF.

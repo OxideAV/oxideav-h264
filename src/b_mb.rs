@@ -565,6 +565,79 @@ fn compensate_partition_b(
     )
 }
 
+/// Public re-export of the private `apply_motion_compensation` routine so
+/// the CABAC B-slice driver can feed it the per-partition MVs + refs. Takes
+/// the same arguments verbatim.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_motion_compensation_b(
+    sh: &SliceHeader,
+    ctx: &BSliceCtx<'_>,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    ph: usize,
+    pw: usize,
+    dir: PredDir,
+    ref_idx_l0: Option<i8>,
+    ref_idx_l1: Option<i8>,
+    mv_l0: Option<(i16, i16)>,
+    mv_l1: Option<(i16, i16)>,
+) -> Result<()> {
+    apply_motion_compensation(
+        sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, r0, c0, ph, pw, dir, ref_idx_l0,
+        ref_idx_l1, mv_l0, mv_l1,
+    )
+}
+
+/// Public wrapper around the whole-MB spatial-or-temporal direct-mode MC
+/// path so CABAC B can reuse the CAVLC helpers without duplicating §8.4.1.2.
+pub fn direct_16x16_compensate_pub(
+    sh: &SliceHeader,
+    sps: &Sps,
+    ctx: &BSliceCtx<'_>,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+) -> Result<()> {
+    if sh.direct_spatial_mv_pred_flag {
+        direct_16x16_spatial_compensate(sh, sps, ctx, mb_x, mb_y, pic, ref_list0, ref_list1)
+    } else {
+        direct_16x16_temporal_compensate(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx)
+    }
+}
+
+/// Public wrapper for the 8×8 direct-mode sub-MB compensate helpers. Used
+/// from the CABAC `B_8x8` path when a sub-partition is `B_Direct_8x8`.
+#[allow(clippy::too_many_arguments)]
+pub fn direct_8x8_compensate_pub(
+    sh: &SliceHeader,
+    sps: &Sps,
+    ctx: &BSliceCtx<'_>,
+    mb_x: u32,
+    mb_y: u32,
+    sr0: usize,
+    sc0: usize,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+) -> Result<()> {
+    if sh.direct_spatial_mv_pred_flag {
+        direct_8x8_spatial_compensate(
+            sh, sps, ctx, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1,
+        )
+    } else {
+        direct_8x8_temporal_compensate(
+            sh, sps, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1, ctx,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_motion_compensation(
     sh: &SliceHeader,
