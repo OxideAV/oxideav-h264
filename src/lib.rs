@@ -109,7 +109,7 @@
 //!   vertically and 4 horizontal internal edges per MB vs. 4:2:0's
 //!   single mid-edge) per H.264 Amd 2 §8.7 chroma edge rules. Bit-exact
 //!   against ffmpeg on the 64×64 `iframe_yuv422_64x64` fixture.
-//! * **4:2:2 CAVLC P-slice** decode — the luma MC path is unchanged
+//! * **4:2:2 CAVLC P / B-slices** decode — the luma MC path is unchanged
 //!   (chroma format doesn't touch luma). Chroma MC follows §8.4.2.2.1
 //!   ChromaArrayType == 2: the horizontal 1/8-pel bilinear filter is
 //!   the same as 4:2:0 but the vertical MV is scaled by 4 (not 8)
@@ -117,9 +117,23 @@
 //!   the intra 4:2:2 shape — 2×4 DC Hadamard (CAVLC `ChromaDc2x4`,
 //!   nC = -2, QP'_C,DC = QP'_C + 3) plus 8 inter AC blocks per plane
 //!   in row-major order with slots 4/5 of the inter scaling lists.
-//!   Bit-exact against ffmpeg on the 64×64 `yuv422_p_64x64` smptebars
-//!   fixture (1 IDR + 2 P-slices, `-preset ultrafast -coder 0`).
-//!   CABAC and B-slices under 4:2:2 still return `Error::Unsupported`.
+//!   Both single-list P and bipred B paths thread the 4:2:2
+//!   chroma partition through the same helper; bipred averaging +
+//!   weighted bipred work on 8×16 tiles. Bit-exact against ffmpeg on
+//!   the 64×64 `yuv422_p_64x64` smptebars fixture (CAVLC P). The CAVLC
+//!   B `yuv422_b_64x64` fixture reconstructs ≥ 98 % matched (the
+//!   inherited P-residual divergence in `wt/pb-residual`).
+//! * **4:2:2 CABAC I / P-slices** decode — §9.3.3.1.1.9 ctxBlockCat = 3
+//!   ChromaDC bank extended to 8 coefficients per plane with the
+//!   `sig_coeff_offset_dc[7] = {0,0,1,1,2,2,2}` ctxIdxInc mapping
+//!   (§9.3.3.1.3), the cat-3 `coeff_abs_levelgt1_ctx` cap at slot 8
+//!   (not 9), and the §6.4.3 inverse scan
+//!   (CHROMA422_DC_SCAN = [0,2,1,4,6,3,5,7]) applied before the 2×4
+//!   inverse Hadamard. The CABAC P path dispatches through the same
+//!   helper with `intra = false` so inter chroma uses slots 4/5
+//!   of the dequant scaling list. Both paths are bit-exact against
+//!   ffmpeg on the `yuv422_cabac_{i,p}_64x64` fixtures.
+//!   CABAC B-slices under 4:2:2 still return `Error::Unsupported`.
 //! * **Spec-accurate §8.7 in-loop deblocking filter** — per-4-pixel-edge
 //!   boundary strength (bS) derivation distinguishing MB-edge vs internal
 //!   edges, intra/inter sides, non-zero residual, and MV/reference
@@ -312,8 +326,8 @@
 //!   `Error::Unsupported`.
 //! * `separate_colour_plane_flag = 1` (§7.4.2.1.1, three independent
 //!   colour planes) is rejected at slice entry with `Error::Unsupported`.
-//!   4:2:2 is supported for CAVLC I-slices only — 4:2:2 P / B and CABAC
-//!   entry return `Error::Unsupported`.
+//!   4:2:2 is supported for CAVLC I/P/B and CABAC I/P slices — CABAC
+//!   4:2:2 B-slice entry still returns `Error::Unsupported`.
 //! * Monochrome (`chroma_format_idc = 0`) is rejected — the same
 //!   helpers are wired but the MB-layer path assumes chroma planes
 //!   exist.

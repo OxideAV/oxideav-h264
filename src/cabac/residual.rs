@@ -182,6 +182,158 @@ pub fn decode_residual_block_cabac(
     Ok(coeffs)
 }
 
+/// §6.4.3 inverse scan for ChromaArrayType == 2 ChromaDC. Each entry
+/// maps a CABAC coded-scan position (0..=7) to a (row, col) raster
+/// offset — `CHROMA422_DC_SCAN[i] = row*2 + col`. Transcribed from
+/// FFmpeg's `ff_h264_chroma422_dc_scan[]` and cross-checked against
+/// xfxhn/h264's 2×4 ChromaDC scan traversal in Macroblock.cpp.
+pub const CHROMA422_DC_SCAN: [u8; 8] = [
+    0, // (x=0, y=0) → raster 0
+    2, // (x=0, y=1) → raster 2
+    1, // (x=1, y=0) → raster 1
+    4, // (x=0, y=2) → raster 4
+    6, // (x=0, y=3) → raster 6
+    3, // (x=1, y=1) → raster 3
+    5, // (x=1, y=2) → raster 5
+    7, // (x=1, y=3) → raster 7
+];
+
+/// Decode one 4:2:2 Chroma-DC block (ctxBlockCat = 3, 8 coefficients).
+///
+/// Under ChromaArrayType = 2, §9.3.3.1.3 sets the significance and
+/// last-significance `ctxIdxInc` to `min(levelListIdx / NumC8x8, 2) =
+/// min(levelListIdx / 2, 2)`, sharing only 3 of the 4 bank slots
+/// available at ctxIdxOffset 149..=152 (105+44+0..2). Unlike the
+/// straight-`i` mapping used for cat 0/1/2/4, positions 0..=7 collapse
+/// onto ctxIdxInc values 0, 0, 1, 1, 2, 2, 2, 2. The level-abs bank
+/// drops the top slot — `max_num_coeff-1` plays no context role here.
+///
+/// Output is in **raster (row, col) order** (CHROMA422_DC_SCAN
+/// applied). Callers feed the 8-vector into `inv_hadamard_2x4_chroma_dc_scaled`
+/// which expects `dc[row*2 + col]` order.
+///
+/// Layout of `ctxs[]` matches [`decode_residual_block_cabac`] except
+/// that the caller is expected to have arranged the 3-wide
+/// significance banks at `ctxs[1..=3]` and `ctxs[17..=19]` (the plan
+/// returned by `ResidualCtxPlan::new` does this automatically since
+/// those slots map to `sig_base + 0..=2`).
+pub fn decode_residual_block_cabac_chroma_dc_422(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    neighbours: &CbfNeighbours,
+) -> Result<[i32; 8]> {
+    if ctxs.len() < 43 {
+        return Err(Error::invalid(
+            "h264 cabac residual: insufficient context slice (need 43)",
+        ));
+    }
+    let _ = neighbours;
+    let cbf = d.decode_bin(&mut ctxs[0])?;
+    let mut scan_coeffs = [0i32; 8];
+    if cbf == 0 {
+        return Ok(scan_coeffs);
+    }
+
+    // §9.3.3.1.3 sig/last ctxIdxInc = min(i / 2, 2) for cat 3 w/ NumC8x8 = 2.
+    // Positions 0..=6 are read explicitly; position 7 is implicit-last
+    // (§9.3.3.1.1.9 step 3).
+    let n = 8usize;
+    let mut significant = [false; 8];
+    let mut saw_last = false;
+    let mut last_at: usize = n - 1;
+    for i in 0..(n - 1) {
+        let inc = core::cmp::min(i / 2, 2);
+        let sig = d.decode_bin(&mut ctxs[1 + inc])?;
+        if sig == 1 {
+            significant[i] = true;
+            let last = d.decode_bin(&mut ctxs[17 + inc])?;
+            if last == 1 {
+                last_at = i;
+                saw_last = true;
+                break;
+            }
+        }
+    }
+    if !saw_last {
+        significant[n - 1] = true;
+        last_at = n - 1;
+    }
+
+    // §9.3.3.1.3 level-abs ctxIdxInc — standard 5+5 bank, but table 9-43
+    // adds a "-1" correction for cat == 0 OR cat == 3 on the bin0
+    // branch. The xfxhn reference applies that at line 1534 of Cabac.cpp
+    // (`std::min(4 - ((ctxBlockCat == 3) ? 1 : 0), numDecodAbsLevelGt1)`).
+    // Note: the bin0 max stays at 4; only the gt1 cap drops to 3.
+    let mut num_eq1: u32 = 0;
+    let mut num_gt1: u32 = 0;
+    let mut i = last_at as isize;
+    while i >= 0 {
+        if significant[i as usize] {
+            let bin0_inc = if num_gt1 != 0 {
+                0u32
+            } else {
+                core::cmp::min(4, 1 + num_eq1)
+            };
+            // cat 3: cap gt1 contribution at 3, not 4.
+            let binge1_inc = 5 + core::cmp::min(3u32, num_gt1);
+            const BASE: usize = 33;
+            let b0 = d.decode_bin(&mut ctxs[BASE + bin0_inc as usize])?;
+            let value: u32 = if b0 == 0 {
+                0
+            } else {
+                let mut prefix_ones: u32 = 1;
+                let mut saturated = true;
+                for _ in 1..14 {
+                    let b = d.decode_bin(&mut ctxs[BASE + binge1_inc as usize])?;
+                    if b == 0 {
+                        saturated = false;
+                        break;
+                    }
+                    prefix_ones += 1;
+                }
+                if saturated {
+                    let mut k: u32 = 0;
+                    loop {
+                        let b = d.decode_bypass()?;
+                        if b == 0 {
+                            break;
+                        }
+                        k += 1;
+                        if k > 31 {
+                            return Err(Error::invalid(
+                                "h264 cabac chromadc422 residual: EG0 suffix runaway",
+                            ));
+                        }
+                    }
+                    let mut extra: u32 = 0;
+                    for _ in 0..k {
+                        extra = (extra << 1) | d.decode_bypass()? as u32;
+                    }
+                    14 + (1u32 << k) - 1 + extra
+                } else {
+                    prefix_ones
+                }
+            };
+            if value == 0 {
+                num_eq1 += 1;
+            } else {
+                num_gt1 += 1;
+            }
+            let sign = d.decode_bypass()?;
+            let level = (value as i32) + 1;
+            scan_coeffs[i as usize] = if sign == 1 { -level } else { level };
+        }
+        i -= 1;
+    }
+
+    // §6.4.3 inverse scan: coded-scan idx → raster (row*2 + col).
+    let mut out = [0i32; 8];
+    for (i, &raster) in CHROMA422_DC_SCAN.iter().enumerate() {
+        out[raster as usize] = scan_coeffs[i];
+    }
+    Ok(out)
+}
+
 /// Decode a Luma 8×8 residual block (ctxBlockCat = 5, 64 coefficients).
 ///
 /// Layout of `cbf_ctx`: one context (the `coded_block_flag` slot chosen by

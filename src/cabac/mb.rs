@@ -30,7 +30,8 @@ use crate::cabac::binarize;
 use crate::cabac::context::CabacContext;
 use crate::cabac::engine::CabacDecoder;
 use crate::cabac::residual::{
-    decode_residual_block_cabac, decode_residual_block_cabac_8x8, BlockCat, CbfNeighbours,
+    decode_residual_block_cabac, decode_residual_block_cabac_8x8,
+    decode_residual_block_cabac_chroma_dc_422, BlockCat, CbfNeighbours,
 };
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_FLAG, CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8, CTX_IDX_CODED_BLOCK_PATTERN_LUMA,
@@ -43,8 +44,9 @@ use crate::cabac::tables::{
 use crate::cavlc::ZIGZAG_4X4;
 use crate::intra_pred::{
     predict_intra_16x16, predict_intra_4x4, predict_intra_8x8, predict_intra_chroma,
-    Intra16x16Mode, Intra16x16Neighbours, Intra4x4Mode, Intra4x4Neighbours, Intra8x8Mode,
-    Intra8x8Neighbours, IntraChromaMode, IntraChromaNeighbours,
+    predict_intra_chroma_8x16, Intra16x16Mode, Intra16x16Neighbours, Intra4x4Mode,
+    Intra4x4Neighbours, Intra8x8Mode, Intra8x8Neighbours, IntraChroma8x16Neighbours,
+    IntraChromaMode, IntraChromaNeighbours,
 };
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{decode_i_slice_mb_type, IMbType};
@@ -54,7 +56,8 @@ use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::transform::{
     chroma_qp, dequantize_4x4_scaled, dequantize_8x8_scaled, idct_4x4, idct_8x8,
-    inv_hadamard_2x2_chroma_dc_scaled, inv_hadamard_4x4_dc_scaled, ZIGZAG_8X8,
+    inv_hadamard_2x2_chroma_dc_scaled, inv_hadamard_2x4_chroma_dc_scaled,
+    inv_hadamard_4x4_dc_scaled, ZIGZAG_8X8,
 };
 
 // ---------------------------------------------------------------------------
@@ -678,18 +681,33 @@ fn decode_intra_mb_given_imb_cabac(
     {
         d.trace_label = "chroma";
     }
-    decode_chroma(
-        d,
-        ctxs,
-        sps,
-        pps,
-        mb_x,
-        mb_y,
-        pic,
-        chroma_pred_mode,
-        cbp_chroma,
-        qp_y,
-    )?;
+    if sps.chroma_format_idc == 2 {
+        decode_chroma_422(
+            d,
+            ctxs,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            chroma_pred_mode,
+            cbp_chroma,
+            qp_y,
+            true,
+        )?;
+    } else {
+        decode_chroma(
+            d,
+            ctxs,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            chroma_pred_mode,
+            cbp_chroma,
+            qp_y,
+        )?;
+    }
 
     #[cfg(feature = "cabac-trace")]
     {
@@ -1180,6 +1198,243 @@ fn decode_chroma(
         dst[..4].copy_from_slice(&nc_arr);
     }
     Ok(())
+}
+
+/// 4:2:2 chroma reconstruction under CABAC (§8.5.11.2, §8.3.4
+/// ChromaArrayType == 2). Mirrors [`crate::mb::decode_chroma_422`] (the
+/// CAVLC path) but reads the residual through CABAC — chroma DC is a
+/// 2×4 block (8 coeffs, ctxBlockCat = 3, maxNumCoeff = 4·NumC8x8 with
+/// NumC8x8 = 2 under ChromaArrayType = 2), dequantised via the
+/// `QP'_C,DC = QP'_C + 3` offset baked into
+/// [`inv_hadamard_2x4_chroma_dc_scaled`]. The 8 chroma-AC blocks per
+/// plane share ctxBlockCat = 4 with the 4:2:0 path. `intra` selects the
+/// `condTermFlagN` default + inter/intra scaling slot split (1/2 vs 4/5).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_chroma_422(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    pps: &Pps,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    chroma_mode: IntraChromaMode,
+    cbp_chroma: u8,
+    qp_y: i32,
+    intra: bool,
+) -> Result<()> {
+    let qpc_cb = chroma_qp(qp_y, pps.chroma_qp_index_offset);
+    let qpc_cr = chroma_qp(qp_y, pps.second_chroma_qp_index_offset);
+
+    let mut pred_cb = [0u8; 128];
+    let mut pred_cr = [0u8; 128];
+    if intra {
+        let neigh_cb = collect_chroma_422_neighbours(pic, mb_x, mb_y, true);
+        let neigh_cr = collect_chroma_422_neighbours(pic, mb_x, mb_y, false);
+        predict_intra_chroma_8x16(&mut pred_cb, chroma_mode, &neigh_cb);
+        predict_intra_chroma_8x16(&mut pred_cr, chroma_mode, &neigh_cr);
+    }
+
+    let mut dc_cb = [0i32; 8];
+    let mut dc_cr = [0i32; 8];
+    if cbp_chroma >= 1 {
+        // §9.3.3.1.1.9 — ctxBlockCat = 3 ChromaDC shared with 4:2:0;
+        // `max_num_coeff = 8` under ChromaArrayType = 2. The CABAC
+        // residual decoder writes coded-scan positions 0..7 which match
+        // the 2×4 raster directly per §6.4.3 (column-then-row walk).
+        let neigh_cb_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
+        let cb = decode_residual_block_cabac_8(
+            d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, intra,
+        )?;
+        dc_cb = cb;
+        pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb.iter().any(|&v| v != 0);
+        let neigh_cr_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
+        let cr = decode_residual_block_cabac_8(
+            d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, intra,
+        )?;
+        dc_cr = cr;
+        pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[1] = cr.iter().any(|&v| v != 0);
+        // §7.4.2.2 — intra chroma (slots 1/2) vs inter chroma (slots 4/5).
+        let (cb_slot, cr_slot) = if intra { (1, 2) } else { (4, 5) };
+        let w_cb = pic.scaling_lists.matrix_4x4(cb_slot)[0];
+        let w_cr = pic.scaling_lists.matrix_4x4(cr_slot)[0];
+        inv_hadamard_2x4_chroma_dc_scaled(&mut dc_cb, qpc_cb, w_cb);
+        inv_hadamard_2x4_chroma_dc_scaled(&mut dc_cr, qpc_cr, w_cr);
+    }
+
+    let row_step = pic.chroma_row_stride_for_at(mb_x, mb_y);
+    let co = pic.chroma_off(mb_x, mb_y);
+    for plane_kind in [true, false] {
+        let pred = if plane_kind { &pred_cb } else { &pred_cr };
+        let dc = if plane_kind { &dc_cb } else { &dc_cr };
+        let qpc = if plane_kind { qpc_cb } else { qpc_cr };
+        let (intra_slot, inter_slot) = if plane_kind { (1, 4) } else { (2, 5) };
+        let cat = if intra { intra_slot } else { inter_slot };
+
+        // 4:2:2 AC grid: 4 rows × 2 cols of 4×4 blocks. Row-major order
+        // so neighbour CBF lookups see already-decoded blocks above and
+        // to the left (§9.3.3.1.1.9 Table 9-41).
+        let mut nc_arr = [0u8; 8];
+        for blk_row in 0..4usize {
+            for blk_col in 0..2usize {
+                let blk_idx = blk_row * 2 + blk_col;
+                let mut res = [0i32; 16];
+                let mut total_coeff = 0u32;
+                if cbp_chroma == 2 {
+                    let neigh = chroma_ac_cbf_neighbours_422(
+                        pic, mb_x, mb_y, plane_kind, blk_row, blk_col, &nc_arr,
+                    );
+                    let ac = decode_residual_block_in_place(
+                        d,
+                        ctxs,
+                        BlockCat::ChromaAc,
+                        &neigh,
+                        15,
+                        intra,
+                    )?;
+                    res = ac;
+                    total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
+                    let scale = *pic.scaling_lists.matrix_4x4(cat);
+                    dequantize_4x4_scaled(&mut res, qpc, &scale);
+                }
+                res[0] = dc[blk_idx];
+                idct_4x4(&mut res);
+                let off_in_mb = blk_row * 4 * row_step + blk_col * 4;
+                let plane = if plane_kind { &mut pic.cb } else { &mut pic.cr };
+                if intra {
+                    for r in 0..4 {
+                        for c in 0..4 {
+                            let p_idx = (blk_row * 4 + r) * 8 + (blk_col * 4 + c);
+                            let v = pred[p_idx] as i32 + res[r * 4 + c];
+                            plane[co + off_in_mb + r * row_step + c] = v.clamp(0, 255) as u8;
+                        }
+                    }
+                } else {
+                    for r in 0..4 {
+                        for c in 0..4 {
+                            let base = plane[co + off_in_mb + r * row_step + c] as i32;
+                            let v = (base + res[r * 4 + c]).clamp(0, 255) as u8;
+                            plane[co + off_in_mb + r * row_step + c] = v;
+                        }
+                    }
+                }
+                nc_arr[blk_idx] = total_coeff as u8;
+                let info = pic.mb_info_mut(mb_x, mb_y);
+                let dst = if plane_kind {
+                    &mut info.cb_nc
+                } else {
+                    &mut info.cr_nc
+                };
+                dst[..8].copy_from_slice(&nc_arr);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Helper: run [`decode_residual_block_cabac_chroma_dc_422`] for an
+/// 8-coeff 4:2:2 ChromaDC block (ctxBlockCat = 3, NumC8x8 = 2).
+/// Handles the gather/scatter against the slice-wide context array so
+/// probability-state updates persist across blocks. Returns the 8 DC
+/// coefficients in the 2×4 raster, which matches the coded scan order
+/// per §6.4.3 — no inverse scan needed.
+fn decode_residual_block_cabac_8(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    cat: BlockCat,
+    neighbours: &CbfNeighbours,
+    intra: bool,
+) -> Result<[i32; 8]> {
+    let plan = ResidualCtxPlan::new(cat, neighbours, intra);
+    let mut window = plan.gather(ctxs);
+    let out = decode_residual_block_cabac_chroma_dc_422(d, &mut window, neighbours)?;
+    plan.scatter(ctxs, &window);
+    Ok(out)
+}
+
+/// 4:2:2 chroma-AC CBF neighbour derivation (§9.3.3.1.1.9 Table 9-41
+/// under ChromaArrayType = 2). The 2×4 grid stores per-block
+/// `total_coeff` at `MbInfo::{cb,cr}_nc[blk_row*2 + blk_col]`. Cross-MB
+/// left/top reads follow the §6.4.10.4 chroma-block neighbour rule for
+/// 4:2:2 (8 blocks laid out as 4 rows × 2 cols).
+fn chroma_ac_cbf_neighbours_422(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    plane_kind: bool,
+    blk_row: usize,
+    blk_col: usize,
+    already_decoded: &[u8; 8],
+) -> CbfNeighbours {
+    let left = if blk_col > 0 {
+        Some(already_decoded[blk_row * 2 + (blk_col - 1)] != 0)
+    } else if mb_x > 0 {
+        let m = pic.mb_info_at(mb_x - 1, mb_y);
+        if m.coded {
+            let nc = if plane_kind { &m.cb_nc } else { &m.cr_nc };
+            Some(nc[blk_row * 2 + 1] != 0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let above = if blk_row > 0 {
+        Some(already_decoded[(blk_row - 1) * 2 + blk_col] != 0)
+    } else if mb_y > 0 {
+        let m = pic.mb_info_at(mb_x, mb_y - 1);
+        if m.coded {
+            let nc = if plane_kind { &m.cb_nc } else { &m.cr_nc };
+            // Bottom row of 2×4 grid is at blk_row = 3 → indices 6, 7.
+            Some(nc[3 * 2 + blk_col] != 0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    CbfNeighbours { left, above }
+}
+
+/// 4:2:2 chroma 8×16 neighbour gather for CABAC intra prediction —
+/// mirrors [`crate::mb::collect_chroma_422_neighbours`].
+fn collect_chroma_422_neighbours(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    cb: bool,
+) -> IntraChroma8x16Neighbours {
+    let row_stride = pic.chroma_row_stride_for_at(mb_x, mb_y);
+    let co_mb = pic.chroma_off(mb_x, mb_y);
+    let plane = if cb { &pic.cb } else { &pic.cr };
+    let top_avail = pic.mb_top_available(mb_y);
+    let mut top = [0u8; 8];
+    if top_avail {
+        let off = co_mb - row_stride;
+        for i in 0..8 {
+            top[i] = plane[off + i];
+        }
+    }
+    let left_avail = mb_x > 0;
+    let mut left = [0u8; 16];
+    if left_avail {
+        for i in 0..16 {
+            left[i] = plane[co_mb + i * row_stride - 1];
+        }
+    }
+    let tl_avail = top_avail && left_avail;
+    let top_left = if tl_avail {
+        plane[co_mb - row_stride - 1]
+    } else {
+        0
+    };
+    IntraChroma8x16Neighbours {
+        top,
+        left,
+        top_left,
+        top_available: top_avail,
+        left_available: left_avail,
+        top_left_available: tl_avail,
+    }
 }
 
 /// Derive Chroma DC CBF neighbours for plane `c` (0=Cb, 1=Cr) per
