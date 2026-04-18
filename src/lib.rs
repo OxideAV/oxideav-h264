@@ -41,9 +41,26 @@
 //!   `PixelFormat::Yuv420P10Le`. Bit-exact against ffmpeg on
 //!   `iframe_10bit_64x64` (I-slice), `pframe_10bit_64x64` (three
 //!   P-slices), `10bit_cabac_i_64x64` (CABAC I, 100% match), and
-//!   `10bit_b_64x64` (6-frame I / P / B mix at 100% bit-exact).
-//!   12-bit / 14-bit, CABAC P / B at 10-bit, Intra_8×8 at 10-bit, and
-//!   I_PCM at 10-bit all return `Error::Unsupported`.
+//!   `10bit_b_64x64` (6-frame I / P / B mix at 100% bit-exact). CABAC P /
+//!   B at 10-bit, Intra_8×8 at 10-bit, and I_PCM at 10-bit all return
+//!   `Error::Unsupported`.
+//! * **12-bit + 14-bit (High 4:2:2 / High 4:4:4 Predictive CAVLC I)**
+//!   (§7.4.2.1.1 with `bit_depth_luma_minus8 ∈ {4, 6}`, 4:2:0 only for
+//!   now) — the slice-entry gate accepts even `bit_depth_luma_minus8`
+//!   values 0 / 2 / 4 / 6. `QpBdOffsetY = 6 * bit_depth_luma_minus8`
+//!   drives the extended QP range (`0..=75` at 12-bit, `0..=87` at
+//!   14-bit) and `mb_qp_delta` wraps modulo `52 + QpBdOffsetY` through
+//!   the same wrapping logic the 10-bit path uses. The i64-widened
+//!   `dequantize_4x4_scaled_ext`, `inv_hadamard_4x4_dc_scaled_ext`, and
+//!   `inv_hadamard_2x2_chroma_dc_scaled_ext` in [`transform`] handle
+//!   shift constants at the larger `qp/6` magnitudes (up to 14 at
+//!   `qp = 87`). Intra prediction clips to `(1 << bit_depth) - 1` =
+//!   4095 at 12-bit / 16383 at 14-bit, and the DC fallback yields
+//!   `1 << (bit_depth - 1)`. Emit: `PixelFormat::Yuv420P12Le` for
+//!   12-bit; 14-bit reuses `Yuv420P10Le` as a 16-bit-container fallback
+//!   (the u16 words still carry full 14-bit samples). 12/14-bit CABAC,
+//!   P/B, 4:2:2 / 4:4:4 chroma and asymmetric luma/chroma depths return
+//!   `Error::Unsupported`.
 //! * **4:4:4 CAVLC I / P / B slices** (§6.4.1 Table 6-1, ChromaArrayType = 3)
 //!   — the chroma planes share the luma 16×16 dimensions, reuse the
 //!   Intra_4×4 / Intra_16×16 predictors (no chroma 8×8 modes), skip the
@@ -300,9 +317,10 @@
 //! * Monochrome (`chroma_format_idc = 0`) is rejected — the same
 //!   helpers are wired but the MB-layer path assumes chroma planes
 //!   exist.
-//! * Bit depths above 10 (12-bit / 14-bit). 10-bit is supported for
-//!   CAVLC I-slices in 4:2:0 only — see the High 10 bullet above for
-//!   the remaining gaps at 10 bits.
+//! * 12-bit / 14-bit CABAC, 12/14-bit P/B, and 12/14-bit chroma formats
+//!   other than 4:2:0. 12/14-bit CAVLC I at 4:2:0 IS wired — see the
+//!   12-bit + 14-bit bullet above. 10-bit keeps full CAVLC I/P/B +
+//!   CABAC I coverage.
 //! * Rate control, adaptive QP, mode decision (Intra4×4 / Plane / Vertical /
 //!   Horizontal), or any psychovisual tuning. The encoder always emits
 //!   Intra_16×16 with DC_PRED and a fixed QP.

@@ -692,8 +692,17 @@ impl Picture {
             pack_row(&self.cr16[off..off + cw as usize], &mut cr_bytes, cw as usize);
         }
 
-        let format = match self.chroma_format_idc {
-            3 => PixelFormat::Yuv444P10Le,
+        // §7.4.2.1.1 — pick a PixelFormat variant that matches the luma
+        // bit depth stored in `y16` / `cb16` / `cr16`. The u16 LE packing
+        // is identical across depths; the enum variant only annotates the
+        // valid sample range so downstream consumers know the
+        // Clip1Y bound. oxideav-core 0.0 exposes 10-bit and 12-bit 4:2:0
+        // variants but not 14-bit; the 14-bit path therefore reuses
+        // `Yuv420P10Le` as a 16-bit-container fallback — the actual u16
+        // words still carry full 14-bit samples (0..=16383).
+        let format = match (self.chroma_format_idc, self.bit_depth_y) {
+            (3, _) => PixelFormat::Yuv444P10Le,
+            (_, 12) => PixelFormat::Yuv420P12Le,
             _ => PixelFormat::Yuv420P10Le,
         };
         VideoFrame {

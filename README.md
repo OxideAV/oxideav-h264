@@ -356,10 +356,11 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   scope. CABAC on 4:4:4 remains out of scope — CABAC I under
   ChromaArrayType = 3 needs its own plane-aligned residual pipeline
   + `intra_chroma_pred_mode` absence handling that isn't wired yet.
-- Bit depths above 10; 10-bit is supported for CAVLC I / P / B slices
-  and CABAC I-slice in 4:2:0 only (see the 10-bit section below).
-  12-bit / 14-bit return `Error::Unsupported`. Separate colour planes
-  are also rejected.
+- Bit depth above 14 or odd luma/chroma bit depths. 12-bit / 14-bit
+  are supported for **CAVLC I-slices in 4:2:0 only** (see the 12/14-bit
+  section below). 10-bit covers CAVLC I / P / B + CABAC I. Luma must
+  equal chroma bit depth. Separate colour planes (§7.4.2.1.1) are
+  rejected.
 - SI / SP slices.
 
 ## 10-bit (High 10) decode
@@ -404,10 +405,50 @@ pipeline:
 
 Out of scope at 10-bit (return `Error::Unsupported`): CABAC for P / B
 slices, Intra_8×8 (`transform_size_8x8_flag = 1`), 4:2:2 / 4:4:4
-chroma, and I_PCM. 12-bit and 14-bit profiles are rejected at slice
-entry. Explicit weighted P-slice prediction is supported; explicit
-and implicit weighted bipred are supported on the 10-bit CAVLC B
-path.
+chroma, and I_PCM. Explicit weighted P-slice prediction is supported;
+explicit and implicit weighted bipred are supported on the 10-bit
+CAVLC B path.
+
+## 12-bit + 14-bit (High 4:2:2 / High 4:4:4 Predictive) CAVLC I
+
+The slice-entry gate accepts `bit_depth_luma_minus8 ∈ {0, 2, 4, 6}`
+(8 / 10 / 12 / 14-bit). 12-bit and 14-bit decode reuses the entire
+10-bit high-bit-depth pipeline — u16 `Picture` planes, `bit_depth`-
+parameterised intra prediction, and the i64-widened `*_ext` dequant
+helpers in [`transform`] — the extensions are:
+
+- `QpBdOffsetY = 6 * bit_depth_luma_minus8` (24 at 12-bit, 36 at
+  14-bit). QpY' = `QpY + QpBdOffsetY` reaches 75 / 87 respectively,
+  which fits comfortably inside the i64-widened dequant shifts
+  (`qp6 = QpY' / 6` is at most 14, well below any overflow bound).
+- `mb_qp_delta` wraps modulo `52 + QpBdOffsetY` per §7.4.5 — the same
+  wrapping the 10-bit path already does (just with a larger modulus).
+- Chroma QP Table 7-2 (`chroma_qp_hi` in [`transform`]) is an identity
+  function outside `0..=51`, so the larger `qpi = QpY +
+  chroma_qp_index_offset` range passes through untouched before
+  `+ QpBdOffsetC`.
+- Intra prediction clip bound is `(1 << bit_depth) - 1` = 4095 at
+  12-bit / 16383 at 14-bit; DC no-neighbour fallback is
+  `1 << (bit_depth - 1)` = 2048 / 8192 (all already parameterised in
+  [`intra_pred_hi`]).
+- Emit: 12-bit → `PixelFormat::Yuv420P12Le`; 14-bit reuses
+  `Yuv420P10Le` as a 16-bit-container fallback because
+  oxideav-core 0.0.3 doesn't carry a `Yuv420P14Le` variant. The u16
+  words still hold full 14-bit samples (`0..=16383`).
+
+Out of scope at 12/14-bit (return `Error::Unsupported`):
+
+- CABAC at any slice type.
+- P / B slices at 12 or 14-bit — only I-slices are wired.
+- 4:2:2 or 4:4:4 chroma at 12 / 14-bit (4:2:0 only for now).
+- Asymmetric luma / chroma bit depths
+  (`bit_depth_luma_minus8 != bit_depth_chroma_minus8`).
+
+A synthetic single-MB fixture (`tests/decode_iframe_12_14bit.rs`)
+hand-crafts a 16×16 IDR at `bit_depth_luma_minus8 = 4` and `= 6` to
+exercise both the I_NxN DC-fallback path and the I_16x16 Hadamard DC
+dequant chain without needing an external 12/14-bit libx264 build
+(most distro packages ship a 10-bit-only libx264).
 
 ## Codec id
 
