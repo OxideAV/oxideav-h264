@@ -375,8 +375,17 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
 - Bit depth above 14 or odd luma/chroma bit depths. 12-bit / 14-bit
   are supported for **CAVLC I-slices in 4:2:0 only** (see the 12/14-bit
   section below). 10-bit covers CAVLC I / P / B + CABAC I. Luma must
-  equal chroma bit depth. Separate colour planes (§7.4.2.1.1) are
-  rejected.
+  equal chroma bit depth.
+- **Separate colour planes** (`separate_colour_plane_flag = 1`,
+  §7.4.2.1.1) decode end-to-end for **CAVLC I-slices at 8-bit
+  progressive**. Each slice decodes as an independent monochrome
+  picture keyed by `colour_plane_id ∈ {0, 1, 2}`; the decoder
+  accumulates the per-plane buffers by `(frame_num, colour_plane_id)`
+  and emits a merged `Yuv444P` `VideoFrame` once all three planes have
+  arrived. Sep-plane P/B slices, CABAC entropy, 10-bit samples, and
+  PAFF/MBAFF sep-plane still return `Error::Unsupported`. Coverage:
+  `tests/separate_colour_plane.rs` (SPS parse, per-plane slice header
+  parse, 1×1-MB + 2×2-MB end-to-end decode).
 - **Primary SI / SP slices** (§7.3.5 / §7.4.5 Table 7-12 / Table 7-13
   SP entries / §8.6) are **supported** on the CAVLC 4:2:0 / 8-bit
   path when `slice_qs_delta == slice_qp_delta` (the §8.6.1 / §8.6.2
