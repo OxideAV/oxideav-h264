@@ -4,10 +4,11 @@ Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
 oxideav. Decodes CAVLC + CABAC I-slices, CAVLC + CABAC P-slices, and
 CAVLC B-slices (spatial + temporal direct + explicit weighted bipred +
 implicit weighted bipred); encodes a minimal Baseline-Profile, I-frame-only,
-Intra_16×16 DC_PRED output stream. **High-Profile 8×8 transform CAVLC I-slice decode**
-(§7.3.5.3.2, §8.3.2, §8.5.13) is wired end-to-end and bit-exact against
-ffmpeg's libavcodec reference; CABAC 8×8 residual coding (§9.3.3.1.1.10)
-and P-slice inter 8×8 remain out of scope. Zero C dependencies.
+Intra_16×16 DC_PRED output stream. **High-Profile 8×8 transform CAVLC decode**
+(§7.3.5.3.2, §8.3.2, §8.5.13) is wired end-to-end for both intra and
+P-slice inter macroblocks and bit-exact against ffmpeg's libavcodec
+reference; CABAC 8×8 residual coding (§9.3.3.1.1.10) remains out of
+scope. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -216,29 +217,33 @@ let pkt = enc.receive_packet()?;   // Annex B: SPS+PPS+IDR
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-## High Profile 8×8 transform — CAVLC I-slice wired
+## High Profile 8×8 transform — CAVLC intra + P-slice inter wired
 
-The CAVLC I-slice 8×8 transform path is fully wired and bit-exact:
+The CAVLC 8×8 transform path is fully wired on both intra and P-slice
+paths and bit-exact against ffmpeg's libavcodec reference:
 
 - 8×8 inverse integer transform (`transform::idct_8x8`) and its 6-class
   dequantisation (`transform::dequantize_8x8`) over the default flat-16
   scaling list — §8.5.13.
 - Nine Intra_8×8 prediction modes with reference-sample low-pass
   filtering per §8.3.2.2.2 (`intra_pred::predict_intra_8x8`) — §8.3.2.
-- `transform_size_8x8_flag` parse + four-mode (`prev_intra8x8_pred_mode_flag`
-  + optional 3-bit `rem_intra8x8_pred_mode`) decode in `mb::decode_one_mb`
-  (§7.3.5.1).
+- `transform_size_8x8_flag` parse at both spec positions: before the
+  intra-mode syntax for I_NxN (§7.3.5.1 intra branch) and after
+  `coded_block_pattern` / before `mb_qp_delta` for the P-slice inter
+  branch, with the §7.3.5.1 conditional (`cbp_luma > 0` and no sub-8×8
+  motion partitions on P_8x8).
 - Per-sub-block CAVLC residual (`cavlc::decode_residual_8x8_sub`) —
   four 16-coefficient blocks spliced via `cavlc::ZIGZAG_8X8_CAVLC`
   (§7.3.5.3.2, FFmpeg's `zigzag_scan8x8_cavlc` untransposed).
 - Per-sub-block `non_zero_count_cache` neighbour nC prediction +
   post-decode `nnz[0] += nnz[1] + nnz[8] + nnz[9]` aggregation so
   neighbour MBs see a single representative count for the whole 8×8
-  block (mirrors FFmpeg's `scan8[]`-indexed cache).
+  block (mirrors FFmpeg's `scan8[]`-indexed cache). Inter 8×8 reuses
+  the same cache layout via `p_mb::predict_inter_nc_luma`.
 
-The CABAC 8×8 path (§9.3.3.1.1.10) and P-slice inter 8×8 still surface
-`Error::Unsupported`. Custom scaling-list matrices are parsed but not
-applied (only flat-16 is used for 8×8 dequant).
+The CABAC 8×8 path (§9.3.3.1.1.10) still surfaces `Error::Unsupported`.
+Custom scaling-list matrices are parsed but not applied (only flat-16 is
+used for 8×8 dequant).
 
 ## Not supported
 
@@ -250,8 +255,8 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   P_8×8 with all four sub-partitions, intra-in-P) with two caveats that
   surface `Error::Unsupported` on this first pass:
   - `transform_size_8x8_flag = 1` is not supported on the CABAC path
-    (CAVLC I-slice 8×8 is wired — see the section above — but CABAC 8×8
-    residual coding per §9.3.3.1.1.10 and P-slice inter 8×8 are not).
+    (CAVLC intra + P-slice inter 8×8 are both wired — see the section
+    above — but CABAC 8×8 residual coding per §9.3.3.1.1.10 is not).
   - Weighted prediction on the CABAC P path is parsed but weights are
     not applied; encoders should disable weighted P for CABAC bitstreams
     fed into this decoder, or tolerate unweighted MC output.
@@ -260,7 +265,8 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   deblocking.
 - `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 - Interlaced coding, MBAFF, PAFF, frame/field picture mixes.
-- Inter 8×8 transform (`transform_size_8x8_flag = 1` on P/B MBs).
+- Inter 8×8 transform on B-slice MBs — CAVLC P-slice inter 8×8 is wired
+  (see above); B-slice inter 8×8 is not yet.
 - 4:2:2 / 4:4:4 chroma, bit depths above 8, separate colour planes.
 - SI / SP slices.
 
