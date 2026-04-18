@@ -774,26 +774,27 @@ pub fn predict_intra_8x8(out: &mut [u8; 64], mode: Intra8x8Mode, n: &Intra8x8Nei
             }
         }
         DiagonalDownRight => {
-            // §8.3.2.2.5 — needs ft, fl, ftl.
-            // Build a linear "edge" array e[0..=16] indexed around the
-            // corner: e[7] = ftl, e[8..=15] = ft[0..=7], e[6..=-1] = fl[0..=7]
-            // (reversed). i.e. for k = x - y in -7..=7, the reference used
-            // is e[7 + k].
-            let mut e = [0u8; 16];
-            e[7] = ftl;
+            // §8.3.2.2.5 — needs ft, fl, ftl. Shares the 17-entry `e[]`
+            // layout with HD/VR so the k=-7 case at (x=0,y=7) can reach
+            // fl[7] via e[1] (spec taps p[-1,6], p[-1,7], ...). For k=x-y
+            // in -7..=7, the spec 3-tap is centred at e[8+k].
+            //
+            // Layout:
+            //   e[0..=7] = fl[7..=0] reversed (so fl[7]=e[0], fl[0]=e[7])
+            //   e[8]     = ftl
+            //   e[9..=16] = ft[0..=7]
+            let mut e = [0u8; 17];
             for i in 0..8 {
-                e[8 + i] = ft[i];
+                e[i] = fl[7 - i];
             }
-            for i in 0..7 {
-                e[6 - i] = fl[i];
+            e[8] = ftl;
+            for i in 0..8 {
+                e[9 + i] = ft[i];
             }
-            e[0] = fl[6]; // keep last of fl in e[0]; unused beyond -7 offset.
-                          // For each position compute p[x,y] = (e[7 + k - 1] + 2*e[7 + k] +
-                          // e[7 + k + 1] + 2) >> 2 with k = x - y.
             for y in 0..8 {
                 for x in 0..8 {
                     let k = x as i32 - y as i32;
-                    let idx = (7 + k) as usize;
+                    let idx = (8 + k) as usize;
                     let l = e[idx - 1] as u32;
                     let m = e[idx] as u32;
                     let r = e[idx + 1] as u32;
@@ -802,33 +803,36 @@ pub fn predict_intra_8x8(out: &mut [u8; 64], mode: Intra8x8Mode, n: &Intra8x8Nei
             }
         }
         VerticalRight => {
-            // §8.3.2.2.6 — needs ft, fl, ftl.
-            // Build e[0..=15] where e[7] = ftl, e[8..=15] = ft[0..=7],
-            // e[0..=6] = fl[6..=0] (reversed).
-            let mut e = [0u8; 16];
-            e[7] = ftl;
+            // §8.3.2.2.6. Linearised reference ring `e[0..=16]`:
+            // * `e[0..=7]`  = filtered left column reversed (`fl[7..=0]`).
+            // * `e[8]`      = filtered top-left.
+            // * `e[9..=16]` = filtered top row (`ft[0..=7]`).
+            // `fl[7]` must live in `e[]` so the HorizontalDown sibling at
+            // zhd=14 can reach it; we keep a single shared layout so the
+            // two mirror-symmetric modes share index arithmetic.
+            let mut e = [0u8; 17];
             for i in 0..8 {
-                e[8 + i] = ft[i];
+                e[i] = fl[7 - i];
             }
-            for i in 0..7 {
-                e[6 - i] = fl[i];
+            e[8] = ftl;
+            for i in 0..8 {
+                e[9 + i] = ft[i];
             }
             for y in 0..8 {
                 for x in 0..8 {
                     let zvr = 2 * x as i32 - y as i32;
-                    let v = if (0..=12).contains(&zvr) && zvr % 2 == 0 {
-                        let base = 7 + x as i32 - (y as i32 >> 1);
+                    let v = if zvr >= 0 && zvr % 2 == 0 {
+                        let base = 8 + x as i32 - (y as i32 >> 1);
                         let i = base as usize;
                         ((e[i] as u32 + e[i + 1] as u32 + 1) >> 1) as u8
-                    } else if (0..=12).contains(&zvr) {
-                        let base = 7 + x as i32 - ((y as i32 + 1) >> 1);
+                    } else if zvr >= 1 {
+                        let base = 8 + x as i32 - ((y as i32 + 1) >> 1);
                         let i = base as usize;
                         ((e[i] as u32 + 2 * e[i + 1] as u32 + e[i + 2] as u32 + 2) >> 2) as u8
                     } else {
-                        // zvr < 0 — p[x,y] based on the left column.
-                        // zVR = -1, -2, -3, ..., -7.
+                        // zvr ∈ {-1..=-7} — left-column 3-tap around e[i+1].
                         let k = -zvr - 1;
-                        let i = (6 - k) as usize;
+                        let i = (7 - k) as usize;
                         ((e[i] as u32 + 2 * e[i + 1] as u32 + e[i + 2] as u32 + 2) >> 2) as u8
                     };
                     out[y * 8 + x] = v;
@@ -836,36 +840,39 @@ pub fn predict_intra_8x8(out: &mut [u8; 64], mode: Intra8x8Mode, n: &Intra8x8Nei
             }
         }
         HorizontalDown => {
-            // §8.3.2.2.7 — mirror of VerticalRight.
-            let mut e = [0u8; 16];
-            e[7] = ftl;
+            // §8.3.2.2.7 — mirror of VerticalRight. Shares the 17-entry
+            // `e[]` layout so the zhd=14 case at (x=0,y=7) can reach fl[7],
+            // which was out-of-range in the prior 16-entry layout.
+            //
+            // Indexing matches FFmpeg's pred8x8l_horizontal_down reference:
+            // * even zhd∈{0..14}: 2-tap `(e[i-1]+e[i]+1)>>1`.
+            // * odd  zhd∈{1..13}: 3-tap `(e[i+1]+2·e[i]+e[i-1]+2)>>2`.
+            // * zhd=-1 merges into the top-row 3-tap centred at ftl.
+            // * zhd∈{-2..=-7}: 3-tap along the top row.
+            let mut e = [0u8; 17];
             for i in 0..8 {
-                e[8 + i] = ft[i];
+                e[i] = fl[7 - i];
             }
-            for i in 0..7 {
-                e[6 - i] = fl[i];
+            e[8] = ftl;
+            for i in 0..8 {
+                e[9 + i] = ft[i];
             }
             for y in 0..8 {
                 for x in 0..8 {
                     let zhd = 2 * y as i32 - x as i32;
                     let v = if zhd >= 0 && zhd % 2 == 0 {
-                        // §8.3.2.2.7 even zhd ∈ {0,2,..,14}: 2-tap left column.
-                        let base = 7 - (y as i32 - (x as i32 >> 1));
+                        let base = 8 - (y as i32 - (x as i32 >> 1));
                         let i = base as usize;
                         ((e[i] as u32 + e[i - 1] as u32 + 1) >> 1) as u8
                     } else if zhd >= 1 {
-                        // §8.3.2.2.7 odd zhd ∈ {1,3,..,13}: 3-tap left column.
-                        let base = 7 - (y as i32 - ((x as i32 + 1) >> 1));
+                        let base = 8 - (y as i32 - (x as i32 >> 1));
                         let i = base as usize;
                         ((e[i + 1] as u32 + 2 * e[i] as u32 + e[i - 1] as u32 + 2) >> 2) as u8
                     } else {
-                        // zhd ∈ {-1..=-7} — spec §8.3.2.2.7 taps top row at
-                        // (x-2y-2), (x-2y-1), (x-2y). With zhd = 2y-x we have
-                        // x-2y-2 = -(zhd+2) = k-1, so base-in-e[] = 7+k.
-                        let k = -zhd - 1;
-                        let base = 7 + k;
-                        let i = base as usize;
-                        ((e[i] as u32 + 2 * e[i + 1] as u32 + e[i + 2] as u32 + 2) >> 2) as u8
+                        // zhd ∈ {-1..=-7} — top-row 3-tap centred at
+                        // e[i] (zhd=-1 centre is ftl, zhd=-k centre is ft[k-2]).
+                        let i = (7 - zhd) as usize;
+                        ((e[i - 1] as u32 + 2 * e[i] as u32 + e[i + 1] as u32 + 2) >> 2) as u8
                     };
                     out[y * 8 + x] = v;
                 }
@@ -1044,6 +1051,68 @@ mod tests {
         // (x=2, y=3) zHU=8, (x=3, y=3) zHU=9 → left[3] too.
         assert_eq!(out[3 * 4 + 2], 200);
         assert_eq!(out[3 * 4 + 3], 200);
+    }
+
+    #[test]
+    fn intra8x8_horizontal_down_zhd14_reaches_fl7() {
+        // §8.3.2.2.7 at (x=0,y=7), zhd=14: pred = (fl[6] + fl[7] + 1) >> 1.
+        // Before the e[] resize fl[7] was out of scope so this would either
+        // panic or return garbage. Uniform left gives 200.
+        let n = Intra8x8Neighbours {
+            top: [5; 16],
+            left: [200; 8],
+            top_left: 200,
+            top_available: true,
+            left_available: true,
+            top_left_available: true,
+            top_right_available: true,
+        };
+        let mut out = [0u8; 64];
+        predict_intra_8x8(&mut out, Intra8x8Mode::HorizontalDown, &n);
+        assert_eq!(out[7 * 8 + 0], 200, "(x=0,y=7) must be (fl[6]+fl[7]+1)/2");
+    }
+
+    #[test]
+    fn intra8x8_horizontal_down_zhd_minus1_ffmpeg() {
+        // FFmpeg SRC(1,0) for pred8x8l_horizontal_down:
+        //   (l0 + 2*lt + t0 + 2) >> 2  (zhd=-1 corner-crossing 3-tap).
+        // Prior impl used a top-row 3-tap here; this test pins the fix.
+        let n = Intra8x8Neighbours {
+            top: [80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80],
+            left: [100, 100, 100, 100, 100, 100, 100, 100],
+            top_left: 40,
+            top_available: true,
+            left_available: true,
+            top_left_available: true,
+            top_right_available: true,
+        };
+        let mut out = [0u8; 64];
+        predict_intra_8x8(&mut out, Intra8x8Mode::HorizontalDown, &n);
+        // Filtered samples: fl[0] = (tl + 2*l[0] + l[1] + 2)>>2 = (40+200+100+2)/4 = 85.
+        // ftl = (t[0] + 2*tl + l[0] + 2)>>2 = (80+80+100+2)/4 = 65.
+        // ft[0] = (tl + 2*t[0] + t[1] + 2)>>2 = (40+160+80+2)/4 = 70.
+        // SRC(1,0) = (fl[0] + 2*ftl + ft[0] + 2)>>2 = (85+130+70+2)/4 = 71.
+        assert_eq!(out[0 * 8 + 1], 71, "(x=1,y=0) zhd=-1 corner-crossing 3-tap");
+    }
+
+    #[test]
+    fn intra8x8_vertical_right_zvr14_reaches_ft7() {
+        // §8.3.2.2.6 at (x=7, y=0), zvr=14: pred = (ft[6] + ft[7] + 1) >> 1.
+        // Prior impl's range-check excluded zvr=14 from the even branch,
+        // pushing it into the top-row 3-tap and then OOB-indexing.
+        let n = Intra8x8Neighbours {
+            top: [20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20],
+            left: [5; 8],
+            top_left: 5,
+            top_available: true,
+            left_available: true,
+            top_left_available: true,
+            top_right_available: true,
+        };
+        let mut out = [0u8; 64];
+        predict_intra_8x8(&mut out, Intra8x8Mode::VerticalRight, &n);
+        // Constant top row → every filtered ft[] is 20.
+        assert_eq!(out[0 * 8 + 7], 20, "(x=7,y=0) must be (ft[6]+ft[7]+1)/2");
     }
 
     #[test]
