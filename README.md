@@ -101,11 +101,20 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
   edge-replicated out-of-picture reads.
 - Inter residual decode: CAVLC 4×4 luma blocks and 4×4 chroma AC /
   2×2 chroma DC. CBP uses the inter-column of Table 9-4(b).
-- Reference picture handling: exactly one L0 reference — the
-  previously-decoded output frame. Multi-reference prediction
-  (`ref_idx_l0 > 0`), reference list modification, and reference
-  picture list reordering are not supported and surface as
-  `Error::Unsupported` when the bitstream requests them.
+- Reference picture handling: a Decoded Picture Buffer (Annex C /
+  §8.2.5) holding up to `sps.max_num_ref_frames` reconstructed
+  reference frames. Each P-slice builds a fresh `RefPicList0`
+  (§8.2.4.2.1) and `ref_idx_l0 > 0` indexes into it. Picture order
+  count derivation covers `pic_order_cnt_type == 0` (LSB + MSB
+  tracking, §8.2.1.1) and `pic_order_cnt_type == 2`
+  (`2·frame_num` for references, `2·frame_num - 1` otherwise —
+  §8.2.1.3). Reference marking: sliding-window default (§8.2.5.3)
+  plus explicit MMCO operations 1 (mark short-term unused),
+  2 (mark long-term unused), 3 (assign long-term index),
+  4 (`MaxLongTermFrameIdx`), 5 (mark all unused — IDR-like),
+  and 6 (tag current picture as long-term) — §8.2.5.4. Reference
+  picture list modification (RPLM) is parsed but non-identity
+  commands surface `Error::Unsupported` (planned follow-up).
 
 ## What is encoded today
 
@@ -196,8 +205,10 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   deblocking.
 - B-slices, bi-prediction, implicit weighted bi-prediction (the
   explicit P-slice form is supported).
-- Multi-reference DPB / `ref_idx_l0 > 0`, reference list modification
-  operations (decoder).
+- Reference picture list modification (RPLM) — the identity form
+  (flag = 0) is accepted; non-trivial modification commands surface
+  `Error::Unsupported`.
+- `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 - Interlaced coding, MBAFF, PAFF, frame/field picture mixes.
 - Inter 8×8 transform (`transform_size_8x8_flag = 1` on P/B MBs).
 - 4:2:2 / 4:4:4 chroma, bit depths above 8, separate colour planes.

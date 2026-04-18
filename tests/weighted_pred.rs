@@ -52,6 +52,10 @@ fn make_slice_with_luma_weight(lw: LumaWeight, cw: ChromaWeight) -> SliceHeader 
         slice_data_bit_offset: 0,
         is_idr: false,
         pred_weight_table: Some(tbl),
+        idr_no_output_of_prior_pics_flag: false,
+        idr_long_term_reference_flag: false,
+        adaptive_ref_pic_marking_mode_flag: false,
+        mmco_commands: Vec::new(),
     }
 }
 
@@ -98,7 +102,7 @@ fn p_skip_halves_luma_and_chroma_with_weight_one_denom_one() {
     // samples come from the collocated reference samples, then get weighted.
     for mby in 0..mb_h {
         for mbx in 0..mb_w {
-            decode_p_skip_mb(&sh, mbx, mby, &mut pic, &reference, 26).expect("p_skip");
+            decode_p_skip_mb(&sh, mbx, mby, &mut pic, &[&reference], 26).expect("p_skip");
         }
     }
 
@@ -157,7 +161,7 @@ fn p_skip_additive_offset_only() {
     };
     let sh = make_slice_with_luma_weight(lw, cw);
 
-    decode_p_skip_mb(&sh, 0, 0, &mut pic, &reference, 26).expect("p_skip");
+    decode_p_skip_mb(&sh, 0, 0, &mut pic, &[&reference], 26).expect("p_skip");
 
     let lstride = pic.luma_stride();
     for y in 0..pic.height as usize {
@@ -222,9 +226,13 @@ fn p_skip_without_weight_table_is_plain_copy() {
         slice_data_bit_offset: 0,
         is_idr: false,
         pred_weight_table: None,
+        idr_no_output_of_prior_pics_flag: false,
+        idr_long_term_reference_flag: false,
+        adaptive_ref_pic_marking_mode_flag: false,
+        mmco_commands: Vec::new(),
     };
 
-    decode_p_skip_mb(&sh, 0, 0, &mut pic, &reference, 26).expect("p_skip");
+    decode_p_skip_mb(&sh, 0, 0, &mut pic, &[&reference], 26).expect("p_skip");
 
     assert!(pic.y.iter().all(|&v| v == 77));
     assert!(pic.cb.iter().all(|&v| v == 200));

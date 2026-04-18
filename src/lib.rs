@@ -16,8 +16,16 @@
 //!   16×8 / 8×16, P_8×8 (all four sub-partition shapes) and P_8×8ref0,
 //!   P_Skip, plus intra-in-P macroblocks. Luma 6-tap half-pel + bilinear
 //!   quarter-pel MC; bilinear 1/8-pel chroma MC; edge-replicated
-//!   out-of-picture reads. A single-slot L0 reference (the previous frame
-//!   output) is retained across packets.
+//!   out-of-picture reads.
+//! * **Multi-reference DPB** (Annex C / §8.2.5) — [`dpb::Dpb`] holds up
+//!   to `sps.max_num_ref_frames` reconstructed reference frames. Each
+//!   P-slice builds a fresh `RefPicList0` (§8.2.4.2.1) — short-term
+//!   references first (descending `FrameNumWrap`), then long-term
+//!   references (ascending `LongTermFrameIdx`) — and `ref_idx_l0 > 0`
+//!   indexes into it. Picture order count is derived for
+//!   `pic_order_cnt_type == 0` and `pic_order_cnt_type == 2`. Sliding-
+//!   window marking (§8.2.5.3) and MMCO operations 1 / 2 / 3 / 4 / 5 / 6
+//!   (§8.2.5.4) are implemented.
 //! * **Explicit weighted P-slice prediction** (§7.3.3.2 / §8.4.2.3.2) —
 //!   the slice's `pred_weight_table` is parsed when the PPS has
 //!   `weighted_pred_flag = 1`, and the per-reference (weight, offset,
@@ -65,8 +73,11 @@
 //! * B-slices (bi-prediction). Implicit weighted bi-prediction
 //!   (`weighted_bipred_idc == 2`, §8.4.2.3.3) is not implemented either —
 //!   only the explicit P-slice form (§8.4.2.3.2) is supported today.
-//! * Multi-reference DPB (`ref_idx_l0 > 0`), reference picture list
-//!   modification operations.
+//! * Reference picture list modification (RPLM, §7.4.3.1 / §8.2.4.3) —
+//!   only the identity (flag = 0) form is accepted; any non-trivial
+//!   RPLM command surfaces `Error::Unsupported`.
+//! * `pic_order_cnt_type == 1` (rarely used in practice) is the one
+//!   POC derivation mode not implemented.
 //! * Interlaced coding / MBAFF / PAFF.
 //! * 4:2:2 / 4:4:4 chroma, bit depths above 8.
 //! * Rate control, adaptive QP, mode decision (Intra4×4 / Plane / Vertical /
@@ -88,6 +99,7 @@ pub mod cavlc;
 pub mod cavlc_enc;
 pub mod deblock;
 pub mod decoder;
+pub mod dpb;
 pub mod encoder;
 pub mod fwd_transform;
 pub mod intra_pred;

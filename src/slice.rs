@@ -15,6 +15,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
+use crate::dpb::MmcoCommand;
 use crate::nal::{NalHeader, NalUnitType};
 use crate::pps::Pps;
 use crate::sps::Sps;
@@ -119,6 +120,16 @@ pub struct SliceHeader {
     /// Parsed `pred_weight_table` (§7.3.3.2). `None` unless explicit
     /// weighted prediction is enabled for this slice's type + PPS flags.
     pub pred_weight_table: Option<PredWeightTable>,
+    /// `no_output_of_prior_pics_flag` from `dec_ref_pic_marking()` on an
+    /// IDR slice (§7.3.3.3).
+    pub idr_no_output_of_prior_pics_flag: bool,
+    /// `long_term_reference_flag` from `dec_ref_pic_marking()` on an IDR.
+    pub idr_long_term_reference_flag: bool,
+    /// `adaptive_ref_pic_marking_mode_flag` on a non-IDR reference slice.
+    pub adaptive_ref_pic_marking_mode_flag: bool,
+    /// Parsed MMCO command list (§8.2.5.4), populated only when
+    /// `adaptive_ref_pic_marking_mode_flag == true`.
+    pub mmco_commands: Vec<MmcoCommand>,
 }
 
 /// Parse slice header. The active SPS and PPS must already be available.
@@ -202,9 +213,10 @@ pub fn parse_slice_header(
         }
     }
 
-    // Reference picture list modification (§7.3.3.1) — skip without storing.
+    // Reference picture list modification (§7.3.3.1) — parse the flag and
+    // reject any non-identity modification (RPLM is not yet implemented).
     if header.nal_unit_type != NalUnitType::SliceExtension {
-        skip_ref_pic_list_modification(&mut br, slice_type)?;
+        reject_non_identity_ref_pic_list_modification(&mut br, slice_type)?;
     }
 
     // Prediction weight table (§7.3.3.2). Present when explicit weighted
@@ -225,9 +237,21 @@ pub fn parse_slice_header(
         )?);
     }
 
-    // Decoded reference picture marking (§7.3.3.3).
+    // Decoded reference picture marking (§7.3.3.3) — parse and retain
+    // the commands so the decoder can replay them against its DPB.
+    let mut idr_no_output_of_prior_pics_flag = false;
+    let mut idr_long_term_reference_flag = false;
+    let mut adaptive_ref_pic_marking_mode_flag = false;
+    let mut mmco_commands: Vec<MmcoCommand> = Vec::new();
     if header.nal_ref_idc != 0 {
-        skip_dec_ref_pic_marking(&mut br, is_idr)?;
+        parse_dec_ref_pic_marking(
+            &mut br,
+            is_idr,
+            &mut idr_no_output_of_prior_pics_flag,
+            &mut idr_long_term_reference_flag,
+            &mut adaptive_ref_pic_marking_mode_flag,
+            &mut mmco_commands,
+        )?;
     }
 
     let mut cabac_init_idc = 0;
@@ -286,34 +310,33 @@ pub fn parse_slice_header(
         slice_data_bit_offset,
         is_idr,
         pred_weight_table,
+        idr_no_output_of_prior_pics_flag,
+        idr_long_term_reference_flag,
+        adaptive_ref_pic_marking_mode_flag,
+        mmco_commands,
     })
 }
 
-fn skip_ref_pic_list_modification(br: &mut BitReader<'_>, st: SliceType) -> Result<()> {
+fn reject_non_identity_ref_pic_list_modification(
+    br: &mut BitReader<'_>,
+    st: SliceType,
+) -> Result<()> {
     let do_l0 = !matches!(st, SliceType::I | SliceType::SI);
     let do_l1 = matches!(st, SliceType::B);
     if do_l0 {
         let flag = br.read_flag()?;
         if flag {
-            loop {
-                let mod_op = br.read_ue()?;
-                if mod_op == 3 {
-                    break;
-                }
-                let _val = br.read_ue()?;
-            }
+            return Err(Error::unsupported(
+                "h264 slice: reference picture list modification (RPLM) not yet supported",
+            ));
         }
     }
     if do_l1 {
         let flag = br.read_flag()?;
         if flag {
-            loop {
-                let mod_op = br.read_ue()?;
-                if mod_op == 3 {
-                    break;
-                }
-                let _val = br.read_ue()?;
-            }
+            return Err(Error::unsupported(
+                "h264 slice: reference picture list modification (RPLM) not yet supported",
+            ));
         }
     }
     Ok(())
@@ -402,12 +425,20 @@ fn parse_weight_list(
     Ok((luma, cw))
 }
 
-fn skip_dec_ref_pic_marking(br: &mut BitReader<'_>, is_idr: bool) -> Result<()> {
+fn parse_dec_ref_pic_marking(
+    br: &mut BitReader<'_>,
+    is_idr: bool,
+    idr_no_output_of_prior_pics_flag: &mut bool,
+    idr_long_term_reference_flag: &mut bool,
+    adaptive_ref_pic_marking_mode_flag: &mut bool,
+    mmco_commands: &mut Vec<MmcoCommand>,
+) -> Result<()> {
     if is_idr {
-        let _no_output_of_prior_pics_flag = br.read_flag()?;
-        let _long_term_reference_flag = br.read_flag()?;
+        *idr_no_output_of_prior_pics_flag = br.read_flag()?;
+        *idr_long_term_reference_flag = br.read_flag()?;
     } else {
         let adaptive = br.read_flag()?;
+        *adaptive_ref_pic_marking_mode_flag = adaptive;
         if adaptive {
             loop {
                 let op = br.read_ue()?;
@@ -415,21 +446,40 @@ fn skip_dec_ref_pic_marking(br: &mut BitReader<'_>, is_idr: bool) -> Result<()> 
                     break;
                 }
                 match op {
-                    1 | 3 => {
-                        let _diff_pic_num_minus1 = br.read_ue()?;
-                        if op == 3 {
-                            let _long_term_frame_idx = br.read_ue()?;
-                        }
+                    1 => {
+                        let d = br.read_ue()?;
+                        mmco_commands.push(MmcoCommand::MarkShortTermUnused {
+                            difference_of_pic_nums_minus1: d,
+                        });
                     }
                     2 => {
-                        let _long_term_pic_num = br.read_ue()?;
+                        let n = br.read_ue()?;
+                        mmco_commands.push(MmcoCommand::MarkLongTermUnused {
+                            long_term_pic_num: n,
+                        });
+                    }
+                    3 => {
+                        let d = br.read_ue()?;
+                        let idx = br.read_ue()?;
+                        mmco_commands.push(MmcoCommand::AssignLongTerm {
+                            difference_of_pic_nums_minus1: d,
+                            long_term_frame_idx: idx,
+                        });
                     }
                     4 => {
-                        let _max_long_term_frame_idx_plus1 = br.read_ue()?;
+                        let m = br.read_ue()?;
+                        mmco_commands.push(MmcoCommand::SetMaxLongTerm {
+                            max_long_term_frame_idx_plus1: m,
+                        });
                     }
-                    5 => {} // mark all reference pictures as unused
+                    5 => {
+                        mmco_commands.push(MmcoCommand::MarkAllUnused);
+                    }
                     6 => {
-                        let _long_term_frame_idx = br.read_ue()?;
+                        let idx = br.read_ue()?;
+                        mmco_commands.push(MmcoCommand::AssignCurrentLongTerm {
+                            long_term_frame_idx: idx,
+                        });
                     }
                     _ => {
                         return Err(Error::invalid(format!(

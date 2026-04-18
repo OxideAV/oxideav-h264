@@ -9,16 +9,24 @@
 //! * Parses slice headers and runs the pixel reconstruction pipeline for:
 //!   - I-slices in CAVLC or CABAC entropy mode (§7.3.5 / §8.3 / §8.5).
 //!   - P-slices in CAVLC entropy mode (§8.4 motion compensation) —
-//!     P16×16 / P16×8 / P8×16 / P8×8 / P8x8ref0 / P_Skip with a
-//!     single-reference list 0. Intra-in-P macroblocks reuse the I-slice
-//!     intra path. Explicit weighted prediction (§8.4.2.3.2) is applied
-//!     to MC output when the PPS + slice header enable it.
+//!     P16×16 / P16×8 / P8×16 / P8×8 / P8x8ref0 / P_Skip. Intra-in-P
+//!     macroblocks reuse the I-slice intra path. Explicit weighted
+//!     prediction (§8.4.2.3.2) is applied to MC output when the PPS +
+//!     slice header enable it.
+//! * Owns a [`crate::dpb::Dpb`] holding up to `sps.max_num_ref_frames`
+//!   reconstructed reference frames with POC ordering, sliding-window
+//!   marking (§8.2.5.3), and MMCO operations 1 / 2 / 3 / 4 / 5 / 6
+//!   (§8.2.5.4). Each P-slice sees a freshly-built `RefPicList0`
+//!   (§8.2.4.2.1) and can index it via `ref_idx_l0 > 0`.
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * CABAC P-slices.
 //! * B-slices (bi-prediction). Implicit weighted bi-prediction
 //!   (`weighted_bipred_idc == 2`) is not implemented either.
-//! * Multi-reference DPB / ref_idx > 0 / reference picture list modification.
+//! * Reference picture list modification (RPLM) — only the identity
+//!   (flag = 0) form is accepted. Any non-trivial RPLM command surfaces
+//!   `Error::Unsupported`.
+//! * `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 //! * Interlaced coding / MBAFF.
 //! * 8×8 transform, 4:2:2 / 4:4:4 chroma, bit depth > 8.
 
@@ -32,6 +40,7 @@ use oxideav_core::{
 
 use crate::bitreader::BitReader;
 use crate::cabac::{engine::CabacDecoder, mb::decode_i_mb_cabac, tables::init_slice_contexts};
+use crate::dpb::{derive_poc_type0, derive_poc_type2, Dpb, MmcoCommand, PocState};
 use crate::mb::decode_i_slice_data;
 use crate::p_mb::{decode_p_slice_mb, decode_p_skip_mb};
 use crate::nal::{
@@ -68,9 +77,21 @@ pub struct H264Decoder {
     last_slice_headers: Vec<SliceHeader>,
     /// Picture under construction — held across slices of a single frame.
     current_pic: Option<Picture>,
-    /// The most recently decoded picture, retained as the single L0
-    /// reference for subsequent P-slices. Cleared on IDR / reset.
-    last_reference: Option<Picture>,
+    /// Decoded Picture Buffer — `sps.max_num_ref_frames` reference slots
+    /// plus a small reorder queue. Lazily initialised on the first slice.
+    dpb: Option<Dpb>,
+    /// Running POC state for `pic_order_cnt_type == 0` (§8.2.1.1).
+    poc_state: PocState,
+    /// Running state for `pic_order_cnt_type == 2` (§8.2.1.3).
+    prev_frame_num: u32,
+    prev_frame_num_offset: i32,
+    /// `frame_num` of the most recently decoded **reference** picture —
+    /// drives `FrameNumWrap` for DPB short-term entries (§8.2.4.1).
+    prev_ref_frame_num: u32,
+    /// FIFO of (pts, timebase) pairs aligned with the decode-order
+    /// pictures being queued for POC-reordered output. Drained as the
+    /// DPB releases frames.
+    pts_fifo: std::collections::VecDeque<(Option<i64>, TimeBase)>,
 }
 
 impl H264Decoder {
@@ -87,7 +108,12 @@ impl H264Decoder {
             eof: false,
             last_slice_headers: Vec::new(),
             current_pic: None,
-            last_reference: None,
+            dpb: None,
+            poc_state: PocState::default(),
+            prev_frame_num: 0,
+            prev_frame_num_offset: 0,
+            prev_ref_frame_num: 0,
+            pts_fifo: VecDeque::new(),
         }
     }
 
@@ -173,12 +199,88 @@ impl H264Decoder {
                     pic = Picture::new(mb_w, mb_h);
                 }
 
-                if sh.is_idr {
-                    // IDR — wipe any previously stored reference so no
-                    // future P-slice accidentally predicts from a stale
-                    // picture.
-                    self.last_reference = None;
+                // Lazily (re)create the DPB when we first see an SPS —
+                // its size depends on `max_num_ref_frames`. We use
+                // `reorder_window = 0` because B-slices are not yet
+                // implemented; without B-slices, decode order equals POC
+                // order and no buffering is needed to deliver frames to
+                // the caller.
+                let want_dpb_size = sps.max_num_ref_frames.max(1);
+                if self
+                    .dpb
+                    .as_ref()
+                    .map(|d| d.max_num_ref_frames)
+                    .unwrap_or(0)
+                    != want_dpb_size
+                {
+                    self.dpb = Some(Dpb::new(want_dpb_size, 0));
                 }
+
+                let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
+
+                if sh.is_idr {
+                    // IDR — drain the DPB's reorder queue and wipe references.
+                    let out = if let Some(dpb) = self.dpb.as_mut() {
+                        if !sh.idr_no_output_of_prior_pics_flag {
+                            let out = dpb.flush_all();
+                            dpb.clear();
+                            out
+                        } else {
+                            dpb.clear();
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    for pic_out in out {
+                        self.queue_ready_frame(&sps, pic_out);
+                    }
+                    self.poc_state = PocState::default();
+                    self.prev_frame_num = 0;
+                    self.prev_frame_num_offset = 0;
+                    self.prev_ref_frame_num = 0;
+                }
+
+                // ---- POC derivation (§8.2.1) -------------------------
+                let is_ref = header.nal_ref_idc != 0;
+                let poc = match sps.pic_order_cnt_type {
+                    0 => {
+                        let (p, new_state) = derive_poc_type0(
+                            sh.pic_order_cnt_lsb,
+                            sps.log2_max_pic_order_cnt_lsb_minus4,
+                            self.poc_state,
+                            sh.is_idr,
+                        );
+                        if is_ref {
+                            self.poc_state = new_state;
+                        }
+                        p
+                    }
+                    2 => {
+                        let (p, off) = derive_poc_type2(
+                            sh.frame_num,
+                            self.prev_frame_num,
+                            self.prev_frame_num_offset,
+                            max_frame_num,
+                            header.nal_ref_idc,
+                            sh.is_idr,
+                        );
+                        if is_ref {
+                            self.prev_frame_num_offset = off;
+                        }
+                        p
+                    }
+                    1 => {
+                        return Err(Error::unsupported(
+                            "h264: pic_order_cnt_type == 1 not implemented",
+                        ));
+                    }
+                    other => {
+                        return Err(Error::invalid(format!(
+                            "h264: unknown pic_order_cnt_type {other}"
+                        )));
+                    }
+                };
 
                 match sh.slice_type {
                     SliceType::I => {
@@ -191,19 +293,26 @@ impl H264Decoder {
                         }
                     }
                     SliceType::P => {
-                        let reference = self.last_reference.as_ref().ok_or_else(|| {
-                            Error::invalid(
-                                "h264 p-slice: no reference picture available (no prior IDR?)",
-                            )
-                        })?;
-                        if reference.mb_width != mb_w || reference.mb_height != mb_h {
+                        let dpb = self.dpb.as_mut().expect("DPB initialised above");
+                        dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
+                        let ref_entries = dpb.build_list0_p(sh.num_ref_idx_l0_active_minus1);
+                        if ref_entries.is_empty() {
                             return Err(Error::invalid(
-                                "h264 p-slice: reference picture size mismatch",
+                                "h264 p-slice: no reference picture available (no prior IDR?)",
                             ));
                         }
+                        for rf in &ref_entries {
+                            if rf.pic.mb_width != mb_w || rf.pic.mb_height != mb_h {
+                                return Err(Error::invalid(
+                                    "h264 p-slice: reference picture size mismatch",
+                                ));
+                            }
+                        }
+                        let list0: Vec<&Picture> =
+                            ref_entries.iter().map(|r| &r.pic).collect();
                         let mut br = BitReader::new(&rbsp);
                         br.skip(sh.slice_data_bit_offset as u32)?;
-                        decode_p_slice_data(&mut br, &sh, &sps, &pps, &mut pic, reference)?;
+                        decode_p_slice_data(&mut br, &sh, &sps, &pps, &mut pic, &list0)?;
                     }
                     _ => unreachable!(),
                 }
@@ -213,12 +322,52 @@ impl H264Decoder {
                     crate::deblock::deblock_picture(&mut pic, &pps, &sh);
                 }
 
-                // Crop and emit a frame, then stash the decoded picture as
-                // the single L0 reference for subsequent P-slices.
-                let (vw, vh) = sps.visible_size();
-                let frame = pic.to_video_frame(vw, vh, self.pending_pts, self.pending_tb);
-                self.ready_frames.push_back(frame);
-                self.last_reference = Some(pic);
+                // ---- DPB insertion + reference marking ---------------
+                // Record the packet PTS paired with this decode-order
+                // picture for later POC-reordered delivery.
+                self.pts_fifo.push_back((self.pending_pts, self.pending_tb));
+                let dpb = self.dpb.as_mut().expect("DPB initialised above");
+                if is_ref {
+                    dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
+                    let frame_num_wrap = Dpb::compute_frame_num_wrap(
+                        sh.frame_num,
+                        self.prev_ref_frame_num,
+                        max_frame_num,
+                    );
+                    if sh.adaptive_ref_pic_marking_mode_flag {
+                        // MMCO mode — ops 3 and 6 may reference the
+                        // current picture, so insert before replaying.
+                        dpb.insert_reference(pic.clone(), sh.frame_num, frame_num_wrap, poc);
+                        for cmd in &sh.mmco_commands {
+                            dpb.apply_mmco(*cmd, sh.frame_num, max_frame_num)?;
+                        }
+                    } else {
+                        // Sliding-window mode — age the oldest short-term
+                        // ref out when at capacity, then insert.
+                        dpb.apply_sliding_window();
+                        dpb.insert_reference(pic.clone(), sh.frame_num, frame_num_wrap, poc);
+                        if sh.is_idr && sh.idr_long_term_reference_flag {
+                            dpb.apply_mmco(
+                                MmcoCommand::AssignCurrentLongTerm {
+                                    long_term_frame_idx: 0,
+                                },
+                                sh.frame_num,
+                                max_frame_num,
+                            )?;
+                        }
+                    }
+                    dpb.mark_last_output();
+                    self.prev_ref_frame_num = sh.frame_num;
+                }
+                self.prev_frame_num = sh.frame_num;
+
+                // Queue the picture for POC-ordered output and drain any
+                // pictures that the reorder window now allows.
+                dpb.queue_output(pic, poc);
+                let ready = dpb.take_ready_outputs();
+                for out in ready {
+                    self.queue_ready_frame(&sps, out);
+                }
             }
             NalUnitType::Aud
             | NalUnitType::Sei
@@ -248,6 +397,20 @@ impl H264Decoder {
     pub fn last_slice_headers(&self) -> &[SliceHeader] {
         &self.last_slice_headers
     }
+
+    /// Turn a decoded `Picture` (emerging from DPB POC-ordering) into a
+    /// `VideoFrame` and enqueue it for the caller. Picks pts/timebase
+    /// from the head of `pts_fifo` (decode-order), which is a sensible
+    /// default when POC order matches decode order (no B-slices).
+    fn queue_ready_frame(&mut self, sps: &Sps, pic: Picture) {
+        let (vw, vh) = sps.visible_size();
+        let (pts, tb) = self
+            .pts_fifo
+            .pop_front()
+            .unwrap_or((self.pending_pts, self.pending_tb));
+        let frame = pic.to_video_frame(vw, vh, pts, tb);
+        self.ready_frames.push_back(frame);
+    }
 }
 
 /// CAVLC P-slice data loop — §7.3.4.
@@ -263,7 +426,7 @@ fn decode_p_slice_data(
     sps: &Sps,
     pps: &Pps,
     pic: &mut Picture,
-    reference: &Picture,
+    ref_list0: &[&Picture],
 ) -> Result<()> {
     let mb_w = sps.pic_width_in_mbs();
     let mb_h = sps.pic_height_in_map_units();
@@ -276,14 +439,13 @@ fn decode_p_slice_data(
 
     while mb_addr < total_mbs {
         let skip_run = br.read_ue()?;
-        // Emit `skip_run` skipped MBs then one coded MB (if any remain).
         for _ in 0..skip_run {
             if mb_addr >= total_mbs {
                 break;
             }
             let mb_x = mb_addr % mb_w;
             let mb_y = mb_addr / mb_w;
-            decode_p_skip_mb(sh, mb_x, mb_y, pic, reference, prev_qp)?;
+            decode_p_skip_mb(sh, mb_x, mb_y, pic, ref_list0, prev_qp)?;
             mb_addr += 1;
         }
         if mb_addr >= total_mbs {
@@ -291,7 +453,7 @@ fn decode_p_slice_data(
         }
         let mb_x = mb_addr % mb_w;
         let mb_y = mb_addr / mb_w;
-        decode_p_slice_mb(br, sps, pps, sh, mb_x, mb_y, pic, reference, &mut prev_qp)?;
+        decode_p_slice_mb(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, &mut prev_qp)?;
         mb_addr += 1;
     }
     Ok(())
@@ -392,6 +554,19 @@ impl Decoder for H264Decoder {
 
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
+        // Drain any pictures still parked in the DPB reorder queue. We
+        // have to clone a reference SPS so we can release the DPB borrow
+        // before calling `queue_ready_frame`.
+        let (remaining, sps_opt) = if let Some(dpb) = self.dpb.as_mut() {
+            (dpb.flush_all(), self.sps_by_id.values().next().cloned())
+        } else {
+            (Vec::new(), None)
+        };
+        if let Some(sps) = sps_opt {
+            for pic in remaining {
+                self.queue_ready_frame(&sps, pic);
+            }
+        }
         Ok(())
     }
 
@@ -400,15 +575,22 @@ impl Decoder for H264Decoder {
         // ready frame queue. SPS/PPS tables + AVCC config (length_size,
         // last_avc_config) are stream-level — they come from extradata or
         // out-of-band SPS/PPS NALs that won't be retransmitted post-seek,
-        // so they stay put. The L0 reference picture is dropped too so
-        // the next P-slice sees a clean slate (it must be preceded by an
+        // so they stay put. The DPB + POC state are dropped too so the
+        // next P-slice sees a clean slate (it must be preceded by an
         // IDR or another I-slice).
         self.pending_pts = None;
         self.ready_frames.clear();
         self.eof = false;
         self.last_slice_headers.clear();
         self.current_pic = None;
-        self.last_reference = None;
+        if let Some(dpb) = self.dpb.as_mut() {
+            dpb.clear();
+        }
+        self.poc_state = PocState::default();
+        self.prev_frame_num = 0;
+        self.prev_frame_num_offset = 0;
+        self.prev_ref_frame_num = 0;
+        self.pts_fifo.clear();
         Ok(())
     }
 }

@@ -11,8 +11,9 @@
 //! * Intra-in-P macroblocks (`mb_type >= 5`) — dispatched back into the
 //!   existing I-slice decode helpers.
 //!
-//! `num_ref_idx_l0_active_minus1 > 0` is accepted in the bitstream but
-//! rejected at decode time — the decoder keeps a single L0 reference.
+//! The caller supplies a `RefPicList0` (a slice of `&Picture` built by
+//! [`crate::dpb::Dpb`]) and each partition's `ref_idx_l0` indexes directly
+//! into it. An out-of-range index is rejected as `Error::InvalidData`.
 
 use oxideav_core::{Error, Result};
 
@@ -46,7 +47,7 @@ pub fn decode_p_slice_mb(
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
-    reference: &Picture,
+    ref_list0: &[&Picture],
     prev_qp: &mut i32,
 ) -> Result<()> {
     let mb_type = br.read_ue()?;
@@ -57,13 +58,13 @@ pub fn decode_p_slice_mb(
         PMbType::IntraInP(imb) => decode_intra_in_p(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb),
         PMbType::Inter { partition } => match partition {
             PPartition::P16x16 => {
-                decode_p16x16(br, sps, pps, sh, mb_x, mb_y, pic, reference, prev_qp)
+                decode_p16x16(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp)
             }
             PPartition::P16x8 => {
-                decode_p16x8(br, sps, pps, sh, mb_x, mb_y, pic, reference, prev_qp)
+                decode_p16x8(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp)
             }
             PPartition::P8x16 => {
-                decode_p8x16(br, sps, pps, sh, mb_x, mb_y, pic, reference, prev_qp)
+                decode_p8x16(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp)
             }
             PPartition::P8x8 | PPartition::P8x8Ref0 => decode_p8x8(
                 br,
@@ -73,7 +74,7 @@ pub fn decode_p_slice_mb(
                 mb_x,
                 mb_y,
                 pic,
-                reference,
+                ref_list0,
                 prev_qp,
                 matches!(partition, PPartition::P8x8Ref0),
             ),
@@ -90,9 +91,10 @@ pub fn decode_p_skip_mb(
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
-    reference: &Picture,
+    ref_list0: &[&Picture],
     prev_qp: i32,
 ) -> Result<()> {
+    let reference = lookup_ref(ref_list0, 0)?;
     let mv = predict_mv_pskip(pic, mb_x, mb_y);
     // Reset MB info up-front, then record MV + ref_idx. All 16 sub-blocks
     // share the same MV / ref_idx = 0.
@@ -151,12 +153,12 @@ fn decode_p16x16(
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
-    reference: &Picture,
+    ref_list0: &[&Picture],
     prev_qp: &mut i32,
 ) -> Result<()> {
     let num_ref_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
     let ref_idx = read_ref_idx(br, num_ref_l0)?;
-    require_single_reference(ref_idx)?;
+    let reference = lookup_ref(ref_list0, ref_idx)?;
     let mvd_x = br.read_se()? as i32;
     let mvd_y = br.read_se()? as i32;
 
@@ -220,19 +222,17 @@ fn decode_p16x8(
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
-    reference: &Picture,
+    ref_list0: &[&Picture],
     prev_qp: &mut i32,
 ) -> Result<()> {
     let num_ref_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
     let ref_idx_0 = read_ref_idx(br, num_ref_l0)?;
     let ref_idx_1 = read_ref_idx(br, num_ref_l0)?;
-    require_single_reference(ref_idx_0)?;
-    require_single_reference(ref_idx_1)?;
 
     let rects = [(0usize, 0usize, 2usize, 4usize), (2, 0, 2, 4)];
     let refs = [ref_idx_0, ref_idx_1];
     decode_two_partition_p(
-        br, sps, pps, sh, mb_x, mb_y, pic, reference, prev_qp, &rects, &refs,
+        br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp, &rects, &refs,
         PPartition::P16x8,
     )
 }
@@ -245,19 +245,17 @@ fn decode_p8x16(
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
-    reference: &Picture,
+    ref_list0: &[&Picture],
     prev_qp: &mut i32,
 ) -> Result<()> {
     let num_ref_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
     let ref_idx_0 = read_ref_idx(br, num_ref_l0)?;
     let ref_idx_1 = read_ref_idx(br, num_ref_l0)?;
-    require_single_reference(ref_idx_0)?;
-    require_single_reference(ref_idx_1)?;
 
     let rects = [(0usize, 0usize, 4usize, 2usize), (0, 2, 4, 2)];
     let refs = [ref_idx_0, ref_idx_1];
     decode_two_partition_p(
-        br, sps, pps, sh, mb_x, mb_y, pic, reference, prev_qp, &rects, &refs,
+        br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp, &rects, &refs,
         PPartition::P8x16,
     )
 }
@@ -270,7 +268,7 @@ fn decode_two_partition_p(
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
-    reference: &Picture,
+    ref_list0: &[&Picture],
     prev_qp: &mut i32,
     rects: &[(usize, usize, usize, usize); 2],
     refs: &[i8; 2],
@@ -281,6 +279,7 @@ fn decode_two_partition_p(
     let mut mvs = [(0i16, 0i16); 2];
     for p in 0..2 {
         let (r0, c0, ph, pw) = rects[p];
+        let reference = lookup_ref(ref_list0, refs[p])?;
         let mvd_x = br.read_se()? as i32;
         let mvd_y = br.read_se()? as i32;
         let pmv = predict_mv_l0(pic, mb_x, mb_y, r0, c0, ph, pw, refs[p]);
@@ -333,7 +332,7 @@ fn decode_p8x8(
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
-    reference: &Picture,
+    ref_list0: &[&Picture],
     prev_qp: &mut i32,
     is_ref0: bool,
 ) -> Result<()> {
@@ -351,7 +350,6 @@ fn decode_p8x8(
     if !is_ref0 {
         for s in 0..4 {
             ref_idxs[s] = read_ref_idx(br, num_ref_l0)?;
-            require_single_reference(ref_idxs[s])?;
         }
     }
     // For each sub-MB and each of its sub-partitions, read mvd_l0.
@@ -361,6 +359,7 @@ fn decode_p8x8(
         let sp = sub_parts[s];
         let (sr0, sc0) = SUB_OFFSETS[s];
         let ref_idx = ref_idxs[s];
+        let reference = lookup_ref(ref_list0, ref_idx)?;
         for sub_idx in 0..sp.num_sub_partitions() {
             let (dr, dc, sh_h, sh_w) = sp.sub_rect(sub_idx);
             let r0 = sr0 + dr;
@@ -536,14 +535,23 @@ fn read_ref_idx(br: &mut BitReader<'_>, num_ref: u32) -> Result<i8> {
     Ok(br.read_ue()? as i8)
 }
 
-fn require_single_reference(ref_idx: i8) -> Result<()> {
-    if ref_idx != 0 {
-        return Err(Error::unsupported(format!(
-            "h264 p-slice: ref_idx_l0 {} (multi-reference DPB not implemented)",
-            ref_idx
-        )));
+/// Index `ref_list0` by `ref_idx`, returning a reference to the `Picture`
+/// or an `Error::InvalidData` when the bitstream addresses an index past
+/// the slice's active list.
+fn lookup_ref<'a>(ref_list0: &[&'a Picture], ref_idx: i8) -> Result<&'a Picture> {
+    if ref_idx < 0 {
+        return Err(Error::invalid(
+            "h264 p-slice: negative ref_idx_l0 (should not be emitted by a valid encoder)",
+        ));
     }
-    Ok(())
+    let idx = ref_idx as usize;
+    ref_list0.get(idx).copied().ok_or_else(|| {
+        Error::invalid(format!(
+            "h264 p-slice: ref_idx_l0 {} out of RefPicList0 range (len={})",
+            ref_idx,
+            ref_list0.len()
+        ))
+    })
 }
 
 fn fill_partition_mv(
