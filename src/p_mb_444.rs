@@ -390,7 +390,7 @@ fn decode_plane_inter_4x4(
 // Motion compensation — luma filter applied to every plane.
 // ---------------------------------------------------------------------------
 
-fn mc_partition_all_planes(
+pub(crate) fn mc_partition_all_planes(
     pic: &mut Picture,
     reference: &Picture,
     mb_x: u32,
@@ -501,8 +501,23 @@ fn fill_partition_mv(
     }
 }
 
-fn l0_luma_weight<'a>(sh: &'a SliceHeader, ref_idx: i8) -> Option<&'a LumaWeight> {
+pub(crate) fn l0_luma_weight<'a>(sh: &'a SliceHeader, ref_idx: i8) -> Option<&'a LumaWeight> {
     let tbl = sh.pred_weight_table.as_ref()?;
     let idx = ref_idx.max(0) as usize;
     tbl.luma_l0.get(idx)
 }
+
+pub(crate) fn lookup_ref_444<'a>(ref_list0: &[&'a Picture], ref_idx: i8) -> Result<&'a Picture> {
+    if ref_idx < 0 {
+        return Err(Error::invalid("h264 p-slice 4:4:4: negative ref_idx"));
+    }
+    let idx = ref_idx as usize;
+    ref_list0.get(idx).copied().ok_or_else(|| {
+        Error::invalid(format!(
+            "h264 p-slice 4:4:4: ref_idx {} out of RefPicList0 range (len={})",
+            ref_idx,
+            ref_list0.len()
+        ))
+    })
+}
+
