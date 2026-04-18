@@ -2,12 +2,12 @@
 
 Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
 oxideav. Decodes CAVLC + CABAC I-slices, CAVLC + CABAC P-slices, and
-CAVLC B-slices (spatial direct + explicit weighted bipred); encodes a minimal
-Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED output stream.
-**High-Profile 8×8 transform CAVLC I-slice decode** (§7.3.5.3.2, §8.3.2,
-§8.5.13) is wired end-to-end and bit-exact against ffmpeg's libavcodec
-reference; CABAC 8×8 residual coding (§9.3.3.1.1.10) and P-slice inter
-8×8 remain out of scope. Zero C dependencies.
+CAVLC B-slices (spatial + temporal direct + explicit weighted bipred);
+encodes a minimal Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED
+output stream. **High-Profile 8×8 transform CAVLC I-slice decode**
+(§7.3.5.3.2, §8.3.2, §8.5.13) is wired end-to-end and bit-exact against
+ffmpeg's libavcodec reference; CABAC 8×8 residual coding (§9.3.3.1.1.10)
+and P-slice inter 8×8 remain out of scope. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -92,10 +92,19 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
 - `B_8x8` sub-macroblock types (§7.4.5.2 Table 7-17 B entries):
   `B_Direct_8x8` and `B_{L0,L1,Bi}_{8x8,8x4,4x8,4x4}`.
 - `B_Skip` handling driven by `mb_skip_run` before each coded MB —
-  MVs derived via spatial direct (§8.4.1.2.2).
+  MVs derived via spatial or temporal direct depending on
+  `direct_spatial_mv_pred_flag`.
 - **Spatial direct** MV prediction for `B_Direct_*` (§8.4.1.2.2):
   per-list `ref_idx` = minimum non-negative over the A/B/C neighbours,
   median MV predictor over neighbours matching that `ref_idx`.
+- **Temporal direct** MV prediction (§8.4.1.2.3, the
+  `direct_spatial_mv_pred_flag = 0` path): for each 4×4 block the
+  colocated block in `RefPicList1[0]` is located, its MV + the POC of
+  its reference picture are read from the decoded picture's per-MB
+  snapshot, and `DistScaleFactor` (POC arithmetic) produces
+  `mvL0 = (DSF·mvCol + 128) >> 8` and `mvL1 = mvL0 − mvCol`.
+  Intra-colocated blocks use zero MVs; long-term references in either
+  slot short-circuit the scaler to identity.
 - Default **bi-prediction** averages the two list predictions as
   `(pred_L0 + pred_L1 + 1) >> 1` (§8.4.2.3.1). **Explicit weighted
   bi-prediction** (§8.4.2.3.2) uses the slice's `pred_weight_table` for
@@ -245,8 +254,6 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
 - **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16
   modes other than DC, rate control, adaptive QP, mode decision,
   deblocking.
-- **B-slice temporal direct** MV prediction (§8.4.1.2.3,
-  `direct_spatial_mv_pred_flag = 0`) — only spatial direct is wired.
 - **Implicit weighted bi-prediction** (`weighted_bipred_idc == 2`,
   §8.4.2.3.3) — explicit bipred and P-slice weighted prediction are
   supported.

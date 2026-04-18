@@ -47,8 +47,14 @@
 //!   log2_denom) triples are applied to the MC output before the residual
 //!   is added.
 //! * **CAVLC B-slice** pixel reconstruction (§7.3.5 / §8.4) —
-//!   `B_Direct_16x16` + `B_Skip` via **spatial direct** MV derivation
-//!   (§8.4.1.2.2), `B_L0_16x16` / `B_L1_16x16` / `B_Bi_16x16`, the 16×8 /
+//!   `B_Direct_16x16` + `B_Skip` via both **spatial direct** MV derivation
+//!   (§8.4.1.2.2, `direct_spatial_mv_pred_flag = 1`) and **temporal direct**
+//!   derivation (§8.4.1.2.3, `direct_spatial_mv_pred_flag = 0`). The
+//!   temporal-direct path walks the colocated 4×4 block in `RefPicList1[0]`,
+//!   reads its MV + the POC of the ref it pointed to, and rescales via
+//!   `DistScaleFactor` using POC arithmetic — intra-colocated blocks use
+//!   zero MVs, long-term references short-circuit the scaler to identity.
+//!   Also supported: `B_L0_16x16` / `B_L1_16x16` / `B_Bi_16x16`, the 16×8 /
 //!   8×16 pair variants (L0/L0, L1/L1, L0/L1, L1/L0, L0/Bi, L1/Bi, Bi/L0,
 //!   Bi/L1, Bi/Bi), and `B_8x8` with every Table 7-17 sub-partition type
 //!   (`B_Direct_8x8`, `B_{L0,L1,Bi}_{8x8,8x4,4x8,4x4}`). Intra-in-B MBs
@@ -94,9 +100,6 @@
 //! * CABAC B-slices (decode); any CABAC encoding; any P/B slice encoding.
 //!   CABAC P-slices are wired but weighted-P on the CABAC path and the
 //!   8×8 transform path are out of scope on this first pass.
-//! * **Temporal direct** B-slice MV prediction (§8.4.1.2.3,
-//!   `direct_spatial_mv_pred_flag = 0`) — only spatial direct
-//!   (§8.4.1.2.2) is wired today.
 //! * **Implicit weighted bi-prediction** (`weighted_bipred_idc == 2`,
 //!   §8.4.2.3.3) — the PPS flag value surfaces `Error::Unsupported` for
 //!   B-slices. Explicit weighted bipred (`weighted_bipred_idc == 1`) is
