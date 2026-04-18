@@ -1,5 +1,6 @@
-//! Reproduce the pre-existing CABAC I-slice residual decode desync against
-//! a real ffmpeg-generated CABAC IDR.
+//! CABAC I-slice bit-accurate decode tests against real ffmpeg-generated
+//! CABAC IDR fixtures. Pins the CABAC entropy path end-to-end against
+//! production bitstreams.
 
 use oxideav_codec::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
@@ -76,34 +77,34 @@ fn run_fixture(es: &[u8], yuv: &[u8], w: usize, h: usize, label: &str) -> Result
 
 #[test]
 fn decode_cabac_i_slice_tiny_all_zero_residual() {
-    // 16×16 solid-grey IDR — a single MB I_16x16 with cbp_luma=0 /
-    // cbp_chroma=0 (stream length ~8 bytes). The hand-crafted
-    // cabac_iframe_single_mb_all_grey test covers the happy-path encode/decode
-    // pair but this fixture exercises the CABAC engine against a real ffmpeg
-    // bitstream for the smallest possible IDR. Soft-asserted: residual-decode
-    // desync past mb_qp_delta is still under investigation.
+    // 16×16 solid-grey IDR (x264 @ QP=20) — a single MB that exercises
+    // mb_type / mb_qp_delta / intra_chroma_pred_mode / coded_block_flag /
+    // significant map / levels / end_of_slice on the real ffmpeg bitstream.
+    // Hard-asserted: the CABAC context-init table (`tables::INIT_MN_DATA`)
+    // was corrected against ITU-T H.264 Tables 9-12..9-23 and the §8.5.6
+    // inverse-scan is applied in `mb::decode_residual_block_in_place`.
     let es = include_bytes!("fixtures/cabac_i_tiny.es");
     let yuv = include_bytes!("fixtures/cabac_i_tiny.yuv");
-    match run_fixture(es, yuv, 16, 16, "cabac-i-tiny") {
-        Ok((luma_pct, total_pct)) => {
-            if luma_pct < 95.0 || total_pct < 95.0 {
-                eprintln!(
-                    "cabac-i-tiny decoded but mismatches reference (luma {luma_pct:.2}%, total {total_pct:.2}%)"
-                );
-            }
-        }
-        Err(e) => {
-            eprintln!("cabac-i-tiny desync: {e}");
-        }
-    }
+    let (luma_pct, total_pct) = run_fixture(es, yuv, 16, 16, "cabac-i-tiny")
+        .expect("cabac-i-tiny decode must succeed");
+    assert!(
+        luma_pct >= 99.0,
+        "cabac-i-tiny luma match {luma_pct:.2}% < 99%"
+    );
+    assert!(
+        total_pct >= 99.0,
+        "cabac-i-tiny total match {total_pct:.2}% < 99%"
+    );
 }
 
 #[test]
 fn decode_cabac_i_slice_against_reference() {
-    // 64×64 testsrc IDR with real residual coefficient traffic. This is the
-    // hard case that pins the residual-decode path against a real ffmpeg
-    // encoding. Soft-asserted until the remaining desync is identified —
-    // the tiny fixture above already verifies the non-residual surface.
+    // 64×64 testsrc IDR (x264 @ QP=20) with real residual coefficient
+    // traffic across all 16 MBs. Stays soft-asserted: after the INIT_MN
+    // and inverse-scan fixes the stream no longer desyncs (end_of_slice
+    // fires), but per-pixel reconstruction is still wrong for complex
+    // residual content — further investigation needed on the Intra_16x16
+    // AC and chroma AC reconstruction paths.
     let es = include_bytes!("fixtures/cabac_i_64x64.es");
     let yuv = include_bytes!("fixtures/cabac_i_64x64.yuv");
     let res = run_fixture(es, yuv, 64, 64, "cabac-i-64x64");
@@ -125,3 +126,4 @@ fn decode_cabac_i_slice_against_reference() {
         }
     }
 }
+

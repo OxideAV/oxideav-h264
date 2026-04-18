@@ -110,6 +110,8 @@ pub struct CabacDecoder<'a> {
     bit_pos: usize,    // absolute bit position into bytes
     cod_i_range: u32,  // §9.3.1.2 codIRange (init 0x01FE at byte-alignment)
     cod_i_offset: u32, // §9.3.1.2 codIOffset
+    #[cfg(feature = "cabac-trace")]
+    pub trace_label: &'static str,
 }
 
 impl<'a> CabacDecoder<'a> {
@@ -130,6 +132,8 @@ impl<'a> CabacDecoder<'a> {
             bit_pos,
             cod_i_range: 0x01FE,
             cod_i_offset: 0,
+            #[cfg(feature = "cabac-trace")]
+            trace_label: "?",
         };
         dec.cod_i_offset = dec.read_bits(9)?;
         Ok(dec)
@@ -219,6 +223,9 @@ impl<'a> CabacDecoder<'a> {
         let r_lps = RANGE_TAB_LPS[p_state][rcp_idx] as u32;
         let mut cod_i_range = self.cod_i_range - r_lps;
 
+        #[cfg(feature = "cabac-trace")]
+        let pre = (self.cod_i_range, self.cod_i_offset, ctx.p_state_idx, ctx.val_mps);
+
         let bin_val;
         if self.cod_i_offset >= cod_i_range {
             // LPS path.
@@ -240,6 +247,13 @@ impl<'a> CabacDecoder<'a> {
 
         self.cod_i_range = cod_i_range;
         self.renormalize()?;
+
+        #[cfg(feature = "cabac-trace")]
+        eprintln!(
+            "[{}] decbin bit_pos={} pre_range={} pre_off={} pState={} valMps={} -> bin={} post_range={} post_off={}",
+            self.trace_label, self.bit_pos, pre.0, pre.1, pre.2, pre.3, bin_val, self.cod_i_range, self.cod_i_offset
+        );
+
         Ok(bin_val)
     }
 
@@ -249,12 +263,18 @@ impl<'a> CabacDecoder<'a> {
         //   if codIOffset >= codIRange: binVal = 1; codIOffset -= codIRange;
         //   else: binVal = 0;
         self.cod_i_offset = (self.cod_i_offset << 1) | self.read_bit()?;
-        if self.cod_i_offset >= self.cod_i_range {
+        let bin = if self.cod_i_offset >= self.cod_i_range {
             self.cod_i_offset -= self.cod_i_range;
-            Ok(1)
+            1
         } else {
-            Ok(0)
-        }
+            0
+        };
+        #[cfg(feature = "cabac-trace")]
+        eprintln!(
+            "[{}] bypbin bit_pos={} -> bin={} off={} range={}",
+            self.trace_label, self.bit_pos, bin, self.cod_i_offset, self.cod_i_range
+        );
+        Ok(bin)
     }
 
     /// §9.3.3.2.4 — Terminate (end-of-slice). Returns 1 when the arithmetic
