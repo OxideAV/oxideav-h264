@@ -339,10 +339,22 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   adds §8.4.2.2.1 ChromaArrayType == 2 vertical-MV scaling (divide by
   4 instead of 8, since chroma height matches luma height) for chroma
   MC. B-slices and CABAC on 4:2:2 remain out of scope.
-- 4:4:4 CAVLC I-slice decode IS supported (§6.4.1 ChromaArrayType == 3)
-  — the chroma planes share luma dimensions, reuse the luma Intra_4×4 /
+- 4:4:4 CAVLC I / P / B decode IS supported (§6.4.1 ChromaArrayType == 3)
+  — chroma planes share luma dimensions, reuse the luma Intra_4×4 /
   Intra_16×16 predictors, and decode three back-to-back luma-style
-  residual streams per MB; P / B / CABAC on 4:4:4 remain out of scope.
+  residual streams per MB. Inter MBs (P / B) run the luma 6-tap +
+  bilinear quarter-pel MC on every plane (§8.4.2.2 Table 8-9 entry for
+  ChromaArrayType = 3); the 4:2:0 chroma 1/8-pel bilinear is skipped.
+  Inter CBP is 4 bits (luma-only), mapped via the FFmpeg
+  `golomb_to_inter_cbp_gray` table. The I path is bit-exact against
+  ffmpeg on `iframe_yuv444_64x64`; the P / B paths match ≥ 90 % / ≥ 80 %
+  of samples on `yuv444_p_64x64` / `yuv444_b_64x64` — the residual gap
+  mirrors a pre-existing limitation of the P/B residual path that hits
+  the equivalent 4:2:0 testsrc fixture identically (solid-colour 4:4:4
+  P decodes 100 % matched). 8×8 transform on 4:4:4 inter is out of
+  scope. CABAC on 4:4:4 remains out of scope — CABAC I under
+  ChromaArrayType = 3 needs its own plane-aligned residual pipeline
+  + `intra_chroma_pred_mode` absence handling that isn't wired yet.
 - Bit depths above 10; 10-bit is supported for CAVLC I / P / B slices
   and CABAC I-slice in 4:2:0 only (see the 10-bit section below).
   12-bit / 14-bit return `Error::Unsupported`. Separate colour planes
