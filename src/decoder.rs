@@ -69,6 +69,7 @@ use crate::nal::{
     extract_rbsp, split_annex_b, split_length_prefixed, AvcConfig, NalHeader, NalUnitType,
 };
 use crate::p_mb::{decode_p_skip_mb, decode_p_slice_mb};
+use crate::p_mb_hi::{decode_p_skip_mb_hi, decode_p_slice_mb_hi};
 use crate::picture::Picture;
 use crate::pps::{parse_pps, Pps};
 use crate::slice::{parse_slice_header, SliceHeader, SliceType};
@@ -300,14 +301,17 @@ impl H264Decoder {
                             "h264: high-bit-depth decode only wired for 4:2:0 (chroma_format_idc=1)",
                         ));
                     }
-                    if sh.slice_type != SliceType::I {
-                        return Err(Error::unsupported(
-                            "h264: high-bit-depth decode only wired for I-slices",
-                        ));
+                    match sh.slice_type {
+                        SliceType::I | SliceType::P => {}
+                        _ => {
+                            return Err(Error::unsupported(
+                                "h264: high-bit-depth decode wired for I/P slices only",
+                            ));
+                        }
                     }
                     if pps.entropy_coding_mode_flag {
                         return Err(Error::unsupported(
-                            "h264: high-bit-depth CABAC entropy decode not wired — CAVLC I-slice only",
+                            "h264: high-bit-depth CABAC entropy decode not wired — CAVLC I/P only",
                         ));
                     }
                 }
@@ -508,6 +512,10 @@ impl H264Decoder {
                         let list0_pocs: Vec<i32> = ref_entries.iter().map(|r| r.poc).collect();
                         if pps.entropy_coding_mode_flag {
                             decode_cabac_p_slice(&rbsp, &sh, &sps, &pps, &mut pic, &list0)?;
+                        } else if high_bit_depth {
+                            let mut br = BitReader::new(&rbsp);
+                            br.skip(sh.slice_data_bit_offset as u32)?;
+                            decode_p_slice_data_hi(&mut br, &sh, &sps, &pps, &mut pic, &list0)?;
                         } else {
                             let mut br = BitReader::new(&rbsp);
                             br.skip(sh.slice_data_bit_offset as u32)?;
@@ -758,6 +766,60 @@ fn decode_p_slice_data(
         let mb_x = mb_addr % mb_w;
         let mb_y = mb_addr / mb_w;
         decode_p_slice_mb(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, &mut prev_qp)?;
+        mb_addr += 1;
+    }
+    Ok(())
+}
+
+/// CAVLC P-slice data loop — 10-bit pipeline. Mirrors
+/// [`decode_p_slice_data`] but drives the u16 macroblock decoder
+/// [`decode_p_slice_mb_hi`] and uses the 10-bit P_Skip helper. The
+/// initial QpY is allowed to start in `[-QpBdOffsetY, 51]` per
+/// §7.4.2.1.1, and `prev_qp` is extended to the same range before being
+/// fed through the macroblock loop.
+fn decode_p_slice_data_hi(
+    br: &mut BitReader<'_>,
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+) -> Result<()> {
+    let mb_w = sps.pic_width_in_mbs();
+    let mb_h = sps.pic_height_in_map_units();
+    let total_mbs = mb_w * mb_h;
+    let mut mb_addr = sh.first_mb_in_slice;
+    if mb_addr >= total_mbs {
+        return Err(Error::invalid(
+            "h264 p-slice: first_mb_in_slice out of range",
+        ));
+    }
+    let qp_bd_offset_y = 6 * sps.bit_depth_luma_minus8 as i32;
+    let mut prev_qp = pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta;
+    if prev_qp < -qp_bd_offset_y || prev_qp > 51 {
+        return Err(Error::invalid(format!(
+            "h264 10bit p-slice: initial QP {prev_qp} out of range [{}..=51]",
+            -qp_bd_offset_y
+        )));
+    }
+
+    while mb_addr < total_mbs {
+        let skip_run = br.read_ue()?;
+        for _ in 0..skip_run {
+            if mb_addr >= total_mbs {
+                break;
+            }
+            let mb_x = mb_addr % mb_w;
+            let mb_y = mb_addr / mb_w;
+            decode_p_skip_mb_hi(sh, mb_x, mb_y, pic, ref_list0, prev_qp)?;
+            mb_addr += 1;
+        }
+        if mb_addr >= total_mbs {
+            break;
+        }
+        let mb_x = mb_addr % mb_w;
+        let mb_y = mb_addr / mb_w;
+        decode_p_slice_mb_hi(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, &mut prev_qp)?;
         mb_addr += 1;
     }
     Ok(())
