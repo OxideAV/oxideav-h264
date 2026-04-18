@@ -49,6 +49,7 @@ use crate::slice::{ChromaWeight, LumaWeight, PredWeightTable, SliceHeader};
 use crate::sps::Sps;
 use crate::transform::{
     chroma_qp, dequantize_4x4_scaled, idct_4x4, inv_hadamard_2x2_chroma_dc_scaled,
+    inv_hadamard_2x4_chroma_dc_scaled,
 };
 
 /// Per-slice context needed for temporal direct MV prediction (§8.4.1.2.3).
@@ -944,6 +945,25 @@ fn mc_chroma_partition(
     mv_y_q: i32,
     chroma_weight: Option<&ChromaWeight>,
 ) {
+    // §8.4.2.2.1 ChromaArrayType == 2 — chroma height equals luma
+    // height, so the MV y-component scales by 4 (not 8) and the chroma
+    // partition vertical extent is 4*h samples (not 2*h).
+    if pic.chroma_format_idc == 2 {
+        mc_chroma_partition_422(
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            h,
+            w,
+            mv_x_q,
+            mv_y_q,
+            chroma_weight,
+        );
+        return;
+    }
     let pw = w * 2;
     let ph = h * 2;
     let mut tmp_cb = vec![0u8; pw * ph];
@@ -985,6 +1005,75 @@ fn mc_chroma_partition(
     }
     let stride = pic.chroma_stride();
     let off = pic.chroma_off(mb_x, mb_y) + r0 * 2 * stride + c0 * 2;
+    for rr in 0..ph {
+        for cc in 0..pw {
+            pic.cb[off + rr * stride + cc] = tmp_cb[rr * pw + cc];
+            pic.cr[off + rr * stride + cc] = tmp_cr[rr * pw + cc];
+        }
+    }
+}
+
+/// 4:2:2 B-slice single-direction chroma MC (§8.4.2.2.1
+/// ChromaArrayType = 2). Chroma width is halved but height matches
+/// luma; `mv_y_q << 1` feeds `chroma_mc` so the 1/8-pel bilinear
+/// filter sees `(mv_y_q >> 2, (mv_y_q & 3) << 1)` the way the spec
+/// requires. Mirrors `crate::p_mb::mc_chroma_partition_422`.
+#[allow(clippy::too_many_arguments)]
+fn mc_chroma_partition_422(
+    pic: &mut Picture,
+    reference: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    h: usize,
+    w: usize,
+    mv_x_q: i32,
+    mv_y_q: i32,
+    chroma_weight: Option<&ChromaWeight>,
+) {
+    let pw = w * 2;
+    let ph = h * 4;
+    let mut tmp_cb = vec![0u8; pw * ph];
+    let mut tmp_cr = vec![0u8; pw * ph];
+    let base_x = (mb_x as i32) * 8 + (c0 as i32) * 2;
+    let base_y = (mb_y as i32) * 16 + (r0 as i32) * 4;
+    let cstride = reference.chroma_stride();
+    let cw = (reference.width / 2) as i32;
+    let ch = reference.height as i32;
+    let mv_y_c = mv_y_q << 1;
+    chroma_mc(
+        &mut tmp_cb,
+        &reference.cb,
+        cstride,
+        cw,
+        ch,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_c,
+        pw,
+        ph,
+    );
+    chroma_mc(
+        &mut tmp_cr,
+        &reference.cr,
+        cstride,
+        cw,
+        ch,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_c,
+        pw,
+        ph,
+    );
+    if let Some(cw_entry) = chroma_weight {
+        apply_chroma_weight(&mut tmp_cb, cw_entry, 0);
+        apply_chroma_weight(&mut tmp_cr, cw_entry, 1);
+    }
+    let stride = pic.chroma_stride();
+    let off = pic.chroma_off(mb_x, mb_y) + r0 * 4 * stride + c0 * 2;
     for rr in 0..ph {
         for cc in 0..pw {
             pic.cb[off + rr * stride + cc] = tmp_cb[rr * pw + cc];
@@ -1081,21 +1170,42 @@ fn mc_bipred_partition(
         }
     }
 
-    // Chroma
+    // Chroma — dimensions + MV scaling depend on ChromaArrayType.
+    // 4:2:0: width × 2, height × 2, mv passed verbatim.
+    // 4:2:2: width × 2, height × 4, mv_y << 1 (§8.4.2.2.1).
+    let is_422 = pic.chroma_format_idc == 2;
     let cpw = w * 2;
-    let cph = h * 2;
+    let cph = if is_422 { h * 4 } else { h * 2 };
     let mut tmp_cb0 = vec![0u8; cpw * cph];
     let mut tmp_cb1 = vec![0u8; cpw * cph];
     let mut tmp_cr0 = vec![0u8; cpw * cph];
     let mut tmp_cr1 = vec![0u8; cpw * cph];
     let base_cx = (mb_x as i32) * 8 + (c0 as i32) * 2;
-    let base_cy = (mb_y as i32) * 8 + (r0 as i32) * 2;
+    let base_cy = if is_422 {
+        (mb_y as i32) * 16 + (r0 as i32) * 4
+    } else {
+        (mb_y as i32) * 8 + (r0 as i32) * 2
+    };
     let cstride0 = ref0.chroma_stride();
     let cstride1 = ref1.chroma_stride();
     let cw0 = (ref0.width / 2) as i32;
-    let ch0 = (ref0.height / 2) as i32;
+    let ch0 = if is_422 {
+        ref0.height as i32
+    } else {
+        (ref0.height / 2) as i32
+    };
     let cw1 = (ref1.width / 2) as i32;
-    let ch1 = (ref1.height / 2) as i32;
+    let ch1 = if is_422 {
+        ref1.height as i32
+    } else {
+        (ref1.height / 2) as i32
+    };
+    // `chroma_mc` consumes `mv_y` as a luma quarter-pel. 4:2:2 needs
+    // `yIntC = base_y + (mv_y >> 2)` and `yFracC = (mv_y & 3) << 1`,
+    // which is what `mv_y << 1` reproduces inside `chroma_mc`'s
+    // `>> 3` + `& 7` logic. §8.4.2.2.1 under ChromaArrayType == 2.
+    let mv0_y_c = if is_422 { mv0_y_q << 1 } else { mv0_y_q };
+    let mv1_y_c = if is_422 { mv1_y_q << 1 } else { mv1_y_q };
     chroma_mc(
         &mut tmp_cb0,
         &ref0.cb,
@@ -1105,7 +1215,7 @@ fn mc_bipred_partition(
         base_cx,
         base_cy,
         mv0_x_q,
-        mv0_y_q,
+        mv0_y_c,
         cpw,
         cph,
     );
@@ -1118,7 +1228,7 @@ fn mc_bipred_partition(
         base_cx,
         base_cy,
         mv0_x_q,
-        mv0_y_q,
+        mv0_y_c,
         cpw,
         cph,
     );
@@ -1131,7 +1241,7 @@ fn mc_bipred_partition(
         base_cx,
         base_cy,
         mv1_x_q,
-        mv1_y_q,
+        mv1_y_c,
         cpw,
         cph,
     );
@@ -1144,7 +1254,7 @@ fn mc_bipred_partition(
         base_cx,
         base_cy,
         mv1_x_q,
-        mv1_y_q,
+        mv1_y_c,
         cpw,
         cph,
     );
@@ -1196,7 +1306,8 @@ fn mc_bipred_partition(
         }
     }
     let stride = pic.chroma_stride();
-    let coff = pic.chroma_off(mb_x, mb_y) + r0 * 2 * stride + c0 * 2;
+    let c_rstep = if is_422 { 4 } else { 2 };
+    let coff = pic.chroma_off(mb_x, mb_y) + r0 * c_rstep * stride + c0 * 2;
     for rr in 0..cph {
         for cc in 0..cpw {
             pic.cb[coff + rr * stride + cc] = cb_out[rr * cpw + cc];
@@ -1679,6 +1790,11 @@ fn decode_inter_residual_chroma(
     cbp_chroma: u8,
     qp_y: i32,
 ) -> Result<()> {
+    // §8.5.11.2 ChromaArrayType dispatch — 4:2:2 uses a 2×4 chroma DC
+    // Hadamard and 8 AC blocks per plane instead of 4:2:0's 2×2 + 4.
+    if pic.chroma_format_idc == 2 {
+        return decode_inter_residual_chroma_422(br, pps, mb_x, mb_y, pic, cbp_chroma, qp_y);
+    }
     let qpc = chroma_qp(qp_y, pps.chroma_qp_index_offset);
     let mut dc_cb = [0i32; 4];
     let mut dc_cr = [0i32; 4];
@@ -1738,6 +1854,129 @@ fn decode_inter_residual_chroma(
         }
     }
     Ok(())
+}
+
+/// 4:2:2 B-slice inter residual (§8.5.11.2, §9.2.1.2 ChromaArrayType == 2).
+///
+/// Same cbp_chroma encoding as 4:2:0 (0 = none, 1 = DC only, 2 = DC + AC),
+/// but the plane is 8×16 samples = 2 cols × 4 rows of 4×4 AC blocks and
+/// the chroma DC block is 2×4 (CAVLC kind `ChromaDc2x4`, nC = -2) fed
+/// through `inv_hadamard_2x4_chroma_dc_scaled` with the Amendment-2
+/// `QP'_C,DC = QP'_C + 3` offset baked in. B-slice chroma is always
+/// inter → residual uses inter-Cb/Cr scaling slots 4/5.
+fn decode_inter_residual_chroma_422(
+    br: &mut BitReader<'_>,
+    pps: &Pps,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    cbp_chroma: u8,
+    qp_y: i32,
+) -> Result<()> {
+    let qpc_cb = chroma_qp(qp_y, pps.chroma_qp_index_offset);
+    let qpc_cr = chroma_qp(qp_y, pps.second_chroma_qp_index_offset);
+    let mut dc_cb = [0i32; 8];
+    let mut dc_cr = [0i32; 8];
+    if cbp_chroma >= 1 {
+        let blk = decode_residual_block(br, -2, BlockKind::ChromaDc2x4)?;
+        dc_cb.copy_from_slice(&blk.coeffs[..8]);
+        let blk = decode_residual_block(br, -2, BlockKind::ChromaDc2x4)?;
+        dc_cr.copy_from_slice(&blk.coeffs[..8]);
+        let w_cb = pic.scaling_lists.matrix_4x4(4)[0];
+        let w_cr = pic.scaling_lists.matrix_4x4(5)[0];
+        inv_hadamard_2x4_chroma_dc_scaled(&mut dc_cb, qpc_cb, w_cb);
+        inv_hadamard_2x4_chroma_dc_scaled(&mut dc_cr, qpc_cr, w_cr);
+    }
+    let cstride = pic.chroma_stride();
+    let co = pic.chroma_off(mb_x, mb_y);
+    for plane_cb in [true, false] {
+        let dc = if plane_cb { &dc_cb } else { &dc_cr };
+        let qpc = if plane_cb { qpc_cb } else { qpc_cr };
+        let mut nc_arr = [0u8; 8];
+        for blk_row in 0..4usize {
+            for blk_col in 0..2usize {
+                let blk_idx = blk_row * 2 + blk_col;
+                let mut res = [0i32; 16];
+                let mut total_coeff = 0u32;
+                if cbp_chroma == 2 {
+                    let nc = predict_inter_nc_chroma_422(
+                        pic, mb_x, mb_y, plane_cb, blk_row, blk_col,
+                    );
+                    let ac = decode_residual_block(br, nc, BlockKind::ChromaAc)?;
+                    total_coeff = ac.total_coeff;
+                    res = ac.coeffs;
+                    let cat = if plane_cb { 4 } else { 5 };
+                    let scale = *pic.scaling_lists.matrix_4x4(cat);
+                    dequantize_4x4_scaled(&mut res, qpc, &scale);
+                }
+                res[0] = dc[blk_idx];
+                idct_4x4(&mut res);
+                let off_in_mb = blk_row * 4 * cstride + blk_col * 4;
+                let plane = if plane_cb { &mut pic.cb } else { &mut pic.cr };
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let base = plane[co + off_in_mb + r * cstride + c] as i32;
+                        plane[co + off_in_mb + r * cstride + c] =
+                            (base + res[r * 4 + c]).clamp(0, 255) as u8;
+                    }
+                }
+                nc_arr[blk_idx] = total_coeff as u8;
+                let info = pic.mb_info_mut(mb_x, mb_y);
+                let dst = if plane_cb {
+                    &mut info.cb_nc
+                } else {
+                    &mut info.cr_nc
+                };
+                dst[..8].copy_from_slice(&nc_arr);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 4:2:2 B-slice neighbour-nC predictor — mirrors the P-slice 4:2:2
+/// predictor in [`crate::p_mb::predict_inter_nc_chroma_422`].
+fn predict_inter_nc_chroma_422(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    cb: bool,
+    blk_row: usize,
+    blk_col: usize,
+) -> i32 {
+    let pick = |info: &MbInfo, idx: usize| -> u8 {
+        if cb {
+            info.cb_nc[idx]
+        } else {
+            info.cr_nc[idx]
+        }
+    };
+    let info_here = pic.mb_info_at(mb_x, mb_y);
+    let left = if blk_col > 0 {
+        Some(pick(info_here, blk_row * 2 + (blk_col - 1)))
+    } else if mb_x > 0 {
+        let info = pic.mb_info_at(mb_x - 1, mb_y);
+        if info.coded {
+            Some(pick(info, blk_row * 2 + 1))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let top = if blk_row > 0 {
+        Some(pick(info_here, (blk_row - 1) * 2 + blk_col))
+    } else if mb_y > 0 {
+        let info = pic.mb_info_at(mb_x, mb_y - 1);
+        if info.coded {
+            Some(pick(info, 3 * 2 + blk_col))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    crate::mb::nc_from_neighbours(left, top)
 }
 
 // ---------------------------------------------------------------------------

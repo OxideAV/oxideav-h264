@@ -678,6 +678,27 @@ fn decode_inter_residual_chroma(
     cbp_chroma: u8,
     qp_y: i32,
 ) -> Result<()> {
+    // §8.5.11.2 ChromaArrayType dispatch — 4:2:2 uses a 2×4 chroma DC
+    // Hadamard and 8 AC blocks per plane instead of 4:2:0's 2×2 + 4.
+    // Prediction is already in the chroma plane (from MC); pass `intra =
+    // false` so the 4:2:2 helper accumulates residual on top of the
+    // pre-written samples.
+    if pic.chroma_format_idc == 2 {
+        // `chroma_mode` is unused for inter MBs — the helper skips
+        // intra-chroma prediction when `intra == false`.
+        return crate::cabac::mb::decode_chroma_422(
+            d,
+            ctxs,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            crate::intra_pred::IntraChromaMode::Dc,
+            cbp_chroma,
+            qp_y,
+            false,
+        );
+    }
     let qpc = chroma_qp(qp_y, pps.chroma_qp_index_offset);
     let mut dc_cb = [0i32; 4];
     let mut dc_cr = [0i32; 4];
@@ -1052,6 +1073,27 @@ fn mc_chroma_partition(
     mv_y_q: i32,
     chroma_weight: Option<&ChromaWeight>,
 ) {
+    // §8.4.2.2.1 ChromaArrayType dispatch. 4:2:2 keeps horizontal
+    // subsampling but skips vertical — the 1/8-pel bilinear chroma
+    // filter still applies, but mvY is scaled by `>> 2` instead of
+    // `>> 3` with `yFracC = (mv_y_q & 3) << 1`, which we reproduce by
+    // feeding `mv_y_q << 1` to `chroma_mc`.
+    if pic.chroma_format_idc == 2 {
+        mc_chroma_partition_422(
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            h,
+            w,
+            mv_x_q,
+            mv_y_q,
+            chroma_weight,
+        );
+        return;
+    }
     let pw = w * 2;
     let ph = h * 2;
     let mut tmp_cb = vec![0u8; pw * ph];
@@ -1093,6 +1135,75 @@ fn mc_chroma_partition(
     }
     let stride = pic.chroma_stride();
     let off = pic.chroma_off(mb_x, mb_y) + r0 * 2 * stride + c0 * 2;
+    for rr in 0..ph {
+        for cc in 0..pw {
+            pic.cb[off + rr * stride + cc] = tmp_cb[rr * pw + cc];
+            pic.cr[off + rr * stride + cc] = tmp_cr[rr * pw + cc];
+        }
+    }
+}
+
+/// 4:2:2 chroma MC under ChromaArrayType = 2 (§8.4.2.2.1) —
+/// chroma height equals luma height, chroma width is halved. See
+/// [`crate::p_mb::mc_chroma_partition_422`] for the reference
+/// implementation; this is a local clone to keep the CABAC module
+/// self-contained against the CAVLC p_mb private items.
+#[allow(clippy::too_many_arguments)]
+fn mc_chroma_partition_422(
+    pic: &mut Picture,
+    reference: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    h: usize,
+    w: usize,
+    mv_x_q: i32,
+    mv_y_q: i32,
+    chroma_weight: Option<&ChromaWeight>,
+) {
+    let pw = w * 2;
+    let ph = h * 4;
+    let mut tmp_cb = vec![0u8; pw * ph];
+    let mut tmp_cr = vec![0u8; pw * ph];
+    let base_x = (mb_x as i32) * 8 + (c0 as i32) * 2;
+    let base_y = (mb_y as i32) * 16 + (r0 as i32) * 4;
+    let cstride = reference.chroma_stride();
+    let cw = (reference.width / 2) as i32;
+    let ch = reference.height as i32;
+    let mv_y_c = mv_y_q << 1;
+    chroma_mc(
+        &mut tmp_cb,
+        &reference.cb,
+        cstride,
+        cw,
+        ch,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_c,
+        pw,
+        ph,
+    );
+    chroma_mc(
+        &mut tmp_cr,
+        &reference.cr,
+        cstride,
+        cw,
+        ch,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_c,
+        pw,
+        ph,
+    );
+    if let Some(cw_entry) = chroma_weight {
+        apply_chroma_weight(&mut tmp_cb, cw_entry, 0);
+        apply_chroma_weight(&mut tmp_cr, cw_entry, 1);
+    }
+    let stride = pic.chroma_stride();
+    let off = pic.chroma_off(mb_x, mb_y) + r0 * 4 * stride + c0 * 2;
     for rr in 0..ph {
         for cc in 0..pw {
             pic.cb[off + rr * stride + cc] = tmp_cb[rr * pw + cc];
