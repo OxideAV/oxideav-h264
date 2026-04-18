@@ -29,16 +29,22 @@ use oxideav_core::{Error, Result};
 use crate::cabac::binarize;
 use crate::cabac::context::CabacContext;
 use crate::cabac::engine::CabacDecoder;
-use crate::cabac::residual::{decode_residual_block_cabac, BlockCat, CbfNeighbours};
+use crate::cabac::residual::{
+    decode_residual_block_cabac, decode_residual_block_cabac_8x8, BlockCat, CbfNeighbours,
+};
 use crate::cabac::tables::{
-    CTX_IDX_CODED_BLOCK_FLAG, CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_COEFF_ABS_LEVEL_MINUS1,
-    CTX_IDX_INTRA_CHROMA_PRED_MODE, CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG, CTX_IDX_MB_QP_DELTA,
-    CTX_IDX_MB_TYPE_I, CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_SIGNIFICANT_COEFF_FLAG,
+    CTX_IDX_CODED_BLOCK_FLAG, CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8, CTX_IDX_CODED_BLOCK_PATTERN_LUMA,
+    CTX_IDX_COEFF_ABS_LEVEL_MINUS1, CTX_IDX_COEFF_ABS_LEVEL_MINUS1_LUMA8X8,
+    CTX_IDX_INTRA_CHROMA_PRED_MODE, CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG,
+    CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_TYPE_I,
+    CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_SIGNIFICANT_COEFF_FLAG,
+    CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
 };
 use crate::cavlc::ZIGZAG_4X4;
 use crate::intra_pred::{
-    predict_intra_16x16, predict_intra_4x4, predict_intra_chroma, Intra16x16Mode,
-    Intra16x16Neighbours, Intra4x4Mode, Intra4x4Neighbours, IntraChromaMode, IntraChromaNeighbours,
+    predict_intra_16x16, predict_intra_4x4, predict_intra_8x8, predict_intra_chroma,
+    Intra16x16Mode, Intra16x16Neighbours, Intra4x4Mode, Intra4x4Neighbours, Intra8x8Mode,
+    Intra8x8Neighbours, IntraChromaMode, IntraChromaNeighbours,
 };
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{decode_i_slice_mb_type, IMbType};
@@ -47,8 +53,8 @@ use crate::pps::Pps;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::transform::{
-    chroma_qp, dequantize_4x4_scaled, idct_4x4, inv_hadamard_2x2_chroma_dc_scaled,
-    inv_hadamard_4x4_dc_scaled,
+    chroma_qp, dequantize_4x4_scaled, dequantize_8x8_scaled, idct_4x4, idct_8x8,
+    inv_hadamard_2x2_chroma_dc_scaled, inv_hadamard_4x4_dc_scaled, ZIGZAG_8X8,
 };
 
 // ---------------------------------------------------------------------------
@@ -286,6 +292,13 @@ pub(crate) fn decode_residual_block_in_place(
                 raster[i] = coded[i];
             }
         }
+        BlockCat::Luma8x8 => {
+            // 8×8 blocks never flow through the 4×4-shaped helper; callers
+            // must route cat = 5 through `decode_luma_8x8_residual_in_place`.
+            return Err(Error::invalid(
+                "h264 cabac residual: Luma8x8 routed through 4x4 helper",
+            ));
+        }
     }
     Ok(raster)
 }
@@ -297,6 +310,78 @@ pub(crate) const SIG_BASE_OFFSETS: [usize; 5] = [0, 15, 29, 44, 47];
 /// Table 9-30 — `ctxIdxBlockCatOffset` for `coeff_abs_level_minus1`.
 /// Note cat 3 (ChromaDC) consumes 9 slots, not 10, so cat 4 starts at 39.
 pub(crate) const LVL_BASE_OFFSETS: [usize; 5] = [0, 10, 20, 30, 39];
+
+/// §9.3.3.1.1.10 — ctxIdxInc for `transform_size_8x8_flag`. Neighbour
+/// `condTermFlagN = 1` when the neighbour MB is coded AND used
+/// `transform_size_8x8_flag = 1`; 0 otherwise (including unavailable
+/// neighbours). Result = condTermFlagA + condTermFlagB, picking one of
+/// contexts 399 / 400 / 401.
+pub(crate) fn transform_size_8x8_flag_ctx_idx_inc(pic: &Picture, mb_x: u32, mb_y: u32) -> u8 {
+    let a = mb_x > 0 && {
+        let m = pic.mb_info_at(mb_x - 1, mb_y);
+        m.coded && m.transform_8x8
+    };
+    let b = mb_y > 0 && {
+        let m = pic.mb_info_at(mb_x, mb_y - 1);
+        m.coded && m.transform_8x8
+    };
+    (a as u8) + (b as u8)
+}
+
+/// Decode one Luma-8×8 residual block through the slice-wide CABAC state.
+/// Gathers the 4 cbf + 15 sig + 9 last + 10 abs-level context slots from
+/// `ctxs`, runs the 64-coefficient decode, scatters updated probability
+/// states back, and returns the raster-order 8×8 block ready for
+/// dequant + IDCT.
+///
+/// §9.3.3.1.1.9 — for an intra MB with unavailable neighbour, the CBF
+/// condTermFlagN defaults to 1; inter MBs default to 0.
+pub(crate) fn decode_luma_8x8_residual_in_place(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    neighbours: &CbfNeighbours,
+    intra: bool,
+) -> Result<[i32; 64]> {
+    let cbf_inc = coded_block_flag_inc(neighbours, intra) as usize;
+    let cbf_ctx_idx = CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8 + cbf_inc;
+    let sig_base = CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8;
+    let last_base = CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8;
+    let lvl_base = CTX_IDX_COEFF_ABS_LEVEL_MINUS1_LUMA8X8;
+
+    // §9.3.3.1.1.9 last ≥ sig ≥ cbf: the three banks are disjoint, so
+    // borrow them one at a time around the decode.
+    let mut sig_last_window = [CabacContext::default(); 24];
+    for k in 0..15 {
+        sig_last_window[k] = ctxs[sig_base + k];
+    }
+    for k in 0..9 {
+        sig_last_window[15 + k] = ctxs[last_base + k];
+    }
+    let mut abs_window = [CabacContext::default(); 10];
+    for k in 0..10 {
+        abs_window[k] = ctxs[lvl_base + k];
+    }
+    let mut cbf_ctx = ctxs[cbf_ctx_idx];
+    let coded =
+        decode_residual_block_cabac_8x8(d, &mut cbf_ctx, &mut sig_last_window, &mut abs_window)?;
+    ctxs[cbf_ctx_idx] = cbf_ctx;
+    for k in 0..15 {
+        ctxs[sig_base + k] = sig_last_window[k];
+    }
+    for k in 0..9 {
+        ctxs[last_base + k] = sig_last_window[15 + k];
+    }
+    for k in 0..10 {
+        ctxs[lvl_base + k] = abs_window[k];
+    }
+
+    // §8.5.6 inverse scan: 8×8 zig-zag → raster.
+    let mut raster = [0i32; 64];
+    for i in 0..64 {
+        raster[ZIGZAG_8X8[i]] = coded[i];
+    }
+    Ok(raster)
+}
 
 fn coded_block_flag_inc(neighbours: &CbfNeighbours, intra_default: bool) -> u8 {
     // §9.3.3.1.1.9: for an intra MB with unavailable neighbour,
@@ -378,39 +463,72 @@ fn decode_intra_mb_given_imb_cabac(
         return decode_pcm_mb_cabac(d, sps, mb_x, mb_y, pic, *prev_qp);
     }
 
-    // --- intra4x4 modes (only for I_NxN) ---
+    // --- transform_size_8x8_flag (I_NxN, High Profile) ---
+    let mut transform_8x8 = false;
     let mut intra4x4_modes = [INTRA_DC_FAKE; 16];
     if matches!(imb, IMbType::INxN) {
-        // CABAC's `transform_size_8x8_flag` (§9.3.3.1.1.10, ctxIdx 399..=401)
-        // isn't implemented in this crate yet. Refuse the macroblock when
-        // the PPS advertises 8×8 transform support so we don't silently
-        // desync the bitstream.
+        // §9.3.3.1.1.10 — flag is present before the intra mode bits when
+        // pps.transform_8x8_mode_flag is set.
         if pps.transform_8x8_mode_flag {
-            return Err(Error::unsupported(
-                "h264: CABAC transform_size_8x8_flag (§9.3.3.1.1.10) not yet supported — \
-                 use CAVLC to decode 8×8-transform bitstreams",
-            ));
+            let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
+            let slice = &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+            transform_8x8 = binarize::decode_transform_size_8x8_flag(d, slice, inc)?;
         }
-        for blk in 0..16usize {
-            let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
-            let prev_flag = {
-                let slice = &mut ctxs[CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG
-                    ..CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG + 1];
-                binarize::decode_prev_intra4x4_pred_mode_flag(d, slice)?
-            };
-            let predicted =
-                predict_intra4x4_mode_with(pic, mb_x, mb_y, br_row, br_col, &intra4x4_modes);
-            let mode = if prev_flag {
-                predicted
-            } else {
-                let rem = binarize::decode_rem_intra4x4_pred_mode(d)? as u8;
-                if rem < predicted {
-                    rem
+        if transform_8x8 {
+            // §8.3.2 — four Intra_8×8 modes: each stored slot is replicated
+            // into the four 4×4 positions the 8×8 covers so the in-MB
+            // neighbour-mode predictor (keyed on 4×4 raster) picks up the
+            // correct §8.3.2.1 min() neighbour for subsequent 8×8 blocks.
+            for blk8 in 0..4usize {
+                let br_row = (blk8 >> 1) * 2;
+                let br_col = (blk8 & 1) * 2;
+                let prev_flag = {
+                    let slice = &mut ctxs[CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG
+                        ..CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG + 1];
+                    binarize::decode_prev_intra4x4_pred_mode_flag(d, slice)?
+                };
+                let predicted =
+                    predict_intra4x4_mode_with(pic, mb_x, mb_y, br_row, br_col, &intra4x4_modes);
+                let mode = if prev_flag {
+                    predicted
                 } else {
-                    rem + 1
+                    // rem_intra8x8_pred_mode shares the FL(3) binarization
+                    // with rem_intra4x4_pred_mode (§9.3.2.5).
+                    let rem = binarize::decode_rem_intra4x4_pred_mode(d)? as u8;
+                    if rem < predicted {
+                        rem
+                    } else {
+                        rem + 1
+                    }
+                };
+                for dr in 0..2 {
+                    for dc in 0..2 {
+                        intra4x4_modes[(br_row + dr) * 4 + br_col + dc] = mode;
+                    }
                 }
-            };
-            intra4x4_modes[br_row * 4 + br_col] = mode;
+            }
+        } else {
+            for blk in 0..16usize {
+                let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
+                let prev_flag = {
+                    let slice = &mut ctxs[CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG
+                        ..CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG + 1];
+                    binarize::decode_prev_intra4x4_pred_mode_flag(d, slice)?
+                };
+                let predicted =
+                    predict_intra4x4_mode_with(pic, mb_x, mb_y, br_row, br_col, &intra4x4_modes);
+                let mode = if prev_flag {
+                    predicted
+                } else {
+                    let rem = binarize::decode_rem_intra4x4_pred_mode(d)? as u8;
+                    if rem < predicted {
+                        rem
+                    } else {
+                        rem + 1
+                    }
+                };
+                intra4x4_modes[br_row * 4 + br_col] = mode;
+            }
         }
     }
 
@@ -488,6 +606,7 @@ fn decode_intra_mb_given_imb_cabac(
             intra4x4_pred_mode: intra4x4_modes,
             intra_chroma_pred_mode: chroma_mode_val as u8,
             mb_type_i: Some(imb),
+            transform_8x8,
             ..Default::default()
         };
     }
@@ -506,6 +625,16 @@ fn decode_intra_mb_given_imb_cabac(
             mb_y,
             pic,
             intra16x16_pred_mode,
+            cbp_luma,
+            qp_y,
+        )?,
+        IMbType::INxN if transform_8x8 => decode_luma_intra_8x8_cabac(
+            d,
+            ctxs,
+            mb_x,
+            mb_y,
+            pic,
+            &intra4x4_modes,
             cbp_luma,
             qp_y,
         )?,
@@ -702,6 +831,151 @@ fn decode_luma_intra_nxn(
         pic.mb_info_mut(mb_x, mb_y).luma_nc[br_row * 4 + br_col] = total_coeff as u8;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Luma — I_NxN with transform_size_8x8_flag (High Profile, §8.3.2 + §8.5.13).
+// ---------------------------------------------------------------------------
+//
+// Mirrors the CAVLC intra 8×8 path in `mb::decode_luma_intra_8x8` but feeds
+// the residual through the CABAC 64-coefficient decoder (`ctxBlockCat = 5`,
+// §9.3.3.1.1.9). Each 8×8 sub-block gets its own `coded_block_flag` bin
+// (ctxIdxOffset 1012) + full significance map + UEGk levels. The decoded
+// 64-coefficient vector is zig-zag-inverted, dequantised via the 8×8
+// scaling list (intra-Y slot 0), and fed through `idct_8x8` before being
+// added to the intra-8×8 prediction and clamped into `pic.y`.
+
+#[allow(clippy::too_many_arguments)]
+fn decode_luma_intra_8x8_cabac(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    modes: &[u8; 16],
+    cbp_luma: u8,
+    qp_y: i32,
+) -> Result<()> {
+    let lstride = pic.luma_stride();
+    let lo_mb = pic.luma_off(mb_x, mb_y);
+
+    for blk8 in 0..4usize {
+        let br8_row = blk8 >> 1;
+        let br8_col = blk8 & 1;
+        let mode_v = modes[(br8_row * 2) * 4 + br8_col * 2];
+        let mode = Intra8x8Mode::from_u8(mode_v).ok_or_else(|| {
+            Error::invalid(format!("h264 cabac mb: invalid intra8x8 mode {mode_v}"))
+        })?;
+        let neigh = collect_intra8x8_neighbours(pic, mb_x, mb_y, br8_row, br8_col);
+        let mut pred = [0u8; 64];
+        predict_intra_8x8(&mut pred, mode, &neigh);
+
+        let has_residual = (cbp_luma >> blk8) & 1 != 0;
+        let mut residual = [0i32; 64];
+        if has_residual {
+            let r0 = br8_row * 2;
+            let c0 = br8_col * 2;
+            // §9.3.3.1.1.9 — CBF neighbour for the 8×8 block takes its
+            // left and above from the 4×4 cache at the block's top-left
+            // corner, same as the CAVLC nC predictor.
+            let neighbours = cbf_neighbours_luma(pic, mb_x, mb_y, r0, c0);
+            let coeffs = decode_luma_8x8_residual_in_place(d, ctxs, &neighbours, true)?;
+            residual = coeffs;
+            let nnz = residual.iter().filter(|&&v| v != 0).count() as u16;
+            // §7.4.2.2 — Intra-Y 8×8 uses scaling-list slot 0.
+            let scale = *pic.scaling_lists.matrix_8x8(0);
+            dequantize_8x8_scaled(&mut residual, qp_y, &scale);
+            idct_8x8(&mut residual);
+            // Mirror the CAVLC path: write per-4×4 counts into `luma_nc`
+            // so neighbour derivations on subsequent MBs see a consistent
+            // "this 8×8 had residual" signal at the top-left slot.
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            let byte = nnz.min(16) as u8;
+            info.luma_nc[r0 * 4 + c0] = byte;
+            info.luma_nc[r0 * 4 + c0 + 1] = byte;
+            info.luma_nc[(r0 + 1) * 4 + c0] = byte;
+            info.luma_nc[(r0 + 1) * 4 + c0 + 1] = byte;
+        }
+
+        let lo = lo_mb + (br8_row * 8) * lstride + br8_col * 8;
+        for r in 0..8 {
+            for c in 0..8 {
+                let v = pred[r * 8 + c] as i32 + residual[r * 8 + c];
+                pic.y[lo + r * lstride + c] = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_intra8x8_neighbours(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    br8_row: usize,
+    br8_col: usize,
+) -> Intra8x8Neighbours {
+    // Mirrors `crate::mb::collect_intra8x8_neighbours`; duplicated here to
+    // keep CABAC path's dependencies self-contained.
+    let lstride = pic.luma_stride();
+
+    let top_avail = br8_row > 0 || mb_y > 0;
+    let mut top = [0u8; 16];
+    let mut top_right_available = false;
+    if top_avail {
+        let row_y_global = (mb_y as usize) * 16 + br8_row * 8 - 1;
+        let row_off = row_y_global * lstride;
+        let col_base = (mb_x as usize) * 16 + br8_col * 8;
+        for i in 0..8 {
+            top[i] = pic.y[row_off + col_base + i];
+        }
+        top_right_available = match (br8_row, br8_col) {
+            (0, 0) => mb_y > 0,
+            (0, 1) => {
+                mb_y > 0 && mb_x + 1 < pic.mb_width && pic.mb_info_at(mb_x + 1, mb_y - 1).coded
+            }
+            (1, 0) => true,
+            _ => false,
+        };
+        if top_right_available {
+            for i in 0..8 {
+                top[8 + i] = pic.y[row_off + col_base + 8 + i];
+            }
+        } else {
+            for i in 0..8 {
+                top[8 + i] = top[7];
+            }
+        }
+    }
+
+    let left_avail = br8_col > 0 || mb_x > 0;
+    let mut left = [0u8; 8];
+    if left_avail {
+        let col_x_global = (mb_x as usize) * 16 + br8_col * 8 - 1;
+        for i in 0..8 {
+            let row = (mb_y as usize) * 16 + br8_row * 8 + i;
+            left[i] = pic.y[row * lstride + col_x_global];
+        }
+    }
+
+    let tl_avail = top_avail && left_avail;
+    let top_left = if tl_avail {
+        let row_y_global = (mb_y as usize) * 16 + br8_row * 8 - 1;
+        let col_x_global = (mb_x as usize) * 16 + br8_col * 8 - 1;
+        pic.y[row_y_global * lstride + col_x_global]
+    } else {
+        0
+    };
+
+    Intra8x8Neighbours {
+        top,
+        left,
+        top_left,
+        top_available: top_avail,
+        left_available: left_avail,
+        top_left_available: tl_avail,
+        top_right_available,
+    }
 }
 
 // ---------------------------------------------------------------------------

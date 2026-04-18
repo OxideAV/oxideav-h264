@@ -48,7 +48,7 @@
 //!   (UEGk with §9.3.3.1.1.7 neighbour-magnitude ctxIdxInc),
 //!   `coded_block_pattern`, `mb_qp_delta`, and 4×4 residual coding.
 //!   `weighted_pred_flag = 1` is parsed but weights are not yet wired
-//!   on the CABAC path; `transform_size_8x8_flag = 1` is rejected.
+//!   on the CABAC path.
 //! * **CABAC Main-profile B-slice** entropy decode (§9.3) —
 //!   `mb_skip_flag` (B bank), `mb_type` (Table 9-37 with the 48-value
 //!   inter + intra tree), `sub_mb_type` (Table 9-38 B column, 13 values),
@@ -57,7 +57,19 @@
 //!   `MbInfo` field), `coded_block_pattern`, `mb_qp_delta`, and 4×4
 //!   residual coding. Motion compensation, direct-mode (spatial + temporal)
 //!   MV derivation, and bipred blending all reuse the CAVLC B-slice
-//!   helpers. `transform_size_8x8_flag = 1` and MBAFF are rejected.
+//!   helpers. MBAFF is rejected.
+//! * **CABAC High-profile 8×8 transform** (§9.3.3.1.1.10) — intra AND
+//!   inter. `transform_size_8x8_flag` is binarised as FL(1) with
+//!   `ctxIdxInc = condTermFlagA + condTermFlagB` against ctxIdxOffset 399
+//!   (slots 399/400/401 per §9.3.3.1.1.10). The 8×8 luma residual is
+//!   then read as a single 64-coefficient CABAC block with `ctxBlockCat =
+//!   5`: `coded_block_flag` at ctxIdxOffset 1012, `significant_coeff_flag`
+//!   at 402, `last_significant_coeff_flag` at 417, `coeff_abs_level_minus1`
+//!   at 426. Per-position ctxIdxInc for sig/last uses the §9.3.3.1.3
+//!   `ctxIdxMap[63][2]` table wired in [`cabac::residual::LUMA8X8_SIG_LAST_CTX_INC`].
+//!   The reconstructed 8×8 block flows through `dequantize_8x8_scaled` +
+//!   `idct_8x8`, matching the CAVLC 8×8 path bit-for-bit on the shared
+//!   §8.5.13 math.
 //! * **Multi-reference DPB** (Annex C / §8.2.5) — [`dpb::Dpb`] holds up
 //!   to `sps.max_num_ref_frames` reconstructed reference frames. Each
 //!   P-slice builds a fresh `RefPicList0` (§8.2.4.2.1) — short-term
@@ -137,13 +149,9 @@
 //!
 //! # Out of scope (returns `Error::Unsupported` or the encoder refuses)
 //!
-//! * High-Profile 8×8 residual decode on the **CABAC** I-slice path
-//!   (§9.3.3.1.1.10) and on **any** P-slice macroblocks — CAVLC I-slice
-//!   8×8 is wired and bit-exact (see above); the CABAC 8×8 flag is
-//!   parse-and-reject for now.
-//! * Any CABAC encoding; any P/B slice encoding. CABAC I/P/B-slice
-//!   decode is wired; weighted-P on the CABAC path and the 8×8 transform
-//!   path are out of scope on this first pass.
+//! * Any CABAC encoding; any P/B slice encoding. CABAC I/P/B decode and
+//!   the CABAC 8×8 transform path are all wired; weighted-P on the CABAC
+//!   path is parsed but the weights aren't yet applied to the MC output.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
 //! * Interlaced coding / MBAFF / PAFF.

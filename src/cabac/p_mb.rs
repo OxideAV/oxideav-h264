@@ -12,7 +12,6 @@
 //!   * Intra-in-P (`mb_type >= 5`), dispatched to the CABAC I-slice path.
 //!
 //! Out of scope — surfaces `Error::Unsupported`:
-//!   * `transform_size_8x8_flag = 1` (8×8 transform).
 //!   * B-slice structures, MBAFF, 4:2:2 / 4:4:4.
 
 use oxideav_core::{Error, Result};
@@ -20,11 +19,15 @@ use oxideav_core::{Error, Result};
 use crate::cabac::binarize;
 use crate::cabac::context::CabacContext;
 use crate::cabac::engine::CabacDecoder;
-use crate::cabac::mb::decode_residual_block_in_place;
+use crate::cabac::mb::{
+    decode_luma_8x8_residual_in_place, decode_residual_block_in_place,
+    transform_size_8x8_flag_ctx_idx_inc,
+};
 use crate::cabac::residual::{BlockCat, CbfNeighbours};
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_SKIP_FLAG_P,
     CTX_IDX_MB_TYPE_I, CTX_IDX_MB_TYPE_P, CTX_IDX_REF_IDX_L0, CTX_IDX_SUB_MB_TYPE_P,
+    CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
 };
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{IMbType, PMbType, PPartition, PSubPartition};
@@ -34,7 +37,8 @@ use crate::pps::Pps;
 use crate::slice::{ChromaWeight, LumaWeight, SliceHeader};
 use crate::sps::Sps;
 use crate::transform::{
-    chroma_qp, dequantize_4x4_scaled, idct_4x4, inv_hadamard_2x2_chroma_dc_scaled,
+    chroma_qp, dequantize_4x4_scaled, dequantize_8x8_scaled, idct_4x4, idct_8x8,
+    inv_hadamard_2x2_chroma_dc_scaled,
 };
 
 // MVD contexts are laid out as two 7-slot banks for list-0 components:
@@ -285,18 +289,6 @@ fn decode_p_inter(
         );
     }
 
-    // §9.3.3.1.1.10 — transform_size_8x8_flag (parse-and-reject).
-    if pps.transform_8x8_mode_flag {
-        // When transform_8x8_mode_flag is set, the flag is transmitted only
-        // if the MB has luma residual (cbp_luma != 0 and this isn't P_8x8).
-        // We don't yet support the 8×8 path — refuse the whole MB so we
-        // don't risk desync.
-        return Err(Error::unsupported(
-            "h264: CABAC transform_size_8x8_flag = 1 (§9.3.3.1.1.10) not supported — \
-             use a CABAC bitstream with 8×8 transform disabled",
-        ));
-    }
-
     // §9.3.3.1.1.4 — coded_block_pattern.
     let luma_incs = cbp_luma_ctx_idx_incs(pic, mb_x, mb_y);
     let chroma_incs = cbp_chroma_ctx_idx_incs(pic, mb_x, mb_y);
@@ -313,6 +305,18 @@ fn decode_p_inter(
     };
     let cbp_luma = (cbp & 0x0F) as u8;
     let cbp_chroma = ((cbp >> 4) & 0x03) as u8;
+
+    // §7.3.5.1 — `transform_size_8x8_flag` is present for P inter MBs
+    // (non-P_8x8) when the PPS enables 8×8 AND cbp_luma != 0. Partition
+    // types 16×16 / 16×8 / 8×16 all qualify (no sub-8×8 motion splits).
+    let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 {
+        let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
+        let slice =
+            &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+        binarize::decode_transform_size_8x8_flag(d, slice, inc)?
+    } else {
+        false
+    };
 
     let needs_qp = cbp_luma != 0 || cbp_chroma != 0;
     if needs_qp {
@@ -340,9 +344,14 @@ fn decode_p_inter(
         info.mb_type_p = Some(PMbType::Inter { partition });
         info.p_partition = Some(partition);
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
+        info.transform_8x8 = transform_8x8;
     }
 
-    decode_inter_residual_luma(d, ctxs, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    if transform_8x8 {
+        decode_inter_residual_luma_8x8(d, ctxs, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    } else {
+        decode_inter_residual_luma(d, ctxs, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    }
     decode_inter_residual_chroma(d, ctxs, pps, mb_x, mb_y, pic, cbp_chroma, qp_y)?;
     Ok(())
 }
@@ -472,12 +481,6 @@ fn decode_p_8x8(
         }
     }
 
-    if pps.transform_8x8_mode_flag {
-        return Err(Error::unsupported(
-            "h264: CABAC transform_size_8x8_flag = 1 (§9.3.3.1.1.10) not supported",
-        ));
-    }
-
     let luma_incs = cbp_luma_ctx_idx_incs(pic, mb_x, mb_y);
     let chroma_incs = cbp_chroma_ctx_idx_incs(pic, mb_x, mb_y);
     let cbp = {
@@ -493,6 +496,20 @@ fn decode_p_8x8(
     };
     let cbp_luma = (cbp & 0x0F) as u8;
     let cbp_chroma = ((cbp >> 4) & 0x03) as u8;
+
+    // §7.3.5.1 — P_8x8's `transform_size_8x8_flag` is gated on all four
+    // sub_mb_types being at least 8×8 (no sub-8×8 split would straddle an
+    // 8×8 transform). Matches the CAVLC gate in `p_mb::decode_p8x8`.
+    let all_sub_8x8 = sub_parts.iter().all(|sp| sp.is_at_least_8x8());
+    let transform_8x8 =
+        if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
+            let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
+            let slice =
+                &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+            binarize::decode_transform_size_8x8_flag(d, slice, inc)?
+        } else {
+            false
+        };
 
     let needs_qp = cbp_luma != 0 || cbp_chroma != 0;
     if needs_qp {
@@ -519,9 +536,14 @@ fn decode_p_8x8(
         info.mb_type_p = Some(PMbType::Inter { partition });
         info.p_partition = Some(partition);
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
+        info.transform_8x8 = transform_8x8;
     }
 
-    decode_inter_residual_luma(d, ctxs, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    if transform_8x8 {
+        decode_inter_residual_luma_8x8(d, ctxs, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    } else {
+        decode_inter_residual_luma(d, ctxs, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    }
     decode_inter_residual_chroma(d, ctxs, pps, mb_x, mb_y, pic, cbp_chroma, qp_y)?;
     Ok(())
 }
@@ -586,6 +608,61 @@ fn decode_inter_residual_luma(
             }
         }
         pic.mb_info_mut(mb_x, mb_y).luma_nc[br_row * 4 + br_col] = total_coeff as u8;
+    }
+    Ok(())
+}
+
+// Inter luma residual with `transform_size_8x8_flag = 1`. Mirrors the
+// CAVLC path (`p_mb::decode_inter_residual_luma_8x8`) but pulls the
+// 64-coefficient block through `decode_luma_8x8_residual_in_place`
+// (ctxBlockCat = 5, §9.3.3.1.1.9). `luma_nc` is populated per-4×4 with a
+// consolidated NNZ so neighbour MV/mode derivations on subsequent MBs see
+// a consistent "this 8×8 had residual" signal.
+fn decode_inter_residual_luma_8x8(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    cbp_luma: u8,
+    qp_y: i32,
+) -> Result<()> {
+    let lstride = pic.luma_stride();
+    let lo_mb = pic.luma_off(mb_x, mb_y);
+
+    for blk8 in 0..4usize {
+        if (cbp_luma >> blk8) & 1 == 0 {
+            continue;
+        }
+        let br8_row = blk8 >> 1;
+        let br8_col = blk8 & 1;
+        let r0 = br8_row * 2;
+        let c0 = br8_col * 2;
+
+        let neighbours = cbf_neighbours_luma(pic, mb_x, mb_y, r0, c0);
+        let coeffs = decode_luma_8x8_residual_in_place(d, ctxs, &neighbours, false)?;
+        let mut residual = coeffs;
+        let nnz = residual.iter().filter(|&&v| v != 0).count() as u16;
+        // §7.4.2.2 — Inter-Y 8×8 uses scaling-list slot 1.
+        let scale = *pic.scaling_lists.matrix_8x8(1);
+        dequantize_8x8_scaled(&mut residual, qp_y, &scale);
+        idct_8x8(&mut residual);
+
+        let info = pic.mb_info_mut(mb_x, mb_y);
+        let byte = nnz.min(16) as u8;
+        info.luma_nc[r0 * 4 + c0] = byte;
+        info.luma_nc[r0 * 4 + c0 + 1] = byte;
+        info.luma_nc[(r0 + 1) * 4 + c0] = byte;
+        info.luma_nc[(r0 + 1) * 4 + c0 + 1] = byte;
+
+        let lo = lo_mb + (br8_row * 8) * lstride + br8_col * 8;
+        for r in 0..8 {
+            for c in 0..8 {
+                let base = pic.y[lo + r * lstride + c] as i32;
+                let v = base + residual[r * 8 + c];
+                pic.y[lo + r * lstride + c] = v.clamp(0, 255) as u8;
+            }
+        }
     }
     Ok(())
 }

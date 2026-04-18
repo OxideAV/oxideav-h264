@@ -4,11 +4,11 @@ Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
 oxideav. Decodes CAVLC + CABAC I-slices, CAVLC + CABAC P-slices, and
 CAVLC + CABAC B-slices (spatial + temporal direct + explicit weighted
 bipred + implicit weighted bipred); encodes a minimal Baseline-Profile,
-I-frame-only, Intra_16×16 DC_PRED output stream. **High-Profile 8×8 transform CAVLC decode**
-(§7.3.5.3.2, §8.3.2, §8.5.13) is wired end-to-end for both intra and
-P-slice inter macroblocks and bit-exact against ffmpeg's libavcodec
-reference; CABAC 8×8 residual coding (§9.3.3.1.1.10) remains out of
-scope. Zero C dependencies.
+I-frame-only, Intra_16×16 DC_PRED output stream. **High-Profile 8×8
+transform** is wired end-to-end on both the CAVLC path (§7.3.5.3.2,
+§8.5.13, bit-exact against libavcodec) and the CABAC path
+(§9.3.3.1.1.10 for the transform size flag + §9.3.3.1.1.9
+ctxBlockCat = 5 for the 64-coefficient residual). Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -224,21 +224,26 @@ let pkt = enc.receive_packet()?;   // Annex B: SPS+PPS+IDR
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-## High Profile 8×8 transform — CAVLC intra + P-slice inter wired
+## High Profile 8×8 transform — CAVLC and CABAC wired
 
-The CAVLC 8×8 transform path is fully wired on both intra and P-slice
-paths and bit-exact against ffmpeg's libavcodec reference:
+The 8×8 transform path is fully wired on **both** the CAVLC and CABAC
+entropy paths, for intra and P-slice inter macroblocks.
+
+Shared §8 math — bit-exact against ffmpeg's libavcodec reference:
 
 - 8×8 inverse integer transform (`transform::idct_8x8`) and its 6-class
   dequantisation (`transform::dequantize_8x8`) over the default flat-16
   scaling list — §8.5.13.
 - Nine Intra_8×8 prediction modes with reference-sample low-pass
   filtering per §8.3.2.2.2 (`intra_pred::predict_intra_8x8`) — §8.3.2.
-- `transform_size_8x8_flag` parse at both spec positions: before the
+- `transform_size_8x8_flag` at both spec positions: before the
   intra-mode syntax for I_NxN (§7.3.5.1 intra branch) and after
   `coded_block_pattern` / before `mb_qp_delta` for the P-slice inter
   branch, with the §7.3.5.1 conditional (`cbp_luma > 0` and no sub-8×8
   motion partitions on P_8x8).
+
+CAVLC 8×8 residual:
+
 - Per-sub-block CAVLC residual (`cavlc::decode_residual_8x8_sub`) —
   four 16-coefficient blocks spliced via `cavlc::ZIGZAG_8X8_CAVLC`
   (§7.3.5.3.2, FFmpeg's `zigzag_scan8x8_cavlc` untransposed).
@@ -248,26 +253,35 @@ paths and bit-exact against ffmpeg's libavcodec reference:
   block (mirrors FFmpeg's `scan8[]`-indexed cache). Inter 8×8 reuses
   the same cache layout via `p_mb::predict_inter_nc_luma`.
 
-The CABAC 8×8 path (§9.3.3.1.1.10) still surfaces `Error::Unsupported`.
-Custom scaling-list matrices are parsed but not applied (only flat-16 is
-used for 8×8 dequant).
+CABAC 8×8 residual (§9.3.3.1.1.9 / §9.3.3.1.1.10 — new):
+
+- `transform_size_8x8_flag` binarised FL(1) at ctxIdxOffset 399, with
+  `ctxIdxInc = condTermFlagA + condTermFlagB` (spec positions 399 / 400
+  / 401). Neighbour derivation uses each MB's recorded `transform_8x8`.
+- Luma 8×8 residual decodes as a single 64-coefficient CABAC block
+  (`ctxBlockCat = 5`): `coded_block_flag` at ctxIdxOffset **1012**,
+  `significant_coeff_flag` at **402**, `last_significant_coeff_flag` at
+  **417**, `coeff_abs_level_minus1` at **426**. Per-position ctxIdxInc
+  for sig/last uses the 63-entry map wired in
+  `cabac::residual::LUMA8X8_SIG_LAST_CTX_INC` (§9.3.3.1.3). The
+  UEGk(k=0, uCoff=14) abs-level uses the same `num_eq1` / `num_gt1`
+  counters as the 4×4 path.
+- Custom scaling-list matrices are parsed but not applied (only
+  flat-16 is used for 8×8 dequant).
 
 ## Not supported
 
 Decoder surfaces `Error::Unsupported` (or `Error::InvalidData` when the
 bitstream claims a feature that isn't wired); encoder outright refuses:
 
-- **Decoder**: CABAC P- and B-slices are wired for the
-  CAVLC-equivalent coverage (P_Skip / all P Table 7-13 inter partitions
-  + sub-partitions / intra-in-P; B_Skip / all B Table 7-14 16×16, 16×8,
-  8×16, and B_8x8 with every Table 7-17 sub-partition / intra-in-B)
-  with two caveats that surface `Error::Unsupported` on this first pass:
-  - `transform_size_8x8_flag = 1` is not supported on the CABAC path
-    (CAVLC intra + P-slice inter 8×8 are both wired — see the section
-    above — but CABAC 8×8 residual coding per §9.3.3.1.1.10 is not).
-  - Weighted prediction on the CABAC P path is parsed but weights are
-    not applied; encoders should disable weighted P for CABAC bitstreams
-    fed into this decoder, or tolerate unweighted MC output.
+- **Decoder**: CABAC P- and B-slices are wired for the CAVLC-equivalent
+  coverage (P_Skip / all P Table 7-13 inter partitions + sub-partitions /
+  intra-in-P; B_Skip / all B Table 7-14 16×16, 16×8, 8×16 variants +
+  B_8×8 with every Table 7-17 sub-partition / intra-in-B), including
+  `transform_size_8x8_flag = 1` on both intra and inter CABAC paths.
+  Weighted prediction on the CABAC P path is parsed but weights are
+  not applied; encoders should disable weighted P for CABAC bitstreams
+  fed into this decoder, or tolerate unweighted MC output.
 - **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16
   modes other than DC, rate control, adaptive QP, mode decision,
   deblocking.

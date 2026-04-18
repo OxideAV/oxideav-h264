@@ -848,18 +848,22 @@ pub fn predict_intra_8x8(out: &mut [u8; 64], mode: Intra8x8Mode, n: &Intra8x8Nei
             for y in 0..8 {
                 for x in 0..8 {
                     let zhd = 2 * y as i32 - x as i32;
-                    let v = if (0..=12).contains(&zhd) && zhd % 2 == 0 {
+                    let v = if zhd >= 0 && zhd % 2 == 0 {
+                        // §8.3.2.2.7 even zhd ∈ {0,2,..,14}: 2-tap left column.
                         let base = 7 - (y as i32 - (x as i32 >> 1));
                         let i = base as usize;
                         ((e[i] as u32 + e[i - 1] as u32 + 1) >> 1) as u8
-                    } else if (0..=12).contains(&zhd) {
+                    } else if zhd >= 1 {
+                        // §8.3.2.2.7 odd zhd ∈ {1,3,..,13}: 3-tap left column.
                         let base = 7 - (y as i32 - ((x as i32 + 1) >> 1));
                         let i = base as usize;
                         ((e[i + 1] as u32 + 2 * e[i] as u32 + e[i - 1] as u32 + 2) >> 2) as u8
                     } else {
-                        // zhd < 0 — p[x,y] based on top row.
+                        // zhd ∈ {-1..=-7} — spec §8.3.2.2.7 taps top row at
+                        // (x-2y-2), (x-2y-1), (x-2y). With zhd = 2y-x we have
+                        // x-2y-2 = -(zhd+2) = k-1, so base-in-e[] = 7+k.
                         let k = -zhd - 1;
-                        let base = 8 + k;
+                        let base = 7 + k;
                         let i = base as usize;
                         ((e[i] as u32 + 2 * e[i + 1] as u32 + e[i + 2] as u32 + 2) >> 2) as u8
                     };

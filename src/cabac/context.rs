@@ -142,7 +142,9 @@ mod tests {
     fn init_slice_contexts_for_i_slice_has_460_entries() {
         let ctxs = init_slice_contexts(0, true, 26);
         assert_eq!(ctxs.len(), NUM_CTX);
-        assert_eq!(NUM_CTX, 460);
+        // 460 main-profile contexts + 4 Luma8×8 coded_block_flag contexts
+        // (ctxIdx 1012..=1015 remapped into tail slots, §9.3.3.1.1.9).
+        assert_eq!(NUM_CTX, 464);
         // All pStateIdx values must be in 0..=63.
         for c in &ctxs {
             assert!(c.p_state_idx <= 63);

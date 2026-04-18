@@ -32,12 +32,17 @@ pub enum BlockCat {
     ChromaDc,
     /// Chroma AC — 15 AC coeffs per chroma 4×4 block.
     ChromaAc,
+    /// High Profile 8×8 luma residual (64 coeffs). Table 9-42 assigns this
+    /// ctxBlockCat = 5. Unlike the 4×4 categories, 8×8 residuals use their
+    /// own ctxIdxOffsets for sig/last/abs-level (402, 417, 426) and a
+    /// distinct per-position ctxIdxInc map (§9.3.3.1.3).
+    Luma8x8,
 }
 
 impl BlockCat {
-    /// `ctxBlockCat` integer as defined by §9.3.3.1.1.9 Table 9-42
-    /// (restricted to the 4×4 transform profile — 8×8 transform
-    /// categories are added when that path is enabled).
+    /// `ctxBlockCat` integer as defined by §9.3.3.1.1.9 Table 9-42.
+    /// Cat 5 (Luma 8×8 frame-coded) is the only High-Profile extension
+    /// we model; chroma 8×8 (422 / 444) is out of scope.
     pub fn ctx_block_cat(self) -> u8 {
         match self {
             BlockCat::Luma16x16Dc => 0,
@@ -50,6 +55,7 @@ impl BlockCat {
             // public API is exhaustive, but it shares its context
             // block category with ChromaAc.
             BlockCat::Chroma4x4 => 4,
+            BlockCat::Luma8x8 => 5,
         }
     }
 }
@@ -75,6 +81,26 @@ impl CbfNeighbours {
         }
     }
 }
+
+/// §9.3.3.1.3 — per-position ctxIdxInc mapping for Luma 8×8 frame-coded
+/// (`ctxBlockCat = 5`) `significant_coeff_flag` (column 0) and
+/// `last_significant_coeff_flag` (column 1). Indexed by `levelListIdx`
+/// in 0..=62 (position 63 is implicit-last so never read).
+///
+/// Values transcribed from ITU-T H.264 Table 9-43 (column header
+/// "ctxBlockCat = 5, 9, 13") and cross-checked against xfxhn/h264's
+/// `Cabac::decode_significant_coeff_flag_and_last_significant_coeff_flag`.
+#[rustfmt::skip]
+pub const LUMA8X8_SIG_LAST_CTX_INC: [[u8; 2]; 63] = [
+    [0,0],[1,1],[2,1],[3,1],[4,1],[5,1],[5,1],[4,1],
+    [4,1],[3,1],[3,1],[4,1],[4,1],[4,1],[5,1],[5,1],
+    [4,2],[4,2],[4,2],[4,2],[3,2],[3,2],[6,2],[7,2],
+    [7,2],[7,2],[8,2],[9,2],[10,2],[9,2],[8,2],[7,2],
+    [7,3],[6,3],[11,3],[12,3],[13,3],[11,3],[6,3],[7,3],
+    [8,4],[9,4],[14,4],[10,4],[9,4],[8,4],[6,4],[11,4],
+    [12,5],[13,5],[11,5],[6,5],[9,6],[14,6],[10,6],[9,6],
+    [11,7],[12,7],[13,7],[11,7],[14,8],[10,8],[12,8],
+];
 
 /// Decode one block's CABAC residual.
 ///
@@ -153,6 +179,138 @@ pub fn decode_residual_block_cabac(
 
     let coeffs_out = finish_levels(d, ctxs, &significant, n - 1, cat, coeffs.len())?;
     coeffs = coeffs_out;
+    Ok(coeffs)
+}
+
+/// Decode a Luma 8×8 residual block (ctxBlockCat = 5, 64 coefficients).
+///
+/// Layout of `cbf_ctx`: one context (the `coded_block_flag` slot chosen by
+/// the caller per §9.3.3.1.1.9 neighbour derivation). Layout of `sig_last`:
+/// 24 contexts — `sig_last[0..15]` = significant_coeff_flag bank
+/// (ctxIdxOffset 402..=416), `sig_last[15..24]` =
+/// last_significant_coeff_flag bank (ctxIdxOffset 417..=425). Layout of
+/// `abs_level`: 10 contexts at ctxIdxOffset 426..=435.
+///
+/// Returns the 64-entry coefficient array in **coded scan order**; the
+/// caller is responsible for zig-zag inversion via `ZIGZAG_8X8`,
+/// dequantisation (`dequantize_8x8_scaled`) and `idct_8x8`.
+pub fn decode_residual_block_cabac_8x8(
+    d: &mut CabacDecoder<'_>,
+    cbf_ctx: &mut CabacContext,
+    sig_last: &mut [CabacContext],
+    abs_level: &mut [CabacContext],
+) -> Result<[i32; 64]> {
+    if sig_last.len() < 24 {
+        return Err(Error::invalid(
+            "h264 cabac residual 8x8: insufficient sig/last contexts (need 24)",
+        ));
+    }
+    if abs_level.len() < 10 {
+        return Err(Error::invalid(
+            "h264 cabac residual 8x8: insufficient abs_level contexts (need 10)",
+        ));
+    }
+
+    // §9.3.3.1.1.9 — coded_block_flag first (unless this caller knows it's
+    // implicit: not possible for cat=5 in this subset).
+    let cbf = d.decode_bin(cbf_ctx)?;
+    let mut coeffs = [0i32; 64];
+    if cbf == 0 {
+        return Ok(coeffs);
+    }
+
+    // §9.3.3.1.1.9 — significance map walk across scan positions 0..=62
+    // (position 63 is implicit-last when reached). Per §9.3.3.1.3, ctxIdxInc
+    // for sig/last at position i is LUMA8X8_SIG_LAST_CTX_INC[i][0] / [1].
+    let n = 64usize;
+    let mut significant = [false; 64];
+    let mut last_at: usize = n - 1;
+    let mut saw_last = false;
+    for i in 0..(n - 1) {
+        let sig_inc = LUMA8X8_SIG_LAST_CTX_INC[i][0] as usize;
+        let last_inc = LUMA8X8_SIG_LAST_CTX_INC[i][1] as usize;
+        let sig = d.decode_bin(&mut sig_last[sig_inc])?;
+        if sig == 1 {
+            significant[i] = true;
+            let last = d.decode_bin(&mut sig_last[15 + last_inc])?;
+            if last == 1 {
+                last_at = i;
+                saw_last = true;
+                break;
+            }
+        }
+    }
+    if !saw_last {
+        // Fell through: position 63 is the implicit last by definition
+        // (§9.3.3.1.1.9 step 3). It is always significant in this case.
+        significant[n - 1] = true;
+        last_at = n - 1;
+    }
+
+    // §9.3.3.1.3 — absolute levels in reverse scan order.
+    let mut num_eq1: u32 = 0;
+    let mut num_gt1: u32 = 0;
+    let mut i = last_at as isize;
+    while i >= 0 {
+        if significant[i as usize] {
+            let bin0_inc = if num_gt1 != 0 {
+                0u32
+            } else {
+                core::cmp::min(4, 1 + num_eq1)
+            };
+            let binge1_inc = 5 + core::cmp::min(4u32, num_gt1);
+
+            // UEGk(k=0, uCoff=14) prefix.
+            let b0 = d.decode_bin(&mut abs_level[bin0_inc as usize])?;
+            let value: u32 = if b0 == 0 {
+                0
+            } else {
+                let mut prefix_ones: u32 = 1;
+                let mut saturated = true;
+                for _ in 1..14 {
+                    let b = d.decode_bin(&mut abs_level[binge1_inc as usize])?;
+                    if b == 0 {
+                        saturated = false;
+                        break;
+                    }
+                    prefix_ones += 1;
+                }
+                if saturated {
+                    let mut k: u32 = 0;
+                    loop {
+                        let b = d.decode_bypass()?;
+                        if b == 1 {
+                            break;
+                        }
+                        k += 1;
+                        if k > 31 {
+                            return Err(Error::invalid(
+                                "h264 cabac residual 8x8: EG0 suffix runaway",
+                            ));
+                        }
+                    }
+                    let mut extra: u32 = 0;
+                    for _ in 0..k {
+                        extra = (extra << 1) | d.decode_bypass()? as u32;
+                    }
+                    14 + (1u32 << k) - 1 + extra
+                } else {
+                    prefix_ones
+                }
+            };
+
+            if value == 0 {
+                num_eq1 += 1;
+            } else {
+                num_gt1 += 1;
+            }
+
+            let sign = d.decode_bypass()?;
+            let level = (value as i32) + 1;
+            coeffs[i as usize] = if sign == 1 { -level } else { level };
+        }
+        i -= 1;
+    }
     Ok(coeffs)
 }
 
