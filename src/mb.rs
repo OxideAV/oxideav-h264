@@ -458,7 +458,11 @@ fn decode_chroma(
     let cstride = pic.chroma_stride();
     let co = pic.chroma_off(mb_x, mb_y);
 
-    // Reconstruct AC blocks for Cb then Cr.
+    // Reconstruct AC blocks for Cb then Cr. nC prediction within an MB uses
+    // the per-block counts we are building up in this loop (§9.2.1.1 —
+    // neighbours that are still being decoded must reflect their current
+    // totals, not the pre-MB zeros). Write the in-progress `nc_arr` back
+    // through `MbInfo` after every block so `predict_nc_chroma` sees it.
     for plane_kind in [true, false] {
         let pred = if plane_kind { &pred_cb } else { &pred_cr };
         let dc = if plane_kind { &dc_cb } else { &dc_cr };
@@ -486,12 +490,12 @@ fn decode_chroma(
                 }
             }
             nc_arr[(br_row << 1) | br_col] = total_coeff as u8;
-        }
-        let info = pic.mb_info_mut(mb_x, mb_y);
-        if plane_kind {
-            info.cb_nc = nc_arr;
-        } else {
-            info.cr_nc = nc_arr;
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            if plane_kind {
+                info.cb_nc = nc_arr;
+            } else {
+                info.cr_nc = nc_arr;
+            }
         }
     }
     Ok(())

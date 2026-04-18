@@ -393,13 +393,29 @@ pub fn predict_intra_16x16(out: &mut [u8; 256], mode: Intra16x16Mode, n: &Intra1
             // §8.3.3.4
             // H = sum_{i=0..7} (i+1) * (top[8+i] - top[6-i])
             // V = sum_{i=0..7} (i+1) * (left[8+i] - left[6-i])
+            // When i == 7, the `-i` term hits `top[-1]` / `left[-1]`, which is
+            // the top-left corner sample stored separately.
+            let top_at = |k: i32| -> i32 {
+                if k < 0 {
+                    n.top_left as i32
+                } else {
+                    n.top[k as usize] as i32
+                }
+            };
+            let left_at = |k: i32| -> i32 {
+                if k < 0 {
+                    n.top_left as i32
+                } else {
+                    n.left[k as usize] as i32
+                }
+            };
             let mut h: i32 = 0;
-            for i in 0..8 {
-                h += (i as i32 + 1) * (n.top[8 + i] as i32 - n.top[6 - i] as i32);
+            for i in 0..8i32 {
+                h += (i + 1) * (top_at(8 + i) - top_at(6 - i));
             }
             let mut v: i32 = 0;
-            for i in 0..8 {
-                v += (i as i32 + 1) * (n.left[8 + i] as i32 - n.left[6 - i] as i32);
+            for i in 0..8i32 {
+                v += (i + 1) * (left_at(8 + i) - left_at(6 - i));
             }
             let b = (5 * h + 32) >> 6;
             let c = (5 * v + 32) >> 6;
@@ -524,14 +540,29 @@ pub fn predict_intra_chroma(out: &mut [u8; 64], mode: IntraChromaMode, n: &Intra
             }
         }
         Plane => {
-            // §8.3.4.4
+            // §8.3.4.4. The sums reach index `-1` of the top/left rows,
+            // which is the top-left corner sample (stored separately).
+            let top_at = |k: i32| -> i32 {
+                if k < 0 {
+                    n.top_left as i32
+                } else {
+                    n.top[k as usize] as i32
+                }
+            };
+            let left_at = |k: i32| -> i32 {
+                if k < 0 {
+                    n.top_left as i32
+                } else {
+                    n.left[k as usize] as i32
+                }
+            };
             let mut h: i32 = 0;
-            for i in 0..4 {
-                h += (i as i32 + 1) * (n.top[4 + i] as i32 - n.top[2 - i] as i32);
+            for i in 0..4i32 {
+                h += (i + 1) * (top_at(4 + i) - top_at(2 - i));
             }
             let mut v: i32 = 0;
-            for i in 0..4 {
-                v += (i as i32 + 1) * (n.left[4 + i] as i32 - n.left[2 - i] as i32);
+            for i in 0..4i32 {
+                v += (i + 1) * (left_at(4 + i) - left_at(2 - i));
             }
             let b = (34 * h + 32) >> 6;
             let c = (34 * v + 32) >> 6;

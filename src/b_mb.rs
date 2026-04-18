@@ -1124,12 +1124,15 @@ fn decode_inter_residual_chroma(
                 }
             }
             nc_arr[(br_row << 1) | br_col] = total_coeff as u8;
-        }
-        let info = pic.mb_info_mut(mb_x, mb_y);
-        if plane_kind {
-            info.cb_nc = nc_arr;
-        } else {
-            info.cr_nc = nc_arr;
+            // Publish the in-progress nc totals back to `MbInfo` after every
+            // block so the next block's `predict_inter_nc_chroma` sees the
+            // up-to-date counts (§9.2.1.1 neighbour prediction).
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            if plane_kind {
+                info.cb_nc = nc_arr;
+            } else {
+                info.cr_nc = nc_arr;
+            }
         }
     }
     Ok(())
