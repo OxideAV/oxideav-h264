@@ -338,12 +338,16 @@ fn decode_16x16_single_dir(
         None
     };
     let mvd_l0 = if ref_l0.is_some() {
-        Some(read_mvd(d, ctxs, pic, mb_x, mb_y, 0, 0, 0)?)
+        let mvd = read_mvd(d, ctxs, pic, mb_x, mb_y, 0, 0, 0)?;
+        write_mvd_abs(pic, mb_x, mb_y, 0, 0, 4, 4, 0, mvd);
+        Some(mvd)
     } else {
         None
     };
     let mvd_l1 = if ref_l1.is_some() {
-        Some(read_mvd(d, ctxs, pic, mb_x, mb_y, 0, 0, 1)?)
+        let mvd = read_mvd(d, ctxs, pic, mb_x, mb_y, 0, 0, 1)?;
+        write_mvd_abs(pic, mb_x, mb_y, 0, 0, 4, 4, 1, mvd);
+        Some(mvd)
     } else {
         None
     };
@@ -397,16 +401,25 @@ fn decode_two_partition(
             )?);
         }
     }
+    // §9.3.3.1.1.7 — write absolute MVD magnitudes into `mvd_lX_abs`
+    // immediately after each partition's MVD decode so the next
+    // partition's MVD ctxIdxInc sees the updated neighbour block.
+    // FFmpeg does this via `fill_rectangle(sl->mvd_cache[list], ...)`
+    // inline with `DECODE_CABAC_MB_MVD`.
     for p in 0..2 {
         if uses_l0(dirs[p]) {
-            let (r0, c0, _, _) = rects[p];
-            mvd_l0[p] = Some(read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 0)?);
+            let (r0, c0, ph, pw) = rects[p];
+            let mvd = read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 0)?;
+            write_mvd_abs(pic, mb_x, mb_y, r0, c0, ph, pw, 0, mvd);
+            mvd_l0[p] = Some(mvd);
         }
     }
     for p in 0..2 {
         if uses_l1(dirs[p]) {
-            let (r0, c0, _, _) = rects[p];
-            mvd_l1[p] = Some(read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 1)?);
+            let (r0, c0, ph, pw) = rects[p];
+            let mvd = read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 1)?;
+            write_mvd_abs(pic, mb_x, mb_y, r0, c0, ph, pw, 1, mvd);
+            mvd_l1[p] = Some(mvd);
         }
     }
     for p in 0..2 {
@@ -495,16 +508,20 @@ fn decode_b_8x8(
         for sub_idx in 0..n {
             if let Some(dir) = dir_opt {
                 let (sr0, sc0) = SUB_OFFSETS[s];
-                let (dr, dc, _sh_h, _sh_w) = sp.sub_rect(sub_idx);
+                let (dr, dc, sh_h, sh_w) = sp.sub_rect(sub_idx);
                 let r0 = sr0 + dr;
                 let c0 = sc0 + dc;
                 let mvd_l0 = if uses_l0(dir) {
-                    Some(read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 0)?)
+                    let mvd = read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 0)?;
+                    write_mvd_abs(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, 0, mvd);
+                    Some(mvd)
                 } else {
                     None
                 };
                 let mvd_l1 = if uses_l1(dir) {
-                    Some(read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 1)?)
+                    let mvd = read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 1)?;
+                    write_mvd_abs(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, 1, mvd);
+                    Some(mvd)
                 } else {
                     None
                 };
@@ -583,10 +600,26 @@ fn compensate_partition(
     } else {
         None
     };
-    // Publish MV + ref_idx state before MC so later neighbour MV lookups
-    // (e.g., adjacent 8×8 sub-MBs) see the right values.
+    // Publish MV + ref_idx + abs-MVD state before MC. §9.3.3.1.1.7 needs
+    // the absolute MVD magnitudes of the left/above neighbour blocks to
+    // derive the ctxIdxInc for later partitions within this MB (and the
+    // first-row blocks of the MB below / first-col blocks of the MB to
+    // the right). FFmpeg tracks this via `mvd_cache[list]` per scan8
+    // entry; we fold it into `mb_info.mvd_lX_abs`.
     {
         let info = pic.mb_info_mut(mb_x, mb_y);
+        let abs0 = mvd_l0.map(|(x, y)| {
+            (
+                (x.unsigned_abs()).min(u16::MAX as u32) as u16,
+                (y.unsigned_abs()).min(u16::MAX as u32) as u16,
+            )
+        });
+        let abs1 = mvd_l1.map(|(x, y)| {
+            (
+                (x.unsigned_abs()).min(u16::MAX as u32) as u16,
+                (y.unsigned_abs()).min(u16::MAX as u32) as u16,
+            )
+        });
         for rr in r0..r0 + ph {
             for cc in c0..c0 + pw {
                 let idx = rr * 4 + cc;
@@ -597,6 +630,12 @@ fn compensate_partition(
                 if let (Some(r), Some(mv)) = (ref_idx_l1, mv_l1) {
                     info.ref_idx_l1[idx] = r;
                     info.mv_l1[idx] = mv;
+                }
+                if let Some(a) = abs0 {
+                    info.mvd_l0_abs[idx] = a;
+                }
+                if let Some(a) = abs1 {
+                    info.mvd_l1_abs[idx] = a;
                 }
             }
         }
@@ -695,6 +734,38 @@ pub(crate) fn read_ref_idx_lx(
         )));
     }
     Ok(raw as i8)
+}
+
+/// Publish the absolute MVD magnitudes for a partition's 4×4 blocks
+/// into `mvd_l{0,1}_abs`. §9.3.3.1.1.7 reads the neighbour block's
+/// abs-MVD for the MVD ctxIdxInc, so a later partition within the
+/// same MB needs to see the earlier partition's magnitudes. FFmpeg
+/// tracks this via `mvd_cache[list]` and writes it inline with every
+/// `DECODE_CABAC_MB_MVD` invocation.
+pub(crate) fn write_mvd_abs(
+    pic: &mut Picture,
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    ph: usize,
+    pw: usize,
+    list: u8,
+    mvd: (i32, i32),
+) {
+    let ax = (mvd.0.unsigned_abs()).min(u16::MAX as u32) as u16;
+    let ay = (mvd.1.unsigned_abs()).min(u16::MAX as u32) as u16;
+    let info = pic.mb_info_mut(mb_x, mb_y);
+    let dst = if list == 0 {
+        &mut info.mvd_l0_abs
+    } else {
+        &mut info.mvd_l1_abs
+    };
+    for rr in r0..r0 + ph {
+        for cc in c0..c0 + pw {
+            dst[rr * 4 + cc] = (ax, ay);
+        }
+    }
 }
 
 pub(crate) fn read_mvd(

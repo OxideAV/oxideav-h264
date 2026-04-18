@@ -39,12 +39,13 @@ use crate::cabac::residual::{BlockCat, CbfNeighbours};
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_SKIP_FLAG_B,
     CTX_IDX_MB_SKIP_FLAG_P, CTX_IDX_MB_TYPE_B, CTX_IDX_MB_TYPE_I, CTX_IDX_MB_TYPE_INTRA_IN_P,
-    CTX_IDX_MB_TYPE_P, CTX_IDX_REF_IDX_L0, CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
+    CTX_IDX_MB_TYPE_P, CTX_IDX_REF_IDX_L0, CTX_IDX_SUB_MB_TYPE_B, CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
 };
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_444::{self as mb444, Plane};
 use crate::mb_type::{
-    decode_b_slice_mb_type, decode_i_slice_mb_type, BMbType, IMbType, PMbType, PPartition,
+    decode_b_slice_mb_type, decode_b_sub_mb_type, decode_i_slice_mb_type, BMbType, BSubPartition,
+    IMbType, PMbType, PPartition, PredDir,
 };
 use crate::motion::predict_mv_l0;
 use crate::p_mb_444::{l0_luma_weight, lookup_ref_444, mc_partition_all_planes};
@@ -208,23 +209,37 @@ pub fn decode_b_mb_cabac_444(
     };
 
     if mb_type_raw == 48 {
-        decode_intra_in_p_cabac_444(d, ctxs, sh, sps, pps, mb_x, mb_y, pic, prev_qp, IMbType::IPcm)?;
+        decode_intra_in_p_cabac_444(
+            d,
+            ctxs,
+            sh,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            prev_qp,
+            IMbType::IPcm,
+        )?;
         return Ok(false);
     }
     let bmb = decode_b_slice_mb_type(mb_type_raw).ok_or_else(|| {
-        Error::invalid(format!("h264 cabac 4:4:4 b-slice: bad mb_type {mb_type_raw}"))
+        Error::invalid(format!(
+            "h264 cabac 4:4:4 b-slice: bad mb_type {mb_type_raw}"
+        ))
     })?;
     match bmb {
         BMbType::IntraInB(imb) => {
             decode_intra_in_p_cabac_444(d, ctxs, sh, sps, pps, mb_x, mb_y, pic, prev_qp, imb)?;
             Ok(false)
         }
-        BMbType::Inter { partition: _ } => Err(Error::unsupported(
-            "h264: CABAC 4:4:4 B-slice inter macroblocks not yet wired — \
-             CABAC context state diverges during Cb/Cr residual decode after \
-             Direct16x16 / TwoPart16x8 / 8x16 partitions; intra-in-B + B_Skip \
-             are supported",
-        )),
+        BMbType::Inter { partition } => {
+            decode_b_inter_444(
+                d, ctxs, sh, sps, pps, mb_x, mb_y, pic, ref_list0, ref_list1, bctx, prev_qp,
+                partition,
+            )?;
+            Ok(false)
+        }
     }
 }
 
@@ -233,12 +248,12 @@ pub fn decode_b_mb_cabac_444(
 // still returns Unsupported.
 // ---------------------------------------------------------------------------
 
-// The helpers below stage a first cut at CABAC 4:4:4 B-inter decode.
-// They're kept as a starting point for the follow-up that resolves the
-// CBF-bank divergence observed after Direct16x16 / TwoPart partitions;
-// until that's fixed the top-level `decode_b_mb_cabac_444` returns
-// `Error::Unsupported` for any B inter partition.
-#[allow(dead_code, clippy::too_many_arguments)]
+// CABAC 4:4:4 B-inter decode — dispatches by partition, reads list-0/1
+// ref_idx and MVDs in §7.3.5.1 syntax order, then runs the 4:4:4
+// luma-filter motion compensation on all three planes, followed by
+// three plane-aligned luma-style residual streams gated by the 4-bit
+// inter CBP.
+#[allow(clippy::too_many_arguments)]
 fn decode_b_inter_444(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
@@ -273,26 +288,52 @@ fn decode_b_inter_444(
             // scratch so the CAVLC direct-mode compensator (written against
             // 4:2:0 planes) can do its work, then mirror the MB MV state
             // back and re-apply MC on 4:4:4 via `apply_mvs_444`.
-            let (mvs, dirs) = snapshot_b_direct_mv_state(
-                sh, sps, bctx, mb_x, mb_y, pic, ref_list0, ref_list1,
-            )?;
+            let (mvs, dirs) =
+                snapshot_b_direct_mv_state(sh, sps, bctx, mb_x, mb_y, pic, ref_list0, ref_list1)?;
             crate::b_mb_444::apply_mvs_444(
                 pic, ref_list0, ref_list1, sh, bctx, mb_x, mb_y, &mvs, &dirs,
             );
         }
         BPartition::L0_16x16 => {
             decode_b_16x16_single(
-                d, ctxs, sh, bctx, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::L0,
+                d,
+                ctxs,
+                sh,
+                bctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::L0,
             )?;
         }
         BPartition::L1_16x16 => {
             decode_b_16x16_single(
-                d, ctxs, sh, bctx, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::L1,
+                d,
+                ctxs,
+                sh,
+                bctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::L1,
             )?;
         }
         BPartition::Bi_16x16 => {
             decode_b_16x16_single(
-                d, ctxs, sh, bctx, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::BiPred,
+                d,
+                ctxs,
+                sh,
+                bctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::BiPred,
             )?;
         }
         BPartition::TwoPart16x8 { dirs } => {
@@ -308,9 +349,9 @@ fn decode_b_inter_444(
             )?;
         }
         BPartition::B8x8 => {
-            return Err(Error::unsupported(
-                "h264: CABAC 4:4:4 B_8x8 not yet wired — Direct/L0/L1/Bi 16x16 + TwoPart16x8/8x16 + intra-in-B + B_Skip only",
-            ));
+            decode_b_8x8_444(
+                d, ctxs, sh, sps, bctx, mb_x, mb_y, pic, ref_list0, ref_list1,
+            )?;
         }
     }
 
@@ -330,8 +371,7 @@ fn decode_b_inter_444(
 
     let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 {
         let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
-        let slice =
-            &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+        let slice = &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
         binarize::decode_transform_size_8x8_flag(d, slice, inc)?
     } else {
         false
@@ -379,7 +419,7 @@ fn decode_b_inter_444(
     Ok(())
 }
 
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn decode_b_16x16_single(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
@@ -426,12 +466,16 @@ fn decode_b_16x16_single(
         None
     };
     let mvd_l0 = if uses_l0 {
-        Some(crate::cabac::b_mb::read_mvd(d, ctxs, pic, mb_x, mb_y, 0, 0, 0)?)
+        let mvd = crate::cabac::b_mb::read_mvd(d, ctxs, pic, mb_x, mb_y, 0, 0, 0)?;
+        crate::cabac::b_mb::write_mvd_abs(pic, mb_x, mb_y, 0, 0, 4, 4, 0, mvd);
+        Some(mvd)
     } else {
         None
     };
     let mvd_l1 = if uses_l1 {
-        Some(crate::cabac::b_mb::read_mvd(d, ctxs, pic, mb_x, mb_y, 0, 0, 1)?)
+        let mvd = crate::cabac::b_mb::read_mvd(d, ctxs, pic, mb_x, mb_y, 0, 0, 1)?;
+        crate::cabac::b_mb::write_mvd_abs(pic, mb_x, mb_y, 0, 0, 4, 4, 1, mvd);
+        Some(mvd)
     } else {
         None
     };
@@ -441,7 +485,7 @@ fn decode_b_16x16_single(
     )
 }
 
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn decode_b_two_partition(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
@@ -481,20 +525,28 @@ fn decode_b_two_partition(
             )?);
         }
     }
+    // §9.3.3.1.1.7 — each MVD's ctxIdxInc depends on abs-MVD of left +
+    // above neighbour blocks in the current MB's scan8 layout. FFmpeg
+    // (`h264_cabac.c::DECODE_CABAC_MB_MVD`) fills `mvd_cache[list]`
+    // immediately after each MVD decode via `fill_rectangle`, before
+    // the next MVD decode. Mirror that here by writing `mvd_lX_abs`
+    // into `pic.mb_info` as we go; otherwise a 16×8 / 8×16 second
+    // partition's MVD ctx drifts because the first partition's blocks
+    // still read back 0.
     for p in 0..2 {
         if uses_l0(dirs[p]) {
-            let (r0, c0, _, _) = rects[p];
-            mvd_l0[p] = Some(crate::cabac::b_mb::read_mvd(
-                d, ctxs, pic, mb_x, mb_y, r0, c0, 0,
-            )?);
+            let (r0, c0, ph, pw) = rects[p];
+            let mvd = crate::cabac::b_mb::read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 0)?;
+            crate::cabac::b_mb::write_mvd_abs(pic, mb_x, mb_y, r0, c0, ph, pw, 0, mvd);
+            mvd_l0[p] = Some(mvd);
         }
     }
     for p in 0..2 {
         if uses_l1(dirs[p]) {
-            let (r0, c0, _, _) = rects[p];
-            mvd_l1[p] = Some(crate::cabac::b_mb::read_mvd(
-                d, ctxs, pic, mb_x, mb_y, r0, c0, 1,
-            )?);
+            let (r0, c0, ph, pw) = rects[p];
+            let mvd = crate::cabac::b_mb::read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 1)?;
+            crate::cabac::b_mb::write_mvd_abs(pic, mb_x, mb_y, r0, c0, ph, pw, 1, mvd);
+            mvd_l1[p] = Some(mvd);
         }
     }
     for p in 0..2 {
@@ -507,11 +559,218 @@ fn decode_b_two_partition(
     Ok(())
 }
 
+/// B_8x8 under ChromaArrayType = 3. Mirrors the 4:2:0 CABAC B_8x8
+/// syntax walk (§7.3.5.1 — sub_mb_type for each sub, then ref_idx_l0,
+/// ref_idx_l1, mvd_l0, mvd_l1 streamed per sub-MB) and then runs MC
+/// on all three planes via [`crate::b_mb_444::compensate_444_partition`]
+/// / the direct-8x8 snapshot helper.
+#[allow(clippy::too_many_arguments)]
+fn decode_b_8x8_444(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    sh: &SliceHeader,
+    sps: &Sps,
+    bctx: &BSliceCtx<'_>,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+) -> Result<()> {
+    const SUB_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 2), (2, 0), (2, 2)];
+    let uses_l0 = |dir: PredDir| matches!(dir, PredDir::L0 | PredDir::BiPred);
+    let uses_l1 = |dir: PredDir| matches!(dir, PredDir::L1 | PredDir::BiPred);
+    let num_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
+    let num_l1 = sh.num_ref_idx_l1_active_minus1 + 1;
+    let mut subs = [BSubPartition::Direct8x8; 4];
+    for s in 0..4 {
+        let raw = {
+            let slice = &mut ctxs[CTX_IDX_SUB_MB_TYPE_B..CTX_IDX_SUB_MB_TYPE_B + 4];
+            binarize::decode_sub_mb_type_b(d, slice)?
+        };
+        subs[s] = decode_b_sub_mb_type(raw).ok_or_else(|| {
+            Error::invalid(format!("h264 cabac 4:4:4 b-slice: bad sub_mb_type {raw}"))
+        })?;
+    }
+
+    // ref_idx_l0 for non-direct L0/BiPred sub-MBs.
+    let mut ref_l0 = [None; 4];
+    let mut ref_l1 = [None; 4];
+    for s in 0..4 {
+        if let Some(dir) = subs[s].pred_dir() {
+            if uses_l0(dir) {
+                let (sr0, sc0) = SUB_OFFSETS[s];
+                ref_l0[s] = Some(crate::cabac::b_mb::read_ref_idx_lx(
+                    d, ctxs, pic, mb_x, mb_y, sr0, sc0, num_l0, 0,
+                )?);
+            }
+        }
+    }
+    for s in 0..4 {
+        if let Some(dir) = subs[s].pred_dir() {
+            if uses_l1(dir) {
+                let (sr0, sc0) = SUB_OFFSETS[s];
+                ref_l1[s] = Some(crate::cabac::b_mb::read_ref_idx_lx(
+                    d, ctxs, pic, mb_x, mb_y, sr0, sc0, num_l1, 1,
+                )?);
+            }
+        }
+    }
+    // mvd_l0 then mvd_l1 across all sub-partitions; fill mvd_abs inline
+    // so subsequent sub-MBs' MVD ctx sees the updated neighbours.
+    #[derive(Clone, Copy, Default)]
+    struct SubMvd {
+        mvd_l0: Option<(i32, i32)>,
+        mvd_l1: Option<(i32, i32)>,
+    }
+    let mut mvds: Vec<Vec<SubMvd>> = Vec::with_capacity(4);
+    for s in 0..4 {
+        let sp = subs[s];
+        let n = sp.num_sub_partitions();
+        let mut entry = Vec::with_capacity(n);
+        let dir_opt = sp.pred_dir();
+        for sub_idx in 0..n {
+            if let Some(dir) = dir_opt {
+                let (sr0, sc0) = SUB_OFFSETS[s];
+                let (dr, dc, sh_h, sh_w) = sp.sub_rect(sub_idx);
+                let r0 = sr0 + dr;
+                let c0 = sc0 + dc;
+                let mvd_l0 = if uses_l0(dir) {
+                    let mvd = crate::cabac::b_mb::read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 0)?;
+                    crate::cabac::b_mb::write_mvd_abs(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, 0, mvd);
+                    Some(mvd)
+                } else {
+                    None
+                };
+                let mvd_l1 = if uses_l1(dir) {
+                    let mvd = crate::cabac::b_mb::read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 1)?;
+                    crate::cabac::b_mb::write_mvd_abs(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, 1, mvd);
+                    Some(mvd)
+                } else {
+                    None
+                };
+                entry.push(SubMvd { mvd_l0, mvd_l1 });
+            } else {
+                entry.push(SubMvd::default());
+            }
+        }
+        mvds.push(entry);
+    }
+
+    // Compensate each sub-MB on all three planes.
+    for s in 0..4 {
+        let sp = subs[s];
+        let (sr0, sc0) = SUB_OFFSETS[s];
+        if matches!(sp, BSubPartition::Direct8x8) {
+            // Direct 8×8 — derive MVs through the CAVLC compensator on a
+            // 4:2:0 scratch, then snapshot + re-MC on 4:4:4 via the
+            // shared helper.
+            let (mvs, dirs) = snapshot_b_direct_8x8_mv_state(
+                sh, sps, bctx, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1,
+            )?;
+            crate::b_mb_444::apply_mvs_444_rect_pub(
+                pic, ref_list0, ref_list1, sh, bctx, mb_x, mb_y, sr0, sc0, 2, 2, &mvs, &dirs,
+            );
+            continue;
+        }
+        let dir = sp.pred_dir().expect("non-direct");
+        for sub_idx in 0..sp.num_sub_partitions() {
+            let (dr, dc, sh_h, sh_w) = sp.sub_rect(sub_idx);
+            let r0 = sr0 + dr;
+            let c0 = sc0 + dc;
+            let m = mvds[s][sub_idx];
+            crate::b_mb_444::compensate_444_partition(
+                sh, bctx, pic, ref_list0, ref_list1, mb_x, mb_y, r0, c0, sh_h, sh_w, dir,
+                ref_l0[s], ref_l1[s], m.mvd_l0, m.mvd_l1,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// 8×8 direct-mode snapshot mirroring [`snapshot_b_direct_mv_state`]
+/// — drives `direct_8x8_compensate_pub` on a 4:2:0 scratch picture so
+/// §8.4.1.2 resolves the sub-MB MVs, then returns a 16-slot MV grid
+/// restricted to the sub-MB rect.
+#[allow(clippy::too_many_arguments)]
+fn snapshot_b_direct_8x8_mv_state(
+    sh: &SliceHeader,
+    sps: &Sps,
+    ctx: &BSliceCtx<'_>,
+    mb_x: u32,
+    mb_y: u32,
+    sr0: usize,
+    sc0: usize,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+) -> Result<(
+    crate::b_mb_444::PerBlockMv,
+    [Option<crate::mb_type::PredDir>; 16],
+)> {
+    let mut scratch = crate::b_mb_444::make_420_scratch_pub(pic);
+    let refs420_0: Vec<crate::picture::Picture> = ref_list0
+        .iter()
+        .map(|r| crate::b_mb_444::to_420_reference_pub(r))
+        .collect();
+    let refs420_1: Vec<crate::picture::Picture> = ref_list1
+        .iter()
+        .map(|r| crate::b_mb_444::to_420_reference_pub(r))
+        .collect();
+    let r0: Vec<&crate::picture::Picture> = refs420_0.iter().collect();
+    let r1: Vec<&crate::picture::Picture> = refs420_1.iter().collect();
+    crate::b_mb::direct_8x8_compensate_pub(
+        sh,
+        sps,
+        ctx,
+        mb_x,
+        mb_y,
+        sr0,
+        sc0,
+        &mut scratch,
+        &r0,
+        &r1,
+    )?;
+    // Merge scratch MB info back — the direct path only updates the
+    // sub-MB rect (rows sr0..sr0+2, cols sc0..sc0+2).
+    {
+        let src = scratch.mb_info_at(mb_x, mb_y).clone();
+        let dst = pic.mb_info_mut(mb_x, mb_y);
+        for rr in sr0..sr0 + 2 {
+            for cc in sc0..sc0 + 2 {
+                let idx = rr * 4 + cc;
+                dst.ref_idx_l0[idx] = src.ref_idx_l0[idx];
+                dst.ref_idx_l1[idx] = src.ref_idx_l1[idx];
+                dst.mv_l0[idx] = src.mv_l0[idx];
+                dst.mv_l1[idx] = src.mv_l1[idx];
+            }
+        }
+    }
+    let info = pic.mb_info_at(mb_x, mb_y);
+    let mut mvs = crate::b_mb_444::PerBlockMv::default();
+    let mut dirs = [None; 16];
+    for i in 0..16 {
+        let ri0 = info.ref_idx_l0[i];
+        let ri1 = info.ref_idx_l1[i];
+        mvs.ref_l0[i] = ri0;
+        mvs.ref_l1[i] = ri1;
+        mvs.mv_l0[i] = info.mv_l0[i];
+        mvs.mv_l1[i] = info.mv_l1[i];
+        dirs[i] = match (ri0 >= 0, ri1 >= 0) {
+            (true, true) => Some(PredDir::BiPred),
+            (true, false) => Some(PredDir::L0),
+            (false, true) => Some(PredDir::L1),
+            (false, false) => None,
+        };
+    }
+    Ok((mvs, dirs))
+}
+
 /// Resolve direct-mode MVs for a whole MB (§8.4.1.2) and materialise
 /// the per-4×4 MV / ref / dir grid ready to hand to
 /// [`crate::b_mb_444::apply_mvs_444`]. Uses the shared 4:2:0 scratch +
 /// `direct_16x16_compensate_pub` pattern from the CAVLC 4:4:4 path.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn snapshot_b_direct_mv_state(
     sh: &SliceHeader,
     sps: &Sps,
@@ -530,15 +789,17 @@ fn snapshot_b_direct_mv_state(
     // write 4:2:0 chroma samples; we'll discard those and re-run MC on
     // 4:4:4 with the resulting MV grid.
     let mut scratch = crate::b_mb_444::make_420_scratch_pub(pic);
-    let refs420_0: Vec<crate::picture::Picture> =
-        ref_list0.iter().map(|r| crate::b_mb_444::to_420_reference_pub(r)).collect();
-    let refs420_1: Vec<crate::picture::Picture> =
-        ref_list1.iter().map(|r| crate::b_mb_444::to_420_reference_pub(r)).collect();
+    let refs420_0: Vec<crate::picture::Picture> = ref_list0
+        .iter()
+        .map(|r| crate::b_mb_444::to_420_reference_pub(r))
+        .collect();
+    let refs420_1: Vec<crate::picture::Picture> = ref_list1
+        .iter()
+        .map(|r| crate::b_mb_444::to_420_reference_pub(r))
+        .collect();
     let r0: Vec<&crate::picture::Picture> = refs420_0.iter().collect();
     let r1: Vec<&crate::picture::Picture> = refs420_1.iter().collect();
-    crate::b_mb::direct_16x16_compensate_pub(
-        sh, sps, ctx, mb_x, mb_y, &mut scratch, &r0, &r1,
-    )?;
+    crate::b_mb::direct_16x16_compensate_pub(sh, sps, ctx, mb_x, mb_y, &mut scratch, &r0, &r1)?;
     {
         let src = scratch.mb_info_at(mb_x, mb_y).clone();
         let dst = pic.mb_info_mut(mb_x, mb_y);
@@ -674,8 +935,7 @@ fn decode_p_inter_444(
     // wired for 4:4:4 chroma).
     let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 {
         let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
-        let slice =
-            &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+        let slice = &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
         binarize::decode_transform_size_8x8_flag(d, slice, inc)?
     } else {
         false

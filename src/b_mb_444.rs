@@ -176,17 +176,19 @@ fn decode_b_inter_mb_444(
                 BPartition::Bi_16x16 => PredDir::BiPred,
                 _ => unreachable!(),
             };
-            handle_16x16_single_dir(
-                br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, dir,
-            )?;
+            handle_16x16_single_dir(br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, dir)?;
         }
         BPartition::TwoPart16x8 { dirs } => {
             let rects = [(0usize, 0usize, 2usize, 4usize), (2, 0, 2, 4)];
-            handle_two_partition(br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, &rects, &dirs)?;
+            handle_two_partition(
+                br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, &rects, &dirs,
+            )?;
         }
         BPartition::TwoPart8x16 { dirs } => {
             let rects = [(0usize, 0usize, 4usize, 2usize), (0, 2, 4, 2)];
-            handle_two_partition(br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, &rects, &dirs)?;
+            handle_two_partition(
+                br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, &rects, &dirs,
+            )?;
         }
         BPartition::B8x8 => {
             handle_b8x8(br, sh, sps, ctx, mb_x, mb_y, pic, ref_list0, ref_list1)?;
@@ -369,8 +371,16 @@ fn handle_16x16_single_dir(
 ) -> Result<()> {
     let num_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
     let num_l1 = sh.num_ref_idx_l1_active_minus1 + 1;
-    let ref_l0 = if uses_l0(dir) { Some(read_ref_idx(br, num_l0)?) } else { None };
-    let ref_l1 = if uses_l1(dir) { Some(read_ref_idx(br, num_l1)?) } else { None };
+    let ref_l0 = if uses_l0(dir) {
+        Some(read_ref_idx(br, num_l0)?)
+    } else {
+        None
+    };
+    let ref_l1 = if uses_l1(dir) {
+        Some(read_ref_idx(br, num_l1)?)
+    } else {
+        None
+    };
     let mvd_l0 = if uses_l0(dir) {
         Some((br.read_se()? as i32, br.read_se()? as i32))
     } else {
@@ -520,9 +530,7 @@ fn handle_b8x8(
                 ref_list0,
                 ref_list1,
                 |sh2, sps2, ctx2, pic2, rl0, rl1| {
-                    direct_8x8_compensate_pub(
-                        sh2, sps2, ctx2, mb_x, mb_y, sr0, sc0, pic2, rl0, rl1,
-                    )
+                    direct_8x8_compensate_pub(sh2, sps2, ctx2, mb_x, mb_y, sr0, sc0, pic2, rl0, rl1)
                 },
             )?;
             apply_mvs_444_rect(
@@ -537,22 +545,8 @@ fn handle_b8x8(
             let c0 = sc0 + dc;
             let m = mvds[s][sub_idx];
             compensate_444_partition(
-                sh,
-                ctx,
-                pic,
-                ref_list0,
-                ref_list1,
-                mb_x,
-                mb_y,
-                r0,
-                c0,
-                sh_h,
-                sh_w,
-                dir,
-                ref_l0[s],
-                ref_l1[s],
-                m.mvd_l0,
-                m.mvd_l1,
+                sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, r0, c0, sh_h, sh_w, dir, ref_l0[s],
+                ref_l1[s], m.mvd_l0, m.mvd_l1,
             )?;
         }
     }
@@ -599,6 +593,21 @@ pub(crate) fn compensate_444_partition(
     };
     {
         let info = pic.mb_info_mut(mb_x, mb_y);
+        // §9.3.3.1.1.7 — subsequent partitions' MVD ctxIdxInc needs
+        // `mvd_l{0,1}_abs` populated for already-decoded blocks of this
+        // MB (same layout FFmpeg tracks via `mvd_cache[list]`).
+        let abs0 = mvd_l0.map(|(x, y)| {
+            (
+                (x.unsigned_abs()).min(u16::MAX as u32) as u16,
+                (y.unsigned_abs()).min(u16::MAX as u32) as u16,
+            )
+        });
+        let abs1 = mvd_l1.map(|(x, y)| {
+            (
+                (x.unsigned_abs()).min(u16::MAX as u32) as u16,
+                (y.unsigned_abs()).min(u16::MAX as u32) as u16,
+            )
+        });
         for rr in r0..r0 + ph {
             for cc in c0..c0 + pw {
                 let idx = rr * 4 + cc;
@@ -610,27 +619,19 @@ pub(crate) fn compensate_444_partition(
                     info.ref_idx_l1[idx] = r;
                     info.mv_l1[idx] = mv;
                 }
+                if let Some(a) = abs0 {
+                    info.mvd_l0_abs[idx] = a;
+                }
+                if let Some(a) = abs1 {
+                    info.mvd_l1_abs[idx] = a;
+                }
             }
         }
     }
     // Apply 4:4:4 motion compensation directly on `pic`.
     mc_partition_444(
-        pic,
-        ref_list0,
-        ref_list1,
-        sh,
-        ctx,
-        mb_x,
-        mb_y,
-        r0,
-        c0,
-        ph,
-        pw,
-        dir,
-        ref_idx_l0,
-        ref_idx_l1,
-        mv_l0,
-        mv_l1,
+        pic, ref_list0, ref_list1, sh, ctx, mb_x, mb_y, r0, c0, ph, pw, dir, ref_idx_l0,
+        ref_idx_l1, mv_l0, mv_l1,
     );
     Ok(())
 }
@@ -652,6 +653,30 @@ pub(crate) fn apply_mvs_444(
 ) {
     apply_mvs_444_rect(
         pic, ref_list0, ref_list1, sh, ctx, mb_x, mb_y, 0, 0, 4, 4, mvs, dirs,
+    )
+}
+
+/// Public wrapper for [`apply_mvs_444_rect`] — exposed so the CABAC
+/// 4:4:4 B path can run MC on a single 8×8 sub-MB rect (used by the
+/// direct-8×8 helper after snapshotting the MV grid).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_mvs_444_rect_pub(
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+    sh: &SliceHeader,
+    ctx: &BSliceCtx<'_>,
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    h: usize,
+    w: usize,
+    mvs: &PerBlockMv,
+    dirs: &[Option<PredDir>; 16],
+) {
+    apply_mvs_444_rect(
+        pic, ref_list0, ref_list1, sh, ctx, mb_x, mb_y, r0, c0, h, w, mvs, dirs,
     )
 }
 
@@ -741,10 +766,20 @@ fn mc_partition_444(
         }
     }
 
-    let r0p = ref_idx_l0
-        .and_then(|r| if (r as usize) < ref_list0.len() { Some(ref_list0[r as usize]) } else { None });
-    let r1p = ref_idx_l1
-        .and_then(|r| if (r as usize) < ref_list1.len() { Some(ref_list1[r as usize]) } else { None });
+    let r0p = ref_idx_l0.and_then(|r| {
+        if (r as usize) < ref_list0.len() {
+            Some(ref_list0[r as usize])
+        } else {
+            None
+        }
+    });
+    let r1p = ref_idx_l1.and_then(|r| {
+        if (r as usize) < ref_list1.len() {
+            Some(ref_list1[r as usize])
+        } else {
+            None
+        }
+    });
 
     for plane in [mb444::Plane::Y, mb444::Plane::Cb, mb444::Plane::Cr] {
         let mut tmp0 = vec![0u8; pw * ph];
@@ -882,11 +917,7 @@ fn write_plane(
     }
 }
 
-fn resolve_bipred_mode(
-    ctx: &BSliceCtx<'_>,
-    r0: i8,
-    r1: i8,
-) -> (BipredMode, ImplicitBiWeights) {
+fn resolve_bipred_mode(ctx: &BSliceCtx<'_>, r0: i8, r1: i8) -> (BipredMode, ImplicitBiWeights) {
     match ctx.bipred_mode {
         BipredMode::Implicit => {
             let (weights, ok) = match (
@@ -895,10 +926,9 @@ fn resolve_bipred_mode(
                 ctx.list0_short_term.get(r0.max(0) as usize),
                 ctx.list1_short_term.get(r1.max(0) as usize),
             ) {
-                (Some(&p0), Some(&p1), Some(&s0), Some(&s1)) => (
-                    implicit_bipred_weights(ctx.curr_poc, p0, p1, s0, s1),
-                    true,
-                ),
+                (Some(&p0), Some(&p1), Some(&s0), Some(&s1)) => {
+                    (implicit_bipred_weights(ctx.curr_poc, p0, p1, s0, s1), true)
+                }
                 _ => (ImplicitBiWeights::Default, false),
             };
             let _ = ok;
@@ -908,11 +938,7 @@ fn resolve_bipred_mode(
     }
 }
 
-fn list_luma_weights_for_bi(
-    pwt: &PredWeightTable,
-    r0: i8,
-    r1: i8,
-) -> (LumaWeight, LumaWeight) {
+fn list_luma_weights_for_bi(pwt: &PredWeightTable, r0: i8, r1: i8) -> (LumaWeight, LumaWeight) {
     let idx0 = r0.max(0) as usize;
     let idx1 = r1.max(0) as usize;
     let lw0 = pwt.luma_l0.get(idx0).copied().unwrap_or_default();
