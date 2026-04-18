@@ -3,8 +3,10 @@
 Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
 oxideav. Decodes CAVLC + CABAC I-slices, CAVLC + CABAC P-slices, and
 CAVLC + CABAC B-slices (spatial + temporal direct + explicit weighted
-bipred + implicit weighted bipred); encodes a minimal Baseline-Profile,
-I-frame-only, Intra_16×16 DC_PRED output stream. **High-Profile 8×8
+bipred + implicit weighted bipred); primary **SI / SP slices** decode
+through the CAVLC 4:2:0 / 8-bit path (`slice_qs_delta ==
+slice_qp_delta` — the §8.6 identity case); encodes a minimal
+Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED output stream. **High-Profile 8×8
 transform** is wired end-to-end on both the CAVLC path (§7.3.5.3.2,
 §8.5.13, bit-exact against libavcodec) and the CABAC path
 (§9.3.3.1.1.10 for the transform size flag + §9.3.3.1.1.9
@@ -370,7 +372,13 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   section below). 10-bit covers CAVLC I / P / B + CABAC I. Luma must
   equal chroma bit depth. Separate colour planes (§7.4.2.1.1) are
   rejected.
-- SI / SP slices.
+- **Primary SI / SP slices** (§7.3.5 / §7.4.5 Table 7-12 / Table 7-13
+  SP entries / §8.6) are **supported** on the CAVLC 4:2:0 / 8-bit
+  path when `slice_qs_delta == slice_qp_delta` (the §8.6.1 / §8.6.2
+  dequant+requant pair is the identity in that case). Secondary SI /
+  SP (the `sp_for_switch_flag = 1` or `QS != QP` switching targets)
+  return `Error::Unsupported`; CABAC SI / SP and high-bit-depth /
+  4:2:2 / 4:4:4 SI / SP are rejected at the slice-entry gate.
 
 ## 10-bit (High 10) decode
 
