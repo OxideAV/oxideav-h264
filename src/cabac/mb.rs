@@ -196,14 +196,16 @@ pub(crate) struct ResidualCtxPlan {
 
 impl ResidualCtxPlan {
     /// Build the 43-entry ctxIdx plan for the given ctxBlockCat and the
-    /// neighbour-derived `coded_block_flag` increment.
-    pub fn new(cat: BlockCat, neighbours: &CbfNeighbours) -> Self {
+    /// neighbour-derived `coded_block_flag` increment. `intra` selects the
+    /// unavailable-neighbour default per §9.3.3.1.1.9 (condTermFlagN = 1
+    /// for intra, 0 for inter).
+    pub fn new(cat: BlockCat, neighbours: &CbfNeighbours, intra: bool) -> Self {
         let ctx_block_cat = cat.ctx_block_cat() as usize;
-        let cbf_inc = coded_block_flag_inc(neighbours) as usize;
+        let cbf_inc = coded_block_flag_inc(neighbours, intra) as usize;
         let cbf_base = CTX_IDX_CODED_BLOCK_FLAG + ctx_block_cat * 4;
         let sig_base = CTX_IDX_SIGNIFICANT_COEFF_FLAG + SIG_BASE_OFFSETS[ctx_block_cat];
         let last_base = CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG + SIG_BASE_OFFSETS[ctx_block_cat];
-        let lvl_base = CTX_IDX_COEFF_ABS_LEVEL_MINUS1 + ctx_block_cat * 10;
+        let lvl_base = CTX_IDX_COEFF_ABS_LEVEL_MINUS1 + LVL_BASE_OFFSETS[ctx_block_cat];
         let mut indices = [0usize; 43];
         indices[0] = cbf_base + cbf_inc;
         for i in 0..16 {
@@ -238,14 +240,17 @@ impl ResidualCtxPlan {
 /// Decode one residual block through the shared plan, updating the
 /// slice-wide CABAC state in place. Wraps [`decode_residual_block_cabac`]
 /// with the gather/scatter plumbing so adaptive probabilities persist.
+/// `intra` selects the unavailable-neighbour default for the CBF ctxIdxInc
+/// per §9.3.3.1.1.9 (1 when the current MB is intra-coded, 0 otherwise).
 pub(crate) fn decode_residual_block_in_place(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
     cat: BlockCat,
     neighbours: &CbfNeighbours,
     max_num_coeff: usize,
+    intra: bool,
 ) -> Result<[i32; 16]> {
-    let plan = ResidualCtxPlan::new(cat, neighbours);
+    let plan = ResidualCtxPlan::new(cat, neighbours, intra);
     let mut window = plan.gather(ctxs);
     let result = decode_residual_block_cabac(d, &mut window, cat, neighbours, max_num_coeff)?;
     plan.scatter(ctxs, &window);
@@ -256,9 +261,18 @@ pub(crate) fn decode_residual_block_in_place(
 /// significant/last coeff flag tables. Indexed by `BlockCat::ctx_block_cat()`.
 pub(crate) const SIG_BASE_OFFSETS: [usize; 5] = [0, 15, 29, 44, 47];
 
-fn coded_block_flag_inc(neighbours: &CbfNeighbours) -> u8 {
-    let a = neighbours.left.unwrap_or(false) as u8;
-    let b = neighbours.above.unwrap_or(false) as u8;
+/// Table 9-30 — `ctxIdxBlockCatOffset` for `coeff_abs_level_minus1`.
+/// Note cat 3 (ChromaDC) consumes 9 slots, not 10, so cat 4 starts at 39.
+pub(crate) const LVL_BASE_OFFSETS: [usize; 5] = [0, 10, 20, 30, 39];
+
+fn coded_block_flag_inc(neighbours: &CbfNeighbours, intra_default: bool) -> u8 {
+    // §9.3.3.1.1.9: for an intra MB with unavailable neighbour,
+    // condTermFlagN = 1 (§9.3.3.1.1.9 para "Otherwise, if any of the
+    // following conditions is true, condTermFlagN is set equal to 1:
+    // mbAddrN is not available and the current MB is coded in Intra
+    // prediction mode"). Inter MBs default to 0.
+    let a = neighbours.left.unwrap_or(intra_default) as u8;
+    let b = neighbours.above.unwrap_or(intra_default) as u8;
     a + 2 * b
 }
 
@@ -282,7 +296,7 @@ pub fn decode_i_mb_cabac(
     let mb_type_inc = mb_type_i_ctx_idx_inc(pic, mb_x, mb_y);
     let mb_type_raw = {
         // I-slice mb_type contexts live at ctxIdxOffset 3 (CTX_IDX_MB_TYPE_I),
-        // 7 or 8 slots covering bin 0 neighbour-indexed + bins 2..6.
+        // 8 slots covering bin 0 neighbour-indexed + bins 2..6.
         let slice = &mut ctxs[CTX_IDX_MB_TYPE_I..CTX_IDX_MB_TYPE_I + 8];
         binarize::decode_mb_type_i(d, slice, mb_type_inc)?
     };
@@ -616,7 +630,7 @@ fn decode_luma_intra_nxn(
         if has_residual {
             let neighbours = cbf_neighbours_luma(pic, mb_x, mb_y, br_row, br_col);
             let coeffs =
-                decode_residual_block_in_place(d, ctxs, BlockCat::Luma4x4, &neighbours, 16)?;
+                decode_residual_block_in_place(d, ctxs, BlockCat::Luma4x4, &neighbours, 16, true)?;
             residual = coeffs;
             total_coeff = coeffs.iter().filter(|&&v| v != 0).count() as u32;
             dequantize_4x4(&mut residual, qp_y);
@@ -662,7 +676,8 @@ fn decode_luma_intra_16x16(
 
     // DC luma — always coded.
     let dc_neigh = cbf_neighbours_luma(pic, mb_x, mb_y, 0, 0);
-    let dc_coeffs = decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Dc, &dc_neigh, 16)?;
+    let dc_coeffs =
+        decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Dc, &dc_neigh, 16, true)?;
     let mut dc = dc_coeffs;
     inv_hadamard_4x4_dc(&mut dc, qp_y);
 
@@ -674,8 +689,14 @@ fn decode_luma_intra_16x16(
         let mut total_coeff = 0u32;
         if cbp_luma != 0 {
             let neighbours = cbf_neighbours_luma(pic, mb_x, mb_y, br_row, br_col);
-            let ac =
-                decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Ac, &neighbours, 15)?;
+            let ac = decode_residual_block_in_place(
+                d,
+                ctxs,
+                BlockCat::Luma16x16Ac,
+                &neighbours,
+                15,
+                true,
+            )?;
             residual = ac;
             total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
             dequantize_4x4(&mut residual, qp_y);
@@ -725,11 +746,11 @@ fn decode_chroma(
     let mut dc_cr = [0i32; 4];
     if cbp_chroma >= 1 {
         let neigh = CbfNeighbours::none();
-        let cb = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4)?;
+        let cb = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, true)?;
         for i in 0..4 {
             dc_cb[i] = cb[i];
         }
-        let cr = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4)?;
+        let cr = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, true)?;
         for i in 0..4 {
             dc_cr[i] = cr[i];
         }
@@ -750,7 +771,8 @@ fn decode_chroma(
             let mut total_coeff = 0u32;
             if cbp_chroma == 2 {
                 let neigh = CbfNeighbours::none();
-                let ac = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15)?;
+                let ac =
+                    decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, true)?;
                 res = ac;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
                 dequantize_4x4(&mut res, qpc);

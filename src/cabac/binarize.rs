@@ -196,9 +196,9 @@ pub fn decode_mb_type_i(
     ctxs: &mut [CabacContext],
     ctx_idx_inc_a_b: u8,
 ) -> Result<u32> {
-    if ctxs.len() < 7 {
+    if ctxs.len() < 8 {
         return Err(Error::invalid(
-            "cabac::binarize::decode_mb_type_i: need >=7 I-slice mb_type ctxs",
+            "cabac::binarize::decode_mb_type_i: need >=8 I-slice mb_type ctxs",
         ));
     }
     // bin 0 — `I_NxN` vs other.
@@ -219,24 +219,30 @@ pub fn decode_mb_type_i(
     if term == 1 {
         return Ok(25);
     }
-    // bins 2..6 — see Table 9-36. The bin string for the Intra_16x16 family
-    // is (cbp_luma, cbp_chroma_0, cbp_chroma_1, intra_pred_mode_0,
-    // intra_pred_mode_1), each a single bin with ctx idx inc 3, 4, 5, 6, 7.
-    let b2 = d.decode_bin(&mut ctxs[3])?; // CBP luma
+    // §9.3.3.1.1.3 + Tables 9-26 / 9-29 / 9-31 — I-slice mb_type bins.
+    //   binIdx 2: ctxIdxInc = 3  (CBP luma bit)
+    //   binIdx 3: ctxIdxInc = 4  (CBP chroma bit 0)
+    //   binIdx 4: ctxIdxInc = (b3 != 0) ? 5 : 6
+    //   binIdx 5: ctxIdxInc = (b3 != 0) ? 6 : 7
+    //   binIdx 6: ctxIdxInc = 7
+    //
+    // The I_16x16 bin string is "1 term b2 b3 [b4] b5 b6" with b4 present
+    // only when b3 == 1. binIdx counts parsed bins, not conceptual fields,
+    // so the (b3 != 0) branch in Table 9-31 compensates: intra_pred_mode
+    // bit 0 always lands on ctxIdxInc = 6 and bit 1 always on 7 regardless
+    // of whether b4 was emitted.
+    let b2 = d.decode_bin(&mut ctxs[3])?;
     let cbp_luma = b2 as u32;
-    let b3 = d.decode_bin(&mut ctxs[4])?; // CBP chroma bin 0
+    let b3 = d.decode_bin(&mut ctxs[4])?;
     let cbp_chroma = if b3 == 0 {
         0u32
     } else {
-        let b4 = d.decode_bin(&mut ctxs[5])?; // CBP chroma bin 1
+        let b4 = d.decode_bin(&mut ctxs[5])?;
         1 + b4 as u32
     };
-    let b5 = d.decode_bin(&mut ctxs[6])?; // intra_pred_mode bin 0
-    let b6_ctx = 6.min(ctxs.len() - 1);
-    let b6 = d.decode_bin(&mut ctxs[b6_ctx])?; // intra_pred_mode bin 1
+    let b5 = d.decode_bin(&mut ctxs[6])?;
+    let b6 = d.decode_bin(&mut ctxs[7])?;
     let intra_pred_mode = (b5 as u32) * 2 + b6 as u32;
-    // mb_type = 1 + intra_pred_mode + 4 * cbp_chroma + 12 * cbp_luma
-    //  per the reordering of Table 9-36 for I-slices.
     Ok(1 + intra_pred_mode + 4 * cbp_chroma + 12 * cbp_luma)
 }
 

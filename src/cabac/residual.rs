@@ -76,14 +76,6 @@ impl CbfNeighbours {
     }
 }
 
-/// Derive `ctxIdxInc` for `coded_block_flag` per §9.3.3.1.1.9
-/// (condTermFlagA + 2·condTermFlagB).
-fn coded_block_flag_ctx_inc(neighbours: &CbfNeighbours, default_when_unavail: bool) -> u8 {
-    let a = neighbours.left.unwrap_or(default_when_unavail) as u8;
-    let b = neighbours.above.unwrap_or(default_when_unavail) as u8;
-    a + (b << 1)
-}
-
 /// Decode one block's CABAC residual.
 ///
 /// Returns the 16-entry coefficient array indexed in **coded scan
@@ -121,18 +113,11 @@ pub fn decode_residual_block_cabac(
     }
 
     // --- 1) coded_block_flag -------------------------------------------
-    // For Luma16x16Dc, the spec always codes cbf (no implicit derivation);
-    // for all other cats the cbf is decoded here regardless.
-    // ctxIdxInc = condTermFlagA + 2·condTermFlagB, derived from the
-    // neighbours' cbf values, defaulting to 0 when unavailable (the
-    // decoder sits at a slice boundary).
-    let cbf_inc = coded_block_flag_ctx_inc(neighbours, false);
-    // With only one ctxBlockCat we'd use ctxs[0..4]; here we collapse to
-    // a single slot plus the neighbour-derived ctxIdxInc offset. The
-    // mapping is equivalent (all four ctxIdxInc values map through the
-    // same table slot in this stub surface).
-    let _ = cat; // ctxBlockCat affects ctxIdx in the full table; see Agent B.
-    let _ = cbf_inc;
+    // ctxIdxInc is already baked into `ctxs[0]` by the caller via
+    // `ResidualCtxPlan::new`, which selects the correct per-ctxBlockCat
+    // slot in the slice-wide context array after §9.3.3.1.1.9 derives
+    // condTermFlagA + 2·condTermFlagB (with the intra-default rule).
+    let _ = neighbours;
     let cbf = d.decode_bin(&mut ctxs[0])?;
 
     let mut coeffs = [0i32; 16];
@@ -227,26 +212,20 @@ fn decode_coeff_abs_level_minus1(
     ctxs: &mut [CabacContext],
     num_eq1: u32,
     num_gt1: u32,
-    cat: BlockCat,
+    _cat: BlockCat,
 ) -> Result<(u32, u32, u32)> {
-    // §9.3.3.1.1.9 Table 9-43.
-    //
-    // bin index 0 uses ctxIdxInc =
-    //     (num_gt1 != 0) ? 0 : min(4, 1 + num_eq1)
-    //
-    // bin index >= 1 uses ctxIdxInc =
-    //     5 + min(4 - ((cat == Luma16x16Dc) ? 1 : 0), num_gt1)
-    let cat_adj = if matches!(cat, BlockCat::Luma16x16Dc) {
-        1u32
-    } else {
-        0u32
-    };
+    // §9.3.3.1.3 eqs. 9-15 / 9-16 — ctxIdxInc for coeff_abs_level_minus1:
+    //   binIdx == 0: (num_gt1 != 0) ? 0 : Min(4, 1 + num_eq1)
+    //   binIdx  > 0: 5 + Min(4, num_gt1)
+    // The spec has no cat-dependent adjustment (the "cat==0 → -1" tweak
+    // previously applied here doesn't appear in §9.3.3.1.3; it corresponds
+    // to FFmpeg's chroma-422 DC row, irrelevant for 4:2:0).
     let bin0_inc = if num_gt1 != 0 {
         0u32
     } else {
         core::cmp::min(4, 1 + num_eq1)
     };
-    let binge1_inc = 5 + core::cmp::min(4u32.saturating_sub(cat_adj), num_gt1);
+    let binge1_inc = 5 + core::cmp::min(4u32, num_gt1);
 
     // Base offset 33 in `ctxs[]` for coeff_abs_level_minus1 contexts
     // (see module-doc on `ctxs[]` layout).
@@ -493,19 +472,14 @@ mod tests {
         value: u32,
         num_eq1: u32,
         num_gt1: u32,
-        cat: BlockCat,
+        _cat: BlockCat,
     ) {
-        let cat_adj = if matches!(cat, BlockCat::Luma16x16Dc) {
-            1u32
-        } else {
-            0u32
-        };
         let bin0_inc = if num_gt1 != 0 {
             0u32
         } else {
             core::cmp::min(4, 1 + num_eq1)
         };
-        let binge1_inc = 5 + core::cmp::min(4u32.saturating_sub(cat_adj), num_gt1);
+        let binge1_inc = 5 + core::cmp::min(4u32, num_gt1);
         const BASE: usize = 33;
 
         // Prefix: TU(14).
