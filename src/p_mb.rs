@@ -586,9 +586,9 @@ fn decode_inter_residual_luma(
             continue;
         }
         let nc = predict_inter_nc_luma(pic, mb_x, mb_y, br_row, br_col);
-        let blk = decode_residual_block(br, nc, BlockKind::Luma4x4)?;
-        let mut residual = blk.coeffs;
-        let total_coeff = blk.total_coeff;
+        let blk_parsed = decode_residual_block(br, nc, BlockKind::Luma4x4)?;
+        let mut residual = blk_parsed.coeffs;
+        let total_coeff = blk_parsed.total_coeff;
         // §7.4.2.2 — Inter-Y 4×4 is slot 3.
         let scale = *pic.scaling_lists.matrix_4x4(3);
         dequantize_4x4_scaled(&mut residual, qp_y, &scale);
