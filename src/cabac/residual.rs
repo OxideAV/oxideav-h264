@@ -214,6 +214,7 @@ fn decode_coeff_abs_level_minus1(
     num_gt1: u32,
     _cat: BlockCat,
 ) -> Result<(u32, u32, u32)> {
+
     // §9.3.3.1.3 eqs. 9-15 / 9-16 — ctxIdxInc for coeff_abs_level_minus1:
     //   binIdx == 0: (num_gt1 != 0) ? 0 : Min(4, 1 + num_eq1)
     //   binIdx  > 0: 5 + Min(4, num_gt1)
@@ -255,12 +256,15 @@ fn decode_coeff_abs_level_minus1(
     }
 
     // --- suffix: only present if prefix saturated (14 ones observed) ---
-    // Exp-Golomb(0) decoded in bypass mode (§9.3.2.3).
+    // §9.3.2.3 EGk binarisation: the prefix is a sequence of `k_tmp`
+    // one-bins (while `absValue >> k_tmp > 0`, emit "1" and subtract
+    // `1 << k_tmp`), then a terminating zero, then `k_tmp` suffix bits.
+    // Decoder counts leading 1-bins — opposite polarity from ue(v).
     let value: u32 = if saturated {
         let mut k: u32 = 0;
         loop {
             let b = d.decode_bypass()?;
-            if b == 1 {
+            if b == 0 {
                 break;
             }
             k += 1;
