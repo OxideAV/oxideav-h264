@@ -355,18 +355,20 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   mirrors a pre-existing limitation of the P/B residual path that hits
   the equivalent 4:2:0 testsrc fixture identically (solid-colour 4:4:4
   P decodes 100 % matched). 8×8 transform on 4:4:4 inter is out of
-  scope. CABAC on 4:4:4 is partially staged: the
-  [`cabac::mb_444`] / [`cabac::p_mb_444`] modules hold the entry-point
-  plumbing (mb_type decoding, per-plane intra prediction, per-plane
-  residual dispatch, intra-in-P / intra-in-B dispatch) but the slice
-  gate still rejects cleanly with a specific `Error::Unsupported`
-  message. Lighting up CABAC 4:4:4 end-to-end requires the §9.3.3.1.1.9
-  Table 9-42 extended ctxBlockCat banks (6..=13 at ctxIdxOffset 1012+) —
-  reusing the luma cat 0/1/2/5 banks across three planes diverges from
-  the encoder's probability state after the first MB (the first-pass
-  experiment confirms ~69 % sample match on a 4-MB solid-colour test
-  clip, collapsing to "only MB 0 is decoded" after `decode_terminate`
-  fires prematurely).
+  scope. CABAC on 4:4:4 is supported for I-slices bit-exact and for
+  P-slice inter partitions (P16×16 / P16×8 / P8×16 + intra-in-P + P_Skip)
+  at ≥ 90 % sample match on the `yuv444_cabac_p_64x64` testsrc fixture.
+  The §9.3.3.1.1.9 Table 9-42 extended ctxBlockCat banks (cats 6..=13 at
+  spec ctxIdx 460..=483, 484..=674, 708..=775, 952..=1011, 1016..=1023)
+  are transcribed from FFmpeg's `libavcodec/h264_cabac.c`
+  `cabac_context_init_I / PB` arrays into `src/cabac/tables.rs`; the
+  residual helpers take a `ResidualPlane` selector that routes Y/Cb/Cr
+  to their own banks. CABAC B-slice inter (Direct / L0 / L1 / Bi 16×16,
+  TwoPart 16×8 / 8×16, B_8×8) is still staged behind a specific
+  `Error::Unsupported` message — intra-in-B and B_Skip are wired but a
+  first cut at B inter exhibits context-state drift during Cb/Cr
+  residual decode at MB 7+ of the testsrc fixture; the test is
+  `#[ignore]`d with that note and awaits an MVD/ref_idx ctxIdxInc audit.
 - Bit depth above 14 or odd luma/chroma bit depths. 12-bit / 14-bit
   are supported for **CAVLC I-slices in 4:2:0 only** (see the 12/14-bit
   section below). 10-bit covers CAVLC I / P / B + CABAC I. Luma must

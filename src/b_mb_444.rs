@@ -301,11 +301,11 @@ where
 }
 
 #[derive(Default, Clone, Copy)]
-struct PerBlockMv {
-    mv_l0: [(i16, i16); 16],
-    mv_l1: [(i16, i16); 16],
-    ref_l0: [i8; 16],
-    ref_l1: [i8; 16],
+pub(crate) struct PerBlockMv {
+    pub mv_l0: [(i16, i16); 16],
+    pub mv_l1: [(i16, i16); 16],
+    pub ref_l0: [i8; 16],
+    pub ref_l1: [i8; 16],
 }
 
 /// Clone a 4:4:4 picture into a 4:2:0-shaped picture that copies over the
@@ -314,6 +314,21 @@ struct PerBlockMv {
 /// prediction (§8.4.1.3) needs it intact. Used as a scratch so the 4:2:0
 /// MC helpers in [`crate::b_mb`] can run without being called on the
 /// 4:4:4 buffers directly.
+/// Public wrapper for [`make_420_scratch`] so CABAC 4:4:4 can reuse the
+/// scratch clone when driving the shared direct-mode MV compensator.
+/// Currently staged for the CABAC B-inter follow-up.
+#[allow(dead_code)]
+pub(crate) fn make_420_scratch_pub(src: &Picture) -> Picture {
+    make_420_scratch(src, 0, 0)
+}
+
+/// Public wrapper for [`to_420_reference`]. See
+/// [`make_420_scratch_pub`].
+#[allow(dead_code)]
+pub(crate) fn to_420_reference_pub(src: &Picture) -> Picture {
+    to_420_reference(src)
+}
+
 fn make_420_scratch(src: &Picture, _mb_x: u32, _mb_y: u32) -> Picture {
     let mut dst = Picture::new_with_format(src.mb_width, src.mb_height, 1);
     dst.mb_info = src.mb_info.clone();
@@ -545,7 +560,7 @@ fn handle_b8x8(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compensate_444_partition(
+pub(crate) fn compensate_444_partition(
     sh: &SliceHeader,
     ctx: &BSliceCtx<'_>,
     pic: &mut Picture,
@@ -624,7 +639,7 @@ fn compensate_444_partition(
 /// picture. Used after `snapshot_mv_state_via_420` produced the MV grid
 /// from a direct-mode derivation.
 #[allow(clippy::too_many_arguments)]
-fn apply_mvs_444(
+pub(crate) fn apply_mvs_444(
     pic: &mut Picture,
     ref_list0: &[&Picture],
     ref_list1: &[&Picture],

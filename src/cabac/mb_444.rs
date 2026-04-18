@@ -25,8 +25,8 @@ use crate::cabac::binarize;
 use crate::cabac::context::CabacContext;
 use crate::cabac::engine::CabacDecoder;
 use crate::cabac::mb::{
-    cbp_luma_ctx_idx_inc, decode_luma_8x8_residual_in_place, decode_residual_block_in_place,
-    transform_size_8x8_flag_ctx_idx_inc,
+    cbp_luma_ctx_idx_inc, decode_luma_8x8_residual_in_place_plane,
+    decode_residual_block_in_place_plane, transform_size_8x8_flag_ctx_idx_inc, ResidualPlane,
 };
 use crate::cabac::residual::{BlockCat, CbfNeighbours};
 use crate::cabac::tables::{
@@ -254,6 +254,18 @@ fn decode_intra_mb_given_imb_cabac_444(
 // Per-plane residual pipelines — luma-shape for every colour component.
 // ---------------------------------------------------------------------------
 
+/// §9.3.3.1.1.9 Table 9-42 — translate a 4:4:4 [`Plane`] into the
+/// CABAC residual bank selector so the Cb / Cr streams use their own
+/// context sets (cats 6..=8 / 10..=12 for the 4×4-shaped helper,
+/// 9 / 13 for the 8×8 helper).
+fn residual_plane_for(plane: Plane) -> ResidualPlane {
+    match plane {
+        Plane::Y => ResidualPlane::Luma,
+        Plane::Cb => ResidualPlane::Cb444,
+        Plane::Cr => ResidualPlane::Cr444,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_plane_intra_nxn_cabac(
     d: &mut CabacDecoder<'_>,
@@ -287,8 +299,15 @@ fn decode_plane_intra_nxn_cabac(
         let mut total_coeff = 0u32;
         if has_residual {
             let neighbours = cbf_neighbours_plane(pic, mb_x, mb_y, plane, br_row, br_col);
-            let coeffs =
-                decode_residual_block_in_place(d, ctxs, BlockCat::Luma4x4, &neighbours, 16, true)?;
+            let coeffs = decode_residual_block_in_place_plane(
+                d,
+                ctxs,
+                BlockCat::Luma4x4,
+                &neighbours,
+                16,
+                true,
+                residual_plane_for(plane),
+            )?;
             residual = coeffs;
             total_coeff = coeffs.iter().filter(|&&v| v != 0).count() as u32;
             let scale = *pic.scaling_lists.matrix_4x4(scale_idx);
@@ -334,8 +353,15 @@ fn decode_plane_intra_16x16_cabac(
     predict_intra_16x16(&mut pred, mode, &neigh);
 
     let dc_neigh = plane_luma16x16_dc_cbf_neighbours(pic, mb_x, mb_y, plane);
-    let dc_coeffs =
-        decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Dc, &dc_neigh, 16, true)?;
+    let dc_coeffs = decode_residual_block_in_place_plane(
+        d,
+        ctxs,
+        BlockCat::Luma16x16Dc,
+        &dc_neigh,
+        16,
+        true,
+        residual_plane_for(plane),
+    )?;
     let mut dc = dc_coeffs;
     match plane {
         Plane::Y => {
@@ -359,13 +385,14 @@ fn decode_plane_intra_16x16_cabac(
         let mut total_coeff = 0u32;
         if cbp_luma != 0 {
             let neighbours = cbf_neighbours_plane(pic, mb_x, mb_y, plane, br_row, br_col);
-            let ac = decode_residual_block_in_place(
+            let ac = decode_residual_block_in_place_plane(
                 d,
                 ctxs,
                 BlockCat::Luma16x16Ac,
                 &neighbours,
                 15,
                 true,
+                residual_plane_for(plane),
             )?;
             residual = ac;
             total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
@@ -429,7 +456,13 @@ pub(crate) fn decode_inter_residual_plane_8x8(
         let r0 = br8_row * 2;
         let c0 = br8_col * 2;
         let neighbours = cbf_neighbours_plane(pic, mb_x, mb_y, plane, r0, c0);
-        let coeffs = decode_luma_8x8_residual_in_place(d, ctxs, &neighbours, false)?;
+        let coeffs = decode_luma_8x8_residual_in_place_plane(
+            d,
+            ctxs,
+            &neighbours,
+            false,
+            residual_plane_for(plane),
+        )?;
         let mut residual = coeffs;
         let nnz = residual.iter().filter(|&&v| v != 0).count() as u16;
         let scale = *pic.scaling_lists.matrix_8x8(scale_idx);
@@ -489,8 +522,15 @@ pub(crate) fn decode_inter_residual_plane_4x4(
             continue;
         }
         let neighbours = cbf_neighbours_plane(pic, mb_x, mb_y, plane, br_row, br_col);
-        let coeffs =
-            decode_residual_block_in_place(d, ctxs, BlockCat::Luma4x4, &neighbours, 16, false)?;
+        let coeffs = decode_residual_block_in_place_plane(
+            d,
+            ctxs,
+            BlockCat::Luma4x4,
+            &neighbours,
+            16,
+            false,
+            residual_plane_for(plane),
+        )?;
         let mut residual = coeffs;
         let total_coeff = coeffs.iter().filter(|&&v| v != 0).count() as u32;
         let scale = *pic.scaling_lists.matrix_4x4(scale_idx);

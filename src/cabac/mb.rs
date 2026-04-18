@@ -34,12 +34,23 @@ use crate::cabac::residual::{
     decode_residual_block_cabac_chroma_dc_422, BlockCat, CbfNeighbours,
 };
 use crate::cabac::tables::{
-    CTX_IDX_CODED_BLOCK_FLAG, CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8, CTX_IDX_CODED_BLOCK_PATTERN_LUMA,
-    CTX_IDX_COEFF_ABS_LEVEL_MINUS1, CTX_IDX_COEFF_ABS_LEVEL_MINUS1_LUMA8X8,
-    CTX_IDX_INTRA_CHROMA_PRED_MODE, CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG,
+    CTX_IDX_ABSLVL_CB_LUMA16X16AC, CTX_IDX_ABSLVL_CB_LUMA16X16DC, CTX_IDX_ABSLVL_CB_LUMA4X4,
+    CTX_IDX_ABSLVL_CB_LUMA8X8, CTX_IDX_ABSLVL_CR_LUMA16X16AC, CTX_IDX_ABSLVL_CR_LUMA16X16DC,
+    CTX_IDX_ABSLVL_CR_LUMA4X4, CTX_IDX_ABSLVL_CR_LUMA8X8, CTX_IDX_CBF_CB_LUMA16X16AC,
+    CTX_IDX_CBF_CB_LUMA16X16DC, CTX_IDX_CBF_CB_LUMA4X4, CTX_IDX_CBF_CB_LUMA8X8,
+    CTX_IDX_CBF_CR_LUMA16X16AC, CTX_IDX_CBF_CR_LUMA16X16DC, CTX_IDX_CBF_CR_LUMA4X4,
+    CTX_IDX_CBF_CR_LUMA8X8, CTX_IDX_CODED_BLOCK_FLAG, CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8,
+    CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_COEFF_ABS_LEVEL_MINUS1,
+    CTX_IDX_COEFF_ABS_LEVEL_MINUS1_LUMA8X8, CTX_IDX_INTRA_CHROMA_PRED_MODE,
+    CTX_IDX_LAST_CB_LUMA16X16AC, CTX_IDX_LAST_CB_LUMA16X16DC, CTX_IDX_LAST_CB_LUMA4X4,
+    CTX_IDX_LAST_CB_LUMA8X8, CTX_IDX_LAST_CR_LUMA16X16AC, CTX_IDX_LAST_CR_LUMA16X16DC,
+    CTX_IDX_LAST_CR_LUMA4X4, CTX_IDX_LAST_CR_LUMA8X8, CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG,
     CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_TYPE_I,
     CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_SIGNIFICANT_COEFF_FLAG,
-    CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
+    CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_SIG_CB_LUMA16X16AC,
+    CTX_IDX_SIG_CB_LUMA16X16DC, CTX_IDX_SIG_CB_LUMA4X4, CTX_IDX_SIG_CB_LUMA8X8,
+    CTX_IDX_SIG_CR_LUMA16X16AC, CTX_IDX_SIG_CR_LUMA16X16DC, CTX_IDX_SIG_CR_LUMA4X4,
+    CTX_IDX_SIG_CR_LUMA8X8, CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
 };
 use crate::cavlc::ZIGZAG_4X4;
 use crate::intra_pred::{
@@ -207,6 +218,22 @@ pub(crate) fn cbp_chroma_ctx_idx_inc_ac(pic: &Picture, mb_x: u32, mb_y: u32) -> 
 /// conservative vs. the spec's shared per-slice state but yields correct
 /// decode for the reduced subset of streams we target (no residuals for
 /// the I_16x16/cbp_luma=0 fixture).
+/// Colour plane for the residual stream. Under 4:2:0 every residual
+/// is `Luma` (chroma streams use the dedicated `BlockCat::Chroma*`
+/// variants rather than a plane selector). Under 4:4:4 (ChromaArrayType
+/// = 3), each of the three planes decodes luma-shaped residuals through
+/// its own bank (§9.3.3.1.1.9 Table 9-42 extension cats 6..=13):
+///
+/// * `Plane::Luma` — cat 0/1/2/5 (Y)
+/// * `Plane::Cb444` — cat 6/7/8/9 (Cb)
+/// * `Plane::Cr444` — cat 10/11/12/13 (Cr)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidualPlane {
+    Luma,
+    Cb444,
+    Cr444,
+}
+
 /// Plan describing the ctxIdx backing each bin a residual decoder may read.
 ///
 /// The 43-slot window (`coded_block_flag`, 16× `significant_coeff_flag`,
@@ -224,13 +251,103 @@ impl ResidualCtxPlan {
     /// neighbour-derived `coded_block_flag` increment. `intra` selects the
     /// unavailable-neighbour default per §9.3.3.1.1.9 (condTermFlagN = 1
     /// for intra, 0 for inter).
+    ///
+    /// This is the 4:2:0 entry point — it always selects the luma-side
+    /// context banks (cats 0/1/2/5 for Luma, cats 3/4 for Chroma). Under
+    /// 4:4:4 the chroma planes need their own banks; use
+    /// [`ResidualCtxPlan::new_for_plane`] instead.
     pub fn new(cat: BlockCat, neighbours: &CbfNeighbours, intra: bool) -> Self {
-        let ctx_block_cat = cat.ctx_block_cat() as usize;
+        Self::new_for_plane(cat, neighbours, intra, ResidualPlane::Luma)
+    }
+
+    /// Plane-aware variant of [`Self::new`]. Under `ResidualPlane::Luma`
+    /// behaves identically to `new`; under `Cb444` / `Cr444` selects the
+    /// §9.3.3.1.1.9 Table 9-42 extension banks at spec ctxIdx 460+.
+    pub fn new_for_plane(
+        cat: BlockCat,
+        neighbours: &CbfNeighbours,
+        intra: bool,
+        plane: ResidualPlane,
+    ) -> Self {
         let cbf_inc = coded_block_flag_inc(neighbours, intra) as usize;
-        let cbf_base = CTX_IDX_CODED_BLOCK_FLAG + ctx_block_cat * 4;
-        let sig_base = CTX_IDX_SIGNIFICANT_COEFF_FLAG + SIG_BASE_OFFSETS[ctx_block_cat];
-        let last_base = CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG + SIG_BASE_OFFSETS[ctx_block_cat];
-        let lvl_base = CTX_IDX_COEFF_ABS_LEVEL_MINUS1 + LVL_BASE_OFFSETS[ctx_block_cat];
+        let (cbf_base, sig_base, last_base, lvl_base) = match plane {
+            ResidualPlane::Luma => {
+                let ctx_block_cat = cat.ctx_block_cat() as usize;
+                (
+                    CTX_IDX_CODED_BLOCK_FLAG + ctx_block_cat * 4,
+                    CTX_IDX_SIGNIFICANT_COEFF_FLAG + SIG_BASE_OFFSETS[ctx_block_cat],
+                    CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG + SIG_BASE_OFFSETS[ctx_block_cat],
+                    CTX_IDX_COEFF_ABS_LEVEL_MINUS1 + LVL_BASE_OFFSETS[ctx_block_cat],
+                )
+            }
+            ResidualPlane::Cb444 => match cat {
+                BlockCat::Luma16x16Dc => (
+                    CTX_IDX_CBF_CB_LUMA16X16DC,
+                    CTX_IDX_SIG_CB_LUMA16X16DC,
+                    CTX_IDX_LAST_CB_LUMA16X16DC,
+                    CTX_IDX_ABSLVL_CB_LUMA16X16DC,
+                ),
+                BlockCat::Luma16x16Ac => (
+                    CTX_IDX_CBF_CB_LUMA16X16AC,
+                    CTX_IDX_SIG_CB_LUMA16X16AC,
+                    CTX_IDX_LAST_CB_LUMA16X16AC,
+                    CTX_IDX_ABSLVL_CB_LUMA16X16AC,
+                ),
+                BlockCat::Luma4x4 => (
+                    CTX_IDX_CBF_CB_LUMA4X4,
+                    CTX_IDX_SIG_CB_LUMA4X4,
+                    CTX_IDX_LAST_CB_LUMA4X4,
+                    CTX_IDX_ABSLVL_CB_LUMA4X4,
+                ),
+                BlockCat::Luma8x8 => (
+                    CTX_IDX_CBF_CB_LUMA8X8,
+                    CTX_IDX_SIG_CB_LUMA8X8,
+                    CTX_IDX_LAST_CB_LUMA8X8,
+                    CTX_IDX_ABSLVL_CB_LUMA8X8,
+                ),
+                // §6.4.1 under 4:4:4 there's no Chroma DC/AC bank — the
+                // Cb path always uses luma-shaped cats. Fall back to Cb
+                // 4×4 to keep the struct total; callers never hit this.
+                _ => (
+                    CTX_IDX_CBF_CB_LUMA4X4,
+                    CTX_IDX_SIG_CB_LUMA4X4,
+                    CTX_IDX_LAST_CB_LUMA4X4,
+                    CTX_IDX_ABSLVL_CB_LUMA4X4,
+                ),
+            },
+            ResidualPlane::Cr444 => match cat {
+                BlockCat::Luma16x16Dc => (
+                    CTX_IDX_CBF_CR_LUMA16X16DC,
+                    CTX_IDX_SIG_CR_LUMA16X16DC,
+                    CTX_IDX_LAST_CR_LUMA16X16DC,
+                    CTX_IDX_ABSLVL_CR_LUMA16X16DC,
+                ),
+                BlockCat::Luma16x16Ac => (
+                    CTX_IDX_CBF_CR_LUMA16X16AC,
+                    CTX_IDX_SIG_CR_LUMA16X16AC,
+                    CTX_IDX_LAST_CR_LUMA16X16AC,
+                    CTX_IDX_ABSLVL_CR_LUMA16X16AC,
+                ),
+                BlockCat::Luma4x4 => (
+                    CTX_IDX_CBF_CR_LUMA4X4,
+                    CTX_IDX_SIG_CR_LUMA4X4,
+                    CTX_IDX_LAST_CR_LUMA4X4,
+                    CTX_IDX_ABSLVL_CR_LUMA4X4,
+                ),
+                BlockCat::Luma8x8 => (
+                    CTX_IDX_CBF_CR_LUMA8X8,
+                    CTX_IDX_SIG_CR_LUMA8X8,
+                    CTX_IDX_LAST_CR_LUMA8X8,
+                    CTX_IDX_ABSLVL_CR_LUMA8X8,
+                ),
+                _ => (
+                    CTX_IDX_CBF_CR_LUMA4X4,
+                    CTX_IDX_SIG_CR_LUMA4X4,
+                    CTX_IDX_LAST_CR_LUMA4X4,
+                    CTX_IDX_ABSLVL_CR_LUMA4X4,
+                ),
+            },
+        };
         let mut indices = [0usize; 43];
         indices[0] = cbf_base + cbf_inc;
         for i in 0..16 {
@@ -281,7 +398,32 @@ pub(crate) fn decode_residual_block_in_place(
     max_num_coeff: usize,
     intra: bool,
 ) -> Result<[i32; 16]> {
-    let plan = ResidualCtxPlan::new(cat, neighbours, intra);
+    decode_residual_block_in_place_plane(
+        d,
+        ctxs,
+        cat,
+        neighbours,
+        max_num_coeff,
+        intra,
+        ResidualPlane::Luma,
+    )
+}
+
+/// Plane-aware variant of [`decode_residual_block_in_place`]. Under
+/// 4:4:4 (ChromaArrayType = 3) the Cb / Cr luma-shaped residuals run
+/// against the §9.3.3.1.1.9 Table 9-42 extension banks (cats 6..=8 for
+/// Cb, 10..=12 for Cr).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_residual_block_in_place_plane(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    cat: BlockCat,
+    neighbours: &CbfNeighbours,
+    max_num_coeff: usize,
+    intra: bool,
+    plane: ResidualPlane,
+) -> Result<[i32; 16]> {
+    let plan = ResidualCtxPlan::new_for_plane(cat, neighbours, intra, plane);
     let mut window = plan.gather(ctxs);
     let coded = decode_residual_block_cabac(d, &mut window, cat, neighbours, max_num_coeff)?;
     plan.scatter(ctxs, &window);
@@ -359,11 +501,40 @@ pub(crate) fn decode_luma_8x8_residual_in_place(
     neighbours: &CbfNeighbours,
     intra: bool,
 ) -> Result<[i32; 64]> {
+    decode_luma_8x8_residual_in_place_plane(d, ctxs, neighbours, intra, ResidualPlane::Luma)
+}
+
+/// Plane-aware 8×8 residual decode. Under 4:4:4 Cb / Cr the banks are
+/// cats 9 / 13 (§9.3.3.1.1.9 Table 9-42 extension, spec ctxIdx 660+).
+pub(crate) fn decode_luma_8x8_residual_in_place_plane(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    neighbours: &CbfNeighbours,
+    intra: bool,
+    plane: ResidualPlane,
+) -> Result<[i32; 64]> {
     let cbf_inc = coded_block_flag_inc(neighbours, intra) as usize;
-    let cbf_ctx_idx = CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8 + cbf_inc;
-    let sig_base = CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8;
-    let last_base = CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8;
-    let lvl_base = CTX_IDX_COEFF_ABS_LEVEL_MINUS1_LUMA8X8;
+    let (cbf_base, sig_base, last_base, lvl_base) = match plane {
+        ResidualPlane::Luma => (
+            CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8,
+            CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8,
+            CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8,
+            CTX_IDX_COEFF_ABS_LEVEL_MINUS1_LUMA8X8,
+        ),
+        ResidualPlane::Cb444 => (
+            CTX_IDX_CBF_CB_LUMA8X8,
+            CTX_IDX_SIG_CB_LUMA8X8,
+            CTX_IDX_LAST_CB_LUMA8X8,
+            CTX_IDX_ABSLVL_CB_LUMA8X8,
+        ),
+        ResidualPlane::Cr444 => (
+            CTX_IDX_CBF_CR_LUMA8X8,
+            CTX_IDX_SIG_CR_LUMA8X8,
+            CTX_IDX_LAST_CR_LUMA8X8,
+            CTX_IDX_ABSLVL_CR_LUMA8X8,
+        ),
+    };
+    let cbf_ctx_idx = cbf_base + cbf_inc;
 
     // §9.3.3.1.1.9 last ≥ sig ≥ cbf: the three banks are disjoint, so
     // borrow them one at a time around the decode.
