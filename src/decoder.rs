@@ -30,11 +30,14 @@
 //! Out of scope (returns `Error::Unsupported`):
 //! * Interlaced coding / MBAFF (P and B).
 //! * 8×8 transform on the CABAC path, bit depth > 8.
-//! * Non-4:2:0 chroma: `chroma_format_idc ∈ {0, 2, 3}` and
-//!   `separate_colour_plane_flag = 1` are rejected at slice entry
-//!   (§7.4.2.1.1 / §6.4.1). See [`crate::picture::chroma_plane_w`] /
-//!   [`crate::picture::chroma_plane_h`] for the format-aware helpers
-//!   reserved for future 4:2:2 / 4:4:4 work.
+//! * 4:2:2 chroma (`chroma_format_idc = 2`), monochrome
+//!   (`chroma_format_idc = 0`), and `separate_colour_plane_flag = 1`
+//!   are rejected at slice entry (§7.4.2.1.1 / §6.4.1). 4:4:4
+//!   (`chroma_format_idc = 3`) is supported for CAVLC I-slices only —
+//!   P / B / CABAC entry in 4:4:4 returns `Error::Unsupported`. See
+//!   [`crate::mb_444`] for the 4:4:4 CAVLC path and
+//!   [`crate::picture::chroma_plane_w`] / [`crate::picture::chroma_plane_h`]
+//!   for the format-aware sample-layout helpers.
 //!
 //! Reference picture list modification (RPLM, §7.3.3.1 / §8.2.4.3) is
 //! parsed into [`crate::slice::SliceHeader::rplm_l0`] /
@@ -234,13 +237,24 @@ impl H264Decoder {
                     1 => {}
                     2 => {
                         return Err(Error::unsupported(
-                            "h264: chroma_format_idc=2 (4:2:2, §6.4.1) not supported — only 4:2:0",
+                            "h264: chroma_format_idc=2 (4:2:2, §6.4.1) not supported — only 4:2:0 / 4:4:4",
                         ));
                     }
                     3 => {
-                        return Err(Error::unsupported(
-                            "h264: chroma_format_idc=3 (4:4:4, §6.4.1) not supported — only 4:2:0",
-                        ));
+                        // 4:4:4 — only CAVLC I-slices are wired so far.
+                        // The CABAC path, P/B slices, and any other slice
+                        // type route back to Error::Unsupported via the
+                        // slice-type dispatch below.
+                        if sh.slice_type != SliceType::I {
+                            return Err(Error::unsupported(
+                                "h264: 4:4:4 (chroma_format_idc=3) supports I-slices only",
+                            ));
+                        }
+                        if pps.entropy_coding_mode_flag {
+                            return Err(Error::unsupported(
+                                "h264: 4:4:4 CABAC entropy decode not yet wired — CAVLC I-slice only",
+                            ));
+                        }
                     }
                     v => {
                         return Err(Error::unsupported(format!(
@@ -251,12 +265,14 @@ impl H264Decoder {
                 // Macroblock-layer decode (§7.3.5 / §8.3 / §8.4 / §8.5 / §9.2).
                 let mb_w = sps.pic_width_in_mbs();
                 let mb_h = sps.pic_height_in_map_units();
-                let mut pic = self
-                    .current_pic
-                    .take()
-                    .unwrap_or_else(|| Picture::new(mb_w, mb_h));
-                if pic.mb_width != mb_w || pic.mb_height != mb_h {
-                    pic = Picture::new(mb_w, mb_h);
+                let mut pic = self.current_pic.take().unwrap_or_else(|| {
+                    Picture::new_with_format(mb_w, mb_h, sps.chroma_format_idc)
+                });
+                if pic.mb_width != mb_w
+                    || pic.mb_height != mb_h
+                    || pic.chroma_format_idc != sps.chroma_format_idc
+                {
+                    pic = Picture::new_with_format(mb_w, mb_h, sps.chroma_format_idc);
                 }
                 // §7.4.2.2 Table 7-2 — resolve the active scaling
                 // matrices (SPS + PPS, with fallback). Stored on the

@@ -289,7 +289,12 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
 - Interlaced coding, MBAFF, PAFF, frame/field picture mixes.
 - Inter 8×8 transform on B-slice MBs — CAVLC P-slice inter 8×8 is wired
   (see above); B-slice inter 8×8 is not yet.
-- 4:2:2 / 4:4:4 chroma, bit depths above 8, separate colour planes.
+- 4:2:2 chroma (`chroma_format_idc = 2`). 4:4:4 CAVLC I-slice decode
+  IS supported (§6.4.1 ChromaArrayType == 3) — the chroma planes share
+  luma dimensions, reuse the luma Intra_4×4 / Intra_16×16 predictors,
+  and decode three back-to-back luma-style residual streams per MB;
+  P / B / CABAC on 4:4:4 remain out of scope.
+- Bit depths above 8, separate colour planes.
 - SI / SP slices.
 
 ## Codec id

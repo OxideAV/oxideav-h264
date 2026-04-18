@@ -121,6 +121,9 @@ pub fn decode_intra_mb_given_imb(
     if matches!(imb, IMbType::IPcm) {
         return decode_pcm_mb(br, mb_x, mb_y, pic, *prev_qp);
     }
+    if sps.chroma_format_idc == 3 {
+        return crate::mb_444::decode_intra_mb_444(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb);
+    }
 
     // Per §7.3.5.1, transform_size_8x8_flag comes before the intra mode
     // syntax for I_NxN when the PPS enables it. When the flag is set we
@@ -320,13 +323,15 @@ fn decode_pcm_mb(
     }
     let cstride = pic.chroma_stride();
     let co = pic.chroma_off(mb_x, mb_y);
-    for r in 0..8 {
-        for c in 0..8 {
+    let chroma_rows = pic.mb_height_chroma();
+    let chroma_cols = pic.mb_width_chroma();
+    for r in 0..chroma_rows {
+        for c in 0..chroma_cols {
             pic.cb[co + r * cstride + c] = br.read_u32(8)? as u8;
         }
     }
-    for r in 0..8 {
-        for c in 0..8 {
+    for r in 0..chroma_rows {
+        for c in 0..chroma_cols {
             pic.cr[co + r * cstride + c] = br.read_u32(8)? as u8;
         }
     }
@@ -724,7 +729,7 @@ fn decode_chroma(
 // Predicted nC (§9.2.1.1).
 // -----------------------------------------------------------------------------
 
-fn predict_nc_luma(pic: &Picture, mb_x: u32, mb_y: u32, br_row: usize, br_col: usize) -> i32 {
+pub(crate) fn predict_nc_luma(pic: &Picture, mb_x: u32, mb_y: u32, br_row: usize, br_col: usize) -> i32 {
     let info_here = pic.mb_info_at(mb_x, mb_y);
     let left = if br_col > 0 {
         Some(info_here.luma_nc[br_row * 4 + br_col - 1])
@@ -809,7 +814,7 @@ fn nc_from_neighbours(left: Option<u8>, top: Option<u8>) -> i32 {
 // Intra 4×4 mode prediction.
 // -----------------------------------------------------------------------------
 
-fn predict_intra4x4_mode_with(
+pub(crate) fn predict_intra4x4_mode_with(
     pic: &Picture,
     mb_x: u32,
     mb_y: u32,
@@ -857,7 +862,7 @@ fn predict_intra4x4_mode_with(
 // Neighbour collection.
 // -----------------------------------------------------------------------------
 
-fn collect_intra4x4_neighbours(
+pub(crate) fn collect_intra4x4_neighbours(
     pic: &Picture,
     mb_x: u32,
     mb_y: u32,
@@ -934,7 +939,7 @@ fn collect_intra4x4_neighbours(
 }
 
 /// Whether the 4 samples just above-right of this 4×4 block exist.
-fn top_right_available_4x4(
+pub(crate) fn top_right_available_4x4(
     mb_x: u32,
     mb_y: u32,
     br_row: usize,
@@ -972,7 +977,7 @@ fn top_right_available_4x4(
     }
 }
 
-fn collect_intra16x16_neighbours(pic: &Picture, mb_x: u32, mb_y: u32) -> Intra16x16Neighbours {
+pub(crate) fn collect_intra16x16_neighbours(pic: &Picture, mb_x: u32, mb_y: u32) -> Intra16x16Neighbours {
     let lstride = pic.luma_stride();
     let lo_mb = pic.luma_off(mb_x, mb_y);
     let top_avail = mb_y > 0;
