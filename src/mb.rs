@@ -9,23 +9,25 @@
 //! 1. `mb_type`
 //! 2. If `mb_type == I_NxN && pps.transform_8x8_mode_flag`:
 //!    `transform_size_8x8_flag` — selects 4 × Intra_8×8 modes vs.
-//!    16 × Intra_4×4 modes. This crate does not yet wire the 8×8 residual
-//!    decode into the MB loop, so a set flag surfaces as `Error::Unsupported`.
-//! 3. If `mb_type == I_NxN`: 16 × (`prev_intra4x4_pred_mode_flag` +
-//!    optional `rem_intra4x4_pred_mode`).
+//!    16 × Intra_4×4 modes.
+//! 3. If `mb_type == I_NxN` with 4×4 transform: 16 ×
+//!    (`prev_intra4x4_pred_mode_flag` + optional `rem_intra4x4_pred_mode`);
+//!    with 8×8 transform (High Profile §8.3.2): 4 ×
+//!    (`prev_intra8x8_pred_mode_flag` + optional `rem_intra8x8_pred_mode`).
 //! 4. If `chroma_format_idc != 0`: `intra_chroma_pred_mode`
 //! 5. If `mb_type == I_NxN`: `coded_block_pattern` (`me(v)`)
 //! 6. If `cbp != 0` or `mb_type starts I_16x16`: `mb_qp_delta`
-//! 7. Residual: luma DC (Intra16x16 only) + 16 × 4×4 luma + 2 chroma DC +
-//!    8 chroma AC
+//! 7. Residual: luma DC (Intra16x16 only) + 16 × 4×4 luma (or 4 × 8×8) +
+//!    2 chroma DC + 8 chroma AC
 
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
-use crate::cavlc::{decode_residual_block, BlockKind};
+use crate::cavlc::{decode_residual_8x8_sub, decode_residual_block, BlockKind};
 use crate::intra_pred::{
-    predict_intra_16x16, predict_intra_4x4, predict_intra_chroma, Intra16x16Mode,
-    Intra16x16Neighbours, Intra4x4Mode, Intra4x4Neighbours, IntraChromaMode, IntraChromaNeighbours,
+    predict_intra_16x16, predict_intra_4x4, predict_intra_8x8, predict_intra_chroma,
+    Intra16x16Mode, Intra16x16Neighbours, Intra4x4Mode, Intra4x4Neighbours, Intra8x8Mode,
+    Intra8x8Neighbours, IntraChromaMode, IntraChromaNeighbours,
 };
 use crate::mb_type::{decode_i_slice_mb_type, IMbType};
 use crate::picture::{MbInfo, Picture, INTRA_DC_FAKE};
@@ -34,7 +36,8 @@ use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::tables::decode_cbp_intra;
 use crate::transform::{
-    chroma_qp, dequantize_4x4, idct_4x4, inv_hadamard_2x2_chroma_dc, inv_hadamard_4x4_dc,
+    chroma_qp, dequantize_4x4, dequantize_8x8, idct_4x4, idct_8x8, inv_hadamard_2x2_chroma_dc,
+    inv_hadamard_4x4_dc,
 };
 
 /// Per-block (4×4) raster ordering of the residual blocks within a
@@ -120,38 +123,62 @@ pub fn decode_intra_mb_given_imb(
     }
 
     // Per §7.3.5.1, transform_size_8x8_flag comes before the intra mode
-    // syntax for I_NxN when the PPS enables it. This decoder only supports
-    // the 4×4 residual path today — surface the flag as `Unsupported` so
-    // callers don't silently desync the bitstream.
+    // syntax for I_NxN when the PPS enables it. When the flag is set we
+    // read 4 Intra_8×8 mode slots and dispatch to the High Profile §8.5.13
+    // residual path; otherwise we read 16 Intra_4×4 mode slots.
+    let mut transform_8x8 = false;
     let mut intra4x4_modes = [INTRA_DC_FAKE; 16];
     if matches!(imb, IMbType::INxN) {
         if pps.transform_8x8_mode_flag {
-            let transform_8x8 = br.read_flag()?;
-            if transform_8x8 {
-                return Err(Error::unsupported(
-                    "h264: CAVLC transform_size_8x8_flag residual decode \
-                     (§7.3.5.3.2, §8.5.13) not wired into the MB loop yet",
-                ));
-            }
+            transform_8x8 = br.read_flag()?;
         }
-        // Iterate in raster of 4×4 sub-blocks per spec coding order
-        // (LUMA_BLOCK_RASTER walks the zig-zag scan of 4×4 blocks).
-        for blk in 0..16usize {
-            let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
-            let prev_flag = br.read_flag()?;
-            let predicted =
-                predict_intra4x4_mode_with(pic, mb_x, mb_y, br_row, br_col, &intra4x4_modes);
-            let mode = if prev_flag {
-                predicted
-            } else {
-                let rem = br.read_u32(3)? as u8;
-                if rem < predicted {
-                    rem
+        if transform_8x8 {
+            // §8.3.2 — four Intra_8×8 blocks in raster order. The chosen
+            // mode is replicated into all four 4×4 slots the 8×8 covers,
+            // so the 4×4-keyed `predict_intra4x4_mode_with` returns the
+            // correct §8.3.2.1 neighbour-min for subsequent 8×8 blocks.
+            for blk8 in 0..4usize {
+                let br_row = (blk8 >> 1) * 2;
+                let br_col = (blk8 & 1) * 2;
+                let prev_flag = br.read_flag()?;
+                let predicted =
+                    predict_intra4x4_mode_with(pic, mb_x, mb_y, br_row, br_col, &intra4x4_modes);
+                let mode = if prev_flag {
+                    predicted
                 } else {
-                    rem + 1
+                    let rem = br.read_u32(3)? as u8;
+                    if rem < predicted {
+                        rem
+                    } else {
+                        rem + 1
+                    }
+                };
+                for dr in 0..2 {
+                    for dc in 0..2 {
+                        intra4x4_modes[(br_row + dr) * 4 + br_col + dc] = mode;
+                    }
                 }
-            };
-            intra4x4_modes[br_row * 4 + br_col] = mode;
+            }
+        } else {
+            // Iterate in raster of 4×4 sub-blocks per spec coding order
+            // (LUMA_BLOCK_RASTER walks the zig-zag scan of 4×4 blocks).
+            for blk in 0..16usize {
+                let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
+                let prev_flag = br.read_flag()?;
+                let predicted =
+                    predict_intra4x4_mode_with(pic, mb_x, mb_y, br_row, br_col, &intra4x4_modes);
+                let mode = if prev_flag {
+                    predicted
+                } else {
+                    let rem = br.read_u32(3)? as u8;
+                    if rem < predicted {
+                        rem
+                    } else {
+                        rem + 1
+                    }
+                };
+                intra4x4_modes[br_row * 4 + br_col] = mode;
+            }
         }
     }
 
@@ -218,6 +245,18 @@ pub fn decode_intra_mb_given_imb(
             mb_y,
             pic,
             intra16x16_pred_mode,
+            cbp_luma,
+            qp_y,
+        )?,
+        IMbType::INxN if transform_8x8 => decode_luma_intra_8x8(
+            br,
+            sps,
+            pps,
+            sh,
+            mb_x,
+            mb_y,
+            pic,
+            &intra4x4_modes,
             cbp_luma,
             qp_y,
         )?,
@@ -348,6 +387,161 @@ fn decode_luma_intra_nxn(
         pic.mb_info_mut(mb_x, mb_y).luma_nc[br_row * 4 + br_col] = total_coeff as u8;
     }
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Luma — I_NxN with transform_size_8x8_flag (High Profile, §8.3.2 + §8.5.13).
+// -----------------------------------------------------------------------------
+//
+// Mirrors FFmpeg's `decode_luma_residual` when `IS_8x8DCT(mb_type)` is set
+// (`libavcodec/h264_cavlc.c`). Each of the four 8×8 blocks (`i8x8` = 0..=3)
+// decodes as four 4×4-style CAVLC sub-blocks (`i4x4` = 0..=3) spliced
+// together via [`cavlc::ZIGZAG_8X8_CAVLC`]. Inside this loop the per-4×4
+// `luma_nc` slots act as FFmpeg's `non_zero_count_cache`: each sub-block
+// writes its own `total_coeff` at its 4×4 position so the NEXT sub-block's
+// `pred_non_zero_count` lookup sees it. Once all four sub-blocks of one 8×8
+// are decoded, the top-left slot is overwritten with the sum of all four
+// (`nnz[0] += nnz[1] + nnz[8] + nnz[9]` in FFmpeg) so downstream neighbour
+// MBs see a single consolidated count at the 8×8 block's top-left position.
+
+fn decode_luma_intra_8x8(
+    br: &mut BitReader<'_>,
+    _sps: &Sps,
+    _pps: &Pps,
+    _sh: &SliceHeader,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    modes: &[u8; 16],
+    cbp_luma: u8,
+    qp_y: i32,
+) -> Result<()> {
+    let lstride = pic.luma_stride();
+    let lo_mb = pic.luma_off(mb_x, mb_y);
+
+    for blk8 in 0..4usize {
+        let br8_row = blk8 >> 1;
+        let br8_col = blk8 & 1;
+        // Mode was replicated across all four 4×4 slots — any one works.
+        let mode_v = modes[(br8_row * 2) * 4 + br8_col * 2];
+        let mode = Intra8x8Mode::from_u8(mode_v)
+            .ok_or_else(|| Error::invalid(format!("h264 mb: invalid intra8x8 mode {mode_v}")))?;
+        let neigh = collect_intra8x8_neighbours(pic, mb_x, mb_y, br8_row, br8_col);
+        let mut pred = [0u8; 64];
+        predict_intra_8x8(&mut pred, mode, &neigh);
+
+        let has_residual = (cbp_luma >> blk8) & 1 != 0;
+        let mut residual = [0i32; 64];
+        if has_residual {
+            let r0 = br8_row * 2;
+            let c0 = br8_col * 2;
+            // Sub-block order matches FFmpeg's i4x4 = 0..=3 inside i8x8:
+            // TL, TR, BL, BR — scan8 slots (r,c), (r,c+1), (r+1,c),
+            // (r+1,c+1). Writing `luma_nc` between sub-blocks lets the
+            // in-MB neighbour lookup for sub-blocks 1..=3 read the
+            // previous sub-block's `total_coeff`.
+            let slots = [(r0, c0), (r0, c0 + 1), (r0 + 1, c0), (r0 + 1, c0 + 1)];
+            for (sub, &(sr, sc)) in slots.iter().enumerate() {
+                let nc = predict_nc_luma(pic, mb_x, mb_y, sr, sc);
+                let tc = decode_residual_8x8_sub(br, nc, sub, &mut residual)?;
+                pic.mb_info_mut(mb_x, mb_y).luma_nc[sr * 4 + sc] = tc;
+            }
+            dequantize_8x8(&mut residual, qp_y);
+            idct_8x8(&mut residual);
+
+            // FFmpeg post-decode aggregation: collapse the 2×2 of
+            // per-sub-block counts into the top-left slot so neighbouring
+            // MBs see one representative nnz for the whole 8×8 block.
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            let sum = info.luma_nc[r0 * 4 + c0] as u16
+                + info.luma_nc[r0 * 4 + c0 + 1] as u16
+                + info.luma_nc[(r0 + 1) * 4 + c0] as u16
+                + info.luma_nc[(r0 + 1) * 4 + c0 + 1] as u16;
+            info.luma_nc[r0 * 4 + c0] = sum.min(16) as u8;
+        }
+
+        let lo = lo_mb + (br8_row * 8) * lstride + br8_col * 8;
+        for r in 0..8 {
+            for c in 0..8 {
+                let v = pred[r * 8 + c] as i32 + residual[r * 8 + c];
+                pic.y[lo + r * lstride + c] = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_intra8x8_neighbours(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    br8_row: usize,
+    br8_col: usize,
+) -> Intra8x8Neighbours {
+    let lstride = pic.luma_stride();
+
+    let top_avail = br8_row > 0 || mb_y > 0;
+    let mut top = [0u8; 16];
+    let mut top_right_available = false;
+    if top_avail {
+        let row_y_global = (mb_y as usize) * 16 + br8_row * 8 - 1;
+        let row_off = row_y_global * lstride;
+        let col_base = (mb_x as usize) * 16 + br8_col * 8;
+        for i in 0..8 {
+            top[i] = pic.y[row_off + col_base + i];
+        }
+        // Top-right availability table for an 8×8 block (§6.4.11.4 adapted
+        // to 8×8 raster): TL 8×8 reads top-right from MB above;
+        // TR 8×8 reads from the above-right MB; BL 8×8 reads from the
+        // top-right 8×8 in the same MB (already decoded); BR 8×8 would
+        // read into the MB to the right, which is not yet decoded.
+        top_right_available = match (br8_row, br8_col) {
+            (0, 0) => mb_y > 0,
+            (0, 1) => {
+                mb_y > 0 && mb_x + 1 < pic.mb_width && pic.mb_info_at(mb_x + 1, mb_y - 1).coded
+            }
+            (1, 0) => true,
+            _ => false,
+        };
+        if top_right_available {
+            for i in 0..8 {
+                top[8 + i] = pic.y[row_off + col_base + 8 + i];
+            }
+        } else {
+            for i in 0..8 {
+                top[8 + i] = top[7];
+            }
+        }
+    }
+
+    let left_avail = br8_col > 0 || mb_x > 0;
+    let mut left = [0u8; 8];
+    if left_avail {
+        let col_x_global = (mb_x as usize) * 16 + br8_col * 8 - 1;
+        for i in 0..8 {
+            let row = (mb_y as usize) * 16 + br8_row * 8 + i;
+            left[i] = pic.y[row * lstride + col_x_global];
+        }
+    }
+
+    let tl_avail = top_avail && left_avail;
+    let top_left = if tl_avail {
+        let row_y_global = (mb_y as usize) * 16 + br8_row * 8 - 1;
+        let col_x_global = (mb_x as usize) * 16 + br8_col * 8 - 1;
+        pic.y[row_y_global * lstride + col_x_global]
+    } else {
+        0
+    };
+
+    Intra8x8Neighbours {
+        top,
+        left,
+        top_left,
+        top_available: top_avail,
+        left_available: left_avail,
+        top_left_available: tl_avail,
+        top_right_available,
+    }
 }
 
 // -----------------------------------------------------------------------------

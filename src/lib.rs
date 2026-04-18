@@ -12,6 +12,14 @@
 //!   prediction, residual decode, 4×4 IDCT + Hadamard, optional deblocking.
 //!   The CABAC I-path covers I_16×16, I_NxN and I_PCM (with the mid-stream
 //!   arithmetic-engine re-init mandated by §9.3.1.2).
+//! * **High Profile 8×8 transform** on the CAVLC I-slice path —
+//!   `transform_size_8x8_flag = 1` macroblocks (§7.3.5.3.2) decode as four
+//!   interleaved CAVLC sub-blocks via the `zigzag_scan8x8_cavlc` table,
+//!   with FFmpeg-style per-sub-block `non_zero_count_cache` neighbour
+//!   indexing and post-decode `nnz[0] += nnz[1] + nnz[8] + nnz[9]`
+//!   aggregation, then through the §8.5.13 dequant + inverse 8×8 integer
+//!   transform and §8.3.2 Intra_8×8 prediction. Bit-exact against
+//!   ffmpeg's libavcodec reference on a smpte-bars 128×128 IDR.
 //! * **CAVLC baseline P-slice** pixel reconstruction (§8.4) — P_L0_16×16 /
 //!   16×8 / 8×16, P_8×8 (all four sub-partition shapes) and P_8×8ref0,
 //!   P_Skip, plus intra-in-P macroblocks. Luma 6-tap half-pel + bilinear
@@ -75,31 +83,12 @@
 //! to PSNR ≥ 28 dB for gradient content at QP 22 and ≥ 40 dB for solid
 //! content.
 //!
-//! # High Profile 8×8 transform — primitives only, not wired
-//!
-//! The math primitives for the High-Profile 8×8 residual path are
-//! implemented and unit-tested in isolation but are **not** wired into the
-//! macroblock decode loop:
-//!
-//! * 8×8 inverse integer transform ([`transform::idct_8x8`]) and its
-//!   6-class dequantisation ([`transform::dequantize_8x8`]) — §8.5.13.
-//! * Nine Intra_8×8 prediction modes ([`intra_pred::predict_intra_8x8`])
-//!   including reference-sample low-pass filtering — §8.3.2.
-//!
-//! When `pps.transform_8x8_mode_flag = 1` and a macroblock sets
-//! `transform_size_8x8_flag = 1`, both the CAVLC I-slice path
-//! ([`mb::decode_i_slice_data`]) and the CABAC I-slice path
-//! ([`cabac::mb`]) surface `Error::Unsupported`. The CAVLC §7.3.5.3.2
-//! residual decode and the CABAC 8×8 context coding (§9.3.3.1.1.10) are
-//! not implemented — a prior attempt hit a bit-accounting desync against
-//! real x264 output and was rolled back so the public surface stays
-//! honest about what's wired.
-//!
 //! # Out of scope (returns `Error::Unsupported` or the encoder refuses)
 //!
-//! * High-Profile 8×8 residual decode (both CAVLC §7.3.5.3.2 and CABAC
-//!   §9.3.3.1.1.10), and P-slice inter macroblocks with
-//!   `transform_size_8x8_flag = 1`.
+//! * High-Profile 8×8 residual decode on the **CABAC** I-slice path
+//!   (§9.3.3.1.1.10) and on **any** P-slice macroblocks — CAVLC I-slice
+//!   8×8 is wired and bit-exact (see above); the CABAC 8×8 flag is
+//!   parse-and-reject for now.
 //! * Custom scaling-list matrices — the SPS/PPS fields are parsed and
 //!   skipped, and only the flat-16 default list is used for 4×4 dequant.
 //! * CABAC B-slices (decode); any CABAC encoding; any P/B slice encoding.

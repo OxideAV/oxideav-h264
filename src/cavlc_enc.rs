@@ -187,6 +187,15 @@ pub fn encode_residual_block(
             }
             (coded, 4usize)
         }
+        BlockKind::Luma8x8Sub => {
+            // The baseline encoder never emits 8×8-transform blocks (§8.5.13).
+            // The caller (decoder) uses `decode_residual_8x8_sub` directly;
+            // encoding is out of scope for the High Profile 8×8 path.
+            return Err(Error::unsupported(
+                "h264 cavlc_enc: Luma8x8Sub encode path not supported \
+                 (High Profile §8.5.13 encoder out of scope)",
+            ));
+        }
     };
 
     // Count non-zeros and their positions.
