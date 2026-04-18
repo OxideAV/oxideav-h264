@@ -158,20 +158,32 @@ fn decode_first_iframe_against_reference() {
     assert!(pct >= 80.0, "testsrc pixel-match {:.2}% < 80%", pct);
 }
 
-/// Regression test for the pre-existing CAVLC chroma-AC nC desync
-/// (§9.2.1.1). Before this fix the very first macroblock of a richer
-/// testsrc IDR hit `InvalidData("coded_len 16 > max_num_coeff 15")`,
-/// because `predict_nc_chroma` inside the chroma AC loop read a
-/// stale per-MB nC table — the decoder wrote the accumulated counts
-/// only once, after all four blocks had been parsed. That meant nC
-/// for the last chroma AC block fell into VLC class 0 when it
-/// should have been class 2, aliasing the `total_zeros` code and
-/// overshooting `max_num_coeff`.
+/// Regression test for two CAVLC-side defects on a richer testsrc IDR:
 ///
-/// Fixed by publishing the in-progress per-block `nc_arr` back into
-/// `MbInfo` after every chroma block is decoded, mirroring what the
-/// luma path already did. The fixture is committed so this test
-/// doesn't depend on a local ffmpeg invocation.
+/// 1. §9.2.1.1 chroma-AC nC desync — `predict_nc_chroma` inside the chroma
+///    AC loop read a stale per-MB nC table because the decoder published
+///    the accumulated counts only once, after all four blocks had been
+///    parsed. The last chroma AC block then fell into VLC class 0 instead
+///    of class 2, aliased the `total_zeros` codeword, and ran off the end
+///    (`coded_len 16 > max_num_coeff 15`). Fixed by writing the in-progress
+///    `nc_arr` back to `MbInfo` after every chroma block — mirroring what
+///    the luma path already does.
+///
+/// 2. §9.2.2.1 level_code +15 over-shift for `level_prefix == 14` — the
+///    pre-escape range [14, 29] is reached directly from `prefix = 14,
+///    sl = 0` via a 4-bit suffix; the +15 adjustment only applies to the
+///    escape path at `prefix >= 15`. The prior code added the +15 for
+///    `prefix >= 14`, which double-shifted every level coded at prefix=14
+///    (e.g. decoded +17 where the spec-correct level is −8). This biased
+///    chroma DC reconstruction by a full Hadamard-basis class in every
+///    MB that carried a medium-magnitude chroma DC coefficient, producing
+///    systematic per-quadrant offsets matching the [+K, −K, −K, +K]
+///    signature of the f[1][1] basis.
+///
+/// After both fixes the testsrc 64×64 IDR decodes bit-exact against
+/// ffmpeg: every luma and chroma sample matches the reference YUV. The
+/// fixture is committed so this test doesn't depend on a local ffmpeg
+/// invocation.
 #[test]
 fn cavlc_chroma_ac_nc_desync_regression() {
     let es_path = concat!(
@@ -196,24 +208,46 @@ fn cavlc_chroma_ac_nc_desync_regression() {
     assert_eq!(frame.width, 64);
     assert_eq!(frame.height, 64);
 
-    // Sanity check we actually reconstructed samples — most luma pixels
-    // should land on the ffmpeg reference. Chroma intra prediction has
-    // known separate (non-CAVLC) errors we accept here.
     let ref_y = &yuv[0..(64 * 64)];
+    let ref_cb = &yuv[(64 * 64)..(64 * 64 + 32 * 32)];
+    let ref_cr = &yuv[(64 * 64 + 32 * 32)..(64 * 64 + 32 * 32 * 2)];
     let dec_y = &frame.planes[0].data;
-    let y_match = count_within(dec_y, ref_y, 8);
+    let dec_cb = &frame.planes[1].data;
+    let dec_cr = &frame.planes[2].data;
+
+    let y_match = count_within(dec_y, ref_y, 0);
     let y_pct = (y_match as f64) * 100.0 / (ref_y.len() as f64);
+    let mse = |a: &[u8], b: &[u8]| -> f64 {
+        let s: i64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| {
+                let d = *x as i64 - *y as i64;
+                d * d
+            })
+            .sum();
+        s as f64 / a.len() as f64
+    };
+    let cb_mse = mse(dec_cb, ref_cb);
+    let cr_mse = mse(dec_cr, ref_cr);
     eprintln!(
-        "cavlc-desync regression: luma ±8 LSB match {}/{} ({:.2}%)",
+        "cavlc-desync regression: luma exact match {}/{} ({:.2}%), Cb MSE {:.4}, Cr MSE {:.4}",
         y_match,
         ref_y.len(),
-        y_pct
+        y_pct,
+        cb_mse,
+        cr_mse
     );
-    // Before the fix the decoder threw an error — this catches any
-    // regression that re-introduces the desync on a CAVLC block that's
-    // not covered by the synthetic roundtrip tests.
+
+    // Before the nC-desync fix the decoder threw an error; before the
+    // level-prefix fix we had 97.66% luma and Cb/Cr MSE 285/139. With
+    // both fixes the testsrc IDR is bit-exact.
     assert!(
-        y_pct >= 75.0,
-        "luma match {y_pct:.2}% < 75% — CAVLC desync likely reintroduced"
+        y_pct >= 99.99,
+        "luma exact match {y_pct:.2}% < 99.99% — CAVLC desync or level-prefix regression"
+    );
+    assert!(
+        cb_mse < 0.5 && cr_mse < 0.5,
+        "chroma MSE Cb={cb_mse:.4} Cr={cr_mse:.4} — chroma CAVLC regression"
     );
 }
