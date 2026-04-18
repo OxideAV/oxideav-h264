@@ -381,13 +381,13 @@ impl Picture {
     /// stride.
     pub fn luma_off(&self, mb_x: u32, mb_y: u32) -> usize {
         let lstride = self.luma_stride();
-        let (first_row, _) = self.mb_luma_row_info(mb_y);
+        let (first_row, _) = self.mb_luma_row_info_at(mb_x, mb_y);
         first_row * lstride + (mb_x as usize * 16)
     }
     pub fn chroma_off(&self, mb_x: u32, mb_y: u32) -> usize {
         let cstride = self.chroma_stride();
         let mbw = self.mb_width_chroma();
-        let (first_row, _) = self.mb_chroma_row_info(mb_y);
+        let (first_row, _) = self.mb_chroma_row_info_at(mb_x, mb_y);
         first_row * cstride + (mb_x as usize * mbw)
     }
 
@@ -397,26 +397,43 @@ impl Picture {
     /// otherwise. Callers that walk rows inside an MB must use this
     /// instead of [`Self::luma_stride`] once MBAFF is enabled.
     pub fn luma_row_stride_for(&self, mb_y: u32) -> usize {
-        self.luma_stride() * if self.is_mb_field(mb_y) { 2 } else { 1 }
+        self.luma_row_stride_for_at(0, mb_y)
+    }
+
+    /// Column-aware variant of [`Self::luma_row_stride_for`]. Needed
+    /// on mixed-mode MBAFF pictures where neighbour pairs may carry
+    /// different `mb_field_decoding_flag` values.
+    pub fn luma_row_stride_for_at(&self, mb_x: u32, mb_y: u32) -> usize {
+        self.luma_stride() * if self.is_mb_field_at(mb_x, mb_y) { 2 } else { 1 }
     }
 
     /// Chroma counterpart of [`Self::luma_row_stride_for`].
     pub fn chroma_row_stride_for(&self, mb_y: u32) -> usize {
-        self.chroma_stride() * if self.is_mb_field(mb_y) { 2 } else { 1 }
+        self.chroma_row_stride_for_at(0, mb_y)
     }
 
-    /// True when `(mb_x, mb_y)` sits in a field-coded MBAFF pair. Checked
-    /// against [`Self::mbaff_enabled`] + the stored
-    /// [`MbInfo::mb_field_decoding_flag`].
+    /// Column-aware variant of [`Self::chroma_row_stride_for`].
+    pub fn chroma_row_stride_for_at(&self, mb_x: u32, mb_y: u32) -> usize {
+        self.chroma_stride() * if self.is_mb_field_at(mb_x, mb_y) { 2 } else { 1 }
+    }
+
+    /// True when the pair at (mb_x, mb_y) is field-coded. The current
+    /// MVP uses `mb_x = 0` as a proxy (queries keyed on just `mb_y`),
+    /// which is correct for uniformly-field-coded pictures. Mixed-mode
+    /// pictures still need the more precise `is_mb_field_at(mb_x, mb_y)`
+    /// variant below.
     pub fn is_mb_field(&self, mb_y: u32) -> bool {
+        self.is_mb_field_at(0, mb_y)
+    }
+
+    /// True when the specific MB at `(mb_x, mb_y)` is field-coded. Per
+    /// §7.3.4 both MBs of a pair carry the same flag so the column
+    /// affects the result only on mixed-mode MBAFF pictures.
+    pub fn is_mb_field_at(&self, mb_x: u32, mb_y: u32) -> bool {
         if !self.mbaff_enabled {
             return false;
         }
-        // Per §7.3.4 both MBs of a pair carry the same flag; indexing the
-        // MB at column 0 is sufficient for queries that only need the
-        // pair's field-mode. Callers on specific (mb_x, mb_y) can still
-        // reach through `mb_info_at` directly.
-        let idx = (mb_y * self.mb_width) as usize;
+        let idx = (mb_y * self.mb_width + mb_x) as usize;
         self.mb_info
             .get(idx)
             .map(|m| m.mb_field_decoding_flag)
@@ -464,7 +481,12 @@ impl Picture {
     /// rows (row_stride_in_rows = 2) and the bottom MB on odd rows.
     /// Frame-coded or non-MBAFF MBs return `(mb_y*16, 1)`.
     pub fn mb_luma_row_info(&self, mb_y: u32) -> (usize, usize) {
-        if self.mbaff_enabled && self.is_mb_field(mb_y) {
+        self.mb_luma_row_info_at(0, mb_y)
+    }
+
+    /// Column-aware variant of [`Self::mb_luma_row_info`].
+    pub fn mb_luma_row_info_at(&self, mb_x: u32, mb_y: u32) -> (usize, usize) {
+        if self.mbaff_enabled && self.is_mb_field_at(mb_x, mb_y) {
             let pair_y = (mb_y / 2) as usize;
             let which = (mb_y & 1) as usize;
             (pair_y * 32 + which, 2)
@@ -477,12 +499,15 @@ impl Picture {
     /// chroma plane row, row-step-in-rows)`. For 4:2:0 the chroma MB is
     /// 8 rows tall per frame-MB and steps by 2 under field-coded MBAFF.
     pub fn mb_chroma_row_info(&self, mb_y: u32) -> (usize, usize) {
+        self.mb_chroma_row_info_at(0, mb_y)
+    }
+
+    /// Column-aware variant of [`Self::mb_chroma_row_info`].
+    pub fn mb_chroma_row_info_at(&self, mb_x: u32, mb_y: u32) -> (usize, usize) {
         let mbh = self.mb_height_chroma();
-        if self.mbaff_enabled && self.is_mb_field(mb_y) {
+        if self.mbaff_enabled && self.is_mb_field_at(mb_x, mb_y) {
             let pair_y = (mb_y / 2) as usize;
             let which = (mb_y & 1) as usize;
-            // Each pair covers 2*mbh chroma rows; top MB on even rows,
-            // bottom on odd.
             (pair_y * (mbh * 2) + which, 2)
         } else {
             ((mb_y as usize) * mbh, 1)
