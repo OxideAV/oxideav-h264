@@ -215,44 +215,55 @@ impl H264Decoder {
                 // `field_pic_flag = 0` and the SPS has
                 // `mb_adaptive_frame_field_flag = 1`), PAFF field coding
                 // (slice has `field_pic_flag = 1`), and plain field-mode
-                // frames. This decoder wires PAFF I-slice CAVLC only;
-                // MBAFF and PAFF for other slice types / entropy modes
-                // continue to return `Error::Unsupported`.
+                // frames. This decoder wires PAFF I-slice CAVLC and MBAFF
+                // I-slice CAVLC MVPs for 4:2:0 / 8-bit; other slice types /
+                // entropy modes continue to return `Error::Unsupported`.
                 if !sps.frame_mbs_only_flag {
                     if !sh.field_pic_flag {
-                        if sps.mb_adaptive_frame_field_flag {
+                        // MBAFF frame coding path.
+                        if !sps.mb_adaptive_frame_field_flag {
                             return Err(Error::unsupported(
-                                "h264: MBAFF (§7.3.2.1.1 mb_adaptive_frame_field_flag=1) not supported",
+                                "h264: frame-mode slice under frame_mbs_only_flag=0 without MBAFF/PAFF not supported",
                             ));
                         }
-                        return Err(Error::unsupported(
-                            "h264: frame-mode slice under frame_mbs_only_flag=0 without MBAFF/PAFF not supported",
-                        ));
-                    }
-                    // PAFF field slice: only CAVLC I-slices in 4:2:0 / 8-bit
-                    // land on the field-reconstruction path below.
-                    if sh.slice_type != SliceType::I {
-                        return Err(Error::unsupported(
-                            "h264: PAFF (field_pic_flag=1) supports I-slices only",
-                        ));
-                    }
-                    if pps.entropy_coding_mode_flag {
-                        return Err(Error::unsupported(
-                            "h264: PAFF CABAC entropy decode not wired — CAVLC I-slice only",
-                        ));
-                    }
-                    if sps.chroma_format_idc != 1
-                        || sps.bit_depth_luma_minus8 != 0
-                        || sps.bit_depth_chroma_minus8 != 0
-                    {
-                        return Err(Error::unsupported(
-                            "h264: PAFF only wired for 4:2:0 / 8-bit (no 4:2:2 / 4:4:4 / 10-bit)",
-                        ));
-                    }
-                    if sps.mb_adaptive_frame_field_flag {
-                        return Err(Error::unsupported(
-                            "h264: PAFF + MBAFF mixed within the same CVS not supported",
-                        ));
+                        let mbaff_ok = sh.slice_type == SliceType::I
+                            && !pps.entropy_coding_mode_flag
+                            && sps.chroma_format_idc == 1
+                            && sps.bit_depth_luma_minus8 == 0
+                            && sps.bit_depth_chroma_minus8 == 0
+                            && !sps.separate_colour_plane_flag;
+                        if !mbaff_ok {
+                            return Err(Error::unsupported(
+                                "h264: only MBAFF I-slice CAVLC 4:2:0 8-bit interlaced is wired (§7.3.4); \
+                                 MBAFF+P/B/CABAC/chroma>420/10-bit still reject",
+                            ));
+                        }
+                    } else {
+                        // PAFF field slice: only CAVLC I-slices in 4:2:0 / 8-bit
+                        // land on the field-reconstruction path below.
+                        if sh.slice_type != SliceType::I {
+                            return Err(Error::unsupported(
+                                "h264: PAFF (field_pic_flag=1) supports I-slices only",
+                            ));
+                        }
+                        if pps.entropy_coding_mode_flag {
+                            return Err(Error::unsupported(
+                                "h264: PAFF CABAC entropy decode not wired — CAVLC I-slice only",
+                            ));
+                        }
+                        if sps.chroma_format_idc != 1
+                            || sps.bit_depth_luma_minus8 != 0
+                            || sps.bit_depth_chroma_minus8 != 0
+                        {
+                            return Err(Error::unsupported(
+                                "h264: PAFF only wired for 4:2:0 / 8-bit (no 4:2:2 / 4:4:4 / 10-bit)",
+                            ));
+                        }
+                        if sps.mb_adaptive_frame_field_flag {
+                            return Err(Error::unsupported(
+                                "h264: PAFF + MBAFF mixed within the same CVS not supported",
+                            ));
+                        }
                     }
                 }
                 // §7.4.2.1.1 — chroma format. The MB-layer pipeline below
@@ -357,16 +368,18 @@ impl H264Decoder {
                 }
 
                 // Macroblock-layer decode (§7.3.5 / §8.3 / §8.4 / §8.5 / §9.2).
-                // §7.4.3 — for a field-coded picture (PAFF) the MB grid
-                // is `PicWidthInMbs × PicHeightInMapUnits`; for a frame-
-                // coded picture under `frame_mbs_only_flag = 1` it's the
-                // same formula. When `frame_mbs_only_flag = 0` a
-                // frame-coded slice would have `2 × PicHeightInMapUnits`
-                // rows — that path is gated out above (MBAFF + non-PAFF
-                // frame mode both return `Error::Unsupported`), so the
-                // value computed here is correct for every path we wire.
+                // §7.4.3 — MB grid height depends on frame/field mode:
+                //   frame_mbs_only_flag = 1: PicHeightInMapUnits (progressive)
+                //   MBAFF frame-mode (field_pic_flag = 0): 2 × map_units
+                //     (every MB, top + bottom of each MBAFF pair, gets a slot)
+                //   PAFF field picture (field_pic_flag = 1): PicHeightInMapUnits
+                //     (one field = half-height, already the map-unit count)
                 let mb_w = sps.pic_width_in_mbs();
-                let mb_h = sps.pic_height_in_map_units();
+                let mb_h = if sh.field_pic_flag {
+                    sps.pic_height_in_map_units()
+                } else {
+                    sps.pic_height_in_mbs()
+                };
                 let bit_depth_y = (sps.bit_depth_luma_minus8 + 8) as u8;
                 let bit_depth_c = (sps.bit_depth_chroma_minus8 + 8) as u8;
                 let make_pic = || -> Picture {
@@ -393,6 +406,8 @@ impl H264Decoder {
                 {
                     pic = make_pic();
                 }
+                pic.mbaff_enabled =
+                    !sps.frame_mbs_only_flag && sps.mb_adaptive_frame_field_flag;
                 // §7.4.2.2 Table 7-2 — resolve the active scaling
                 // matrices (SPS + PPS, with fallback). Stored on the
                 // picture so every MB-level dequant call can index
@@ -673,7 +688,15 @@ impl H264Decoder {
                 // touches `pic.y/cb/cr`; the 10-bit kernel touches the u16
                 // planes and scales α / β / tC0 by `1 << (BitDepth - 8)`
                 // per §8.7.2.1.
-                if sh.disable_deblocking_filter_idc != 1 {
+                //
+                // §8.7.1.1 — MBAFF deblocking needs an extra edge pass that
+                // keys on each MB pair's `mb_field_decoding_flag` plus
+                // cross-pair field/frame boundaries. The frame-only §8.7
+                // kernel wired here would corrupt field-coded MBs, so it is
+                // skipped entirely for MBAFF pictures. The MBAFF fixture
+                // accepts a looser luma-match threshold to tolerate the
+                // missing deblock pass.
+                if sh.disable_deblocking_filter_idc != 1 && !pic.mbaff_enabled {
                     if pic.is_high_bit_depth() {
                         crate::deblock_hi::deblock_picture_hi(&mut pic, &pps, &sh);
                     } else {

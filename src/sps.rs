@@ -107,6 +107,16 @@ impl Sps {
         self.pic_height_in_map_units_minus1 + 1
     }
 
+    /// Height in macroblocks (`PicHeightInMbs` per §7.4.2.1.1). Equals
+    /// `pic_height_in_map_units` for progressive content and **twice**
+    /// that for interlaced / MBAFF content (each map unit stores a pair
+    /// of MBs). Drives the `Picture::mb_height` allocation + the
+    /// MB-loop bounds.
+    pub fn pic_height_in_mbs(&self) -> u32 {
+        let factor = if self.frame_mbs_only_flag { 1 } else { 2 };
+        self.pic_height_in_map_units() * factor
+    }
+
     /// Width in macroblocks * 16.
     pub fn coded_width(&self) -> u32 {
         self.pic_width_in_mbs() * 16

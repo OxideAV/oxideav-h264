@@ -100,6 +100,14 @@ pub struct Picture {
     /// Carried on the picture so downstream field-pairing can identify
     /// parity without replaying the slice header.
     pub bottom_field: bool,
+    /// §7.3.4 — true when the slice the picture is being decoded from
+    /// has `frame_mbs_only_flag = 0 && mb_adaptive_frame_field_flag = 1`
+    /// and `field_pic_flag = 0`. Under MBAFF an MB pair (top + bottom
+    /// MBs at the same pair coordinate) may be frame- or field-coded
+    /// independently; [`MbInfo::mb_field_decoding_flag`] records the
+    /// per-pair choice and the sample-offset / row-stride helpers on
+    /// this struct key on it to implement §6.4.9.4 neighbour lookups.
+    pub mbaff_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +217,12 @@ pub struct MbInfo {
     /// Consumed by the §9.3.3.1.1.4 chroma CBP ctxIdxInc derivation on
     /// neighbour MBs.
     pub cbp_chroma: u8,
+    /// §7.4.4 `mb_field_decoding_flag` — `true` for a field-coded MB
+    /// in an MBAFF pair. Zero for non-MBAFF pictures; per §7.3.4 every
+    /// MB in the same pair shares this value (both the top and bottom
+    /// MB see the same flag). Drives the per-MB row-stride / sample
+    /// offset helpers on [`Picture`].
+    pub mb_field_decoding_flag: bool,
 }
 
 impl Default for MbInfo {
@@ -241,6 +255,7 @@ impl Default for MbInfo {
             chroma_dc_cbf: [false; 2],
             cbp_luma: 0,
             cbp_chroma: 0,
+            mb_field_decoding_flag: false,
         }
     }
 }
@@ -345,6 +360,7 @@ impl Picture {
             scaling_lists: crate::scaling_list::ScalingLists::flat(),
             field_pic: false,
             bottom_field: false,
+            mbaff_enabled: false,
         }
         // `mid_y` exists for future symmetry; luma recon always overwrites
         // so there's no need to pre-fill the luma plane with grey.
@@ -387,13 +403,148 @@ impl Picture {
     }
 
     /// Linear address of the top-left luma sample of `(mb_x, mb_y)`.
+    ///
+    /// Under MBAFF (§7.3.4) an MB at `mb_y = 2*pair_y + which` in a
+    /// field-coded pair occupies rows `pair_y*32 + which + r*2` for
+    /// `r = 0..15` — the top MB sits on even plane rows and the bottom
+    /// MB on odd rows. In the frame-coded (or non-MBAFF) case the MB
+    /// covers contiguous rows `mb_y*16 + r`. The helper always returns
+    /// the byte offset of that MB's `(0, 0)` sample; callers walk rows
+    /// with [`Self::luma_row_stride_for`] rather than the raw plane
+    /// stride.
     pub fn luma_off(&self, mb_x: u32, mb_y: u32) -> usize {
-        (mb_y as usize * 16) * self.luma_stride() + (mb_x as usize * 16)
+        let lstride = self.luma_stride();
+        let (first_row, _) = self.mb_luma_row_info_at(mb_x, mb_y);
+        first_row * lstride + (mb_x as usize * 16)
     }
     pub fn chroma_off(&self, mb_x: u32, mb_y: u32) -> usize {
+        let cstride = self.chroma_stride();
         let mbw = self.mb_width_chroma();
+        let (first_row, _) = self.mb_chroma_row_info_at(mb_x, mb_y);
+        first_row * cstride + (mb_x as usize * mbw)
+    }
+
+    /// §7.3.4 — per-MB row stride in luma samples. Returns `2 *
+    /// luma_stride()` for a field-coded MB in an MBAFF pair (the
+    /// MB samples interleave with its sibling) and `luma_stride()`
+    /// otherwise. Callers that walk rows inside an MB must use this
+    /// instead of [`Self::luma_stride`] once MBAFF is enabled.
+    pub fn luma_row_stride_for(&self, mb_y: u32) -> usize {
+        self.luma_row_stride_for_at(0, mb_y)
+    }
+
+    /// Column-aware variant of [`Self::luma_row_stride_for`]. Needed
+    /// on mixed-mode MBAFF pictures where neighbour pairs may carry
+    /// different `mb_field_decoding_flag` values.
+    pub fn luma_row_stride_for_at(&self, mb_x: u32, mb_y: u32) -> usize {
+        self.luma_stride() * if self.is_mb_field_at(mb_x, mb_y) { 2 } else { 1 }
+    }
+
+    /// Chroma counterpart of [`Self::luma_row_stride_for`].
+    pub fn chroma_row_stride_for(&self, mb_y: u32) -> usize {
+        self.chroma_row_stride_for_at(0, mb_y)
+    }
+
+    /// Column-aware variant of [`Self::chroma_row_stride_for`].
+    pub fn chroma_row_stride_for_at(&self, mb_x: u32, mb_y: u32) -> usize {
+        self.chroma_stride() * if self.is_mb_field_at(mb_x, mb_y) { 2 } else { 1 }
+    }
+
+    /// True when the pair at (mb_x, mb_y) is field-coded. The current
+    /// MVP uses `mb_x = 0` as a proxy (queries keyed on just `mb_y`),
+    /// which is correct for uniformly-field-coded pictures. Mixed-mode
+    /// pictures still need the more precise `is_mb_field_at(mb_x, mb_y)`
+    /// variant below.
+    pub fn is_mb_field(&self, mb_y: u32) -> bool {
+        self.is_mb_field_at(0, mb_y)
+    }
+
+    /// True when the specific MB at `(mb_x, mb_y)` is field-coded. Per
+    /// §7.3.4 both MBs of a pair carry the same flag so the column
+    /// affects the result only on mixed-mode MBAFF pictures.
+    pub fn is_mb_field_at(&self, mb_x: u32, mb_y: u32) -> bool {
+        if !self.mbaff_enabled {
+            return false;
+        }
+        let idx = (mb_y * self.mb_width + mb_x) as usize;
+        self.mb_info
+            .get(idx)
+            .map(|m| m.mb_field_decoding_flag)
+            .unwrap_or(false)
+    }
+
+    /// Whether MB `(mb_x, mb_y)` has an "above" neighbour in the §6.4.9.4
+    /// sense. Non-MBAFF and frame-coded MBAFF pairs: true iff `mb_y > 0`.
+    /// Field-coded MBAFF pairs: both top and bottom MBs look at the
+    /// **previous pair** (same-polarity field), so availability requires
+    /// `pair_y > 0`.
+    pub fn mb_top_available(&self, mb_y: u32) -> bool {
+        if !self.mbaff_enabled {
+            return mb_y > 0;
+        }
+        if self.is_mb_field(mb_y) {
+            (mb_y / 2) > 0
+        } else {
+            mb_y > 0
+        }
+    }
+
+    /// Index of the "above" neighbour MB for `mb_y` per §6.4.9.4.
+    /// Returns `None` when unavailable. For non-MBAFF and frame-coded
+    /// MBAFF pairs the above neighbour is `mb_y - 1`. For field-coded
+    /// MBAFF pairs the neighbour sits in the **previous pair** at the
+    /// same field polarity, so `mb_y - 2`.
+    pub fn mb_above_neighbour(&self, mb_y: u32) -> Option<u32> {
+        if !self.mb_top_available(mb_y) {
+            return None;
+        }
+        if self.mbaff_enabled && self.is_mb_field(mb_y) {
+            // Top MB of pair P (which=0): above = top MB of pair P-1
+            //   → mb_y - 2.
+            // Bottom MB of pair P (which=1): above = bottom MB of pair
+            //   P-1 → mb_y - 2.
+            Some(mb_y - 2)
+        } else {
+            Some(mb_y - 1)
+        }
+    }
+
+    /// (first luma plane row, row stride in rows) for MB row `mb_y`.
+    /// Under MBAFF with a field-coded pair the top MB sits on even plane
+    /// rows (row_stride_in_rows = 2) and the bottom MB on odd rows.
+    /// Frame-coded or non-MBAFF MBs return `(mb_y*16, 1)`.
+    pub fn mb_luma_row_info(&self, mb_y: u32) -> (usize, usize) {
+        self.mb_luma_row_info_at(0, mb_y)
+    }
+
+    /// Column-aware variant of [`Self::mb_luma_row_info`].
+    pub fn mb_luma_row_info_at(&self, mb_x: u32, mb_y: u32) -> (usize, usize) {
+        if self.mbaff_enabled && self.is_mb_field_at(mb_x, mb_y) {
+            let pair_y = (mb_y / 2) as usize;
+            let which = (mb_y & 1) as usize;
+            (pair_y * 32 + which, 2)
+        } else {
+            ((mb_y as usize) * 16, 1)
+        }
+    }
+
+    /// Chroma counterpart of [`Self::mb_luma_row_info`]. Returns `(first
+    /// chroma plane row, row-step-in-rows)`. For 4:2:0 the chroma MB is
+    /// 8 rows tall per frame-MB and steps by 2 under field-coded MBAFF.
+    pub fn mb_chroma_row_info(&self, mb_y: u32) -> (usize, usize) {
+        self.mb_chroma_row_info_at(0, mb_y)
+    }
+
+    /// Column-aware variant of [`Self::mb_chroma_row_info`].
+    pub fn mb_chroma_row_info_at(&self, mb_x: u32, mb_y: u32) -> (usize, usize) {
         let mbh = self.mb_height_chroma();
-        (mb_y as usize * mbh) * self.chroma_stride() + (mb_x as usize * mbw)
+        if self.mbaff_enabled && self.is_mb_field_at(mb_x, mb_y) {
+            let pair_y = (mb_y / 2) as usize;
+            let which = (mb_y & 1) as usize;
+            (pair_y * (mbh * 2) + which, 2)
+        } else {
+            ((mb_y as usize) * mbh, 1)
+        }
     }
 
     /// Get a mutable reference to a single MB's bookkeeping.
