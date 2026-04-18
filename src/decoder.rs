@@ -333,15 +333,19 @@ impl H264Decoder {
                         )));
                     }
                 }
-                // §7.4.2.1.1 bit depth. 12-bit and 14-bit profiles (High422 /
-                // High444Pred with `bit_depth_luma_minus8 > 2`) would need
-                // wider `i32` intermediate precision throughout the pipeline
-                // and additional Clip1 bounds; reject them early.
-                if sps.bit_depth_luma_minus8 > 2 || sps.bit_depth_chroma_minus8 > 2 {
-                    return Err(Error::unsupported(format!(
-                        "h264: bit_depth > 10 (luma_minus8={}, chroma_minus8={}) not supported",
-                        sps.bit_depth_luma_minus8, sps.bit_depth_chroma_minus8
-                    )));
+                // §7.4.2.1.1 bit depth — `bit_depth_luma_minus8 ∈ {0,2,4,6}`
+                // map to 8 / 10 / 12 / 14 bits. The spec also defines odd
+                // values (9, 11, 13 bits) via `bit_depth_luma_minus8 ∈
+                // {1, 3, 5}` but no profile permits those in practice and
+                // none of the conformance fixtures exercise them.
+                match sps.bit_depth_luma_minus8 {
+                    0 | 2 | 4 | 6 => {}
+                    v => {
+                        return Err(Error::unsupported(format!(
+                            "h264: bit_depth_luma_minus8={v} not supported \
+                             (only 0/2/4/6 = 8/10/12/14-bit are wired)"
+                        )));
+                    }
                 }
                 let high_bit_depth =
                     sps.bit_depth_luma_minus8 > 0 || sps.bit_depth_chroma_minus8 > 0;
@@ -364,9 +368,23 @@ impl H264Decoder {
                             ));
                         }
                     }
-                    // CABAC P/B + CAVLC I/P/B are supported at 10-bit; CABAC I
-                    // landed in wt/hi-ext. Anything else (CABAC P/B, ...)
-                    // still routes through the block below.
+                    // 10-bit: CAVLC I/P/B + CABAC I are wired.
+                    // 12/14-bit: CAVLC I only — P/B and CABAC return
+                    // Error::Unsupported while the rest of the pipeline
+                    // (motion comp u16 filters, CABAC ctx clamps, etc.)
+                    // is audited for higher `QpBdOffset`.
+                    if sps.bit_depth_luma_minus8 > 2 {
+                        if pps.entropy_coding_mode_flag {
+                            return Err(Error::unsupported(
+                                "h264: 12/14-bit CABAC not yet wired — CAVLC I only",
+                            ));
+                        }
+                        if sh.slice_type != SliceType::I {
+                            return Err(Error::unsupported(
+                                "h264: 12/14-bit CAVLC wired for I-slices only (P/B not yet audited)",
+                            ));
+                        }
+                    }
                     if pps.entropy_coding_mode_flag && sh.slice_type != SliceType::I {
                         return Err(Error::unsupported(
                             "h264: high-bit-depth CABAC entropy decode wired for I only — P/B return Error::Unsupported",
