@@ -450,56 +450,110 @@ pub fn decode_mb_skip_flag_p(
 
 /// Table 9-36 — `mb_type` for P/SP slices. Returns the spec's raw mb_type
 /// value in `0..=30` (values 0..=4 are the P inter partitions, 5..=30 map
-/// to the intra-in-P offset of Table 7-11).
+/// to the intra-in-P offset of Table 7-13).
 ///
-/// Binarization (Table 9-36):
-///   prefix bin 0 ctxIdxInc = 0 (within the P mb_type ctx bank)
-///   bin  value  binstring
-///   0    P_L0_16x16          0
-///   1    P_L0_L0_16x8        1 0 0
-///   2    P_L0_L0_8x16        1 0 1
-///   3    P_8x8               1 1 0
-///   4    P_8x8ref0           not applicable here (main profile only)
-///   5..30 intra-in-P         prefix `1 1 1` followed by the I-slice
-///                            bin-string with ctxIdxOffset 17.
+/// Binarization (Table 9-36 as driven by the reference decoder in JM /
+/// FFmpeg `decode_cabac_mb_type`):
 ///
-/// The P-slice's 7 `mb_type` contexts are laid out in `ctxs[0..7]`:
-///   `ctxs[0]`        — prefix bin 0
-///   `ctxs[1]`        — bin 1 (sub-branch select)
-///   `ctxs[2]`        — bin 2 (partition select)
-///   `ctxs[3..7]`     — intra-in-P bins (mapped from CTX_IDX_MB_TYPE_I
-///                      via the same `decode_mb_type_i` machinery).
+///   * bin 0 == 0 → inter: two more bins select the partition.
+///   * bin 0 == 1 → intra-in-P: parse I-slice `mb_type` bin string with
+///     `ctxIdxOffset = 17` (see [`CTX_IDX_MB_TYPE_INTRA_IN_P`]) — NOT 3 or 32.
+///
+/// Inter sub-tree (3 bins total):
+///   bin 0 | bin 1 | bin 2 | mb_type | meaning
+///   ------|-------|-------|---------|-----------------
+///     0   |   0   |   0   |    0    | P_L0_16×16
+///     0   |   0   |   1   |    3    | P_8×8
+///     0   |   1   |   0   |    2    | P_L0_L0_8×16
+///     0   |   1   |   1   |    1    | P_L0_L0_16×8
+///
+/// Context slots inside `p_ctxs` (laid out at ctxIdxOffset 14):
+///   * `p_ctxs[0]` — prefix bin 0 (ctxIdx 14)
+///   * `p_ctxs[1]` — bin 1 inside inter sub-tree (ctxIdx 15)
+///   * `p_ctxs[2]` — bin 2 when bin 1 == 0 (ctxIdx 16)
+///   * `p_ctxs[3]` — bin 2 when bin 1 == 1 (ctxIdx 17) — spec-mandated
+///     split so the "inner" partition decision has its own context.
+///
+/// The intra suffix consumes its own 4-context bank starting at
+/// `CTX_IDX_MB_TYPE_INTRA_IN_P` (17). Caller passes that slice via
+/// `intra_ctxs`.
 pub fn decode_mb_type_p(
     d: &mut CabacDecoder<'_>,
-    p_ctxs: &mut [CabacContext],
-    i_ctxs: &mut [CabacContext],
+    ctxs: &mut [CabacContext],
+    intra_base: usize,
 ) -> Result<u32> {
-    if p_ctxs.len() < 3 {
+    // Need 7 slots covering ctxIdx 14..=20 so both prefix and intra suffix
+    // can index into the same contiguous mutable slice.
+    if ctxs.len() < 7 || intra_base + 4 > ctxs.len() {
         return Err(Error::invalid(
-            "cabac::binarize::decode_mb_type_p: need >=3 P mb_type ctxs",
+            "cabac::binarize::decode_mb_type_p: need >=7 P mb_type ctxs",
         ));
     }
-    let b0 = d.decode_bin(&mut p_ctxs[0])?;
-    if b0 == 0 {
-        // P_L0_16x16 — mb_type = 0.
-        return Ok(0);
+    let b0 = d.decode_bin(&mut ctxs[0])?;
+    if b0 == 1 {
+        // Intra-in-P: dispatch to the shared intra mb_type bin tree with
+        // ctxIdxOffset = 17. Returns the raw I-slice mb_type (0..=25).
+        let raw = decode_mb_type_intra_in_p(d, &mut ctxs[intra_base..intra_base + 4])?;
+        // Table 7-13 re-indexing: intra-in-P lives at mb_type offset +5.
+        return Ok(5 + raw);
     }
-    let b1 = d.decode_bin(&mut p_ctxs[1])?;
-    let b2 = d.decode_bin(&mut p_ctxs[2])?;
+    // Inter sub-tree: bins 1 and 2 select the partition shape.
+    let b1 = d.decode_bin(&mut ctxs[1])?;
     if b1 == 0 {
-        // 1 0 x
-        return Ok(if b2 == 0 { 1 } else { 2 });
+        // `0 0 x` — P_L0_16×16 vs P_8×8 (bin 2 on ctx 2).
+        let b2 = d.decode_bin(&mut ctxs[2])?;
+        Ok(if b2 == 0 { 0 } else { 3 })
+    } else {
+        // `0 1 x` — P_L0_L0_8×16 vs P_L0_L0_16×8 (bin 2 on ctx 3).
+        let b2 = d.decode_bin(&mut ctxs[3])?;
+        Ok(if b2 == 0 { 2 } else { 1 })
     }
-    // 1 1 0 → P_8x8, 1 1 1 → intra-in-P (plus further bins).
-    if b2 == 0 {
-        return Ok(3);
+}
+
+/// §9.3.3.1.1.3 — intra `mb_type` suffix bin tree shared between I/SI slices
+/// (ctxIdxOffset 3, with neighbour-derived bin-0 ctx) and intra-in-P/B (bin 0
+/// with fixed ctxIdxInc = 0).
+///
+/// For intra-in-P / intra-in-B (the `intra_slice = 0` branch of FFmpeg's
+/// `decode_cabac_intra_mb_type`), the suffix bank has only 4 unique slots:
+///   * `ctxs[0]` — bin 0 (I_NxN flag)
+///   * `ctxs[1]` — bin 2 (cbp_luma bit)
+///   * `ctxs[2]` — bins 3 AND 4 (cbp_chroma bits) — same ctx reused
+///   * `ctxs[3]` — bins 5 AND 6 (intra16x16 pred_mode bits) — same ctx
+///
+/// Returns the raw I-slice mb_type value in `0..=25`.
+fn decode_mb_type_intra_in_p(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+) -> Result<u32> {
+    if ctxs.len() < 4 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_mb_type_intra_in_p: need >=4 ctxs",
+        ));
     }
-    // Intra-in-P: decode the I-slice mb_type bin string with ctxIdxInc = 0
-    // (the first bin's neighbour-derived ctxIdxInc is folded into `inc=0`
-    // here because P_8x8 vs intra branch is already decided).
-    let raw = decode_mb_type_i(d, i_ctxs, 0)?;
-    // Offset by +5 for Table 7-13's intra-in-P re-indexing.
-    Ok(5 + raw)
+    // bin 0 — `I_NxN` vs other (ctxIdxInc is fixed 0 for intra-in-P/B per
+    // §9.3.3.1.1.3, so no neighbour derivation here).
+    let b0 = d.decode_bin(&mut ctxs[0])?;
+    if b0 == 0 {
+        return Ok(0); // I_NxN
+    }
+    // bin 1 — terminate (I_PCM check).
+    let term = d.decode_terminate()?;
+    if term == 1 {
+        return Ok(25); // I_PCM
+    }
+    // Remaining bins: cbp_luma, cbp_chroma (0, 1), pred_mode (0, 1).
+    let cbp_luma = d.decode_bin(&mut ctxs[1])? as u32;
+    let b_cbp_ch0 = d.decode_bin(&mut ctxs[2])?;
+    let cbp_chroma = if b_cbp_ch0 == 0 {
+        0
+    } else {
+        1 + d.decode_bin(&mut ctxs[2])? as u32
+    };
+    let pm0 = d.decode_bin(&mut ctxs[3])? as u32;
+    let pm1 = d.decode_bin(&mut ctxs[3])? as u32;
+    let intra_pred_mode = pm0 * 2 + pm1;
+    Ok(1 + intra_pred_mode + 4 * cbp_chroma + 12 * cbp_luma)
 }
 
 /// Table 9-38 — `sub_mb_type` for P/SP slices. Returns the spec value

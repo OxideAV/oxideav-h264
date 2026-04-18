@@ -85,6 +85,12 @@ pub const CTX_IDX_MB_TYPE_SI: usize = 0;
 pub const CTX_IDX_MB_TYPE_I: usize = 3;
 pub const CTX_IDX_MB_SKIP_FLAG_P: usize = 11;
 pub const CTX_IDX_MB_TYPE_P: usize = 14;
+/// §9.3.3.1.1.3 + Table 9-34 — when a P/SP macroblock's prefix bin 0 is `1`
+/// the remaining intra-mb-type bin string is parsed with `ctxIdxOffset = 17`
+/// (reusing the four contexts 17..=20 inside the P mb_type bank). Not 3 or
+/// 32 — those are the I/SI and B intra-suffix offsets respectively. FFmpeg's
+/// `decode_cabac_mb_type` passes `ctx_base = 17` for the P-slice intra path.
+pub const CTX_IDX_MB_TYPE_INTRA_IN_P: usize = 17;
 pub const CTX_IDX_SUB_MB_TYPE_P: usize = 21;
 pub const CTX_IDX_MB_SKIP_FLAG_B: usize = 24;
 pub const CTX_IDX_MB_TYPE_B: usize = 27;
