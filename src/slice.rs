@@ -8,10 +8,10 @@
 //! into [`SliceHeader::mmco_commands`].
 //!
 //! Explicit weighted prediction (§7.3.3.2) for P-slices is parsed and the
-//! weight table is returned on the [`SliceHeader`]. B-slice bi-prediction is
-//! out of scope; the L1 side of the weight table is parsed but left unused.
-//! Implicit weighted bi-prediction (`weighted_bipred_idc == 2`) is also out
-//! of scope.
+//! weight table is returned on the [`SliceHeader`]. Explicit B-slice
+//! bi-prediction reads both L0 and L1 entries from the same table.
+//! Implicit weighted bi-prediction (`weighted_bipred_idc == 2`) is derived
+//! at decode time from POC arithmetic and does not add a header field.
 
 use oxideav_core::{Error, Result};
 

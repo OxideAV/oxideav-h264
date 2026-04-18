@@ -10,8 +10,10 @@
 //!   quarter-pel (§8.4.2.2.1).
 //! * Chroma motion compensation: bilinear 1/8-pel (§8.4.2.2.2).
 //! * Explicit weighted prediction (§8.4.2.3.2) for single-list-0 samples
-//!   applied on top of the interpolated predictor. B-slice bi-prediction
-//!   and implicit weighted bi-prediction (§8.4.2.3.3) are out of scope.
+//!   applied on top of the interpolated predictor.
+//! * Implicit weighted bi-prediction (§8.4.2.3.3) — POC-derived
+//!   `DistScaleFactor` gives a per-block (w0, w1) applied to `predL0` and
+//!   `predL1` via `(a*w0 + b*w1 + 32) >> 6`. See [`implicit_bipred_weights`].
 //!
 //! Motion vectors use quarter-pel units for luma (spec convention); chroma
 //! MVs are derived from luma / 2 to produce 1/8-pel chroma offsets.
@@ -601,6 +603,77 @@ pub fn weighted_bipred_plane(
     }
 }
 
+/// Derive the `(w0, w1)` implicit luma/chroma bi-prediction weights per
+/// §8.4.2.3.3. Returns `ImplicitBiWeights::Default` when the caller must
+/// fall back to the unweighted `(predL0 + predL1 + 1) >> 1` average:
+///
+/// * either reference is long-term (§8.4.2.3.3 last paragraph),
+/// * or `DistScaleFactor` is outside `[-256, 512]` (i.e. the clip kicked in
+///   at the edges of the `[-1024, 1023]` range — treated as degenerate).
+///
+/// The spec derivation:
+/// ```text
+/// tb = Clip3(-128, 127, CurrPoc - PicL0Poc)
+/// td = Clip3(-128, 127, PicL1Poc - PicL0Poc)
+/// tx = (16384 + (|td| / 2)) / td
+/// DistScaleFactor = Clip3(-1024, 1023, (tb * tx + 32) >> 6)
+/// w1 = DistScaleFactor >> 2
+/// w0 = 64 - w1
+/// ```
+/// When `td == 0` the scale collapses to 50/50 (`w0 = w1 = 32`), matching
+/// the spec's `DistScaleFactor = 128` fallback.
+pub fn implicit_bipred_weights(
+    curr_poc: i32,
+    l0_poc: i32,
+    l1_poc: i32,
+    l0_long_term: bool,
+    l1_long_term: bool,
+) -> ImplicitBiWeights {
+    if l0_long_term || l1_long_term {
+        return ImplicitBiWeights::Default;
+    }
+    let tb = (curr_poc - l0_poc).clamp(-128, 127);
+    let td = (l1_poc - l0_poc).clamp(-128, 127);
+    let dsf = if td == 0 {
+        // §8.4.2.3.3: td == 0 → use 128 (= 50/50 with >> 2 giving 32 each).
+        128
+    } else {
+        let td_abs = td.unsigned_abs() as i32;
+        let tx = (16384 + (td_abs / 2)) / td;
+        ((tb * tx + 32) >> 6).clamp(-1024, 1023)
+    };
+    if !(-256..=512).contains(&dsf) {
+        // Outside the "well-behaved" window → fall back to unweighted average.
+        return ImplicitBiWeights::Default;
+    }
+    let w1 = dsf >> 2;
+    let w0 = 64 - w1;
+    ImplicitBiWeights::Weighted { w0, w1 }
+}
+
+/// Outcome of [`implicit_bipred_weights`]. `Default` means "use plain
+/// `(predL0 + predL1 + 1) >> 1`"; `Weighted` carries the derived (w0, w1)
+/// for the `(predL0 * w0 + predL1 * w1 + 32) >> 6` formula.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImplicitBiWeights {
+    Default,
+    Weighted { w0: i32, w1: i32 },
+}
+
+/// Implicit weighted bi-prediction sample combine per §8.4.2.3.3:
+/// `pred = Clip1( (predL0 * w0 + predL1 * w1 + 32) >> 6 )`. Luma and chroma
+/// share the same weights. Matches the dimensions of the two inputs.
+pub fn implicit_weighted_bipred_plane(dst: &mut [u8], l0: &[u8], l1: &[u8], w0: i32, w1: i32) {
+    debug_assert_eq!(dst.len(), l0.len());
+    debug_assert_eq!(dst.len(), l1.len());
+    for i in 0..dst.len() {
+        let a = l0[i] as i32;
+        let b = l1[i] as i32;
+        let v = (a * w0 + b * w1 + 32) >> 6;
+        dst[i] = v.clamp(0, 255) as u8;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Explicit weighted prediction — §8.4.2.3.2.
 // ---------------------------------------------------------------------------
@@ -844,6 +917,60 @@ mod tests {
         weighted_bipred_plane(&mut out, &l0, &l1, 1, 0, 1, 0, 1);
         // (10 + 30 + 2) >> 2 = 10; (20 + 20 + 2) >> 2 = 10; etc.
         assert_eq!(out, [10, 10, 10, 25]);
+    }
+
+    #[test]
+    fn implicit_bipred_symmetric_poc_is_50_50() {
+        // Current is exactly midway between L0 and L1: w0 = w1 = 32, which
+        // with the `(a*32 + b*32 + 32) >> 6` formula recovers the unweighted
+        // rounded average.
+        let w = implicit_bipred_weights(10, 0, 20, false, false);
+        assert_eq!(w, ImplicitBiWeights::Weighted { w0: 32, w1: 32 });
+    }
+
+    #[test]
+    fn implicit_bipred_closer_to_l0_gives_more_l0_weight() {
+        // curr_poc=2, l0=0, l1=20 → tb=2, td=20, tx=(16384+10)/20 = 819,
+        // dsf = ((2*819) + 32) >> 6 = 1670 >> 6 = 26, w1 = 26 >> 2 = 6,
+        // w0 = 64 - 6 = 58. L0 dominates (curr is near L0).
+        let w = implicit_bipred_weights(2, 0, 20, false, false);
+        assert_eq!(w, ImplicitBiWeights::Weighted { w0: 58, w1: 6 });
+    }
+
+    #[test]
+    fn implicit_bipred_td_zero_falls_back_to_50_50() {
+        // Same POC on both lists → spec prescribes DSF = 128, giving 32/32.
+        let w = implicit_bipred_weights(5, 10, 10, false, false);
+        assert_eq!(w, ImplicitBiWeights::Weighted { w0: 32, w1: 32 });
+    }
+
+    #[test]
+    fn implicit_bipred_long_term_ref_forces_default() {
+        let w = implicit_bipred_weights(5, 0, 20, true, false);
+        assert_eq!(w, ImplicitBiWeights::Default);
+        let w = implicit_bipred_weights(5, 0, 20, false, true);
+        assert_eq!(w, ImplicitBiWeights::Default);
+    }
+
+    #[test]
+    fn implicit_bipred_dsf_clip_forces_default() {
+        // curr far outside [l0, l1] so `tb * tx` blows past ±512 after >>6
+        // → not in [-256, 512] → default equal weights per §8.4.2.3.3.
+        let w = implicit_bipred_weights(127, 0, 1, false, false);
+        assert_eq!(w, ImplicitBiWeights::Default);
+    }
+
+    #[test]
+    fn implicit_weighted_bipred_plane_matches_formula() {
+        // w0=48, w1=16 (3:1) over (100, 200):
+        //   (100*48 + 200*16 + 32) >> 6 = (4800 + 3200 + 32) >> 6 = 8032 >> 6 = 125
+        let l0 = [100u8, 50];
+        let l1 = [200u8, 250];
+        let mut out = [0u8; 2];
+        implicit_weighted_bipred_plane(&mut out, &l0, &l1, 48, 16);
+        // (100*48 + 200*16 + 32) >> 6 = 8032 >> 6 = 125
+        // ( 50*48 + 250*16 + 32) >> 6 = 6432 >> 6 = 100
+        assert_eq!(out, [125, 100]);
     }
 
     #[test]
