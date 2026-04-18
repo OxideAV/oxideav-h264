@@ -294,8 +294,39 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   luma dimensions, reuse the luma Intra_4×4 / Intra_16×16 predictors,
   and decode three back-to-back luma-style residual streams per MB;
   P / B / CABAC on 4:4:4 remain out of scope.
-- Bit depths above 8, separate colour planes.
+- Bit depths above 10; 10-bit is supported for CAVLC I-slices in
+  4:2:0 only (see the 10-bit section below). 12-bit / 14-bit return
+  `Error::Unsupported`. Separate colour planes are also rejected.
 - SI / SP slices.
+
+## 10-bit (High 10) CAVLC I-slice decode
+
+The decoder handles 10-bit CAVLC I-slices in 4:2:0 end-to-end and emits
+`PixelFormat::Yuv420P10Le` frames (u16 samples packed little-endian).
+Bit-exact against ffmpeg on the `iframe_10bit_64x64` fixture shipped
+under `tests/fixtures/`.
+
+The high-bit-depth path runs alongside — not in place of — the 8-bit
+pipeline:
+
+- [`picture::Picture`] gains companion u16 planes (`y16` / `cb16` /
+  `cr16`) and `bit_depth_y` / `bit_depth_c` fields. At 8 bits only the
+  u8 planes are allocated; above 8 only the u16 planes are populated.
+- Intra prediction ([`intra_pred_hi`]) clips to `(1 << bit_depth) - 1`
+  and uses `1 << (bit_depth - 1)` as the DC no-neighbour fallback
+  (§8.3.1.2.3 / §8.3.3.3 / §8.3.4.2).
+- The residual pipeline ([`mb_hi`]) adds `QpBdOffsetY` to the decoded
+  `QpY` before dispatching through the i64-widened `dequantize_*_ext`
+  variants in [`transform`], and wraps `mb_qp_delta` modulo
+  `52 + QpBdOffsetY` per §7.4.5.
+- [`picture::Picture::to_video_frame`] packs the u16 planes as
+  little-endian bytes for `Yuv420P10Le`.
+
+Out of scope at 10-bit (return `Error::Unsupported`): P/B slices,
+CABAC, Intra_8×8 (`transform_size_8x8_flag = 1`), 4:2:2 / 4:4:4
+chroma, I_PCM, and in-loop deblocking (the 8.7 kernel still operates
+on u8 and is skipped on the high-bit-depth path). 12-bit and 14-bit
+profiles are rejected at slice entry.
 
 ## Codec id
 
@@ -373,6 +404,15 @@ ffmpeg -y -i /tmp/bframe_implicit.mp4 -c:v copy -bsf:v h264_mp4toannexb \
     -f h264 tests/fixtures/bframe_implicit_64x64.es
 ffmpeg -y -i /tmp/bframe_implicit.mp4 -f rawvideo -pix_fmt yuv420p \
     tests/fixtures/bframe_implicit_64x64.yuv
+
+# 10-bit (High 10) CAVLC I-slice — 64×64 yuv420p10le testsrc IDR.
+ffmpeg -y -f lavfi -i testsrc=duration=1:size=64x64:rate=1 \
+    -vframes 1 -pix_fmt yuv420p10le -c:v libx264 -profile:v high10 \
+    -preset ultrafast /tmp/10bit.mp4
+ffmpeg -y -i /tmp/10bit.mp4 -c copy -bsf:v h264_mp4toannexb -f h264 \
+    tests/fixtures/iframe_10bit_64x64.es
+ffmpeg -y -i /tmp/10bit.mp4 -f rawvideo -pix_fmt yuv420p10le \
+    tests/fixtures/iframe_10bit_64x64.yuv
 ```
 
 ## License

@@ -13,6 +13,20 @@
 //!   in-loop deblocking (§8.7). The CABAC I-path covers I_16×16, I_NxN and
 //!   I_PCM (with the mid-stream arithmetic-engine re-init mandated by
 //!   §9.3.1.2).
+//! * **10-bit (High 10) CAVLC I-slice** decode (§7.4.2.1.1 with
+//!   `bit_depth_luma_minus8 = 2`) — a u16 plane pair
+//!   ([`picture::Picture::y16`] / `cb16` / `cr16`) holds the
+//!   reconstructed samples, the dequant math uses i64-widened
+//!   `*_ext` helpers so the extended `QpY + QpBdOffsetY` range
+//!   (up to 63 at 10-bit) doesn't overflow, `mb_qp_delta` wraps mod
+//!   `52 + QpBdOffsetY`, and intra prediction clips to
+//!   `(1 << bit_depth) - 1`. The decoded frame is surfaced as
+//!   `PixelFormat::Yuv420P10Le` with the u16 samples packed little-endian.
+//!   Bit-exact against ffmpeg on the `iframe_10bit_64x64` fixture
+//!   committed under `tests/fixtures/`. Deblocking is skipped on the
+//!   10-bit path — it still operates on u8. 12-bit / 14-bit, P/B
+//!   slices, CABAC at 10-bit, Intra_8×8 at 10-bit, and I_PCM-at-10-bit
+//!   all return `Error::Unsupported`.
 //! * **4:4:4 CAVLC I-slice** decode (§6.4.1 Table 6-1, ChromaArrayType = 3)
 //!   — the chroma planes share the luma 16×16 dimensions, reuse the
 //!   Intra_4×4 / Intra_16×16 predictors (no chroma 8×8 modes), skip the
@@ -175,7 +189,9 @@
 //! * Monochrome (`chroma_format_idc = 0`) is rejected — the same
 //!   helpers are wired but the MB-layer path assumes chroma planes
 //!   exist.
-//! * Bit depths above 8.
+//! * Bit depths above 10 (12-bit / 14-bit). 10-bit is supported for
+//!   CAVLC I-slices in 4:2:0 only — see the High 10 bullet above for
+//!   the remaining gaps at 10 bits.
 //! * Rate control, adaptive QP, mode decision (Intra4×4 / Plane / Vertical /
 //!   Horizontal), or any psychovisual tuning. The encoder always emits
 //!   Intra_16×16 with DC_PRED and a fixed QP.
