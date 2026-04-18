@@ -209,10 +209,27 @@ impl H264Decoder {
                         )));
                     }
                 }
+                // §7.3.2.1.1 — interlaced coding allowed only in the MBAFF
+                // I-slice CAVLC MVP shape. MBAFF covers `frame_mbs_only_flag
+                // = 0 && mb_adaptive_frame_field_flag = 1 && !field_pic_flag`;
+                // anything else (PAFF `field_pic_flag = 1`, or non-MBAFF
+                // interlaced) still returns `Unsupported` so upstream can
+                // route to a fallback.
                 if !sps.frame_mbs_only_flag {
-                    return Err(Error::unsupported(
-                        "h264: interlaced / MBAFF (§7.3.2.1.1 frame_mbs_only_flag=0) not supported",
-                    ));
+                    let mbaff_ok = sps.mb_adaptive_frame_field_flag
+                        && !sh.field_pic_flag
+                        && sh.slice_type == SliceType::I
+                        && !pps.entropy_coding_mode_flag
+                        && sps.chroma_format_idc == 1
+                        && sps.bit_depth_luma_minus8 == 0
+                        && sps.bit_depth_chroma_minus8 == 0
+                        && !sps.separate_colour_plane_flag;
+                    if !mbaff_ok {
+                        return Err(Error::unsupported(
+                            "h264: only MBAFF I-slice CAVLC 4:2:0 8-bit interlaced is wired (§7.3.4); \
+                             field_pic/PAFF/P/B/CABAC/MBAFF+chroma>420/MBAFF+10-bit still reject",
+                        ));
+                    }
                 }
                 // §7.4.2.1.1 — chroma format. The MB-layer pipeline below
                 // (intra prediction, inverse transforms, motion
@@ -313,8 +330,11 @@ impl H264Decoder {
                 }
 
                 // Macroblock-layer decode (§7.3.5 / §8.3 / §8.4 / §8.5 / §9.2).
+                // `pic_height_in_mbs` doubles the map-unit count when
+                // `frame_mbs_only_flag == 0` so every MB (top + bottom of
+                // each MBAFF pair) owns its own slot in `pic.mb_info`.
                 let mb_w = sps.pic_width_in_mbs();
-                let mb_h = sps.pic_height_in_map_units();
+                let mb_h = sps.pic_height_in_mbs();
                 let bit_depth_y = (sps.bit_depth_luma_minus8 + 8) as u8;
                 let bit_depth_c = (sps.bit_depth_chroma_minus8 + 8) as u8;
                 let mut pic = self.current_pic.take().unwrap_or_else(|| {
@@ -340,6 +360,8 @@ impl H264Decoder {
                         bit_depth_c,
                     );
                 }
+                pic.mbaff_enabled =
+                    !sps.frame_mbs_only_flag && sps.mb_adaptive_frame_field_flag;
                 // §7.4.2.2 Table 7-2 — resolve the active scaling
                 // matrices (SPS + PPS, with fallback). Stored on the
                 // picture so every MB-level dequant call can index
@@ -617,7 +639,18 @@ impl H264Decoder {
                 // it is skipped (the decoded output is otherwise correct
                 // bit-exact against an ffmpeg `-filter_v h264=no-deblock`
                 // reference for the 10-bit fixture shipped with this crate).
-                if sh.disable_deblocking_filter_idc != 1 && !pic.is_high_bit_depth() {
+                //
+                // §8.7.1.1 — MBAFF deblocking needs an extra edge pass that
+                // keys on each MB pair's `mb_field_decoding_flag` plus
+                // cross-pair field/frame boundaries. The frame-only §8.7
+                // kernel wired here would corrupt field-coded MBs, so it
+                // is skipped entirely for MBAFF pictures. The MBAFF
+                // fixture accepts a looser luma-match threshold to tolerate
+                // the missing deblock pass.
+                if sh.disable_deblocking_filter_idc != 1
+                    && !pic.is_high_bit_depth()
+                    && !pic.mbaff_enabled
+                {
                     crate::deblock::deblock_picture(&mut pic, &pps, &sh);
                 }
 

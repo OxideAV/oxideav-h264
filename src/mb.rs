@@ -64,6 +64,12 @@ pub const LUMA_BLOCK_RASTER: [(usize, usize); 16] = [
 ];
 
 /// Top-left slice decode entry — drives the macroblock loop.
+///
+/// Under MBAFF (§7.3.4) MBs arrive as top+bottom pairs; before the top MB
+/// of each pair we read `mb_field_decoding_flag` and propagate it to
+/// both MBs of the pair so the per-MB sample-offset / row-stride helpers
+/// on [`Picture`] pick the right layout (§6.4.9.4). Non-MBAFF pictures
+/// fall through the same loop with a single-step `pair_size = 1`.
 pub fn decode_i_slice_data(
     br: &mut BitReader<'_>,
     sh: &SliceHeader,
@@ -72,19 +78,45 @@ pub fn decode_i_slice_data(
     pic: &mut Picture,
 ) -> Result<()> {
     let mb_w = sps.pic_width_in_mbs();
-    let mb_h = sps.pic_height_in_map_units();
+    let mb_h = sps.pic_height_in_mbs();
     let total_mbs = mb_w * mb_h;
-    let mut mb_addr = sh.first_mb_in_slice;
-    if mb_addr >= total_mbs {
+    if sh.first_mb_in_slice >= total_mbs {
         return Err(Error::invalid("h264 slice: first_mb_in_slice out of range"));
     }
     let mut prev_qp = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
 
-    while mb_addr < total_mbs {
-        let mb_x = mb_addr % mb_w;
-        let mb_y = mb_addr / mb_w;
-        decode_one_mb(br, sps, pps, sh, mb_x, mb_y, pic, &mut prev_qp)?;
-        mb_addr += 1;
+    if pic.mbaff_enabled {
+        // §7.3.4 — `first_mb_in_slice` counts MB pairs in MBAFF, so the
+        // starting (mb_x, mb_y_top) pair coord is `(fm %  mb_w, 2 * (fm /
+        // mb_w))`. Each iteration consumes two MBs (top then bottom).
+        let first_pair = sh.first_mb_in_slice as usize;
+        let pair_rows = (mb_h / 2) as usize;
+        let mb_w_us = mb_w as usize;
+        let total_pairs = pair_rows * mb_w_us;
+        for pair_idx in first_pair..total_pairs {
+            let pair_x = (pair_idx % mb_w_us) as u32;
+            let pair_y = (pair_idx / mb_w_us) as u32;
+            let bp = br.bit_position();
+            let field = br.read_flag()?;
+            eprintln!("MBAFF pair ({},{}) field={} bp={}", pair_x, pair_y, field, bp);
+            let top_mb_y = pair_y * 2;
+            let bot_mb_y = top_mb_y + 1;
+            // Stamp the per-pair field flag before decode so
+            // `Picture::luma_off` / `Picture::mb_luma_row_info` return
+            // the field-aware offsets throughout `decode_one_mb`.
+            pic.mb_info_mut(pair_x, top_mb_y).mb_field_decoding_flag = field;
+            pic.mb_info_mut(pair_x, bot_mb_y).mb_field_decoding_flag = field;
+            decode_one_mb(br, sps, pps, sh, pair_x, top_mb_y, pic, &mut prev_qp)?;
+            decode_one_mb(br, sps, pps, sh, pair_x, bot_mb_y, pic, &mut prev_qp)?;
+        }
+    } else {
+        let mut mb_addr = sh.first_mb_in_slice;
+        while mb_addr < total_mbs {
+            let mb_x = mb_addr % mb_w;
+            let mb_y = mb_addr / mb_w;
+            decode_one_mb(br, sps, pps, sh, mb_x, mb_y, pic, &mut prev_qp)?;
+            mb_addr += 1;
+        }
     }
     Ok(())
 }
@@ -99,9 +131,11 @@ fn decode_one_mb(
     pic: &mut Picture,
     prev_qp: &mut i32,
 ) -> Result<()> {
+    let bp = br.bit_position();
     let mb_type = br.read_ue()?;
     let imb = decode_i_slice_mb_type(mb_type)
         .ok_or_else(|| Error::invalid(format!("h264 slice: bad I mb_type {mb_type}")))?;
+    eprintln!("  MB({},{}) bp={} mb_type={} imb={:?}", mb_x, mb_y, bp, mb_type, imb);
     decode_intra_mb_given_imb(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb)
 }
 
@@ -204,8 +238,10 @@ pub fn decode_intra_mb_given_imb(
     let (cbp_luma, cbp_chroma) = match imb {
         IMbType::INxN => {
             let cbp_raw = br.read_ue()?;
-            decode_cbp_intra(cbp_raw)
-                .ok_or_else(|| Error::invalid(format!("h264 mb: bad CBP {cbp_raw}")))?
+            let cbp = decode_cbp_intra(cbp_raw)
+                .ok_or_else(|| Error::invalid(format!("h264 mb: bad CBP {cbp_raw}")))?;
+            eprintln!("    MB({},{}) cbp_raw={} -> cbp_luma={} cbp_chroma={}", mb_x, mb_y, cbp_raw, cbp.0, cbp.1);
+            cbp
         }
         IMbType::I16x16 {
             cbp_luma,
@@ -224,9 +260,13 @@ pub fn decode_intra_mb_given_imb(
     }
     let qp_y = *prev_qp;
 
-    // Initialise MB info.
+    // Initialise MB info. Preserve `mb_field_decoding_flag` which the
+    // slice loop stamped before dispatch (§7.3.4) — the `..Default::default()`
+    // below would otherwise reset it to `false` and flip the MB back to
+    // frame-coded mid-decode.
     {
         let info = pic.mb_info_mut(mb_x, mb_y);
+        let field = info.mb_field_decoding_flag;
         *info = MbInfo {
             qp_y,
             coded: true,
@@ -234,6 +274,7 @@ pub fn decode_intra_mb_given_imb(
             intra4x4_pred_mode: intra4x4_modes,
             cbp_luma,
             cbp_chroma,
+            mb_field_decoding_flag: field,
             ..Default::default()
         };
     }
@@ -390,7 +431,10 @@ fn decode_luma_intra_nxn(
     cbp_luma: u8,
     qp_y: i32,
 ) -> Result<()> {
-    let lstride = pic.luma_stride();
+    // `row_stride` accounts for MBAFF field-coded MBs which skip every
+    // other plane row (§7.3.4) — non-MBAFF falls through to plain
+    // `luma_stride()`.
+    let row_stride = pic.luma_row_stride_for(mb_y);
     let lo_mb = pic.luma_off(mb_x, mb_y);
 
     for blk in 0..16usize {
@@ -409,6 +453,7 @@ fn decode_luma_intra_nxn(
         let mut total_coeff = 0u32;
         if has_residual {
             let nc = predict_nc_luma(pic, mb_x, mb_y, br_row, br_col);
+            eprintln!("      blk=({},{}) nc={} bp={}", br_row, br_col, nc, br.bit_position());
             let blk = decode_residual_block(br, nc, BlockKind::Luma4x4)?;
             total_coeff = blk.total_coeff;
             residual = blk.coeffs;
@@ -417,11 +462,11 @@ fn decode_luma_intra_nxn(
             dequantize_4x4_scaled(&mut residual, qp_y, &scale);
             idct_4x4(&mut residual);
         }
-        let lo = lo_mb + br_row * 4 * lstride + br_col * 4;
+        let lo = lo_mb + br_row * 4 * row_stride + br_col * 4;
         for r in 0..4 {
             for c in 0..4 {
                 let v = pred[r * 4 + c] as i32 + residual[r * 4 + c];
-                pic.y[lo + r * lstride + c] = v.clamp(0, 255) as u8;
+                pic.y[lo + r * row_stride + c] = v.clamp(0, 255) as u8;
             }
         }
         pic.mb_info_mut(mb_x, mb_y).luma_nc[br_row * 4 + br_col] = total_coeff as u8;
@@ -456,7 +501,7 @@ fn decode_luma_intra_8x8(
     cbp_luma: u8,
     qp_y: i32,
 ) -> Result<()> {
-    let lstride = pic.luma_stride();
+    let row_stride = pic.luma_row_stride_for(mb_y);
     let lo_mb = pic.luma_off(mb_x, mb_y);
 
     for blk8 in 0..4usize {
@@ -502,11 +547,11 @@ fn decode_luma_intra_8x8(
             info.luma_nc[r0 * 4 + c0] = sum.min(16) as u8;
         }
 
-        let lo = lo_mb + (br8_row * 8) * lstride + br8_col * 8;
+        let lo = lo_mb + (br8_row * 8) * row_stride + br8_col * 8;
         for r in 0..8 {
             for c in 0..8 {
                 let v = pred[r * 8 + c] as i32 + residual[r * 8 + c];
-                pic.y[lo + r * lstride + c] = v.clamp(0, 255) as u8;
+                pic.y[lo + r * row_stride + c] = v.clamp(0, 255) as u8;
             }
         }
     }
@@ -520,17 +565,21 @@ fn collect_intra8x8_neighbours(
     br8_row: usize,
     br8_col: usize,
 ) -> Intra8x8Neighbours {
-    let lstride = pic.luma_stride();
+    // §6.4.9.4 — field-coded MBs under MBAFF step by `2 * luma_stride`
+    // per sample-row so the neighbour reads below follow the same
+    // interleaved layout as the per-MB sample writes.
+    let row_stride = pic.luma_row_stride_for(mb_y);
+    let lo_mb = pic.luma_off(mb_x, mb_y);
+    let blk_tl = lo_mb + br8_row * 8 * row_stride + br8_col * 8;
 
-    let top_avail = br8_row > 0 || mb_y > 0;
+    let top_avail = br8_row > 0 || pic.mb_top_available(mb_y);
     let mut top = [0u8; 16];
     let mut top_right_available = false;
     if top_avail {
-        let row_y_global = (mb_y as usize) * 16 + br8_row * 8 - 1;
-        let row_off = row_y_global * lstride;
-        let col_base = (mb_x as usize) * 16 + br8_col * 8;
+        // Row just above the block's row 0.
+        let row_off = blk_tl - row_stride;
         for i in 0..8 {
-            top[i] = pic.y[row_off + col_base + i];
+            top[i] = pic.y[row_off + i];
         }
         // Top-right availability table for an 8×8 block (§6.4.11.4 adapted
         // to 8×8 raster): TL 8×8 reads top-right from MB above;
@@ -547,7 +596,7 @@ fn collect_intra8x8_neighbours(
         };
         if top_right_available {
             for i in 0..8 {
-                top[8 + i] = pic.y[row_off + col_base + 8 + i];
+                top[8 + i] = pic.y[row_off + 8 + i];
             }
         } else {
             for i in 0..8 {
@@ -559,18 +608,14 @@ fn collect_intra8x8_neighbours(
     let left_avail = br8_col > 0 || mb_x > 0;
     let mut left = [0u8; 8];
     if left_avail {
-        let col_x_global = (mb_x as usize) * 16 + br8_col * 8 - 1;
         for i in 0..8 {
-            let row = (mb_y as usize) * 16 + br8_row * 8 + i;
-            left[i] = pic.y[row * lstride + col_x_global];
+            left[i] = pic.y[blk_tl + i * row_stride - 1];
         }
     }
 
     let tl_avail = top_avail && left_avail;
     let top_left = if tl_avail {
-        let row_y_global = (mb_y as usize) * 16 + br8_row * 8 - 1;
-        let col_x_global = (mb_x as usize) * 16 + br8_col * 8 - 1;
-        pic.y[row_y_global * lstride + col_x_global]
+        pic.y[blk_tl - row_stride - 1]
     } else {
         0
     };
@@ -620,7 +665,7 @@ fn decode_luma_intra_16x16(
     let w_dc = pic.scaling_lists.matrix_4x4(0)[0];
     inv_hadamard_4x4_dc_scaled(&mut dc, qp_y, w_dc);
 
-    let lstride = pic.luma_stride();
+    let row_stride = pic.luma_row_stride_for(mb_y);
     let lo_mb = pic.luma_off(mb_x, mb_y);
     for blk in 0..16usize {
         let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
@@ -642,11 +687,11 @@ fn decode_luma_intra_16x16(
         residual[0] = dc[br_row * 4 + br_col];
         idct_4x4(&mut residual);
 
-        let lo = lo_mb + br_row * 4 * lstride + br_col * 4;
+        let lo = lo_mb + br_row * 4 * row_stride + br_col * 4;
         for r in 0..4 {
             for c in 0..4 {
                 let v = pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32 + residual[r * 4 + c];
-                pic.y[lo + r * lstride + c] = v.clamp(0, 255) as u8;
+                pic.y[lo + r * row_stride + c] = v.clamp(0, 255) as u8;
             }
         }
         pic.mb_info_mut(mb_x, mb_y).luma_nc[br_row * 4 + br_col] = total_coeff as u8;
@@ -701,7 +746,7 @@ fn decode_chroma(
         inv_hadamard_2x2_chroma_dc_scaled(&mut dc_cr, qpc, w_cr);
     }
 
-    let cstride = pic.chroma_stride();
+    let crow_stride = pic.chroma_row_stride_for(mb_y);
     let co = pic.chroma_off(mb_x, mb_y);
 
     // Reconstruct AC blocks for Cb then Cr. nC prediction within an MB uses
@@ -732,12 +777,12 @@ fn decode_chroma(
             }
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);
-            let off_in_mb = br_row * 4 * cstride + br_col * 4;
+            let off_in_mb = br_row * 4 * crow_stride + br_col * 4;
             let plane = if plane_kind { &mut pic.cb } else { &mut pic.cr };
             for r in 0..4 {
                 for c in 0..4 {
                     let v = pred[(br_row * 4 + r) * 8 + (br_col * 4 + c)] as i32 + res[r * 4 + c];
-                    plane[co + off_in_mb + r * cstride + c] = v.clamp(0, 255) as u8;
+                    plane[co + off_in_mb + r * crow_stride + c] = v.clamp(0, 255) as u8;
                 }
             }
             nc_arr[(br_row << 1) | br_col] = total_coeff as u8;
@@ -773,7 +818,7 @@ pub(crate) fn predict_nc_luma(pic: &Picture, mb_x: u32, mb_y: u32, br_row: usize
     };
     let top = if br_row > 0 {
         Some(info_here.luma_nc[(br_row - 1) * 4 + br_col])
-    } else if mb_y > 0 {
+    } else if pic.mb_top_available(mb_y) {
         let info = pic.mb_info_at(mb_x, mb_y - 1);
         if info.coded {
             Some(info.luma_nc[12 + br_col])
@@ -816,7 +861,7 @@ fn predict_nc_chroma(
     };
     let top = if br_row > 0 {
         Some(pick(info_here, (br_row - 1) * 2 + br_col))
-    } else if mb_y > 0 {
+    } else if pic.mb_top_available(mb_y) {
         let info = pic.mb_info_at(mb_x, mb_y - 1);
         if info.coded {
             Some(pick(info, 2 + br_col))
@@ -870,7 +915,7 @@ pub(crate) fn predict_intra4x4_mode_with(
     };
     let top_mode = if br_row > 0 {
         Some(here_get(br_row - 1, br_col))
-    } else if mb_y > 0 {
+    } else if pic.mb_top_available(mb_y) {
         let ti = pic.mb_info_at(mb_x, mb_y - 1);
         if ti.coded && ti.intra {
             Some(ti.intra4x4_pred_mode[12 + br_col])
@@ -897,25 +942,23 @@ pub(crate) fn collect_intra4x4_neighbours(
     br_row: usize,
     br_col: usize,
 ) -> Intra4x4Neighbours {
-    let lstride = pic.luma_stride();
-    let _ = pic.luma_off(mb_x, mb_y);
+    // §6.4.9.4 — stride follows the MB's field-mode so every cross-MB
+    // read hits the same-polarity field on a field-coded MBAFF pair.
+    let row_stride = pic.luma_row_stride_for(mb_y);
+    let lo_mb = pic.luma_off(mb_x, mb_y);
+    let blk_tl = lo_mb + br_row * 4 * row_stride + br_col * 4;
 
-    let top_avail = br_row > 0 || mb_y > 0;
+    let top_avail = br_row > 0 || pic.mb_top_available(mb_y);
     let mut top = [0u8; 8];
     if top_avail {
-        let row_y_global = if br_row > 0 {
-            (mb_y as usize) * 16 + br_row * 4 - 1
-        } else {
-            (mb_y as usize) * 16 - 1
-        };
-        let row_off = row_y_global * lstride;
+        let row_off = blk_tl - row_stride;
         for i in 0..4 {
-            top[i] = pic.y[row_off + (mb_x as usize) * 16 + br_col * 4 + i];
+            top[i] = pic.y[row_off + i];
         }
         let tr_avail = top_right_available_4x4(mb_x, mb_y, br_row, br_col, pic);
         if tr_avail {
             for i in 0..4 {
-                top[4 + i] = pic.y[row_off + (mb_x as usize) * 16 + br_col * 4 + 4 + i];
+                top[4 + i] = pic.y[row_off + 4 + i];
             }
         } else {
             for i in 0..4 {
@@ -927,30 +970,14 @@ pub(crate) fn collect_intra4x4_neighbours(
     let left_avail = br_col > 0 || mb_x > 0;
     let mut left = [0u8; 4];
     if left_avail {
-        let col_x_global: usize = if br_col > 0 {
-            (mb_x as usize) * 16 + br_col * 4 - 1
-        } else {
-            (mb_x as usize) * 16 - 1
-        };
         for i in 0..4 {
-            let row = (mb_y as usize) * 16 + br_row * 4 + i;
-            left[i] = pic.y[row * lstride + col_x_global];
+            left[i] = pic.y[blk_tl + i * row_stride - 1];
         }
     }
 
     let tl_avail = top_avail && left_avail;
     let top_left = if tl_avail {
-        let row_y_global: usize = if br_row > 0 {
-            (mb_y as usize) * 16 + br_row * 4 - 1
-        } else {
-            (mb_y as usize) * 16 - 1
-        };
-        let col_x_global: usize = if br_col > 0 {
-            (mb_x as usize) * 16 + br_col * 4 - 1
-        } else {
-            (mb_x as usize) * 16 - 1
-        };
-        pic.y[row_y_global * lstride + col_x_global]
+        pic.y[blk_tl - row_stride - 1]
     } else {
         0
     };
@@ -1006,12 +1033,18 @@ pub(crate) fn top_right_available_4x4(
 }
 
 pub(crate) fn collect_intra16x16_neighbours(pic: &Picture, mb_x: u32, mb_y: u32) -> Intra16x16Neighbours {
-    let lstride = pic.luma_stride();
+    // §6.4.9.4 — under MBAFF a field-coded MB reads neighbour samples
+    // from the same-polarity field of the previous pair, which in the
+    // "uniform pair-mode" case translates to `row_stride = 2 *
+    // luma_stride` on the reconstructed plane. For the top MB of pair
+    // row 0 the "above" neighbour is unavailable (top edge of the
+    // picture), matching the non-MBAFF guard.
+    let row_stride = pic.luma_row_stride_for(mb_y);
     let lo_mb = pic.luma_off(mb_x, mb_y);
-    let top_avail = mb_y > 0;
+    let top_avail = pic.mb_top_available(mb_y);
     let mut top = [0u8; 16];
     if top_avail {
-        let off = lo_mb - lstride;
+        let off = lo_mb - row_stride;
         for i in 0..16 {
             top[i] = pic.y[off + i];
         }
@@ -1020,12 +1053,12 @@ pub(crate) fn collect_intra16x16_neighbours(pic: &Picture, mb_x: u32, mb_y: u32)
     let mut left = [0u8; 16];
     if left_avail {
         for i in 0..16 {
-            left[i] = pic.y[lo_mb + i * lstride - 1];
+            left[i] = pic.y[lo_mb + i * row_stride - 1];
         }
     }
     let tl_avail = top_avail && left_avail;
     let top_left = if tl_avail {
-        pic.y[lo_mb - lstride - 1]
+        pic.y[lo_mb - row_stride - 1]
     } else {
         0
     };
@@ -1242,13 +1275,16 @@ fn collect_chroma_neighbours(
     mb_y: u32,
     cb: bool,
 ) -> IntraChromaNeighbours {
-    let cstride = pic.chroma_stride();
+    // Mirrors the luma neighbour fetch under MBAFF — `chroma_row_stride_for`
+    // doubles the plane stride for field-coded MBs so cross-MB reads
+    // pick the same-polarity chroma field (§6.4.9.4 applied to 4:2:0).
+    let row_stride = pic.chroma_row_stride_for(mb_y);
     let co_mb = pic.chroma_off(mb_x, mb_y);
     let plane = if cb { &pic.cb } else { &pic.cr };
-    let top_avail = mb_y > 0;
+    let top_avail = pic.mb_top_available(mb_y);
     let mut top = [0u8; 8];
     if top_avail {
-        let off = co_mb - cstride;
+        let off = co_mb - row_stride;
         for i in 0..8 {
             top[i] = plane[off + i];
         }
@@ -1257,12 +1293,12 @@ fn collect_chroma_neighbours(
     let mut left = [0u8; 8];
     if left_avail {
         for i in 0..8 {
-            left[i] = plane[co_mb + i * cstride - 1];
+            left[i] = plane[co_mb + i * row_stride - 1];
         }
     }
     let tl_avail = top_avail && left_avail;
     let top_left = if tl_avail {
-        plane[co_mb - cstride - 1]
+        plane[co_mb - row_stride - 1]
     } else {
         0
     };
