@@ -13,9 +13,10 @@
 //!     macroblocks reuse the I-slice intra path. Explicit weighted
 //!     prediction (§8.4.2.3.2) is applied to MC output when the PPS +
 //!     slice header enable it.
-//!   - B-slices in CAVLC entropy mode with spatial direct prediction
-//!     (§8.4.1.2.2), default + explicit weighted bi-prediction, and
-//!     all Table 7-14 / 7-17 non-MBAFF partition shapes.
+//!   - B-slices in CAVLC entropy mode with both spatial direct
+//!     (§8.4.1.2.2) and temporal direct (§8.4.1.2.3) MV derivation,
+//!     default + explicit weighted bi-prediction, and all Table 7-14 /
+//!     7-17 non-MBAFF partition shapes.
 //! * Owns a [`crate::dpb::Dpb`] holding up to `sps.max_num_ref_frames`
 //!   reconstructed reference frames with POC ordering, sliding-window
 //!   marking (§8.2.5.3), and MMCO operations 1 / 2 / 3 / 4 / 5 / 6
@@ -28,8 +29,6 @@
 //! Out of scope (returns `Error::Unsupported`):
 //! * CABAC B-slices. (CABAC P-slices are wired; see
 //!   [`crate::cabac::p_mb`].)
-//! * B-slice temporal direct MV prediction (§8.4.1.2.3,
-//!   `direct_spatial_mv_pred_flag = 0`).
 //! * Implicit weighted bi-prediction (`weighted_bipred_idc == 2`,
 //!   §8.4.2.3.3).
 //! * `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
@@ -193,11 +192,6 @@ impl H264Decoder {
                         if pps.entropy_coding_mode_flag {
                             return Err(Error::unsupported(
                                 "h264: CABAC B-slices not implemented — use CAVLC (entropy_coding_mode_flag=0)",
-                            ));
-                        }
-                        if !sh.direct_spatial_mv_pred_flag {
-                            return Err(Error::unsupported(
-                                "h264 b-slice: temporal direct MV prediction (§8.4.1.2.3) not implemented",
                             ));
                         }
                         if pps.weighted_bipred_idc == 2 {
@@ -365,6 +359,7 @@ impl H264Decoder {
                             }
                         }
                         let list0: Vec<&Picture> = ref_entries.iter().map(|r| &r.pic).collect();
+                        let list0_pocs: Vec<i32> = ref_entries.iter().map(|r| r.poc).collect();
                         if pps.entropy_coding_mode_flag {
                             decode_cabac_p_slice(&rbsp, &sh, &sps, &pps, &mut pic, &list0)?;
                         } else {
@@ -372,6 +367,12 @@ impl H264Decoder {
                             br.skip(sh.slice_data_bit_offset as u32)?;
                             decode_p_slice_data(&mut br, &sh, &sps, &pps, &mut pic, &list0)?;
                         }
+                        // Snapshot POCs so a subsequent B-slice that picks
+                        // this P-picture as its colocated L1[0] reference
+                        // can resolve colocated `refIdxCol` → POC
+                        // (§8.4.1.2.3 temporal direct). P-slices have no
+                        // list1, so only list0 POCs are recorded.
+                        pic.snapshot_ref_pocs(&list0_pocs, &[]);
                     }
                     SliceType::B => {
                         let dpb = self.dpb.as_mut().expect("DPB initialised above");
@@ -420,9 +421,29 @@ impl H264Decoder {
                         }
                         let list0: Vec<&Picture> = l0_entries.iter().map(|r| &r.pic).collect();
                         let list1: Vec<&Picture> = l1_entries.iter().map(|r| &r.pic).collect();
+                        let list0_pocs: Vec<i32> = l0_entries.iter().map(|r| r.poc).collect();
+                        let list1_pocs: Vec<i32> = l1_entries.iter().map(|r| r.poc).collect();
+                        let list0_short: Vec<bool> =
+                            l0_entries.iter().map(|r| r.short_term).collect();
+                        let list1_short: Vec<bool> =
+                            l1_entries.iter().map(|r| r.short_term).collect();
+                        let b_ctx = crate::b_mb::BSliceCtx {
+                            curr_poc: poc,
+                            list0_pocs: &list0_pocs,
+                            list1_pocs: &list1_pocs,
+                            list0_short_term: &list0_short,
+                            list1_short_term: &list1_short,
+                        };
                         let mut br = BitReader::new(&rbsp);
                         br.skip(sh.slice_data_bit_offset as u32)?;
-                        decode_b_slice_data(&mut br, &sh, &sps, &pps, &mut pic, &list0, &list1)?;
+                        decode_b_slice_data(
+                            &mut br, &sh, &sps, &pps, &mut pic, &list0, &list1, &b_ctx,
+                        )?;
+                        // Snapshot POCs so future B-slices that use this
+                        // picture as a colocated reference can resolve
+                        // `refIdxCol` to a POC without holding reference
+                        // list pointers (§8.4.1.2.3).
+                        pic.snapshot_ref_pocs(&list0_pocs, &list1_pocs);
                     }
                     _ => unreachable!(),
                 }
@@ -584,6 +605,7 @@ fn decode_b_slice_data(
     pic: &mut Picture,
     ref_list0: &[&Picture],
     ref_list1: &[&Picture],
+    ctx: &crate::b_mb::BSliceCtx<'_>,
 ) -> Result<()> {
     let mb_w = sps.pic_width_in_mbs();
     let mb_h = sps.pic_height_in_map_units();
@@ -604,7 +626,7 @@ fn decode_b_slice_data(
             }
             let mb_x = mb_addr % mb_w;
             let mb_y = mb_addr / mb_w;
-            decode_b_skip_mb(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, prev_qp)?;
+            decode_b_skip_mb(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, prev_qp)?;
             mb_addr += 1;
         }
         if mb_addr >= total_mbs {
@@ -622,6 +644,7 @@ fn decode_b_slice_data(
             pic,
             ref_list0,
             ref_list1,
+            ctx,
             &mut prev_qp,
         )?;
         mb_addr += 1;

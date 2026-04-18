@@ -71,6 +71,16 @@ pub struct MbInfo {
     /// prediction not used at this 4×4 location" (P macroblocks, L0-only
     /// B sub-partitions, intra MBs).
     pub ref_idx_l1: [i8; 16],
+    /// POC of the list-0 reference pointed to by `ref_idx_l0[i]`, snapshotted
+    /// at slice-decode end so that a later B-slice can resolve this picture's
+    /// colocated block's MV reference via POC (§8.4.1.2.3 temporal direct).
+    /// `i32::MIN` sentinel means "no list-0 reference at this 4×4 sub-block"
+    /// (intra, or L1-only B sub-partition). Populated by
+    /// [`Picture::snapshot_ref_pocs`] after slice decode completes.
+    pub ref_poc_l0: [i32; 16],
+    /// POC of the list-1 reference at each 4×4 sub-block. `i32::MIN` for
+    /// "no list-1 reference." See [`Self::ref_poc_l0`].
+    pub ref_poc_l1: [i32; 16],
     /// Per-4×4-sub-block absolute list-0 MVD components. Used by CABAC
     /// §9.3.3.1.1.7 ctxIdxInc derivation (`absMvdComp_A + absMvdComp_B`).
     /// Set on the partition's top-left 4×4 block and replicated into
@@ -103,6 +113,8 @@ impl Default for MbInfo {
             ref_idx_l0: [-1; 16],
             mv_l1: [(0, 0); 16],
             ref_idx_l1: [-1; 16],
+            ref_poc_l0: [i32::MIN; 16],
+            ref_poc_l1: [i32::MIN; 16],
             mvd_l0_abs: [(0, 0); 16],
             intra: false,
             skipped: false,
@@ -156,6 +168,32 @@ impl Picture {
     pub fn mb_info_at(&self, mb_x: u32, mb_y: u32) -> &MbInfo {
         let idx = (mb_y * self.mb_width + mb_x) as usize;
         &self.mb_info[idx]
+    }
+
+    /// Snapshot the POC of each 4×4 block's list-0 / list-1 reference so that
+    /// a later B-slice using this picture as a colocated reference can resolve
+    /// `refIdxCol` → POC without holding the RefPicList references alive.
+    /// Walks every MB and resolves `ref_idx_lN[i]` against the supplied lists.
+    /// An out-of-range index or `ref_idx < 0` maps to `i32::MIN` (the "none"
+    /// sentinel). Called from the decoder at end-of-slice, before the picture
+    /// is inserted into the DPB (§8.4.1.2.3 temporal direct colocated lookup).
+    pub fn snapshot_ref_pocs(&mut self, list0_pocs: &[i32], list1_pocs: &[i32]) {
+        for info in &mut self.mb_info {
+            for i in 0..16usize {
+                let r0 = info.ref_idx_l0[i];
+                info.ref_poc_l0[i] = if r0 >= 0 {
+                    list0_pocs.get(r0 as usize).copied().unwrap_or(i32::MIN)
+                } else {
+                    i32::MIN
+                };
+                let r1 = info.ref_idx_l1[i];
+                info.ref_poc_l1[i] = if r1 >= 0 {
+                    list1_pocs.get(r1 as usize).copied().unwrap_or(i32::MIN)
+                } else {
+                    i32::MIN
+                };
+            }
+        }
     }
 
     /// Crop to (visible_w × visible_h) and emit a `VideoFrame`. The picture's

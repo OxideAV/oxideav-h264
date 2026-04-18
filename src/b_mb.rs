@@ -2,9 +2,13 @@
 //!
 //! This mirrors [`crate::p_mb`] for the B-slice case:
 //!
-//! * B_Direct_16x16 and B_Skip — MVs / ref-idx derived via spatial direct
-//!   prediction (§8.4.1.2.2). Temporal direct (§8.4.1.2.3) is not yet
-//!   implemented and is rejected by the slice header handler.
+//! * B_Direct_16x16 and B_Skip — MVs / ref-idx derived either via
+//!   **spatial direct** prediction (§8.4.1.2.2) when the slice header's
+//!   `direct_spatial_mv_pred_flag == 1`, or **temporal direct** prediction
+//!   (§8.4.1.2.3) when it is `0`. Temporal direct walks the colocated
+//!   block in `RefPicList1[0]` (the colocated picture), reads its MV
+//!   and the POC of the reference that MV pointed to, and rescales the
+//!   MV via `DistScaleFactor` (POC arithmetic) to produce `(mvL0, mvL1)`.
 //! * B_L0_16x16 / B_L1_16x16 / B_Bi_16x16 — whole-MB single- or
 //!   bi-directional prediction with explicit MVDs (ref_idx_lN is coded
 //!   per list).
@@ -42,6 +46,40 @@ use crate::slice::{ChromaWeight, LumaWeight, PredWeightTable, SliceHeader};
 use crate::sps::Sps;
 use crate::transform::{chroma_qp, dequantize_4x4, idct_4x4, inv_hadamard_2x2_chroma_dc};
 
+/// Per-slice context needed for temporal direct MV prediction (§8.4.1.2.3).
+///
+/// The current slice's POC and the POCs of every entry in RefPicList0 and
+/// RefPicList1, plus per-entry short-term/long-term class. These are used
+/// to derive `DistScaleFactor` (POC arithmetic) and to map a colocated
+/// block's `refIdxCol` (an index into the colocated picture's own list)
+/// back into the current slice's `RefPicList0` via POC matching.
+#[derive(Clone, Copy, Debug)]
+pub struct BSliceCtx<'a> {
+    pub curr_poc: i32,
+    /// Per-entry POCs of the current slice's `RefPicList0`.
+    pub list0_pocs: &'a [i32],
+    /// Per-entry POCs of the current slice's `RefPicList1`. `list1_pocs[0]`
+    /// is the colocated picture's POC.
+    pub list1_pocs: &'a [i32],
+    /// `true` if the corresponding RefPicList0 entry is short-term, `false`
+    /// if long-term. Same length as `list0_pocs`.
+    pub list0_short_term: &'a [bool],
+    /// Short-term / long-term class for each RefPicList1 entry.
+    pub list1_short_term: &'a [bool],
+}
+
+impl<'a> BSliceCtx<'a> {
+    /// Find the index in the current `RefPicList0` whose POC matches
+    /// `target_poc`. Returns `None` if no entry matches — the caller should
+    /// fall back to index 0 per the temporal-direct default.
+    fn list0_idx_for_poc(&self, target_poc: i32) -> Option<i8> {
+        self.list0_pocs
+            .iter()
+            .position(|&p| p == target_poc)
+            .map(|i| i as i8)
+    }
+}
+
 /// Decode a single coded B-slice macroblock at `(mb_x, mb_y)`. `B_Skip`
 /// macroblocks are emitted separately by [`decode_b_skip_mb`] from the
 /// outer loop (CAVLC signals skips via `mb_skip_run` preceding the
@@ -56,6 +94,7 @@ pub fn decode_b_slice_mb(
     pic: &mut Picture,
     ref_list0: &[&Picture],
     ref_list1: &[&Picture],
+    ctx: &BSliceCtx<'_>,
     prev_qp: &mut i32,
 ) -> Result<()> {
     let mb_type = br.read_ue()?;
@@ -67,7 +106,7 @@ pub fn decode_b_slice_mb(
             crate::mb::decode_intra_mb_given_imb(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb)
         }
         BMbType::Inter { partition } => decode_b_inter_mb(
-            br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, ref_list1, prev_qp, partition,
+            br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, prev_qp, partition,
         ),
     }
 }
@@ -82,13 +121,9 @@ pub fn decode_b_skip_mb(
     pic: &mut Picture,
     ref_list0: &[&Picture],
     ref_list1: &[&Picture],
+    ctx: &BSliceCtx<'_>,
     prev_qp: i32,
 ) -> Result<()> {
-    if !sh.direct_spatial_mv_pred_flag {
-        return Err(Error::unsupported(
-            "h264 b-slice: temporal direct MV prediction (§8.4.1.2.3) not implemented",
-        ));
-    }
     // Initialise MB info for the direct MB.
     {
         let info = pic.mb_info_mut(mb_x, mb_y);
@@ -103,7 +138,11 @@ pub fn decode_b_skip_mb(
         };
     }
     // Derive + compensate four 8×8 direct sub-MBs.
-    direct_16x16_spatial_compensate(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1)?;
+    if sh.direct_spatial_mv_pred_flag {
+        direct_16x16_spatial_compensate(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1)?;
+    } else {
+        direct_16x16_temporal_compensate(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx)?;
+    }
     Ok(())
 }
 
@@ -122,6 +161,7 @@ fn decode_b_inter_mb(
     pic: &mut Picture,
     ref_list0: &[&Picture],
     ref_list1: &[&Picture],
+    ctx: &BSliceCtx<'_>,
     prev_qp: &mut i32,
     partition: BPartition,
 ) -> Result<()> {
@@ -140,7 +180,13 @@ fn decode_b_inter_mb(
 
     match partition {
         BPartition::Direct16x16 => {
-            direct_16x16_spatial_compensate(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1)?;
+            if sh.direct_spatial_mv_pred_flag {
+                direct_16x16_spatial_compensate(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1)?;
+            } else {
+                direct_16x16_temporal_compensate(
+                    sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx,
+                )?;
+            }
         }
         BPartition::L0_16x16 => {
             decode_16x16_single_dir(br, sh, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::L0)?;
@@ -169,7 +215,7 @@ fn decode_b_inter_mb(
             decode_two_partition_b(br, sh, mb_x, mb_y, pic, ref_list0, ref_list1, &rects, &dirs)?;
         }
         BPartition::B8x8 => {
-            decode_b8x8(br, sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1)?;
+            decode_b8x8(br, sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx)?;
         }
     }
 
@@ -305,6 +351,7 @@ fn decode_b8x8(
     pic: &mut Picture,
     ref_list0: &[&Picture],
     ref_list1: &[&Picture],
+    ctx: &BSliceCtx<'_>,
 ) -> Result<()> {
     const SUB_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 2), (2, 0), (2, 2)];
     let num_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
@@ -375,9 +422,15 @@ fn decode_b8x8(
         let sp = subs[s];
         let (sr0, sc0) = SUB_OFFSETS[s];
         if matches!(sp, BSubPartition::Direct8x8) {
-            direct_8x8_spatial_compensate(
-                sh, sps, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1,
-            )?;
+            if sh.direct_spatial_mv_pred_flag {
+                direct_8x8_spatial_compensate(
+                    sh, sps, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1,
+                )?;
+            } else {
+                direct_8x8_temporal_compensate(
+                    sh, sps, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1, ctx,
+                )?;
+            }
             continue;
         }
         let dir = sp.pred_dir().expect("non-direct");
@@ -1035,6 +1088,254 @@ fn pick_bipred_dir(r0: i8, r1: i8) -> PredDir {
         (false, true) => PredDir::L1,
         (false, false) => PredDir::L0, // degenerate — treated as (0,0)/ref0
     }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal direct MV prediction — §8.4.1.2.3.
+// ---------------------------------------------------------------------------
+
+/// The colocated block's selected MV + reference POC, plus the class
+/// (short-term / long-term) of that reference and whether the block was
+/// intra-coded. Per §8.4.1.2.3 the colocated picture is `RefPicList1[0]`;
+/// the colocated 4×4 block is at the same `(br_row, br_col)` within its
+/// macroblock. When the colocated block is bi-predicted we take the L0
+/// side (per the spec's "L0 first" rule); when it is L1-only we fall
+/// back to the L1 side.
+#[derive(Clone, Copy, Debug)]
+struct Colocated {
+    intra: bool,
+    /// `true` if the picture pointed to by `ref_poc` is a short-term
+    /// reference. Long-term references force zero-scaled MVs
+    /// (DistScaleFactor collapses to `mvCol` identity).
+    short_term_ref: bool,
+    mv: (i16, i16),
+    /// POC of the picture the colocated block's MV pointed to. Used as
+    /// `pic0PocL0` in the DistScaleFactor formula. Meaningless when
+    /// `intra == true`.
+    ref_poc: i32,
+}
+
+/// Read the colocated block at `(br_row, br_col)` of macroblock
+/// `(mb_x, mb_y)` in `ref_pic_col` (= `RefPicList1[0]`). Falls back to
+/// the L1 side if the L0 side is unreferenced at that 4×4 block.
+fn colocated_block(
+    ref_pic_col: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    br_row: usize,
+    br_col: usize,
+) -> Colocated {
+    let info = ref_pic_col.mb_info_at(mb_x, mb_y);
+    if info.intra || !info.coded {
+        return Colocated {
+            intra: true,
+            short_term_ref: true,
+            mv: (0, 0),
+            ref_poc: 0,
+        };
+    }
+    let idx = br_row * 4 + br_col;
+    let r0 = info.ref_idx_l0[idx];
+    if r0 >= 0 {
+        let poc = info.ref_poc_l0[idx];
+        return Colocated {
+            intra: false,
+            // Heuristic: a short-term ref's POC snapshot is finite. If the
+            // snapshot was unresolved (i32::MIN) we treat the colocated
+            // block as intra to stay on the safe zero-MV path.
+            short_term_ref: poc != i32::MIN,
+            mv: info.mv_l0[idx],
+            ref_poc: poc,
+        };
+    }
+    let r1 = info.ref_idx_l1[idx];
+    if r1 >= 0 {
+        let poc = info.ref_poc_l1[idx];
+        return Colocated {
+            intra: false,
+            short_term_ref: poc != i32::MIN,
+            mv: info.mv_l1[idx],
+            ref_poc: poc,
+        };
+    }
+    // Neither list referenced — treat as intra-colocated.
+    Colocated {
+        intra: true,
+        short_term_ref: true,
+        mv: (0, 0),
+        ref_poc: 0,
+    }
+}
+
+/// `DistScaleFactor` per §8.4.1.2.3. `tb = curr - pic0`, `td = pic1 - pic0`
+/// (clipped to [-128, 127] each). Returns a scaled MV: `mvL0 = (DSF * mvCol
+/// + 128) >> 8`, `mvL1 = mvL0 - mvCol`. When `td == 0` (reference and
+/// colocated share a POC) the scale collapses to identity — `mvL0 = mvCol`,
+/// `mvL1 = (0, 0)`. Long-term references also force identity (see
+/// §8.4.1.2.3 last paragraph).
+fn temporal_scale_mv(
+    mv_col: (i16, i16),
+    curr_poc: i32,
+    pic0_poc: i32,
+    pic1_poc: i32,
+    long_term: bool,
+) -> ((i16, i16), (i16, i16)) {
+    let tb = (curr_poc - pic0_poc).clamp(-128, 127);
+    let td = (pic1_poc - pic0_poc).clamp(-128, 127);
+    if td == 0 || long_term {
+        // Degenerate: same-POC or LT ref → mvL0 = mvCol, mvL1 = 0.
+        return (mv_col, (0, 0));
+    }
+    let td_abs = td.unsigned_abs() as i32;
+    let tx = (16384 + (td_abs / 2)) / td;
+    let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+
+    let scale_component = |c: i16| -> i16 {
+        let v = (dsf * (c as i32) + 128) >> 8;
+        // MVs are stored as i16 quarter-pel; clamp to avoid overflow on
+        // pathological inputs (real encoder output won't hit this).
+        v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+    };
+    let mv_l0 = (scale_component(mv_col.0), scale_component(mv_col.1));
+    let mv_l1 = (
+        mv_l0.0.wrapping_sub(mv_col.0),
+        mv_l0.1.wrapping_sub(mv_col.1),
+    );
+    (mv_l0, mv_l1)
+}
+
+/// Derive the per-4×4 `(ref_idx_l0, ref_idx_l1, mv_l0, mv_l1)` for a
+/// direct temporal macroblock covering `(r0..r0+ph, c0..c0+pw)` 4×4 grid.
+///
+/// Per §8.4.1.2.3: `refIdxL1 = 0` (refPicCol is by construction the L1[0]
+/// entry). `refIdxL0` is set to the current-slice L0 index whose POC
+/// matches the colocated block's reference POC. When no match is found
+/// (colocated references a picture not in the current L0) the spec falls
+/// back to 0 — this is also what we do on the intra-colocated path.
+#[allow(clippy::too_many_arguments)]
+fn direct_temporal_rect_compensate(
+    sh: &SliceHeader,
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    ph: usize,
+    pw: usize,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+    ctx: &BSliceCtx<'_>,
+) -> Result<()> {
+    if ref_list1.is_empty() {
+        return Err(Error::invalid(
+            "h264 b-slice temporal-direct: empty RefPicList1",
+        ));
+    }
+    let ref_pic_col = ref_list1[0];
+    let pic1_poc = *ctx.list1_pocs.first().ok_or_else(|| {
+        Error::invalid("h264 b-slice temporal-direct: list1_pocs empty (DistScaleFactor input)")
+    })?;
+    let curr_poc = ctx.curr_poc;
+
+    // Write per-4×4 MV / ref_idx into this MB's info for neighbour lookups
+    // and deblocking, then run apply_motion_compensation over the rect.
+    for rr in r0..r0 + ph {
+        for cc in c0..c0 + pw {
+            let col = colocated_block(ref_pic_col, mb_x, mb_y, rr, cc);
+            let (ri0, ri1, mv0, mv1) = if col.intra {
+                // §8.4.1.2.3: intra-colocated → zero MVs, ref_idx 0 on both
+                // lists (the refs themselves are present in the current
+                // RefPicLists by construction).
+                (0i8, 0i8, (0i16, 0i16), (0i16, 0i16))
+            } else {
+                let ri0 = ctx.list0_idx_for_poc(col.ref_poc).unwrap_or(0);
+                let ri1 = 0i8;
+                // Long-term refs in either the colocated's target or the
+                // current slice's L0[ri0] force identity scaling (spec
+                // §8.4.1.2.3 long-term exception).
+                let l0_short = ctx
+                    .list0_short_term
+                    .get(ri0 as usize)
+                    .copied()
+                    .unwrap_or(true);
+                let long_term = !col.short_term_ref || !l0_short;
+                let (mv0, mv1) =
+                    temporal_scale_mv(col.mv, curr_poc, col.ref_poc, pic1_poc, long_term);
+                (ri0, ri1, mv0, mv1)
+            };
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            info.ref_idx_l0[rr * 4 + cc] = ri0;
+            info.ref_idx_l1[rr * 4 + cc] = ri1;
+            info.mv_l0[rr * 4 + cc] = mv0;
+            info.mv_l1[rr * 4 + cc] = mv1;
+        }
+    }
+
+    // MC path: the entire rect uses bi-prediction on (ref0, ref1). Per-4×4
+    // MVs vary, so run MC on each 4×4 sub-block independently rather than
+    // assuming a single partition-wide MV.
+    for rr in r0..r0 + ph {
+        for cc in c0..c0 + pw {
+            let info = pic.mb_info_at(mb_x, mb_y);
+            let ri0 = info.ref_idx_l0[rr * 4 + cc];
+            let ri1 = info.ref_idx_l1[rr * 4 + cc];
+            let mv0 = info.mv_l0[rr * 4 + cc];
+            let mv1 = info.mv_l1[rr * 4 + cc];
+            let dir = pick_bipred_dir(ri0, ri1);
+            apply_motion_compensation(
+                sh,
+                pic,
+                ref_list0,
+                ref_list1,
+                mb_x,
+                mb_y,
+                rr,
+                cc,
+                1,
+                1,
+                dir,
+                if ri0 >= 0 { Some(ri0) } else { None },
+                if ri1 >= 0 { Some(ri1) } else { None },
+                if ri0 >= 0 { Some(mv0) } else { None },
+                if ri1 >= 0 { Some(mv1) } else { None },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Temporal-direct compensate for a whole 16×16 MB — §8.4.1.2.3.
+#[allow(clippy::too_many_arguments)]
+fn direct_16x16_temporal_compensate(
+    sh: &SliceHeader,
+    _sps: &Sps,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+    ctx: &BSliceCtx<'_>,
+) -> Result<()> {
+    direct_temporal_rect_compensate(sh, mb_x, mb_y, 0, 0, 4, 4, pic, ref_list0, ref_list1, ctx)
+}
+
+/// Temporal-direct compensate for a single 8×8 B_Direct_8x8 sub-MB.
+#[allow(clippy::too_many_arguments)]
+fn direct_8x8_temporal_compensate(
+    sh: &SliceHeader,
+    _sps: &Sps,
+    mb_x: u32,
+    mb_y: u32,
+    sr0: usize,
+    sc0: usize,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+    ctx: &BSliceCtx<'_>,
+) -> Result<()> {
+    direct_temporal_rect_compensate(
+        sh, mb_x, mb_y, sr0, sc0, 2, 2, pic, ref_list0, ref_list1, ctx,
+    )
 }
 
 // ---------------------------------------------------------------------------
