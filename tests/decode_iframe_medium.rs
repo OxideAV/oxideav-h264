@@ -136,12 +136,11 @@ fn decode_preset_medium_nodbl_bit_exact() {
     );
 }
 
-/// Post-deblock match on the mission-specified fixture. Uses ±1 LSB
-/// tolerance to absorb deblocking rounding drift that the current
-/// simplified §8.7 implementation exhibits (chroma edges aren't filtered
-/// yet, internal-edge bS assignment is simplified). A real intra-pred
-/// regression would produce larger per-MB errors that exceed this
-/// tolerance on many samples.
+/// Post-deblock match on the mission-specified fixture. The spec-accurate
+/// §8.7 implementation (per-edge bS derivation, chroma filtering, 8×8
+/// transform-aware internal edges) reaches ≥ 99.5 % bit-exact and
+/// ≥ 99.85 % within ±1 LSB. A real intra-pred regression would push this
+/// below the threshold as per-MB pred errors are tens of LSBs.
 #[test]
 fn decode_preset_medium_matches_within_tolerance() {
     let es = match read_fixture("iframe_128x128_medium.es") {
@@ -166,18 +165,14 @@ fn decode_preset_medium_matches_within_tolerance() {
             .filter(|(x, y)| (**x as i32 - **y as i32).abs() <= tol)
             .count()
     };
+    let exact = within(dec_y, ref_y, 0) + within(dec_cb, ref_cb, 0) + within(dec_cr, ref_cr, 0);
     let within_1 = within(dec_y, ref_y, 1) + within(dec_cb, ref_cb, 1) + within(dec_cr, ref_cr, 1);
     let pct = within_1 as f64 * 100.0 / total as f64;
-    eprintln!("preset-medium (deblock on): ±1 LSB = {within_1}/{total} = {pct:.4}%");
-    // The §8.7 deblocking pass in this crate is a simplified I-slice
-    // implementation (chroma edges aren't filtered yet, internal-edge bS
-    // uses nC heuristics rather than the full Table 7-14 lookup), so a
-    // modest residue of ±2 / ±4 samples along 4×4 block edges is
-    // expected. A true intra-prediction regression would push this
-    // below the threshold as per-MB pred errors are tens of LSBs.
+    let exact_pct = exact as f64 * 100.0 / total as f64;
+    eprintln!("preset-medium (deblock on): exact = {exact}/{total} = {exact_pct:.4}%, ±1 LSB = {within_1}/{total} = {pct:.4}%");
     assert!(
-        pct >= 98.0,
-        "preset-medium (deblock) ±1 LSB match {pct:.4}% < 98%",
+        pct >= 99.5,
+        "preset-medium (deblock) ±1 LSB match {pct:.4}% < 99.5%",
     );
 }
 
@@ -198,6 +193,8 @@ fn diagnose_first_divergent_mb() {
     let frame = decode_first_iframe(&es);
     let (ref_y, _, _) = split_ref(&yuv);
     let dec_y = &frame.planes[0].data;
+    let mut divergences = 0usize;
+    let mut by_diff: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
     for mb_y in 0..8usize {
         for mb_x in 0..8usize {
             for r in 0..16usize {
@@ -206,17 +203,22 @@ fn diagnose_first_divergent_mb() {
                     let x = mb_x * 16 + c;
                     let i = y * 128 + x;
                     if dec_y[i] != ref_y[i] {
-                        eprintln!(
-                            "first luma divergence at MB ({mb_x},{mb_y}) pixel ({c},{r}) decoded={} ref={} diff={}",
-                            dec_y[i],
-                            ref_y[i],
-                            dec_y[i] as i32 - ref_y[i] as i32,
-                        );
-                        return;
+                        let d = dec_y[i] as i32 - ref_y[i] as i32;
+                        *by_diff.entry(d).or_insert(0) += 1;
+                        if divergences < 16 {
+                            eprintln!(
+                                "div@ MB({mb_x},{mb_y}) pix({c},{r}) dec={} ref={} d={}",
+                                dec_y[i], ref_y[i], d,
+                            );
+                        }
+                        divergences += 1;
                     }
                 }
             }
         }
     }
-    eprintln!("no luma divergence — full frame bit-exact");
+    eprintln!(
+        "total luma divergences = {divergences} histogram={:?}",
+        by_diff
+    );
 }

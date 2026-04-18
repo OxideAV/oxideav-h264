@@ -94,6 +94,11 @@ pub struct MbInfo {
     /// deblocking and neighbour lookups so the zero-cbp P_Skip case can be
     /// recognised without re-parsing.
     pub skipped: bool,
+    /// True when this macroblock used `transform_size_8x8_flag = 1`
+    /// (High Profile 8×8 residual transform). Consumed by §8.7 deblocking
+    /// to skip the internal 4×4 edges that don't exist under an 8×8
+    /// transform (only the mid-MB edge at sample offset 8 is filtered).
+    pub transform_8x8: bool,
 }
 
 impl Default for MbInfo {
@@ -118,6 +123,7 @@ impl Default for MbInfo {
             mvd_l0_abs: [(0, 0); 16],
             intra: false,
             skipped: false,
+            transform_8x8: false,
         }
     }
 }

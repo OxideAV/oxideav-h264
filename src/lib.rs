@@ -9,9 +9,21 @@
 //!   (ISO/IEC 14496-15 §5.2.4.1).
 //! * SPS / PPS / slice-header parsing (§7.3.2.1.1, §7.3.2.2, §7.3.3).
 //! * **I-slice** pixel reconstruction for **both CAVLC and CABAC** — intra
-//!   prediction, residual decode, 4×4 IDCT + Hadamard, optional deblocking.
-//!   The CABAC I-path covers I_16×16, I_NxN and I_PCM (with the mid-stream
-//!   arithmetic-engine re-init mandated by §9.3.1.2).
+//!   prediction, residual decode, 4×4 IDCT + Hadamard, spec-accurate
+//!   in-loop deblocking (§8.7). The CABAC I-path covers I_16×16, I_NxN and
+//!   I_PCM (with the mid-stream arithmetic-engine re-init mandated by
+//!   §9.3.1.2).
+//! * **Spec-accurate §8.7 in-loop deblocking filter** — per-4-pixel-edge
+//!   boundary strength (bS) derivation distinguishing MB-edge vs internal
+//!   edges, intra/inter sides, non-zero residual, and MV/reference
+//!   mismatch (quarter-pel delta ≥ 4 or different ref POC → bS = 1).
+//!   Luma filtering uses the §8.7.2.2 normal filter for bS ∈ {1, 2, 3}
+//!   and the strong filter for bS = 4 (MB-edge intra). Chroma filtering
+//!   (§8.7.2.3) runs on both planes with `chroma_qp_index_offset` /
+//!   `second_chroma_qp_index_offset` applied through the Table 8-15 QP
+//!   map, and uses the `tC = tC0 + 1` chroma bump. Internal luma edges
+//!   are transform-size-aware: under `transform_size_8x8_flag = 1` only
+//!   the mid-MB edge at offset 8 is filtered (not offsets 4 and 12).
 //! * **High Profile 8×8 transform** on the CAVLC path — intra AND inter.
 //!   `transform_size_8x8_flag = 1` macroblocks (§7.3.5.3.2) decode as four
 //!   interleaved CAVLC sub-blocks via the `zigzag_scan8x8_cavlc` table,
