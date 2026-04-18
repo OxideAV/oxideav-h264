@@ -61,7 +61,11 @@
 //!   dispatch back into the I-slice decode helper. Default bi-prediction
 //!   averages the L0 and L1 samples per `(pred_L0 + pred_L1 + 1) >> 1`
 //!   (§8.4.2.3.1); explicit weighted bipred (§8.4.2.3.2) uses the slice's
-//!   `pred_weight_table` for both lists when `weighted_bipred_idc == 1`.
+//!   `pred_weight_table` for both lists when `weighted_bipred_idc == 1`;
+//!   **implicit** weighted bipred (§8.4.2.3.3) is derived from POC
+//!   differences via `DistScaleFactor` when `weighted_bipred_idc == 2`,
+//!   with a default-equal-weights fallback for long-term references or
+//!   out-of-range `DistScaleFactor`.
 //! * **B-slice RefPicList0 / RefPicList1** construction per §8.2.4.2.3 —
 //!   short-term past/future split around `CurrPicOrderCnt` with the
 //!   per-list ordering reversal, followed by ascending long-term
@@ -100,10 +104,6 @@
 //! * CABAC B-slices (decode); any CABAC encoding; any P/B slice encoding.
 //!   CABAC P-slices are wired but weighted-P on the CABAC path and the
 //!   8×8 transform path are out of scope on this first pass.
-//! * **Implicit weighted bi-prediction** (`weighted_bipred_idc == 2`,
-//!   §8.4.2.3.3) — the PPS flag value surfaces `Error::Unsupported` for
-//!   B-slices. Explicit weighted bipred (`weighted_bipred_idc == 1`) is
-//!   supported.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
 //! * `pic_order_cnt_type == 1` (rarely used in practice) is the one

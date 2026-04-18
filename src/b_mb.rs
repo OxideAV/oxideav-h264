@@ -24,8 +24,10 @@
 //! (§8.4.2.3.1). When the slice header carries an explicit `pred_weight_table`
 //! (`weighted_bipred_idc == 1`) the L0 and L1 predictions are combined using
 //! per-reference weights + offsets per §8.4.2.3.2. Implicit bipred
-//! (`weighted_bipred_idc == 2`) is out of scope and surfaces as
-//! `Error::Unsupported` from the slice-header handler.
+//! (`weighted_bipred_idc == 2`) derives a per-block (w0, w1) pair from the
+//! POC distances between the current slice and its two references, per
+//! §8.4.2.3.3; long-term references or an out-of-range `DistScaleFactor`
+//! short-circuit to the default unweighted average.
 
 use oxideav_core::{Error, Result};
 
@@ -37,8 +39,9 @@ use crate::mb_type::{
     BSubPartition, PredDir,
 };
 use crate::motion::{
-    apply_chroma_weight, apply_luma_weight, average_bipred, chroma_mc, luma_mc, predict_mv_list,
-    weighted_bipred_plane,
+    apply_chroma_weight, apply_luma_weight, average_bipred, chroma_mc, implicit_bipred_weights,
+    implicit_weighted_bipred_plane, luma_mc, predict_mv_list, weighted_bipred_plane,
+    ImplicitBiWeights,
 };
 use crate::picture::{MbInfo, Picture, INTRA_DC_FAKE};
 use crate::pps::Pps;
@@ -66,6 +69,21 @@ pub struct BSliceCtx<'a> {
     pub list0_short_term: &'a [bool],
     /// Short-term / long-term class for each RefPicList1 entry.
     pub list1_short_term: &'a [bool],
+    /// How to combine L0 and L1 predictions for bi-predicted blocks
+    /// (§8.4.2.3). Selected from `pps.weighted_bipred_idc` and the presence
+    /// of an explicit `pred_weight_table` at the slice header.
+    pub bipred_mode: BipredMode,
+}
+
+/// §8.4.2.3 dispatch mode for how the two predictions are blended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BipredMode {
+    /// `(predL0 + predL1 + 1) >> 1` — §8.4.2.3.1.
+    Default,
+    /// Explicit slice-header weights — §8.4.2.3.2.
+    Explicit,
+    /// POC-derived implicit weights — §8.4.2.3.3.
+    Implicit,
 }
 
 impl<'a> BSliceCtx<'a> {
@@ -139,7 +157,7 @@ pub fn decode_b_skip_mb(
     }
     // Derive + compensate four 8×8 direct sub-MBs.
     if sh.direct_spatial_mv_pred_flag {
-        direct_16x16_spatial_compensate(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1)?;
+        direct_16x16_spatial_compensate(sh, sps, ctx, mb_x, mb_y, pic, ref_list0, ref_list1)?;
     } else {
         direct_16x16_temporal_compensate(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx)?;
     }
@@ -181,7 +199,9 @@ fn decode_b_inter_mb(
     match partition {
         BPartition::Direct16x16 => {
             if sh.direct_spatial_mv_pred_flag {
-                direct_16x16_spatial_compensate(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1)?;
+                direct_16x16_spatial_compensate(
+                    sh, sps, ctx, mb_x, mb_y, pic, ref_list0, ref_list1,
+                )?;
             } else {
                 direct_16x16_temporal_compensate(
                     sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx,
@@ -189,15 +209,36 @@ fn decode_b_inter_mb(
             }
         }
         BPartition::L0_16x16 => {
-            decode_16x16_single_dir(br, sh, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::L0)?;
+            decode_16x16_single_dir(
+                br,
+                sh,
+                ctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::L0,
+            )?;
         }
         BPartition::L1_16x16 => {
-            decode_16x16_single_dir(br, sh, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::L1)?;
+            decode_16x16_single_dir(
+                br,
+                sh,
+                ctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::L1,
+            )?;
         }
         BPartition::Bi_16x16 => {
             decode_16x16_single_dir(
                 br,
                 sh,
+                ctx,
                 mb_x,
                 mb_y,
                 pic,
@@ -208,11 +249,15 @@ fn decode_b_inter_mb(
         }
         BPartition::TwoPart16x8 { dirs } => {
             let rects = [(0usize, 0usize, 2usize, 4usize), (2, 0, 2, 4)];
-            decode_two_partition_b(br, sh, mb_x, mb_y, pic, ref_list0, ref_list1, &rects, &dirs)?;
+            decode_two_partition_b(
+                br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, &rects, &dirs,
+            )?;
         }
         BPartition::TwoPart8x16 { dirs } => {
             let rects = [(0usize, 0usize, 4usize, 2usize), (0, 2, 4, 2)];
-            decode_two_partition_b(br, sh, mb_x, mb_y, pic, ref_list0, ref_list1, &rects, &dirs)?;
+            decode_two_partition_b(
+                br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, &rects, &dirs,
+            )?;
         }
         BPartition::B8x8 => {
             decode_b8x8(br, sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx)?;
@@ -247,6 +292,7 @@ fn decode_b_inter_mb(
 fn decode_16x16_single_dir(
     br: &mut BitReader<'_>,
     sh: &SliceHeader,
+    ctx: &BSliceCtx<'_>,
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
@@ -275,7 +321,8 @@ fn decode_16x16_single_dir(
         None
     };
     compensate_partition_b(
-        sh, pic, ref_list0, ref_list1, mb_x, mb_y, 0, 0, 4, 4, dir, ref_l0, ref_l1, mvd_l0, mvd_l1,
+        sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, 0, 0, 4, 4, dir, ref_l0, ref_l1, mvd_l0,
+        mvd_l1,
     )
 }
 
@@ -287,6 +334,7 @@ fn decode_16x16_single_dir(
 fn decode_two_partition_b(
     br: &mut BitReader<'_>,
     sh: &SliceHeader,
+    ctx: &BSliceCtx<'_>,
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
@@ -330,7 +378,7 @@ fn decode_two_partition_b(
     for p in 0..2 {
         let (r0, c0, ph, pw) = rects[p];
         compensate_partition_b(
-            sh, pic, ref_list0, ref_list1, mb_x, mb_y, r0, c0, ph, pw, dirs[p], ref_l0[p],
+            sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, r0, c0, ph, pw, dirs[p], ref_l0[p],
             ref_l1[p], mvd_l0[p], mvd_l1[p],
         )?;
     }
@@ -424,7 +472,7 @@ fn decode_b8x8(
         if matches!(sp, BSubPartition::Direct8x8) {
             if sh.direct_spatial_mv_pred_flag {
                 direct_8x8_spatial_compensate(
-                    sh, sps, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1,
+                    sh, sps, ctx, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1,
                 )?;
             } else {
                 direct_8x8_temporal_compensate(
@@ -440,7 +488,7 @@ fn decode_b8x8(
             let c0 = sc0 + dc;
             let m = mvds[s][sub_idx];
             compensate_partition_b(
-                sh, pic, ref_list0, ref_list1, mb_x, mb_y, r0, c0, sh_h, sh_w, dir, ref_l0[s],
+                sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, r0, c0, sh_h, sh_w, dir, ref_l0[s],
                 ref_l1[s], m.mvd_l0, m.mvd_l1,
             )?;
         }
@@ -455,6 +503,7 @@ fn decode_b8x8(
 #[allow(clippy::too_many_arguments)]
 fn compensate_partition_b(
     sh: &SliceHeader,
+    ctx: &BSliceCtx<'_>,
     pic: &mut Picture,
     ref_list0: &[&Picture],
     ref_list1: &[&Picture],
@@ -509,14 +558,15 @@ fn compensate_partition_b(
     }
 
     apply_motion_compensation(
-        sh, pic, ref_list0, ref_list1, mb_x, mb_y, r0, c0, ph, pw, dir, ref_idx_l0, ref_idx_l1,
-        mv_l0, mv_l1,
+        sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, r0, c0, ph, pw, dir, ref_idx_l0,
+        ref_idx_l1, mv_l0, mv_l1,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn apply_motion_compensation(
     sh: &SliceHeader,
+    ctx: &BSliceCtx<'_>,
     pic: &mut Picture,
     ref_list0: &[&Picture],
     ref_list1: &[&Picture],
@@ -609,7 +659,7 @@ fn apply_motion_compensation(
             let ref0 = lookup_ref(ref_list0, r0_idx, "L0")?;
             let ref1 = lookup_ref(ref_list1, r1_idx, "L1")?;
             let wt = sh.pred_weight_table.as_ref();
-            let explicit = wt.is_some();
+            let (mode, implicit_weights) = resolve_bipred_mode(ctx, r0_idx, r1_idx);
             mc_bipred_partition(
                 pic,
                 ref0,
@@ -627,7 +677,8 @@ fn apply_motion_compensation(
                 r0_idx,
                 r1_idx,
                 wt,
-                explicit,
+                mode,
+                implicit_weights,
             );
         }
     }
@@ -751,7 +802,8 @@ fn mc_bipred_partition(
     ref_idx_l0: i8,
     ref_idx_l1: i8,
     pwt: Option<&PredWeightTable>,
-    explicit: bool,
+    mode: BipredMode,
+    implicit_weights: ImplicitBiWeights,
 ) {
     let lpw = w * 4;
     let lph = h * 4;
@@ -783,24 +835,36 @@ fn mc_bipred_partition(
     let lstride = pic.luma_stride();
     let loff = pic.luma_off(mb_x, mb_y) + r0 * 4 * lstride + c0 * 4;
     let mut luma_out = vec![0u8; lpw * lph];
-    if explicit {
-        let pwt = pwt.unwrap();
-        let idx0 = ref_idx_l0.max(0) as usize;
-        let idx1 = ref_idx_l1.max(0) as usize;
-        let lw0 = pwt.luma_l0.get(idx0).copied().unwrap_or_default();
-        let lw1 = pwt.luma_l1.get(idx1).copied().unwrap_or_default();
-        weighted_bipred_plane(
-            &mut luma_out,
-            &tmp_l0,
-            &tmp_l1,
-            lw0.weight,
-            lw0.offset,
-            lw1.weight,
-            lw1.offset,
-            pwt.luma_log2_weight_denom,
-        );
-    } else {
-        average_bipred(&mut luma_out, &tmp_l0, &tmp_l1);
+    match mode {
+        BipredMode::Explicit => {
+            let pwt = pwt.unwrap();
+            let idx0 = ref_idx_l0.max(0) as usize;
+            let idx1 = ref_idx_l1.max(0) as usize;
+            let lw0 = pwt.luma_l0.get(idx0).copied().unwrap_or_default();
+            let lw1 = pwt.luma_l1.get(idx1).copied().unwrap_or_default();
+            weighted_bipred_plane(
+                &mut luma_out,
+                &tmp_l0,
+                &tmp_l1,
+                lw0.weight,
+                lw0.offset,
+                lw1.weight,
+                lw1.offset,
+                pwt.luma_log2_weight_denom,
+            );
+        }
+        BipredMode::Implicit => match implicit_weights {
+            ImplicitBiWeights::Weighted { w0, w1 } => {
+                implicit_weighted_bipred_plane(&mut luma_out, &tmp_l0, &tmp_l1, w0, w1);
+            }
+            ImplicitBiWeights::Default => {
+                // §8.4.2.3.3 long-term / clipped-DSF fallback.
+                average_bipred(&mut luma_out, &tmp_l0, &tmp_l1);
+            }
+        },
+        BipredMode::Default => {
+            average_bipred(&mut luma_out, &tmp_l0, &tmp_l1);
+        }
     }
     for rr in 0..lph {
         for cc in 0..lpw {
@@ -878,35 +942,49 @@ fn mc_bipred_partition(
 
     let mut cb_out = vec![0u8; cpw * cph];
     let mut cr_out = vec![0u8; cpw * cph];
-    if explicit {
-        let pwt = pwt.unwrap();
-        let idx0 = ref_idx_l0.max(0) as usize;
-        let idx1 = ref_idx_l1.max(0) as usize;
-        let cw_l0 = pwt.chroma_l0.get(idx0).copied().unwrap_or_default();
-        let cw_l1 = pwt.chroma_l1.get(idx1).copied().unwrap_or_default();
-        weighted_bipred_plane(
-            &mut cb_out,
-            &tmp_cb0,
-            &tmp_cb1,
-            cw_l0.weight[0],
-            cw_l0.offset[0],
-            cw_l1.weight[0],
-            cw_l1.offset[0],
-            pwt.chroma_log2_weight_denom,
-        );
-        weighted_bipred_plane(
-            &mut cr_out,
-            &tmp_cr0,
-            &tmp_cr1,
-            cw_l0.weight[1],
-            cw_l0.offset[1],
-            cw_l1.weight[1],
-            cw_l1.offset[1],
-            pwt.chroma_log2_weight_denom,
-        );
-    } else {
-        average_bipred(&mut cb_out, &tmp_cb0, &tmp_cb1);
-        average_bipred(&mut cr_out, &tmp_cr0, &tmp_cr1);
+    match mode {
+        BipredMode::Explicit => {
+            let pwt = pwt.unwrap();
+            let idx0 = ref_idx_l0.max(0) as usize;
+            let idx1 = ref_idx_l1.max(0) as usize;
+            let cw_l0 = pwt.chroma_l0.get(idx0).copied().unwrap_or_default();
+            let cw_l1 = pwt.chroma_l1.get(idx1).copied().unwrap_or_default();
+            weighted_bipred_plane(
+                &mut cb_out,
+                &tmp_cb0,
+                &tmp_cb1,
+                cw_l0.weight[0],
+                cw_l0.offset[0],
+                cw_l1.weight[0],
+                cw_l1.offset[0],
+                pwt.chroma_log2_weight_denom,
+            );
+            weighted_bipred_plane(
+                &mut cr_out,
+                &tmp_cr0,
+                &tmp_cr1,
+                cw_l0.weight[1],
+                cw_l0.offset[1],
+                cw_l1.weight[1],
+                cw_l1.offset[1],
+                pwt.chroma_log2_weight_denom,
+            );
+        }
+        BipredMode::Implicit => match implicit_weights {
+            ImplicitBiWeights::Weighted { w0, w1 } => {
+                // §8.4.2.3.3 — same weights apply to luma and chroma.
+                implicit_weighted_bipred_plane(&mut cb_out, &tmp_cb0, &tmp_cb1, w0, w1);
+                implicit_weighted_bipred_plane(&mut cr_out, &tmp_cr0, &tmp_cr1, w0, w1);
+            }
+            ImplicitBiWeights::Default => {
+                average_bipred(&mut cb_out, &tmp_cb0, &tmp_cb1);
+                average_bipred(&mut cr_out, &tmp_cr0, &tmp_cr1);
+            }
+        },
+        BipredMode::Default => {
+            average_bipred(&mut cb_out, &tmp_cb0, &tmp_cb1);
+            average_bipred(&mut cr_out, &tmp_cr0, &tmp_cr1);
+        }
     }
     let stride = pic.chroma_stride();
     let coff = pic.chroma_off(mb_x, mb_y) + r0 * 2 * stride + c0 * 2;
@@ -973,6 +1051,7 @@ fn direct_spatial_ref_idx(pic: &Picture, mb_x: u32, mb_y: u32) -> (i8, i8) {
 fn direct_16x16_spatial_compensate(
     sh: &SliceHeader,
     _sps: &Sps,
+    ctx: &BSliceCtx<'_>,
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
@@ -999,6 +1078,7 @@ fn direct_16x16_spatial_compensate(
     }
     apply_motion_compensation(
         sh,
+        ctx,
         pic,
         ref_list0,
         ref_list1,
@@ -1022,6 +1102,7 @@ fn direct_16x16_spatial_compensate(
 fn direct_8x8_spatial_compensate(
     sh: &SliceHeader,
     _sps: &Sps,
+    ctx: &BSliceCtx<'_>,
     mb_x: u32,
     mb_y: u32,
     sr0: usize,
@@ -1044,6 +1125,7 @@ fn direct_8x8_spatial_compensate(
     }
     apply_motion_compensation(
         sh,
+        ctx,
         pic,
         ref_list0,
         ref_list1,
@@ -1284,6 +1366,7 @@ fn direct_temporal_rect_compensate(
             let dir = pick_bipred_dir(ri0, ri1);
             apply_motion_compensation(
                 sh,
+                ctx,
                 pic,
                 ref_list0,
                 ref_list1,
@@ -1474,6 +1557,32 @@ fn lookup_ref<'a>(list: &[&'a Picture], ref_idx: i8, tag: &str) -> Result<&'a Pi
             list.len()
         ))
     })
+}
+
+/// Pick the bipred blend mode for `(ref_idx_l0, ref_idx_l1)` at the current
+/// slice. For [`BipredMode::Implicit`] the per-ref POCs and long-term class
+/// come from `ctx`; missing entries (out-of-range ref_idx) short-circuit to
+/// the default equal-weight fallback per §8.4.2.3.3.
+fn resolve_bipred_mode(
+    ctx: &BSliceCtx<'_>,
+    r0_idx: i8,
+    r1_idx: i8,
+) -> (BipredMode, ImplicitBiWeights) {
+    if ctx.bipred_mode != BipredMode::Implicit {
+        return (ctx.bipred_mode, ImplicitBiWeights::Default);
+    }
+    let i0 = r0_idx.max(0) as usize;
+    let i1 = r1_idx.max(0) as usize;
+    let Some(&l0_poc) = ctx.list0_pocs.get(i0) else {
+        return (BipredMode::Implicit, ImplicitBiWeights::Default);
+    };
+    let Some(&l1_poc) = ctx.list1_pocs.get(i1) else {
+        return (BipredMode::Implicit, ImplicitBiWeights::Default);
+    };
+    let l0_short = ctx.list0_short_term.get(i0).copied().unwrap_or(true);
+    let l1_short = ctx.list1_short_term.get(i1).copied().unwrap_or(true);
+    let weights = implicit_bipred_weights(ctx.curr_poc, l0_poc, l1_poc, !l0_short, !l1_short);
+    (BipredMode::Implicit, weights)
 }
 
 fn list_weight<'a>(

@@ -2,9 +2,9 @@
 
 Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
 oxideav. Decodes CAVLC + CABAC I-slices, CAVLC + CABAC P-slices, and
-CAVLC B-slices (spatial + temporal direct + explicit weighted bipred);
-encodes a minimal Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED
-output stream. **High-Profile 8×8 transform CAVLC I-slice decode**
+CAVLC B-slices (spatial + temporal direct + explicit weighted bipred +
+implicit weighted bipred); encodes a minimal Baseline-Profile, I-frame-only,
+Intra_16×16 DC_PRED output stream. **High-Profile 8×8 transform CAVLC I-slice decode**
 (§7.3.5.3.2, §8.3.2, §8.5.13) is wired end-to-end and bit-exact against
 ffmpeg's libavcodec reference; CABAC 8×8 residual coding (§9.3.3.1.1.10)
 and P-slice inter 8×8 remain out of scope. Zero C dependencies.
@@ -108,7 +108,11 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
 - Default **bi-prediction** averages the two list predictions as
   `(pred_L0 + pred_L1 + 1) >> 1` (§8.4.2.3.1). **Explicit weighted
   bi-prediction** (§8.4.2.3.2) uses the slice's `pred_weight_table` for
-  both lists when `weighted_bipred_idc == 1`.
+  both lists when `weighted_bipred_idc == 1`. **Implicit weighted
+  bi-prediction** (§8.4.2.3.3) derives per-block `(w0, w1)` from POC
+  distances via `DistScaleFactor` when `weighted_bipred_idc == 2`;
+  long-term references or an out-of-range `DistScaleFactor` fall back
+  to the default unweighted average.
 - **RefPicList0 / RefPicList1** built per §8.2.4.2.3: short-term
   entries split by POC relative to `CurrPicOrderCnt` (past-desc +
   future-asc for list 0; future-asc + past-desc for list 1), then
@@ -254,9 +258,6 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
 - **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16
   modes other than DC, rate control, adaptive QP, mode decision,
   deblocking.
-- **Implicit weighted bi-prediction** (`weighted_bipred_idc == 2`,
-  §8.4.2.3.3) — explicit bipred and P-slice weighted prediction are
-  supported.
 - `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 - Interlaced coding, MBAFF, PAFF, frame/field picture mixes.
 - Inter 8×8 transform (`transform_size_8x8_flag = 1` on P/B MBs).
@@ -314,6 +315,19 @@ ffmpeg -y -i /tmp/oxideav_bslice.mp4 -c:v copy -bsf:v h264_mp4toannexb \
     -f h264 tests/fixtures/bslice_64x64.es
 ffmpeg -y -i /tmp/oxideav_bslice.mp4 -f rawvideo -pix_fmt yuv420p \
     tests/fixtures/bslice_64x64.yuv
+
+# CAVLC B-slice implicit weighted-bipred clip (§8.4.2.3.3) — a 64×64
+# `smptebars` pan at QP 20 so the decoder sees real bi-predicted MBs
+# combined via POC-derived weights (PPS sets `weighted_bipred_idc = 2`).
+ffmpeg -y -f lavfi -i "smptebars=size=128x64:rate=24:duration=0.5" \
+    -vf "crop=64:64:t*16:0" -pix_fmt yuv420p -c:v libx264 -profile:v main \
+    -qp 20 -preset slow -g 6 -bf 3 -b_strategy 0 -coder 0 \
+    -x264opts "no-scenecut:no-mbtree:no-8x8dct:weightb:weightp=0:bframes=3:ref=3" \
+    /tmp/bframe_implicit.mp4
+ffmpeg -y -i /tmp/bframe_implicit.mp4 -c:v copy -bsf:v h264_mp4toannexb \
+    -f h264 tests/fixtures/bframe_implicit_64x64.es
+ffmpeg -y -i /tmp/bframe_implicit.mp4 -f rawvideo -pix_fmt yuv420p \
+    tests/fixtures/bframe_implicit_64x64.yuv
 ```
 
 ## License

@@ -29,8 +29,6 @@
 //! Out of scope (returns `Error::Unsupported`):
 //! * CABAC B-slices. (CABAC P-slices are wired; see
 //!   [`crate::cabac::p_mb`].)
-//! * Implicit weighted bi-prediction (`weighted_bipred_idc == 2`,
-//!   §8.4.2.3.3).
 //! * `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 //! * Interlaced coding / MBAFF (P and B).
 //! * 8×8 transform, 4:2:2 / 4:4:4 chroma, bit depth > 8.
@@ -192,11 +190,6 @@ impl H264Decoder {
                         if pps.entropy_coding_mode_flag {
                             return Err(Error::unsupported(
                                 "h264: CABAC B-slices not implemented — use CAVLC (entropy_coding_mode_flag=0)",
-                            ));
-                        }
-                        if pps.weighted_bipred_idc == 2 {
-                            return Err(Error::unsupported(
-                                "h264 b-slice: implicit weighted bi-prediction (weighted_bipred_idc=2) not implemented",
                             ));
                         }
                     }
@@ -427,12 +420,24 @@ impl H264Decoder {
                             l0_entries.iter().map(|r| r.short_term).collect();
                         let list1_short: Vec<bool> =
                             l1_entries.iter().map(|r| r.short_term).collect();
+                        // Pick the bipred combine mode per §8.4.2.3:
+                        // explicit table present → §8.4.2.3.2,
+                        // PPS `weighted_bipred_idc == 2` → §8.4.2.3.3 implicit,
+                        // otherwise default average (§8.4.2.3.1).
+                        let bipred_mode = if sh.pred_weight_table.is_some() {
+                            crate::b_mb::BipredMode::Explicit
+                        } else if pps.weighted_bipred_idc == 2 {
+                            crate::b_mb::BipredMode::Implicit
+                        } else {
+                            crate::b_mb::BipredMode::Default
+                        };
                         let b_ctx = crate::b_mb::BSliceCtx {
                             curr_poc: poc,
                             list0_pocs: &list0_pocs,
                             list1_pocs: &list1_pocs,
                             list0_short_term: &list0_short,
                             list1_short_term: &list1_short,
+                            bipred_mode,
                         };
                         let mut br = BitReader::new(&rbsp);
                         br.skip(sh.slice_data_bit_offset as u32)?;

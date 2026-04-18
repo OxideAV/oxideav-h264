@@ -35,7 +35,13 @@ fn count_within(a: &[u8], b: &[u8], tol: i32) -> usize {
         .count()
 }
 
-fn run_fixture(es: &[u8], yuv: &[u8], w: usize, h: usize, label: &str) -> Result<(f64, f64), String> {
+fn run_fixture(
+    es: &[u8],
+    yuv: &[u8],
+    w: usize,
+    h: usize,
+    label: &str,
+) -> Result<(f64, f64), String> {
     let frame_bytes = w * h * 3 / 2;
     assert!(yuv.len() >= frame_bytes);
     let (sps, pps, frame_nalus) = split_frames(es);
@@ -48,15 +54,21 @@ fn run_fixture(es: &[u8], yuv: &[u8], w: usize, h: usize, label: &str) -> Result
     primer.extend_from_slice(&[0, 0, 0, 1]);
     primer.extend_from_slice(&pps);
     let primer_pkt = Packet::new(0, TimeBase::new(1, 90_000), primer);
-    dec.send_packet(&primer_pkt).map_err(|e| format!("{label}: primer: {e:?}"))?;
+    dec.send_packet(&primer_pkt)
+        .map_err(|e| format!("{label}: primer: {e:?}"))?;
     while dec.receive_frame().is_ok() {}
 
     let pkt = Packet::new(0, TimeBase::new(1, 90_000), frame_nalus[0].clone())
         .with_pts(0)
         .with_keyframe(true);
-    dec.send_packet(&pkt).map_err(|e| format!("{label}: send IDR: {e:?}"))?;
-    let frame = dec.receive_frame().map_err(|e| format!("{label}: receive IDR: {e:?}"))?;
-    let Frame::Video(vf) = frame else { unreachable!() };
+    dec.send_packet(&pkt)
+        .map_err(|e| format!("{label}: send IDR: {e:?}"))?;
+    let frame = dec
+        .receive_frame()
+        .map_err(|e| format!("{label}: receive IDR: {e:?}"))?;
+    let Frame::Video(vf) = frame else {
+        unreachable!()
+    };
     let mut buf = Vec::with_capacity(frame_bytes);
     buf.extend_from_slice(&vf.planes[0].data);
     buf.extend_from_slice(&vf.planes[1].data);
@@ -119,9 +131,7 @@ fn decode_cabac_i_slice_against_reference() {
             }
         }
         Err(e) => {
-            eprintln!(
-                "cabac-i-64x64 residual decode still desyncs: {e}"
-            );
+            eprintln!("cabac-i-64x64 residual decode still desyncs: {e}");
         }
     }
 }
