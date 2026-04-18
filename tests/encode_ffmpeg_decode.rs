@@ -151,3 +151,127 @@ fn ffmpeg_decodes_our_h264_output() {
         psnr
     );
 }
+
+#[test]
+fn ffmpeg_decodes_our_pframe_stream() {
+    if !have_ffmpeg() {
+        eprintln!("ffmpeg not on PATH — skipping");
+        return;
+    }
+    let w = 64u32;
+    let h = 48u32;
+    let mut enc = H264Encoder::new(
+        CodecId::new("h264"),
+        w,
+        h,
+        H264EncoderOptions {
+            qp: 26,
+            p_slice_interval: 3,
+            ..Default::default()
+        },
+    )
+    .expect("encoder::new");
+    // Build three slightly different frames so we force P residual
+    // emission (rather than pure P_Skip).
+    let mut sources: Vec<VideoFrame> = Vec::new();
+    for t in 0..3u32 {
+        let cw = w / 2;
+        let ch = h / 2;
+        let mut y = vec![0u8; (w * h) as usize];
+        for r in 0..h {
+            for c in 0..w {
+                y[(r * w + c) as usize] = ((r + c + t).min(255)) as u8;
+            }
+        }
+        sources.push(VideoFrame {
+            format: PixelFormat::Yuv420P,
+            width: w,
+            height: h,
+            pts: Some(t as i64),
+            time_base: TimeBase::new(1, 30),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: y,
+                },
+                VideoPlane {
+                    stride: cw as usize,
+                    data: vec![128u8; (cw * ch) as usize],
+                },
+                VideoPlane {
+                    stride: cw as usize,
+                    data: vec![128u8; (cw * ch) as usize],
+                },
+            ],
+        });
+    }
+    let mut stream: Vec<u8> = Vec::new();
+    for src in &sources {
+        enc.send_frame(&Frame::Video(src.clone())).expect("send_frame");
+        let pkt = enc.receive_packet().expect("receive_packet");
+        stream.extend_from_slice(&pkt.data);
+    }
+    enc.flush().expect("flush");
+
+    let mut cmd = Command::new("ffmpeg")
+        .args([
+            "-loglevel",
+            "error",
+            "-f",
+            "h264",
+            "-i",
+            "-",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffmpeg");
+    {
+        let stdin = cmd.stdin.as_mut().expect("stdin");
+        stdin.write_all(&stream).expect("write_all");
+    }
+    let out = cmd.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "ffmpeg exit: {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let frame_size = (w * h) as usize + (w * h / 2) as usize;
+    assert_eq!(
+        out.stdout.len(),
+        frame_size * 3,
+        "ffmpeg produced {} bytes, expected {}",
+        out.stdout.len(),
+        frame_size * 3
+    );
+    for (i, src) in sources.iter().enumerate() {
+        let start = i * frame_size;
+        let y_out = &out.stdout[start..start + (w * h) as usize];
+        let mse: f64 = y_out
+            .iter()
+            .zip(src.planes[0].data.iter())
+            .map(|(a, b)| {
+                let d = *a as f64 - *b as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / (y_out.len() as f64);
+        let psnr = if mse < 1e-9 {
+            99.0
+        } else {
+            10.0 * (255.0 * 255.0 / mse).log10()
+        };
+        eprintln!("frame {i} ffmpeg-decode psnr = {psnr:.2} dB");
+        assert!(
+            psnr >= 28.0,
+            "frame {i} ffmpeg-decoded luma psnr {psnr:.2} < 28 dB"
+        );
+    }
+}
