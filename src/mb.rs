@@ -1096,13 +1096,16 @@ fn collect_chroma_422_neighbours(
     mb_y: u32,
     cb: bool,
 ) -> IntraChroma8x16Neighbours {
-    let cstride = pic.chroma_stride();
+    // MBAFF-aware row step — for field-coded MB pairs, chroma planes
+    // interleave per-row so the neighbour lookups must step by 2 ×
+    // chroma_stride on the "above" direction.
+    let row_stride = pic.chroma_row_stride_for_at(mb_x, mb_y);
     let co_mb = pic.chroma_off(mb_x, mb_y);
     let plane = if cb { &pic.cb } else { &pic.cr };
-    let top_avail = mb_y > 0;
+    let top_avail = pic.mb_top_available(mb_y);
     let mut top = [0u8; 8];
     if top_avail {
-        let off = co_mb - cstride;
+        let off = co_mb - row_stride;
         for i in 0..8 {
             top[i] = plane[off + i];
         }
@@ -1111,12 +1114,12 @@ fn collect_chroma_422_neighbours(
     let mut left = [0u8; 16];
     if left_avail {
         for i in 0..16 {
-            left[i] = plane[co_mb + i * cstride - 1];
+            left[i] = plane[co_mb + i * row_stride - 1];
         }
     }
     let tl_avail = top_avail && left_avail;
     let top_left = if tl_avail {
-        plane[co_mb - cstride - 1]
+        plane[co_mb - row_stride - 1]
     } else {
         0
     };
@@ -1182,7 +1185,7 @@ fn decode_chroma_422(
         inv_hadamard_2x4_chroma_dc_scaled(&mut dc_cr, qpc_cr, w_cr);
     }
 
-    let cstride = pic.chroma_stride();
+    let row_step = pic.chroma_row_stride_for_at(mb_x, mb_y);
     let co = pic.chroma_off(mb_x, mb_y);
 
     for plane_cb in [true, false] {
@@ -1209,13 +1212,13 @@ fn decode_chroma_422(
                 }
                 res[0] = dc[blk_idx];
                 idct_4x4(&mut res);
-                let off_in_mb = (blk_row * 4) * cstride + blk_col * 4;
+                let off_in_mb = (blk_row * 4) * row_step + blk_col * 4;
                 let plane_buf = if plane_cb { &mut pic.cb } else { &mut pic.cr };
                 for r in 0..4 {
                     for c in 0..4 {
                         let p_idx = (blk_row * 4 + r) * 8 + (blk_col * 4 + c);
                         let v = pred[p_idx] as i32 + res[r * 4 + c];
-                        plane_buf[co + off_in_mb + r * cstride + c] = v.clamp(0, 255) as u8;
+                        plane_buf[co + off_in_mb + r * row_step + c] = v.clamp(0, 255) as u8;
                     }
                 }
                 nc_arr[blk_idx] = total_coeff as u8;
@@ -1269,8 +1272,8 @@ fn predict_nc_chroma_422(
     };
     let top = if blk_row > 0 {
         Some(pick(info_here, (blk_row - 1) * 2 + blk_col))
-    } else if mb_y > 0 {
-        let info = pic.mb_info_at(mb_x, mb_y - 1);
+    } else if let Some(above_y) = pic.mb_above_neighbour(mb_y) {
+        let info = pic.mb_info_at(mb_x, above_y);
         if info.coded {
             // The bottom row of the 2×4 chroma AC grid is at block-row 3.
             Some(pick(info, 3 * 2 + blk_col))

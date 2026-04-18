@@ -20,8 +20,15 @@
 //!   spec's `tC = tC0 + 1` bump for chroma is applied.
 //! * §8.7.1 vertical-then-horizontal ordering.
 //!
-//! MBAFF (macroblock-adaptive frame/field) is scoped out — the frame-only
-//! `frame_mbs_only_flag = 1` decoder this crate supports never enables it.
+//! MBAFF is handled by the sibling [`deblock_picture_mbaff`] entry point:
+//! under MBAFF an MB pair may be field- or frame-coded independently, so
+//! vertical edges on a field-coded MB step through the interleaved plane
+//! at `2 × luma_stride`, and the "inside-pair" horizontal boundary
+//! between the top and bottom MB of a field-coded pair is skipped
+//! entirely (§8.7.1.1) — the two MBs live on different field polarities
+//! and never share a sample edge. The same-polarity §6.4.9.4 neighbour
+//! rule means the "pair above" (two MB rows up) is used for the top
+//! MB's top edge in field-coded pairs.
 //! `disable_deblocking_filter_idc = 2` (filter only within slice) is
 //! treated as the default idc = 0 here because this decoder currently
 //! emits one slice per picture.
@@ -507,6 +514,56 @@ fn filter_luma_edge_4(
     }
 }
 
+/// MBAFF-aware luma edge filter. Identical to [`filter_luma_edge_4`] but
+/// with an explicit plane-row step `row_stride` so field-coded MBs
+/// iterate over their interleaved (every-other-row) sample layout.
+///
+/// `x0` is the column of the q-side sample at row 0 of the edge; `y0`
+/// is the plane-row of the q-side sample at column index `i = 0`. The
+/// 4-segment inner step in the non-vertical case uses `col_step = 1`
+/// (adjacent columns) and moves across columns `x0..x0+4`.
+#[allow(clippy::too_many_arguments)]
+fn filter_luma_edge_4_mbaff(
+    pic: &mut Picture,
+    x0: usize,
+    y0: usize,
+    vertical: bool,
+    row_step: usize,
+    bs: i32,
+    qp_avg: i32,
+    alpha_off: i32,
+    beta_off: i32,
+) {
+    let plane_stride = pic.luma_stride();
+    let index_a = (qp_avg + alpha_off).clamp(0, 51) as usize;
+    let index_b = (qp_avg + beta_off).clamp(0, 51) as usize;
+    let alpha = ALPHA[index_a] as i32;
+    let beta = BETA[index_b] as i32;
+    if alpha == 0 || beta == 0 {
+        return;
+    }
+    let tc0 = if bs < 4 {
+        TC0[bs as usize - 1][index_a] as i32
+    } else {
+        0
+    };
+
+    for i in 0..4usize {
+        let idx = |delta: isize| -> usize {
+            if vertical {
+                // delta moves across columns; row steps by i × row_step.
+                let col = (x0 as isize + delta) as usize;
+                (y0 + i * row_step) * plane_stride + col
+            } else {
+                // delta moves across rows using the field-aware step.
+                let row = y0 as isize + delta * row_step as isize;
+                (row as usize) * plane_stride + x0 + i
+            }
+        };
+        filter_luma_line(pic, idx, bs, alpha, beta, tc0);
+    }
+}
+
 fn filter_luma_line(
     pic: &mut Picture,
     idx: impl Fn(isize) -> usize,
@@ -666,5 +723,446 @@ fn filter_chroma_edge_2(
             plane[p0_i] = (p0 + delta).clamp(0, 255) as u8;
             plane[q0_i] = (q0 - delta).clamp(0, 255) as u8;
         }
+    }
+}
+
+/// MBAFF-aware chroma edge filter — 2-sample segment, `row_step`-aware.
+/// Mirrors [`filter_chroma_edge_2`] but the inner loop walks the chroma
+/// plane with the field-aware step on the "row" axis. Used for field-
+/// coded chroma edges on 4:2:0 / 4:2:2 / 4:4:4 under MBAFF.
+#[allow(clippy::too_many_arguments)]
+fn filter_chroma_edge_2_mbaff(
+    pic: &mut Picture,
+    plane_cb: bool,
+    x0: usize,
+    y0: usize,
+    vertical: bool,
+    row_step: usize,
+    bs: i32,
+    qp_avg: i32,
+    alpha_off: i32,
+    beta_off: i32,
+) {
+    let plane_stride = pic.chroma_stride();
+    let index_a = (qp_avg + alpha_off).clamp(0, 51) as usize;
+    let index_b = (qp_avg + beta_off).clamp(0, 51) as usize;
+    let alpha = ALPHA[index_a] as i32;
+    let beta = BETA[index_b] as i32;
+    if alpha == 0 || beta == 0 {
+        return;
+    }
+    let tc = if bs < 4 {
+        TC0[bs as usize - 1][index_a] as i32 + 1
+    } else {
+        0
+    };
+
+    for i in 0..2usize {
+        let idx = |delta: isize| -> usize {
+            if vertical {
+                let col = (x0 as isize + delta) as usize;
+                (y0 + i * row_step) * plane_stride + col
+            } else {
+                let row = y0 as isize + delta * row_step as isize;
+                (row as usize) * plane_stride + x0 + i
+            }
+        };
+        let p1_i = idx(-2);
+        let p0_i = idx(-1);
+        let q0_i = idx(0);
+        let q1_i = idx(1);
+        let plane = if plane_cb { &mut pic.cb } else { &mut pic.cr };
+        let p0 = plane[p0_i] as i32;
+        let p1 = plane[p1_i] as i32;
+        let q0 = plane[q0_i] as i32;
+        let q1 = plane[q1_i] as i32;
+        if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
+            continue;
+        }
+        if bs == 4 {
+            plane[p0_i] = ((2 * p1 + p0 + q1 + 2) >> 2).clamp(0, 255) as u8;
+            plane[q0_i] = ((2 * q1 + q0 + p1 + 2) >> 2).clamp(0, 255) as u8;
+        } else {
+            let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+            plane[p0_i] = (p0 + delta).clamp(0, 255) as u8;
+            plane[q0_i] = (q0 - delta).clamp(0, 255) as u8;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// §8.7.1.1 — MBAFF deblock driver.
+// -----------------------------------------------------------------------------
+//
+// MBAFF (macroblock-adaptive frame/field) changes the edge schedule in
+// three ways relative to the progressive filter:
+//
+// 1. Samples in a field-coded MB occupy every other plane row inside
+//    the pair (top MB = even rows, bottom MB = odd rows), so
+//    intra-MB filtering must step through the plane with
+//    `row_step = 2` on vertical edges and move `row_step` rows per
+//    spec-edge-unit on horizontal edges.
+// 2. The horizontal boundary between the two MBs of a field-coded
+//    pair is not filtered: those MBs belong to different field
+//    polarities and do not share a sample edge.
+// 3. The "above-pair" neighbour of the top MB's top edge follows the
+//    §6.4.9.4 same-polarity rule — in the uniformly-field-coded MBAFF
+//    layout this means the neighbour is the same-polarity MB of the
+//    previous pair (`mb_y - 2`), reached naturally on the interleaved
+//    plane at `current_mb_row - row_step`.
+//
+// The driver here targets the uniform-mode MBAFF case (all pairs share
+// the same `mb_field_decoding_flag`). Mixed-mode pictures need the
+// §8.7.1.1 twice-per-edge pass at the pair-mode boundary, which is
+// described but not wired in this MVP — the existing x264 fixture is
+// uniformly field-coded so the uniform path suffices.
+
+/// Apply MBAFF-aware deblocking to all edges in `pic`. Dispatches MB
+/// pairs, with per-pair `mb_field_decoding_flag` driving the edge
+/// schedule and sample-row step.
+pub fn deblock_picture_mbaff(pic: &mut Picture, pps: &Pps, sh: &SliceHeader) {
+    if sh.disable_deblocking_filter_idc == 1 {
+        return;
+    }
+    let alpha_off = sh.slice_alpha_c0_offset_div2 * 2;
+    let beta_off = sh.slice_beta_offset_div2 * 2;
+    let chroma_off_cb = pps.chroma_qp_index_offset;
+    let chroma_off_cr = pps.second_chroma_qp_index_offset;
+    let mb_w = pic.mb_width;
+    let mb_h = pic.mb_height;
+
+    // Raster over MB pairs. For each pair, process its top MB then its
+    // bottom MB. The per-MB `mb_field_decoding_flag` comes from
+    // `is_mb_field_at`.
+    let pair_rows = mb_h / 2;
+    for pair_y in 0..pair_rows {
+        for mb_x in 0..mb_w {
+            let top_mb_y = pair_y * 2;
+            let bot_mb_y = top_mb_y + 1;
+            let pair_field = pic.is_mb_field_at(mb_x, top_mb_y);
+            let row_step = if pair_field { 2 } else { 1 };
+            // Top MB of the pair.
+            process_mb_mbaff(
+                pic, mb_x, top_mb_y, pair_field, /*is_bottom_of_pair=*/ false, row_step,
+                alpha_off, beta_off, chroma_off_cb, chroma_off_cr, sh.slice_type,
+            );
+            // Bottom MB of the pair.
+            process_mb_mbaff(
+                pic, mb_x, bot_mb_y, pair_field, /*is_bottom_of_pair=*/ true, row_step,
+                alpha_off, beta_off, chroma_off_cb, chroma_off_cr, sh.slice_type,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_mb_mbaff(
+    pic: &mut Picture,
+    mb_x: u32,
+    mb_y: u32,
+    pair_field: bool,
+    is_bottom_of_pair: bool,
+    row_step: usize,
+    alpha_off: i32,
+    beta_off: i32,
+    cqp_off_cb: i32,
+    cqp_off_cr: i32,
+    slice_type: SliceType,
+) {
+    let tr8 = pic.mb_info_at(mb_x, mb_y).transform_8x8;
+
+    // ---- Vertical edges ---------------------------------------------
+    // Left MB edge (vertical) — neighbour pair's `mb_field_decoding_flag`
+    // may differ. For the uniform-mode case (the only one wired here)
+    // the neighbour has the same mode and the filter walks the same
+    // interleaved layout.
+    if mb_x > 0 {
+        filter_mb_edge_vertical_mbaff(
+            pic, mb_x, mb_y, 0, row_step, alpha_off, beta_off, cqp_off_cb, cqp_off_cr, slice_type,
+        );
+    }
+    for edge_col in [4usize, 8, 12] {
+        if tr8 && edge_col != 8 {
+            continue;
+        }
+        filter_mb_edge_vertical_mbaff(
+            pic, mb_x, mb_y, edge_col, row_step, alpha_off, beta_off, cqp_off_cb, cqp_off_cr,
+            slice_type,
+        );
+    }
+
+    // ---- Horizontal edges -------------------------------------------
+    // Top MB edge. For the top MB of a pair (is_bottom_of_pair == false)
+    // the neighbour is the "above pair" — always available if pair_y > 0
+    // regardless of coding mode (same-polarity rule). For the bottom MB
+    // of a pair the "above" is the top MB of the same pair — this is the
+    // inside-pair edge that §8.7.1.1 skips when the pair is field-coded.
+    let top_edge_applies = if is_bottom_of_pair {
+        !pair_field
+    } else {
+        pic.mb_top_available(mb_y)
+    };
+    if top_edge_applies {
+        filter_mb_edge_horizontal_mbaff(
+            pic, mb_x, mb_y, 0, row_step, alpha_off, beta_off, cqp_off_cb, cqp_off_cr, slice_type,
+        );
+    }
+    // Internal horizontal edges — within the MB, same polarity all the
+    // way, so `row_step` alone handles the interleave.
+    for edge_row in [4usize, 8, 12] {
+        if tr8 && edge_row != 8 {
+            continue;
+        }
+        filter_mb_edge_horizontal_mbaff(
+            pic, mb_x, mb_y, edge_row, row_step, alpha_off, beta_off, cqp_off_cb, cqp_off_cr,
+            slice_type,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_mb_edge_vertical_mbaff(
+    pic: &mut Picture,
+    mb_x: u32,
+    mb_y: u32,
+    edge_col: usize,
+    row_step: usize,
+    alpha_off: i32,
+    beta_off: i32,
+    cqp_off_cb: i32,
+    cqp_off_cr: i32,
+    slice_type: SliceType,
+) {
+    let is_mb_edge = edge_col == 0;
+    let sub_q_col = edge_col / 4;
+    let (p_mb_x, p_mb_y, p_sub_col) = if is_mb_edge {
+        (mb_x - 1, mb_y, 3usize)
+    } else {
+        (mb_x, mb_y, sub_q_col - 1)
+    };
+    let q_mb_x = mb_x;
+    let q_mb_y = mb_y;
+
+    let mut bs = [0u8; 4];
+    for r in 0..4usize {
+        bs[r] = derive_bs(
+            pic, p_mb_x, p_mb_y, p_sub_col, r, q_mb_x, q_mb_y, sub_q_col, r, is_mb_edge, true,
+            slice_type,
+        );
+    }
+    if bs.iter().all(|&b| b == 0) {
+        return;
+    }
+
+    let qp_p = pic.mb_info_at(p_mb_x, p_mb_y).qp_y;
+    let qp_q = pic.mb_info_at(q_mb_x, q_mb_y).qp_y;
+    let qp_avg_y = (qp_p + qp_q + 1) >> 1;
+
+    // Top-left luma plane address for this MB, accounting for
+    // field-interleaving under MBAFF.
+    let y_mb_off = pic.luma_off(mb_x, mb_y);
+    let luma_stride = pic.luma_stride();
+    let y_base_x = (y_mb_off % luma_stride) + edge_col;
+    let y_base_y0 = y_mb_off / luma_stride;
+    for seg in 0..4usize {
+        if bs[seg] == 0 {
+            continue;
+        }
+        // Each bS segment covers 4 sample-rows of the MB, but those rows
+        // step by `row_step` on the plane. seg `s` starts at row
+        // `y_base_y0 + s * 4 * row_step`.
+        filter_luma_edge_4_mbaff(
+            pic,
+            y_base_x,
+            y_base_y0 + seg * 4 * row_step,
+            /*vertical=*/ true,
+            row_step,
+            bs[seg] as i32,
+            qp_avg_y,
+            alpha_off,
+            beta_off,
+        );
+    }
+
+    // Chroma vertical edges.
+    if chroma_vertical_edge_applies(pic, edge_col) {
+        let chroma_is_420 = pic.chroma_format_idc == 1;
+        let chroma_is_422 = pic.chroma_format_idc == 2;
+        let chroma_is_444 = pic.chroma_format_idc == 3;
+        let c_mb_off = pic.chroma_off(mb_x, mb_y);
+        let cstride = pic.chroma_stride();
+        let c_edge_col = if chroma_is_444 {
+            edge_col
+        } else {
+            edge_col / 2
+        };
+        let c_base_x = (c_mb_off % cstride) + c_edge_col;
+        let c_base_y0 = c_mb_off / cstride;
+        for (plane_cb, qp_off) in [(true, cqp_off_cb), (false, cqp_off_cr)] {
+            let qp_pc = chroma_qp(qp_p, qp_off);
+            let qp_qc = chroma_qp(qp_q, qp_off);
+            let qp_avg_c = (qp_pc + qp_qc + 1) >> 1;
+            // Bands per chroma plane: 4:2:0 → 2 bands of 4 rows (8 rows
+            // per MB); 4:2:2 / 4:4:4 → 4 bands of 4 rows (16 rows).
+            let bands = if chroma_is_420 { 2 } else { 4 };
+            for band in 0..bands {
+                for sub in 0..2usize {
+                    let bs_idx = if chroma_is_422 || chroma_is_444 {
+                        band
+                    } else {
+                        band * 2 + sub
+                    };
+                    let bs_here = bs[bs_idx] as i32;
+                    if bs_here == 0 {
+                        continue;
+                    }
+                    let cy = c_base_y0 + (band * 4 + sub * 2) * row_step;
+                    filter_chroma_edge_2_mbaff(
+                        pic, plane_cb, c_base_x, cy, /*vertical=*/ true, row_step, bs_here,
+                        qp_avg_c, alpha_off, beta_off,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_mb_edge_horizontal_mbaff(
+    pic: &mut Picture,
+    mb_x: u32,
+    mb_y: u32,
+    edge_row: usize,
+    row_step: usize,
+    alpha_off: i32,
+    beta_off: i32,
+    cqp_off_cb: i32,
+    cqp_off_cr: i32,
+    slice_type: SliceType,
+) {
+    let is_mb_edge = edge_row == 0;
+    let sub_q_row = edge_row / 4;
+    // When we're at the top of an MB (edge_row == 0) the p-side MB is
+    // the same-polarity neighbour. In uniform-mode MBAFF:
+    //   top MB of pair (which = 0): p = bottom MB of pair above = mb_y-1
+    //     when pair above is field-coded, or mb_y-1 when frame-coded.
+    //   bottom MB of pair (which = 1): p = top MB of same pair = mb_y-1.
+    // For the uniform-field case the same-polarity rule in plane terms
+    // translates to p_mb_y = mb_y - 1 regardless (we follow the sample
+    // plane one row_step up). `mb_above_neighbour` gives the logical MB
+    // index, but for bS lookup the top MB of the pair-above belongs to
+    // the same polarity as the current top MB, so `mb_y - 2` is the
+    // right p MB for the pair-above top edge — see below.
+    let (p_mb_x, p_mb_y, p_sub_row) = if is_mb_edge {
+        // The p-side MB for §8.7.2 bS derivation is the same-polarity
+        // neighbour. For the top MB of a pair the neighbour is the
+        // same-polarity MB of the pair above — `mb_above_neighbour`
+        // returns `mb_y - 2` in the field-coded case and `mb_y - 1` in
+        // the frame-coded case. For the bottom MB of a pair the top-edge
+        // p-neighbour is the top MB of the same pair (mb_y - 1).
+        let py = pic.mb_above_neighbour(mb_y).unwrap_or(mb_y);
+        (mb_x, py, 3usize)
+    } else {
+        (mb_x, mb_y, sub_q_row - 1)
+    };
+    let q_mb_x = mb_x;
+    let q_mb_y = mb_y;
+
+    let mut bs = [0u8; 4];
+    for c in 0..4usize {
+        bs[c] = derive_bs(
+            pic, p_mb_x, p_mb_y, c, p_sub_row, q_mb_x, q_mb_y, c, sub_q_row, is_mb_edge, false,
+            slice_type,
+        );
+    }
+    if bs.iter().all(|&b| b == 0) {
+        return;
+    }
+
+    let qp_p = pic.mb_info_at(p_mb_x, p_mb_y).qp_y;
+    let qp_q = pic.mb_info_at(q_mb_x, q_mb_y).qp_y;
+    let qp_avg_y = (qp_p + qp_q + 1) >> 1;
+
+    // The edge sits on sample row `y_mb_off_row + edge_row * row_step`
+    // of the plane. The 4-segment inner loop moves 4 columns per
+    // segment along x.
+    let y_mb_off = pic.luma_off(mb_x, mb_y);
+    let luma_stride = pic.luma_stride();
+    let y_base_x = y_mb_off % luma_stride;
+    let y_base_y = y_mb_off / luma_stride + edge_row * row_step;
+    for seg in 0..4usize {
+        if bs[seg] == 0 {
+            continue;
+        }
+        filter_luma_edge_4_mbaff(
+            pic,
+            y_base_x + seg * 4,
+            y_base_y,
+            /*vertical=*/ false,
+            row_step,
+            bs[seg] as i32,
+            qp_avg_y,
+            alpha_off,
+            beta_off,
+        );
+    }
+
+    // Chroma horizontal edges.
+    let chroma_is_420 = pic.chroma_format_idc == 1;
+    let chroma_is_444 = pic.chroma_format_idc == 3;
+    // 4:2:0: chroma MB is 8 rows, edges at 0/8 luma → chroma 0/4.
+    // 4:2:2 / 4:4:4: every luma edge has a chroma counterpart.
+    let chroma_edge_applies = !chroma_is_420 || edge_row == 0 || edge_row == 8;
+    if chroma_edge_applies {
+        let cstride = pic.chroma_stride();
+        let c_mb_off = pic.chroma_off(mb_x, mb_y);
+        let c_base_x0 = c_mb_off % cstride;
+        let c_base_y0 = c_mb_off / cstride;
+        // Chroma edge-row offset within the MB.
+        let c_edge_row = if chroma_is_444 {
+            edge_row
+        } else if pic.chroma_format_idc == 2 {
+            edge_row
+        } else {
+            edge_row / 2
+        };
+        let c_base_y = c_base_y0 + c_edge_row * row_step;
+        for (plane_cb, qp_off) in [(true, cqp_off_cb), (false, cqp_off_cr)] {
+            let qp_pc = chroma_qp(qp_p, qp_off);
+            let qp_qc = chroma_qp(qp_q, qp_off);
+            let qp_avg_c = (qp_pc + qp_qc + 1) >> 1;
+            // Bands per chroma plane horizontally:
+            //   4:2:0 → 2 bands × (2 sub × 2 cols chroma == 4 luma cols)
+            //   4:2:2 → same as 4:2:0 horizontally (chroma width 8)
+            //   4:4:4 → 4 bands × (2 sub × 2 cols == 4 luma cols)
+            let bands = if chroma_is_444 { 4 } else { 2 };
+            for band in 0..bands {
+                let seg0 = if chroma_is_444 { band } else { band * 2 };
+                for sub in 0..2usize {
+                    let bs_idx = if chroma_is_444 { seg0 } else { seg0 + sub };
+                    let bs_here = bs[bs_idx] as i32;
+                    if bs_here == 0 {
+                        continue;
+                    }
+                    let cx = c_base_x0 + band * 4 + sub * 2;
+                    filter_chroma_edge_2_mbaff(
+                        pic, plane_cb, cx, c_base_y, /*vertical=*/ false, row_step, bs_here,
+                        qp_avg_c, alpha_off, beta_off,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Chroma vertical edge applies at which luma edge columns.
+fn chroma_vertical_edge_applies(pic: &Picture, edge_col: usize) -> bool {
+    match pic.chroma_format_idc {
+        // 4:2:0 / 4:2:2: chroma width is 8, edges at luma cols 0/8.
+        1 | 2 => edge_col == 0 || edge_col == 8,
+        // 4:4:4: chroma width is 16, every luma edge column has a
+        // matching chroma one.
+        3 => true,
+        _ => false,
     }
 }

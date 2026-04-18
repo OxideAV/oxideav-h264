@@ -230,14 +230,16 @@ impl H264Decoder {
                         }
                         let mbaff_ok = sh.slice_type == SliceType::I
                             && !pps.entropy_coding_mode_flag
-                            && sps.chroma_format_idc == 1
+                            && (sps.chroma_format_idc == 1
+                                || sps.chroma_format_idc == 2
+                                || sps.chroma_format_idc == 3)
                             && sps.bit_depth_luma_minus8 == 0
                             && sps.bit_depth_chroma_minus8 == 0
                             && !sps.separate_colour_plane_flag;
                         if !mbaff_ok {
                             return Err(Error::unsupported(
-                                "h264: only MBAFF I-slice CAVLC 4:2:0 8-bit interlaced is wired (§7.3.4); \
-                                 MBAFF+P/B/CABAC/chroma>420/10-bit still reject",
+                                "h264: only MBAFF I-slice CAVLC 4:2:0/4:2:2/4:4:4 8-bit interlaced is wired (§7.3.4); \
+                                 MBAFF+P/B/CABAC/10-bit still reject",
                             ));
                         }
                     } else {
@@ -714,15 +716,22 @@ impl H264Decoder {
                 // planes and scales α / β / tC0 by `1 << (BitDepth - 8)`
                 // per §8.7.2.1.
                 //
-                // §8.7.1.1 — MBAFF deblocking needs an extra edge pass that
-                // keys on each MB pair's `mb_field_decoding_flag` plus
-                // cross-pair field/frame boundaries. The frame-only §8.7
-                // kernel wired here would corrupt field-coded MBs, so it is
-                // skipped entirely for MBAFF pictures. The MBAFF fixture
-                // accepts a looser luma-match threshold to tolerate the
-                // missing deblock pass.
-                if sh.disable_deblocking_filter_idc != 1 && !pic.mbaff_enabled {
-                    if pic.is_high_bit_depth() {
+                // §8.7.1.1 — MBAFF pictures use a dedicated deblock
+                // driver that walks MB pairs and keys the edge schedule
+                // on each pair's `mb_field_decoding_flag`. Frame-coded
+                // pairs follow the progressive schedule; field-coded
+                // pairs step through the interleaved plane at
+                // `row_step = 2` and skip the inside-pair boundary
+                // between the top and bottom MB. 10-bit MBAFF falls
+                // back to skipping deblock for now — that path isn't
+                // wired (MBAFF + high-bit-depth returns Unsupported at
+                // slice entry).
+                if sh.disable_deblocking_filter_idc != 1 {
+                    if pic.mbaff_enabled {
+                        if !pic.is_high_bit_depth() {
+                            crate::deblock::deblock_picture_mbaff(&mut pic, &pps, &sh);
+                        }
+                    } else if pic.is_high_bit_depth() {
                         crate::deblock_hi::deblock_picture_hi(&mut pic, &pps, &sh);
                     } else {
                         crate::deblock::deblock_picture(&mut pic, &pps, &sh);

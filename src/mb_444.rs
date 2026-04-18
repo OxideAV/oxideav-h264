@@ -293,8 +293,8 @@ pub(crate) fn predict_nc_plane(
     };
     let top = if br_row > 0 {
         Some(here[(br_row - 1) * 4 + br_col])
-    } else if mb_y > 0 {
-        let info = pic.mb_info_at(mb_x, mb_y - 1);
+    } else if let Some(above_y) = pic.mb_above_neighbour(mb_y) {
+        let info = pic.mb_info_at(mb_x, above_y);
         if info.coded {
             Some(plane_nc_at(info, plane)[12 + br_col])
         } else {
@@ -315,6 +315,12 @@ pub(crate) fn predict_nc_plane(
 /// the shared helper. Chroma planes read samples directly from the
 /// chroma buffer but reuse the 4:2:0 luma neighbour geometry (the grid
 /// dimensions match under 4:4:4).
+///
+/// MBAFF note: the sample offsets use [`Picture::luma_off`] and
+/// [`Picture::luma_row_stride_for_at`] so field-coded MB pairs read
+/// neighbour samples from the same-polarity interleaved row — the
+/// chroma planes under 4:4:4 share the luma grid so the same helpers
+/// apply without a chroma-specific variant.
 fn collect_intra4x4_neighbours_plane(
     pic: &Picture,
     mb_x: u32,
@@ -326,24 +332,23 @@ fn collect_intra4x4_neighbours_plane(
     if plane == Plane::Y {
         return collect_intra4x4_neighbours(pic, mb_x, mb_y, br_row, br_col);
     }
-    let (buf, stride) = plane_samples(pic, plane);
+    let (buf, _) = plane_samples(pic, plane);
+    let row_stride = pic.luma_row_stride_for_at(mb_x, mb_y);
+    let lo_mb = pic.luma_off(mb_x, mb_y);
+    // Top-left plane address of this 4×4 block.
+    let blk_tl = lo_mb + br_row * 4 * row_stride + br_col * 4;
 
-    let top_avail = br_row > 0 || mb_y > 0;
+    let top_avail = br_row > 0 || pic.mb_top_available(mb_y);
     let mut top = [0u8; 8];
     if top_avail {
-        let row_y_global = if br_row > 0 {
-            (mb_y as usize) * 16 + br_row * 4 - 1
-        } else {
-            (mb_y as usize) * 16 - 1
-        };
-        let row_off = row_y_global * stride;
+        let row_off = blk_tl - row_stride;
         for i in 0..4 {
-            top[i] = buf[row_off + (mb_x as usize) * 16 + br_col * 4 + i];
+            top[i] = buf[row_off + i];
         }
         let tr_avail = top_right_available_4x4(mb_x, mb_y, br_row, br_col, pic);
         if tr_avail {
             for i in 0..4 {
-                top[4 + i] = buf[row_off + (mb_x as usize) * 16 + br_col * 4 + 4 + i];
+                top[4 + i] = buf[row_off + 4 + i];
             }
         } else {
             for i in 0..4 {
@@ -355,30 +360,14 @@ fn collect_intra4x4_neighbours_plane(
     let left_avail = br_col > 0 || mb_x > 0;
     let mut left = [0u8; 4];
     if left_avail {
-        let col_x_global: usize = if br_col > 0 {
-            (mb_x as usize) * 16 + br_col * 4 - 1
-        } else {
-            (mb_x as usize) * 16 - 1
-        };
         for i in 0..4 {
-            let row = (mb_y as usize) * 16 + br_row * 4 + i;
-            left[i] = buf[row * stride + col_x_global];
+            left[i] = buf[blk_tl + i * row_stride - 1];
         }
     }
 
     let tl_avail = top_avail && left_avail;
     let top_left = if tl_avail {
-        let row_y_global: usize = if br_row > 0 {
-            (mb_y as usize) * 16 + br_row * 4 - 1
-        } else {
-            (mb_y as usize) * 16 - 1
-        };
-        let col_x_global: usize = if br_col > 0 {
-            (mb_x as usize) * 16 + br_col * 4 - 1
-        } else {
-            (mb_x as usize) * 16 - 1
-        };
-        buf[row_y_global * stride + col_x_global]
+        buf[blk_tl - row_stride - 1]
     } else {
         0
     };
@@ -404,12 +393,13 @@ fn collect_intra16x16_neighbours_plane(
     if plane == Plane::Y {
         return collect_intra16x16_neighbours(pic, mb_x, mb_y);
     }
-    let (buf, stride) = plane_samples(pic, plane);
+    let (buf, _) = plane_samples(pic, plane);
+    let row_stride = pic.luma_row_stride_for_at(mb_x, mb_y);
     let lo_mb = pic.luma_off(mb_x, mb_y);
-    let top_avail = mb_y > 0;
+    let top_avail = pic.mb_top_available(mb_y);
     let mut top = [0u8; 16];
     if top_avail {
-        let off = lo_mb - stride;
+        let off = lo_mb - row_stride;
         for i in 0..16 {
             top[i] = buf[off + i];
         }
@@ -418,11 +408,15 @@ fn collect_intra16x16_neighbours_plane(
     let mut left = [0u8; 16];
     if left_avail {
         for i in 0..16 {
-            left[i] = buf[lo_mb + i * stride - 1];
+            left[i] = buf[lo_mb + i * row_stride - 1];
         }
     }
     let tl_avail = top_avail && left_avail;
-    let top_left = if tl_avail { buf[lo_mb - stride - 1] } else { 0 };
+    let top_left = if tl_avail {
+        buf[lo_mb - row_stride - 1]
+    } else {
+        0
+    };
     Intra16x16Neighbours {
         top,
         left,
@@ -453,7 +447,11 @@ fn decode_plane_intra_nxn(
     let scale_idx = plane.as_idx();
 
     let lo_mb = pic.luma_off(mb_x, mb_y);
-    let stride = pic.luma_stride();
+    // MBAFF-aware row step — under a field-coded MB pair this is
+    // `2 * luma_stride()` so sample writes interleave with the sibling
+    // MB of the pair. Collapses to `luma_stride()` on non-MBAFF and
+    // on frame-coded MBAFF pairs.
+    let row_step = pic.luma_row_stride_for_at(mb_x, mb_y);
 
     for blk in 0..16usize {
         let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
@@ -479,18 +477,17 @@ fn decode_plane_intra_nxn(
             idct_4x4(&mut residual);
         }
         {
-            let (buf, s) = plane_samples_mut(pic, plane);
-            let lo = lo_mb + br_row * 4 * s + br_col * 4;
+            let (buf, _) = plane_samples_mut(pic, plane);
+            let lo = lo_mb + br_row * 4 * row_step + br_col * 4;
             for r in 0..4 {
                 for c in 0..4 {
                     let v = pred[r * 4 + c] as i32 + residual[r * 4 + c];
-                    buf[lo + r * s + c] = v.clamp(0, 255) as u8;
+                    buf[lo + r * row_step + c] = v.clamp(0, 255) as u8;
                 }
             }
         }
         let info = pic.mb_info_mut(mb_x, mb_y);
         plane_nc_at_mut(info, plane)[br_row * 4 + br_col] = total_coeff as u8;
-        let _ = stride;
     }
     Ok(())
 }
@@ -524,6 +521,7 @@ fn decode_plane_intra_16x16(
     inv_hadamard_4x4_dc_scaled(&mut dc, qp, w_dc);
 
     let lo_mb = pic.luma_off(mb_x, mb_y);
+    let row_step = pic.luma_row_stride_for_at(mb_x, mb_y);
     for blk in 0..16usize {
         let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
         let mut residual = [0i32; 16];
@@ -540,13 +538,13 @@ fn decode_plane_intra_16x16(
         idct_4x4(&mut residual);
 
         {
-            let (buf, s) = plane_samples_mut(pic, plane);
-            let lo = lo_mb + br_row * 4 * s + br_col * 4;
+            let (buf, _) = plane_samples_mut(pic, plane);
+            let lo = lo_mb + br_row * 4 * row_step + br_col * 4;
             for r in 0..4 {
                 for c in 0..4 {
                     let v =
                         pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32 + residual[r * 4 + c];
-                    buf[lo + r * s + c] = v.clamp(0, 255) as u8;
+                    buf[lo + r * row_step + c] = v.clamp(0, 255) as u8;
                 }
             }
         }
