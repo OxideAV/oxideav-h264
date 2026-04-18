@@ -74,6 +74,17 @@ pub struct H264EncoderOptions {
     pub sps_id: u32,
     /// PPS pic_parameter_set_id. Default 0.
     pub pps_id: u32,
+    /// `Some(false)` → emit the frame as a PAFF top-field I-slice
+    /// (§7.3.3 `field_pic_flag = 1`, `bottom_field_flag = 0`).
+    /// `Some(true)`  → emit as a PAFF bottom-field I-slice.
+    /// `None`        → emit as a progressive frame (default).
+    ///
+    /// The input [`VideoFrame`] is the field samples themselves — the
+    /// encoder does *not* deinterleave a full-height frame. When set,
+    /// the SPS carries `frame_mbs_only_flag = 0` and
+    /// `mb_adaptive_frame_field_flag = 0` so the slice's
+    /// `field_pic_flag` bit is emitted.
+    pub paff_field: Option<bool>,
 }
 
 impl Default for H264EncoderOptions {
@@ -82,6 +93,7 @@ impl Default for H264EncoderOptions {
             qp: 26,
             sps_id: 0,
             pps_id: 0,
+            paff_field: None,
         }
     }
 }
@@ -132,7 +144,7 @@ impl H264Encoder {
         let mb_height = height.div_ceil(16);
         let coded_width = mb_width * 16;
         let coded_height = mb_height * 16;
-        let sps_nal = build_sps_nal(width, height, opts.sps_id)?;
+        let sps_nal = build_sps_nal(width, height, opts.sps_id, opts.paff_field.is_some())?;
         let pps_nal = build_pps_nal(opts.pps_id, opts.sps_id)?;
 
         let mut output_params = CodecParameters::video(codec_id.clone());
@@ -297,6 +309,13 @@ impl H264Encoder {
         w.write_ue(self.opts.pps_id); // pic_parameter_set_id
                                       // frame_num — 4 bits total (log2_max_frame_num_minus4 = 0 in our SPS).
         w.write_bits(0, 4);
+        // §7.3.3 — field_pic_flag / bottom_field_flag only present when the
+        // SPS has frame_mbs_only_flag = 0. Our PAFF path sets the SPS flag
+        // off and encodes a single field per packet.
+        if let Some(bottom) = self.opts.paff_field {
+            w.write_flag(true); // field_pic_flag = 1
+            w.write_flag(bottom); // bottom_field_flag
+        }
         // idr_pic_id (IDR only).
         w.write_ue(0);
         // pic_order_cnt_lsb — log2_max_pic_order_cnt_lsb_minus4 = 0 → 4 bits.
@@ -794,7 +813,7 @@ fn collect_chroma_neighbours(
 /// Build an SPS NAL (header byte + RBSP + emulation prevention). Baseline
 /// profile, level 3.0, chroma 4:2:0, 8-bit, single colour plane. Includes
 /// frame_cropping when width/height are not multiples of 16.
-fn build_sps_nal(width: u32, height: u32, sps_id: u32) -> Result<Vec<u8>> {
+fn build_sps_nal(width: u32, height: u32, sps_id: u32, paff: bool) -> Result<Vec<u8>> {
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
     let coded_w = mb_w * 16;
@@ -823,8 +842,16 @@ fn build_sps_nal(width: u32, height: u32, sps_id: u32) -> Result<Vec<u8>> {
     // pic_width_in_mbs_minus1, pic_height_in_map_units_minus1.
     w.write_ue(mb_w - 1);
     w.write_ue(mb_h - 1);
-    // frame_mbs_only_flag = 1; direct_8x8_inference_flag = 1.
-    w.write_flag(true);
+    // §7.3.2.1.1 — frame_mbs_only_flag: 1 for progressive, 0 when the CVS
+    // may carry PAFF field slices. When 0 we follow with
+    // mb_adaptive_frame_field_flag = 0 (no MBAFF, so every slice with
+    // field_pic_flag = 0 is a plain frame — which our progressive
+    // encoder doesn't emit alongside PAFF fields anyway).
+    w.write_flag(!paff);
+    if paff {
+        w.write_flag(false); // mb_adaptive_frame_field_flag
+    }
+    // direct_8x8_inference_flag = 1.
     w.write_flag(true);
     // frame_cropping_flag.
     w.write_flag(needs_crop);

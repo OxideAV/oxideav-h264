@@ -89,6 +89,17 @@ pub struct Picture {
     /// reset to flat on picture allocation. Referenced by the
     /// dequant paths in `mb.rs` / `p_mb.rs` / `b_mb.rs` / `cabac/*.rs`.
     pub scaling_lists: crate::scaling_list::ScalingLists,
+    /// `true` when this picture represents a single field from a PAFF
+    /// coded video sequence (§7.3.3 `field_pic_flag = 1`). The luma /
+    /// chroma buffers already hold the half-height field samples; the
+    /// decoder flags this so `to_video_frame` can report the field
+    /// dimensions verbatim without attempting frame-pair combination.
+    pub field_pic: bool,
+    /// `true` when this picture is the *bottom* field of a PAFF pair
+    /// (§7.3.3 `bottom_field_flag = 1`). Ignored when `field_pic == false`.
+    /// Carried on the picture so downstream field-pairing can identify
+    /// parity without replaying the slice header.
+    pub bottom_field: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +265,26 @@ impl Picture {
         Self::new_with_bit_depth(mb_width, mb_height, chroma_format_idc, 8, 8)
     }
 
+    /// Allocate a PAFF field picture — `mb_height` is the field's MB row
+    /// count (§7.3.3, equal to `PicHeightInMapUnits` when
+    /// `field_pic_flag = 1`). The luma plane is `mb_width * 16` wide by
+    /// `mb_height * 16` rows (half the parent frame's rows); the chroma
+    /// planes follow §6.4.1 subsampling of the field dimensions.
+    /// `bottom_field` records which parity this field belongs to so a
+    /// downstream pair-combiner can stack top + bottom back into a
+    /// full-height frame.
+    pub fn new_field(
+        mb_width: u32,
+        mb_height: u32,
+        chroma_format_idc: u32,
+        bottom_field: bool,
+    ) -> Self {
+        let mut pic = Self::new_with_bit_depth(mb_width, mb_height, chroma_format_idc, 8, 8);
+        pic.field_pic = true;
+        pic.bottom_field = bottom_field;
+        pic
+    }
+
     /// Allocate a picture at the given chroma format and bit depths.
     /// When `bit_depth_y` is 8, the 8-bit planes are allocated and the
     /// 10-bit companions stay empty; above 8, only the u16 planes are
@@ -312,6 +343,8 @@ impl Picture {
             mb_info: vec![MbInfo::default(); (mb_width * mb_height) as usize],
             last_mb_qp_delta_was_nonzero: false,
             scaling_lists: crate::scaling_list::ScalingLists::flat(),
+            field_pic: false,
+            bottom_field: false,
         }
         // `mid_y` exists for future symmetry; luma recon always overwrites
         // so there's no need to pre-fill the luma plane with grey.

@@ -286,7 +286,17 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   modes other than DC, rate control, adaptive QP, mode decision,
   deblocking.
 - `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
-- Interlaced coding, MBAFF, PAFF, frame/field picture mixes.
+- MBAFF, PAFF for non-I slice types, MBAFF + PAFF mixed within a coded
+  video sequence. **PAFF I-slice CAVLC** is supported (§7.3.3
+  `field_pic_flag = 1`): top and bottom fields decode into half-height
+  `Picture`s allocated via `Picture::new_field`, POC derivation reuses
+  §8.2.1.1 (which returns TopFieldOrderCnt / BottomFieldOrderCnt per
+  field directly), and each field is emitted as its own `VideoFrame`
+  at field-sample dimensions. Downstream callers can stack top+bottom
+  rows to reconstruct a full-height frame. The encoder exposes a
+  `H264EncoderOptions::paff_field` flag that writes the required SPS +
+  slice header bits so the round-trip tests can exercise the PAFF path
+  without a PAFF-capable external encoder.
 - Inter 8×8 transform on B-slice MBs — CAVLC P-slice inter 8×8 is wired
   (see above); B-slice inter 8×8 is not yet.
 - 4:2:2 CAVLC I-slice decode IS supported (§6.4.1 ChromaArrayType == 2)

@@ -210,10 +210,50 @@ impl H264Decoder {
                         )));
                     }
                 }
+                // §7.3.2.1.1 / §7.3.3: `frame_mbs_only_flag = 0` allows
+                // three interlaced modes — MBAFF frame coding (slice has
+                // `field_pic_flag = 0` and the SPS has
+                // `mb_adaptive_frame_field_flag = 1`), PAFF field coding
+                // (slice has `field_pic_flag = 1`), and plain field-mode
+                // frames. This decoder wires PAFF I-slice CAVLC only;
+                // MBAFF and PAFF for other slice types / entropy modes
+                // continue to return `Error::Unsupported`.
                 if !sps.frame_mbs_only_flag {
-                    return Err(Error::unsupported(
-                        "h264: interlaced / MBAFF (§7.3.2.1.1 frame_mbs_only_flag=0) not supported",
-                    ));
+                    if !sh.field_pic_flag {
+                        if sps.mb_adaptive_frame_field_flag {
+                            return Err(Error::unsupported(
+                                "h264: MBAFF (§7.3.2.1.1 mb_adaptive_frame_field_flag=1) not supported",
+                            ));
+                        }
+                        return Err(Error::unsupported(
+                            "h264: frame-mode slice under frame_mbs_only_flag=0 without MBAFF/PAFF not supported",
+                        ));
+                    }
+                    // PAFF field slice: only CAVLC I-slices in 4:2:0 / 8-bit
+                    // land on the field-reconstruction path below.
+                    if sh.slice_type != SliceType::I {
+                        return Err(Error::unsupported(
+                            "h264: PAFF (field_pic_flag=1) supports I-slices only",
+                        ));
+                    }
+                    if pps.entropy_coding_mode_flag {
+                        return Err(Error::unsupported(
+                            "h264: PAFF CABAC entropy decode not wired — CAVLC I-slice only",
+                        ));
+                    }
+                    if sps.chroma_format_idc != 1
+                        || sps.bit_depth_luma_minus8 != 0
+                        || sps.bit_depth_chroma_minus8 != 0
+                    {
+                        return Err(Error::unsupported(
+                            "h264: PAFF only wired for 4:2:0 / 8-bit (no 4:2:2 / 4:4:4 / 10-bit)",
+                        ));
+                    }
+                    if sps.mb_adaptive_frame_field_flag {
+                        return Err(Error::unsupported(
+                            "h264: PAFF + MBAFF mixed within the same CVS not supported",
+                        ));
+                    }
                 }
                 // §7.4.2.1.1 — chroma format. The MB-layer pipeline below
                 // (intra prediction, inverse transforms, motion
@@ -317,32 +357,41 @@ impl H264Decoder {
                 }
 
                 // Macroblock-layer decode (§7.3.5 / §8.3 / §8.4 / §8.5 / §9.2).
+                // §7.4.3 — for a field-coded picture (PAFF) the MB grid
+                // is `PicWidthInMbs × PicHeightInMapUnits`; for a frame-
+                // coded picture under `frame_mbs_only_flag = 1` it's the
+                // same formula. When `frame_mbs_only_flag = 0` a
+                // frame-coded slice would have `2 × PicHeightInMapUnits`
+                // rows — that path is gated out above (MBAFF + non-PAFF
+                // frame mode both return `Error::Unsupported`), so the
+                // value computed here is correct for every path we wire.
                 let mb_w = sps.pic_width_in_mbs();
                 let mb_h = sps.pic_height_in_map_units();
                 let bit_depth_y = (sps.bit_depth_luma_minus8 + 8) as u8;
                 let bit_depth_c = (sps.bit_depth_chroma_minus8 + 8) as u8;
-                let mut pic = self.current_pic.take().unwrap_or_else(|| {
-                    Picture::new_with_bit_depth(
-                        mb_w,
-                        mb_h,
-                        sps.chroma_format_idc,
-                        bit_depth_y,
-                        bit_depth_c,
-                    )
-                });
+                let make_pic = || -> Picture {
+                    if sh.field_pic_flag {
+                        Picture::new_field(mb_w, mb_h, sps.chroma_format_idc, sh.bottom_field_flag)
+                    } else {
+                        Picture::new_with_bit_depth(
+                            mb_w,
+                            mb_h,
+                            sps.chroma_format_idc,
+                            bit_depth_y,
+                            bit_depth_c,
+                        )
+                    }
+                };
+                let mut pic = self.current_pic.take().unwrap_or_else(make_pic);
                 if pic.mb_width != mb_w
                     || pic.mb_height != mb_h
                     || pic.chroma_format_idc != sps.chroma_format_idc
                     || pic.bit_depth_y != bit_depth_y
                     || pic.bit_depth_c != bit_depth_c
+                    || pic.field_pic != sh.field_pic_flag
+                    || (sh.field_pic_flag && pic.bottom_field != sh.bottom_field_flag)
                 {
-                    pic = Picture::new_with_bit_depth(
-                        mb_w,
-                        mb_h,
-                        sps.chroma_format_idc,
-                        bit_depth_y,
-                        bit_depth_c,
-                    );
+                    pic = make_pic();
                 }
                 // §7.4.2.2 Table 7-2 — resolve the active scaling
                 // matrices (SPS + PPS, with fallback). Stored on the
@@ -713,7 +762,24 @@ impl H264Decoder {
     /// from the head of `pts_fifo` (decode-order), which is a sensible
     /// default when POC order matches decode order (no B-slices).
     fn queue_ready_frame(&mut self, sps: &Sps, pic: Picture) {
-        let (vw, vh) = sps.visible_size();
+        let (mut vw, mut vh) = sps.visible_size();
+        // §7.4.3 PAFF: a field picture holds only half the frame's rows.
+        // Emit it at half-visible-height so downstream consumers see
+        // the correct sample layout (pairing back into a full frame is
+        // left to the caller — see README).
+        if pic.field_pic {
+            vh /= 2;
+            // Guard against pathological odd visible heights that would
+            // otherwise zero-collapse on division. Clamp to at least 1
+            // row so `to_video_frame` sees non-empty planes.
+            if vh == 0 {
+                vh = 1;
+            }
+            // Clamp to the allocated field dimensions so we never read
+            // past the buffer when visible crop differs from coded.
+            vw = vw.min(pic.width);
+            vh = vh.min(pic.height);
+        }
         let (pts, tb) = self
             .pts_fifo
             .pop_front()
