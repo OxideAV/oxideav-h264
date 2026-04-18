@@ -573,6 +573,186 @@ pub fn predict_intra_chroma(out: &mut [u8; 64], mode: IntraChromaMode, n: &Intra
 }
 
 // ---------------------------------------------------------------------------
+// Intra chroma 8×16 (§8.3.4, ChromaArrayType == 2 / 4:2:2)
+// ---------------------------------------------------------------------------
+
+/// Neighbours for an 8×16 chroma block — i.e. a whole 4:2:2 chroma MB.
+/// `top[0..=7]` is the 8-sample row above, `left[0..=15]` is the
+/// 16-sample column to the left, and `top_left` is the corner at
+/// (-1, -1). Matches the neighbour layout FFmpeg's
+/// `pred8x16_dc/plane/vertical/horizontal` consumes.
+#[derive(Clone, Debug)]
+pub struct IntraChroma8x16Neighbours {
+    pub top: [u8; 8],
+    pub left: [u8; 16],
+    pub top_left: u8,
+    pub top_available: bool,
+    pub left_available: bool,
+    pub top_left_available: bool,
+}
+
+/// Predict an 8×16 chroma block (ChromaArrayType == 2). Writes the
+/// prediction into `out` (raster layout `row * 8 + col`). The four
+/// modes mirror the 4:2:0 chroma set but scaled to the taller 8×16
+/// tile: DC uses 8 independent 4×4 DC splats (one per 4×4 sub-block),
+/// Vertical replicates the 8-sample top row down all 16 rows,
+/// Horizontal replicates each of the 16 left-column samples across its
+/// row, and Plane matches FFmpeg's `pred8x16_plane` gradient.
+pub fn predict_intra_chroma_8x16(
+    out: &mut [u8; 128],
+    mode: IntraChromaMode,
+    n: &IntraChroma8x16Neighbours,
+) {
+    use IntraChromaMode::*;
+    let mode = match mode {
+        Vertical if !n.top_available => Dc,
+        Horizontal if !n.left_available => Dc,
+        Plane if !n.top_available || !n.left_available || !n.top_left_available => Dc,
+        m => m,
+    };
+    match mode {
+        Vertical => {
+            for y in 0..16 {
+                for x in 0..8 {
+                    out[y * 8 + x] = n.top[x];
+                }
+            }
+        }
+        Horizontal => {
+            for y in 0..16 {
+                for x in 0..8 {
+                    out[y * 8 + x] = n.left[y];
+                }
+            }
+        }
+        Dc => {
+            // Spec §8.3.4.2 — eight 4×4 DC averages laid out over the
+            // 8×16 tile. Translated directly from FFmpeg's
+            // `pred8x16_dc`: the left-column is split into four
+            // 4-sample bands (dc0_left, dc2, dc3, dc4) and the top row
+            // into two 4-sample halves (dc0_top, dc1).
+            let (dc0_top, dc1, dc0_left, dc2, dc3, dc4);
+            if n.top_available && n.left_available {
+                dc0_top = n.top[0..4].iter().map(|&v| v as u32).sum::<u32>();
+                dc1 = n.top[4..8].iter().map(|&v| v as u32).sum::<u32>();
+                dc0_left = n.left[0..4].iter().map(|&v| v as u32).sum::<u32>();
+                dc2 = n.left[4..8].iter().map(|&v| v as u32).sum::<u32>();
+                dc3 = n.left[8..12].iter().map(|&v| v as u32).sum::<u32>();
+                dc4 = n.left[12..16].iter().map(|&v| v as u32).sum::<u32>();
+            } else if n.top_available {
+                dc0_top = n.top[0..4].iter().map(|&v| v as u32).sum::<u32>();
+                dc1 = n.top[4..8].iter().map(|&v| v as u32).sum::<u32>();
+                dc0_left = dc0_top;
+                dc2 = dc0_top;
+                dc3 = dc0_top;
+                dc4 = dc0_top;
+            } else if n.left_available {
+                dc0_top = n.left[0..4].iter().map(|&v| v as u32).sum::<u32>();
+                dc1 = dc0_top;
+                dc0_left = dc0_top;
+                dc2 = n.left[4..8].iter().map(|&v| v as u32).sum::<u32>();
+                dc3 = n.left[8..12].iter().map(|&v| v as u32).sum::<u32>();
+                dc4 = n.left[12..16].iter().map(|&v| v as u32).sum::<u32>();
+            } else {
+                for px in out.iter_mut() {
+                    *px = 128;
+                }
+                return;
+            }
+            // Splats per FFmpeg `pred8x16_dc` (quadrants within each
+            // 4-row band pick top / left / averaged depending on
+            // position).
+            let quads: [[u8; 2]; 4] = if n.top_available && n.left_available {
+                [
+                    [
+                        (((dc0_top + dc0_left + 4) >> 3) as u8),
+                        (((dc1 + 2) >> 2) as u8),
+                    ],
+                    [
+                        (((dc2 + 2) >> 2) as u8),
+                        (((dc1 + dc2 + 4) >> 3) as u8),
+                    ],
+                    [
+                        (((dc3 + 2) >> 2) as u8),
+                        (((dc1 + dc3 + 4) >> 3) as u8),
+                    ],
+                    [
+                        (((dc4 + 2) >> 2) as u8),
+                        (((dc1 + dc4 + 4) >> 3) as u8),
+                    ],
+                ]
+            } else if n.top_available {
+                [
+                    [(((dc0_top + 2) >> 2) as u8), (((dc1 + 2) >> 2) as u8)],
+                    [(((dc0_top + 2) >> 2) as u8), (((dc1 + 2) >> 2) as u8)],
+                    [(((dc0_top + 2) >> 2) as u8), (((dc1 + 2) >> 2) as u8)],
+                    [(((dc0_top + 2) >> 2) as u8), (((dc1 + 2) >> 2) as u8)],
+                ]
+            } else {
+                [
+                    [(((dc0_left + 2) >> 2) as u8), (((dc0_left + 2) >> 2) as u8)],
+                    [(((dc2 + 2) >> 2) as u8), (((dc2 + 2) >> 2) as u8)],
+                    [(((dc3 + 2) >> 2) as u8), (((dc3 + 2) >> 2) as u8)],
+                    [(((dc4 + 2) >> 2) as u8), (((dc4 + 2) >> 2) as u8)],
+                ]
+            };
+            for band in 0..4usize {
+                for sub_row in 0..4usize {
+                    let y = band * 4 + sub_row;
+                    for x in 0..8 {
+                        out[y * 8 + x] = quads[band][x / 4];
+                    }
+                }
+            }
+        }
+        Plane => {
+            // §8.3.4.4 adapted — FFmpeg's `pred8x16_plane`:
+            //   H = Σ k=1..=3 k * (top[3+k] - top[3-k])  using top_left for k=4
+            //   V = Σ k=1..=7 k * (left[7+k] - left[7-k])  using top_left
+            //   b = (17*H + 16) >> 5,  c = (5*V + 32) >> 6
+            //   a = 16 * (left[15] + top[7]) + 16 (FFmpeg uses left[15]+top[7]+1 then *16)
+            //   pred[x,y] = Clip((a - 7c - 3b + b*(x+1) + c*(y+1) + 16) >> 5)
+            let top_at = |k: i32| -> i32 {
+                if k < 0 {
+                    n.top_left as i32
+                } else {
+                    n.top[k as usize] as i32
+                }
+            };
+            let left_at = |k: i32| -> i32 {
+                if k < 0 {
+                    n.top_left as i32
+                } else {
+                    n.left[k as usize] as i32
+                }
+            };
+            let mut h: i32 = top_at(4) - top_at(2);
+            for k in 2..=4i32 {
+                h += k * (top_at(3 + k) - top_at(3 - k));
+            }
+            let mut v: i32 = left_at(8) - left_at(6);
+            for k in 2..=8i32 {
+                v += k * (left_at(7 + k) - left_at(7 - k));
+            }
+            let b = (17 * h + 16) >> 5;
+            let c = (5 * v + 32) >> 6;
+            // FFmpeg `pred8x16_plane`: a_start = 16*(left[15]+top[7]+1) - 7c - 3b.
+            // Per row the predictor rolls as `a += c`, per column `+ b*x`.
+            // pred[x, y] = ((a_start + y*c + x*b) + 16) >> 5 only inside the
+            // shift — but FFmpeg has no extra `+16` because the `+1` inside
+            // `16*(… + 1)` already contributes 16 to the accumulator.
+            let a = 16 * ((n.left[15] as i32) + (n.top[7] as i32) + 1) - 7 * c - 3 * b;
+            for y in 0..16 {
+                for x in 0..8 {
+                    let pix = (a + b * (x as i32) + c * (y as i32)) >> 5;
+                    out[y * 8 + x] = pix.clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Intra_8×8 (§8.3.2) — High Profile.
 // ---------------------------------------------------------------------------
 

@@ -196,6 +196,14 @@ pub fn encode_residual_block(
                  (High Profile §8.5.13 encoder out of scope)",
             ));
         }
+        BlockKind::ChromaDc2x4 => {
+            // The baseline encoder emits 4:2:0 only; 4:2:2 encode is
+            // out of scope. Decoder-only block kind.
+            return Err(Error::unsupported(
+                "h264 cavlc_enc: ChromaDc2x4 encode path not supported \
+                 (4:2:2 encoder out of scope)",
+            ));
+        }
     };
 
     // Count non-zeros and their positions.

@@ -236,9 +236,22 @@ impl H264Decoder {
                     }
                     1 => {}
                     2 => {
-                        return Err(Error::unsupported(
-                            "h264: chroma_format_idc=2 (4:2:2, §6.4.1) not supported — only 4:2:0 / 4:4:4",
-                        ));
+                        // 4:2:2 — only CAVLC I-slices are wired so far.
+                        // Chroma plane is w/2 × h (half-width, full-height);
+                        // chroma DC uses a 2×4 Hadamard (§8.5.11.2), 8 AC
+                        // blocks per plane, and intra prediction runs over
+                        // 8×16 tiles (§8.3.4). P/B and CABAC paths fall
+                        // through to Error::Unsupported below.
+                        if sh.slice_type != SliceType::I {
+                            return Err(Error::unsupported(
+                                "h264: 4:2:2 (chroma_format_idc=2) supports I-slices only",
+                            ));
+                        }
+                        if pps.entropy_coding_mode_flag {
+                            return Err(Error::unsupported(
+                                "h264: 4:2:2 CABAC entropy decode not yet wired — CAVLC I-slice only",
+                            ));
+                        }
                     }
                     3 => {
                         // 4:4:4 — only CAVLC I-slices are wired so far.

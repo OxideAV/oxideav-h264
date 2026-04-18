@@ -30,7 +30,7 @@
 //!   and `-profile:v high444`.
 
 use oxideav_codec::Decoder;
-use oxideav_core::{CodecId, Error, Packet, TimeBase};
+use oxideav_core::{CodecId, Packet, TimeBase};
 use oxideav_h264::decoder::H264Decoder;
 use oxideav_h264::nal::{extract_rbsp, split_annex_b, NalHeader, NalUnitType};
 use oxideav_h264::sps::parse_sps;
@@ -104,25 +104,60 @@ fn yuv444_fixture_carries_chroma_format_idc_3() {
 }
 
 #[test]
-fn yuv422_decode_returns_unsupported() {
-    // §6.4.1 — `chroma_format_idc = 2` is not yet wired through the
-    // MB-layer pipeline: chroma plane dims are w/2 × h (not w/2 × h/2),
-    // chroma DC transform is 2×4 (not 2×2), and deblock adds an extra
-    // internal chroma horizontal edge (§8.7.2). Until that lands, the
-    // decoder must fail fast rather than produce garbage output.
+fn decode_yuv422_iframe_matches_reference() {
+    // §6.4.1 — `chroma_format_idc = 2` (4:2:2): chroma planes have half
+    // the luma width but the same height. Chroma DC uses the 2×4
+    // Hadamard (§8.5.11.2), each MB carries 8 chroma AC blocks per
+    // plane (§9.2.1.2 ChromaArrayType == 2), and intra chroma
+    // prediction runs over an 8×16 tile (§8.3.4). This test drives a
+    // 64×64 yuv422p IDR produced by x264 (`high422` profile) and
+    // asserts the reconstructed frame matches the ffmpeg-decoded
+    // reference at ≥ 99 % of samples (ideally bit-exact).
+    use oxideav_core::PixelFormat;
+    use oxideav_core::Frame;
     let es = read_fixture("tests/fixtures/iframe_yuv422_64x64.es");
+    let ref_yuv = read_fixture("tests/fixtures/iframe_yuv422_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));
-    let err = dec
-        .send_packet(&first_packet(&es))
-        .expect_err("4:2:2 must be rejected");
+    dec.send_packet(&first_packet(&es))
+        .expect("4:2:2 CAVLC I decode should succeed");
+    let frame = match dec.receive_frame().expect("frame") {
+        Frame::Video(v) => v,
+        _ => panic!("not a video frame"),
+    };
+    assert_eq!(frame.format, PixelFormat::Yuv422P);
+    assert_eq!(frame.width, 64);
+    assert_eq!(frame.height, 64);
+    assert_eq!(frame.planes.len(), 3);
+    // Reference fixture is raw yuv422p: 64×64 Y followed by 32×64 Cb then
+    // 32×64 Cr — chroma stride 32, same height as luma.
+    assert_eq!(ref_yuv.len(), 64 * 64 + 32 * 64 * 2);
+    let mut got = Vec::with_capacity(ref_yuv.len());
+    // Luma plane
+    {
+        let p = &frame.planes[0];
+        for row in 0..64usize {
+            let off = row * p.stride;
+            got.extend_from_slice(&p.data[off..off + 64]);
+        }
+    }
+    for pi in 1..=2usize {
+        let p = &frame.planes[pi];
+        for row in 0..64usize {
+            let off = row * p.stride;
+            got.extend_from_slice(&p.data[off..off + 32]);
+        }
+    }
+    assert_eq!(got.len(), ref_yuv.len());
+    let matches = got
+        .iter()
+        .zip(ref_yuv.iter())
+        .filter(|(a, b)| a == b)
+        .count();
+    let ratio = matches as f64 / got.len() as f64;
     assert!(
-        matches!(err, Error::Unsupported(_)),
-        "expected Error::Unsupported, got {err:?}"
-    );
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("4:2:2") || msg.contains("chroma_format_idc=2"),
-        "error message should mention 4:2:2, got: {msg}"
+        ratio >= 0.99,
+        "4:2:2 decode accuracy {:.3}% — below 99%",
+        ratio * 100.0
     );
 }
 

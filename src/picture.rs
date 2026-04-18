@@ -363,6 +363,7 @@ impl Picture {
         }
 
         let format = match self.chroma_format_idc {
+            2 => PixelFormat::Yuv422P,
             3 => PixelFormat::Yuv444P,
             _ => PixelFormat::Yuv420P,
         };
