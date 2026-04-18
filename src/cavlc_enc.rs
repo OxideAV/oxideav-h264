@@ -228,7 +228,9 @@ pub fn encode_residual_block(
     // 1. coeff_token.
     let token_idx = (total_coeff * 4 + trailing_ones) as usize;
     if total_coeff > max_num_coeff as u32 {
-        return Err(Error::invalid("h264 cavlc_enc: total_coeff > max_num_coeff"));
+        return Err(Error::invalid(
+            "h264 cavlc_enc: total_coeff > max_num_coeff",
+        ));
     }
     match kind {
         BlockKind::ChromaDc2x2 => {

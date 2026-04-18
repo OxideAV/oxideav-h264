@@ -740,10 +740,7 @@ pub fn predict_intra_8x8(out: &mut [u8; 64], mode: Intra8x8Mode, n: &Intra8x8Nei
                     let v = if x == 7 && y == 7 {
                         ((ft[14] as u32 + 3 * ft[15] as u32 + 2) >> 2) as u8
                     } else {
-                        ((ft[x + y] as u32
-                            + 2 * ft[x + y + 1] as u32
-                            + ft[x + y + 2] as u32
-                            + 2)
+                        ((ft[x + y] as u32 + 2 * ft[x + y + 1] as u32 + ft[x + y + 2] as u32 + 2)
                             >> 2) as u8
                     };
                     out[y * 8 + x] = v;
@@ -765,8 +762,8 @@ pub fn predict_intra_8x8(out: &mut [u8; 64], mode: Intra8x8Mode, n: &Intra8x8Nei
                 e[6 - i] = fl[i];
             }
             e[0] = fl[6]; // keep last of fl in e[0]; unused beyond -7 offset.
-            // For each position compute p[x,y] = (e[7 + k - 1] + 2*e[7 + k] +
-            // e[7 + k + 1] + 2) >> 2 with k = x - y.
+                          // For each position compute p[x,y] = (e[7 + k - 1] + 2*e[7 + k] +
+                          // e[7 + k + 1] + 2) >> 2 with k = x - y.
             for y in 0..8 {
                 for x in 0..8 {
                     let k = x as i32 - y as i32;

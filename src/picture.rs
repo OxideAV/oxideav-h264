@@ -64,6 +64,13 @@ pub struct MbInfo {
     /// Per-4×4-sub-block list-0 reference indices. `-1` for "no prediction"
     /// (intra or not yet decoded); `0..` otherwise.
     pub ref_idx_l0: [i8; 16],
+    /// Per-4×4-sub-block list-1 motion vectors in quarter-pel units.
+    /// Populated only for B-slice inter macroblocks; zero otherwise.
+    pub mv_l1: [(i16, i16); 16],
+    /// Per-4×4-sub-block list-1 reference indices. `-1` means "list-1
+    /// prediction not used at this 4×4 location" (P macroblocks, L0-only
+    /// B sub-partitions, intra MBs).
+    pub ref_idx_l1: [i8; 16],
     /// True when this macroblock is intra. For an I-slice all MBs are intra,
     /// but the field exists to support future P-slice deblocking edges.
     pub intra: bool,
@@ -88,6 +95,8 @@ impl Default for MbInfo {
             p_partition: None,
             mv_l0: [(0, 0); 16],
             ref_idx_l0: [-1; 16],
+            mv_l1: [(0, 0); 16],
+            ref_idx_l1: [-1; 16],
             intra: false,
             skipped: false,
         }

@@ -342,11 +342,7 @@ fn build_pps_rbsp() -> Vec<u8> {
 
 /// Build the IDR slice RBSP. The single macroblock is `I_PCM` with a caller-
 /// supplied 256-byte luma + 64-byte Cb + 64-byte Cr payload.
-fn build_idr_slice_rbsp_ipcm(
-    luma: &[u8; 256],
-    cb: &[u8; 64],
-    cr: &[u8; 64],
-) -> Vec<u8> {
+fn build_idr_slice_rbsp_ipcm(luma: &[u8; 256], cb: &[u8; 64], cr: &[u8; 64]) -> Vec<u8> {
     // ----- Slice header -----
     let mut bw = BitWriter::new();
     bw.write_ue(0); // first_mb_in_slice
@@ -359,7 +355,7 @@ fn build_idr_slice_rbsp_ipcm(
     bw.write_bit(0); // long_term_reference_flag
     bw.write_se(0); // slice_qp_delta
     bw.write_ue(1); // disable_deblocking_filter_idc = 1 → no alpha/beta
-    // cabac_alignment_one_bit pad up to byte boundary.
+                    // cabac_alignment_one_bit pad up to byte boundary.
     while bw.bits.len() % 8 != 0 {
         bw.write_bit(1);
     }

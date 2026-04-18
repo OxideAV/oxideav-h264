@@ -10,9 +10,7 @@
 //! The bound for the gradient fixture at QP=22 is PSNR ≥ 28 dB (luma).
 
 use oxideav_codec::{Decoder, Encoder};
-use oxideav_core::{
-    frame::VideoPlane, CodecId, Frame, Packet, PixelFormat, TimeBase, VideoFrame,
-};
+use oxideav_core::{frame::VideoPlane, CodecId, Frame, Packet, PixelFormat, TimeBase, VideoFrame};
 use oxideav_h264::decoder::H264Decoder;
 use oxideav_h264::encoder::{H264Encoder, H264EncoderOptions};
 
@@ -112,7 +110,8 @@ fn encode_decode(frame: &VideoFrame, qp: i32) -> (Vec<u8>, VideoFrame) {
         },
     )
     .expect("encoder::new");
-    enc.send_frame(&Frame::Video(frame.clone())).expect("send_frame");
+    enc.send_frame(&Frame::Video(frame.clone()))
+        .expect("send_frame");
     enc.flush().expect("flush");
     let pkt = enc.receive_packet().expect("receive_packet");
     let bytes = pkt.data.clone();
@@ -176,7 +175,11 @@ fn roundtrip_gradient_128x96_qp28() {
         psnr_y
     );
     // Larger gradient at higher QP — bound a bit lower.
-    assert!(psnr_y >= 24.0, "gradient128 luma psnr {:.2} < 24 dB", psnr_y);
+    assert!(
+        psnr_y >= 24.0,
+        "gradient128 luma psnr {:.2} < 24 dB",
+        psnr_y
+    );
 }
 
 #[test]

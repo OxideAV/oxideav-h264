@@ -38,7 +38,12 @@ impl BitWriter {
 
     /// Number of bits written so far.
     pub fn bits_written(&self) -> u64 {
-        (self.buf.len() as u64) * 8 - if self.cur_bit == 0 { 0 } else { 8 - self.cur_bit as u64 }
+        (self.buf.len() as u64) * 8
+            - if self.cur_bit == 0 {
+                0
+            } else {
+                8 - self.cur_bit as u64
+            }
     }
 
     pub fn is_byte_aligned(&self) -> bool {
@@ -157,11 +162,7 @@ pub fn rbsp_to_ebsp(rbsp: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i < rbsp.len() {
         let b = rbsp[i];
-        if out.len() >= 2
-            && out[out.len() - 1] == 0
-            && out[out.len() - 2] == 0
-            && b <= 0x03
-        {
+        if out.len() >= 2 && out[out.len() - 1] == 0 && out[out.len() - 2] == 0 && b <= 0x03 {
             out.push(0x03);
         }
         out.push(b);

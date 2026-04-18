@@ -149,7 +149,10 @@ fn decoder_emits_both_of_two_idrs() {
         CodecId::new("h264"),
         16,
         16,
-        H264EncoderOptions { qp: 22, ..Default::default() },
+        H264EncoderOptions {
+            qp: 22,
+            ..Default::default()
+        },
     )
     .expect("encoder");
 

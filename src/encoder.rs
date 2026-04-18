@@ -177,7 +177,9 @@ impl H264Encoder {
             )));
         }
         if frame.planes.len() < 3 {
-            return Err(Error::invalid("h264 encoder: expected 3 planes for YUV420P"));
+            return Err(Error::invalid(
+                "h264 encoder: expected 3 planes for YUV420P",
+            ));
         }
 
         // Build the MB-aligned raw-sample buffer (padding replicate-edges
@@ -267,7 +269,8 @@ impl H264Encoder {
 
         // Packet payload: Annex B framing. Start codes (4-byte) before each
         // of the three NALs.
-        let mut out = Vec::with_capacity(slice_ebsp.len() + self.sps_nal.len() + self.pps_nal.len() + 12);
+        let mut out =
+            Vec::with_capacity(slice_ebsp.len() + self.sps_nal.len() + self.pps_nal.len() + 12);
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.extend_from_slice(&self.sps_nal);
         out.extend_from_slice(&[0, 0, 0, 1]);
@@ -292,7 +295,7 @@ impl H264Encoder {
         w.write_ue(0); // first_mb_in_slice
         w.write_ue(7); // slice_type = 7 (I, single-type-per-picture variant)
         w.write_ue(self.opts.pps_id); // pic_parameter_set_id
-        // frame_num — 4 bits total (log2_max_frame_num_minus4 = 0 in our SPS).
+                                      // frame_num — 4 bits total (log2_max_frame_num_minus4 = 0 in our SPS).
         w.write_bits(0, 4);
         // idr_pic_id (IDR only).
         w.write_ue(0);
@@ -303,8 +306,8 @@ impl H264Encoder {
         // dec_ref_pic_marking (nal_ref_idc != 0, IDR):
         w.write_flag(false); // no_output_of_prior_pics_flag
         w.write_flag(false); // long_term_reference_flag
-        // slice_qp_delta = qp - (pic_init_qp - 26) ⇒ we set pic_init_qp_minus26
-        // = 0 in PPS, so slice_qp_delta = qp - 26.
+                             // slice_qp_delta = qp - (pic_init_qp - 26) ⇒ we set pic_init_qp_minus26
+                             // = 0 in PPS, so slice_qp_delta = qp - 26.
         w.write_se(self.opts.qp - 26);
         // Deblocking filter control — disable_deblocking_filter_idc = 1 (off).
         w.write_ue(1);
@@ -407,8 +410,15 @@ impl H264Encoder {
         let mut luma_nc_local = [0u8; 16];
         for blk in 0..16usize {
             let (br, bc) = LUMA_BLOCK_RASTER[blk];
-            let nc =
-                predict_nc_luma_combined(luma_nc, &luma_nc_local, mb_x, mb_y, br, bc, self.mb_width);
+            let nc = predict_nc_luma_combined(
+                luma_nc,
+                &luma_nc_local,
+                mb_x,
+                mb_y,
+                br,
+                bc,
+                self.mb_width,
+            );
             let total_coeff =
                 encode_residual_block(w, &ac_blocks[br * 4 + bc], nc, BlockKind::Luma16x16Ac)?;
             luma_nc_local[br * 4 + bc] = total_coeff as u8;
@@ -508,15 +518,8 @@ impl H264Encoder {
         for bi in 0..4usize {
             let br = bi >> 1;
             let bc = bi & 1;
-            let nc = predict_nc_chroma_combined(
-                cb_nc,
-                &cb_nc_local,
-                mb_x,
-                mb_y,
-                br,
-                bc,
-                self.mb_width,
-            );
+            let nc =
+                predict_nc_chroma_combined(cb_nc, &cb_nc_local, mb_x, mb_y, br, bc, self.mb_width);
             let tc = encode_residual_block(w, &cb_ac[bi], nc, BlockKind::ChromaAc)?;
             cb_nc_local[bi] = tc as u8;
         }
@@ -524,15 +527,8 @@ impl H264Encoder {
         for bi in 0..4usize {
             let br = bi >> 1;
             let bc = bi & 1;
-            let nc = predict_nc_chroma_combined(
-                cr_nc,
-                &cr_nc_local,
-                mb_x,
-                mb_y,
-                br,
-                bc,
-                self.mb_width,
-            );
+            let nc =
+                predict_nc_chroma_combined(cr_nc, &cr_nc_local, mb_x, mb_y, br, bc, self.mb_width);
             let tc = encode_residual_block(w, &cr_ac[bi], nc, BlockKind::ChromaAc)?;
             cr_nc_local[bi] = tc as u8;
         }
@@ -644,7 +640,14 @@ fn predict_nc_luma_combined(
     nc_from(left, top)
 }
 
-fn predict_nc_luma(global: &[u8], mb_x: u32, mb_y: u32, br: usize, bc: usize, mb_width: u32) -> i32 {
+fn predict_nc_luma(
+    global: &[u8],
+    mb_x: u32,
+    mb_y: u32,
+    br: usize,
+    bc: usize,
+    mb_width: u32,
+) -> i32 {
     let stride = mb_width as usize * 4;
     let left: Option<u8> = if bc > 0 {
         // This overload is only used for the first block of the MB where nothing
@@ -803,7 +806,7 @@ fn build_sps_nal(width: u32, height: u32, sps_id: u32) -> Result<Vec<u8>> {
     // Build RBSP body: 3 header bytes (profile, constraints, level) + bit stream.
     let mut body = Vec::new();
     body.push(66u8); // profile_idc = Baseline
-    // constraint_set{0,1}_flag = 1, others 0 → 0xC0
+                     // constraint_set{0,1}_flag = 1, others 0 → 0xC0
     body.push(0xC0);
     body.push(30u8); // level_idc = 30 → level 3.0
 
@@ -852,7 +855,7 @@ fn build_pps_nal(pps_id: u32, sps_id: u32) -> Result<Vec<u8>> {
     w.write_flag(false); // entropy_coding_mode_flag = 0 (CAVLC)
     w.write_flag(false); // bottom_field_pic_order_in_frame_present_flag
     w.write_ue(0); // num_slice_groups_minus1 = 0
-    // no slice group map
+                   // no slice group map
     w.write_ue(0); // num_ref_idx_l0_default_active_minus1
     w.write_ue(0); // num_ref_idx_l1_default_active_minus1
     w.write_flag(false); // weighted_pred_flag
@@ -876,7 +879,7 @@ fn build_pps_nal(pps_id: u32, sps_id: u32) -> Result<Vec<u8>> {
 fn build_avcc(sps_nal: &[u8], pps_nal: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(sps_nal.len() + pps_nal.len() + 16);
     out.push(1); // configurationVersion
-    // The SPS body (after the 1-byte NAL header) starts with profile, compat, level.
+                 // The SPS body (after the 1-byte NAL header) starts with profile, compat, level.
     out.push(sps_nal[1]); // profile_indication
     out.push(sps_nal[2]); // profile_compatibility
     out.push(sps_nal[3]); // level_indication
@@ -895,12 +898,12 @@ fn build_avcc(sps_nal: &[u8], pps_nal: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    let w = params.width.ok_or_else(|| {
-        Error::invalid("h264 encoder: CodecParameters.width is required")
-    })?;
-    let h = params.height.ok_or_else(|| {
-        Error::invalid("h264 encoder: CodecParameters.height is required")
-    })?;
+    let w = params
+        .width
+        .ok_or_else(|| Error::invalid("h264 encoder: CodecParameters.width is required"))?;
+    let h = params
+        .height
+        .ok_or_else(|| Error::invalid("h264 encoder: CodecParameters.height is required"))?;
     let opts = H264EncoderOptions::default();
     let enc = H264Encoder::new(params.codec_id.clone(), w, h, opts)?;
     Ok(Box::new(enc))

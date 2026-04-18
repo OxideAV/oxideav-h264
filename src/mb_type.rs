@@ -117,9 +117,7 @@ impl PPartition {
 /// as `IntraInP(..)` so the caller can reuse the I-slice decode path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PMbType {
-    Inter {
-        partition: PPartition,
-    },
+    Inter { partition: PPartition },
     IntraInP(IMbType),
 }
 
@@ -200,6 +198,252 @@ pub fn decode_p_sub_mb_type(sub_mb_type: u32) -> Option<PSubPartition> {
         3 => Some(PSubPartition::Sub4x4),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// B-slice mb_type + sub_mb_type — §7.4.5.1 Table 7-14, §7.4.5.2 Table 7-17.
+// ---------------------------------------------------------------------------
+
+/// Which of L0 / L1 a B-slice partition uses for prediction. `BiPred`
+/// averages samples from both lists (per §8.4.2.3, default — or weighted
+/// via `pred_weight_table` when `weighted_bipred_idc == 1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredDir {
+    L0,
+    L1,
+    BiPred,
+}
+
+/// Partition layout + per-partition prediction direction for a B-slice
+/// macroblock. Covers Table 7-14 entries; anything not in this enum surfaces
+/// `Error::Unsupported` at decode time.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BPartition {
+    /// Whole MB is derived from §8.4.1.2 direct-mode MVs, no MVD transmitted.
+    Direct16x16,
+    /// Whole-MB single-list-0 prediction.
+    L0_16x16,
+    /// Whole-MB single-list-1 prediction.
+    L1_16x16,
+    /// Whole-MB bi-prediction (average of L0 + L1 MC).
+    Bi_16x16,
+    /// Two 16×8 or 8×16 partitions, each with its own prediction direction.
+    TwoPart16x8 {
+        dirs: [PredDir; 2],
+    },
+    TwoPart8x16 {
+        dirs: [PredDir; 2],
+    },
+    /// Four 8×8 sub-MBs — sub_mb_type follows (§7.4.5.2 Table 7-17).
+    B8x8,
+}
+
+/// Decoded B-slice macroblock type. For `mb_type` values that code an intra
+/// macroblock (23..48 in spec), the value is re-indexed against Table 7-11
+/// and returned as `IntraInB(..)` so the caller reuses the I-slice decode
+/// path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BMbType {
+    Inter { partition: BPartition },
+    IntraInB(IMbType),
+}
+
+/// Decode a B-slice `mb_type` per Table 7-14. Returns `None` for values the
+/// decoder has not implemented (uncommon transpose or swap variants); the
+/// caller surfaces `Error::Unsupported` when that happens.
+///
+/// Supported entries:
+///   0   → B_Direct_16x16
+///   1   → B_L0_16x16
+///   2   → B_L1_16x16
+///   3   → B_Bi_16x16
+///   4   → B_L0_L0_16x8
+///   5   → B_L0_L0_8x16
+///   6   → B_L1_L1_16x8
+///   7   → B_L1_L1_8x16
+///   8   → B_L0_L1_16x8
+///   9   → B_L0_L1_8x16
+///   10  → B_L1_L0_16x8
+///   11  → B_L1_L0_8x16
+///   12  → B_L0_Bi_16x8
+///   13  → B_L0_Bi_8x16
+///   14  → B_L1_Bi_16x8
+///   15  → B_L1_Bi_8x16
+///   16  → B_Bi_L0_16x8
+///   17  → B_Bi_L0_8x16
+///   18  → B_Bi_L1_16x8
+///   19  → B_Bi_L1_8x16
+///   20  → B_Bi_Bi_16x8
+///   21  → B_Bi_Bi_8x16
+///   22  → B_8x8
+///   23..48 → intra (offset -23 into Table 7-11)
+pub fn decode_b_slice_mb_type(mb_type: u32) -> Option<BMbType> {
+    use BPartition::*;
+    use PredDir::*;
+    Some(match mb_type {
+        0 => BMbType::Inter {
+            partition: Direct16x16,
+        },
+        1 => BMbType::Inter {
+            partition: L0_16x16,
+        },
+        2 => BMbType::Inter {
+            partition: L1_16x16,
+        },
+        3 => BMbType::Inter {
+            partition: Bi_16x16,
+        },
+        // 16x8 pairs: columns are top then bottom.
+        4 => BMbType::Inter {
+            partition: TwoPart16x8 { dirs: [L0, L0] },
+        },
+        5 => BMbType::Inter {
+            partition: TwoPart8x16 { dirs: [L0, L0] },
+        },
+        6 => BMbType::Inter {
+            partition: TwoPart16x8 { dirs: [L1, L1] },
+        },
+        7 => BMbType::Inter {
+            partition: TwoPart8x16 { dirs: [L1, L1] },
+        },
+        8 => BMbType::Inter {
+            partition: TwoPart16x8 { dirs: [L0, L1] },
+        },
+        9 => BMbType::Inter {
+            partition: TwoPart8x16 { dirs: [L0, L1] },
+        },
+        10 => BMbType::Inter {
+            partition: TwoPart16x8 { dirs: [L1, L0] },
+        },
+        11 => BMbType::Inter {
+            partition: TwoPart8x16 { dirs: [L1, L0] },
+        },
+        12 => BMbType::Inter {
+            partition: TwoPart16x8 { dirs: [L0, BiPred] },
+        },
+        13 => BMbType::Inter {
+            partition: TwoPart8x16 { dirs: [L0, BiPred] },
+        },
+        14 => BMbType::Inter {
+            partition: TwoPart16x8 { dirs: [L1, BiPred] },
+        },
+        15 => BMbType::Inter {
+            partition: TwoPart8x16 { dirs: [L1, BiPred] },
+        },
+        16 => BMbType::Inter {
+            partition: TwoPart16x8 { dirs: [BiPred, L0] },
+        },
+        17 => BMbType::Inter {
+            partition: TwoPart8x16 { dirs: [BiPred, L0] },
+        },
+        18 => BMbType::Inter {
+            partition: TwoPart16x8 { dirs: [BiPred, L1] },
+        },
+        19 => BMbType::Inter {
+            partition: TwoPart8x16 { dirs: [BiPred, L1] },
+        },
+        20 => BMbType::Inter {
+            partition: TwoPart16x8 {
+                dirs: [BiPred, BiPred],
+            },
+        },
+        21 => BMbType::Inter {
+            partition: TwoPart8x16 {
+                dirs: [BiPred, BiPred],
+            },
+        },
+        22 => BMbType::Inter { partition: B8x8 },
+        n if (23..=48).contains(&n) => {
+            return decode_i_slice_mb_type(n - 23).map(BMbType::IntraInB);
+        }
+        _ => return None,
+    })
+}
+
+/// B-slice sub-partition kind for one of the four 8×8 sub-MBs inside a
+/// `B_8x8` macroblock (§7.4.5.2 Table 7-17). Covers entries 0–12.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BSubPartition {
+    /// `B_Direct_8x8` — §8.4.1.2 direct-mode MVs; no MVD in the bitstream.
+    Direct8x8,
+    /// `B_L0_8x8` / `B_L1_8x8` / `B_Bi_8x8` — whole 8×8 coded with one dir.
+    Full8x8 {
+        dir: PredDir,
+    },
+    /// 8×4 or 4×8 pair; each half has the same prediction direction.
+    TwoPart8x4 {
+        dir: PredDir,
+    },
+    TwoPart4x8 {
+        dir: PredDir,
+    },
+    /// Four 4×4 sub-partitions, all with the same prediction direction.
+    Four4x4 {
+        dir: PredDir,
+    },
+}
+
+impl BSubPartition {
+    pub fn num_sub_partitions(self) -> usize {
+        match self {
+            BSubPartition::Direct8x8 | BSubPartition::Full8x8 { .. } => 1,
+            BSubPartition::TwoPart8x4 { .. } | BSubPartition::TwoPart4x8 { .. } => 2,
+            BSubPartition::Four4x4 { .. } => 4,
+        }
+    }
+    /// Prediction direction, or `None` for `Direct8x8` (callers derive MVs
+    /// via direct prediction rather than following a partition-level dir).
+    pub fn pred_dir(self) -> Option<PredDir> {
+        match self {
+            BSubPartition::Direct8x8 => None,
+            BSubPartition::Full8x8 { dir }
+            | BSubPartition::TwoPart8x4 { dir }
+            | BSubPartition::TwoPart4x8 { dir }
+            | BSubPartition::Four4x4 { dir } => Some(dir),
+        }
+    }
+    /// Sub-rectangle in 4×4-block units, relative to the parent 8×8 block.
+    pub fn sub_rect(self, idx: usize) -> (usize, usize, usize, usize) {
+        match self {
+            BSubPartition::Direct8x8 | BSubPartition::Full8x8 { .. } => (0, 0, 2, 2),
+            BSubPartition::TwoPart8x4 { .. } => match idx {
+                0 => (0, 0, 1, 2),
+                _ => (1, 0, 1, 2),
+            },
+            BSubPartition::TwoPart4x8 { .. } => match idx {
+                0 => (0, 0, 2, 1),
+                _ => (0, 1, 2, 1),
+            },
+            BSubPartition::Four4x4 { .. } => match idx {
+                0 => (0, 0, 1, 1),
+                1 => (0, 1, 1, 1),
+                2 => (1, 0, 1, 1),
+                _ => (1, 1, 1, 1),
+            },
+        }
+    }
+}
+
+/// Decode a B-slice `sub_mb_type` per Table 7-17 (B entries: values 0–12).
+pub fn decode_b_sub_mb_type(v: u32) -> Option<BSubPartition> {
+    use PredDir::*;
+    Some(match v {
+        0 => BSubPartition::Direct8x8,
+        1 => BSubPartition::Full8x8 { dir: L0 },
+        2 => BSubPartition::Full8x8 { dir: L1 },
+        3 => BSubPartition::Full8x8 { dir: BiPred },
+        4 => BSubPartition::TwoPart8x4 { dir: L0 },
+        5 => BSubPartition::TwoPart4x8 { dir: L0 },
+        6 => BSubPartition::TwoPart8x4 { dir: L1 },
+        7 => BSubPartition::TwoPart4x8 { dir: L1 },
+        8 => BSubPartition::TwoPart8x4 { dir: BiPred },
+        9 => BSubPartition::TwoPart4x8 { dir: BiPred },
+        10 => BSubPartition::Four4x4 { dir: L0 },
+        11 => BSubPartition::Four4x4 { dir: L1 },
+        12 => BSubPartition::Four4x4 { dir: BiPred },
+        _ => return None,
+    })
 }
 
 /// Decode a P-slice `coded_block_pattern` me(v) value (Table 9-4(b) — inter

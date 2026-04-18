@@ -55,7 +55,9 @@ pub fn decode_p_slice_mb(
         .ok_or_else(|| Error::invalid(format!("h264 p-slice: bad P mb_type {mb_type}")))?;
 
     match pmb {
-        PMbType::IntraInP(imb) => decode_intra_in_p(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb),
+        PMbType::IntraInP(imb) => {
+            decode_intra_in_p(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb)
+        }
         PMbType::Inter { partition } => match partition {
             PPartition::P16x16 => {
                 decode_p16x16(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp)
@@ -115,10 +117,30 @@ pub fn decode_p_skip_mb(
     fill_partition_mv(pic, mb_x, mb_y, 0, 0, 4, 4, mv, 0);
     let (lw, cw) = l0_weight_for(sh, 0);
     mc_luma_partition(
-        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, lw,
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        lw,
     );
     mc_chroma_partition(
-        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, cw,
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        cw,
     );
     Ok(())
 }
@@ -175,10 +197,30 @@ fn decode_p16x16(
     // when the slice carries a pred_weight_table.
     let (lw, cw) = l0_weight_for(sh, ref_idx);
     mc_luma_partition(
-        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, lw,
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        lw,
     );
     mc_chroma_partition(
-        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, cw,
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        cw,
     );
 
     // CBP (inter) + optional qp_delta + residual.
@@ -232,7 +274,17 @@ fn decode_p16x8(
     let rects = [(0usize, 0usize, 2usize, 4usize), (2, 0, 2, 4)];
     let refs = [ref_idx_0, ref_idx_1];
     decode_two_partition_p(
-        br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp, &rects, &refs,
+        br,
+        sps,
+        pps,
+        sh,
+        mb_x,
+        mb_y,
+        pic,
+        ref_list0,
+        prev_qp,
+        &rects,
+        &refs,
         PPartition::P16x8,
     )
 }
@@ -255,7 +307,17 @@ fn decode_p8x16(
     let rects = [(0usize, 0usize, 4usize, 2usize), (0, 2, 4, 2)];
     let refs = [ref_idx_0, ref_idx_1];
     decode_two_partition_p(
-        br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp, &rects, &refs,
+        br,
+        sps,
+        pps,
+        sh,
+        mb_x,
+        mb_y,
+        pic,
+        ref_list0,
+        prev_qp,
+        &rects,
+        &refs,
         PPartition::P8x16,
     )
 }
@@ -291,10 +353,30 @@ fn decode_two_partition_p(
         fill_partition_mv(pic, mb_x, mb_y, r0, c0, ph, pw, mv, refs[p]);
         let (lw, cw) = l0_weight_for(sh, refs[p]);
         mc_luma_partition(
-            pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, lw,
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            ph,
+            pw,
+            mv.0 as i32,
+            mv.1 as i32,
+            lw,
         );
         mc_chroma_partition(
-            pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, cw,
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            ph,
+            pw,
+            mv.0 as i32,
+            mv.1 as i32,
+            cw,
         );
     }
 
@@ -374,10 +456,30 @@ fn decode_p8x8(
             fill_partition_mv(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, mv, ref_idx);
             let (lw, cw) = l0_weight_for(sh, ref_idx);
             mc_luma_partition(
-                pic, reference, mb_x, mb_y, r0, c0, sh_h, sh_w, mv.0 as i32, mv.1 as i32, lw,
+                pic,
+                reference,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                sh_h,
+                sh_w,
+                mv.0 as i32,
+                mv.1 as i32,
+                lw,
             );
             mc_chroma_partition(
-                pic, reference, mb_x, mb_y, r0, c0, sh_h, sh_w, mv.0 as i32, mv.1 as i32, cw,
+                pic,
+                reference,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                sh_h,
+                sh_w,
+                mv.0 as i32,
+                mv.1 as i32,
+                cw,
             );
         }
     }
@@ -687,13 +789,7 @@ fn l0_weight_for<'a>(
     (lw, cw)
 }
 
-fn predict_inter_nc_luma(
-    pic: &Picture,
-    mb_x: u32,
-    mb_y: u32,
-    br_row: usize,
-    br_col: usize,
-) -> i32 {
+fn predict_inter_nc_luma(pic: &Picture, mb_x: u32, mb_y: u32, br_row: usize, br_col: usize) -> i32 {
     // Same predictor as intra (§9.2.1.1), but also walks MB boundaries where
     // the neighbour might be an inter MB with coded residual.
     let info_here = pic.mb_info_at(mb_x, mb_y);

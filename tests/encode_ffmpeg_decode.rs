@@ -11,9 +11,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use oxideav_codec::Encoder;
-use oxideav_core::{
-    frame::VideoPlane, CodecId, Frame, PixelFormat, TimeBase, VideoFrame,
-};
+use oxideav_core::{frame::VideoPlane, CodecId, Frame, PixelFormat, TimeBase, VideoFrame};
 use oxideav_h264::encoder::{H264Encoder, H264EncoderOptions};
 
 fn have_ffmpeg() -> bool {
@@ -79,7 +77,8 @@ fn ffmpeg_decodes_our_h264_output() {
         },
     )
     .expect("encoder::new");
-    enc.send_frame(&Frame::Video(src.clone())).expect("send_frame");
+    enc.send_frame(&Frame::Video(src.clone()))
+        .expect("send_frame");
     enc.flush().expect("flush");
     let pkt = enc.receive_packet().expect("receive_packet");
 

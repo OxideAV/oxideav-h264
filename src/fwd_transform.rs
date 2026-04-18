@@ -243,9 +243,7 @@ mod tests {
     #[test]
     fn quant_then_dequant_roundtrip_ac_qp22() {
         // A moderately textured block; encode then decode and check residual sum.
-        let original: [i32; 16] = [
-            10, -5, 2, 0, 7, 1, -2, 3, -4, 0, 1, -1, 2, 3, 0, -1,
-        ];
+        let original: [i32; 16] = [10, -5, 2, 0, 7, 1, -2, 3, -4, 0, 1, -1, 2, 3, 0, -1];
         let mut x = original;
         forward_dct_4x4(&mut x);
         quantize_4x4_ac(&mut x, 22);
@@ -277,7 +275,12 @@ mod tests {
         // `(v+32)>>6` yields 16 per sample.
         let mean: i32 = dc.iter().sum::<i32>() / 16;
         for &v in dc.iter() {
-            assert!((v - mean).abs() <= 16, "dc spread too large: {} vs mean {}", v, mean);
+            assert!(
+                (v - mean).abs() <= 16,
+                "dc spread too large: {} vs mean {}",
+                v,
+                mean
+            );
         }
         // Expect ~1024 (allowing some quant error).
         assert!(

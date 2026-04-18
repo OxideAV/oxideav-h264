@@ -19,11 +19,12 @@
 use crate::picture::Picture;
 use crate::slice::{ChromaWeight, LumaWeight};
 
-/// 4×4-block-local neighbour lookup: returns (mv_x, mv_y, ref_idx) for the
-/// block at position `(br_row, br_col)` of macroblock `(mb_x, mb_y)`.
+/// 4×4-block-local neighbour lookup: returns (mv, ref_idx) for the list-0
+/// predictor at position `(br_row, br_col)` of macroblock `(mb_x, mb_y)`.
 ///
-/// `Some((mv, ref_idx))` when the neighbour is available and inter-coded.
-/// `None` when the neighbour doesn't exist (picture edge) or is intra.
+/// `Some((mv, ref_idx))` when the neighbour is available and inter-coded on
+/// list 0. `None` when the neighbour doesn't exist (picture edge), is intra,
+/// or wasn't predicted from list 0.
 pub fn neighbour_mv(
     pic: &Picture,
     mb_x: i32,
@@ -31,7 +32,19 @@ pub fn neighbour_mv(
     br_row: i32,
     br_col: i32,
 ) -> Option<((i16, i16), i8)> {
-    // Walk MB coordinates first, then sub-block position within that MB.
+    neighbour_mv_list(pic, mb_x, mb_y, br_row, br_col, 0)
+}
+
+/// List-aware variant of [`neighbour_mv`] — `list == 0` reads
+/// `mv_l0`/`ref_idx_l0`, `list == 1` reads `mv_l1`/`ref_idx_l1`.
+pub fn neighbour_mv_list(
+    pic: &Picture,
+    mb_x: i32,
+    mb_y: i32,
+    br_row: i32,
+    br_col: i32,
+    list: u8,
+) -> Option<((i16, i16), i8)> {
     let mut mbx = mb_x;
     let mut mby = mb_y;
     let mut row = br_row;
@@ -60,11 +73,15 @@ pub fn neighbour_mv(
         return None;
     }
     let idx = (row * 4 + col) as usize;
-    let ref_idx = info.ref_idx_l0[idx];
+    let (ref_idx, mv) = if list == 0 {
+        (info.ref_idx_l0[idx], info.mv_l0[idx])
+    } else {
+        (info.ref_idx_l1[idx], info.mv_l1[idx])
+    };
     if ref_idx < 0 {
         return None;
     }
-    Some((info.mv_l0[idx], ref_idx))
+    Some((mv, ref_idx))
 }
 
 /// Predict `mv_l0` for a partition whose top-left 4×4 block is
@@ -170,6 +187,94 @@ pub fn predict_mv_l0(
         return c.unwrap().0;
     }
 
+    let ax = a.map(|(mv, _)| mv.0).unwrap_or(0);
+    let ay = a.map(|(mv, _)| mv.1).unwrap_or(0);
+    let bx = b.map(|(mv, _)| mv.0).unwrap_or(0);
+    let by = b.map(|(mv, _)| mv.1).unwrap_or(0);
+    let cx = c.map(|(mv, _)| mv.0).unwrap_or(0);
+    let cy = c.map(|(mv, _)| mv.1).unwrap_or(0);
+    (median3(ax, bx, cx), median3(ay, by, cy))
+}
+
+/// List-aware median predictor for B-slices — same algorithm as
+/// [`predict_mv_l0`] but reading from `mv_l1`/`ref_idx_l1` when `list == 1`.
+/// The partition-shape special cases in §8.4.1.3 apply independently per
+/// list.
+pub fn predict_mv_list(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    br_row: usize,
+    br_col: usize,
+    part_h: usize,
+    part_w: usize,
+    ref_idx: i8,
+    list: u8,
+) -> (i16, i16) {
+    let mbx = mb_x as i32;
+    let mby = mb_y as i32;
+    let br_row = br_row as i32;
+    let br_col = br_col as i32;
+
+    let a = neighbour_mv_list(pic, mbx, mby, br_row, br_col - 1, list);
+    let b = neighbour_mv_list(pic, mbx, mby, br_row - 1, br_col, list);
+    let tr_col = br_col + part_w as i32;
+    let tr_row = br_row - 1;
+    let mut c = neighbour_mv_list(pic, mbx, mby, tr_row, tr_col, list);
+    if c.is_none() {
+        c = neighbour_mv_list(pic, mbx, mby, br_row - 1, br_col - 1, list);
+    }
+
+    if part_h == 2 && part_w == 4 {
+        if br_row == 0 {
+            if let Some((mv, r)) = b {
+                if r == ref_idx {
+                    return mv;
+                }
+            }
+        } else if br_row == 2 {
+            if let Some((mv, r)) = a {
+                if r == ref_idx {
+                    return mv;
+                }
+            }
+        }
+    } else if part_h == 4 && part_w == 2 {
+        if br_col == 0 {
+            if let Some((mv, r)) = a {
+                if r == ref_idx {
+                    return mv;
+                }
+            }
+        } else if br_col == 2 {
+            if let Some((mv, r)) = c {
+                if r == ref_idx {
+                    return mv;
+                }
+            }
+        }
+    }
+
+    let matches_a = a.map(|(_, r)| r == ref_idx).unwrap_or(false);
+    let matches_b = b.map(|(_, r)| r == ref_idx).unwrap_or(false);
+    let matches_c = c.map(|(_, r)| r == ref_idx).unwrap_or(false);
+    let only_matches = [matches_a, matches_b, matches_c]
+        .iter()
+        .filter(|&&m| m)
+        .count();
+
+    if b.is_none() && c.is_none() && a.is_some() {
+        return a.unwrap().0;
+    }
+    if only_matches == 1 {
+        if matches_a {
+            return a.unwrap().0;
+        }
+        if matches_b {
+            return b.unwrap().0;
+        }
+        return c.unwrap().0;
+    }
     let ax = a.map(|(mv, _)| mv.0).unwrap_or(0);
     let ay = a.map(|(mv, _)| mv.1).unwrap_or(0);
     let bx = b.map(|(mv, _)| mv.0).unwrap_or(0);
@@ -418,14 +523,14 @@ pub fn chroma_mc(
             let x0 = int_x + c;
             let y1 = y0 + 1;
             let x1 = x0 + 1;
-            let p00 = ref_plane[clamp_ref(y0, plane_h) * plane_stride + clamp_ref(x0, plane_w)]
-                as i32;
-            let p01 = ref_plane[clamp_ref(y0, plane_h) * plane_stride + clamp_ref(x1, plane_w)]
-                as i32;
-            let p10 = ref_plane[clamp_ref(y1, plane_h) * plane_stride + clamp_ref(x0, plane_w)]
-                as i32;
-            let p11 = ref_plane[clamp_ref(y1, plane_h) * plane_stride + clamp_ref(x1, plane_w)]
-                as i32;
+            let p00 =
+                ref_plane[clamp_ref(y0, plane_h) * plane_stride + clamp_ref(x0, plane_w)] as i32;
+            let p01 =
+                ref_plane[clamp_ref(y0, plane_h) * plane_stride + clamp_ref(x1, plane_w)] as i32;
+            let p10 =
+                ref_plane[clamp_ref(y1, plane_h) * plane_stride + clamp_ref(x0, plane_w)] as i32;
+            let p11 =
+                ref_plane[clamp_ref(y1, plane_h) * plane_stride + clamp_ref(x1, plane_w)] as i32;
             let v = ((8 - dx) * (8 - dy) * p00
                 + dx * (8 - dy) * p01
                 + (8 - dx) * dy * p10
@@ -434,6 +539,65 @@ pub fn chroma_mc(
                 >> 6;
             dst[r as usize * part_w + c as usize] = v.clamp(0, 255) as u8;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bi-prediction — §8.4.2.3.
+// ---------------------------------------------------------------------------
+
+/// Default bi-prediction: `pred = (pred_L0 + pred_L1 + 1) >> 1` per
+/// §8.4.2.3.1. Both input buffers must be `part_w * part_h` samples in
+/// raster order; the result is written into `dst`.
+pub fn average_bipred(dst: &mut [u8], l0: &[u8], l1: &[u8]) {
+    debug_assert_eq!(dst.len(), l0.len());
+    debug_assert_eq!(dst.len(), l1.len());
+    for i in 0..dst.len() {
+        let v = (l0[i] as i32 + l1[i] as i32 + 1) >> 1;
+        dst[i] = v.clamp(0, 255) as u8;
+    }
+}
+
+/// Explicit weighted bi-prediction per §8.4.2.3.2 for a single plane.
+///
+/// The spec formula for the non-`logWD == 0` case is:
+/// ```text
+/// predSample = Clip1( ( pred_L0 * w0 + pred_L1 * w1
+///                       + (1 << logWD) ) >> (logWD + 1)
+///                     + ((o0 + o1 + 1) >> 1) )
+/// ```
+/// When `logWD == 0` the shift-and-round pair reduces to `(x + y + 1) >> 1`,
+/// which matches the un-weighted fallback — but per spec the offsets are
+/// still additive afterwards.
+pub fn weighted_bipred_plane(
+    dst: &mut [u8],
+    l0: &[u8],
+    l1: &[u8],
+    w0: i32,
+    o0: i32,
+    w1: i32,
+    o1: i32,
+    log2_denom: u32,
+) {
+    debug_assert_eq!(dst.len(), l0.len());
+    debug_assert_eq!(dst.len(), l1.len());
+    let combined_offset = (o0 + o1 + 1) >> 1;
+    if log2_denom == 0 {
+        for i in 0..dst.len() {
+            let a = l0[i] as i32;
+            let b = l1[i] as i32;
+            let v = a * w0 + b * w1 + combined_offset;
+            dst[i] = v.clamp(0, 255) as u8;
+        }
+        return;
+    }
+    let round = 1i32 << log2_denom;
+    let shift = log2_denom + 1;
+    for i in 0..dst.len() {
+        let a = l0[i] as i32;
+        let b = l1[i] as i32;
+        let v = ((a * w0 + b * w1 + round) >> shift) + combined_offset;
+        dst[i] = v.clamp(0, 255) as u8;
     }
 }
 
@@ -627,6 +791,59 @@ mod tests {
         };
         apply_luma_weight(&mut buf, &w);
         assert_eq!(buf, [10, 25, 55]);
+    }
+
+    #[test]
+    fn bipred_integer_mv_average_of_two_solid_pictures() {
+        // Integer MV (0,0) MC from two solid references yields the simple
+        // per-pixel average. Combined with `average_bipred`, this end-to-end
+        // verifies the chain luma_mc + average used by the B-slice MC path.
+        let ref0 = make_solid_picture(2, 2, 60);
+        let ref1 = make_solid_picture(2, 2, 140);
+        let mut l0 = vec![0u8; 16 * 16];
+        let mut l1 = vec![0u8; 16 * 16];
+        luma_mc(&mut l0, &ref0, 0, 0, 0, 0, 16, 16);
+        luma_mc(&mut l1, &ref1, 0, 0, 0, 0, 16, 16);
+        let mut out = vec![0u8; 16 * 16];
+        average_bipred(&mut out, &l0, &l1);
+        // (60 + 140 + 1) >> 1 = 100.
+        assert!(out.iter().all(|&x| x == 100));
+    }
+
+    #[test]
+    fn bipred_average_rounds_to_nearest() {
+        // Averaging (100, 100) must give 100; (0, 255) rounds to 128
+        // per `(a + b + 1) >> 1`.
+        let l0 = [100u8, 0, 10, 200];
+        let l1 = [100u8, 255, 20, 100];
+        let mut out = [0u8; 4];
+        average_bipred(&mut out, &l0, &l1);
+        assert_eq!(out, [100, 128, 15, 150]);
+    }
+
+    #[test]
+    fn bipred_average_bi_directional_zero_mv_is_source() {
+        // If both prediction buffers are identical (e.g., same reference,
+        // zero MV), bipred collapses to the shared value with no loss.
+        let l0 = [42u8; 16];
+        let l1 = [42u8; 16];
+        let mut out = [0u8; 16];
+        average_bipred(&mut out, &l0, &l1);
+        assert_eq!(out, [42u8; 16]);
+    }
+
+    #[test]
+    fn weighted_bipred_logwd_one_is_plain_average_with_offset() {
+        // w0 = w1 = 1, logWD = 1 → (a + b + 2) / 4? No — (a*1 + b*1 + 2)>>2.
+        //   (10 + 30 + 2) >> 2 = 42 >> 2 = 10
+        //   Offsets stored unchanged → +0.
+        // With w0=1, w1=1, logWD=1, the formula: ((a + b + 2) >> 2) + 0.
+        let l0 = [10u8, 20, 30, 40];
+        let l1 = [30u8, 20, 10, 60];
+        let mut out = [0u8; 4];
+        weighted_bipred_plane(&mut out, &l0, &l1, 1, 0, 1, 0, 1);
+        // (10 + 30 + 2) >> 2 = 10; (20 + 20 + 2) >> 2 = 10; etc.
+        assert_eq!(out, [10, 10, 10, 25]);
     }
 
     #[test]

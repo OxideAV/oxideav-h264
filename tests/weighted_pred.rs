@@ -11,9 +11,7 @@
 
 use oxideav_h264::p_mb::decode_p_skip_mb;
 use oxideav_h264::picture::Picture;
-use oxideav_h264::slice::{
-    ChromaWeight, LumaWeight, PredWeightTable, SliceHeader, SliceType,
-};
+use oxideav_h264::slice::{ChromaWeight, LumaWeight, PredWeightTable, SliceHeader, SliceType};
 
 fn make_slice_with_luma_weight(lw: LumaWeight, cw: ChromaWeight) -> SliceHeader {
     let tbl = PredWeightTable {

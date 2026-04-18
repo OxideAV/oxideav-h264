@@ -1,12 +1,13 @@
 # oxideav-h264
 
 Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
-oxideav. Decodes CAVLC + CABAC I-slices and CAVLC baseline P-slices;
-encodes a minimal Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED
-output stream. The High-Profile 8×8 transform + Intra_8×8 prediction
-math primitives are unit-tested but **not** wired into the macroblock
-decode loop — bitstreams that set `transform_size_8x8_flag = 1` surface
-as `Error::Unsupported`. Zero C dependencies.
+oxideav. Decodes CAVLC + CABAC I-slices, CAVLC P-slices, and CAVLC
+B-slices (spatial direct + explicit weighted bipred); encodes a minimal
+Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED output stream. The
+High-Profile 8×8 transform + Intra_8×8 prediction math primitives are
+unit-tested but **not** wired into the macroblock decode loop —
+bitstreams that set `transform_size_8x8_flag = 1` surface as
+`Error::Unsupported`. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -82,6 +83,32 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
 - Optional in-loop deblocking (§8.7) honouring
   `disable_deblocking_filter_idc` and the per-slice alpha / beta
   offsets.
+
+### CAVLC B-slice decode (§8.4 + §8.2.4.2.3)
+
+- Macroblock types (§7.4.5 Table 7-14): `B_Direct_16x16`, `B_L0_16x16`,
+  `B_L1_16x16`, `B_Bi_16x16`, and the 16×8 / 8×16 pair variants —
+  L0/L0, L1/L1, L0/L1, L1/L0, L0/Bi, L1/Bi, Bi/L0, Bi/L1, Bi/Bi.
+- `B_8x8` sub-macroblock types (§7.4.5.2 Table 7-17 B entries):
+  `B_Direct_8x8` and `B_{L0,L1,Bi}_{8x8,8x4,4x8,4x4}`.
+- `B_Skip` handling driven by `mb_skip_run` before each coded MB —
+  MVs derived via spatial direct (§8.4.1.2.2).
+- **Spatial direct** MV prediction for `B_Direct_*` (§8.4.1.2.2):
+  per-list `ref_idx` = minimum non-negative over the A/B/C neighbours,
+  median MV predictor over neighbours matching that `ref_idx`.
+- Default **bi-prediction** averages the two list predictions as
+  `(pred_L0 + pred_L1 + 1) >> 1` (§8.4.2.3.1). **Explicit weighted
+  bi-prediction** (§8.4.2.3.2) uses the slice's `pred_weight_table` for
+  both lists when `weighted_bipred_idc == 1`.
+- **RefPicList0 / RefPicList1** built per §8.2.4.2.3: short-term
+  entries split by POC relative to `CurrPicOrderCnt` (past-desc +
+  future-asc for list 0; future-asc + past-desc for list 1), then
+  long-term ascending by `LongTermFrameIdx`.
+- **POC output reordering** — on the first B-slice the DPB's
+  pending-output queue is sized to `max_num_ref_frames` so a
+  `I B B P …` decode-order stream emerges as `I P B B …` in
+  presentation order. The VUI's
+  `bitstream_restriction.max_num_reorder_frames` is not yet parsed.
 
 ### CAVLC baseline P-slice decode (§8.4)
 
@@ -197,14 +224,18 @@ a half-finished code path in the decode loop.
 Decoder surfaces `Error::Unsupported` (or `Error::InvalidData` when the
 bitstream claims a feature that isn't wired); encoder outright refuses:
 
-- **Decoder**: CABAC P-slices (baseline CAVLC P works — set
-  `entropy_coding_mode_flag = 0` at the external encoder). Any I-slice
-  macroblock with `transform_size_8x8_flag = 1` (CAVLC and CABAC).
+- **Decoder**: CABAC P-slices and CABAC B-slices (baseline CAVLC P + B
+  work — set `entropy_coding_mode_flag = 0` at the external encoder).
+  Any I-slice macroblock with `transform_size_8x8_flag = 1` (CAVLC and
+  CABAC).
 - **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16
   modes other than DC, rate control, adaptive QP, mode decision,
   deblocking.
-- B-slices, bi-prediction, implicit weighted bi-prediction (the
-  explicit P-slice form is supported).
+- **B-slice temporal direct** MV prediction (§8.4.1.2.3,
+  `direct_spatial_mv_pred_flag = 0`) — only spatial direct is wired.
+- **Implicit weighted bi-prediction** (`weighted_bipred_idc == 2`,
+  §8.4.2.3.3) — explicit bipred and P-slice weighted prediction are
+  supported.
 - Reference picture list modification (RPLM) — the identity form
   (flag = 0) is accepted; non-trivial modification commands surface
   `Error::Unsupported`.
@@ -254,6 +285,17 @@ ffmpeg -y -i /tmp/h264_pslice_simple.mp4 -c:v copy -bsf:v h264_mp4toannexb \
     -f h264 /tmp/h264_pslice_simple.es
 ffmpeg -y -i /tmp/h264_pslice_simple.mp4 -f rawvideo -pix_fmt yuv420p \
     /tmp/h264_pslice_simple.yuv
+
+# CAVLC B-slice acceptance clip — 12 frames I/B/B/P/B/B/... solid grey,
+# bundled in tests/fixtures/ so this test works without ffmpeg.
+ffmpeg -y -f lavfi -i "color=c=gray:size=64x64:rate=24:duration=0.5" \
+    -pix_fmt yuv420p -c:v libx264 -profile:v main -g 6 -bf 2 \
+    -x264opts no-scenecut:no-weightb:weightp=0:no-mbtree -coder 0 \
+    /tmp/oxideav_bslice.mp4
+ffmpeg -y -i /tmp/oxideav_bslice.mp4 -c:v copy -bsf:v h264_mp4toannexb \
+    -f h264 tests/fixtures/bslice_64x64.es
+ffmpeg -y -i /tmp/oxideav_bslice.mp4 -f rawvideo -pix_fmt yuv420p \
+    tests/fixtures/bslice_64x64.yuv
 ```
 
 ## License

@@ -124,6 +124,18 @@ impl Dpb {
         }
     }
 
+    /// Current reorder window — number of pictures that may sit in the
+    /// pending-output queue before one is forced to emerge in POC order.
+    pub fn reorder_window(&self) -> u32 {
+        self.reorder_window
+    }
+
+    /// Adjust the reorder window. Used by the decoder when the first
+    /// B-slice appears to raise the window above the P-only default of 0.
+    pub fn set_reorder_window(&mut self, window: u32) {
+        self.reorder_window = window;
+    }
+
     /// Reset the DPB to its empty state.
     pub fn clear(&mut self) {
         self.frames.clear();
@@ -143,6 +155,91 @@ impl Dpb {
     }
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
+    }
+
+    /// Live references, ordered for `RefPicList0` construction for a B-slice
+    /// per §8.2.4.2.3: short-term entries with `poc < curr_poc` in
+    /// descending-POC order, then short-term entries with `poc > curr_poc`
+    /// in ascending-POC order, then long-term entries in ascending
+    /// `LongTermFrameIdx` order. The list is then trimmed to the slice's
+    /// active L0 length.
+    pub fn build_list0_b(
+        &self,
+        curr_poc: i32,
+        num_ref_idx_l0_active_minus1: u32,
+    ) -> Vec<&RefFrame> {
+        let mut past: Vec<&RefFrame> = self
+            .frames
+            .iter()
+            .filter(|f| f.used_for_reference && f.short_term && f.poc < curr_poc)
+            .collect();
+        past.sort_by(|a, b| b.poc.cmp(&a.poc));
+
+        let mut future: Vec<&RefFrame> = self
+            .frames
+            .iter()
+            .filter(|f| f.used_for_reference && f.short_term && f.poc > curr_poc)
+            .collect();
+        future.sort_by_key(|f| f.poc);
+
+        let mut long: Vec<&RefFrame> = self
+            .frames
+            .iter()
+            .filter(|f| f.used_for_reference && !f.short_term)
+            .collect();
+        long.sort_by_key(|f| f.long_term_frame_idx.unwrap_or(u32::MAX));
+
+        let mut list: Vec<&RefFrame> = past;
+        list.extend(future);
+        list.extend(long);
+        let want = (num_ref_idx_l0_active_minus1 as usize) + 1;
+        if list.len() > want {
+            list.truncate(want);
+        }
+        list
+    }
+
+    /// Live references, ordered for `RefPicList1` construction for a B-slice
+    /// per §8.2.4.2.3: short-term entries with `poc > curr_poc` in
+    /// ascending-POC order, then short-term entries with `poc < curr_poc`
+    /// in descending-POC order, then long-term entries in ascending
+    /// `LongTermFrameIdx` order. When `RefPicList1` and `RefPicList0` are
+    /// identical and have more than one entry, the first two entries of
+    /// `RefPicList1` are swapped (§8.2.4.2.3 last paragraph).
+    pub fn build_list1_b(
+        &self,
+        curr_poc: i32,
+        num_ref_idx_l1_active_minus1: u32,
+    ) -> Vec<&RefFrame> {
+        let mut future: Vec<&RefFrame> = self
+            .frames
+            .iter()
+            .filter(|f| f.used_for_reference && f.short_term && f.poc > curr_poc)
+            .collect();
+        future.sort_by_key(|f| f.poc);
+
+        let mut past: Vec<&RefFrame> = self
+            .frames
+            .iter()
+            .filter(|f| f.used_for_reference && f.short_term && f.poc < curr_poc)
+            .collect();
+        past.sort_by(|a, b| b.poc.cmp(&a.poc));
+
+        let mut long: Vec<&RefFrame> = self
+            .frames
+            .iter()
+            .filter(|f| f.used_for_reference && !f.short_term)
+            .collect();
+        long.sort_by_key(|f| f.long_term_frame_idx.unwrap_or(u32::MAX));
+
+        let mut list: Vec<&RefFrame> = future;
+        list.extend(past);
+        list.extend(long);
+        let want = (num_ref_idx_l1_active_minus1 as usize) + 1;
+        if list.len() > want {
+            list.truncate(want);
+        }
+        list
     }
 
     /// Live references, ordered for `RefPicList0` construction for a P-slice
@@ -198,11 +295,7 @@ impl Dpb {
 
     /// Apply sliding-window reference picture marking (§8.2.5.3).
     pub fn apply_sliding_window(&mut self) {
-        let total_refs = self
-            .frames
-            .iter()
-            .filter(|f| f.used_for_reference)
-            .count() as u32;
+        let total_refs = self.frames.iter().filter(|f| f.used_for_reference).count() as u32;
         if total_refs < self.max_num_ref_frames {
             return;
         }
@@ -661,6 +754,60 @@ mod tests {
         let list = dpb.build_list0_p(0);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].frame_num, 3);
+    }
+
+    #[test]
+    fn list0_b_splits_past_future_short_term() {
+        // Four short-term references with POCs [2, 4, 6, 10].
+        // Current POC = 5. §8.2.4.2.3 RefPicList0 order:
+        //   past (poc < 5) descending by POC → [4, 2]
+        //   future (poc > 5) ascending by POC → [6, 10]
+        // Expected list: [4, 2, 6, 10].
+        let mut dpb = Dpb::new(8, 8);
+        for (fn_, poc) in [(0u32, 2i32), (1, 4), (2, 6), (3, 10)] {
+            dpb.insert_reference(dummy_pic(), fn_, fn_ as i32, poc);
+        }
+        let list = dpb.build_list0_b(5, 7);
+        let pocs: Vec<i32> = list.iter().map(|f| f.poc).collect();
+        assert_eq!(pocs, vec![4, 2, 6, 10]);
+    }
+
+    #[test]
+    fn list1_b_splits_future_past_short_term() {
+        // Same setup as above. §8.2.4.2.3 RefPicList1 order:
+        //   future ascending → [6, 10]
+        //   past descending → [4, 2]
+        // Expected: [6, 10, 4, 2].
+        let mut dpb = Dpb::new(8, 8);
+        for (fn_, poc) in [(0u32, 2i32), (1, 4), (2, 6), (3, 10)] {
+            dpb.insert_reference(dummy_pic(), fn_, fn_ as i32, poc);
+        }
+        let list = dpb.build_list1_b(5, 7);
+        let pocs: Vec<i32> = list.iter().map(|f| f.poc).collect();
+        assert_eq!(pocs, vec![6, 10, 4, 2]);
+    }
+
+    #[test]
+    fn list1_b_long_term_after_short_term() {
+        // Two short-term refs (POC 2 and 10) plus one long-term ref.
+        let mut dpb = Dpb::new(8, 8);
+        dpb.insert_reference(dummy_pic(), 0, 0, 2);
+        dpb.insert_reference(dummy_pic(), 1, 1, 10);
+        dpb.insert_reference(dummy_pic(), 2, 2, 7);
+        // Promote the last one to long-term.
+        dpb.apply_mmco(
+            MmcoCommand::AssignLongTerm {
+                difference_of_pic_nums_minus1: 0,
+                long_term_frame_idx: 3,
+            },
+            2,
+            16,
+        )
+        .unwrap();
+        let list = dpb.build_list1_b(5, 7);
+        // Short-term first (future-asc then past-desc), then long-term.
+        let lt_end = list.last().unwrap();
+        assert_eq!(lt_end.long_term_frame_idx, Some(3));
     }
 
     #[test]

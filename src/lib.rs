@@ -30,9 +30,28 @@
 //!   the slice's `pred_weight_table` is parsed when the PPS has
 //!   `weighted_pred_flag = 1`, and the per-reference (weight, offset,
 //!   log2_denom) triples are applied to the MC output before the residual
-//!   is added. List-0 only (the L1 side of the weight table is parsed for
-//!   bitstream conformance but unused; B-slice bi-prediction remains out
-//!   of scope).
+//!   is added.
+//! * **CAVLC B-slice** pixel reconstruction (§7.3.5 / §8.4) —
+//!   `B_Direct_16x16` + `B_Skip` via **spatial direct** MV derivation
+//!   (§8.4.1.2.2), `B_L0_16x16` / `B_L1_16x16` / `B_Bi_16x16`, the 16×8 /
+//!   8×16 pair variants (L0/L0, L1/L1, L0/L1, L1/L0, L0/Bi, L1/Bi, Bi/L0,
+//!   Bi/L1, Bi/Bi), and `B_8x8` with every Table 7-17 sub-partition type
+//!   (`B_Direct_8x8`, `B_{L0,L1,Bi}_{8x8,8x4,4x8,4x4}`). Intra-in-B MBs
+//!   dispatch back into the I-slice decode helper. Default bi-prediction
+//!   averages the L0 and L1 samples per `(pred_L0 + pred_L1 + 1) >> 1`
+//!   (§8.4.2.3.1); explicit weighted bipred (§8.4.2.3.2) uses the slice's
+//!   `pred_weight_table` for both lists when `weighted_bipred_idc == 1`.
+//! * **B-slice RefPicList0 / RefPicList1** construction per §8.2.4.2.3 —
+//!   short-term past/future split around `CurrPicOrderCnt` with the
+//!   per-list ordering reversal, followed by ascending long-term
+//!   references.
+//! * **POC output reordering** — the DPB's pending-output queue is
+//!   parameterised by a reorder window that the decoder bumps up to
+//!   `max_num_ref_frames` on the first B-slice. Pictures emerge in POC
+//!   order via `receive_frame`, letting a `I B B P B B …` decode-order
+//!   stream deliver frames in presentation order. The VUI's
+//!   `bitstream_restriction.max_num_reorder_frames` is not yet parsed;
+//!   the conservative `max_num_ref_frames` upper bound is used.
 //!
 //! # What is encoded today
 //!
@@ -69,10 +88,17 @@
 //!   `transform_size_8x8_flag = 1`.
 //! * Custom scaling-list matrices — the SPS/PPS fields are parsed and
 //!   skipped, and only the flat-16 default list is used for 4×4 dequant.
-//! * CABAC P-slices (decode); any CABAC encoding; any P/B slice encoding.
-//! * B-slices (bi-prediction). Implicit weighted bi-prediction
-//!   (`weighted_bipred_idc == 2`, §8.4.2.3.3) is not implemented either —
-//!   only the explicit P-slice form (§8.4.2.3.2) is supported today.
+//! * CABAC P-slices and CABAC B-slices (decode); any CABAC encoding; any
+//!   P/B slice encoding.
+//! * **Temporal direct** B-slice MV prediction (§8.4.1.2.3,
+//!   `direct_spatial_mv_pred_flag = 0`) — only spatial direct
+//!   (§8.4.1.2.2) is wired today.
+//! * **Implicit weighted bi-prediction** (`weighted_bipred_idc == 2`,
+//!   §8.4.2.3.3) — the PPS flag value surfaces `Error::Unsupported` for
+//!   B-slices. Explicit weighted bipred (`weighted_bipred_idc == 1`) is
+//!   supported.
+//! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
+//!   existing 8×8 scoping).
 //! * Reference picture list modification (RPLM, §7.4.3.1 / §8.2.4.3) —
 //!   only the identity (flag = 0) form is accepted; any non-trivial
 //!   RPLM command surfaces `Error::Unsupported`.
@@ -92,6 +118,7 @@
 #![allow(clippy::manual_memcpy)]
 #![allow(clippy::derivable_impls)]
 
+pub mod b_mb;
 pub mod bitreader;
 pub mod bitwriter;
 pub mod cabac;

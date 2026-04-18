@@ -223,9 +223,9 @@ pub fn parse_slice_header(
     // prediction is enabled by the PPS for this slice type. Implicit
     // weighted bi-prediction (`weighted_bipred_idc == 2`) is gated by the
     // PPS flag being `== 1` and therefore does not trigger parsing here.
-    let weighted_explicit =
-        (matches!(slice_type, SliceType::P | SliceType::SP) && pps.weighted_pred_flag)
-            || (slice_type == SliceType::B && pps.weighted_bipred_idc == 1);
+    let weighted_explicit = (matches!(slice_type, SliceType::P | SliceType::SP)
+        && pps.weighted_pred_flag)
+        || (slice_type == SliceType::B && pps.weighted_bipred_idc == 1);
     let mut pred_weight_table: Option<PredWeightTable> = None;
     if weighted_explicit {
         pred_weight_table = Some(parse_pred_weight_table(

@@ -13,21 +13,29 @@
 //!     macroblocks reuse the I-slice intra path. Explicit weighted
 //!     prediction (§8.4.2.3.2) is applied to MC output when the PPS +
 //!     slice header enable it.
+//!   - B-slices in CAVLC entropy mode with spatial direct prediction
+//!     (§8.4.1.2.2), default + explicit weighted bi-prediction, and
+//!     all Table 7-14 / 7-17 non-MBAFF partition shapes.
 //! * Owns a [`crate::dpb::Dpb`] holding up to `sps.max_num_ref_frames`
 //!   reconstructed reference frames with POC ordering, sliding-window
 //!   marking (§8.2.5.3), and MMCO operations 1 / 2 / 3 / 4 / 5 / 6
 //!   (§8.2.5.4). Each P-slice sees a freshly-built `RefPicList0`
-//!   (§8.2.4.2.1) and can index it via `ref_idx_l0 > 0`.
+//!   (§8.2.4.2.1); each B-slice sees both `RefPicList0` and
+//!   `RefPicList1` (§8.2.4.2.3). The DPB's POC-ordered reorder queue
+//!   is activated (size = `max_num_ref_frames`) on the first B-slice
+//!   so frames emerge in presentation order.
 //!
 //! Out of scope (returns `Error::Unsupported`):
-//! * CABAC P-slices.
-//! * B-slices (bi-prediction). Implicit weighted bi-prediction
-//!   (`weighted_bipred_idc == 2`) is not implemented either.
+//! * CABAC P- and B-slices.
+//! * B-slice temporal direct MV prediction (§8.4.1.2.3,
+//!   `direct_spatial_mv_pred_flag = 0`).
+//! * Implicit weighted bi-prediction (`weighted_bipred_idc == 2`,
+//!   §8.4.2.3.3).
 //! * Reference picture list modification (RPLM) — only the identity
 //!   (flag = 0) form is accepted. Any non-trivial RPLM command surfaces
 //!   `Error::Unsupported`.
 //! * `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
-//! * Interlaced coding / MBAFF.
+//! * Interlaced coding / MBAFF (P and B).
 //! * 8×8 transform, 4:2:2 / 4:4:4 chroma, bit depth > 8.
 
 use std::collections::{HashMap, VecDeque};
@@ -38,14 +46,15 @@ use oxideav_core::{
     VideoFrame,
 };
 
+use crate::b_mb::{decode_b_skip_mb, decode_b_slice_mb};
 use crate::bitreader::BitReader;
 use crate::cabac::{engine::CabacDecoder, mb::decode_i_mb_cabac, tables::init_slice_contexts};
 use crate::dpb::{derive_poc_type0, derive_poc_type2, Dpb, MmcoCommand, PocState};
 use crate::mb::decode_i_slice_data;
-use crate::p_mb::{decode_p_slice_mb, decode_p_skip_mb};
 use crate::nal::{
     extract_rbsp, split_annex_b, split_length_prefixed, AvcConfig, NalHeader, NalUnitType,
 };
+use crate::p_mb::{decode_p_skip_mb, decode_p_slice_mb};
 use crate::picture::Picture;
 use crate::pps::{parse_pps, Pps};
 use crate::slice::{parse_slice_header, SliceHeader, SliceType};
@@ -176,9 +185,26 @@ impl H264Decoder {
                             ));
                         }
                     }
+                    SliceType::B => {
+                        if pps.entropy_coding_mode_flag {
+                            return Err(Error::unsupported(
+                                "h264: CABAC B-slices not implemented — use CAVLC (entropy_coding_mode_flag=0)",
+                            ));
+                        }
+                        if !sh.direct_spatial_mv_pred_flag {
+                            return Err(Error::unsupported(
+                                "h264 b-slice: temporal direct MV prediction (§8.4.1.2.3) not implemented",
+                            ));
+                        }
+                        if pps.weighted_bipred_idc == 2 {
+                            return Err(Error::unsupported(
+                                "h264 b-slice: implicit weighted bi-prediction (weighted_bipred_idc=2) not implemented",
+                            ));
+                        }
+                    }
                     other => {
                         return Err(Error::unsupported(format!(
-                            "h264: slice type {:?} not implemented (only I + CAVLC P supported)",
+                            "h264: slice type {:?} not implemented",
                             other
                         )));
                     }
@@ -200,20 +226,29 @@ impl H264Decoder {
                 }
 
                 // Lazily (re)create the DPB when we first see an SPS —
-                // its size depends on `max_num_ref_frames`. We use
-                // `reorder_window = 0` because B-slices are not yet
-                // implemented; without B-slices, decode order equals POC
-                // order and no buffering is needed to deliver frames to
-                // the caller.
+                // its size depends on `max_num_ref_frames`. We size the
+                // output-reorder window from `max_num_ref_frames` unless
+                // the stream contains no B-slices, in which case POC order
+                // equals decode order and no buffering is required. Once a
+                // B-slice is observed we bump the reorder window so
+                // decode-order pictures delayed in the DPB can emerge in
+                // POC order. The VUI's `bitstream_restriction.max_num_reorder_frames`
+                // is the canonical source but we do not parse VUI yet —
+                // using `max_num_ref_frames` is a safe upper bound.
                 let want_dpb_size = sps.max_num_ref_frames.max(1);
-                if self
-                    .dpb
-                    .as_ref()
-                    .map(|d| d.max_num_ref_frames)
-                    .unwrap_or(0)
-                    != want_dpb_size
-                {
-                    self.dpb = Some(Dpb::new(want_dpb_size, 0));
+                let want_reorder = if sh.slice_type == SliceType::B {
+                    sps.max_num_ref_frames.max(1)
+                } else {
+                    0
+                };
+                match self.dpb.as_mut() {
+                    Some(d) if d.max_num_ref_frames == want_dpb_size => {
+                        // Bump the reorder window if a B-slice raises it.
+                        d.set_reorder_window(d.reorder_window().max(want_reorder));
+                    }
+                    _ => {
+                        self.dpb = Some(Dpb::new(want_dpb_size, want_reorder));
+                    }
                 }
 
                 let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
@@ -308,11 +343,33 @@ impl H264Decoder {
                                 ));
                             }
                         }
-                        let list0: Vec<&Picture> =
-                            ref_entries.iter().map(|r| &r.pic).collect();
+                        let list0: Vec<&Picture> = ref_entries.iter().map(|r| &r.pic).collect();
                         let mut br = BitReader::new(&rbsp);
                         br.skip(sh.slice_data_bit_offset as u32)?;
                         decode_p_slice_data(&mut br, &sh, &sps, &pps, &mut pic, &list0)?;
+                    }
+                    SliceType::B => {
+                        let dpb = self.dpb.as_mut().expect("DPB initialised above");
+                        dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
+                        let l0_entries = dpb.build_list0_b(poc, sh.num_ref_idx_l0_active_minus1);
+                        let l1_entries = dpb.build_list1_b(poc, sh.num_ref_idx_l1_active_minus1);
+                        if l0_entries.is_empty() || l1_entries.is_empty() {
+                            return Err(Error::invalid(
+                                "h264 b-slice: empty RefPicList0/1 (no prior references?)",
+                            ));
+                        }
+                        for rf in l0_entries.iter().chain(l1_entries.iter()) {
+                            if rf.pic.mb_width != mb_w || rf.pic.mb_height != mb_h {
+                                return Err(Error::invalid(
+                                    "h264 b-slice: reference picture size mismatch",
+                                ));
+                            }
+                        }
+                        let list0: Vec<&Picture> = l0_entries.iter().map(|r| &r.pic).collect();
+                        let list1: Vec<&Picture> = l1_entries.iter().map(|r| &r.pic).collect();
+                        let mut br = BitReader::new(&rbsp);
+                        br.skip(sh.slice_data_bit_offset as u32)?;
+                        decode_b_slice_data(&mut br, &sh, &sps, &pps, &mut pic, &list0, &list1)?;
                     }
                     _ => unreachable!(),
                 }
@@ -433,7 +490,9 @@ fn decode_p_slice_data(
     let total_mbs = mb_w * mb_h;
     let mut mb_addr = sh.first_mb_in_slice;
     if mb_addr >= total_mbs {
-        return Err(Error::invalid("h264 p-slice: first_mb_in_slice out of range"));
+        return Err(Error::invalid(
+            "h264 p-slice: first_mb_in_slice out of range",
+        ));
     }
     let mut prev_qp = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
 
@@ -454,6 +513,64 @@ fn decode_p_slice_data(
         let mb_x = mb_addr % mb_w;
         let mb_y = mb_addr / mb_w;
         decode_p_slice_mb(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, &mut prev_qp)?;
+        mb_addr += 1;
+    }
+    Ok(())
+}
+
+/// CAVLC B-slice data loop — §7.3.4.
+///
+/// Mirrors the P-slice loop: each coded MB is preceded by `mb_skip_run` that
+/// counts how many `B_Skip` MBs come before the next coded MB. Trailing
+/// `B_Skip` runs are also permitted (no coded MB follows).
+fn decode_b_slice_data(
+    br: &mut BitReader<'_>,
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+) -> Result<()> {
+    let mb_w = sps.pic_width_in_mbs();
+    let mb_h = sps.pic_height_in_map_units();
+    let total_mbs = mb_w * mb_h;
+    let mut mb_addr = sh.first_mb_in_slice;
+    if mb_addr >= total_mbs {
+        return Err(Error::invalid(
+            "h264 b-slice: first_mb_in_slice out of range",
+        ));
+    }
+    let mut prev_qp = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+
+    while mb_addr < total_mbs {
+        let skip_run = br.read_ue()?;
+        for _ in 0..skip_run {
+            if mb_addr >= total_mbs {
+                break;
+            }
+            let mb_x = mb_addr % mb_w;
+            let mb_y = mb_addr / mb_w;
+            decode_b_skip_mb(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, prev_qp)?;
+            mb_addr += 1;
+        }
+        if mb_addr >= total_mbs {
+            break;
+        }
+        let mb_x = mb_addr % mb_w;
+        let mb_y = mb_addr / mb_w;
+        decode_b_slice_mb(
+            br,
+            sps,
+            pps,
+            sh,
+            mb_x,
+            mb_y,
+            pic,
+            ref_list0,
+            ref_list1,
+            &mut prev_qp,
+        )?;
         mb_addr += 1;
     }
     Ok(())
