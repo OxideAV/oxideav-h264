@@ -1,8 +1,8 @@
 # oxideav-h264
 
 Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
-oxideav. Decodes CAVLC + CABAC I-slices, CAVLC P-slices, and CAVLC
-B-slices (spatial direct + explicit weighted bipred); encodes a minimal
+oxideav. Decodes CAVLC + CABAC I-slices, CAVLC + CABAC P-slices, and
+CAVLC B-slices (spatial direct + explicit weighted bipred); encodes a minimal
 Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED output stream. The
 High-Profile 8×8 transform + Intra_8×8 prediction math primitives are
 unit-tested but **not** wired into the macroblock decode loop —
@@ -224,8 +224,15 @@ a half-finished code path in the decode loop.
 Decoder surfaces `Error::Unsupported` (or `Error::InvalidData` when the
 bitstream claims a feature that isn't wired); encoder outright refuses:
 
-- **Decoder**: CABAC P-slices and CABAC B-slices (baseline CAVLC P + B
-  work — set `entropy_coding_mode_flag = 0` at the external encoder).
+- **Decoder**: CABAC B-slices (CAVLC B works). CABAC P-slices are wired
+  for the CAVLC-equivalent coverage (P_Skip, P_L0_16×16 / 16×8 / 8×16,
+  P_8×8 with all four sub-partitions, intra-in-P) with two caveats that
+  surface `Error::Unsupported` on this first pass:
+  - `transform_size_8x8_flag = 1` is not supported (same scoping as the
+    CAVLC I / P paths).
+  - Weighted prediction on the CABAC P path is parsed but weights are
+    not applied; encoders should disable weighted P for CABAC bitstreams
+    fed into this decoder, or tolerate unweighted MC output.
   Any I-slice macroblock with `transform_size_8x8_flag = 1` (CAVLC and
   CABAC).
 - **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16

@@ -422,6 +422,249 @@ pub fn decode_rem_intra4x4_pred_mode(d: &mut CabacDecoder<'_>) -> Result<u32> {
     decode_fixed_length(d, 3)
 }
 
+/// §9.3.3.1.1.1 — `mb_skip_flag` for P/SP slices. A single regular-mode bin
+/// with `ctxIdxInc = condTermFlagA + condTermFlagB`, where `condTermFlagN = 1`
+/// iff neighbour N exists and is NOT a skipped macroblock. Returns `true`
+/// when the macroblock is skipped.
+pub fn decode_mb_skip_flag_p(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    ctx_idx_inc: u8,
+) -> Result<bool> {
+    if ctxs.len() < 3 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_mb_skip_flag_p: need >=3 ctxs",
+        ));
+    }
+    let inc = (ctx_idx_inc as usize).min(2);
+    Ok(d.decode_bin(&mut ctxs[inc])? == 1)
+}
+
+/// Table 9-36 — `mb_type` for P/SP slices. Returns the spec's raw mb_type
+/// value in `0..=30` (values 0..=4 are the P inter partitions, 5..=30 map
+/// to the intra-in-P offset of Table 7-11).
+///
+/// Binarization (Table 9-36):
+///   prefix bin 0 ctxIdxInc = 0 (within the P mb_type ctx bank)
+///   bin  value  binstring
+///   0    P_L0_16x16          0
+///   1    P_L0_L0_16x8        1 0 0
+///   2    P_L0_L0_8x16        1 0 1
+///   3    P_8x8               1 1 0
+///   4    P_8x8ref0           not applicable here (main profile only)
+///   5..30 intra-in-P         prefix `1 1 1` followed by the I-slice
+///                            bin-string with ctxIdxOffset 17.
+///
+/// The P-slice's 7 `mb_type` contexts are laid out in `ctxs[0..7]`:
+///   `ctxs[0]`        — prefix bin 0
+///   `ctxs[1]`        — bin 1 (sub-branch select)
+///   `ctxs[2]`        — bin 2 (partition select)
+///   `ctxs[3..7]`     — intra-in-P bins (mapped from CTX_IDX_MB_TYPE_I
+///                      via the same `decode_mb_type_i` machinery).
+pub fn decode_mb_type_p(
+    d: &mut CabacDecoder<'_>,
+    p_ctxs: &mut [CabacContext],
+    i_ctxs: &mut [CabacContext],
+) -> Result<u32> {
+    if p_ctxs.len() < 3 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_mb_type_p: need >=3 P mb_type ctxs",
+        ));
+    }
+    let b0 = d.decode_bin(&mut p_ctxs[0])?;
+    if b0 == 0 {
+        // P_L0_16x16 — mb_type = 0.
+        return Ok(0);
+    }
+    let b1 = d.decode_bin(&mut p_ctxs[1])?;
+    let b2 = d.decode_bin(&mut p_ctxs[2])?;
+    if b1 == 0 {
+        // 1 0 x
+        return Ok(if b2 == 0 { 1 } else { 2 });
+    }
+    // 1 1 0 → P_8x8, 1 1 1 → intra-in-P (plus further bins).
+    if b2 == 0 {
+        return Ok(3);
+    }
+    // Intra-in-P: decode the I-slice mb_type bin string with ctxIdxInc = 0
+    // (the first bin's neighbour-derived ctxIdxInc is folded into `inc=0`
+    // here because P_8x8 vs intra branch is already decided).
+    let raw = decode_mb_type_i(d, i_ctxs, 0)?;
+    // Offset by +5 for Table 7-13's intra-in-P re-indexing.
+    Ok(5 + raw)
+}
+
+/// Table 9-38 — `sub_mb_type` for P/SP slices. Returns the spec value
+/// (`0..=3`) corresponding to P_L0_8x8 / 8x4 / 4x8 / 4x4.
+///
+/// Binarization:
+///   0  P_L0_8x8  : 0
+///   1  P_L0_8x4  : 1 0 0
+///   2  P_L0_4x8  : 1 0 1
+///   3  P_L0_4x4  : 1 1
+///
+/// ctxIdxOffset = 21 for P sub_mb_type; ctxIdxInc is 0/1/2 for bins 0/1/2.
+pub fn decode_sub_mb_type_p(d: &mut CabacDecoder<'_>, ctxs: &mut [CabacContext]) -> Result<u32> {
+    if ctxs.len() < 3 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_sub_mb_type_p: need >=3 P sub_mb_type ctxs",
+        ));
+    }
+    let b0 = d.decode_bin(&mut ctxs[0])?;
+    if b0 == 0 {
+        return Ok(0);
+    }
+    let b1 = d.decode_bin(&mut ctxs[1])?;
+    if b1 == 1 {
+        return Ok(3);
+    }
+    let b2 = d.decode_bin(&mut ctxs[2])?;
+    Ok(if b2 == 0 { 1 } else { 2 })
+}
+
+/// §9.3.3.1.1.7, Table 9-37 — `mvd_lX` component (x or y) binarization.
+///
+/// UEGk with `uCoff = 9, k = 3`, regular-mode unary prefix with bin-0 ctxIdx
+/// picked by the neighbour MVD magnitude sum, bypass suffix + sign. The
+/// caller passes `ctxs` = the 7-element MVD context bank for this component
+/// (either MVD_L0_X or MVD_L0_Y, starting at ctxIdxOffset 40 or 47).
+/// `abs_neighbour_sum` is `absMvdComp(A) + absMvdComp(B)` per §9.3.3.1.1.7.
+pub fn decode_mvd_component(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    abs_neighbour_sum: u32,
+) -> Result<i32> {
+    if ctxs.len() < 7 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_mvd_component: need >=7 ctxs (one component)",
+        ));
+    }
+    // §9.3.3.1.1.7 Table 9-37: ctxIdxInc for prefix bin 0 comes from
+    // `abs_neighbour_sum`:
+    //   <  3    -> 0
+    //   >  32   -> 2
+    //   else    -> 1
+    // bins 1..=5 use ctxIdxInc 3, 4, 5, 6, 6.
+    let inc0 = if abs_neighbour_sum < 3 {
+        0usize
+    } else if abs_neighbour_sum > 32 {
+        2
+    } else {
+        1
+    };
+    // Read bin 0.
+    let b0 = d.decode_bin(&mut ctxs[inc0])?;
+    if b0 == 0 {
+        return Ok(0);
+    }
+    // Bins 1..=8 (prefix can be up to 9 ones before suffix kicks in).
+    let mut prefix_ones: u32 = 1;
+    let mut saturated = true;
+    const BIN_INCS: [usize; 8] = [3, 4, 5, 6, 6, 6, 6, 6];
+    for bin_inc in BIN_INCS.iter().copied() {
+        let b = d.decode_bin(&mut ctxs[bin_inc])?;
+        if b == 0 {
+            saturated = false;
+            break;
+        }
+        prefix_ones += 1;
+        if prefix_ones == 9 {
+            break;
+        }
+    }
+    let magnitude = if saturated {
+        // UEGk suffix with k = 3 in bypass.
+        let mut k: u32 = 3;
+        let mut extra: u32 = 0;
+        loop {
+            let b = d.decode_bypass()?;
+            if b == 0 {
+                break;
+            }
+            extra = extra.checked_add(1u32 << k).ok_or_else(|| {
+                Error::invalid("cabac::binarize::decode_mvd_component: suffix overflow")
+            })?;
+            k = k.checked_add(1).ok_or_else(|| {
+                Error::invalid("cabac::binarize::decode_mvd_component: suffix k overflow")
+            })?;
+            if k > 31 {
+                return Err(Error::invalid(
+                    "cabac::binarize::decode_mvd_component: suffix too long",
+                ));
+            }
+        }
+        let mut tail: u32 = 0;
+        for _ in 0..k {
+            tail = (tail << 1) | d.decode_bypass()? as u32;
+        }
+        9u32.saturating_add(extra).saturating_add(tail)
+    } else {
+        prefix_ones
+    };
+    // Sign bypass bit.
+    let sign = d.decode_bypass()?;
+    let v = magnitude as i32;
+    Ok(if sign == 1 { -v } else { v })
+}
+
+/// §9.3.3.1.1.2 — `ref_idx_lX`. Unary binarization with `ctxIdxInc` on
+/// bin 0 derived from neighbours:
+///   `condTermFlagN = (neighbour uses list-X AND neighbour ref_idx_lX > 0)`
+///   `ctxIdxInc(0) = condTermFlagA + 2·condTermFlagB`
+/// bins 1..=3 use ctxIdxInc 4 and 5 (per spec Table 9-34 / 9-19, with
+/// saturation at 5).
+///
+/// Returns the reference index (0-based; caller enforces the upper bound
+/// from `num_ref_idx_lX_active_minus1`).
+pub fn decode_ref_idx_lx(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    ctx_idx_inc_0: u8,
+) -> Result<u32> {
+    if ctxs.len() < 6 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_ref_idx_lx: need >=6 ctxs",
+        ));
+    }
+    let inc0 = (ctx_idx_inc_0 as usize).min(3);
+    let b0 = d.decode_bin(&mut ctxs[inc0])?;
+    if b0 == 0 {
+        return Ok(0);
+    }
+    let mut value: u32 = 1;
+    loop {
+        let bin_inc = if value == 1 { 4 } else { 5 };
+        let b = d.decode_bin(&mut ctxs[bin_inc])?;
+        if b == 0 {
+            return Ok(value);
+        }
+        value = value
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid("cabac::binarize::decode_ref_idx_lx: unary runaway"))?;
+        if value > 64 {
+            return Err(Error::invalid(
+                "cabac::binarize::decode_ref_idx_lx: ref_idx exceeded sanity limit",
+            ));
+        }
+    }
+}
+
+/// §9.3.3.1.1.10 — `transform_size_8x8_flag`. Single regular-mode bin with
+/// `ctxIdxInc = condTermFlagA + condTermFlagB`.
+pub fn decode_transform_size_8x8_flag(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+    ctx_idx_inc: u8,
+) -> Result<bool> {
+    if ctxs.is_empty() {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_transform_size_8x8_flag: empty ctxs",
+        ));
+    }
+    let inc = (ctx_idx_inc as usize).min(ctxs.len() - 1);
+    Ok(d.decode_bin(&mut ctxs[inc])? == 1)
+}
+
 // ---------------------------------------------------------------------------
 // Tests (§9.3.2 behaviours only — per-syntax wrappers are integration-tested
 // by Agent E against real bitstreams).

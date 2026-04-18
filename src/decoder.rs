@@ -26,7 +26,8 @@
 //!   so frames emerge in presentation order.
 //!
 //! Out of scope (returns `Error::Unsupported`):
-//! * CABAC P- and B-slices.
+//! * CABAC B-slices. (CABAC P-slices are wired; see
+//!   [`crate::cabac::p_mb`].)
 //! * B-slice temporal direct MV prediction (§8.4.1.2.3,
 //!   `direct_spatial_mv_pred_flag = 0`).
 //! * Implicit weighted bi-prediction (`weighted_bipred_idc == 2`,
@@ -48,7 +49,10 @@ use oxideav_core::{
 
 use crate::b_mb::{decode_b_skip_mb, decode_b_slice_mb};
 use crate::bitreader::BitReader;
-use crate::cabac::{engine::CabacDecoder, mb::decode_i_mb_cabac, tables::init_slice_contexts};
+use crate::cabac::{
+    engine::CabacDecoder, mb::decode_i_mb_cabac, p_mb::decode_p_mb_cabac,
+    tables::init_slice_contexts,
+};
 use crate::dpb::{derive_poc_type0, derive_poc_type2, Dpb, MmcoCommand, PocState};
 use crate::mb::decode_i_slice_data;
 use crate::nal::{
@@ -179,11 +183,9 @@ impl H264Decoder {
                 match sh.slice_type {
                     SliceType::I => {}
                     SliceType::P => {
-                        if pps.entropy_coding_mode_flag {
-                            return Err(Error::unsupported(
-                                "h264: CABAC P-slices not implemented — use CAVLC (entropy_coding_mode_flag=0) for P",
-                            ));
-                        }
+                        // CABAC P-slice support shipped in this crate; the
+                        // dispatch below routes to the CABAC data loop when
+                        // `entropy_coding_mode_flag = 1`.
                     }
                     SliceType::B => {
                         if pps.entropy_coding_mode_flag {
@@ -344,9 +346,13 @@ impl H264Decoder {
                             }
                         }
                         let list0: Vec<&Picture> = ref_entries.iter().map(|r| &r.pic).collect();
-                        let mut br = BitReader::new(&rbsp);
-                        br.skip(sh.slice_data_bit_offset as u32)?;
-                        decode_p_slice_data(&mut br, &sh, &sps, &pps, &mut pic, &list0)?;
+                        if pps.entropy_coding_mode_flag {
+                            decode_cabac_p_slice(&rbsp, &sh, &sps, &pps, &mut pic, &list0)?;
+                        } else {
+                            let mut br = BitReader::new(&rbsp);
+                            br.skip(sh.slice_data_bit_offset as u32)?;
+                            decode_p_slice_data(&mut br, &sh, &sps, &pps, &mut pic, &list0)?;
+                        }
                     }
                     SliceType::B => {
                         let dpb = self.dpb.as_mut().expect("DPB initialised above");
@@ -624,6 +630,65 @@ fn decode_cabac_i_slice(
         if mb_addr >= total_mbs {
             return Err(Error::invalid(
                 "h264 cabac slice: end_of_slice_flag did not fire before last MB",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// §9.3 CABAC entropy-coded P-slice data loop. Mirrors `decode_p_slice_data`
+/// but feeds every macroblock through [`crate::cabac::p_mb::decode_p_mb_cabac`]
+/// and relies on [`CabacDecoder::decode_terminate`] for the
+/// `end_of_slice_flag`. `mb_skip_flag` replaces CAVLC's `mb_skip_run`.
+fn decode_cabac_p_slice(
+    rbsp: &[u8],
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+) -> Result<()> {
+    let mb_w = sps.pic_width_in_mbs();
+    let mb_h = sps.pic_height_in_map_units();
+    let total_mbs = mb_w * mb_h;
+    let slice_qpy = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+    let mut ctxs = init_slice_contexts(sh.cabac_init_idc, false, slice_qpy);
+    let mut dec = CabacDecoder::new(rbsp, sh.slice_data_bit_offset as usize)?;
+    let mut prev_qp = slice_qpy;
+    pic.last_mb_qp_delta_was_nonzero = false;
+    let mut mb_addr = sh.first_mb_in_slice;
+    if mb_addr >= total_mbs {
+        return Err(Error::invalid(
+            "h264 cabac p-slice: first_mb_in_slice out of range",
+        ));
+    }
+    loop {
+        let mb_x = mb_addr % mb_w;
+        let mb_y = mb_addr / mb_w;
+        let skipped = decode_p_mb_cabac(
+            &mut dec,
+            &mut ctxs,
+            sh,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            ref_list0,
+            &mut prev_qp,
+        )?;
+        mb_addr += 1;
+        // §9.3.3.2.4 end_of_slice_flag — terminate bin after every MB, even
+        // skipped ones. If a skip runs us past the last MB without the
+        // terminate bit firing we flag a malformed bitstream.
+        let _ = skipped;
+        let end = dec.decode_terminate()?;
+        if end == 1 {
+            break;
+        }
+        if mb_addr >= total_mbs {
+            return Err(Error::invalid(
+                "h264 cabac p-slice: end_of_slice_flag did not fire before last MB",
             ));
         }
     }

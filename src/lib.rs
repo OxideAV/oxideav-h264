@@ -17,6 +17,13 @@
 //!   P_Skip, plus intra-in-P macroblocks. Luma 6-tap half-pel + bilinear
 //!   quarter-pel MC; bilinear 1/8-pel chroma MC; edge-replicated
 //!   out-of-picture reads.
+//! * **CABAC Main-profile P-slice** entropy decode (§9.3) —
+//!   `mb_skip_flag`, `mb_type` (Table 9-36), `sub_mb_type` (Table 9-38),
+//!   `ref_idx_l0` (unary + neighbour-indexed ctxIdxInc), `mvd_l0_{x,y}`
+//!   (UEGk with §9.3.3.1.1.7 neighbour-magnitude ctxIdxInc),
+//!   `coded_block_pattern`, `mb_qp_delta`, and 4×4 residual coding.
+//!   `weighted_pred_flag = 1` is parsed but weights are not yet wired
+//!   on the CABAC path; `transform_size_8x8_flag = 1` is rejected.
 //! * **Multi-reference DPB** (Annex C / §8.2.5) — [`dpb::Dpb`] holds up
 //!   to `sps.max_num_ref_frames` reconstructed reference frames. Each
 //!   P-slice builds a fresh `RefPicList0` (§8.2.4.2.1) — short-term
@@ -88,8 +95,9 @@
 //!   `transform_size_8x8_flag = 1`.
 //! * Custom scaling-list matrices — the SPS/PPS fields are parsed and
 //!   skipped, and only the flat-16 default list is used for 4×4 dequant.
-//! * CABAC P-slices and CABAC B-slices (decode); any CABAC encoding; any
-//!   P/B slice encoding.
+//! * CABAC B-slices (decode); any CABAC encoding; any P/B slice encoding.
+//!   CABAC P-slices are wired but weighted-P on the CABAC path and the
+//!   8×8 transform path are out of scope on this first pass.
 //! * **Temporal direct** B-slice MV prediction (§8.4.1.2.3,
 //!   `direct_spatial_mv_pred_flag = 0`) — only spatial direct
 //!   (§8.4.1.2.2) is wired today.
