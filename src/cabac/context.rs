@@ -139,12 +139,13 @@ mod tests {
 
     /// An I-slice invocation must produce exactly `NUM_CTX` entries.
     #[test]
-    fn init_slice_contexts_for_i_slice_has_460_entries() {
+    fn init_slice_contexts_for_i_slice_has_full_range() {
         let ctxs = init_slice_contexts(0, true, 26);
         assert_eq!(ctxs.len(), NUM_CTX);
-        // 460 main-profile contexts + 4 Luma8×8 coded_block_flag contexts
-        // (ctxIdx 1012..=1015 remapped into tail slots, §9.3.3.1.1.9).
-        assert_eq!(NUM_CTX, 464);
+        // Full 1024-slot layout from ITU-T H.264 (2019): Main-profile
+        // 0..=459 + High-Profile 8×8 + 4:4:4 Cb/Cr extension at
+        // 460..=1023 (§9.3.3.1.1.9 Table 9-42).
+        assert_eq!(NUM_CTX, 1024);
         // All pStateIdx values must be in 0..=63.
         for c in &ctxs {
             assert!(c.p_state_idx <= 63);
@@ -154,7 +155,7 @@ mod tests {
 
     /// Same for a P-slice using cabac_init_idc = 0.
     #[test]
-    fn init_slice_contexts_for_p_slice_has_460_entries() {
+    fn init_slice_contexts_for_p_slice_has_full_range() {
         let ctxs = init_slice_contexts(0, false, 28);
         assert_eq!(ctxs.len(), NUM_CTX);
         for c in &ctxs {

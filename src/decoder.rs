@@ -347,25 +347,11 @@ impl H264Decoder {
                         // pipeline (chroma planes the same size as luma,
                         // luma-style residual / intra prediction per plane,
                         // luma 6-tap MC filter on chroma per §8.4.2.2
-                        // Table 8-9).
-                        //
-                        // CABAC 4:4:4 is gated until the spec's extended
-                        // ctxBlockCat banks (6..=13 in §9.3.3.1.1.9
-                        // Table 9-42, ctxIdxOffsets 1012+) are wired —
-                        // sharing the luma cat=0/1/2/5 banks across all
-                        // three planes diverges from the encoder's
-                        // probability state after the first MB.
-                        // `crate::cabac::mb_444` holds the entry-point
-                        // plumbing (mb_type + per-plane intra prediction +
-                        // per-plane residual dispatch) for the follow-up
-                        // that lights those banks up.
-                        if pps.entropy_coding_mode_flag {
-                            return Err(Error::unsupported(
-                                "h264: 4:4:4 CABAC entropy decode not yet wired — \
-                                 needs §9.3.3.1.1.9 Table 9-42 extended Cb/Cr \
-                                 ctxBlockCat banks (CAVLC I/P/B supported)",
-                            ));
-                        }
+                        // Table 8-9). CABAC 4:4:4 routes through
+                        // [`crate::cabac::mb_444`] with the §9.3.3.1.1.9
+                        // Table 9-42 extension banks (cats 6..=13 at spec
+                        // ctxIdx 460+ / 952+ / 1012+) wired in
+                        // `ResidualCtxPlan::new_for_plane`.
                     }
                     v => {
                         return Err(Error::unsupported(format!(

@@ -149,28 +149,6 @@ fn decode_yuv444_cavlc_b_matches_reference() {
 }
 
 #[test]
-fn decode_yuv444_cabac_is_rejected_cleanly() {
-    // The 4:4:4 CABAC entry-point infrastructure (mb_type + per-plane
-    // intra prediction + per-plane residual dispatch) is staged in
-    // [`crate::cabac::mb_444`] / [`crate::cabac::p_mb_444`], but decode
-    // is gated at the slice gate until the spec's extended Cb/Cr
-    // ctxBlockCat banks (§9.3.3.1.1.9 Table 9-42 extension, ctxIdxOffset
-    // 1012+) are wired. Reusing the luma cat=0/1/2/5 banks across all
-    // three planes diverges from the encoder's probability state after
-    // the first MB, so the gate rejects cleanly with a specific
-    // `Error::Unsupported` message rather than producing corrupted YUV.
-    let es = read_fixture("tests/fixtures/yuv444_cabac_i_64x64.es");
-    let mut dec = H264Decoder::new(CodecId::new("h264"));
-    let err = dec.send_packet(&single_packet(es)).expect_err("expected gate reject");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("4:4:4 CABAC entropy decode"),
-        "expected 4:4:4 CABAC gate reject, got {msg}",
-    );
-}
-
-#[test]
-#[ignore = "4:4:4 CABAC I needs §9.3.3.1.1.9 Table 9-42 extended Cb/Cr ctxBlockCat banks (ctxIdxOffset 1012+). Entry-point plumbing lives in cabac::mb_444; gate rejects cleanly until the extended banks land."]
 fn decode_yuv444_cabac_i_matches_reference() {
     // §9.3 — 4:4:4 CABAC I. Three luma-style residual streams per MB,
     // luma contexts applied to each plane (Y uses scaling slot 0, Cb
@@ -199,7 +177,6 @@ fn decode_yuv444_cabac_i_matches_reference() {
 }
 
 #[test]
-#[ignore = "4:4:4 CABAC P inter MBs not yet wired — currently supports intra-in-P + P_Skip only"]
 fn decode_yuv444_cabac_p_matches_reference() {
     // §9.3 — 4:4:4 CABAC P. Inter MBs require a per-plane MC + residual
     // pipeline that isn't wired yet; this test is kept ignored until
@@ -221,7 +198,6 @@ fn decode_yuv444_cabac_p_matches_reference() {
 }
 
 #[test]
-#[ignore = "4:4:4 CABAC B inter MBs not yet wired — currently supports intra-in-B + B_Skip only"]
 fn decode_yuv444_cabac_b_matches_reference() {
     // §9.3 — 4:4:4 CABAC B. Same situation as the P test above.
     let es = read_fixture("tests/fixtures/yuv444_cabac_b_64x64.es");
