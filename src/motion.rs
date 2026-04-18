@@ -346,14 +346,51 @@ pub fn luma_mc(
     part_w: usize,
     part_h: usize,
 ) {
+    // §6.4.1 / §8.4.2.2.1 — luma MC is bit-depth agnostic and plane-agnostic;
+    // only the source buffer + stride + Clip1 bounds change. 4:4:4 chroma MC
+    // (§8.4.2.2 under chroma_format_idc = 3) uses the same 6-tap / bilinear
+    // recipe against the chroma plane, so we go through a plane-agnostic
+    // helper.
+    luma_mc_plane(
+        dst,
+        &ref_pic.y,
+        ref_pic.luma_stride(),
+        ref_pic.width as i32,
+        ref_pic.height as i32,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_q,
+        part_w,
+        part_h,
+    );
+}
+
+/// Plane-agnostic 8-bit luma-style motion compensation. Reads 6-tap half-pel
+/// + bilinear quarter-pel samples from the supplied plane buffer and writes
+/// into `dst` (row-major, stride = `part_w`). Used by both the 4:2:0 luma
+/// path and the 4:4:4 chroma path (which applies the luma filter to each
+/// chroma plane per §6.4.1 / §8.4.2.2.1 Table 8-9 when `ChromaArrayType = 3`).
+#[allow(clippy::too_many_arguments)]
+pub fn luma_mc_plane(
+    dst: &mut [u8],
+    src: &[u8],
+    stride: usize,
+    plane_w: i32,
+    plane_h: i32,
+    base_x: i32,
+    base_y: i32,
+    mv_x_q: i32,
+    mv_y_q: i32,
+    part_w: usize,
+    part_h: usize,
+) {
     let fx = mv_x_q & 3;
     let fy = mv_y_q & 3;
     let int_x = base_x + (mv_x_q >> 2);
     let int_y = base_y + (mv_y_q >> 2);
-    let w = ref_pic.width as i32;
-    let h = ref_pic.height as i32;
-    let stride = ref_pic.luma_stride();
-    let src = &ref_pic.y;
+    let w = plane_w;
+    let h = plane_h;
     let get = |y: i32, x: i32| -> i32 { src[clamp_ref(y, h) * stride + clamp_ref(x, w)] as i32 };
 
     // Compute interpolated samples at (int_x + fx/4, int_y + fy/4) for each

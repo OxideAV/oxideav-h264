@@ -69,6 +69,8 @@ use crate::nal::{
     extract_rbsp, split_annex_b, split_length_prefixed, AvcConfig, NalHeader, NalUnitType,
 };
 use crate::p_mb::{decode_p_skip_mb, decode_p_slice_mb};
+use crate::p_mb_444::{decode_p_skip_mb_444, decode_p_slice_mb_444};
+use crate::b_mb_444::{decode_b_skip_mb_444, decode_b_slice_mb_444};
 use crate::p_mb_hi::{decode_p_skip_mb_hi, decode_p_slice_mb_hi};
 use crate::picture::Picture;
 use crate::pps::{parse_pps, Pps};
@@ -308,19 +310,22 @@ impl H264Decoder {
                         }
                     }
                     3 => {
-                        // 4:4:4 — only CAVLC I-slices are wired so far.
-                        // The CABAC path, P/B slices, and any other slice
-                        // type route back to Error::Unsupported via the
-                        // slice-type dispatch below.
-                        if sh.slice_type != SliceType::I {
-                            return Err(Error::unsupported(
-                                "h264: 4:4:4 (chroma_format_idc=3) supports I-slices only",
-                            ));
-                        }
+                        // 4:4:4 — CAVLC I/P/B and CABAC I are wired.
+                        // CABAC P/B under 4:4:4 still route back to
+                        // Error::Unsupported. §6.4.1 ChromaArrayType = 3
+                        // requires chroma planes the same size as luma,
+                        // luma-style residual / intra prediction per
+                        // plane, and the luma 6-tap MC filter on chroma
+                        // (§8.4.2.2 Table 8-9).
                         if pps.entropy_coding_mode_flag {
-                            return Err(Error::unsupported(
-                                "h264: 4:4:4 CABAC entropy decode not yet wired — CAVLC I-slice only",
-                            ));
+                            match sh.slice_type {
+                                SliceType::I => {}
+                                _ => {
+                                    return Err(Error::unsupported(
+                                        "h264: 4:4:4 CABAC P/B not yet wired — I only",
+                                    ));
+                                }
+                            }
                         }
                     }
                     v => {
@@ -580,6 +585,10 @@ impl H264Decoder {
                             let mut br = BitReader::new(&rbsp);
                             br.skip(sh.slice_data_bit_offset as u32)?;
                             decode_p_slice_data_hi(&mut br, &sh, &sps, &pps, &mut pic, &list0)?;
+                        } else if sps.chroma_format_idc == 3 {
+                            let mut br = BitReader::new(&rbsp);
+                            br.skip(sh.slice_data_bit_offset as u32)?;
+                            decode_p_slice_data_444(&mut br, &sh, &sps, &pps, &mut pic, &list0)?;
                         } else {
                             let mut br = BitReader::new(&rbsp);
                             br.skip(sh.slice_data_bit_offset as u32)?;
@@ -667,6 +676,12 @@ impl H264Decoder {
                         if pps.entropy_coding_mode_flag {
                             decode_cabac_b_slice(
                                 &rbsp, &sh, &sps, &pps, &mut pic, &list0, &list1, &b_ctx,
+                            )?;
+                        } else if sps.chroma_format_idc == 3 {
+                            let mut br = BitReader::new(&rbsp);
+                            br.skip(sh.slice_data_bit_offset as u32)?;
+                            decode_b_slice_data_444(
+                                &mut br, &sh, &sps, &pps, &mut pic, &list0, &list1, &b_ctx,
                             )?;
                         } else {
                             let mut br = BitReader::new(&rbsp);
@@ -968,6 +983,96 @@ fn decode_b_slice_data(
             ref_list1,
             ctx,
             &mut prev_qp,
+        )?;
+        mb_addr += 1;
+    }
+    Ok(())
+}
+
+/// CAVLC P-slice data loop for 4:4:4. Mirrors [`decode_p_slice_data`] but
+/// drives the 4:4:4 macroblock decoder in [`crate::p_mb_444`]. The spec
+/// wire-layer is unchanged (`mb_skip_run` preceding each coded MB); only
+/// the per-MB decoding shape differs under ChromaArrayType = 3.
+fn decode_p_slice_data_444(
+    br: &mut BitReader<'_>,
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+) -> Result<()> {
+    let mb_w = sps.pic_width_in_mbs();
+    let mb_h = sps.pic_height_in_map_units();
+    let total_mbs = mb_w * mb_h;
+    let mut mb_addr = sh.first_mb_in_slice;
+    if mb_addr >= total_mbs {
+        return Err(Error::invalid(
+            "h264 p-slice 4:4:4: first_mb_in_slice out of range",
+        ));
+    }
+    let mut prev_qp = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+    while mb_addr < total_mbs {
+        let skip_run = br.read_ue()?;
+        for _ in 0..skip_run {
+            if mb_addr >= total_mbs {
+                break;
+            }
+            let mb_x = mb_addr % mb_w;
+            let mb_y = mb_addr / mb_w;
+            decode_p_skip_mb_444(sh, mb_x, mb_y, pic, ref_list0, prev_qp)?;
+            mb_addr += 1;
+        }
+        if mb_addr >= total_mbs {
+            break;
+        }
+        let mb_x = mb_addr % mb_w;
+        let mb_y = mb_addr / mb_w;
+        decode_p_slice_mb_444(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, &mut prev_qp)?;
+        mb_addr += 1;
+    }
+    Ok(())
+}
+
+/// CAVLC B-slice data loop for 4:4:4. Mirrors [`decode_b_slice_data`].
+#[allow(clippy::too_many_arguments)]
+fn decode_b_slice_data_444(
+    br: &mut BitReader<'_>,
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+    ctx: &crate::b_mb::BSliceCtx<'_>,
+) -> Result<()> {
+    let mb_w = sps.pic_width_in_mbs();
+    let mb_h = sps.pic_height_in_map_units();
+    let total_mbs = mb_w * mb_h;
+    let mut mb_addr = sh.first_mb_in_slice;
+    if mb_addr >= total_mbs {
+        return Err(Error::invalid(
+            "h264 b-slice 4:4:4: first_mb_in_slice out of range",
+        ));
+    }
+    let mut prev_qp = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+    while mb_addr < total_mbs {
+        let skip_run = br.read_ue()?;
+        for _ in 0..skip_run {
+            if mb_addr >= total_mbs {
+                break;
+            }
+            let mb_x = mb_addr % mb_w;
+            let mb_y = mb_addr / mb_w;
+            decode_b_skip_mb_444(sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, prev_qp)?;
+            mb_addr += 1;
+        }
+        if mb_addr >= total_mbs {
+            break;
+        }
+        let mb_x = mb_addr % mb_w;
+        let mb_y = mb_addr / mb_w;
+        decode_b_slice_mb_444(
+            br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, &mut prev_qp,
         )?;
         mb_addr += 1;
     }

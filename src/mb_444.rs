@@ -55,14 +55,14 @@ pub const GOLOMB_TO_INTRA4X4_CBP_GRAY: [u8; 16] = [
 /// 4:4:4, are the same dimensions as luma and decode through the same
 /// luma intra / residual code paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Plane {
+pub enum Plane {
     Y,
     Cb,
     Cr,
 }
 
 impl Plane {
-    fn as_idx(self) -> usize {
+    pub fn as_idx(self) -> usize {
         match self {
             Plane::Y => 0,
             Plane::Cb => 1,
@@ -231,7 +231,7 @@ fn plane_samples(pic: &Picture, plane: Plane) -> (&[u8], usize) {
     (buf, stride)
 }
 
-fn plane_samples_mut(pic: &mut Picture, plane: Plane) -> (&mut [u8], usize) {
+pub fn plane_samples_mut(pic: &mut Picture, plane: Plane) -> (&mut [u8], usize) {
     let stride = pic.luma_stride();
     let buf = match plane {
         Plane::Y => pic.y.as_mut_slice(),
@@ -245,7 +245,7 @@ fn plane_samples_mut(pic: &mut Picture, plane: Plane) -> (&mut [u8], usize) {
 /// [`crate::mb::predict_nc_luma`] but lets chroma planes read/write
 /// their own arrays. In 4:4:4 each chroma plane has a full 16-entry
 /// array because the chroma grid matches luma's 4×4 raster.
-fn plane_nc_at(info: &MbInfo, plane: Plane) -> &[u8; 16] {
+pub(crate) fn plane_nc_at(info: &MbInfo, plane: Plane) -> &[u8; 16] {
     match plane {
         Plane::Y => &info.luma_nc,
         Plane::Cb => &info.cb_nc,
@@ -253,7 +253,7 @@ fn plane_nc_at(info: &MbInfo, plane: Plane) -> &[u8; 16] {
     }
 }
 
-fn plane_nc_at_mut(info: &mut MbInfo, plane: Plane) -> &mut [u8; 16] {
+pub fn plane_nc_at_mut(info: &mut MbInfo, plane: Plane) -> &mut [u8; 16] {
     match plane {
         Plane::Y => &mut info.luma_nc,
         Plane::Cb => &mut info.cb_nc,
@@ -263,8 +263,10 @@ fn plane_nc_at_mut(info: &mut MbInfo, plane: Plane) -> &mut [u8; 16] {
 
 /// §9.2.1.1 predicted-nC for a 4×4 block of `plane`. For luma this
 /// defers to the shared helper in `mb.rs` so the 4:2:0 path stays
-/// bit-exact.
-fn predict_nc_plane(
+/// bit-exact. Same function covers intra and inter neighbours —
+/// §9.2.1.1 reads the neighbour's per-4×4 TotalCoeff (`nc`) regardless
+/// of whether the neighbour MB is intra or inter.
+pub(crate) fn predict_nc_plane(
     pic: &Picture,
     mb_x: u32,
     mb_y: u32,
