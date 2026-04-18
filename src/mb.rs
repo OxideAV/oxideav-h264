@@ -248,18 +248,23 @@ pub fn decode_intra_mb_given_imb(
             cbp_luma,
             qp_y,
         )?,
-        IMbType::INxN if transform_8x8 => decode_luma_intra_8x8(
-            br,
-            sps,
-            pps,
-            sh,
-            mb_x,
-            mb_y,
-            pic,
-            &intra4x4_modes,
-            cbp_luma,
-            qp_y,
-        )?,
+        IMbType::INxN if transform_8x8 => {
+            // §8.7 deblocking keys on `transform_8x8` to skip the internal
+            // 4×4 edges that don't exist under an 8×8 transform.
+            pic.mb_info_mut(mb_x, mb_y).transform_8x8 = true;
+            decode_luma_intra_8x8(
+                br,
+                sps,
+                pps,
+                sh,
+                mb_x,
+                mb_y,
+                pic,
+                &intra4x4_modes,
+                cbp_luma,
+                qp_y,
+            )?
+        }
         IMbType::INxN => decode_luma_intra_nxn(
             br,
             sps,

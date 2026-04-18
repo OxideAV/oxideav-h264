@@ -80,9 +80,16 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
   Horizontal / DC / Plane), chroma 8×8 intra.
 - Inverse transforms: 4×4 integer IDCT, 4×4 Hadamard for Intra16×16 DC,
   2×2 Hadamard for chroma DC, spec-accurate dequantisation tables.
-- Optional in-loop deblocking (§8.7) honouring
-  `disable_deblocking_filter_idc` and the per-slice alpha / beta
-  offsets.
+- Spec-accurate in-loop deblocking (§8.7) on luma + both chroma planes:
+  per-4-pixel-edge `bS` derivation per §8.7.2 (MB-edge intra → 4,
+  internal intra → 3, non-zero residual → 2, MV/ref mismatch → 1);
+  §8.7.2.2 normal + strong luma filters, §8.7.2.3 chroma filter with
+  `chroma_qp_index_offset` applied through the Table 8-15 QP map and
+  the `tC = tC0 + 1` chroma bump. Internal edges are transform-size
+  aware (§7.3.5.1 `transform_size_8x8_flag = 1` → only the mid-MB edge
+  at offset 8 is filtered). Per-slice `slice_alpha_c0_offset_div2` and
+  `slice_beta_offset_div2` are honoured. MBAFF is out of scope (this
+  crate is frame-only).
 
 ### CAVLC B-slice decode (§8.4 + §8.2.4.2.3)
 
