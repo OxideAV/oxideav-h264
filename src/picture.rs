@@ -104,6 +104,16 @@ pub struct MbInfo {
     /// to skip the internal 4×4 edges that don't exist under an 8×8
     /// transform (only the mid-MB edge at sample offset 8 is filtered).
     pub transform_8x8: bool,
+    /// True when this is an I_16x16 macroblock whose luma DC block had
+    /// `coded_block_flag = 1` (i.e., at least one nonzero DC coefficient).
+    /// Used by §9.3.3.1.1.9 CABAC CBF ctxIdxInc derivation for the
+    /// Luma16x16 DC block of a neighbouring MB. False for I_NxN (no DC
+    /// block) and for MBs where DC CBF was 0.
+    pub luma16x16_dc_cbf: bool,
+    /// Per-plane chroma DC `coded_block_flag` (Cb=0, Cr=1). Used by
+    /// §9.3.3.1.1.9 to derive the CBF ctxIdxInc for a neighbouring MB's
+    /// chroma DC block.
+    pub chroma_dc_cbf: [bool; 2],
 }
 
 impl Default for MbInfo {
@@ -129,6 +139,8 @@ impl Default for MbInfo {
             intra: false,
             skipped: false,
             transform_8x8: false,
+            luma16x16_dc_cbf: false,
+            chroma_dc_cbf: [false; 2],
         }
     }
 }

@@ -112,45 +112,23 @@ fn decode_cabac_i_slice_tiny_all_zero_residual() {
 #[test]
 fn decode_cabac_i_slice_against_reference() {
     // 64×64 testsrc IDR (x264 @ QP=20) with real residual coefficient
-    // traffic across all 16 MBs.
-    //
-    // Status in wt/cabac-recon2:
-    //   * MB 0 decodes **bit-exact** against the ffmpeg reference (all 256
-    //     luma samples match, verified via a throwaway trace test).
-    //   * MBs 1..15 still mis-decode — the CABAC engine state (codIRange)
-    //     at the MB 1 boundary is off by 5 relative to ffmpeg's internal
-    //     CABAC_BITS=16 representation, causing mb_type bin 0 to pick the
-    //     wrong MPS/LPS branch and the remainder of the slice to desync.
-    //
-    // Root cause of the MB 0 bit-exactness fix (this wt): the §9.3.2.3 EGk
-    // suffix prefix for `coeff_abs_level_minus1 >= 14` is LEADING-ONES
-    // terminated by 0 — the opposite polarity from §9.1 ue(v). Our decoder
-    // was counting leading 0s, so every saturated coefficient (abs ≥ 15)
-    // clamped to abs=15 instead of the real magnitude, and MB 0's DC
-    // residual ([-128, -122, -57, ...]) was decoded as [8, -1, -25, ...]
-    // → 115/131/137 reconstruction instead of 15/17/81.
-    //
-    // The remaining MB 1+ divergence is a CABAC-engine-state issue
-    // (difference of 5 in codIRange at MB 1 pre-mb_type) that the current
-    // wt didn't run down. Soft-logged until that is resolved so the MB 0
-    // fix stays pinned without blocking CI.
+    // traffic across all 16 MBs. Hard-asserted bit-exact against the
+    // ffmpeg reference after §9.3.2.3 EGk prefix polarity fix plus spec-
+    // correct CBF neighbour derivations (§9.3.3.1.1.9) for:
+    //   * Luma_16x16 DC (stored as MbInfo::luma16x16_dc_cbf).
+    //   * Chroma DC per-plane (MbInfo::chroma_dc_cbf[0/1]).
+    //   * Chroma AC using in-MB running counts + neighbour MB cb/cr_nc.
     let es = include_bytes!("fixtures/cabac_i_64x64.es");
     let yuv = include_bytes!("fixtures/cabac_i_64x64.yuv");
-    let res = run_fixture(es, yuv, 64, 64, "cabac-i-64x64");
-    match res {
-        Ok((luma_pct, total_pct)) => {
-            if luma_pct >= 95.0 && total_pct >= 95.0 {
-                // Pass — desync was fixed.
-            } else {
-                eprintln!(
-                    "cabac-i-64x64 decoded but mismatches reference (luma {luma_pct:.2}%, total {total_pct:.2}%) — \
-                     MB 1+ CABAC-engine-state desync still present (MB 0 is bit-exact)"
-                );
-            }
-        }
-        Err(e) => {
-            eprintln!("cabac-i-64x64 MB 1+ residual decode still desyncs: {e}");
-        }
-    }
+    let (luma_pct, total_pct) = run_fixture(es, yuv, 64, 64, "cabac-i-64x64")
+        .expect("cabac-i-64x64 decode must succeed");
+    assert!(
+        luma_pct >= 99.0,
+        "cabac-i-64x64 luma match {luma_pct:.2}% < 99%"
+    );
+    assert!(
+        total_pct >= 99.0,
+        "cabac-i-64x64 total match {total_pct:.2}% < 99%"
+    );
 }
 

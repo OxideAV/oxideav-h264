@@ -720,13 +720,22 @@ fn decode_luma_intra_16x16(
     })?;
     predict_intra_16x16(&mut pred, mode, &neigh);
 
-    // DC luma — always coded.
-    let dc_neigh = cbf_neighbours_luma(pic, mb_x, mb_y, 0, 0);
+    // DC luma — always coded. §9.3.3.1.1.9: CBF ctxIdxInc derives from
+    // the neighbour MB's luma16x16 DC CBF (not from per-4x4 AC counts).
+    // For an I_16x16 neighbour the DC block is always present and its CBF
+    // is recorded via `luma_nc[..].iter().any(|&v| v != 0)` proxy — but
+    // that's an AC signal, not DC. We use `luma_dc_coded` stored in
+    // MbInfo instead.
+    let dc_neigh = luma16x16_dc_cbf_neighbours(pic, mb_x, mb_y);
     #[cfg(feature = "cabac-trace")]
     { d.trace_label = "luma16x16.dc"; }
     let dc_coeffs =
         decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Dc, &dc_neigh, 16, true)?;
     let mut dc = dc_coeffs;
+    // Record that this MB's DC block had any nonzero coefficient so
+    // subsequent neighbours can derive their Luma16x16 DC CBF ctxIdxInc
+    // per §9.3.3.1.1.9.
+    pic.mb_info_mut(mb_x, mb_y).luma16x16_dc_cbf = dc_coeffs.iter().any(|&v| v != 0);
     // §8.5.10 — Luma_16×16 DC dequant with Intra-Y (slot 0) weight.
     let w_dc = pic.scaling_lists.matrix_4x4(0)[0];
     inv_hadamard_4x4_dc_scaled(&mut dc, qp_y, w_dc);
@@ -797,15 +806,17 @@ fn decode_chroma(
     let mut dc_cb = [0i32; 4];
     let mut dc_cr = [0i32; 4];
     if cbp_chroma >= 1 {
-        let neigh = CbfNeighbours::none();
-        let cb = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, true)?;
-        for i in 0..4 {
-            dc_cb[i] = cb[i];
-        }
-        let cr = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, true)?;
-        for i in 0..4 {
-            dc_cr[i] = cr[i];
-        }
+        // §9.3.3.1.1.9 — chroma DC CBF ctxIdxInc derives from the
+        // neighbour MB's chroma DC CBF (bit 6 for Cb, bit 7 for Cr in
+        // FFmpeg's cbp_table). Track the per-plane flag in `MbInfo`.
+        let neigh_cb_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
+        let cb = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, true)?;
+        for i in 0..4 { dc_cb[i] = cb[i]; }
+        pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb.iter().any(|&v| v != 0);
+        let neigh_cr_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
+        let cr = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, true)?;
+        for i in 0..4 { dc_cr[i] = cr[i]; }
+        pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[1] = cr.iter().any(|&v| v != 0);
         // §8.5.11.1 — CABAC I-slice chroma is intra.
         let w_cb = pic.scaling_lists.matrix_4x4(1)[0];
         let w_cr = pic.scaling_lists.matrix_4x4(2)[0];
@@ -825,7 +836,13 @@ fn decode_chroma(
             let mut res = [0i32; 16];
             let mut total_coeff = 0u32;
             if cbp_chroma == 2 {
-                let neigh = CbfNeighbours::none();
+                // §9.3.3.1.1.9 — for chroma AC, the CBF ctxIdxInc derives
+                // from the neighbour 4×4 block's chroma AC CBF. Within the
+                // MB we read the already-decoded block's `total_coeff`;
+                // crossing the MB boundary we peek at the neighbour MB's
+                // stored chroma nc. Unavailable intra neighbour → 1.
+                let neigh =
+                    chroma_ac_cbf_neighbours(pic, mb_x, mb_y, plane_kind, br_row, br_col, &nc_arr);
                 let ac =
                     decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, true)?;
                 res = ac;
@@ -856,6 +873,84 @@ fn decode_chroma(
         }
     }
     Ok(())
+}
+
+/// Derive Chroma DC CBF neighbours for plane `c` (0=Cb, 1=Cr) per
+/// §9.3.3.1.1.9. The neighbour contributes `condTermFlagN` equal to
+/// the neighbour MB's chroma DC CBF for plane `c` (tracked in
+/// `MbInfo::chroma_dc_cbf`).
+fn chroma_dc_cbf_neighbours(pic: &Picture, mb_x: u32, mb_y: u32, c: usize) -> CbfNeighbours {
+    let probe = |mx: u32, my: u32| -> Option<bool> {
+        let info = pic.mb_info_at(mx, my);
+        if !info.coded {
+            return None;
+        }
+        Some(info.chroma_dc_cbf[c])
+    };
+    let left = if mb_x > 0 { probe(mb_x - 1, mb_y) } else { None };
+    let above = if mb_y > 0 { probe(mb_x, mb_y - 1) } else { None };
+    CbfNeighbours { left, above }
+}
+
+/// Derive Luma16x16 DC CBF neighbours per §9.3.3.1.1.9. The neighbour
+/// contributes to condTermFlagN iff it's an I_16x16 MB with luma DC
+/// CBF set. I_NxN / inter neighbours have no DC block — their
+/// condTermFlagN is 0 (even when coded), which matches `Some(false)`.
+fn luma16x16_dc_cbf_neighbours(pic: &Picture, mb_x: u32, mb_y: u32) -> CbfNeighbours {
+    let probe = |mx: u32, my: u32| -> Option<bool> {
+        let info = pic.mb_info_at(mx, my);
+        if !info.coded {
+            return None;
+        }
+        Some(info.luma16x16_dc_cbf)
+    };
+    let left = if mb_x > 0 { probe(mb_x - 1, mb_y) } else { None };
+    let above = if mb_y > 0 { probe(mb_x, mb_y - 1) } else { None };
+    CbfNeighbours { left, above }
+}
+
+/// Derive chroma-AC CBF neighbours for block `(br_row, br_col)` in the
+/// current 2×2 chroma grid. `already_decoded[i]` is this MB's running
+/// `nc_arr` for the plane being decoded. Crossing the MB boundary reads
+/// the left/top neighbour MB's stored chroma nc (Cb or Cr selected by
+/// `plane_kind`). §9.3.3.1.1.9 Table 9-41 — condTermFlagN from the
+/// chroma AC CBF.
+fn chroma_ac_cbf_neighbours(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    plane_kind: bool,
+    br_row: usize,
+    br_col: usize,
+    already_decoded: &[u8; 4],
+) -> CbfNeighbours {
+    let left = if br_col > 0 {
+        Some(already_decoded[br_row * 2 + br_col - 1] != 0)
+    } else if mb_x > 0 {
+        let m = pic.mb_info_at(mb_x - 1, mb_y);
+        if m.coded {
+            let nc = if plane_kind { &m.cb_nc } else { &m.cr_nc };
+            Some(nc[br_row * 2 + 1] != 0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let above = if br_row > 0 {
+        Some(already_decoded[(br_row - 1) * 2 + br_col] != 0)
+    } else if mb_y > 0 {
+        let m = pic.mb_info_at(mb_x, mb_y - 1);
+        if m.coded {
+            let nc = if plane_kind { &m.cb_nc } else { &m.cr_nc };
+            Some(nc[2 + br_col] != 0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    CbfNeighbours { left, above }
 }
 
 // ---------------------------------------------------------------------------
