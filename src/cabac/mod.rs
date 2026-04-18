@@ -3,11 +3,13 @@
 //! See ITU-T H.264 (07/2019) §9.3.
 
 pub mod b_mb;
+pub mod b_mb_hi;
 pub mod binarize;
 pub mod context;
 pub mod engine;
 pub mod mb;
 pub mod mb_hi;
 pub mod p_mb;
+pub mod p_mb_hi;
 pub mod residual;
 pub mod tables;

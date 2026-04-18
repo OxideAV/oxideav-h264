@@ -18,8 +18,10 @@
 //!   keeping `prev_qp` in the canonical `[-QpBdOffsetY, 51]` window.
 //!
 //! Scope: 4:2:0, CABAC, I-slice (I_16x16 and I_NxN with 4×4 transform).
-//! Intra_8×8 / transform_size_8x8_flag = 1, I_PCM, and CABAC at 10-bit
-//! for P/B slices all return `Error::Unsupported`.
+//! Intra_8×8 / transform_size_8x8_flag = 1 and I_PCM at 10-bit still
+//! return `Error::Unsupported`. The 10-bit CABAC P/B paths now live in
+//! [`crate::cabac::p_mb_hi`] / [`crate::cabac::b_mb_hi`] and dispatch
+//! through [`decode_intra_mb_given_imb_cabac_hi`] for intra-in-P/B.
 
 use oxideav_core::{Error, Result};
 
@@ -102,7 +104,7 @@ pub fn decode_i_mb_cabac_hi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_intra_mb_given_imb_cabac_hi(
+pub(crate) fn decode_intra_mb_given_imb_cabac_hi(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
     _sh: &SliceHeader,

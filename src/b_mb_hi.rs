@@ -560,7 +560,7 @@ pub fn apply_motion_compensation_b_hi(
 /// `sh.direct_spatial_mv_pred_flag`. Mirrors
 /// [`crate::b_mb::direct_16x16_compensate_pub`] but writes `pic.y16 / cb16 /
 /// cr16` instead of the 8-bit planes.
-fn direct_16x16_compensate_hi(
+pub(crate) fn direct_16x16_compensate_hi(
     sh: &SliceHeader,
     ctx: &BSliceCtx<'_>,
     mb_x: u32,
@@ -596,7 +596,7 @@ fn direct_16x16_compensate_hi(
 /// one MC call; temporal walks the 2×2 4×4-grid so each 4×4 colocated
 /// result lands independently.
 #[allow(clippy::too_many_arguments)]
-fn direct_8x8_compensate_hi(
+pub(crate) fn direct_8x8_compensate_hi(
     sh: &SliceHeader,
     ctx: &BSliceCtx<'_>,
     mb_x: u32,
