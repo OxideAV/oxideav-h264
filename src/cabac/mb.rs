@@ -30,12 +30,12 @@ use crate::cabac::binarize;
 use crate::cabac::context::CabacContext;
 use crate::cabac::engine::CabacDecoder;
 use crate::cabac::residual::{decode_residual_block_cabac, BlockCat, CbfNeighbours};
-use crate::cavlc::ZIGZAG_4X4;
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_FLAG, CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_COEFF_ABS_LEVEL_MINUS1,
     CTX_IDX_INTRA_CHROMA_PRED_MODE, CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG, CTX_IDX_MB_QP_DELTA,
     CTX_IDX_MB_TYPE_I, CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_SIGNIFICANT_COEFF_FLAG,
 };
+use crate::cavlc::ZIGZAG_4X4;
 use crate::intra_pred::{
     predict_intra_16x16, predict_intra_4x4, predict_intra_chroma, Intra16x16Mode,
     Intra16x16Neighbours, Intra4x4Mode, Intra4x4Neighbours, IntraChromaMode, IntraChromaNeighbours,
@@ -328,7 +328,9 @@ pub fn decode_i_mb_cabac(
     // --- mb_type ---
     let mb_type_inc = mb_type_i_ctx_idx_inc(pic, mb_x, mb_y);
     #[cfg(feature = "cabac-trace")]
-    { d.trace_label = "mb_type"; }
+    {
+        d.trace_label = "mb_type";
+    }
     let mb_type_raw = {
         // I-slice mb_type contexts live at ctxIdxOffset 3 (CTX_IDX_MB_TYPE_I),
         // 8 slots covering bin 0 neighbour-indexed + bins 2..6.
@@ -414,7 +416,9 @@ fn decode_intra_mb_given_imb_cabac(
 
     // --- intra_chroma_pred_mode (always present when chroma_format_idc != 0) ---
     #[cfg(feature = "cabac-trace")]
-    { d.trace_label = "intra_chroma_pred_mode"; }
+    {
+        d.trace_label = "intra_chroma_pred_mode";
+    }
     let chroma_mode_val = if sps.chroma_format_idc != 0 {
         let inc = intra_chroma_pred_mode_ctx_idx_inc(pic, mb_x, mb_y);
         let slice = &mut ctxs[CTX_IDX_INTRA_CHROMA_PRED_MODE..CTX_IDX_INTRA_CHROMA_PRED_MODE + 4];
@@ -457,7 +461,9 @@ fn decode_intra_mb_given_imb_cabac(
         matches!(imb, IMbType::I16x16 { .. }) || (cbp_luma != 0 || cbp_chroma != 0);
     if needs_qp_delta {
         #[cfg(feature = "cabac-trace")]
-        { d.trace_label = "mb_qp_delta"; }
+        {
+            d.trace_label = "mb_qp_delta";
+        }
         let inc = if pic.last_mb_qp_delta_was_nonzero {
             1u8
         } else {
@@ -520,7 +526,9 @@ fn decode_intra_mb_given_imb_cabac(
 
     // --- Chroma reconstruction ---
     #[cfg(feature = "cabac-trace")]
-    { d.trace_label = "chroma"; }
+    {
+        d.trace_label = "chroma";
+    }
     decode_chroma(
         d,
         ctxs,
@@ -535,7 +543,9 @@ fn decode_intra_mb_given_imb_cabac(
     )?;
 
     #[cfg(feature = "cabac-trace")]
-    { d.trace_label = "end_of_slice"; }
+    {
+        d.trace_label = "end_of_slice";
+    }
 
     Ok(())
 }
@@ -728,7 +738,9 @@ fn decode_luma_intra_16x16(
     // MbInfo instead.
     let dc_neigh = luma16x16_dc_cbf_neighbours(pic, mb_x, mb_y);
     #[cfg(feature = "cabac-trace")]
-    { d.trace_label = "luma16x16.dc"; }
+    {
+        d.trace_label = "luma16x16.dc";
+    }
     let dc_coeffs =
         decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Dc, &dc_neigh, 16, true)?;
     let mut dc = dc_coeffs;

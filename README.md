@@ -2,9 +2,9 @@
 
 Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
 oxideav. Decodes CAVLC + CABAC I-slices, CAVLC + CABAC P-slices, and
-CAVLC B-slices (spatial + temporal direct + explicit weighted bipred +
-implicit weighted bipred); encodes a minimal Baseline-Profile, I-frame-only,
-Intra_16×16 DC_PRED output stream. **High-Profile 8×8 transform CAVLC decode**
+CAVLC + CABAC B-slices (spatial + temporal direct + explicit weighted
+bipred + implicit weighted bipred); encodes a minimal Baseline-Profile,
+I-frame-only, Intra_16×16 DC_PRED output stream. **High-Profile 8×8 transform CAVLC decode**
 (§7.3.5.3.2, §8.3.2, §8.5.13) is wired end-to-end for both intra and
 P-slice inter macroblocks and bit-exact against ffmpeg's libavcodec
 reference; CABAC 8×8 residual coding (§9.3.3.1.1.10) remains out of
@@ -257,10 +257,11 @@ used for 8×8 dequant).
 Decoder surfaces `Error::Unsupported` (or `Error::InvalidData` when the
 bitstream claims a feature that isn't wired); encoder outright refuses:
 
-- **Decoder**: CABAC B-slices (CAVLC B works). CABAC P-slices are wired
-  for the CAVLC-equivalent coverage (P_Skip, P_L0_16×16 / 16×8 / 8×16,
-  P_8×8 with all four sub-partitions, intra-in-P) with two caveats that
-  surface `Error::Unsupported` on this first pass:
+- **Decoder**: CABAC P- and B-slices are wired for the
+  CAVLC-equivalent coverage (P_Skip / all P Table 7-13 inter partitions
+  + sub-partitions / intra-in-P; B_Skip / all B Table 7-14 16×16, 16×8,
+  8×16, and B_8x8 with every Table 7-17 sub-partition / intra-in-B)
+  with two caveats that surface `Error::Unsupported` on this first pass:
   - `transform_size_8x8_flag = 1` is not supported on the CABAC path
     (CAVLC intra + P-slice inter 8×8 are both wired — see the section
     above — but CABAC 8×8 residual coding per §9.3.3.1.1.10 is not).
@@ -328,6 +329,18 @@ ffmpeg -y -i /tmp/oxideav_bslice.mp4 -c:v copy -bsf:v h264_mp4toannexb \
     -f h264 tests/fixtures/bslice_64x64.es
 ffmpeg -y -i /tmp/oxideav_bslice.mp4 -f rawvideo -pix_fmt yuv420p \
     tests/fixtures/bslice_64x64.yuv
+
+# CABAC B-slice acceptance clip — 6 frames (IDR + 2 P + 3 B),
+# Main profile with CABAC, bframes=2, no weighted bipred.
+ffmpeg -y -f lavfi -i testsrc=duration=1:size=64x64:rate=12 \
+    -vframes 6 -pix_fmt yuv420p -c:v libx264 -profile:v main \
+    -preset ultrafast -coder 1 -bf 2 \
+    -x264opts no-scenecut:no-weightb:weightp=0:no-mbtree:bframes=2:keyint=6:min-keyint=6 \
+    /tmp/cabac_b.mp4
+ffmpeg -y -i /tmp/cabac_b.mp4 -c:v copy -bsf:v h264_mp4toannexb \
+    -f h264 tests/fixtures/cabac_b_64x64.es
+ffmpeg -y -i /tmp/cabac_b.mp4 -f rawvideo -pix_fmt yuv420p \
+    tests/fixtures/cabac_b_64x64.yuv
 
 # CAVLC B-slice implicit weighted-bipred clip (§8.4.2.3.3) — a 64×64
 # `smptebars` pan at QP 20 so the decoder sees real bi-predicted MBs

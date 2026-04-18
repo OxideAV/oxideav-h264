@@ -92,6 +92,10 @@ pub struct MbInfo {
     /// every 4×4 block the partition covers so neighbour lookups into
     /// adjacent partitions / MBs read the right summed magnitude.
     pub mvd_l0_abs: [(u16, u16); 16],
+    /// Per-4×4-sub-block absolute list-1 MVD components. Same role as
+    /// [`Self::mvd_l0_abs`] but for `mvd_l1_{x,y}` under §9.3.3.1.1.7.
+    /// Populated only by the CABAC B-slice entropy driver.
+    pub mvd_l1_abs: [(u16, u16); 16],
     /// True when this macroblock is intra. For an I-slice all MBs are intra,
     /// but the field exists to support future P-slice deblocking edges.
     pub intra: bool,
@@ -136,6 +140,7 @@ impl Default for MbInfo {
             ref_poc_l0: [i32::MIN; 16],
             ref_poc_l1: [i32::MIN; 16],
             mvd_l0_abs: [(0, 0); 16],
+            mvd_l1_abs: [(0, 0); 16],
             intra: false,
             skipped: false,
             transform_8x8: false,
