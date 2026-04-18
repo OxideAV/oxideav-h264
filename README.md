@@ -3,11 +3,11 @@
 Pure-Rust **H.264 / AVC** (ITU-T H.264 | ISO/IEC 14496-10) codec for
 oxideav. Decodes CAVLC + CABAC I-slices, CAVLC + CABAC P-slices, and
 CAVLC B-slices (spatial direct + explicit weighted bipred); encodes a minimal
-Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED output stream. The
-High-Profile 8×8 transform + Intra_8×8 prediction math primitives are
-unit-tested but **not** wired into the macroblock decode loop —
-bitstreams that set `transform_size_8x8_flag = 1` surface as
-`Error::Unsupported`. Zero C dependencies.
+Baseline-Profile, I-frame-only, Intra_16×16 DC_PRED output stream.
+**High-Profile 8×8 transform CAVLC I-slice decode** (§7.3.5.3.2, §8.3.2,
+§8.5.13) is wired end-to-end and bit-exact against ffmpeg's libavcodec
+reference; CABAC 8×8 residual coding (§9.3.3.1.1.10) and P-slice inter
+8×8 remain out of scope. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -203,24 +203,29 @@ let pkt = enc.receive_packet()?;   // Annex B: SPS+PPS+IDR
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-## High Profile 8×8 transform — primitives only, not wired
+## High Profile 8×8 transform — CAVLC I-slice wired
 
-The math primitives are implemented and unit-tested but the High-Profile
-8×8 residual path is **not** wired into the macroblock decode loop:
+The CAVLC I-slice 8×8 transform path is fully wired and bit-exact:
 
 - 8×8 inverse integer transform (`transform::idct_8x8`) and its 6-class
   dequantisation (`transform::dequantize_8x8`) over the default flat-16
   scaling list — §8.5.13.
-- Nine Intra_8×8 prediction modes (§8.3.2) with reference-sample low-pass
-  filtering per §8.3.2.2.2 (`intra_pred::predict_intra_8x8`).
+- Nine Intra_8×8 prediction modes with reference-sample low-pass
+  filtering per §8.3.2.2.2 (`intra_pred::predict_intra_8x8`) — §8.3.2.
+- `transform_size_8x8_flag` parse + four-mode (`prev_intra8x8_pred_mode_flag`
+  + optional 3-bit `rem_intra8x8_pred_mode`) decode in `mb::decode_one_mb`
+  (§7.3.5.1).
+- Per-sub-block CAVLC residual (`cavlc::decode_residual_8x8_sub`) —
+  four 16-coefficient blocks spliced via `cavlc::ZIGZAG_8X8_CAVLC`
+  (§7.3.5.3.2, FFmpeg's `zigzag_scan8x8_cavlc` untransposed).
+- Per-sub-block `non_zero_count_cache` neighbour nC prediction +
+  post-decode `nnz[0] += nnz[1] + nnz[8] + nnz[9]` aggregation so
+  neighbour MBs see a single representative count for the whole 8×8
+  block (mirrors FFmpeg's `scan8[]`-indexed cache).
 
-When the PPS advertises `transform_8x8_mode_flag = 1` and a macroblock
-sets `transform_size_8x8_flag = 1`, both the CAVLC and CABAC I-slice
-paths surface `Error::Unsupported`. The CAVLC §7.3.5.3.2 residual
-decode and the CABAC 8×8 context coding (§9.3.3.1.1.10) are not
-implemented — a prior attempt hit a bit-accounting desync against real
-x264 `8x8dct=1:cabac=0` output and was rolled back rather than left as
-a half-finished code path in the decode loop.
+The CABAC 8×8 path (§9.3.3.1.1.10) and P-slice inter 8×8 still surface
+`Error::Unsupported`. Custom scaling-list matrices are parsed but not
+applied (only flat-16 is used for 8×8 dequant).
 
 ## Not supported
 
@@ -231,13 +236,12 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   for the CAVLC-equivalent coverage (P_Skip, P_L0_16×16 / 16×8 / 8×16,
   P_8×8 with all four sub-partitions, intra-in-P) with two caveats that
   surface `Error::Unsupported` on this first pass:
-  - `transform_size_8x8_flag = 1` is not supported (same scoping as the
-    CAVLC I / P paths).
+  - `transform_size_8x8_flag = 1` is not supported on the CABAC path
+    (CAVLC I-slice 8×8 is wired — see the section above — but CABAC 8×8
+    residual coding per §9.3.3.1.1.10 and P-slice inter 8×8 are not).
   - Weighted prediction on the CABAC P path is parsed but weights are
     not applied; encoders should disable weighted P for CABAC bitstreams
     fed into this decoder, or tolerate unweighted MC output.
-  Any I-slice macroblock with `transform_size_8x8_flag = 1` (CAVLC and
-  CABAC).
 - **Encoder**: P / B slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16
   modes other than DC, rate control, adaptive QP, mode decision,
   deblocking.
