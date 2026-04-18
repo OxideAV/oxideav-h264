@@ -96,9 +96,7 @@ pub fn decode_i_slice_data(
         for pair_idx in first_pair..total_pairs {
             let pair_x = (pair_idx % mb_w_us) as u32;
             let pair_y = (pair_idx / mb_w_us) as u32;
-            let bp = br.bit_position();
             let field = br.read_flag()?;
-            eprintln!("MBAFF pair ({},{}) field={} bp={}", pair_x, pair_y, field, bp);
             let top_mb_y = pair_y * 2;
             let bot_mb_y = top_mb_y + 1;
             // Stamp the per-pair field flag before decode so
@@ -131,11 +129,9 @@ fn decode_one_mb(
     pic: &mut Picture,
     prev_qp: &mut i32,
 ) -> Result<()> {
-    let bp = br.bit_position();
     let mb_type = br.read_ue()?;
     let imb = decode_i_slice_mb_type(mb_type)
         .ok_or_else(|| Error::invalid(format!("h264 slice: bad I mb_type {mb_type}")))?;
-    eprintln!("  MB({},{}) bp={} mb_type={} imb={:?}", mb_x, mb_y, bp, mb_type, imb);
     decode_intra_mb_given_imb(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb)
 }
 
@@ -238,10 +234,8 @@ pub fn decode_intra_mb_given_imb(
     let (cbp_luma, cbp_chroma) = match imb {
         IMbType::INxN => {
             let cbp_raw = br.read_ue()?;
-            let cbp = decode_cbp_intra(cbp_raw)
-                .ok_or_else(|| Error::invalid(format!("h264 mb: bad CBP {cbp_raw}")))?;
-            eprintln!("    MB({},{}) cbp_raw={} -> cbp_luma={} cbp_chroma={}", mb_x, mb_y, cbp_raw, cbp.0, cbp.1);
-            cbp
+            decode_cbp_intra(cbp_raw)
+                .ok_or_else(|| Error::invalid(format!("h264 mb: bad CBP {cbp_raw}")))?
         }
         IMbType::I16x16 {
             cbp_luma,
@@ -453,7 +447,6 @@ fn decode_luma_intra_nxn(
         let mut total_coeff = 0u32;
         if has_residual {
             let nc = predict_nc_luma(pic, mb_x, mb_y, br_row, br_col);
-            eprintln!("      blk=({},{}) nc={} bp={}", br_row, br_col, nc, br.bit_position());
             let blk = decode_residual_block(br, nc, BlockKind::Luma4x4)?;
             total_coeff = blk.total_coeff;
             residual = blk.coeffs;
@@ -587,9 +580,14 @@ fn collect_intra8x8_neighbours(
         // top-right 8×8 in the same MB (already decoded); BR 8×8 would
         // read into the MB to the right, which is not yet decoded.
         top_right_available = match (br8_row, br8_col) {
-            (0, 0) => mb_y > 0,
+            (0, 0) => pic.mb_top_available(mb_y),
             (0, 1) => {
-                mb_y > 0 && mb_x + 1 < pic.mb_width && pic.mb_info_at(mb_x + 1, mb_y - 1).coded
+                if let Some(above_y) = pic.mb_above_neighbour(mb_y) {
+                    mb_x + 1 < pic.mb_width
+                        && pic.mb_info_at(mb_x + 1, above_y).coded
+                } else {
+                    false
+                }
             }
             (1, 0) => true,
             _ => false,
@@ -818,8 +816,11 @@ pub(crate) fn predict_nc_luma(pic: &Picture, mb_x: u32, mb_y: u32, br_row: usize
     };
     let top = if br_row > 0 {
         Some(info_here.luma_nc[(br_row - 1) * 4 + br_col])
-    } else if pic.mb_top_available(mb_y) {
-        let info = pic.mb_info_at(mb_x, mb_y - 1);
+    } else if let Some(above_y) = pic.mb_above_neighbour(mb_y) {
+        // §6.4.9.4: under MBAFF the above neighbour of a field-coded MB
+        // lives in the previous pair at matching field polarity, i.e.
+        // `mb_y - 2`, not the default `mb_y - 1`.
+        let info = pic.mb_info_at(mb_x, above_y);
         if info.coded {
             Some(info.luma_nc[12 + br_col])
         } else {
@@ -861,8 +862,8 @@ fn predict_nc_chroma(
     };
     let top = if br_row > 0 {
         Some(pick(info_here, (br_row - 1) * 2 + br_col))
-    } else if pic.mb_top_available(mb_y) {
-        let info = pic.mb_info_at(mb_x, mb_y - 1);
+    } else if let Some(above_y) = pic.mb_above_neighbour(mb_y) {
+        let info = pic.mb_info_at(mb_x, above_y);
         if info.coded {
             Some(pick(info, 2 + br_col))
         } else {
@@ -915,8 +916,8 @@ pub(crate) fn predict_intra4x4_mode_with(
     };
     let top_mode = if br_row > 0 {
         Some(here_get(br_row - 1, br_col))
-    } else if pic.mb_top_available(mb_y) {
-        let ti = pic.mb_info_at(mb_x, mb_y - 1);
+    } else if let Some(above_y) = pic.mb_above_neighbour(mb_y) {
+        let ti = pic.mb_info_at(mb_x, above_y);
         if ti.coded && ti.intra {
             Some(ti.intra4x4_pred_mode[12 + br_col])
         } else {
@@ -1011,7 +1012,12 @@ pub(crate) fn top_right_available_4x4(
     //   row, not yet decoded → unavailable.
     if br_col == 3 {
         if br_row == 0 {
-            mb_x + 1 < pic.mb_width && mb_y > 0 && pic.mb_info_at(mb_x + 1, mb_y - 1).coded
+            if let Some(above_y) = pic.mb_above_neighbour(mb_y) {
+                mb_x + 1 < pic.mb_width
+                    && pic.mb_info_at(mb_x + 1, above_y).coded
+            } else {
+                false
+            }
         } else {
             false
         }

@@ -439,6 +439,26 @@ impl Picture {
         }
     }
 
+    /// Index of the "above" neighbour MB for `mb_y` per §6.4.9.4.
+    /// Returns `None` when unavailable. For non-MBAFF and frame-coded
+    /// MBAFF pairs the above neighbour is `mb_y - 1`. For field-coded
+    /// MBAFF pairs the neighbour sits in the **previous pair** at the
+    /// same field polarity, so `mb_y - 2`.
+    pub fn mb_above_neighbour(&self, mb_y: u32) -> Option<u32> {
+        if !self.mb_top_available(mb_y) {
+            return None;
+        }
+        if self.mbaff_enabled && self.is_mb_field(mb_y) {
+            // Top MB of pair P (which=0): above = top MB of pair P-1
+            //   → mb_y - 2.
+            // Bottom MB of pair P (which=1): above = bottom MB of pair
+            //   P-1 → mb_y - 2.
+            Some(mb_y - 2)
+        } else {
+            Some(mb_y - 1)
+        }
+    }
+
     /// (first luma plane row, row stride in rows) for MB row `mb_y`.
     /// Under MBAFF with a field-coded pair the top MB sits on even plane
     /// rows (row_stride_in_rows = 2) and the bottom MB on odd rows.

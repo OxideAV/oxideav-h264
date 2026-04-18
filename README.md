@@ -89,8 +89,37 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
   the `tC = tC0 + 1` chroma bump. Internal edges are transform-size
   aware (§7.3.5.1 `transform_size_8x8_flag = 1` → only the mid-MB edge
   at offset 8 is filtered). Per-slice `slice_alpha_c0_offset_div2` and
-  `slice_beta_offset_div2` are honoured. MBAFF is out of scope (this
-  crate is frame-only).
+  `slice_beta_offset_div2` are honoured. The §8.7.1.1 MBAFF
+  extra-edge pass is not wired — frame-coded MBAFF pictures currently
+  skip the deblocker.
+
+### MBAFF I-slice CAVLC (§7.3.4, §6.4.9.4)
+
+- `frame_mbs_only_flag = 0` AND `mb_adaptive_frame_field_flag = 1`
+  pictures are accepted for **I-slice CAVLC in 4:2:0 8-bit** only.
+  `field_pic_flag = 1` (PAFF), P/B/MBAFF, CABAC/MBAFF, 10-bit/MBAFF
+  and 4:2:2/4:4:4/MBAFF all still return `Error::Unsupported`.
+- §7.3.4 MB-pair decode loop reads `mb_field_decoding_flag` once per
+  pair; per-MB [`Picture::luma_off`] / [`Picture::chroma_off`] and
+  [`Picture::luma_row_stride_for`] honour the field-interleaved sample
+  layout.
+- §6.4.9.4 same-polarity "above" neighbour lookup for field-coded MBs
+  skips the sibling MB of the current pair — the `mb_above_neighbour`
+  helper points at `mb_y - 2` rather than `mb_y - 1` so CAVLC `nC`
+  prediction, intra-4×4 mode prediction and intra prediction sample
+  fetches all resolve to the correct previous-pair MB.
+- Deblocking is skipped for MBAFF pictures — the frame-only §8.7
+  kernel would corrupt field-coded MBs and the §8.7.1.1 MBAFF pass
+  isn't wired yet. Decoded luma matches ffmpeg within ±8 LSB for >
+  99% of samples on the in-tree `mbaff_128x128` fixture (all-field
+  high-QP noise).
+- **Known gaps**: mixed-mode MBAFF (some pairs frame-coded, some
+  field-coded) can decode successfully on the sample-read path but
+  §6.4.9.4 neighbour lookups that span a frame↔field pair boundary
+  still use the "uniform-pair-mode" fallback; a Table 6-5 lookup
+  table would make cross-mode neighbour resolution spec-accurate.
+  The MBAFF deblock pass, MBAFF + P/B motion, and MBAFF + CABAC are
+  all deferred.
 
 ### CAVLC B-slice decode (§8.4 + §8.2.4.2.3)
 
@@ -286,7 +315,12 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   modes other than DC, rate control, adaptive QP, mode decision,
   deblocking.
 - `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
-- Interlaced coding, MBAFF, PAFF, frame/field picture mixes.
+- Interlaced coding + PAFF / field-picture slices still return
+  `Error::Unsupported`. MBAFF (frame + field MB pairs in a single
+  progressive-container picture) is **partially** supported — 4:2:0
+  8-bit CAVLC I-slices only; see "MBAFF I-slice CAVLC" above. MBAFF
+  P/B, MBAFF CABAC, MBAFF chroma > 4:2:0, and MBAFF 10-bit all still
+  reject at slice entry.
 - Inter 8×8 transform on B-slice MBs — CAVLC P-slice inter 8×8 is wired
   (see above); B-slice inter 8×8 is not yet.
 - 4:2:2 CAVLC I-slice decode IS supported (§6.4.1 ChromaArrayType == 2)

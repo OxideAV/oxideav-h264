@@ -98,6 +98,17 @@
 //!   `coded_block_pattern`, `mb_qp_delta`, and 4×4 residual coding.
 //!   `weighted_pred_flag = 1` is parsed but weights are not yet wired
 //!   on the CABAC path.
+//! * **MBAFF I-slice CAVLC** (§7.3.4, §6.4.9.4) — 4:2:0 8-bit pictures
+//!   with `frame_mbs_only_flag = 0 && mb_adaptive_frame_field_flag = 1`
+//!   are decoded by a pair-granular loop that reads
+//!   `mb_field_decoding_flag` per pair and routes sample writes through
+//!   the field-stride helpers on [`picture::Picture`]. The §6.4.9.4
+//!   same-polarity "above" lookup is implemented via
+//!   [`picture::Picture::mb_above_neighbour`], so CAVLC `nC` prediction,
+//!   intra-4×4 mode prediction and intra neighbour samples all resolve
+//!   to the correct previous-pair MB for field-coded pairs. Deblocking
+//!   is deferred for MBAFF pictures (§8.7.1.1). MBAFF P/B/CABAC and
+//!   MBAFF with chroma > 4:2:0 or bit depth > 8 are still rejected.
 //! * **CABAC Main-profile B-slice** entropy decode (§9.3) —
 //!   `mb_skip_flag` (B bank), `mb_type` (Table 9-37 with the 48-value
 //!   inter + intra tree), `sub_mb_type` (Table 9-38 B column, 13 values),
@@ -203,7 +214,13 @@
 //!   path is parsed but the weights aren't yet applied to the MC output.
 //! * B-slice MBAFF and B-slice 8×8 transform (consistent with the
 //!   existing 8×8 scoping).
-//! * Interlaced coding / MBAFF / PAFF.
+//! * Interlaced coding / MBAFF — the MBAFF I-slice CAVLC 4:2:0 8-bit
+//!   path is wired (`frame_mbs_only_flag = 0 &&
+//!   mb_adaptive_frame_field_flag = 1` pictures now decode via the
+//!   §7.3.4 MB-pair loop + §6.4.9.4 field-stride neighbour logic), but
+//!   MBAFF P/B, MBAFF CABAC, MBAFF chroma > 4:2:0, MBAFF 10-bit, the
+//!   §8.7.1.1 extra deblock pass, and `field_pic_flag = 1` PAFF all
+//!   still return `Error::Unsupported`.
 //! * `separate_colour_plane_flag = 1` (§7.4.2.1.1, three independent
 //!   colour planes) is rejected at slice entry with `Error::Unsupported`.
 //!   4:2:2 is supported for CAVLC I-slices only — 4:2:2 P / B and CABAC
