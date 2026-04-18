@@ -669,7 +669,6 @@ fn decode_cabac_i_slice(
             &mut prev_qp,
         )?;
         mb_addr += 1;
-        // §9.3.3.2.4 end_of_slice_flag — one terminate bin after each MB.
         let end = dec.decode_terminate()?;
         if end == 1 {
             break;

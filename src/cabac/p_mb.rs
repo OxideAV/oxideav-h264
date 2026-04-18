@@ -568,7 +568,8 @@ fn decode_inter_residual_luma(
             continue;
         }
         let neighbours = cbf_neighbours_luma(pic, mb_x, mb_y, br_row, br_col);
-        let coeffs = decode_residual_block_in_place(d, ctxs, BlockCat::Luma4x4, &neighbours, 16)?;
+        let coeffs =
+            decode_residual_block_in_place(d, ctxs, BlockCat::Luma4x4, &neighbours, 16, false)?;
         let mut residual = coeffs;
         let total_coeff = coeffs.iter().filter(|&&v| v != 0).count() as u32;
         dequantize_4x4(&mut residual, qp_y);
@@ -600,11 +601,13 @@ fn decode_inter_residual_chroma(
     let mut dc_cr = [0i32; 4];
     if cbp_chroma >= 1 {
         let neigh = CbfNeighbours::none();
-        let cb_coeffs = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4)?;
+        let cb_coeffs =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, false)?;
         for i in 0..4 {
             dc_cb[i] = cb_coeffs[i];
         }
-        let cr_coeffs = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4)?;
+        let cr_coeffs =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, false)?;
         for i in 0..4 {
             dc_cr[i] = cr_coeffs[i];
         }
@@ -623,7 +626,8 @@ fn decode_inter_residual_chroma(
             let mut total_coeff = 0u32;
             if cbp_chroma == 2 {
                 let neigh = CbfNeighbours::none();
-                let ac = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15)?;
+                let ac =
+                    decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, false)?;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
                 res = ac;
                 dequantize_4x4(&mut res, qpc);

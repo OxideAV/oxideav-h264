@@ -361,24 +361,31 @@ fn build_idr_slice_rbsp() -> Vec<u8> {
     // Build only the handful of contexts we actually touch. The values are
     // identical to `cabac::tables::init_slice_contexts(0, true, 26)` for
     // those ctxIdx entries we cite below.
-    // I-slice mb_type live at ctxIdxOffset 3..=10. For our fixture we need:
-    //  - mb_type bin 0   ctx_idx = 3 (ctx_idx_inc=0, no neighbours)
-    //  - mb_type bin 2/3/5/6 ctx_idx = 6, 7, 9, 9  (offsets 3 + 3/4/6/6)
+    // I-slice mb_type bins live at ctxIdxOffset 3..=10. Per Tables 9-29 /
+    // 9-31, when b3 (cbp_chroma bin 0) is 0 the intra_pred_mode bits at
+    // binIdx 4 and 5 use ctxIdxInc = 6 and 7 respectively (NOT 6 / 6). The
+    // cbp_chroma bit 1 is skipped entirely when b3 == 0.
+    //  - bin 0    ctx_idx = 3 (ctx_idx_inc = 0, no neighbours)
+    //  - bin 2    ctx_idx = 6 (cbp_luma)
+    //  - bin 3    ctx_idx = 7 (cbp_chroma bin 0)
+    //  - bin 4 (when b3=0): intra_pred_mode bit 0 at ctx_idx = 9
+    //  - bin 5 (when b3=0): intra_pred_mode bit 1 at ctx_idx = 10
     //  mb_type encoding for I_16x16 DC cbp_luma=0 cbp_chroma=0:
     //    b0 = 1 (not I_NxN)
     //    b1 = 0 (terminate bin — not I_PCM)
     //    b2 = 0 (cbp_luma)
     //    b3 = 0 (cbp_chroma bin 0 — 0 short-circuits)
-    //    b5 = 0 (intra_pred bin 0)
-    //    b6 = 0 (intra_pred bin 1)
-    //  → mb_type = 1 + (0) + 4*(0) + 12*(0) = 1
-    //  (Per binarize::decode_mb_type_i + decode_i_slice_mb_type Table:
-    //   mb_type=1 → I_16x16 pred_mode=DC, cbp_luma=0, cbp_chroma=0.)
+    //    b5 = 0 (intra_pred bit 0, at ctx 9)
+    //    b6 = 0 (intra_pred bit 1, at ctx 10)
+    //  → mb_type = 1 + 0 + 4*0 + 12*0 = 1
+    //  (decode_i_slice_mb_type maps 1 → I_16x16 pred=DC, cbp_luma=0, cbp_chroma=0.)
     //
     // mb_qp_delta bin 0 ctx_idx = 60 (ctx_idx_inc=0, prev_delta=0) — emit 0.
     // intra_chroma_pred_mode bin 0 ctx_idx = 64 (ctx_idx_inc=0) — emit 0.
-    // Luma16x16 DC block coded_block_flag: ctxIdxOffset 85 + cat*4 + inc
-    //   ctxBlockCat Luma16x16Dc = 0, inc = 0 → ctxIdx = 85.
+    // Luma16x16 DC block coded_block_flag: ctxIdxOffset 85 + cat*4 + inc.
+    //   ctxBlockCat Luma16x16Dc = 0. At the corner MB(0,0) with no available
+    //   neighbours and the current MB coded intra, §9.3.3.1.1.9 makes
+    //   condTermFlagA = condTermFlagB = 1 → ctxIdxInc = 3 → ctxIdx = 88.
     //   We emit 0 → block is skipped, no further residual bins.
     // end_of_slice_flag via encode_terminate(1).
 
@@ -390,6 +397,7 @@ fn build_idr_slice_rbsp() -> Vec<u8> {
             6 => (-28, 127),
             7 => (-23, 104),
             9 => (-1, 54),
+            10 => (7, 51),
             60 => (0, 41),
             61 => (0, 63),
             62 => (0, 63),
@@ -399,6 +407,7 @@ fn build_idr_slice_rbsp() -> Vec<u8> {
             66 => (0, 58),
             67 => (0, 63),
             85 => (-8, 71),
+            88 => (-1, 65),
             _ => panic!("unexpected ctxIdx {idx}"),
         };
         CabacCtx::init(mn.0, mn.1, slice_qpy)
@@ -432,8 +441,8 @@ fn build_idr_slice_rbsp() -> Vec<u8> {
     enc.encode_terminate(0); // bin 1 — not I_PCM (terminate, no ctx)
     enc_bin!(6, 0); // cbp_luma
     enc_bin!(7, 0); // cbp_chroma bin 0 (0 → short-circuit)
-    enc_bin!(9, 0); // intra_pred bin 0
-    enc_bin!(9, 0); // intra_pred bin 1 — REUSES ctxs[9]
+    enc_bin!(9, 0); // intra_pred bit 0 (binIdx 4 when b3=0, ctxIdxInc=6 → abs 9)
+    enc_bin!(10, 0); // intra_pred bit 1 (binIdx 5 when b3=0, ctxIdxInc=7 → abs 10)
 
     // intra_chroma_pred_mode = 0 → single bin 0 at ctx 64.
     enc_bin!(64, 0);
@@ -442,7 +451,7 @@ fn build_idr_slice_rbsp() -> Vec<u8> {
     enc_bin!(60, 0);
 
     // Luma DC residual block — coded_block_flag = 0, no further residual.
-    enc_bin!(85, 0);
+    enc_bin!(88, 0);
 
     // end_of_slice_flag = 1 (terminate) + encoding flush (§9.3.4.6).
     enc.encode_terminate(1);
