@@ -23,10 +23,12 @@ use crate::mb_type::{
     decode_cbp_inter, decode_p_slice_mb_type, decode_p_sub_mb_type, IMbType, PMbType, PPartition,
     PSubPartition,
 };
-use crate::motion::{chroma_mc, luma_mc, predict_mv_l0, predict_mv_pskip};
+use crate::motion::{
+    apply_chroma_weight, apply_luma_weight, chroma_mc, luma_mc, predict_mv_l0, predict_mv_pskip,
+};
 use crate::picture::{MbInfo, Picture, INTRA_DC_FAKE};
 use crate::pps::Pps;
-use crate::slice::SliceHeader;
+use crate::slice::{ChromaWeight, LumaWeight, SliceHeader};
 use crate::sps::Sps;
 use crate::transform::{chroma_qp, dequantize_4x4, idct_4x4, inv_hadamard_2x2_chroma_dc};
 
@@ -80,8 +82,11 @@ pub fn decode_p_slice_mb(
 }
 
 /// Apply the `P_Skip` derivation and fill in `(mb_x, mb_y)` — no residual,
-/// motion vectors come from §8.4.1.1.
+/// motion vectors come from §8.4.1.1. The slice header is consulted for the
+/// L0 pred-weight-table entry (§8.4.2.3.2); when the slice has no weighted
+/// prediction enabled the MC output is written through unchanged.
 pub fn decode_p_skip_mb(
+    sh: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
@@ -106,8 +111,13 @@ pub fn decode_p_skip_mb(
         };
     }
     fill_partition_mv(pic, mb_x, mb_y, 0, 0, 4, 4, mv, 0);
-    mc_luma_partition(pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32);
-    mc_chroma_partition(pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32);
+    let (lw, cw) = l0_weight_for(sh, 0);
+    mc_luma_partition(
+        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, lw,
+    );
+    mc_chroma_partition(
+        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, cw,
+    );
     Ok(())
 }
 
@@ -158,9 +168,16 @@ fn decode_p16x16(
 
     fill_partition_mv(pic, mb_x, mb_y, 0, 0, 4, 4, mv, ref_idx);
 
-    // Predict luma + chroma from reference before residual is added.
-    mc_luma_partition(pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32);
-    mc_chroma_partition(pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32);
+    // Predict luma + chroma from reference before residual is added. Apply
+    // explicit weighted prediction (§8.4.2.3.2) to the predicted samples
+    // when the slice carries a pred_weight_table.
+    let (lw, cw) = l0_weight_for(sh, ref_idx);
+    mc_luma_partition(
+        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, lw,
+    );
+    mc_chroma_partition(
+        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, cw,
+    );
 
     // CBP (inter) + optional qp_delta + residual.
     let cbp_raw = br.read_ue()?;
@@ -249,7 +266,7 @@ fn decode_two_partition_p(
     br: &mut BitReader<'_>,
     _sps: &Sps,
     pps: &Pps,
-    _sh: &SliceHeader,
+    sh: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
     pic: &mut Picture,
@@ -273,9 +290,12 @@ fn decode_two_partition_p(
         );
         mvs[p] = mv;
         fill_partition_mv(pic, mb_x, mb_y, r0, c0, ph, pw, mv, refs[p]);
-        mc_luma_partition(pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32);
+        let (lw, cw) = l0_weight_for(sh, refs[p]);
+        mc_luma_partition(
+            pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, lw,
+        );
         mc_chroma_partition(
-            pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32,
+            pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, cw,
         );
     }
 
@@ -353,11 +373,12 @@ fn decode_p8x8(
                 pmv.1.wrapping_add(mvd_y as i16),
             );
             fill_partition_mv(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, mv, ref_idx);
+            let (lw, cw) = l0_weight_for(sh, ref_idx);
             mc_luma_partition(
-                pic, reference, mb_x, mb_y, r0, c0, sh_h, sh_w, mv.0 as i32, mv.1 as i32,
+                pic, reference, mb_x, mb_y, r0, c0, sh_h, sh_w, mv.0 as i32, mv.1 as i32, lw,
             );
             mc_chroma_partition(
-                pic, reference, mb_x, mb_y, r0, c0, sh_h, sh_w, mv.0 as i32, mv.1 as i32,
+                pic, reference, mb_x, mb_y, r0, c0, sh_h, sh_w, mv.0 as i32, mv.1 as i32, cw,
             );
         }
     }
@@ -556,6 +577,7 @@ fn mc_luma_partition(
     w: usize,
     mv_x_q: i32,
     mv_y_q: i32,
+    luma_weight: Option<&LumaWeight>,
 ) {
     let pw = w * 4;
     let ph = h * 4;
@@ -563,6 +585,9 @@ fn mc_luma_partition(
     let base_x = (mb_x as i32) * 16 + (c0 as i32) * 4;
     let base_y = (mb_y as i32) * 16 + (r0 as i32) * 4;
     luma_mc(&mut tmp, reference, base_x, base_y, mv_x_q, mv_y_q, pw, ph);
+    if let Some(lw) = luma_weight {
+        apply_luma_weight(&mut tmp, lw);
+    }
     let lstride = pic.luma_stride();
     let off = pic.luma_off(mb_x, mb_y) + r0 * 4 * lstride + c0 * 4;
     for rr in 0..ph {
@@ -583,6 +608,7 @@ fn mc_chroma_partition(
     w: usize,
     mv_x_q: i32,
     mv_y_q: i32,
+    chroma_weight: Option<&ChromaWeight>,
 ) {
     // Luma partition is (4h × 4w) samples at (mb*16 + r0*4, mb*16 + c0*4).
     // Chroma 4:2:0 — halve all coordinates; partition is (2h × 2w) samples.
@@ -621,6 +647,10 @@ fn mc_chroma_partition(
         pw,
         ph,
     );
+    if let Some(cw_entry) = chroma_weight {
+        apply_chroma_weight(&mut tmp_cb, cw_entry, 0);
+        apply_chroma_weight(&mut tmp_cr, cw_entry, 1);
+    }
     let stride = pic.chroma_stride();
     let off = pic.chroma_off(mb_x, mb_y) + r0 * 2 * stride + c0 * 2;
     for rr in 0..ph {
@@ -629,6 +659,24 @@ fn mc_chroma_partition(
             pic.cr[off + rr * stride + cc] = tmp_cr[rr * pw + cc];
         }
     }
+}
+
+/// Return the (luma, chroma) weight pair for list 0 at reference index
+/// `ref_idx`. Returns `None` when the slice header has no
+/// `pred_weight_table` (explicit weighted prediction disabled for the
+/// slice) — callers pass that straight through to MC which skips the
+/// weighting step.
+fn l0_weight_for<'a>(
+    sh: &'a SliceHeader,
+    ref_idx: i8,
+) -> (Option<&'a LumaWeight>, Option<&'a ChromaWeight>) {
+    let Some(tbl) = sh.pred_weight_table.as_ref() else {
+        return (None, None);
+    };
+    let idx = ref_idx.max(0) as usize;
+    let lw = tbl.luma_l0.get(idx);
+    let cw = tbl.chroma_l0.get(idx);
+    (lw, cw)
 }
 
 fn predict_inter_nc_luma(

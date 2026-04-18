@@ -2,9 +2,15 @@
 //!
 //! Covers the fields needed to identify a slice and reach the start of
 //! `slice_data()` for a baseline-profile decoder. Reference picture list
-//! modification, prediction weight tables, and decoded reference picture
-//! marking are parsed enough to skip past their syntax — a baseline I-slice
-//! decoder doesn't need their values.
+//! modification and decoded reference picture marking are parsed enough to
+//! skip past their syntax — a baseline I-slice decoder doesn't need their
+//! values.
+//!
+//! Explicit weighted prediction (§7.3.3.2) for P-slices is parsed and the
+//! weight table is returned on the [`SliceHeader`]. B-slice bi-prediction is
+//! out of scope; the L1 side of the weight table is parsed but left unused.
+//! Implicit weighted bi-prediction (`weighted_bipred_idc == 2`) is also out
+//! of scope.
 
 use oxideav_core::{Error, Result};
 
@@ -35,6 +41,47 @@ impl SliceType {
             _ => unreachable!(),
         }
     }
+}
+
+/// Per-reference luma weight/offset triple from the `pred_weight_table`
+/// syntax (§7.3.3.2). Values are stored in the range the spec gives them:
+/// `weight` and `offset` are signed ed(v), `log2_denom` comes from the
+/// `luma_log2_weight_denom` read once for the whole table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LumaWeight {
+    /// `luma_weight_lX[i]` — signed multiplier in units of `1 << log2_denom`.
+    pub weight: i32,
+    /// `luma_offset_lX[i]` — signed additive offset in sample units (pre-clip).
+    pub offset: i32,
+    /// `luma_log2_weight_denom` for the whole list (§7.4.3.2).
+    pub log2_denom: u32,
+    /// True if `luma_weight_lX_flag` was set for this reference. When false,
+    /// the default-weight rule in §8.4.2.3.2 applies (weight = 1<<denom,
+    /// offset = 0).
+    pub present: bool,
+}
+
+/// Per-reference chroma weight/offset pair (one per chroma plane, Cb then Cr).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChromaWeight {
+    pub weight: [i32; 2],
+    pub offset: [i32; 2],
+    pub log2_denom: u32,
+    pub present: bool,
+}
+
+/// Parsed `pred_weight_table` (§7.3.3.2). Entry index is `ref_idx`.
+/// Only the L0 side is applied by the decoder today (P-slices); L1 entries
+/// are parsed for bitstream conformance but remain unused until B-slice
+/// support lands.
+#[derive(Clone, Debug, Default)]
+pub struct PredWeightTable {
+    pub luma_log2_weight_denom: u32,
+    pub chroma_log2_weight_denom: u32,
+    pub luma_l0: Vec<LumaWeight>,
+    pub chroma_l0: Vec<ChromaWeight>,
+    pub luma_l1: Vec<LumaWeight>,
+    pub chroma_l1: Vec<ChromaWeight>,
 }
 
 /// Parsed slice header (subset).
@@ -69,6 +116,9 @@ pub struct SliceHeader {
     pub slice_data_bit_offset: u64,
     /// True if this slice belongs to an IDR picture.
     pub is_idr: bool,
+    /// Parsed `pred_weight_table` (§7.3.3.2). `None` unless explicit
+    /// weighted prediction is enabled for this slice's type + PPS flags.
+    pub pred_weight_table: Option<PredWeightTable>,
 }
 
 /// Parse slice header. The active SPS and PPS must already be available.
@@ -157,18 +207,22 @@ pub fn parse_slice_header(
         skip_ref_pic_list_modification(&mut br, slice_type)?;
     }
 
-    // Prediction weight table (§7.3.3.2). Only present when weighted prediction
-    // is enabled. Baseline rejects this combination, so we just skip.
-    let weighted = (matches!(slice_type, SliceType::P | SliceType::SP) && pps.weighted_pred_flag)
-        || (slice_type == SliceType::B && pps.weighted_bipred_idc == 1);
-    if weighted {
-        skip_pred_weight_table(
+    // Prediction weight table (§7.3.3.2). Present when explicit weighted
+    // prediction is enabled by the PPS for this slice type. Implicit
+    // weighted bi-prediction (`weighted_bipred_idc == 2`) is gated by the
+    // PPS flag being `== 1` and therefore does not trigger parsing here.
+    let weighted_explicit =
+        (matches!(slice_type, SliceType::P | SliceType::SP) && pps.weighted_pred_flag)
+            || (slice_type == SliceType::B && pps.weighted_bipred_idc == 1);
+    let mut pred_weight_table: Option<PredWeightTable> = None;
+    if weighted_explicit {
+        pred_weight_table = Some(parse_pred_weight_table(
             &mut br,
             sps.chroma_format_idc,
             num_ref_idx_l0_active_minus1,
             num_ref_idx_l1_active_minus1,
             slice_type == SliceType::B,
-        )?;
+        )?);
     }
 
     // Decoded reference picture marking (§7.3.3.3).
@@ -231,6 +285,7 @@ pub fn parse_slice_header(
         slice_beta_offset_div2,
         slice_data_bit_offset,
         is_idr,
+        pred_weight_table,
     })
 }
 
@@ -264,43 +319,87 @@ fn skip_ref_pic_list_modification(br: &mut BitReader<'_>, st: SliceType) -> Resu
     Ok(())
 }
 
-fn skip_pred_weight_table(
+fn parse_pred_weight_table(
     br: &mut BitReader<'_>,
     chroma_format_idc: u32,
     num_l0: u32,
     num_l1: u32,
     has_l1: bool,
-) -> Result<()> {
-    let _luma_log2_weight_denom = br.read_ue()?;
+) -> Result<PredWeightTable> {
+    let luma_log2_weight_denom = br.read_ue()?;
     let chroma_present = chroma_format_idc != 0;
-    if chroma_present {
-        let _chroma_log2_weight_denom = br.read_ue()?;
-    }
-    skip_weight_list(br, num_l0, chroma_present)?;
-    if has_l1 {
-        skip_weight_list(br, num_l1, chroma_present)?;
-    }
-    Ok(())
+    let chroma_log2_weight_denom = if chroma_present { br.read_ue()? } else { 0 };
+
+    let (luma_l0, chroma_l0) = parse_weight_list(
+        br,
+        num_l0,
+        chroma_present,
+        luma_log2_weight_denom,
+        chroma_log2_weight_denom,
+    )?;
+    let (luma_l1, chroma_l1) = if has_l1 {
+        parse_weight_list(
+            br,
+            num_l1,
+            chroma_present,
+            luma_log2_weight_denom,
+            chroma_log2_weight_denom,
+        )?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    Ok(PredWeightTable {
+        luma_log2_weight_denom,
+        chroma_log2_weight_denom,
+        luma_l0,
+        chroma_l0,
+        luma_l1,
+        chroma_l1,
+    })
 }
 
-fn skip_weight_list(br: &mut BitReader<'_>, num: u32, chroma: bool) -> Result<()> {
-    for _ in 0..=num {
-        let l = br.read_flag()?;
-        if l {
-            let _w = br.read_se()?;
-            let _o = br.read_se()?;
+fn parse_weight_list(
+    br: &mut BitReader<'_>,
+    num: u32,
+    chroma: bool,
+    luma_log2_denom: u32,
+    chroma_log2_denom: u32,
+) -> Result<(Vec<LumaWeight>, Vec<ChromaWeight>)> {
+    let count = num as usize + 1;
+    let mut luma = Vec::with_capacity(count);
+    let mut cw = Vec::with_capacity(if chroma { count } else { 0 });
+    for _ in 0..count {
+        let luma_flag = br.read_flag()?;
+        let mut lw = LumaWeight {
+            weight: 1 << luma_log2_denom,
+            offset: 0,
+            log2_denom: luma_log2_denom,
+            present: luma_flag,
+        };
+        if luma_flag {
+            lw.weight = br.read_se()?;
+            lw.offset = br.read_se()?;
         }
+        luma.push(lw);
         if chroma {
-            let c = br.read_flag()?;
-            if c {
-                for _ in 0..2 {
-                    let _w = br.read_se()?;
-                    let _o = br.read_se()?;
+            let c_flag = br.read_flag()?;
+            let mut c = ChromaWeight {
+                weight: [1 << chroma_log2_denom, 1 << chroma_log2_denom],
+                offset: [0, 0],
+                log2_denom: chroma_log2_denom,
+                present: c_flag,
+            };
+            if c_flag {
+                for j in 0..2 {
+                    c.weight[j] = br.read_se()?;
+                    c.offset[j] = br.read_se()?;
                 }
             }
+            cw.push(c);
         }
     }
-    Ok(())
+    Ok((luma, cw))
 }
 
 fn skip_dec_ref_pic_marking(br: &mut BitReader<'_>, is_idr: bool) -> Result<()> {
@@ -342,4 +441,83 @@ fn skip_dec_ref_pic_marking(br: &mut BitReader<'_>, is_idr: bool) -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitwriter::BitWriter;
+
+    /// Round-trip a pred_weight_table with a handful of entries through the
+    /// BitWriter → BitReader pipeline and assert the parser recovers the
+    /// exact weight/offset/log2_denom values, including the "flag not set"
+    /// path that defaults to weight = 1<<denom / offset = 0.
+    #[test]
+    fn pred_weight_table_roundtrip() {
+        let mut bw = BitWriter::new();
+        // luma_log2_weight_denom = 5, chroma_log2_weight_denom = 4.
+        bw.write_ue(5);
+        bw.write_ue(4);
+        // L0 has two entries (num_l0 = 1). Entry 0: luma present w=48 o=-16,
+        // chroma present w=[20, 18] o=[-4, 2]. Entry 1: all flags off.
+        bw.write_flag(true);
+        bw.write_se(48);
+        bw.write_se(-16);
+        bw.write_flag(true);
+        bw.write_se(20);
+        bw.write_se(-4);
+        bw.write_se(18);
+        bw.write_se(2);
+
+        bw.write_flag(false);
+        bw.write_flag(false);
+        bw.write_rbsp_trailing_bits();
+        let buf = bw.finish();
+
+        let mut br = BitReader::new(&buf);
+        let t = parse_pred_weight_table(&mut br, 1, 1, 0, false).expect("parse");
+        assert_eq!(t.luma_log2_weight_denom, 5);
+        assert_eq!(t.chroma_log2_weight_denom, 4);
+        assert_eq!(t.luma_l0.len(), 2);
+        assert_eq!(t.chroma_l0.len(), 2);
+
+        assert!(t.luma_l0[0].present);
+        assert_eq!(t.luma_l0[0].weight, 48);
+        assert_eq!(t.luma_l0[0].offset, -16);
+        assert_eq!(t.luma_l0[0].log2_denom, 5);
+
+        assert!(t.chroma_l0[0].present);
+        assert_eq!(t.chroma_l0[0].weight, [20, 18]);
+        assert_eq!(t.chroma_l0[0].offset, [-4, 2]);
+        assert_eq!(t.chroma_l0[0].log2_denom, 4);
+
+        // Entry 1: flag cleared → default weight = 1<<denom, offset = 0.
+        assert!(!t.luma_l0[1].present);
+        assert_eq!(t.luma_l0[1].weight, 1 << 5);
+        assert_eq!(t.luma_l0[1].offset, 0);
+        assert!(!t.chroma_l0[1].present);
+        assert_eq!(t.chroma_l0[1].weight, [1 << 4, 1 << 4]);
+        assert_eq!(t.chroma_l0[1].offset, [0, 0]);
+    }
+
+    #[test]
+    fn pred_weight_table_skip_chroma_when_monochrome() {
+        // chroma_format_idc = 0 → chroma syntax fully skipped.
+        let mut bw = BitWriter::new();
+        bw.write_ue(2); // luma_log2_weight_denom
+        bw.write_flag(true);
+        bw.write_se(7);
+        bw.write_se(-3);
+        bw.write_rbsp_trailing_bits();
+        let buf = bw.finish();
+
+        let mut br = BitReader::new(&buf);
+        let t = parse_pred_weight_table(&mut br, 0, 0, 0, false).expect("parse");
+        assert_eq!(t.luma_log2_weight_denom, 2);
+        assert_eq!(t.chroma_log2_weight_denom, 0);
+        assert_eq!(t.luma_l0.len(), 1);
+        assert!(t.chroma_l0.is_empty());
+        assert_eq!(t.luma_l0[0].weight, 7);
+        assert_eq!(t.luma_l0[0].offset, -3);
+    }
 }

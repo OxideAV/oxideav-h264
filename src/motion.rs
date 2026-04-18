@@ -9,11 +9,15 @@
 //! * Luma motion compensation: integer + 6-tap half-pel + bilinear
 //!   quarter-pel (§8.4.2.2.1).
 //! * Chroma motion compensation: bilinear 1/8-pel (§8.4.2.2.2).
+//! * Explicit weighted prediction (§8.4.2.3.2) for single-list-0 samples
+//!   applied on top of the interpolated predictor. B-slice bi-prediction
+//!   and implicit weighted bi-prediction (§8.4.2.3.3) are out of scope.
 //!
 //! Motion vectors use quarter-pel units for luma (spec convention); chroma
 //! MVs are derived from luma / 2 to produce 1/8-pel chroma offsets.
 
 use crate::picture::Picture;
+use crate::slice::{ChromaWeight, LumaWeight};
 
 /// 4×4-block-local neighbour lookup: returns (mv_x, mv_y, ref_idx) for the
 /// block at position `(br_row, br_col)` of macroblock `(mb_x, mb_y)`.
@@ -433,6 +437,46 @@ pub fn chroma_mc(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Explicit weighted prediction — §8.4.2.3.2.
+// ---------------------------------------------------------------------------
+
+/// Apply explicit luma weighted prediction in place over a `part_w × part_h`
+/// block stored in raster order with stride = `part_w`.
+///
+/// Implements §8.4.2.3.2 for single-list prediction (P-slice L0 only):
+///   `predSampleLX = Clip1Y(((x * w) + (1 << (logWD - 1))) >> logWD) + o)`
+/// with the `logWD == 0` special case `predSampleLX = Clip1Y(x * w + o)`.
+/// When the weight entry isn't `present` in the slice header the default
+/// weight `1 << logWD` and offset `0` leave the input unchanged.
+pub fn apply_luma_weight(dst: &mut [u8], w: &LumaWeight) {
+    apply_weight_plane(dst, w.weight, w.offset, w.log2_denom);
+}
+
+/// Apply explicit chroma weighted prediction in place to a single chroma
+/// plane (`plane_idx == 0` for Cb, `1` for Cr). Same formula as
+/// [`apply_luma_weight`]; `plane_idx` picks the (weight, offset) pair.
+pub fn apply_chroma_weight(dst: &mut [u8], w: &ChromaWeight, plane_idx: usize) {
+    apply_weight_plane(dst, w.weight[plane_idx], w.offset[plane_idx], w.log2_denom);
+}
+
+#[inline]
+fn apply_weight_plane(dst: &mut [u8], weight: i32, offset: i32, log2_denom: u32) {
+    if log2_denom == 0 {
+        for p in dst.iter_mut() {
+            let x = *p as i32;
+            *p = (x * weight + offset).clamp(0, 255) as u8;
+        }
+        return;
+    }
+    let round = 1i32 << (log2_denom - 1);
+    for p in dst.iter_mut() {
+        let x = *p as i32;
+        let v = ((x * weight + round) >> log2_denom) + offset;
+        *p = v.clamp(0, 255) as u8;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +543,107 @@ mod tests {
         assert_eq!(median3(1, 2, 3), 2);
         assert_eq!(median3(3, 1, 2), 2);
         assert_eq!(median3(-5, 10, 0), 0);
+    }
+
+    #[test]
+    fn weight_default_is_identity() {
+        // present=false → weight = 1<<log2Denom, offset=0; result equals input.
+        let mut buf = [10u8, 40, 80, 200];
+        let w = LumaWeight {
+            weight: 1 << 3,
+            offset: 0,
+            log2_denom: 3,
+            present: false,
+        };
+        let expected = buf;
+        apply_luma_weight(&mut buf, &w);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn weight_half_brightness() {
+        // weight=1, log2_denom=1 → x>>1 (rounded). offset=0.
+        //   10 → (10 + 1) >> 1 = 5
+        //   40 → 20
+        //  200 → 100
+        let mut buf = [10u8, 40, 200];
+        let w = LumaWeight {
+            weight: 1,
+            offset: 0,
+            log2_denom: 1,
+            present: true,
+        };
+        apply_luma_weight(&mut buf, &w);
+        assert_eq!(buf, [5, 20, 100]);
+    }
+
+    #[test]
+    fn weight_offset_is_additive() {
+        // weight = 1<<denom, offset=+20 → result = x + 20 (clipped to 255).
+        let mut buf = [10u8, 100, 250];
+        let w = LumaWeight {
+            weight: 1 << 5,
+            offset: 20,
+            log2_denom: 5,
+            present: true,
+        };
+        apply_luma_weight(&mut buf, &w);
+        assert_eq!(buf, [30, 120, 255]);
+    }
+
+    #[test]
+    fn weight_clips_to_valid_range() {
+        // weight = 2<<denom, offset=0 → result = 2*x (clipped to 255).
+        let mut buf = [10u8, 100, 200];
+        let w = LumaWeight {
+            weight: 2 << 4,
+            offset: 0,
+            log2_denom: 4,
+            present: true,
+        };
+        apply_luma_weight(&mut buf, &w);
+        assert_eq!(buf, [20, 200, 255]);
+        // Negative offset clips at 0.
+        let mut buf = [10u8, 100, 200];
+        let w = LumaWeight {
+            weight: 1 << 4,
+            offset: -50,
+            log2_denom: 4,
+            present: true,
+        };
+        apply_luma_weight(&mut buf, &w);
+        assert_eq!(buf, [0, 50, 150]);
+    }
+
+    #[test]
+    fn weight_log2_zero_uses_plain_formula() {
+        // Special case: logWD == 0 → predSampleLX = Clip1(x*w + o).
+        let mut buf = [5u8, 10, 20];
+        let w = LumaWeight {
+            weight: 3,
+            offset: -5,
+            log2_denom: 0,
+            present: true,
+        };
+        apply_luma_weight(&mut buf, &w);
+        assert_eq!(buf, [10, 25, 55]);
+    }
+
+    #[test]
+    fn chroma_weight_per_plane() {
+        let mut cb = [50u8, 100, 150];
+        let mut cr = [50u8, 100, 150];
+        let w = ChromaWeight {
+            weight: [2 << 3, 1 << 3],
+            offset: [-10, 30],
+            log2_denom: 3,
+            present: true,
+        };
+        apply_chroma_weight(&mut cb, &w, 0);
+        apply_chroma_weight(&mut cr, &w, 1);
+        // Cb: (x * 16 + 4) >> 3 - 10 = 2x - 10
+        assert_eq!(cb, [90, 190, 255]);
+        // Cr: (x * 8 + 4) >> 3 + 30 = x + 30
+        assert_eq!(cr, [80, 130, 180]);
     }
 }

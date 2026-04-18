@@ -11,11 +11,13 @@
 //!   - P-slices in CAVLC entropy mode (§8.4 motion compensation) —
 //!     P16×16 / P16×8 / P8×16 / P8×8 / P8x8ref0 / P_Skip with a
 //!     single-reference list 0. Intra-in-P macroblocks reuse the I-slice
-//!     intra path.
+//!     intra path. Explicit weighted prediction (§8.4.2.3.2) is applied
+//!     to MC output when the PPS + slice header enable it.
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * CABAC P-slices.
-//! * B-slices (bi-prediction, weighted prediction).
+//! * B-slices (bi-prediction). Implicit weighted bi-prediction
+//!   (`weighted_bipred_idc == 2`) is not implemented either.
 //! * Multi-reference DPB / ref_idx > 0 / reference picture list modification.
 //! * Interlaced coding / MBAFF.
 //! * 8×8 transform, 4:2:2 / 4:4:4 chroma, bit depth > 8.
@@ -281,7 +283,7 @@ fn decode_p_slice_data(
             }
             let mb_x = mb_addr % mb_w;
             let mb_y = mb_addr / mb_w;
-            decode_p_skip_mb(mb_x, mb_y, pic, reference, prev_qp)?;
+            decode_p_skip_mb(sh, mb_x, mb_y, pic, reference, prev_qp)?;
             mb_addr += 1;
         }
         if mb_addr >= total_mbs {
