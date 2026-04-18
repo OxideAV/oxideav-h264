@@ -82,9 +82,14 @@
 //!   ≥ 90 % / ≥ 80 % sample match respectively — the residual gap comes
 //!   from a pre-existing limitation of the P/B residual path that
 //!   affects the equivalent 4:2:0 testsrc fixture identically. Solid
-//!   colour P fixtures decode 100 % matched. CABAC under 4:4:4 returns
-//!   `Error::Unsupported`. 8×8 transform on the 4:4:4 inter path is
-//!   out of scope.
+//!   colour P fixtures decode 100 % matched. CABAC under 4:4:4 is
+//!   partially staged — [`cabac::mb_444`] / [`cabac::p_mb_444`] hold
+//!   the entry-point plumbing (mb_type, per-plane intra prediction,
+//!   per-plane residual dispatch, intra-in-P / intra-in-B re-entry)
+//!   but the slice gate rejects cleanly until the §9.3.3.1.1.9
+//!   Table 9-42 extended Cb/Cr ctxBlockCat banks (6..=13 at
+//!   ctxIdxOffset 1012+) land. 8×8 transform on the 4:4:4 inter path
+//!   is out of scope.
 //! * **4:2:2 CAVLC I-slice** decode (§6.4.1 Table 6-1, ChromaArrayType = 2)
 //!   — chroma planes are half-width / full-height relative to luma.
 //!   Each MB carries two 2×4 chroma DC Hadamard blocks (new

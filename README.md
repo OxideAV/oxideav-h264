@@ -353,9 +353,18 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   mirrors a pre-existing limitation of the P/B residual path that hits
   the equivalent 4:2:0 testsrc fixture identically (solid-colour 4:4:4
   P decodes 100 % matched). 8×8 transform on 4:4:4 inter is out of
-  scope. CABAC on 4:4:4 remains out of scope — CABAC I under
-  ChromaArrayType = 3 needs its own plane-aligned residual pipeline
-  + `intra_chroma_pred_mode` absence handling that isn't wired yet.
+  scope. CABAC on 4:4:4 is partially staged: the
+  [`cabac::mb_444`] / [`cabac::p_mb_444`] modules hold the entry-point
+  plumbing (mb_type decoding, per-plane intra prediction, per-plane
+  residual dispatch, intra-in-P / intra-in-B dispatch) but the slice
+  gate still rejects cleanly with a specific `Error::Unsupported`
+  message. Lighting up CABAC 4:4:4 end-to-end requires the §9.3.3.1.1.9
+  Table 9-42 extended ctxBlockCat banks (6..=13 at ctxIdxOffset 1012+) —
+  reusing the luma cat 0/1/2/5 banks across three planes diverges from
+  the encoder's probability state after the first MB (the first-pass
+  experiment confirms ~69 % sample match on a 4-MB solid-colour test
+  clip, collapsing to "only MB 0 is decoded" after `decode_terminate`
+  fires prematurely).
 - Bit depth above 14 or odd luma/chroma bit depths. 12-bit / 14-bit
   are supported for **CAVLC I-slices in 4:2:0 only** (see the 12/14-bit
   section below). 10-bit covers CAVLC I / P / B + CABAC I. Luma must

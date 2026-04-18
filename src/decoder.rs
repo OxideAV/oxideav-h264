@@ -58,7 +58,9 @@ use crate::b_mb::{decode_b_skip_mb, decode_b_slice_mb};
 use crate::bitreader::BitReader;
 use crate::cabac::{
     b_mb::decode_b_mb_cabac, engine::CabacDecoder, mb::decode_i_mb_cabac,
-    mb_hi::decode_i_mb_cabac_hi, p_mb::decode_p_mb_cabac, tables::init_slice_contexts,
+    mb_444::decode_i_mb_cabac_444, mb_hi::decode_i_mb_cabac_hi, p_mb::decode_p_mb_cabac,
+    p_mb_444::{decode_b_mb_cabac_444, decode_p_mb_cabac_444},
+    tables::init_slice_contexts,
 };
 use crate::dpb::{
     apply_rplm, derive_poc_type0, derive_poc_type1, derive_poc_type2, Dpb, MmcoCommand, PocState,
@@ -319,13 +321,23 @@ impl H264Decoder {
                         // pipeline (chroma planes the same size as luma,
                         // luma-style residual / intra prediction per plane,
                         // luma 6-tap MC filter on chroma per §8.4.2.2
-                        // Table 8-9). CABAC under 4:4:4 still returns
-                        // Unsupported — the CABAC I path needs its own
-                        // per-plane residual + `intra_chroma_pred_mode`
-                        // absence handling that isn't wired yet.
+                        // Table 8-9).
+                        //
+                        // CABAC 4:4:4 is gated until the spec's extended
+                        // ctxBlockCat banks (6..=13 in §9.3.3.1.1.9
+                        // Table 9-42, ctxIdxOffsets 1012+) are wired —
+                        // sharing the luma cat=0/1/2/5 banks across all
+                        // three planes diverges from the encoder's
+                        // probability state after the first MB.
+                        // `crate::cabac::mb_444` holds the entry-point
+                        // plumbing (mb_type + per-plane intra prediction +
+                        // per-plane residual dispatch) for the follow-up
+                        // that lights those banks up.
                         if pps.entropy_coding_mode_flag {
                             return Err(Error::unsupported(
-                                "h264: 4:4:4 CABAC entropy decode not yet wired — CAVLC I/P/B only",
+                                "h264: 4:4:4 CABAC entropy decode not yet wired — \
+                                 needs §9.3.3.1.1.9 Table 9-42 extended Cb/Cr \
+                                 ctxBlockCat banks (CAVLC I/P/B supported)",
                             ));
                         }
                     }
@@ -554,6 +566,10 @@ impl H264Decoder {
                     SliceType::I => {
                         if pps.entropy_coding_mode_flag && high_bit_depth {
                             decode_cabac_i_slice_hi(&rbsp, &sh, &sps, &pps, &mut pic)?;
+                        } else if pps.entropy_coding_mode_flag
+                            && sps.chroma_format_idc == 3
+                        {
+                            decode_cabac_i_slice_444(&rbsp, &sh, &sps, &pps, &mut pic)?;
                         } else if pps.entropy_coding_mode_flag {
                             decode_cabac_i_slice(&rbsp, &sh, &sps, &pps, &mut pic)?;
                         } else if high_bit_depth {
@@ -603,7 +619,9 @@ impl H264Decoder {
                         }
                         let list0: Vec<&Picture> = ref_entries.iter().map(|r| &r.pic).collect();
                         let list0_pocs: Vec<i32> = ref_entries.iter().map(|r| r.poc).collect();
-                        if pps.entropy_coding_mode_flag {
+                        if pps.entropy_coding_mode_flag && sps.chroma_format_idc == 3 {
+                            decode_cabac_p_slice_444(&rbsp, &sh, &sps, &pps, &mut pic, &list0)?;
+                        } else if pps.entropy_coding_mode_flag {
                             decode_cabac_p_slice(&rbsp, &sh, &sps, &pps, &mut pic, &list0)?;
                         } else if high_bit_depth {
                             let mut br = BitReader::new(&rbsp);
@@ -697,7 +715,11 @@ impl H264Decoder {
                             list1_short_term: &list1_short,
                             bipred_mode,
                         };
-                        if pps.entropy_coding_mode_flag {
+                        if pps.entropy_coding_mode_flag && sps.chroma_format_idc == 3 {
+                            decode_cabac_b_slice_444(
+                                &rbsp, &sh, &sps, &pps, &mut pic, &list0, &list1, &b_ctx,
+                            )?;
+                        } else if pps.entropy_coding_mode_flag {
                             decode_cabac_b_slice(
                                 &rbsp, &sh, &sps, &pps, &mut pic, &list0, &list1, &b_ctx,
                             )?;
@@ -1225,6 +1247,168 @@ fn decode_b_slice_data_hi(
             br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, &mut prev_qp,
         )?;
         mb_addr += 1;
+    }
+    Ok(())
+}
+
+/// §9.3 CABAC entropy-coded 4:4:4 I-slice loop. Mirrors
+/// [`decode_cabac_i_slice`] but dispatches each macroblock through
+/// [`crate::cabac::mb_444::decode_i_mb_cabac_444`] so the three colour
+/// planes (Y / Cb / Cr) each run through a luma-shaped residual pipeline.
+fn decode_cabac_i_slice_444(
+    rbsp: &[u8],
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+) -> Result<()> {
+    let mb_w = sps.pic_width_in_mbs();
+    let mb_h = sps.pic_height_in_map_units();
+    let total_mbs = mb_w * mb_h;
+    let slice_qpy = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+    let mut ctxs = init_slice_contexts(sh.cabac_init_idc, true, slice_qpy);
+    let mut dec = CabacDecoder::new(rbsp, sh.slice_data_bit_offset as usize)?;
+    let mut prev_qp = slice_qpy;
+    pic.last_mb_qp_delta_was_nonzero = false;
+    let mut mb_addr = sh.first_mb_in_slice;
+    if mb_addr >= total_mbs {
+        return Err(Error::invalid(
+            "h264 cabac 4:4:4 i-slice: first_mb_in_slice out of range",
+        ));
+    }
+    loop {
+        let mb_x = mb_addr % mb_w;
+        let mb_y = mb_addr / mb_w;
+        decode_i_mb_cabac_444(
+            &mut dec,
+            &mut ctxs,
+            sh,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            &mut prev_qp,
+        )?;
+        mb_addr += 1;
+        let end = dec.decode_terminate()?;
+        if end == 1 {
+            break;
+        }
+        if mb_addr >= total_mbs {
+            return Err(Error::invalid(
+                "h264 cabac 4:4:4 i-slice: end_of_slice_flag did not fire before last MB",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// §9.3 CABAC entropy-coded 4:4:4 P-slice loop.
+fn decode_cabac_p_slice_444(
+    rbsp: &[u8],
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+) -> Result<()> {
+    let mb_w = sps.pic_width_in_mbs();
+    let mb_h = sps.pic_height_in_map_units();
+    let total_mbs = mb_w * mb_h;
+    let slice_qpy = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+    let mut ctxs = init_slice_contexts(sh.cabac_init_idc, false, slice_qpy);
+    let mut dec = CabacDecoder::new(rbsp, sh.slice_data_bit_offset as usize)?;
+    let mut prev_qp = slice_qpy;
+    pic.last_mb_qp_delta_was_nonzero = false;
+    let mut mb_addr = sh.first_mb_in_slice;
+    if mb_addr >= total_mbs {
+        return Err(Error::invalid(
+            "h264 cabac 4:4:4 p-slice: first_mb_in_slice out of range",
+        ));
+    }
+    loop {
+        let mb_x = mb_addr % mb_w;
+        let mb_y = mb_addr / mb_w;
+        decode_p_mb_cabac_444(
+            &mut dec,
+            &mut ctxs,
+            sh,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            ref_list0,
+            &mut prev_qp,
+        )?;
+        mb_addr += 1;
+        let end = dec.decode_terminate()?;
+        if end == 1 {
+            break;
+        }
+        if mb_addr >= total_mbs {
+            return Err(Error::invalid(
+                "h264 cabac 4:4:4 p-slice: end_of_slice_flag did not fire before last MB",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// §9.3 CABAC entropy-coded 4:4:4 B-slice loop.
+#[allow(clippy::too_many_arguments)]
+fn decode_cabac_b_slice_444(
+    rbsp: &[u8],
+    sh: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    ref_list0: &[&Picture],
+    ref_list1: &[&Picture],
+    bctx: &crate::b_mb::BSliceCtx<'_>,
+) -> Result<()> {
+    let mb_w = sps.pic_width_in_mbs();
+    let mb_h = sps.pic_height_in_map_units();
+    let total_mbs = mb_w * mb_h;
+    let slice_qpy = (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51);
+    let mut ctxs = init_slice_contexts(sh.cabac_init_idc, false, slice_qpy);
+    let mut dec = CabacDecoder::new(rbsp, sh.slice_data_bit_offset as usize)?;
+    let mut prev_qp = slice_qpy;
+    pic.last_mb_qp_delta_was_nonzero = false;
+    let mut mb_addr = sh.first_mb_in_slice;
+    if mb_addr >= total_mbs {
+        return Err(Error::invalid(
+            "h264 cabac 4:4:4 b-slice: first_mb_in_slice out of range",
+        ));
+    }
+    loop {
+        let mb_x = mb_addr % mb_w;
+        let mb_y = mb_addr / mb_w;
+        decode_b_mb_cabac_444(
+            &mut dec,
+            &mut ctxs,
+            sh,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            ref_list0,
+            ref_list1,
+            bctx,
+            &mut prev_qp,
+        )?;
+        mb_addr += 1;
+        let end = dec.decode_terminate()?;
+        if end == 1 {
+            break;
+        }
+        if mb_addr >= total_mbs {
+            return Err(Error::invalid(
+                "h264 cabac 4:4:4 b-slice: end_of_slice_flag did not fire before last MB",
+            ));
+        }
     }
     Ok(())
 }

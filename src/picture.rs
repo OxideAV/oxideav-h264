@@ -202,6 +202,13 @@ pub struct MbInfo {
     /// Luma16x16 DC block of a neighbouring MB. False for I_NxN (no DC
     /// block) and for MBs where DC CBF was 0.
     pub luma16x16_dc_cbf: bool,
+    /// 4:4:4 mirror of [`Self::luma16x16_dc_cbf`] for the Cb plane:
+    /// under ChromaArrayType = 3 the chroma plane runs a luma-shaped
+    /// I_16×16 DC pipeline with its own `coded_block_flag` context, so
+    /// neighbour derivations need a per-plane cbf flag.
+    pub cb_luma16x16_dc_cbf: bool,
+    /// 4:4:4 mirror of [`Self::luma16x16_dc_cbf`] for the Cr plane.
+    pub cr_luma16x16_dc_cbf: bool,
     /// Per-plane chroma DC `coded_block_flag` (Cb=0, Cr=1). Used by
     /// §9.3.3.1.1.9 to derive the CBF ctxIdxInc for a neighbouring MB's
     /// chroma DC block.
@@ -252,6 +259,8 @@ impl Default for MbInfo {
             skipped: false,
             transform_8x8: false,
             luma16x16_dc_cbf: false,
+            cb_luma16x16_dc_cbf: false,
+            cr_luma16x16_dc_cbf: false,
             chroma_dc_cbf: [false; 2],
             cbp_luma: 0,
             cbp_chroma: 0,
