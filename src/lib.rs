@@ -12,14 +12,19 @@
 //!   prediction, residual decode, 4×4 IDCT + Hadamard, optional deblocking.
 //!   The CABAC I-path covers I_16×16, I_NxN and I_PCM (with the mid-stream
 //!   arithmetic-engine re-init mandated by §9.3.1.2).
-//! * **High Profile 8×8 transform** on the CAVLC I-slice path —
+//! * **High Profile 8×8 transform** on the CAVLC path — intra AND inter.
 //!   `transform_size_8x8_flag = 1` macroblocks (§7.3.5.3.2) decode as four
 //!   interleaved CAVLC sub-blocks via the `zigzag_scan8x8_cavlc` table,
 //!   with FFmpeg-style per-sub-block `non_zero_count_cache` neighbour
 //!   indexing and post-decode `nnz[0] += nnz[1] + nnz[8] + nnz[9]`
 //!   aggregation, then through the §8.5.13 dequant + inverse 8×8 integer
-//!   transform and §8.3.2 Intra_8×8 prediction. Bit-exact against
-//!   ffmpeg's libavcodec reference on a smpte-bars 128×128 IDR.
+//!   transform. The intra path couples this to §8.3.2 Intra_8×8 prediction
+//!   (with the (1,2,1) reference-sample pre-filter); the P-slice path
+//!   applies the 8×8 residual on top of motion-compensated samples, gated
+//!   on the §7.3.5.1 conditional (`pps.transform_8x8_mode_flag` + `cbp_luma
+//!   > 0` + no sub-8×8 motion partitions for P_8x8). Bit-exact against
+//!   ffmpeg's libavcodec reference on both a smpte-bars 128×128 IDR and a
+//!   128×128 P-slice clip encoded with `-x264opts 8x8dct=1`.
 //! * **CAVLC baseline P-slice** pixel reconstruction (§8.4) — P_L0_16×16 /
 //!   16×8 / 8×16, P_8×8 (all four sub-partition shapes) and P_8×8ref0,
 //!   P_Skip, plus intra-in-P macroblocks. Luma 6-tap half-pel + bilinear

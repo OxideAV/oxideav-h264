@@ -166,6 +166,14 @@ impl PSubPartition {
             PSubPartition::Sub4x4 => 4,
         }
     }
+    /// True when the sub-partition covers a full 8×8 (i.e. `Sub8x8`). Used
+    /// by the §7.3.5.1 conditional that gates `transform_size_8x8_flag`:
+    /// the 8×8 transform is legal on a `P_8x8` MB only when every sub-MB
+    /// is `P_L0_8x8` (no sub-block smaller than 8×8).
+    pub fn is_at_least_8x8(self) -> bool {
+        matches!(self, PSubPartition::Sub8x8)
+    }
+
     /// Sub-partition rectangle in 4×4-block units, relative to the parent
     /// 8×8 block's top-left (so max extent is 2×2 blocks).
     pub fn sub_rect(self, idx: usize) -> (usize, usize, usize, usize) {

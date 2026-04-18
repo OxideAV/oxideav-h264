@@ -18,7 +18,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
-use crate::cavlc::{decode_residual_block, BlockKind};
+use crate::cavlc::{decode_residual_8x8_sub, decode_residual_block, BlockKind};
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{
     decode_cbp_inter, decode_p_slice_mb_type, decode_p_sub_mb_type, IMbType, PMbType, PPartition,
@@ -31,7 +31,9 @@ use crate::picture::{MbInfo, Picture, INTRA_DC_FAKE};
 use crate::pps::Pps;
 use crate::slice::{ChromaWeight, LumaWeight, SliceHeader};
 use crate::sps::Sps;
-use crate::transform::{chroma_qp, dequantize_4x4, idct_4x4, inv_hadamard_2x2_chroma_dc};
+use crate::transform::{
+    chroma_qp, dequantize_4x4, dequantize_8x8, idct_4x4, idct_8x8, inv_hadamard_2x2_chroma_dc,
+};
 
 /// Decode one coded P-slice macroblock at `(mb_x, mb_y)`. On return the
 /// pixel buffer + MbInfo at that address have been filled in; `prev_qp` is
@@ -223,10 +225,19 @@ fn decode_p16x16(
         cw,
     );
 
-    // CBP (inter) + optional qp_delta + residual.
+    // CBP (inter) + optional transform_8x8_flag + optional qp_delta + residual.
     let cbp_raw = br.read_ue()?;
     let (cbp_luma, cbp_chroma) = decode_cbp_inter(cbp_raw)
         .ok_or_else(|| Error::invalid(format!("h264 p-slice: bad inter CBP {cbp_raw}")))?;
+    // §7.3.5.1: `transform_size_8x8_flag` is present when the PPS enables
+    // the 8×8 transform, the MB has at least one coded luma residual block,
+    // and the MB is not a P_8x8 with a sub-block smaller than 8×8. P_L0_16×16
+    // satisfies the latter trivially (NumMbPart == 1).
+    let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 {
+        br.read_flag()?
+    } else {
+        false
+    };
     let needs_qp = cbp_luma != 0 || cbp_chroma != 0;
     if needs_qp {
         let dqp = br.read_se()?;
@@ -247,7 +258,11 @@ fn decode_p16x16(
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
     }
 
-    decode_inter_residual_luma(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    if transform_8x8 {
+        decode_inter_residual_luma_8x8(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    } else {
+        decode_inter_residual_luma(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    }
     decode_inter_residual_chroma(br, pps, mb_x, mb_y, pic, cbp_chroma, qp_y)?;
     Ok(())
 }
@@ -383,6 +398,14 @@ fn decode_two_partition_p(
     let cbp_raw = br.read_ue()?;
     let (cbp_luma, cbp_chroma) = decode_cbp_inter(cbp_raw)
         .ok_or_else(|| Error::invalid(format!("h264 p-slice: bad inter CBP {cbp_raw}")))?;
+    // §7.3.5.1 — `transform_size_8x8_flag` gates on PPS + `cbp_luma > 0`.
+    // P_L0_16×8 / P_L0_8×16 both have NumMbPart == 2 (no sub-8×8 splits),
+    // so the "no sub-block smaller than 8×8" clause is trivially true here.
+    let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 {
+        br.read_flag()?
+    } else {
+        false
+    };
     let needs_qp = cbp_luma != 0 || cbp_chroma != 0;
     if needs_qp {
         let dqp = br.read_se()?;
@@ -401,7 +424,11 @@ fn decode_two_partition_p(
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
     }
 
-    decode_inter_residual_luma(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    if transform_8x8 {
+        decode_inter_residual_luma_8x8(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    } else {
+        decode_inter_residual_luma(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    }
     decode_inter_residual_chroma(br, pps, mb_x, mb_y, pic, cbp_chroma, qp_y)?;
     Ok(())
 }
@@ -487,6 +514,18 @@ fn decode_p8x8(
     let cbp_raw = br.read_ue()?;
     let (cbp_luma, cbp_chroma) = decode_cbp_inter(cbp_raw)
         .ok_or_else(|| Error::invalid(format!("h264 p-slice: bad inter CBP {cbp_raw}")))?;
+    // §7.3.5.1 — `transform_size_8x8_flag` is present for a P_8x8 MB only
+    // when every sub-MB is at least 8×8 (i.e. `P_L0_8x8` / `Sub8x8`). Any
+    // sub-8×8 split would make an 8×8 transform span two motion partitions,
+    // which the spec forbids. libx264's `mb_cache_transform_8x8` test
+    // (`encoder/macroblock.c`) enforces the same rule.
+    let all_sub_8x8 = sub_parts.iter().all(|sp| sp.is_at_least_8x8());
+    let transform_8x8 =
+        if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
+            br.read_flag()?
+        } else {
+            false
+        };
     let needs_qp = cbp_luma != 0 || cbp_chroma != 0;
     if needs_qp {
         let dqp = br.read_se()?;
@@ -510,7 +549,11 @@ fn decode_p8x8(
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
     }
 
-    decode_inter_residual_luma(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    if transform_8x8 {
+        decode_inter_residual_luma_8x8(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    } else {
+        decode_inter_residual_luma(br, mb_x, mb_y, pic, cbp_luma, qp_y)?;
+    }
     decode_inter_residual_chroma(br, pps, mb_x, mb_y, pic, cbp_chroma, qp_y)?;
     Ok(())
 }
@@ -549,6 +592,64 @@ fn decode_inter_residual_luma(
             }
         }
         pic.mb_info_mut(mb_x, mb_y).luma_nc[br_row * 4 + br_col] = total_coeff as u8;
+    }
+    Ok(())
+}
+
+// Inter luma residual with `transform_size_8x8_flag = 1`. Mirrors the
+// intra 8×8 path (`mb::decode_luma_intra_8x8`) but adds the residual on top
+// of the already motion-compensated samples in `pic.y` — no intra prediction
+// and no (1,2,1) pre-filter of reference samples. CAVLC coding of each 8×8
+// is four interleaved 4×4 sub-blocks (§7.3.5.3.2) spliced back into 8×8
+// raster via `ZIGZAG_8X8_CAVLC`, with FFmpeg's per-sub-block
+// `non_zero_count_cache` update between sub-blocks (`h264_cavlc.c`) and the
+// post-decode `nnz[0] += nnz[1] + nnz[8] + nnz[9]` aggregation that lets
+// neighbouring MBs read one consolidated count per 8×8 block.
+fn decode_inter_residual_luma_8x8(
+    br: &mut BitReader<'_>,
+    mb_x: u32,
+    mb_y: u32,
+    pic: &mut Picture,
+    cbp_luma: u8,
+    qp_y: i32,
+) -> Result<()> {
+    let lstride = pic.luma_stride();
+    let lo_mb = pic.luma_off(mb_x, mb_y);
+
+    for blk8 in 0..4usize {
+        if (cbp_luma >> blk8) & 1 == 0 {
+            continue;
+        }
+        let br8_row = blk8 >> 1;
+        let br8_col = blk8 & 1;
+        let r0 = br8_row * 2;
+        let c0 = br8_col * 2;
+
+        let mut residual = [0i32; 64];
+        let slots = [(r0, c0), (r0, c0 + 1), (r0 + 1, c0), (r0 + 1, c0 + 1)];
+        for (sub, &(sr, sc)) in slots.iter().enumerate() {
+            let nc = predict_inter_nc_luma(pic, mb_x, mb_y, sr, sc);
+            let tc = decode_residual_8x8_sub(br, nc, sub, &mut residual)?;
+            pic.mb_info_mut(mb_x, mb_y).luma_nc[sr * 4 + sc] = tc;
+        }
+        dequantize_8x8(&mut residual, qp_y);
+        idct_8x8(&mut residual);
+
+        let info = pic.mb_info_mut(mb_x, mb_y);
+        let sum = info.luma_nc[r0 * 4 + c0] as u16
+            + info.luma_nc[r0 * 4 + c0 + 1] as u16
+            + info.luma_nc[(r0 + 1) * 4 + c0] as u16
+            + info.luma_nc[(r0 + 1) * 4 + c0 + 1] as u16;
+        info.luma_nc[r0 * 4 + c0] = sum.min(16) as u8;
+
+        let lo = lo_mb + (br8_row * 8) * lstride + br8_col * 8;
+        for r in 0..8 {
+            for c in 0..8 {
+                let base = pic.y[lo + r * lstride + c] as i32;
+                let v = base + residual[r * 8 + c];
+                pic.y[lo + r * lstride + c] = v.clamp(0, 255) as u8;
+            }
+        }
     }
     Ok(())
 }
