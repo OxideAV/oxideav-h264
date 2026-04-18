@@ -242,17 +242,21 @@ fn decode_b_inter(
 
     // §9.3.3.1.1.4 — coded_block_pattern (inter CBP binarisation is shared
     // with P-slices).
-    let luma_incs = cbp_luma_ctx_idx_incs(pic, mb_x, mb_y);
-    let chroma_incs = cbp_chroma_ctx_idx_incs(pic, mb_x, mb_y);
     let cbp = {
         let slice =
-            &mut ctxs[CTX_IDX_CODED_BLOCK_PATTERN_LUMA..CTX_IDX_CODED_BLOCK_PATTERN_LUMA + 8];
+            &mut ctxs[CTX_IDX_CODED_BLOCK_PATTERN_LUMA..CTX_IDX_CODED_BLOCK_PATTERN_LUMA + 12];
         binarize::decode_coded_block_pattern(
             d,
             slice,
             sps.chroma_format_idc as u8,
-            luma_incs,
-            chroma_incs,
+            |i, decoded| super::mb::cbp_luma_ctx_idx_inc(pic, mb_x, mb_y, i, decoded),
+            |bin| {
+                if bin == 0 {
+                    super::mb::cbp_chroma_ctx_idx_inc_any(pic, mb_x, mb_y)
+                } else {
+                    super::mb::cbp_chroma_ctx_idx_inc_ac(pic, mb_x, mb_y)
+                }
+            },
         )?
     };
     let cbp_luma = (cbp & 0x0F) as u8;
@@ -278,6 +282,8 @@ fn decode_b_inter(
         let info = pic.mb_info_mut(mb_x, mb_y);
         info.qp_y = qp_y;
         info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
+        info.cbp_luma = cbp_luma;
+        info.cbp_chroma = cbp_chroma;
     }
     decode_inter_residual_luma(d, ctxs, mb_x, mb_y, pic, cbp_luma, qp_y)?;
     decode_inter_residual_chroma(d, ctxs, pps, mb_x, mb_y, pic, cbp_chroma, qp_y)?;
@@ -1013,74 +1019,6 @@ fn wrap_neighbour(
         return None;
     }
     Some((mbx as u32, mby as u32, r as u32, c as u32))
-}
-
-fn cbp_luma_ctx_idx_incs(pic: &Picture, mb_x: u32, mb_y: u32) -> [u8; 4] {
-    // §9.3.3.1.1.4 — conservative CBP neighbour derivation matches the
-    // CABAC P-slice path (future refinement: track per-8×8 cbp bits).
-    let mut out = [0u8; 4];
-    for i in 0..4 {
-        let (xi, yi) = match i {
-            0 => (0usize, 0usize),
-            1 => (1, 0),
-            2 => (0, 1),
-            _ => (1, 1),
-        };
-        let a_coded = if xi > 0 {
-            1u8
-        } else if mb_x > 0 {
-            let m = pic.mb_info_at(mb_x - 1, mb_y);
-            if m.coded {
-                let has = m.luma_nc.iter().any(|&n| n != 0);
-                if has {
-                    0
-                } else {
-                    1
-                }
-            } else {
-                1
-            }
-        } else {
-            1
-        };
-        let b_coded = if yi > 0 {
-            1u8
-        } else if mb_y > 0 {
-            let m = pic.mb_info_at(mb_x, mb_y - 1);
-            if m.coded {
-                let has = m.luma_nc.iter().any(|&n| n != 0);
-                if has {
-                    0
-                } else {
-                    1
-                }
-            } else {
-                1
-            }
-        } else {
-            1
-        };
-        out[i] = a_coded + 2 * b_coded;
-    }
-    out
-}
-
-fn cbp_chroma_ctx_idx_incs(pic: &Picture, mb_x: u32, mb_y: u32) -> [u8; 2] {
-    let neighbour_any = |m: &MbInfo| {
-        m.coded && (m.cb_nc.iter().any(|&n| n != 0) || m.cr_nc.iter().any(|&n| n != 0))
-    };
-    let a_any = if mb_x > 0 {
-        neighbour_any(pic.mb_info_at(mb_x - 1, mb_y))
-    } else {
-        false
-    };
-    let b_any = if mb_y > 0 {
-        neighbour_any(pic.mb_info_at(mb_x, mb_y - 1))
-    } else {
-        false
-    };
-    let inc_any = (a_any as u8) + 2 * (b_any as u8);
-    [inc_any, inc_any]
 }
 
 fn cbf_neighbours_luma(

@@ -230,6 +230,8 @@ pub fn decode_intra_mb_given_imb(
             coded: true,
             intra: true,
             intra4x4_pred_mode: intra4x4_modes,
+            cbp_luma,
+            cbp_chroma,
             ..Default::default()
         };
     }
@@ -343,6 +345,10 @@ fn decode_pcm_mb(
     info.cb_nc = [16; 16];
     info.cr_nc = [16; 16];
     info.intra4x4_pred_mode = [INTRA_DC_FAKE; 16];
+    // §9.3.3.1.1.4: for I_PCM neighbour derivations, treat all CBP bits as
+    // "coded" so neighbour ctxIdxInc sees the expected condTermFlag=0.
+    info.cbp_luma = 0x0F;
+    info.cbp_chroma = 2;
     Ok(())
 }
 
