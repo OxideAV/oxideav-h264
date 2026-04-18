@@ -54,19 +54,30 @@
 //! |338-398| last_significant_coeff_flag (field)   |
 //! |399-459| coeff_abs_level_minus1 (field)        |
 //!
-//! NB: the full 1024-context span documented in the 2019 revision
-//! covers transform_size_8x8_flag and the 8×8/4×4 coefficient coding
-//! contexts for High profile.  For v1 (Baseline/Main parity) we stop
-//! at `NUM_CTX = 460`, matching the original H.264 spec.
+//! The 1024-context span documented in the 2019 revision covers
+//! `transform_size_8x8_flag` + the frame-coded 8×8 / field-coded 4×4
+//! and 8×8 coefficient contexts for High profile. This table holds
+//! the first 460 entries (Baseline / Main) plus the single
+//! `coded_block_flag` bank for ctxBlockCat = 5 at ctxIdx 1012..=1015
+//! (§9.3.3.1.1.9, Table 9-34 bottom row — "ctxBlockCat == 5 for
+//! coded_block_flag uses ctxIdxOffset 1012"); positions in between
+//! are zero-filled since no syntax element in our supported subset
+//! references them. See `CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8`.
 
 use super::context::CabacContext;
 
 /// Total number of ctxIdx entries covered by this module.
 ///
-/// Baseline/Main profile uses ctxIdx `0..460`.  High profile's
-/// extended 8×8 transform contexts (ctxIdx 460..1024) are not needed
-/// for Baseline/Main decode and are not (yet) stored here.
-pub const NUM_CTX: usize = 460;
+/// Baseline/Main profile uses ctxIdx `0..460`. High Profile's
+/// `coded_block_flag` bank for `ctxBlockCat == 5` (frame-coded 8×8
+/// luma) lives at ctxIdx 1012..=1015 per §9.3.3.1.1.9 Table 9-34;
+/// we store those four entries immediately after the 460 main-profile
+/// contexts and expose them via [`CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8`].
+/// The `significant_coeff_flag` / `last_significant_coeff_flag` /
+/// `coeff_abs_level_minus1` banks for `ctxBlockCat == 5` overlap the
+/// original 402..=435 range and therefore share storage with the
+/// field-coded context names documented in the range table above.
+pub const NUM_CTX: usize = 464;
 
 // --- ctxIdx range constants (Table 9-34) ---
 
@@ -100,6 +111,47 @@ pub const CTX_IDX_SIGNIFICANT_COEFF_FLAG_FIELD: usize = 277;
 pub const CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_FIELD: usize = 338;
 pub const CTX_IDX_COEFF_ABS_LEVEL_MINUS1_FIELD: usize = 399;
 
+/// §9.3.3.1.1.10 — `transform_size_8x8_flag` uses 3 regular-mode contexts
+/// (Table 9-30 row "ctxIdxOffset = 399"). ctxIdxInc = condTermFlagA +
+/// condTermFlagB selects slot 399, 400 or 401.
+pub const CTX_IDX_TRANSFORM_SIZE_8X8_FLAG: usize = 399;
+
+/// §9.3.3.1.1.9 — `significant_coeff_flag` for ctxBlockCat = 5 (frame-coded
+/// Luma 8×8) lives at ctxIdxOffset 402 (Table 9-34 "frame-coded blocks with
+/// ctxBlockCat = 5"). Indexed by position-class ctxIdxInc[levelListIdx][0],
+/// spanning 402..=416 (15 slots).
+pub const CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8: usize = 402;
+
+/// §9.3.3.1.1.9 — `last_significant_coeff_flag` for ctxBlockCat = 5 lives
+/// at ctxIdxOffset 417 (Table 9-34). Indexed by ctxIdxInc[levelListIdx][1]
+/// spanning 417..=425 (9 slots).
+pub const CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8: usize = 417;
+
+/// §9.3.3.1.1.9 — `coeff_abs_level_minus1` for ctxBlockCat = 5 lives at
+/// ctxIdxOffset 426 (Table 9-34). 10 slots — the standard ctxIdxInc[bin]
+/// formula uses the full 5 + 5 = 10-entry bank.
+pub const CTX_IDX_COEFF_ABS_LEVEL_MINUS1_LUMA8X8: usize = 426;
+
+/// §9.3.3.1.1.9 — `coded_block_flag` for ctxBlockCat = 5 is the sole
+/// High-Profile extension we materialise here. The spec places it at
+/// ctxIdxOffset 1012 (Table 9-34). Storing those four entries separately
+/// avoids bloating the 460-entry base table with 560 unused rows. The
+/// mapping lives in [`LUMA8X8_CBF_INIT_MN`]; callers use
+/// [`luma8x8_cbf_ctx_idx`] to translate an in-storage index.
+pub const CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8: usize = 460;
+
+/// §9.3.3.1.1.9 Table 9-34 — init (m, n) pairs for ctxIdx 1012..=1015
+/// (`coded_block_flag`, ctxBlockCat = 5 frame-coded). Format matches
+/// [`INIT_MN_DATA`]: `[I/SI, idc0, idc1, idc2]`. Cross-checked against
+/// xfxhn/h264 and x264's `x264_cabac_context_init_I` /
+/// `x264_cabac_context_init_PB`.
+const LUMA8X8_CBF_INIT_MN: [[(i32, i32); 4]; 4] = [
+    [(-3, 70), (-3, 74), (-2, 73), (-5, 79)],
+    [(-8, 93), (-9, 92), (-12, 104), (-11, 104)],
+    [(-10, 90), (-8, 87), (-9, 91), (-11, 91)],
+    [(-30, 127), (-23, 126), (-31, 127), (-30, 127)],
+];
+
 // ---------------------------------------------------------------
 //  Initialization tables
 //
@@ -118,7 +170,27 @@ pub const CTX_IDX_COEFF_ABS_LEVEL_MINUS1_FIELD: usize = 399;
 /// Inner array indexed as `[0]=I/SI, [1]=idc0, [2]=idc1, [3]=idc2`.
 pub const INIT_MN: &[[(i32, i32); 4]] = &INIT_MN_DATA;
 
-const INIT_MN_DATA: [[(i32, i32); 4]; NUM_CTX] = [
+const INIT_MN_DATA: [[(i32, i32); 4]; NUM_CTX] = build_init_mn_data();
+
+const fn build_init_mn_data() -> [[(i32, i32); 4]; NUM_CTX] {
+    let base = BASE_INIT_MN_DATA;
+    let mut out = [[(0, 0); 4]; NUM_CTX];
+    let mut i = 0;
+    while i < 460 {
+        out[i] = base[i];
+        i += 1;
+    }
+    // ctxIdx 1012..=1015 (coded_block_flag, ctxBlockCat = 5) remapped into
+    // local slots 460..=463. See CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8.
+    let mut j = 0;
+    while j < 4 {
+        out[460 + j] = LUMA8X8_CBF_INIT_MN[j];
+        j += 1;
+    }
+    out
+}
+
+const BASE_INIT_MN_DATA: [[(i32, i32); 4]; 460] = [
     /*   0 */ [(20, -15), (20, -15), (20, -15), (20, -15)],
     /*   1 */ [(2, 54), (2, 54), (2, 54), (2, 54)],
     /*   2 */ [(3, 74), (3, 74), (3, 74), (3, 74)],
@@ -628,9 +700,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_has_460_rows() {
+    fn table_has_expected_rows() {
         assert_eq!(INIT_MN.len(), NUM_CTX);
-        assert_eq!(NUM_CTX, 460);
+        // 460 main-profile contexts + 4 Luma8×8 coded_block_flag contexts
+        // (§9.3.3.1.1.9 Table 9-34, ctxBlockCat = 5).
+        assert_eq!(NUM_CTX, 464);
     }
 
     #[test]
