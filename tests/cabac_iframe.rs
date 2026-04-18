@@ -390,8 +390,8 @@ fn build_idr_slice_rbsp() -> Vec<u8> {
     // end_of_slice_flag via encode_terminate(1).
 
     let ctx = |idx: usize| -> CabacCtx {
-        // Pull (m,n) from the inline-literal rows listed below. These match
-        // cabac::tables::INIT_MN_DATA's column 0 (I/SI slice) at that row.
+        // (m, n) values from ITU-T H.264 Tables 9-12 .. 9-18, I/SI column.
+        // These match `cabac::tables::INIT_MN_DATA[idx][0]`.
         let mn = match idx {
             3 => (20, -15),
             6 => (-28, 127),
@@ -402,12 +402,12 @@ fn build_idr_slice_rbsp() -> Vec<u8> {
             61 => (0, 63),
             62 => (0, 63),
             63 => (0, 63),
-            64 => (13, 41),
-            65 => (3, 62),
-            66 => (0, 58),
-            67 => (0, 63),
-            85 => (-8, 71),
-            88 => (-1, 65),
+            64 => (-9, 83),
+            65 => (4, 86),
+            66 => (0, 97),
+            67 => (-7, 72),
+            85 => (-17, 123),
+            88 => (-11, 115),
             _ => panic!("unexpected ctxIdx {idx}"),
         };
         CabacCtx::init(mn.0, mn.1, slice_qpy)

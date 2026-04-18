@@ -13,6 +13,12 @@ homepage = "https://github.com/OxideAV/oxideav-h264"
 keywords = ["multimedia", "video", "h264", "avc", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
+[features]
+# Developer-only: emit bin-level trace to stderr during CABAC decode.
+# Feeds the diff-against-JM/FFmpeg investigation documented in
+# `docs/cabac-investigation.md`.
+cabac-trace = []
+
 [dependencies]
 oxideav-core = "0.0"
 oxideav-codec = "0.0"

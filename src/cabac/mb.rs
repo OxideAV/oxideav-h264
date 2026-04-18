@@ -30,6 +30,7 @@ use crate::cabac::binarize;
 use crate::cabac::context::CabacContext;
 use crate::cabac::engine::CabacDecoder;
 use crate::cabac::residual::{decode_residual_block_cabac, BlockCat, CbfNeighbours};
+use crate::cavlc::ZIGZAG_4X4;
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_FLAG, CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_COEFF_ABS_LEVEL_MINUS1,
     CTX_IDX_INTRA_CHROMA_PRED_MODE, CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG, CTX_IDX_MB_QP_DELTA,
@@ -242,6 +243,12 @@ impl ResidualCtxPlan {
 /// with the gather/scatter plumbing so adaptive probabilities persist.
 /// `intra` selects the unavailable-neighbour default for the CBF ctxIdxInc
 /// per §9.3.3.1.1.9 (1 when the current MB is intra-coded, 0 otherwise).
+///
+/// The output is returned in **4×4 raster order** (for 4×4-shaped blocks)
+/// or **2×2 raster order** (for the 4:2:0 ChromaDc block). `decode_residual_block_cabac`
+/// emits coefficients in coded scan order; §8.5.6 / §8.5.12 demand
+/// zig-zag inverse before dequantise + IDCT, so this wrapper applies it
+/// here — matching the CAVLC path in [`crate::cavlc::decode_residual_block`].
 pub(crate) fn decode_residual_block_in_place(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
@@ -252,9 +259,34 @@ pub(crate) fn decode_residual_block_in_place(
 ) -> Result<[i32; 16]> {
     let plan = ResidualCtxPlan::new(cat, neighbours, intra);
     let mut window = plan.gather(ctxs);
-    let result = decode_residual_block_cabac(d, &mut window, cat, neighbours, max_num_coeff)?;
+    let coded = decode_residual_block_cabac(d, &mut window, cat, neighbours, max_num_coeff)?;
     plan.scatter(ctxs, &window);
-    Ok(result)
+
+    // §8.5.6 inverse scan: CABAC emits coefficients in scan order.
+    // Subsequent §8.5.10 / §8.5.11 / §8.5.12 processing (inverse Hadamard,
+    // dequantise, inverse 4×4/IDCT) works on the 4×4 (or 2×2) raster.
+    let mut raster = [0i32; 16];
+    match cat {
+        BlockCat::Luma16x16Dc | BlockCat::Luma4x4 => {
+            for i in 0..16 {
+                raster[ZIGZAG_4X4[i]] = coded[i];
+            }
+        }
+        BlockCat::Luma16x16Ac | BlockCat::ChromaAc | BlockCat::Chroma4x4 => {
+            // Coded positions 0..=14 map into raster 1..=15; raster 0 (DC)
+            // is filled from the separate DC block.
+            for i in 0..15 {
+                raster[ZIGZAG_4X4[i + 1]] = coded[i];
+            }
+        }
+        BlockCat::ChromaDc => {
+            // 2×2 chroma DC scan order matches raster (see §8.5.11.1).
+            for i in 0..4 {
+                raster[i] = coded[i];
+            }
+        }
+    }
+    Ok(raster)
 }
 
 /// §9.3.3.1.1.9 — cumulative per-ctxBlockCat base into the 61-slot
@@ -294,6 +326,8 @@ pub fn decode_i_mb_cabac(
 ) -> Result<()> {
     // --- mb_type ---
     let mb_type_inc = mb_type_i_ctx_idx_inc(pic, mb_x, mb_y);
+    #[cfg(feature = "cabac-trace")]
+    { d.trace_label = "mb_type"; }
     let mb_type_raw = {
         // I-slice mb_type contexts live at ctxIdxOffset 3 (CTX_IDX_MB_TYPE_I),
         // 8 slots covering bin 0 neighbour-indexed + bins 2..6.
@@ -378,6 +412,8 @@ fn decode_intra_mb_given_imb_cabac(
     }
 
     // --- intra_chroma_pred_mode (always present when chroma_format_idc != 0) ---
+    #[cfg(feature = "cabac-trace")]
+    { d.trace_label = "intra_chroma_pred_mode"; }
     let chroma_mode_val = if sps.chroma_format_idc != 0 {
         let inc = intra_chroma_pred_mode_ctx_idx_inc(pic, mb_x, mb_y);
         let slice = &mut ctxs[CTX_IDX_INTRA_CHROMA_PRED_MODE..CTX_IDX_INTRA_CHROMA_PRED_MODE + 4];
@@ -419,6 +455,8 @@ fn decode_intra_mb_given_imb_cabac(
     let needs_qp_delta =
         matches!(imb, IMbType::I16x16 { .. }) || (cbp_luma != 0 || cbp_chroma != 0);
     if needs_qp_delta {
+        #[cfg(feature = "cabac-trace")]
+        { d.trace_label = "mb_qp_delta"; }
         let inc = if pic.last_mb_qp_delta_was_nonzero {
             1u8
         } else {
@@ -480,6 +518,8 @@ fn decode_intra_mb_given_imb_cabac(
     }
 
     // --- Chroma reconstruction ---
+    #[cfg(feature = "cabac-trace")]
+    { d.trace_label = "chroma"; }
     decode_chroma(
         d,
         ctxs,
@@ -492,6 +532,9 @@ fn decode_intra_mb_given_imb_cabac(
         cbp_chroma,
         qp_y,
     )?;
+
+    #[cfg(feature = "cabac-trace")]
+    { d.trace_label = "end_of_slice"; }
 
     Ok(())
 }
@@ -676,6 +719,8 @@ fn decode_luma_intra_16x16(
 
     // DC luma — always coded.
     let dc_neigh = cbf_neighbours_luma(pic, mb_x, mb_y, 0, 0);
+    #[cfg(feature = "cabac-trace")]
+    { d.trace_label = "luma16x16.dc"; }
     let dc_coeffs =
         decode_residual_block_in_place(d, ctxs, BlockCat::Luma16x16Dc, &dc_neigh, 16, true)?;
     let mut dc = dc_coeffs;
