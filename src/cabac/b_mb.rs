@@ -81,6 +81,12 @@ pub fn decode_b_mb_cabac(
         crate::b_mb::decode_b_skip_mb(
             sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, bctx, *prev_qp,
         )?;
+        // §9.3.3.1.1.5 — a skipped MB has no `mb_qp_delta`; the
+        // "previous non-zero" tracker resets to 0 across skips so the
+        // next coded MB's bin-0 ctxIdxInc lands on ctx 60 (not ctx 61).
+        // Mirrors FFmpeg's `sl->last_qscale_diff = 0` after
+        // `decode_mb_skip` (libavcodec/h264_cabac.c:1952).
+        pic.last_mb_qp_delta_was_nonzero = false;
         return Ok(true);
     }
 

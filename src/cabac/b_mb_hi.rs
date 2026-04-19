@@ -83,6 +83,10 @@ pub fn decode_b_mb_cabac_hi(
         crate::b_mb_hi::decode_b_skip_mb_hi(
             sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, bctx, *prev_qp,
         )?;
+        // §9.3.3.1.1.5 — see `cabac::p_mb::decode_p_skip`; the tracker
+        // resets to 0 across every skipped MB so the next coded MB's
+        // mb_qp_delta ctxIdxInc lands on ctx 60 (not ctx 61).
+        pic.last_mb_qp_delta_was_nonzero = false;
         return Ok(true);
     }
 
