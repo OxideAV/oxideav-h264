@@ -47,11 +47,10 @@ use crate::cabac::tables::{
     CTX_IDX_LAST_CR_LUMA4X4, CTX_IDX_LAST_CR_LUMA8X8, CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG,
     CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_TYPE_I,
     CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_REM_INTRA4X4_PRED_MODE,
-    CTX_IDX_SIGNIFICANT_COEFF_FLAG,
-    CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_SIG_CB_LUMA16X16AC, CTX_IDX_SIG_CB_LUMA16X16DC,
-    CTX_IDX_SIG_CB_LUMA4X4, CTX_IDX_SIG_CB_LUMA8X8, CTX_IDX_SIG_CR_LUMA16X16AC,
-    CTX_IDX_SIG_CR_LUMA16X16DC, CTX_IDX_SIG_CR_LUMA4X4, CTX_IDX_SIG_CR_LUMA8X8,
-    CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
+    CTX_IDX_SIGNIFICANT_COEFF_FLAG, CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8,
+    CTX_IDX_SIG_CB_LUMA16X16AC, CTX_IDX_SIG_CB_LUMA16X16DC, CTX_IDX_SIG_CB_LUMA4X4,
+    CTX_IDX_SIG_CB_LUMA8X8, CTX_IDX_SIG_CR_LUMA16X16AC, CTX_IDX_SIG_CR_LUMA16X16DC,
+    CTX_IDX_SIG_CR_LUMA4X4, CTX_IDX_SIG_CR_LUMA8X8, CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
 };
 use crate::cavlc::ZIGZAG_4X4;
 use crate::intra_pred::{
@@ -698,8 +697,8 @@ fn decode_intra_mb_given_imb_cabac(
                 } else {
                     // rem_intra8x8_pred_mode shares the FL(3) regular-mode
                     // binarization with rem_intra4x4_pred_mode (§9.3.3.1.1.7).
-                    let slice = &mut ctxs[CTX_IDX_REM_INTRA4X4_PRED_MODE
-                        ..CTX_IDX_REM_INTRA4X4_PRED_MODE + 1];
+                    let slice = &mut ctxs
+                        [CTX_IDX_REM_INTRA4X4_PRED_MODE..CTX_IDX_REM_INTRA4X4_PRED_MODE + 1];
                     let rem = binarize::decode_rem_intra4x4_pred_mode(d, slice)? as u8;
                     if rem < predicted {
                         rem
@@ -726,8 +725,8 @@ fn decode_intra_mb_given_imb_cabac(
                 let mode = if prev_flag {
                     predicted
                 } else {
-                    let slice = &mut ctxs[CTX_IDX_REM_INTRA4X4_PRED_MODE
-                        ..CTX_IDX_REM_INTRA4X4_PRED_MODE + 1];
+                    let slice = &mut ctxs
+                        [CTX_IDX_REM_INTRA4X4_PRED_MODE..CTX_IDX_REM_INTRA4X4_PRED_MODE + 1];
                     let rem = binarize::decode_rem_intra4x4_pred_mode(d, slice)? as u8;
                     if rem < predicted {
                         rem

@@ -139,8 +139,8 @@ fn decode_intra_mb_given_imb_cabac_444(
             let mode = if prev_flag {
                 predicted
             } else {
-                let slice = &mut ctxs[CTX_IDX_REM_INTRA4X4_PRED_MODE
-                    ..CTX_IDX_REM_INTRA4X4_PRED_MODE + 1];
+                let slice =
+                    &mut ctxs[CTX_IDX_REM_INTRA4X4_PRED_MODE..CTX_IDX_REM_INTRA4X4_PRED_MODE + 1];
                 let rem = binarize::decode_rem_intra4x4_pred_mode(d, slice)? as u8;
                 if rem < predicted {
                     rem
