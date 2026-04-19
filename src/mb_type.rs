@@ -417,6 +417,16 @@ impl BSubPartition {
             BSubPartition::Four4x4 { .. } => 4,
         }
     }
+    /// True when the sub-partition covers a full 8×8 (i.e. `Direct8x8` or
+    /// `Full8x8`). §7.3.5.1 gates `transform_size_8x8_flag` on every B_8x8
+    /// sub-MB being ≥ 8×8 (no 8×4 / 4×8 / 4×4 sub-partitions straddling an
+    /// 8×8 transform block).
+    pub fn is_at_least_8x8(self) -> bool {
+        matches!(
+            self,
+            BSubPartition::Direct8x8 | BSubPartition::Full8x8 { .. }
+        )
+    }
     /// Prediction direction, or `None` for `Direct8x8` (callers derive MVs
     /// via direct prediction rather than following a partition-level dir).
     pub fn pred_dir(self) -> Option<PredDir> {
