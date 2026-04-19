@@ -1773,14 +1773,30 @@ fn predict_intra4x4_mode_with(
     br_col: usize,
     in_progress: &[u8; 16],
 ) -> u8 {
+    // §8.3.1.1 predIntra4x4PredMode derivation. A / B neighbours:
+    //   * geometrically unavailable  → None (triggers DC fallback below)
+    //   * inter-coded (and `constrained_intra_pred_flag = 0`) → treated as
+    //     `Intra4x4PredMode = 2 (DC)` per spec step 3, NOT as unavailable.
+    //     Mirrors FFmpeg's `2 - 3 * !(type & type_mask)` cache fill in
+    //     `h264_mvpred.h:fill_decode_caches` (result = 2 when the MB is
+    //     coded but not intra, provided constrained_intra_pred is off).
+    //   * intra-coded neighbour outside current MB → pull the block's actual
+    //     `intra4x4_pred_mode`.
+    //   * intra-coded same MB (earlier block in decode order) → pulled from
+    //     `in_progress`.
+    //
+    // TODO when we plumb `constrained_intra_pred_flag` through: treat inter
+    // neighbours as unavailable in that mode instead of mapping to DC.
     let left_mode = if br_col > 0 {
         Some(in_progress[br_row * 4 + br_col - 1])
     } else if mb_x > 0 {
         let li = pic.mb_info_at(mb_x - 1, mb_y);
-        if li.coded && li.intra {
+        if !li.coded {
+            None
+        } else if li.intra {
             Some(li.intra4x4_pred_mode[br_row * 4 + 3])
         } else {
-            None
+            Some(INTRA_DC_FAKE)
         }
     } else {
         None
@@ -1789,10 +1805,12 @@ fn predict_intra4x4_mode_with(
         Some(in_progress[(br_row - 1) * 4 + br_col])
     } else if mb_y > 0 {
         let ti = pic.mb_info_at(mb_x, mb_y - 1);
-        if ti.coded && ti.intra {
+        if !ti.coded {
+            None
+        } else if ti.intra {
             Some(ti.intra4x4_pred_mode[12 + br_col])
         } else {
-            None
+            Some(INTRA_DC_FAKE)
         }
     } else {
         None
