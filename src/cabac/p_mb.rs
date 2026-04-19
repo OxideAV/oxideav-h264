@@ -189,10 +189,17 @@ fn decode_p_inter(
     let num_ref_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
     let n_parts = partition.num_partitions();
     let mut ref_idxs = [0i8; 4];
-    // Read ref_idx_l0 for each partition (only when more than one ref).
+    // §9.3.3.1.1.6 — bin 0's ctxIdxInc reads the left/above 4×4 neighbour
+    // blocks' `ref_idx_lX`. Partition 1 of a P_16x8 / P_8x16 MB has its
+    // intra-MB neighbour at partition 0's 4×4 grid, so we must publish
+    // each partition's ref_idx into `mb_info.ref_idx_l0` *before* the next
+    // partition derives its ctxIdxInc. This mirrors FFmpeg's
+    // `fill_rectangle(&ref_cache[..], ..)` inside the per-partition decode
+    // loop (h264_cabac.c:2240).
     for p in 0..n_parts {
+        let (r0, c0, ph, pw) = partition.partition_rect(p);
         ref_idxs[p] = if num_ref_l0 > 1 {
-            let inc = ref_idx_ctx_idx_inc(pic, mb_x, mb_y, partition, p)?;
+            let inc = ref_idx_ctx_idx_inc_at(pic, mb_x, mb_y, r0, c0)?;
             let slice = &mut ctxs[CTX_IDX_REF_IDX_L0..CTX_IDX_REF_IDX_L0 + 6];
             let raw = binarize::decode_ref_idx_lx(d, slice, inc)?;
             if raw >= num_ref_l0 {
@@ -204,6 +211,7 @@ fn decode_p_inter(
         } else {
             0
         };
+        publish_ref_idx_l0(pic, mb_x, mb_y, r0, c0, ph, pw, ref_idxs[p]);
     }
 
     // Read MVDs + apply MV prediction + motion compensation.
@@ -381,13 +389,19 @@ fn decode_p_8x8(
             .ok_or_else(|| Error::invalid(format!("h264 cabac p-slice: bad sub_mb_type {raw}")))?;
     }
 
-    // ref_idx_l0 for each 8×8 sub-MB.
+    // ref_idx_l0 for each 8×8 sub-MB. §9.3.3.1.1.6 — bin 0's ctxIdxInc
+    // reads the left/above 4×4 neighbour blocks' `ref_idx_lX` flags, so
+    // sub-MBs 1/2/3 (whose neighbour set can include earlier sub-MBs
+    // *inside* the same MB) must see the freshly-decoded values. Publish
+    // each sub-MB's ref_idx to the per-4×4 grid immediately after decoding,
+    // mirroring FFmpeg's `fill_rectangle(&ref_cache[scan8[4*i]+1], ...)`
+    // write that accompanies every `decode_cabac_mb_ref` call
+    // (h264_cabac.c:2156-2157).
     let mut ref_idxs = [0i8; 4];
     if !is_ref0 {
         for s in 0..4 {
+            let (sr0, sc0) = SUB_OFFSETS[s];
             ref_idxs[s] = if num_ref_l0 > 1 {
-                let (sr0, sc0) = SUB_OFFSETS[s];
-                // ref_idx neighbour derivation uses the sub-MB's top-left block.
                 let inc = ref_idx_ctx_idx_inc_at(pic, mb_x, mb_y, sr0, sc0)?;
                 let slice = &mut ctxs[CTX_IDX_REF_IDX_L0..CTX_IDX_REF_IDX_L0 + 6];
                 let raw = binarize::decode_ref_idx_lx(d, slice, inc)?;
@@ -400,6 +414,7 @@ fn decode_p_8x8(
             } else {
                 0
             };
+            publish_ref_idx_l0(pic, mb_x, mb_y, sr0, sc0, 2, 2, ref_idxs[s]);
         }
     }
 
@@ -812,7 +827,15 @@ fn neighbour_ref_idx_gt_zero(pic: &Picture, mb_x: i32, mb_y: i32, row: i32, col:
         None => return false,
     };
     let info = pic.mb_info_at(mbx, mby);
-    if !info.coded || info.intra || info.skipped {
+    // Same-MB lookups happen during progressive partition decode — the MB
+    // metadata flags (`coded`, `intra`, `skipped`) are only written after
+    // the residual stage, so gating on them here would discard the
+    // intra-MB neighbour contribution §9.3.3.1.1.6 requires.
+    // `publish_ref_idx_l0` has already filled the per-4×4 grid for earlier
+    // partitions of the *same* MB with the freshly-decoded ref_idx, so a
+    // direct read is the correct source of truth.
+    let same_mb = mbx as i32 == mb_x && mby as i32 == mb_y;
+    if !same_mb && (!info.coded || info.intra || info.skipped) {
         return false;
     }
     info.ref_idx_l0[(r * 4 + c) as usize] > 0
@@ -852,7 +875,15 @@ fn neighbour_abs_mvd(pic: &Picture, mb_x: i32, mb_y: i32, row: i32, col: i32, is
         None => return 0,
     };
     let info = pic.mb_info_at(mbx, mby);
-    if !info.coded || info.intra || info.skipped {
+    // Same-MB lookups see the in-progress partition state: earlier
+    // partitions have already published their |mvd| into the per-4×4 grid
+    // via `fill_partition_mvd_abs`. The `coded` / `intra` / `skipped`
+    // flags don't flip until the MB decode completes, so gating on them
+    // here would discard the intra-MB neighbour magnitudes §9.3.3.1.1.7
+    // requires. Mirrors FFmpeg's `mvd_cache[list][scan8[n] - 1]` read
+    // against the progressively-filled cache (h264_cabac.c:1545-1548).
+    let same_mb = mbx as i32 == mb_x && mby as i32 == mb_y;
+    if !same_mb && (!info.coded || info.intra || info.skipped) {
         return 0;
     }
     let (x, y) = info.mvd_l0_abs[(r * 4 + c) as usize];
@@ -1016,6 +1047,29 @@ pub(crate) fn fill_partition_mv(
     for rr in r0..r0 + h {
         for cc in c0..c0 + w {
             info.mv_l0[rr * 4 + cc] = mv;
+            info.ref_idx_l0[rr * 4 + cc] = ref_idx;
+        }
+    }
+}
+
+/// Publish `ref_idx_l0` for an MB partition's 4×4 block footprint so a
+/// later partition within the same MB can derive its ctxIdxInc against
+/// the freshly-decoded neighbour (§9.3.3.1.1.6). Mirrors FFmpeg's
+/// `fill_rectangle(&sl->ref_cache[list][scan8[n]], ...)` write that
+/// accompanies every `decode_cabac_mb_ref` call.
+pub(crate) fn publish_ref_idx_l0(
+    pic: &mut Picture,
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    h: usize,
+    w: usize,
+    ref_idx: i8,
+) {
+    let info = pic.mb_info_mut(mb_x, mb_y);
+    for rr in r0..r0 + h {
+        for cc in c0..c0 + w {
             info.ref_idx_l0[rr * 4 + cc] = ref_idx;
         }
     }
