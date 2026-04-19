@@ -968,7 +968,7 @@ fn list_luma_weights_for_bi(pwt: &PredWeightTable, r0: i8, r1: i8) -> (LumaWeigh
     (lw0, lw1)
 }
 
-fn list_luma_weight<'a>(sh: &'a SliceHeader, list: u8, ref_idx: i8) -> Option<&'a LumaWeight> {
+fn list_luma_weight(sh: &SliceHeader, list: u8, ref_idx: i8) -> Option<&LumaWeight> {
     let tbl = sh.pred_weight_table.as_ref()?;
     let idx = ref_idx.max(0) as usize;
     if list == 0 {

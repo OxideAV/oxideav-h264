@@ -692,7 +692,6 @@ pub fn predict_intra_chroma_8x16(
 fn filter_ref_8x8(n: &Intra8x8Neighbours16) -> ([u16; 16], [u16; 8], u16) {
     let mut ft = [0u16; 16];
     let mut fl = [0u16; 8];
-    let ftl;
 
     if n.top_available {
         let tl_src = if n.top_left_available {
@@ -722,18 +721,18 @@ fn filter_ref_8x8(n: &Intra8x8Neighbours16) -> ([u16; 16], [u16; 8], u16) {
         fl[7] = ((n.left[6] as u32 + 3 * n.left[7] as u32 + 2) >> 2) as u16;
     }
 
-    if n.top_left_available {
-        ftl = match (n.top_available, n.left_available) {
+    let ftl = if n.top_left_available {
+        match (n.top_available, n.left_available) {
             (true, true) => {
                 ((n.top[0] as u32 + 2 * n.top_left as u32 + n.left[0] as u32 + 2) >> 2) as u16
             }
             (true, false) => ((3 * n.top_left as u32 + n.top[0] as u32 + 2) >> 2) as u16,
             (false, true) => ((3 * n.top_left as u32 + n.left[0] as u32 + 2) >> 2) as u16,
             (false, false) => n.top_left,
-        };
+        }
     } else {
-        ftl = 0;
-    }
+        0
+    };
 
     (ft, fl, ftl)
 }

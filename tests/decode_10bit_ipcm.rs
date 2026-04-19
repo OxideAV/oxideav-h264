@@ -218,7 +218,7 @@ fn cavlc_ipcm_10bit_single_mb_round_trip() {
     // stride/bit-depth bug shows up immediately.
     let mut luma = [0u16; 256];
     for (i, v) in luma.iter_mut().enumerate() {
-        *v = (i * 4 & 0x3FF) as u16;
+        *v = ((i * 4) & 0x3FF) as u16;
     }
     let mut cb = [0u16; 64];
     for (i, v) in cb.iter_mut().enumerate() {

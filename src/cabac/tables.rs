@@ -237,7 +237,7 @@ pub const CTX_IDX_ABSLVL_CR_LUMA8X8: usize = 766;
 /// Inner array indexed as `[0]=I/SI, [1]=idc0, [2]=idc1, [3]=idc2`.
 pub const INIT_MN: &[[(i32, i32); 4]] = &INIT_MN_DATA;
 
-const INIT_MN_DATA: [[(i32, i32); 4]; NUM_CTX] = build_init_mn_data();
+static INIT_MN_DATA: [[(i32, i32); 4]; NUM_CTX] = build_init_mn_data();
 
 const fn build_init_mn_data() -> [[(i32, i32); 4]; NUM_CTX] {
     let base = BASE_INIT_MN_DATA;
@@ -736,7 +736,7 @@ const BASE_INIT_MN_DATA: [[(i32, i32); 4]; 460] = [
 // Cb 16×16-DC sig slots at 484..=498 carry the same init values as
 // the cat=0 luma slots at 105..=119 (runtime divergence, not init).
 // ---------------------------------------------------------------
-const EXT_INIT_MN_DATA: [[(i32, i32); 4]; 564] = [
+static EXT_INIT_MN_DATA: [[(i32, i32); 4]; 564] = [
     /*  460 */ [(-17, 123), (-7, 92), (0, 80), (11, 80)],
     /*  461 */ [(-12, 115), (-5, 89), (-5, 89), (5, 76)],
     /*  462 */ [(-16, 122), (-7, 96), (-7, 94), (2, 84)],

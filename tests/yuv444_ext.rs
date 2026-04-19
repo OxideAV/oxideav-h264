@@ -46,18 +46,12 @@ fn single_packet(es: Vec<u8>) -> Packet {
 /// frames.
 fn collect_frames(dec: &mut H264Decoder) -> Vec<oxideav_core::VideoFrame> {
     let mut out = Vec::new();
-    loop {
-        match dec.receive_frame() {
-            Ok(Frame::Video(v)) => out.push(v),
-            _ => break,
-        }
+    while let Ok(Frame::Video(v)) = dec.receive_frame() {
+        out.push(v);
     }
     dec.flush().expect("flush");
-    loop {
-        match dec.receive_frame() {
-            Ok(Frame::Video(v)) => out.push(v),
-            _ => break,
-        }
+    while let Ok(Frame::Video(v)) = dec.receive_frame() {
+        out.push(v);
     }
     out
 }

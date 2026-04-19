@@ -186,8 +186,7 @@ pub fn predict_mv_l0(
 
     // Spec §8.4.1.3.1 first-row availability oddity: when B and C are both
     // unavailable but A is available, use A directly (not median).
-    if b.is_none() && c.is_none() && a.is_some() {
-        let mv = a.unwrap().0;
+    if let (Some((mv, _)), None, None) = (a, b, c) {
         return mv;
     }
 
@@ -277,8 +276,8 @@ pub fn predict_mv_list(
         .filter(|&&m| m)
         .count();
 
-    if b.is_none() && c.is_none() && a.is_some() {
-        return a.unwrap().0;
+    if let (Some((mv, _)), None, None) = (a, b, c) {
+        return mv;
     }
     if only_matches == 1 {
         if matches_a {
@@ -304,16 +303,8 @@ pub fn predict_mv_list(
 pub fn predict_mv_pskip(pic: &Picture, mb_x: u32, mb_y: u32) -> (i16, i16) {
     let a = neighbour_mv(pic, mb_x as i32, mb_y as i32, 0, -1);
     let b = neighbour_mv(pic, mb_x as i32, mb_y as i32, -1, 0);
-    let trivial_a = match a {
-        None => true,
-        Some(((0, 0), 0)) => true,
-        _ => false,
-    };
-    let trivial_b = match b {
-        None => true,
-        Some(((0, 0), 0)) => true,
-        _ => false,
-    };
+    let trivial_a = matches!(a, None | Some(((0, 0), 0)));
+    let trivial_b = matches!(b, None | Some(((0, 0), 0)));
     if trivial_a || trivial_b {
         return (0, 0);
     }
@@ -379,9 +370,9 @@ pub fn luma_mc(
 }
 
 /// Plane-agnostic 8-bit luma-style motion compensation. Reads 6-tap half-pel
-/// + bilinear quarter-pel samples from the supplied plane buffer and writes
-/// into `dst` (row-major, stride = `part_w`). Used by both the 4:2:0 luma
-/// path and the 4:4:4 chroma path (which applies the luma filter to each
+/// samples (plus bilinear quarter-pel) from the supplied plane buffer and
+/// writes into `dst` (row-major, stride = `part_w`). Used by both the 4:2:0
+/// luma path and the 4:4:4 chroma path (which applies the luma filter to each
 /// chroma plane per §6.4.1 / §8.4.2.2.1 Table 8-9 when `ChromaArrayType = 3`).
 #[allow(clippy::too_many_arguments)]
 pub fn luma_mc_plane(

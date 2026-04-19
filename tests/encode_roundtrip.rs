@@ -28,8 +28,8 @@ fn make_gradient_frame(w: u32, h: u32) -> VideoFrame {
     }
     for r in 0..ch {
         for c in 0..cw {
-            cb[(r * cw + c) as usize] = (64 + r as u8).min(255);
-            cr[(r * cw + c) as usize] = (192u32.saturating_sub(c) as u8).min(255);
+            cb[(r * cw + c) as usize] = 64 + r as u8;
+            cr[(r * cw + c) as usize] = 192u32.saturating_sub(c) as u8;
         }
     }
     VideoFrame {

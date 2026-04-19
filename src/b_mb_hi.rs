@@ -1406,11 +1406,11 @@ fn lookup_ref<'a>(list: &[&'a Picture], ref_idx: i8, tag: &str) -> Result<&'a Pi
     })
 }
 
-fn list_weight<'a>(
-    sh: &'a SliceHeader,
+fn list_weight(
+    sh: &SliceHeader,
     list: u8,
     ref_idx: i8,
-) -> (Option<&'a LumaWeight>, Option<&'a ChromaWeight>) {
+) -> (Option<&LumaWeight>, Option<&ChromaWeight>) {
     let Some(tbl) = sh.pred_weight_table.as_ref() else {
         return (None, None);
     };

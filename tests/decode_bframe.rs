@@ -158,7 +158,7 @@ fn decode_bslice_cavlc_clip_against_reference() {
     }
 
     assert!(
-        decoded_frames.len() >= 1,
+        !decoded_frames.is_empty(),
         "decoder produced zero frames (I-slice expected to pass)"
     );
     if parse_failures > 0 {
@@ -169,8 +169,7 @@ fn decode_bslice_cavlc_clip_against_reference() {
     let mut total_samples = 0usize;
     let mut total_psnr = 0.0f64;
     let cmp_count = decoded_frames.len().min(total_ref_frames);
-    for i in 0..cmp_count {
-        let dec_buf = &decoded_frames[i];
+    for (i, dec_buf) in decoded_frames.iter().enumerate().take(cmp_count) {
         let ref_off = i * FRAME_BYTES;
         let ref_buf = &yuv_all[ref_off..ref_off + FRAME_BYTES];
         let m = count_within(dec_buf, ref_buf, 8);
@@ -199,5 +198,5 @@ fn decode_bslice_cavlc_clip_against_reference() {
         avg_psnr >= 28.0,
         "B-slice decode avg PSNR {avg_psnr:.2} dB below 28 dB threshold"
     );
-    assert!(decoded_frames.len() >= 1);
+    assert!(!decoded_frames.is_empty());
 }

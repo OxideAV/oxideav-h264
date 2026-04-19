@@ -571,7 +571,7 @@ fn fill_partition_mv(
     }
 }
 
-pub(crate) fn l0_luma_weight<'a>(sh: &'a SliceHeader, ref_idx: i8) -> Option<&'a LumaWeight> {
+pub(crate) fn l0_luma_weight(sh: &SliceHeader, ref_idx: i8) -> Option<&LumaWeight> {
     let tbl = sh.pred_weight_table.as_ref()?;
     let idx = ref_idx.max(0) as usize;
     tbl.luma_l0.get(idx)

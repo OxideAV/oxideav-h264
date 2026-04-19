@@ -31,8 +31,8 @@ fn make_gradient_frame(w: u32, h: u32, t: u32) -> VideoFrame {
     }
     for r in 0..ch {
         for c in 0..cw {
-            cb[(r * cw + c) as usize] = ((64 + r as u32 + t).min(255)) as u8;
-            cr[(r * cw + c) as usize] = (192u32.saturating_sub(c + t) as u8).min(255);
+            cb[(r * cw + c) as usize] = ((64 + r + t).min(255)) as u8;
+            cr[(r * cw + c) as usize] = 192u32.saturating_sub(c + t) as u8;
         }
     }
     VideoFrame {
@@ -172,7 +172,7 @@ fn roundtrip_i_then_p_panning_frame_64x64_qp26() {
                 // (out of scope for this test).
                 let yy = r as i32 + pan_y;
                 let xx = c as i32 + pan_x;
-                y[(r * w + c) as usize] = ((yy + xx).min(255).max(0)) as u8;
+                y[(r * w + c) as usize] = (yy + xx).clamp(0, 255) as u8;
             }
         }
         VideoFrame {

@@ -85,7 +85,7 @@ pub fn dequantize_4x4_scaled(coeffs: &mut [i32; 16], qp: i32, weight_scale: &[i1
         }
         return;
     }
-    let qp6 = (qp / 6) as i32;
+    let qp6 = qp / 6;
     let qmod = (qp % 6) as usize;
     if qp6 >= 4 {
         let shift = (qp6 - 4) as u32;
@@ -166,7 +166,7 @@ pub fn idct_4x4(coeffs: &mut [i32; 16]) {
 /// §8.5.12.1 formula with an unbounded `qP/6` shift.
 pub fn dequantize_4x4_scaled_ext(coeffs: &mut [i32; 16], qp: i32, weight_scale: &[i16; 16]) {
     let qp = qp.max(0);
-    let qp6 = (qp / 6) as i32;
+    let qp6 = qp / 6;
     let qmod = (qp % 6) as usize;
     if weight_scale == &crate::scaling_list::FLAT_4X4 {
         let shift = qp6 as u32;
@@ -230,7 +230,7 @@ pub fn inv_hadamard_4x4_dc_scaled_ext(dc: &mut [i32; 16], qp: i32, weight_scale_
     }
 
     let qp = qp.max(0);
-    let qp6 = (qp / 6) as i32;
+    let qp6 = qp / 6;
     let qmod = (qp % 6) as usize;
     let v = V_TABLE[qmod][0] as i64;
     if weight_scale_00 == 16 {
@@ -296,12 +296,12 @@ pub fn inv_hadamard_2x2_chroma_dc_scaled_ext(dc: &mut [i32; 4], qp: i32, weight_
     } else {
         let w = weight_scale_00 as i64;
         if qp >= 30 {
-            let shift = (qp6 - 5) as u32;
+            let shift = qp6 - 5;
             for x in dc.iter_mut() {
                 *x = ((*x as i64 * w * v) << shift) as i32;
             }
         } else {
-            let shift = (5 - qp6) as u32;
+            let shift = 5 - qp6;
             let round = 1i64 << (shift - 1);
             for x in dc.iter_mut() {
                 *x = ((*x as i64 * w * v + round) >> shift) as i32;
@@ -373,7 +373,7 @@ pub fn inv_hadamard_4x4_dc_scaled(dc: &mut [i32; 16], qp: i32, weight_scale_00: 
     // `2 - qP/6` right shift with rounding). The scaled path below
     // generalises by factoring `w` into the intermediate.
     let qp = qp.clamp(0, 51);
-    let qp6 = (qp / 6) as i32;
+    let qp6 = qp / 6;
     let qmod = (qp % 6) as usize;
     let v = V_TABLE[qmod][0];
     if weight_scale_00 == 16 {
@@ -471,7 +471,7 @@ pub fn inv_hadamard_2x4_chroma_dc_scaled(dc: &mut [i32; 8], qp: i32, weight_scal
     // same shape as the 2×2 code path, with QP replaced by QP + 3 and one
     // more right-shift absorbed into the shift constants.
     let qp_dc = (qp + 3).clamp(0, 51);
-    let qp6 = (qp_dc / 6) as i32;
+    let qp6 = qp_dc / 6;
     let qmod = (qp_dc % 6) as usize;
     let v = V_TABLE[qmod][0];
     let w = weight_scale_00 as i32;
@@ -513,7 +513,7 @@ pub fn inv_hadamard_2x4_chroma_dc_scaled_ext(dc: &mut [i32; 8], qp: i32, weight_
     }
 
     let qp_dc = (qp + 3).max(0);
-    let qp6 = (qp_dc / 6) as i32;
+    let qp6 = qp_dc / 6;
     let qmod = (qp_dc % 6) as usize;
     let v = V_TABLE[qmod][0] as i64;
     let w = weight_scale_00 as i64;
@@ -575,12 +575,12 @@ pub fn inv_hadamard_2x2_chroma_dc_scaled(dc: &mut [i32; 4], qp: i32, weight_scal
         // §8.5.11.1 full form: (f * w * V + rnd) >> 5 for qP < 30,
         // shift-left for qP >= 30.
         if qp >= 30 {
-            let shift = (qp6 - 5) as u32;
+            let shift = qp6 - 5;
             for x in dc.iter_mut() {
                 *x = (*x * w * v) << shift;
             }
         } else {
-            let shift = (5 - qp6) as u32;
+            let shift = 5 - qp6;
             let round = 1i32 << (shift - 1);
             for x in dc.iter_mut() {
                 *x = (*x * w * v + round) >> shift;
@@ -685,7 +685,7 @@ pub fn dequantize_8x8(coeffs: &mut [i32; 64], qp: i32) {
 /// `w`.
 pub fn dequantize_8x8_scaled(coeffs: &mut [i32; 64], qp: i32, weight_scale: &[i16; 64]) {
     let qp = qp.clamp(0, 51);
-    let qp6 = (qp / 6) as i32;
+    let qp6 = qp / 6;
     let qmod = (qp % 6) as usize;
     if qp6 >= 6 {
         let shift = (qp6 - 6) as u32;
@@ -716,7 +716,7 @@ pub fn dequantize_8x8_scaled(coeffs: &mut [i32; 64], qp: i32, weight_scale: &[i1
 /// 10-bit P/B inter 8×8 residual paths.
 pub fn dequantize_8x8_scaled_ext(coeffs: &mut [i32; 64], qp: i32, weight_scale: &[i16; 64]) {
     let qp = qp.max(0);
-    let qp6 = (qp / 6) as i32;
+    let qp6 = qp / 6;
     let qmod = (qp % 6) as usize;
     if qp6 >= 6 {
         let shift = (qp6 - 6) as u32;

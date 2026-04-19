@@ -163,7 +163,7 @@ fn decode_10bit_bframe_against_reference() {
     let frame_plane_y_bytes = y_plane_bytes;
     let mut best_for_ref: Vec<Option<usize>> = vec![None; num_ref_frames];
     let mut used = vec![false; frames.len()];
-    for ref_idx in 0..num_ref_frames {
+    for (ref_idx, slot) in best_for_ref.iter_mut().enumerate().take(num_ref_frames) {
         let base = ref_idx * frame_bytes_local;
         let ref_y_raw = &yuv[base..base + frame_plane_y_bytes];
         let mut best: Option<(usize, usize)> = None;
@@ -184,7 +184,7 @@ fn decode_10bit_bframe_against_reference() {
             }
         }
         if let Some((di, _)) = best {
-            best_for_ref[ref_idx] = Some(di);
+            *slot = Some(di);
             used[di] = true;
         }
     }

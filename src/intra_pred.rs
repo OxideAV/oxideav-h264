@@ -820,7 +820,6 @@ pub struct Intra8x8Neighbours {
 fn filter_ref_8x8(n: &Intra8x8Neighbours) -> ([u8; 16], [u8; 8], u8) {
     let mut ft = [0u8; 16];
     let mut fl = [0u8; 8];
-    let ftl;
 
     // Top row filtering: uses top_left + top[0..=15] as input samples.
     if n.top_available {
@@ -854,18 +853,18 @@ fn filter_ref_8x8(n: &Intra8x8Neighbours) -> ([u8; 16], [u8; 8], u8) {
     }
 
     // Top-left corner filtering.
-    if n.top_left_available {
-        ftl = match (n.top_available, n.left_available) {
+    let ftl = if n.top_left_available {
+        match (n.top_available, n.left_available) {
             (true, true) => {
                 ((n.top[0] as u32 + 2 * n.top_left as u32 + n.left[0] as u32 + 2) >> 2) as u8
             }
             (true, false) => ((3 * n.top_left as u32 + n.top[0] as u32 + 2) >> 2) as u8,
             (false, true) => ((3 * n.top_left as u32 + n.left[0] as u32 + 2) >> 2) as u8,
             (false, false) => n.top_left,
-        };
+        }
     } else {
-        ftl = 0;
-    }
+        0
+    };
 
     (ft, fl, ftl)
 }
@@ -1087,6 +1086,7 @@ pub fn predict_intra_8x8(out: &mut [u8; 64], mode: Intra8x8Mode, n: &Intra8x8Nei
 }
 
 #[cfg(test)]
+#[allow(clippy::identity_op, clippy::erasing_op)]
 mod tests {
     use super::*;
 

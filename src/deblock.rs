@@ -1137,9 +1137,8 @@ fn filter_mb_edge_horizontal_mbaff(
         let c_base_x0 = c_mb_off % cstride;
         let c_base_y0 = c_mb_off / cstride;
         // Chroma edge-row offset within the MB.
-        let c_edge_row = if chroma_is_444 {
-            edge_row
-        } else if pic.chroma_format_idc == 2 {
+        // 4:4:4 and 4:2:2 keep the full luma row; 4:2:0 halves it.
+        let c_edge_row = if chroma_is_444 || pic.chroma_format_idc == 2 {
             edge_row
         } else {
             edge_row / 2

@@ -1359,11 +1359,9 @@ fn direct_spatial_ref_idx(pic: &Picture, mb_x: u32, mb_y: u32) -> (i8, i8) {
 
     fn min_ref(items: &[Option<((i16, i16), i8)>]) -> i8 {
         let mut m: Option<i8> = None;
-        for it in items {
-            if let Some((_, r)) = it {
-                if *r >= 0 {
-                    m = Some(m.map_or(*r, |cur| cur.min(*r)));
-                }
+        for (_, r) in items.iter().flatten() {
+            if *r >= 0 {
+                m = Some(m.map_or(*r, |cur| cur.min(*r)));
             }
         }
         m.unwrap_or(-1)
@@ -2059,11 +2057,11 @@ fn resolve_bipred_mode(
     (BipredMode::Implicit, weights)
 }
 
-fn list_weight<'a>(
-    sh: &'a SliceHeader,
+fn list_weight(
+    sh: &SliceHeader,
     list: u8,
     ref_idx: i8,
-) -> (Option<&'a LumaWeight>, Option<&'a ChromaWeight>) {
+) -> (Option<&LumaWeight>, Option<&ChromaWeight>) {
     let Some(tbl) = sh.pred_weight_table.as_ref() else {
         return (None, None);
     };

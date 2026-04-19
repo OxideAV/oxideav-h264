@@ -174,7 +174,7 @@ impl Dpb {
             .iter()
             .filter(|f| f.used_for_reference && f.short_term && f.poc < curr_poc)
             .collect();
-        past.sort_by(|a, b| b.poc.cmp(&a.poc));
+        past.sort_by_key(|b| std::cmp::Reverse(b.poc));
 
         let mut future: Vec<&RefFrame> = self
             .frames
@@ -224,7 +224,7 @@ impl Dpb {
             .iter()
             .filter(|f| f.used_for_reference && f.short_term && f.poc < curr_poc)
             .collect();
-        past.sort_by(|a, b| b.poc.cmp(&a.poc));
+        past.sort_by_key(|b| std::cmp::Reverse(b.poc));
 
         let mut long: Vec<&RefFrame> = self
             .frames
@@ -251,7 +251,7 @@ impl Dpb {
             .iter()
             .filter(|f| f.used_for_reference && f.short_term)
             .collect();
-        short.sort_by(|a, b| b.frame_num_wrap.cmp(&a.frame_num_wrap));
+        short.sort_by_key(|b| std::cmp::Reverse(b.frame_num_wrap));
 
         let mut long: Vec<&RefFrame> = self
             .frames

@@ -298,8 +298,8 @@ impl H264Encoder {
         // will produce. Populated MB-by-MB so later MBs' intra prediction
         // uses bit-exact neighbour samples.
         let mut rec_y = vec![0u8; (self.coded_width * self.coded_height) as usize];
-        let mut rec_cb = vec![0u8; (coded_cw * coded_ch) as usize];
-        let mut rec_cr = vec![0u8; (coded_cw * coded_ch) as usize];
+        let mut rec_cb = vec![0u8; coded_cw * coded_ch];
+        let mut rec_cr = vec![0u8; coded_cw * coded_ch];
         let l_stride = self.coded_width as usize;
         let c_stride = coded_cw;
 
@@ -738,9 +738,9 @@ impl H264Encoder {
         inv_hadamard_2x2_chroma_dc(&mut cr_dc_rec, qpc);
         for plane_is_cb in [true, false] {
             let (rec, pred, ac, dc) = if plane_is_cb {
-                (rec_cb.as_mut(), &pred_cb, &cb_ac, &cb_dc_rec)
+                (&mut *rec_cb, &pred_cb, &cb_ac, &cb_dc_rec)
             } else {
-                (rec_cr.as_mut(), &pred_cr, &cr_ac, &cr_dc_rec)
+                (&mut *rec_cr, &pred_cr, &cr_ac, &cr_dc_rec)
             };
             for bi in 0..4usize {
                 let br = bi >> 1;
@@ -981,8 +981,8 @@ impl H264Encoder {
             ref_pic.height as i32,
             (mb_x as i32) * 16,
             (mb_y as i32) * 16,
-            (skip_mv.0 as i32) * 1, // already quarter-pel (integer)
-            (skip_mv.1 as i32) * 1,
+            skip_mv.0 as i32, // already quarter-pel (integer)
+            skip_mv.1 as i32,
             16,
             16,
         );

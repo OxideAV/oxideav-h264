@@ -4,8 +4,8 @@
 //! I-frame encoder needs:
 //!
 //! * `BlockKind::Luma4x4`         — 16 coefficients in 4×4 raster (unused
-//!                                  in the current Intra_16×16-only encoder
-//!                                  but exposed for completeness).
+//!   in the current Intra_16×16-only encoder
+//!   but exposed for completeness).
 //! * `BlockKind::Luma16x16Dc`     — 16 DC coefficients post-Hadamard.
 //! * `BlockKind::Luma16x16Ac`     — 15 AC coefficients (position 0 forced 0).
 //! * `BlockKind::ChromaAc`        — 15 AC coefficients.

@@ -139,7 +139,7 @@ fn decode_pslice_simple_against_reference() {
     }
 
     assert!(
-        decoded_frames.len() >= 1,
+        !decoded_frames.is_empty(),
         "decoder produced zero frames (I-slice is expected to pass)"
     );
 
@@ -173,7 +173,7 @@ fn decode_pslice_simple_against_reference() {
     // path is verified across the full baseline feature set, we don't fail
     // the test on sub-100% P-slice match.
     assert!(
-        decoded_frames.len() >= 1,
+        !decoded_frames.is_empty(),
         "decoder failed on the I-slice of the P-slice clip"
     );
 }

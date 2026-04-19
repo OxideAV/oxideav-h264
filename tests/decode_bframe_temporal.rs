@@ -169,8 +169,7 @@ fn decode_temporal_direct_clip_against_reference() {
     let mut total_luma_samples = 0usize;
     let mut total_psnr = 0.0f64;
     let cmp_count = decoded_frames.len().min(total_ref_frames);
-    for i in 0..cmp_count {
-        let dec_buf = &decoded_frames[i];
+    for (i, dec_buf) in decoded_frames.iter().enumerate().take(cmp_count) {
         let ref_off = i * FRAME_BYTES;
         let ref_buf = &yuv_all[ref_off..ref_off + FRAME_BYTES];
         let luma_match = count_within(&dec_buf[..luma_bytes], &ref_buf[..luma_bytes], 0);
