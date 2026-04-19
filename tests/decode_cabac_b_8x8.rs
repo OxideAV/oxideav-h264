@@ -165,11 +165,7 @@ fn decode_cabac_b_8x8_matches_reference() {
             "CABAC B 8×8 aggregate: {}/{} ({:.2}%)",
             total_within, total_bytes, total_pct
         );
-        let idr_within = count_within(
-            &decoded_frames[0],
-            &yuv_all[..FRAME_BYTES],
-            8,
-        );
+        let idr_within = count_within(&decoded_frames[0], &yuv_all[..FRAME_BYTES], 8);
         let idr_pct = (idr_within as f64) * 100.0 / (FRAME_BYTES as f64);
         assert!(
             idr_pct >= 99.0,

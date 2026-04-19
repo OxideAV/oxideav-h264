@@ -454,7 +454,7 @@ pub mod sps;
 pub mod tables;
 pub mod transform;
 
-use oxideav_codec::CodecRegistry;
+use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag, PixelFormat};
 
 /// The canonical oxideav codec id for H.264 / AVC video.
@@ -464,12 +464,39 @@ pub const CODEC_ID_STR: &str = "h264";
 /// registry. Both are registered under the same `"h264"` id; the registry's
 /// preference + priority logic picks one at resolve time.
 pub fn register(reg: &mut CodecRegistry) {
+    let cid = CodecId::new(CODEC_ID_STR);
     let dec_caps = CodecCapabilities::video("h264_sw")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(8192, 8192);
-    let cid = CodecId::new(CODEC_ID_STR);
-    reg.register_decoder_impl(cid.clone(), dec_caps, decoder::make_decoder);
+    // AVI FourCC claims — H.264 / AVC covers both Annex B and avcC
+    // prefixed streams; the individual FourCCs below all route here.
+    // H264 / AVC1 are the canonical ones; X264 is libx264; VSSH / DAVC
+    // / PAVC are DVR / prosumer variants; AVC2 / AVC3 cover MP4 Annex B
+    // indicators sometimes stamped into AVI. AI* are Panasonic AVC-Intra.
+    reg.register(
+        CodecInfo::new(cid.clone())
+            .capabilities(dec_caps)
+            .decoder(decoder::make_decoder)
+            .tags([
+                CodecTag::fourcc(b"H264"),
+                CodecTag::fourcc(b"AVC1"),
+                CodecTag::fourcc(b"X264"),
+                CodecTag::fourcc(b"VSSH"),
+                CodecTag::fourcc(b"DAVC"),
+                CodecTag::fourcc(b"PAVC"),
+                CodecTag::fourcc(b"AVC2"),
+                CodecTag::fourcc(b"AVC3"),
+                CodecTag::fourcc(b"AI5Q"),
+                CodecTag::fourcc(b"AI55"),
+                CodecTag::fourcc(b"AI15"),
+                CodecTag::fourcc(b"AI13"),
+                CodecTag::fourcc(b"AI12"),
+                CodecTag::fourcc(b"AI1Q"),
+                CodecTag::fourcc(b"AI5P"),
+                CodecTag::fourcc(b"AI53"),
+            ]),
+    );
 
     // Encoder: Baseline CAVLC IDR + P. The registered caps advertise
     // `intra_only = false` (P-slice encoding is opt-in via
@@ -480,17 +507,9 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_intra_only(false)
         .with_max_size(720, 576)
         .with_pixel_format(PixelFormat::Yuv420P);
-    reg.register_encoder_impl(cid.clone(), enc_caps, encoder::make_encoder);
-
-    // AVI FourCC claims — H.264 / AVC covers both Annex B and avcC
-    // prefixed streams; the individual FourCCs below all route here.
-    // H264 / AVC1 are the canonical ones; X264 is libx264; VSSH / DAVC
-    // / PAVC are DVR / prosumer variants; AVC2 / AVC3 cover MP4 Annex B
-    // indicators sometimes stamped into AVI. AI* are Panasonic AVC-Intra.
-    for fcc in &[
-        b"H264", b"AVC1", b"X264", b"VSSH", b"DAVC", b"PAVC", b"AVC2", b"AVC3", b"AI5Q", b"AI55",
-        b"AI15", b"AI13", b"AI12", b"AI1Q", b"AI5P", b"AI53",
-    ] {
-        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
-    }
+    reg.register(
+        CodecInfo::new(cid)
+            .capabilities(enc_caps)
+            .encoder(encoder::make_encoder),
+    );
 }
