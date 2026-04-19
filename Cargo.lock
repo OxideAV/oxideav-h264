@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "oxideav-h264"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "oxideav-codec",
  "oxideav-core",
