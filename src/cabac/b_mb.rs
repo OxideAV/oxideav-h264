@@ -1106,7 +1106,11 @@ fn neighbour_ref_idx_gt_zero_b(
         None => return false,
     };
     let info = pic.mb_info_at(mbx, mby);
-    if !info.coded || info.intra {
+    // Same-MB lookups see the in-progress partition state for earlier
+    // partitions of the current MB; `info.coded` is only set after residual
+    // decode so we can't gate on it here (§9.3.3.1.1.6).
+    let same_mb = mbx as i32 == mb_x && mby as i32 == mb_y;
+    if !same_mb && (!info.coded || info.intra) {
         return false;
     }
     // B_Skip / B_Direct_16x16 / B8x8 Direct_8x8 sub → direct-cache gate
@@ -1169,7 +1173,11 @@ fn neighbour_abs_mvd(
         None => return 0,
     };
     let info = pic.mb_info_at(mbx, mby);
-    if !info.coded || info.intra {
+    // Same-MB lookups see the progressively-filled |mvd| state from
+    // earlier partitions of the current MB (§9.3.3.1.1.7). See the
+    // mirror comment in `neighbour_ref_idx_gt_zero_b`.
+    let same_mb = mbx as i32 == mb_x && mby as i32 == mb_y;
+    if !same_mb && (!info.coded || info.intra) {
         return 0;
     }
     // §9.3.3.1.1.7 — FFmpeg's `mvd_cache` is zeroed on direct / skip

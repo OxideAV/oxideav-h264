@@ -80,10 +80,20 @@ pub fn neighbour_mv_list(
         return None;
     }
     let info = pic.mb_info_at(mbx as u32, mby as u32);
-    if !info.coded {
+    // Same-MB lookups happen during progressive partition decode — the
+    // current MB's `coded` / `intra` flags are only written after the
+    // residual stage, so gating on them here would treat the freshly-
+    // decoded intra-MB neighbour partitions as unavailable and fall
+    // through to the C→D / match_count=0 paths incorrectly (§8.4.1.3.1 +
+    // §6.4.11.4). Earlier partitions' MV / ref_idx have already been
+    // published into the per-4×4 grid via `fill_partition_mv` /
+    // `publish_ref_idx_l0`, mirroring FFmpeg's `fill_rectangle(..mv_cache..)`
+    // updates inside the per-partition decode loop (h264_cabac.c:2210).
+    let same_mb = mbx == mb_x && mby == mb_y;
+    if !same_mb && !info.coded {
         return None;
     }
-    if info.intra {
+    if !same_mb && info.intra {
         return Some(((0, 0), -1));
     }
     let idx = (row * 4 + col) as usize;
