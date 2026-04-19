@@ -96,34 +96,39 @@ while let Ok(Frame::Video(vf)) = dec.receive_frame() {
   extra-edge pass is wired as a sibling entry point
   (`deblock::deblock_picture_mbaff`) — see the MBAFF section below.
 
-### MBAFF I-slice CAVLC (§7.3.4, §6.4.9.4, §8.7.1.1)
+### MBAFF I/P/B CAVLC (§7.3.4, §6.4.9.4, §8.7.1.1)
 
 - `frame_mbs_only_flag = 0` AND `mb_adaptive_frame_field_flag = 1`
-  pictures are accepted for **I-slice CAVLC in 4:2:0 / 4:2:2 / 4:4:4
-  8-bit**. `field_pic_flag = 1` (PAFF), P/B/MBAFF, CABAC/MBAFF, and
-  10-bit/MBAFF all still return `Error::Unsupported`.
+  pictures are accepted for **CAVLC I, P, and B slices in 4:2:0 /
+  4:2:2 / 4:4:4 at 8-bit**. MBAFF + CABAC and MBAFF + 10-bit still
+  return `Error::Unsupported`.
 - §7.3.4 MB-pair decode loop reads `mb_field_decoding_flag` once per
   pair; per-MB [`Picture::luma_off`] / [`Picture::chroma_off`] and
   [`Picture::luma_row_stride_for`] honour the field-interleaved sample
-  layout.
+  layout. P/B dispatch scales `first_mb_in_slice` by 2 and emits
+  `mb_field_decoding_flag` at every pair's first coded MB; inside an
+  `mb_skip_run` the flag is inferred from the left-neighbour pair.
 - §6.4.9.4 same-polarity "above" neighbour lookup for field-coded MBs
   skips the sibling MB of the current pair — the `mb_above_neighbour`
   helper points at `mb_y - 2` rather than `mb_y - 1` so CAVLC `nC`
-  prediction, intra-4×4 mode prediction and intra prediction sample
-  fetches all resolve to the correct previous-pair MB.
+  prediction, intra-4×4 mode prediction, intra prediction sample
+  fetches, and MV prediction (§8.4.1.1) all resolve to the correct
+  previous-pair MB.
 - §8.7.1.1 MBAFF deblock pass is wired
   (`deblock::deblock_picture_mbaff`). The driver walks MB pairs and
   keys the edge schedule on each pair's `mb_field_decoding_flag`:
   field-coded pairs step vertical edges at `row_step = 2` through
   the interleaved plane layout and skip the inside-pair top/bottom
   boundary. Decoded luma matches ffmpeg bit-exact (100% ±0 LSB) on
-  the in-tree `mbaff_128x128` fixture.
+  the in-tree `mbaff_128x128` fixture; `mbaff_422_128x128` and
+  `mbaff_444_128x128` are bit-exact on luma and within ±4 LSB on
+  chroma.
 - **Known gaps**: mixed-mode MBAFF (some pairs frame-coded, some
   field-coded) can decode successfully on the sample-read path but
   §6.4.9.4 neighbour lookups that span a frame↔field pair boundary
   still use the "uniform-pair-mode" fallback; a Table 6-5 lookup
   table would make cross-mode neighbour resolution spec-accurate.
-  MBAFF + P/B motion and MBAFF + CABAC are deferred.
+  MBAFF + CABAC is deferred.
 
 ### CAVLC B-slice decode (§8.4 + §8.2.4.2.3)
 
@@ -342,10 +347,10 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   is an all-skip P-field (`mb_skip_run = TotalMbs`, no coded MB,
   §8.4.1.1 `P_Skip` zero-MV) so round-trip tests can drive the PAFF P
   path without shipping a full inter-prediction writer.
-- **MBAFF I-slice CAVLC** is supported for 4:2:0 / 4:2:2 / 4:4:4 8-bit
+- **MBAFF I/P/B CAVLC** is supported for 4:2:0 / 4:2:2 / 4:4:4 8-bit
   (§7.3.4 MB-pair loop + §6.4.9.4 field-stride neighbour lookups +
-  §8.7.1.1 MBAFF deblock). MBAFF P/B, MBAFF CABAC, and MBAFF 10-bit
-  still return `Error::Unsupported`.
+  §8.7.1.1 MBAFF deblock). MBAFF + CABAC and MBAFF + 10-bit still
+  return `Error::Unsupported`.
 - Inter 8×8 transform on B-slice MBs — CAVLC P-slice inter 8×8 is wired
   (see above); B-slice inter 8×8 is not yet.
 - 4:2:2 CAVLC I- and P-slice decode IS supported (§6.4.1
@@ -385,9 +390,11 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   first cut at B inter exhibits context-state drift during Cb/Cr
   residual decode at MB 7+ of the testsrc fixture; the test is
   `#[ignore]`d with that note and awaits an MVD/ref_idx ctxIdxInc audit.
-- Bit depth above 14 or odd luma/chroma bit depths. 12-bit / 14-bit
-  are supported for **CAVLC I-slices in 4:2:0 only** (see the 12/14-bit
-  section below). 10-bit covers CAVLC I / P / B + CABAC I. Luma must
+- Bit depth above 14 or asymmetric luma/chroma bit depths. 12-bit /
+  14-bit are supported for **CAVLC I-slices in 4:2:0 only** (see the
+  12/14-bit section below). 10-bit (High 10) supports CAVLC I / P / B
+  + CABAC I / P / B at 4:2:0, plus CAVLC I at 4:2:2 / 4:4:4,
+  Intra_8×8 (`transform_size_8x8_flag = 1`), and I_PCM. Luma must
   equal chroma bit depth.
 - **Separate colour planes** (`separate_colour_plane_flag = 1`,
   §7.4.2.1.1) decode end-to-end for **CAVLC I-slices at 8-bit
@@ -409,17 +416,28 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
 
 ## 10-bit (High 10) decode
 
-The decoder handles 10-bit CAVLC I / P / B slices and 10-bit CABAC
-I-slices in 4:2:0 end-to-end and emits `PixelFormat::Yuv420P10Le`
-frames (u16 samples packed little-endian). Bit-exact against ffmpeg
-on every `10bit_*_64x64` / `iframe_10bit_64x64` /
-`pframe_10bit_64x64` fixture shipped under `tests/fixtures/`:
+The decoder handles 10-bit content end-to-end across **CAVLC I / P / B
+slices**, **CABAC I / P / B slices**, **4:2:0 / 4:2:2 / 4:4:4** chroma
+formats (4:2:2 and 4:4:4 currently at I-slice only), **Intra_8×8**
+(`transform_size_8x8_flag = 1`), and **I_PCM**, emitting
+`PixelFormat::Yuv420P10Le` / `Yuv422P10Le` / `Yuv444P10Le` frames (u16
+samples packed little-endian). Bit-exact against ffmpeg on every
+`iframe_10bit_*` / `pframe_10bit_*` / `10bit_*` / `b_10bit_*` fixture
+shipped under `tests/fixtures/`:
 
-- `iframe_10bit_64x64`: 99% within ±4 LSB (deblock edge drift).
-- `pframe_10bit_64x64`: 100% bit-exact, three consecutive P-slices.
-- `10bit_cabac_i_64x64`: 100% bit-exact (CABAC I-slice).
-- `10bit_b_64x64`: 100% bit-exact across 6 frames (I / P / B mix
-  with `bf=2`, `no-weightb`).
+- `iframe_10bit_64x64` (CAVLC I 4:2:0): 99% within ±4 LSB.
+- `pframe_10bit_64x64` (CAVLC P 4:2:0): 100% bit-exact across three
+  consecutive P-slices.
+- `10bit_cabac_i_64x64` (CABAC I 4:2:0): 100% bit-exact.
+- `10bit_b_64x64` (CAVLC B 4:2:0): 100% bit-exact across 6 frames
+  (I / P / B mix with `bf=2`, `no-weightb`).
+- `10bit_cabac_p_64x64` (CABAC P 4:2:0): 100% bit-exact.
+- `10bit_cabac_b_64x64` (CABAC B 4:2:0): 100% bit-exact.
+- `iframe_10bit_422_64x64` (CAVLC I 4:2:2): 100% bit-exact.
+- `iframe_10bit_444_64x64` (CAVLC I 4:4:4): 100% bit-exact.
+- `iframe_10bit_8x8_64x64` (CAVLC I with `transform_size_8x8_flag = 1`):
+  100% bit-exact.
+- Hand-crafted 10-bit I_PCM single-MB fixture: 100% bit-exact.
 
 The high-bit-depth path runs alongside — not in place of — the 8-bit
 pipeline:
@@ -429,29 +447,40 @@ pipeline:
   u8 planes are allocated; above 8 only the u16 planes are populated.
 - Intra prediction ([`intra_pred_hi`]) clips to `(1 << bit_depth) - 1`
   and uses `1 << (bit_depth - 1)` as the DC no-neighbour fallback
-  (§8.3.1.2.3 / §8.3.3.3 / §8.3.4.2).
-- The residual pipeline ([`mb_hi`] / [`p_mb_hi`]) adds `QpBdOffsetY` to
-  the decoded `QpY` before dispatching through the i64-widened
-  `dequantize_*_ext` variants in [`transform`], and wraps `mb_qp_delta`
-  modulo `52 + QpBdOffsetY` per §7.4.5.
+  (§8.3.1.2.3 / §8.3.3.3 / §8.3.4.2). Includes full Intra_8×8 mode set.
+- The residual pipeline ([`mb_hi`] / [`p_mb_hi`] / [`b_mb_hi`]) adds
+  `QpBdOffsetY` to the decoded `QpY` before dispatching through the
+  i64-widened `dequantize_*_ext` variants in [`transform`], and wraps
+  `mb_qp_delta` modulo `52 + QpBdOffsetY` per §7.4.5.
+- Chroma dispatch in [`mb_hi`] routes `chroma_format_idc == 2` into
+  [`mb_hi_422`] (2×4 chroma DC Hadamard on u16 + 8 AC blocks per plane)
+  and `== 3` into [`mb_hi_444`] (three luma-style residual streams at
+  u16 with per-plane QP + scaling list).
+- CABAC at high bit depth ([`cabac::mb_hi`] / [`cabac::p_mb_hi`] /
+  [`cabac::b_mb_hi`]) reuses the 8-bit entropy layer (contexts,
+  binarisation, residual decode — all bit-depth agnostic) and
+  reconstructs into u16 planes via the shared `*_ext` dequant chain.
 - P-slice motion compensation ([`motion::luma_mc_hi`] /
   [`motion::chroma_mc_hi`]) operates on the u16 planes with the same
   6-tap half-pel + bilinear quarter-pel luma filter and bilinear 1/8-pel
   chroma filter as the 8-bit path; the final Clip1 uses the per-plane
-  bit-depth max.
+  bit-depth max. Explicit and implicit weighted bipred both wire on the
+  10-bit B path.
 - In-loop deblocking on the 10-bit path ([`deblock_hi`]) reads / writes
   the u16 planes, scales `α` / `β` / `tC0` by `1 << (BitDepth - 8)` per
   §8.7.2.1, and clips to the widened sample range. The §8.7.2 bS
   derivation and edge schedule are shared with the 8-bit deblocker via
   `deblock::derive_bs_for_edge`.
+- I_PCM at 10-bit reads `bit_depth_luma` / `bit_depth_chroma` raw bits
+  per sample post byte-alignment, matching the 8-bit path parameterised
+  on depth.
 - [`picture::Picture::to_video_frame`] packs the u16 planes as
-  little-endian bytes for `Yuv420P10Le`.
+  little-endian bytes — `Yuv420P10Le` at 4:2:0, `Yuv422P10Le` at 4:2:2,
+  `Yuv444P10Le` at 4:4:4.
 
-Out of scope at 10-bit (return `Error::Unsupported`): CABAC for P / B
-slices, Intra_8×8 (`transform_size_8x8_flag = 1`), 4:2:2 / 4:4:4
-chroma, and I_PCM. Explicit weighted P-slice prediction is supported;
-explicit and implicit weighted bipred are supported on the 10-bit
-CAVLC B path.
+Out of scope at 10-bit (return `Error::Unsupported`): CABAC at 4:2:2 /
+4:4:4; P / B at 4:2:2 / 4:4:4 (only I is wired for those chroma formats
+at 10-bit); MBAFF / PAFF 10-bit.
 
 ## 12-bit + 14-bit (High 4:2:2 / High 4:4:4 Predictive) CAVLC I
 
@@ -476,9 +505,9 @@ helpers in [`transform`] — the extensions are:
   `1 << (bit_depth - 1)` = 2048 / 8192 (all already parameterised in
   [`intra_pred_hi`]).
 - Emit: 12-bit → `PixelFormat::Yuv420P12Le`; 14-bit reuses
-  `Yuv420P10Le` as a 16-bit-container fallback because
-  oxideav-core 0.0.3 doesn't carry a `Yuv420P14Le` variant. The u16
-  words still hold full 14-bit samples (`0..=16383`).
+  `Yuv420P10Le` as a 16-bit-container fallback because oxideav-core
+  doesn't carry a `Yuv420P14Le` variant. The u16 words still hold
+  full 14-bit samples (`0..=16383`).
 
 Out of scope at 12/14-bit (return `Error::Unsupported`):
 
