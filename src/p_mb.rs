@@ -1142,10 +1142,7 @@ fn mc_chroma_partition_422(
 /// `pred_weight_table` (explicit weighted prediction disabled for the
 /// slice) — callers pass that straight through to MC which skips the
 /// weighting step.
-fn l0_weight_for(
-    sh: &SliceHeader,
-    ref_idx: i8,
-) -> (Option<&LumaWeight>, Option<&ChromaWeight>) {
+fn l0_weight_for(sh: &SliceHeader, ref_idx: i8) -> (Option<&LumaWeight>, Option<&ChromaWeight>) {
     let Some(tbl) = sh.pred_weight_table.as_ref() else {
         return (None, None);
     };

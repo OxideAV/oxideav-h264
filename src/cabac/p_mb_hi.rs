@@ -774,10 +774,7 @@ fn mc_chroma_partition_hi(
     }
 }
 
-fn l0_weight_for(
-    sh: &SliceHeader,
-    ref_idx: i8,
-) -> (Option<&LumaWeight>, Option<&ChromaWeight>) {
+fn l0_weight_for(sh: &SliceHeader, ref_idx: i8) -> (Option<&LumaWeight>, Option<&ChromaWeight>) {
     let Some(tbl) = sh.pred_weight_table.as_ref() else {
         return (None, None);
     };
