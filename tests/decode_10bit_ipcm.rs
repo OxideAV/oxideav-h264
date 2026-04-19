@@ -76,7 +76,7 @@ fn build_sps_high10_rbsp() -> Vec<u8> {
 
     let mut bw = BitWriter::new();
     bw.write_ue(0); // seq_parameter_set_id
-    // High profile — chroma_format_idc, bit depths, scaling lists.
+                    // High profile — chroma_format_idc, bit depths, scaling lists.
     bw.write_ue(1); // chroma_format_idc = 1 (4:2:0)
     bw.write_ue(2); // bit_depth_luma_minus8 = 2 → 10-bit
     bw.write_ue(2); // bit_depth_chroma_minus8 = 2 → 10-bit
@@ -127,11 +127,7 @@ fn build_pps_cavlc_rbsp() -> Vec<u8> {
 
 /// Build an IDR slice RBSP consisting of a single CAVLC `mb_type = 25`
 /// (I_PCM) macroblock with explicit 10-bit samples for every plane.
-fn build_idr_slice_cavlc_ipcm_10bit(
-    luma: &[u16; 256],
-    cb: &[u16; 64],
-    cr: &[u16; 64],
-) -> Vec<u8> {
+fn build_idr_slice_cavlc_ipcm_10bit(luma: &[u16; 256], cb: &[u16; 64], cr: &[u16; 64]) -> Vec<u8> {
     let mut bw = BitWriter::new();
     // Slice header — §7.3.3.
     bw.write_ue(0); // first_mb_in_slice
@@ -190,11 +186,7 @@ fn wrap_nalu(nal_unit_type: u8, nal_ref_idc: u8, rbsp: &[u8]) -> Vec<u8> {
     out
 }
 
-fn build_annex_b_packet(
-    luma: &[u16; 256],
-    cb: &[u16; 64],
-    cr: &[u16; 64],
-) -> Vec<u8> {
+fn build_annex_b_packet(luma: &[u16; 256], cb: &[u16; 64], cr: &[u16; 64]) -> Vec<u8> {
     let sps_rbsp = build_sps_high10_rbsp();
     let pps_rbsp = build_pps_cavlc_rbsp();
     let idr_rbsp = build_idr_slice_cavlc_ipcm_10bit(luma, cb, cr);

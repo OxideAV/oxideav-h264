@@ -29,12 +29,13 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::golomb::BitReaderExt;
 use crate::p_mb::{decode_p_skip_mb, decode_p_slice_mb};
 use crate::picture::Picture;
 use crate::pps::Pps;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
+use oxideav_core::bits::BitReader;
 
 /// CAVLC SP-slice data loop — §7.3.4, Table 7-13 (SP entries).
 ///

@@ -12,8 +12,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::intra_pred::{Intra16x16Mode, Intra4x4Mode};
 use crate::intra_pred_hi::{
     predict_intra_16x16 as pred16_hi, predict_intra_4x4 as pred4_hi, Intra16x16Neighbours16,
@@ -30,6 +30,7 @@ use crate::sps::Sps;
 use crate::transform::{
     chroma_qp_hi, dequantize_4x4_scaled_ext, idct_4x4, inv_hadamard_4x4_dc_scaled_ext,
 };
+use oxideav_core::bits::BitReader;
 
 /// Top-level entry for a 10-bit 4:4:4 intra macroblock. `imb` has been
 /// parsed by the slice loop. Reuses the 8-bit 4:4:4 plumbing for mode
@@ -118,10 +119,9 @@ pub fn decode_intra_mb_hi_444(
     // Per-plane chroma QP — §8.5.11 with QpBdOffsetC support (the chroma
     // QP lookup runs on QpY + offset, then shifts by QpBdOffsetC for the
     // internal dequant).
-    let cb_qpi =
-        (qp_y + pps.chroma_qp_index_offset).clamp(-qp_bd_offset_c, 51 + qp_bd_offset_c);
-    let cr_qpi = (qp_y + pps.second_chroma_qp_index_offset)
-        .clamp(-qp_bd_offset_c, 51 + qp_bd_offset_c);
+    let cb_qpi = (qp_y + pps.chroma_qp_index_offset).clamp(-qp_bd_offset_c, 51 + qp_bd_offset_c);
+    let cr_qpi =
+        (qp_y + pps.second_chroma_qp_index_offset).clamp(-qp_bd_offset_c, 51 + qp_bd_offset_c);
     let qp_cb_prime = chroma_qp_hi(cb_qpi) + qp_bd_offset_c;
     let qp_cr_prime = chroma_qp_hi(cr_qpi) + qp_bd_offset_c;
 
@@ -326,7 +326,9 @@ fn decode_plane_intra_nxn_hi(
         let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
         let mode_v = modes[br_row * 4 + br_col];
         let mode = Intra4x4Mode::from_u8(mode_v).ok_or_else(|| {
-            Error::invalid(format!("h264 10bit 4:4:4 mb: invalid intra4x4 mode {mode_v}"))
+            Error::invalid(format!(
+                "h264 10bit 4:4:4 mb: invalid intra4x4 mode {mode_v}"
+            ))
         })?;
         let neigh = collect_intra4x4_neighbours_plane_hi(pic, mb_x, mb_y, plane, br_row, br_col);
         let mut pred = [0u16; 16];
@@ -414,8 +416,8 @@ fn decode_plane_intra_16x16_hi(
             let lo = lo_mb + br_row * 4 * row_step + br_col * 4;
             for r in 0..4 {
                 for c in 0..4 {
-                    let v = pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32
-                        + residual[r * 4 + c];
+                    let v =
+                        pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32 + residual[r * 4 + c];
                     buf[lo + r * row_step + c] = v.clamp(0, max_sample) as u16;
                 }
             }

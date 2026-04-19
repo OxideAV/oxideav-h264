@@ -10,7 +10,6 @@
 
 use oxideav_core::Result;
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_block, BlockKind};
 use crate::intra_pred::IntraChromaMode;
 use crate::intra_pred_hi::{predict_intra_chroma_8x16, IntraChroma8x16Neighbours16};
@@ -21,6 +20,7 @@ use crate::sps::Sps;
 use crate::transform::{
     chroma_qp_hi, dequantize_4x4_scaled_ext, idct_4x4, inv_hadamard_2x4_chroma_dc_scaled_ext,
 };
+use oxideav_core::bits::BitReader;
 
 /// Decode the two chroma planes of a 10-bit 4:2:2 macroblock. Analogous
 /// to the 8-bit [`decode_chroma_422`](crate::mb) but operating on u16
@@ -42,10 +42,9 @@ pub fn decode_chroma_422_hi(
     let max_sample: i32 = (1i32 << bit_depth_c) - 1;
     let qp_bd_offset_c = 6 * sps.bit_depth_chroma_minus8 as i32;
 
-    let cb_qpi =
-        (qp_y + pps.chroma_qp_index_offset).clamp(-qp_bd_offset_c, 51 + qp_bd_offset_c);
-    let cr_qpi = (qp_y + pps.second_chroma_qp_index_offset)
-        .clamp(-qp_bd_offset_c, 51 + qp_bd_offset_c);
+    let cb_qpi = (qp_y + pps.chroma_qp_index_offset).clamp(-qp_bd_offset_c, 51 + qp_bd_offset_c);
+    let cr_qpi =
+        (qp_y + pps.second_chroma_qp_index_offset).clamp(-qp_bd_offset_c, 51 + qp_bd_offset_c);
     let qpc_cb_prime = chroma_qp_hi(cb_qpi) + qp_bd_offset_c;
     let qpc_cr_prime = chroma_qp_hi(cr_qpi) + qp_bd_offset_c;
 
@@ -87,8 +86,7 @@ pub fn decode_chroma_422_hi(
                 let mut res = [0i32; 16];
                 let mut total_coeff = 0u32;
                 if cbp_chroma == 2 {
-                    let nc =
-                        predict_nc_chroma_422_hi(pic, mb_x, mb_y, plane_cb, blk_row, blk_col);
+                    let nc = predict_nc_chroma_422_hi(pic, mb_x, mb_y, plane_cb, blk_row, blk_col);
                     let ac = decode_residual_block(br, nc, BlockKind::ChromaAc)?;
                     total_coeff = ac.total_coeff;
                     res = ac.coeffs;
@@ -99,7 +97,11 @@ pub fn decode_chroma_422_hi(
                 res[0] = dc[blk_idx];
                 idct_4x4(&mut res);
                 let off_in_mb = (blk_row * 4) * row_step + blk_col * 4;
-                let plane_buf = if plane_cb { &mut pic.cb16 } else { &mut pic.cr16 };
+                let plane_buf = if plane_cb {
+                    &mut pic.cb16
+                } else {
+                    &mut pic.cr16
+                };
                 for r in 0..4 {
                     for c in 0..4 {
                         let p_idx = (blk_row * 4 + r) * 8 + (blk_col * 4 + c);

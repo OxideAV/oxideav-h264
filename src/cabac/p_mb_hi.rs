@@ -94,15 +94,47 @@ pub fn decode_p_mb_cabac_hi(
 
     match mb_type_raw {
         0 => decode_p_inter_hi(
-            d, ctxs, sh, sps, pps, mb_x, mb_y, pic, ref_list0, prev_qp, PPartition::P16x16,
+            d,
+            ctxs,
+            sh,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            ref_list0,
+            prev_qp,
+            PPartition::P16x16,
         ),
         1 => decode_p_inter_hi(
-            d, ctxs, sh, sps, pps, mb_x, mb_y, pic, ref_list0, prev_qp, PPartition::P16x8,
+            d,
+            ctxs,
+            sh,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            ref_list0,
+            prev_qp,
+            PPartition::P16x8,
         ),
         2 => decode_p_inter_hi(
-            d, ctxs, sh, sps, pps, mb_x, mb_y, pic, ref_list0, prev_qp, PPartition::P8x16,
+            d,
+            ctxs,
+            sh,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            ref_list0,
+            prev_qp,
+            PPartition::P8x16,
         ),
-        3 => decode_p_8x8_hi(d, ctxs, sh, sps, pps, mb_x, mb_y, pic, ref_list0, prev_qp, false),
+        3 => decode_p_8x8_hi(
+            d, ctxs, sh, sps, pps, mb_x, mb_y, pic, ref_list0, prev_qp, false,
+        ),
         5..=30 => {
             let imb = crate::mb_type::decode_i_slice_mb_type(mb_type_raw - 5).ok_or_else(|| {
                 Error::invalid(format!(
@@ -196,10 +228,30 @@ fn decode_p_inter_hi(
         let (lw, cw) = l0_weight_for(sh, ref_idxs[p]);
         let mv = mvs[p];
         mc_luma_partition_hi(
-            pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, lw,
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            ph,
+            pw,
+            mv.0 as i32,
+            mv.1 as i32,
+            lw,
         );
         mc_chroma_partition_hi(
-            pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, cw,
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            ph,
+            pw,
+            mv.0 as i32,
+            mv.1 as i32,
+            cw,
         );
     }
 
@@ -209,8 +261,7 @@ fn decode_p_inter_hi(
 
     let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 {
         let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
-        let slice =
-            &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+        let slice = &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
         binarize::decode_transform_size_8x8_flag(d, slice, inc)?
     } else {
         false
@@ -284,9 +335,7 @@ fn decode_p_8x8_hi(
             binarize::decode_sub_mb_type_p(d, slice)?
         };
         sub_parts[s] = crate::mb_type::decode_p_sub_mb_type(raw).ok_or_else(|| {
-            Error::invalid(format!(
-                "h264 10bit cabac p-slice: bad sub_mb_type {raw}"
-            ))
+            Error::invalid(format!("h264 10bit cabac p-slice: bad sub_mb_type {raw}"))
         })?;
     }
 
@@ -386,15 +435,13 @@ fn decode_p_8x8_hi(
     let cbp_chroma = ((cbp >> 4) & 0x03) as u8;
 
     let all_sub_8x8 = sub_parts.iter().all(|sp| sp.is_at_least_8x8());
-    let transform_8x8 =
-        if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
-            let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
-            let slice =
-                &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
-            binarize::decode_transform_size_8x8_flag(d, slice, inc)?
-        } else {
-            false
-        };
+    let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
+        let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
+        let slice = &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+        binarize::decode_transform_size_8x8_flag(d, slice, inc)?
+    } else {
+        false
+    };
     if transform_8x8 {
         return Err(Error::unsupported(
             "h264 10bit cabac p-slice: transform_size_8x8_flag=1 not yet wired",
@@ -542,27 +589,15 @@ fn decode_inter_residual_chroma_hi(
     let mut dc_cr = [0i32; 4];
     if cbp_chroma >= 1 {
         let neigh_cb_dc = cabac_p::p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
-        let cb_coeffs = decode_residual_block_in_place(
-            d,
-            ctxs,
-            BlockCat::ChromaDc,
-            &neigh_cb_dc,
-            4,
-            false,
-        )?;
+        let cb_coeffs =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, false)?;
         for i in 0..4 {
             dc_cb[i] = cb_coeffs[i];
         }
         pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb_coeffs.iter().any(|&v| v != 0);
         let neigh_cr_dc = cabac_p::p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
-        let cr_coeffs = decode_residual_block_in_place(
-            d,
-            ctxs,
-            BlockCat::ChromaDc,
-            &neigh_cr_dc,
-            4,
-            false,
-        )?;
+        let cr_coeffs =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, false)?;
         for i in 0..4 {
             dc_cr[i] = cr_coeffs[i];
         }
@@ -586,14 +621,8 @@ fn decode_inter_residual_chroma_hi(
                 let neigh = cabac_p::p_chroma_ac_cbf_neighbours(
                     pic, mb_x, mb_y, plane_kind, br_row, br_col, &nc_arr,
                 );
-                let ac = decode_residual_block_in_place(
-                    d,
-                    ctxs,
-                    BlockCat::ChromaAc,
-                    &neigh,
-                    15,
-                    false,
-                )?;
+                let ac =
+                    decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, false)?;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
                 res = ac;
                 let cat = if plane_kind { 4 } else { 5 };
@@ -603,7 +632,11 @@ fn decode_inter_residual_chroma_hi(
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);
             let off_in_mb = br_row * 4 * cstride + br_col * 4;
-            let plane = if plane_kind { &mut pic.cb16 } else { &mut pic.cr16 };
+            let plane = if plane_kind {
+                &mut pic.cb16
+            } else {
+                &mut pic.cr16
+            };
             for r in 0..4 {
                 for c in 0..4 {
                     let base = plane[co + off_in_mb + r * cstride + c] as i32;
@@ -700,12 +733,32 @@ fn mc_chroma_partition_hi(
     let cw_plane = (reference.width / 2) as i32;
     let ch_plane = (reference.height / 2) as i32;
     chroma_mc_hi(
-        &mut tmp_cb, &reference.cb16, cstride, cw_plane, ch_plane, base_x, base_y, mv_x_q, mv_y_q,
-        pw, ph, reference.bit_depth_c,
+        &mut tmp_cb,
+        &reference.cb16,
+        cstride,
+        cw_plane,
+        ch_plane,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_q,
+        pw,
+        ph,
+        reference.bit_depth_c,
     );
     chroma_mc_hi(
-        &mut tmp_cr, &reference.cr16, cstride, cw_plane, ch_plane, base_x, base_y, mv_x_q, mv_y_q,
-        pw, ph, reference.bit_depth_c,
+        &mut tmp_cr,
+        &reference.cr16,
+        cstride,
+        cw_plane,
+        ch_plane,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_q,
+        pw,
+        ph,
+        reference.bit_depth_c,
     );
     if let Some(cw_entry) = chroma_weight {
         apply_chroma_weight_hi(&mut tmp_cb, cw_entry, 0, pic.bit_depth_c);
@@ -731,4 +784,3 @@ fn l0_weight_for<'a>(
     let idx = ref_idx.max(0) as usize;
     (tbl.luma_l0.get(idx), tbl.chroma_l0.get(idx))
 }
-

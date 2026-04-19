@@ -62,7 +62,11 @@ fn flatten_frames_yuv420(
     let mut out = Vec::with_capacity(n * w * h * 3 / 2);
     for frame in frames.iter().take(n) {
         assert_eq!(frame.format, PixelFormat::Yuv420P);
-        let (pw, ph) = [(w, h), (w / 2, h / 2), (w / 2, h / 2)].iter().copied().next().unwrap();
+        let (pw, ph) = [(w, h), (w / 2, h / 2), (w / 2, h / 2)]
+            .iter()
+            .copied()
+            .next()
+            .unwrap();
         let planes_dims = [(w, h), (w / 2, h / 2), (w / 2, h / 2)];
         let _ = (pw, ph);
         for (i, p) in frame.planes.iter().enumerate() {
@@ -90,9 +94,14 @@ fn testsrc_p_decode_above_current_floor() {
     let es = read_fixture("tests/fixtures/testsrc_p_64x64.es");
     let ref_yuv = read_fixture("tests/fixtures/testsrc_p_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));
-    dec.send_packet(&single_packet(es)).expect("decode succeeds");
+    dec.send_packet(&single_packet(es))
+        .expect("decode succeeds");
     let frames = collect_frames(&mut dec);
-    assert!(frames.len() >= 3, "expected >=3 frames, got {}", frames.len());
+    assert!(
+        frames.len() >= 3,
+        "expected >=3 frames, got {}",
+        frames.len()
+    );
     let got = flatten_frames_yuv420(&frames, 3, 64, 64);
     assert_eq!(got.len(), ref_yuv.len(), "decoded length mismatch");
     let r = ratio_match(&got, &ref_yuv);

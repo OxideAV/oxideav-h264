@@ -15,11 +15,13 @@
 //!    match the per-plane samples bit-exactly.
 
 use oxideav_codec::Decoder;
+use oxideav_core::bits::BitWriter;
 use oxideav_core::{CodecId, Packet, PixelFormat, TimeBase};
-use oxideav_h264::bitwriter::{rbsp_to_ebsp, BitWriter};
 use oxideav_h264::cavlc::BlockKind;
 use oxideav_h264::cavlc_enc::encode_residual_block;
 use oxideav_h264::decoder::H264Decoder;
+use oxideav_h264::golomb::BitWriterExt;
+use oxideav_h264::nal::rbsp_to_ebsp;
 use oxideav_h264::nal::{NalHeader, NalUnitType};
 use oxideav_h264::pps::parse_pps;
 use oxideav_h264::slice::parse_slice_header;
@@ -91,16 +93,16 @@ fn write_sep_plane_slice_header(bw: &mut BitWriter, plane_id: u8) {
     bw.write_ue(0); // pic_parameter_set_id
     bw.write_bits(plane_id as u32, 2); // colour_plane_id
     bw.write_bits(0, 4); // frame_num (4 bits, log2_max_frame_num_minus4 = 0)
-    // frame_mbs_only_flag = 1 → no field_pic_flag bits.
+                         // frame_mbs_only_flag = 1 → no field_pic_flag bits.
     bw.write_ue(0); // idr_pic_id
-    // pic_order_cnt_type = 2 in the SPS → no pic_order_cnt_lsb bits.
-    // weighted_pred_flag = 0 in PPS → no pred_weight_table.
-    // dec_ref_pic_marking (is_idr, nal_ref_idc != 0):
+                    // pic_order_cnt_type = 2 in the SPS → no pic_order_cnt_lsb bits.
+                    // weighted_pred_flag = 0 in PPS → no pred_weight_table.
+                    // dec_ref_pic_marking (is_idr, nal_ref_idc != 0):
     bw.write_flag(false); // no_output_of_prior_pics_flag
     bw.write_flag(false); // long_term_reference_flag
-    // entropy_coding_mode_flag = 0 → no cabac_init_idc.
+                          // entropy_coding_mode_flag = 0 → no cabac_init_idc.
     bw.write_se(0); // slice_qp_delta
-    // deblocking_filter_control_present_flag = 1 in PPS:
+                    // deblocking_filter_control_present_flag = 1 in PPS:
     bw.write_ue(1); // disable_deblocking_filter_idc = 1 (off)
 }
 
@@ -123,8 +125,7 @@ fn write_single_mb_i_16x16_dc(bw: &mut BitWriter) {
     // as all-zero (total_coeff = 0, coeff_token alone).
     // Neighbours unavailable → nC = 0, pick coeff_token class 0.
     let coeffs = [0i32; 16];
-    encode_residual_block(bw, &coeffs, 0, BlockKind::Luma16x16Dc)
-        .expect("encode empty DC block");
+    encode_residual_block(bw, &coeffs, 0, BlockKind::Luma16x16Dc).expect("encode empty DC block");
     // `mb_qp_delta` is present because this is I_16x16 (§7.3.5.1
     // `needs_qp_delta` branch) — emit 0.
     bw.write_se(0);
@@ -177,8 +178,7 @@ fn slice_header_parses_colour_plane_id_all_three() {
             nal_ref_idc: 3,
             nal_unit_type: NalUnitType::SliceIdr,
         };
-        let sh =
-            parse_slice_header(&slice_header, &rbsp, &sps, &pps).expect("parse slice header");
+        let sh = parse_slice_header(&slice_header, &rbsp, &sps, &pps).expect("parse slice header");
         assert_eq!(
             sh.colour_plane_id, plane_id,
             "§7.3.3 colour_plane_id round-trip failed for plane {plane_id}"
@@ -320,14 +320,14 @@ fn build_2x2_separate_colour_plane_sps() -> Vec<u8> {
 fn write_2x2_mb_i_16x16_dc(bw: &mut BitWriter) {
     for _ in 0..4 {
         bw.write_ue(3); // mb_type = 3 (I_16x16, DC, cbp_luma=0, cbp_chroma=0)
-        // Monochrome → no intra_chroma_pred_mode. I_16x16 always emits
-        // a DC block even when cbp_luma = 0. nC for the first block of
-        // every MB: the top-left MB has no neighbours (nC = 0). The
-        // subsequent MBs' DC block also uses nC = 0 because
-        // `Intra16x16DCLevel` sits on the DC transform, not a 4×4 AC
-        // block — the decoder queries `predict_nc_luma` at (0, 0) but
-        // every preceding MB's luma_nc[0] is 0 (all AC blocks are
-        // empty), so nC stays 0 throughout.
+                        // Monochrome → no intra_chroma_pred_mode. I_16x16 always emits
+                        // a DC block even when cbp_luma = 0. nC for the first block of
+                        // every MB: the top-left MB has no neighbours (nC = 0). The
+                        // subsequent MBs' DC block also uses nC = 0 because
+                        // `Intra16x16DCLevel` sits on the DC transform, not a 4×4 AC
+                        // block — the decoder queries `predict_nc_luma` at (0, 0) but
+                        // every preceding MB's luma_nc[0] is 0 (all AC blocks are
+                        // empty), so nC stays 0 throughout.
         let coeffs = [0i32; 16];
         encode_residual_block(bw, &coeffs, 0, BlockKind::Luma16x16Dc)
             .expect("encode empty DC block");

@@ -186,7 +186,8 @@ fn decode_yuv444_cabac_p_matches_reference() {
     let es = read_fixture("tests/fixtures/yuv444_cabac_p_64x64.es");
     let ref_yuv = read_fixture("tests/fixtures/yuv444_cabac_p_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));
-    dec.send_packet(&single_packet(es)).expect("CABAC P 4:4:4 decode succeeds");
+    dec.send_packet(&single_packet(es))
+        .expect("CABAC P 4:4:4 decode succeeds");
     let frames = collect_frames(&mut dec);
     assert!(frames.len() >= 3, "expected at least 3 frames");
     let got = flatten_frames_yuv444(&frames, 3, 64, 64);
@@ -213,7 +214,8 @@ fn decode_yuv444_cabac_b_matches_reference() {
     let es = read_fixture("tests/fixtures/yuv444_cabac_b_64x64.es");
     let ref_yuv = read_fixture("tests/fixtures/yuv444_cabac_b_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));
-    dec.send_packet(&single_packet(es)).expect("CABAC B 4:4:4 decode succeeds");
+    dec.send_packet(&single_packet(es))
+        .expect("CABAC B 4:4:4 decode succeeds");
     let frames = collect_frames(&mut dec);
     assert!(frames.len() >= 6, "expected at least 6 frames");
     let got = flatten_frames_yuv444(&frames, 6, 64, 64);

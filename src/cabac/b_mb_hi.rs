@@ -106,7 +106,16 @@ pub fn decode_b_mb_cabac_hi(
 
     if mb_type_raw == 48 {
         return crate::cabac::mb_hi::decode_intra_mb_given_imb_cabac_hi(
-            d, ctxs, sh, sps, pps, mb_x, mb_y, pic, prev_qp, IMbType::IPcm,
+            d,
+            ctxs,
+            sh,
+            sps,
+            pps,
+            mb_x,
+            mb_y,
+            pic,
+            prev_qp,
+            IMbType::IPcm,
         )
         .map(|_| false);
     }
@@ -170,17 +179,44 @@ fn decode_b_inter_hi(
         }
         BPartition::L0_16x16 => {
             decode_16x16_single_dir(
-                d, ctxs, sh, bctx, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::L0,
+                d,
+                ctxs,
+                sh,
+                bctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::L0,
             )?;
         }
         BPartition::L1_16x16 => {
             decode_16x16_single_dir(
-                d, ctxs, sh, bctx, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::L1,
+                d,
+                ctxs,
+                sh,
+                bctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::L1,
             )?;
         }
         BPartition::Bi_16x16 => {
             decode_16x16_single_dir(
-                d, ctxs, sh, bctx, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::BiPred,
+                d,
+                ctxs,
+                sh,
+                bctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::BiPred,
             )?;
         }
         BPartition::TwoPart16x8 { dirs } => {
@@ -412,9 +448,7 @@ fn decode_b_8x8(
             binarize::decode_sub_mb_type_b(d, slice)?
         };
         subs[s] = decode_b_sub_mb_type(raw).ok_or_else(|| {
-            Error::invalid(format!(
-                "h264 10bit cabac b-slice: bad sub_mb_type {raw}"
-            ))
+            Error::invalid(format!("h264 10bit cabac b-slice: bad sub_mb_type {raw}"))
         })?;
     }
 
@@ -640,27 +674,15 @@ fn decode_inter_residual_chroma_hi(
     let mut dc_cr = [0i32; 4];
     if cbp_chroma >= 1 {
         let neigh_cb_dc = cabac_p::p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
-        let cb_coeffs = decode_residual_block_in_place(
-            d,
-            ctxs,
-            BlockCat::ChromaDc,
-            &neigh_cb_dc,
-            4,
-            false,
-        )?;
+        let cb_coeffs =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, false)?;
         for i in 0..4 {
             dc_cb[i] = cb_coeffs[i];
         }
         pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb_coeffs.iter().any(|&v| v != 0);
         let neigh_cr_dc = cabac_p::p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
-        let cr_coeffs = decode_residual_block_in_place(
-            d,
-            ctxs,
-            BlockCat::ChromaDc,
-            &neigh_cr_dc,
-            4,
-            false,
-        )?;
+        let cr_coeffs =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, false)?;
         for i in 0..4 {
             dc_cr[i] = cr_coeffs[i];
         }
@@ -684,14 +706,8 @@ fn decode_inter_residual_chroma_hi(
                 let neigh = cabac_p::p_chroma_ac_cbf_neighbours(
                     pic, mb_x, mb_y, plane_kind, br_row, br_col, &nc_arr,
                 );
-                let ac = decode_residual_block_in_place(
-                    d,
-                    ctxs,
-                    BlockCat::ChromaAc,
-                    &neigh,
-                    15,
-                    false,
-                )?;
+                let ac =
+                    decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, false)?;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
                 res = ac;
                 let cat = if plane_kind { 4 } else { 5 };
@@ -701,7 +717,11 @@ fn decode_inter_residual_chroma_hi(
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);
             let off_in_mb = br_row * 4 * cstride + br_col * 4;
-            let plane = if plane_kind { &mut pic.cb16 } else { &mut pic.cr16 };
+            let plane = if plane_kind {
+                &mut pic.cb16
+            } else {
+                &mut pic.cr16
+            };
             for r in 0..4 {
                 for c in 0..4 {
                     let base = plane[co + off_in_mb + r * cstride + c] as i32;

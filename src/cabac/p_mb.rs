@@ -792,7 +792,13 @@ pub(crate) fn ref_idx_ctx_idx_inc(
     ref_idx_ctx_idx_inc_at(pic, mb_x, mb_y, r0, c0)
 }
 
-pub(crate) fn ref_idx_ctx_idx_inc_at(pic: &Picture, mb_x: u32, mb_y: u32, r0: usize, c0: usize) -> Result<u8> {
+pub(crate) fn ref_idx_ctx_idx_inc_at(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+) -> Result<u8> {
     // §9.3.3.1.1.2: condTermFlagN = 1 when neighbour block N is inter and
     // has ref_idx_lX > 0; 0 otherwise (including intra and unavailable).
     let a = neighbour_ref_idx_gt_zero(pic, mb_x as i32, mb_y as i32, r0 as i32, c0 as i32 - 1);
@@ -812,7 +818,14 @@ fn neighbour_ref_idx_gt_zero(pic: &Picture, mb_x: i32, mb_y: i32, row: i32, col:
     info.ref_idx_l0[(r * 4 + c) as usize] > 0
 }
 
-pub(crate) fn mvd_ctx_idx_inc(pic: &Picture, mb_x: u32, mb_y: u32, r0: usize, c0: usize, is_x: bool) -> u32 {
+pub(crate) fn mvd_ctx_idx_inc(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    r0: usize,
+    c0: usize,
+    is_x: bool,
+) -> u32 {
     // §9.3.3.1.1.7: absMvdComp(A) + absMvdComp(B).
     let a = neighbour_abs_mvd(
         pic,
@@ -884,7 +897,12 @@ fn wrap_neighbour(
     Some((mbx as u32, mby as u32, r as u32, c as u32))
 }
 
-pub(crate) fn p_chroma_dc_cbf_neighbours(pic: &Picture, mb_x: u32, mb_y: u32, c: usize) -> CbfNeighbours {
+pub(crate) fn p_chroma_dc_cbf_neighbours(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    c: usize,
+) -> CbfNeighbours {
     let probe = |mx: u32, my: u32| -> Option<bool> {
         let info = pic.mb_info_at(mx, my);
         if !info.coded {

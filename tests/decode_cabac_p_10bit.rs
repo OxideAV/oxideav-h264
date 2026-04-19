@@ -120,9 +120,8 @@ fn decode_10bit_cabac_pframes_against_reference() {
             .filter(|(x, y)| (**x as i32 - **y as i32).abs() <= tol)
             .count()
     };
-    let exact_count = |a: &[u16], b: &[u16]| -> usize {
-        a.iter().zip(b.iter()).filter(|(x, y)| x == y).count()
-    };
+    let exact_count =
+        |a: &[u16], b: &[u16]| -> usize { a.iter().zip(b.iter()).filter(|(x, y)| x == y).count() };
 
     let mut total = 0usize;
     let mut total_exact = 0usize;
@@ -130,12 +129,10 @@ fn decode_10bit_cabac_pframes_against_reference() {
     for (i, frame) in frames.iter().enumerate() {
         let ref_off = i * frame_bytes;
         let ref_y = unpack_u16_le(&yuv[ref_off..ref_off + y_plane_bytes]);
-        let ref_cb = unpack_u16_le(
-            &yuv[ref_off + y_plane_bytes..ref_off + y_plane_bytes + c_plane_bytes],
-        );
-        let ref_cr = unpack_u16_le(
-            &yuv[ref_off + y_plane_bytes + c_plane_bytes..ref_off + frame_bytes],
-        );
+        let ref_cb =
+            unpack_u16_le(&yuv[ref_off + y_plane_bytes..ref_off + y_plane_bytes + c_plane_bytes]);
+        let ref_cr =
+            unpack_u16_le(&yuv[ref_off + y_plane_bytes + c_plane_bytes..ref_off + frame_bytes]);
 
         let dec_y = unpack_u16_le(&frame.planes[0].data);
         let dec_cb = unpack_u16_le(&frame.planes[1].data);

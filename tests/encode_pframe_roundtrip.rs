@@ -76,10 +76,7 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
     }
 }
 
-fn receive_all(
-    dec: &mut H264Decoder,
-    out: &mut Vec<VideoFrame>,
-) {
+fn receive_all(dec: &mut H264Decoder, out: &mut Vec<VideoFrame>) {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Video(v)) => out.push(v),
@@ -108,12 +105,12 @@ fn roundtrip_i_then_p_p_64x64_qp26() {
     .expect("encoder::new");
 
     // Three source frames with small per-frame shifts.
-    let sources: Vec<VideoFrame> =
-        (0..3u32).map(|t| make_gradient_frame(w, h, t)).collect();
+    let sources: Vec<VideoFrame> = (0..3u32).map(|t| make_gradient_frame(w, h, t)).collect();
 
     let mut packets: Vec<Vec<u8>> = Vec::new();
     for src in &sources {
-        enc.send_frame(&Frame::Video(src.clone())).expect("send_frame");
+        enc.send_frame(&Frame::Video(src.clone()))
+            .expect("send_frame");
         let pkt = enc.receive_packet().expect("receive_packet");
         packets.push(pkt.data.clone());
     }
@@ -153,10 +150,7 @@ fn roundtrip_i_then_p_p_64x64_qp26() {
             packets[i].len(),
             psnr_y
         );
-        assert!(
-            psnr_y >= 30.0,
-            "frame {i} luma psnr {psnr_y:.2} < 30 dB"
-        );
+        assert!(psnr_y >= 30.0, "frame {i} luma psnr {psnr_y:.2} < 30 dB");
     }
 }
 
@@ -311,5 +305,8 @@ fn roundtrip_i_then_p_solid_gray_produces_skip_mbs() {
         p.data.len(),
         luma_psnr
     );
-    assert!(luma_psnr >= 40.0, "solid P luma psnr {luma_psnr:.2} < 40 dB");
+    assert!(
+        luma_psnr >= 40.0,
+        "solid P luma psnr {luma_psnr:.2} < 40 dB"
+    );
 }

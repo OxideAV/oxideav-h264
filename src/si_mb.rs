@@ -28,13 +28,14 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::golomb::BitReaderExt;
 use crate::mb::decode_intra_mb_given_imb;
 use crate::mb_type::{decode_i_slice_mb_type, IMbType};
 use crate::picture::Picture;
 use crate::pps::Pps;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
+use oxideav_core::bits::BitReader;
 
 /// Decode an SI-slice `mb_type` (Table 7-12). `mb_type = 0` selects the
 /// SI intra macroblock (wire-identical to `I_NxN`); `mb_type >= 1`

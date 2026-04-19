@@ -81,8 +81,8 @@ fn decode_es(es: &[u8]) -> Vec<oxideav_core::VideoFrame> {
         packet_data.extend_from_slice(&[0, 0, 0, 1]);
         packet_data.extend_from_slice(slice);
 
-        let is_keyframe = NalHeader::parse(slice[0]).unwrap().nal_unit_type
-            == NalUnitType::SliceIdr;
+        let is_keyframe =
+            NalHeader::parse(slice[0]).unwrap().nal_unit_type == NalUnitType::SliceIdr;
         let pkt = Packet::new(0, TimeBase::new(1, 25), packet_data)
             .with_pts(i as i64)
             .with_keyframe(is_keyframe);

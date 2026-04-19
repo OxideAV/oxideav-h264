@@ -590,4 +590,3 @@ pub(crate) fn lookup_ref_444<'a>(ref_list0: &[&'a Picture], ref_idx: i8) -> Resu
         ))
     })
 }
-

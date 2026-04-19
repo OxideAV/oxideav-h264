@@ -91,7 +91,9 @@ fn decode_all(es: &[u8]) -> Vec<u8> {
         dec.send_packet(&pkt)
             .unwrap_or_else(|e| panic!("send {i}: {e}"));
         while let Ok(f) = dec.receive_frame() {
-            let Frame::Video(v) = f else { panic!("not video") };
+            let Frame::Video(v) = f else {
+                panic!("not video")
+            };
             assert_eq!(v.format, PixelFormat::Yuv422P);
             assert_eq!(v.width, W as u32);
             assert_eq!(v.height, H as u32);
@@ -103,7 +105,9 @@ fn decode_all(es: &[u8]) -> Vec<u8> {
     // buffer so the caller sees every frame in display order.
     let _ = dec.flush();
     while let Ok(f) = dec.receive_frame() {
-        let Frame::Video(v) = f else { panic!("not video") };
+        let Frame::Video(v) = f else {
+            panic!("not video")
+        };
         append(&v, &mut out);
     }
     out

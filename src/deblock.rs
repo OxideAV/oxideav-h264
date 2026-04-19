@@ -843,13 +843,31 @@ pub fn deblock_picture_mbaff(pic: &mut Picture, pps: &Pps, sh: &SliceHeader) {
             let row_step = if pair_field { 2 } else { 1 };
             // Top MB of the pair.
             process_mb_mbaff(
-                pic, mb_x, top_mb_y, pair_field, /*is_bottom_of_pair=*/ false, row_step,
-                alpha_off, beta_off, chroma_off_cb, chroma_off_cr, sh.slice_type,
+                pic,
+                mb_x,
+                top_mb_y,
+                pair_field,
+                /*is_bottom_of_pair=*/ false,
+                row_step,
+                alpha_off,
+                beta_off,
+                chroma_off_cb,
+                chroma_off_cr,
+                sh.slice_type,
             );
             // Bottom MB of the pair.
             process_mb_mbaff(
-                pic, mb_x, bot_mb_y, pair_field, /*is_bottom_of_pair=*/ true, row_step,
-                alpha_off, beta_off, chroma_off_cb, chroma_off_cr, sh.slice_type,
+                pic,
+                mb_x,
+                bot_mb_y,
+                pair_field,
+                /*is_bottom_of_pair=*/ true,
+                row_step,
+                alpha_off,
+                beta_off,
+                chroma_off_cb,
+                chroma_off_cr,
+                sh.slice_type,
             );
         }
     }

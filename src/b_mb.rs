@@ -1896,9 +1896,8 @@ fn decode_inter_residual_chroma_422(
                 let mut res = [0i32; 16];
                 let mut total_coeff = 0u32;
                 if cbp_chroma == 2 {
-                    let nc = predict_inter_nc_chroma_422(
-                        pic, mb_x, mb_y, plane_cb, blk_row, blk_col,
-                    );
+                    let nc =
+                        predict_inter_nc_chroma_422(pic, mb_x, mb_y, plane_cb, blk_row, blk_col);
                     let ac = decode_residual_block(br, nc, BlockKind::ChromaAc)?;
                     total_coeff = ac.total_coeff;
                     res = ac.coeffs;

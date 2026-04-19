@@ -194,11 +194,11 @@ fn emit_inxn_zero_residual(bw: &mut BitWriter, mb_type: u32) {
                     // coded_block_pattern = 0 → me(v) codeNum = 3 per Table 9-4
                     // (`ME_INTRA_4_2_0[3] == 0`). Emitted as ue(v) codeNum.
     bw.write_ue(3); // ChromaArrayType=1, intra CBP 0 → me(v) codeNum 3.
-                     // No mb_qp_delta because CBP == 0 and MB is I_NxN.
-                     // Residual: 16 AC blocks + chroma DC + chroma AC, all zero. But
-                     // when cbp_luma == 0 no luma AC blocks are read, and when
-                     // cbp_chroma == 0 neither chroma DC nor chroma AC are read. So
-                     // we emit nothing more.
+                    // No mb_qp_delta because CBP == 0 and MB is I_NxN.
+                    // Residual: 16 AC blocks + chroma DC + chroma AC, all zero. But
+                    // when cbp_luma == 0 no luma AC blocks are read, and when
+                    // cbp_chroma == 0 neither chroma DC nor chroma AC are read. So
+                    // we emit nothing more.
 }
 
 /// Emit a single P_Skip macroblock as CAVLC mb_skip_run = 1 (then 0 to

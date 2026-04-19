@@ -47,10 +47,10 @@ use crate::cabac::tables::{
     CTX_IDX_LAST_CR_LUMA4X4, CTX_IDX_LAST_CR_LUMA8X8, CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG,
     CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_TYPE_I,
     CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_SIGNIFICANT_COEFF_FLAG,
-    CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_SIG_CB_LUMA16X16AC,
-    CTX_IDX_SIG_CB_LUMA16X16DC, CTX_IDX_SIG_CB_LUMA4X4, CTX_IDX_SIG_CB_LUMA8X8,
-    CTX_IDX_SIG_CR_LUMA16X16AC, CTX_IDX_SIG_CR_LUMA16X16DC, CTX_IDX_SIG_CR_LUMA4X4,
-    CTX_IDX_SIG_CR_LUMA8X8, CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
+    CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_SIG_CB_LUMA16X16AC, CTX_IDX_SIG_CB_LUMA16X16DC,
+    CTX_IDX_SIG_CB_LUMA4X4, CTX_IDX_SIG_CB_LUMA8X8, CTX_IDX_SIG_CR_LUMA16X16AC,
+    CTX_IDX_SIG_CR_LUMA16X16DC, CTX_IDX_SIG_CR_LUMA4X4, CTX_IDX_SIG_CR_LUMA8X8,
+    CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
 };
 use crate::cavlc::ZIGZAG_4X4;
 use crate::intra_pred::{
@@ -1412,15 +1412,11 @@ pub(crate) fn decode_chroma_422(
         // residual decoder writes coded-scan positions 0..7 which match
         // the 2×4 raster directly per §6.4.3 (column-then-row walk).
         let neigh_cb_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
-        let cb = decode_residual_block_cabac_8(
-            d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, intra,
-        )?;
+        let cb = decode_residual_block_cabac_8(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, intra)?;
         dc_cb = cb;
         pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb.iter().any(|&v| v != 0);
         let neigh_cr_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
-        let cr = decode_residual_block_cabac_8(
-            d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, intra,
-        )?;
+        let cr = decode_residual_block_cabac_8(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, intra)?;
         dc_cr = cr;
         pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[1] = cr.iter().any(|&v| v != 0);
         // §7.4.2.2 — intra chroma (slots 1/2) vs inter chroma (slots 4/5).

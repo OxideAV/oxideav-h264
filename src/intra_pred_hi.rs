@@ -607,17 +607,41 @@ pub fn predict_intra_chroma_8x16(
                 ]
             } else if n.top_available {
                 [
-                    [clip1(((dc0_top + 2) >> 2) as i32, max_sample), clip1(((dc1 + 2) >> 2) as i32, max_sample)],
-                    [clip1(((dc0_top + 2) >> 2) as i32, max_sample), clip1(((dc1 + 2) >> 2) as i32, max_sample)],
-                    [clip1(((dc0_top + 2) >> 2) as i32, max_sample), clip1(((dc1 + 2) >> 2) as i32, max_sample)],
-                    [clip1(((dc0_top + 2) >> 2) as i32, max_sample), clip1(((dc1 + 2) >> 2) as i32, max_sample)],
+                    [
+                        clip1(((dc0_top + 2) >> 2) as i32, max_sample),
+                        clip1(((dc1 + 2) >> 2) as i32, max_sample),
+                    ],
+                    [
+                        clip1(((dc0_top + 2) >> 2) as i32, max_sample),
+                        clip1(((dc1 + 2) >> 2) as i32, max_sample),
+                    ],
+                    [
+                        clip1(((dc0_top + 2) >> 2) as i32, max_sample),
+                        clip1(((dc1 + 2) >> 2) as i32, max_sample),
+                    ],
+                    [
+                        clip1(((dc0_top + 2) >> 2) as i32, max_sample),
+                        clip1(((dc1 + 2) >> 2) as i32, max_sample),
+                    ],
                 ]
             } else {
                 [
-                    [clip1(((dc0_left + 2) >> 2) as i32, max_sample), clip1(((dc0_left + 2) >> 2) as i32, max_sample)],
-                    [clip1(((dc2 + 2) >> 2) as i32, max_sample), clip1(((dc2 + 2) >> 2) as i32, max_sample)],
-                    [clip1(((dc3 + 2) >> 2) as i32, max_sample), clip1(((dc3 + 2) >> 2) as i32, max_sample)],
-                    [clip1(((dc4 + 2) >> 2) as i32, max_sample), clip1(((dc4 + 2) >> 2) as i32, max_sample)],
+                    [
+                        clip1(((dc0_left + 2) >> 2) as i32, max_sample),
+                        clip1(((dc0_left + 2) >> 2) as i32, max_sample),
+                    ],
+                    [
+                        clip1(((dc2 + 2) >> 2) as i32, max_sample),
+                        clip1(((dc2 + 2) >> 2) as i32, max_sample),
+                    ],
+                    [
+                        clip1(((dc3 + 2) >> 2) as i32, max_sample),
+                        clip1(((dc3 + 2) >> 2) as i32, max_sample),
+                    ],
+                    [
+                        clip1(((dc4 + 2) >> 2) as i32, max_sample),
+                        clip1(((dc4 + 2) >> 2) as i32, max_sample),
+                    ],
                 ]
             };
             for band in 0..4usize {

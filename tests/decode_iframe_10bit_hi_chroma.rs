@@ -68,12 +68,7 @@ fn decode_first_iframe(es: &[u8]) -> oxideav_core::VideoFrame {
     }
 }
 
-fn compare_u16_planes(
-    label: &str,
-    got: &[&[u16]],
-    want: &[&[u16]],
-    threshold_pct: f64,
-) {
+fn compare_u16_planes(label: &str, got: &[&[u16]], want: &[&[u16]], threshold_pct: f64) {
     assert_eq!(got.len(), want.len());
     let total: usize = want.iter().map(|p| p.len()).sum();
     let exact: usize = got

@@ -109,9 +109,7 @@ fn decode_intra_mb_given_imb_cabac_444(
     imb: IMbType,
 ) -> Result<()> {
     if matches!(imb, IMbType::IPcm) {
-        return Err(Error::unsupported(
-            "h264: CABAC 4:4:4 I_PCM not yet wired",
-        ));
+        return Err(Error::unsupported("h264: CABAC 4:4:4 I_PCM not yet wired"));
     }
 
     let mut transform_8x8 = false;
@@ -407,8 +405,8 @@ fn decode_plane_intra_16x16_cabac(
             let lo = lo_mb + br_row * 4 * stride + br_col * 4;
             for r in 0..4 {
                 for c in 0..4 {
-                    let v = pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32
-                        + residual[r * 4 + c];
+                    let v =
+                        pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32 + residual[r * 4 + c];
                     buf[lo + r * stride + c] = v.clamp(0, 255) as u8;
                 }
             }
@@ -441,7 +439,7 @@ pub(crate) fn decode_inter_residual_plane_8x8(
     qp: i32,
 ) -> Result<()> {
     let scale_idx = match plane {
-        Plane::Y => 1usize, // Inter-Y 8×8
+        Plane::Y => 1usize,              // Inter-Y 8×8
         Plane::Cb | Plane::Cr => 1usize, // fall back to inter-Y 8×8 list
     };
     let stride = pic.luma_stride();
@@ -541,8 +539,7 @@ pub(crate) fn decode_inter_residual_plane_4x4(
         for r in 0..4 {
             for c in 0..4 {
                 let base = buf[lo + r * stride + c] as i32;
-                buf[lo + r * stride + c] =
-                    (base + residual[r * 4 + c]).clamp(0, 255) as u8;
+                buf[lo + r * stride + c] = (base + residual[r * 4 + c]).clamp(0, 255) as u8;
             }
         }
         let info = pic.mb_info_mut(mb_x, mb_y);
@@ -611,8 +608,16 @@ fn plane_luma16x16_dc_cbf_neighbours(
         }
         Some(flag_for(info))
     };
-    let left = if mb_x > 0 { probe(mb_x - 1, mb_y) } else { None };
-    let above = if mb_y > 0 { probe(mb_x, mb_y - 1) } else { None };
+    let left = if mb_x > 0 {
+        probe(mb_x - 1, mb_y)
+    } else {
+        None
+    };
+    let above = if mb_y > 0 {
+        probe(mb_x, mb_y - 1)
+    } else {
+        None
+    };
     CbfNeighbours { left, above }
 }
 
@@ -698,11 +703,7 @@ fn collect_intra16x16_neighbours_plane(
         }
     }
     let tl_avail = top_avail && left_avail;
-    let top_left = if tl_avail {
-        buf[lo_mb - stride - 1]
-    } else {
-        0
-    };
+    let top_left = if tl_avail { buf[lo_mb - stride - 1] } else { 0 };
     Intra16x16Neighbours {
         top,
         left,

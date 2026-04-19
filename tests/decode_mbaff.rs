@@ -197,9 +197,7 @@ fn decode_mbaff_422_iframe_matches_ffmpeg_reference() {
     let cr_match = count_within(dec_cr, ref_cr, 4);
     let cr_pct = (cr_match as f64) * 100.0 / (ref_cr.len() as f64);
 
-    eprintln!(
-        "mbaff-422: luma ±4 {y_pct_tight:.2}%, Cb ±4 {cb_pct:.2}%, Cr ±4 {cr_pct:.2}%"
-    );
+    eprintln!("mbaff-422: luma ±4 {y_pct_tight:.2}%, Cb ±4 {cb_pct:.2}%, Cr ±4 {cr_pct:.2}%");
 
     assert!(
         y_pct_tight >= 99.0,
@@ -258,9 +256,7 @@ fn decode_mbaff_444_iframe_matches_ffmpeg_reference() {
     let cr_match = count_within(dec_cr, ref_cr, 4);
     let cr_pct = (cr_match as f64) * 100.0 / (ref_cr.len() as f64);
 
-    eprintln!(
-        "mbaff-444: luma ±4 {y_pct_tight:.2}%, Cb ±4 {cb_pct:.2}%, Cr ±4 {cr_pct:.2}%"
-    );
+    eprintln!("mbaff-444: luma ±4 {y_pct_tight:.2}%, Cb ±4 {cb_pct:.2}%, Cr ±4 {cr_pct:.2}%");
 
     assert!(
         y_pct_tight >= 99.0,

@@ -207,7 +207,8 @@ fn ffmpeg_decodes_our_pframe_stream() {
     }
     let mut stream: Vec<u8> = Vec::new();
     for src in &sources {
-        enc.send_frame(&Frame::Video(src.clone())).expect("send_frame");
+        enc.send_frame(&Frame::Video(src.clone()))
+            .expect("send_frame");
         let pkt = enc.receive_packet().expect("receive_packet");
         stream.extend_from_slice(&pkt.data);
     }
