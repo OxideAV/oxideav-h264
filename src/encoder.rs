@@ -519,23 +519,54 @@ impl H264Encoder {
         cr_nc: &mut [u8],
         last_qp: &mut i32,
     ) -> Result<()> {
-        // Spec Table 7-11: mb_type 23 = I_16x16_2_2_15 — Intra16x16PredMode=2
-        // (DC), CodedBlockPatternLuma=15, CodedBlockPatternChroma=2. This
-        // encoder always emits that combination: DC prediction is the most
-        // neighbour-robust (works for the first MB with no available
-        // neighbours), coded AC and chroma AC guarantee the decoder
-        // receives residual for every 4×4 sub-block, and the fixed QP
-        // keeps the whole pipeline deterministic.
-        let mb_type: u32 = 23;
-        w.write_ue(mb_type);
-
         // Collect intra prediction neighbours from reconstruction buffer.
         let lneigh = collect_intra16x16_neighbours(rec_y, l_stride, mb_x, mb_y);
         let cneigh_cb = collect_chroma_neighbours(rec_cb, c_stride, mb_x, mb_y);
         let cneigh_cr = collect_chroma_neighbours(rec_cr, c_stride, mb_x, mb_y);
 
-        // Intra chroma pred mode — DC (0). Emitted as ue(v).
-        w.write_ue(0);
+        // --- Intra_16×16 luma mode decision ---
+        //
+        // Score each of the 4 Intra16×16 modes (Table 8-4) by SAD against
+        // the source MB. `predict_intra_16x16` substitutes to DC when a
+        // mode's required neighbour isn't available, so scoring an
+        // "unavailable" mode just re-tests DC — harmless for the pick.
+        let y_off_mb = (mb_y as usize * 16) * l_stride + mb_x as usize * 16;
+        let mut src_mb = [0u8; 256];
+        for r in 0..16usize {
+            for c in 0..16usize {
+                src_mb[r * 16 + c] = y_src[y_off_mb + r * l_stride + c];
+            }
+        }
+        let (luma_mode, pred) = pick_intra_16x16_mode(&src_mb, &lneigh);
+
+        // --- Intra chroma mode decision ---
+        //
+        // Score each of the 4 chroma modes (Table 8-5) by summed SAD over
+        // Cb + Cr against the MB's chroma source. The prediction + mode
+        // picked here goes through the chroma residual pipeline below and
+        // is also written into the bitstream ahead of `mb_qp_delta`.
+        let c_off_mb = (mb_y as usize * 8) * c_stride + mb_x as usize * 8;
+        let mut cb_src_mb = [0u8; 64];
+        let mut cr_src_mb = [0u8; 64];
+        for r in 0..8usize {
+            for c in 0..8usize {
+                cb_src_mb[r * 8 + c] = cb_src[c_off_mb + r * c_stride + c];
+                cr_src_mb[r * 8 + c] = cr_src[c_off_mb + r * c_stride + c];
+            }
+        }
+        let (chroma_mode, pred_cb, pred_cr) =
+            pick_intra_chroma_mode(&cb_src_mb, &cr_src_mb, &cneigh_cb, &cneigh_cr);
+
+        // Encode the selected mb_type from the (pred, cbp_luma=15,
+        // cbp_chroma=2) triple per Table 7-11 decoding:
+        //   n - 1 = pred + 4 * cbp_chroma_class + 12 * (cbp_luma==15)
+        // with cbp_luma = 15 and cbp_chroma_class = 2 for chroma AC + DC.
+        let pred_idx = luma_mode as u32;
+        let mb_type: u32 = 1 + pred_idx + 4 * 2 + 12;
+        w.write_ue(mb_type);
+
+        // Intra chroma pred mode — emitted as ue(v) per Table 8-5.
+        w.write_ue(chroma_mode as u32);
 
         // I_16x16 has no explicit CBP — it's packed into mb_type.
 
@@ -550,14 +581,11 @@ impl H264Encoder {
         // ------------------------------------------------------------------
         // Luma pipeline.
         // ------------------------------------------------------------------
-        let mut pred = [0u8; 256];
-        predict_intra_16x16(&mut pred, Intra16x16Mode::Dc, &lneigh);
 
         // Compute residuals for all 16 4×4 blocks in MB.
         // Layout: luma_blocks[row_4x4 * 4 + col_4x4] = [i32; 16] raster.
         let mut ac_blocks: [[i32; 16]; 16] = [[0; 16]; 16];
         let mut dc_block = [0i32; 16];
-        let y_off_mb = (mb_y as usize * 16) * l_stride + mb_x as usize * 16;
         for br in 0..4usize {
             for bc in 0..4usize {
                 let mut residual = [0i32; 16];
@@ -647,13 +675,9 @@ impl H264Encoder {
         // Chroma pipeline (Cb then Cr).
         // ------------------------------------------------------------------
         let qpc = chroma_qp(qp_y, 0 /* chroma_qp_index_offset = 0 in our PPS */);
-        let c_off_mb = (mb_y as usize * 8) * c_stride + mb_x as usize * 8;
 
-        // DC Cb then DC Cr block (always coded when cbp_chroma>=1).
-        let mut pred_cb = [0u8; 64];
-        let mut pred_cr = [0u8; 64];
-        predict_intra_chroma(&mut pred_cb, IntraChromaMode::Dc, &cneigh_cb);
-        predict_intra_chroma(&mut pred_cr, IntraChromaMode::Dc, &cneigh_cr);
+        // Chroma predictions were computed up in the mode-selection block;
+        // reuse them without re-running predict_intra_chroma.
 
         let mut cb_ac: [[i32; 16]; 4] = [[0; 16]; 4];
         let mut cr_ac: [[i32; 16]; 4] = [[0; 16]; 4];
@@ -843,7 +867,7 @@ impl H264Encoder {
         for mb_y in 0..self.mb_height {
             for mb_x in 0..self.mb_width {
                 // Integer-pel motion search (±16), SAD.
-                let (best_mv, best_sad) = integer_me_16x16(
+                let (int_mv, int_sad) = integer_me_16x16(
                     &y_src,
                     &ref_pic.y,
                     l_stride,
@@ -851,6 +875,21 @@ impl H264Encoder {
                     mb_y,
                     self.coded_width as usize,
                     self.coded_height as usize,
+                );
+                // 3×3 half-pel refinement around the integer best — runs
+                // the §8.4.2.2.1 6-tap/bilinear filter through luma_mc_plane
+                // so the quarter-pel MV can land on any of the 8 half-pel
+                // neighbours when one gives a lower SAD.
+                let (best_mv, best_sad) = refine_half_pel_16x16(
+                    &y_src,
+                    &ref_pic.y,
+                    l_stride,
+                    mb_x,
+                    mb_y,
+                    ref_pic.width as i32,
+                    ref_pic.height as i32,
+                    int_mv,
+                    int_sad,
                 );
                 // Try P_Skip first: need the §8.4.1.1 skip predictor to
                 // match, and the resulting motion-compensated residual to
@@ -1644,6 +1683,67 @@ fn integer_me_16x16(
     (((best.0 * 4) as i16, (best.1 * 4) as i16), best_sad)
 }
 
+/// Refine an integer-pel MV by scanning the 3×3 half-pel neighbourhood
+/// (±2 quarter-pel offsets along each axis) around the integer best.
+/// Uses `luma_mc_plane` to produce motion-compensated samples for each
+/// candidate and picks the MV with the lowest SAD.
+///
+/// `mv_q` is the incoming best MV in quarter-pel units; the returned MV
+/// is also in quarter-pel units. When no half-pel candidate beats the
+/// integer best this returns the input unchanged.
+fn refine_half_pel_16x16(
+    src: &[u8],
+    ref_y: &[u8],
+    stride: usize,
+    mb_x: u32,
+    mb_y: u32,
+    plane_w: i32,
+    plane_h: i32,
+    mv_q: (i16, i16),
+    integer_sad: u32,
+) -> ((i16, i16), u32) {
+    let mb_ox = mb_x as usize * 16;
+    let mb_oy = mb_y as usize * 16;
+    let base_x = (mb_x as i32) * 16;
+    let base_y = (mb_y as i32) * 16;
+
+    // Read the source MB once for SAD comparisons.
+    let mut src_mb = [0u8; 256];
+    for r in 0..16usize {
+        for c in 0..16usize {
+            src_mb[r * 16 + c] = src[(mb_oy + r) * stride + mb_ox + c];
+        }
+    }
+
+    let mut best = mv_q;
+    let mut best_sad = integer_sad;
+    // 3×3 half-pel grid around (0, 0): center is the integer best; the 8
+    // offsets are every combination of {-2, 0, +2} quarter-pel deltas
+    // (excluding (0, 0) which is the integer best we already scored).
+    for &dy_q in &[-2i32, 0, 2] {
+        for &dx_q in &[-2i32, 0, 2] {
+            if dx_q == 0 && dy_q == 0 {
+                continue;
+            }
+            let cand_x = mv_q.0 as i32 + dx_q;
+            let cand_y = mv_q.1 as i32 + dy_q;
+            let mut pred = [0u8; 256];
+            luma_mc_plane(
+                &mut pred, ref_y, stride, plane_w, plane_h, base_x, base_y, cand_x, cand_y, 16, 16,
+            );
+            let mut sad: u32 = 0;
+            for i in 0..256 {
+                sad += (src_mb[i] as i32 - pred[i] as i32).unsigned_abs();
+            }
+            if sad < best_sad {
+                best_sad = sad;
+                best = (cand_x as i16, cand_y as i16);
+            }
+        }
+    }
+    (best, best_sad)
+}
+
 fn sad_16x16(
     src: &[u8],
     ref_y: &[u8],
@@ -1746,6 +1846,98 @@ fn predict_inter_nc_chroma_local(
         None
     };
     nc_from(left, top)
+}
+
+/// Pick the best Intra_16×16 luma mode for a macroblock by 16×16 SAD.
+///
+/// Scores each of the 4 modes in Table 8-4 (Vertical, Horizontal, DC,
+/// Plane) against `src` and returns the mode whose prediction minimises
+/// the sum of absolute differences. `predict_intra_16x16` handles
+/// neighbour-availability fallbacks internally (Vertical without top →
+/// DC, Horizontal without left → DC, Plane without both neighbours +
+/// top-left → DC), so scoring an "unavailable" mode is harmless — it
+/// just scores as DC.
+///
+/// Returns the picked `Intra16x16Mode` plus its 16×16 prediction block.
+fn pick_intra_16x16_mode(src: &[u8; 256], n: &Intra16x16Neighbours) -> (Intra16x16Mode, [u8; 256]) {
+    let candidates = [
+        Intra16x16Mode::Vertical,
+        Intra16x16Mode::Horizontal,
+        Intra16x16Mode::Dc,
+        Intra16x16Mode::Plane,
+    ];
+    let mut best_mode = Intra16x16Mode::Dc;
+    let mut best_pred = [0u8; 256];
+    predict_intra_16x16(&mut best_pred, Intra16x16Mode::Dc, n);
+    let mut best_sad = sad_256(src, &best_pred);
+    for &mode in &candidates {
+        if mode == Intra16x16Mode::Dc {
+            continue;
+        }
+        let mut pred = [0u8; 256];
+        predict_intra_16x16(&mut pred, mode, n);
+        let sad = sad_256(src, &pred);
+        if sad < best_sad {
+            best_sad = sad;
+            best_pred = pred;
+            best_mode = mode;
+        }
+    }
+    (best_mode, best_pred)
+}
+
+/// Pick the best chroma intra mode by summed Cb + Cr SAD over the 8×8
+/// chroma tile. Evaluates all 4 modes in Table 8-5 (DC, Horizontal,
+/// Vertical, Plane) and returns the mode plus its Cb + Cr 8×8 predictions.
+fn pick_intra_chroma_mode(
+    cb_src: &[u8; 64],
+    cr_src: &[u8; 64],
+    n_cb: &IntraChromaNeighbours,
+    n_cr: &IntraChromaNeighbours,
+) -> (IntraChromaMode, [u8; 64], [u8; 64]) {
+    let candidates = [
+        IntraChromaMode::Dc,
+        IntraChromaMode::Horizontal,
+        IntraChromaMode::Vertical,
+        IntraChromaMode::Plane,
+    ];
+    let mut best_mode = IntraChromaMode::Dc;
+    let mut best_cb = [0u8; 64];
+    let mut best_cr = [0u8; 64];
+    predict_intra_chroma(&mut best_cb, IntraChromaMode::Dc, n_cb);
+    predict_intra_chroma(&mut best_cr, IntraChromaMode::Dc, n_cr);
+    let mut best_sad = sad_64(cb_src, &best_cb) + sad_64(cr_src, &best_cr);
+    for &mode in &candidates {
+        if mode == IntraChromaMode::Dc {
+            continue;
+        }
+        let mut pcb = [0u8; 64];
+        let mut pcr = [0u8; 64];
+        predict_intra_chroma(&mut pcb, mode, n_cb);
+        predict_intra_chroma(&mut pcr, mode, n_cr);
+        let sad = sad_64(cb_src, &pcb) + sad_64(cr_src, &pcr);
+        if sad < best_sad {
+            best_sad = sad;
+            best_cb = pcb;
+            best_cr = pcr;
+            best_mode = mode;
+        }
+    }
+    (best_mode, best_cb, best_cr)
+}
+
+fn sad_256(a: &[u8; 256], b: &[u8; 256]) -> u32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x as i32 - y as i32).unsigned_abs())
+        .sum()
+}
+
+fn sad_64(a: &[u8; 64], b: &[u8; 64]) -> u32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x as i32 - y as i32).unsigned_abs())
+        .sum()
 }
 
 fn collect_intra16x16_neighbours(

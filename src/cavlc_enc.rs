@@ -229,18 +229,13 @@ pub fn encode_residual_block(
         }
     }
 
-    // Avoid the unencodable edge case: when trailing_ones == 3 and
-    // suffix_length starts at 0 (i.e. total_coeff <= 10), the first
-    // non-trailing level of magnitude +8 produces level_code=14 which
-    // has no representation in the sl=0 grammar. Reduce trailing_ones to
-    // 2 so the +2 adjustment shifts level_code down to 12 (representable).
-    if trailing_ones == 3 && total_coeff >= 4 && (total_coeff as usize) <= 10 {
-        let first_nt_pos = nonzero_positions[nonzero_positions.len() - 4];
-        let first_nt_level = coded[first_nt_pos];
-        if first_nt_level == 8 {
-            trailing_ones = 2;
-        }
-    }
+    // With the prefix=14 + 4-bit suffix path wired below, the
+    // trailing_ones == 3 / first-non-trailing |level| = 8 /
+    // level_code = 14 case is fully representable — no downgrade needed
+    // (the previous code downgraded TO=3 → TO=2 here, which silently
+    // corrupted the stream when the first "demoted" trailing-one was
+    // magnitude 1: the decoder would apply the +2 adjustment, leading to
+    // a negative level_code and a level_prefix overflow at parse time).
 
     // 1. coeff_token.
     let token_idx = (total_coeff * 4 + trailing_ones) as usize;
@@ -389,33 +384,39 @@ fn encode_level(
     // Now level_code >= 0. Determine level_prefix from level_code and suffix_length.
     let sl = *suffix_length;
     if sl == 0 {
-        // Representable sub-ranges (from the decoder's §9.2.2.1 formulae):
-        //   level_code 0..=13   → level_prefix = level_code, no suffix
-        //   level_code 14       → unrepresentable (must be avoided upstream)
-        //   level_code 15..=4110 → level_prefix = 15 with 12-bit suffix
-        //                          (levelCode = 15 + suffix, since the
-        //                          +(1<<12)-4096 escape term vanishes)
-        //   level_code 29..=44  → level_prefix = 14 with 4-bit suffix
-        //                          (levelCode = 14 + suffix + 15)
-        // We use prefix=15 for level_code >= 15 (simpler; range overlaps
-        // with prefix=14 at 29..44 but the decoder accepts either path and
-        // prefix=15 is shorter at the low end).
+        // Representable sub-ranges (from the decoder's §9.2.2.1 formulae
+        // mirrored in `src/cavlc.rs::read_level`):
+        //   level_code 0..=13   → level_prefix = level_code, no suffix.
+        //   level_code 14..=29  → level_prefix = 14 with a 4-bit suffix:
+        //                          decoded levelCode = prefix(=14) + suffix
+        //                          where the suffix spans [0, 15].
+        //   level_code 30..=4125 → level_prefix = 15 with a 12-bit suffix:
+        //                          decoded levelCode = (15 << 0) + suffix + 15
+        //                          (the + 15 fall-through applied when
+        //                          `prefix >= 15 && sl == 0`), suffix in
+        //                          [0, 4095].
+        // The prefix=14 path is required to represent level_code=14, which
+        // was previously flagged as unrepresentable (e.g. trailing_ones=3,
+        // sl=0, first non-trailing level = +8 lands exactly here).
         if level_code < 14 {
             let prefix = level_code as u32;
             for _ in 0..prefix {
                 w.write_bit(false);
             }
             w.write_bit(true);
-        } else if level_code == 14 {
-            // Hit by the "trailing_ones==3, sl=0, first non-trailing |level|=+8"
-            // edge case. The caller is supposed to have downgraded trailing_ones
-            // to avoid this; if it slipped through, error out rather than lie.
-            return Err(Error::invalid(
-                "h264 cavlc_enc: level_code=14 at suffix_length=0 is not representable",
-            ));
-        } else if level_code <= 4110 {
-            // prefix = 15, 12-bit suffix = level_code - 15.
-            let suffix = (level_code - 15) as u32;
+        } else if level_code <= 29 {
+            // prefix = 14, 4-bit suffix = level_code - 14.
+            let suffix = (level_code - 14) as u32;
+            for _ in 0..14 {
+                w.write_bit(false);
+            }
+            w.write_bit(true);
+            w.write_bits(suffix, 4);
+        } else if level_code <= 4125 {
+            // prefix = 15, 12-bit suffix = level_code - 30 (since the
+            // decoder adds +15 at sl=0 and the escape term is 0 for
+            // prefix=15: levelCode = 15 + suffix + 15).
+            let suffix = (level_code - 30) as u32;
             for _ in 0..15 {
                 w.write_bit(false);
             }
@@ -601,5 +602,50 @@ mod tests {
         // Levels big enough to push suffix_length > 0 after the first non-trailing.
         let b = [10, -7, 4, 2, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         roundtrip(b, 4, BlockKind::Luma4x4);
+    }
+
+    #[test]
+    fn roundtrip_level_code_14_path() {
+        // First non-trailing level = +9 → pre-adjust level_code = 16 → after
+        // the "first non-trailing w/ TO < 3" adjust → level_code = 14.
+        // Previously unrepresentable at sl=0; now encodes via prefix=14 + 4-bit
+        // suffix. TO < 3 guaranteed here by only one trailing-1 at the tail.
+        let b = [9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        roundtrip(b, 0, BlockKind::Luma4x4);
+        let b = [-9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1];
+        roundtrip(b, 0, BlockKind::Luma4x4);
+    }
+
+    #[test]
+    fn roundtrip_level_code_15_to_29_path() {
+        // First non-trailing of magnitude 9..=16 covers level_code in
+        // [14, 29] — all representable as prefix=14 + 4-bit suffix under
+        // the fix to the sl=0 path.
+        for mag in 9i32..=16 {
+            let b = [mag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            roundtrip(b, 0, BlockKind::Luma4x4);
+            let mut bn = b;
+            bn[0] = -mag;
+            roundtrip(bn, 0, BlockKind::Luma4x4);
+        }
+    }
+
+    #[test]
+    fn roundtrip_level_code_escape_path() {
+        // Large single coefficient pushes level_code beyond the 4-bit
+        // suffix range of prefix=14, into the prefix=15 12-bit escape.
+        let b = [100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        roundtrip(b, 0, BlockKind::Luma4x4);
+    }
+
+    #[test]
+    fn roundtrip_intra_dc_heavy_block_level8_level_code_14() {
+        // trailing_ones = 3 AND first-non-trailing |level| = 8 →
+        // pre-adjust level_code = 14. Either the TO=3→TO=2 downgrade kicks
+        // in (keeping level_code in the representable <=13 range) or the
+        // new prefix=14 path takes over. Either way this must round-trip
+        // bit-exact.
+        let b = [8, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        roundtrip(b, 0, BlockKind::Luma16x16Dc);
     }
 }
