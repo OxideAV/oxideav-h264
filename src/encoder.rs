@@ -23,12 +23,19 @@
 //! * CAVLC entropy coding (entropy_coding_mode_flag = 0).
 //! * Single slice per picture (`num_slice_groups_minus1 = 0`).
 //! * 4:2:0 chroma, 8-bit luma / chroma, single colour plane.
-//! * I-MB path: Intra_16×16 DC_PRED for every luma macroblock;
-//!   chroma DC for chroma.
+//! * I-MB path: Intra_16×16 with **per-MB mode decision** across all
+//!   four Table 8-4 modes (Vertical / Horizontal / DC / Plane),
+//!   picked by 16×16 SAD against source; chroma runs a parallel SAD
+//!   pick over the four Table 8-5 modes (DC / Horizontal / Vertical
+//!   / Plane). Edge-MB fallback to DC happens inside
+//!   [`crate::intra_pred::predict_intra_16x16`] / `predict_intra_chroma`
+//!   when a required neighbour is unavailable.
 //! * P-MB path: `P_L0_16×16` with a single 16×16 partition, ref_idx = 0,
-//!   integer-pel ME via SAD over a ±16-pixel window; MVD = mv − §8.4.1.3
-//!   median predictor; 4×4 residual forward DCT + quant + CAVLC; inter
-//!   CBP via me(v); `P_Skip` when MVD = 0 and residual is all-zero.
+//!   ±16 integer-pel ME via SAD followed by a 3×3 half-pel refinement
+//!   through the §8.4.2.2.1 6-tap / bilinear filter
+//!   ([`crate::motion::luma_mc_plane`]); MVD = mv − §8.4.1.3 median
+//!   predictor; 4×4 residual forward DCT + quant + CAVLC; inter CBP
+//!   via me(v); `P_Skip` when MVD = 0 and residual is all-zero.
 //! * Fixed QP (configurable, default = 26). No rate control, no adaptive QP.
 //! * Deblocking disabled on emit (`disable_deblocking_filter_idc = 1`).
 //! * Annex B framing with 4-byte start codes.

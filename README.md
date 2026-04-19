@@ -5,13 +5,17 @@ oxideav. Decodes CAVLC + CABAC I-slices, CAVLC + CABAC P-slices, and
 CAVLC + CABAC B-slices (spatial + temporal direct + explicit weighted
 bipred + implicit weighted bipred); primary **SI / SP slices** decode
 through the CAVLC 4:2:0 / 8-bit path (`slice_qs_delta ==
-slice_qp_delta` — the §8.6 identity case); encodes a minimal
-Baseline-Profile output stream with Intra_16×16 DC_PRED and CAVLC
-**P_L0_16×16 / P_Skip** inter macroblocks driven by integer-pel motion
-estimation. **High-Profile 8×8 transform** is wired end-to-end on both
-the CAVLC path (§7.3.5.3.2, §8.5.13, bit-exact against libavcodec) and
-the CABAC path (§9.3.3.1.1.10 for the transform size flag + §9.3.3.1.1.9
-ctxBlockCat = 5 for the 64-coefficient residual). Zero C dependencies.
+slice_qp_delta` — the §8.6 identity case); encodes a **Baseline-Profile
+CAVLC** output stream with all four **Intra_16×16** modes (Vertical /
+Horizontal / DC / Plane) selected per-MB by SAD, all four chroma intra
+modes (DC / Horizontal / Vertical / Plane), and CAVLC
+**P_L0_16×16 / P_Skip** inter macroblocks driven by ±16 integer-pel
+motion estimation with 3×3 half-pel refinement through the §8.4.2.2.1
+6-tap / bilinear filter. **High-Profile 8×8 transform** is wired
+end-to-end on both the CAVLC path (§7.3.5.3.2, §8.5.13, bit-exact
+against libavcodec) and the CABAC path (§9.3.3.1.1.10 for the transform
+size flag + §9.3.3.1.1.9 ctxBlockCat = 5 for the 64-coefficient
+residual). Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -216,7 +220,7 @@ IDR:     [start code] SPS  [start code] PPS  [start code] IDR slice
 P-frame: [start code] SPS  [start code] PPS  [start code] non-IDR slice
 ```
 
-Fixed encoder policy (no rate control, no mode decision, no tuning):
+Fixed encoder policy (no rate control, no tuning):
 
 - **Baseline Profile** (`profile_idc = 66`), level 3.0.
 - **IDR + CAVLC P-slice cadence** — every frame is an IDR by default
@@ -225,14 +229,21 @@ Fixed encoder policy (no rate control, no mode decision, no tuning):
 - **CAVLC** entropy coding (`entropy_coding_mode_flag = 0`).
 - **Single slice per picture** (`num_slice_groups_minus1 = 0`).
 - **4:2:0** chroma (`chroma_format_idc = 1`), **8-bit** luma + chroma.
-- **I-macroblocks**: **Intra_16×16** with `Intra16x16PredMode = DC`
-  (Table 8-4 value 2); **chroma DC** (Table 8-5 value 0).
+- **I-macroblocks**: **Intra_16×16 with mode decision** across all four
+  Table 8-4 modes (Vertical / Horizontal / DC / Plane), picked
+  per-MB by 16×16 SAD against source. Chroma runs a parallel SAD pick
+  over Table 8-5 (DC / Horizontal / Vertical / Plane). At picture
+  edges where the required neighbour is unavailable, the predictor
+  falls back to DC per §8.3.3.
 - **P-macroblocks** (opt-in): `P_L0_16×16` with a single 16×16 partition
   and `ref_idx = 0` (single-slot L0 referencing the previous
-  reconstructed frame); integer-pel motion estimation via SAD over a
-  ±16-pixel window; MVD = mv − §8.4.1.3 median predictor; inter CBP via
-  me(v); `P_Skip` when the MV predictor matches and the quantised
-  residual is all-zero (§8.4.1.1 `P_Skip` derivation).
+  reconstructed frame); ±16 integer-pel motion estimation via SAD,
+  followed by a **3×3 half-pel refinement** that evaluates the 8
+  half-pel neighbours of the integer best through `luma_mc_plane`
+  (the §8.4.2.2.1 6-tap / bilinear filter); MVD = mv − §8.4.1.3
+  median predictor; inter CBP via me(v); `P_Skip` when the MV
+  predictor matches and the quantised residual is all-zero (§8.4.1.1
+  `P_Skip` derivation).
 - **Fixed QP**, configurable via `H264EncoderOptions::qp`. Default 26.
 - **Deblocking filter disabled** on emit
   (`disable_deblocking_filter_idc = 1`).
@@ -240,9 +251,30 @@ Fixed encoder policy (no rate control, no mode decision, no tuning):
   `AVCDecoderConfigurationRecord` blob is exposed in
   `output_params().extradata` for MP4 wrapping.
 
-Round-trip PSNR: ≥ 44 dB on a 64×48 gradient IDR at QP 22, ≥ 30 dB on
-an IDR + 2 P-frame low-motion gradient at QP 26 (tested against this
-crate's decoder in `tests/encode_pframe_roundtrip.rs`).
+Round-trip PSNR (against this crate's decoder):
+
+- **≥ 44 dB** on a 64×48 gradient IDR at QP 22
+  (`tests/encode_roundtrip.rs`).
+- **≥ 30 dB** on an IDR + 2 P-frame low-motion gradient at QP 26
+  (`tests/encode_pframe_roundtrip.rs`).
+- **≥ 30 dB** on a 10-frame 64×64 synthetic-testsrc clip (1 IDR + 9
+  P-slices) at QP 26 — average ≈ 49 dB
+  (`tests/encode_10frame_testsrc.rs`).
+
+The Annex B stream produced by the encoder is also self-decodable
+through the concatenated-NAL entry point: `tests/encode_ffmpeg_decode.rs`
+feeds a multi-frame Annex B blob back through the decoder's NAL
+splitter without external ffmpeg. Validating against `ffmpeg -i
+out.264 -c:v copy out.mp4` is still a useful acceptance check when
+ffmpeg is available locally:
+
+```shell
+# Dump one frame of Annex B from the integration test harness, then
+# re-wrap it into an MP4. ffmpeg should accept the stream without
+# complaint (no `-err_detect strict` needed).
+cargo test --release --test encode_ffmpeg_decode -- --nocapture
+ffmpeg -i /tmp/oxideav_h264_encoder_test.264 -c:v copy /tmp/out.mp4
+```
 
 ```rust
 use oxideav_codec::Encoder;
@@ -330,11 +362,18 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   Weighted prediction on the CABAC P path is parsed but weights are
   not applied; encoders should disable weighted P for CABAC bitstreams
   fed into this decoder, or tolerate unweighted MC output.
-- **Encoder**: B-slices, CABAC, Intra_4×4, Intra_8×8, Intra_16×16 modes
-  other than DC, rate control, adaptive QP, mode decision, deblocking.
-  P-slices: only `P_L0_16×16` / `P_Skip` are emitted; no 16×8 / 8×16 /
-  8×8 partitions, no sub-pel motion estimation (integer-pel only), no
-  multi-reference, no weighted prediction.
+- **Encoder**: B-slices, CABAC, Intra_4×4, Intra_8×8, rate control,
+  adaptive QP, in-loop deblocking on emit (the encoder disables §8.7
+  via `disable_deblocking_filter_idc = 1` in the slice header, so its
+  local reconstruction matches the decoder's bit-exactly without
+  running a deblock pass). P-slices: only `P_L0_16×16` / `P_Skip` are
+  emitted; no 16×8 / 8×16 / 8×8 partitions, no quarter-pel motion
+  refinement (half-pel is wired; quarter-pel refinement runs through
+  the same `luma_mc_plane` filter but is not yet tied into a search),
+  no multi-reference, no weighted prediction. **Intra_16×16 mode
+  decision** covers all four Table 8-4 modes (Vertical / Horizontal /
+  DC / Plane) picked by SAD; Intra_4×4 and Intra_8×8 remain out of
+  scope.
 - `pic_order_cnt_type == 1` — only types 0 and 2 are implemented.
 - PAFF CABAC, PAFF chroma > 4:2:0, PAFF 10-bit, and PAFF + MBAFF mixed
   within a coded video sequence remain out of scope.

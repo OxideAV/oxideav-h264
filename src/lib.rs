@@ -350,23 +350,32 @@
 //! # What is encoded today
 //!
 //! See [`encoder::H264Encoder`] — Baseline Profile, CAVLC, single
-//! slice per frame, 4:2:0, 8-bit, fixed QP, deblocking disabled.
-//! Supported macroblock types:
+//! slice per frame, 4:2:0, 8-bit, fixed QP, deblocking disabled on
+//! emit. Supported macroblock types:
 //!
-//! * Intra: `I_16×16` DC_PRED for every luma MB; chroma DC.
+//! * Intra: `I_16×16` with **per-MB mode selection** across all four
+//!   Table 8-4 modes (Vertical / Horizontal / DC / Plane), picked by
+//!   16×16 SAD against source. Chroma runs a parallel SAD selection
+//!   over Table 8-5 (DC / Horizontal / Vertical / Plane). At picture
+//!   edges where the required neighbour is unavailable the predictor
+//!   substitutes to DC per §8.3.3.
 //! * Inter (opt-in via `H264EncoderOptions::p_slice_interval > 0`):
 //!   `P_L0_16×16` with a single 16×16 partition and `ref_idx = 0`
-//!   (single-slot L0), integer-pel motion estimation via SAD search
-//!   over a ±16-pixel window, MVD = mv − §8.4.1.3 median predictor,
-//!   and `P_Skip` when MVD = 0 and the residual quantises to all-zero
-//!   (§8.4.1.1 skip derivation). Residual coding is 16 × 4×4 `Luma4x4`
-//!   blocks + chroma DC Hadamard + 4 × 4×4 `ChromaAc` per plane,
-//!   gated by an inter CBP me(v).
+//!   (single-slot L0), ±16 integer-pel motion estimation via SAD
+//!   followed by a 3×3 half-pel refinement through the §8.4.2.2.1
+//!   6-tap / bilinear filter (`motion::luma_mc_plane`); MVD = mv −
+//!   §8.4.1.3 median predictor; `P_Skip` when MVD = 0 and the
+//!   residual quantises to all-zero (§8.4.1.1 skip derivation).
+//!   Residual coding is 16 × 4×4 `Luma4x4` blocks + chroma DC
+//!   Hadamard + 4 × 4×4 `ChromaAc` per plane, gated by an inter CBP
+//!   me(v).
 //!
 //! The encoder and decoder round-trip to PSNR ≥ 28 dB for gradient
-//! content at QP 22 (I-only), ≥ 40 dB for solid content, and ≥ 30 dB
-//! on an IDR + 2 P-frame sequence at QP 26 (low-frequency gradient /
-//! low-motion pan).
+//! content at QP 22 (I-only), ≥ 40 dB for solid content, ≥ 30 dB on
+//! an IDR + 2 P-frame sequence at QP 26 (low-frequency gradient /
+//! low-motion pan), and ≥ 30 dB (avg ≈ 49 dB) on a 10-frame 64×64
+//! testsrc-style clip with smooth motion
+//! (`tests/encode_10frame_testsrc.rs`).
 //!
 //! # Out of scope (returns `Error::Unsupported` or the encoder refuses)
 //!
@@ -406,9 +415,11 @@
 //!   other than 4:2:0. 12/14-bit CAVLC I at 4:2:0 IS wired — see the
 //!   12-bit + 14-bit bullet above. 10-bit keeps full CAVLC I/P/B +
 //!   CABAC I coverage.
-//! * Rate control, adaptive QP, mode decision (Intra4×4 / Plane / Vertical /
-//!   Horizontal), or any psychovisual tuning. The encoder always emits
-//!   Intra_16×16 with DC_PRED and a fixed QP.
+//! * Rate control, adaptive QP, or any psychovisual tuning. The
+//!   encoder uses a single fixed QP throughout. **Intra_16×16 mode
+//!   decision** across all four Table 8-4 modes (Vertical /
+//!   Horizontal / DC / Plane) IS wired; Intra_4×4 and Intra_8×8 are
+//!   still out of scope.
 //!
 //! This crate has no runtime dependencies beyond `oxideav-core` and
 //! `oxideav-codec`.
