@@ -159,4 +159,76 @@ fn compare_frame_against_ref(
         .max()
         .unwrap_or(0);
     println!("    display #{display_idx:>2}: diff {diff}/{n} bytes  max|Δ|={max_abs}");
+    // Per-MB luma diff summary, sorted/limited.
+    if std::env::var("OXIDEAV_H264_DIFF_MB").is_ok() {
+        let luma_size = width * height;
+        let chroma_size = (width / 2) * (height / 2);
+        let mb_w = width.div_ceil(16);
+        let mb_h = height.div_ceil(16);
+        let mut mb_diffs = Vec::new();
+        for my in 0..mb_h {
+            for mx in 0..mb_w {
+                let mut dl = 0usize;
+                let mut maxal = 0u32;
+                for r in 0..16 {
+                    let y = my * 16 + r;
+                    if y >= height {
+                        continue;
+                    }
+                    for c in 0..16 {
+                        let x = mx * 16 + c;
+                        if x >= width {
+                            continue;
+                        }
+                        let i = y * width + x;
+                        if i < luma_size && ours[i] != their[i] {
+                            dl += 1;
+                            let a = (ours[i] as i32 - their[i] as i32).unsigned_abs();
+                            if a > maxal {
+                                maxal = a;
+                            }
+                        }
+                    }
+                }
+                let mut dc = 0usize;
+                let mut maxac = 0u32;
+                for r in 0..8 {
+                    let y = my * 8 + r;
+                    if y >= height / 2 {
+                        continue;
+                    }
+                    for c in 0..8 {
+                        let x = mx * 8 + c;
+                        if x >= width / 2 {
+                            continue;
+                        }
+                        let cb_off = luma_size + y * (width / 2) + x;
+                        let cr_off = luma_size + chroma_size + y * (width / 2) + x;
+                        if ours[cb_off] != their[cb_off] {
+                            dc += 1;
+                            let a = (ours[cb_off] as i32 - their[cb_off] as i32).unsigned_abs();
+                            if a > maxac {
+                                maxac = a;
+                            }
+                        }
+                        if ours[cr_off] != their[cr_off] {
+                            dc += 1;
+                            let a = (ours[cr_off] as i32 - their[cr_off] as i32).unsigned_abs();
+                            if a > maxac {
+                                maxac = a;
+                            }
+                        }
+                    }
+                }
+                if dl > 0 || dc > 0 {
+                    mb_diffs.push((mx, my, dl, maxal, dc, maxac));
+                }
+            }
+        }
+        // First by raster order to find the first divergence point.
+        for (mx, my, dl, maxal, dc, maxac) in mb_diffs.iter().take(20) {
+            println!("      raster mb ({mx:>2},{my:>2}): luma {dl:>3} max|Δ|={maxal} | chroma {dc:>3} max|Δ|={maxac}");
+        }
+        println!("      total: {} MBs differ", mb_diffs.len());
+    }
 }
