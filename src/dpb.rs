@@ -568,8 +568,8 @@ pub enum RplmCommand {
 ///
 /// Error recovery — commands that reference a picture no longer in the
 /// DPB are logged to stderr and skipped, mirroring FFmpeg's lenient
-/// `ff_h264_build_ref_list` ("reference picture missing during reorder"
-/// + continue with the default list slot). Real-world High-profile
+/// `ff_h264_build_ref_list` ("reference picture missing during reorder",
+/// then continue with the default list slot). Real-world High-profile
 /// streams routinely emit such commands (sloppy encoders, mid-stream
 /// entry, dropped refs) and a hard reject would reject the bulk of
 /// in-the-wild content.
