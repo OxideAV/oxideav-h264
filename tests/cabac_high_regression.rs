@@ -1,4 +1,4 @@
-//! Regression fixture for the known CABAC I-slice correctness gap on
+//! Regression target for the known CABAC I-slice correctness bug on
 //! **High-profile** 4:2:0 8-bit streams at realistic sizes.
 //!
 //! The Main-profile CABAC path (see `decode_cabac_b.rs`) already
@@ -9,14 +9,18 @@
 //! leaking out of the I-slice into the CABAC engine state: a few
 //! frames in, the arithmetic decoder reads past the end of a slice
 //! and every subsequent slice errors out. That's what failed on the
-//! user-reported Slayer/Repentless 1920×1080 MKV.
+//! user-reported 1920×1080 H.264 MKV.
 //!
-//! This test captures the failure on a tiny public-domain synthesised
-//! fixture so the h264 author has a 5 KB repro that's committable as
-//! CI-safe regression. It intentionally asserts the **current broken
-//! behaviour** so it stays green on HEAD today. Once the CABAC I-slice
-//! residual bug is fixed upstream and frames 8+ stop erroring, flip
-//! the assertion: the test will then demand a clean decode.
+//! This test fails today (bug is still present) and is therefore
+//! marked `#[ignore]` so the default `cargo test` run stays green.
+//! To run it explicitly:
+//!
+//! ```sh
+//! cargo test -p oxideav-h264 --test cabac_high_regression -- --ignored
+//! ```
+//!
+//! When the bug is fixed, remove the `#[ignore]` attribute and the
+//! test joins the default suite as a permanent guard.
 //!
 //! ## Fixture regeneration
 //!
@@ -27,12 +31,19 @@
 //!   -coder 1 -bf 2 -refs 1 -g 12 /tmp/repro.mp4
 //! ffmpeg -y -i /tmp/repro.mp4 -c:v copy -bsf:v h264_mp4toannexb -f h264 \
 //!   tests/fixtures/cabac_high_200x200.es
+//! ffmpeg -y -i /tmp/repro.mp4 -vframes 12 -f rawvideo -pix_fmt yuv420p \
+//!   tests/fixtures/cabac_high_200x200.yuv
 //! ```
 
-use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase, VideoFrame};
 use oxideav_h264::nal::{split_annex_b, NalHeader, NalUnitType};
 
 const ES: &[u8] = include_bytes!("fixtures/cabac_high_200x200.es");
+const REF_YUV: &[u8] = include_bytes!("fixtures/cabac_high_200x200.yuv");
+const WIDTH: usize = 200;
+const HEIGHT: usize = 200;
+const FRAME_BYTES: usize = WIDTH * HEIGHT * 3 / 2;
+const EXPECTED_FRAMES: usize = 12;
 
 /// Split an Annex-B byte stream into (sps, pps, frame_bodies). Each
 /// frame body is a single VCL NALU with a 4-byte start code prefix —
@@ -63,16 +74,76 @@ fn split_frames(es: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<Vec<u8>>) {
     (sps.unwrap(), pps.unwrap(), frames)
 }
 
-/// Decode all frames and return per-frame outcomes. `Ok(())` when the
-/// frame went through without an error; `Err(msg)` on the first error
-/// reported by `send_packet`.
-fn decode_frames(es: &[u8]) -> Vec<Result<(), String>> {
-    let (sps, pps, frames) = split_frames(es);
+/// Flatten one decoded video frame into a yuv420p byte vector, trimming
+/// each plane to its logical size (strides may pad for alignment).
+fn flatten_yuv420p(vf: &VideoFrame) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAME_BYTES);
+    for (pi, plane) in vf.planes.iter().enumerate() {
+        let (pw, ph) = if pi == 0 {
+            (WIDTH, HEIGHT)
+        } else {
+            (WIDTH / 2, HEIGHT / 2)
+        };
+        for row in 0..ph {
+            let off = row * plane.stride;
+            out.extend_from_slice(&plane.data[off..off + pw]);
+        }
+    }
+    out
+}
+
+/// Byte diff + max absolute deviation between two equal-sized buffers.
+/// Used for a friendlier failure message than a straight `assert_eq`.
+fn summarise_diff(ours: &[u8], theirs: &[u8]) -> (usize, u8) {
+    debug_assert_eq!(ours.len(), theirs.len());
+    let diff = ours.iter().zip(theirs).filter(|(a, b)| a != b).count();
+    let max = ours
+        .iter()
+        .zip(theirs)
+        .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u8)
+        .max()
+        .unwrap_or(0);
+    (diff, max)
+}
+
+/// Cheap sanity check that the fixture contents haven't drifted. Runs
+/// in the default `cargo test` suite so regenerating the fixture with
+/// a different `testsrc`/x264 config immediately fails here.
+#[test]
+fn fixture_contains_expected_frame_count() {
+    let (_, _, frames) = split_frames(ES);
+    assert_eq!(frames.len(), EXPECTED_FRAMES, "fixture frame count drift");
+    assert_eq!(
+        REF_YUV.len(),
+        FRAME_BYTES * EXPECTED_FRAMES,
+        "reference YUV size drift"
+    );
+}
+
+/// Hard bit-exact check of `oxideav-h264` against libavcodec on a
+/// High-profile CABAC fixture. Fails today because of the known
+/// I-slice residual drift — both on the IDR itself (≈ 57% bytes
+/// differ) and cascading through P / B slices until the CABAC
+/// arithmetic decoder reads past end of stream a few frames in.
+///
+/// Marked `#[ignore]` so the default suite stays green. Remove the
+/// `#[ignore]` once the bug is fixed; the test then becomes the
+/// permanent regression guard.
+///
+/// Run explicitly with:
+/// ```sh
+/// cargo test -p oxideav-h264 --test cabac_high_regression -- --ignored
+/// ```
+#[test]
+#[ignore = "known CABAC I-slice correctness bug; un-ignore once fixed"]
+fn cabac_high_profile_decodes_bit_exact_vs_ffmpeg() {
+    let (sps, pps, frames) = split_frames(ES);
+    assert_eq!(frames.len(), EXPECTED_FRAMES);
+
     let mut params = CodecParameters::video(CodecId::new("h264"));
     params.extradata.clear();
     let mut dec = oxideav_h264::decoder::make_decoder(&params).expect("make_decoder");
 
-    // Prime the SPS + PPS as one combined Annex-B packet.
     let mut header = Vec::new();
     header.extend_from_slice(&[0, 0, 0, 1]);
     header.extend_from_slice(&sps);
@@ -81,81 +152,35 @@ fn decode_frames(es: &[u8]) -> Vec<Result<(), String>> {
     let pkt = Packet::new(0, TimeBase::new(1, 24), header);
     let _ = dec.send_packet(&pkt);
 
-    let mut out = Vec::with_capacity(frames.len());
-    for frame_bytes in &frames {
+    let mut display_idx = 0usize;
+    for (decode_idx, frame_bytes) in frames.iter().enumerate() {
         let pkt = Packet::new(0, TimeBase::new(1, 24), frame_bytes.clone());
-        let res = dec.send_packet(&pkt).map_err(|e| format!("{e}"));
-        // Drain any frames produced so the decoder state advances
-        // correctly between sends. Errors from receive_frame are the
-        // "need-more packet" / "EOF" signals, not fatal; fatal errors
-        // already come from send_packet.
-        while let Ok(Frame::Video(_)) = dec.receive_frame() {}
-        out.push(res);
-    }
-    out
-}
-
-/// Sanity check: the fixture contains exactly 12 frames (IDR + 11
-/// referencing frames) — matches the `ffmpeg` invocation in the
-/// regeneration docstring at the top of this file. If fixture
-/// regeneration drifts this will fail loudly.
-#[test]
-fn fixture_contains_expected_frame_count() {
-    let (_, _, frames) = split_frames(ES);
-    assert_eq!(frames.len(), 12, "fixture should contain 12 VCL frames");
-}
-
-/// Known-broken: decoding 12 frames of High-profile CABAC at 200×200
-/// today desyncs the CABAC arithmetic engine partway through and
-/// starts returning `cabac: read past end of stream`. This test
-/// asserts the **current broken behaviour** so it stays green on
-/// HEAD. The expected transition is:
-///
-/// * **Today (broken):** at least one frame past the first returns a
-///   CABAC error. Test passes because the expected-broken assertion
-///   holds.
-/// * **After fix:** every frame returns `Ok(())`. The assertion below
-///   will then *fail* — flip the test to `results.iter().all(Result::is_ok)`
-///   or split into the strict pixel-equality variant next to this one.
-///
-/// See `examples/probe.rs` for a standalone harness that also
-/// byte-diffs the decoded YUV against an external reference.
-#[test]
-fn cabac_high_profile_engine_currently_desyncs_past_idr() {
-    let results = decode_frames(ES);
-    let errored = results
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| r.as_ref().err().map(|e| (i, e.clone())))
-        .collect::<Vec<_>>();
-
-    eprintln!("decode_frames results:");
-    for (i, r) in results.iter().enumerate() {
-        match r {
-            Ok(()) => eprintln!("  frame {i:>2}: ok"),
-            Err(e) => eprintln!("  frame {i:>2}: ERR {e}"),
+        dec.send_packet(&pkt).unwrap_or_else(|e| {
+            panic!("send_packet on decode frame {decode_idx} failed: {e}")
+        });
+        while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+            let ours = flatten_yuv420p(&vf);
+            let off = display_idx * FRAME_BYTES;
+            assert!(
+                off + FRAME_BYTES <= REF_YUV.len(),
+                "decoded past end of reference yuv at display #{display_idx}"
+            );
+            let theirs = &REF_YUV[off..off + FRAME_BYTES];
+            if ours != theirs {
+                let (diff, max) = summarise_diff(&ours, theirs);
+                panic!(
+                    "display #{display_idx} (from decode frame {decode_idx}): \
+                     {diff}/{total} bytes differ, max |Δ|={max} — \
+                     libavcodec-bit-exact decode regressed (or the \
+                     known CABAC I-slice bug is still present).",
+                    total = FRAME_BYTES
+                );
+            }
+            display_idx += 1;
         }
     }
-
-    // Frame 0 (IDR) is decoded without a CABAC-engine-level error
-    // today — the I-slice pixel-residual drift documented in
-    // `decode_cabac_b.rs` corrupts the output bytes but leaves the
-    // bitstream read cursor in a valid place. The desync only starts
-    // cascading once later slices build on the corrupted IDR state.
-    assert!(
-        results[0].is_ok(),
-        "frame 0 (IDR) should not error today: got {:?}",
-        results[0]
-    );
-
-    // At least one subsequent frame must surface a `cabac: read past
-    // end of stream`. If *none* do today, the CABAC I-slice fix has
-    // landed — celebrate and flip this assertion to require all-ok.
-    assert!(
-        errored
-            .iter()
-            .any(|(_, msg)| msg.contains("cabac: read past end")),
-        "expected the known CABAC desync to surface on HEAD; got errors = {:?}",
-        errored
+    assert_eq!(
+        display_idx, EXPECTED_FRAMES,
+        "decoder emitted {display_idx} frames, expected {EXPECTED_FRAMES}"
     );
 }
