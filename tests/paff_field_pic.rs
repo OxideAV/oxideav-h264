@@ -90,7 +90,8 @@ fn encode_decode_field(src: &VideoFrame, qp: i32, bottom_field: bool) -> (Vec<u8
         },
     )
     .expect("encoder::new");
-    enc.send_frame(&Frame::Video(src.clone())).expect("send_frame");
+    enc.send_frame(&Frame::Video(src.clone()))
+        .expect("send_frame");
     enc.flush().expect("flush");
     let pkt = enc.receive_packet().expect("receive_packet");
     let bytes = pkt.data.clone();
@@ -199,7 +200,10 @@ fn roundtrip_paff_top_field_64x64_qp22() {
     let src = make_field(64, 64, 0);
     let (_bytes, dec) = encode_decode_field(&src, 22, false);
     assert_eq!(dec.width, 64, "field width must match encoder input");
-    assert_eq!(dec.height, 64, "field height reflects the field's sample rows");
+    assert_eq!(
+        dec.height, 64,
+        "field height reflects the field's sample rows"
+    );
     let p = psnr(&src.planes[0].data, &dec.planes[0].data);
     eprintln!("paff top-field 64x64 qp22: luma psnr = {:.2} dB", p);
     assert!(p >= 26.0, "paff top-field luma psnr {:.2} < 26 dB", p);

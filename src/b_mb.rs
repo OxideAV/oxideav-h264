@@ -31,8 +31,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{
     decode_b_slice_mb_type, decode_b_sub_mb_type, decode_cbp_inter, BMbType, BPartition,
@@ -51,6 +51,7 @@ use crate::transform::{
     chroma_qp, dequantize_4x4_scaled, idct_4x4, inv_hadamard_2x2_chroma_dc_scaled,
     inv_hadamard_2x4_chroma_dc_scaled,
 };
+use oxideav_core::bits::BitReader;
 
 /// Per-slice context needed for temporal direct MV prediction (§8.4.1.2.3).
 ///
@@ -316,12 +317,12 @@ fn decode_16x16_single_dir(
         ),
     };
     let mvd_l0 = if ref_l0.is_some() {
-        Some((br.read_se()? as i32, br.read_se()? as i32))
+        Some((br.read_se()?, br.read_se()?))
     } else {
         None
     };
     let mvd_l1 = if ref_l1.is_some() {
-        Some((br.read_se()? as i32, br.read_se()? as i32))
+        Some((br.read_se()?, br.read_se()?))
     } else {
         None
     };
@@ -371,12 +372,12 @@ fn decode_two_partition_b(
     }
     for p in 0..2 {
         if uses_l0(dirs[p]) {
-            mvd_l0[p] = Some((br.read_se()? as i32, br.read_se()? as i32));
+            mvd_l0[p] = Some((br.read_se()?, br.read_se()?));
         }
     }
     for p in 0..2 {
         if uses_l1(dirs[p]) {
-            mvd_l1[p] = Some((br.read_se()? as i32, br.read_se()? as i32));
+            mvd_l1[p] = Some((br.read_se()?, br.read_se()?));
         }
     }
 
@@ -452,12 +453,12 @@ fn decode_b8x8(
         for _ in 0..n {
             if let Some(dir) = dir_opt {
                 let mvd_l0 = if uses_l0(dir) {
-                    Some((br.read_se()? as i32, br.read_se()? as i32))
+                    Some((br.read_se()?, br.read_se()?))
                 } else {
                     None
                 };
                 let mvd_l1 = if uses_l1(dir) {
-                    Some((br.read_se()? as i32, br.read_se()? as i32))
+                    Some((br.read_se()?, br.read_se()?))
                 } else {
                     None
                 };
@@ -643,11 +644,7 @@ impl DirectMv {
 /// Spatial-direct MV derivation (§8.4.1.2.2) for a whole 16×16 MB — returns
 /// a single DirectMv shared by every 4×4 block plus writes the MVs / refs
 /// into `pic.mb_info[mb_x, mb_y]` so subsequent neighbour lookups see them.
-pub fn direct_16x16_spatial_mvs_pub(
-    pic: &mut Picture,
-    mb_x: u32,
-    mb_y: u32,
-) -> DirectMv {
+pub fn direct_16x16_spatial_mvs_pub(pic: &mut Picture, mb_x: u32, mb_y: u32) -> DirectMv {
     let (ri0, ri1) = direct_spatial_ref_idx(pic, mb_x, mb_y);
     let (mv0, mv1) = direct_spatial_mvs(pic, mb_x, mb_y, ri0, ri1);
     let d = DirectMv::new(ri0, ri1, mv0, mv1);

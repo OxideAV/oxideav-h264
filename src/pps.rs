@@ -7,9 +7,10 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::golomb::BitReaderExt;
 use crate::nal::NalHeader;
 use crate::sps::Sps;
+use oxideav_core::bits::BitReader;
 
 /// Parsed PPS.
 #[derive(Clone, Debug)]
@@ -196,7 +197,11 @@ fn parse_scaling_list_4x4(br: &mut BitReader<'_>) -> Result<([i16; 16], bool)> {
                 use_default = true;
             }
         }
-        let val = if next_scale == 0 { last_scale } else { next_scale };
+        let val = if next_scale == 0 {
+            last_scale
+        } else {
+            next_scale
+        };
         let raster = crate::scaling_list::ZIGZAG_4X4[j as usize];
         list[raster] = val as i16;
         if next_scale != 0 {
@@ -220,7 +225,11 @@ fn parse_scaling_list_8x8(br: &mut BitReader<'_>) -> Result<([i16; 64], bool)> {
                 use_default = true;
             }
         }
-        let val = if next_scale == 0 { last_scale } else { next_scale };
+        let val = if next_scale == 0 {
+            last_scale
+        } else {
+            next_scale
+        };
         let raster = crate::transform::ZIGZAG_8X8[j as usize];
         list[raster] = val as i16;
         if next_scale != 0 {

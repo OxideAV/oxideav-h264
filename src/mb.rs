@@ -22,8 +22,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_8x8_sub, decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::intra_pred::{
     predict_intra_16x16, predict_intra_4x4, predict_intra_8x8, predict_intra_chroma,
     predict_intra_chroma_8x16, Intra16x16Mode, Intra16x16Neighbours, Intra4x4Mode,
@@ -41,6 +41,7 @@ use crate::transform::{
     inv_hadamard_2x2_chroma_dc_scaled, inv_hadamard_2x4_chroma_dc_scaled,
     inv_hadamard_4x4_dc_scaled,
 };
+use oxideav_core::bits::BitReader;
 
 /// Per-block (4×4) raster ordering of the residual blocks within a
 /// macroblock — §8.5.1, Figure 6-12. Block N covers `(LUMA_BLOCK_RASTER[N])`.
@@ -599,8 +600,7 @@ fn collect_intra8x8_neighbours(
             (0, 0) => pic.mb_top_available(mb_y),
             (0, 1) => {
                 if let Some(above_y) = pic.mb_above_neighbour(mb_y) {
-                    mb_x + 1 < pic.mb_width
-                        && pic.mb_info_at(mb_x + 1, above_y).coded
+                    mb_x + 1 < pic.mb_width && pic.mb_info_at(mb_x + 1, above_y).coded
                 } else {
                     false
                 }
@@ -816,7 +816,13 @@ fn decode_chroma(
 // Predicted nC (§9.2.1.1).
 // -----------------------------------------------------------------------------
 
-pub(crate) fn predict_nc_luma(pic: &Picture, mb_x: u32, mb_y: u32, br_row: usize, br_col: usize) -> i32 {
+pub(crate) fn predict_nc_luma(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+    br_row: usize,
+    br_col: usize,
+) -> i32 {
     let info_here = pic.mb_info_at(mb_x, mb_y);
     let left = if br_col > 0 {
         Some(info_here.luma_nc[br_row * 4 + br_col - 1])
@@ -1029,8 +1035,7 @@ pub(crate) fn top_right_available_4x4(
     if br_col == 3 {
         if br_row == 0 {
             if let Some(above_y) = pic.mb_above_neighbour(mb_y) {
-                mb_x + 1 < pic.mb_width
-                    && pic.mb_info_at(mb_x + 1, above_y).coded
+                mb_x + 1 < pic.mb_width && pic.mb_info_at(mb_x + 1, above_y).coded
             } else {
                 false
             }
@@ -1054,7 +1059,11 @@ pub(crate) fn top_right_available_4x4(
     }
 }
 
-pub(crate) fn collect_intra16x16_neighbours(pic: &Picture, mb_x: u32, mb_y: u32) -> Intra16x16Neighbours {
+pub(crate) fn collect_intra16x16_neighbours(
+    pic: &Picture,
+    mb_x: u32,
+    mb_y: u32,
+) -> Intra16x16Neighbours {
     // §6.4.9.4 — under MBAFF a field-coded MB reads neighbour samples
     // from the same-polarity field of the previous pair, which in the
     // "uniform pair-mode" case translates to `row_stride = 2 *

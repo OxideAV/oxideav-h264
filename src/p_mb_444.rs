@@ -21,28 +21,28 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_444::{self as mb444};
-use crate::mb_type::{decode_p_slice_mb_type, decode_p_sub_mb_type, PMbType, PPartition, PSubPartition};
-use crate::motion::{
-    apply_luma_weight, luma_mc_plane, predict_mv_l0, predict_mv_pskip,
+use crate::mb_type::{
+    decode_p_slice_mb_type, decode_p_sub_mb_type, PMbType, PPartition, PSubPartition,
 };
+use crate::motion::{apply_luma_weight, luma_mc_plane, predict_mv_l0, predict_mv_pskip};
 use crate::picture::{MbInfo, Picture, INTRA_DC_FAKE};
 use crate::pps::Pps;
 use crate::slice::{LumaWeight, SliceHeader};
 use crate::sps::Sps;
 use crate::transform::{chroma_qp, dequantize_4x4_scaled, idct_4x4};
+use oxideav_core::bits::BitReader;
 
 /// §9.1.2 / Table 9-4(b) — 4:4:4 and monochrome inter CBP gray code.
 /// Source: FFmpeg `golomb_to_inter_cbp_gray` in `libavcodec/h264_cavlc.c`.
 /// Maps `me(v)` (0..=15) → 4-bit `CodedBlockPatternLuma`. The chroma
 /// columns of Table 9-4 are absent in 4:4:4; the luma CBP is applied to
 /// every colour plane.
-pub const GOLOMB_TO_INTER_CBP_GRAY: [u8; 16] = [
-    0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9,
-];
+pub const GOLOMB_TO_INTER_CBP_GRAY: [u8; 16] =
+    [0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9];
 
 /// Entry for one CAVLC P-slice macroblock under 4:4:4.
 pub fn decode_p_slice_mb_444(
@@ -66,9 +66,15 @@ pub fn decode_p_slice_mb_444(
             mb444::decode_intra_mb_444(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb)
         }
         PMbType::Inter { partition } => match partition {
-            PPartition::P16x16 => decode_p16x16(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp),
-            PPartition::P16x8 => decode_p16x8(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp),
-            PPartition::P8x16 => decode_p8x16(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp),
+            PPartition::P16x16 => {
+                decode_p16x16(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp)
+            }
+            PPartition::P16x8 => {
+                decode_p16x8(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp)
+            }
+            PPartition::P8x16 => {
+                decode_p8x16(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp)
+            }
             PPartition::P8x8 | PPartition::P8x8Ref0 => decode_p8x8(
                 br,
                 sps,
@@ -114,7 +120,17 @@ pub fn decode_p_skip_mb_444(
     fill_partition_mv(pic, mb_x, mb_y, 0, 0, 4, 4, mv, 0);
     let lw = l0_luma_weight(sh, 0);
     mc_partition_all_planes(
-        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, lw,
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        lw,
     );
     Ok(())
 }
@@ -133,8 +149,8 @@ fn decode_p16x16(
     let num_ref_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
     let ref_idx = read_ref_idx(br, num_ref_l0)?;
     let reference = lookup_ref(ref_list0, ref_idx)?;
-    let mvd_x = br.read_se()? as i32;
-    let mvd_y = br.read_se()? as i32;
+    let mvd_x = br.read_se()?;
+    let mvd_y = br.read_se()?;
     let pmv = predict_mv_l0(pic, mb_x, mb_y, 0, 0, 4, 4, ref_idx);
     let mv = (
         pmv.0.wrapping_add(mvd_x as i16),
@@ -143,7 +159,17 @@ fn decode_p16x16(
     fill_partition_mv(pic, mb_x, mb_y, 0, 0, 4, 4, mv, ref_idx);
     let lw = l0_luma_weight(sh, ref_idx);
     mc_partition_all_planes(
-        pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, lw,
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        lw,
     );
 
     finalize_p_mb(br, pps, mb_x, mb_y, pic, prev_qp, PPartition::P16x16)
@@ -165,7 +191,19 @@ fn decode_p16x8(
     let ref_idx_1 = read_ref_idx(br, num_ref_l0)?;
     let rects = [(0usize, 0usize, 2usize, 4usize), (2, 0, 2, 4)];
     let refs = [ref_idx_0, ref_idx_1];
-    decode_two_partition(br, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp, &rects, &refs, PPartition::P16x8)
+    decode_two_partition(
+        br,
+        pps,
+        sh,
+        mb_x,
+        mb_y,
+        pic,
+        ref_list0,
+        prev_qp,
+        &rects,
+        &refs,
+        PPartition::P16x8,
+    )
 }
 
 fn decode_p8x16(
@@ -184,7 +222,19 @@ fn decode_p8x16(
     let ref_idx_1 = read_ref_idx(br, num_ref_l0)?;
     let rects = [(0usize, 0usize, 4usize, 2usize), (0, 2, 4, 2)];
     let refs = [ref_idx_0, ref_idx_1];
-    decode_two_partition(br, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp, &rects, &refs, PPartition::P8x16)
+    decode_two_partition(
+        br,
+        pps,
+        sh,
+        mb_x,
+        mb_y,
+        pic,
+        ref_list0,
+        prev_qp,
+        &rects,
+        &refs,
+        PPartition::P8x16,
+    )
 }
 
 fn decode_two_partition(
@@ -203,8 +253,8 @@ fn decode_two_partition(
     for p in 0..2 {
         let (r0, c0, ph, pw) = rects[p];
         let reference = lookup_ref(ref_list0, refs[p])?;
-        let mvd_x = br.read_se()? as i32;
-        let mvd_y = br.read_se()? as i32;
+        let mvd_x = br.read_se()?;
+        let mvd_y = br.read_se()?;
         let pmv = predict_mv_l0(pic, mb_x, mb_y, r0, c0, ph, pw, refs[p]);
         let mv = (
             pmv.0.wrapping_add(mvd_x as i16),
@@ -213,7 +263,17 @@ fn decode_two_partition(
         fill_partition_mv(pic, mb_x, mb_y, r0, c0, ph, pw, mv, refs[p]);
         let lw = l0_luma_weight(sh, refs[p]);
         mc_partition_all_planes(
-            pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, lw,
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            ph,
+            pw,
+            mv.0 as i32,
+            mv.1 as i32,
+            lw,
         );
     }
     finalize_p_mb(br, pps, mb_x, mb_y, pic, prev_qp, partition)
@@ -254,8 +314,8 @@ fn decode_p8x8(
             let (dr, dc, sh_h, sh_w) = sp.sub_rect(sub_idx);
             let r0 = sr0 + dr;
             let c0 = sc0 + dc;
-            let mvd_x = br.read_se()? as i32;
-            let mvd_y = br.read_se()? as i32;
+            let mvd_x = br.read_se()?;
+            let mvd_y = br.read_se()?;
             let pmv = predict_mv_l0(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, ref_idx);
             let mv = (
                 pmv.0.wrapping_add(mvd_x as i16),
@@ -264,7 +324,17 @@ fn decode_p8x8(
             fill_partition_mv(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, mv, ref_idx);
             let lw = l0_luma_weight(sh, ref_idx);
             mc_partition_all_planes(
-                pic, reference, mb_x, mb_y, r0, c0, sh_h, sh_w, mv.0 as i32, mv.1 as i32, lw,
+                pic,
+                reference,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                sh_h,
+                sh_w,
+                mv.0 as i32,
+                mv.1 as i32,
+                lw,
             );
         }
     }

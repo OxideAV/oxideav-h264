@@ -13,9 +13,7 @@
 //! filter / 2-tap averaging coefficients are identical to the 8-bit
 //! module — only the input/output types change.
 
-use crate::intra_pred::{
-    Intra16x16Mode, Intra4x4Mode, Intra8x8Mode, IntraChromaMode,
-};
+use crate::intra_pred::{Intra16x16Mode, Intra4x4Mode, Intra8x8Mode, IntraChromaMode};
 
 #[derive(Clone, Debug)]
 pub struct Intra4x4Neighbours16 {
@@ -137,7 +135,10 @@ pub fn predict_intra_4x4(
                 let c = t[i + 2] as u32;
                 z[i] = clip1(((a + 2 * b + c + 2) >> 2) as i32, max_sample);
             }
-            z[7] = clip1(((t[6] as u32 + 3 * t[7] as u32 + 2) >> 2) as i32, max_sample);
+            z[7] = clip1(
+                ((t[6] as u32 + 3 * t[7] as u32 + 2) >> 2) as i32,
+                max_sample,
+            );
             for y in 0..4 {
                 for x in 0..4 {
                     let zi = if x == 3 && y == 3 { 7 } else { x + y };
@@ -178,11 +179,15 @@ pub fn predict_intra_4x4(
                     let v;
                     if zvr == 0 || zvr == 2 || zvr == 4 || zvr == 6 {
                         let i0 = (4 + x as i32 - (y as i32 >> 1)) as usize;
-                        v = clip1(((e[i0] as u32 + e[i0 + 1] as u32 + 1) >> 1) as i32, max_sample);
+                        v = clip1(
+                            ((e[i0] as u32 + e[i0 + 1] as u32 + 1) >> 1) as i32,
+                            max_sample,
+                        );
                     } else if zvr == 1 || zvr == 3 || zvr == 5 {
                         let i0 = (3 + x as i32 - (y as i32 >> 1)) as usize;
                         v = clip1(
-                            ((e[i0] as u32 + 2 * e[i0 + 1] as u32 + e[i0 + 2] as u32 + 2) >> 2) as i32,
+                            ((e[i0] as u32 + 2 * e[i0 + 1] as u32 + e[i0 + 2] as u32 + 2) >> 2)
+                                as i32,
                             max_sample,
                         );
                     } else if zvr == -1 {
@@ -215,11 +220,15 @@ pub fn predict_intra_4x4(
                     let v;
                     if zhd == 0 || zhd == 2 || zhd == 4 || zhd == 6 {
                         let i0 = (3 - (y as i32 - (x as i32 >> 1))) as usize;
-                        v = clip1(((e[i0] as u32 + e[i0 + 1] as u32 + 1) >> 1) as i32, max_sample);
+                        v = clip1(
+                            ((e[i0] as u32 + e[i0 + 1] as u32 + 1) >> 1) as i32,
+                            max_sample,
+                        );
                     } else if zhd == 1 || zhd == 3 || zhd == 5 {
                         let i0 = (3 - (y as i32 - (x as i32 >> 1))) as usize;
                         v = clip1(
-                            ((e[i0] as u32 + 2 * e[i0 + 1] as u32 + e[i0 + 2] as u32 + 2) >> 2) as i32,
+                            ((e[i0] as u32 + 2 * e[i0 + 1] as u32 + e[i0 + 2] as u32 + 2) >> 2)
+                                as i32,
                             max_sample,
                         );
                     } else if zhd == -1 {
@@ -245,7 +254,10 @@ pub fn predict_intra_4x4(
                 for x in 0..4 {
                     let i = x + (y >> 1);
                     let v = if y % 2 == 0 {
-                        clip1(((t[i] as u32 + t[i + 1] as u32 + 1) >> 1) as i32, max_sample)
+                        clip1(
+                            ((t[i] as u32 + t[i + 1] as u32 + 1) >> 1) as i32,
+                            max_sample,
+                        )
                     } else {
                         clip1(
                             ((t[i] as u32 + 2 * t[i + 1] as u32 + t[i + 2] as u32 + 2) >> 2) as i32,
@@ -264,7 +276,10 @@ pub fn predict_intra_4x4(
                     let v = match zhu {
                         0 | 2 | 4 => {
                             let yy = y + (x >> 1);
-                            clip1(((l[yy] as u32 + l[yy + 1] as u32 + 1) >> 1) as i32, max_sample)
+                            clip1(
+                                ((l[yy] as u32 + l[yy + 1] as u32 + 1) >> 1) as i32,
+                                max_sample,
+                            )
                         }
                         1 | 3 => {
                             let yy = y + (x >> 1);
@@ -274,7 +289,10 @@ pub fn predict_intra_4x4(
                                 max_sample,
                             )
                         }
-                        5 => clip1(((l[2] as u32 + 3 * l[3] as u32 + 2) >> 2) as i32, max_sample),
+                        5 => clip1(
+                            ((l[2] as u32 + 3 * l[3] as u32 + 2) >> 2) as i32,
+                            max_sample,
+                        ),
                         _ => l[3],
                     };
                     out[y * 4 + x] = v;
@@ -660,8 +678,8 @@ fn filter_ref_8x8(n: &Intra8x8Neighbours16) -> ([u16; 16], [u16; 8], u16) {
         };
         ft[0] = ((tl_src as u32 + 2 * n.top[0] as u32 + n.top[1] as u32 + 2) >> 2) as u16;
         for i in 1..15 {
-            ft[i] = ((n.top[i - 1] as u32 + 2 * n.top[i] as u32 + n.top[i + 1] as u32 + 2) >> 2)
-                as u16;
+            ft[i] =
+                ((n.top[i - 1] as u32 + 2 * n.top[i] as u32 + n.top[i + 1] as u32 + 2) >> 2) as u16;
         }
         ft[15] = ((n.top[14] as u32 + 3 * n.top[15] as u32 + 2) >> 2) as u16;
     }
@@ -756,10 +774,16 @@ pub fn predict_intra_8x8(
             for y in 0..8 {
                 for x in 0..8 {
                     let v = if x == 7 && y == 7 {
-                        clip1(((ft[14] as u32 + 3 * ft[15] as u32 + 2) >> 2) as i32, max_sample)
+                        clip1(
+                            ((ft[14] as u32 + 3 * ft[15] as u32 + 2) >> 2) as i32,
+                            max_sample,
+                        )
                     } else {
                         clip1(
-                            ((ft[x + y] as u32 + 2 * ft[x + y + 1] as u32 + ft[x + y + 2] as u32 + 2)
+                            ((ft[x + y] as u32
+                                + 2 * ft[x + y + 1] as u32
+                                + ft[x + y + 2] as u32
+                                + 2)
                                 >> 2) as i32,
                             max_sample,
                         )
@@ -803,7 +827,10 @@ pub fn predict_intra_8x8(
                     let v = if zvr >= 0 && zvr % 2 == 0 {
                         let base = 8 + x as i32 - (y as i32 >> 1);
                         let i = base as usize;
-                        clip1(((e[i] as u32 + e[i + 1] as u32 + 1) >> 1) as i32, max_sample)
+                        clip1(
+                            ((e[i] as u32 + e[i + 1] as u32 + 1) >> 1) as i32,
+                            max_sample,
+                        )
                     } else if zvr >= 1 {
                         let base = 8 + x as i32 - ((y as i32 + 1) >> 1);
                         let i = base as usize;
@@ -838,7 +865,10 @@ pub fn predict_intra_8x8(
                     let v = if zhd >= 0 && zhd % 2 == 0 {
                         let base = 8 - (y as i32 - (x as i32 >> 1));
                         let i = base as usize;
-                        clip1(((e[i] as u32 + e[i - 1] as u32 + 1) >> 1) as i32, max_sample)
+                        clip1(
+                            ((e[i] as u32 + e[i - 1] as u32 + 1) >> 1) as i32,
+                            max_sample,
+                        )
                     } else if zhd >= 1 {
                         let base = 8 - (y as i32 - (x as i32 >> 1));
                         let i = base as usize;
@@ -862,7 +892,10 @@ pub fn predict_intra_8x8(
                 for x in 0..8 {
                     let i = x + (y >> 1);
                     let v = if y % 2 == 0 {
-                        clip1(((ft[i] as u32 + ft[i + 1] as u32 + 1) >> 1) as i32, max_sample)
+                        clip1(
+                            ((ft[i] as u32 + ft[i + 1] as u32 + 1) >> 1) as i32,
+                            max_sample,
+                        )
                     } else {
                         clip1(
                             ((ft[i] as u32 + 2 * ft[i + 1] as u32 + ft[i + 2] as u32 + 2) >> 2)
@@ -880,7 +913,10 @@ pub fn predict_intra_8x8(
                     let zhu = x + 2 * y;
                     let v = if zhu <= 12 && zhu % 2 == 0 {
                         let i = y + (x >> 1);
-                        clip1(((fl[i] as u32 + fl[i + 1] as u32 + 1) >> 1) as i32, max_sample)
+                        clip1(
+                            ((fl[i] as u32 + fl[i + 1] as u32 + 1) >> 1) as i32,
+                            max_sample,
+                        )
                     } else if zhu <= 11 {
                         let i = y + (x >> 1);
                         clip1(
@@ -889,7 +925,10 @@ pub fn predict_intra_8x8(
                             max_sample,
                         )
                     } else if zhu == 13 {
-                        clip1(((fl[6] as u32 + 3 * fl[7] as u32 + 2) >> 2) as i32, max_sample)
+                        clip1(
+                            ((fl[6] as u32 + 3 * fl[7] as u32 + 2) >> 2) as i32,
+                            max_sample,
+                        )
                     } else {
                         fl[7]
                     };

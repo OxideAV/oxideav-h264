@@ -522,10 +522,7 @@ pub fn decode_mb_type_p(
 ///   * `ctxs[3]` — bins 5 AND 6 (intra16x16 pred_mode bits) — same ctx
 ///
 /// Returns the raw I-slice mb_type value in `0..=25`.
-fn decode_mb_type_intra_in_p(
-    d: &mut CabacDecoder<'_>,
-    ctxs: &mut [CabacContext],
-) -> Result<u32> {
+fn decode_mb_type_intra_in_p(d: &mut CabacDecoder<'_>, ctxs: &mut [CabacContext]) -> Result<u32> {
     if ctxs.len() < 4 {
         return Err(Error::invalid(
             "cabac::binarize::decode_mb_type_intra_in_p: need >=4 ctxs",

@@ -17,8 +17,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_8x8_sub, decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{
     decode_cbp_inter, decode_p_slice_mb_type, decode_p_sub_mb_type, IMbType, PMbType, PPartition,
@@ -36,6 +36,7 @@ use crate::transform::{
     chroma_qp_hi, dequantize_4x4_scaled_ext, dequantize_8x8_scaled_ext, idct_4x4, idct_8x8,
     inv_hadamard_2x2_chroma_dc_scaled_ext,
 };
+use oxideav_core::bits::BitReader;
 
 /// Decode one coded P-slice macroblock at `(mb_x, mb_y)` in the 10-bit
 /// pipeline. Mirrors [`crate::p_mb::decode_p_slice_mb`] on u16 planes.
@@ -55,7 +56,9 @@ pub fn decode_p_slice_mb_hi(
         .ok_or_else(|| Error::invalid(format!("h264 p-slice: bad P mb_type {mb_type}")))?;
 
     match pmb {
-        PMbType::IntraInP(imb) => decode_intra_in_p_hi(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb),
+        PMbType::IntraInP(imb) => {
+            decode_intra_in_p_hi(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb)
+        }
         PMbType::Inter { partition } => match partition {
             PPartition::P16x16 => {
                 decode_p16x16_hi(br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp)
@@ -111,8 +114,32 @@ pub fn decode_p_skip_mb_hi(
     }
     fill_partition_mv(pic, mb_x, mb_y, 0, 0, 4, 4, mv, 0);
     let (lw, cw) = l0_weight_for(sh, 0);
-    mc_luma_partition_hi(pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, lw);
-    mc_chroma_partition_hi(pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, cw);
+    mc_luma_partition_hi(
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        lw,
+    );
+    mc_chroma_partition_hi(
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        cw,
+    );
     Ok(())
 }
 
@@ -144,8 +171,8 @@ fn decode_p16x16_hi(
     let num_ref_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
     let ref_idx = read_ref_idx(br, num_ref_l0)?;
     let reference = lookup_ref(ref_list0, ref_idx)?;
-    let mvd_x = br.read_se()? as i32;
-    let mvd_y = br.read_se()? as i32;
+    let mvd_x = br.read_se()?;
+    let mvd_y = br.read_se()?;
 
     let pmv = predict_mv_l0(pic, mb_x, mb_y, 0, 0, 4, 4, ref_idx);
     let mv = (
@@ -156,8 +183,32 @@ fn decode_p16x16_hi(
     fill_partition_mv(pic, mb_x, mb_y, 0, 0, 4, 4, mv, ref_idx);
 
     let (lw, cw) = l0_weight_for(sh, ref_idx);
-    mc_luma_partition_hi(pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, lw);
-    mc_chroma_partition_hi(pic, reference, mb_x, mb_y, 0, 0, 4, 4, mv.0 as i32, mv.1 as i32, cw);
+    mc_luma_partition_hi(
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        lw,
+    );
+    mc_chroma_partition_hi(
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        4,
+        mv.0 as i32,
+        mv.1 as i32,
+        cw,
+    );
 
     let cbp_raw = br.read_ue()?;
     let (cbp_luma, cbp_chroma) = decode_cbp_inter(cbp_raw)
@@ -218,7 +269,18 @@ fn decode_p16x8_hi(
     let rects = [(0usize, 0usize, 2usize, 4usize), (2, 0, 2, 4)];
     let refs = [ref_idx_0, ref_idx_1];
     decode_two_partition_p_hi(
-        br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp, &rects, &refs, PPartition::P16x8,
+        br,
+        sps,
+        pps,
+        sh,
+        mb_x,
+        mb_y,
+        pic,
+        ref_list0,
+        prev_qp,
+        &rects,
+        &refs,
+        PPartition::P16x8,
     )
 }
 
@@ -240,7 +302,18 @@ fn decode_p8x16_hi(
     let rects = [(0usize, 0usize, 4usize, 2usize), (0, 2, 4, 2)];
     let refs = [ref_idx_0, ref_idx_1];
     decode_two_partition_p_hi(
-        br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, prev_qp, &rects, &refs, PPartition::P8x16,
+        br,
+        sps,
+        pps,
+        sh,
+        mb_x,
+        mb_y,
+        pic,
+        ref_list0,
+        prev_qp,
+        &rects,
+        &refs,
+        PPartition::P8x16,
     )
 }
 
@@ -263,8 +336,8 @@ fn decode_two_partition_p_hi(
     for p in 0..2 {
         let (r0, c0, ph, pw) = rects[p];
         let reference = lookup_ref(ref_list0, refs[p])?;
-        let mvd_x = br.read_se()? as i32;
-        let mvd_y = br.read_se()? as i32;
+        let mvd_x = br.read_se()?;
+        let mvd_y = br.read_se()?;
         let pmv = predict_mv_l0(pic, mb_x, mb_y, r0, c0, ph, pw, refs[p]);
         let mv = (
             pmv.0.wrapping_add(mvd_x as i16),
@@ -273,8 +346,32 @@ fn decode_two_partition_p_hi(
         mvs[p] = mv;
         fill_partition_mv(pic, mb_x, mb_y, r0, c0, ph, pw, mv, refs[p]);
         let (lw, cw) = l0_weight_for(sh, refs[p]);
-        mc_luma_partition_hi(pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, lw);
-        mc_chroma_partition_hi(pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, cw);
+        mc_luma_partition_hi(
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            ph,
+            pw,
+            mv.0 as i32,
+            mv.1 as i32,
+            lw,
+        );
+        mc_chroma_partition_hi(
+            pic,
+            reference,
+            mb_x,
+            mb_y,
+            r0,
+            c0,
+            ph,
+            pw,
+            mv.0 as i32,
+            mv.1 as i32,
+            cw,
+        );
     }
 
     let cbp_raw = br.read_ue()?;
@@ -353,8 +450,8 @@ fn decode_p8x8_hi(
             let (dr, dc, sh_h, sh_w) = sp.sub_rect(sub_idx);
             let r0 = sr0 + dr;
             let c0 = sc0 + dc;
-            let mvd_x = br.read_se()? as i32;
-            let mvd_y = br.read_se()? as i32;
+            let mvd_x = br.read_se()?;
+            let mvd_y = br.read_se()?;
             let pmv = predict_mv_l0(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, ref_idx);
             let mv = (
                 pmv.0.wrapping_add(mvd_x as i16),
@@ -362,8 +459,32 @@ fn decode_p8x8_hi(
             );
             fill_partition_mv(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, mv, ref_idx);
             let (lw, cw) = l0_weight_for(sh, ref_idx);
-            mc_luma_partition_hi(pic, reference, mb_x, mb_y, r0, c0, sh_h, sh_w, mv.0 as i32, mv.1 as i32, lw);
-            mc_chroma_partition_hi(pic, reference, mb_x, mb_y, r0, c0, sh_h, sh_w, mv.0 as i32, mv.1 as i32, cw);
+            mc_luma_partition_hi(
+                pic,
+                reference,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                sh_h,
+                sh_w,
+                mv.0 as i32,
+                mv.1 as i32,
+                lw,
+            );
+            mc_chroma_partition_hi(
+                pic,
+                reference,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                sh_h,
+                sh_w,
+                mv.0 as i32,
+                mv.1 as i32,
+                cw,
+            );
         }
     }
 
@@ -371,12 +492,11 @@ fn decode_p8x8_hi(
     let (cbp_luma, cbp_chroma) = decode_cbp_inter(cbp_raw)
         .ok_or_else(|| Error::invalid(format!("h264 p-slice: bad inter CBP {cbp_raw}")))?;
     let all_sub_8x8 = sub_parts.iter().all(|sp| sp.is_at_least_8x8());
-    let transform_8x8 =
-        if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
-            br.read_flag()?
-        } else {
-            false
-        };
+    let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
+        br.read_flag()?
+    } else {
+        false
+    };
     let needs_qp = cbp_luma != 0 || cbp_chroma != 0;
     if needs_qp {
         let dqp = br.read_se()?;
@@ -568,7 +688,11 @@ fn decode_inter_residual_chroma_hi(
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);
             let off_in_mb = br_row * 4 * cstride + br_col * 4;
-            let plane = if plane_kind { &mut pic.cb16 } else { &mut pic.cr16 };
+            let plane = if plane_kind {
+                &mut pic.cb16
+            } else {
+                &mut pic.cr16
+            };
             for r in 0..4 {
                 for c in 0..4 {
                     let base = plane[co + off_in_mb + r * cstride + c] as i32;
@@ -695,12 +819,32 @@ fn mc_chroma_partition_hi(
     let cw_plane = (reference.width / 2) as i32;
     let ch_plane = (reference.height / 2) as i32;
     chroma_mc_hi(
-        &mut tmp_cb, &reference.cb16, cstride, cw_plane, ch_plane, base_x, base_y, mv_x_q, mv_y_q,
-        pw, ph, reference.bit_depth_c,
+        &mut tmp_cb,
+        &reference.cb16,
+        cstride,
+        cw_plane,
+        ch_plane,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_q,
+        pw,
+        ph,
+        reference.bit_depth_c,
     );
     chroma_mc_hi(
-        &mut tmp_cr, &reference.cr16, cstride, cw_plane, ch_plane, base_x, base_y, mv_x_q, mv_y_q,
-        pw, ph, reference.bit_depth_c,
+        &mut tmp_cr,
+        &reference.cr16,
+        cstride,
+        cw_plane,
+        ch_plane,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_q,
+        pw,
+        ph,
+        reference.bit_depth_c,
     );
     if let Some(cw_entry) = chroma_weight {
         apply_chroma_weight_hi(&mut tmp_cb, cw_entry, 0, pic.bit_depth_c);

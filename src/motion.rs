@@ -976,7 +976,13 @@ pub fn apply_chroma_weight_hi(dst: &mut [u16], w: &ChromaWeight, plane_idx: usiz
 }
 
 #[inline]
-fn apply_weight_plane_hi(dst: &mut [u16], weight: i32, offset: i32, log2_denom: u32, bit_depth: u8) {
+fn apply_weight_plane_hi(
+    dst: &mut [u16],
+    weight: i32,
+    offset: i32,
+    log2_denom: u32,
+    bit_depth: u8,
+) {
     let max_sample: i32 = (1i32 << bit_depth) - 1;
     if log2_denom == 0 {
         for p in dst.iter_mut() {

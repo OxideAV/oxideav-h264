@@ -69,13 +69,13 @@ use oxideav_core::{
     Result, VideoFrame,
 };
 
-use crate::bitwriter::{rbsp_to_ebsp, BitWriter};
 use crate::cavlc::BlockKind;
 use crate::cavlc_enc::encode_residual_block;
 use crate::fwd_transform::{
     forward_dct_4x4, forward_hadamard_2x2, forward_hadamard_4x4, quantize_4x4_ac,
     quantize_chroma_dc_2x2, quantize_luma_dc_4x4,
 };
+use crate::golomb::BitWriterExt;
 use crate::intra_pred::{
     predict_intra_16x16, predict_intra_chroma, Intra16x16Mode, Intra16x16Neighbours,
     IntraChromaMode, IntraChromaNeighbours,
@@ -83,11 +83,13 @@ use crate::intra_pred::{
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{PMbType, PPartition, ME_INTER_4_2_0};
 use crate::motion::{chroma_mc, luma_mc_plane, predict_mv_l0, predict_mv_pskip};
+use crate::nal::rbsp_to_ebsp;
 use crate::picture::{MbInfo, Picture};
 use crate::tables::ME_INTRA_4_2_0;
 use crate::transform::{
     chroma_qp, dequantize_4x4, idct_4x4, inv_hadamard_2x2_chroma_dc, inv_hadamard_4x4_dc,
 };
+use oxideav_core::bits::BitWriter;
 
 /// Options for the H.264 encoder.
 #[derive(Clone, Debug)]
@@ -927,7 +929,7 @@ impl H264Encoder {
         w.write_ue(0); // first_mb_in_slice
         w.write_ue(5); // slice_type = 5 (P, single-type-per-picture variant)
         w.write_ue(self.opts.pps_id); // pic_parameter_set_id
-        // frame_num — 4 bits (log2_max_frame_num_minus4 = 0).
+                                      // frame_num — 4 bits (log2_max_frame_num_minus4 = 0).
         w.write_bits(self.frame_num & 0xF, 4);
         // No field_pic_flag when frame_mbs_only_flag = 1 (progressive SPS).
         // pic_order_cnt_lsb — 4 bits. Use `2 * frame_num` so each P-slice
@@ -1318,8 +1320,7 @@ impl H264Encoder {
             forward_hadamard_2x2(dc_dst);
             quantize_chroma_dc_2x2(dc_dst, qpc);
         }
-        let chroma_dc_nz =
-            cb_dc.iter().any(|&v| v != 0) || cr_dc.iter().any(|&v| v != 0);
+        let chroma_dc_nz = cb_dc.iter().any(|&v| v != 0) || cr_dc.iter().any(|&v| v != 0);
         let chroma_ac_nz = cb_ac.iter().any(|b| b.iter().any(|&v| v != 0))
             || cr_ac.iter().any(|b| b.iter().any(|&v| v != 0));
         let cbp_chroma: u8 = if chroma_ac_nz {
@@ -1373,12 +1374,8 @@ impl H264Encoder {
                 let br = br8 * 2 + sub_br;
                 let bc = bc8 * 2 + sub_bc;
                 let nc = predict_inter_nc_luma_local(cur, mb_x, mb_y, br, bc);
-                let tc = encode_residual_block(
-                    w,
-                    &luma_blocks[br * 4 + bc],
-                    nc,
-                    BlockKind::Luma4x4,
-                )?;
+                let tc =
+                    encode_residual_block(w, &luma_blocks[br * 4 + bc], nc, BlockKind::Luma4x4)?;
                 cur.mb_info_mut(mb_x, mb_y).luma_nc[br * 4 + bc] = tc as u8;
             }
         }
@@ -1644,10 +1641,7 @@ fn integer_me_16x16(
         }
     }
     // Convert integer-pel (dx, dy) to quarter-pel MV by × 4.
-    (
-        ((best.0 * 4) as i16, (best.1 * 4) as i16),
-        best_sad,
-    )
+    (((best.0 * 4) as i16, (best.1 * 4) as i16), best_sad)
 }
 
 fn sad_16x16(
@@ -1680,13 +1674,7 @@ fn sad_16x16(
 /// `(mb_x, mb_y)` using only the `cur` [`Picture`]'s MbInfo — mirrors
 /// [`crate::p_mb::predict_inter_nc_luma`] but bounded to the encoder's
 /// single-slice scope.
-fn predict_inter_nc_luma_local(
-    cur: &Picture,
-    mb_x: u32,
-    mb_y: u32,
-    br: usize,
-    bc: usize,
-) -> i32 {
+fn predict_inter_nc_luma_local(cur: &Picture, mb_x: u32, mb_y: u32, br: usize, bc: usize) -> i32 {
     let info_here = cur.mb_info_at(mb_x, mb_y);
     let left = if bc > 0 {
         Some(info_here.luma_nc[br * 4 + bc - 1])

@@ -239,11 +239,7 @@ fn filter_mb_edge_vertical(
                     // seg0+1 — pick the right bS per 2-row chunk. Under
                     // 4:2:2 chroma y matches luma y exactly, so each
                     // 4-row band maps to one luma segment `band`.
-                    let bs_idx = if chroma_is_422 {
-                        band
-                    } else {
-                        band * 2 + sub
-                    };
+                    let bs_idx = if chroma_is_422 { band } else { band * 2 + sub };
                     let bs_here = bs[bs_idx] as i32;
                     if bs_here == 0 {
                         continue;
@@ -327,7 +323,11 @@ fn filter_mb_edge_horizontal(
             let qp_avg_c = (qp_pc + qp_qc + 1) >> 1;
             let c_base_x = (mb_x * 8) as usize;
             let c_base_y = (mb_y as usize) * mb_height_c
-                + if chroma_is_422 { edge_row } else { edge_row / 2 };
+                + if chroma_is_422 {
+                    edge_row
+                } else {
+                    edge_row / 2
+                };
             for band in 0..2usize {
                 let seg0 = band * 2;
                 for sub in 0..2usize {

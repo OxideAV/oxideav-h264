@@ -15,8 +15,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_444::{self as mb444};
 use crate::mb_type::{
@@ -32,6 +32,7 @@ use crate::pps::Pps;
 use crate::slice::{LumaWeight, PredWeightTable, SliceHeader};
 use crate::sps::Sps;
 use crate::transform::{chroma_qp, dequantize_4x4_scaled, idct_4x4};
+use oxideav_core::bits::BitReader;
 
 use crate::b_mb::{
     apply_motion_compensation_b, direct_16x16_compensate_pub, direct_8x8_compensate_pub, BSliceCtx,
@@ -382,12 +383,12 @@ fn handle_16x16_single_dir(
         None
     };
     let mvd_l0 = if uses_l0(dir) {
-        Some((br.read_se()? as i32, br.read_se()? as i32))
+        Some((br.read_se()?, br.read_se()?))
     } else {
         None
     };
     let mvd_l1 = if uses_l1(dir) {
-        Some((br.read_se()? as i32, br.read_se()? as i32))
+        Some((br.read_se()?, br.read_se()?))
     } else {
         None
     };
@@ -428,12 +429,12 @@ fn handle_two_partition(
     }
     for p in 0..2 {
         if uses_l0(dirs[p]) {
-            mvd_l0[p] = Some((br.read_se()? as i32, br.read_se()? as i32));
+            mvd_l0[p] = Some((br.read_se()?, br.read_se()?));
         }
     }
     for p in 0..2 {
         if uses_l1(dirs[p]) {
-            mvd_l1[p] = Some((br.read_se()? as i32, br.read_se()? as i32));
+            mvd_l1[p] = Some((br.read_se()?, br.read_se()?));
         }
     }
     for p in 0..2 {
@@ -498,12 +499,12 @@ fn handle_b8x8(
         for _ in 0..n {
             if let Some(dir) = dir_opt {
                 let mvd_l0 = if uses_l0(dir) {
-                    Some((br.read_se()? as i32, br.read_se()? as i32))
+                    Some((br.read_se()?, br.read_se()?))
                 } else {
                     None
                 };
                 let mvd_l1 = if uses_l1(dir) {
-                    Some((br.read_se()? as i32, br.read_se()? as i32))
+                    Some((br.read_se()?, br.read_se()?))
                 } else {
                     None
                 };

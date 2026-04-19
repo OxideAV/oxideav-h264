@@ -199,7 +199,6 @@ pub(crate) fn cbp_chroma_ctx_idx_inc_ac(pic: &Picture, mb_x: u32, mb_y: u32) -> 
     (a as u8) + 2 * (b as u8)
 }
 
-
 /// Select the 43-entry context window for a residual block per
 /// §9.3.3.1.1.9 (Table 9-42). The layout returned into `out` is the flat
 /// view `decode_residual_block_cabac` expects:
@@ -659,7 +658,8 @@ fn decode_intra_mb_given_imb_cabac(
         // pps.transform_8x8_mode_flag is set.
         if pps.transform_8x8_mode_flag {
             let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
-            let slice = &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+            let slice =
+                &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
             transform_8x8 = binarize::decode_transform_size_8x8_flag(d, slice, inc)?;
         }
         if transform_8x8 {
@@ -822,16 +822,9 @@ fn decode_intra_mb_given_imb_cabac(
             cbp_luma,
             qp_y,
         )?,
-        IMbType::INxN if transform_8x8 => decode_luma_intra_8x8_cabac(
-            d,
-            ctxs,
-            mb_x,
-            mb_y,
-            pic,
-            &intra4x4_modes,
-            cbp_luma,
-            qp_y,
-        )?,
+        IMbType::INxN if transform_8x8 => {
+            decode_luma_intra_8x8_cabac(d, ctxs, mb_x, mb_y, pic, &intra4x4_modes, cbp_luma, qp_y)?
+        }
         IMbType::INxN => decode_luma_intra_nxn(
             d,
             ctxs,
@@ -1305,12 +1298,18 @@ fn decode_chroma(
         // neighbour MB's chroma DC CBF (bit 6 for Cb, bit 7 for Cr in
         // FFmpeg's cbp_table). Track the per-plane flag in `MbInfo`.
         let neigh_cb_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
-        let cb = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, true)?;
-        for i in 0..4 { dc_cb[i] = cb[i]; }
+        let cb =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, true)?;
+        for i in 0..4 {
+            dc_cb[i] = cb[i];
+        }
         pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb.iter().any(|&v| v != 0);
         let neigh_cr_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
-        let cr = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, true)?;
-        for i in 0..4 { dc_cr[i] = cr[i]; }
+        let cr =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, true)?;
+        for i in 0..4 {
+            dc_cr[i] = cr[i];
+        }
         pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[1] = cr.iter().any(|&v| v != 0);
         // §8.5.11.1 — CABAC I-slice chroma is intra.
         let w_cb = pic.scaling_lists.matrix_4x4(1)[0];
@@ -1620,8 +1619,16 @@ fn chroma_dc_cbf_neighbours(pic: &Picture, mb_x: u32, mb_y: u32, c: usize) -> Cb
         }
         Some(info.chroma_dc_cbf[c])
     };
-    let left = if mb_x > 0 { probe(mb_x - 1, mb_y) } else { None };
-    let above = if mb_y > 0 { probe(mb_x, mb_y - 1) } else { None };
+    let left = if mb_x > 0 {
+        probe(mb_x - 1, mb_y)
+    } else {
+        None
+    };
+    let above = if mb_y > 0 {
+        probe(mb_x, mb_y - 1)
+    } else {
+        None
+    };
     CbfNeighbours { left, above }
 }
 
@@ -1637,8 +1644,16 @@ fn luma16x16_dc_cbf_neighbours(pic: &Picture, mb_x: u32, mb_y: u32) -> CbfNeighb
         }
         Some(info.luma16x16_dc_cbf)
     };
-    let left = if mb_x > 0 { probe(mb_x - 1, mb_y) } else { None };
-    let above = if mb_y > 0 { probe(mb_x, mb_y - 1) } else { None };
+    let left = if mb_x > 0 {
+        probe(mb_x - 1, mb_y)
+    } else {
+        None
+    };
+    let above = if mb_y > 0 {
+        probe(mb_x, mb_y - 1)
+    } else {
+        None
+    };
     CbfNeighbours { left, above }
 }
 

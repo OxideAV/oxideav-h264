@@ -419,9 +419,8 @@
 #![allow(clippy::derivable_impls)]
 
 pub mod b_mb;
+pub mod b_mb_444;
 pub mod b_mb_hi;
-pub mod bitreader;
-pub mod bitwriter;
 pub mod cabac;
 pub mod cavlc;
 pub mod cavlc_enc;
@@ -431,6 +430,7 @@ pub mod decoder;
 pub mod dpb;
 pub mod encoder;
 pub mod fwd_transform;
+pub mod golomb;
 pub mod intra_pred;
 pub mod intra_pred_hi;
 pub mod mb;
@@ -444,7 +444,6 @@ pub mod nal;
 pub mod p_mb;
 pub mod p_mb_444;
 pub mod p_mb_hi;
-pub mod b_mb_444;
 pub mod picture;
 pub mod pps;
 pub mod scaling_list;

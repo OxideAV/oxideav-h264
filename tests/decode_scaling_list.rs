@@ -23,9 +23,9 @@ use oxideav_codec::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::decoder::H264Decoder;
 use oxideav_h264::nal::{extract_rbsp, split_annex_b, NalHeader, NalUnitType};
+use oxideav_h264::pps::parse_pps;
 use oxideav_h264::scaling_list::ScalingLists;
 use oxideav_h264::sps::parse_sps;
-use oxideav_h264::pps::parse_pps;
 
 fn read_fixture(path: &str) -> Option<Vec<u8>> {
     if !Path::new(path).exists() {

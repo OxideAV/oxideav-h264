@@ -17,8 +17,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_8x8_sub, decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{
     decode_cbp_inter, decode_p_slice_mb_type, decode_p_sub_mb_type, IMbType, PMbType, PPartition,
@@ -35,6 +35,7 @@ use crate::transform::{
     chroma_qp, dequantize_4x4_scaled, dequantize_8x8_scaled, idct_4x4, idct_8x8,
     inv_hadamard_2x2_chroma_dc_scaled, inv_hadamard_2x4_chroma_dc_scaled,
 };
+use oxideav_core::bits::BitReader;
 
 /// Decode one coded P-slice macroblock at `(mb_x, mb_y)`. On return the
 /// pixel buffer + MbInfo at that address have been filled in; `prev_qp` is
@@ -184,8 +185,8 @@ fn decode_p16x16(
     let num_ref_l0 = sh.num_ref_idx_l0_active_minus1 + 1;
     let ref_idx = read_ref_idx(br, num_ref_l0)?;
     let reference = lookup_ref(ref_list0, ref_idx)?;
-    let mvd_x = br.read_se()? as i32;
-    let mvd_y = br.read_se()? as i32;
+    let mvd_x = br.read_se()?;
+    let mvd_y = br.read_se()?;
 
     let pmv = predict_mv_l0(pic, mb_x, mb_y, 0, 0, 4, 4, ref_idx);
     let mv = (
@@ -360,8 +361,8 @@ fn decode_two_partition_p(
     for p in 0..2 {
         let (r0, c0, ph, pw) = rects[p];
         let reference = lookup_ref(ref_list0, refs[p])?;
-        let mvd_x = br.read_se()? as i32;
-        let mvd_y = br.read_se()? as i32;
+        let mvd_x = br.read_se()?;
+        let mvd_y = br.read_se()?;
         let pmv = predict_mv_l0(pic, mb_x, mb_y, r0, c0, ph, pw, refs[p]);
         let mv = (
             pmv.0.wrapping_add(mvd_x as i16),
@@ -478,8 +479,8 @@ fn decode_p8x8(
             let (dr, dc, sh_h, sh_w) = sp.sub_rect(sub_idx);
             let r0 = sr0 + dr;
             let c0 = sc0 + dc;
-            let mvd_x = br.read_se()? as i32;
-            let mvd_y = br.read_se()? as i32;
+            let mvd_x = br.read_se()?;
+            let mvd_y = br.read_se()?;
             let pmv = predict_mv_l0(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, ref_idx);
             let mv = (
                 pmv.0.wrapping_add(mvd_x as i16),
@@ -525,12 +526,11 @@ fn decode_p8x8(
     // which the spec forbids. libx264's `mb_cache_transform_8x8` test
     // (`encoder/macroblock.c`) enforces the same rule.
     let all_sub_8x8 = sub_parts.iter().all(|sp| sp.is_at_least_8x8());
-    let transform_8x8 =
-        if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
-            br.read_flag()?
-        } else {
-            false
-        };
+    let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
+        br.read_flag()?
+    } else {
+        false
+    };
     let needs_qp = cbp_luma != 0 || cbp_chroma != 0;
     if needs_qp {
         let dqp = br.read_se()?;
@@ -787,9 +787,8 @@ fn decode_inter_residual_chroma_422(
                 let mut res = [0i32; 16];
                 let mut total_coeff = 0u32;
                 if cbp_chroma == 2 {
-                    let nc = predict_inter_nc_chroma_422(
-                        pic, mb_x, mb_y, plane_cb, blk_row, blk_col,
-                    );
+                    let nc =
+                        predict_inter_nc_chroma_422(pic, mb_x, mb_y, plane_cb, blk_row, blk_col);
                     let ac = decode_residual_block(br, nc, BlockKind::ChromaAc)?;
                     total_coeff = ac.total_coeff;
                     res = ac.coeffs;

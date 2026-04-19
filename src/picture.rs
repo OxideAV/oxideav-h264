@@ -338,7 +338,11 @@ impl Picture {
             chroma_format_idc,
             bit_depth_y,
             bit_depth_c,
-            y: if hi_y { Vec::new() } else { vec![0u8; luma_pixels] },
+            y: if hi_y {
+                Vec::new()
+            } else {
+                vec![0u8; luma_pixels]
+            },
             cb: if hi_c {
                 Vec::new()
             } else {
@@ -446,7 +450,12 @@ impl Picture {
     /// on mixed-mode MBAFF pictures where neighbour pairs may carry
     /// different `mb_field_decoding_flag` values.
     pub fn luma_row_stride_for_at(&self, mb_x: u32, mb_y: u32) -> usize {
-        self.luma_stride() * if self.is_mb_field_at(mb_x, mb_y) { 2 } else { 1 }
+        self.luma_stride()
+            * if self.is_mb_field_at(mb_x, mb_y) {
+                2
+            } else {
+                1
+            }
     }
 
     /// Chroma counterpart of [`Self::luma_row_stride_for`].
@@ -456,7 +465,12 @@ impl Picture {
 
     /// Column-aware variant of [`Self::chroma_row_stride_for`].
     pub fn chroma_row_stride_for_at(&self, mb_x: u32, mb_y: u32) -> usize {
-        self.chroma_stride() * if self.is_mb_field_at(mb_x, mb_y) { 2 } else { 1 }
+        self.chroma_stride()
+            * if self.is_mb_field_at(mb_x, mb_y) {
+                2
+            } else {
+                1
+            }
     }
 
     /// True when the pair at (mb_x, mb_y) is field-coded. The current
@@ -691,14 +705,26 @@ impl Picture {
         let mut y_bytes = Vec::with_capacity((visible_w * visible_h * 2) as usize);
         for r in 0..visible_h as usize {
             let off = r * l_stride;
-            pack_row(&self.y16[off..off + visible_w as usize], &mut y_bytes, visible_w as usize);
+            pack_row(
+                &self.y16[off..off + visible_w as usize],
+                &mut y_bytes,
+                visible_w as usize,
+            );
         }
         let mut cb_bytes = Vec::with_capacity((cw * ch * 2) as usize);
         let mut cr_bytes = Vec::with_capacity((cw * ch * 2) as usize);
         for r in 0..ch as usize {
             let off = r * c_stride;
-            pack_row(&self.cb16[off..off + cw as usize], &mut cb_bytes, cw as usize);
-            pack_row(&self.cr16[off..off + cw as usize], &mut cr_bytes, cw as usize);
+            pack_row(
+                &self.cb16[off..off + cw as usize],
+                &mut cb_bytes,
+                cw as usize,
+            );
+            pack_row(
+                &self.cr16[off..off + cw as usize],
+                &mut cr_bytes,
+                cw as usize,
+            );
         }
 
         // §7.4.2.1.1 — pick a PixelFormat variant that matches the luma

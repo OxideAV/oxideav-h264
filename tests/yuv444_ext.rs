@@ -65,7 +65,12 @@ fn collect_frames(dec: &mut H264Decoder) -> Vec<oxideav_core::VideoFrame> {
 /// Pull the first `n` frames' YUV planes concatenated (Y, Cb, Cr) into a
 /// single buffer. Each plane is extracted at visible `(w, h)` skipping
 /// any per-row padding.
-fn flatten_frames_yuv444(frames: &[oxideav_core::VideoFrame], n: usize, w: usize, h: usize) -> Vec<u8> {
+fn flatten_frames_yuv444(
+    frames: &[oxideav_core::VideoFrame],
+    n: usize,
+    w: usize,
+    h: usize,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(n * w * h * 3);
     for frame in frames.iter().take(n) {
         assert_eq!(frame.format, PixelFormat::Yuv444P);
@@ -93,7 +98,8 @@ fn decode_yuv444_cavlc_p_matches_reference() {
     let es = read_fixture("tests/fixtures/yuv444_p_64x64.es");
     let ref_yuv = read_fixture("tests/fixtures/yuv444_p_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));
-    dec.send_packet(&single_packet(es)).expect("P 4:4:4 decode succeeds");
+    dec.send_packet(&single_packet(es))
+        .expect("P 4:4:4 decode succeeds");
     let frames = collect_frames(&mut dec);
     assert!(
         frames.len() >= 3,
@@ -121,7 +127,8 @@ fn decode_yuv444_cavlc_b_matches_reference() {
     let es = read_fixture("tests/fixtures/yuv444_b_64x64.es");
     let ref_yuv = read_fixture("tests/fixtures/yuv444_b_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));
-    dec.send_packet(&single_packet(es)).expect("B 4:4:4 decode succeeds");
+    dec.send_packet(&single_packet(es))
+        .expect("B 4:4:4 decode succeeds");
     let frames = collect_frames(&mut dec);
     assert!(
         frames.len() >= 6,
@@ -151,7 +158,8 @@ fn decode_yuv444_cabac_i_matches_reference() {
     let es = read_fixture("tests/fixtures/yuv444_cabac_i_64x64.es");
     let ref_yuv = read_fixture("tests/fixtures/yuv444_cabac_i_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));
-    dec.send_packet(&single_packet(es)).expect("CABAC I 4:4:4 decode succeeds");
+    dec.send_packet(&single_packet(es))
+        .expect("CABAC I 4:4:4 decode succeeds");
     let frames = collect_frames(&mut dec);
     assert!(!frames.is_empty(), "expected at least 1 frame");
     let got = flatten_frames_yuv444(&frames, 1, 64, 64);

@@ -9,8 +9,9 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::golomb::BitReaderExt;
 use crate::nal::NalHeader;
+use oxideav_core::bits::BitReader;
 
 /// Parsed SPS. Field names follow the spec exactly.
 #[derive(Clone, Debug)]
@@ -469,7 +470,11 @@ fn parse_scaling_list_4x4(br: &mut BitReader<'_>) -> Result<([i16; 16], bool)> {
                 use_default = true;
             }
         }
-        let val = if next_scale == 0 { last_scale } else { next_scale };
+        let val = if next_scale == 0 {
+            last_scale
+        } else {
+            next_scale
+        };
         // §7.3.2.1.1.1 stores deltas in zig-zag scan order.
         let raster = crate::scaling_list::ZIGZAG_4X4[j as usize];
         list[raster] = val as i16;
@@ -494,7 +499,11 @@ fn parse_scaling_list_8x8(br: &mut BitReader<'_>) -> Result<([i16; 64], bool)> {
                 use_default = true;
             }
         }
-        let val = if next_scale == 0 { last_scale } else { next_scale };
+        let val = if next_scale == 0 {
+            last_scale
+        } else {
+            next_scale
+        };
         let raster = crate::transform::ZIGZAG_8X8[j as usize];
         list[raster] = val as i16;
         if next_scale != 0 {
@@ -565,7 +574,8 @@ mod tests {
     /// install `Default_4x4_Intra` at slot 0.
     #[test]
     fn parse_sps_with_custom_4x4_scaling_list() {
-        use crate::bitwriter::BitWriter;
+        use crate::golomb::BitWriterExt;
+        use oxideav_core::bits::BitWriter;
         let mut bw = BitWriter::new();
         // seq_parameter_set_id = 0
         bw.write_ue(0);
@@ -621,7 +631,8 @@ mod tests {
 
     #[test]
     fn parse_vui_bitstream_restriction_only() {
-        use crate::bitwriter::BitWriter;
+        use crate::golomb::BitWriterExt;
+        use oxideav_core::bits::BitWriter;
         let mut bw = BitWriter::new();
         // aspect_ratio_info_present_flag = 0
         bw.write_flag(false);

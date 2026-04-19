@@ -63,7 +63,6 @@ use oxideav_core::{
 
 use crate::b_mb::{decode_b_skip_mb, decode_b_slice_mb};
 use crate::b_mb_444::{decode_b_skip_mb_444, decode_b_slice_mb_444};
-use crate::bitreader::BitReader;
 use crate::cabac::{
     b_mb::decode_b_mb_cabac,
     b_mb_hi::decode_b_mb_cabac_hi,
@@ -80,6 +79,7 @@ use crate::dpb::{
     apply_rplm, derive_poc_type0, derive_poc_type1, derive_poc_type2, Dpb, MmcoCommand, PocState,
     PocType1Params,
 };
+use crate::golomb::BitReaderExt;
 use crate::mb::decode_i_slice_data;
 use crate::nal::{
     extract_rbsp, split_annex_b, split_length_prefixed, AvcConfig, NalHeader, NalUnitType,
@@ -91,6 +91,7 @@ use crate::picture::Picture;
 use crate::pps::{parse_pps, Pps};
 use crate::slice::{parse_slice_header, SliceHeader, SliceType};
 use crate::sps::{parse_sps, Sps};
+use oxideav_core::bits::BitReader;
 
 /// Build a decoder from `params`.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -331,9 +332,7 @@ impl H264Decoder {
                 // re-runs the I-slice pipeline with `ChromaArrayType = 0`
                 // and merges the three planes into a 4:4:4 `VideoFrame`.
                 if sps.separate_colour_plane_flag {
-                    self.ingest_separate_colour_plane_slice(
-                        &header, &rbsp, &sps, &pps, &sh,
-                    )?;
+                    self.ingest_separate_colour_plane_slice(&header, &rbsp, &sps, &pps, &sh)?;
                     return Ok(());
                 }
                 match sps.chroma_format_idc {
@@ -1098,8 +1097,7 @@ impl H264Decoder {
         self.sep_plane_pics.insert(key, pic);
 
         // If all three planes for this frame_num have arrived, merge.
-        let have_all = (0u8..=2)
-            .all(|id| self.sep_plane_pics.contains_key(&(sh.frame_num, id)));
+        let have_all = (0u8..=2).all(|id| self.sep_plane_pics.contains_key(&(sh.frame_num, id)));
         if have_all {
             let y_pic = self
                 .sep_plane_pics
@@ -2216,7 +2214,7 @@ fn decode_cabac_b_slice_hi(
 
 /// Peek the `pic_parameter_set_id` from a slice RBSP without consuming.
 fn peek_pps_id(rbsp: &[u8]) -> Result<u32> {
-    let mut br = crate::bitreader::BitReader::new(rbsp);
+    let mut br = oxideav_core::bits::BitReader::new(rbsp);
     let _first_mb_in_slice = br.read_ue()?;
     let _slice_type_raw = br.read_ue()?;
     let pps_id = br.read_ue()?;

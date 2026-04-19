@@ -113,9 +113,8 @@ fn decode_10bit_iframe_against_reference() {
     assert_eq!(dec_cb.len(), ref_cb.len());
     assert_eq!(dec_cr.len(), ref_cr.len());
 
-    let exact_count = |a: &[u16], b: &[u16]| -> usize {
-        a.iter().zip(b.iter()).filter(|(x, y)| x == y).count()
-    };
+    let exact_count =
+        |a: &[u16], b: &[u16]| -> usize { a.iter().zip(b.iter()).filter(|(x, y)| x == y).count() };
     let close_count = |a: &[u16], b: &[u16], tol: i32| -> usize {
         a.iter()
             .zip(b.iter())
@@ -124,9 +123,8 @@ fn decode_10bit_iframe_against_reference() {
     };
 
     let total = ref_y.len() + ref_cb.len() + ref_cr.len();
-    let exact = exact_count(&dec_y, &ref_y)
-        + exact_count(&dec_cb, &ref_cb)
-        + exact_count(&dec_cr, &ref_cr);
+    let exact =
+        exact_count(&dec_y, &ref_y) + exact_count(&dec_cb, &ref_cb) + exact_count(&dec_cr, &ref_cr);
     let within4 = close_count(&dec_y, &ref_y, 4)
         + close_count(&dec_cb, &ref_cb, 4)
         + close_count(&dec_cr, &ref_cr, 4);

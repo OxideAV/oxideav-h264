@@ -97,8 +97,8 @@ fn decode_cabac_i_slice_tiny_all_zero_residual() {
     // inverse-scan is applied in `mb::decode_residual_block_in_place`.
     let es = include_bytes!("fixtures/cabac_i_tiny.es");
     let yuv = include_bytes!("fixtures/cabac_i_tiny.yuv");
-    let (luma_pct, total_pct) = run_fixture(es, yuv, 16, 16, "cabac-i-tiny")
-        .expect("cabac-i-tiny decode must succeed");
+    let (luma_pct, total_pct) =
+        run_fixture(es, yuv, 16, 16, "cabac-i-tiny").expect("cabac-i-tiny decode must succeed");
     assert!(
         luma_pct >= 99.0,
         "cabac-i-tiny luma match {luma_pct:.2}% < 99%"
@@ -120,8 +120,8 @@ fn decode_cabac_i_slice_against_reference() {
     //   * Chroma AC using in-MB running counts + neighbour MB cb/cr_nc.
     let es = include_bytes!("fixtures/cabac_i_64x64.es");
     let yuv = include_bytes!("fixtures/cabac_i_64x64.yuv");
-    let (luma_pct, total_pct) = run_fixture(es, yuv, 64, 64, "cabac-i-64x64")
-        .expect("cabac-i-64x64 decode must succeed");
+    let (luma_pct, total_pct) =
+        run_fixture(es, yuv, 64, 64, "cabac-i-64x64").expect("cabac-i-64x64 decode must succeed");
     assert!(
         luma_pct >= 99.0,
         "cabac-i-64x64 luma match {luma_pct:.2}% < 99%"
@@ -131,4 +131,3 @@ fn decode_cabac_i_slice_against_reference() {
         "cabac-i-64x64 total match {total_pct:.2}% < 99%"
     );
 }
-

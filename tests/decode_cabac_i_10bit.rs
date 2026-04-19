@@ -109,14 +109,12 @@ fn decode_10bit_cabac_iframe_against_reference() {
     let dec_cb = unpack_u16_le(&frame.planes[1].data);
     let dec_cr = unpack_u16_le(&frame.planes[2].data);
 
-    let exact_count = |a: &[u16], b: &[u16]| -> usize {
-        a.iter().zip(b.iter()).filter(|(x, y)| x == y).count()
-    };
+    let exact_count =
+        |a: &[u16], b: &[u16]| -> usize { a.iter().zip(b.iter()).filter(|(x, y)| x == y).count() };
 
     let total = ref_y.len() + ref_cb.len() + ref_cr.len();
-    let exact = exact_count(&dec_y, &ref_y)
-        + exact_count(&dec_cb, &ref_cb)
-        + exact_count(&dec_cr, &ref_cr);
+    let exact =
+        exact_count(&dec_y, &ref_y) + exact_count(&dec_cb, &ref_cb) + exact_count(&dec_cr, &ref_cr);
 
     let exact_pct = (exact as f64) * 100.0 / (total as f64);
     eprintln!(

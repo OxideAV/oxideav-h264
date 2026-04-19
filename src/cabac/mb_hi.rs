@@ -25,13 +25,13 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::cabac::binarize;
+use crate::cabac::context::CabacContext;
 use crate::cabac::engine::CabacDecoder;
 use crate::cabac::mb::{
-    cbp_luma_ctx_idx_inc, cbp_chroma_ctx_idx_inc_any, cbp_chroma_ctx_idx_inc_ac,
+    cbp_chroma_ctx_idx_inc_ac, cbp_chroma_ctx_idx_inc_any, cbp_luma_ctx_idx_inc,
     decode_residual_block_in_place, transform_size_8x8_flag_ctx_idx_inc,
 };
-use crate::cabac::context::CabacContext;
-use crate::cabac::binarize;
 use crate::cabac::residual::{BlockCat, CbfNeighbours};
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_INTRA_CHROMA_PRED_MODE, CTX_IDX_MB_QP_DELTA,
@@ -98,8 +98,9 @@ pub fn decode_i_mb_cabac_hi(
         let slice = &mut ctxs[CTX_IDX_MB_TYPE_I..CTX_IDX_MB_TYPE_I + 8];
         binarize::decode_mb_type_i(d, slice, mb_type_inc)?
     };
-    let imb = decode_i_slice_mb_type(mb_type_raw)
-        .ok_or_else(|| Error::invalid(format!("h264 cabac mb (hi): bad I mb_type {mb_type_raw}")))?;
+    let imb = decode_i_slice_mb_type(mb_type_raw).ok_or_else(|| {
+        Error::invalid(format!("h264 cabac mb (hi): bad I mb_type {mb_type_raw}"))
+    })?;
     decode_intra_mb_given_imb_cabac_hi(d, ctxs, sh, sps, pps, mb_x, mb_y, pic, prev_qp, imb)
 }
 
@@ -117,9 +118,7 @@ pub(crate) fn decode_intra_mb_given_imb_cabac_hi(
     imb: IMbType,
 ) -> Result<()> {
     if matches!(imb, IMbType::IPcm) {
-        return Err(Error::unsupported(
-            "h264 10bit cabac: I_PCM not yet wired",
-        ));
+        return Err(Error::unsupported("h264 10bit cabac: I_PCM not yet wired"));
     }
 
     let mut transform_8x8 = false;
@@ -127,8 +126,8 @@ pub(crate) fn decode_intra_mb_given_imb_cabac_hi(
     if matches!(imb, IMbType::INxN) {
         if pps.transform_8x8_mode_flag {
             let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
-            let slice = &mut ctxs
-                [CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+            let slice =
+                &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
             transform_8x8 = binarize::decode_transform_size_8x8_flag(d, slice, inc)?;
         }
         if transform_8x8 {
@@ -139,8 +138,8 @@ pub(crate) fn decode_intra_mb_given_imb_cabac_hi(
         for blk in 0..16usize {
             let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
             let prev_flag = {
-                let slice = &mut ctxs
-                    [CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG..CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG + 1];
+                let slice = &mut ctxs[CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG
+                    ..CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG + 1];
                 binarize::decode_prev_intra4x4_pred_mode_flag(d, slice)?
             };
             let predicted =
@@ -202,7 +201,11 @@ pub(crate) fn decode_intra_mb_given_imb_cabac_hi(
     let needs_qp_delta =
         matches!(imb, IMbType::I16x16 { .. }) || (cbp_luma != 0 || cbp_chroma != 0);
     if needs_qp_delta {
-        let inc = if pic.last_mb_qp_delta_was_nonzero { 1u8 } else { 0u8 };
+        let inc = if pic.last_mb_qp_delta_was_nonzero {
+            1u8
+        } else {
+            0u8
+        };
         let slice = &mut ctxs[CTX_IDX_MB_QP_DELTA..CTX_IDX_MB_QP_DELTA + 4];
         let dqp = binarize::decode_mb_qp_delta(d, slice, inc)?;
         pic.last_mb_qp_delta_was_nonzero = dqp != 0;
@@ -253,7 +256,15 @@ pub(crate) fn decode_intra_mb_given_imb_cabac_hi(
             qp_y_prime,
         )?,
         IMbType::INxN => decode_luma_intra_nxn_hi(
-            d, ctxs, sps, mb_x, mb_y, pic, &intra4x4_modes, cbp_luma, qp_y_prime,
+            d,
+            ctxs,
+            sps,
+            mb_x,
+            mb_y,
+            pic,
+            &intra4x4_modes,
+            cbp_luma,
+            qp_y_prime,
         )?,
         IMbType::IPcm => unreachable!(),
     }
@@ -299,7 +310,9 @@ fn decode_luma_intra_nxn_hi(
         let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
         let mode_v = modes[br_row * 4 + br_col];
         let mode = Intra4x4Mode::from_u8(mode_v).ok_or_else(|| {
-            Error::invalid(format!("h264 cabac mb (hi): invalid intra4x4 mode {mode_v}"))
+            Error::invalid(format!(
+                "h264 cabac mb (hi): invalid intra4x4 mode {mode_v}"
+            ))
         })?;
         let neigh = collect_intra4x4_neighbours_hi(pic, mb_x, mb_y, br_row, br_col);
         let mut pred = [0u16; 16];
@@ -312,14 +325,8 @@ fn decode_luma_intra_nxn_hi(
         let mut total_coeff = 0u32;
         if has_residual {
             let neighbours = cbf_neighbours_luma(pic, mb_x, mb_y, br_row, br_col);
-            let coeffs = decode_residual_block_in_place(
-                d,
-                ctxs,
-                BlockCat::Luma4x4,
-                &neighbours,
-                16,
-                true,
-            )?;
+            let coeffs =
+                decode_residual_block_in_place(d, ctxs, BlockCat::Luma4x4, &neighbours, 16, true)?;
             residual = coeffs;
             total_coeff = coeffs.iter().filter(|&&v| v != 0).count() as u32;
             let scale = *pic.scaling_lists.matrix_4x4(0);
@@ -400,8 +407,7 @@ fn decode_luma_intra_16x16_hi(
         let lo = lo_mb + br_row * 4 * lstride + br_col * 4;
         for r in 0..4 {
             for c in 0..4 {
-                let v = pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32
-                    + residual[r * 4 + c];
+                let v = pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32 + residual[r * 4 + c];
                 pic.y16[lo + r * lstride + c] = v.clamp(0, max_sample) as u16;
             }
         }
@@ -447,13 +453,15 @@ fn decode_chroma_hi(
     let mut dc_cr = [0i32; 4];
     if cbp_chroma >= 1 {
         let neigh_cb_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
-        let cb = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, true)?;
+        let cb =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, true)?;
         for i in 0..4 {
             dc_cb[i] = cb[i];
         }
         pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb.iter().any(|&v| v != 0);
         let neigh_cr_dc = chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
-        let cr = decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, true)?;
+        let cr =
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, true)?;
         for i in 0..4 {
             dc_cr[i] = cr[i];
         }
@@ -476,17 +484,10 @@ fn decode_chroma_hi(
             let mut res = [0i32; 16];
             let mut total_coeff = 0u32;
             if cbp_chroma == 2 {
-                let neigh = chroma_ac_cbf_neighbours(
-                    pic, mb_x, mb_y, plane_kind, br_row, br_col, &nc_arr,
-                );
-                let ac = decode_residual_block_in_place(
-                    d,
-                    ctxs,
-                    BlockCat::ChromaAc,
-                    &neigh,
-                    15,
-                    true,
-                )?;
+                let neigh =
+                    chroma_ac_cbf_neighbours(pic, mb_x, mb_y, plane_kind, br_row, br_col, &nc_arr);
+                let ac =
+                    decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, true)?;
                 res = ac;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
                 let cat = if plane_kind { 1 } else { 2 };
@@ -496,18 +497,25 @@ fn decode_chroma_hi(
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);
             let off_in_mb = br_row * 4 * cstride + br_col * 4;
-            let plane = if plane_kind { &mut pic.cb16 } else { &mut pic.cr16 };
+            let plane = if plane_kind {
+                &mut pic.cb16
+            } else {
+                &mut pic.cr16
+            };
             for r in 0..4 {
                 for c in 0..4 {
-                    let v = pred[(br_row * 4 + r) * 8 + (br_col * 4 + c)] as i32
-                        + res[r * 4 + c];
+                    let v = pred[(br_row * 4 + r) * 8 + (br_col * 4 + c)] as i32 + res[r * 4 + c];
                     plane[co + off_in_mb + r * cstride + c] = v.clamp(0, max_sample) as u16;
                 }
             }
             nc_arr[(br_row << 1) | br_col] = total_coeff as u8;
         }
         let info = pic.mb_info_mut(mb_x, mb_y);
-        let dst = if plane_kind { &mut info.cb_nc } else { &mut info.cr_nc };
+        let dst = if plane_kind {
+            &mut info.cb_nc
+        } else {
+            &mut info.cr_nc
+        };
         dst[..4].copy_from_slice(&nc_arr);
     }
     Ok(())
@@ -563,8 +571,16 @@ fn luma16x16_dc_cbf_neighbours(pic: &Picture, mb_x: u32, mb_y: u32) -> CbfNeighb
         }
         Some(info.luma16x16_dc_cbf)
     };
-    let left = if mb_x > 0 { probe(mb_x - 1, mb_y) } else { None };
-    let above = if mb_y > 0 { probe(mb_x, mb_y - 1) } else { None };
+    let left = if mb_x > 0 {
+        probe(mb_x - 1, mb_y)
+    } else {
+        None
+    };
+    let above = if mb_y > 0 {
+        probe(mb_x, mb_y - 1)
+    } else {
+        None
+    };
     CbfNeighbours { left, above }
 }
 
@@ -576,8 +592,16 @@ fn chroma_dc_cbf_neighbours(pic: &Picture, mb_x: u32, mb_y: u32, c: usize) -> Cb
         }
         Some(info.chroma_dc_cbf[c])
     };
-    let left = if mb_x > 0 { probe(mb_x - 1, mb_y) } else { None };
-    let above = if mb_y > 0 { probe(mb_x, mb_y - 1) } else { None };
+    let left = if mb_x > 0 {
+        probe(mb_x - 1, mb_y)
+    } else {
+        None
+    };
+    let above = if mb_y > 0 {
+        probe(mb_x, mb_y - 1)
+    } else {
+        None
+    };
     CbfNeighbours { left, above }
 }
 
@@ -678,8 +702,7 @@ fn collect_intra4x4_neighbours_hi(
         for i in 0..4 {
             top[i] = pic.y16[row_off + (mb_x as usize) * 16 + br_col * 4 + i];
         }
-        let tr_avail =
-            crate::mb::top_right_available_4x4(mb_x, mb_y, br_row, br_col, pic);
+        let tr_avail = crate::mb::top_right_available_4x4(mb_x, mb_y, br_row, br_col, pic);
         if tr_avail {
             for i in 0..4 {
                 top[4 + i] = pic.y16[row_off + (mb_x as usize) * 16 + br_col * 4 + 4 + i];
@@ -733,11 +756,7 @@ fn collect_intra4x4_neighbours_hi(
     }
 }
 
-fn collect_intra16x16_neighbours_hi(
-    pic: &Picture,
-    mb_x: u32,
-    mb_y: u32,
-) -> Intra16x16Neighbours16 {
+fn collect_intra16x16_neighbours_hi(pic: &Picture, mb_x: u32, mb_y: u32) -> Intra16x16Neighbours16 {
     let lstride = pic.luma_stride();
     let lo_mb = pic.luma_off(mb_x, mb_y);
     let top_avail = mb_y > 0;

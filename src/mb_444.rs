@@ -22,8 +22,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::intra_pred::{
     predict_intra_16x16, predict_intra_4x4, Intra16x16Mode, Intra16x16Neighbours, Intra4x4Mode,
     Intra4x4Neighbours,
@@ -37,18 +37,16 @@ use crate::picture::{MbInfo, Picture, INTRA_DC_FAKE};
 use crate::pps::Pps;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
-use crate::transform::{
-    chroma_qp, dequantize_4x4_scaled, idct_4x4, inv_hadamard_4x4_dc_scaled,
-};
+use crate::transform::{chroma_qp, dequantize_4x4_scaled, idct_4x4, inv_hadamard_4x4_dc_scaled};
+use oxideav_core::bits::BitReader;
 
 /// §9.1.2 / Table 9-4 — 4:4:4 and monochrome CBP mapping for intra-4×4
 /// macroblocks. Source: FFmpeg `golomb_to_intra4x4_cbp_gray` in
 /// `libavcodec/h264_cavlc.c`. Maps the `me(v)` golomb value (0..=15)
 /// to the 4-bit `CodedBlockPatternLuma` — the same pattern is applied
 /// to every colour plane in 4:4:4.
-pub const GOLOMB_TO_INTRA4X4_CBP_GRAY: [u8; 16] = [
-    15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9,
-];
+pub const GOLOMB_TO_INTRA4X4_CBP_GRAY: [u8; 16] =
+    [15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9];
 
 /// Identifies one of the three colour planes in 4:4:4. `Plane::Y` is the
 /// luma plane; `Plane::Cb` / `Plane::Cr` are chroma planes that, in
@@ -456,8 +454,9 @@ fn decode_plane_intra_nxn(
     for blk in 0..16usize {
         let (br_row, br_col) = LUMA_BLOCK_RASTER[blk];
         let mode_v = modes[br_row * 4 + br_col];
-        let mode = Intra4x4Mode::from_u8(mode_v)
-            .ok_or_else(|| Error::invalid(format!("h264 4:4:4 mb: invalid intra4x4 mode {mode_v}")))?;
+        let mode = Intra4x4Mode::from_u8(mode_v).ok_or_else(|| {
+            Error::invalid(format!("h264 4:4:4 mb: invalid intra4x4 mode {mode_v}"))
+        })?;
         let neigh = collect_intra4x4_neighbours_plane(pic, mb_x, mb_y, plane, br_row, br_col);
         let mut pred = [0u8; 16];
         predict_intra_4x4(&mut pred, mode, &neigh);

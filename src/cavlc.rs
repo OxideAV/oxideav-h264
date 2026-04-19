@@ -16,7 +16,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::golomb::BitReaderExt;
+use oxideav_core::bits::BitReader;
 
 /// 4×4 zig-zag scan (frame coding, §8.5.6 Table 8-12). Maps coded-order
 /// index → raster index.
@@ -343,8 +344,8 @@ const CHROMA_DC_COEFF_TOKEN_BITS: [u8; 20] =
 /// `chroma422_dc_coeff_token_len` / `_bits` in `libavcodec/h264_cavlc.c`,
 /// which mirrors the H.264 spec's Table 9-5(e).
 const CHROMA_DC_422_COEFF_TOKEN_LEN: [u8; 36] = [
-    1, 0, 0, 0, 7, 2, 0, 0, 7, 7, 3, 0, 9, 7, 7, 5, 9, 9, 7, 6, 10, 10, 9, 7, 11, 11, 10, 7, 12, 12,
-    11, 10, 13, 12, 12, 11,
+    1, 0, 0, 0, 7, 2, 0, 0, 7, 7, 3, 0, 9, 7, 7, 5, 9, 9, 7, 6, 10, 10, 9, 7, 11, 11, 10, 7, 12,
+    12, 11, 10, 13, 12, 12, 11,
 ];
 const CHROMA_DC_422_COEFF_TOKEN_BITS: [u8; 36] = [
     1, 0, 0, 0, 15, 1, 0, 0, 14, 13, 1, 0, 7, 12, 11, 1, 6, 5, 10, 1, 7, 6, 4, 9, 7, 6, 5, 8, 7, 6,

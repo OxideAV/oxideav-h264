@@ -304,8 +304,7 @@ fn decode_p_inter(
     // types 16×16 / 16×8 / 8×16 all qualify (no sub-8×8 motion splits).
     let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 {
         let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
-        let slice =
-            &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+        let slice = &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
         binarize::decode_transform_size_8x8_flag(d, slice, inc)?
     } else {
         false
@@ -500,15 +499,13 @@ fn decode_p_8x8(
     // sub_mb_types being at least 8×8 (no sub-8×8 split would straddle an
     // 8×8 transform). Matches the CAVLC gate in `p_mb::decode_p8x8`.
     let all_sub_8x8 = sub_parts.iter().all(|sp| sp.is_at_least_8x8());
-    let transform_8x8 =
-        if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
-            let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
-            let slice =
-                &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
-            binarize::decode_transform_size_8x8_flag(d, slice, inc)?
-        } else {
-            false
-        };
+    let transform_8x8 = if pps.transform_8x8_mode_flag && cbp_luma != 0 && all_sub_8x8 {
+        let inc = transform_size_8x8_flag_ctx_idx_inc(pic, mb_x, mb_y);
+        let slice = &mut ctxs[CTX_IDX_TRANSFORM_SIZE_8X8_FLAG..CTX_IDX_TRANSFORM_SIZE_8X8_FLAG + 3];
+        binarize::decode_transform_size_8x8_flag(d, slice, inc)?
+    } else {
+        false
+    };
 
     let needs_qp = cbp_luma != 0 || cbp_chroma != 0;
     if needs_qp {
@@ -708,12 +705,16 @@ fn decode_inter_residual_chroma(
         let neigh_cb_dc = p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
         let cb_coeffs =
             decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, false)?;
-        for i in 0..4 { dc_cb[i] = cb_coeffs[i]; }
+        for i in 0..4 {
+            dc_cb[i] = cb_coeffs[i];
+        }
         pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb_coeffs.iter().any(|&v| v != 0);
         let neigh_cr_dc = p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
         let cr_coeffs =
             decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, false)?;
-        for i in 0..4 { dc_cr[i] = cr_coeffs[i]; }
+        for i in 0..4 {
+            dc_cr[i] = cr_coeffs[i];
+        }
         pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[1] = cr_coeffs.iter().any(|&v| v != 0);
         // CABAC P-slice chroma is inter.
         let w_cb = pic.scaling_lists.matrix_4x4(4)[0];
@@ -732,7 +733,9 @@ fn decode_inter_residual_chroma(
             let mut res = [0i32; 16];
             let mut total_coeff = 0u32;
             if cbp_chroma == 2 {
-                let neigh = p_chroma_ac_cbf_neighbours(pic, mb_x, mb_y, plane_kind, br_row, br_col, &nc_arr);
+                let neigh = p_chroma_ac_cbf_neighbours(
+                    pic, mb_x, mb_y, plane_kind, br_row, br_col, &nc_arr,
+                );
                 let ac =
                     decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, false)?;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
@@ -889,8 +892,16 @@ pub(crate) fn p_chroma_dc_cbf_neighbours(pic: &Picture, mb_x: u32, mb_y: u32, c:
         }
         Some(info.chroma_dc_cbf[c])
     };
-    let left = if mb_x > 0 { probe(mb_x - 1, mb_y) } else { None };
-    let above = if mb_y > 0 { probe(mb_x, mb_y - 1) } else { None };
+    let left = if mb_x > 0 {
+        probe(mb_x - 1, mb_y)
+    } else {
+        None
+    };
+    let above = if mb_y > 0 {
+        probe(mb_x, mb_y - 1)
+    } else {
+        None
+    };
     CbfNeighbours { left, above }
 }
 

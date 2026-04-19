@@ -438,10 +438,10 @@ pub fn inv_hadamard_2x4_chroma_dc_scaled(dc: &mut [i32; 8], qp: i32, weight_scal
     let mut tmp = [0i32; 8];
     // Column 4-pt Hadamard first (down each of the 2 columns).
     for c in 0..2 {
-        let a = dc[c];        // row 0
-        let b = dc[2 + c];    // row 1
-        let cc = dc[4 + c];   // row 2
-        let d = dc[6 + c];    // row 3
+        let a = dc[c]; // row 0
+        let b = dc[2 + c]; // row 1
+        let cc = dc[4 + c]; // row 2
+        let d = dc[6 + c]; // row 3
         tmp[c] = a + b + cc + d;
         tmp[2 + c] = a + b - cc - d;
         tmp[4 + c] = a - b - cc + d;

@@ -150,10 +150,7 @@ fn decode_cabac_p_slices_against_reference() {
     );
     // All three frames (IDR + 2 P-slices) must decode bit-exact (≥99% luma
     // ±8 LSB) after the CABAC P mb_type / intra-in-P ctxIdxOffset fix.
-    assert!(
-        errors.is_empty(),
-        "CABAC P decode errors: {errors:?}",
-    );
+    assert!(errors.is_empty(), "CABAC P decode errors: {errors:?}",);
     assert_eq!(
         decoded_frames.len(),
         3,

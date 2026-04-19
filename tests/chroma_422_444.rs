@@ -113,8 +113,8 @@ fn decode_yuv422_iframe_matches_reference() {
     // 64×64 yuv422p IDR produced by x264 (`high422` profile) and
     // asserts the reconstructed frame matches the ffmpeg-decoded
     // reference at ≥ 99 % of samples (ideally bit-exact).
-    use oxideav_core::PixelFormat;
     use oxideav_core::Frame;
+    use oxideav_core::PixelFormat;
     let es = read_fixture("tests/fixtures/iframe_yuv422_64x64.es");
     let ref_yuv = read_fixture("tests/fixtures/iframe_yuv422_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));
@@ -294,8 +294,8 @@ fn decode_yuv444_iframe_matches_reference() {
     // produced by x264 (`high444` profile) and asserts the reconstructed
     // frame matches the ffmpeg-decoded reference byte-for-byte (or at
     // worst ≥ 99% of the samples).
-    use oxideav_core::PixelFormat;
     use oxideav_core::Frame;
+    use oxideav_core::PixelFormat;
     let es = read_fixture("tests/fixtures/iframe_yuv444_64x64.es");
     let ref_yuv = read_fixture("tests/fixtures/iframe_yuv444_64x64.yuv");
     let mut dec = H264Decoder::new(CodecId::new("h264"));

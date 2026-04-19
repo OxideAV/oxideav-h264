@@ -38,8 +38,16 @@ pub fn deblock_picture_hi(pic: &mut Picture, pps: &Pps, sh: &SliceHeader) {
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             process_mb_hi(
-                pic, mb_x, mb_y, alpha_off, beta_off, chroma_off_cb, chroma_off_cr,
-                sh.slice_type, bit_depth_y, bit_depth_c,
+                pic,
+                mb_x,
+                mb_y,
+                alpha_off,
+                beta_off,
+                chroma_off_cb,
+                chroma_off_cr,
+                sh.slice_type,
+                bit_depth_y,
+                bit_depth_c,
             );
         }
     }
@@ -62,8 +70,17 @@ fn process_mb_hi(
 
     if mb_x > 0 {
         filter_mb_edge_vertical_hi(
-            pic, mb_x, mb_y, 0, alpha_off, beta_off, cqp_off_cb, cqp_off_cr, slice_type,
-            bit_depth_y, bit_depth_c,
+            pic,
+            mb_x,
+            mb_y,
+            0,
+            alpha_off,
+            beta_off,
+            cqp_off_cb,
+            cqp_off_cr,
+            slice_type,
+            bit_depth_y,
+            bit_depth_c,
         );
     }
     for edge_col in [4usize, 8, 12] {
@@ -71,15 +88,33 @@ fn process_mb_hi(
             continue;
         }
         filter_mb_edge_vertical_hi(
-            pic, mb_x, mb_y, edge_col, alpha_off, beta_off, cqp_off_cb, cqp_off_cr, slice_type,
-            bit_depth_y, bit_depth_c,
+            pic,
+            mb_x,
+            mb_y,
+            edge_col,
+            alpha_off,
+            beta_off,
+            cqp_off_cb,
+            cqp_off_cr,
+            slice_type,
+            bit_depth_y,
+            bit_depth_c,
         );
     }
 
     if mb_y > 0 {
         filter_mb_edge_horizontal_hi(
-            pic, mb_x, mb_y, 0, alpha_off, beta_off, cqp_off_cb, cqp_off_cr, slice_type,
-            bit_depth_y, bit_depth_c,
+            pic,
+            mb_x,
+            mb_y,
+            0,
+            alpha_off,
+            beta_off,
+            cqp_off_cb,
+            cqp_off_cr,
+            slice_type,
+            bit_depth_y,
+            bit_depth_c,
         );
     }
     for edge_row in [4usize, 8, 12] {
@@ -87,8 +122,17 @@ fn process_mb_hi(
             continue;
         }
         filter_mb_edge_horizontal_hi(
-            pic, mb_x, mb_y, edge_row, alpha_off, beta_off, cqp_off_cb, cqp_off_cr, slice_type,
-            bit_depth_y, bit_depth_c,
+            pic,
+            mb_x,
+            mb_y,
+            edge_row,
+            alpha_off,
+            beta_off,
+            cqp_off_cb,
+            cqp_off_cr,
+            slice_type,
+            bit_depth_y,
+            bit_depth_c,
         );
     }
 }
@@ -120,8 +164,7 @@ fn filter_mb_edge_vertical_hi(
     let mut bs = [0u8; 4];
     for r in 0..4usize {
         bs[r] = derive_bs_for_edge(
-            pic, p_mb_x, p_mb_y, p_sub_col, r, q_mb_x, q_mb_y, sub_q_col, r, is_mb_edge,
-            slice_type,
+            pic, p_mb_x, p_mb_y, p_sub_col, r, q_mb_x, q_mb_y, sub_q_col, r, is_mb_edge, slice_type,
         );
     }
     if bs.iter().all(|&b| b == 0) {
@@ -139,8 +182,15 @@ fn filter_mb_edge_vertical_hi(
             continue;
         }
         filter_luma_edge_4_hi(
-            pic, y_base_x, y_base_y + seg * 4, true, bs[seg] as i32, qp_avg_y,
-            alpha_off, beta_off, bit_depth_y,
+            pic,
+            y_base_x,
+            y_base_y + seg * 4,
+            true,
+            bs[seg] as i32,
+            qp_avg_y,
+            alpha_off,
+            beta_off,
+            bit_depth_y,
         );
     }
 
@@ -161,8 +211,16 @@ fn filter_mb_edge_vertical_hi(
                     }
                     let cy = c_base_y + band * 4 + sub * 2;
                     filter_chroma_edge_2_hi(
-                        pic, plane_cb, c_base_x, cy, true, bs_here, qp_avg_c,
-                        alpha_off, beta_off, bit_depth_c,
+                        pic,
+                        plane_cb,
+                        c_base_x,
+                        cy,
+                        true,
+                        bs_here,
+                        qp_avg_c,
+                        alpha_off,
+                        beta_off,
+                        bit_depth_c,
                     );
                 }
             }
@@ -197,8 +255,7 @@ fn filter_mb_edge_horizontal_hi(
     let mut bs = [0u8; 4];
     for c in 0..4usize {
         bs[c] = derive_bs_for_edge(
-            pic, p_mb_x, p_mb_y, c, p_sub_row, q_mb_x, q_mb_y, c, sub_q_row, is_mb_edge,
-            slice_type,
+            pic, p_mb_x, p_mb_y, c, p_sub_row, q_mb_x, q_mb_y, c, sub_q_row, is_mb_edge, slice_type,
         );
     }
     if bs.iter().all(|&b| b == 0) {
@@ -216,8 +273,15 @@ fn filter_mb_edge_horizontal_hi(
             continue;
         }
         filter_luma_edge_4_hi(
-            pic, y_base_x + seg * 4, y_base_y, false, bs[seg] as i32, qp_avg_y,
-            alpha_off, beta_off, bit_depth_y,
+            pic,
+            y_base_x + seg * 4,
+            y_base_y,
+            false,
+            bs[seg] as i32,
+            qp_avg_y,
+            alpha_off,
+            beta_off,
+            bit_depth_y,
         );
     }
 
@@ -239,8 +303,16 @@ fn filter_mb_edge_horizontal_hi(
                     }
                     let cx = c_base_x + band * 4 + sub * 2;
                     filter_chroma_edge_2_hi(
-                        pic, plane_cb, cx, c_base_y, false, bs_here, qp_avg_c,
-                        alpha_off, beta_off, bit_depth_c,
+                        pic,
+                        plane_cb,
+                        cx,
+                        c_base_y,
+                        false,
+                        bs_here,
+                        qp_avg_c,
+                        alpha_off,
+                        beta_off,
+                        bit_depth_c,
                     );
                 }
             }
@@ -426,7 +498,11 @@ fn filter_chroma_edge_2_hi(
         let p0_i = idx(-1);
         let q0_i = idx(0);
         let q1_i = idx(1);
-        let plane = if plane_cb { &mut pic.cb16 } else { &mut pic.cr16 };
+        let plane = if plane_cb {
+            &mut pic.cb16
+        } else {
+            &mut pic.cr16
+        };
         let p0 = plane[p0_i] as i32;
         let p1 = plane[p1_i] as i32;
         let q0 = plane[q0_i] as i32;

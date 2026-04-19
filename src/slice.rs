@@ -15,11 +15,12 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::dpb::{MmcoCommand, RplmCommand};
+use crate::golomb::BitReaderExt;
 use crate::nal::{NalHeader, NalUnitType};
 use crate::pps::Pps;
 use crate::sps::Sps;
+use oxideav_core::bits::BitReader;
 
 /// H.264 slice type (§7.4.3 Table 7-6). Includes the `% 5` and the
 /// `>= 5` (single-slice-type-per-picture) variants.
@@ -547,7 +548,8 @@ fn parse_dec_ref_pic_marking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitwriter::BitWriter;
+    use crate::golomb::BitWriterExt;
+    use oxideav_core::bits::BitWriter;
 
     /// Round-trip a pred_weight_table with a handful of entries through the
     /// BitWriter → BitReader pipeline and assert the parser recovers the

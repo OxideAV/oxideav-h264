@@ -120,9 +120,7 @@ fn decode_cabac_8x8_intra_matches_reference() {
             return;
         }
         Err(e) => {
-            eprintln!(
-                "cabac 8×8 intra: receive_frame {e:?} — residual CABAC 8×8 work outstanding"
-            );
+            eprintln!("cabac 8×8 intra: receive_frame {e:?} — residual CABAC 8×8 work outstanding");
             return;
         }
     };
@@ -146,8 +144,6 @@ fn decode_cabac_8x8_intra_matches_reference() {
         within_1, total, pct
     );
     if pct < 99.0 {
-        eprintln!(
-            "cabac 8×8 pixel-match {pct:.2}% — residual CABAC 8×8 work outstanding."
-        );
+        eprintln!("cabac 8×8 pixel-match {pct:.2}% — residual CABAC 8×8 work outstanding.");
     }
 }

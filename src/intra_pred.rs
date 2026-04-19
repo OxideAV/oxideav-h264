@@ -668,18 +668,9 @@ pub fn predict_intra_chroma_8x16(
                         (((dc0_top + dc0_left + 4) >> 3) as u8),
                         (((dc1 + 2) >> 2) as u8),
                     ],
-                    [
-                        (((dc2 + 2) >> 2) as u8),
-                        (((dc1 + dc2 + 4) >> 3) as u8),
-                    ],
-                    [
-                        (((dc3 + 2) >> 2) as u8),
-                        (((dc1 + dc3 + 4) >> 3) as u8),
-                    ],
-                    [
-                        (((dc4 + 2) >> 2) as u8),
-                        (((dc1 + dc4 + 4) >> 3) as u8),
-                    ],
+                    [(((dc2 + 2) >> 2) as u8), (((dc1 + dc2 + 4) >> 3) as u8)],
+                    [(((dc3 + 2) >> 2) as u8), (((dc1 + dc3 + 4) >> 3) as u8)],
+                    [(((dc4 + 2) >> 2) as u8), (((dc1 + dc4 + 4) >> 3) as u8)],
                 ]
             } else if n.top_available {
                 [
@@ -1258,7 +1249,9 @@ mod tests {
         //   (l0 + 2*lt + t0 + 2) >> 2  (zhd=-1 corner-crossing 3-tap).
         // Prior impl used a top-row 3-tap here; this test pins the fix.
         let n = Intra8x8Neighbours {
-            top: [80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80],
+            top: [
+                80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80,
+            ],
             left: [100, 100, 100, 100, 100, 100, 100, 100],
             top_left: 40,
             top_available: true,
@@ -1281,7 +1274,9 @@ mod tests {
         // Prior impl's range-check excluded zvr=14 from the even branch,
         // pushing it into the top-row 3-tap and then OOB-indexing.
         let n = Intra8x8Neighbours {
-            top: [20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20],
+            top: [
+                20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
+            ],
             left: [5; 8],
             top_left: 5,
             top_available: true,

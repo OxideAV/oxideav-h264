@@ -24,16 +24,15 @@ use crate::b_mb::{
     direct_16x16_spatial_mvs_pub, direct_8x8_spatial_mvs_pub, direct_temporal_mvs_pub, BSliceCtx,
     BipredMode,
 };
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{
     decode_b_slice_mb_type, decode_b_sub_mb_type, decode_cbp_inter, BMbType, BPartition,
     BSubPartition, PredDir,
 };
 use crate::motion::{
-    apply_chroma_weight_hi, apply_luma_weight_hi, chroma_mc_hi, luma_mc_hi,
-    predict_mv_list,
+    apply_chroma_weight_hi, apply_luma_weight_hi, chroma_mc_hi, luma_mc_hi, predict_mv_list,
 };
 use crate::picture::{MbInfo, Picture, INTRA_DC_FAKE};
 use crate::pps::Pps;
@@ -42,6 +41,7 @@ use crate::sps::Sps;
 use crate::transform::{
     chroma_qp_hi, dequantize_4x4_scaled_ext, idct_4x4, inv_hadamard_2x2_chroma_dc_scaled_ext,
 };
+use oxideav_core::bits::BitReader;
 
 /// Decode one coded B-slice macroblock at `(mb_x, mb_y)` on the 10-bit path.
 /// Mirrors [`crate::b_mb::decode_b_slice_mb`].
@@ -142,17 +142,41 @@ fn decode_b_inter_mb_hi(
         }
         BPartition::L0_16x16 => {
             decode_16x16_single_dir(
-                br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::L0,
+                br,
+                sh,
+                ctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::L0,
             )?;
         }
         BPartition::L1_16x16 => {
             decode_16x16_single_dir(
-                br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::L1,
+                br,
+                sh,
+                ctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::L1,
             )?;
         }
         BPartition::Bi_16x16 => {
             decode_16x16_single_dir(
-                br, sh, ctx, mb_x, mb_y, pic, ref_list0, ref_list1, PredDir::BiPred,
+                br,
+                sh,
+                ctx,
+                mb_x,
+                mb_y,
+                pic,
+                ref_list0,
+                ref_list1,
+                PredDir::BiPred,
             )?;
         }
         BPartition::TwoPart16x8 { dirs } => {
@@ -222,12 +246,12 @@ fn decode_16x16_single_dir(
         ),
     };
     let mvd_l0 = if ref_l0.is_some() {
-        Some((br.read_se()? as i32, br.read_se()? as i32))
+        Some((br.read_se()?, br.read_se()?))
     } else {
         None
     };
     let mvd_l1 = if ref_l1.is_some() {
-        Some((br.read_se()? as i32, br.read_se()? as i32))
+        Some((br.read_se()?, br.read_se()?))
     } else {
         None
     };
@@ -274,12 +298,12 @@ fn decode_two_partition_b(
     }
     for p in 0..2 {
         if uses_l0(dirs[p]) {
-            mvd_l0[p] = Some((br.read_se()? as i32, br.read_se()? as i32));
+            mvd_l0[p] = Some((br.read_se()?, br.read_se()?));
         }
     }
     for p in 0..2 {
         if uses_l1(dirs[p]) {
-            mvd_l1[p] = Some((br.read_se()? as i32, br.read_se()? as i32));
+            mvd_l1[p] = Some((br.read_se()?, br.read_se()?));
         }
     }
 
@@ -351,12 +375,12 @@ fn decode_b8x8(
         for _ in 0..n {
             if let Some(dir) = dir_opt {
                 let mvd_l0 = if uses_l0(dir) {
-                    Some((br.read_se()? as i32, br.read_se()? as i32))
+                    Some((br.read_se()?, br.read_se()?))
                 } else {
                     None
                 };
                 let mvd_l1 = if uses_l1(dir) {
-                    Some((br.read_se()? as i32, br.read_se()? as i32))
+                    Some((br.read_se()?, br.read_se()?))
                 } else {
                     None
                 };
@@ -372,9 +396,7 @@ fn decode_b8x8(
         let sp = subs[s];
         let (sr0, sc0) = SUB_OFFSETS[s];
         if matches!(sp, BSubPartition::Direct8x8) {
-            direct_8x8_compensate_hi(
-                sh, ctx, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1,
-            )?;
+            direct_8x8_compensate_hi(sh, ctx, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1)?;
             continue;
         }
         let dir = sp.pred_dir().expect("non-direct");
@@ -488,10 +510,30 @@ fn apply_mc_hi(
             let reference = lookup_ref(ref_list0, r, "L0")?;
             let (lw, cw) = list_weight(sh, 0, r);
             mc_luma_partition_hi(
-                pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, lw,
+                pic,
+                reference,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                ph,
+                pw,
+                mv.0 as i32,
+                mv.1 as i32,
+                lw,
             );
             mc_chroma_partition_hi(
-                pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, cw,
+                pic,
+                reference,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                ph,
+                pw,
+                mv.0 as i32,
+                mv.1 as i32,
+                cw,
             );
         }
         PredDir::L1 => {
@@ -500,10 +542,30 @@ fn apply_mc_hi(
             let reference = lookup_ref(ref_list1, r, "L1")?;
             let (lw, cw) = list_weight(sh, 1, r);
             mc_luma_partition_hi(
-                pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, lw,
+                pic,
+                reference,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                ph,
+                pw,
+                mv.0 as i32,
+                mv.1 as i32,
+                lw,
             );
             mc_chroma_partition_hi(
-                pic, reference, mb_x, mb_y, r0, c0, ph, pw, mv.0 as i32, mv.1 as i32, cw,
+                pic,
+                reference,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                ph,
+                pw,
+                mv.0 as i32,
+                mv.1 as i32,
+                cw,
             );
         }
         PredDir::BiPred => {
@@ -516,8 +578,24 @@ fn apply_mc_hi(
             let wt = sh.pred_weight_table.as_ref();
             let mode = resolve_bipred_mode_hi(ctx);
             mc_bipred_partition_hi(
-                pic, ref0, ref1, mb_x, mb_y, r0, c0, ph, pw, mv0.0 as i32, mv0.1 as i32,
-                mv1.0 as i32, mv1.1 as i32, r0_idx, r1_idx, wt, mode, ctx,
+                pic,
+                ref0,
+                ref1,
+                mb_x,
+                mb_y,
+                r0,
+                c0,
+                ph,
+                pw,
+                mv0.0 as i32,
+                mv0.1 as i32,
+                mv1.0 as i32,
+                mv1.1 as i32,
+                r0_idx,
+                r1_idx,
+                wt,
+                mode,
+                ctx,
             );
         }
     }
@@ -572,8 +650,21 @@ pub(crate) fn direct_16x16_compensate_hi(
     if sh.direct_spatial_mv_pred_flag {
         let d = direct_16x16_spatial_mvs_pub(pic, mb_x, mb_y);
         apply_mc_hi(
-            sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, 0, 0, 4, 4, d.dir,
-            direct_ref_opt(d.ref_idx_l0), direct_ref_opt(d.ref_idx_l1), direct_mv_opt(d.ref_idx_l0, d.mv_l0),
+            sh,
+            ctx,
+            pic,
+            ref_list0,
+            ref_list1,
+            mb_x,
+            mb_y,
+            0,
+            0,
+            4,
+            4,
+            d.dir,
+            direct_ref_opt(d.ref_idx_l0),
+            direct_ref_opt(d.ref_idx_l1),
+            direct_mv_opt(d.ref_idx_l0, d.mv_l0),
             direct_mv_opt(d.ref_idx_l1, d.mv_l1),
         )
     } else {
@@ -582,9 +673,22 @@ pub(crate) fn direct_16x16_compensate_hi(
         for (rr_idx, row) in grid.iter().enumerate() {
             for (cc_idx, d) in row.iter().enumerate() {
                 apply_mc_hi(
-                    sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, rr_idx, cc_idx, 1, 1, d.dir,
-                    direct_ref_opt(d.ref_idx_l0), direct_ref_opt(d.ref_idx_l1),
-                    direct_mv_opt(d.ref_idx_l0, d.mv_l0), direct_mv_opt(d.ref_idx_l1, d.mv_l1),
+                    sh,
+                    ctx,
+                    pic,
+                    ref_list0,
+                    ref_list1,
+                    mb_x,
+                    mb_y,
+                    rr_idx,
+                    cc_idx,
+                    1,
+                    1,
+                    d.dir,
+                    direct_ref_opt(d.ref_idx_l0),
+                    direct_ref_opt(d.ref_idx_l1),
+                    direct_mv_opt(d.ref_idx_l0, d.mv_l0),
+                    direct_mv_opt(d.ref_idx_l1, d.mv_l1),
                 )?;
             }
         }
@@ -610,18 +714,44 @@ pub(crate) fn direct_8x8_compensate_hi(
     if sh.direct_spatial_mv_pred_flag {
         let d = direct_8x8_spatial_mvs_pub(pic, mb_x, mb_y, sr0, sc0);
         apply_mc_hi(
-            sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, sr0, sc0, 2, 2, d.dir,
-            direct_ref_opt(d.ref_idx_l0), direct_ref_opt(d.ref_idx_l1),
-            direct_mv_opt(d.ref_idx_l0, d.mv_l0), direct_mv_opt(d.ref_idx_l1, d.mv_l1),
+            sh,
+            ctx,
+            pic,
+            ref_list0,
+            ref_list1,
+            mb_x,
+            mb_y,
+            sr0,
+            sc0,
+            2,
+            2,
+            d.dir,
+            direct_ref_opt(d.ref_idx_l0),
+            direct_ref_opt(d.ref_idx_l1),
+            direct_mv_opt(d.ref_idx_l0, d.mv_l0),
+            direct_mv_opt(d.ref_idx_l1, d.mv_l1),
         )
     } else {
         let grid = direct_temporal_mvs_pub(mb_x, mb_y, sr0, sc0, 2, 2, pic, ref_list1, ctx)?;
         for (idx_r, row) in grid.iter().enumerate() {
             for (idx_c, d) in row.iter().enumerate() {
                 apply_mc_hi(
-                    sh, ctx, pic, ref_list0, ref_list1, mb_x, mb_y, sr0 + idx_r, sc0 + idx_c, 1, 1,
-                    d.dir, direct_ref_opt(d.ref_idx_l0), direct_ref_opt(d.ref_idx_l1),
-                    direct_mv_opt(d.ref_idx_l0, d.mv_l0), direct_mv_opt(d.ref_idx_l1, d.mv_l1),
+                    sh,
+                    ctx,
+                    pic,
+                    ref_list0,
+                    ref_list1,
+                    mb_x,
+                    mb_y,
+                    sr0 + idx_r,
+                    sc0 + idx_c,
+                    1,
+                    1,
+                    d.dir,
+                    direct_ref_opt(d.ref_idx_l0),
+                    direct_ref_opt(d.ref_idx_l1),
+                    direct_mv_opt(d.ref_idx_l0, d.mv_l0),
+                    direct_mv_opt(d.ref_idx_l1, d.mv_l1),
                 )?;
             }
         }
@@ -630,10 +760,18 @@ pub(crate) fn direct_8x8_compensate_hi(
 }
 
 fn direct_ref_opt(r: i8) -> Option<i8> {
-    if r >= 0 { Some(r) } else { None }
+    if r >= 0 {
+        Some(r)
+    } else {
+        None
+    }
 }
 fn direct_mv_opt(r: i8, mv: (i16, i16)) -> Option<(i16, i16)> {
-    if r >= 0 { Some(mv) } else { None }
+    if r >= 0 {
+        Some(mv)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -696,12 +834,32 @@ fn mc_chroma_partition_hi(
     let cw_plane = (reference.width / 2) as i32;
     let ch_plane = (reference.height / 2) as i32;
     chroma_mc_hi(
-        &mut tmp_cb, &reference.cb16, cstride, cw_plane, ch_plane, base_x, base_y, mv_x_q, mv_y_q,
-        pw, ph, reference.bit_depth_c,
+        &mut tmp_cb,
+        &reference.cb16,
+        cstride,
+        cw_plane,
+        ch_plane,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_q,
+        pw,
+        ph,
+        reference.bit_depth_c,
     );
     chroma_mc_hi(
-        &mut tmp_cr, &reference.cr16, cstride, cw_plane, ch_plane, base_x, base_y, mv_x_q, mv_y_q,
-        pw, ph, reference.bit_depth_c,
+        &mut tmp_cr,
+        &reference.cr16,
+        cstride,
+        cw_plane,
+        ch_plane,
+        base_x,
+        base_y,
+        mv_x_q,
+        mv_y_q,
+        pw,
+        ph,
+        reference.bit_depth_c,
     );
     if let Some(cw_entry) = chroma_weight {
         apply_chroma_weight_hi(&mut tmp_cb, cw_entry, 0, pic.bit_depth_c);
@@ -749,8 +907,26 @@ fn mc_bipred_partition_hi(
     let mut tmp_l1 = vec![0u16; lpw * lph];
     let base_lx = (mb_x as i32) * 16 + (c0 as i32) * 4;
     let base_ly = (mb_y as i32) * 16 + (r0 as i32) * 4;
-    luma_mc_hi(&mut tmp_l0, ref0, base_lx, base_ly, mv0_x_q, mv0_y_q, lpw, lph);
-    luma_mc_hi(&mut tmp_l1, ref1, base_lx, base_ly, mv1_x_q, mv1_y_q, lpw, lph);
+    luma_mc_hi(
+        &mut tmp_l0,
+        ref0,
+        base_lx,
+        base_ly,
+        mv0_x_q,
+        mv0_y_q,
+        lpw,
+        lph,
+    );
+    luma_mc_hi(
+        &mut tmp_l1,
+        ref1,
+        base_lx,
+        base_ly,
+        mv1_x_q,
+        mv1_y_q,
+        lpw,
+        lph,
+    );
 
     let lstride = pic.luma_stride();
     let loff = pic.luma_off(mb_x, mb_y) + r0 * 4 * lstride + c0 * 4;
@@ -764,29 +940,46 @@ fn mc_bipred_partition_hi(
             let lw0 = pwt.luma_l0.get(idx0).copied().unwrap_or_default();
             let lw1 = pwt.luma_l1.get(idx1).copied().unwrap_or_default();
             weighted_bipred_plane_hi(
-                &mut luma_out, &tmp_l0, &tmp_l1, lw0.weight, lw0.offset, lw1.weight, lw1.offset,
-                pwt.luma_log2_weight_denom, bit_depth_y,
+                &mut luma_out,
+                &tmp_l0,
+                &tmp_l1,
+                lw0.weight,
+                lw0.offset,
+                lw1.weight,
+                lw1.offset,
+                pwt.luma_log2_weight_denom,
+                bit_depth_y,
             );
         }
         BipredMode::Implicit => {
-            let weights =
-                crate::motion::implicit_bipred_weights(
-                    ctx.curr_poc,
-                    ctx.list0_pocs.get(ref_idx_l0.max(0) as usize).copied().unwrap_or(0),
-                    ctx.list1_pocs.get(ref_idx_l1.max(0) as usize).copied().unwrap_or(0),
-                    !ctx.list0_short_term
-                        .get(ref_idx_l0.max(0) as usize)
-                        .copied()
-                        .unwrap_or(true),
-                    !ctx.list1_short_term
-                        .get(ref_idx_l1.max(0) as usize)
-                        .copied()
-                        .unwrap_or(true),
-                );
+            let weights = crate::motion::implicit_bipred_weights(
+                ctx.curr_poc,
+                ctx.list0_pocs
+                    .get(ref_idx_l0.max(0) as usize)
+                    .copied()
+                    .unwrap_or(0),
+                ctx.list1_pocs
+                    .get(ref_idx_l1.max(0) as usize)
+                    .copied()
+                    .unwrap_or(0),
+                !ctx.list0_short_term
+                    .get(ref_idx_l0.max(0) as usize)
+                    .copied()
+                    .unwrap_or(true),
+                !ctx.list1_short_term
+                    .get(ref_idx_l1.max(0) as usize)
+                    .copied()
+                    .unwrap_or(true),
+            );
             match weights {
                 crate::motion::ImplicitBiWeights::Weighted { w0, w1 } => {
                     implicit_weighted_bipred_plane_hi(
-                        &mut luma_out, &tmp_l0, &tmp_l1, w0, w1, bit_depth_y,
+                        &mut luma_out,
+                        &tmp_l0,
+                        &tmp_l1,
+                        w0,
+                        w1,
+                        bit_depth_y,
                     );
                 }
                 crate::motion::ImplicitBiWeights::Default => {
@@ -820,19 +1013,59 @@ fn mc_bipred_partition_hi(
     let cw1 = (ref1.width / 2) as i32;
     let ch1 = (ref1.height / 2) as i32;
     chroma_mc_hi(
-        &mut tmp_cb0, &ref0.cb16, cstride0, cw0, ch0, base_cx, base_cy, mv0_x_q, mv0_y_q, cpw, cph,
+        &mut tmp_cb0,
+        &ref0.cb16,
+        cstride0,
+        cw0,
+        ch0,
+        base_cx,
+        base_cy,
+        mv0_x_q,
+        mv0_y_q,
+        cpw,
+        cph,
         ref0.bit_depth_c,
     );
     chroma_mc_hi(
-        &mut tmp_cr0, &ref0.cr16, cstride0, cw0, ch0, base_cx, base_cy, mv0_x_q, mv0_y_q, cpw, cph,
+        &mut tmp_cr0,
+        &ref0.cr16,
+        cstride0,
+        cw0,
+        ch0,
+        base_cx,
+        base_cy,
+        mv0_x_q,
+        mv0_y_q,
+        cpw,
+        cph,
         ref0.bit_depth_c,
     );
     chroma_mc_hi(
-        &mut tmp_cb1, &ref1.cb16, cstride1, cw1, ch1, base_cx, base_cy, mv1_x_q, mv1_y_q, cpw, cph,
+        &mut tmp_cb1,
+        &ref1.cb16,
+        cstride1,
+        cw1,
+        ch1,
+        base_cx,
+        base_cy,
+        mv1_x_q,
+        mv1_y_q,
+        cpw,
+        cph,
         ref1.bit_depth_c,
     );
     chroma_mc_hi(
-        &mut tmp_cr1, &ref1.cr16, cstride1, cw1, ch1, base_cx, base_cy, mv1_x_q, mv1_y_q, cpw, cph,
+        &mut tmp_cr1,
+        &ref1.cr16,
+        cstride1,
+        cw1,
+        ch1,
+        base_cx,
+        base_cy,
+        mv1_x_q,
+        mv1_y_q,
+        cpw,
+        cph,
         ref1.bit_depth_c,
     );
 
@@ -847,36 +1080,65 @@ fn mc_bipred_partition_hi(
             let cw_l0 = pwt.chroma_l0.get(idx0).copied().unwrap_or_default();
             let cw_l1 = pwt.chroma_l1.get(idx1).copied().unwrap_or_default();
             weighted_bipred_plane_hi(
-                &mut cb_out, &tmp_cb0, &tmp_cb1, cw_l0.weight[0], cw_l0.offset[0], cw_l1.weight[0],
-                cw_l1.offset[0], pwt.chroma_log2_weight_denom, bit_depth_c,
+                &mut cb_out,
+                &tmp_cb0,
+                &tmp_cb1,
+                cw_l0.weight[0],
+                cw_l0.offset[0],
+                cw_l1.weight[0],
+                cw_l1.offset[0],
+                pwt.chroma_log2_weight_denom,
+                bit_depth_c,
             );
             weighted_bipred_plane_hi(
-                &mut cr_out, &tmp_cr0, &tmp_cr1, cw_l0.weight[1], cw_l0.offset[1], cw_l1.weight[1],
-                cw_l1.offset[1], pwt.chroma_log2_weight_denom, bit_depth_c,
+                &mut cr_out,
+                &tmp_cr0,
+                &tmp_cr1,
+                cw_l0.weight[1],
+                cw_l0.offset[1],
+                cw_l1.weight[1],
+                cw_l1.offset[1],
+                pwt.chroma_log2_weight_denom,
+                bit_depth_c,
             );
         }
         BipredMode::Implicit => {
-            let weights =
-                crate::motion::implicit_bipred_weights(
-                    ctx.curr_poc,
-                    ctx.list0_pocs.get(ref_idx_l0.max(0) as usize).copied().unwrap_or(0),
-                    ctx.list1_pocs.get(ref_idx_l1.max(0) as usize).copied().unwrap_or(0),
-                    !ctx.list0_short_term
-                        .get(ref_idx_l0.max(0) as usize)
-                        .copied()
-                        .unwrap_or(true),
-                    !ctx.list1_short_term
-                        .get(ref_idx_l1.max(0) as usize)
-                        .copied()
-                        .unwrap_or(true),
-                );
+            let weights = crate::motion::implicit_bipred_weights(
+                ctx.curr_poc,
+                ctx.list0_pocs
+                    .get(ref_idx_l0.max(0) as usize)
+                    .copied()
+                    .unwrap_or(0),
+                ctx.list1_pocs
+                    .get(ref_idx_l1.max(0) as usize)
+                    .copied()
+                    .unwrap_or(0),
+                !ctx.list0_short_term
+                    .get(ref_idx_l0.max(0) as usize)
+                    .copied()
+                    .unwrap_or(true),
+                !ctx.list1_short_term
+                    .get(ref_idx_l1.max(0) as usize)
+                    .copied()
+                    .unwrap_or(true),
+            );
             match weights {
                 crate::motion::ImplicitBiWeights::Weighted { w0, w1 } => {
                     implicit_weighted_bipred_plane_hi(
-                        &mut cb_out, &tmp_cb0, &tmp_cb1, w0, w1, bit_depth_c,
+                        &mut cb_out,
+                        &tmp_cb0,
+                        &tmp_cb1,
+                        w0,
+                        w1,
+                        bit_depth_c,
                     );
                     implicit_weighted_bipred_plane_hi(
-                        &mut cr_out, &tmp_cr0, &tmp_cr1, w0, w1, bit_depth_c,
+                        &mut cr_out,
+                        &tmp_cr0,
+                        &tmp_cr1,
+                        w0,
+                        w1,
+                        bit_depth_c,
                     );
                 }
                 crate::motion::ImplicitBiWeights::Default => {
@@ -1082,7 +1344,11 @@ fn decode_inter_residual_chroma_hi(
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);
             let off_in_mb = br_row * 4 * cstride + br_col * 4;
-            let plane = if plane_kind { &mut pic.cb16 } else { &mut pic.cr16 };
+            let plane = if plane_kind {
+                &mut pic.cb16
+            } else {
+                &mut pic.cr16
+            };
             for r in 0..4 {
                 for c in 0..4 {
                     let base = plane[co + off_in_mb + r * cstride + c] as i32;
@@ -1092,7 +1358,11 @@ fn decode_inter_residual_chroma_hi(
             }
             nc_arr[(br_row << 1) | br_col] = total_coeff as u8;
             let info = pic.mb_info_mut(mb_x, mb_y);
-            let dst = if plane_kind { &mut info.cb_nc } else { &mut info.cr_nc };
+            let dst = if plane_kind {
+                &mut info.cb_nc
+            } else {
+                &mut info.cr_nc
+            };
             dst[..4].copy_from_slice(&nc_arr);
         }
     }

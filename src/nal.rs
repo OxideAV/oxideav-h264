@@ -377,6 +377,28 @@ impl AvcConfig {
     }
 }
 
+/// Convert a raw RBSP byte stream into an EBSP (Encapsulated Byte Sequence
+/// Payload) — i.e. insert §7.4.1.1 emulation-prevention `0x03` bytes so the
+/// resulting stream cannot contain an Annex B start-code sequence or a
+/// `0x00 0x00 0x00`/`0x00 0x00 0x01`/`0x00 0x00 0x02`/`0x00 0x00 0x03`
+/// triplet.
+///
+/// Per the spec, for every triplet `0x00 0x00 0xAB` where `0xAB <= 0x03`,
+/// an `0x03` byte is inserted before the third byte. Also, if the final
+/// two bytes are both `0x00`, an extra `0x03` is appended as cabac_zero_word
+/// protection. We keep the common case only — the extra-trailing-zero
+/// condition is handled by never emitting trailing zeros.
+pub fn rbsp_to_ebsp(rbsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rbsp.len() + rbsp.len() / 100);
+    for &b in rbsp {
+        if out.len() >= 2 && out[out.len() - 1] == 0 && out[out.len() - 2] == 0 && b <= 0x03 {
+            out.push(0x03);
+        }
+        out.push(b);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

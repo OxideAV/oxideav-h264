@@ -8,8 +8,9 @@
 //! uses at the slice boundary — a real encoded RPLM-using fixture is
 //! not feasible without a hand-built macroblock layer.
 
-use oxideav_h264::bitwriter::BitWriter;
+use oxideav_core::bits::BitWriter;
 use oxideav_h264::dpb::{apply_rplm, Dpb, RplmCommand};
+use oxideav_h264::golomb::BitWriterExt;
 use oxideav_h264::nal::{NalHeader, NalUnitType};
 use oxideav_h264::picture::Picture;
 use oxideav_h264::pps::{parse_pps, Pps};

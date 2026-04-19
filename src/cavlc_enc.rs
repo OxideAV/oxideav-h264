@@ -26,8 +26,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitwriter::BitWriter;
 use crate::cavlc::{BlockKind, ZIGZAG_4X4};
+use oxideav_core::bits::BitWriter;
 
 /// Forward lookups mirroring the decoder's tables in [`crate::cavlc`].
 /// We include the same (len, code) pairs — indexed by
@@ -298,7 +298,7 @@ pub fn encode_residual_block(
     for i in 0..trailing_ones as usize {
         // levels[i] is ±1. Sign bit: 1 for negative, 0 for positive.
         let sign_bit = if levels[i] < 0 { 1 } else { 0 };
-        w.write_bit(sign_bit);
+        w.write_bit(sign_bit != 0);
     }
 
     // 3. Remaining levels with level_prefix + level_suffix.
@@ -403,9 +403,9 @@ fn encode_level(
         if level_code < 14 {
             let prefix = level_code as u32;
             for _ in 0..prefix {
-                w.write_bit(0);
+                w.write_bit(false);
             }
-            w.write_bit(1);
+            w.write_bit(true);
         } else if level_code == 14 {
             // Hit by the "trailing_ones==3, sl=0, first non-trailing |level|=+8"
             // edge case. The caller is supposed to have downgraded trailing_ones
@@ -417,9 +417,9 @@ fn encode_level(
             // prefix = 15, 12-bit suffix = level_code - 15.
             let suffix = (level_code - 15) as u32;
             for _ in 0..15 {
-                w.write_bit(0);
+                w.write_bit(false);
             }
-            w.write_bit(1);
+            w.write_bit(true);
             w.write_bits(suffix, 12);
         } else {
             return Err(Error::invalid(format!(
@@ -436,9 +436,9 @@ fn encode_level(
         if prefix < 15 {
             let suffix = (level_code as u32) & sl_mask;
             for _ in 0..prefix {
-                w.write_bit(0);
+                w.write_bit(false);
             }
-            w.write_bit(1);
+            w.write_bit(true);
             w.write_bits(suffix, sl);
         } else {
             // Escape: prefix >= 15 with level_suffix_size = prefix - 3 (8-bit profile).
@@ -466,9 +466,9 @@ fn encode_level(
             let suffix = (level_code as u32) - (15u32 << sl);
             // 15 zeros, then 1, then 12-bit suffix.
             for _ in 0..15 {
-                w.write_bit(0);
+                w.write_bit(false);
             }
-            w.write_bit(1);
+            w.write_bit(true);
             w.write_bits(suffix, 12);
         }
     }
@@ -538,8 +538,9 @@ fn write_run_before(w: &mut BitWriter, zeros_left: u32, run: u32) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitreader::BitReader;
     use crate::cavlc::decode_residual_block;
+    use crate::golomb::BitWriterExt;
+    use oxideav_core::bits::BitReader;
 
     fn roundtrip(block: [i32; 16], nc: i32, kind: BlockKind) {
         let mut w = BitWriter::new();

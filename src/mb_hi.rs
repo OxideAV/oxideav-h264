@@ -21,15 +21,16 @@
 //! into [`crate::mb_hi_422`] (2×4 chroma DC Hadamard + 8 AC blocks per
 //! plane).
 
+use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::cavlc::{decode_residual_8x8_sub, decode_residual_block, BlockKind};
+use crate::golomb::BitReaderExt;
 use crate::intra_pred::{Intra16x16Mode, Intra4x4Mode, Intra8x8Mode, IntraChromaMode};
 use crate::intra_pred_hi::{
-    predict_intra_16x16 as pred16_hi, predict_intra_4x4 as pred4_hi,
-    predict_intra_8x8 as pred8_hi, predict_intra_chroma as predc_hi, Intra16x16Neighbours16,
-    Intra4x4Neighbours16, Intra8x8Neighbours16, IntraChromaNeighbours16,
+    predict_intra_16x16 as pred16_hi, predict_intra_4x4 as pred4_hi, predict_intra_8x8 as pred8_hi,
+    predict_intra_chroma as predc_hi, Intra16x16Neighbours16, Intra4x4Neighbours16,
+    Intra8x8Neighbours16, IntraChromaNeighbours16,
 };
 use crate::mb::{predict_nc_luma, LUMA_BLOCK_RASTER};
 use crate::mb_type::{decode_i_slice_mb_type, IMbType};
@@ -443,8 +444,7 @@ fn decode_luma_intra_16x16_hi(
         let lo = lo_mb + br_row * 4 * lstride + br_col * 4;
         for r in 0..4 {
             for c in 0..4 {
-                let v = pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32
-                    + residual[r * 4 + c];
+                let v = pred[(br_row * 4 + r) * 16 + (br_col * 4 + c)] as i32 + residual[r * 4 + c];
                 pic.y16[lo + r * lstride + c] = v.clamp(0, max_sample as i32) as u16;
             }
         }
@@ -472,8 +472,9 @@ fn decode_luma_intra_8x8_hi(
         let br8_row = blk8 >> 1;
         let br8_col = blk8 & 1;
         let mode_v = modes[(br8_row * 2) * 4 + br8_col * 2];
-        let mode = Intra8x8Mode::from_u8(mode_v)
-            .ok_or_else(|| Error::invalid(format!("h264 10bit mb: invalid intra8x8 mode {mode_v}")))?;
+        let mode = Intra8x8Mode::from_u8(mode_v).ok_or_else(|| {
+            Error::invalid(format!("h264 10bit mb: invalid intra8x8 mode {mode_v}"))
+        })?;
         let neigh = collect_intra8x8_neighbours_hi(pic, mb_x, mb_y, br8_row, br8_col);
         let mut pred = [0u16; 64];
         pred8_hi(&mut pred, mode, &neigh, bit_depth);
@@ -542,9 +543,7 @@ fn collect_intra8x8_neighbours_hi(
         top_right_available = match (br8_row, br8_col) {
             (0, 0) => mb_y > 0,
             (0, 1) => {
-                mb_y > 0
-                    && mb_x + 1 < pic.mb_width
-                    && pic.mb_info_at(mb_x + 1, mb_y - 1).coded
+                mb_y > 0 && mb_x + 1 < pic.mb_width && pic.mb_info_at(mb_x + 1, mb_y - 1).coded
             }
             (1, 0) => true,
             _ => false,
@@ -657,13 +656,15 @@ fn decode_chroma_hi(
             res[0] = dc[(br_row << 1) | br_col];
             idct_4x4(&mut res);
             let off_in_mb = br_row * 4 * cstride + br_col * 4;
-            let plane = if plane_kind { &mut pic.cb16 } else { &mut pic.cr16 };
+            let plane = if plane_kind {
+                &mut pic.cb16
+            } else {
+                &mut pic.cr16
+            };
             for r in 0..4 {
                 for c in 0..4 {
-                    let v = pred[(br_row * 4 + r) * 8 + (br_col * 4 + c)] as i32
-                        + res[r * 4 + c];
-                    plane[co + off_in_mb + r * cstride + c] =
-                        v.clamp(0, max_sample as i32) as u16;
+                    let v = pred[(br_row * 4 + r) * 8 + (br_col * 4 + c)] as i32 + res[r * 4 + c];
+                    plane[co + off_in_mb + r * cstride + c] = v.clamp(0, max_sample as i32) as u16;
                 }
             }
             nc_arr[(br_row << 1) | br_col] = total_coeff as u8;
@@ -788,8 +789,7 @@ fn collect_intra4x4_neighbours_hi(
         for i in 0..4 {
             top[i] = pic.y16[row_off + (mb_x as usize) * 16 + br_col * 4 + i];
         }
-        let tr_avail =
-            crate::mb::top_right_available_4x4(mb_x, mb_y, br_row, br_col, pic);
+        let tr_avail = crate::mb::top_right_available_4x4(mb_x, mb_y, br_row, br_col, pic);
         if tr_avail {
             for i in 0..4 {
                 top[4 + i] = pic.y16[row_off + (mb_x as usize) * 16 + br_col * 4 + 4 + i];
@@ -843,11 +843,7 @@ fn collect_intra4x4_neighbours_hi(
     }
 }
 
-fn collect_intra16x16_neighbours_hi(
-    pic: &Picture,
-    mb_x: u32,
-    mb_y: u32,
-) -> Intra16x16Neighbours16 {
+fn collect_intra16x16_neighbours_hi(pic: &Picture, mb_x: u32, mb_y: u32) -> Intra16x16Neighbours16 {
     let lstride = pic.luma_stride();
     let lo_mb = pic.luma_off(mb_x, mb_y);
     let top_avail = mb_y > 0;
