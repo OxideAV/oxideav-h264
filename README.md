@@ -222,11 +222,25 @@ P-frame: [start code] SPS  [start code] PPS  [start code] non-IDR slice
 
 Fixed encoder policy (no rate control, no tuning):
 
-- **Baseline Profile** (`profile_idc = 66`), level 3.0.
+- **Baseline Profile** (`profile_idc = 66`), level 3.0 by default. When
+  `H264EncoderOptions::use_cabac = true` is set the SPS is bumped to
+  **Main Profile** (`profile_idc = 77`) so the CABAC flag is spec-legal
+  (§A.2.1 explicitly bans CABAC under Baseline).
 - **IDR + CAVLC P-slice cadence** — every frame is an IDR by default
   (`p_slice_interval = 0`). Setting `H264EncoderOptions::p_slice_interval
   = N` emits one IDR every `N` frames and CAVLC P-slices in between.
-- **CAVLC** entropy coding (`entropy_coding_mode_flag = 0`).
+  Under `use_cabac = true` the encoder currently emits only IDRs
+  regardless of the P-slice cadence; CABAC P/B encoding is a follow-up.
+- **Entropy coding** — **CAVLC** by default (`entropy_coding_mode_flag =
+  0`); **CABAC** (`entropy_coding_mode_flag = 1`) for I-slices when
+  `H264EncoderOptions::use_cabac = true`. The CABAC path mirrors the
+  decoder's §9.3 pipeline — regular / bypass / terminate bins,
+  `mb_skip_flag`, `mb_type`, `prev_intra4x4_pred_mode_flag`,
+  `rem_intra4x4_pred_mode`, `intra_chroma_pred_mode`,
+  `coded_block_pattern`, `coded_block_flag`, `significant_coeff_flag`,
+  `last_significant_coeff_flag`, `coeff_abs_level_minus1`, and
+  `coeff_sign_flag` — with the shared §9.3.3.1.1 context-derivation
+  helpers driving both directions.
 - **Single slice per picture** (`num_slice_groups_minus1 = 0`).
 - **4:2:0** chroma (`chroma_format_idc = 1`), **8-bit** luma + chroma.
 - **I-macroblocks**: **Intra_16×16 with mode decision** across all four
@@ -260,6 +274,8 @@ Round-trip PSNR (against this crate's decoder):
 - **≥ 30 dB** on a 10-frame 64×64 synthetic-testsrc clip (1 IDR + 9
   P-slices) at QP 26 — average ≈ 49 dB
   (`tests/encode_10frame_testsrc.rs`).
+- **≥ 30 dB** on the same 10-frame clip encoded as CABAC IDRs at QP 26
+  — average ≈ 41 dB (`tests/encode_cabac_roundtrip.rs`).
 
 The Annex B stream produced by the encoder is also self-decodable
 through the concatenated-NAL entry point: `tests/encode_ffmpeg_decode.rs`
@@ -362,7 +378,9 @@ bitstream claims a feature that isn't wired); encoder outright refuses:
   Weighted prediction on the CABAC P path is parsed but weights are
   not applied; encoders should disable weighted P for CABAC bitstreams
   fed into this decoder, or tolerate unweighted MC output.
-- **Encoder**: B-slices, CABAC, Intra_4×4, Intra_8×8, rate control,
+- **Encoder**: B-slices, CABAC P/B (CABAC **I-slice** encoding is
+  wired via `H264EncoderOptions::use_cabac`), Intra_4×4, Intra_8×8,
+  rate control,
   adaptive QP, in-loop deblocking on emit (the encoder disables §8.7
   via `disable_deblocking_filter_idc = 1` in the slice header, so its
   local reconstruction matches the decoder's bit-exactly without

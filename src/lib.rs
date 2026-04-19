@@ -379,9 +379,16 @@
 //!
 //! # Out of scope (returns `Error::Unsupported` or the encoder refuses)
 //!
-//! * Any CABAC encoding. CABAC I/P/B decode and the CABAC 8×8 transform
-//!   path are all wired; weighted-P on the CABAC path is parsed but the
-//!   weights aren't yet applied to the MC output.
+//! * CABAC **I-slice** encoding IS wired behind
+//!   [`encoder::H264EncoderOptions::use_cabac`]: enabling the flag bumps
+//!   the SPS to Main profile (`profile_idc = 77`), sets
+//!   `entropy_coding_mode_flag = 1` in the PPS, and emits every IDR
+//!   macroblock through the new [`cabac_enc`] module (§9.3.4 arithmetic
+//!   encoder + §9.3.2 binarisers, mirroring the decoder's `cabac::*`
+//!   tree). CABAC P/B encoding is still out of scope. CABAC I/P/B
+//!   **decoding** + the CABAC 8×8 transform path are all wired;
+//!   weighted-P on the CABAC path is parsed but the weights aren't yet
+//!   applied to the MC output.
 //! * B-slice encoding. CAVLC P-slice encoding is wired but constrained
 //!   to the P_L0_16×16 partition, single L0 reference, integer-pel ME
 //!   only (no sub-pel / quarter-pel refinement), no weighted prediction.
@@ -433,6 +440,7 @@ pub mod b_mb;
 pub mod b_mb_444;
 pub mod b_mb_hi;
 pub mod cabac;
+pub mod cabac_enc;
 pub mod cavlc;
 pub mod cavlc_enc;
 pub mod deblock;

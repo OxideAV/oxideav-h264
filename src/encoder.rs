@@ -135,6 +135,13 @@ pub struct H264EncoderOptions {
     /// Ignored on the PAFF path — PAFF still emits one IDR + all-skip P
     /// fields as documented on [`Self::paff_field`].
     pub p_slice_interval: u32,
+    /// When `true`, emit CABAC entropy coding (§9.3) — PPS
+    /// `entropy_coding_mode_flag = 1`, Main-profile. Only I-slices (IDR)
+    /// are supported on the CABAC path at present; P/B emission falls
+    /// back to CAVLC regardless of this flag. The output is compliant
+    /// Main-profile CABAC and round-trips cleanly through this crate's
+    /// own decoder.
+    pub use_cabac: bool,
 }
 
 impl Default for H264EncoderOptions {
@@ -145,6 +152,7 @@ impl Default for H264EncoderOptions {
             pps_id: 0,
             paff_field: None,
             p_slice_interval: 0,
+            use_cabac: false,
         }
     }
 }
@@ -203,8 +211,14 @@ impl H264Encoder {
         let mb_height = height.div_ceil(16);
         let coded_width = mb_width * 16;
         let coded_height = mb_height * 16;
-        let sps_nal = build_sps_nal(width, height, opts.sps_id, opts.paff_field.is_some())?;
-        let pps_nal = build_pps_nal(opts.pps_id, opts.sps_id)?;
+        let sps_nal = build_sps_nal(
+            width,
+            height,
+            opts.sps_id,
+            opts.paff_field.is_some(),
+            opts.use_cabac,
+        )?;
+        let pps_nal = build_pps_nal(opts.pps_id, opts.sps_id, opts.use_cabac)?;
 
         let mut output_params = CodecParameters::video(codec_id.clone());
         output_params.media_type = MediaType::Video;
@@ -260,14 +274,22 @@ impl H264Encoder {
         if self.opts.paff_field.is_some() && self.frame_num > 0 {
             return self.encode_paff_p_skip_field(frame);
         }
-        // Progressive P-slice cadence (ignored under PAFF).
+        // Progressive P-slice cadence (ignored under PAFF). CABAC only
+        // supports I-slice (IDR) emission today — downstream P-slice
+        // frames with `use_cabac = true` fall back to the CAVLC P path
+        // and produce a mixed-entropy CVS (the decoder handles both).
         if self.opts.paff_field.is_none()
             && self.opts.p_slice_interval > 0
             && self.frames_since_idr > 0
             && self.frames_since_idr < self.opts.p_slice_interval
             && self.ref_pic.is_some()
+            && !self.opts.use_cabac
         {
             return self.encode_p_frame(frame);
+        }
+        // CABAC IDR path.
+        if self.opts.paff_field.is_none() && self.opts.use_cabac {
+            return self.encode_idr_cabac(frame);
         }
 
         // Build the MB-aligned raw-sample buffer (padding replicate-edges
@@ -392,6 +414,356 @@ impl H264Encoder {
         // the "available, intra" answer defined by §8.4.1.3.1.
         let pic = self.build_ref_picture_intra(rec_y, rec_cb, rec_cr);
         self.ref_pic = Some(pic);
+        Ok(())
+    }
+
+    /// Encode one IDR frame through the **CABAC** entropy layer (§9.3).
+    ///
+    /// Layout matches the CAVLC path above: one I-slice, Intra_16×16 per
+    /// MB with mode-decision via SAD, zig-zag + quant + CABAC residual
+    /// emission, local reconstruction. The only entropy-layer
+    /// differences are:
+    ///
+    /// * The PPS was built with `entropy_coding_mode_flag = 1`.
+    /// * The slice header writes the CABAC-required `cabac_alignment_one_bit`
+    ///   padding (§7.3.4) up to the next byte boundary.
+    /// * Every syntax element goes through [`cabac_enc::mb::encode_i_16x16_mb_cabac`]
+    ///   rather than the CAVLC bit writer.
+    /// * An `end_of_slice_flag` terminate bin closes the slice.
+    fn encode_idr_cabac(&mut self, frame: &VideoFrame) -> Result<()> {
+        // Prep source planes + reconstruction buffers (mirror the CAVLC path).
+        let y_src = plane_to_mb_aligned(
+            &frame.planes[0].data,
+            frame.planes[0].stride,
+            self.width as usize,
+            self.height as usize,
+            self.coded_width as usize,
+            self.coded_height as usize,
+        );
+        let cw = (self.width / 2) as usize;
+        let ch = (self.height / 2) as usize;
+        let coded_cw = (self.coded_width / 2) as usize;
+        let coded_ch = (self.coded_height / 2) as usize;
+        let cb_src = plane_to_mb_aligned(
+            &frame.planes[1].data,
+            frame.planes[1].stride,
+            cw,
+            ch,
+            coded_cw,
+            coded_ch,
+        );
+        let cr_src = plane_to_mb_aligned(
+            &frame.planes[2].data,
+            frame.planes[2].stride,
+            cw,
+            ch,
+            coded_cw,
+            coded_ch,
+        );
+        let mut rec_y = vec![0u8; (self.coded_width * self.coded_height) as usize];
+        let mut rec_cb = vec![0u8; coded_cw * coded_ch];
+        let mut rec_cr = vec![0u8; coded_cw * coded_ch];
+        let l_stride = self.coded_width as usize;
+        let c_stride = coded_cw;
+
+        // Slice RBSP starts with the slice header, CABAC alignment, then
+        // the CABAC byte stream.
+        let mut slice_rbsp = BitWriter::new();
+        self.write_slice_header(&mut slice_rbsp);
+        // §7.3.4 — cabac_alignment_one_bit: pad with '1' bits up to the
+        // next byte boundary. The decoder's `CabacDecoder::new` rounds the
+        // start bit up to the same boundary and ignores the content.
+        while !slice_rbsp.is_byte_aligned() {
+            slice_rbsp.write_flag(true);
+        }
+
+        // CABAC engine driving the whole slice body.
+        let mut cabac = crate::cabac_enc::engine::CabacEncoder::new();
+        let slice_qpy = self.opts.qp; // slice header wrote `slice_qp_delta`.
+        let mut ctxs = crate::cabac::tables::init_slice_contexts(0, true, slice_qpy);
+
+        // Picture for neighbour-state tracking — lives only inside this
+        // fn; we don't need it after emit.
+        let mut pic = Picture::new(self.mb_width, self.mb_height);
+
+        let mb_w = self.mb_width;
+        let mb_h = self.mb_height;
+        let total_mbs = mb_w * mb_h;
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                // Transform MB into all the CABAC-ready coefficient arrays
+                // and emit one MB. This helper also writes the recon
+                // back into rec_y/rec_cb/rec_cr and updates pic.mb_info.
+                self.encode_one_mb_cabac(
+                    mb_x,
+                    mb_y,
+                    &y_src,
+                    &cb_src,
+                    &cr_src,
+                    &mut rec_y,
+                    &mut rec_cb,
+                    &mut rec_cr,
+                    l_stride,
+                    c_stride,
+                    &mut cabac,
+                    &mut ctxs,
+                    &mut pic,
+                )?;
+                // Emit the per-MB `end_of_slice_flag` terminate bin: 0 if
+                // more MBs follow, 1 on the last MB.
+                let is_last = (mb_y * mb_w + mb_x) + 1 == total_mbs;
+                cabac.encode_terminate(if is_last { 1 } else { 0 });
+            }
+        }
+        // Append CABAC bytes to the slice RBSP (already byte-aligned).
+        let cabac_bytes = cabac.finish_rbsp();
+        for b in &cabac_bytes {
+            slice_rbsp.write_bits(*b as u32, 8);
+        }
+        // §7.3.2.11 — for CABAC slices, the trailing_bits consist of the
+        // stop bit embedded in `flush_on_terminate` already, plus
+        // byte-alignment zeros. We emit the RBSP trailer here to keep the
+        // NAL parser happy (the decoder's `more_rbsp_data` will spot the
+        // stop bit inside the CABAC tail).
+        let rbsp = slice_rbsp.finish();
+
+        // NAL header for an IDR slice: forbidden=0, nal_ref_idc=3, type=5 → 0x65.
+        let nal_header = 0x65u8;
+        let mut slice_nal = Vec::with_capacity(1 + rbsp.len());
+        slice_nal.push(nal_header);
+        slice_nal.extend_from_slice(&rbsp);
+        let slice_ebsp = rbsp_to_ebsp(&slice_nal);
+
+        let mut out =
+            Vec::with_capacity(slice_ebsp.len() + self.sps_nal.len() + self.pps_nal.len() + 12);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&self.sps_nal);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&self.pps_nal);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&slice_ebsp);
+
+        let mut pkt = Packet::new(0, frame.time_base, out);
+        pkt.pts = frame.pts;
+        pkt.dts = frame.pts;
+        pkt.flags = PacketFlags {
+            keyframe: true,
+            ..Default::default()
+        };
+        self.packets.push_back(pkt);
+        self.frame_num = self.frame_num.wrapping_add(1);
+        self.frames_since_idr = 1;
+        // Stash the reconstruction for any future P-slice needs. The
+        // CABAC encoder only emits IDRs today, but the P-slice fallback
+        // still consumes this ref_pic.
+        let pic_ref = self.build_ref_picture_intra(rec_y, rec_cb, rec_cr);
+        self.ref_pic = Some(pic_ref);
+        Ok(())
+    }
+
+    /// Encode one I_16×16 macroblock through the CABAC entropy layer.
+    /// Computes pixel residuals exactly like [`Self::encode_one_mb`],
+    /// then invokes the CABAC MB-level writer for the entropy emit.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_one_mb_cabac(
+        &self,
+        mb_x: u32,
+        mb_y: u32,
+        y_src: &[u8],
+        cb_src: &[u8],
+        cr_src: &[u8],
+        rec_y: &mut [u8],
+        rec_cb: &mut [u8],
+        rec_cr: &mut [u8],
+        l_stride: usize,
+        c_stride: usize,
+        cabac: &mut crate::cabac_enc::engine::CabacEncoder,
+        ctxs: &mut [crate::cabac::context::CabacContext],
+        pic: &mut Picture,
+    ) -> Result<()> {
+        // Neighbours for intra prediction come from the reconstruction
+        // buffer, identical to the CAVLC path.
+        let lneigh = collect_intra16x16_neighbours(rec_y, l_stride, mb_x, mb_y);
+        let cneigh_cb = collect_chroma_neighbours(rec_cb, c_stride, mb_x, mb_y);
+        let cneigh_cr = collect_chroma_neighbours(rec_cr, c_stride, mb_x, mb_y);
+
+        // Pull a 16×16 src MB out and pick an Intra_16×16 mode by SAD.
+        let y_off_mb = (mb_y as usize * 16) * l_stride + mb_x as usize * 16;
+        let mut src_mb = [0u8; 256];
+        for r in 0..16usize {
+            for c in 0..16usize {
+                src_mb[r * 16 + c] = y_src[y_off_mb + r * l_stride + c];
+            }
+        }
+        let (luma_mode, pred) = pick_intra_16x16_mode(&src_mb, &lneigh);
+
+        // Chroma mode decision.
+        let c_off_mb = (mb_y as usize * 8) * c_stride + mb_x as usize * 8;
+        let mut cb_src_mb = [0u8; 64];
+        let mut cr_src_mb = [0u8; 64];
+        for r in 0..8usize {
+            for c in 0..8usize {
+                cb_src_mb[r * 8 + c] = cb_src[c_off_mb + r * c_stride + c];
+                cr_src_mb[r * 8 + c] = cr_src[c_off_mb + r * c_stride + c];
+            }
+        }
+        let (chroma_mode, pred_cb, pred_cr) =
+            pick_intra_chroma_mode(&cb_src_mb, &cr_src_mb, &cneigh_cb, &cneigh_cr);
+
+        let qp_y = self.opts.qp;
+        let qpc = chroma_qp(qp_y, 0);
+
+        // Luma pipeline — 16 AC blocks + DC Hadamard, quantised.
+        let mut ac_blocks: [[i32; 16]; 16] = [[0; 16]; 16];
+        let mut dc_block = [0i32; 16];
+        for br in 0..4usize {
+            for bc in 0..4usize {
+                let mut residual = [0i32; 16];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let src = y_src[y_off_mb + (br * 4 + r) * l_stride + (bc * 4 + c)] as i32;
+                        let p = pred[(br * 4 + r) * 16 + (bc * 4 + c)] as i32;
+                        residual[r * 4 + c] = src - p;
+                    }
+                }
+                forward_dct_4x4(&mut residual);
+                dc_block[br * 4 + bc] = residual[0];
+                residual[0] = 0;
+                ac_blocks[br * 4 + bc] = residual;
+            }
+        }
+        for b in ac_blocks.iter_mut() {
+            quantize_4x4_ac(b, qp_y);
+        }
+        forward_hadamard_4x4(&mut dc_block);
+        quantize_luma_dc_4x4(&mut dc_block, qp_y);
+
+        // Chroma pipeline.
+        let mut cb_ac: [[i32; 16]; 4] = [[0; 16]; 4];
+        let mut cr_ac: [[i32; 16]; 4] = [[0; 16]; 4];
+        let mut cb_dc = [0i32; 4];
+        let mut cr_dc = [0i32; 4];
+        for plane_is_cb in [true, false] {
+            let (src, pred_p, ac_dst, dc_dst) = if plane_is_cb {
+                (cb_src, &pred_cb, &mut cb_ac, &mut cb_dc)
+            } else {
+                (cr_src, &pred_cr, &mut cr_ac, &mut cr_dc)
+            };
+            for bi in 0..4usize {
+                let br = bi >> 1;
+                let bc = bi & 1;
+                let mut residual = [0i32; 16];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let s = src[c_off_mb + (br * 4 + r) * c_stride + (bc * 4 + c)] as i32;
+                        let p = pred_p[(br * 4 + r) * 8 + (bc * 4 + c)] as i32;
+                        residual[r * 4 + c] = s - p;
+                    }
+                }
+                forward_dct_4x4(&mut residual);
+                dc_dst[bi] = residual[0];
+                residual[0] = 0;
+                ac_dst[bi] = residual;
+                quantize_4x4_ac(&mut ac_dst[bi], qpc);
+            }
+            forward_hadamard_2x2(dc_dst);
+            quantize_chroma_dc_2x2(dc_dst, qpc);
+        }
+
+        // CBP derivation for I_16×16 (Table 7-11 cbp_luma/cbp_chroma).
+        let mut cbp_luma_flag = 0u8;
+        for b in &ac_blocks {
+            if b.iter().any(|&v| v != 0) {
+                cbp_luma_flag = 15;
+                break;
+            }
+        }
+        let chroma_dc_nz = cb_dc.iter().any(|&v| v != 0) || cr_dc.iter().any(|&v| v != 0);
+        let chroma_ac_nz = cb_ac.iter().any(|b| b.iter().any(|&v| v != 0))
+            || cr_ac.iter().any(|b| b.iter().any(|&v| v != 0));
+        let cbp_chroma: u8 = if chroma_ac_nz {
+            2
+        } else if chroma_dc_nz {
+            1
+        } else {
+            0
+        };
+
+        // mb_type: Table 7-11 idx = pred + 4*cbp_chroma + 12*cbp_luma_flag,
+        //          mb_type = idx + 1.
+        let pred_idx = luma_mode as u32;
+        let cbp_luma_bit = u32::from(cbp_luma_flag == 15);
+        let mb_type: u32 = 1 + pred_idx + 4 * cbp_chroma as u32 + 12 * cbp_luma_bit;
+
+        // Zig-zag into coded-scan: the CABAC helper expects raster-order
+        // input and applies zig-zag internally (for simplicity of the
+        // dispatcher). The input buffers above are already raster.
+
+        // Emit one CABAC I_16×16 MB.
+        crate::cabac_enc::mb::encode_i_16x16_mb_cabac(
+            cabac,
+            ctxs,
+            pic,
+            mb_x,
+            mb_y,
+            mb_type,
+            chroma_mode as u32,
+            0, // mb_qp_delta = 0 (fixed QP)
+            qp_y,
+            &dc_block,
+            &ac_blocks,
+            &cb_dc,
+            &cr_dc,
+            &cb_ac,
+            &cr_ac,
+            cbp_luma_flag,
+            cbp_chroma,
+        )?;
+
+        // Local reconstruction — identical to the CAVLC path.
+        let mut dc_reconstructed = dc_block;
+        inv_hadamard_4x4_dc(&mut dc_reconstructed, qp_y);
+        for br in 0..4 {
+            for bc in 0..4 {
+                let mut res = ac_blocks[br * 4 + bc];
+                dequantize_4x4(&mut res, qp_y);
+                res[0] = dc_reconstructed[br * 4 + bc];
+                idct_4x4(&mut res);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let v = pred[(br * 4 + r) * 16 + (bc * 4 + c)] as i32 + res[r * 4 + c];
+                        rec_y[y_off_mb + (br * 4 + r) * l_stride + (bc * 4 + c)] =
+                            v.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        let mut cb_dc_rec = cb_dc;
+        let mut cr_dc_rec = cr_dc;
+        inv_hadamard_2x2_chroma_dc(&mut cb_dc_rec, qpc);
+        inv_hadamard_2x2_chroma_dc(&mut cr_dc_rec, qpc);
+        for plane_is_cb in [true, false] {
+            let (rec, pred_p, ac, dc) = if plane_is_cb {
+                (&mut *rec_cb, &pred_cb, &cb_ac, &cb_dc_rec)
+            } else {
+                (&mut *rec_cr, &pred_cr, &cr_ac, &cr_dc_rec)
+            };
+            for bi in 0..4usize {
+                let br = bi >> 1;
+                let bc = bi & 1;
+                let mut res = ac[bi];
+                dequantize_4x4(&mut res, qpc);
+                res[0] = dc[bi];
+                idct_4x4(&mut res);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let v = pred_p[(br * 4 + r) * 8 + (bc * 4 + c)] as i32 + res[r * 4 + c];
+                        rec[c_off_mb + (br * 4 + r) * c_stride + (bc * 4 + c)] =
+                            v.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2032,7 +2404,13 @@ fn collect_chroma_neighbours(
 /// Build an SPS NAL (header byte + RBSP + emulation prevention). Baseline
 /// profile, level 3.0, chroma 4:2:0, 8-bit, single colour plane. Includes
 /// frame_cropping when width/height are not multiples of 16.
-fn build_sps_nal(width: u32, height: u32, sps_id: u32, paff: bool) -> Result<Vec<u8>> {
+fn build_sps_nal(
+    width: u32,
+    height: u32,
+    sps_id: u32,
+    paff: bool,
+    use_cabac: bool,
+) -> Result<Vec<u8>> {
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
     let coded_w = mb_w * 16;
@@ -2043,9 +2421,15 @@ fn build_sps_nal(width: u32, height: u32, sps_id: u32, paff: bool) -> Result<Vec
 
     // Build RBSP body: 3 header bytes (profile, constraints, level) + bit stream.
     let mut body = Vec::new();
-    body.push(66u8); // profile_idc = Baseline
-                     // constraint_set{0,1}_flag = 1, others 0 → 0xC0
-    body.push(0xC0);
+    // CABAC needs Main profile (77) at minimum — Baseline explicitly bans
+    // entropy_coding_mode_flag = 1 per §A.2.1. CAVLC keeps Baseline (66).
+    if use_cabac {
+        body.push(77u8); // profile_idc = Main
+        body.push(0x00); // no constraint flags (Main ⇒ constraint_set0..5 = 0)
+    } else {
+        body.push(66u8); // profile_idc = Baseline
+        body.push(0xC0); // constraint_set{0,1}_flag = 1 (Baseline+CBP).
+    }
     body.push(30u8); // level_idc = 30 → level 3.0
 
     let mut w = BitWriter::new();
@@ -2094,11 +2478,11 @@ fn build_sps_nal(width: u32, height: u32, sps_id: u32, paff: bool) -> Result<Vec
     Ok(nal)
 }
 
-fn build_pps_nal(pps_id: u32, sps_id: u32) -> Result<Vec<u8>> {
+fn build_pps_nal(pps_id: u32, sps_id: u32, use_cabac: bool) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     w.write_ue(pps_id);
     w.write_ue(sps_id);
-    w.write_flag(false); // entropy_coding_mode_flag = 0 (CAVLC)
+    w.write_flag(use_cabac); // entropy_coding_mode_flag
     w.write_flag(false); // bottom_field_pic_order_in_frame_present_flag
     w.write_ue(0); // num_slice_groups_minus1 = 0
                    // no slice group map
