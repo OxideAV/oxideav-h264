@@ -1824,9 +1824,20 @@ fn collect_intra4x4_neighbours(
         for i in 0..4 {
             top[i] = pic.y[row_off + (mb_x as usize) * 16 + br_col * 4 + i];
         }
-        // Top-right: replicate top[3] if unavailable.
-        for i in 0..4 {
-            top[4 + i] = top[3];
+        // §6.4.10 — top-right 4 samples are available when the block at
+        // (br_row, br_col) has its upper-right 4×4 neighbour already
+        // reconstructed (§8.3.1.2 table; see `top_right_available_4x4`).
+        // When unavailable, the spec replicates `top[3]` into the four
+        // top-right slots, which modes DDL/VL use for their formulas.
+        let tr_avail = crate::mb::top_right_available_4x4(mb_x, mb_y, br_row, br_col, pic);
+        if tr_avail {
+            for i in 0..4 {
+                top[4 + i] = pic.y[row_off + (mb_x as usize) * 16 + br_col * 4 + 4 + i];
+            }
+        } else {
+            for i in 0..4 {
+                top[4 + i] = top[3];
+            }
         }
     }
 
