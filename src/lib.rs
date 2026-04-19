@@ -455,7 +455,7 @@ pub mod tables;
 pub mod transform;
 
 use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecCapabilities, CodecId, PixelFormat};
+use oxideav_core::{CodecCapabilities, CodecId, CodecTag, PixelFormat};
 
 /// The canonical oxideav codec id for H.264 / AVC video.
 pub const CODEC_ID_STR: &str = "h264";
@@ -468,7 +468,8 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(8192, 8192);
-    reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), dec_caps, decoder::make_decoder);
+    let cid = CodecId::new(CODEC_ID_STR);
+    reg.register_decoder_impl(cid.clone(), dec_caps, decoder::make_decoder);
 
     // Encoder: Baseline CAVLC IDR + P. The registered caps advertise
     // `intra_only = false` (P-slice encoding is opt-in via
@@ -479,5 +480,17 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_intra_only(false)
         .with_max_size(720, 576)
         .with_pixel_format(PixelFormat::Yuv420P);
-    reg.register_encoder_impl(CodecId::new(CODEC_ID_STR), enc_caps, encoder::make_encoder);
+    reg.register_encoder_impl(cid.clone(), enc_caps, encoder::make_encoder);
+
+    // AVI FourCC claims — H.264 / AVC covers both Annex B and avcC
+    // prefixed streams; the individual FourCCs below all route here.
+    // H264 / AVC1 are the canonical ones; X264 is libx264; VSSH / DAVC
+    // / PAVC are DVR / prosumer variants; AVC2 / AVC3 cover MP4 Annex B
+    // indicators sometimes stamped into AVI. AI* are Panasonic AVC-Intra.
+    for fcc in &[
+        b"H264", b"AVC1", b"X264", b"VSSH", b"DAVC", b"PAVC", b"AVC2", b"AVC3", b"AI5Q", b"AI55",
+        b"AI15", b"AI13", b"AI12", b"AI1Q", b"AI5P", b"AI53",
+    ] {
+        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
+    }
 }
