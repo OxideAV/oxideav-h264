@@ -64,9 +64,17 @@ pub fn decode_b_slice_mb_444(
         BMbType::IntraInB(imb) => {
             mb444::decode_intra_mb_444(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb)
         }
-        BMbType::Inter { partition } => decode_b_inter_mb_444(
-            br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, prev_qp, partition,
-        ),
+        BMbType::Inter { partition } => {
+            decode_b_inter_mb_444(
+                br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, prev_qp, partition,
+            )?;
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            info.mb_type_b = Some(bmb);
+            if matches!(partition, BPartition::Direct16x16) {
+                info.b_direct_per_block = [true; 16];
+            }
+            Ok(())
+        }
     }
 }
 
@@ -84,6 +92,8 @@ pub fn decode_b_skip_mb_444(
     prev_qp: i32,
 ) -> Result<()> {
     // Initialise MB info for the direct MB — mirrors the 4:2:0 path.
+    // `b_direct_per_block` is all-true because B_Skip covers the whole
+    // MB under §9.3.3.1.1's direct-cache rule.
     {
         let info = pic.mb_info_mut(mb_x, mb_y);
         *info = MbInfo {
@@ -93,6 +103,7 @@ pub fn decode_b_skip_mb_444(
             skipped: true,
             mb_type_p: None,
             p_partition: None,
+            b_direct_per_block: [true; 16],
             ..Default::default()
         };
     }
@@ -519,6 +530,16 @@ fn handle_b8x8(
         let sp = subs[s];
         let (sr0, sc0) = SUB_OFFSETS[s];
         if matches!(sp, BSubPartition::Direct8x8) {
+            // §9.3.3.1.1 direct-cache marker — the 2×2 4×4-block grid
+            // under this sub-MB is direct.
+            {
+                let info = pic.mb_info_mut(mb_x, mb_y);
+                for rr in sr0..sr0 + 2 {
+                    for cc in sc0..sc0 + 2 {
+                        info.b_direct_per_block[rr * 4 + cc] = true;
+                    }
+                }
+            }
             // Direct 8×8 — run `direct_8x8_compensate_pub` through a scratch
             // picture and snapshot MVs, same pattern as 16×16 direct.
             let (mvs, dirs) = snapshot_mv_state_via_420(

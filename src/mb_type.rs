@@ -257,6 +257,23 @@ pub enum BMbType {
     IntraInB(IMbType),
 }
 
+impl BMbType {
+    /// True iff the MB-level type is `B_Direct_16x16`. Used by
+    /// §9.3.3.1.1.3 B-slice `mb_type` bin-0 ctxIdxInc: condTermFlagN = 0
+    /// when the neighbour MB is B_Skip or B_Direct_16x16 (MB-level
+    /// only — B_8x8 with a Direct_8x8 sub-MB does NOT count here; that
+    /// distinction mirrors FFmpeg's `IS_DIRECT(mb_type)` which only
+    /// tests the MB-level `MB_TYPE_DIRECT2` flag.)
+    pub fn is_direct_mb(&self) -> bool {
+        matches!(
+            self,
+            BMbType::Inter {
+                partition: BPartition::Direct16x16
+            }
+        )
+    }
+}
+
 /// Decode a B-slice `mb_type` per Table 7-14. Returns `None` for values the
 /// decoder has not implemented (uncommon transpose or swap variants); the
 /// caller surfaces `Error::Unsupported` when that happens.

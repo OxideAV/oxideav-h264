@@ -127,9 +127,17 @@ pub fn decode_b_slice_mb(
             // Intra MB inside a B-slice — same syntax + reconstruct as I.
             crate::mb::decode_intra_mb_given_imb(br, sps, pps, sh, mb_x, mb_y, pic, prev_qp, imb)
         }
-        BMbType::Inter { partition } => decode_b_inter_mb(
-            br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, prev_qp, partition,
-        ),
+        BMbType::Inter { partition } => {
+            decode_b_inter_mb(
+                br, sps, pps, sh, mb_x, mb_y, pic, ref_list0, ref_list1, ctx, prev_qp, partition,
+            )?;
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            info.mb_type_b = Some(bmb);
+            if matches!(partition, BPartition::Direct16x16) {
+                info.b_direct_per_block = [true; 16];
+            }
+            Ok(())
+        }
     }
 }
 
@@ -146,7 +154,9 @@ pub fn decode_b_skip_mb(
     ctx: &BSliceCtx<'_>,
     prev_qp: i32,
 ) -> Result<()> {
-    // Initialise MB info for the direct MB.
+    // Initialise MB info for the direct MB. `b_direct_per_block` is
+    // all-true because B_Skip is direct over the whole MB (§9.3.3.1.1
+    // neighbour lookups consult this for ref_idx / MVD ctxIdxInc).
     {
         let info = pic.mb_info_mut(mb_x, mb_y);
         *info = MbInfo {
@@ -156,6 +166,7 @@ pub fn decode_b_skip_mb(
             skipped: true,
             mb_type_p: None,
             p_partition: None,
+            b_direct_per_block: [true; 16],
             ..Default::default()
         };
     }
@@ -476,6 +487,16 @@ fn decode_b8x8(
         let sp = subs[s];
         let (sr0, sc0) = SUB_OFFSETS[s];
         if matches!(sp, BSubPartition::Direct8x8) {
+            // §9.3.3.1.1 direct-cache marker — 2×2 4×4-block grid is
+            // direct under this sub-MB.
+            {
+                let info = pic.mb_info_mut(mb_x, mb_y);
+                for rr in sr0..sr0 + 2 {
+                    for cc in sc0..sc0 + 2 {
+                        info.b_direct_per_block[rr * 4 + cc] = true;
+                    }
+                }
+            }
             if sh.direct_spatial_mv_pred_flag {
                 direct_8x8_spatial_compensate(
                     sh, sps, ctx, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1,

@@ -128,6 +128,14 @@ pub fn decode_b_mb_cabac(
                 d, ctxs, sh, sps, pps, mb_x, mb_y, pic, ref_list0, ref_list1, bctx, prev_qp,
                 partition,
             )?;
+            // §9.3.3.1.1.3 neighbour ctxIdxInc uses `mb_type_b` below —
+            // publish the decoded B-MB type + "whole MB direct" flag so
+            // later MBs' ctxIdxInc sees the right classification.
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            info.mb_type_b = Some(bmb);
+            if matches!(partition, BPartition::Direct16x16) {
+                info.b_direct_per_block = [true; 16];
+            }
         }
     }
     Ok(false)
@@ -538,6 +546,18 @@ fn decode_b_8x8(
         let sp = subs[s];
         let (sr0, sc0) = SUB_OFFSETS[s];
         if matches!(sp, BSubPartition::Direct8x8) {
+            // §9.3.3.1.1.6 / .7 — mark this sub-MB's 2×2 4×4 grid as
+            // "direct" for downstream ctxIdxInc lookups. Mirrors FFmpeg's
+            // `fill_rectangle(&direct_cache[scan8[4*i]], 2, 2, 8, ...)` at
+            // h264_cabac.c:2190.
+            {
+                let info = pic.mb_info_mut(mb_x, mb_y);
+                for rr in sr0..sr0 + 2 {
+                    for cc in sc0..sc0 + 2 {
+                        info.b_direct_per_block[rr * 4 + cc] = true;
+                    }
+                }
+            }
             direct_8x8_compensate(
                 sh, sps, bctx, mb_x, mb_y, sr0, sc0, pic, ref_list0, ref_list1,
             )?;
@@ -927,21 +947,30 @@ pub(crate) fn mb_skip_flag_b_ctx_idx_inc(pic: &Picture, mb_x: u32, mb_y: u32) ->
 
 pub(crate) fn mb_type_b_ctx_idx_inc(pic: &Picture, mb_x: u32, mb_y: u32) -> u8 {
     // §9.3.3.1.1.3 B-slice bin 0: condTermFlagN = 0 iff mbN is unavailable
-    // or mbN is `B_Skip` or `B_Direct_16x16`, else 1. We proxy "direct" via
-    // the skipped flag + the tracked mb_type — conservatively treat a
-    // coded non-intra MB as non-direct.
-    let a = if mb_x > 0 {
-        let m = pic.mb_info_at(mb_x - 1, mb_y);
-        m.coded && !m.skipped
-    } else {
-        false
+    // or mbN is `B_Skip` or `B_Direct_16x16`, else 1. Mirrors FFmpeg's
+    // `decode_cabac_mb_type` at h264_cabac.c:2032 — `!IS_DIRECT(top_type)`
+    // checks MB-level MB_TYPE_DIRECT2 which is set for B_Skip and
+    // B_Direct_16x16 only (B_8x8 with direct sub-MBs does NOT set it).
+    let cond = |m: &crate::picture::MbInfo| -> bool {
+        if !m.coded {
+            return false;
+        }
+        if m.skipped {
+            // B_Skip → condTermFlagN = 0.
+            return false;
+        }
+        if matches!(
+            m.mb_type_b,
+            Some(crate::mb_type::BMbType::Inter {
+                partition: crate::mb_type::BPartition::Direct16x16,
+            })
+        ) {
+            return false;
+        }
+        true
     };
-    let b = if mb_y > 0 {
-        let m = pic.mb_info_at(mb_x, mb_y - 1);
-        m.coded && !m.skipped
-    } else {
-        false
-    };
+    let a = mb_x > 0 && cond(pic.mb_info_at(mb_x - 1, mb_y));
+    let b = mb_y > 0 && cond(pic.mb_info_at(mb_x, mb_y - 1));
     (a as u8) + (b as u8)
 }
 
@@ -953,7 +982,11 @@ fn ref_idx_ctx_idx_inc_at(
     c0: usize,
     list: u8,
 ) -> u8 {
-    let a = neighbour_ref_idx_gt_zero(
+    // §9.3.3.1.1.6 — FFmpeg `decode_cabac_mb_ref`: for B slices, a
+    // neighbour block whose `direct_cache` bit is set contributes 0 to
+    // ctxIdxInc regardless of its `ref_idx_lX`. For P slices it's just
+    // `ref_idx > 0` with no direct gating.
+    let a = neighbour_ref_idx_gt_zero_b(
         pic,
         mb_x as i32,
         mb_y as i32,
@@ -961,7 +994,7 @@ fn ref_idx_ctx_idx_inc_at(
         c0 as i32 - 1,
         list,
     );
-    let b = neighbour_ref_idx_gt_zero(
+    let b = neighbour_ref_idx_gt_zero_b(
         pic,
         mb_x as i32,
         mb_y as i32,
@@ -972,7 +1005,7 @@ fn ref_idx_ctx_idx_inc_at(
     (a as u8) + 2 * (b as u8)
 }
 
-fn neighbour_ref_idx_gt_zero(
+fn neighbour_ref_idx_gt_zero_b(
     pic: &Picture,
     mb_x: i32,
     mb_y: i32,
@@ -985,7 +1018,12 @@ fn neighbour_ref_idx_gt_zero(
         None => return false,
     };
     let info = pic.mb_info_at(mbx, mby);
-    if !info.coded || info.intra || info.skipped {
+    if !info.coded || info.intra {
+        return false;
+    }
+    // B_Skip / B_Direct_16x16 / B8x8 Direct_8x8 sub → direct-cache gate
+    // contributes 0 regardless of ref_idx.
+    if info.b_direct_per_block[(r * 4 + c) as usize] {
         return false;
     }
     let ref_idx = if list == 0 {
@@ -1043,7 +1081,14 @@ fn neighbour_abs_mvd(
         None => return 0,
     };
     let info = pic.mb_info_at(mbx, mby);
-    if !info.coded || info.intra || info.skipped {
+    if !info.coded || info.intra {
+        return 0;
+    }
+    // §9.3.3.1.1.7 — FFmpeg's `mvd_cache` is zeroed on direct / skip
+    // blocks (no MVD was coded). Our per-MB `mvd_lX_abs` can hold stale
+    // magnitudes from a previous decode; gate by the direct-cache flag
+    // so the amvd accumulator mirrors FFmpeg's.
+    if info.b_direct_per_block[(r * 4 + c) as usize] {
         return 0;
     }
     let (x, y) = if list == 0 {

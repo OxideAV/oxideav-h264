@@ -5,7 +5,7 @@
 
 use oxideav_core::{frame::VideoPlane, PixelFormat, TimeBase, VideoFrame};
 
-use crate::mb_type::{IMbType, PMbType, PPartition};
+use crate::mb_type::{BMbType, IMbType, PMbType, PPartition};
 
 /// §6.4.1 — (SubWidthC, SubHeightC) for a given `chroma_format_idc`.
 /// Chroma plane sample dimensions are `PicWidthInSamplesL / SubWidthC`
@@ -151,6 +151,13 @@ pub struct MbInfo {
     /// P-slice partition layout for inter macroblocks — cached here so
     /// neighbour MV lookups don't re-parse `mb_type_p`.
     pub p_partition: Option<PPartition>,
+    /// Parsed B-slice macroblock type. `None` for non-B macroblocks.
+    /// Consulted by §9.3.3.1.1.3 B-slice `mb_type` ctxIdxInc (bin 0:
+    /// condTermFlagN = 0 when the neighbour MB is B_Skip or
+    /// B_Direct_16x16, else 1). Also gates the "direct-cache" lookups
+    /// in §9.3.3.1.1.6 (`ref_idx_lX`) and §9.3.3.1.1.7 (`mvd_lX`) —
+    /// see [`Self::b_direct_per_block`] for block-level granularity.
+    pub mb_type_b: Option<BMbType>,
     /// Per-4×4-sub-block list-0 motion vectors in quarter-pel units
     /// (`mv[row*4+col]`). Zero for intra macroblocks.
     pub mv_l0: [(i16, i16); 16],
@@ -230,6 +237,15 @@ pub struct MbInfo {
     /// MB see the same flag). Drives the per-MB row-stride / sample
     /// offset helpers on [`Picture`].
     pub mb_field_decoding_flag: bool,
+    /// Per-4×4 block "is direct" flag mirroring FFmpeg's `direct_cache`:
+    /// `true` on every block that belongs to a B_Skip / B_Direct_16x16 /
+    /// B8x8 sub-MB with `B_Direct_8x8`. Consulted by §9.3.3.1.1.3
+    /// (B-slice `mb_type` ctxIdxInc), §9.3.3.1.1.6 (`ref_idx_lX`
+    /// ctxIdxInc — `direct_cache` gate in `decode_cabac_mb_ref`), and
+    /// §9.3.3.1.1.7 (`mvd_lX` ctxIdxInc — MVD magnitudes published by a
+    /// direct neighbour default to 0 because direct MVs are not coded
+    /// as MVDs).
+    pub b_direct_per_block: [bool; 16],
 }
 
 impl Default for MbInfo {
@@ -247,6 +263,7 @@ impl Default for MbInfo {
             mb_type_i: None,
             mb_type_p: None,
             p_partition: None,
+            mb_type_b: None,
             mv_l0: [(0, 0); 16],
             ref_idx_l0: [-1; 16],
             mv_l1: [(0, 0); 16],
@@ -265,6 +282,7 @@ impl Default for MbInfo {
             cbp_luma: 0,
             cbp_chroma: 0,
             mb_field_decoding_flag: false,
+            b_direct_per_block: [false; 16],
         }
     }
 }

@@ -238,6 +238,11 @@ pub fn decode_b_mb_cabac_444(
                 d, ctxs, sh, sps, pps, mb_x, mb_y, pic, ref_list0, ref_list1, bctx, prev_qp,
                 partition,
             )?;
+            let info = pic.mb_info_mut(mb_x, mb_y);
+            info.mb_type_b = Some(bmb);
+            if matches!(partition, crate::mb_type::BPartition::Direct16x16) {
+                info.b_direct_per_block = [true; 16];
+            }
             Ok(false)
         }
     }
@@ -662,6 +667,18 @@ fn decode_b_8x8_444(
         let sp = subs[s];
         let (sr0, sc0) = SUB_OFFSETS[s];
         if matches!(sp, BSubPartition::Direct8x8) {
+            // §9.3.3.1.1 direct-cache — mark this sub-MB's 2×2 4×4
+            // block grid as "direct" so the ctxIdxInc for later MBs'
+            // ref_idx / MVD reads sees this neighbour as direct
+            // (FFmpeg h264_cabac.c:2190).
+            {
+                let info = pic.mb_info_mut(mb_x, mb_y);
+                for rr in sr0..sr0 + 2 {
+                    for cc in sc0..sc0 + 2 {
+                        info.b_direct_per_block[rr * 4 + cc] = true;
+                    }
+                }
+            }
             // Direct 8×8 — derive MVs through the CAVLC compensator on a
             // 4:2:0 scratch, then snapshot + re-MC on 4:4:4 via the
             // shared helper.

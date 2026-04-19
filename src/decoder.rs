@@ -1772,21 +1772,10 @@ fn decode_cabac_b_slice_444(
             "h264 cabac 4:4:4 b-slice: first_mb_in_slice out of range",
         ));
     }
-    // The §9.3 CABAC B-slice parse has a known bin-level divergence
-    // vs FFmpeg once partition-shape interactions get non-trivial on
-    // the testsrc fixture — drift surfaces either as a "read past end
-    // of stream" during residual or as a post-slice terminator
-    // misalignment. Rather than bail the whole slice, we catch the
-    // error, blank the remainder of the MB row as B_Skip (direct-mode
-    // MVs, zero residual), and still return the frame the decoder has
-    // built up to that MB. The 4:4:4 CABAC B test measures % match
-    // against the raw reference, so partial decode + graceful tail
-    // recovery is both safer and closer to the FFmpeg behaviour of
-    // emitting "best-effort" frames on parse drift.
     loop {
         let mb_x = mb_addr % mb_w;
         let mb_y = mb_addr / mb_w;
-        let decode_result = decode_b_mb_cabac_444(
+        decode_b_mb_cabac_444(
             &mut dec,
             &mut ctxs,
             sh,
@@ -1799,105 +1788,19 @@ fn decode_cabac_b_slice_444(
             ref_list1,
             bctx,
             &mut prev_qp,
-        );
-        if decode_result.is_err() {
-            // Fill the rest of the slice as B_Skip (direct-mode MVs,
-            // zero residual) using the CAVLC direct compensator.
-            fill_remaining_b_slice_as_skip_444(
-                sh, sps, mb_addr, total_mbs, mb_w, pic, ref_list0, ref_list1, bctx, prev_qp,
-            );
-            return Ok(());
-        }
+        )?;
         mb_addr += 1;
-        let end = match dec.decode_terminate() {
-            Ok(e) => e,
-            Err(_) => {
-                // Terminator read drifted past the bitstream — fill the
-                // remainder as skip and bail gracefully.
-                fill_remaining_b_slice_as_skip_444(
-                    sh, sps, mb_addr, total_mbs, mb_w, pic, ref_list0, ref_list1, bctx, prev_qp,
-                );
-                return Ok(());
-            }
-        };
+        let end = dec.decode_terminate()?;
         if end == 1 {
             break;
         }
         if mb_addr >= total_mbs {
-            // Ran out of MBs without a terminator — fill nothing
-            // (we've already written all MBs) and return cleanly.
-            return Ok(());
+            return Err(Error::invalid(
+                "h264 cabac 4:4:4 b-slice: end_of_slice_flag did not fire before last MB",
+            ));
         }
     }
     Ok(())
-}
-
-/// Populate [`mb_addr..total_mbs`] by copying samples from the first
-/// L0 reference. On the testsrc fixture the reference is the previous
-/// frame and produces a closer match than filling with zeros or
-/// running direct-mode MC against drifted MV state. If no L0 reference
-/// is available, fall back to direct-mode B_Skip.
-#[allow(clippy::too_many_arguments)]
-fn fill_remaining_b_slice_as_skip_444(
-    sh: &SliceHeader,
-    sps: &Sps,
-    mut mb_addr: u32,
-    total_mbs: u32,
-    mb_w: u32,
-    pic: &mut Picture,
-    ref_list0: &[&Picture],
-    ref_list1: &[&Picture],
-    bctx: &crate::b_mb::BSliceCtx<'_>,
-    prev_qp: i32,
-) {
-    // Prefer list-1 (which is usually the next display-order anchor)
-    // on testsrc — it's temporally closer than list-0 on B frames.
-    // If there's no list-1 reference, fall back to list-0.
-    let copy_ref = ref_list1
-        .first()
-        .copied()
-        .or_else(|| ref_list0.first().copied());
-    while mb_addr < total_mbs {
-        let mb_x = mb_addr % mb_w;
-        let mb_y = mb_addr / mb_w;
-        if let Some(src) = copy_ref {
-            copy_mb_444_from_reference(pic, src, mb_x, mb_y);
-            {
-                let info = pic.mb_info_mut(mb_x, mb_y);
-                *info = crate::picture::MbInfo {
-                    qp_y: prev_qp,
-                    coded: true,
-                    intra: false,
-                    skipped: true,
-                    ..Default::default()
-                };
-            }
-        } else {
-            let _ = crate::b_mb_444::decode_b_skip_mb_444(
-                sh, sps, mb_x, mb_y, pic, ref_list0, ref_list1, bctx, prev_qp,
-            );
-        }
-        mb_addr += 1;
-    }
-}
-
-/// Copy a 4:4:4 MB's Y/Cb/Cr samples from a reference picture into
-/// `pic` at the same MB position. Used by the drift-recovery path so
-/// the emitted frame has the reference's content (instead of zeros
-/// or carried-over stale samples) for any MB past the point of CABAC
-/// divergence.
-fn copy_mb_444_from_reference(pic: &mut Picture, src: &Picture, mb_x: u32, mb_y: u32) {
-    let stride_dst = pic.luma_stride();
-    let stride_src = src.luma_stride();
-    let off_dst = pic.luma_off(mb_x, mb_y);
-    let off_src = src.luma_off(mb_x, mb_y);
-    for r in 0..16usize {
-        for c in 0..16usize {
-            pic.y[off_dst + r * stride_dst + c] = src.y[off_src + r * stride_src + c];
-            pic.cb[off_dst + r * stride_dst + c] = src.cb[off_src + r * stride_src + c];
-            pic.cr[off_dst + r * stride_dst + c] = src.cr[off_src + r * stride_src + c];
-        }
-    }
 }
 
 /// §9.3 CABAC entropy-coded 10-bit I-slice loop — mirrors
