@@ -155,9 +155,8 @@ fn cabac_high_profile_decodes_bit_exact_vs_ffmpeg() {
     let mut display_idx = 0usize;
     for (decode_idx, frame_bytes) in frames.iter().enumerate() {
         let pkt = Packet::new(0, TimeBase::new(1, 24), frame_bytes.clone());
-        dec.send_packet(&pkt).unwrap_or_else(|e| {
-            panic!("send_packet on decode frame {decode_idx} failed: {e}")
-        });
+        dec.send_packet(&pkt)
+            .unwrap_or_else(|e| panic!("send_packet on decode frame {decode_idx} failed: {e}"));
         while let Ok(Frame::Video(vf)) = dec.receive_frame() {
             let ours = flatten_yuv420p(&vf);
             let off = display_idx * FRAME_BYTES;
