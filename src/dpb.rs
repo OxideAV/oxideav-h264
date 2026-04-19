@@ -560,10 +560,19 @@ pub enum RplmCommand {
 /// in the DPB's live short-term set (by `frame_num_wrap`, since
 /// `PicNum == FrameNumWrap` for frame-coded pictures). For long-term
 /// commands the target is located by `LongTermPicNum`. The picture is
-/// moved to position `refIdxLX` (which advances each command) and every
-/// entry at or below that position shifts down; a prior occurrence of the
-/// same picture higher in the list is then removed. The final list is
-/// truncated back to `num_ref_idx_lX_active_minus1 + 1`.
+/// moved to position `refIdxLX` (which advances on each successfully
+/// applied command) and every entry at or below that position shifts
+/// down; a prior occurrence of the same picture higher in the list is
+/// then removed. The final list is truncated back to
+/// `num_ref_idx_lX_active_minus1 + 1`.
+///
+/// Error recovery — commands that reference a picture no longer in the
+/// DPB are logged to stderr and skipped, mirroring FFmpeg's lenient
+/// `ff_h264_build_ref_list` ("reference picture missing during reorder"
+/// + continue with the default list slot). Real-world High-profile
+/// streams routinely emit such commands (sloppy encoders, mid-stream
+/// entry, dropped refs) and a hard reject would reject the bulk of
+/// in-the-wild content.
 pub fn apply_rplm<'a>(
     default: Vec<&'a RefFrame>,
     commands: &[RplmCommand],
@@ -578,9 +587,18 @@ pub fn apply_rplm<'a>(
     // selected, initialised to CurrPicNum at the start of each list's
     // modification loop. Long-term commands do not update it.
     let mut pic_num_pred = curr_pic_num;
+    // Insertion cursor (`refIdxLX` in the spec). Advances only on a
+    // successfully-applied command so that skipped commands do not leave
+    // gaps in the list.
+    let mut ref_idx: usize = 0;
 
-    for (ref_idx, cmd) in commands.iter().enumerate() {
-        let target: Option<&'a RefFrame> = match *cmd {
+    for cmd in commands {
+        // Compute the target picture number (for short-term commands) and
+        // look it up. For short-term ops, `picNumPred` MUST be updated
+        // even when the target is not found — the spec's iterative
+        // definition of `picNumLXPred` does not branch on presence, and
+        // keeping it in sync preserves the meaning of subsequent deltas.
+        let (target, diag): (Option<&'a RefFrame>, MissingDiag) = match *cmd {
             RplmCommand::ShortTermSubtract {
                 abs_diff_pic_num_minus1,
             } => {
@@ -597,7 +615,10 @@ pub fn apply_rplm<'a>(
                     no_wrap
                 };
                 pic_num_pred = no_wrap;
-                find_short_term_ref(all_refs, pic_num)
+                (
+                    find_short_term_ref(all_refs, pic_num),
+                    MissingDiag::ShortTerm(pic_num),
+                )
             }
             RplmCommand::ShortTermAdd {
                 abs_diff_pic_num_minus1,
@@ -613,18 +634,45 @@ pub fn apply_rplm<'a>(
                     no_wrap
                 };
                 pic_num_pred = no_wrap;
-                find_short_term_ref(all_refs, pic_num)
+                (
+                    find_short_term_ref(all_refs, pic_num),
+                    MissingDiag::ShortTerm(pic_num),
+                )
             }
-            RplmCommand::LongTerm { long_term_pic_num } => {
-                find_long_term_ref(all_refs, long_term_pic_num)
-            }
+            RplmCommand::LongTerm { long_term_pic_num } => (
+                find_long_term_ref(all_refs, long_term_pic_num),
+                MissingDiag::LongTerm(long_term_pic_num),
+            ),
         };
 
-        let target = target.ok_or_else(|| {
-            oxideav_core::Error::invalid(
-                "h264 rplm: modification command references a picture not in the DPB",
-            )
-        })?;
+        let target = match target {
+            Some(t) => t,
+            None => {
+                // Real-world streams routinely emit RPLM commands that
+                // address references already evicted by sliding-window
+                // marking — sloppy encoders, reference frames dropped
+                // intentionally for bitrate, or mid-stream decoder entry.
+                // FFmpeg's `ff_h264_build_ref_list` logs and continues
+                // (optionally substituting a default); a hard reject here
+                // would make the decoder unusable on High-profile content.
+                // Skip this command — the list stays unchanged for this
+                // slot, subsequent commands still apply at the same
+                // insertion cursor.
+                match diag {
+                    MissingDiag::ShortTerm(pic_num) => {
+                        eprintln!(
+                            "h264 rplm: short-term pic_num {pic_num} not in DPB; skipping command"
+                        );
+                    }
+                    MissingDiag::LongTerm(ltpn) => {
+                        eprintln!(
+                            "h264 rplm: long_term_pic_num {ltpn} not in DPB; skipping command"
+                        );
+                    }
+                }
+                continue;
+            }
+        };
         // §8.2.4.3.1 — insert target at refIdx, shift the tail down,
         // and drop any later duplicate of the same picture. RefFrame
         // identity is established by pointer comparison against
@@ -648,10 +696,19 @@ pub fn apply_rplm<'a>(
                 true
             }
         });
+        ref_idx += 1;
     }
 
     list.truncate(want);
     Ok(list)
+}
+
+/// Diagnostic payload for a failed RPLM lookup — carries the spec-level
+/// identifier (picNum for short-term, LongTermPicNum for long-term) so the
+/// skip log can point directly at the missing reference.
+enum MissingDiag {
+    ShortTerm(i32),
+    LongTerm(u32),
 }
 
 fn find_short_term_ref(all_refs: &[RefFrame], pic_num: i32) -> Option<&RefFrame> {
@@ -1295,18 +1352,52 @@ mod tests {
         assert_eq!(modified[1].frame_num, 3);
     }
 
-    /// Commands referencing a picture not in the DPB surface
-    /// `Error::InvalidData` rather than silently succeeding.
+    /// Commands referencing a picture not in the DPB are tolerated:
+    /// real-world High-profile streams routinely emit RPLM targeting
+    /// already-evicted references (FFmpeg prints
+    /// "reference picture missing during reorder" and continues). The
+    /// command is skipped — the default list survives unchanged — and
+    /// subsequent commands still apply.
     #[test]
-    fn rplm_missing_picture_errors() {
+    fn rplm_missing_picture_is_skipped() {
         let mut dpb = Dpb::new(4, 4);
         dpb.insert_reference(dummy_pic(), 0, 0, 0);
         dpb.insert_reference(dummy_pic(), 1, 1, 1);
         let default = dpb.build_list0_p(1);
+        let default_frame_nums: Vec<u32> = default.iter().map(|f| f.frame_num).collect();
         let cmds = vec![RplmCommand::LongTerm {
             long_term_pic_num: 99,
         }];
-        let res = apply_rplm(default, &cmds, 2, 16, 1, dpb.frames_raw());
-        assert!(res.is_err());
+        let modified =
+            apply_rplm(default, &cmds, 2, 16, 1, dpb.frames_raw()).expect("apply tolerant");
+        let got: Vec<u32> = modified.iter().map(|f| f.frame_num).collect();
+        assert_eq!(got, default_frame_nums);
+    }
+
+    /// A missing command in the middle of a sequence must not block the
+    /// commands after it: the surviving commands apply at the cursor the
+    /// skipped one would have occupied, so the resulting list equals what
+    /// the non-skipped commands alone would have produced.
+    #[test]
+    fn rplm_missing_picture_mid_sequence_skipped() {
+        let mut dpb = Dpb::new(4, 4);
+        for fn_ in 0..4u32 {
+            dpb.insert_reference(dummy_pic(), fn_, fn_ as i32, fn_ as i32);
+        }
+        dpb.update_frame_num_wrap(4, 16);
+        let default = dpb.build_list0_p(3);
+        // Default is [3, 2, 1, 0]. Sequence: unresolvable LongTerm (skip),
+        // then idc=0 delta=2 → picNum = curr(4) - 3 = 1 moves to slot 0.
+        let cmds = vec![
+            RplmCommand::LongTerm {
+                long_term_pic_num: 42,
+            },
+            RplmCommand::ShortTermSubtract {
+                abs_diff_pic_num_minus1: 2,
+            },
+        ];
+        let modified = apply_rplm(default, &cmds, 4, 16, 3, dpb.frames_raw()).expect("apply");
+        let pocs: Vec<i32> = modified.iter().map(|f| f.poc).collect();
+        assert_eq!(pocs, vec![1, 3, 2, 0]);
     }
 }
