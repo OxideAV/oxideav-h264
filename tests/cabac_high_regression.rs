@@ -1,26 +1,13 @@
-//! Regression target for the known CABAC I-slice correctness bug on
-//! **High-profile** 4:2:0 8-bit streams at realistic sizes.
+//! Regression guard for CABAC High-profile streams with mixed I / P / B
+//! slices at realistic sizes.
 //!
 //! The Main-profile CABAC path (see `decode_cabac_b.rs`) already
-//! exercises I + P + B slices at 64×64 and documents that the I-slice
-//! produces non-bit-exact pixels. At that size the decoder stays in
-//! sync — the residual drift only shows up in pixel values. At any
-//! High-profile size ≥ ~200×200, the same underlying desync starts
-//! leaking out of the I-slice into the CABAC engine state: a few
-//! frames in, the arithmetic decoder reads past the end of a slice
-//! and every subsequent slice errors out. That's what failed on the
-//! user-reported 1920×1080 H.264 MKV.
-//!
-//! This test fails today (bug is still present) and is therefore
-//! marked `#[ignore]` so the default `cargo test` run stays green.
-//! To run it explicitly:
-//!
-//! ```sh
-//! cargo test -p oxideav-h264 --test cabac_high_regression -- --ignored
-//! ```
-//!
-//! When the bug is fixed, remove the `#[ignore]` attribute and the
-//! test joins the default suite as a permanent guard.
+//! exercises I + P + B slices at 64×64. At any High-profile size ≥
+//! ~200×200 with the same GOP shape, an earlier bug caused the
+//! arithmetic decoder to read past end of stream a few frames into
+//! the first B-slice — the test now bit-exact verifies every decoded
+//! display against the libavcodec reference YUV so that regression
+//! cannot come back.
 //!
 //! ## Fixture regeneration
 //!
@@ -121,21 +108,11 @@ fn fixture_contains_expected_frame_count() {
 }
 
 /// Hard bit-exact check of `oxideav-h264` against libavcodec on a
-/// High-profile CABAC fixture. Fails today because of the known
-/// I-slice residual drift — both on the IDR itself (≈ 57% bytes
-/// differ) and cascading through P / B slices until the CABAC
-/// arithmetic decoder reads past end of stream a few frames in.
-///
-/// Marked `#[ignore]` so the default suite stays green. Remove the
-/// `#[ignore]` once the bug is fixed; the test then becomes the
-/// permanent regression guard.
-///
-/// Run explicitly with:
-/// ```sh
-/// cargo test -p oxideav-h264 --test cabac_high_regression -- --ignored
-/// ```
+/// High-profile CABAC fixture with I + P + B slices. Covers the
+/// CABAC B-slice intra-in-B context bank (ctx 32..=35) — mis-routing
+/// this to the I-slice bank desyncs the arithmetic decoder inside
+/// the first B-slice of the GOP.
 #[test]
-#[ignore = "known CABAC I-slice correctness bug; un-ignore once fixed"]
 fn cabac_high_profile_decodes_bit_exact_vs_ffmpeg() {
     let (sps, pps, frames) = split_frames(ES);
     assert_eq!(frames.len(), EXPECTED_FRAMES);
@@ -153,30 +130,49 @@ fn cabac_high_profile_decodes_bit_exact_vs_ffmpeg() {
     let _ = dec.send_packet(&pkt);
 
     let mut display_idx = 0usize;
+    let check = |vf: &VideoFrame, display_idx: usize, decode_idx: Option<usize>| {
+        let ours = flatten_yuv420p(vf);
+        let off = display_idx * FRAME_BYTES;
+        assert!(
+            off + FRAME_BYTES <= REF_YUV.len(),
+            "decoded past end of reference yuv at display #{display_idx}"
+        );
+        let theirs = &REF_YUV[off..off + FRAME_BYTES];
+        if ours != theirs {
+            let (diff, max) = summarise_diff(&ours, theirs);
+            match decode_idx {
+                Some(i) => panic!(
+                    "display #{display_idx} (from decode frame {i}): \
+                     {diff}/{total} bytes differ, max |Δ|={max} — \
+                     libavcodec-bit-exact decode regressed (or the \
+                     known CABAC I-slice bug is still present).",
+                    total = FRAME_BYTES
+                ),
+                None => panic!(
+                    "display #{display_idx} (drained after flush): \
+                     {diff}/{total} bytes differ, max |Δ|={max} — \
+                     libavcodec-bit-exact decode regressed.",
+                    total = FRAME_BYTES
+                ),
+            }
+        }
+    };
     for (decode_idx, frame_bytes) in frames.iter().enumerate() {
         let pkt = Packet::new(0, TimeBase::new(1, 24), frame_bytes.clone());
         dec.send_packet(&pkt)
             .unwrap_or_else(|e| panic!("send_packet on decode frame {decode_idx} failed: {e}"));
         while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-            let ours = flatten_yuv420p(&vf);
-            let off = display_idx * FRAME_BYTES;
-            assert!(
-                off + FRAME_BYTES <= REF_YUV.len(),
-                "decoded past end of reference yuv at display #{display_idx}"
-            );
-            let theirs = &REF_YUV[off..off + FRAME_BYTES];
-            if ours != theirs {
-                let (diff, max) = summarise_diff(&ours, theirs);
-                panic!(
-                    "display #{display_idx} (from decode frame {decode_idx}): \
-                     {diff}/{total} bytes differ, max |Δ|={max} — \
-                     libavcodec-bit-exact decode regressed (or the \
-                     known CABAC I-slice bug is still present).",
-                    total = FRAME_BYTES
-                );
-            }
+            check(&vf, display_idx, Some(decode_idx));
             display_idx += 1;
         }
+    }
+    // Final flush — POC reorder may hold the last 1-2 pictures back
+    // until EOS. Drain them all so the full display sequence is
+    // verified end-to-end.
+    dec.flush().expect("flush");
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        check(&vf, display_idx, None);
+        display_idx += 1;
     }
     assert_eq!(
         display_idx, EXPECTED_FRAMES,

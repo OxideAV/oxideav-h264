@@ -513,10 +513,21 @@ impl H264Decoder {
                 // to 0 so frames emerge immediately.
                 let want_dpb_size = sps.max_num_ref_frames.max(1);
                 let vui_reorder = sps.vui.as_ref().and_then(|v| v.max_num_reorder_frames);
-                let want_reorder = if sh.slice_type == SliceType::B {
-                    vui_reorder.unwrap_or(sps.max_num_ref_frames).max(1)
-                } else {
-                    0
+                // P-slices need the VUI reorder bound too: if the stream
+                // declares `max_num_reorder_frames > 0` then some B-slice
+                // later in the GOP will need an earlier P held back for
+                // POC ordering. Missing this meant the first few P-slices
+                // after an IDR drained with a zero window and the first
+                // B's POC (which falls *between* two already-emitted P
+                // POCs) could no longer land in the right display slot.
+                // I-slices keep a zero window because a single I frame
+                // has nothing to reorder against — letting it emerge
+                // immediately keeps the latency of I-frame-only streams
+                // (e.g., the 8×8 intra fixture) matching the pre-B era.
+                let want_reorder = match sh.slice_type {
+                    SliceType::I | SliceType::SI => 0,
+                    SliceType::P | SliceType::SP => vui_reorder.unwrap_or(0),
+                    SliceType::B => vui_reorder.unwrap_or(sps.max_num_ref_frames).max(1),
                 };
                 match self.dpb.as_mut() {
                     Some(d) if d.max_num_ref_frames == want_dpb_size => {

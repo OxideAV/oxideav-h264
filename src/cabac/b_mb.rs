@@ -29,9 +29,9 @@ use crate::cabac::mb::{
 use crate::cabac::residual::{BlockCat, CbfNeighbours};
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_SKIP_FLAG_B,
-    CTX_IDX_MB_TYPE_B, CTX_IDX_MB_TYPE_I, CTX_IDX_MVD_L0_X, CTX_IDX_MVD_L0_Y, CTX_IDX_MVD_L1_X,
-    CTX_IDX_MVD_L1_Y, CTX_IDX_REF_IDX_L0, CTX_IDX_REF_IDX_L1, CTX_IDX_SUB_MB_TYPE_B,
-    CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
+    CTX_IDX_MB_TYPE_B, CTX_IDX_MB_TYPE_INTRA_IN_B, CTX_IDX_MVD_L0_X, CTX_IDX_MVD_L0_Y,
+    CTX_IDX_MVD_L1_X, CTX_IDX_MVD_L1_Y, CTX_IDX_REF_IDX_L0, CTX_IDX_REF_IDX_L1,
+    CTX_IDX_SUB_MB_TYPE_B, CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
 };
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{
@@ -92,22 +92,26 @@ pub fn decode_b_mb_cabac(
 
     // §9.3.3.1.1.3 — B-slice mb_type. Decoded value uses the Table 7-14
     // convention (0..=22 inter, 23..=47 intra-in-B, 48 = I_PCM).
+    //
+    // The intra-in-B suffix lives at its OWN ctxIdxOffset 32 (ctx 32..=35)
+    // — NOT ctxIdxOffset 3 (I/SI slice mb_type). The two banks happen to
+    // share the same `(m, n)` initialisation rows per spec Table 9-14, but
+    // the runtime state diverges: during a B slice nothing writes to
+    // ctx 3..=10, so those contexts stay at their slice-init values, while
+    // ctx 32..=35 evolve with each intra-in-B MB decoded.
+    //
+    // We pass the full B mb_type window (27..=35) to the prefix decoder
+    // — its `b_ctxs[5]` read at ctx 32 is the same bin FFmpeg reads inside
+    // `decode_cabac_intra_mb_type(..., 32, 0)` as the I_NxN flag, so it
+    // serves both the prefix's "bits[LSB]" role AND the intra-suffix's
+    // bin-0 role. For the non-I_NxN intra branch we need ctx 33..=35
+    // separately.
     let mb_type_raw = {
-        let (b_slice, i_slice) = if CTX_IDX_MB_TYPE_B < CTX_IDX_MB_TYPE_I {
-            let (head, tail) = ctxs.split_at_mut(CTX_IDX_MB_TYPE_I);
-            (
-                &mut head[CTX_IDX_MB_TYPE_B..CTX_IDX_MB_TYPE_B + 9],
-                &mut tail[..8],
-            )
-        } else {
-            let (head, tail) = ctxs.split_at_mut(CTX_IDX_MB_TYPE_B);
-            (
-                &mut tail[..9],
-                &mut head[CTX_IDX_MB_TYPE_I..CTX_IDX_MB_TYPE_I + 8],
-            )
-        };
         let inc = mb_type_b_ctx_idx_inc(pic, mb_x, mb_y);
-        binarize::decode_mb_type_b(d, b_slice, i_slice, inc)?
+        let (b_slice, b_intra) = ctxs[CTX_IDX_MB_TYPE_B..CTX_IDX_MB_TYPE_INTRA_IN_B + 4]
+            .split_at_mut(CTX_IDX_MB_TYPE_INTRA_IN_B + 1 - CTX_IDX_MB_TYPE_B);
+        // b_slice: ctx 27..=32 (6 slots), b_intra: ctx 33..=35 (3 slots).
+        binarize::decode_mb_type_b(d, b_slice, b_intra, inc)?
     };
 
     // Map raw B-slice mb_type to the internal enum. I_PCM (48) is handled

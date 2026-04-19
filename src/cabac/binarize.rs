@@ -756,18 +756,26 @@ pub fn decode_mb_skip_flag_b(
 /// The bin tree matches ITU-T H.264 (07/2019) §9.3.2.5 / Table 9-37 — bin 0
 /// ctxIdxInc = `condTermFlagA + condTermFlagB` from the B-slice neighbour
 /// derivation; bins 1..=5 use fixed ctxIdxInc 3/4/5/5/5/5 within the B bank.
-/// The intra suffix dispatches through the I-slice bin tree
-/// ([`decode_mb_type_i`]) with ctxIdxOffset 32 (re-using the I-slice ctx
-/// bank for consistency with the shared context initialisation tables).
+/// The intra suffix runs through its OWN context bank at ctxIdxOffset 32
+/// (ctx 32..=35, four slots), NOT the I-slice bank at ctxIdxOffset 3.
+/// Mirrors FFmpeg's `decode_cabac_intra_mb_type(sl, 32, 0)` call for the
+/// `bits == 13` path (libavcodec/h264_cabac.c:2033).
+///
+/// `b_ctxs` covers the B mb_type prefix bank starting at
+/// [`CTX_IDX_MB_TYPE_B`] (ctx 27..=32, 6 slots). `b_intra_ctxs` covers the
+/// non-I_NxN intra-in-B suffix contexts (ctx 33..=35, 3 slots). The
+/// I_NxN bin at ctx 32 is shared between the prefix tree and the intra
+/// suffix — we read it once from `b_ctxs[5]` and interpret it per the
+/// branch we end up in.
 pub fn decode_mb_type_b(
     d: &mut CabacDecoder<'_>,
     b_ctxs: &mut [CabacContext],
-    i_ctxs: &mut [CabacContext],
+    b_intra_ctxs: &mut [CabacContext],
     ctx_idx_inc_a_b: u8,
 ) -> Result<u32> {
-    if b_ctxs.len() < 9 {
+    if b_ctxs.len() < 6 {
         return Err(Error::invalid(
-            "cabac::binarize::decode_mb_type_b: need >=9 B mb_type ctxs",
+            "cabac::binarize::decode_mb_type_b: need >=6 B mb_type prefix ctxs (27..=32)",
         ));
     }
     let inc0 = (ctx_idx_inc_a_b as usize).min(2);
@@ -827,37 +835,44 @@ pub fn decode_mb_type_b(
     if act_sym <= 22 {
         return Ok(act_sym);
     }
-    // act_sym is 23 or 24 → intra-in-B. Consume the terminate bin (I_PCM
-    // path); otherwise dispatch to the I-slice mb_type bin decoder with a
-    // shifted offset.
+    // act_sym is 23 (→ `I_NxN` in B) or 24 (→ non-`I_NxN` intra). The
+    // bin we just read at b_ctxs[5] is exactly ctxIdx 32 — FFmpeg's
+    // `decode_cabac_intra_mb_type(..., 32, 0)` reads the same bin as its
+    // internal "bin 0" (I_NxN flag) at ctxIdxOffset 32. We've consumed
+    // it here, so the dispatch is:
+    //   act_sym == 23 -> raw B mb_type 23 (I_NxN)
+    //   act_sym == 24 -> continue into the non-I_NxN intra suffix
+    //                     (ctx 33, 34, [34], 35, 35 — matches
+    //                     `decode_cabac_intra_mb_type`'s `state[1..=3]`
+    //                     reads with `intra_slice = 0`).
+    // NOT ctx 3..=10 — that's the I-slice bank, whose state has no
+    // relation to what's been published into ctx 32..=35 this slice.
+    if act_sym == 23 {
+        return Ok(23);
+    }
+    if b_intra_ctxs.len() < 3 {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_mb_type_b: need >=3 intra-in-B ctxs (ctx 33..=35)",
+        ));
+    }
+    // Non-I_NxN intra-in-B: terminate for I_PCM, then the 5-bin I_16x16
+    // parameter string at ctxs 33, 34, [34], 35, 35 (indexed here as
+    // b_intra_ctxs[0], [1], [1], [2], [2]).
     let term = d.decode_terminate()?;
     if term == 1 {
         return Ok(48);
     }
-    // Intra MB in B-slice: read the remaining I-slice mb_type bins. We
-    // already know this is NOT `I_NxN` (bin 0 of the I-slice decoder would
-    // be 0); simulate having already read bin 0 = 1 + terminate = 0 by
-    // decoding the remaining 5 bins directly.
-    if i_ctxs.len() < 8 {
-        return Err(Error::invalid(
-            "cabac::binarize::decode_mb_type_b: need >=8 I-slice mb_type ctxs",
-        ));
-    }
-    let b2i = d.decode_bin(&mut i_ctxs[3])?;
-    let cbp_luma = b2i as u32;
-    let b3i = d.decode_bin(&mut i_ctxs[4])?;
-    let cbp_chroma = if b3i == 0 {
+    let cbp_luma = d.decode_bin(&mut b_intra_ctxs[0])? as u32;
+    let b_cbp_ch0 = d.decode_bin(&mut b_intra_ctxs[1])?;
+    let cbp_chroma = if b_cbp_ch0 == 0 {
         0u32
     } else {
-        let b4i = d.decode_bin(&mut i_ctxs[5])?;
-        1 + b4i as u32
+        1 + d.decode_bin(&mut b_intra_ctxs[1])? as u32
     };
-    let b5i = d.decode_bin(&mut i_ctxs[6])?;
-    let b6i = d.decode_bin(&mut i_ctxs[7])?;
-    let intra_pred_mode = (b5i as u32) * 2 + b6i as u32;
+    let pm0 = d.decode_bin(&mut b_intra_ctxs[2])? as u32;
+    let pm1 = d.decode_bin(&mut b_intra_ctxs[2])? as u32;
+    let intra_pred_mode = pm0 * 2 + pm1;
     let i_raw = 1 + intra_pred_mode + 4 * cbp_chroma + 12 * cbp_luma;
-    // Return as B-slice mb_type offset — intra MBs live at 23..47 per Table
-    // 7-14 (Table 7-11 value + 23). I_PCM is already handled above.
     Ok(23 + i_raw)
 }
 

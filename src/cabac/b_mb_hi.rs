@@ -39,7 +39,7 @@ use crate::cabac::p_mb as cabac_p;
 use crate::cabac::residual::BlockCat;
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_SKIP_FLAG_B,
-    CTX_IDX_MB_TYPE_B, CTX_IDX_MB_TYPE_I, CTX_IDX_SUB_MB_TYPE_B,
+    CTX_IDX_MB_TYPE_B, CTX_IDX_MB_TYPE_INTRA_IN_B, CTX_IDX_SUB_MB_TYPE_B,
 };
 use crate::mb::LUMA_BLOCK_RASTER;
 use crate::mb_type::{
@@ -90,22 +90,14 @@ pub fn decode_b_mb_cabac_hi(
         return Ok(true);
     }
 
+    // §9.3.3.1.1.3 — see [`cabac::b_mb::decode_b_mb_cabac`] for the full
+    // rationale. The intra-in-B suffix lives at ctxIdxOffset 32 (ctx
+    // 32..=35), NOT at ctxIdxOffset 3.
     let mb_type_raw = {
-        let (b_slice, i_slice) = if CTX_IDX_MB_TYPE_B < CTX_IDX_MB_TYPE_I {
-            let (head, tail) = ctxs.split_at_mut(CTX_IDX_MB_TYPE_I);
-            (
-                &mut head[CTX_IDX_MB_TYPE_B..CTX_IDX_MB_TYPE_B + 9],
-                &mut tail[..8],
-            )
-        } else {
-            let (head, tail) = ctxs.split_at_mut(CTX_IDX_MB_TYPE_B);
-            (
-                &mut tail[..9],
-                &mut head[CTX_IDX_MB_TYPE_I..CTX_IDX_MB_TYPE_I + 8],
-            )
-        };
         let inc = cabac_b::mb_type_b_ctx_idx_inc(pic, mb_x, mb_y);
-        binarize::decode_mb_type_b(d, b_slice, i_slice, inc)?
+        let (b_slice, b_intra) = ctxs[CTX_IDX_MB_TYPE_B..CTX_IDX_MB_TYPE_INTRA_IN_B + 4]
+            .split_at_mut(CTX_IDX_MB_TYPE_INTRA_IN_B + 1 - CTX_IDX_MB_TYPE_B);
+        binarize::decode_mb_type_b(d, b_slice, b_intra, inc)?
     };
 
     if mb_type_raw == 48 {

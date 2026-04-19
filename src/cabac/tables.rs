@@ -114,6 +114,16 @@ pub const CTX_IDX_MB_TYPE_INTRA_IN_P: usize = 17;
 pub const CTX_IDX_SUB_MB_TYPE_P: usize = 21;
 pub const CTX_IDX_MB_SKIP_FLAG_B: usize = 24;
 pub const CTX_IDX_MB_TYPE_B: usize = 27;
+/// §9.3.3.1.1.3 + Table 9-34 — when a B macroblock prefix resolves to an
+/// intra-in-B suffix, the remaining bins are parsed with
+/// `ctxIdxOffset = 32` (ctx 32..=35, four contexts matching the
+/// intra-in-P bank layout). Mirrors FFmpeg's
+/// `decode_cabac_intra_mb_type(sl, 32, 0)` call at `bits == 13`
+/// (libavcodec/h264_cabac.c:2033). NOT 3 — that's the I/SI slice
+/// bank — and NOT 17 — that's P-slice intra-in-P. Using the wrong
+/// bank leaks I-slice context state into B-slice intra decode, which
+/// desyncs CABAC a couple of frames into any GOP with B pictures.
+pub const CTX_IDX_MB_TYPE_INTRA_IN_B: usize = 32;
 pub const CTX_IDX_SUB_MB_TYPE_B: usize = 36;
 pub const CTX_IDX_MVD_L0_X: usize = 40;
 pub const CTX_IDX_MVD_L0_Y: usize = 47;
