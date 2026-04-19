@@ -505,6 +505,13 @@ pub(crate) fn decode_luma_8x8_residual_in_place(
 
 /// Plane-aware 8×8 residual decode. Under 4:4:4 Cb / Cr the banks are
 /// cats 9 / 13 (§9.3.3.1.1.9 Table 9-42 extension, spec ctxIdx 660+).
+///
+/// §7.3.5.3.1 — `coded_block_flag` is present for this call *only* in the
+/// 4:4:4 Cb/Cr planes (where `ChromaArrayType == 3` → cat 9 / 13). The
+/// 4:2:0 / 4:2:2 luma variant (cat 5, `maxNumCoeff == 64`) skips the
+/// flag because the per-block bit has already been signalled by
+/// `cbp_luma`. FFmpeg's `decode_cabac_residual_nondc` enforces the same
+/// gating (`cat != 5 || CHROMA444(h)`).
 pub(crate) fn decode_luma_8x8_residual_in_place_plane(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
@@ -513,24 +520,27 @@ pub(crate) fn decode_luma_8x8_residual_in_place_plane(
     plane: ResidualPlane,
 ) -> Result<[i32; 64]> {
     let cbf_inc = coded_block_flag_inc(neighbours, intra) as usize;
-    let (cbf_base, sig_base, last_base, lvl_base) = match plane {
+    let (cbf_base, sig_base, last_base, lvl_base, decode_cbf) = match plane {
         ResidualPlane::Luma => (
             CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8,
             CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8,
             CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8,
             CTX_IDX_COEFF_ABS_LEVEL_MINUS1_LUMA8X8,
+            false,
         ),
         ResidualPlane::Cb444 => (
             CTX_IDX_CBF_CB_LUMA8X8,
             CTX_IDX_SIG_CB_LUMA8X8,
             CTX_IDX_LAST_CB_LUMA8X8,
             CTX_IDX_ABSLVL_CB_LUMA8X8,
+            true,
         ),
         ResidualPlane::Cr444 => (
             CTX_IDX_CBF_CR_LUMA8X8,
             CTX_IDX_SIG_CR_LUMA8X8,
             CTX_IDX_LAST_CR_LUMA8X8,
             CTX_IDX_ABSLVL_CR_LUMA8X8,
+            true,
         ),
     };
     let cbf_ctx_idx = cbf_base + cbf_inc;
@@ -549,8 +559,13 @@ pub(crate) fn decode_luma_8x8_residual_in_place_plane(
         abs_window[k] = ctxs[lvl_base + k];
     }
     let mut cbf_ctx = ctxs[cbf_ctx_idx];
-    let coded =
-        decode_residual_block_cabac_8x8(d, &mut cbf_ctx, &mut sig_last_window, &mut abs_window)?;
+    let coded = decode_residual_block_cabac_8x8(
+        d,
+        &mut cbf_ctx,
+        &mut sig_last_window,
+        &mut abs_window,
+        decode_cbf,
+    )?;
     ctxs[cbf_ctx_idx] = cbf_ctx;
     for k in 0..15 {
         ctxs[sig_base + k] = sig_last_window[k];
