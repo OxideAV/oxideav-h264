@@ -1585,12 +1585,13 @@ fn colocated_block(
     }
 }
 
-/// `DistScaleFactor` per §8.4.1.2.3. `tb = curr - pic0`, `td = pic1 - pic0`
-/// (clipped to [-128, 127] each). Returns a scaled MV: `mvL0 = (DSF * mvCol
-/// + 128) >> 8`, `mvL1 = mvL0 - mvCol`. When `td == 0` (reference and
-/// colocated share a POC) the scale collapses to identity — `mvL0 = mvCol`,
-/// `mvL1 = (0, 0)`. Long-term references also force identity (see
-/// §8.4.1.2.3 last paragraph).
+/// `DistScaleFactor` per §8.4.1.2.3.
+///
+/// `tb = curr - pic0`, `td = pic1 - pic0` (each clipped to `[-128, 127]`).
+/// Returns a scaled MV: `mvL0 = (DSF * mvCol + 128) >> 8`, `mvL1 = mvL0 - mvCol`.
+/// When `td == 0` (reference and colocated share a POC) the scale collapses to
+/// identity — `mvL0 = mvCol`, `mvL1 = (0, 0)`. Long-term references also force
+/// identity (see §8.4.1.2.3 last paragraph).
 fn temporal_scale_mv(
     mv_col: (i16, i16),
     curr_poc: i32,
