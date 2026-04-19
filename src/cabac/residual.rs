@@ -428,10 +428,15 @@ pub fn decode_residual_block_cabac_8x8(
                     prefix_ones += 1;
                 }
                 if saturated {
+                    // §9.3.2.3 EGk suffix — count leading 1-bypass-bits until
+                    // a terminating 0-bypass-bit. `k` is the number of 1-bins
+                    // read (= number of `info` bits that follow). Break on
+                    // the 0 terminator, matching the cat != 5 path in
+                    // [`decode_coeff_abs_level_minus1`].
                     let mut k: u32 = 0;
                     loop {
                         let b = d.decode_bypass()?;
-                        if b == 1 {
+                        if b == 0 {
                             break;
                         }
                         k += 1;
