@@ -194,9 +194,7 @@ impl Dpb {
         list.extend(future);
         list.extend(long);
         let want = (num_ref_idx_l0_active_minus1 as usize) + 1;
-        if list.len() > want {
-            list.truncate(want);
-        }
+        pad_or_truncate(&mut list, want);
         list
     }
 
@@ -237,9 +235,7 @@ impl Dpb {
         list.extend(past);
         list.extend(long);
         let want = (num_ref_idx_l1_active_minus1 as usize) + 1;
-        if list.len() > want {
-            list.truncate(want);
-        }
+        pad_or_truncate(&mut list, want);
         list
     }
 
@@ -264,9 +260,7 @@ impl Dpb {
         list.extend(long);
 
         let want = (num_ref_idx_l0_active_minus1 as usize) + 1;
-        if list.len() > want {
-            list.truncate(want);
-        }
+        pad_or_truncate(&mut list, want);
         list
     }
 
@@ -699,8 +693,33 @@ pub fn apply_rplm<'a>(
         ref_idx += 1;
     }
 
-    list.truncate(want);
+    pad_or_truncate(&mut list, want);
     Ok(list)
+}
+
+/// Clamp a reference list to exactly `want` entries.
+///
+/// If the list already has `want` or more entries, truncate to `want`.
+/// Otherwise (the slice header's `num_ref_idx_lX_active_minus1` declared
+/// more refs than the DPB actually holds), duplicate entry 0 into every
+/// missing slot — equivalent to FFmpeg's `ff_h264_build_ref_list` error-
+/// concealment path (libavcodec/h264_refs.c:400-412), which substitutes
+/// the default ref (= `ref_list[0]`) for any slot whose `parent` is NULL
+/// after the default-list build. x264 routinely emits this pattern when
+/// `keyint` forces a fresh IDR before the DPB has grown to
+/// `max_num_ref_frames`, and a conformant decoder must tolerate it so the
+/// CABAC `ref_idx` range check (§7.4.5.1) doesn't reject legitimate bins
+/// that map to a padded slot.
+fn pad_or_truncate(list: &mut Vec<&RefFrame>, want: usize) {
+    if list.len() >= want {
+        list.truncate(want);
+        return;
+    }
+    if let Some(&first) = list.first() {
+        while list.len() < want {
+            list.push(first);
+        }
+    }
 }
 
 /// Diagnostic payload for a failed RPLM lookup — carries the spec-level
@@ -1156,12 +1175,15 @@ mod tests {
         // Current POC = 5. §8.2.4.2.3 RefPicList0 order:
         //   past (poc < 5) descending by POC → [4, 2]
         //   future (poc > 5) ascending by POC → [6, 10]
-        // Expected list: [4, 2, 6, 10].
+        // Expected list: [4, 2, 6, 10]. `num_ref_idx_active_minus1 = 3`
+        // matches the natural list length; higher values trigger the
+        // FFmpeg-style error-concealment padding covered by
+        // `build_list_pads_with_entry_zero_when_dpb_shorter_than_want`.
         let mut dpb = Dpb::new(8, 8);
         for (fn_, poc) in [(0u32, 2i32), (1, 4), (2, 6), (3, 10)] {
             dpb.insert_reference(dummy_pic(), fn_, fn_ as i32, poc);
         }
-        let list = dpb.build_list0_b(5, 7);
+        let list = dpb.build_list0_b(5, 3);
         let pocs: Vec<i32> = list.iter().map(|f| f.poc).collect();
         assert_eq!(pocs, vec![4, 2, 6, 10]);
     }
@@ -1176,7 +1198,7 @@ mod tests {
         for (fn_, poc) in [(0u32, 2i32), (1, 4), (2, 6), (3, 10)] {
             dpb.insert_reference(dummy_pic(), fn_, fn_ as i32, poc);
         }
-        let list = dpb.build_list1_b(5, 7);
+        let list = dpb.build_list1_b(5, 3);
         let pocs: Vec<i32> = list.iter().map(|f| f.poc).collect();
         assert_eq!(pocs, vec![6, 10, 4, 2]);
     }
@@ -1198,7 +1220,10 @@ mod tests {
             16,
         )
         .unwrap();
-        let list = dpb.build_list1_b(5, 7);
+        // `num_ref_idx_active_minus1 = 2` → want = 3, matches DPB size so
+        // no FFmpeg-style padding kicks in; the long-term ref takes the
+        // final slot per §8.2.4.2.3.
+        let list = dpb.build_list1_b(5, 2);
         // Short-term first (future-asc then past-desc), then long-term.
         let lt_end = list.last().unwrap();
         assert_eq!(lt_end.long_term_frame_idx, Some(3));
@@ -1399,5 +1424,31 @@ mod tests {
         let modified = apply_rplm(default, &cmds, 4, 16, 3, dpb.frames_raw()).expect("apply");
         let pocs: Vec<i32> = modified.iter().map(|f| f.poc).collect();
         assert_eq!(pocs, vec![1, 3, 2, 0]);
+    }
+
+    #[test]
+    fn build_list_pads_with_entry_zero_when_dpb_shorter_than_want() {
+        // Real-world x264: SPS declares `max_num_ref_frames = 2`, DPB
+        // fills with just IDR + P1 when the next P-slice emits
+        // `num_ref_idx_l0_active_minus1 = 2` (so `want = 3`). §7.4.5.1
+        // allows `ref_idx_l0` up to `num_ref_idx_l0_active - 1`, and x264
+        // does occasionally encode such bins, so the decoder must tolerate
+        // the shortfall by duplicating entry 0 — equivalent to FFmpeg's
+        // error-concealment path (libavcodec/h264_refs.c: any
+        // `parent == NULL` slot is replaced by `h->default_ref[list]`,
+        // which was snapshotted as `ref_list[list][0]`).
+        let mut dpb = Dpb::new(8, 8);
+        dpb.insert_reference(dummy_pic(), 0, 0, 0);
+        dpb.insert_reference(dummy_pic(), 1, 1, 2);
+        let list = dpb.build_list0_p(2); // want = 3, DPB has 2
+        assert_eq!(list.len(), 3);
+        // Default short-term order: descending frame_num_wrap.
+        // Both refs have wrap == frame_num here (no wrap in 2-entry run),
+        // so entry 0 = POC 2 (most recent), entry 1 = POC 0 (IDR),
+        // entry 2 = padded dup of entry 0.
+        assert_eq!(list[0].poc, 2);
+        assert_eq!(list[1].poc, 0);
+        assert_eq!(list[2].poc, 2);
+        assert_eq!(list[0] as *const _, list[2] as *const _);
     }
 }

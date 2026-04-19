@@ -165,7 +165,17 @@ fn decode_p_skip(
 ) -> Result<()> {
     // Reuse the CAVLC P_Skip code path verbatim — the motion-compensation
     // and metadata bookkeeping are identical regardless of entropy mode.
-    crate::p_mb::decode_p_skip_mb(sh, mb_x, mb_y, pic, ref_list0, prev_qp)
+    crate::p_mb::decode_p_skip_mb(sh, mb_x, mb_y, pic, ref_list0, prev_qp)?;
+    // §9.3.3.1.1.5 — a skipped MB emits no `mb_qp_delta`, so the spec's
+    // "previous non-zero mb_qp_delta" tracker resets to 0 across every
+    // skip (equivalent to FFmpeg's `sl->last_qscale_diff = 0` after
+    // `decode_mb_skip`, libavcodec/h264_cabac.c:1952). Missing this
+    // reset flipped the next coded MB's `mb_qp_delta` bin 0 ctxIdxInc
+    // from 0 (ctx 60) to 1 (ctx 61), drifting the unary bin polarity
+    // and cascading much later into a bogus `sub_ref_idx_l0 N out of
+    // range` inside `decode_p_8x8`.
+    pic.last_mb_qp_delta_was_nonzero = false;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

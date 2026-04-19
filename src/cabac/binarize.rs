@@ -424,10 +424,30 @@ pub fn decode_prev_intra4x4_pred_mode_flag(
     Ok(d.decode_bin(&mut ctxs[0])? == 1)
 }
 
-/// §9.3.3.1.1.7 — `rem_intra4x4_pred_mode` (and 8x8 variant). Fixed-length
-/// 3-bit bypass binarization, representing one of the 8 remaining modes.
-pub fn decode_rem_intra4x4_pred_mode(d: &mut CabacDecoder<'_>) -> Result<u32> {
-    decode_fixed_length(d, 3)
+/// §9.3.3.1.1.7 — `rem_intra4x4_pred_mode` (and `rem_intra8x8_pred_mode`).
+/// FL(cMax=7) binarization with all three bins decoded in **regular mode**
+/// under the SAME context at ctxIdxOffset 276 + ctxIdxInc 0 (= absolute
+/// ctxIdx 69 — the sole slot allocated to this syntax element per spec
+/// Table 9-34). Matches FFmpeg's `decode_cabac_mb_intra4x4_pred_mode`, which
+/// reads three `get_cabac` bins with `cabac_state[69]`
+/// (libavcodec/h264_cabac.c:1373). The binarization itself is MSB-first 3-bit
+/// FL, so the first bin contributes bit 0, the second bit 1, the third bit 2
+/// (FFmpeg accumulates `mode += (1<<binIdx) * bin`).
+pub fn decode_rem_intra4x4_pred_mode(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+) -> Result<u32> {
+    if ctxs.is_empty() {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_rem_intra4x4_pred_mode: empty ctxs",
+        ));
+    }
+    let mut v: u32 = 0;
+    for i in 0..3u32 {
+        let bin = d.decode_bin(&mut ctxs[0])? as u32;
+        v += bin << i;
+    }
+    Ok(v)
 }
 
 /// §9.3.3.1.1.1 — `mb_skip_flag` for P/SP slices. A single regular-mode bin
@@ -553,14 +573,16 @@ fn decode_mb_type_intra_in_p(d: &mut CabacDecoder<'_>, ctxs: &mut [CabacContext]
     Ok(1 + intra_pred_mode + 4 * cbp_chroma + 12 * cbp_luma)
 }
 
-/// Table 9-38 — `sub_mb_type` for P/SP slices. Returns the spec value
+/// Table 9-37 — `sub_mb_type` for P/SP slices. Returns the spec value
 /// (`0..=3`) corresponding to P_L0_8x8 / 8x4 / 4x8 / 4x4.
 ///
-/// Binarization:
-///   0  P_L0_8x8  : 0
-///   1  P_L0_8x4  : 1 0 0
-///   2  P_L0_4x8  : 1 0 1
-///   3  P_L0_4x4  : 1 1
+/// Binarization (ITU-T H.264 (07/2019) Table 9-37, verified against x264's
+/// `cabac_subpartition_p` and FFmpeg's `decode_cabac_p_mb_sub_type`):
+///
+///   0  P_L0_8x8  : "1"
+///   1  P_L0_8x4  : "0 0"
+///   2  P_L0_4x8  : "0 1 1"
+///   3  P_L0_4x4  : "0 1 0"
 ///
 /// ctxIdxOffset = 21 for P sub_mb_type; ctxIdxInc is 0/1/2 for bins 0/1/2.
 pub fn decode_sub_mb_type_p(d: &mut CabacDecoder<'_>, ctxs: &mut [CabacContext]) -> Result<u32> {
@@ -570,15 +592,15 @@ pub fn decode_sub_mb_type_p(d: &mut CabacDecoder<'_>, ctxs: &mut [CabacContext])
         ));
     }
     let b0 = d.decode_bin(&mut ctxs[0])?;
-    if b0 == 0 {
+    if b0 == 1 {
         return Ok(0);
     }
     let b1 = d.decode_bin(&mut ctxs[1])?;
-    if b1 == 1 {
-        return Ok(3);
+    if b1 == 0 {
+        return Ok(1);
     }
     let b2 = d.decode_bin(&mut ctxs[2])?;
-    Ok(if b2 == 0 { 1 } else { 2 })
+    Ok(if b2 == 1 { 2 } else { 3 })
 }
 
 /// §9.3.3.1.1.7, Table 9-37 — `mvd_lX` component (x or y) binarization.

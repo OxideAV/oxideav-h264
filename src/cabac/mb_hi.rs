@@ -35,7 +35,8 @@ use crate::cabac::mb::{
 use crate::cabac::residual::{BlockCat, CbfNeighbours};
 use crate::cabac::tables::{
     CTX_IDX_CODED_BLOCK_PATTERN_LUMA, CTX_IDX_INTRA_CHROMA_PRED_MODE, CTX_IDX_MB_QP_DELTA,
-    CTX_IDX_MB_TYPE_I, CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
+    CTX_IDX_MB_TYPE_I, CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_REM_INTRA4X4_PRED_MODE,
+    CTX_IDX_TRANSFORM_SIZE_8X8_FLAG,
 };
 use crate::intra_pred::{Intra16x16Mode, Intra4x4Mode, IntraChromaMode};
 use crate::intra_pred_hi::{
@@ -147,7 +148,9 @@ pub(crate) fn decode_intra_mb_given_imb_cabac_hi(
             let mode = if prev_flag {
                 predicted
             } else {
-                let rem = binarize::decode_rem_intra4x4_pred_mode(d)? as u8;
+                let slice = &mut ctxs[CTX_IDX_REM_INTRA4X4_PRED_MODE
+                    ..CTX_IDX_REM_INTRA4X4_PRED_MODE + 1];
+                let rem = binarize::decode_rem_intra4x4_pred_mode(d, slice)? as u8;
                 if rem < predicted {
                     rem
                 } else {

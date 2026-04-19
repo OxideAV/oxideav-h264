@@ -117,10 +117,15 @@ pub const CTX_IDX_MB_TYPE_B: usize = 27;
 pub const CTX_IDX_SUB_MB_TYPE_B: usize = 36;
 pub const CTX_IDX_MVD_L0_X: usize = 40;
 pub const CTX_IDX_MVD_L0_Y: usize = 47;
-pub const CTX_IDX_MVD_L1_X: usize = 54;
-pub const CTX_IDX_MVD_L1_Y: usize = 61;
+// Per §9.3.3.1.1.7 Table 9-34, mvd_lX and ref_idx_lX share ctxIdxOffset
+// between L0 and L1; the list distinction lives in the neighbour lookup
+// (ctxIdxInc reads the same-list neighbour absMvd/ref_idx), not the
+// context bank. FFmpeg's `decode_cabac_mb_mvd` and `decode_cabac_mb_ref`
+// both use the L0 base regardless of list.
+pub const CTX_IDX_MVD_L1_X: usize = 40;
+pub const CTX_IDX_MVD_L1_Y: usize = 47;
 pub const CTX_IDX_REF_IDX_L0: usize = 54;
-pub const CTX_IDX_REF_IDX_L1: usize = 60;
+pub const CTX_IDX_REF_IDX_L1: usize = 54;
 pub const CTX_IDX_MB_QP_DELTA: usize = 60;
 pub const CTX_IDX_INTRA_CHROMA_PRED_MODE: usize = 64;
 pub const CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG: usize = 68;

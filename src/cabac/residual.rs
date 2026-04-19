@@ -343,6 +343,15 @@ pub fn decode_residual_block_cabac_chroma_dc_422(
 /// last_significant_coeff_flag bank (ctxIdxOffset 417..=425). Layout of
 /// `abs_level`: 10 contexts at ctxIdxOffset 426..=435.
 ///
+/// `decode_cbf` — whether to read the `coded_block_flag` bin. Per
+/// §7.3.5.3.1 the flag is present iff `maxNumCoeff != 64` OR
+/// `ChromaArrayType == 3`. For 8×8 luma in 4:2:0 / 4:2:2 both conditions
+/// are false and the block is assumed coded (the CBP already signalled
+/// it), so callers must pass `false`. FFmpeg's gating is the same:
+/// `(cat != 5 || CHROMA444(h))` in `decode_cabac_residual_nondc`
+/// (libavcodec/h264_cabac.c:1912). When `false` the `cbf_ctx` slot is
+/// untouched.
+///
 /// Returns the 64-entry coefficient array in **coded scan order**; the
 /// caller is responsible for zig-zag inversion via `ZIGZAG_8X8`,
 /// dequantisation (`dequantize_8x8_scaled`) and `idct_8x8`.
@@ -351,6 +360,7 @@ pub fn decode_residual_block_cabac_8x8(
     cbf_ctx: &mut CabacContext,
     sig_last: &mut [CabacContext],
     abs_level: &mut [CabacContext],
+    decode_cbf: bool,
 ) -> Result<[i32; 64]> {
     if sig_last.len() < 24 {
         return Err(Error::invalid(
@@ -363,12 +373,16 @@ pub fn decode_residual_block_cabac_8x8(
         ));
     }
 
-    // §9.3.3.1.1.9 — coded_block_flag first (unless this caller knows it's
-    // implicit: not possible for cat=5 in this subset).
-    let cbf = d.decode_bin(cbf_ctx)?;
+    // §7.3.5.3.1 / §9.3.3.1.1.9 — coded_block_flag is present iff
+    // `maxNumCoeff != 64` or `ChromaArrayType == 3`. 8×8 luma in 4:2:0 /
+    // 4:2:2 has `maxNumCoeff == 64` and `ChromaArrayType != 3`, so the
+    // block is implicitly coded (caller already saw cbp_luma[blk] = 1).
     let mut coeffs = [0i32; 64];
-    if cbf == 0 {
-        return Ok(coeffs);
+    if decode_cbf {
+        let cbf = d.decode_bin(cbf_ctx)?;
+        if cbf == 0 {
+            return Ok(coeffs);
+        }
     }
 
     // §9.3.3.1.1.9 — significance map walk across scan positions 0..=62

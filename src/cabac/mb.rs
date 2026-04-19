@@ -46,7 +46,8 @@ use crate::cabac::tables::{
     CTX_IDX_LAST_CB_LUMA8X8, CTX_IDX_LAST_CR_LUMA16X16AC, CTX_IDX_LAST_CR_LUMA16X16DC,
     CTX_IDX_LAST_CR_LUMA4X4, CTX_IDX_LAST_CR_LUMA8X8, CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG,
     CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_MB_QP_DELTA, CTX_IDX_MB_TYPE_I,
-    CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_SIGNIFICANT_COEFF_FLAG,
+    CTX_IDX_PREV_INTRA4X4_PRED_MODE_FLAG, CTX_IDX_REM_INTRA4X4_PRED_MODE,
+    CTX_IDX_SIGNIFICANT_COEFF_FLAG,
     CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8, CTX_IDX_SIG_CB_LUMA16X16AC, CTX_IDX_SIG_CB_LUMA16X16DC,
     CTX_IDX_SIG_CB_LUMA4X4, CTX_IDX_SIG_CB_LUMA8X8, CTX_IDX_SIG_CR_LUMA16X16AC,
     CTX_IDX_SIG_CR_LUMA16X16DC, CTX_IDX_SIG_CR_LUMA4X4, CTX_IDX_SIG_CR_LUMA8X8,
@@ -505,6 +506,13 @@ pub(crate) fn decode_luma_8x8_residual_in_place(
 
 /// Plane-aware 8×8 residual decode. Under 4:4:4 Cb / Cr the banks are
 /// cats 9 / 13 (§9.3.3.1.1.9 Table 9-42 extension, spec ctxIdx 660+).
+///
+/// §7.3.5.3.1 — `coded_block_flag` is present for this call *only* in the
+/// 4:4:4 Cb/Cr planes (where `ChromaArrayType == 3` → cat 9 / 13). The
+/// 4:2:0 / 4:2:2 luma variant (cat 5, `maxNumCoeff == 64`) skips the
+/// flag because the per-block bit has already been signalled by
+/// `cbp_luma`. FFmpeg's `decode_cabac_residual_nondc` enforces the same
+/// gating (`cat != 5 || CHROMA444(h)`).
 pub(crate) fn decode_luma_8x8_residual_in_place_plane(
     d: &mut CabacDecoder<'_>,
     ctxs: &mut [CabacContext],
@@ -513,24 +521,27 @@ pub(crate) fn decode_luma_8x8_residual_in_place_plane(
     plane: ResidualPlane,
 ) -> Result<[i32; 64]> {
     let cbf_inc = coded_block_flag_inc(neighbours, intra) as usize;
-    let (cbf_base, sig_base, last_base, lvl_base) = match plane {
+    let (cbf_base, sig_base, last_base, lvl_base, decode_cbf) = match plane {
         ResidualPlane::Luma => (
             CTX_IDX_CODED_BLOCK_FLAG_LUMA8X8,
             CTX_IDX_SIGNIFICANT_COEFF_FLAG_LUMA8X8,
             CTX_IDX_LAST_SIGNIFICANT_COEFF_FLAG_LUMA8X8,
             CTX_IDX_COEFF_ABS_LEVEL_MINUS1_LUMA8X8,
+            false,
         ),
         ResidualPlane::Cb444 => (
             CTX_IDX_CBF_CB_LUMA8X8,
             CTX_IDX_SIG_CB_LUMA8X8,
             CTX_IDX_LAST_CB_LUMA8X8,
             CTX_IDX_ABSLVL_CB_LUMA8X8,
+            true,
         ),
         ResidualPlane::Cr444 => (
             CTX_IDX_CBF_CR_LUMA8X8,
             CTX_IDX_SIG_CR_LUMA8X8,
             CTX_IDX_LAST_CR_LUMA8X8,
             CTX_IDX_ABSLVL_CR_LUMA8X8,
+            true,
         ),
     };
     let cbf_ctx_idx = cbf_base + cbf_inc;
@@ -549,8 +560,13 @@ pub(crate) fn decode_luma_8x8_residual_in_place_plane(
         abs_window[k] = ctxs[lvl_base + k];
     }
     let mut cbf_ctx = ctxs[cbf_ctx_idx];
-    let coded =
-        decode_residual_block_cabac_8x8(d, &mut cbf_ctx, &mut sig_last_window, &mut abs_window)?;
+    let coded = decode_residual_block_cabac_8x8(
+        d,
+        &mut cbf_ctx,
+        &mut sig_last_window,
+        &mut abs_window,
+        decode_cbf,
+    )?;
     ctxs[cbf_ctx_idx] = cbf_ctx;
     for k in 0..15 {
         ctxs[sig_base + k] = sig_last_window[k];
@@ -680,9 +696,11 @@ fn decode_intra_mb_given_imb_cabac(
                 let mode = if prev_flag {
                     predicted
                 } else {
-                    // rem_intra8x8_pred_mode shares the FL(3) binarization
-                    // with rem_intra4x4_pred_mode (§9.3.2.5).
-                    let rem = binarize::decode_rem_intra4x4_pred_mode(d)? as u8;
+                    // rem_intra8x8_pred_mode shares the FL(3) regular-mode
+                    // binarization with rem_intra4x4_pred_mode (§9.3.3.1.1.7).
+                    let slice = &mut ctxs[CTX_IDX_REM_INTRA4X4_PRED_MODE
+                        ..CTX_IDX_REM_INTRA4X4_PRED_MODE + 1];
+                    let rem = binarize::decode_rem_intra4x4_pred_mode(d, slice)? as u8;
                     if rem < predicted {
                         rem
                     } else {
@@ -708,7 +726,9 @@ fn decode_intra_mb_given_imb_cabac(
                 let mode = if prev_flag {
                     predicted
                 } else {
-                    let rem = binarize::decode_rem_intra4x4_pred_mode(d)? as u8;
+                    let slice = &mut ctxs[CTX_IDX_REM_INTRA4X4_PRED_MODE
+                        ..CTX_IDX_REM_INTRA4X4_PRED_MODE + 1];
+                    let rem = binarize::decode_rem_intra4x4_pred_mode(d, slice)? as u8;
                     if rem < predicted {
                         rem
                     } else {
@@ -1081,6 +1101,15 @@ fn decode_luma_intra_8x8_cabac(
             // left and above from the 4×4 cache at the block's top-left
             // corner, same as the CAVLC nC predictor.
             let neighbours = cbf_neighbours_luma(pic, mb_x, mb_y, r0, c0);
+            #[cfg(feature = "cabac-trace")]
+            {
+                d.trace_label = match blk8 {
+                    0 => "luma8x8.blk0",
+                    1 => "luma8x8.blk1",
+                    2 => "luma8x8.blk2",
+                    _ => "luma8x8.blk3",
+                };
+            }
             let coeffs = decode_luma_8x8_residual_in_place(d, ctxs, &neighbours, true)?;
             residual = coeffs;
             let nnz = residual.iter().filter(|&&v| v != 0).count() as u16;
