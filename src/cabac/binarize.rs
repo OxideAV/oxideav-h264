@@ -424,10 +424,30 @@ pub fn decode_prev_intra4x4_pred_mode_flag(
     Ok(d.decode_bin(&mut ctxs[0])? == 1)
 }
 
-/// §9.3.3.1.1.7 — `rem_intra4x4_pred_mode` (and 8x8 variant). Fixed-length
-/// 3-bit bypass binarization, representing one of the 8 remaining modes.
-pub fn decode_rem_intra4x4_pred_mode(d: &mut CabacDecoder<'_>) -> Result<u32> {
-    decode_fixed_length(d, 3)
+/// §9.3.3.1.1.7 — `rem_intra4x4_pred_mode` (and `rem_intra8x8_pred_mode`).
+/// FL(cMax=7) binarization with all three bins decoded in **regular mode**
+/// under the SAME context at ctxIdxOffset 276 + ctxIdxInc 0 (= absolute
+/// ctxIdx 69 — the sole slot allocated to this syntax element per spec
+/// Table 9-34). Matches FFmpeg's `decode_cabac_mb_intra4x4_pred_mode`, which
+/// reads three `get_cabac` bins with `cabac_state[69]`
+/// (libavcodec/h264_cabac.c:1373). The binarization itself is MSB-first 3-bit
+/// FL, so the first bin contributes bit 0, the second bit 1, the third bit 2
+/// (FFmpeg accumulates `mode += (1<<binIdx) * bin`).
+pub fn decode_rem_intra4x4_pred_mode(
+    d: &mut CabacDecoder<'_>,
+    ctxs: &mut [CabacContext],
+) -> Result<u32> {
+    if ctxs.is_empty() {
+        return Err(Error::invalid(
+            "cabac::binarize::decode_rem_intra4x4_pred_mode: empty ctxs",
+        ));
+    }
+    let mut v: u32 = 0;
+    for i in 0..3u32 {
+        let bin = d.decode_bin(&mut ctxs[0])? as u32;
+        v += bin << i;
+    }
+    Ok(v)
 }
 
 /// §9.3.3.1.1.1 — `mb_skip_flag` for P/SP slices. A single regular-mode bin
