@@ -143,73 +143,66 @@ const BETA_PRIME: [u8; 52] = [
 ];
 
 /// Table 8-17 — t'C0 as a function of indexA (0..=51) and bS (1..=3).
-/// Spec page 210. Verbatim transcription; 8-bit depth reference.
-/// Row layout: [bs=1, bs=2, bs=3] per indexA.
+/// Spec page 210. Verbatim transcription from the 08/2024 edition;
+/// 8-bit depth reference. Row layout: [bs=1, bs=2, bs=3] per indexA.
+///
+/// Table 8-17 main part (indexA 0..=25):
+///   indexA:  0 1 2 3 4 5 6 7 8 9 10..22 23 24 25
+///   bS=1:    0 0 0 0 0 0 0 0 0 0  0      1  1  1
+///   bS=2:    0 0 0 0 0 0 0 0 0 0  0      0  1  1
+///   bS=3:    0 0 0 0 0 0 0 0 0 0  0      0  1  1
+///
+/// Table 8-17 (concluded) (indexA 26..=51):
+///   indexA: 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51
+///   bS=1:    1  1  1  1  1  1  1  2  2  2  2  3  3  3  4  4  4  5  6  6  7  8  9 10 11 13
+///   bS=2:    1  1  1  1  1  2  2  2  2  3  3  3  4  4  5  5  6  7  8  8 10 11 12 13 15 17
+///   bS=3:    1  2  2  2  2  3  3  3  4  4  4  5  6  6  7  8  9 10 11 13 14 16 18 20 23 25
 const TC0_PRIME: [[u8; 3]; 52] = [
-    // indexA 0..=9
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    // indexA 10..=15
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    // indexA 16..=22
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    // indexA 23..=25
-    [1, 0, 0],
-    [1, 1, 1],
-    [1, 1, 1],
-    // indexA 26..=29
-    [1, 1, 1],
-    [1, 1, 2],
-    [1, 1, 2],
-    [1, 1, 2],
-    // indexA 30..=32
-    [1, 2, 2],
-    [2, 2, 3],
-    [2, 2, 3],
-    // indexA 33..=35
-    [2, 3, 3],
-    [2, 3, 4],
-    [3, 3, 4],
-    // indexA 36..=38
-    [3, 4, 5],
-    [3, 4, 5],
-    [4, 4, 6],
-    // indexA 39..=41
-    [4, 5, 6],
-    [4, 5, 7],
-    [5, 6, 8],
-    // indexA 42..=44
-    [5, 7, 8],
-    [6, 8, 10],
-    [7, 8, 11],
-    // indexA 45..=47
-    [8, 10, 12],
-    [8, 11, 13],
-    [10, 12, 15],
-    // indexA 48..=51
-    [11, 13, 17],
-    [12, 15, 19],
-    [13, 17, 22],
-    [15, 20, 25],
+    // indexA 0..=9 — all zeros.
+    [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
+    [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
+    // indexA 10..=15 — all zeros.
+    [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
+    // indexA 16..=22 — all zeros.
+    [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
+    // indexA 23..=25.
+    [1, 0, 0],   // 23
+    [1, 1, 1],   // 24
+    [1, 1, 1],   // 25
+    // indexA 26..=29.
+    [1, 1, 1],   // 26
+    [1, 1, 2],   // 27
+    [1, 1, 2],   // 28
+    [1, 1, 2],   // 29
+    // indexA 30..=32.
+    [1, 1, 2],   // 30
+    [1, 2, 3],   // 31
+    [1, 2, 3],   // 32
+    // indexA 33..=35.
+    [2, 2, 3],   // 33
+    [2, 2, 4],   // 34
+    [2, 3, 4],   // 35
+    // indexA 36..=38.
+    [2, 3, 4],   // 36
+    [3, 3, 5],   // 37
+    [3, 4, 6],   // 38
+    // indexA 39..=41.
+    [3, 4, 6],   // 39
+    [4, 5, 7],   // 40
+    [4, 5, 8],   // 41
+    // indexA 42..=44.
+    [4, 6, 9],   // 42
+    [5, 7, 10],  // 43
+    [6, 8, 11],  // 44
+    // indexA 45..=47.
+    [6, 8, 13],  // 45
+    [7, 10, 14], // 46
+    [8, 11, 16], // 47
+    // indexA 48..=51.
+    [9, 12, 18], // 48
+    [10, 13, 20],// 49
+    [11, 15, 23],// 50
+    [13, 17, 25],// 51
 ];
 
 // --------------------------------------------------------------------
@@ -562,7 +555,7 @@ mod tests {
 
     #[test]
     fn tc0_table_spotcheck() {
-        // Values from Table 8-17.
+        // Values from Table 8-17 (main + concluded), 08/2024 edition.
         // bs=1, indexA=0..22 → 0
         assert_eq!(tc0_from(1, 0, 8), 0);
         assert_eq!(tc0_from(1, 22, 8), 0);
@@ -570,15 +563,27 @@ mod tests {
         assert_eq!(tc0_from(1, 23, 8), 1);
         assert_eq!(tc0_from(2, 23, 8), 0);
         assert_eq!(tc0_from(3, 23, 8), 0);
-        // bs=3, indexA=36 → 5 (spec row: 3,4,5)
-        assert_eq!(tc0_from(3, 36, 8), 5);
-        // bs=3, indexA=51 → 25
+        // indexA=24 → (1, 1, 1).
+        assert_eq!(tc0_from(1, 24, 8), 1);
+        assert_eq!(tc0_from(2, 24, 8), 1);
+        assert_eq!(tc0_from(3, 24, 8), 1);
+        // indexA=30 row: (1, 1, 2).
+        assert_eq!(tc0_from(1, 30, 8), 1);
+        assert_eq!(tc0_from(2, 30, 8), 1);
+        assert_eq!(tc0_from(3, 30, 8), 2);
+        // indexA=36 row: (2, 3, 4).
+        assert_eq!(tc0_from(1, 36, 8), 2);
+        assert_eq!(tc0_from(2, 36, 8), 3);
+        assert_eq!(tc0_from(3, 36, 8), 4);
+        // indexA=44 row: (6, 8, 11).
+        assert_eq!(tc0_from(1, 44, 8), 6);
+        assert_eq!(tc0_from(2, 44, 8), 8);
+        assert_eq!(tc0_from(3, 44, 8), 11);
+        // indexA=51 row: (13, 17, 25).
+        assert_eq!(tc0_from(1, 51, 8), 13);
+        assert_eq!(tc0_from(2, 51, 8), 17);
         assert_eq!(tc0_from(3, 51, 8), 25);
-        // bs=2, indexA=51 → 20
-        assert_eq!(tc0_from(2, 51, 8), 20);
-        // bs=1, indexA=51 → 15
-        assert_eq!(tc0_from(1, 51, 8), 15);
-        // bs=0 / bs=4 → 0 (not in table)
+        // bs=0 / bs=4 → 0 (not in table).
         assert_eq!(tc0_from(0, 36, 8), 0);
         assert_eq!(tc0_from(4, 36, 8), 0);
     }
@@ -588,7 +593,57 @@ mod tests {
         // eq. 8-456: α = α' * (1 << (BitDepth - 8)).
         assert_eq!(alpha_from_index(36, 10), 50 * 4);
         assert_eq!(beta_from_index(36, 10), 11 * 4);
-        assert_eq!(tc0_from(3, 36, 10), 5 * 4);
+        // Table 8-17: t'C0 at (bS=3, indexA=36) is 4. At 10-bit, t_C0 = 4 * 4.
+        assert_eq!(tc0_from(3, 36, 10), 4 * 4);
+    }
+
+    #[test]
+    fn tc0_table_every_entry_matches_spec() {
+        // Full transcription check: Table 8-17 main (indexA 0..=25) and
+        // concluded (indexA 26..=51). Each row-major.
+        // indexA 0..=22 — all zero.
+        for idx in 0..=22 {
+            assert_eq!(tc0_from(1, idx, 8), 0, "bS=1 idxA={}", idx);
+            assert_eq!(tc0_from(2, idx, 8), 0, "bS=2 idxA={}", idx);
+            assert_eq!(tc0_from(3, idx, 8), 0, "bS=3 idxA={}", idx);
+        }
+        // (bS=1, bS=2, bS=3) rows for indexA=23..=51.
+        let expected: [(i32, i32, i32, i32); 29] = [
+            (23, 1,  0,  0),
+            (24, 1,  1,  1),
+            (25, 1,  1,  1),
+            (26, 1,  1,  1),
+            (27, 1,  1,  2),
+            (28, 1,  1,  2),
+            (29, 1,  1,  2),
+            (30, 1,  1,  2),
+            (31, 1,  2,  3),
+            (32, 1,  2,  3),
+            (33, 2,  2,  3),
+            (34, 2,  2,  4),
+            (35, 2,  3,  4),
+            (36, 2,  3,  4),
+            (37, 3,  3,  5),
+            (38, 3,  4,  6),
+            (39, 3,  4,  6),
+            (40, 4,  5,  7),
+            (41, 4,  5,  8),
+            (42, 4,  6,  9),
+            (43, 5,  7, 10),
+            (44, 6,  8, 11),
+            (45, 6,  8, 13),
+            (46, 7, 10, 14),
+            (47, 8, 11, 16),
+            (48, 9, 12, 18),
+            (49, 10, 13, 20),
+            (50, 11, 15, 23),
+            (51, 13, 17, 25),
+        ];
+        for (idx, e1, e2, e3) in expected {
+            assert_eq!(tc0_from(1, idx, 8), e1, "bS=1 idxA={}", idx);
+            assert_eq!(tc0_from(2, idx, 8), e2, "bS=2 idxA={}", idx);
+            assert_eq!(tc0_from(3, idx, 8), e3, "bS=3 idxA={}", idx);
+        }
     }
 
     // ---------------- §8.7.2.1 boundary-strength derivation ----------

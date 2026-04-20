@@ -351,7 +351,11 @@ pub fn interpolate_chroma(
     if y_frac > 7 {
         return Err(InterPredError::ChromaFracOutOfRange(y_frac));
     }
-    if w == 0 || h == 0 || w % 4 != 0 || h % 4 != 0 {
+    // Chroma bilinear (eq. 8-270) has no inherent size constraint — each
+    // output pixel depends on 4 integer neighbours, so any w >= 1 and
+    // h >= 1 is legitimate. For 4:2:0 luma partitions down to 4x4, the
+    // corresponding chroma block is 2x2; for 4x8 luma we get 2x4; etc.
+    if w == 0 || h == 0 {
         return Err(InterPredError::InvalidBlockSize { w, h });
     }
 
@@ -1101,6 +1105,37 @@ mod tests {
     }
 
     // ---- Chroma full range of fractions ----
+
+    #[test]
+    fn chroma_2x2_block_4x4_luma_sub_partition() {
+        // For luma 4x4 sub-sub-partitions the chroma block is 2x2.
+        // The bilinear formula eq. 8-270 has no minimum-size constraint,
+        // so interpolate_chroma must accept w=2, h=2. Prior to the fix
+        // this returned InvalidBlockSize, aborting inter reconstruction
+        // of any slice that used 4x4 or smaller sub-partitions.
+        let src = make_plane(16, 16, |x, y| (x * 2 + y) & 0xff);
+        let mut dst = vec![0i32; 2 * 2];
+        assert!(
+            interpolate_chroma(&src, 16, 16, 16, 4, 4, 0, 0, 2, 2, 8, &mut dst, 2).is_ok(),
+            "2x2 chroma MC should be accepted (luma 4x4 sub-partitions \
+             imply 2x2 chroma for 4:2:0)"
+        );
+        // Integer-position copy: each output equals src at the given int.
+        assert_eq!(dst[0], ((4 * 2 + 4) & 0xff) as i32);
+        assert_eq!(dst[1], ((5 * 2 + 4) & 0xff) as i32);
+        assert_eq!(dst[2], ((4 * 2 + 5) & 0xff) as i32);
+        assert_eq!(dst[3], ((5 * 2 + 5) & 0xff) as i32);
+    }
+
+    #[test]
+    fn chroma_2x4_block_4x8_luma_sub_partition() {
+        // Luma 4x8 sub-partition -> chroma 2x4 for 4:2:0. Regression.
+        let src = make_plane(16, 16, |x, y| x + y);
+        let mut dst = vec![0i32; 2 * 4];
+        assert!(
+            interpolate_chroma(&src, 16, 16, 16, 2, 2, 0, 0, 2, 4, 8, &mut dst, 2).is_ok()
+        );
+    }
 
     #[test]
     fn chroma_full_offset_corner_d() {

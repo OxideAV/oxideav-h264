@@ -616,6 +616,20 @@ pub struct Macroblock {
     /// §7.3.5.3 — chroma AC per 4x4 block.
     pub residual_chroma_ac_cb: Vec<[i32; 16]>,
     pub residual_chroma_ac_cr: Vec<[i32; 16]>,
+    /// §7.3.5.3 — Cb plane residual in the 4:4:4 "coded like luma" path
+    /// (ChromaArrayType == 3 only). Mirrors `residual_luma`: each entry
+    /// is one 4x4 block (or sub-block of an 8x8 transform, padded to
+    /// 16). Empty for ChromaArrayType != 3.
+    pub residual_cb_luma_like: Vec<[i32; 16]>,
+    /// §7.3.5.3 — Cr plane 4:4:4 luma-like residual. See
+    /// `residual_cb_luma_like`.
+    pub residual_cr_luma_like: Vec<[i32; 16]>,
+    /// §7.3.5.3 — Cb Intra16x16 DC block when ChromaArrayType == 3 and
+    /// mb_type is Intra_16x16.
+    pub residual_cb_16x16_dc: Option<[i32; 16]>,
+    /// §7.3.5.3 — Cr Intra16x16 DC block when ChromaArrayType == 3 and
+    /// mb_type is Intra_16x16.
+    pub residual_cr_16x16_dc: Option<[i32; 16]>,
     /// True if this entry represents a P_Skip / B_Skip MB, in which
     /// case none of the residual / pred fields carry meaningful data.
     pub is_skip: bool,
@@ -646,6 +660,10 @@ impl Macroblock {
             residual_chroma_dc_cr: Vec::new(),
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: true,
         }
     }
@@ -761,6 +779,13 @@ pub struct CavlcMbNc {
     pub cb_total_coeff: [u8; 8],
     /// Per-chroma-4x4-block `TotalCoeff(coeff_token)` values for Cr.
     pub cr_total_coeff: [u8; 8],
+    /// §7.3.5.3 / §9.2.1.1 — per-4x4 Cb block `TotalCoeff` for
+    /// ChromaArrayType == 3 (4:4:4), where chroma is coded like luma.
+    /// 16 blocks, same indexing as `luma_total_coeff`.
+    pub cb_luma_total_coeff: [u8; 16],
+    /// §7.3.5.3 / §9.2.1.1 — per-4x4 Cr block `TotalCoeff` for
+    /// ChromaArrayType == 3.
+    pub cr_luma_total_coeff: [u8; 16],
 }
 
 impl Default for CavlcMbNc {
@@ -773,6 +798,8 @@ impl Default for CavlcMbNc {
             luma_total_coeff: [0; 16],
             cb_total_coeff: [0; 8],
             cr_total_coeff: [0; 8],
+            cb_luma_total_coeff: [0; 16],
+            cr_luma_total_coeff: [0; 16],
         }
     }
 }
@@ -960,6 +987,39 @@ fn nc_nn_luma(
     }
     let idx = blk as usize;
     let n = info.luma_total_coeff.get(idx).copied().unwrap_or(0);
+    (true, n)
+}
+
+/// §9.2.1.1 step 5 + step 6 for a Cb/Cr 4x4 neighbour in the 4:4:4
+/// "coded like luma" path (ChromaArrayType == 3). Mirrors `nc_nn_luma`
+/// but reads the per-plane `cb_luma_total_coeff` / `cr_luma_total_coeff`
+/// arrays. Returns `(availableFlagN, nN)`.
+fn nc_nn_plane_luma_like(
+    grid: &CavlcNcGrid,
+    mb_addr: Option<u32>,
+    blk: u8,
+    is_cr: bool,
+    current_is_intra: bool,
+    constrained_intra_pred_flag: bool,
+) -> (bool, u8) {
+    let Some(addr) = mb_addr else { return (false, 0) };
+    let Some(info) = grid.mbs.get(addr as usize) else { return (false, 0) };
+    if !info.is_available {
+        return (false, 0);
+    }
+    let _ = (current_is_intra, constrained_intra_pred_flag);
+    if info.is_skip {
+        return (true, 0);
+    }
+    if info.is_i_pcm {
+        return (true, 16);
+    }
+    let arr = if is_cr {
+        &info.cr_luma_total_coeff
+    } else {
+        &info.cb_luma_total_coeff
+    };
+    let n = arr.get(blk as usize).copied().unwrap_or(0);
     (true, n)
 }
 
@@ -1169,6 +1229,17 @@ pub struct CabacMbNeighbourInfo {
     pub cbf_luma_16x16_dc: bool,
     /// §9.3.3.1.1.9 Table 9-42 ctxBlockCat = 1 — Luma16x16ACLevel.
     pub cbf_luma_16x16_ac: [bool; 16],
+    /// §9.3.3.1.1.9 Table 9-42 ctxBlockCat = 6 / 7 / 8 — Cb plane in
+    /// 4:4:4 (coded like luma): 16x16 DC, 16x16 AC per 4x4, 4x4 and 8x8
+    /// CBFs respectively. Populated when ChromaArrayType == 3.
+    pub cbf_cb_16x16_dc: bool,
+    pub cbf_cb_16x16_ac: [bool; 16],
+    pub cbf_cb_luma_4x4: [bool; 16],
+    /// §9.3.3.1.1.9 Table 9-42 ctxBlockCat = 10 / 11 / 12 — Cr plane in
+    /// 4:4:4.
+    pub cbf_cr_16x16_dc: bool,
+    pub cbf_cr_16x16_ac: [bool; 16],
+    pub cbf_cr_luma_4x4: [bool; 16],
 }
 
 impl Default for CabacMbNeighbourInfo {
@@ -1191,6 +1262,12 @@ impl Default for CabacMbNeighbourInfo {
             cbf_cr_ac: [false; 8],
             cbf_luma_16x16_dc: false,
             cbf_luma_16x16_ac: [false; 16],
+            cbf_cb_16x16_dc: false,
+            cbf_cb_16x16_ac: [false; 16],
+            cbf_cb_luma_4x4: [false; 16],
+            cbf_cr_16x16_dc: false,
+            cbf_cr_16x16_ac: [false; 16],
+            cbf_cr_luma_4x4: [false; 16],
         }
     }
 }
@@ -1554,14 +1631,12 @@ fn unavail_cbf(current_is_intra: bool, _block_type: BlockType) -> bool {
 #[inline]
 fn cbf_luma_for(info: &CabacMbNeighbourInfo, block_type: BlockType, bi: usize) -> bool {
     match block_type {
-        BlockType::Luma4x4 | BlockType::CbLuma4x4 | BlockType::CrLuma4x4 => {
-            info.cbf_luma_4x4.get(bi).copied().unwrap_or(false)
-        }
-        BlockType::Luma16x16Ac
-        | BlockType::CbIntra16x16Ac
-        | BlockType::CrIntra16x16Ac => {
-            info.cbf_luma_16x16_ac.get(bi).copied().unwrap_or(false)
-        }
+        BlockType::Luma4x4 => info.cbf_luma_4x4.get(bi).copied().unwrap_or(false),
+        BlockType::CbLuma4x4 => info.cbf_cb_luma_4x4.get(bi).copied().unwrap_or(false),
+        BlockType::CrLuma4x4 => info.cbf_cr_luma_4x4.get(bi).copied().unwrap_or(false),
+        BlockType::Luma16x16Ac => info.cbf_luma_16x16_ac.get(bi).copied().unwrap_or(false),
+        BlockType::CbIntra16x16Ac => info.cbf_cb_16x16_ac.get(bi).copied().unwrap_or(false),
+        BlockType::CrIntra16x16Ac => info.cbf_cr_16x16_ac.get(bi).copied().unwrap_or(false),
         _ => false,
     }
 }
@@ -1600,11 +1675,10 @@ fn cbf_mb_level_for(info: &CabacMbNeighbourInfo, block_type: BlockType, is_cr: b
             }
         }
         BlockType::Luma16x16Dc => info.cbf_luma_16x16_dc,
-        // 4:4:4 per-plane DC — each plane tracks its own 16x16-DC bit
-        // but we currently reuse `cbf_luma_16x16_dc`. Leave as-is (the
-        // 4:4:4 pipeline is outside the foreman test path).
-        BlockType::CbIntra16x16Dc => info.cbf_luma_16x16_dc,
-        BlockType::CrIntra16x16Dc => info.cbf_luma_16x16_dc,
+        // §9.3.3.1.1.9 — 4:4:4 per-plane 16x16-DC: each plane has its
+        // own coded_block_flag bit (ctxBlockCat=6 for Cb, 10 for Cr).
+        BlockType::CbIntra16x16Dc => info.cbf_cb_16x16_dc,
+        BlockType::CrIntra16x16Dc => info.cbf_cr_16x16_dc,
         _ => false,
     }
 }
@@ -1798,6 +1872,10 @@ pub fn parse_macroblock(
             residual_chroma_dc_cr: Vec::new(),
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         });
     }
@@ -1954,6 +2032,10 @@ pub fn parse_macroblock(
         residual_chroma_dc_cr: Vec::new(),
         residual_chroma_ac_cb: Vec::new(),
         residual_chroma_ac_cr: Vec::new(),
+        residual_cb_luma_like: Vec::new(),
+        residual_cr_luma_like: Vec::new(),
+        residual_cb_16x16_dc: None,
+        residual_cr_16x16_dc: None,
         is_skip: false,
     };
 
@@ -2720,6 +2802,12 @@ fn parse_residual_cavlc_only(
     let mut own_luma_totals: [u8; 16] = [0; 16];
     let mut own_cb_totals: [u8; 8] = [0; 8];
     let mut own_cr_totals: [u8; 8] = [0; 8];
+    // §7.3.5.3 — 4:4:4 (ChromaArrayType == 3) chroma is coded like
+    // luma: 16 per-plane 4x4 blocks in the same indexing as luma. We
+    // track their TotalCoeff values here for nC derivation of the
+    // remaining blocks within this MB (§9.2.1.1 step 3).
+    let mut own_cb_luma_totals: [u8; 16] = [0; 16];
+    let mut own_cr_luma_totals: [u8; 16] = [0; 16];
 
     // Helper: derive nC for a luma 4x4 block using the neighbour grid
     // plus this MB's own-block progressively-filled totals. We model
@@ -2791,6 +2879,38 @@ fn parse_residual_cavlc_only(
             let Some(g) = grid else { return 0 };
             let (addr, bi) = resolve_chroma_neighbour(g, current_mb_addr, xb, yb, max_w, max_h);
             nc_nn_chroma(g, addr, bi, is_cr, current_is_intra, cip)
+        };
+        combine_nc(avail_a, n_a, avail_b, n_b)
+    };
+
+    // §9.2.1.1 — nC derivation for a Cb/Cr 4x4 block in the 4:4:4
+    // (ChromaArrayType == 3) coded-like-luma path. The block layout
+    // matches luma (16 blocks, same §6.4.11.4 neighbour map), but the
+    // TotalCoeff values come from the per-plane arrays in the
+    // neighbour grid (`cb_luma_total_coeff` / `cr_luma_total_coeff`).
+    let derive_plane_luma_like = |blk_idx: u8,
+                                  is_cr: bool,
+                                  own_cb_lt: &[u8; 16],
+                                  own_cr_lt: &[u8; 16],
+                                  grid: Option<&CavlcNcGrid>|
+     -> i32 {
+        let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk_idx);
+        let own = if is_cr { own_cr_lt } else { own_cb_lt };
+        let (avail_a, n_a) = match a_src {
+            NeighbourSource::InternalBlock(i) => (true, own[i as usize]),
+            _ => {
+                let Some(g) = grid else { return 0 };
+                let (addr, bi) = resolve_luma_neighbour(g, current_mb_addr, a_src);
+                nc_nn_plane_luma_like(g, addr, bi, is_cr, current_is_intra, cip)
+            }
+        };
+        let (avail_b, n_b) = match b_src {
+            NeighbourSource::InternalBlock(i) => (true, own[i as usize]),
+            _ => {
+                let Some(g) = grid else { return 0 };
+                let (addr, bi) = resolve_luma_neighbour(g, current_mb_addr, b_src);
+                nc_nn_plane_luma_like(g, addr, bi, is_cr, current_is_intra, cip)
+            }
         };
         combine_nc(avail_a, n_a, avail_b, n_b)
     };
@@ -2962,8 +3082,132 @@ fn parse_residual_cavlc_only(
         }
     } else if chroma_array_type == 0 {
         // Monochrome — no chroma residual.
+    } else if chroma_array_type == 3 {
+        // §7.3.5.3 — ChromaArrayType == 3: Cb and Cr are each coded
+        // like luma — `residual_luma(...)` invoked once per plane.
+        // Each plane carries its own 16x16 DC (for Intra_16x16), 16
+        // 4x4 AC blocks (or 4 8x8 blocks when transform_size_8x8 is
+        // set), gated by cbp_luma in the same way as luma.
+        //
+        // §9.2.1 — coeff_token nC derivation uses per-plane neighbour
+        // nC (the spec points to "neighbouring blocks of the same
+        // colour component").
+        for plane_is_cr in [false, true] {
+            // --- Plane 16x16 DC (Intra_16x16 only) ---
+            if mb_type.is_intra_16x16() {
+                let nc = derive_plane_luma_like(
+                    0,
+                    plane_is_cr,
+                    &own_cb_luma_totals,
+                    &own_cr_luma_totals,
+                    grid_ref,
+                );
+                let blk = parse_residual_block_cavlc(
+                    r,
+                    CoeffTokenContext::Numeric(nc),
+                    0,
+                    15,
+                    16,
+                )?;
+                if plane_is_cr {
+                    out.residual_cr_16x16_dc = Some(pad_to_16(blk));
+                } else {
+                    out.residual_cb_16x16_dc = Some(pad_to_16(blk));
+                }
+                // §9.2.1.1 NOTE 1: DC counts do NOT contribute to nN.
+            }
+
+            // --- Plane AC / 4x4 / 8x8 ---
+            if mb_type.is_intra_16x16() {
+                if cbp_luma == 15 {
+                    for blk_idx in 0..16u8 {
+                        let nc = derive_plane_luma_like(
+                            blk_idx,
+                            plane_is_cr,
+                            &own_cb_luma_totals,
+                            &own_cr_luma_totals,
+                            grid_ref,
+                        );
+                        let blk = parse_residual_block_cavlc(
+                            r,
+                            CoeffTokenContext::Numeric(nc),
+                            0,
+                            14,
+                            15,
+                        )?;
+                        let tc = count_nonzero(&blk);
+                        if plane_is_cr {
+                            own_cr_luma_totals[blk_idx as usize] = tc;
+                            out.residual_cr_luma_like.push(pad_to_16(blk));
+                        } else {
+                            own_cb_luma_totals[blk_idx as usize] = tc;
+                            out.residual_cb_luma_like.push(pad_to_16(blk));
+                        }
+                    }
+                }
+            } else if transform_size_8x8_flag {
+                for blk8 in 0..4u8 {
+                    if (cbp_luma >> blk8) & 1 == 1 {
+                        for sub in 0..4u8 {
+                            let blk_idx = blk8 * 4 + sub;
+                            let nc = derive_plane_luma_like(
+                                blk_idx,
+                                plane_is_cr,
+                                &own_cb_luma_totals,
+                                &own_cr_luma_totals,
+                                grid_ref,
+                            );
+                            let blk = parse_residual_block_cavlc(
+                                r,
+                                CoeffTokenContext::Numeric(nc),
+                                0,
+                                15,
+                                16,
+                            )?;
+                            let tc = count_nonzero(&blk);
+                            if plane_is_cr {
+                                own_cr_luma_totals[blk_idx as usize] = tc;
+                                out.residual_cr_luma_like.push(pad_to_16(blk));
+                            } else {
+                                own_cb_luma_totals[blk_idx as usize] = tc;
+                                out.residual_cb_luma_like.push(pad_to_16(blk));
+                            }
+                        }
+                    }
+                }
+            } else {
+                for blk8 in 0..4u8 {
+                    if (cbp_luma >> blk8) & 1 == 1 {
+                        for sub in 0..4u8 {
+                            let blk_idx = blk8 * 4 + sub;
+                            let nc = derive_plane_luma_like(
+                                blk_idx,
+                                plane_is_cr,
+                                &own_cb_luma_totals,
+                                &own_cr_luma_totals,
+                                grid_ref,
+                            );
+                            let blk = parse_residual_block_cavlc(
+                                r,
+                                CoeffTokenContext::Numeric(nc),
+                                0,
+                                15,
+                                16,
+                            )?;
+                            let tc = count_nonzero(&blk);
+                            if plane_is_cr {
+                                own_cr_luma_totals[blk_idx as usize] = tc;
+                                out.residual_cr_luma_like.push(pad_to_16(blk));
+                            } else {
+                                own_cb_luma_totals[blk_idx as usize] = tc;
+                                out.residual_cb_luma_like.push(pad_to_16(blk));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } else {
-        // 4:4:4 chroma is modelled like luma; not implemented.
         return Err(MacroblockLayerError::UnsupportedChromaArrayType(
             chroma_array_type,
         ));
@@ -2975,6 +3219,8 @@ fn parse_residual_cavlc_only(
             slot.luma_total_coeff = own_luma_totals;
             slot.cb_total_coeff = own_cb_totals;
             slot.cr_total_coeff = own_cr_totals;
+            slot.cb_luma_total_coeff = own_cb_luma_totals;
+            slot.cr_luma_total_coeff = own_cr_luma_totals;
         }
     }
 
@@ -3266,6 +3512,138 @@ fn parse_residual_cabac_only(
         }
     } else if chroma_array_type == 0 {
         // Monochrome — no chroma residual.
+    } else if chroma_array_type == 3 {
+        // §7.3.5.3 — ChromaArrayType == 3: each plane is coded like
+        // luma. Use the per-plane CABAC block types with per-plane CBF
+        // neighbour tracking (§9.3.3.1.1.9 Table 9-42 ctxBlockCat:
+        // Cb DC=6, Cb AC=7, Cb 4x4=8, Cb 8x8=9,
+        // Cr DC=10, Cr AC=11, Cr 4x4=12, Cr 8x8=13).
+        for plane_is_cr in [false, true] {
+            let (bt_dc, bt_ac, bt_4x4, bt_8x8) = if plane_is_cr {
+                (
+                    BlockType::CrIntra16x16Dc,
+                    BlockType::CrIntra16x16Ac,
+                    BlockType::CrLuma4x4,
+                    BlockType::Cr8x8,
+                )
+            } else {
+                (
+                    BlockType::CbIntra16x16Dc,
+                    BlockType::CbIntra16x16Ac,
+                    BlockType::CbLuma4x4,
+                    BlockType::Cb8x8,
+                )
+            };
+
+            // --- Plane 16x16 DC (Intra_16x16 only) ---
+            if mb_type.is_intra_16x16() {
+                let (ca, cb) = if let Some(g) = grid_ref {
+                    let (a, b) = cabac_cbf_cond_terms(
+                        g, current_mb_addr, &curr_cbf, current_is_intra,
+                        bt_dc, 0, plane_is_cr);
+                    (Some(a), Some(b))
+                } else {
+                    (None, None)
+                };
+                let (blk, coded) = parse_residual_block_cabac(
+                    cabac, ctxs, bt_dc, 0, 15, 16, chroma_array_type, ca, cb,
+                )?;
+                if plane_is_cr {
+                    curr_cbf.cbf_cr_16x16_dc = coded;
+                    out.residual_cr_16x16_dc = Some(pad_to_16(blk));
+                } else {
+                    curr_cbf.cbf_cb_16x16_dc = coded;
+                    out.residual_cb_16x16_dc = Some(pad_to_16(blk));
+                }
+            }
+
+            // --- Plane AC / 4x4 / 8x8 ---
+            if mb_type.is_intra_16x16() {
+                if cbp_luma == 15 {
+                    for blk_idx in 0..16u8 {
+                        let (ca, cb) = if let Some(g) = grid_ref {
+                            let (a, b) = cabac_cbf_cond_terms(
+                                g, current_mb_addr, &curr_cbf, current_is_intra,
+                                bt_ac, blk_idx, plane_is_cr);
+                            (Some(a), Some(b))
+                        } else {
+                            (None, None)
+                        };
+                        let (blk, coded) = parse_residual_block_cabac(
+                            cabac, ctxs, bt_ac, 0, 14, 15, chroma_array_type, ca, cb,
+                        )?;
+                        if plane_is_cr {
+                            curr_cbf.cbf_cr_16x16_ac[blk_idx as usize] = coded;
+                            out.residual_cr_luma_like.push(pad_to_16(blk));
+                        } else {
+                            curr_cbf.cbf_cb_16x16_ac[blk_idx as usize] = coded;
+                            out.residual_cb_luma_like.push(pad_to_16(blk));
+                        }
+                    }
+                }
+            } else if transform_size_8x8_flag {
+                for blk8 in 0..4u8 {
+                    if (cbp_luma >> blk8) & 1 == 1 {
+                        // 8x8 block: CBF is inferred from CBP in 4:4:4
+                        // (max_num_coeff == 64 AND chroma_array_type
+                        // == 3 → coded_block_flag IS coded per
+                        // §7.3.5.3.3).
+                        let (blk, coded) = parse_residual_block_cabac(
+                            cabac, ctxs, bt_8x8, 0, 63, 64, chroma_array_type,
+                            None, None,
+                        )?;
+                        // Propagate coded flag to the four 4x4 sub-
+                        // blocks so subsequent intra-MB neighbour
+                        // lookups see it.
+                        for sub in 0..4u8 {
+                            let idx = (blk8 * 4 + sub) as usize;
+                            if plane_is_cr {
+                                curr_cbf.cbf_cr_luma_4x4[idx] = coded;
+                            } else {
+                                curr_cbf.cbf_cb_luma_4x4[idx] = coded;
+                            }
+                        }
+                        for sub in 0..4 {
+                            let mut chunk = [0i32; 16];
+                            for k in 0..16 {
+                                chunk[k] = blk[sub * 16 + k];
+                            }
+                            if plane_is_cr {
+                                out.residual_cr_luma_like.push(chunk);
+                            } else {
+                                out.residual_cb_luma_like.push(chunk);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for blk8 in 0..4u8 {
+                    if (cbp_luma >> blk8) & 1 == 1 {
+                        for sub in 0..4u8 {
+                            let blk_idx = blk8 * 4 + sub;
+                            let (ca, cb) = if let Some(g) = grid_ref {
+                                let (a, b) = cabac_cbf_cond_terms(
+                                    g, current_mb_addr, &curr_cbf, current_is_intra,
+                                    bt_4x4, blk_idx, plane_is_cr);
+                                (Some(a), Some(b))
+                            } else {
+                                (None, None)
+                            };
+                            let (blk, coded) = parse_residual_block_cabac(
+                                cabac, ctxs, bt_4x4, 0, 15, 16, chroma_array_type, ca, cb,
+                            )?;
+                            if plane_is_cr {
+                                curr_cbf.cbf_cr_luma_4x4[blk_idx as usize] = coded;
+                                out.residual_cr_luma_like.push(pad_to_16(blk));
+                            } else {
+                                curr_cbf.cbf_cb_luma_4x4[blk_idx as usize] = coded;
+                                out.residual_cb_luma_like.push(pad_to_16(blk));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } else {
         return Err(MacroblockLayerError::UnsupportedChromaArrayType(
             chroma_array_type,
@@ -3286,6 +3664,12 @@ fn parse_residual_cabac_only(
             slot.cbf_cr_ac = curr_cbf.cbf_cr_ac;
             slot.cbf_luma_16x16_dc = curr_cbf.cbf_luma_16x16_dc;
             slot.cbf_luma_16x16_ac = curr_cbf.cbf_luma_16x16_ac;
+            slot.cbf_cb_16x16_dc = curr_cbf.cbf_cb_16x16_dc;
+            slot.cbf_cb_16x16_ac = curr_cbf.cbf_cb_16x16_ac;
+            slot.cbf_cb_luma_4x4 = curr_cbf.cbf_cb_luma_4x4;
+            slot.cbf_cr_16x16_dc = curr_cbf.cbf_cr_16x16_dc;
+            slot.cbf_cr_16x16_ac = curr_cbf.cbf_cr_16x16_ac;
+            slot.cbf_cr_luma_4x4 = curr_cbf.cbf_cr_luma_4x4;
             // is_i_pcm sets all CBF to 1 per §9.3.3.1.1.9.
             if mb_type.is_i_pcm() {
                 slot.cbf_luma_4x4 = [true; 16];
@@ -3295,6 +3679,12 @@ fn parse_residual_cabac_only(
                 slot.cbf_cr_ac = [true; 8];
                 slot.cbf_luma_16x16_dc = true;
                 slot.cbf_luma_16x16_ac = [true; 16];
+                slot.cbf_cb_16x16_dc = true;
+                slot.cbf_cb_16x16_ac = [true; 16];
+                slot.cbf_cb_luma_4x4 = [true; 16];
+                slot.cbf_cr_16x16_dc = true;
+                slot.cbf_cr_16x16_ac = [true; 16];
+                slot.cbf_cr_luma_4x4 = [true; 16];
             }
         }
     }
@@ -5096,5 +5486,366 @@ mod tests {
             &data, SliceKind::B, &MbType::B8x8, 0, 0,
         );
         assert!(b_bins > 0, "B sub_mb_type must consume bins (got 0)");
+    }
+
+    // -----------------------------------------------------------------
+    // §7.3.5.3 — ChromaArrayType == 3 (4:4:4) residual parse tests.
+    //
+    // In 4:4:4 mode, Cb and Cr are each coded like luma: Intra_16x16
+    // MBs have per-plane 16x16 DC + 16 4x4 AC blocks; Intra_NxN / Inter
+    // MBs have 16 per-plane 4x4 blocks gated by cbp_luma. None of these
+    // paths existed before; the tests verify the parse completes and
+    // the coefficients land in the new `residual_*_luma_like` /
+    // `residual_*_16x16_dc` storage fields.
+    // -----------------------------------------------------------------
+
+    /// Build a minimal EntropyState for CAVLC 4:4:4 tests
+    /// (ChromaArrayType == 3).
+    fn cavlc_entropy_444() -> EntropyState<'static, 'static> {
+        EntropyState {
+            cabac: None,
+            slice_kind: SliceKind::I,
+            neighbours: NeighbourCtx::default(),
+            prev_mb_qp_delta_nonzero: false,
+            chroma_array_type: 3,
+            transform_8x8_mode_flag: false,
+            cavlc_nc: None,
+            current_mb_addr: 0,
+            constrained_intra_pred_flag: false,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            mbaff_frame_flag: false,
+            cabac_nb: None,
+            pic_width_in_mbs: 0,
+        }
+    }
+
+    /// §7.3.5.3 / §9.2.1 — CAVLC Intra_16x16 in 4:4:4 with cbp_luma=0,
+    /// cbp_chroma=0. The residual consists of exactly three DC blocks
+    /// (Y, Cb, Cr), each a single TotalCoeff=0 coeff_token ("1") in the
+    /// nC<2 column. No AC blocks follow (cbp_luma=0 gates them off for
+    /// all three planes).
+    #[test]
+    fn cavlc_intra_16x16_444_all_zero_dc() {
+        let mut w = BitWriter::new();
+        w.ue(1); // mb_type = 1 → Intra_16x16_0_0_0 (pred=0, cbp_luma=0, cbp_chroma=0)
+        // §7.3.5.1: intra_chroma_pred_mode is only read when
+        // ChromaArrayType == 1 || 2 — NOT for 4:4:4.
+        w.se(0); // mb_qp_delta
+        w.u(1, 1); // Y DC coeff_token TotalCoeff=0 (nC<2) = "1"
+        w.u(1, 1); // Cb DC coeff_token TotalCoeff=0 = "1"
+        w.u(1, 1); // Cr DC coeff_token TotalCoeff=0 = "1"
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let mut r = BitReader::new(&bytes);
+        let mut entropy = cavlc_entropy_444();
+
+        let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        assert!(matches!(
+            mb.mb_type,
+            MbType::Intra16x16(Intra16x16 {
+                pred_mode: 0,
+                cbp_luma: 0,
+                cbp_chroma: 0
+            })
+        ));
+        assert_eq!(mb.coded_block_pattern, 0);
+        // Y DC present, Cb DC + Cr DC present (4:4:4 Intra_16x16 always
+        // parses per-plane DC blocks even when cbp_luma/chroma == 0).
+        assert!(mb.residual_luma_dc.is_some());
+        assert!(mb.residual_cb_16x16_dc.is_some());
+        assert!(mb.residual_cr_16x16_dc.is_some());
+        // All 16 coefficients of each DC block are zero (TotalCoeff=0).
+        assert_eq!(mb.residual_luma_dc.unwrap(), [0; 16]);
+        assert_eq!(mb.residual_cb_16x16_dc.unwrap(), [0; 16]);
+        assert_eq!(mb.residual_cr_16x16_dc.unwrap(), [0; 16]);
+        // No AC blocks (cbp_luma == 0 gates all planes).
+        assert!(mb.residual_luma.is_empty());
+        assert!(mb.residual_cb_luma_like.is_empty());
+        assert!(mb.residual_cr_luma_like.is_empty());
+        // No 4:2:0 / 4:2:2 chroma path state.
+        assert!(mb.residual_chroma_dc_cb.is_empty());
+        assert!(mb.residual_chroma_ac_cb.is_empty());
+    }
+
+    /// §7.3.5.3 / §9.2.1 — CAVLC Intra_16x16 in 4:4:4 with cbp_luma=15,
+    /// cbp_chroma=0. Each plane (Y, Cb, Cr) emits 1 DC block + 16 AC
+    /// blocks. All blocks carry TotalCoeff=0 so each is a single "1"
+    /// bit coeff_token. Total: 3 * (1 + 16) = 51 bits.
+    #[test]
+    fn cavlc_intra_16x16_444_all_zero_with_ac() {
+        let mut w = BitWriter::new();
+        w.ue(13); // mb_type = 13 → Intra_16x16_0_0_15 (pred=0, cbp_luma=15, cbp_chroma=0)
+        w.se(0); // mb_qp_delta
+        // Y: DC + 16 AC. Cb: DC + 16 AC. Cr: DC + 16 AC.
+        // Each block TotalCoeff=0 → coeff_token = "1" (nC<2 column).
+        for _ in 0..(3 * 17) {
+            w.u(1, 1);
+        }
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let mut r = BitReader::new(&bytes);
+        let mut entropy = cavlc_entropy_444();
+
+        let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        assert!(matches!(
+            mb.mb_type,
+            MbType::Intra16x16(Intra16x16 {
+                pred_mode: 0,
+                cbp_luma: 15,
+                cbp_chroma: 0
+            })
+        ));
+        // Y: DC + 16 AC.
+        assert!(mb.residual_luma_dc.is_some());
+        assert_eq!(mb.residual_luma.len(), 16);
+        // Cb: DC + 16 AC (stored in luma-like fields).
+        assert!(mb.residual_cb_16x16_dc.is_some());
+        assert_eq!(mb.residual_cb_luma_like.len(), 16);
+        // Cr: DC + 16 AC.
+        assert!(mb.residual_cr_16x16_dc.is_some());
+        assert_eq!(mb.residual_cr_luma_like.len(), 16);
+        // Every block is zero (TotalCoeff=0 → empty coefficient vector).
+        for blk in &mb.residual_luma {
+            assert_eq!(*blk, [0; 16]);
+        }
+        for blk in &mb.residual_cb_luma_like {
+            assert_eq!(*blk, [0; 16]);
+        }
+        for blk in &mb.residual_cr_luma_like {
+            assert_eq!(*blk, [0; 16]);
+        }
+    }
+
+    /// §7.3.5.3 — CAVLC I_NxN in 4:4:4 with all-zero CBP. Verifies the
+    /// parser doesn't error when ChromaArrayType == 3 but there's no
+    /// residual to read — the Cb/Cr plane loops are gated by cbp_luma
+    /// just like luma.
+    #[test]
+    fn cavlc_i_nxn_444_all_zero_residual() {
+        // §9.1.2 / Table 9-4(b): ChromaArrayType ∈ {0, 3} uses
+        // `ME_INTRA_0_3`. codeNum=1 → CBP=0 for intra.
+        assert_eq!(ME_INTRA_0_3[1], 0);
+
+        let mut w = BitWriter::new();
+        w.ue(0); // mb_type = I_NxN
+        for _ in 0..16 {
+            w.u(1, 1); // prev_intra4x4_pred_mode_flag
+        }
+        // §7.3.5.1: no intra_chroma_pred_mode for 4:4:4.
+        w.ue(1); // coded_block_pattern codeNum=1 → CBP=0 (4:4:4 intra table)
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let mut r = BitReader::new(&bytes);
+        let mut entropy = cavlc_entropy_444();
+
+        let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        assert_eq!(mb.mb_type, MbType::INxN);
+        assert_eq!(mb.coded_block_pattern, 0);
+        assert!(mb.residual_luma.is_empty());
+        assert!(mb.residual_cb_luma_like.is_empty());
+        assert!(mb.residual_cr_luma_like.is_empty());
+        assert!(mb.residual_cb_16x16_dc.is_none());
+        assert!(mb.residual_cr_16x16_dc.is_none());
+    }
+
+    /// §7.3.5.3 — CAVLC Inter P_L0_16x16 in 4:4:4 with cbp_total = 0.
+    /// Verifies the parse succeeds and that the 4:4:4 branch is also
+    /// reachable in inter macroblocks (not just intra).
+    #[test]
+    fn cavlc_inter_444_all_zero_residual() {
+        // codeNum=0 → CBP 0 in the inter 4:2:0/4:2:2 table.
+        assert_eq!(ME_INTER_420_422[0], 0);
+
+        let mut w = BitWriter::new();
+        w.ue(0); // mb_type = P_L0_16x16 (inter, one 16x16 partition)
+        // mb_pred: since num_ref_idx_l0_active_minus1 == 0 and not MBAFF,
+        // no ref_idx_l0 is read. MVD_l0 per component with value 0:
+        w.se(0); // mvd_l0[0][0][0]  (x)
+        w.se(0); // mvd_l0[0][0][1]  (y)
+        w.ue(0); // coded_block_pattern codeNum=0 → CBP 0 (inter)
+        // cbp_luma == 0 AND cbp_chroma == 0 AND not Intra_16x16 →
+        // mb_qp_delta is NOT read, residual block entirely skipped.
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::P);
+        let mut r = BitReader::new(&bytes);
+        let mut entropy = cavlc_entropy_444();
+        entropy.slice_kind = SliceKind::P;
+
+        let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        assert_eq!(mb.mb_type, MbType::PL016x16);
+        assert_eq!(mb.coded_block_pattern, 0);
+        assert!(mb.residual_luma.is_empty());
+        assert!(mb.residual_cb_luma_like.is_empty());
+        assert!(mb.residual_cr_luma_like.is_empty());
+        assert!(mb.residual_luma_dc.is_none());
+        assert!(mb.residual_cb_16x16_dc.is_none());
+        assert!(mb.residual_cr_16x16_dc.is_none());
+    }
+
+    /// §9.2.1.1 — CAVLC 4:4:4 nC neighbour derivation uses per-plane
+    /// totals. `nc_nn_plane_luma_like` returns the Cb/Cr
+    /// `_luma_total_coeff` array entry of an available MB, with the
+    /// standard skip/i_pcm fallbacks of §9.2.1.1 step 6.
+    #[test]
+    fn cavlc_444_nc_plane_reads_per_plane_totals() {
+        let mut grid = CavlcNcGrid::new(2, 2);
+        let slot = &mut grid.mbs[0];
+        slot.is_available = true;
+        slot.is_intra = true;
+        slot.cb_luma_total_coeff[5] = 7;
+        slot.cr_luma_total_coeff[5] = 11;
+
+        // Cb plane: read block index 5 from MB 0.
+        let (avail, n) = nc_nn_plane_luma_like(&grid, Some(0), 5, false, true, false);
+        assert!(avail);
+        assert_eq!(n, 7);
+
+        // Cr plane: same block index, different array.
+        let (avail, n) = nc_nn_plane_luma_like(&grid, Some(0), 5, true, true, false);
+        assert!(avail);
+        assert_eq!(n, 11);
+
+        // Unavailable MB → (false, 0).
+        let (avail, _) = nc_nn_plane_luma_like(&grid, Some(99), 5, false, true, false);
+        assert!(!avail);
+
+        // Skip neighbour → (true, 0).
+        grid.mbs[1].is_available = true;
+        grid.mbs[1].is_skip = true;
+        grid.mbs[1].cb_luma_total_coeff[5] = 9;
+        let (avail, n) = nc_nn_plane_luma_like(&grid, Some(1), 5, false, true, false);
+        assert!(avail);
+        assert_eq!(n, 0);
+
+        // I_PCM neighbour → (true, 16) per §9.2.1.1 step 6.
+        grid.mbs[1].is_skip = false;
+        grid.mbs[1].is_i_pcm = true;
+        let (avail, n) = nc_nn_plane_luma_like(&grid, Some(1), 5, false, true, false);
+        assert!(avail);
+        assert_eq!(n, 16);
+    }
+
+    /// §7.3.5.3 / §9.3.3.1.1.9 — CABAC 4:4:4 reaches the per-plane
+    /// code path when chroma_array_type == 3. This test drives the
+    /// parse through `parse_residual_cabac_only` for an Intra_16x16 MB
+    /// with cbp_luma=0 / cbp_chroma=0 (smallest residual in 4:4:4:
+    /// only Y DC, Cb DC, Cr DC blocks are parsed). We don't construct
+    /// a real CABAC arithmetic stream here — instead we verify that
+    /// the dispatch path does NOT error out with
+    /// `UnsupportedChromaArrayType(3)` when ChromaArrayType == 3.
+    #[test]
+    fn cabac_444_intra_16x16_residual_path_reachable() {
+        // A byte-stream that yields a short sequence of "0" bins in the
+        // CABAC engine — sufficient to get `coded_block_flag = 0` for
+        // each of the three DC blocks so no further significance-map
+        // bins are read. For the Intra_16x16 / cbp=0 case this is the
+        // only residual we need to parse.
+        // Any short zero-biased payload works: the contexts start with
+        // `valMPS=0, pStateIdx=low` in many Intra slots, making the
+        // first bin likely LPS=0. The test asserts only that parsing
+        // does NOT return `UnsupportedChromaArrayType(3)`.
+        let data: [u8; 32] = [
+            // CABAC engine state: codIRange=510, codIOffset = first 9 bits.
+            // Pad enough for several decode_decision calls.
+            0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
+        let mut ctxs = CabacContexts::init(SliceKind::I, None, 26).unwrap();
+        let mut out = Macroblock::new_skip(SliceType::I);
+        // Set it up to look like a non-skip Intra_16x16 MB.
+        out.is_skip = false;
+        let mb_type = MbType::Intra16x16(Intra16x16 {
+            pred_mode: 0,
+            cbp_luma: 0,
+            cbp_chroma: 0,
+        });
+        let res = parse_residual_cabac_only(
+            &mut dec,
+            &mut ctxs,
+            /*chroma_array_type=*/ 3,
+            &mb_type,
+            /*cbp_luma=*/ 0,
+            /*cbp_chroma=*/ 0,
+            /*transform_size_8x8_flag=*/ false,
+            &mut out,
+            /*nb_grid=*/ None,
+            /*current_mb_addr=*/ 0,
+            /*current_is_intra=*/ true,
+        );
+        // The 4:4:4 branch must return Ok (possibly with all-zero
+        // residual blocks) — NOT UnsupportedChromaArrayType.
+        assert!(
+            !matches!(
+                res,
+                Err(MacroblockLayerError::UnsupportedChromaArrayType(3))
+            ),
+            "CABAC 4:4:4 must not return UnsupportedChromaArrayType(3)"
+        );
+        // Whether res is Ok or some other CABAC error depends on the
+        // specific bit pattern — we only assert that the 4:4:4 path
+        // no longer rejects with UnsupportedChromaArrayType(3).
+        if res.is_ok() {
+            // When coded_block_flag decodes to 0 for all three planes'
+            // DC blocks, the corresponding residuals are present as
+            // all-zero vectors (parse_residual_block_cabac pads
+            // `out` to `len` = 16 and returns `coded = false`).
+            assert!(out.residual_luma_dc.is_some());
+            assert!(out.residual_cb_16x16_dc.is_some());
+            assert!(out.residual_cr_16x16_dc.is_some());
+        }
+    }
+
+    /// §9.3.3.1.1.9 — `cbf_luma_for` + `cbf_mb_level_for` route per-
+    /// plane CBF queries to the plane-specific neighbour arrays.
+    #[test]
+    fn cabac_444_cbf_helpers_route_per_plane() {
+        let mut info = CabacMbNeighbourInfo::default();
+        info.available = true;
+        info.cbf_luma_4x4[3] = true;
+        info.cbf_cb_luma_4x4[3] = false;
+        info.cbf_cr_luma_4x4[3] = true;
+        info.cbf_luma_16x16_dc = true;
+        info.cbf_cb_16x16_dc = false;
+        info.cbf_cr_16x16_dc = true;
+        info.cbf_luma_16x16_ac[5] = true;
+        info.cbf_cb_16x16_ac[5] = false;
+        info.cbf_cr_16x16_ac[5] = true;
+
+        // Luma 4x4: route to `cbf_luma_4x4`.
+        assert!(cbf_luma_for(&info, BlockType::Luma4x4, 3));
+        // Cb 4x4: route to `cbf_cb_luma_4x4`.
+        assert!(!cbf_luma_for(&info, BlockType::CbLuma4x4, 3));
+        // Cr 4x4: route to `cbf_cr_luma_4x4`.
+        assert!(cbf_luma_for(&info, BlockType::CrLuma4x4, 3));
+
+        // 16x16 AC routing.
+        assert!(cbf_luma_for(&info, BlockType::Luma16x16Ac, 5));
+        assert!(!cbf_luma_for(&info, BlockType::CbIntra16x16Ac, 5));
+        assert!(cbf_luma_for(&info, BlockType::CrIntra16x16Ac, 5));
+
+        // 16x16 DC routing.
+        assert!(cbf_mb_level_for(&info, BlockType::Luma16x16Dc, false));
+        assert!(!cbf_mb_level_for(&info, BlockType::CbIntra16x16Dc, false));
+        assert!(cbf_mb_level_for(&info, BlockType::CrIntra16x16Dc, true));
     }
 }

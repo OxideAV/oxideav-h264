@@ -1548,6 +1548,281 @@ mod tests {
         assert_eq!(out[at4(1, 2)], 38);
     }
 
+    // ---- Additional systematic tests covering every 4x4 mode with a
+    //      known reference pattern, verifying every output sample
+    //      against hand-derived spec equations. ----
+
+    #[test]
+    fn intra_4x4_ddl_all_samples() {
+        // §8.3.1.2.4 eqs. 8-52 / 8-53.
+        // top + top_right = p[0..=7, -1].
+        // Using p = [8,9,10,11,12,13,14,15] (ascending by 1).
+        let s = mk_4x4([8, 9, 10, 11], [12, 13, 14, 15], [0; 4], 0);
+        let mut out = [0i32; 16];
+        predict_4x4(Intra4x4Mode::DiagonalDownLeft, &s, 8, &mut out);
+        // pred[x,y] = (p[x+y] + 2*p[x+y+1] + p[x+y+2] + 2) >> 2 (eq. 8-53)
+        //   except pred[3,3] = (p[6] + 3*p[7] + 2) >> 2 (eq. 8-52).
+        let p = [8, 9, 10, 11, 12, 13, 14, 15];
+        for y in 0..4 {
+            for x in 0..4 {
+                let expected = if x == 3 && y == 3 {
+                    (p[6] + 3 * p[7] + 2) >> 2
+                } else {
+                    (p[x + y] + 2 * p[x + y + 1] + p[x + y + 2] + 2) >> 2
+                };
+                assert_eq!(
+                    out[at4(x, y)],
+                    expected as i32,
+                    "DDL mismatch at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intra_4x4_ddr_all_samples() {
+        // §8.3.1.2.5 eqs. 8-54..8-56.
+        // top=[10,20,30,40], left=[50,60,70,80], tl=5.
+        let s = mk_4x4([10, 20, 30, 40], [0; 4], [50, 60, 70, 80], 5);
+        let mut out = [0i32; 16];
+        predict_4x4(Intra4x4Mode::DiagonalDownRight, &s, 8, &mut out);
+
+        // Helper to read p[x,-1] or p[-1,y], index -1 = top_left.
+        let p_top = [10, 20, 30, 40];
+        let p_left = [50, 60, 70, 80];
+        let tl = 5;
+        let fetch_top = |x: i32| -> i32 {
+            if x == -1 {
+                tl
+            } else {
+                p_top[x as usize]
+            }
+        };
+        let fetch_left = |y: i32| -> i32 {
+            if y == -1 {
+                tl
+            } else {
+                p_left[y as usize]
+            }
+        };
+
+        for y in 0..4i32 {
+            for x in 0..4i32 {
+                let expected = if x > y {
+                    // eq. 8-54
+                    (fetch_top(x - y - 2) + 2 * fetch_top(x - y - 1) + fetch_top(x - y) + 2) >> 2
+                } else if x < y {
+                    // eq. 8-55
+                    (fetch_left(y - x - 2) + 2 * fetch_left(y - x - 1) + fetch_left(y - x) + 2) >> 2
+                } else {
+                    // eq. 8-56
+                    (fetch_top(0) + 2 * tl + fetch_left(0) + 2) >> 2
+                };
+                assert_eq!(
+                    out[at4(x as usize, y as usize)],
+                    expected,
+                    "DDR mismatch at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intra_4x4_vr_all_samples() {
+        // §8.3.1.2.6 eqs. 8-57..8-60.
+        // Distinct top/left to stress every zVR branch.
+        let s = mk_4x4([100, 110, 120, 130], [0; 4], [50, 60, 70, 80], 5);
+        let mut out = [0i32; 16];
+        predict_4x4(Intra4x4Mode::VerticalRight, &s, 8, &mut out);
+
+        let tl = 5;
+        let top = [100, 110, 120, 130];
+        let left = [50, 60, 70, 80];
+        let p_top = |x: i32| -> i32 {
+            if x == -1 {
+                tl
+            } else {
+                top[x as usize]
+            }
+        };
+        let p_left = |y: i32| -> i32 {
+            if y == -1 {
+                tl
+            } else {
+                left[y as usize]
+            }
+        };
+
+        for y in 0..4i32 {
+            for x in 0..4i32 {
+                let z = 2 * x - y;
+                let expected = match z {
+                    0 | 2 | 4 | 6 => {
+                        let xp = x - (y >> 1) - 1;
+                        (p_top(xp) + p_top(xp + 1) + 1) >> 1
+                    }
+                    1 | 3 | 5 => {
+                        let xp = x - (y >> 1) - 2;
+                        (p_top(xp) + 2 * p_top(xp + 1) + p_top(xp + 2) + 2) >> 2
+                    }
+                    -1 => (p_left(0) + 2 * tl + p_top(0) + 2) >> 2,
+                    _ => {
+                        // z=-2 or -3: eq. 8-60
+                        (p_left(y - 1) + 2 * p_left(y - 2) + p_left(y - 3) + 2) >> 2
+                    }
+                };
+                assert_eq!(
+                    out[at4(x as usize, y as usize)],
+                    expected,
+                    "VR mismatch at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intra_4x4_hd_all_samples() {
+        // §8.3.1.2.7 eqs. 8-61..8-64. Mirror of VR along the diagonal.
+        let s = mk_4x4([100, 110, 120, 130], [0; 4], [50, 60, 70, 80], 5);
+        let mut out = [0i32; 16];
+        predict_4x4(Intra4x4Mode::HorizontalDown, &s, 8, &mut out);
+
+        let tl = 5;
+        let top = [100, 110, 120, 130];
+        let left = [50, 60, 70, 80];
+        let p_top = |x: i32| -> i32 {
+            if x == -1 {
+                tl
+            } else {
+                top[x as usize]
+            }
+        };
+        let p_left = |y: i32| -> i32 {
+            if y == -1 {
+                tl
+            } else {
+                left[y as usize]
+            }
+        };
+
+        for y in 0..4i32 {
+            for x in 0..4i32 {
+                let z = 2 * y - x;
+                let expected = match z {
+                    0 | 2 | 4 | 6 => {
+                        let yp = y - (x >> 1) - 1;
+                        (p_left(yp) + p_left(yp + 1) + 1) >> 1
+                    }
+                    1 | 3 | 5 => {
+                        let yp = y - (x >> 1) - 2;
+                        (p_left(yp) + 2 * p_left(yp + 1) + p_left(yp + 2) + 2) >> 2
+                    }
+                    -1 => (p_left(0) + 2 * tl + p_top(0) + 2) >> 2,
+                    _ => {
+                        // z=-2 or -3: eq. 8-64
+                        (p_top(x - 1) + 2 * p_top(x - 2) + p_top(x - 3) + 2) >> 2
+                    }
+                };
+                assert_eq!(
+                    out[at4(x as usize, y as usize)],
+                    expected,
+                    "HD mismatch at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intra_4x4_vl_all_samples() {
+        // §8.3.1.2.8 eqs. 8-65 / 8-66.
+        // p[0..=7] built from top+top_right.
+        let s = mk_4x4([8, 9, 10, 11], [12, 13, 14, 15], [0; 4], 0);
+        let mut out = [0i32; 16];
+        predict_4x4(Intra4x4Mode::VerticalLeft, &s, 8, &mut out);
+        let p = [8, 9, 10, 11, 12, 13, 14, 15];
+
+        for y in 0..4i32 {
+            for x in 0..4i32 {
+                let xp = (x + (y >> 1)) as usize;
+                let expected = if y == 0 || y == 2 {
+                    (p[xp] + p[xp + 1] + 1) >> 1
+                } else {
+                    (p[xp] + 2 * p[xp + 1] + p[xp + 2] + 2) >> 2
+                };
+                assert_eq!(
+                    out[at4(x as usize, y as usize)],
+                    expected,
+                    "VL mismatch at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intra_4x4_hu_all_samples() {
+        // §8.3.1.2.9 eqs. 8-67..8-70.
+        let s = mk_4x4([0; 4], [0; 4], [50, 60, 70, 80], 0);
+        let mut out = [0i32; 16];
+        predict_4x4(Intra4x4Mode::HorizontalUp, &s, 8, &mut out);
+        let l = [50, 60, 70, 80];
+        for y in 0..4i32 {
+            for x in 0..4i32 {
+                let z_hu = x + 2 * y;
+                let expected = match z_hu {
+                    0 | 2 | 4 => {
+                        let yp = (y + (x >> 1)) as usize;
+                        (l[yp] + l[yp + 1] + 1) >> 1
+                    }
+                    1 | 3 => {
+                        let yp = (y + (x >> 1)) as usize;
+                        // Clamp indices to 3 for the "out of bounds"
+                        // positions the spec says are equal to l[3]
+                        // via the extrapolation rule (Intra_4x4 only
+                        // uses y=0..=3 left samples; index 4+ falls
+                        // back to p[-1,3]).
+                        let p1 = if yp + 1 < 4 { l[yp + 1] } else { l[3] };
+                        let p2 = if yp + 2 < 4 { l[yp + 2] } else { l[3] };
+                        (l[yp] + 2 * p1 + p2 + 2) >> 2
+                    }
+                    5 => (l[2] + 3 * l[3] + 2) >> 2,
+                    _ => l[3],
+                };
+                assert_eq!(
+                    out[at4(x as usize, y as usize)],
+                    expected,
+                    "HU mismatch at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intra_4x4_ddl_top_row_substitution_applied() {
+        // §8.3.1.2 substitution rule: when p[x,-1] for x=4..7 is not
+        // available but p[3,-1] is, substitute p[3,-1].
+        // With top=[10,10,10,10] and no top_right, p[4..7] must become 10
+        // each, making every DDL sample equal to 10.
+        let mut s = mk_4x4([10, 10, 10, 10], [99; 4], [0; 4], 0);
+        s.availability.top_right = false;
+        let mut out = [0i32; 16];
+        predict_4x4(Intra4x4Mode::DiagonalDownLeft, &s, 8, &mut out);
+        for v in out.iter() {
+            assert_eq!(*v, 10);
+        }
+    }
+
     // ----- Intra 8x8 tests -----
 
     fn mk_8x8(top: [i32; 8], top_right: [i32; 8], left: [i32; 8], tl: i32) -> Samples8x8 {

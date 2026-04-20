@@ -41,7 +41,7 @@ use crate::intra_pred::{
 use crate::macroblock_layer::{Macroblock, MbType, SubMbType};
 use crate::mb_grid::{MbGrid, MbInfo};
 use crate::mv_deriv::{
-    derive_mvpred, derive_p_skip_mv, Mv, MvpredInputs, MvpredShape, NeighbourMv,
+    derive_mvpred_with_d, derive_p_skip_mv_with_d, Mv, MvpredInputs, MvpredShape, NeighbourMv,
 };
 use crate::picture::Picture;
 use crate::pps::Pps;
@@ -1760,6 +1760,13 @@ struct InterPartition {
     /// Parsed MVDs (1/4-pel), if present. Zero for direct / skip.
     mvd_l0: (i32, i32),
     mvd_l1: (i32, i32),
+    /// `true` when this partition was generated from P_Skip / B_Skip so
+    /// that `derive_partition_mvs` can apply the §8.4.1.2 zero-MV
+    /// substitution rules specific to skip mode. Regular inter partitions
+    /// with MVD = (0, 0) and ref_idx = 0 look identical in (w, h, mode,
+    /// shape, mvd, ref_idx) but MUST use the standard MVpred derivation
+    /// per §8.4.1.3 — not the P_Skip zero-forcing conditions.
+    is_skip: bool,
 }
 
 /// §8.4 — Per-MB inter reconstruction.
@@ -1797,6 +1804,37 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     // -------- Derive inter partitions --------------------------------
     let partitions = derive_inter_partitions(mb, slice_header)?;
 
+    // Test-only OXIDEAV_H264_RECON_DEBUG / OXIDEAV_H264_RECON_DEBUG_MB
+    // instrumentation — prints per-MB + per-partition inter reconstruct
+    // inputs so a human operator can compare against ffmpeg's trace.
+    let inter_debug_mb = std::env::var("OXIDEAV_H264_RECON_DEBUG_MB")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+    let inter_debug = (mb_addr == 0 && std::env::var("OXIDEAV_H264_RECON_DEBUG").is_ok())
+        || inter_debug_mb == Some(mb_addr);
+    if inter_debug {
+        eprintln!(
+            "RECON_INTER MB#{} mb_type={:?} mb_type_raw={} slice_type={:?} \
+             cbp={:#x} transform8x8={} qp_y={} partitions={}",
+            mb_addr,
+            mb.mb_type,
+            mb.mb_type_raw,
+            slice_header.slice_type,
+            mb.coded_block_pattern,
+            mb.transform_size_8x8_flag,
+            qp_y,
+            partitions.len(),
+        );
+        for (i, p) in partitions.iter().enumerate() {
+            eprintln!(
+                "  part[{}] x={} y={} w={} h={} mode={:?} shape={:?} \
+                 ref_l0={} ref_l1={} mvd_l0={:?} mvd_l1={:?}",
+                i, p.x, p.y, p.w, p.h, p.mode, p.shape, p.ref_idx_l0, p.ref_idx_l1,
+                p.mvd_l0, p.mvd_l1,
+            );
+        }
+    }
+
     // -------- For each partition: MVpred, MV, MC, write prediction ---
     // Luma prediction samples for the whole MB.
     let mut pred_luma = [0i32; 256];
@@ -1822,6 +1860,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             &mut pred_luma,
             &mut pred_cb,
             &mut pred_cr,
+            inter_debug,
         )?;
     }
 
@@ -2153,12 +2192,21 @@ fn process_partition<R: RefPicProvider>(
     pred_luma: &mut [i32; 256],
     pred_cb: &mut [i32],
     pred_cr: &mut [i32],
+    inter_debug: bool,
 ) -> Result<(), ReconstructError> {
     let _ = pic; // currently unused; kept for future neighbour queries.
                  // §8.4.1 — derive L0 / L1 MVpreds. For Direct / Skip we compute MVs
                  // up-front via derive_p_skip_mv or a simple spatial-direct stub.
                  // Everything else uses mvLX = mvpLX + mvdLX (eq. 8-174-ish in §8.4.1).
     let (mv_l0, mv_l1) = derive_partition_mvs(part, mb_addr, grid);
+    if inter_debug {
+        eprintln!(
+            "    derived mv_l0={:?} mv_l1={:?} for part@({},{} {}x{})",
+            (mv_l0.x, mv_l0.y),
+            (mv_l1.x, mv_l1.y),
+            part.x, part.y, part.w, part.h
+        );
+    }
 
     // Store MVs in the MB grid so future MBs can use them. We store in
     // the current MB entry (`grid[mb_addr]`). The grid holds per-4x4-
@@ -2198,10 +2246,17 @@ fn process_partition<R: RefPicProvider>(
                 let qy = q_y0 + qdy;
                 if qx < 2 && qy < 2 {
                     let q_idx = qy * 2 + qx;
+                    // §7.4.5 / §8.4.1 — write ref_idx for each list that
+                    // contributes to this partition. Direct / BSkip derive
+                    // both L0 and L1 refs per §8.4.1.2, so Direct writes
+                    // both just like BiPred.
                     if part.mode != PartMode::L1Only {
                         info.ref_idx_l0[q_idx] = part.ref_idx_l0;
                     }
-                    if matches!(part.mode, PartMode::L1Only | PartMode::BiPred) {
+                    if matches!(
+                        part.mode,
+                        PartMode::L1Only | PartMode::BiPred | PartMode::Direct
+                    ) {
                         info.ref_idx_l1[q_idx] = part.ref_idx_l1;
                     }
                 }
@@ -2803,75 +2858,93 @@ fn mc_chroma_partition(
 /// Neighbour MV data is read from the grid. The partition's shape
 /// selects the §8.4.1.3 shortcut (16x8 / 8x16) when applicable.
 fn derive_partition_mvs(part: &InterPartition, mb_addr: u32, grid: &MbGrid) -> (Mv, Mv) {
-    // Build neighbour MVs (A, B, C) relative to the partition origin.
+    // Build neighbour MVs (A, B, C, D) relative to the partition origin.
     // The simple non-MBAFF frame case: A is the 4x4 block immediately
     // left (within this MB or the left MB if partition is at x=0),
     // B is the 4x4 block immediately above, C is the 4x4 block
-    // upper-right.
-    let (neigh_a_l0, neigh_b_l0, neigh_c_l0) = neighbour_mvs_for_list(part, mb_addr, grid, 0);
-    let (neigh_a_l1, neigh_b_l1, neigh_c_l1) = neighbour_mvs_for_list(part, mb_addr, grid, 1);
-
-    // Apply §8.4.1.3.2 eq. 8-214..8-216 — if C is unavailable,
-    // substitute D. We don't track D explicitly in the per-partition
-    // context here, so we conservatively fall through to median-of-
-    // (A, B, 0) when C is unavailable. Full D substitution is a TODO.
+    // upper-right, D is the 4x4 block upper-left.
+    //
+    // D is consulted only for the §8.4.1.3.2 eq. 8-214..8-216 C→D
+    // substitution applied inside `derive_mvpred_with_d` /
+    // `derive_p_skip_mv_with_d`.
+    let (neigh_a_l0, neigh_b_l0, neigh_c_l0, neigh_d_l0) =
+        neighbour_mvs_for_list(part, mb_addr, grid, 0);
+    let (neigh_a_l1, neigh_b_l1, neigh_c_l1, neigh_d_l1) =
+        neighbour_mvs_for_list(part, mb_addr, grid, 1);
 
     let (mv_l0, mv_l1) = match part.mode {
         PartMode::Direct => {
             // §8.4.1.2 direct mode — for now use spatial-direct median
             // with ref_idx = 0. Temporal direct and full spatial direct
             // precise derivation are deferred.
-            let mvp_l0 = derive_mvpred(&MvpredInputs {
-                neighbour_a: neigh_a_l0,
-                neighbour_b: neigh_b_l0,
-                neighbour_c: neigh_c_l0,
-                current_ref_idx: part.ref_idx_l0.max(0) as i32,
-                shape: MvpredShape::Default,
-            });
-            let mvp_l1 = derive_mvpred(&MvpredInputs {
-                neighbour_a: neigh_a_l1,
-                neighbour_b: neigh_b_l1,
-                neighbour_c: neigh_c_l1,
-                current_ref_idx: part.ref_idx_l1.max(0) as i32,
-                shape: MvpredShape::Default,
-            });
+            let mvp_l0 = derive_mvpred_with_d(
+                &MvpredInputs {
+                    neighbour_a: neigh_a_l0,
+                    neighbour_b: neigh_b_l0,
+                    neighbour_c: neigh_c_l0,
+                    current_ref_idx: part.ref_idx_l0.max(0) as i32,
+                    shape: MvpredShape::Default,
+                },
+                neigh_d_l0,
+            );
+            let mvp_l1 = derive_mvpred_with_d(
+                &MvpredInputs {
+                    neighbour_a: neigh_a_l1,
+                    neighbour_b: neigh_b_l1,
+                    neighbour_c: neigh_c_l1,
+                    current_ref_idx: part.ref_idx_l1.max(0) as i32,
+                    shape: MvpredShape::Default,
+                },
+                neigh_d_l1,
+            );
             (mvp_l0, mvp_l1)
         }
         _ => {
             // §8.4.1.1 — mvLX = mvpLX + mvdLX.
-            // Special-case P_Skip (encoded as PartMode::L0Only with
-            // zero MVD + shape = Default + ref_idx_l0 = 0): invoke
-            // derive_p_skip_mv for the spec-accurate zero-MV
-            // substitution conditions.
-            let mvp_l0 = if part.mode == PartMode::L0Only
-                && part.mvd_l0 == (0, 0)
-                && part.ref_idx_l0 == 0
-                && part.shape == MvpredShape::Default
+            // P_Skip (part.is_skip == true for PSkip macroblocks) invokes
+            // the §8.4.1.2 zero-MV substitution conditions inside
+            // `derive_p_skip_mv_with_d`. Regular P_L0_16x16 macroblocks
+            // that happen to have MVD = (0, 0) and ref_idx = 0 look
+            // identical in (mode, mvd, ref_idx, shape, w, h) but MUST
+            // use the plain §8.4.1.3 MVpred — the skip-specific
+            // "refIdxA == 0 AND mvA == 0 → force zero" rule does NOT
+            // apply to them. Prior to fixing this, a P_L0_16x16 whose
+            // left neighbour was a P_Skip / zero-MV MB would have its
+            // MVpred wrongly forced to zero. `is_skip` disambiguates.
+            let mvp_l0 = if part.is_skip
+                && part.mode == PartMode::L0Only
                 && part.w == 16
                 && part.h == 16
             {
-                // P_Skip path (§8.4.1.2).
-                let (_, mv) = derive_p_skip_mv(neigh_a_l0, neigh_b_l0, neigh_c_l0);
+                // P_Skip path (§8.4.1.2), with §8.4.1.3.2 C→D substitution.
+                let (_, mv) =
+                    derive_p_skip_mv_with_d(neigh_a_l0, neigh_b_l0, neigh_c_l0, neigh_d_l0);
                 mv
             } else if part.mode != PartMode::L1Only && part.ref_idx_l0 >= 0 {
-                derive_mvpred(&MvpredInputs {
-                    neighbour_a: neigh_a_l0,
-                    neighbour_b: neigh_b_l0,
-                    neighbour_c: neigh_c_l0,
-                    current_ref_idx: part.ref_idx_l0 as i32,
-                    shape: part.shape,
-                })
+                derive_mvpred_with_d(
+                    &MvpredInputs {
+                        neighbour_a: neigh_a_l0,
+                        neighbour_b: neigh_b_l0,
+                        neighbour_c: neigh_c_l0,
+                        current_ref_idx: part.ref_idx_l0 as i32,
+                        shape: part.shape,
+                    },
+                    neigh_d_l0,
+                )
             } else {
                 Mv::ZERO
             };
             let mvp_l1 = if part.mode != PartMode::L0Only && part.ref_idx_l1 >= 0 {
-                derive_mvpred(&MvpredInputs {
-                    neighbour_a: neigh_a_l1,
-                    neighbour_b: neigh_b_l1,
-                    neighbour_c: neigh_c_l1,
-                    current_ref_idx: part.ref_idx_l1 as i32,
-                    shape: part.shape,
-                })
+                derive_mvpred_with_d(
+                    &MvpredInputs {
+                        neighbour_a: neigh_a_l1,
+                        neighbour_b: neigh_b_l1,
+                        neighbour_c: neigh_c_l1,
+                        current_ref_idx: part.ref_idx_l1 as i32,
+                        shape: part.shape,
+                    },
+                    neigh_d_l1,
+                )
             } else {
                 Mv::ZERO
             };
@@ -2912,7 +2985,7 @@ fn neighbour_mvs_for_list(
     mb_addr: u32,
     grid: &MbGrid,
     list: u8,
-) -> (NeighbourMv, NeighbourMv, NeighbourMv) {
+) -> (NeighbourMv, NeighbourMv, NeighbourMv, NeighbourMv) {
     // Partition origin in 4x4 units, relative to MB.
     let px = part.x as i32 / 4;
     let py = part.y as i32 / 4;
@@ -2922,21 +2995,34 @@ fn neighbour_mvs_for_list(
     let mb_yy = mb_yy as i32;
 
     // A = (px-1, py) — left.
-    let a = neighbour_from_block(grid, mb_xx, mb_yy, width, px - 1, py, list);
+    let a = neighbour_from_block(grid, mb_addr, mb_xx, mb_yy, width, px - 1, py, list);
     // B = (px, py-1) — above.
-    let b = neighbour_from_block(grid, mb_xx, mb_yy, width, px, py - 1, list);
+    let b = neighbour_from_block(grid, mb_addr, mb_xx, mb_yy, width, px, py - 1, list);
     // C = (px + w/4, py - 1) — above-right of the partition.
     let c_off_x = part.w as i32 / 4;
-    let c = neighbour_from_block(grid, mb_xx, mb_yy, width, px + c_off_x, py - 1, list);
-    (a, b, c)
+    let c = neighbour_from_block(grid, mb_addr, mb_xx, mb_yy, width, px + c_off_x, py - 1, list);
+    // D = (px - 1, py - 1) — above-left (used for §8.4.1.3.2 C→D
+    // substitution). Only consulted when C is unavailable.
+    let d = neighbour_from_block(grid, mb_addr, mb_xx, mb_yy, width, px - 1, py - 1, list);
+    (a, b, c, d)
 }
 
 /// Fetch a NeighbourMv at (bx, by) in 4x4-block coordinates relative
 /// to the current MB. Negative coordinates cross into adjacent MBs
 /// (§6.4.12). Returns `UNAVAILABLE` if the neighbour lies outside the
 /// picture or hasn't been decoded yet.
+///
+/// `curr_mb_addr` is the address of the current (in-flight) MB: when
+/// the wrapped neighbour turns out to be the same MB (i.e. an earlier
+/// partition of this MB), we bypass the `info.available` check since
+/// that flag is only set after the entire MB finishes reconstruction —
+/// but per §7.4.5 / §8.4.1 later partitions in the raster scan may
+/// legitimately read MVs from earlier partitions of the same MB (e.g.
+/// the bottom partition of a 16x8 reads the top partition's MV as its
+/// B-neighbour).
 fn neighbour_from_block(
     grid: &MbGrid,
+    curr_mb_addr: u32,
     mb_xx: i32,
     mb_yy: i32,
     width: i32,
@@ -2970,10 +3056,22 @@ fn neighbour_from_block(
     let Some(info) = grid.get(addr) else {
         return NeighbourMv::UNAVAILABLE;
     };
-    if !info.available {
+    // For the current in-flight MB, bypass the `info.available` check
+    // (that flag is only set after reconstruct_mb_inter returns). The
+    // per-4x4-block MV slot either holds a value written by an earlier
+    // partition (valid) or the (0,0) default with ref_idx = -1 default
+    // (which will fall through to UNAVAILABLE below). For any OTHER MB,
+    // require `available == true` (it may be later in raster scan or a
+    // right-MB neighbour not yet decoded).
+    let is_same_mb = addr == curr_mb_addr;
+    if !is_same_mb && !info.available {
         return NeighbourMv::UNAVAILABLE;
     }
     // §8.4.1.3.2 — intra neighbour => treat as unavailable for MVpred.
+    // For the current (in-flight) MB we know it is inter (we only enter
+    // this function from the inter-reconstruction path) so `is_intra`
+    // being false is guaranteed regardless of whether `available` was
+    // set yet.
     if info.is_intra {
         return NeighbourMv::UNAVAILABLE;
     }
@@ -3018,6 +3116,7 @@ fn derive_inter_partitions(
                 ref_idx_l1: -1,
                 mvd_l0: (0, 0),
                 mvd_l1: (0, 0),
+                is_skip: true,
             }])
         }
         PL016x16 => {
@@ -3037,6 +3136,7 @@ fn derive_inter_partitions(
                 ref_idx_l1: -1,
                 mvd_l0: (mvd[0], mvd[1]),
                 mvd_l1: (0, 0),
+                is_skip: false,
             }])
         }
         PL0L016x8 => {
@@ -3059,6 +3159,7 @@ fn derive_inter_partitions(
                     ref_idx_l1: -1,
                     mvd_l0: (mvd0[0], mvd0[1]),
                     mvd_l1: (0, 0),
+                    is_skip: false,
                 },
                 InterPartition {
                     x: 0,
@@ -3071,6 +3172,7 @@ fn derive_inter_partitions(
                     ref_idx_l1: -1,
                     mvd_l0: (mvd1[0], mvd1[1]),
                     mvd_l1: (0, 0),
+                    is_skip: false,
                 },
             ])
         }
@@ -3094,6 +3196,7 @@ fn derive_inter_partitions(
                     ref_idx_l1: -1,
                     mvd_l0: (mvd0[0], mvd0[1]),
                     mvd_l1: (0, 0),
+                    is_skip: false,
                 },
                 InterPartition {
                     x: 8,
@@ -3106,6 +3209,7 @@ fn derive_inter_partitions(
                     ref_idx_l1: -1,
                     mvd_l0: (mvd1[0], mvd1[1]),
                     mvd_l1: (0, 0),
+                    is_skip: false,
                 },
             ])
         }
@@ -3146,6 +3250,7 @@ fn derive_inter_partitions(
                         ref_idx_l1: -1,
                         mvd_l0: (mvd[0], mvd[1]),
                         mvd_l1: (0, 0),
+                        is_skip: false,
                     });
                 }
             }
@@ -3169,6 +3274,7 @@ fn derive_inter_partitions(
                 ref_idx_l1: 0,
                 mvd_l0: (0, 0),
                 mvd_l1: (0, 0),
+                is_skip: matches!(mb.mb_type, BSkip),
             }])
         }
         BL016x16 | BL116x16 | BBi16x16 => {
@@ -3189,6 +3295,7 @@ fn derive_inter_partitions(
                 ref_idx_l1: r1,
                 mvd_l0: (mvd0[0], mvd0[1]),
                 mvd_l1: (mvd1[0], mvd1[1]),
+                is_skip: false,
             }])
         }
         // B 16x8 / 8x16 variants — all combinations of L0/L1/Bi per half.
@@ -3216,6 +3323,7 @@ fn derive_inter_partitions(
                     ref_idx_l1: r1_top,
                     mvd_l0: (mvd_l0_top[0], mvd_l0_top[1]),
                     mvd_l1: (mvd_l1_top[0], mvd_l1_top[1]),
+                    is_skip: false,
                 },
                 InterPartition {
                     x: 0,
@@ -3228,6 +3336,7 @@ fn derive_inter_partitions(
                     ref_idx_l1: r1_bot,
                     mvd_l0: (mvd_l0_bot[0], mvd_l0_bot[1]),
                     mvd_l1: (mvd_l1_bot[0], mvd_l1_bot[1]),
+                    is_skip: false,
                 },
             ])
         }
@@ -3255,6 +3364,7 @@ fn derive_inter_partitions(
                     ref_idx_l1: r1_l,
                     mvd_l0: (mvd_l0_l[0], mvd_l0_l[1]),
                     mvd_l1: (mvd_l1_l[0], mvd_l1_l[1]),
+                    is_skip: false,
                 },
                 InterPartition {
                     x: 8,
@@ -3267,6 +3377,7 @@ fn derive_inter_partitions(
                     ref_idx_l1: r1_r,
                     mvd_l0: (mvd_l0_r[0], mvd_l0_r[1]),
                     mvd_l1: (mvd_l1_r[0], mvd_l1_r[1]),
+                    is_skip: false,
                 },
             ])
         }
@@ -3303,6 +3414,7 @@ fn derive_inter_partitions(
                         ref_idx_l1: r1,
                         mvd_l0: (mvd0[0], mvd0[1]),
                         mvd_l1: (mvd1[0], mvd1[1]),
+                        is_skip: false,
                     });
                 }
             }
@@ -4319,6 +4431,10 @@ mod tests {
             residual_chroma_dc_cr: Vec::new(),
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         }
     }
@@ -4344,6 +4460,10 @@ mod tests {
             residual_chroma_dc_cr: vec![0i32; 4],
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         }
     }
@@ -4452,6 +4572,10 @@ mod tests {
             residual_chroma_dc_cr: Vec::new(),
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         };
 
@@ -4498,6 +4622,10 @@ mod tests {
             residual_chroma_dc_cr: vec![0i32; 4],
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         };
 
@@ -4576,6 +4704,10 @@ mod tests {
             residual_chroma_dc_cr: vec![0i32; 4],
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         };
         let slice_data = SliceData {
@@ -4989,6 +5121,10 @@ mod tests {
             residual_chroma_dc_cr: Vec::new(),
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         };
 
@@ -5104,6 +5240,10 @@ mod tests {
             residual_chroma_dc_cr: vec![0i32; 4],
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         }
     }
@@ -5251,6 +5391,10 @@ mod tests {
             residual_chroma_dc_cr: vec![0i32; 4],
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         };
         let slice_data = SliceData {
@@ -5307,6 +5451,244 @@ mod tests {
                     v
                 );
             }
+        }
+    }
+
+    #[test]
+    fn p_l0_l0_16x8_bottom_partition_reads_top_partition_mv_from_same_mb() {
+        // §8.4.1.3.2 regression: within a single MB split into 16x8
+        // top + bottom partitions, the bottom partition's MVpred must
+        // consult the top partition's MV as its B-neighbour (the 4x4
+        // block immediately above the bottom partition's top-left 4x4
+        // block lives in the top partition, i.e. still inside the
+        // current in-flight MB whose `info.available` is not yet set
+        // by `reconstruct_slice`). Prior to the fix, `neighbour_from_block`
+        // rejected the current-MB lookup because the `info.available`
+        // flag was still `false`, causing the bottom partition to
+        // compute MVpred from all-zero neighbours.
+        //
+        // Construction:
+        //   - Slice is 1 MB wide, 1 MB tall.
+        //   - MB 0 is P_L0_L0_16x8 with:
+        //     * Top partition MVD = (16, 0)    -> MV = (16, 0) since
+        //       no external neighbours for the top-left MB of the slice.
+        //     * Bottom partition MVD = (0, 0)  -> MV = MVpred = top
+        //       partition's MV = (16, 0) via Partition16x8Bottom shape
+        //       shortcut (eq. 8-204 picks A when refIdxA matches).
+        //       Wait — for 16x8 bottom, A = block-4-to-the-left same
+        //       row, which is outside this MB (unavailable). So it
+        //       falls through to median(A=unavail, B=top-part,
+        //       C=unavail) where only B matches refIdx → pick B's MV.
+        //   - With same-MB neighbour reads working, bottom partition
+        //     produces the reference frame at (x+16, y+8-half) — a
+        //     16-pel horizontal shift.
+        //   - With same-MB reads broken (old code), bottom partition's
+        //     MV = (0, 0), producing the reference frame at (x, y+8)
+        //     with no horizontal shift.
+        let sps = make_sps(1, 2);
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+
+        // Reference picture: gradient increasing with x, flat at 0 for y.
+        // luma[y*W + x] = (x * 2) & 0xFF. So x-shift of 16 produces a
+        // difference of 32 at each sample.
+        let ref_pic = make_ref_pic(32, 32, |x, _| (x * 2) & 0xFF);
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        // Build a P_L0_L0_16x8 MB with top MVD=(16,0), bottom MVD=(0,0).
+        let mut pred = crate::macroblock_layer::MbPred::default();
+        pred.ref_idx_l0 = vec![0, 0];
+        pred.mvd_l0 = vec![[16, 0], [0, 0]];
+        let mb = Macroblock {
+            mb_type: MbType::PL0L016x8,
+            mb_type_raw: 1,
+            mb_pred: Some(pred),
+            sub_mb_pred: None,
+            pcm_samples: None,
+            coded_block_pattern: 0,
+            transform_size_8x8_flag: false,
+            mb_qp_delta: 0,
+            residual_luma: Vec::new(),
+            residual_luma_dc: None,
+            residual_chroma_dc_cb: vec![0i32; 4],
+            residual_chroma_dc_cr: vec![0i32; 4],
+            residual_chroma_ac_cb: Vec::new(),
+            residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
+            is_skip: false,
+        };
+        // Add a filler MB 1 (not used in the check).
+        let mb1 = make_p_l0_16x16(0, [0, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb, mb1],
+            mb_field_decoding_flags: vec![false, false],
+            last_mb_addr: 1,
+        };
+        let mut pic = Picture::new(16, 32, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 2);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid).unwrap();
+
+        // After the fix, the BOTTOM partition (rows 8..15 of MB 0)
+        // reads the top partition's MV=(16,0)>>2=(4,0) integer pixel
+        // shift. Output pixel at (x, y=8..15) should equal
+        // ref_pic[x+4, y+8-8]=(x+4)*2. In particular sample (0, 8)
+        // = ref at (4, 8) = 8.
+        //
+        // Before the fix, the bottom would compute MV=(0,0) so output
+        // at (0, 8) = ref_pic[0, 8] = 0.
+        assert_eq!(
+            pic.luma_at(0, 8),
+            8,
+            "bottom partition did not inherit top partition MV \
+             (same-MB neighbour read regression)"
+        );
+        // Also check top partition for completeness: top gets MV=(16,0)
+        // -> integer shift 4 pixels right. Pixel (0, 0) should be
+        // ref_pic[4, 0] = 8.
+        assert_eq!(pic.luma_at(0, 0), 8);
+    }
+
+    #[test]
+    fn p_l0_16x16_with_zero_mvd_and_ref0_does_not_apply_p_skip_zero_substitution() {
+        // §8.4.1.1 / §8.4.1.2 regression: a regular P_L0_16x16 MB with
+        // MVD = (0, 0) and ref_idx_l0 = 0 is NOT a P_Skip MB, even
+        // though the two look identical in (mode, mvd, ref_idx, shape,
+        // w, h). The §8.4.1.2 zero-MV substitution conditions
+        // (force MV to zero when refIdxL0A == 0 AND mvL0A == 0, etc.)
+        // apply ONLY to P_Skip, per the spec.
+        //
+        // Before the fix, `derive_partition_mvs` detected any 16x16
+        // L0Only partition with mvd=(0,0) ref=0 as P_Skip and applied
+        // the zero-forcing rule, corrupting MVpred for MBs whose left
+        // neighbour happened to have refIdx=0 and mv=(0,0).
+        //
+        // Test setup:
+        //   - 2-wide 1-tall slice.
+        //   - MB 0: P_L0_16x16 with MVD=(0, 0) -> MV=(0, 0) (no
+        //     neighbours). Its mv_l0 becomes (0, 0) and
+        //     ref_idx_l0[*] = 0 across the MB.
+        //   - MB 1: P_L0_16x16 with MVD=(8, 0) and ref_idx=0. The
+        //     MVpred for MB 1 must be the median over the top-left
+        //     4x4's neighbours (A = MB 0's top-right 4x4, B/C/D
+        //     unavailable). Per §8.4.1.3.1 step 1 "both B and C are
+        //     unavail, A is available -> replace B, C with A",
+        //     median(A, A, A) = A = (0, 0). MVpred = (0, 0).
+        //     MV_MB1 = (0, 0) + (8, 0) = (8, 0).
+        //   - With the P_Skip bug: the old code saw mvd=(0,0) AND
+        //     ref=0 (after mvd addition? no, BEFORE mvd addition),
+        //     actually wait — the bug triggers ONLY when mvd=(0,0)
+        //     which makes it look like a P_Skip. Since MB 1 has
+        //     mvd=(8, 0), the bug would NOT fire for MB 1 — the
+        //     regression is harder to trigger in a 1-MB unit test.
+        //     We instead use MB 0 with mvd=(0, 0) and have MB 0's
+        //     neighbours all be unavailable; the P_Skip path forces
+        //     zero when neighbour A unavailable, which yields the
+        //     same result as median-with-unavail, so no observable
+        //     difference for MB 0 on its own.
+        //
+        // Therefore, to isolate the fix we construct a scenario that
+        // differs only via the P_Skip "A's refIdx=0 AND mvA=0"
+        // zero-forcing rule: MB 0 is P_Skip which sets mv=(0,0)+ref=0;
+        // MB 1 is P_L0_16x16 with mvd=(0, 0) and ref_idx=0 (i.e. it
+        // looks identical to P_Skip to the BUGGY code).
+        //
+        // The BUGGY code would route MB 1 through derive_p_skip_mv.
+        // In that path, A (MB 0) has ref_idx=0 AND mv=(0,0) → force
+        // MB 1's MVpred to zero. That's what the buggy code does.
+        //
+        // The CORRECT code uses ordinary median: since MB 0 is A,
+        // refIdx=0 matches, only A matches → return A's MV = (0, 0).
+        // So MB 1's MVpred is also (0, 0), and MV_MB1 = (0, 0).
+        //
+        // Hmm — in THIS setup the two paths yield the same result.
+        // The bug manifests when MB 0 has a NON-zero MV but ref=0
+        // (i.e. P_L0_16x16 with mvd != 0). Then:
+        //   - Buggy: A's ref=0, mv!=0 → does NOT force zero (second
+        //     P_Skip condition doesn't match). Fall back to median.
+        //     Wait — P_Skip only forces zero when A.ref=0 AND A.mv=0.
+        //     So the buggy code and correct code agree when neighbour
+        //     A has mv != 0.
+        //   - But what if A.ref=0 AND A.mv=0 (MB 0 is a legitimate
+        //     zero-MV P_L0_16x16)? Buggy code forces MB 1's MVpred
+        //     to zero — same as median(A=(0,0), B/C/D unavail)
+        //     gives (0, 0) — still same.
+        //
+        // Actually the behavioural difference is more subtle. The
+        // P_Skip path forces zero when ANY of (!A.avail, !B.avail,
+        // A.ref=0 & A.mv=0, B.ref=0 & B.mv=0) hold. Regular median
+        // for unavail A / B replaces them with zeros (via
+        // UNAVAILABLE.refIdx=-1 → doesn't match; eq. 8-211 won't
+        // fire unless ≥1 matches; then median of (0, 0, avail_mv) =
+        // fall-through).
+        //
+        // Concrete case where they diverge: MB 0 = P_L0_16x16 with
+        // ref=0, mv=(3, 4); MB 1 = P_L0_16x16 with mvd=(0, 0), ref=0.
+        //   - BUGGY: detect as P_Skip. A.ref=0, A.mv=(3,4) (not
+        //     zero). B, C, D unavail. None of the 4 zero-forcing
+        //     conditions hits. Fall through to median. median(A=(3,4),
+        //     B/C=UNAVAIL). Step 1: B, C both unavail, A avail →
+        //     copy A to B, C. median(A, A, A) = A = (3, 4). MV = (3, 4).
+        //     Same as correct median! So still no diff.
+        //
+        // Hmm. When DO the buggy and correct paths differ? It's when
+        // the zero-forcing condition "B not available" hits for the
+        // buggy path. E.g. MB 1 on the top row of the picture: A
+        // available (MB 0), B, C unavailable. Buggy: !B.available
+        // → force zero. Correct median: A available, B, C unavail →
+        // median(A, A, A) = A. Different!
+        //
+        // So the regression test IS a top-row MB. Let's do that.
+        //
+        // Setup:
+        //   - 2x1 MB picture. MB 0 and MB 1 on top row.
+        //   - MB 0: P_L0_16x16 with MVD=(3, 4), so MB 0's mv = (3, 4).
+        //   - MB 1: P_L0_16x16 with MVD=(0, 0), ref=0 (looks like
+        //     P_Skip to buggy code).
+        //   - Expected: MB 1's MVpred should be (3, 4) (= MB 0's mv,
+        //     per median fallback with A=MB 0 and B, C unavail).
+        //     MB 1's MV = MVpred + MVD = (3, 4) + (0, 0) = (3, 4).
+        //   - Buggy: MB 1 treated as P_Skip. !B.available holds →
+        //     force zero. MVpred = (0, 0). MV = (0, 0).
+        let sps = make_sps(2, 1);
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+
+        // Reference plane — gradient in x.
+        let ref_pic = make_ref_pic(64, 16, |x, _| (x * 2) & 0xff);
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        // MB 0: MVD = (3, 4). MV = (3, 4). 3 in 1/4-pel = 0 integer, 3 frac.
+        let mb0 = make_p_l0_16x16(0, [3, 4]);
+        // MB 1: MVD = (0, 0). MV depends on MVpred (which should be
+        // MB 0's MV = (3, 4)). So MB 1 pixels at (16 + x, y) come
+        // from ref_pic at integer (16 + x + 0, y + 1) with frac
+        // (3, 0) (x frac part of 3), i.e. a horizontal 6-tap.
+        let mb1 = make_p_l0_16x16(0, [0, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb0, mb1],
+            mb_field_decoding_flags: vec![false, false],
+            last_mb_addr: 1,
+        };
+        let mut pic = Picture::new(32, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(2, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid).unwrap();
+
+        // MB 1's MV grid slots should all be (3, 4) — inherited from MB 0.
+        let info1 = grid.get(1).unwrap();
+        for blk4 in 0..16 {
+            assert_eq!(
+                info1.mv_l0[blk4],
+                (3i16, 4i16),
+                "MB 1's blk{blk4} MV should inherit MB 0's MV via median, \
+                 NOT be forced to zero by the P_Skip zero-MV substitution",
+            );
         }
     }
 
@@ -5491,6 +5873,10 @@ mod tests {
             residual_chroma_dc_cr: vec![0i32; 4],
             residual_chroma_ac_cb: Vec::new(),
             residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
             is_skip: false,
         }
     }
@@ -6216,6 +6602,10 @@ mod tests {
                 residual_chroma_dc_cr: vec![0i32; 4],
                 residual_chroma_ac_cb: Vec::new(),
                 residual_chroma_ac_cr: Vec::new(),
+                residual_cb_luma_like: Vec::new(),
+                residual_cr_luma_like: Vec::new(),
+                residual_cb_16x16_dc: None,
+                residual_cr_16x16_dc: None,
                 is_skip: false,
             }
         };
@@ -6377,6 +6767,10 @@ mod tests {
                 residual_chroma_dc_cr: Vec::new(),
                 residual_chroma_ac_cb: Vec::new(),
                 residual_chroma_ac_cr: Vec::new(),
+                residual_cb_luma_like: Vec::new(),
+                residual_cr_luma_like: Vec::new(),
+                residual_cb_16x16_dc: None,
+                residual_cr_16x16_dc: None,
                 is_skip: false,
             };
 
