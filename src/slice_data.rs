@@ -275,6 +275,11 @@ pub fn parse_slice_data(
                     num_ref_idx_l0_active_minus1: slice_header.num_ref_idx_l0_active_minus1,
                     num_ref_idx_l1_active_minus1: slice_header.num_ref_idx_l1_active_minus1,
                     mbaff_frame_flag: false,
+                    // CABAC per-MB neighbour grid — pass None for the
+                    // conservative approximation. A follow-up commit will
+                    // thread through a proper CabacNeighbourGrid.
+                    cabac_nb: None,
+                    pic_width_in_mbs: 0,
                 };
                 let (byte, bit) = r.position();
                 let mb = parse_macroblock(
@@ -394,6 +399,9 @@ pub fn parse_slice_data(
                 num_ref_idx_l0_active_minus1: slice_header.num_ref_idx_l0_active_minus1,
                 num_ref_idx_l1_active_minus1: slice_header.num_ref_idx_l1_active_minus1,
                 mbaff_frame_flag: false,
+                // CABAC neighbour grid unused on the CAVLC path.
+                cabac_nb: None,
+                pic_width_in_mbs: 0,
             };
             let (byte, bit) = r.position();
             let mb = parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)

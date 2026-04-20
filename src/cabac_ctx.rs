@@ -1874,6 +1874,148 @@ pub fn decode_transform_size_8x8_flag(
 }
 
 // ---------------------------------------------------------------------------
+// §9.3.3.1.2 + Tables 9-37 / 9-38 — sub_mb_type for P/SP and B slices.
+//
+// Per Table 9-34:
+//   * P/SP sub_mb_type[]: ctxIdxOffset = 21, maxBinIdxCtx = 2.
+//   * B   sub_mb_type[]: ctxIdxOffset = 36, maxBinIdxCtx = 3.
+//
+// Per Table 9-39:
+//   * ctxIdxOffset = 21 (P/SP): binIdx 0 → inc 0, binIdx 1 → inc 1,
+//     binIdx 2 → inc 2. (binIdx >= 3 is "na".)
+//   * ctxIdxOffset = 36 (B):   binIdx 0 → inc 0, binIdx 1 → inc 1,
+//     binIdx 2 → inc 2 or 3 via §9.3.3.1.2 (Table 9-41 row
+//     "36,binIdx=2"),  binIdx 3 → inc 3, binIdx 4 → inc 3,
+//     binIdx 5 → inc 3. (binIdx >= 6 is "na".)
+//
+// Table 9-41 entry for ctxIdxOffset = 36, binIdx = 2:
+//   ctxIdxInc = (b1 != 0) ? 2 : 3.
+//
+// Binarisations (Tables 9-37 and 9-38) are walked literally by the
+// code below; see function-level doc comments for each bin branch.
+// ---------------------------------------------------------------------------
+
+/// §9.3.2.5 + Table 9-37 — P / SP slice sub_mb_type.
+///
+/// ctxIdxOffset = 21 (Table 9-34). Bin strings (Table 9-37 P/SP rows):
+///
+///   * value 0 (P_L0_8x8): `1`
+///   * value 1 (P_L0_8x4): `0 0`
+///   * value 2 (P_L0_4x8): `0 1 1`
+///   * value 3 (P_L0_4x4): `0 1 0`
+///
+/// ctxIdxInc per Table 9-39 row for ctxIdxOffset=21:
+///   binIdx 0 → 0, binIdx 1 → 1, binIdx 2 → 2.
+pub fn decode_sub_mb_type_p(
+    dec: &mut CabacDecoder<'_>,
+    ctxs: &mut CabacContexts,
+) -> CabacResult<u32> {
+    const OFFSET: u32 = 21;
+    // binIdx 0 — Table 9-39 ctxIdxInc = 0 → ctxIdx = 21.
+    let b0 = dec.decode_decision(ctxs.at_mut(OFFSET as usize))?;
+    if b0 == 1 {
+        // "1" → Table 9-37 P value 0 (P_L0_8x8).
+        return Ok(0);
+    }
+    // binIdx 1 — Table 9-39 ctxIdxInc = 1 → ctxIdx = 22.
+    let b1 = dec.decode_decision(ctxs.at_mut((OFFSET + 1) as usize))?;
+    if b1 == 0 {
+        // "0 0" → Table 9-37 P value 1 (P_L0_8x4).
+        return Ok(1);
+    }
+    // binIdx 2 — Table 9-39 ctxIdxInc = 2 → ctxIdx = 23.
+    let b2 = dec.decode_decision(ctxs.at_mut((OFFSET + 2) as usize))?;
+    // "0 1 1" → value 2 (P_L0_4x8); "0 1 0" → value 3 (P_L0_4x4).
+    Ok(if b2 == 1 { 2 } else { 3 })
+}
+
+/// §9.3.2.5 + Table 9-38 — B slice sub_mb_type.
+///
+/// ctxIdxOffset = 36 (Table 9-34). Bin strings (Table 9-38 B rows):
+///
+///   * value 0  (B_Direct_8x8): `0`
+///   * value 1  (B_L0_8x8):     `1 0 0`
+///   * value 2  (B_L1_8x8):     `1 0 1`
+///   * value 3  (B_Bi_8x8):     `1 1 0 0 0`
+///   * value 4  (B_L0_8x4):     `1 1 0 0 1`
+///   * value 5  (B_L0_4x8):     `1 1 0 1 0`
+///   * value 6  (B_L1_8x4):     `1 1 0 1 1`
+///   * value 7  (B_L1_4x8):     `1 1 1 0 0 0`
+///   * value 8  (B_Bi_8x4):     `1 1 1 0 0 1`
+///   * value 9  (B_Bi_4x8):     `1 1 1 0 1 0`
+///   * value 10 (B_L0_4x4):     `1 1 1 0 1 1`
+///   * value 11 (B_L1_4x4):     `1 1 1 1 0`
+///   * value 12 (B_Bi_4x4):     `1 1 1 1 1`
+///
+/// ctxIdxInc per Table 9-39 row for ctxIdxOffset=36:
+///   binIdx 0 → 0, binIdx 1 → 1, binIdx 2 → Table 9-41
+///   ((b1 != 0) ? 2 : 3), binIdx 3 → 3, binIdx 4 → 3, binIdx 5 → 3.
+pub fn decode_sub_mb_type_b(
+    dec: &mut CabacDecoder<'_>,
+    ctxs: &mut CabacContexts,
+) -> CabacResult<u32> {
+    const OFFSET: u32 = 36;
+    // binIdx 0 — Table 9-39 ctxIdxInc = 0 → ctxIdx = 36.
+    let b0 = dec.decode_decision(ctxs.at_mut(OFFSET as usize))?;
+    if b0 == 0 {
+        // "0" → Table 9-38 B value 0 (B_Direct_8x8).
+        return Ok(0);
+    }
+    // binIdx 1 — Table 9-39 ctxIdxInc = 1 → ctxIdx = 37.
+    let b1 = dec.decode_decision(ctxs.at_mut((OFFSET + 1) as usize))?;
+    // binIdx 2 — Table 9-39 ctxIdxInc via §9.3.3.1.2:
+    //   Table 9-41 row "36, binIdx=2": (b1 != 0) ? 2 : 3.
+    let inc_b2 = if b1 != 0 { 2 } else { 3 };
+    let b2 = dec.decode_decision(ctxs.at_mut((OFFSET + inc_b2) as usize))?;
+
+    if b1 == 0 {
+        // Prefix "1 0 X" — two 3-bin rows:
+        //   b2 == 0 → "1 0 0" → value 1 (B_L0_8x8)
+        //   b2 == 1 → "1 0 1" → value 2 (B_L1_8x8)
+        return Ok(if b2 == 0 { 1 } else { 2 });
+    }
+
+    // b1 == 1. Prefix so far is "1 1". Remaining bins use ctxIdxInc = 3
+    // (Table 9-39 row for ctxIdxOffset=36 column binIdx >= 3).
+    let b3 = dec.decode_decision(ctxs.at_mut((OFFSET + 3) as usize))?;
+    let b4 = dec.decode_decision(ctxs.at_mut((OFFSET + 3) as usize))?;
+
+    if b2 == 0 {
+        // "1 1 0 X Y" — 5-bin rows (Table 9-38 values 3..=6):
+        //   1 1 0 0 0 → 3  (B_Bi_8x8)
+        //   1 1 0 0 1 → 4  (B_L0_8x4)
+        //   1 1 0 1 0 → 5  (B_L0_4x8)
+        //   1 1 0 1 1 → 6  (B_L1_8x4)
+        return Ok(3 + ((b3 as u32) << 1) + (b4 as u32));
+    }
+
+    // b2 == 1. Prefix so far is "1 1 1 b3 b4".
+    //
+    // From Table 9-38:
+    //   value 7  B_L1_4x8 "1 1 1 0 0 0"
+    //   value 8  B_Bi_8x4 "1 1 1 0 0 1"
+    //   value 9  B_Bi_4x8 "1 1 1 0 1 0"
+    //   value 10 B_L0_4x4 "1 1 1 0 1 1"
+    //   value 11 B_L1_4x4 "1 1 1 1 0"
+    //   value 12 B_Bi_4x4 "1 1 1 1 1"
+    //
+    // So when b3 == 1, the codeword is exactly 5 bins and ends at b4:
+    //   b4 == 0 → 11, b4 == 1 → 12.
+    if b3 == 1 {
+        return Ok(if b4 == 0 { 11 } else { 12 });
+    }
+
+    // b3 == 0. Need a 6th bin. Table 9-39 ctxIdxInc = 3.
+    let b5 = dec.decode_decision(ctxs.at_mut((OFFSET + 3) as usize))?;
+    // "1 1 1 0 b4 b5":
+    //   0 0 → 7  (B_L1_4x8)
+    //   0 1 → 8  (B_Bi_8x4)
+    //   1 0 → 9  (B_Bi_4x8)
+    //   1 1 → 10 (B_L0_4x4)
+    Ok(7 + ((b4 as u32) << 1) + (b5 as u32))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2339,5 +2481,300 @@ mod tests {
         // Row 0 (I_NxN) of Table 9-36.
         assert_eq!(v, 0, "I_NxN in P slice is Table 9-36 row 0");
         assert_eq!(bins, 1, "I_NxN path reads exactly binIdx=0 of the suffix");
+    }
+
+    // ---------------------------------------------------------------
+    // §9.3.4 — test-only CABAC encoder used to round-trip
+    // sub_mb_type bin strings through the real decoder. The encoder
+    // here is transcribed directly from the spec's informative clauses:
+    //
+    //   * §9.3.4.1 — InitEncoder: codILow = 0, codIRange = 510,
+    //     firstBitFlag = 1, bitsOutstanding = 0.
+    //   * §9.3.4.2 / Figure 9-7 — EncodeDecision.
+    //   * §9.3.4.3 / Figure 9-8 — RenormE + Figure 9-9 PutBit.
+    //   * §9.3.4.5 / Figure 9-12 — EncodeFlush (byte alignment).
+    //
+    // Bypass / terminate encoding are not needed here (sub_mb_type is
+    // decision-only) so they are omitted.
+    // ---------------------------------------------------------------
+
+    /// Minimal CABAC encoder. `ctxs` must be initialised with the same
+    /// `(slice_kind, init_idc, qp)` triple the decoder will use, so
+    /// that encoder and decoder walk identical context states.
+    struct TestEncoder {
+        cod_i_low: u32,
+        cod_i_range: u32,
+        first_bit_flag: bool,
+        bits_outstanding: u64,
+        bits: Vec<u8>,     // accumulating bit queue, MSB-first within each byte
+        bit_pos_in_byte: u8, // 0..=7; 0 means next bit goes to MSB of the last byte
+    }
+
+    impl TestEncoder {
+        fn new() -> Self {
+            Self {
+                cod_i_low: 0,
+                cod_i_range: 510,
+                first_bit_flag: true,
+                bits_outstanding: 0,
+                bits: Vec::new(),
+                bit_pos_in_byte: 0,
+            }
+        }
+
+        /// Append one bit to the output queue (MSB-first packing), to
+        /// match `BitReader::u(n)` consumption order used by the
+        /// decoder.
+        fn write_bit(&mut self, b: u8) {
+            if self.bit_pos_in_byte == 0 {
+                self.bits.push(0);
+            }
+            let idx = self.bits.len() - 1;
+            let shift = 7 - self.bit_pos_in_byte;
+            self.bits[idx] |= (b & 1) << shift;
+            self.bit_pos_in_byte = (self.bit_pos_in_byte + 1) % 8;
+        }
+
+        fn put_bit(&mut self, b: u8) {
+            // Figure 9-9.
+            if self.first_bit_flag {
+                self.first_bit_flag = false;
+            } else {
+                self.write_bit(b);
+            }
+            while self.bits_outstanding > 0 {
+                self.write_bit(1 - b);
+                self.bits_outstanding -= 1;
+            }
+        }
+
+        fn renorm_e(&mut self) {
+            // Figure 9-8.
+            while self.cod_i_range < 256 {
+                if self.cod_i_low < 256 {
+                    self.put_bit(0);
+                } else if self.cod_i_low >= 512 {
+                    self.cod_i_low -= 512;
+                    self.put_bit(1);
+                } else {
+                    self.cod_i_low -= 256;
+                    self.bits_outstanding += 1;
+                }
+                self.cod_i_range <<= 1;
+                self.cod_i_low <<= 1;
+            }
+        }
+
+        /// §9.3.4.2 Figure 9-7 — EncodeDecision. Mirrors
+        /// `CabacDecoder::decode_decision` state transitions.
+        fn encode_decision(&mut self, ctx: &mut crate::cabac::CtxState, bin: u8) {
+            let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
+            let cod_i_range_lps =
+                crate::cabac::RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
+            self.cod_i_range -= cod_i_range_lps;
+            if bin != ctx.val_mps {
+                // LPS branch.
+                self.cod_i_low += self.cod_i_range;
+                self.cod_i_range = cod_i_range_lps;
+                if ctx.state_idx == 0 {
+                    ctx.val_mps = 1 - ctx.val_mps;
+                }
+                ctx.state_idx = crate::cabac::TRANS_IDX_LPS[ctx.state_idx as usize];
+            } else {
+                // MPS branch.
+                ctx.state_idx = crate::cabac::TRANS_IDX_MPS[ctx.state_idx as usize];
+            }
+            self.renorm_e();
+        }
+
+        /// §9.3.4.5 Figure 9-12 — EncodeFlush. Terminates the stream so
+        /// all outstanding bits are flushed and the decoder's 9-bit
+        /// codIOffset read lines up against valid data.
+        fn finish(mut self) -> Vec<u8> {
+            // codIRange = 2
+            self.cod_i_range = 2;
+            self.renorm_e();
+            // PutBit((codILow >> 9) & 1)
+            self.put_bit(((self.cod_i_low >> 9) & 1) as u8);
+            // WriteBits(((codILow >> 7) & 3) | 1, 2)
+            let last2 = ((self.cod_i_low >> 7) & 3) | 1;
+            self.write_bit(((last2 >> 1) & 1) as u8);
+            self.write_bit((last2 & 1) as u8);
+            // Pad to a whole byte with zeros so the BitReader has room
+            // to consume any residual alignment/renorm bits. A trailing
+            // byte of zeros is more than enough for the 9-bit init and
+            // any renorm triggers during the small bin strings we test.
+            while self.bit_pos_in_byte != 0 {
+                self.write_bit(0);
+            }
+            for _ in 0..4 {
+                self.bits.push(0);
+            }
+            self.bits
+        }
+    }
+
+    /// §9.3.4 — round-trip one bin sequence through the minimal test
+    /// encoder and then back through the real decoder, using identical
+    /// context indices on both sides. Returns the decoded bins for
+    /// caller-side assertions.
+    ///
+    /// `bins` is a slice of (ctxIdx, binVal) pairs.
+    fn round_trip_bins(
+        slice_kind: SliceKind,
+        init_idc: Option<u32>,
+        qp: i32,
+        bins: &[(usize, u8)],
+    ) -> (Vec<u8>, CabacContexts) {
+        // Encode side.
+        let mut enc = TestEncoder::new();
+        let mut enc_ctxs = CabacContexts::init(slice_kind, init_idc, qp).unwrap();
+        for &(ctx_idx, bin) in bins {
+            enc.encode_decision(enc_ctxs.at_mut(ctx_idx), bin);
+        }
+        let bytes = enc.finish();
+
+        // Decode side — fresh context table, same init.
+        let mut dec = make_decoder(&bytes);
+        let mut dec_ctxs = CabacContexts::init(slice_kind, init_idc, qp).unwrap();
+        let mut decoded = Vec::with_capacity(bins.len());
+        for &(ctx_idx, _) in bins {
+            let b = dec.decode_decision(dec_ctxs.at_mut(ctx_idx)).unwrap();
+            decoded.push(b);
+        }
+        (decoded, dec_ctxs)
+    }
+
+    /// Sanity check: the minimal test encoder round-trips a handful of
+    /// hand-picked bin sequences faithfully. This protects the
+    /// round-trip infrastructure itself.
+    #[test]
+    fn test_encoder_round_trips_simple_sequences() {
+        // A single bin at ctxIdx=21 (P sub_mb_type).
+        for bin in [0u8, 1] {
+            let (decoded, _) = round_trip_bins(SliceKind::P, Some(0), 26, &[(21, bin)]);
+            assert_eq!(decoded, vec![bin]);
+        }
+        // A 3-bin sequence with varied ctxIdx.
+        let bins = [(21, 0u8), (22, 1), (23, 0)];
+        let (decoded, _) = round_trip_bins(SliceKind::P, Some(0), 26, &bins);
+        assert_eq!(
+            decoded,
+            vec![0, 1, 0],
+            "test encoder must round-trip a 3-bin P sub_mb_type sequence"
+        );
+        // A longer 6-bin sequence at B-slice sub_mb_type ctxs:
+        // binIdx 0..=5 with ctxIdx derivation per Table 9-39 row 36
+        // (binIdx 2 uses inc=2 when b1!=0 via Table 9-41).
+        let bins: [(usize, u8); 6] = [(36, 1), (37, 1), (38, 1), (39, 0), (39, 0), (39, 0)];
+        let (decoded, _) = round_trip_bins(SliceKind::B, Some(2), 26, &bins);
+        let expected: Vec<u8> = bins.iter().map(|&(_, b)| b).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    /// Encode the bin string for every Table 9-37 P sub_mb_type value,
+    /// then decode via `decode_sub_mb_type_p` and assert the returned
+    /// value matches.
+    #[test]
+    fn sub_mb_type_p_round_trips_all_values() {
+        // Per Table 9-37 (P / SP rows) and Table 9-39 row 21:
+        //   value 0 (P_L0_8x8): [(21, 1)]
+        //   value 1 (P_L0_8x4): [(21, 0), (22, 0)]
+        //   value 2 (P_L0_4x8): [(21, 0), (22, 1), (23, 1)]
+        //   value 3 (P_L0_4x4): [(21, 0), (22, 1), (23, 0)]
+        let cases: [(&[(usize, u8)], u32); 4] = [
+            (&[(21, 1)], 0),
+            (&[(21, 0), (22, 0)], 1),
+            (&[(21, 0), (22, 1), (23, 1)], 2),
+            (&[(21, 0), (22, 1), (23, 0)], 3),
+        ];
+        for &(bins, expected) in &cases {
+            // Encode the bins.
+            let mut enc = TestEncoder::new();
+            let mut enc_ctxs = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+            for &(ctx_idx, b) in bins {
+                enc.encode_decision(enc_ctxs.at_mut(ctx_idx), b);
+            }
+            let bytes = enc.finish();
+            // Decode through the real primitive.
+            let mut dec = make_decoder(&bytes);
+            let mut dec_ctxs = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+            let got = decode_sub_mb_type_p(&mut dec, &mut dec_ctxs).unwrap();
+            assert_eq!(
+                got, expected,
+                "P sub_mb_type round-trip: bins {bins:?} expected {expected}, got {got}"
+            );
+        }
+    }
+
+    /// Encode the bin string for every Table 9-38 B sub_mb_type value,
+    /// then decode via `decode_sub_mb_type_b`.
+    ///
+    /// ctxIdxOffset = 36 per Table 9-34.
+    /// ctxIdxInc per Table 9-39 row 36:
+    ///   binIdx 0 → inc 0 → ctxIdx 36
+    ///   binIdx 1 → inc 1 → ctxIdx 37
+    ///   binIdx 2 → (b1 != 0) ? 2 : 3 (Table 9-41) → ctxIdx 38 or 39
+    ///   binIdx 3 → inc 3 → ctxIdx 39
+    ///   binIdx 4 → inc 3 → ctxIdx 39
+    ///   binIdx 5 → inc 3 → ctxIdx 39
+    #[test]
+    fn sub_mb_type_b_round_trips_all_values() {
+        // Helper: build the (ctxIdx, bin) sequence for a given bin
+        // string. `bs` is the bit sequence as a slice of u8 (0 or 1).
+        fn build(bs: &[u8]) -> Vec<(usize, u8)> {
+            let mut out: Vec<(usize, u8)> = Vec::with_capacity(bs.len());
+            let mut b1: u8 = 0;
+            for (i, &bit) in bs.iter().enumerate() {
+                let ctx_idx: usize = match i {
+                    0 => 36,           // binIdx 0 → inc 0
+                    1 => 37,           // binIdx 1 → inc 1
+                    2 => {             // binIdx 2 → Table 9-41
+                        if b1 != 0 { 36 + 2 } else { 36 + 3 }
+                    }
+                    _ => 36 + 3,       // binIdx 3..=5 → inc 3
+                };
+                out.push((ctx_idx, bit));
+                if i == 1 {
+                    b1 = bit;
+                }
+            }
+            out
+        }
+
+        // Table 9-38 B sub_mb_type bin strings.
+        let cases: [(&[u8], u32); 13] = [
+            (&[0], 0),                            // B_Direct_8x8
+            (&[1, 0, 0], 1),                      // B_L0_8x8
+            (&[1, 0, 1], 2),                      // B_L1_8x8
+            (&[1, 1, 0, 0, 0], 3),                // B_Bi_8x8
+            (&[1, 1, 0, 0, 1], 4),                // B_L0_8x4
+            (&[1, 1, 0, 1, 0], 5),                // B_L0_4x8
+            (&[1, 1, 0, 1, 1], 6),                // B_L1_8x4
+            (&[1, 1, 1, 0, 0, 0], 7),             // B_L1_4x8
+            (&[1, 1, 1, 0, 0, 1], 8),             // B_Bi_8x4
+            (&[1, 1, 1, 0, 1, 0], 9),             // B_Bi_4x8
+            (&[1, 1, 1, 0, 1, 1], 10),            // B_L0_4x4
+            (&[1, 1, 1, 1, 0], 11),               // B_L1_4x4
+            (&[1, 1, 1, 1, 1], 12),               // B_Bi_4x4
+        ];
+        for &(bs, expected) in &cases {
+            let bins = build(bs);
+            // Encode.
+            let mut enc = TestEncoder::new();
+            let mut enc_ctxs = CabacContexts::init(SliceKind::B, Some(1), 26).unwrap();
+            for &(ctx_idx, b) in &bins {
+                enc.encode_decision(enc_ctxs.at_mut(ctx_idx), b);
+            }
+            let bytes = enc.finish();
+            // Decode.
+            let mut dec = make_decoder(&bytes);
+            let mut dec_ctxs = CabacContexts::init(SliceKind::B, Some(1), 26).unwrap();
+            let got = decode_sub_mb_type_b(&mut dec, &mut dec_ctxs).unwrap();
+            assert_eq!(
+                got, expected,
+                "B sub_mb_type round-trip: bin string {bs:?} expected {expected}, got {got}"
+            );
+        }
     }
 }

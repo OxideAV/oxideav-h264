@@ -33,7 +33,7 @@ pub type CabacResult<T> = Result<T, CabacError>;
 // column (0..=3). Values transcribed verbatim from ITU-T Rec. H.264 (08/2024),
 // document page 278.
 // ---------------------------------------------------------------------------
-static RANGE_TAB_LPS: [[u8; 4]; 64] = [
+pub(crate) static RANGE_TAB_LPS: [[u8; 4]; 64] = [
     [128, 176, 208, 240], // pStateIdx  0
     [128, 167, 197, 227], // pStateIdx  1
     [128, 158, 187, 216], // pStateIdx  2
@@ -108,7 +108,7 @@ static RANGE_TAB_LPS: [[u8; 4]; 64] = [
 // ---------------------------------------------------------------------------
 
 /// Table 9-45 column `transIdxLPS` — next `pStateIdx` after decoding an LPS.
-static TRANS_IDX_LPS: [u8; 64] = [
+pub(crate) static TRANS_IDX_LPS: [u8; 64] = [
     // pStateIdx  0..15
     0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9, 11, 11, 12, // pStateIdx 16..31
     13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21, 21, 22, 22, 23, 24, // pStateIdx 32..47
@@ -117,7 +117,7 @@ static TRANS_IDX_LPS: [u8; 64] = [
 ];
 
 /// Table 9-45 column `transIdxMPS` — next `pStateIdx` after decoding an MPS.
-static TRANS_IDX_MPS: [u8; 64] = [
+pub(crate) static TRANS_IDX_MPS: [u8; 64] = [
     // pStateIdx  0..15
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // pStateIdx 16..31
     17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, // pStateIdx 32..47
