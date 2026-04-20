@@ -15,6 +15,10 @@
 
 pub(crate) mod bitstream;
 pub mod nal;
+pub mod sps;
+pub mod pps;
+pub(crate) mod cavlc;
+pub(crate) mod cabac;
 
 use oxideav_codec::CodecRegistry;
 
