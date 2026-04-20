@@ -2380,19 +2380,27 @@ fn parse_sub_mb_pred(
 
     // 4 sub_mb_type entries. §7.3.5.2.
     //
-    // TODO(sub_mb_type CABAC): §9.3.3.1.2 / Table 9-39 (ctxIdxOffset=21
-    // for P slices and 36 for B slices). A clean-room implementation of
-    // the binarisations from Tables 9-37 (P, rows for sub_mb_type) and
-    // 9-38 (B, rows for sub_mb_type) has to live in `cabac_ctx.rs`, and
-    // that file is owned by another agent this round. Until
-    // `decode_sub_mb_type_p` / `decode_sub_mb_type_b` are available,
-    // default the CABAC raw to 0 (P_L0_8x8 / B_Direct_8x8 per Tables
-    // 7-17 / 7-18). This is still a desync source for any P/B CABAC
-    // stream that uses a non-default sub_mb_type, but it is a narrower
-    // failure mode than the previous ref_idx/mvd stubs.
+    // CABAC: §9.3.3.1.2 / Table 9-39 — ctxIdxOffset = 21 (P/SP) or 36 (B).
+    // The bin strings are in Tables 9-37 (P/SP) and 9-38 (B). The concrete
+    // decoders live in `cabac_ctx::decode_sub_mb_type_{p,b}` and return a
+    // raw u32 that maps directly to the `SubMbType::from_{p,b}` tables
+    // (Tables 7-17 / 7-18).
+    //
+    // Dispatch by slice kind (not `is_b`): a P/SP slice with `mb_type ==
+    // P_8x8 / P_8x8ref0` uses the P binarisation (Table 9-37), while a B
+    // slice with `mb_type == B_8x8` uses the B binarisation (Table 9-38).
     for i in 0..4 {
-        let raw = if entropy.cabac.is_some() {
-            0u32
+        let raw = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
+            match entropy.slice_kind {
+                crate::cabac_ctx::SliceKind::B => {
+                    crate::cabac_ctx::decode_sub_mb_type_b(dec, ctxs)?
+                }
+                // P / SP slices use the P/SP binarisation per Table 9-37.
+                // I / SI slices never reach sub_mb_pred (sub_mb_pred is
+                // only called for P_8x8 / P_8x8ref0 / B_8x8 macroblocks),
+                // so defaulting them to the P decoder is safe.
+                _ => crate::cabac_ctx::decode_sub_mb_type_p(dec, ctxs)?,
+            }
         } else {
             r.ue()?
         };
@@ -4816,5 +4824,166 @@ mod tests {
             any_nonzero,
             "no test stream produced a non-zero mvd — tighten inputs",
         );
+    }
+
+    // --------------------------------------------------------------
+    // sub_mb_type CABAC wiring tests.
+    //
+    // parse_sub_mb_pred must dispatch to decode_sub_mb_type_p for P/SP
+    // slices and decode_sub_mb_type_b for B slices (§9.3.3.1.2 /
+    // Table 9-39 — ctxIdxOffset = 21 (P/SP) or 36 (B)). Skipping those
+    // calls — which is what the former stub did — leaves the sub_mb_type
+    // bins in the stream unconsumed. This test confirms that:
+    //   - For a P slice's P_8x8 mb_type, the CABAC engine consumes at
+    //     least one bin (vs. zero for the old stub).
+    //   - The P-slice path never touches B-slice ctxs (36..=39).
+    //   - The B-slice path consumes bins when mb_type is B_8x8.
+    // --------------------------------------------------------------
+
+    /// Helper: run parse_sub_mb_pred over a fresh CABAC engine on
+    /// `data`, return the resulting SubMbPred and the number of bins
+    /// consumed by CABAC.
+    fn run_cabac_sub_mb_pred(
+        data: &[u8],
+        slice_kind: SliceKind,
+        mb_type: &MbType,
+        num_ref_idx_l0_active_minus1: u32,
+        num_ref_idx_l1_active_minus1: u32,
+    ) -> (SubMbPred, u64) {
+        let mut dec = CabacDecoder::new(BitReader::new(data)).unwrap();
+        let cabac_init_idc = match slice_kind {
+            SliceKind::I | SliceKind::SI => None,
+            _ => Some(0u32),
+        };
+        let mut ctxs = CabacContexts::init(slice_kind, cabac_init_idc, 26).unwrap();
+        let bins_before = dec.bin_count();
+        let dummy = [0u8; 1];
+        let mut r = BitReader::new(&dummy);
+        let mut entropy = EntropyState {
+            cabac: Some((&mut dec, &mut ctxs)),
+            slice_kind,
+            neighbours: NeighbourCtx::default(),
+            prev_mb_qp_delta_nonzero: false,
+            chroma_array_type: 1,
+            transform_8x8_mode_flag: false,
+            cavlc_nc: None,
+            current_mb_addr: 0,
+            constrained_intra_pred_flag: false,
+            num_ref_idx_l0_active_minus1,
+            num_ref_idx_l1_active_minus1,
+            mbaff_frame_flag: false,
+            cabac_nb: None,
+            pic_width_in_mbs: 0,
+        };
+        let pred = parse_sub_mb_pred(&mut r, &mut entropy, mb_type).unwrap();
+        let bins_used = dec.bin_count() - bins_before;
+        (pred, bins_used)
+    }
+
+    /// P slice P_8x8 must invoke decode_sub_mb_type_p — i.e. consume at
+    /// least 4 bins (one per 8x8 part; minimum 1 bin per part for the
+    /// P_L0_8x8 bin string "1" per Table 9-37).
+    #[test]
+    fn cabac_sub_mb_type_p_consumes_bins() {
+        // Stream of all-0xFF bytes forces CABAC's MPS/LPS decisions to
+        // march through context states; the important property is that
+        // decode_sub_mb_type_p is actually called (so ≥ 4 bins for the
+        // 4 sub-MB parts).
+        let data: [u8; 16] = [0xFF; 16];
+        let mb_type = MbType::P8x8;
+        let (_pred, bins) =
+            run_cabac_sub_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
+        assert!(
+            bins >= 4,
+            "P-slice sub_mb_type must consume ≥ 4 bins (one per part) — got {bins}",
+        );
+    }
+
+    /// P slice sub_mb_type must be decoded by `decode_sub_mb_type_p`, not
+    /// `decode_sub_mb_type_b`. Cross-check by comparing to the standalone
+    /// oracle.
+    #[test]
+    fn cabac_sub_mb_type_p_matches_standalone_p_decoder() {
+        let data: [u8; 16] = [
+            0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED,
+            0x00, 0xFF, 0x80, 0x01, 0x22, 0x44, 0x88, 0x77,
+        ];
+        let mb_type = MbType::P8x8;
+        let (pred, _) =
+            run_cabac_sub_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
+
+        // Oracle: invoke decode_sub_mb_type_p four times on a fresh
+        // engine over the same data — must yield the same 4 raw values.
+        let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
+        let mut ctxs =
+            CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+        let mut expected_raws = [0u32; 4];
+        for r in expected_raws.iter_mut() {
+            *r = crate::cabac_ctx::decode_sub_mb_type_p(&mut dec, &mut ctxs)
+                .unwrap();
+        }
+        // Map raw to SubMbType via from_p (§7.3.5.2).
+        for (i, &raw) in expected_raws.iter().enumerate() {
+            let expected = SubMbType::from_p(raw).unwrap();
+            assert_eq!(
+                pred.sub_mb_type[i], expected,
+                "sub_mb_type[{i}] mismatch: expected {expected:?} got {:?}",
+                pred.sub_mb_type[i],
+            );
+        }
+    }
+
+    /// B slice B_8x8 must invoke decode_sub_mb_type_b, not _p.
+    #[test]
+    fn cabac_sub_mb_type_b_matches_standalone_b_decoder() {
+        let data: [u8; 16] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+        ];
+        let mb_type = MbType::B8x8;
+        let (pred, bins) =
+            run_cabac_sub_mb_pred(&data, SliceKind::B, &mb_type, 0, 0);
+        assert!(
+            bins >= 4,
+            "B-slice sub_mb_type must consume ≥ 4 bins (one per part) — got {bins}",
+        );
+
+        // Oracle: invoke decode_sub_mb_type_b four times on a fresh
+        // engine over the same data — must yield the same 4 raw values.
+        let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
+        let mut ctxs =
+            CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
+        let mut expected_raws = [0u32; 4];
+        for r in expected_raws.iter_mut() {
+            *r = crate::cabac_ctx::decode_sub_mb_type_b(&mut dec, &mut ctxs)
+                .unwrap();
+        }
+        for (i, &raw) in expected_raws.iter().enumerate() {
+            let expected = SubMbType::from_b(raw).unwrap();
+            assert_eq!(
+                pred.sub_mb_type[i], expected,
+                "sub_mb_type[{i}] mismatch: expected {expected:?} got {:?}",
+                pred.sub_mb_type[i],
+            );
+        }
+    }
+
+    /// Regression: the pre-wiring stub returned raw=0 without consuming
+    /// any bins. Now the dispatch must produce non-zero bin counts for
+    /// both P and B slices.
+    #[test]
+    fn cabac_sub_mb_type_not_stubbed_zero_bins() {
+        let data: [u8; 16] = [
+            0x80, 0x00, 0x01, 0xFE, 0x7F, 0x55, 0xAA, 0x33,
+            0xCC, 0x11, 0xEE, 0x00, 0xFF, 0x00, 0xFF, 0x00,
+        ];
+        let (_, p_bins) = run_cabac_sub_mb_pred(
+            &data, SliceKind::P, &MbType::P8x8, 0, 0,
+        );
+        assert!(p_bins > 0, "P sub_mb_type must consume bins (got 0)");
+        let (_, b_bins) = run_cabac_sub_mb_pred(
+            &data, SliceKind::B, &MbType::B8x8, 0, 0,
+        );
+        assert!(b_bins > 0, "B sub_mb_type must consume bins (got 0)");
     }
 }

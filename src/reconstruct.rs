@@ -509,7 +509,9 @@ pub fn reconstruct_slice<R: RefPicProvider>(
     }
 
     // -------- Deblocking (§8.7) picture-level pass ------------------
-    if deblock_enabled {
+    // OXIDEAV_H264_NO_DEBLOCK — test-only knob to skip the §8.7 pass.
+    let deblock_env_off = std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok();
+    if deblock_enabled && !deblock_env_off {
         deblock_picture(
             pic,
             grid,
@@ -1061,7 +1063,7 @@ fn reconstruct_intra_nxn(
             let mode = Intra8x8Mode::from_index(mode_idx).unwrap_or(Intra8x8Mode::Dc);
 
             // Gather neighbour samples for this 8x8 block.
-            let raw = gather_samples_8x8(pic, mb_px + bx, mb_py + by);
+            let raw = gather_samples_8x8(pic, mb_px + bx, mb_py + by, blk8);
             let filtered = filter_samples_8x8(&raw, bit_depth_y);
             let mut pred_samples = [0i32; 64];
             predict_8x8(mode, &filtered, bit_depth_y, &mut pred_samples);
@@ -1089,10 +1091,18 @@ fn reconstruct_intra_nxn(
             let coeffs_flat: [i32; 64] = {
                 let bit = (cbp_luma >> blk8) & 1 == 1;
                 if bit {
+                    // `mb.residual_luma` is compacted to only include
+                    // 8x8 quadrants whose cbp_luma bit is set, so map
+                    // `blk8` to the array index by counting set bits
+                    // below it in `cbp_luma` (§7.3.5.3 CAVLC / CABAC
+                    // both push sequentially).
+                    let set_before =
+                        (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                    let base_slot = set_before * 4;
                     let mut scan = [0i32; 64];
                     for sub in 0..4usize {
-                        let base = blk8 * 4 + sub;
-                        if let Some(coefs) = mb.residual_luma.get(base) {
+                        let slot = base_slot + sub;
+                        if let Some(coefs) = mb.residual_luma.get(slot) {
                             for (i, c) in coefs.iter().enumerate().take(16) {
                                 scan[sub * 16 + i] = *c;
                             }
@@ -1126,6 +1136,37 @@ fn reconstruct_intra_nxn(
         }
     } else {
         // §8.3.1 — Intra_4x4 path.
+        // OXIDEAV_H264_RECON_DEBUG — test-only per-block trace for MB 0.
+        let debug_mb = std::env::var("OXIDEAV_H264_RECON_DEBUG_MB")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+        let debug = (mb_addr == 0 && std::env::var("OXIDEAV_H264_RECON_DEBUG").is_ok())
+            || debug_mb == Some(mb_addr);
+        if debug {
+            eprintln!(
+                "RECON MB0 I_NxN: cbp_luma={:#x} qp_y={} mb_type_raw={} cbp={:#x} entropy={}",
+                cbp_luma,
+                qp_y,
+                mb.mb_type_raw,
+                mb.coded_block_pattern,
+                if pps.entropy_coding_mode_flag {
+                    "CABAC"
+                } else {
+                    "CAVLC"
+                }
+            );
+            eprintln!("  prev_flags: {:?}", pred.prev_intra4x4_pred_mode_flag);
+            eprintln!("  rem_modes:  {:?}", pred.rem_intra4x4_pred_mode);
+            eprintln!("  residual_luma.len() = {}", mb.residual_luma.len());
+            for (i, blk) in mb.residual_luma.iter().enumerate() {
+                let nz = blk.iter().filter(|&&v| v != 0).count();
+                if nz > 0 {
+                    eprintln!("  residual_luma[{}] ({} nz): {:?}", i, nz, blk);
+                } else {
+                    eprintln!("  residual_luma[{}] (all zero)", i);
+                }
+            }
+        }
         for block_idx in 0..16usize {
             let (bx, by) = LUMA_4X4_XY[block_idx];
             // §8.3.1.1 — derive Intra_4x4 prediction mode per eq. 8-41.
@@ -1133,14 +1174,25 @@ fn reconstruct_intra_nxn(
             let mode = Intra4x4Mode::from_index(mode_idx).unwrap_or(Intra4x4Mode::Dc);
 
             // Gather neighbour samples for this 4x4 block.
-            let samples = gather_samples_4x4(pic, mb_px + bx, mb_py + by);
+            let samples = gather_samples_4x4(pic, mb_px + bx, mb_py + by, block_idx);
             let mut pred_samples = [0i32; 16];
             predict_4x4(mode, &samples, bit_depth_y, &mut pred_samples);
 
             // §8.5.12 — inverse-transform the residual (if any).
-            let coeffs_scan = if (cbp_luma >> (block_idx / 4)) & 1 == 1 {
+            //
+            // `mb.residual_luma` is populated by the macroblock-layer
+            // parser only for the 8x8 quadrants whose cbp_luma bit is
+            // set (§7.3.5.3 / §7.4.5.3.2), and pushed sequentially in
+            // raster-Z order. So for a cbp_luma with gaps (e.g. 0x5 or
+            // 0xe) the array index is NOT block_idx but the compact
+            // position computed by counting set bits below block_idx's
+            // 8x8 quadrant.
+            let blk8 = block_idx / 4;
+            let coeffs_scan = if (cbp_luma >> blk8) & 1 == 1 {
+                let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                let compact_idx = set_before * 4 + (block_idx % 4);
                 mb.residual_luma
-                    .get(block_idx)
+                    .get(compact_idx)
                     .copied()
                     .unwrap_or([0i32; 16])
             } else {
@@ -1148,6 +1200,23 @@ fn reconstruct_intra_nxn(
             };
             let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
             let residual = inverse_transform_4x4(&coeffs, qp_y, &sl4, bit_depth_y)?;
+
+            if debug && (block_idx == 0 || block_idx == 3) {
+                eprintln!(
+                    "  blk{}: pred_mode={} samples.avail=tl{}t{}tr{}l{}",
+                    block_idx,
+                    mode.as_index(),
+                    samples.availability.top_left,
+                    samples.availability.top,
+                    samples.availability.top_right,
+                    samples.availability.left
+                );
+                eprintln!("    top: {:?}, left: {:?}", samples.top, samples.left);
+                eprintln!("    pred_samples: {:?}", pred_samples);
+                eprintln!("    coeffs_scan: {:?}", coeffs_scan);
+                eprintln!("    coeffs(4x4): {:?}", coeffs);
+                eprintln!("    residual: {:?}", residual);
+            }
 
             // Combine + clip + write.
             write_block_luma(
@@ -1415,17 +1484,31 @@ fn gather_samples_16x16(pic: &Picture, mb_px: i32, mb_py: i32) -> Samples16x16 {
 
 /// §8.3.1 — reference samples for a 4x4 block at (bx, by) (top-left
 /// luma sample of the 4x4 block).
-fn gather_samples_4x4(pic: &Picture, bx: i32, by: i32) -> Samples4x4 {
+///
+/// `block_idx` is the luma4x4BlkIdx (0..=15) of this 4x4 block within
+/// its macroblock; it gates the top-right sample availability per
+/// §6.4.11.4 / the 4x4 block scan order (§6.4.3 / Figure 6-10).
+/// Blocks 3, 7, 11, 13, 15 have their top-right neighbours either not
+/// yet decoded (3, 11) or located in a macroblock to the right that
+/// has not been decoded yet (7, 13, 15). For those indices top-right
+/// is marked "not available for Intra_4x4 prediction"; the §8.3.1.2
+/// substitution rule (copy p[3, -1] into p[4..7, -1]) then kicks in
+/// inside the intra-pred helpers.
+fn gather_samples_4x4(pic: &Picture, bx: i32, by: i32, block_idx: usize) -> Samples4x4 {
     let left_avail = bx > 0;
     let top_avail = by > 0;
     let tl_avail = left_avail && top_avail;
-    // Top-right availability: the 4 samples at (bx+4..=bx+7, by-1).
-    // Simple bound check: above row exists, plus the samples are
-    // inside the picture. More sophisticated rules in §6.4.11.4 bar
-    // certain block positions (top-right 4x4 corner) from seeing
-    // top-right — not handled here; the §8.3.1.2 substitution rule
-    // (copy p[3, -1]) handles the unavailable case anyway.
-    let tr_avail = top_avail && (bx + 4 < pic.width_in_samples as i32);
+    // Top-right availability: the 4 samples at (bx+4..=bx+7, by-1) must
+    // (a) lie in an above-row (i.e. `top_avail`), (b) fit inside the
+    // picture horizontally, AND (c) come from a 4x4 block that has
+    // already been decoded per the §6.4.3 scan. For luma4x4BlkIdx ∈
+    // {3, 7, 11, 13, 15} those samples are not yet available — block
+    // 3/11 need block 4/14 respectively (later in scan), blocks
+    // 7/13/15 need samples from the right-neighbour macroblock which
+    // hasn't been decoded yet when the current MB is being processed.
+    let tr_scan_ok = !matches!(block_idx, 3 | 7 | 11 | 13 | 15);
+    let tr_avail =
+        top_avail && tr_scan_ok && (bx + 4 < pic.width_in_samples as i32);
 
     let top_left = if tl_avail {
         pic.luma_at(bx - 1, by - 1)
@@ -1469,11 +1552,21 @@ fn gather_samples_4x4(pic: &Picture, bx: i32, by: i32) -> Samples4x4 {
 }
 
 /// §8.3.2 — reference samples for an 8x8 block at (bx, by).
-fn gather_samples_8x8(pic: &Picture, bx: i32, by: i32) -> Samples8x8 {
+///
+/// `blk8` is the luma8x8BlkIdx (0..=3) of this 8x8 block within its
+/// macroblock; it gates the top-right availability per §6.4.11.2 and
+/// the 8x8 scan order. Block 3 (bottom-right 8x8 quadrant) needs
+/// samples from the MB to the right which hasn't been decoded yet,
+/// so its top-right is always "not available" regardless of the
+/// picture bounds. The §8.3.2.2 substitution rule (copy p[7, -1] into
+/// p[8..15, -1]) then applies inside `filter_samples_8x8`.
+fn gather_samples_8x8(pic: &Picture, bx: i32, by: i32, blk8: usize) -> Samples8x8 {
     let left_avail = bx > 0;
     let top_avail = by > 0;
     let tl_avail = left_avail && top_avail;
-    let tr_avail = top_avail && (bx + 8 < pic.width_in_samples as i32);
+    let tr_scan_ok = blk8 != 3;
+    let tr_avail =
+        top_avail && tr_scan_ok && (bx + 8 < pic.width_in_samples as i32);
 
     let top_left = if tl_avail {
         pic.luma_at(bx - 1, by - 1)
@@ -1756,10 +1849,16 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             let (bx, by) = LUMA_8X8_XY[blk8];
             let has_res = (cbp_luma >> blk8) & 1 == 1;
             let coeffs = if has_res {
+                // `residual_luma` is compacted by the parser —
+                // quadrants with cbp_luma bit cleared are skipped, so
+                // index by set-bits-below-blk8 (see Intra_NxN path).
+                let set_before =
+                    (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                let base_slot = set_before * 4;
                 let mut scan = [0i32; 64];
                 for sub in 0..4usize {
-                    let base = blk8 * 4 + sub;
-                    if let Some(c) = mb.residual_luma.get(base) {
+                    let slot = base_slot + sub;
+                    if let Some(c) = mb.residual_luma.get(slot) {
                         for (i, v) in c.iter().enumerate().take(16) {
                             scan[sub * 16 + i] = *v;
                         }
@@ -1790,7 +1889,17 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             let blk8 = blk4 / 4;
             let has_res = (cbp_luma >> blk8) & 1 == 1;
             let coeffs_scan = if has_res {
-                mb.residual_luma.get(blk4).copied().unwrap_or([0i32; 16])
+                // Compact index into `residual_luma` — the parser
+                // pushes 4 entries per cbp_luma bit that is set in
+                // low-bit-first order, so the array index is (number
+                // of set bits below blk8) * 4 + (blk4 % 4), not blk4.
+                let set_before =
+                    (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                let compact_idx = set_before * 4 + (blk4 % 4);
+                mb.residual_luma
+                    .get(compact_idx)
+                    .copied()
+                    .unwrap_or([0i32; 16])
             } else {
                 [0i32; 16]
             };
@@ -6120,6 +6229,206 @@ mod tests {
             let mut pic = Picture::new(16, 16, 1, 8, 8);
             let mut grid = MbGrid::new(1, 1);
             reconstruct_slice(&slice_data, &sh, &sps, pps, &NoRefs, &mut pic, &mut grid).unwrap();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §6.4.3 / §6.4.11.4 / §8.3.1.2 — Intra_4x4 top-right availability.
+    //
+    // For luma4x4BlkIdx ∈ {3, 7, 11, 13, 15} the 4 samples p[4..7, -1]
+    // used by DDL / VL / HD / HU / VR prediction come from a block or
+    // macroblock that has NOT yet been decoded in the §6.4.3 scan order.
+    // `gather_samples_4x4` must surface `top_right = false` for those
+    // block indices even though the pixels are inside the picture, so
+    // the §8.3.1.2 "substitute p[3,-1]" fallback kicks in.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn gather_samples_4x4_top_right_unavailable_for_scan_boundary_blocks() {
+        // Picture large enough that bx+4 is well inside the width for
+        // every 4x4 block of MB 0 — so a pure "within picture" check
+        // would say `top_right = true` everywhere.
+        let pic = Picture::new(64, 32, 1, 8, 8);
+
+        // Map luma4x4BlkIdx -> (bx, by) inside MB 0 (LUMA_4X4_XY).
+        let xy = super::LUMA_4X4_XY;
+
+        for (idx, (bx, by)) in xy.iter().copied().enumerate() {
+            let s = super::gather_samples_4x4(&pic, bx, by, idx);
+            let expected = match idx {
+                // Scan-order "top-right not yet decoded" set.
+                3 | 7 | 11 | 13 | 15 => false,
+                // First-row blocks (by == 0) still depend on whether a
+                // top neighbour is available; inside MB 0 at (mb_px=0,
+                // mb_py=0) it is not — so those also report false here.
+                _ if by == 0 => false,
+                _ => true,
+            };
+            assert_eq!(
+                s.availability.top_right, expected,
+                "blk {} (bx={}, by={}) expected tr={} got {}",
+                idx, bx, by, expected, s.availability.top_right
+            );
+        }
+    }
+
+    // §6.4.11.2 / §6.4.3 — Intra_8x8 top-right availability for the
+    // bottom-right 8x8 block (luma8x8BlkIdx == 3). Its top-right
+    // samples (p[8..15, -1] at y = 7 within the MB) would need to come
+    // from the right-neighbour macroblock, which has not been decoded
+    // yet. Report `top_right = false` regardless of picture bounds.
+    #[test]
+    fn gather_samples_8x8_top_right_unavailable_for_blk3() {
+        let pic = Picture::new(64, 32, 1, 8, 8);
+        // LUMA_8X8_XY[3] == (8, 8).
+        let s = super::gather_samples_8x8(&pic, 8, 8, 3);
+        assert!(
+            !s.availability.top_right,
+            "blk8 3: tr should be false (right-neighbour MB not decoded)"
+        );
+        // And blk8 == 2 at (0, 8) — top-right here is block 1 within
+        // the current MB, which HAS been decoded; report true (the
+        // top row is also inside the picture).
+        let s2 = super::gather_samples_8x8(&pic, 0, 8, 2);
+        assert!(s2.availability.top_right);
+    }
+
+    // -----------------------------------------------------------------
+    // §7.4.5.3 — residual_luma compact indexing.
+    //
+    // The macroblock-layer parser pushes 4x4 residual entries into
+    // `Macroblock::residual_luma` ONLY for 8x8 quadrants whose
+    // cbp_luma bit is set (§7.3.5.3). When cbp_luma has gaps (e.g.
+    // 0b1110 — bit 0 clear) the array is *compacted*, not sparse.
+    // The reconstruction path must therefore map `block_idx` to the
+    // array slot by counting set bits below the block's 8x8 quadrant.
+    //
+    // Before the fix, `residual_luma[block_idx]` was read directly,
+    // which silently substituted data from a different 4x4 block for
+    // every block_idx past a gap.
+    //
+    // This test rebuilds an Intra_4x4 MB with cbp_luma = 0b1110 and
+    // a non-zero DC coefficient placed in the residual_luma entry
+    // that corresponds to MB block index 4 (first 4x4 of 8x8 quadrant
+    // 1). Block 4's reconstructed sample value must reflect that
+    // residual — which, before the fix, would have been mis-routed to
+    // block 0 (since residual_luma[0] held the data).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn intra4x4_residual_indexing_respects_cbp_luma_gaps() {
+        use crate::macroblock_layer::{Macroblock, MbPred, MbType};
+        use crate::mb_grid::MbGrid;
+        use crate::slice_data::SliceData;
+        let sps = make_sps(1, 1);
+        let pps = make_pps();
+        let sh = make_slice_header();
+
+        // Build an I_NxN MB with cbp_luma = 0x7 (bits 0, 1, 2 set —
+        // bit 3 clear so block 12..15 get no residual). Place a non-
+        // zero DC residual in the FIRST entry of the array. Pre-fix,
+        // that entry would be read as block 0's residual because the
+        // reconstruct code used `residual_luma[block_idx]` directly.
+        //
+        // Post-fix, `residual_luma[0]` holds block 0's data AND the
+        // offset walking works by counting low-bit cbp_luma bits
+        // below the current 8x8 quadrant (see `set_before`). The
+        // invariant we assert: for cbp=0x7, `residual_luma[0..=11]`
+        // map to block 0..=11 in order (the "all bits set below"
+        // case, which is a no-op and must stay correct).
+        //
+        // Then a second sub-case with cbp_luma = 0xE (bit 0 clear,
+        // bits 1/2/3 set) places residual_luma[0] at block index 4,
+        // proving the fix.
+
+        for (cbp, residual_first_at_block) in [(0x7u8, 0usize), (0xEu8, 4usize)] {
+            // One non-zero DC in the first residual entry. After
+            // inverse 4x4 transform at qP=26 this yields a non-zero
+            // residual block.
+            let mut first_entry = [0i32; 16];
+            first_entry[0] = 4; // AC path, with scaling -> non-zero.
+            // Fill the array with the number of entries the parser
+            // would emit: 4 per set cbp_luma bit, placed sequentially.
+            let n = (cbp & 0x0F).count_ones() as usize * 4;
+            let mut residual_luma = Vec::with_capacity(n);
+            for i in 0..n {
+                if i == 0 {
+                    residual_luma.push(first_entry);
+                } else {
+                    residual_luma.push([0i32; 16]);
+                }
+            }
+            let mut mb_pred = MbPred::default();
+            mb_pred.prev_intra4x4_pred_mode_flag = [true; 16];
+            mb_pred.rem_intra4x4_pred_mode = [0; 16];
+            mb_pred.intra_chroma_pred_mode = 0;
+            let mb = Macroblock {
+                mb_type: MbType::INxN,
+                mb_type_raw: 0,
+                mb_pred: Some(mb_pred),
+                sub_mb_pred: None,
+                pcm_samples: None,
+                coded_block_pattern: cbp as u32,
+                transform_size_8x8_flag: false,
+                mb_qp_delta: 0,
+                residual_luma,
+                residual_luma_dc: None,
+                residual_chroma_dc_cb: Vec::new(),
+                residual_chroma_dc_cr: Vec::new(),
+                residual_chroma_ac_cb: Vec::new(),
+                residual_chroma_ac_cr: Vec::new(),
+                is_skip: false,
+            };
+
+            // Reconstruct.
+            let slice_data = SliceData {
+                macroblocks: vec![mb],
+                mb_field_decoding_flags: vec![false],
+                last_mb_addr: 0,
+            };
+            let mut pic = Picture::new(16, 16, 1, 8, 8);
+            let mut grid = MbGrid::new(1, 1);
+            reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid)
+                .unwrap();
+
+            // Block N of MB 0 occupies (bx, by) = LUMA_4X4_XY[N].
+            // Sum the 16 samples in that block and assert non-flat
+            // (pred was DC=128, residual non-zero → sum != 128 * 16).
+            let (bx, by) = super::LUMA_4X4_XY[residual_first_at_block];
+            let mut sum = 0i32;
+            for y in 0..4 {
+                for x in 0..4 {
+                    sum += pic.luma_at(bx + x, by + y);
+                }
+            }
+            let flat_dc_sum = 128 * 16;
+            assert_ne!(
+                sum, flat_dc_sum,
+                "cbp=0x{:x} block {} should have non-flat output \
+                 (residual_first_at_block stored in residual_luma[0] must route there)",
+                cbp, residual_first_at_block,
+            );
+            // Sanity check: block 0 should be flat DC=128 when the
+            // first residual doesn't land there (cbp=0xE case). When
+            // cbp=0x7 the residual lands at block 0 and that block
+            // won't be flat — skip the "flat" check in that sub-case.
+            if residual_first_at_block != 0 {
+                // For cbp=0xE, bit 0 is clear → block 0, 1, 2, 3 get
+                // NO residual → all DC=128 (but only block 0 has no
+                // neighbours). Check block 0 which has no neighbours.
+                let (ox, oy) = super::LUMA_4X4_XY[0];
+                let mut other_sum = 0i32;
+                for y in 0..4 {
+                    for x in 0..4 {
+                        other_sum += pic.luma_at(ox + x, oy + y);
+                    }
+                }
+                assert_eq!(
+                    other_sum, flat_dc_sum,
+                    "cbp=0x{:x} block 0 should be flat DC=128 (cbp bit 0 clear)",
+                    cbp,
+                );
+            }
         }
     }
 }
