@@ -704,6 +704,21 @@ pub struct NeighbourCtx {
     // transform_size_8x8_flag (§9.3.3.1.1.10)
     pub left_transform_8x8: bool,
     pub above_transform_8x8: bool,
+    // coded_block_pattern (§9.3.3.1.1.4).
+    //
+    // The 4-bit luma CBP of each neighbour macroblock (per-8x8 blocks,
+    // in raster order 0..3). Used to evaluate
+    //   ( ( CodedBlockPatternLuma >> luma8x8BlkIdxN ) & 1 )
+    // per the spec's condTermFlagN derivation.
+    //
+    // `left_is_p_or_b_skip` / `above_is_p_or_b_skip` allow skip MBs to
+    // suppress the CBP lookup per the spec's "not P_Skip / B_Skip" gate.
+    pub left_cbp_luma: u8,
+    pub above_cbp_luma: u8,
+    pub left_cbp_chroma: u8,
+    pub above_cbp_chroma: u8,
+    pub left_is_p_or_b_skip: bool,
+    pub above_is_p_or_b_skip: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,36 +1558,113 @@ pub fn decode_coded_block_flag(
 pub fn decode_coded_block_pattern(
     dec: &mut CabacDecoder<'_>,
     ctxs: &mut CabacContexts,
-    _neighbours: &NeighbourCtx,
+    neighbours: &NeighbourCtx,
     chroma_array_type: u32,
 ) -> CabacResult<u32> {
     const LUMA_OFFSET: u32 = 73;
     const CHROMA_OFFSET: u32 = 77;
     let mut luma: u32 = 0;
     let mut prev_bins = [0u32; 4];
+
+    // §9.3.3.1.1.4 — derive condTermFlagN for an external neighbour MB.
+    //
+    // Inputs:
+    //   avail        — mbAddrN available?
+    //   is_i_pcm     — is mb_type == I_PCM?
+    //   is_skip      — is mb_type ∈ {P_Skip, B_Skip}?
+    //   cbp_luma     — CodedBlockPatternLuma of the neighbour MB
+    //   bit_idx_n    — luma8x8BlkIdxN for N
+    //
+    // Spec: condTermFlagN is 0 when any of these hold:
+    //   * mbAddrN not available
+    //   * mb_type == I_PCM
+    //   * (neighbour ≠ current) and (not skip) and (CBP bit set)
+    // Otherwise condTermFlagN = 1.
+    let cond_ext = |avail: bool, is_i_pcm: bool, is_skip: bool, cbp_luma: u8, bit_idx_n: u32| -> u32 {
+        if !avail {
+            return 0;
+        }
+        if is_i_pcm {
+            // Spec: I_PCM → condTermFlagN = 0.
+            return 0;
+        }
+        if is_skip {
+            // Not skip'd → fall to bit check; skip'd → spec's "not P_Skip/B_Skip"
+            // predicate fails, so the cbp-bit branch does not apply, and
+            // the "Otherwise" branch yields condTermFlagN = 1.
+            return 1;
+        }
+        let bit_set = ((cbp_luma >> bit_idx_n) & 1) != 0;
+        if bit_set { 0 } else { 1 }
+    };
+
+    // §6.4.11.2 / §6.4.3 Figure 6-11 — neighbour 8x8 block of
+    // luma8x8BlkIdx. Each binIdx (= luma8x8BlkIdx) maps to an
+    // (A, B) pair where A is the left neighbour and B is the above
+    // neighbour. For binIdx values where the neighbour lies inside
+    // the current MB, the "internal" branch reads the prior decoded
+    // bin value b_k; for those outside it, the external MB's CBP bit
+    // is consulted.
     for bin_idx in 0..4u32 {
-        // §9.3.3.1.1.4 — ctxIdxInc = condTermFlagA + 2*condTermFlagB.
-        // For the luma sub-block `binIdx`, neighbour blocks come from
-        // the neighbour macroblock's CBP luma bits (above/left) OR
-        // from bins decoded earlier within the same macroblock.
-        //
-        // We approximate: use the prior decoded luma bins in the same
-        // macroblock as internal-neighbour CBP; actual neighbour-MB
-        // CBP values are passed via `neighbours` (reserved for later
-        // upgrade).
-        let internal_a = if bin_idx == 0 || bin_idx == 2 {
-            // left-neighbour within the MB is the previous bin's
-            // horizontal neighbour.
-            0
-        } else {
-            prev_bins[(bin_idx - 1) as usize]
+        // Left neighbour (A).
+        let cond_a = match bin_idx {
+            0 => cond_ext(
+                neighbours.available_left,
+                neighbours.left_is_i_pcm,
+                neighbours.left_is_p_or_b_skip,
+                neighbours.left_cbp_luma,
+                1,
+            ),
+            1 => {
+                // Left neighbour is block 0 of the current MB.
+                let b_k = prev_bins[0];
+                if b_k != 0 { 0 } else { 1 }
+            }
+            2 => cond_ext(
+                neighbours.available_left,
+                neighbours.left_is_i_pcm,
+                neighbours.left_is_p_or_b_skip,
+                neighbours.left_cbp_luma,
+                3,
+            ),
+            3 => {
+                // Left neighbour is block 2 of the current MB.
+                let b_k = prev_bins[2];
+                if b_k != 0 { 0 } else { 1 }
+            }
+            _ => 0,
         };
-        let internal_b = if bin_idx < 2 {
-            0
-        } else {
-            prev_bins[(bin_idx - 2) as usize]
+
+        // Above neighbour (B).
+        let cond_b = match bin_idx {
+            0 => cond_ext(
+                neighbours.available_above,
+                neighbours.above_is_i_pcm,
+                neighbours.above_is_p_or_b_skip,
+                neighbours.above_cbp_luma,
+                2,
+            ),
+            1 => cond_ext(
+                neighbours.available_above,
+                neighbours.above_is_i_pcm,
+                neighbours.above_is_p_or_b_skip,
+                neighbours.above_cbp_luma,
+                3,
+            ),
+            2 => {
+                // Above neighbour is block 0 of the current MB.
+                let b_k = prev_bins[0];
+                if b_k != 0 { 0 } else { 1 }
+            }
+            3 => {
+                // Above neighbour is block 1 of the current MB.
+                let b_k = prev_bins[1];
+                if b_k != 0 { 0 } else { 1 }
+            }
+            _ => 0,
         };
-        let inc = internal_a + 2 * internal_b;
+
+        let inc = cond_a + 2 * cond_b;
         let ctx_idx = (LUMA_OFFSET + inc) as usize;
         let bin = dec.decode_decision(ctxs.at_mut(ctx_idx))?;
         prev_bins[bin_idx as usize] = bin as u32;
@@ -1580,16 +1672,70 @@ pub fn decode_coded_block_pattern(
     }
     let chroma = if chroma_array_type == 1 || chroma_array_type == 2 {
         // TU cMax=2 — up to 2 bins at ctxIdxOffset 77.
-        // §9.3.3.1.1.4 — bin 0 uses eq. 9-11 with (binIdx==1)?4:0
-        // contribution; bin 1 uses same equation with +4.
-        let cond_a = 0u32;
-        let cond_b = 0u32;
-        let inc0 = cond_a + 2 * cond_b;
+        // §9.3.3.1.1.4 eq. (9-11):
+        //   ctxIdxInc = condTermFlagA + 2*condTermFlagB + ((binIdx==1)?4:0)
+        //
+        // condTermFlagN derivation:
+        //   * avail and mb_type == I_PCM → 1.
+        //   * avail && !skip &&
+        //       (binIdx==0 ? cbp_chroma==0 : cbp_chroma != 2) → 0.
+        //   * else → avail-and-not-skip ? 1 : 0.
+        let chroma_cond = |avail: bool, is_i_pcm: bool, is_skip: bool, cbp_chroma: u8, bin_idx: u32| -> u32 {
+            if !avail {
+                return 0;
+            }
+            if is_i_pcm {
+                return 1;
+            }
+            if is_skip {
+                return 0;
+            }
+            // Predicate from spec: flag=0 when
+            //   binIdx==0 && cbp_chroma==0
+            //   binIdx==1 && cbp_chroma != 2
+            let zero_branch = match bin_idx {
+                0 => cbp_chroma == 0,
+                1 => cbp_chroma != 2,
+                _ => false,
+            };
+            if zero_branch { 0 } else { 1 }
+        };
+        // binIdx 0.
+        let cond_a0 = chroma_cond(
+            neighbours.available_left,
+            neighbours.left_is_i_pcm,
+            neighbours.left_is_p_or_b_skip,
+            neighbours.left_cbp_chroma,
+            0,
+        );
+        let cond_b0 = chroma_cond(
+            neighbours.available_above,
+            neighbours.above_is_i_pcm,
+            neighbours.above_is_p_or_b_skip,
+            neighbours.above_cbp_chroma,
+            0,
+        );
+        let inc0 = cond_a0 + 2 * cond_b0;
         let b0 = dec.decode_decision(ctxs.at_mut((CHROMA_OFFSET + inc0) as usize))?;
         if b0 == 0 {
             0
         } else {
-            let inc1 = cond_a + 2 * cond_b + 4;
+            // binIdx 1.
+            let cond_a1 = chroma_cond(
+                neighbours.available_left,
+                neighbours.left_is_i_pcm,
+                neighbours.left_is_p_or_b_skip,
+                neighbours.left_cbp_chroma,
+                1,
+            );
+            let cond_b1 = chroma_cond(
+                neighbours.available_above,
+                neighbours.above_is_i_pcm,
+                neighbours.above_is_p_or_b_skip,
+                neighbours.above_cbp_chroma,
+                1,
+            );
+            let inc1 = cond_a1 + 2 * cond_b1 + 4;
             let b1 = dec.decode_decision(ctxs.at_mut((CHROMA_OFFSET + inc1) as usize))?;
             if b1 == 0 {
                 1

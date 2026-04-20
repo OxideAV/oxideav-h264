@@ -1240,6 +1240,20 @@ pub struct CabacMbNeighbourInfo {
     pub cbf_cr_16x16_dc: bool,
     pub cbf_cr_16x16_ac: [bool; 16],
     pub cbf_cr_luma_4x4: [bool; 16],
+    /// §9.3.3.1.1.4 — CodedBlockPatternLuma (bits 0..=3) for this MB,
+    /// consulted by the next MB's CBP ctxIdxInc derivation.
+    pub coded_block_pattern_luma: u8,
+    /// §9.3.3.1.1.4 — CodedBlockPatternChroma for this MB (0, 1, or 2).
+    pub coded_block_pattern_chroma: u8,
+    /// §9.3.3.1.1.3 — mb_type == I_NxN (I_4x4 / I_8x8) for this MB,
+    /// used by the next MB's mb_type ctxIdxInc derivation.
+    pub is_i_nxn: bool,
+    /// §9.3.3.1.1.8 — intra_chroma_pred_mode of this MB (0..=3). The
+    /// next MB's ctxIdxInc derivation consults whether this is non-zero.
+    pub intra_chroma_pred_mode: u8,
+    /// §9.3.3.1.1.10 — transform_size_8x8_flag of this MB, used by the
+    /// next MB's transform_size_8x8_flag ctxIdxInc derivation.
+    pub transform_size_8x8_flag: bool,
 }
 
 impl Default for CabacMbNeighbourInfo {
@@ -1268,6 +1282,11 @@ impl Default for CabacMbNeighbourInfo {
             cbf_cr_16x16_dc: false,
             cbf_cr_16x16_ac: [false; 16],
             cbf_cr_luma_4x4: [false; 16],
+            coded_block_pattern_luma: 0,
+            coded_block_pattern_chroma: 0,
+            is_i_nxn: false,
+            intra_chroma_pred_mode: 0,
+            transform_size_8x8_flag: false,
         }
     }
 }
@@ -1575,6 +1594,45 @@ fn cbf_cond_for(
                 // Wrap coordinates into the neighbour MB (eq. 6-34/6-35).
                 let (wx, wy) = if is_left_dir { (xn + 16, yn) } else { (xn, yn + 16) };
                 let bi = blk4x4_idx(wx, wy) as usize;
+                // §9.3.3.1.1.9 — transBlockN availability for Luma4x4 /
+                // Luma16x16Ac / CbLuma4x4 / CrLuma4x4 / CbIntra16x16Ac /
+                // CrIntra16x16Ac cat 1/2/7/8/11/12: the neighbour's 4x4
+                // luma block is "available" only when the 8x8 CBP bit
+                // covering `luma4x4BlkIdxN` is set. If the CBP bit is
+                // clear, transBlockN is not available → condTermFlagN
+                // comes from `unavail_cbf(current_is_intra)`.
+                match block_type {
+                    BlockType::Luma4x4
+                    | BlockType::Luma16x16Ac
+                    | BlockType::CbLuma4x4
+                    | BlockType::CrLuma4x4
+                    | BlockType::CbIntra16x16Ac
+                    | BlockType::CrIntra16x16Ac => {
+                        let blk8 = (bi >> 2) as u8;
+                        let cbp = match block_type {
+                            BlockType::CbLuma4x4 | BlockType::CbIntra16x16Ac => {
+                                info.coded_block_pattern_luma // 4:4:4 Cb plane reuses luma CBP in spec; conservative
+                            }
+                            BlockType::CrLuma4x4 | BlockType::CrIntra16x16Ac => {
+                                info.coded_block_pattern_luma
+                            }
+                            _ => info.coded_block_pattern_luma,
+                        };
+                        if ((cbp >> blk8) & 1) == 0 {
+                            return unavail_cbf(current_is_intra, block_type);
+                        }
+                        // transform_size_8x8_flag gate: for ctxBlockCat ∈
+                        // {1, 2}, the 4x4 block is available only when
+                        // t8x8=0 for the neighbour. For ctxBlockCat == 5
+                        // (Luma8x8), the 8x8 block is available only when
+                        // t8x8 == 1. We don't hit cat=5 here (Luma8x8 is
+                        // MbLevel for CBF in our dispatcher).
+                        if info.transform_size_8x8_flag && matches!(block_type, BlockType::Luma4x4 | BlockType::Luma16x16Ac) {
+                            return unavail_cbf(current_is_intra, block_type);
+                        }
+                    }
+                    _ => {}
+                }
                 cbf_luma_for(info, block_type, bi)
             }
         }
@@ -1596,6 +1654,14 @@ fn cbf_cond_for(
                 if !info.available { return unavail_cbf(current_is_intra, block_type) }
                 if info.is_i_pcm { return true }
                 if info.is_skip { return false }
+                // §9.3.3.1.1.9 ctxBlockCat=4 (Chroma AC) — the 4x4
+                // chroma block is available only when
+                // CodedBlockPatternChroma == 2 for the neighbour MB.
+                if matches!(block_type, BlockType::ChromaAc)
+                    && info.coded_block_pattern_chroma != 2
+                {
+                    return unavail_cbf(current_is_intra, block_type);
+                }
                 // Wrap: for chroma plane of width 8 / height 8 (4:2:0) or
                 // 16 (4:2:2). For simplicity always wrap by 8; the blk
                 // index we query is in the first 4 slots for 4:2:0.
@@ -1614,6 +1680,44 @@ fn cbf_cond_for(
             if !info.available { return unavail_cbf(current_is_intra, block_type) }
             if info.is_i_pcm { return true }
             if info.is_skip { return false }
+            // §9.3.3.1.1.9 — transBlockN availability for MB-level DC
+            // blocks depends on whether the neighbour MB carries the
+            // matching DC plane. If it does not, transBlockN is
+            // "not available" and we fall back to unavail_cbf.
+            //
+            // * ctxBlockCat=0 (Luma16x16Dc) — present only when the
+            //   neighbour is coded in Intra_16x16 mode.
+            // * ctxBlockCat=3 (ChromaDc) — present whenever
+            //   CodedBlockPatternChroma != 0 (i.e., ≥1) per spec. When
+            //   chroma_format_idc is 1 or 2, the NOT-P_Skip / NOT-B_Skip
+            //   neighbours always have the DC block potentially present;
+            //   `info.cbf_cb_dc` / `info.cbf_cr_dc` carry the decoded
+            //   coded_block_flag so the fall-through is correct.
+            // * ctxBlockCat=6 (CbIntra16x16Dc) / =10 (CrIntra16x16Dc) —
+            //   same Intra_16x16 gate as cat=0, in 4:4:4.
+            let neighbour_has_transblock = match block_type {
+                BlockType::Luma16x16Dc
+                | BlockType::CbIntra16x16Dc
+                | BlockType::CrIntra16x16Dc => {
+                    // Present only when neighbour is Intra_16x16. Our
+                    // `cbf_luma_16x16_dc` / `cbf_c?_16x16_dc` already
+                    // encode that path: they're only set inside the
+                    // residual walker's Intra_16x16 branch. But the
+                    // condition we need here is "was this MB Intra_16x16?"
+                    // — we don't store that bit directly, so use a proxy:
+                    // if the MB's cbp_luma is 15 AND it's intra AND it
+                    // committed `cbf_luma_16x16_dc` (true or false
+                    // deliberately), transBlockN is available. Simpler
+                    // proxy: for non-Intra_16x16 intra MBs, `is_i_nxn`
+                    // is true; we treat those as "not available".
+                    info.is_intra && !info.is_i_nxn
+                }
+                BlockType::ChromaDc => info.coded_block_pattern_chroma != 0,
+                _ => true,
+            };
+            if !neighbour_has_transblock {
+                return unavail_cbf(current_is_intra, block_type);
+            }
             cbf_mb_level_for(info, block_type, is_cr)
         }
     }
@@ -2062,6 +2166,21 @@ pub fn parse_macroblock(
             current_mb_addr,
             current_is_intra,
         )?;
+        // §9.3.3.1.1.* — commit the per-MB syntax state consulted by the
+        // NEXT MB's CABAC ctxIdxInc derivations that are not covered by
+        // the residual walker's cbf_* commit (CBP, intra_chroma_pred_mode,
+        // transform_size_8x8_flag, I_NxN classification).
+        if let Some(grid) = entropy.cabac_nb.as_deref_mut() {
+            if let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize) {
+                slot.coded_block_pattern_luma = (cbp_total & 0x0F) as u8;
+                slot.coded_block_pattern_chroma = ((cbp_total >> 4) & 0x03) as u8;
+                slot.is_i_nxn = mb_type.is_i_nxn();
+                slot.transform_size_8x8_flag = transform_size_8x8_flag;
+                if let Some(pred) = out.mb_pred.as_ref() {
+                    slot.intra_chroma_pred_mode = pred.intra_chroma_pred_mode;
+                }
+            }
+        }
     } else {
         parse_residual_cavlc_only(
             r,
@@ -2153,6 +2272,7 @@ fn parse_mb_pred(
                     pred.rem_intra4x4_pred_mode[i] = rem as u8;
                 }
             }
+
         }
         // Chroma intra pred mode — read when ChromaArrayType ∈ {1, 2}.
         if matches!(entropy.chroma_array_type, 1 | 2) {
@@ -4668,6 +4788,10 @@ mod tests {
         let mut grid = mk_cabac_grid();
         grid.mbs[0].available = true;
         grid.mbs[0].is_intra = true;
+        // §9.3.3.1.1.9 — transBlockN for ChromaDc requires the neighbour
+        // to have CodedBlockPatternChroma != 0; set it here so the
+        // cbf_cb_dc/cbf_cr_dc values are consulted.
+        grid.mbs[0].coded_block_pattern_chroma = 1;
         grid.mbs[0].cbf_cb_dc = true;
         grid.mbs[0].cbf_cr_dc = false;
         let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
@@ -4688,6 +4812,10 @@ mod tests {
         let mut grid = mk_cabac_grid();
         grid.mbs[0].available = true;
         grid.mbs[0].is_intra = true;
+        // §9.3.3.1.1.9 — transBlockN for ChromaAc requires the neighbour
+        // to have CodedBlockPatternChroma == 2 (DC+AC); set it so the
+        // cbf_c?_ac values are consulted.
+        grid.mbs[0].coded_block_pattern_chroma = 2;
         grid.mbs[0].cbf_cb_ac[0] = true;
         grid.mbs[0].cbf_cr_ac[0] = false;
         // The neighbour wrap for MB 1's chroma AC block 0 at (0, 0)

@@ -267,10 +267,49 @@ pub fn parse_slice_data(
                     }
                 }
                 let flag = pending_pair_flag.unwrap_or(false);
+                // §9.3.3.1.1.4 / .8 — populate the NeighbourCtx fields
+                // that per-syntax ctxIdxInc derivations consult for the
+                // external (neighbour MB) branch. The A/B neighbour
+                // addresses come from §6.4.9 raster-scan: A = left
+                // (same row, x-1), B = above (row above, same x).
+                let mut nctx = NeighbourCtx::default();
+                let (a_addr, b_addr) = cabac_nb.neighbour_mb_addrs(curr_mb_addr);
+                if let Some(a) = a_addr {
+                    if let Some(info) = cabac_nb.mbs.get(a as usize) {
+                        if info.available {
+                            nctx.available_left = true;
+                            nctx.left_is_i_pcm = info.is_i_pcm;
+                            nctx.left_is_p_or_b_skip = info.is_skip;
+                            nctx.left_inter = !info.is_intra;
+                            nctx.left_cbp_luma = info.coded_block_pattern_luma;
+                            nctx.left_cbp_chroma = info.coded_block_pattern_chroma;
+                            nctx.left_is_i_nxn = info.is_i_nxn;
+                            nctx.left_intra_chroma_pred_mode_nonzero =
+                                info.intra_chroma_pred_mode != 0;
+                            nctx.left_transform_8x8 = info.transform_size_8x8_flag;
+                        }
+                    }
+                }
+                if let Some(b) = b_addr {
+                    if let Some(info) = cabac_nb.mbs.get(b as usize) {
+                        if info.available {
+                            nctx.available_above = true;
+                            nctx.above_is_i_pcm = info.is_i_pcm;
+                            nctx.above_is_p_or_b_skip = info.is_skip;
+                            nctx.above_inter = !info.is_intra;
+                            nctx.above_cbp_luma = info.coded_block_pattern_luma;
+                            nctx.above_cbp_chroma = info.coded_block_pattern_chroma;
+                            nctx.above_is_i_nxn = info.is_i_nxn;
+                            nctx.above_intra_chroma_pred_mode_nonzero =
+                                info.intra_chroma_pred_mode != 0;
+                            nctx.above_transform_8x8 = info.transform_size_8x8_flag;
+                        }
+                    }
+                }
                 let mut entropy = EntropyState {
                     cabac: Some((&mut cabac_dec, &mut ctxs)),
                     slice_kind: kind,
-                    neighbours: NeighbourCtx::default(),
+                    neighbours: nctx,
                     prev_mb_qp_delta_nonzero: false,
                     chroma_array_type,
                     transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
