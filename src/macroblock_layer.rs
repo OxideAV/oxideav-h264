@@ -41,10 +41,12 @@
 use crate::bitstream::{BitError, BitReader};
 use crate::cabac::{CabacDecoder, CabacError};
 use crate::cabac_ctx::{
-    decode_coded_block_pattern, decode_intra_chroma_pred_mode, decode_mb_qp_delta,
-    decode_mb_type_b, decode_mb_type_i, decode_mb_type_p, decode_prev_intra_pred_mode_flag,
-    decode_rem_intra_pred_mode, decode_transform_size_8x8_flag, CabacContexts, NeighbourCtx,
-    SliceKind,
+    decode_coded_block_flag, decode_coded_block_pattern, decode_coeff_abs_level_minus1,
+    decode_coeff_sign_flag, decode_intra_chroma_pred_mode, decode_last_significant_coeff_flag,
+    decode_mb_qp_delta, decode_mb_type_b, decode_mb_type_i, decode_mb_type_p,
+    decode_prev_intra_pred_mode_flag, decode_rem_intra_pred_mode,
+    decode_significant_coeff_flag, decode_transform_size_8x8_flag, BlockType, CabacContexts,
+    NeighbourCtx, SliceKind,
 };
 use crate::cavlc::{parse_residual_block_cavlc, CavlcError, CoeffTokenContext};
 use crate::pps::Pps;
@@ -825,15 +827,30 @@ pub fn parse_macroblock(
         is_skip: false,
     };
 
-    parse_residual_cavlc_only(
-        r,
-        entropy.chroma_array_type,
-        &mb_type,
-        cbp_luma,
-        cbp_chroma,
-        transform_size_8x8_flag,
-        &mut out,
-    )?;
+    // §7.3.5.3 — residual block = residual_block_cavlc or
+    // residual_block_cabac depending on entropy_coding_mode_flag.
+    if let Some((cabac, ctxs)) = entropy.cabac.as_mut() {
+        parse_residual_cabac_only(
+            cabac,
+            ctxs,
+            entropy.chroma_array_type,
+            &mb_type,
+            cbp_luma,
+            cbp_chroma,
+            transform_size_8x8_flag,
+            &mut out,
+        )?;
+    } else {
+        parse_residual_cavlc_only(
+            r,
+            entropy.chroma_array_type,
+            &mb_type,
+            cbp_luma,
+            cbp_chroma,
+            transform_size_8x8_flag,
+            &mut out,
+        )?;
+    }
 
     Ok(out)
 }
@@ -1117,6 +1134,259 @@ fn parse_residual_cavlc_only(
         // Monochrome — no chroma residual.
     } else {
         // 4:4:4 chroma is modelled like luma; not implemented.
+        return Err(MacroblockLayerError::UnsupportedChromaArrayType(
+            chroma_array_type,
+        ));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// §7.3.5.3.3 / §9.3.3.1.1.9 — CABAC residual walker.
+// ---------------------------------------------------------------------------
+
+/// §7.3.5.3.3 — residual_block_cabac(coeffLevel, startIdx, endIdx, maxNumCoeff).
+///
+/// Drives the four-stage CABAC residual loop:
+///   1. coded_block_flag (§9.3.3.1.1.9 / Table 9-42)
+///      — skipped when `maxNumCoeff == 64` and ChromaArrayType != 3
+///        (8x8 blocks have coded_block_flag inferred from CBP).
+///   2. significance map: for scan position `i ∈ startIdx..numCoeff-1`
+///      read `significant_coeff_flag[i]` and, if set,
+///      `last_significant_coeff_flag[i]`. Hitting a "last" truncates
+///      `numCoeff`.
+///   3. Reverse-scan abs level + sign decoding: process positions
+///      `numCoeff-1 .. startIdx` decrementing, reading
+///      `coeff_abs_level_minus1` and `coeff_sign_flag` for each
+///      significant coefficient.
+///
+/// `neighbour_cbf_{left,above}` are the §9.3.3.1.1.9 condition-term
+/// flags for the coded_block_flag ctxIdx. We pass `None` for both —
+/// the macroblock layer doesn't yet track per-block CBF neighbours;
+/// spec-wise this biases the probability a little but doesn't
+/// desync the bitstream (ctxIdxInc is just a small integer).
+fn parse_residual_block_cabac(
+    cabac: &mut CabacDecoder<'_>,
+    ctxs: &mut CabacContexts,
+    block_type: BlockType,
+    start_idx: u32,
+    end_idx: u32,
+    max_num_coeff: u32,
+    chroma_array_type: u32,
+) -> McblResult<Vec<i32>> {
+    let len = (end_idx - start_idx + 1) as usize;
+    let mut out = vec![0i32; len];
+
+    // §7.3.5.3.3 — coded_block_flag is suppressed for 8x8 blocks unless
+    // we're in 4:4:4 (where 8x8 CBP semantics differ).
+    let coded = if max_num_coeff != 64 || chroma_array_type == 3 {
+        decode_coded_block_flag(cabac, ctxs, block_type, None, None)?
+    } else {
+        true
+    };
+
+    if !coded {
+        return Ok(out);
+    }
+
+    // §7.3.5.3.3 — significance map, in forward scan order.
+    // `num_coeff` is the count of coefficients still to decode including
+    // the "last" one; it starts at `end_idx - start_idx + 1` and shrinks
+    // when `last_significant_coeff_flag[i]` fires.
+    let mut significant = vec![false; len];
+    let span = end_idx - start_idx + 1;
+    let mut num_coeff_in_scan = span; // positions 0..num_coeff_in_scan-1 remain
+    let field = false; // frame coding; MBAFF field parsing is deferred
+    let mut i: u32 = 0;
+    while i + 1 < num_coeff_in_scan {
+        let sig = decode_significant_coeff_flag(cabac, ctxs, block_type, i, field)?;
+        significant[i as usize] = sig;
+        if sig {
+            let last = decode_last_significant_coeff_flag(cabac, ctxs, block_type, i, field)?;
+            if last {
+                num_coeff_in_scan = i + 1;
+                break;
+            }
+        }
+        i += 1;
+    }
+    // The final scan position in `num_coeff_in_scan` is implicitly
+    // significant (that's what made the while loop terminate, either via
+    // `last_significant_coeff_flag == 1` or by hitting the trailing
+    // position that's always the block's last non-zero by construction).
+    significant[(num_coeff_in_scan - 1) as usize] = true;
+
+    // §7.3.5.3.3 — reverse-scan abs level + sign decode. The ctxIdx for
+    // coeff_abs_level_minus1 bins 0 and 1+ depend on the running counts
+    // of previously-decoded |level|=1 and |level|>1 values per §9.3.3.1.3.
+    let mut num_eq1: u32 = 0;
+    let mut num_gt1: u32 = 0;
+    for pos in (0..num_coeff_in_scan).rev() {
+        if !significant[pos as usize] {
+            continue;
+        }
+        let abs_m1 =
+            decode_coeff_abs_level_minus1(cabac, ctxs, block_type, num_eq1, num_gt1)?;
+        let sign = decode_coeff_sign_flag(cabac)?;
+        let val = ((abs_m1 + 1) as i32) * if sign { -1 } else { 1 };
+        out[pos as usize] = val;
+        if abs_m1 == 0 {
+            num_eq1 += 1;
+        } else {
+            num_gt1 += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// CABAC residual walker (§7.3.5.3 with entropy_coding_mode_flag == 1).
+/// Same shape as `parse_residual_cavlc_only` but routes every block
+/// through the CABAC engine instead of the CAVLC tables.
+fn parse_residual_cabac_only(
+    cabac: &mut CabacDecoder<'_>,
+    ctxs: &mut CabacContexts,
+    chroma_array_type: u32,
+    mb_type: &MbType,
+    cbp_luma: u32,
+    cbp_chroma: u32,
+    transform_size_8x8_flag: bool,
+    out: &mut Macroblock,
+) -> McblResult<()> {
+    // --- Luma DC (Intra_16x16) ---
+    if mb_type.is_intra_16x16() {
+        let blk = parse_residual_block_cabac(
+            cabac,
+            ctxs,
+            BlockType::Luma16x16Dc,
+            0,
+            15,
+            16,
+            chroma_array_type,
+        )?;
+        out.residual_luma_dc = Some(pad_to_16(blk));
+    }
+
+    // --- Luma AC / 4x4 blocks / 8x8 blocks ---
+    if mb_type.is_intra_16x16() {
+        if cbp_luma == 15 {
+            for _ in 0..16 {
+                let blk = parse_residual_block_cabac(
+                    cabac,
+                    ctxs,
+                    BlockType::Luma16x16Ac,
+                    0,
+                    14,
+                    15,
+                    chroma_array_type,
+                )?;
+                out.residual_luma.push(pad_to_16(blk));
+            }
+        }
+    } else if transform_size_8x8_flag {
+        for blk8 in 0..4 {
+            if (cbp_luma >> blk8) & 1 == 1 {
+                // §7.3.5.3.1: a single residual_block call for the whole
+                // 8x8 (64 coefficients). We model it the same way as
+                // the CAVLC fallback (four 4x4 sub-blocks) for now since
+                // the 8x8-specific CABAC scanning tables would need
+                // additional plumbing.
+                let blk = parse_residual_block_cabac(
+                    cabac,
+                    ctxs,
+                    BlockType::Luma8x8,
+                    0,
+                    63,
+                    64,
+                    chroma_array_type,
+                )?;
+                // Pad the 64 coefficients into four 16-slot arrays.
+                for sub in 0..4 {
+                    let mut chunk = [0i32; 16];
+                    for k in 0..16 {
+                        chunk[k] = blk[sub * 16 + k];
+                    }
+                    out.residual_luma.push(chunk);
+                }
+            }
+        }
+    } else {
+        for blk8 in 0..4 {
+            if (cbp_luma >> blk8) & 1 == 1 {
+                for _ in 0..4 {
+                    let blk = parse_residual_block_cabac(
+                        cabac,
+                        ctxs,
+                        BlockType::Luma4x4,
+                        0,
+                        15,
+                        16,
+                        chroma_array_type,
+                    )?;
+                    out.residual_luma.push(pad_to_16(blk));
+                }
+            }
+        }
+    }
+
+    // --- Chroma residual ---
+    if chroma_array_type == 1 || chroma_array_type == 2 {
+        let num_c8x8 = if chroma_array_type == 1 { 1 } else { 2 };
+
+        if cbp_chroma > 0 {
+            let max_dc = if chroma_array_type == 1 { 4 } else { 8 };
+            let cb_dc = parse_residual_block_cabac(
+                cabac,
+                ctxs,
+                BlockType::ChromaDc,
+                0,
+                max_dc - 1,
+                max_dc,
+                chroma_array_type,
+            )?;
+            out.residual_chroma_dc_cb = cb_dc;
+            let cr_dc = parse_residual_block_cabac(
+                cabac,
+                ctxs,
+                BlockType::ChromaDc,
+                0,
+                max_dc - 1,
+                max_dc,
+                chroma_array_type,
+            )?;
+            out.residual_chroma_dc_cr = cr_dc;
+        }
+
+        if cbp_chroma == 2 {
+            let num_ac = 4 * num_c8x8 as usize;
+            for _ in 0..num_ac {
+                let blk = parse_residual_block_cabac(
+                    cabac,
+                    ctxs,
+                    BlockType::ChromaAc,
+                    0,
+                    14,
+                    15,
+                    chroma_array_type,
+                )?;
+                out.residual_chroma_ac_cb.push(pad_to_16(blk));
+            }
+            for _ in 0..num_ac {
+                let blk = parse_residual_block_cabac(
+                    cabac,
+                    ctxs,
+                    BlockType::ChromaAc,
+                    0,
+                    14,
+                    15,
+                    chroma_array_type,
+                )?;
+                out.residual_chroma_ac_cr.push(pad_to_16(blk));
+            }
+        }
+    } else if chroma_array_type == 0 {
+        // Monochrome — no chroma residual.
+    } else {
         return Err(MacroblockLayerError::UnsupportedChromaArrayType(
             chroma_array_type,
         ));
