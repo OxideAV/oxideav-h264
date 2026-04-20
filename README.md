@@ -36,7 +36,7 @@ no packet is decoded.
 
 | Spec area | Clause | Status |
 | --------- | ------ | ------ |
-| NAL parsing (Annex B + AVCC) | §7.3.1, §B.1 | not implemented |
+| NAL parsing (Annex B + AVCC) | §7.3.1, §7.4.1, §B.1 | parsed (no extension headers) |
 | Sequence Parameter Set | §7.3.2.1 | not implemented |
 | Picture Parameter Set | §7.3.2.2 | not implemented |
 | Slice header | §7.3.3 | not implemented |

@@ -14,6 +14,7 @@
 //! See `README.md` for the spec coverage matrix as it grows.
 
 pub(crate) mod bitstream;
+pub mod nal;
 
 use oxideav_codec::CodecRegistry;
 
