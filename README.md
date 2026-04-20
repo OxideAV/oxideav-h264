@@ -43,12 +43,13 @@ no packet is decoded.
 | VUI parameters (+ HRD) | §E.1 | integrated into SPS |
 | AUD + SEI framing + filler + end-of-seq/stream | §7.3.2.3..7 | parsed (SEI payloads per Annex D deferred) |
 | Slice header | §7.3.3 | parsed (incl. RPLM, pred_weight_table, dec_ref_pic_marking) |
-| Picture Order Count derivation (types 0/1/2) | §8.2.1 | implemented |
-| Slice data + macroblock layer | §7.3.4, §7.3.5 | not implemented |
+| Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2; MBAFF + 4:4:4 + CABAC I_PCM termination deferred) |
+| FMO MB address derivation | §8.2.2, §8.2.3 | implemented (all 7 slice_group_map_types + NextMbAddress) |
+| Top-level decoder driver | §7.4.1.2.1 | implemented (events: SPS/PPS stored, AUD, Slice, SEI, end markers, Ignored) |
 | Reference picture marking (sliding window + MMCO) | §7.3.3.3, §8.2.5 | implemented |
 | Reference picture list construction | §8.2.4 | implemented (frame-only; field-pair interleaving partial) |
 | Reference picture list modification (RPLM) | §7.3.3.1, §8.2.4.3 | implemented |
-| Picture order count derivation | §8.2.1 | not implemented |
+| Picture order count derivation (types 0/1/2) | §8.2.1 | implemented |
 | Intra prediction (4x4 / 8x8 / 16x16 / chroma) | §8.3 | implemented (all modes) |
 | Inter prediction — fractional interpolation + weighted pred | §8.4.2 | implemented (luma 6-tap, chroma bilinear, default + explicit weighted) |
 | Inter prediction — MV derivation (MVpred, P/B skip, spatial + temporal direct) | §8.4.1 | implemented |
