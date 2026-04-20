@@ -32,6 +32,10 @@ pub mod deblock;
 pub mod ref_list;
 pub(crate) mod cabac_ctx;
 pub mod sei;
+pub mod mb_address;
+pub mod macroblock_layer;
+pub mod slice_data;
+pub mod decoder;
 
 use oxideav_codec::CodecRegistry;
 
