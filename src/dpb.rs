@@ -265,26 +265,41 @@ impl Dpb {
     }
 
     /// Compute `FrameNumWrap` per §8.2.4.1.
+    ///
+    /// The spec compares the reference picture's `FrameNum` against the
+    /// **current slice's** `frame_num`, not against `prev_ref_frame_num`.
+    /// When `FrameNum > frame_num` of the current slice, the reference is
+    /// considered "from before the modulo wrap" and gets `FrameNumWrap =
+    /// FrameNum − MaxFrameNum` (a signed-negative value), so that the
+    /// ordering comparison still places older references before newer ones
+    /// across the `frame_num` wrap boundary.
     pub fn compute_frame_num_wrap(
-        frame_num: u32,
-        prev_ref_frame_num: u32,
+        ref_frame_num: u32,
+        curr_frame_num: u32,
         max_frame_num: u32,
     ) -> i32 {
-        if frame_num > prev_ref_frame_num {
-            (frame_num as i32) - (max_frame_num as i32)
+        if ref_frame_num > curr_frame_num {
+            (ref_frame_num as i32) - (max_frame_num as i32)
         } else {
-            frame_num as i32
+            ref_frame_num as i32
         }
     }
 
-    /// Refresh `frame_num_wrap` on every short-term entry.
-    pub fn update_frame_num_wrap(&mut self, prev_ref_frame_num: u32, max_frame_num: u32) {
+    /// Refresh `frame_num_wrap` on every short-term entry against the
+    /// current slice's `frame_num`. Callers must pass the slice header's
+    /// `frame_num`, NOT `prev_ref_frame_num` — the spec's §8.2.4.1 rule
+    /// wraps references relative to the decoder's current picture so a
+    /// ref whose `frame_num` is larger than the current `frame_num`
+    /// (meaning it was decoded before the MOD-MaxFrameNum wrap boundary)
+    /// gets a signed-negative `FrameNumWrap` and sorts before the current
+    /// picture in `RefPicList0` construction (§8.2.4.2.1 / §8.2.4.2.3).
+    pub fn update_frame_num_wrap(&mut self, curr_frame_num: u32, max_frame_num: u32) {
         for f in &mut self.frames {
             if !f.used_for_reference || !f.short_term {
                 continue;
             }
             f.frame_num_wrap =
-                Self::compute_frame_num_wrap(f.frame_num, prev_ref_frame_num, max_frame_num);
+                Self::compute_frame_num_wrap(f.frame_num, curr_frame_num, max_frame_num);
         }
     }
 

@@ -645,7 +645,14 @@ impl H264Decoder {
                     }
                     SliceType::P => {
                         let dpb = self.dpb.as_mut().expect("DPB initialised above");
-                        dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
+                        // §8.2.4.1 wraps references relative to the CURRENT
+                        // slice's `frame_num`, not `prev_ref_frame_num`. Using
+                        // the wrong reference here makes the `frame_num_wrap`
+                        // values negative relative to the wrong origin and
+                        // breaks both RPLM lookups (§8.2.4.3.1) and sliding-
+                        // window eviction (§8.2.5.3) across the MaxFrameNum
+                        // wrap boundary.
+                        dpb.update_frame_num_wrap(sh.frame_num, max_frame_num);
                         // Re-borrow immutably to build the list + apply RPLM.
                         let dpb_ref: &Dpb = dpb;
                         let default_list = dpb_ref.build_list0_p(sh.num_ref_idx_l0_active_minus1);
@@ -706,7 +713,9 @@ impl H264Decoder {
                     }
                     SliceType::B => {
                         let dpb = self.dpb.as_mut().expect("DPB initialised above");
-                        dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
+                        // §8.2.4.1 — wrap against the current slice's
+                        // frame_num. See the P-slice arm above for rationale.
+                        dpb.update_frame_num_wrap(sh.frame_num, max_frame_num);
                         let dpb_ref: &Dpb = dpb;
                         let default_l0 =
                             dpb_ref.build_list0_b(poc, sh.num_ref_idx_l0_active_minus1);
@@ -839,7 +848,9 @@ impl H264Decoder {
                             ));
                         }
                         let dpb = self.dpb.as_mut().expect("DPB initialised above");
-                        dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
+                        // §8.2.4.1 — wrap against the current slice's
+                        // frame_num (see the P-slice arm for the rationale).
+                        dpb.update_frame_num_wrap(sh.frame_num, max_frame_num);
                         let dpb_ref: &Dpb = dpb;
                         let default_list = dpb_ref.build_list0_p(sh.num_ref_idx_l0_active_minus1);
                         let ref_entries = if sh.rplm_l0.is_empty() {
@@ -911,12 +922,15 @@ impl H264Decoder {
                 self.pts_fifo.push_back((self.pending_pts, self.pending_tb));
                 let dpb = self.dpb.as_mut().expect("DPB initialised above");
                 if is_ref {
-                    dpb.update_frame_num_wrap(self.prev_ref_frame_num, max_frame_num);
-                    let frame_num_wrap = Dpb::compute_frame_num_wrap(
-                        sh.frame_num,
-                        self.prev_ref_frame_num,
-                        max_frame_num,
-                    );
+                    // §8.2.4.1 — re-wrap existing references against the
+                    // CURRENT slice's `frame_num` before inserting the new
+                    // one, so sliding-window eviction (§8.2.5.3) picks the
+                    // right "oldest" entry across the MaxFrameNum wrap. The
+                    // incoming picture wraps to its own frame_num because
+                    // `sh.frame_num > sh.frame_num` is false.
+                    dpb.update_frame_num_wrap(sh.frame_num, max_frame_num);
+                    let frame_num_wrap =
+                        Dpb::compute_frame_num_wrap(sh.frame_num, sh.frame_num, max_frame_num);
                     if sh.adaptive_ref_pic_marking_mode_flag {
                         // MMCO mode — ops 3 and 6 may reference the
                         // current picture, so insert before replaying.
