@@ -23,6 +23,9 @@
 
 use thiserror::Error;
 
+use crate::pps::Pps;
+use crate::sps::{ScalingListEntry, Sps};
+
 // ---------------------------------------------------------------------------
 // Errors.
 // ---------------------------------------------------------------------------
@@ -166,20 +169,327 @@ fn level_scale_8x8(scaling_list: &[i32; 64], m: usize, i: usize, j: usize) -> i3
 }
 
 // ---------------------------------------------------------------------------
-// §6.4 / §7.4.2.1.1.1 — default flat scaling lists.
+// §7.4.2.1.1 Eqs. 7-8 / 7-9 — flat scaling lists (all 16s).
+// §7.4.2.1.1.1 Tables 7-3 / 7-4 — default scaling matrices.
 // ---------------------------------------------------------------------------
 
-/// Flat 4x4 scaling list. Used when scaling_matrix is not signalled
-/// and "no scaling" applies per §7.4.2.1.1.1 (every entry set to 16
-/// cancels out with the normAdjust / 16 factor implicit in the
-/// derivation of the LevelScale tables).
+/// §7.4.2.1.1 Eq. 7-8 — `Flat_4x4_16`. All 16s. Used as the inferred
+/// sequence-level scaling list when `seq_scaling_matrix_present_flag == 0`
+/// (every entry = 16 cancels out the normAdjust/16 factor implicit in
+/// the LevelScale derivation → "no scaling").
 pub fn default_scaling_list_4x4_flat() -> [i32; 16] {
-    [16; 16]
+    FLAT_4X4_16
 }
 
-/// Flat 8x8 scaling list.
+/// §7.4.2.1.1 Eq. 7-9 — `Flat_8x8_16`. All 16s.
 pub fn default_scaling_list_8x8_flat() -> [i32; 64] {
-    [16; 64]
+    FLAT_8X8_16
+}
+
+/// §7.4.2.1.1 Eq. 7-8 — `Flat_4x4_16`.
+pub const FLAT_4X4_16: [i32; 16] = [16; 16];
+
+/// §7.4.2.1.1 Eq. 7-9 — `Flat_8x8_16`.
+pub const FLAT_8X8_16: [i32; 64] = [16; 64];
+
+/// §7.4.2.1.1.1 Table 7-3 — default Intra 4x4 scaling matrix
+/// (`Default_4x4_Intra`). Row-major, scan-order (same ordering as
+/// Table 7-3 which lists idx 0..15).
+pub const DEFAULT_4X4_INTRA: [i32; 16] = [
+    6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42,
+];
+
+/// §7.4.2.1.1.1 Table 7-3 — default Inter 4x4 scaling matrix
+/// (`Default_4x4_Inter`).
+pub const DEFAULT_4X4_INTER: [i32; 16] = [
+    10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34,
+];
+
+/// §7.4.2.1.1.1 Table 7-4 — default Intra 8x8 scaling matrix
+/// (`Default_8x8_Intra`). 64 entries, scan-order as given in Table 7-4.
+pub const DEFAULT_8X8_INTRA: [i32; 64] = [
+    6, 10, 10, 13, 11, 13, 16, 16, 16, 16, 18, 18, 18, 18, 18, 23, 23, 23, 23, 23, 23, 25, 25, 25,
+    25, 25, 25, 25, 27, 27, 27, 27, 27, 27, 27, 27, 29, 29, 29, 29, 29, 29, 29, 31, 31, 31, 31, 31,
+    31, 33, 33, 33, 33, 33, 36, 36, 36, 36, 38, 38, 38, 40, 40, 42,
+];
+
+/// §7.4.2.1.1.1 Table 7-4 — default Inter 8x8 scaling matrix
+/// (`Default_8x8_Inter`).
+pub const DEFAULT_8X8_INTER: [i32; 64] = [
+    9, 13, 13, 15, 13, 15, 17, 17, 17, 17, 19, 19, 19, 19, 19, 21, 21, 21, 21, 21, 21, 22, 22, 22,
+    22, 22, 22, 22, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 27, 27, 27, 27, 27,
+    27, 28, 28, 28, 28, 28, 30, 30, 30, 30, 32, 32, 32, 33, 33, 35,
+];
+
+// ---------------------------------------------------------------------------
+// §7.4.2.1.1.1 Table 7-2 / fall-back rules A and B — effective scaling
+// list selection for a given list index.
+// ---------------------------------------------------------------------------
+//
+// Table 7-2 (transcribed):
+//
+//   idx  mnemonic            block  pred   comp  rule A                  rule B                      default
+//   ---  ------------------  -----  -----  ----  ----------------------  --------------------------  ------------------
+//    0   Sl_4x4_Intra_Y       4x4    Intra   Y    default scaling list    sequence-level scaling list  Default_4x4_Intra
+//    1   Sl_4x4_Intra_Cb      4x4    Intra   Cb   scaling list for i=0    scaling list for i=0         Default_4x4_Intra
+//    2   Sl_4x4_Intra_Cr      4x4    Intra   Cr   scaling list for i=1    scaling list for i=1         Default_4x4_Intra
+//    3   Sl_4x4_Inter_Y       4x4    Inter   Y    default scaling list    sequence-level scaling list  Default_4x4_Inter
+//    4   Sl_4x4_Inter_Cb      4x4    Inter   Cb   scaling list for i=3    scaling list for i=3         Default_4x4_Inter
+//    5   Sl_4x4_Inter_Cr      4x4    Inter   Cr   scaling list for i=4    scaling list for i=4         Default_4x4_Inter
+//    6   Sl_8x8_Intra_Y       8x8    Intra   Y    default scaling list    sequence-level scaling list  Default_8x8_Intra
+//    7   Sl_8x8_Inter_Y       8x8    Inter   Y    default scaling list    sequence-level scaling list  Default_8x8_Inter
+//    8   Sl_8x8_Intra_Cb      8x8    Intra   Cb   scaling list for i=6    scaling list for i=6         Default_8x8_Intra
+//    9   Sl_8x8_Inter_Cb      8x8    Inter   Cb   scaling list for i=7    scaling list for i=7         Default_8x8_Inter
+//   10   Sl_8x8_Intra_Cr      8x8    Intra   Cr   scaling list for i=8    scaling list for i=8         Default_8x8_Intra
+//   11   Sl_8x8_Inter_Cr      8x8    Inter   Cr   scaling list for i=9    scaling list for i=9         Default_8x8_Inter
+
+/// §7.4.2.1.1.1 Table 7-2 — the class-initial default matrix for a
+/// given 4x4 scaling-list index (0..=5 covers both 4:2:0/4:2:2 cases
+/// `n=8` and 4:4:4 `n=12`).
+fn default_4x4_for(idx: usize) -> [i32; 16] {
+    // idx 0..=2 are Intra (Y/Cb/Cr), idx 3..=5 are Inter.
+    if idx < 3 {
+        DEFAULT_4X4_INTRA
+    } else {
+        DEFAULT_4X4_INTER
+    }
+}
+
+/// §7.4.2.1.1.1 Table 7-2 — the class-initial default matrix for a
+/// given 8x8 scaling-list index. The spec's "12-entry" layout numbers
+/// 8x8 lists as i ∈ 6..=11; the `idx` parameter here is 0..=5 where
+/// 0 maps to i=6 (Intra_Y), 1 → i=7 (Inter_Y), 2 → i=8 (Intra_Cb),
+/// 3 → i=9 (Inter_Cb), 4 → i=10 (Intra_Cr), 5 → i=11 (Inter_Cr).
+fn default_8x8_for(idx: usize) -> [i32; 64] {
+    // Even `idx` (0, 2, 4) = Intra; odd (1, 3, 5) = Inter.
+    if idx & 1 == 0 {
+        DEFAULT_8X8_INTRA
+    } else {
+        DEFAULT_8X8_INTER
+    }
+}
+
+/// §7.4.2.1.1.1 Table 7-2 — Rule A/B "previous index" chain for 4x4
+/// lists. Returns `Some(prev)` when this index inherits from another
+/// 4x4 index (i=1→0, i=2→1, i=4→3, i=5→4), `None` for i=0 and i=3 (the
+/// class heads).
+fn chain_prev_4x4(idx: usize) -> Option<usize> {
+    match idx {
+        1 => Some(0),
+        2 => Some(1),
+        4 => Some(3),
+        5 => Some(4),
+        _ => None, // 0 and 3 are class heads
+    }
+}
+
+/// §7.4.2.1.1.1 Table 7-2 — Rule A/B "previous index" chain for 8x8
+/// lists. Argument `idx` is the 0..=5 position within the 8x8 sub-array
+/// (same convention as [`default_8x8_for`]). Returns `Some(prev)` to
+/// inherit from a previous 8x8 index, `None` for i=6 / i=7 (class
+/// heads, corresponding to local idx 0 / 1).
+fn chain_prev_8x8(idx: usize) -> Option<usize> {
+    match idx {
+        2 => Some(0), // i=8 → i=6
+        3 => Some(1), // i=9 → i=7
+        4 => Some(2), // i=10 → i=8
+        5 => Some(3), // i=11 → i=9
+        _ => None,    // 0 (i=6), 1 (i=7) are class heads
+    }
+}
+
+/// §7.4.2.1.1.1 — derive the sequence-level 4x4 scaling list for index
+/// `idx` ∈ 0..=5. The SPS's `seq_scaling_lists` must be `Some` when
+/// `seq_scaling_matrix_present_flag == 1`; otherwise the flat list is
+/// returned (Eq. 7-8).
+fn derive_sps_4x4(idx: usize, sps: &Sps) -> [i32; 16] {
+    if !sps.seq_scaling_matrix_present_flag {
+        // §7.4.2.1.1 — inferred Flat_4x4_16.
+        return FLAT_4X4_16;
+    }
+    let lists = match sps.seq_scaling_lists.as_ref() {
+        Some(l) => l,
+        None => return FLAT_4X4_16,
+    };
+    let entry = lists.entries.get(idx);
+    match entry {
+        Some(ScalingListEntry::Explicit(vals)) => vec_to_16(vals),
+        Some(ScalingListEntry::UseDefault) => default_4x4_for(idx),
+        Some(ScalingListEntry::NotPresent) => {
+            // Fall-back rule A for the sequence-level list.
+            match chain_prev_4x4(idx) {
+                Some(prev) => derive_sps_4x4(prev, sps),
+                None => default_4x4_for(idx),
+            }
+        }
+        None => FLAT_4X4_16,
+    }
+}
+
+/// §7.4.2.1.1.1 — derive the sequence-level 8x8 scaling list for 8x8
+/// sub-index `idx` ∈ 0..=5 (where 0 maps to spec i=6, 1 → i=7, etc.).
+fn derive_sps_8x8(idx: usize, sps: &Sps) -> [i32; 64] {
+    if !sps.seq_scaling_matrix_present_flag {
+        return FLAT_8X8_16;
+    }
+    let lists = match sps.seq_scaling_lists.as_ref() {
+        Some(l) => l,
+        None => return FLAT_8X8_16,
+    };
+    // The SPS entries vector layout: [0..6) = 4x4 lists; [6..n) = 8x8
+    // lists where n ∈ {8, 12}. We want entries[6 + idx].
+    let spec_idx = 6 + idx;
+    let entry = lists.entries.get(spec_idx);
+    match entry {
+        Some(ScalingListEntry::Explicit(vals)) => vec_to_64(vals),
+        Some(ScalingListEntry::UseDefault) => default_8x8_for(idx),
+        Some(ScalingListEntry::NotPresent) => {
+            // Fall-back rule A for the sequence-level list.
+            match chain_prev_8x8(idx) {
+                Some(prev) => derive_sps_8x8(prev, sps),
+                None => default_8x8_for(idx),
+            }
+        }
+        None => FLAT_8X8_16,
+    }
+}
+
+/// §7.4.2.1.1.1 / §7.4.2.2 — effective 4x4 scaling list for a given
+/// list index (§7.4.2.1.1.1 Table 7-2 indices 0..=5), following the
+/// PPS-over-SPS override and fall-back rules A/B.
+///
+/// `list_idx`: 0=Intra_Y, 1=Intra_Cb, 2=Intra_Cr, 3=Inter_Y, 4=Inter_Cb,
+/// 5=Inter_Cr. Out-of-range indices (≥6 in a non-4:4:4 stream) return
+/// `FLAT_4X4_16`.
+pub fn select_scaling_list_4x4(list_idx: usize, sps: &Sps, pps: &Pps) -> [i32; 16] {
+    if list_idx >= 6 {
+        return FLAT_4X4_16;
+    }
+    // PPS override: when pic_scaling_matrix_present_flag == 1 the
+    // picture-level list is derived from the PPS per-index entries
+    // with the appropriate fall-back rule set.
+    let ext = pps.extension.as_ref();
+    let pic_present = ext.is_some_and(|e| e.pic_scaling_matrix_present_flag);
+    if !pic_present {
+        // §7.4.2.2: pic_scaling_matrix_present_flag == 0 → picture-level
+        // lists equal the sequence-level lists.
+        return derive_sps_4x4(list_idx, sps);
+    }
+    let pic_lists = match ext.and_then(|e| e.pic_scaling_lists.as_ref()) {
+        Some(l) => l,
+        None => return derive_sps_4x4(list_idx, sps),
+    };
+    derive_pps_4x4(list_idx, sps, pic_lists)
+}
+
+/// §7.4.2.1.1.1 / §7.4.2.2 — effective 8x8 scaling list.
+///
+/// `list_idx` ∈ 0..=5 is the 8x8 sub-index (0=Intra_Y, 1=Inter_Y,
+/// 2=Intra_Cb, 3=Inter_Cb, 4=Intra_Cr, 5=Inter_Cr — corresponding to
+/// spec-wide indices 6..=11).
+pub fn select_scaling_list_8x8(list_idx: usize, sps: &Sps, pps: &Pps) -> [i32; 64] {
+    if list_idx >= 6 {
+        return FLAT_8X8_16;
+    }
+    let ext = pps.extension.as_ref();
+    let pic_present = ext.is_some_and(|e| e.pic_scaling_matrix_present_flag);
+    if !pic_present {
+        return derive_sps_8x8(list_idx, sps);
+    }
+    let pic_lists = match ext.and_then(|e| e.pic_scaling_lists.as_ref()) {
+        Some(l) => l,
+        None => return derive_sps_8x8(list_idx, sps),
+    };
+    derive_pps_8x8(list_idx, sps, pic_lists)
+}
+
+/// §7.4.2.1.1.1 Table 7-2 — PPS-level derivation for 4x4 list `idx`.
+///
+/// The PPS entries vector is indexed by i ∈ 0..=5 (the 4x4 slice of
+/// the PPS scaling_list loop; the 8x8 slice follows at index 6..).
+fn derive_pps_4x4(idx: usize, sps: &Sps, pic: &crate::pps::PicScalingLists) -> [i32; 16] {
+    let entry = pic.entries.get(idx);
+    match entry {
+        Some(ScalingListEntry::Explicit(vals)) => vec_to_16(vals),
+        Some(ScalingListEntry::UseDefault) => default_4x4_for(idx),
+        Some(ScalingListEntry::NotPresent) => {
+            // §7.4.2.2 semantics on pic_scaling_list_present_flag[i]:
+            //   seq_scaling_matrix_present_flag == 0 → rule A
+            //   otherwise                            → rule B
+            if !sps.seq_scaling_matrix_present_flag {
+                // Rule A
+                match chain_prev_4x4(idx) {
+                    Some(prev) => derive_pps_4x4(prev, sps, pic),
+                    None => default_4x4_for(idx),
+                }
+            } else {
+                // Rule B — for class heads (i=0, 3) use the
+                // sequence-level list; for i=1/2/4/5 inherit from the
+                // previous PPS index (same PPS context).
+                match chain_prev_4x4(idx) {
+                    Some(prev) => derive_pps_4x4(prev, sps, pic),
+                    None => derive_sps_4x4(idx, sps),
+                }
+            }
+        }
+        None => derive_sps_4x4(idx, sps),
+    }
+}
+
+/// §7.4.2.1.1.1 Table 7-2 — PPS-level derivation for 8x8 list (sub-idx
+/// 0..=5 = spec i=6..=11).
+fn derive_pps_8x8(idx: usize, sps: &Sps, pic: &crate::pps::PicScalingLists) -> [i32; 64] {
+    let spec_idx = 6 + idx;
+    let entry = pic.entries.get(spec_idx);
+    match entry {
+        Some(ScalingListEntry::Explicit(vals)) => vec_to_64(vals),
+        Some(ScalingListEntry::UseDefault) => default_8x8_for(idx),
+        Some(ScalingListEntry::NotPresent) => {
+            if !sps.seq_scaling_matrix_present_flag {
+                // Rule A
+                match chain_prev_8x8(idx) {
+                    Some(prev) => derive_pps_8x8(prev, sps, pic),
+                    None => default_8x8_for(idx),
+                }
+            } else {
+                // Rule B
+                match chain_prev_8x8(idx) {
+                    Some(prev) => derive_pps_8x8(prev, sps, pic),
+                    None => derive_sps_8x8(idx, sps),
+                }
+            }
+        }
+        None => derive_sps_8x8(idx, sps),
+    }
+}
+
+#[inline]
+fn vec_to_16(v: &[i32]) -> [i32; 16] {
+    let mut out = [0i32; 16];
+    let n = v.len().min(16);
+    out[..n].copy_from_slice(&v[..n]);
+    if n < 16 {
+        // Defensive: pad with the last value (shouldn't happen with a
+        // valid parse, since scaling_list() always fills exactly n
+        // entries). Fall back to flat.
+        for slot in out.iter_mut().skip(n) {
+            *slot = 16;
+        }
+    }
+    out
+}
+
+#[inline]
+fn vec_to_64(v: &[i32]) -> [i32; 64] {
+    let mut out = [0i32; 64];
+    let n = v.len().min(64);
+    out[..n].copy_from_slice(&v[..n]);
+    if n < 64 {
+        for slot in out.iter_mut().skip(n) {
+            *slot = 16;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,6 +1485,340 @@ mod tests {
     fn default_scaling_lists_all_16s() {
         assert_eq!(default_scaling_list_4x4_flat(), [16i32; 16]);
         assert_eq!(default_scaling_list_8x8_flat(), [16i32; 64]);
+    }
+
+    // ------------ Default scaling matrices (§7.4.2.1.1.1 T7-3/7-4) ----
+
+    #[test]
+    fn default_4x4_intra_table_7_3() {
+        // Verbatim from Table 7-3, row Default_4x4_Intra.
+        assert_eq!(
+            DEFAULT_4X4_INTRA,
+            [6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42]
+        );
+    }
+
+    #[test]
+    fn default_4x4_inter_table_7_3() {
+        assert_eq!(
+            DEFAULT_4X4_INTER,
+            [10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34]
+        );
+    }
+
+    #[test]
+    fn default_8x8_intra_table_7_4_spot_checks() {
+        // Table 7-4: idx 0→6, idx 1→10, idx 15→23, idx 31→27, idx 63→42.
+        assert_eq!(DEFAULT_8X8_INTRA[0], 6);
+        assert_eq!(DEFAULT_8X8_INTRA[1], 10);
+        assert_eq!(DEFAULT_8X8_INTRA[15], 23);
+        assert_eq!(DEFAULT_8X8_INTRA[31], 27);
+        assert_eq!(DEFAULT_8X8_INTRA[63], 42);
+    }
+
+    #[test]
+    fn default_8x8_inter_table_7_4_spot_checks() {
+        // Table 7-4: idx 0→9, idx 1→13, idx 15→21, idx 31→24, idx 63→35.
+        assert_eq!(DEFAULT_8X8_INTER[0], 9);
+        assert_eq!(DEFAULT_8X8_INTER[1], 13);
+        assert_eq!(DEFAULT_8X8_INTER[15], 21);
+        assert_eq!(DEFAULT_8X8_INTER[31], 24);
+        assert_eq!(DEFAULT_8X8_INTER[63], 35);
+    }
+
+    // ------------ select_scaling_list_4x4 / _8x8 (§7.4.2.1.1.1) --------
+
+    // Minimal SPS/PPS construction helpers for unit tests.
+    fn minimal_sps() -> crate::sps::Sps {
+        // All fields that are irrelevant for scaling-list derivation
+        // get safe defaults; the parser never emits them for a flat
+        // profile, but we only need them to satisfy the struct shape.
+        crate::sps::Sps {
+            profile_idc: 66,
+            constraint_set_flags: 0,
+            level_idc: 30,
+            seq_parameter_set_id: 0,
+            chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            qpprime_y_zero_transform_bypass_flag: false,
+            seq_scaling_matrix_present_flag: false,
+            seq_scaling_lists: None,
+            log2_max_frame_num_minus4: 0,
+            pic_order_cnt_type: 0,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            delta_pic_order_always_zero_flag: false,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_ref_frame: Vec::new(),
+            max_num_ref_frames: 1,
+            gaps_in_frame_num_value_allowed_flag: false,
+            pic_width_in_mbs_minus1: 0,
+            pic_height_in_map_units_minus1: 0,
+            frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
+            direct_8x8_inference_flag: false,
+            frame_cropping: None,
+            vui_parameters_present_flag: false,
+            vui: None,
+        }
+    }
+
+    fn minimal_pps() -> crate::pps::Pps {
+        crate::pps::Pps {
+            pic_parameter_set_id: 0,
+            seq_parameter_set_id: 0,
+            entropy_coding_mode_flag: false,
+            bottom_field_pic_order_in_frame_present_flag: false,
+            num_slice_groups_minus1: 0,
+            slice_group_map: None,
+            num_ref_idx_l0_default_active_minus1: 0,
+            num_ref_idx_l1_default_active_minus1: 0,
+            weighted_pred_flag: false,
+            weighted_bipred_idc: 0,
+            pic_init_qp_minus26: 0,
+            pic_init_qs_minus26: 0,
+            chroma_qp_index_offset: 0,
+            deblocking_filter_control_present_flag: false,
+            constrained_intra_pred_flag: false,
+            redundant_pic_cnt_present_flag: false,
+            extension: None,
+        }
+    }
+
+    #[test]
+    fn select_4x4_returns_flat_when_neither_sps_nor_pps_present() {
+        let sps = minimal_sps();
+        let pps = minimal_pps();
+        for i in 0..6 {
+            assert_eq!(select_scaling_list_4x4(i, &sps, &pps), FLAT_4X4_16);
+        }
+    }
+
+    #[test]
+    fn select_8x8_returns_flat_when_neither_sps_nor_pps_present() {
+        let sps = minimal_sps();
+        let pps = minimal_pps();
+        for i in 0..6 {
+            assert_eq!(select_scaling_list_8x8(i, &sps, &pps), FLAT_8X8_16);
+        }
+    }
+
+    #[test]
+    fn select_4x4_sps_all_not_present_gives_rule_a_defaults() {
+        // seq_scaling_matrix_present_flag=1, every entry NotPresent.
+        // Per Table 7-2 / Rule A: i=0/1/2 → Default_4x4_Intra,
+        // i=3/4/5 → Default_4x4_Inter (via inheritance chain).
+        let mut sps = minimal_sps();
+        sps.seq_scaling_matrix_present_flag = true;
+        sps.seq_scaling_lists = Some(crate::sps::SeqScalingLists {
+            entries: vec![ScalingListEntry::NotPresent; 8],
+        });
+        let pps = minimal_pps();
+
+        assert_eq!(select_scaling_list_4x4(0, &sps, &pps), DEFAULT_4X4_INTRA);
+        assert_eq!(select_scaling_list_4x4(1, &sps, &pps), DEFAULT_4X4_INTRA);
+        assert_eq!(select_scaling_list_4x4(2, &sps, &pps), DEFAULT_4X4_INTRA);
+        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
+        assert_eq!(select_scaling_list_4x4(4, &sps, &pps), DEFAULT_4X4_INTER);
+        assert_eq!(select_scaling_list_4x4(5, &sps, &pps), DEFAULT_4X4_INTER);
+    }
+
+    #[test]
+    fn select_4x4_sps_explicit_entries_are_returned_verbatim() {
+        let mut sps = minimal_sps();
+        sps.seq_scaling_matrix_present_flag = true;
+        let custom: Vec<i32> = (0..16).map(|k| (k + 1) as i32).collect(); // 1..=16
+        sps.seq_scaling_lists = Some(crate::sps::SeqScalingLists {
+            entries: vec![
+                ScalingListEntry::Explicit(custom.clone()),
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+            ],
+        });
+        let pps = minimal_pps();
+        let got = select_scaling_list_4x4(0, &sps, &pps);
+        let mut expected = [0i32; 16];
+        for (k, v) in custom.iter().enumerate() {
+            expected[k] = *v;
+        }
+        assert_eq!(got, expected);
+        // idx=1 inherits (Rule A) from idx=0 → same explicit values.
+        assert_eq!(select_scaling_list_4x4(1, &sps, &pps), expected);
+        // idx=2 inherits from idx=1 → same again.
+        assert_eq!(select_scaling_list_4x4(2, &sps, &pps), expected);
+        // idx=3 is the Inter class head with no signalled list →
+        // Default_4x4_Inter.
+        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
+    }
+
+    #[test]
+    fn select_4x4_use_default_returns_table_default() {
+        let mut sps = minimal_sps();
+        sps.seq_scaling_matrix_present_flag = true;
+        sps.seq_scaling_lists = Some(crate::sps::SeqScalingLists {
+            entries: vec![
+                ScalingListEntry::UseDefault, // idx 0 → Default_4x4_Intra
+                ScalingListEntry::UseDefault, // idx 1 → Default_4x4_Intra
+                ScalingListEntry::UseDefault, // idx 2 → Default_4x4_Intra
+                ScalingListEntry::UseDefault, // idx 3 → Default_4x4_Inter
+                ScalingListEntry::UseDefault, // idx 4 → Default_4x4_Inter
+                ScalingListEntry::UseDefault, // idx 5 → Default_4x4_Inter
+                ScalingListEntry::NotPresent, // 8x8 placeholders
+                ScalingListEntry::NotPresent,
+            ],
+        });
+        let pps = minimal_pps();
+        assert_eq!(select_scaling_list_4x4(0, &sps, &pps), DEFAULT_4X4_INTRA);
+        assert_eq!(select_scaling_list_4x4(1, &sps, &pps), DEFAULT_4X4_INTRA);
+        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
+        assert_eq!(select_scaling_list_4x4(5, &sps, &pps), DEFAULT_4X4_INTER);
+    }
+
+    #[test]
+    fn select_8x8_use_default_and_not_present() {
+        // Layout: 8 entries (n=8 for chroma_format_idc != 3) with 6
+        // 4x4 lists followed by 2 8x8 lists. Mark the 8x8 Intra as
+        // UseDefault, 8x8 Inter as NotPresent.
+        let mut sps = minimal_sps();
+        sps.seq_scaling_matrix_present_flag = true;
+        sps.seq_scaling_lists = Some(crate::sps::SeqScalingLists {
+            entries: vec![
+                ScalingListEntry::NotPresent, // 0
+                ScalingListEntry::NotPresent, // 1
+                ScalingListEntry::NotPresent, // 2
+                ScalingListEntry::NotPresent, // 3
+                ScalingListEntry::NotPresent, // 4
+                ScalingListEntry::NotPresent, // 5
+                ScalingListEntry::UseDefault, // 6 (8x8 Intra_Y)
+                ScalingListEntry::NotPresent, // 7 (8x8 Inter_Y) → Rule A → Default_8x8_Inter
+            ],
+        });
+        let pps = minimal_pps();
+        assert_eq!(select_scaling_list_8x8(0, &sps, &pps), DEFAULT_8X8_INTRA);
+        assert_eq!(select_scaling_list_8x8(1, &sps, &pps), DEFAULT_8X8_INTER);
+    }
+
+    #[test]
+    fn select_8x8_chroma_444_12_entries() {
+        // 4:4:4 stream: 12 entries (6 4x4 + 6 8x8). Exercise idx 2..=5.
+        let mut sps = minimal_sps();
+        sps.chroma_format_idc = 3;
+        sps.seq_scaling_matrix_present_flag = true;
+        let explicit: Vec<i32> = (1..=64).collect();
+        sps.seq_scaling_lists = Some(crate::sps::SeqScalingLists {
+            entries: vec![
+                ScalingListEntry::NotPresent, // 4x4 i=0
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::Explicit(explicit.clone()), // 8x8 i=6 (Intra_Y)
+                ScalingListEntry::NotPresent,                  // 8x8 i=7 (Inter_Y)
+                ScalingListEntry::NotPresent,                  // 8x8 i=8 (Intra_Cb)
+                ScalingListEntry::NotPresent,                  // 8x8 i=9 (Inter_Cb)
+                ScalingListEntry::NotPresent,                  // 8x8 i=10 (Intra_Cr)
+                ScalingListEntry::NotPresent,                  // 8x8 i=11 (Inter_Cr)
+            ],
+        });
+        let pps = minimal_pps();
+        // idx 0 (i=6 Intra_Y): explicit → 1..=64.
+        let got = select_scaling_list_8x8(0, &sps, &pps);
+        assert_eq!(got[0], 1);
+        assert_eq!(got[63], 64);
+        // idx 1 (i=7 Inter_Y): NotPresent, Rule A class head →
+        // Default_8x8_Inter.
+        assert_eq!(select_scaling_list_8x8(1, &sps, &pps), DEFAULT_8X8_INTER);
+        // idx 2 (i=8 Intra_Cb): NotPresent, inherits from idx 0 (i=6).
+        assert_eq!(select_scaling_list_8x8(2, &sps, &pps), got);
+        // idx 3 (i=9 Inter_Cb): inherits from idx 1 (i=7) →
+        // Default_8x8_Inter.
+        assert_eq!(select_scaling_list_8x8(3, &sps, &pps), DEFAULT_8X8_INTER);
+        // idx 4 (i=10 Intra_Cr): inherits from idx 2 (i=8) → got.
+        assert_eq!(select_scaling_list_8x8(4, &sps, &pps), got);
+        // idx 5 (i=11 Inter_Cr): inherits from idx 3 → Default_8x8_Inter.
+        assert_eq!(select_scaling_list_8x8(5, &sps, &pps), DEFAULT_8X8_INTER);
+    }
+
+    #[test]
+    fn select_4x4_pps_override_takes_precedence_rule_b() {
+        // SPS has seq_scaling_matrix_present_flag=1 with an Explicit idx
+        // 0; PPS has pic_scaling_matrix_present_flag=1 with a DIFFERENT
+        // Explicit idx 0. The effective list should be the PPS value.
+        let mut sps = minimal_sps();
+        sps.seq_scaling_matrix_present_flag = true;
+        sps.seq_scaling_lists = Some(crate::sps::SeqScalingLists {
+            entries: vec![
+                ScalingListEntry::Explicit(vec![1; 16]),
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+                ScalingListEntry::NotPresent,
+            ],
+        });
+
+        let mut pps = minimal_pps();
+        pps.extension = Some(crate::pps::PpsExtension {
+            transform_8x8_mode_flag: false,
+            pic_scaling_matrix_present_flag: true,
+            pic_scaling_lists: Some(crate::pps::PicScalingLists {
+                entries: vec![
+                    ScalingListEntry::Explicit(vec![2; 16]), // PPS overrides idx 0
+                    ScalingListEntry::NotPresent,
+                    ScalingListEntry::NotPresent,
+                    ScalingListEntry::NotPresent,
+                    ScalingListEntry::NotPresent,
+                    ScalingListEntry::NotPresent,
+                ],
+            }),
+            second_chroma_qp_index_offset: 0,
+        });
+        // PPS idx 0 Explicit=[2;16] → PPS wins.
+        assert_eq!(select_scaling_list_4x4(0, &sps, &pps), [2i32; 16]);
+        // PPS idx 1 NotPresent, SPS present → Rule B. Rule B for i=1
+        // inherits the "scaling list for i=0" in the PPS chain →
+        // [2;16].
+        assert_eq!(select_scaling_list_4x4(1, &sps, &pps), [2i32; 16]);
+        // PPS idx 3 NotPresent, SPS present → Rule B. Class head (i=3)
+        // falls back to the SEQUENCE-level list for index 3. SPS idx
+        // 3 is NotPresent → its Rule A chain gives Default_4x4_Inter.
+        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
+    }
+
+    #[test]
+    fn select_4x4_pps_override_rule_a_when_sps_absent() {
+        // pic_scaling_matrix_present_flag=1 AND
+        // seq_scaling_matrix_present_flag=0 → Rule A for picture-level.
+        let sps = minimal_sps(); // seq_scaling_matrix_present_flag=false
+        let mut pps = minimal_pps();
+        pps.extension = Some(crate::pps::PpsExtension {
+            transform_8x8_mode_flag: false,
+            pic_scaling_matrix_present_flag: true,
+            pic_scaling_lists: Some(crate::pps::PicScalingLists {
+                entries: vec![
+                    ScalingListEntry::NotPresent, // idx 0 → Rule A → Default_4x4_Intra
+                    ScalingListEntry::NotPresent,
+                    ScalingListEntry::NotPresent,
+                    ScalingListEntry::NotPresent,
+                    ScalingListEntry::NotPresent,
+                    ScalingListEntry::NotPresent,
+                ],
+            }),
+            second_chroma_qp_index_offset: 0,
+        });
+        assert_eq!(select_scaling_list_4x4(0, &sps, &pps), DEFAULT_4X4_INTRA);
+        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
     }
 
     // ------------ Inverse scan (§8.5.6) ---------------------------------

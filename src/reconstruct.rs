@@ -50,9 +50,10 @@ use crate::slice_data::SliceData;
 use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sps::Sps;
 use crate::transform::{
-    default_scaling_list_4x4_flat, default_scaling_list_8x8_flat, inverse_hadamard_chroma_dc_420,
-    inverse_hadamard_chroma_dc_422, inverse_hadamard_luma_dc_16x16, inverse_transform_4x4,
-    inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_y_to_qp_c, TransformError,
+    inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422,
+    inverse_hadamard_luma_dc_16x16, inverse_transform_4x4, inverse_transform_4x4_dc_preserved,
+    inverse_transform_8x8, qp_y_to_qp_c, select_scaling_list_4x4, select_scaling_list_8x8,
+    TransformError,
 };
 
 use thiserror::Error;
@@ -232,6 +233,7 @@ pub fn reconstruct_slice<R: RefPicProvider>(
                 chroma_array_type,
                 bit_depth_y,
                 bit_depth_c,
+                sps,
                 pps,
                 pic,
                 grid,
@@ -245,6 +247,7 @@ pub fn reconstruct_slice<R: RefPicProvider>(
                 bit_depth_y,
                 bit_depth_c,
                 slice_header,
+                sps,
                 pps,
                 ref_pics,
                 pic,
@@ -308,6 +311,7 @@ fn reconstruct_mb_intra(
     chroma_array_type: u32,
     bit_depth_y: u32,
     bit_depth_c: u32,
+    sps: &Sps,
     pps: &Pps,
     pic: &mut Picture,
     grid: &mut MbGrid,
@@ -361,12 +365,13 @@ fn reconstruct_mb_intra(
                 bit_depth_c,
                 mb_px,
                 mb_py,
+                sps,
                 pps,
                 pic,
             )?;
         }
         MbType::INxN => {
-            reconstruct_intra_nxn(mb, qp_y, bit_depth_y, mb_px, mb_py, mb_addr, pic, grid)?;
+            reconstruct_intra_nxn(mb, qp_y, bit_depth_y, mb_px, mb_py, mb_addr, sps, pps, pic, grid)?;
             reconstruct_chroma_intra(
                 mb,
                 qp_y,
@@ -374,6 +379,7 @@ fn reconstruct_mb_intra(
                 bit_depth_c,
                 mb_px,
                 mb_py,
+                sps,
                 pps,
                 pic,
             )?;
@@ -406,6 +412,7 @@ fn reconstruct_intra_16x16(
     bit_depth_c: u32,
     mb_px: i32,
     mb_py: i32,
+    sps: &Sps,
     pps: &Pps,
     pic: &mut Picture,
 ) -> Result<(), ReconstructError> {
@@ -418,7 +425,8 @@ fn reconstruct_intra_16x16(
     predict_16x16(mode, &samples, bit_depth_y, &mut pred);
 
     // -------- §8.5.10 — luma DC block (always present for I_16x16) --
-    let sl4 = default_scaling_list_4x4_flat();
+    // §7.4.2.1.1.1 Table 7-2 — Intra luma 4x4 list (index 0).
+    let sl4 = select_scaling_list_4x4(0, sps, pps);
     let dc_levels = mb.residual_luma_dc.as_ref().copied().unwrap_or([0i32; 16]);
     // DC coefficients are in zig-zag scan order; inverse-scan to a
     // 4x4 matrix before the Hadamard.
@@ -476,6 +484,7 @@ fn reconstruct_intra_16x16(
         bit_depth_c,
         mb_px,
         mb_py,
+        sps,
         pps,
         pic,
     )?;
@@ -487,6 +496,7 @@ fn reconstruct_intra_16x16(
 // §8.3.1 / §8.3.2 — Intra_4x4 / Intra_8x8 luma
 // -------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_intra_nxn(
     mb: &Macroblock,
     qp_y: i32,
@@ -494,6 +504,8 @@ fn reconstruct_intra_nxn(
     mb_px: i32,
     mb_py: i32,
     _mb_addr: u32,
+    sps: &Sps,
+    pps: &Pps,
     pic: &mut Picture,
     grid: &mut MbGrid,
 ) -> Result<(), ReconstructError> {
@@ -501,8 +513,9 @@ fn reconstruct_intra_nxn(
         .mb_pred
         .as_ref()
         .ok_or_else(|| ReconstructError::UnsupportedMbType("I_NxN without mb_pred".into()))?;
-    let sl4 = default_scaling_list_4x4_flat();
-    let sl8 = default_scaling_list_8x8_flat();
+    // §7.4.2.1.1.1 Table 7-2 — intra-luma 4x4 list (i=0) / 8x8 list (i=6 → sub-idx 0).
+    let sl4 = select_scaling_list_4x4(0, sps, pps);
+    let sl8 = select_scaling_list_8x8(0, sps, pps);
     let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
 
     if mb.transform_size_8x8_flag {
@@ -664,6 +677,7 @@ fn reconstruct_chroma_intra(
     bit_depth_c: u32,
     mb_px: i32,
     mb_py: i32,
+    sps: &Sps,
     pps: &Pps,
     pic: &mut Picture,
 ) -> Result<(), ReconstructError> {
@@ -706,7 +720,9 @@ fn reconstruct_chroma_intra(
     let qp_cr = qp_y_to_qp_c(qp_y, cr_offset);
 
     let cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
-    let sl4 = default_scaling_list_4x4_flat();
+    // §7.4.2.1.1.1 Table 7-2 — intra chroma lists: i=1 (Cb) / i=2 (Cr).
+    let sl4_cb = select_scaling_list_4x4(1, sps, pps);
+    let sl4_cr = select_scaling_list_4x4(2, sps, pps);
 
     // Per plane: gather samples, predict, inverse-transform residual,
     // combine.
@@ -717,6 +733,7 @@ fn reconstruct_chroma_intra(
         predict_chroma(chroma_mode, &samples, ct, bit_depth_c, &mut pred_samples);
 
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
+        let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
 
         // §8.5.11 — chroma DC Hadamard.
         let dc_block = if plane == 0 {
@@ -736,10 +753,10 @@ fn reconstruct_chroma_intra(
         let (dc_cb4, dc_cb8): (Option<[i32; 4]>, Option<[i32; 8]>) = if cbp_chroma > 0 {
             if chroma_array_type == 1 {
                 let dc4: [i32; 4] = [dc_flat[0], dc_flat[1], dc_flat[2], dc_flat[3]];
-                let out = inverse_hadamard_chroma_dc_420(&dc4, qp_c, &sl4, bit_depth_c)?;
+                let out = inverse_hadamard_chroma_dc_420(&dc4, qp_c, sl4, bit_depth_c)?;
                 (Some(out), None)
             } else {
-                let out = inverse_hadamard_chroma_dc_422(&dc_flat, qp_c, &sl4, bit_depth_c)?;
+                let out = inverse_hadamard_chroma_dc_422(&dc_flat, qp_c, sl4, bit_depth_c)?;
                 (None, Some(out))
             }
         } else {
@@ -770,7 +787,7 @@ fn reconstruct_chroma_intra(
             };
             let mut coeffs = crate::transform::inverse_scan_4x4_zigzag(&ac_scan);
             coeffs[0] = dc_c;
-            let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, &sl4, bit_depth_c)?;
+            let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?;
 
             // Position of this 4x4 chroma block inside the MB.
             // For 4:2:0 (8x8 chroma MB): blocks laid out in 2x2 at (0,0) (4,0) (0,4) (4,4).
@@ -1119,6 +1136,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     bit_depth_y: u32,
     bit_depth_c: u32,
     slice_header: &SliceHeader,
+    sps: &Sps,
     pps: &Pps,
     ref_pics: &R,
     pic: &mut Picture,
@@ -1167,8 +1185,9 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     // with pred_luma before writing to the picture.
     let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
     let cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
-    let sl4 = default_scaling_list_4x4_flat();
-    let sl8 = default_scaling_list_8x8_flat();
+    // §7.4.2.1.1.1 Table 7-2 — inter-luma lists: 4x4 i=3 / 8x8 i=7 (sub-idx 1).
+    let sl4 = select_scaling_list_4x4(3, sps, pps);
+    let sl8 = select_scaling_list_8x8(1, sps, pps);
 
     if mb.transform_size_8x8_flag {
         // §8.5.13 — 8x8 inter residual path (four 8x8 blocks).
@@ -1244,6 +1263,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             bit_depth_c,
             mb_px,
             mb_py,
+            sps,
             pps,
             cbp_chroma,
             &pred_cb,
@@ -2736,6 +2756,7 @@ fn reconstruct_inter_chroma_residual(
     bit_depth_c: u32,
     mb_px: i32,
     mb_py: i32,
+    sps: &Sps,
     pps: &Pps,
     cbp_chroma: u8,
     pred_cb: &[i32],
@@ -2756,12 +2777,15 @@ fn reconstruct_inter_chroma_residual(
     let qp_cb = qp_y_to_qp_c(qp_y, cb_offset);
     let qp_cr = qp_y_to_qp_c(qp_y, cr_offset);
 
-    let sl4 = default_scaling_list_4x4_flat();
+    // §7.4.2.1.1.1 Table 7-2 — inter chroma lists: i=4 (Cb) / i=5 (Cr).
+    let sl4_cb = select_scaling_list_4x4(4, sps, pps);
+    let sl4_cr = select_scaling_list_4x4(5, sps, pps);
     let num_c8x8 = if chroma_array_type == 1 { 1 } else { 2 };
     let n_ac = 4 * num_c8x8 as usize;
 
     for plane in 0..2u8 {
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
+        let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
         let dc_block = if plane == 0 {
             &mb.residual_chroma_dc_cb
         } else {
@@ -2777,10 +2801,10 @@ fn reconstruct_inter_chroma_residual(
         let (dc4, dc8): (Option<[i32; 4]>, Option<[i32; 8]>) = if cbp_chroma > 0 {
             if chroma_array_type == 1 {
                 let dc4: [i32; 4] = [dc_flat[0], dc_flat[1], dc_flat[2], dc_flat[3]];
-                let out = inverse_hadamard_chroma_dc_420(&dc4, qp_c, &sl4, bit_depth_c)?;
+                let out = inverse_hadamard_chroma_dc_420(&dc4, qp_c, sl4, bit_depth_c)?;
                 (Some(out), None)
             } else {
-                let out = inverse_hadamard_chroma_dc_422(&dc_flat, qp_c, &sl4, bit_depth_c)?;
+                let out = inverse_hadamard_chroma_dc_422(&dc_flat, qp_c, sl4, bit_depth_c)?;
                 (None, Some(out))
             }
         } else {
@@ -2804,7 +2828,7 @@ fn reconstruct_inter_chroma_residual(
             };
             let mut coeffs = crate::transform::inverse_scan_4x4_zigzag(&ac_scan);
             coeffs[0] = dc_c;
-            let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, &sl4, bit_depth_c)?;
+            let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?;
             let (bx, by) = chroma_block_xy(chroma_array_type, blk);
             for yy in 0..4 {
                 for xx in 0..4 {

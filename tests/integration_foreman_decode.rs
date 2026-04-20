@@ -47,7 +47,14 @@ fn decode_foreman_p16x16_first_idr_through_trait() {
     let packet = Packet::new(0, TimeBase::new(1, 25), bytes.clone()).with_pts(0);
     dec.send_packet(&packet).expect("send_packet");
 
-    // First IDR should have been reconstructed and queued.
+    // Signal end-of-stream so the §C.4 bumping process drains the
+    // output DPB. Before `dpb_output` wiring went in, decode-order
+    // output meant `receive_frame` produced the IDR immediately; with
+    // POC-ordered output the queue holds up to `max_num_reorder_frames`
+    // pictures and the trailing IDR is only released once we flush.
+    dec.flush().expect("flush");
+
+    // First IDR (lowest POC) should have been reconstructed and queued.
     let frame = dec.receive_frame().expect("receive_frame");
     let vf = match frame {
         Frame::Video(vf) => vf,

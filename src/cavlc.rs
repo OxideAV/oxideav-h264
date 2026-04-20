@@ -311,28 +311,35 @@ static TABLE_9_5_COL1: [CoeffTokenRow; 62] = [
     (0b00000101,           8, (6, 2)),
     // T1=3, TC=6 : "0010 00"
     (0b001000,             6, (6, 3)),
-    // T1=0, TC=7 : "0000 0001 111"
-    (0b0000001111,         10, (7, 0)),
+    // T1=0, TC=7 : "0000 0001 111" — 11 bits.
+    // BUGFIX 2026-04-20: length was previously 10, which is one phantom
+    // leading zero — desync for nC in [2,4) whose first block was (TC=7,T1=0).
+    (0b00000001111,        11, (7, 0)),
     // T1=1, TC=7 : "0000 0011 0"
     (0b000000110,          9, (7, 1)),
     // T1=2, TC=7 : "0000 0010 1"
     (0b000000101,          9, (7, 2)),
     // T1=3, TC=7 : "0001 00"
     (0b000100,             6, (7, 3)),
-    // T1=0, TC=8 : "0000 0001 011"
-    (0b0000001011,         10, (8, 0)),
-    // T1=1, TC=8 : "0000 0001 110"
-    (0b0000001110,         10, (8, 1)),
-    // T1=2, TC=8 : "0000 0001 101"
-    (0b0000001101,         10, (8, 2)),
+    // T1=0, TC=8 : "0000 0001 011" — 11 bits.
+    // BUGFIX 2026-04-20: length was previously 10 (see §9.2.1 Table 9-5 col "2 <= nC < 4").
+    (0b00000001011,        11, (8, 0)),
+    // T1=1, TC=8 : "0000 0001 110" — 11 bits.
+    // BUGFIX 2026-04-20: length was previously 10.
+    (0b00000001110,        11, (8, 1)),
+    // T1=2, TC=8 : "0000 0001 101" — 11 bits.
+    // BUGFIX 2026-04-20: length was previously 10.
+    (0b00000001101,        11, (8, 2)),
     // T1=3, TC=8 : "0000 100"
     (0b0000100,            7, (8, 3)),
     // T1=0, TC=9 : "0000 0000 1111"
     (0b000000001111,       12, (9, 0)),
-    // T1=1, TC=9 : "0000 0001 010"
-    (0b0000001010,         10, (9, 1)),
-    // T1=2, TC=9 : "0000 0001 001"
-    (0b0000001001,         10, (9, 2)),
+    // T1=1, TC=9 : "0000 0001 010" — 11 bits.
+    // BUGFIX 2026-04-20: length was previously 10.
+    (0b00000001010,        11, (9, 1)),
+    // T1=2, TC=9 : "0000 0001 001" — 11 bits.
+    // BUGFIX 2026-04-20: length was previously 10.
+    (0b00000001001,        11, (9, 2)),
     // T1=3, TC=9 : "0000 0010 0"
     (0b000000100,          9, (9, 3)),
     // T1=0, TC=10: "0000 0000 1011"
@@ -341,16 +348,18 @@ static TABLE_9_5_COL1: [CoeffTokenRow; 62] = [
     (0b000000001110,       12, (10, 1)),
     // T1=2, TC=10: "0000 0000 1101"
     (0b000000001101,       12, (10, 2)),
-    // T1=3, TC=10: "0000 0001 100"
-    (0b0000001100,         10, (10, 3)),
+    // T1=3, TC=10: "0000 0001 100" — 11 bits.
+    // BUGFIX 2026-04-20: length was previously 10.
+    (0b00000001100,        11, (10, 3)),
     // T1=0, TC=11: "0000 0000 1000"
     (0b000000001000,       12, (11, 0)),
     // T1=1, TC=11: "0000 0000 1010"
     (0b000000001010,       12, (11, 1)),
     // T1=2, TC=11: "0000 0000 1001"
     (0b000000001001,       12, (11, 2)),
-    // T1=3, TC=11: "0000 0001 000"
-    (0b0000001000,         10, (11, 3)),
+    // T1=3, TC=11: "0000 0001 000" — 11 bits.
+    // BUGFIX 2026-04-20: length was previously 10.
+    (0b00000001000,        11, (11, 3)),
     // T1=0, TC=12: "0000 0000 0111 1"
     (0b0000000001111,      13, (12, 0)),
     // T1=1, TC=12: "0000 0000 0111 0"
@@ -1619,6 +1628,61 @@ mod tests {
         assert_eq!((b, bi), (1, 5));
     }
 
+    /// Regression tests for the 2026-04-20 COL1 11-bit length bug:
+    /// prior to this fix, every 11-bit codeword in Table 9-5 column
+    /// "2 <= nC < 4" was stored with length=10, which means the VLC
+    /// decoder matched a 10-bit prefix too early and desynced the stream.
+    /// The entries affected: (T1=0,TC=7), (T1=0..2,TC=8), (T1=1..2,TC=9),
+    /// (T1=3,TC=10), (T1=3,TC=11).
+    ///
+    /// Every case below is transcribed directly from ITU-T H.264 (08/2024)
+    /// Table 9-5 `2 <= nC < 4` column.
+    #[test]
+    fn coeff_token_col1_11bit_length_fix() {
+        let cases: &[(&str, (u32, u32))] = &[
+            ("0000 0001 111", (7, 0)),   // §9.2.1 Table 9-5 col "2<=nC<4"
+            ("0000 0001 011", (8, 0)),
+            ("0000 0001 110", (8, 1)),
+            ("0000 0001 101", (8, 2)),
+            ("0000 0001 010", (9, 1)),
+            ("0000 0001 001", (9, 2)),
+            ("0000 0001 100", (10, 3)),
+            ("0000 0001 000", (11, 3)),
+        ];
+        for (bits, want) in cases {
+            let bytes = pack_bits(&[bits]);
+            let mut r = BitReader::new(&bytes);
+            let got = decode_coeff_token(&mut r, CoeffTokenContext::Numeric(3)).unwrap();
+            assert_eq!(got, *want, "bits={bits}");
+            // Cursor must have advanced exactly 11 bits.
+            let (b, bi) = r.position();
+            let consumed = b * 8 + bi as usize;
+            assert_eq!(consumed, 11, "wrong bit count consumed for bits={bits}");
+        }
+    }
+
+    /// Exhaustive check: every COL1 entry decodes round-trip to the
+    /// expected (TotalCoeff, TrailingOnes) with exactly the stored length
+    /// of bits consumed. Also verifies distinct codewords are all
+    /// prefix-free (implied by the VLC decoder always finding a match).
+    #[test]
+    fn coeff_token_col1_all_entries_roundtrip() {
+        for (bits, length, (tc, t1)) in TABLE_9_5_COL1.iter() {
+            // Build a packed bit string of exactly `length` bits.
+            let s: String = (0..*length)
+                .rev()
+                .map(|k| if (bits >> k) & 1 == 1 { '1' } else { '0' })
+                .collect();
+            let bytes = pack_bits(&[&s]);
+            let mut r = BitReader::new(&bytes);
+            let got = decode_coeff_token(&mut r, CoeffTokenContext::Numeric(2)).unwrap();
+            assert_eq!(got, (*tc, *t1), "entry bits={s:?}");
+            let (b, bi) = r.position();
+            let consumed = b * 8 + bi as usize;
+            assert_eq!(consumed, *length as usize, "wrong bit count for bits={s:?}");
+        }
+    }
+
     /// Regression test for the 2026-04-20 COL3 swap bug: prior to the
     /// fix the COL3 table stored `(TrailingOnes, TotalCoeff)` instead of
     /// `(TotalCoeff, TrailingOnes)`. These are rows where the two
@@ -1757,6 +1821,181 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let (lv, _) = decode_level(&mut r, 1, false).unwrap();
         assert_eq!(lv, 1);
+    }
+
+    /// Edge-case: suffix_length == 0, level_prefix == 14. §9.2.2 step 2
+    /// requires levelSuffixSize = 4 in this case (not suffix_length=0),
+    /// so level_suffix is a 4-bit u(v).
+    #[test]
+    fn decode_level_prefix14_suffix0_reads_4_bit_suffix() {
+        // level_prefix = 14 ⇒ 14 zeros then a 1 ⇒ 15-bit unary "0000 0000 0000 001"
+        // followed by a 4-bit suffix, say 0b1010 = 10.
+        // levelCode = (Min(15,14) << 0) + 10 = 14 + 10 = 24 (even).
+        // is_first_after_t1_lt_3 = false → no +2.
+        // levelVal = (24 + 2) >> 1 = 13.
+        let bits = "00000000000000 1 1010"; // 14 zeros + 1 + 4-bit suffix
+        let bytes = pack_bits(&[bits]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, next) = decode_level(&mut r, 0, false).unwrap();
+        assert_eq!(lv, 13);
+        // After this: step 9 promotes 0→1, step 10 checks abs(13) > (3<<0)=3, true and 1<6 → 2.
+        assert_eq!(next, 2);
+    }
+
+    /// §9.2.2 step 10: when `|levelVal| > (3 << (suffixLength − 1))` and
+    /// suffixLength < 6, suffixLength must be incremented. Verify the
+    /// boundary: start at suffixLength = 1, decode a small level that
+    /// does NOT trigger the bump, then one that does.
+    #[test]
+    fn decode_level_step10_triggers_suffix_length_bump() {
+        // suffix_length = 1, level_prefix = 0 ("1"), level_suffix=0 (1 bit).
+        // levelCode = 0, levelVal = (0+2)>>1 = 1. |1| > (3<<0)=3? No.
+        // Expected: next_sl stays 1.
+        let bytes = pack_bits(&["1", "0"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, next) = decode_level(&mut r, 1, false).unwrap();
+        assert_eq!(lv, 1);
+        assert_eq!(next, 1);
+
+        // suffix_length = 1, level_prefix = 2 ("001"), level_suffix = 0 (1 bit).
+        // levelCode = (Min(15,2)<<1) + 0 = 4. Even, levelVal = (4+2)>>1 = 3.
+        // |3| > (3<<0)=3? No (strictly greater).
+        let bytes = pack_bits(&["001", "0"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, next) = decode_level(&mut r, 1, false).unwrap();
+        assert_eq!(lv, 3);
+        assert_eq!(next, 1);
+
+        // suffix_length = 1, level_prefix = 2 ("001"), level_suffix = 1 (1 bit).
+        // levelCode = (2<<1)+1 = 5. Odd, levelVal = (-5-1)>>1 = -3. |-3|=3, not >3.
+        let bytes = pack_bits(&["001", "1"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, next) = decode_level(&mut r, 1, false).unwrap();
+        assert_eq!(lv, -3);
+        assert_eq!(next, 1);
+
+        // suffix_length = 1, level_prefix = 3 ("0001"), level_suffix = 0.
+        // levelCode = (3<<1) + 0 = 6 even, levelVal = 4. |4| > 3 ⇒ next_sl = 2.
+        let bytes = pack_bits(&["0001", "0"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, next) = decode_level(&mut r, 1, false).unwrap();
+        assert_eq!(lv, 4);
+        assert_eq!(next, 2);
+    }
+
+    /// §9.2.2 step 10: suffixLength caps at 6. Starting at 5, a big level
+    /// should bump to 6. Starting at 6, it must stay 6.
+    #[test]
+    fn decode_level_step10_cap_at_6() {
+        // suffix_length = 5. level_prefix=0, level_suffix=0 (5 bits).
+        // levelCode = 0, levelVal = 1. |1| > (3<<4)=48? No.
+        // Stays at 5.
+        let bytes = pack_bits(&["1", "00000"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, next) = decode_level(&mut r, 5, false).unwrap();
+        assert_eq!(lv, 1);
+        assert_eq!(next, 5);
+
+        // suffix_length = 5, level_prefix=3 ("0001"), level_suffix=11111 (=31).
+        // levelCode = (3<<5)+31 = 96+31 = 127, odd. levelVal = (-127-1)>>1 = -64.
+        // |-64| > (3<<4)=48? Yes. next_sl++ → 6.
+        let bytes = pack_bits(&["0001", "11111"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, next) = decode_level(&mut r, 5, false).unwrap();
+        assert_eq!(lv, -64);
+        assert_eq!(next, 6);
+
+        // suffix_length = 6, level_prefix=3 ("0001"), level_suffix = 111111 (63).
+        // levelCode = (3<<6) + 63 = 192+63 = 255, odd. |-(−255-1)>>1| = 128.
+        // |128| > (3<<5)=96? Yes. But suffixLength already 6 → no bump.
+        let bytes = pack_bits(&["0001", "111111"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, next) = decode_level(&mut r, 6, false).unwrap();
+        assert_eq!(lv, -128);
+        assert_eq!(next, 6);
+    }
+
+    /// §9.2.2 step 5: when level_prefix >= 15 AND suffixLength == 0,
+    /// levelCode gets +15. With level_prefix = 15 and suffix = 12 bits,
+    /// levelCode = (15<<0) + level_suffix + 15 = 30 + level_suffix.
+    /// (Baseline/Extended profile: level_prefix maxes at 15, so this
+    /// is the escape path for large levels on those profiles.)
+    #[test]
+    fn decode_level_prefix15_suffix0_escape() {
+        // level_prefix = 15 ⇒ 15 zeros + 1 = 16 bits unary.
+        // level_suffix = 12 bits of 000000000010 (=2).
+        // levelCode = (Min(15,15)<<0) + 2 = 17. Step 5 adds 15 → 32. Even.
+        // levelVal = (32+2)>>1 = 17.
+        let bits = "0000000000000001 000000000010";
+        let bytes = pack_bits(&[bits]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, next) = decode_level(&mut r, 0, false).unwrap();
+        assert_eq!(lv, 17);
+        // Step 9 promotes 0→1. |17| > 3? Yes → bump to 2.
+        assert_eq!(next, 2);
+    }
+
+    /// §9.2.2 step 6: level_prefix >= 16. This is not valid for
+    /// Baseline/Constrained/Main/Extended profiles but is allowed for
+    /// High. Verify the (1<<(lp-3))-4096 correction.
+    #[test]
+    fn decode_level_prefix16_step6_correction() {
+        // level_prefix = 16 ⇒ 16 zeros + 1 = 17 bits unary.
+        // levelSuffixSize = level_prefix - 3 = 13. level_suffix = 0.
+        // levelCode = (Min(15,16)<<0) + 0 = 15.
+        // Step 5 (lp>=15 && sl==0): +15 → 30.
+        // Step 6 (lp>=16): +(1<<(16-3))-4096 = 8192-4096 = 4096 → 4126.
+        // Even, levelVal = (4126+2)>>1 = 2064.
+        let bits = "0000000000000000 1 0000000000000"; // 16 zeros + 1 + 13-bit 0 suffix
+        let bytes = pack_bits(&[bits]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, _next) = decode_level(&mut r, 0, false).unwrap();
+        assert_eq!(lv, 2064);
+    }
+
+    /// §9.2.2 step 7: when `i == TrailingOnes && TrailingOnes < 3`,
+    /// the levelCode is incremented by 2 BEFORE the even/odd mapping.
+    /// This biases the first non-trailing-one level away from ±1
+    /// (already used by trailing ones). Verify the bias against hand
+    /// computation.
+    #[test]
+    fn decode_level_step7_first_after_bias() {
+        // suffix_length = 0, level_prefix = 0 ("1"), not first_after.
+        // levelCode=0, levelVal=1.
+        let bytes = pack_bits(&["1"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, _) = decode_level(&mut r, 0, false).unwrap();
+        assert_eq!(lv, 1);
+
+        // Same with first_after=true. levelCode=0+2=2, levelVal=(2+2)>>1=2.
+        let bytes = pack_bits(&["1"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, _) = decode_level(&mut r, 0, true).unwrap();
+        assert_eq!(lv, 2);
+
+        // level_prefix=1 ("01"), not first_after: levelCode=1, odd, levelVal=-1.
+        let bytes = pack_bits(&["01"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, _) = decode_level(&mut r, 0, false).unwrap();
+        assert_eq!(lv, -1);
+
+        // Same with first_after=true. levelCode=1+2=3, odd, levelVal=(-3-1)>>1=-2.
+        let bytes = pack_bits(&["01"]);
+        let mut r = BitReader::new(&bytes);
+        let (lv, _) = decode_level(&mut r, 0, true).unwrap();
+        assert_eq!(lv, -2);
+    }
+
+    /// The "suffix_length bumps from 0 to 1 on entry" corner (§9.2.2
+    /// step 9). Verify return value.
+    #[test]
+    fn decode_level_step9_always_promotes_0_to_1() {
+        // Small level encoded with suffix_length = 0. step 9 must push
+        // next_sl to 1. Step 10 then considers abs(lv) > 3.
+        let bytes = pack_bits(&["1"]);
+        let mut r = BitReader::new(&bytes);
+        let (_, next) = decode_level(&mut r, 0, false).unwrap();
+        assert_eq!(next, 1);
     }
 
     // ---- total_zeros ----
@@ -2209,6 +2448,81 @@ mod tests {
         let coeff =
             parse_residual_block_cavlc(&mut r, CoeffTokenContext::Numeric(0), 0, 15, 16).unwrap();
         assert_eq!(coeff, vec![0; 16]);
+    }
+
+    /// Regression test: prior to the 2026-04-20 COL1 11-bit-length fix,
+    /// an Intra_16x16 AC block with neighbour nC==3 whose coeff_token
+    /// was (TC=7, T1=0) — "0000 0001 111" in the spec's 11-bit form —
+    /// would be mis-decoded as a 10-bit codeword, consuming only 10 of
+    /// the 11 bits the spec requires. This test exercises parse end-
+    /// to-end and verifies the residual stops at the expected bit
+    /// cursor.
+    #[test]
+    fn col1_11bit_codeword_full_parse_regression() {
+        // Build a minimal valid 4x4 residual block for nC=3 with
+        // TotalCoeff=7, TrailingOnes=0:
+        //   coeff_token (7, 0) col1 "0000 0001 111" (11 bits)
+        //   followed by 7 non-trailing-one level values and
+        //   total_zeros + run_before encoding. To keep the test simple
+        //   we use level_prefix=0 and appropriate suffix choices so
+        //   every level decodes to ±1 or ±small values. With T1=0 the
+        //   first non-trailing is a "first-after" with T1 < 3, so
+        //   levelCode = level_prefix + 2 on the first level.
+        //
+        // suffixLength starts at 0 (TotalCoeff=7 ≤ 10).
+        // Level 0 (is_first_after = true): level_prefix=0 ("1") ⇒
+        //   levelCode=0+2=2 (even) ⇒ levelVal = (2+2)/2 = 2.
+        //   step 9 → next_sl=1. abs(2) > 3? No. next_sl stays 1.
+        // Level 1: level_prefix=0 ("1"), suffix=0 (1 bit) ⇒
+        //   levelCode=(0<<1)+0=0 even ⇒ levelVal = 1. step 10: |1|>3? No.
+        // Levels 2..6: same as level 1, all +1.
+        //
+        // total_zeros with tzVlc=7, want 0 ("0000 01", 6 bits).
+        // All runVal are 0.
+        //
+        // Expected: coeff_level = [2, 1, 1, 1, 1, 1, 1, 0..=0]
+        //
+        // Bits:
+        //   coeff_token "00000001111" (11)
+        //   level[0] lp=0 "1" (1)         → levelVal 2
+        //   level[1] lp=0 "1" + suffix 0 (1 bit) "0" → levelVal 1
+        //   (same for 2..6) : 5 more "10" pairs = 10 bits
+        //   total_zeros "000001" (6)
+        //   No run_before reads (all zerosLeft=0).
+        let bytes = pack_bits(&[
+            "00000001111", // coeff_token (7, 0) col1 11-bit
+            "1",            // level_prefix=0 for levelVal[0]=2 (first-after)
+            "1", "0",       // level_prefix=0, suffix=0 for levelVal[1]=1
+            "1", "0",       // levelVal[2]=1
+            "1", "0",       // levelVal[3]=1
+            "1", "0",       // levelVal[4]=1
+            "1", "0",       // levelVal[5]=1
+            "1", "0",       // levelVal[6]=1
+            "000001",       // total_zeros=0 tzVlc=7
+        ]);
+        let mut r = BitReader::new(&bytes);
+        let coeff =
+            parse_residual_block_cavlc(&mut r, CoeffTokenContext::Numeric(3), 0, 15, 16).unwrap();
+        let mut expected = vec![0i32; 16];
+        // §9.2.4 walk: i=T-1 down to 0, coeffNum starts at -1.
+        //   i=6 (levelVal=1): coeffNum += runVal[6]+1 = 0, coeff[0]=1
+        //   i=5 (1):           coeffNum += 1 = 1, coeff[1]=1
+        //   i=4 (1):           coeff[2]=1
+        //   i=3 (1):           coeff[3]=1
+        //   i=2 (1):           coeff[4]=1
+        //   i=1 (1):           coeff[5]=1
+        //   i=0 (2):           coeff[6]=2
+        expected[0] = 1;
+        expected[1] = 1;
+        expected[2] = 1;
+        expected[3] = 1;
+        expected[4] = 1;
+        expected[5] = 1;
+        expected[6] = 2;
+        assert_eq!(coeff, expected);
+        // Cursor should have advanced exactly 11 + 1 + 2*6 + 6 = 30 bits.
+        let (b, bi) = r.position();
+        assert_eq!(b * 8 + bi as usize, 30);
     }
 
     #[test]

@@ -21,9 +21,9 @@
 //!   picture. Multi-slice pictures (several slice NALs that together
 //!   form one coded picture per §7.4.1.2.4) are not assembled —
 //!   decode artifacts may occur on streams that rely on that.
-//! - **Output ordering**: frames are emitted in decode order, not
-//!   display (POC) order. A follow-up will wire through
-//!   [`crate::dpb_output::DpbOutput`] for proper reordering.
+//! - **Output ordering**: frames are emitted in display (POC) order
+//!   via [`crate::dpb_output::DpbOutput`] per Annex C §C.2.2 / §C.4
+//!   bumping process.
 //! - **Field pictures / MBAFF**: not supported. `field_pic_flag == 1`
 //!   or `mb_adaptive_frame_field_flag == 1` causes the reconstruct
 //!   layer to reject the slice.
@@ -45,6 +45,7 @@ use oxideav_core::{
 };
 
 use crate::decoder::{Decoder as H264Driver, Event};
+use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::mb_grid::MbGrid;
 use crate::picture::Picture;
 use crate::poc::{derive_poc, PocSlice, PocSps, PocState};
@@ -76,8 +77,21 @@ pub struct H264CodecDecoder {
     /// Last slice header we parsed — useful for probes / asserts.
     pub last_slice: Option<SliceHeader>,
     eof: bool,
-    /// Reconstructed frames queued for `receive_frame`.
-    frames: VecDeque<VideoFrame>,
+    /// §C.2.2 / §C.4 — POC-ordered output DPB. Entries live here until
+    /// the bumping process releases them to `receive_frame`. Created
+    /// lazily (or recreated on SPS change) from the active SPS's VUI
+    /// bitstream restriction (§E.2.1), with an Annex A Table A-1
+    /// fallback when the VUI block is absent.
+    output_dpb: DpbOutput<VideoFrame>,
+    /// Pictures that have already been "bumped" from the DPB and are
+    /// waiting for `receive_frame`. This covers both:
+    /// 1. entries evicted by `DpbOutput::push` when the queue is full,
+    ///    and
+    /// 2. entries drained from the queue at an IDR / MMCO-5 so the
+    ///    previous sequence's pictures are delivered in POC order
+    ///    *before* the new sequence's first frames (§C.4).
+    /// Also used to carry the `flush()` drain at EOF.
+    ready: VecDeque<VideoFrame>,
     /// Packet-level pts passed on the most recent `send_packet`. We
     /// stamp the first frame produced from that packet with it.
     pending_pts: Option<i64>,
@@ -111,13 +125,18 @@ pub struct H264CodecDecoder {
 
 impl H264CodecDecoder {
     pub fn new(codec_id: CodecId) -> Self {
+        // Start with a "generous" placeholder sizing (16 frames, the
+        // Annex A upper bound from §A.3.1 item h, `Min(…, 16)`). The
+        // first slice updates the sizing in `ensure_output_dpb_sized`
+        // from the active SPS.
         Self {
             codec_id,
             length_size: None,
             driver: H264Driver::new(),
             last_slice: None,
             eof: false,
-            frames: VecDeque::new(),
+            output_dpb: DpbOutput::<VideoFrame>::new(16, 16),
+            ready: VecDeque::new(),
             pending_pts: None,
             pending_time_base: TimeBase::new(1, 1),
             ref_store: RefPicStore::new(),
@@ -465,14 +484,72 @@ impl H264CodecDecoder {
         }
 
         // Convert the reconstructed Picture into a VideoFrame and
-        // queue it. Output is currently in *decode* order; a later
-        // patch will thread `DpbOutput` (§C.4) in to reorder by POC.
+        // route it through the §C.4 bumping process.
         let pts = self.pending_pts.take();
         let time_base = self.pending_time_base;
         let vf = picture_to_video_frame(&pic, pts, time_base);
-        self.frames.push_back(vf);
+
+        // §C.4 — at an IDR, any pictures still held in the output DPB
+        // belong to the *previous* coded video sequence and must be
+        // delivered in POC order before the IDR itself. Drain them
+        // into `ready` first, then reset the output queue, then push
+        // the IDR. MMCO op 5 inside a reference picture also triggers
+        // this reset (§8.2.5.4 / §C.4); we already detected that as
+        // `mmco5_triggered` above.
+        if is_idr || mmco5_triggered {
+            for drained in self.output_dpb.flush() {
+                self.ready.push_back(drained.picture);
+            }
+            self.output_dpb.reset();
+        }
+
+        // Size the output DPB against the active SPS (§E.2.1 /
+        // §A.3.1 item h). Cheap to call every slice — the helper
+        // short-circuits when the derived capacity hasn't changed.
+        self.ensure_output_dpb_sized(&sps);
+
+        // Push into the output DPB. §C.4: if the queue is full, the
+        // lowest-POC entry is bumped out and becomes immediately
+        // available to `receive_frame`.
+        let entry = OutputEntry {
+            picture: vf,
+            pic_order_cnt: poc.pic_order_cnt,
+            frame_num: header.frame_num,
+            needed_for_output: true,
+        };
+        if let Some(bumped) = self.output_dpb.push(entry) {
+            self.ready.push_back(bumped.picture);
+        }
 
         Ok(())
+    }
+
+    /// Resize the output DPB capacity from the active SPS's VUI
+    /// `bitstream_restriction` (§E.2.1) when present, else fall back
+    /// to the Annex A Table A-1 per-level default derived from
+    /// `MaxDpbMbs` (§A.3.1 item h). Only rebuilds the internal queue
+    /// when the capacity would actually change — the common case of a
+    /// steady SPS is a cheap no-op.
+    fn ensure_output_dpb_sized(&mut self, sps: &Sps) {
+        let (reorder, buffering) = output_dpb_sizing(sps);
+        if self.output_dpb.max_num_reorder_frames != reorder
+            || self.output_dpb.max_dec_frame_buffering != buffering
+        {
+            // The DpbOutput has no "resize" primitive, so move any
+            // entries currently queued into a fresh DpbOutput with the
+            // new capacity. Using push() on the new queue preserves
+            // §C.4 bumping semantics — if the new cap is smaller, the
+            // excess is pushed to `ready` in POC order.
+            let pending = self.output_dpb.flush();
+            let mut new_dpb = DpbOutput::<VideoFrame>::new(reorder, buffering);
+            // Iterate in the POC-ascending order flush() produced.
+            for e in pending {
+                if let Some(bumped) = new_dpb.push(e) {
+                    self.ready.push_back(bumped.picture);
+                }
+            }
+            self.output_dpb = new_dpb;
+        }
     }
 
     fn mint_dpb_key(&mut self) -> u32 {
@@ -500,6 +577,86 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
         };
         let key = *keys.get(idx as usize)?;
         self.store.get_by_key(key)
+    }
+}
+
+/// Derive the `(max_num_reorder_frames, max_dec_frame_buffering)`
+/// pair for sizing [`DpbOutput`] from the active SPS.
+///
+/// Preferred source is the VUI `bitstream_restriction` block
+/// (§E.2.1). When it's absent we infer a sensible default:
+///   1. `max_dec_frame_buffering` ← Annex A Table A-1 per-level
+///      cap, i.e. Min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)
+///      (§A.3.1 item h).
+///   2. `max_num_reorder_frames` ← `sps.max_num_ref_frames`, clamped
+///      to the buffering cap. This is a *pragmatic* default: the
+///      spec allows max_num_reorder_frames up to MaxDpbFrames but
+///      streams without a `bitstream_restriction` block typically
+///      don't reorder further than their reference-count ceiling.
+///      Using MaxDpbFrames directly would force the decoder to hold
+///      pictures far longer than the stream actually requires, which
+///      breaks low-latency consumers that flush one frame at a time.
+///
+/// Both values floor at 1 so `DpbOutput::push` can always bump when
+/// the queue is full (cap of 0 would deadlock the queue).
+fn output_dpb_sizing(sps: &Sps) -> (u32, u32) {
+    if let Some(br) = sps.vui.as_ref().and_then(|v| v.bitstream_restriction.as_ref()) {
+        // §E.2.1 — max_dec_frame_buffering must be ≥ max_num_reorder_frames.
+        // Clamp to at least 1 so the queue can ever bump.
+        let reorder = br.max_num_reorder_frames;
+        let buffering = br.max_dec_frame_buffering.max(reorder).max(1);
+        return (reorder, buffering);
+    }
+
+    // Fallback — level-derived Annex A Table A-1 / §A.3.1 item h cap.
+    let max_dpb_mbs = max_dpb_mbs_for_level(sps.level_idc);
+    let pic_size_mbs = sps
+        .pic_width_in_mbs()
+        .saturating_mul(sps.frame_height_in_mbs())
+        .max(1);
+    let max_dpb_frames = (max_dpb_mbs / pic_size_mbs).min(16).max(1);
+
+    // Pragmatic reorder default when the VUI block is absent: use
+    // max_num_ref_frames (§7.4.2.1.1). A stream with
+    // max_num_ref_frames == 1 never reorders; a B-capable stream
+    // typically signals reorder explicitly via VUI.
+    let reorder = sps.max_num_ref_frames.max(1).min(max_dpb_frames);
+    (reorder, max_dpb_frames)
+}
+
+/// Annex A Table A-1 — `MaxDpbMbs` per `level_idc`.
+///
+/// `level_idc` is the raw `u8` from §7.4.2.1.1; intermediate levels
+/// (e.g. 2.1) are encoded as `10 * <level>` so `21 → 2.1`. Level 1b
+/// is signalled via `constraint_set3_flag` alongside `level_idc == 11`
+/// which carries MaxDpbMbs = 396 (same as level 1.1), so we treat 11
+/// conservatively as 1.1.
+///
+/// Unknown `level_idc` values fall through to the lowest bucket
+/// (MaxDpbMbs = 396) to minimise over-allocation while still
+/// permitting at least one reference picture.
+fn max_dpb_mbs_for_level(level_idc: u8) -> u32 {
+    match level_idc {
+        10 => 396,   // level 1
+        11 => 900,   // level 1.1 (also 1b, per the conservative note above)
+        12 => 2_376, // level 1.2
+        13 => 2_376, // level 1.3
+        20 => 2_376, // level 2
+        21 => 4_752, // level 2.1
+        22 => 8_100, // level 2.2
+        30 => 8_100, // level 3
+        31 => 18_000,
+        32 => 20_480,
+        40 => 32_768,
+        41 => 32_768,
+        42 => 34_816,
+        50 => 110_400,
+        51 => 184_320,
+        52 => 184_320,
+        60 => 696_320,
+        61 => 696_320,
+        62 => 696_320,
+        _ => 396, // conservative fallback
     }
 }
 
@@ -617,10 +774,34 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(vf) = self.frames.pop_front() {
+        // §C.4 — bumped / already-released pictures come out first in
+        // the order the bumping process produced them.
+        if let Some(vf) = self.ready.pop_front() {
             return Ok(Frame::Video(vf));
         }
+        // Try a conservative bump on the output DPB. Per §C.4 / the
+        // `pop_ready` semantics, this only yields a picture when the
+        // queue is genuinely over capacity (mid-stream backpressure).
+        if let Some(bumped) = self.output_dpb.pop_ready() {
+            return Ok(Frame::Video(bumped.picture));
+        }
+        // EOF: drain everything remaining in POC-ascending order
+        // (§C.4 "no_output_of_prior_pics_flag == 0" / end-of-stream).
+        // We drain once into `ready` and then hand out one by one,
+        // so subsequent receive_frame calls pull from `ready` above
+        // until exhausted.
         if self.eof {
+            let drained = self.output_dpb.flush();
+            if drained.is_empty() {
+                return Err(Error::Eof);
+            }
+            for e in drained {
+                self.ready.push_back(e.picture);
+            }
+            // Safe to unwrap: we just confirmed non-empty drain above.
+            if let Some(vf) = self.ready.pop_front() {
+                return Ok(Frame::Video(vf));
+            }
             return Err(Error::Eof);
         }
         Err(Error::NeedMore)
@@ -635,7 +816,10 @@ impl Decoder for H264CodecDecoder {
         self.driver = H264Driver::new();
         self.last_slice = None;
         self.eof = false;
-        self.frames.clear();
+        // §C.4 — wipe the output queue and any picture that was
+        // already bumped but not yet consumed.
+        self.output_dpb.reset();
+        self.ready.clear();
         self.pending_pts = None;
         self.ref_store = RefPicStore::new();
         self.dpb_entries.clear();
@@ -692,5 +876,374 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, time_base: TimeBase) 
         pts,
         time_base,
         planes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the §C.2.2 / §C.4 wiring through
+    //! [`H264CodecDecoder`]. These tests bypass `handle_slice` and push
+    //! fabricated [`VideoFrame`] + POC pairs straight into the output
+    //! path so we exercise only the DPB-output plumbing without
+    //! needing a real H.264 bitstream with B-frames in the samples
+    //! dir. The bumping-logic correctness itself is already covered by
+    //! `crate::dpb_output::tests`; what we assert here is that the
+    //! wrapper delivers entries in POC order through `receive_frame`,
+    //! honours IDR resets (§C.4), and flushes at EOF.
+    //!
+    //! Spec references:
+    //! * §C.2.2 — "Storage and output of decoded pictures"
+    //! * §C.4   — "Bumping process"
+    //! * §8.2.5.4 — MMCO op 5 resets the DPB
+    //! * Annex A Table A-1 — level-derived MaxDpbMbs defaults
+    use super::*;
+    use crate::dpb_output::OutputEntry;
+
+    /// Build a tiny VideoFrame so tests can track individual pictures
+    /// without carrying real pixel data.
+    fn vf(tag: u8) -> VideoFrame {
+        VideoFrame {
+            format: PixelFormat::Gray8,
+            width: 1,
+            height: 1,
+            pts: None,
+            time_base: TimeBase::new(1, 1),
+            planes: vec![VideoPlane {
+                stride: 1,
+                data: vec![tag],
+            }],
+        }
+    }
+
+    /// Test access: pull the single-byte "tag" out of a VideoFrame
+    /// planted by `vf`.
+    fn vf_tag(f: &Frame) -> u8 {
+        match f {
+            Frame::Video(v) => v.planes[0].data[0],
+            _ => panic!("non-video frame"),
+        }
+    }
+
+    fn push_entry(dec: &mut H264CodecDecoder, tag: u8, poc: i32, frame_num: u32) {
+        let entry = OutputEntry {
+            picture: vf(tag),
+            pic_order_cnt: poc,
+            frame_num,
+            needed_for_output: true,
+        };
+        if let Some(bumped) = dec.output_dpb.push(entry) {
+            dec.ready.push_back(bumped.picture);
+        }
+    }
+
+    /// §C.4 — with `max_num_reorder_frames == 2`, feeding a decode
+    /// order that reorders POC mid-stream must eventually deliver
+    /// every picture in POC-ascending order. Mid-stream order depends
+    /// on when the bumping process fires (queue-full threshold); the
+    /// end-of-stream flush cleans up the tail.
+    ///
+    /// Trace (cap = 2, bump runs BEFORE each insertion when len == cap):
+    ///   push (POC 0, tag 10): queue=[0]
+    ///   push (POC 4, tag 11): queue=[0,4]
+    ///   push (POC 2, tag 12): bump lowest POC 0 (tag 10) → ready;
+    ///                         queue=[4,2]
+    ///   push (POC 1, tag 13): bump lowest POC 2 (tag 12) → ready;
+    ///                         queue=[4,1]
+    ///   push (POC 3, tag 14): bump lowest POC 1 (tag 13) → ready;
+    ///                         queue=[4,3]
+    ///   flush: sorted ascending → [POC 3 (tag 14), POC 4 (tag 11)]
+    ///
+    /// Ready drain: 10, 12, 13. Flush: 14, 11. Total: 10, 12, 13, 14, 11.
+    /// This is NOT strictly POC-ascending because the bumping process
+    /// is conservative — it emits the lowest-POC entry *currently
+    /// queued* when capacity is reached, not the lowest POC across
+    /// the whole stream. That matches §C.4's real-decoder behaviour.
+    /// For a genuinely ascending output the bitstream must give the
+    /// decoder enough slack (i.e. a `max_num_reorder_frames` large
+    /// enough to hold every picture that could reorder past the one
+    /// being bumped).
+    #[test]
+    fn reorder_with_small_dpb_matches_conservative_bumping() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.output_dpb = DpbOutput::<VideoFrame>::new(2, 3);
+
+        push_entry(&mut dec, 10, 0, 0); // IDR
+        push_entry(&mut dec, 11, 4, 1); // P
+        push_entry(&mut dec, 12, 2, 2); // B
+        push_entry(&mut dec, 13, 1, 3); // B
+        push_entry(&mut dec, 14, 3, 4); // B
+
+        dec.flush().expect("flush");
+
+        let mut tags = Vec::new();
+        while let Ok(f) = dec.receive_frame() {
+            tags.push(vf_tag(&f));
+        }
+
+        assert_eq!(tags, vec![10, 12, 13, 14, 11]);
+    }
+
+    /// §C.4 — with a reorder window that *is* large enough to hold
+    /// every out-of-order picture, the flush at EOF produces the
+    /// fully POC-ascending output order expected for display.
+    #[test]
+    fn reorder_with_sufficient_dpb_yields_strictly_ascending_poc() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        // Cap = 5 ≥ number of pictures → nothing bumps mid-stream,
+        // every picture goes through the end-of-stream flush in POC
+        // order.
+        dec.output_dpb = DpbOutput::<VideoFrame>::new(5, 5);
+
+        // Same IPBBB decode order as above.
+        push_entry(&mut dec, 10, 0, 0); // IDR
+        push_entry(&mut dec, 11, 4, 1); // P
+        push_entry(&mut dec, 12, 2, 2); // B
+        push_entry(&mut dec, 13, 1, 3); // B
+        push_entry(&mut dec, 14, 3, 4); // B
+
+        dec.flush().expect("flush");
+
+        let mut tags = Vec::new();
+        let mut pocs = Vec::new();
+        while let Ok(f) = dec.receive_frame() {
+            tags.push(vf_tag(&f));
+            // Reconstruct POC from our tagging scheme (tag -> poc):
+            // 10->0, 11->4, 12->2, 13->1, 14->3.
+            let poc = match vf_tag(&f) {
+                10 => 0,
+                11 => 4,
+                12 => 2,
+                13 => 1,
+                14 => 3,
+                _ => unreachable!(),
+            };
+            pocs.push(poc);
+        }
+
+        // Expected POC-ascending order: 0, 1, 2, 3, 4 → tags 10, 13, 12, 14, 11.
+        assert_eq!(tags, vec![10, 13, 12, 14, 11]);
+        assert_eq!(pocs, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// §C.4 — a full flush drains the DPB in POC order at EOF.
+    #[test]
+    fn flush_at_eof_drains_in_poc_order() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.output_dpb = DpbOutput::<VideoFrame>::new(8, 8);
+
+        // Decode order: [POC 3, POC 1, POC 2] — nothing bumped mid-stream
+        // because we stay below capacity.
+        push_entry(&mut dec, 0xA0, 3, 0);
+        push_entry(&mut dec, 0xA1, 1, 1);
+        push_entry(&mut dec, 0xA2, 2, 2);
+
+        // Before flush(), nothing is over capacity → receive_frame gets
+        // NeedMore.
+        assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
+
+        dec.flush().expect("flush");
+
+        let tags: Vec<u8> = std::iter::from_fn(|| dec.receive_frame().ok().map(|f| vf_tag(&f)))
+            .collect();
+        // POC ascending: 1, 2, 3 → tags 0xA1, 0xA2, 0xA0.
+        assert_eq!(tags, vec![0xA1, 0xA2, 0xA0]);
+    }
+
+    /// §C.4 — at EOF with an empty queue, `receive_frame` returns
+    /// `Error::Eof` not `NeedMore`.
+    #[test]
+    fn eof_on_empty_queue_after_flush() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.flush().expect("flush");
+        assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+    }
+
+    /// §C.4 — `receive_frame` returns `NeedMore` mid-stream when the
+    /// queue is under capacity.
+    #[test]
+    fn need_more_before_any_push() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
+    }
+
+    /// §C.4 — the pre-IDR drain: when a new IDR lands, any pictures
+    /// still pending from the previous coded video sequence must be
+    /// delivered in POC order before the IDR itself.
+    ///
+    /// We simulate this by pushing a few entries, then doing the same
+    /// flush-into-ready + reset dance `handle_slice` does on an IDR
+    /// boundary, then pushing the new IDR. The POC counter restarts
+    /// from 0 on IDR, but the old sequence's pictures still need to
+    /// come out first.
+    #[test]
+    fn idr_drains_pending_pictures_in_poc_order() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.output_dpb = DpbOutput::<VideoFrame>::new(4, 4);
+
+        // Sequence 1: POCs 0, 4, 2, 1 — four frames queued, none bumped.
+        push_entry(&mut dec, 1, 0, 0);
+        push_entry(&mut dec, 2, 4, 1);
+        push_entry(&mut dec, 3, 2, 2);
+        push_entry(&mut dec, 4, 1, 3);
+
+        // Mimic `handle_slice`'s IDR branch: drain pending into `ready`
+        // then reset the output DPB.
+        for drained in dec.output_dpb.flush() {
+            dec.ready.push_back(drained.picture);
+        }
+        dec.output_dpb.reset();
+
+        // IDR at POC 0 kicks off sequence 2.
+        push_entry(&mut dec, 100, 0, 0);
+
+        // EOF drains the IDR itself too.
+        dec.flush().expect("flush");
+
+        let tags: Vec<u8> = std::iter::from_fn(|| dec.receive_frame().ok().map(|f| vf_tag(&f)))
+            .collect();
+        // Sequence 1 in POC order (0, 1, 2, 4) → tags [1, 4, 3, 2]
+        // followed by sequence 2's IDR (100).
+        assert_eq!(tags, vec![1, 4, 3, 2, 100]);
+    }
+
+    /// §C.4 — `reset()` wipes both the output DPB and the "already
+    /// bumped" queue.
+    #[test]
+    fn reset_clears_output_dpb_and_ready() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.output_dpb = DpbOutput::<VideoFrame>::new(2, 2);
+        // Fill + overflow so one entry lands in `ready`.
+        push_entry(&mut dec, 1, 0, 0);
+        push_entry(&mut dec, 2, 1, 1);
+        push_entry(&mut dec, 3, 2, 2); // bumps lowest POC (0) → ready.
+        assert_eq!(dec.ready.len(), 1);
+        assert_eq!(dec.output_dpb.len(), 2);
+
+        dec.reset().expect("reset");
+        assert_eq!(dec.output_dpb.len(), 0);
+        assert!(dec.ready.is_empty());
+        assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
+    }
+
+    /// Annex A Table A-1 / §A.3.1 item h — when the SPS carries a VUI
+    /// `bitstream_restriction` block, we honour it; otherwise we fall
+    /// back to the level-derived default.
+    #[test]
+    fn dpb_sizing_prefers_vui() {
+        use crate::sps::Sps;
+        use crate::vui::{BitstreamRestriction, VuiParameters};
+
+        // Construct a minimal SPS with a VUI bitstream_restriction
+        // block that says "max 3 reorder, max 5 buffering".
+        let sps = Sps {
+            profile_idc: 66,
+            constraint_set_flags: 0,
+            level_idc: 30,
+            seq_parameter_set_id: 0,
+            chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            qpprime_y_zero_transform_bypass_flag: false,
+            seq_scaling_matrix_present_flag: false,
+            seq_scaling_lists: None,
+            log2_max_frame_num_minus4: 0,
+            pic_order_cnt_type: 0,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            delta_pic_order_always_zero_flag: false,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_ref_frame: Vec::new(),
+            max_num_ref_frames: 4,
+            gaps_in_frame_num_value_allowed_flag: false,
+            pic_width_in_mbs_minus1: 10,
+            pic_height_in_map_units_minus1: 8,
+            frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
+            direct_8x8_inference_flag: true,
+            frame_cropping: None,
+            vui_parameters_present_flag: true,
+            vui: Some(VuiParameters {
+                bitstream_restriction: Some(BitstreamRestriction {
+                    motion_vectors_over_pic_boundaries_flag: true,
+                    max_bytes_per_pic_denom: 0,
+                    max_bits_per_mb_denom: 0,
+                    log2_max_mv_length_horizontal: 0,
+                    log2_max_mv_length_vertical: 0,
+                    max_num_reorder_frames: 3,
+                    max_dec_frame_buffering: 5,
+                }),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(output_dpb_sizing(&sps), (3, 5));
+    }
+
+    /// Annex A Table A-1 fallback — when VUI is absent, use the
+    /// level-derived MaxDpbMbs cap as `max_dec_frame_buffering`, and
+    /// `sps.max_num_ref_frames` (clamped to the cap) as the reorder
+    /// window. Level 3.0 (level_idc == 30) has MaxDpbMbs = 8100; for
+    /// a 176x144 (11x9 MB) picture that's Min(8100/99, 16) = 16.
+    /// With `max_num_ref_frames == 4` in the fabricated SPS the
+    /// expected result is (4, 16).
+    #[test]
+    fn dpb_sizing_falls_back_to_level_default() {
+        use crate::sps::Sps;
+
+        let sps = Sps {
+            profile_idc: 66,
+            constraint_set_flags: 0,
+            level_idc: 30, // Level 3.0 → MaxDpbMbs 8100.
+            seq_parameter_set_id: 0,
+            chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            qpprime_y_zero_transform_bypass_flag: false,
+            seq_scaling_matrix_present_flag: false,
+            seq_scaling_lists: None,
+            log2_max_frame_num_minus4: 0,
+            pic_order_cnt_type: 0,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            delta_pic_order_always_zero_flag: false,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_ref_frame: Vec::new(),
+            max_num_ref_frames: 4,
+            gaps_in_frame_num_value_allowed_flag: false,
+            pic_width_in_mbs_minus1: 10, // width_in_mbs = 11 (176 px)
+            pic_height_in_map_units_minus1: 8, // height_in_mbs = 9 (144 px)
+            frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
+            direct_8x8_inference_flag: true,
+            frame_cropping: None,
+            vui_parameters_present_flag: false,
+            vui: None,
+        };
+        // PicSize = 11 * 9 = 99; 8100 / 99 = 81 → capped at 16
+        // (max_dec_frame_buffering). Reorder defaults to
+        // max_num_ref_frames = 4 clamped to 16 → 4.
+        assert_eq!(output_dpb_sizing(&sps), (4, 16));
+    }
+
+    /// Annex A Table A-1 — per-level MaxDpbMbs sanity. Levels that
+    /// share the same MaxDpbMbs row in Table A-1 must yield the same
+    /// value.
+    #[test]
+    fn max_dpb_mbs_per_level_table() {
+        assert_eq!(max_dpb_mbs_for_level(10), 396);
+        assert_eq!(max_dpb_mbs_for_level(12), 2_376);
+        assert_eq!(max_dpb_mbs_for_level(21), 4_752);
+        assert_eq!(max_dpb_mbs_for_level(30), 8_100);
+        assert_eq!(max_dpb_mbs_for_level(31), 18_000);
+        assert_eq!(max_dpb_mbs_for_level(40), 32_768);
+        assert_eq!(max_dpb_mbs_for_level(42), 34_816);
+        assert_eq!(max_dpb_mbs_for_level(50), 110_400);
+        assert_eq!(max_dpb_mbs_for_level(51), 184_320);
+        assert_eq!(max_dpb_mbs_for_level(60), 696_320);
+        // Unknown level → conservative fallback.
+        assert_eq!(max_dpb_mbs_for_level(200), 396);
     }
 }

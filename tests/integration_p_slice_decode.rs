@@ -61,7 +61,14 @@ fn decode_p_slices_yields_frames() {
     let packet = Packet::new(0, TimeBase::new(1, 25), bytes.clone()).with_pts(0);
     dec.send_packet(&packet).expect("send_packet");
 
-    // Drain the queued frames. Each call is `NeedMore` once empty.
+    // Signal EOF so the §C.4 bumping process drains the output DPB.
+    // POC-ordered output (post round-78 wiring) holds pictures until
+    // enough follow-up frames arrive to force a bump; flush drains
+    // the remainder in POC-ascending order.
+    dec.flush().expect("flush");
+
+    // Drain the queued frames. Each call is `Eof` once empty (not
+    // `NeedMore`, because we flushed).
     let mut frames: Vec<_> = Vec::new();
     loop {
         match dec.receive_frame() {
