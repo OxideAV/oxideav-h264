@@ -17,6 +17,11 @@ pub(crate) mod bitstream;
 pub mod nal;
 pub mod sps;
 pub mod pps;
+pub mod scaling_list;
+pub mod vui;
+pub mod slice_header;
+pub mod non_vcl;
+pub mod poc;
 pub(crate) mod cavlc;
 pub(crate) mod cabac;
 
