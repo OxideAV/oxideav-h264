@@ -532,50 +532,54 @@ fn decode_b_8x8(
         }
     }
 
-    // Step 3: MVDs per sub-partition, list 0 first then list 1. Because
-    // neighbour MV lookups for later sub-partitions depend on earlier ones,
-    // we read + compensate each sub-MB in a single pass (the non-direct path
-    // reads MVDs and runs MC; the direct path uses direct-mode MVs).
+    // Step 3: MVDs per sub-partition.
     //
-    // Spec requires: all mvd_l0 across all sub-partitions, then all mvd_l1.
-    // We pre-read both lists here, then do compensation afterwards.
+    // §7.3.5.2 / Table 7-18: the full set of `mvd_l0` fields is emitted
+    // before any `mvd_l1` field — the outer loop is list-first, sub-second.
+    // FFmpeg mirrors this at h264_cabac.c:2223 (`for(list=0; list<count;
+    // list++) for(i=0; i<4; i++) { ... DECODE_CABAC_MB_MVD(list, index) }`).
+    //
+    // Reading MVDs interleaved per sub (`L0 for s0, L1 for s0, L0 for s1,
+    // ...`) desyncs the CABAC engine on mixed-direction B_8x8 MBs — e.g.
+    // `[Direct, B_L1_8x8, B_L0_8x8, B_L1_8x8]` would read `L1(s1), L0(s2),
+    // L1(s3)` under the interleaved order but the spec calls for
+    // `L0(s2), L1(s1), L1(s3)`.
     #[derive(Clone, Copy, Default)]
     struct SubMvd {
         mvd_l0: Option<(i32, i32)>,
         mvd_l1: Option<(i32, i32)>,
     }
-    let mut mvds: Vec<Vec<SubMvd>> = Vec::with_capacity(4);
-    for s in 0..4 {
-        let sp = subs[s];
-        let n = sp.num_sub_partitions();
-        let mut entry = Vec::with_capacity(n);
-        let dir_opt = sp.pred_dir();
-        for sub_idx in 0..n {
-            if let Some(dir) = dir_opt {
+    let mut mvds: Vec<Vec<SubMvd>> = (0..4)
+        .map(|s| vec![SubMvd::default(); subs[s].num_sub_partitions()])
+        .collect();
+    for list in 0u8..2 {
+        for s in 0..4 {
+            let sp = subs[s];
+            let Some(dir) = sp.pred_dir() else {
+                continue;
+            };
+            let uses = if list == 0 {
+                uses_l0(dir)
+            } else {
+                uses_l1(dir)
+            };
+            if !uses {
+                continue;
+            }
+            for sub_idx in 0..sp.num_sub_partitions() {
                 let (sr0, sc0) = SUB_OFFSETS[s];
                 let (dr, dc, sh_h, sh_w) = sp.sub_rect(sub_idx);
                 let r0 = sr0 + dr;
                 let c0 = sc0 + dc;
-                let mvd_l0 = if uses_l0(dir) {
-                    let mvd = read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 0)?;
-                    write_mvd_abs(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, 0, mvd);
-                    Some(mvd)
+                let mvd = read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, list)?;
+                write_mvd_abs(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, list, mvd);
+                if list == 0 {
+                    mvds[s][sub_idx].mvd_l0 = Some(mvd);
                 } else {
-                    None
-                };
-                let mvd_l1 = if uses_l1(dir) {
-                    let mvd = read_mvd(d, ctxs, pic, mb_x, mb_y, r0, c0, 1)?;
-                    write_mvd_abs(pic, mb_x, mb_y, r0, c0, sh_h, sh_w, 1, mvd);
-                    Some(mvd)
-                } else {
-                    None
-                };
-                entry.push(SubMvd { mvd_l0, mvd_l1 });
-            } else {
-                entry.push(SubMvd::default());
+                    mvds[s][sub_idx].mvd_l1 = Some(mvd);
+                }
             }
         }
-        mvds.push(entry);
     }
 
     // Step 4: compensate each sub-MB.
@@ -964,17 +968,22 @@ fn decode_inter_residual_chroma(
     let mut dc_cb = [0i32; 4];
     let mut dc_cr = [0i32; 4];
     if cbp_chroma >= 1 {
-        let neigh = CbfNeighbours::none();
+        // §9.3.3.1.1.9 — chroma DC CBF neighbour per plane from
+        // MbInfo::chroma_dc_cbf (mirrors the P-slice CABAC path).
+        let neigh_cb_dc = super::p_mb::p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 0);
         let cb_coeffs =
-            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, false)?;
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cb_dc, 4, false)?;
         for i in 0..4 {
             dc_cb[i] = cb_coeffs[i];
         }
+        pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[0] = cb_coeffs.iter().any(|&v| v != 0);
+        let neigh_cr_dc = super::p_mb::p_chroma_dc_cbf_neighbours(pic, mb_x, mb_y, 1);
         let cr_coeffs =
-            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh, 4, false)?;
+            decode_residual_block_in_place(d, ctxs, BlockCat::ChromaDc, &neigh_cr_dc, 4, false)?;
         for i in 0..4 {
             dc_cr[i] = cr_coeffs[i];
         }
+        pic.mb_info_mut(mb_x, mb_y).chroma_dc_cbf[1] = cr_coeffs.iter().any(|&v| v != 0);
         let w_cb = pic.scaling_lists.matrix_4x4(4)[0];
         let w_cr = pic.scaling_lists.matrix_4x4(5)[0];
         inv_hadamard_2x2_chroma_dc_scaled(&mut dc_cb, qpc, w_cb);
@@ -991,7 +1000,15 @@ fn decode_inter_residual_chroma(
             let mut res = [0i32; 16];
             let mut total_coeff = 0u32;
             if cbp_chroma == 2 {
-                let neigh = CbfNeighbours::none();
+                // §9.3.3.1.1.9 — chroma AC CBF ctxIdxInc derives from the
+                // previously-decoded in-MB block plus the neighbour MB's
+                // stored chroma nc. Without this the CBF bin on every
+                // chroma AC block reads ctxIdxInc=0, which desyncs the
+                // CABAC engine whenever a chroma 4×4 has a nonzero
+                // neighbour (common on textured content).
+                let neigh = super::p_mb::p_chroma_ac_cbf_neighbours(
+                    pic, mb_x, mb_y, plane_kind, br_row, br_col, &nc_arr,
+                );
                 let ac =
                     decode_residual_block_in_place(d, ctxs, BlockCat::ChromaAc, &neigh, 15, false)?;
                 total_coeff = ac.iter().filter(|&&v| v != 0).count() as u32;
