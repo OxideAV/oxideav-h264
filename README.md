@@ -68,15 +68,24 @@ no packet is decoded.
 * Pluggable into the existing oxideav `Decoder` / `Encoder` trait
   surface once functional.
 
-## Profiles + features in scope (eventually)
+## Profiles + features in scope
 
-Targeting the subset of H.264 in widespread use:
+The long-term target is a **complete** implementation of ITU-T Rec.
+H.264 | ISO/IEC 14496-10 — every profile and every coding tool in the
+spec. We're starting from the subset in widespread use and widening
+out from there:
 
-* Profiles: Baseline (66), Main (77), High (100). Extended /
-  High10 / High 4:2:2 / High 4:4:4 left for later.
-* Bit depths: 8 (Baseline / Main / High). 10-bit may follow.
-* Chroma: 4:2:0 first, then 4:2:2 / 4:4:4.
-* Frame coding only first; field / MBAFF / PAFF later if at all.
+| Phase | Profiles | Bit depths | Chroma | Coding |
+| ----- | -------- | ---------- | ------ | ------ |
+| 1 (now) | Baseline (66), Main (77), High (100) | 8 | 4:2:0 | Frame only |
+| 2 | + High10 (110), High 4:2:2 (122) | + 10-bit | + 4:2:2 | + Field / MBAFF / PAFF |
+| 3 | + High 4:4:4 Predictive (244), Extended (88) | + 12 / 14-bit | + 4:4:4 | Full coverage |
+| 4 | + Annex F SVC, Annex G MVC, Annex H 3D-AVC, Annex I 3D-AVC depth | all | all | all |
+
+Intermediate profiles (High 10 Intra, CAVLC 4:4:4 Intra, etc.) land
+opportunistically as the pieces they need go in. Nothing in the spec
+is considered out-of-scope forever — the table is a phasing plan, not
+a scope fence.
 
 ## License
 
