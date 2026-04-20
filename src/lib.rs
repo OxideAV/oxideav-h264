@@ -37,6 +37,7 @@ pub mod macroblock_layer;
 pub mod slice_data;
 pub mod picture;
 pub mod mb_grid;
+pub mod ref_store;
 pub mod reconstruct;
 pub mod dpb_output;
 pub mod decoder;
