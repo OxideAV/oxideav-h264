@@ -1521,6 +1521,13 @@ pub fn decode_coded_block_flag(
     let inc = cond_a + 2 * cond_b;
     let ctx_idx = (base + cat_offset + inc) as usize;
     let bin = dec.decode_decision(ctxs.at_mut(ctx_idx))?;
+    if std::env::var_os("OXIDEAV_H264_CABAC_DEBUG").is_some() {
+        eprintln!(
+            "[CABAC] cbf bt={:?} base={} cat={} inc={} ctx={} -> {}  cond_left={:?} cond_above={:?}",
+            block_type, base, cat_offset, inc, ctx_idx, bin,
+            neighbour_cbf_left, neighbour_cbf_above
+        );
+    }
     Ok(bin == 1)
 }
 
@@ -1830,7 +1837,16 @@ pub fn decode_coeff_sign_flag(dec: &mut CabacDecoder<'_>) -> CabacResult<bool> {
 
 /// end_of_slice_flag — terminate bin (§9.3.3.2.4).
 pub fn decode_end_of_slice_flag(dec: &mut CabacDecoder<'_>) -> CabacResult<bool> {
-    Ok(dec.decode_terminate()? == 1)
+    let before_bins = dec.bin_count();
+    let (b, bi) = dec.position();
+    let v = dec.decode_terminate()?;
+    if std::env::var_os("OXIDEAV_H264_CABAC_DEBUG").is_some() {
+        eprintln!(
+            "[CABAC] end_of_slice_flag pre_bins={} pre_pos=({},{}) -> {}",
+            before_bins, b, bi, v
+        );
+    }
+    Ok(v == 1)
 }
 
 /// prev_intra4x4_pred_mode_flag / prev_intra8x8_pred_mode_flag — FL,

@@ -47,7 +47,8 @@ use crate::cabac_ctx::{
     decode_end_of_slice_flag, decode_mb_skip_flag, CabacContexts, NeighbourCtx, SliceKind,
 };
 use crate::macroblock_layer::{
-    parse_macroblock, CavlcNcGrid, EntropyState, Macroblock, MacroblockLayerError,
+    parse_macroblock, CabacNeighbourGrid, CavlcNcGrid, EntropyState, Macroblock,
+    MacroblockLayerError,
 };
 use crate::pps::Pps;
 use crate::slice_header::{SliceHeader, SliceType};
@@ -201,6 +202,10 @@ pub fn parse_slice_data(
         // both MBs. `pending_pair_flag` holds the top MB's flag so the
         // bottom MB gets the same value without a second read.
         let mut pending_pair_flag: Option<bool> = None;
+        // §9.3.3.1.1.9 — CABAC residual neighbour grid; populated per MB
+        // as the walker steps, and consulted when deriving `ctxIdxInc`
+        // for coded_block_flag / ref_idx / mvd on subsequent MBs.
+        let mut cabac_nb = CabacNeighbourGrid::new(pic_w_mbs, pic_h_mbs);
         loop {
             let mut skipped = false;
             let mut mb_skip_flag_this_iter = false;
@@ -275,11 +280,10 @@ pub fn parse_slice_data(
                     num_ref_idx_l0_active_minus1: slice_header.num_ref_idx_l0_active_minus1,
                     num_ref_idx_l1_active_minus1: slice_header.num_ref_idx_l1_active_minus1,
                     mbaff_frame_flag: false,
-                    // CABAC per-MB neighbour grid — pass None for the
-                    // conservative approximation. A follow-up commit will
-                    // thread through a proper CabacNeighbourGrid.
-                    cabac_nb: None,
-                    pic_width_in_mbs: 0,
+                    // CABAC per-MB neighbour grid — spec-correct per
+                    // §9.3.3.1.1.9.
+                    cabac_nb: Some(&mut cabac_nb),
+                    pic_width_in_mbs: pic_w_mbs,
                 };
                 let (byte, bit) = r.position();
                 let mb = parse_macroblock(

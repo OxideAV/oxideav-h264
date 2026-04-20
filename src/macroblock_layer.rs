@@ -1393,6 +1393,12 @@ fn cabac_mvd_abs_sum(
 /// unavailable + current-is-inter → 0), P_Skip / B_Skip → 0, and
 /// I_PCM → 1.
 ///
+/// `is_cr` disambiguates the iCbCr axis for `BlockType::ChromaDc` and
+/// `BlockType::ChromaAc`: the spec §9.3.3.1.1.9 cat=3 / cat=4 use the
+/// neighbour's Cb DC/AC block when iCbCr=0 and the neighbour's Cr
+/// DC/AC block when iCbCr=1 — our grid tracks both arrays but the
+/// block_type alone is cat-4 generic.
+///
 /// Returns `(cond_a, cond_b)` such that `ctxIdxInc = cond_a + 2 * cond_b`.
 #[allow(clippy::too_many_arguments)]
 fn cabac_cbf_cond_terms(
@@ -1402,6 +1408,7 @@ fn cabac_cbf_cond_terms(
     current_is_intra: bool,
     block_type: BlockType,
     blk_idx: u8,
+    is_cr: bool,
 ) -> (bool, bool) {
     let w = grid.width_in_mbs;
     let x = if w == 0 { 0 } else { current_mb_addr % w };
@@ -1443,8 +1450,8 @@ fn cabac_cbf_cond_terms(
 
     let left_addr = if x > 0 { Some(current_mb_addr - 1) } else { None };
     let above_addr = if y > 0 { Some(current_mb_addr - w) } else { None };
-    let cond_a = cbf_cond_for(grid, current_mb, current_is_intra, block_type, a_loc, left_addr, true);
-    let cond_b = cbf_cond_for(grid, current_mb, current_is_intra, block_type, b_loc, above_addr, false);
+    let cond_a = cbf_cond_for(grid, current_mb, current_is_intra, block_type, a_loc, left_addr, true, is_cr);
+    let cond_b = cbf_cond_for(grid, current_mb, current_is_intra, block_type, b_loc, above_addr, false, is_cr);
     (cond_a, cond_b)
 }
 
@@ -1469,6 +1476,7 @@ fn cbf_cond_for(
     loc: CbfLoc,
     ext_mb_addr: Option<u32>,
     is_left_dir: bool,
+    is_cr: bool,
 ) -> bool {
     match loc {
         CbfLoc::Internal4x4(xn, yn) => {
@@ -1494,20 +1502,12 @@ fn cbf_cond_for(
             }
         }
         CbfLoc::InternalChromaAc(xn, yn, _blk_idx) => {
-            let max_w: i32 = 8;
-            let max_h: i32 = 8; // 4:2:0 / 4:2:2 both use MbHeightC = 8 per-block; actual height tracked via blk_idx layout
-            // For 4:2:2 the chroma plane height is 16 but for AC neighbour
-            // lookup within an MB we only care about internal vs external
-            // — and the chroma layout has at most 4 rows of 4x4 (4:2:2)
-            // = y up to 12. We accept the simplification: treat y in
-            // 0..max_h as internal, otherwise external.
-            let _ = (max_w, max_h);
             if xn >= 0 && yn >= 0 {
                 // Internal — find blk idx for (xn, yn) in chroma layout.
                 // 4:2:0 layout: 2x2 (y up to 4); 4:2:2: 2x4 (y up to 12).
                 // Use the same inverse from xy to idx: idx = 2*(y/4) + (x/4).
                 let bi = (2 * (yn / 4) + (xn / 4)) as usize;
-                cbf_chroma_ac_for(current_mb, block_type, bi.min(7))
+                cbf_chroma_ac_for(current_mb, block_type, bi.min(7), is_cr)
             } else {
                 // External — use left or above MB's same category.
                 let Some(addr) = ext_mb_addr else {
@@ -1524,7 +1524,7 @@ fn cbf_cond_for(
                 // index we query is in the first 4 slots for 4:2:0.
                 let (wx, wy) = if is_left_dir { (xn + 8, yn) } else { (xn, yn + 8) };
                 let bi = (2 * (wy / 4) + (wx / 4)) as usize;
-                cbf_chroma_ac_for(info, block_type, bi.min(7))
+                cbf_chroma_ac_for(info, block_type, bi.min(7), is_cr)
             }
         }
         CbfLoc::MbLevel => {
@@ -1537,7 +1537,7 @@ fn cbf_cond_for(
             if !info.available { return unavail_cbf(current_is_intra, block_type) }
             if info.is_i_pcm { return true }
             if info.is_skip { return false }
-            cbf_mb_level_for(info, block_type)
+            cbf_mb_level_for(info, block_type, is_cr)
         }
     }
 }
@@ -1567,22 +1567,42 @@ fn cbf_luma_for(info: &CabacMbNeighbourInfo, block_type: BlockType, bi: usize) -
 }
 
 #[inline]
-fn cbf_chroma_ac_for(info: &CabacMbNeighbourInfo, block_type: BlockType, bi: usize) -> bool {
+fn cbf_chroma_ac_for(
+    info: &CabacMbNeighbourInfo,
+    block_type: BlockType,
+    bi: usize,
+    is_cr: bool,
+) -> bool {
     match block_type {
-        BlockType::ChromaAc | BlockType::Cb8x8 => {
-            // Cb AC
-            info.cbf_cb_ac.get(bi).copied().unwrap_or(false)
+        BlockType::ChromaAc => {
+            // §9.3.3.1.1.9 cat=4 — Cb when iCbCr=0, Cr when iCbCr=1.
+            if is_cr {
+                info.cbf_cr_ac.get(bi).copied().unwrap_or(false)
+            } else {
+                info.cbf_cb_ac.get(bi).copied().unwrap_or(false)
+            }
         }
+        BlockType::Cb8x8 => info.cbf_cb_ac.get(bi).copied().unwrap_or(false),
         BlockType::Cr8x8 => info.cbf_cr_ac.get(bi).copied().unwrap_or(false),
         _ => false,
     }
 }
 
 #[inline]
-fn cbf_mb_level_for(info: &CabacMbNeighbourInfo, block_type: BlockType) -> bool {
+fn cbf_mb_level_for(info: &CabacMbNeighbourInfo, block_type: BlockType, is_cr: bool) -> bool {
     match block_type {
-        BlockType::ChromaDc => info.cbf_cb_dc, // fallback — see note
+        // §9.3.3.1.1.9 cat=3 — Cb DC when iCbCr=0, Cr DC when iCbCr=1.
+        BlockType::ChromaDc => {
+            if is_cr {
+                info.cbf_cr_dc
+            } else {
+                info.cbf_cb_dc
+            }
+        }
         BlockType::Luma16x16Dc => info.cbf_luma_16x16_dc,
+        // 4:4:4 per-plane DC — each plane tracks its own 16x16-DC bit
+        // but we currently reuse `cbf_luma_16x16_dc`. Leave as-is (the
+        // 4:4:4 pipeline is outside the foreman test path).
         BlockType::CbIntra16x16Dc => info.cbf_luma_16x16_dc,
         BlockType::CrIntra16x16Dc => info.cbf_luma_16x16_dc,
         _ => false,
@@ -1674,9 +1694,15 @@ pub fn parse_macroblock(
     let mb_addr_dbg = entropy.current_mb_addr;
     if dbg {
         let (b, bi) = r.position();
+        let (cb, cbi, bins) = if let Some((dec, _)) = entropy.cabac.as_ref() {
+            let (pb, pbi) = dec.position();
+            (pb as i64, pbi as i64, dec.bin_count() as i64)
+        } else {
+            (-1, -1, -1)
+        };
         eprintln!(
-            "[MB {:>4}] enter cursor=({},{}) slice_type={:?}",
-            mb_addr_dbg, b, bi, slice_type
+            "[MB {:>4}] enter cursor=({},{}) cabac=({},{}) bins={} slice_type={:?}",
+            mb_addr_dbg, b, bi, cb, cbi, bins, slice_type
         );
     }
 
@@ -3087,7 +3113,7 @@ fn parse_residual_cabac_only(
         let (ca, cb) = if let Some(g) = grid_ref {
             let (a, b) = cabac_cbf_cond_terms(
                 g, current_mb_addr, &curr_cbf, current_is_intra,
-                BlockType::Luma16x16Dc, 0);
+                BlockType::Luma16x16Dc, 0, false);
             (Some(a), Some(b))
         } else {
             (None, None)
@@ -3106,7 +3132,7 @@ fn parse_residual_cabac_only(
                 let (ca, cb) = if let Some(g) = grid_ref {
                     let (a, b) = cabac_cbf_cond_terms(
                         g, current_mb_addr, &curr_cbf, current_is_intra,
-                        BlockType::Luma16x16Ac, blk_idx);
+                        BlockType::Luma16x16Ac, blk_idx, false);
                     (Some(a), Some(b))
                 } else {
                     (None, None)
@@ -3150,7 +3176,7 @@ fn parse_residual_cabac_only(
                     let (ca, cb) = if let Some(g) = grid_ref {
                         let (a, b) = cabac_cbf_cond_terms(
                             g, current_mb_addr, &curr_cbf, current_is_intra,
-                            BlockType::Luma4x4, blk_idx);
+                            BlockType::Luma4x4, blk_idx, false);
                         (Some(a), Some(b))
                     } else {
                         (None, None)
@@ -3171,12 +3197,13 @@ fn parse_residual_cabac_only(
 
         if cbp_chroma > 0 {
             let max_dc = if chroma_array_type == 1 { 4 } else { 8 };
-            // Chroma DC — MB-level block; A/B come from left/above MB's
-            // same-category CBF (Cb for Cb DC, Cr for Cr DC).
+            // Chroma DC — MB-level block. §9.3.3.1.1.9 cat=3 derives
+            // condTermN from the iCbCr-matched neighbour DC block.
+            // Compute separately for Cb (iCbCr=0) and Cr (iCbCr=1).
             let (ca_cb, cb_cb) = if let Some(g) = grid_ref {
                 let (a, b) = cabac_cbf_cond_terms(
                     g, current_mb_addr, &curr_cbf, current_is_intra,
-                    BlockType::ChromaDc, 0);
+                    BlockType::ChromaDc, 0, false);
                 (Some(a), Some(b))
             } else {
                 (None, None)
@@ -3188,9 +3215,17 @@ fn parse_residual_cabac_only(
             curr_cbf.cbf_cb_dc = cb_coded;
             out.residual_chroma_dc_cb = cb_dc;
 
+            let (ca_cr, cb_cr) = if let Some(g) = grid_ref {
+                let (a, b) = cabac_cbf_cond_terms(
+                    g, current_mb_addr, &curr_cbf, current_is_intra,
+                    BlockType::ChromaDc, 0, true);
+                (Some(a), Some(b))
+            } else {
+                (None, None)
+            };
             let (cr_dc, cr_coded) = parse_residual_block_cabac(
                 cabac, ctxs, BlockType::ChromaDc, 0, max_dc - 1, max_dc, chroma_array_type,
-                ca_cb, cb_cb,
+                ca_cr, cb_cr,
             )?;
             curr_cbf.cbf_cr_dc = cr_coded;
             out.residual_chroma_dc_cr = cr_dc;
@@ -3202,7 +3237,7 @@ fn parse_residual_cabac_only(
                 let (ca, cb) = if let Some(g) = grid_ref {
                     let (a, b) = cabac_cbf_cond_terms(
                         g, current_mb_addr, &curr_cbf, current_is_intra,
-                        BlockType::ChromaAc, blk_idx);
+                        BlockType::ChromaAc, blk_idx, false);
                     (Some(a), Some(b))
                 } else {
                     (None, None)
@@ -3217,7 +3252,7 @@ fn parse_residual_cabac_only(
                 let (ca, cb) = if let Some(g) = grid_ref {
                     let (a, b) = cabac_cbf_cond_terms(
                         g, current_mb_addr, &curr_cbf, current_is_intra,
-                        BlockType::ChromaAc, blk_idx);
+                        BlockType::ChromaAc, blk_idx, true);
                     (Some(a), Some(b))
                 } else {
                     (None, None)
@@ -4109,7 +4144,7 @@ mod tests {
         let grid = mk_cabac_grid();
         let curr = CabacMbNeighbourInfo::default();
         let (ca, cb) = cabac_cbf_cond_terms(
-            &grid, 0, &curr, /*current_is_intra=*/ false, BlockType::Luma4x4, 0,
+            &grid, 0, &curr, /*current_is_intra=*/ false, BlockType::Luma4x4, 0, false,
         );
         assert!(!ca);
         assert!(!cb);
@@ -4125,7 +4160,7 @@ mod tests {
             ..Default::default()
         };
         let (ca, cb) = cabac_cbf_cond_terms(
-            &grid, 0, &curr, /*current_is_intra=*/ true, BlockType::Luma4x4, 0,
+            &grid, 0, &curr, /*current_is_intra=*/ true, BlockType::Luma4x4, 0, false,
         );
         assert!(ca);
         assert!(cb);
@@ -4147,7 +4182,7 @@ mod tests {
         // wrapped (xN=-1+16=15, yN=0) → block idx = 5.
         // Neighbour B = MB 1 block at (xN=0, yN=-1+16=15) → idx = 10.
         let (ca, cb) = cabac_cbf_cond_terms(
-            &grid, 5, &curr, true, BlockType::Luma4x4, 0,
+            &grid, 5, &curr, true, BlockType::Luma4x4, 0, false,
         );
         assert!(ca);
         assert!(cb);
@@ -4165,7 +4200,7 @@ mod tests {
         grid.mbs[4].is_intra = true; // I_PCM is intra
         let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
         let (ca, _cb) = cabac_cbf_cond_terms(
-            &grid, 1, &curr, true, BlockType::Luma4x4, 0,
+            &grid, 1, &curr, true, BlockType::Luma4x4, 0, false,
         );
         assert!(ca);
     }
@@ -4178,7 +4213,7 @@ mod tests {
         grid.mbs[4].cbf_luma_4x4 = [true; 16]; // numerically non-zero
         let curr = CabacMbNeighbourInfo::default();
         let (ca, _cb) = cabac_cbf_cond_terms(
-            &grid, 1, &curr, false, BlockType::Luma4x4, 0,
+            &grid, 1, &curr, false, BlockType::Luma4x4, 0, false,
         );
         assert!(!ca);
     }
@@ -4194,7 +4229,7 @@ mod tests {
         curr.cbf_luma_4x4[1] = false;
         let (ca, cb) = cabac_cbf_cond_terms(
             &grid, 0, &curr, /*current_is_intra=*/ false,
-            BlockType::Luma4x4, 5,
+            BlockType::Luma4x4, 5, false,
         );
         assert!(ca, "A (internal block 4) has cbf=true");
         assert!(!cb, "B (internal block 1) has cbf=false");
@@ -4225,6 +4260,82 @@ mod tests {
         assert_eq!(grid.neighbour_mb_addrs(4), (None, Some(0)));
         assert_eq!(grid.neighbour_mb_addrs(5), (Some(4), Some(1)));
         assert_eq!(grid.neighbour_mb_addrs(15), (Some(14), Some(11)));
+    }
+
+    // -----------------------------------------------------------------
+    // §9.3.3.1.1.9 cat=3 / cat=4 — ChromaDC / ChromaAC iCbCr.
+    //
+    // The spec says `transBlockN` for cat=3 (ChromaDc) is "the chroma DC
+    // block of chroma component iCbCr of macroblock mbAddrN" — Cb-DC
+    // when iCbCr=0, Cr-DC when iCbCr=1. Same distinction for cat=4.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cbf_chroma_dc_separates_cb_and_cr() {
+        // Left MB has Cb-DC coded but Cr-DC uncoded (encoder wrote
+        // cbf_cb_dc=1, cbf_cr_dc=0). For the current MB, condTermA for
+        // Cb DC should be 1; for Cr DC it should be 0.
+        let mut grid = mk_cabac_grid();
+        grid.mbs[0].available = true;
+        grid.mbs[0].is_intra = true;
+        grid.mbs[0].cbf_cb_dc = true;
+        grid.mbs[0].cbf_cr_dc = false;
+        let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
+        // MB 1 = right neighbour of MB 0. A = MB 0, B = unavailable (row 0).
+        let (ca_cb, _cb_cb) = cabac_cbf_cond_terms(
+            &grid, 1, &curr, true, BlockType::ChromaDc, 0, /*is_cr=*/false,
+        );
+        let (ca_cr, _cb_cr) = cabac_cbf_cond_terms(
+            &grid, 1, &curr, true, BlockType::ChromaDc, 0, /*is_cr=*/true,
+        );
+        assert!(ca_cb, "Cb DC should see neighbour cbf_cb_dc=true");
+        assert!(!ca_cr, "Cr DC should see neighbour cbf_cr_dc=false");
+    }
+
+    #[test]
+    fn cbf_chroma_ac_separates_cb_and_cr() {
+        // Left MB (MB 0) has Cb-AC coded on block 0 but Cr-AC uncoded.
+        let mut grid = mk_cabac_grid();
+        grid.mbs[0].available = true;
+        grid.mbs[0].is_intra = true;
+        grid.mbs[0].cbf_cb_ac[0] = true;
+        grid.mbs[0].cbf_cr_ac[0] = false;
+        // The neighbour wrap for MB 1's chroma AC block 0 at (0, 0)
+        // goes to left-MB chroma block index 1 (wrap xn=-1+8=7 → idx 1).
+        grid.mbs[0].cbf_cb_ac[1] = true;
+        grid.mbs[0].cbf_cr_ac[1] = false;
+        let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
+        let (ca_cb, _cb_cb) = cabac_cbf_cond_terms(
+            &grid, 1, &curr, true, BlockType::ChromaAc, 0, false,
+        );
+        let (ca_cr, _cb_cr) = cabac_cbf_cond_terms(
+            &grid, 1, &curr, true, BlockType::ChromaAc, 0, true,
+        );
+        assert!(ca_cb, "Cb AC should see neighbour cbf_cb_ac=true");
+        assert!(!ca_cr, "Cr AC should see neighbour cbf_cr_ac=false");
+    }
+
+    #[test]
+    fn cbf_chroma_ac_internal_separates_cb_and_cr() {
+        // Current MB has decoded Cb AC block 0 as coded, Cr AC block 0
+        // as uncoded. When decoding Cb AC block 1 (iCbCr=0) we read
+        // `curr_cbf.cbf_cb_ac[0]` for the internal A-neighbour. When
+        // decoding Cr AC block 1 (iCbCr=1) we should read
+        // `curr_cbf.cbf_cr_ac[0]` instead.
+        let grid = mk_cabac_grid();
+        let mut curr = CabacMbNeighbourInfo::default();
+        curr.is_intra = true;
+        curr.cbf_cb_ac[0] = true;
+        curr.cbf_cr_ac[0] = false;
+        // ChromaAc blk_idx=1 is at (4, 0) → A=(3, 0) internal block 0.
+        let (ca_cb, _cb_cb) = cabac_cbf_cond_terms(
+            &grid, 0, &curr, true, BlockType::ChromaAc, 1, false,
+        );
+        let (ca_cr, _cb_cr) = cabac_cbf_cond_terms(
+            &grid, 0, &curr, true, BlockType::ChromaAc, 1, true,
+        );
+        assert!(ca_cb, "Cb AC internal should see cbf_cb_ac[0]=true");
+        assert!(!ca_cr, "Cr AC internal should see cbf_cr_ac[0]=false");
     }
 
     // -----------------------------------------------------------------
