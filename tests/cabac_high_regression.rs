@@ -27,6 +27,8 @@ use oxideav_h264::nal::{split_annex_b, NalHeader, NalUnitType};
 
 const ES: &[u8] = include_bytes!("fixtures/cabac_high_200x200.es");
 const REF_YUV: &[u8] = include_bytes!("fixtures/cabac_high_200x200.yuv");
+const NOISY_ES: &[u8] = include_bytes!("fixtures/cabac_high_200x200_noisy.es");
+const NOISY_REF_YUV: &[u8] = include_bytes!("fixtures/cabac_high_200x200_noisy.yuv");
 const WIDTH: usize = 200;
 const HEIGHT: usize = 200;
 const FRAME_BYTES: usize = WIDTH * HEIGHT * 3 / 2;
@@ -105,6 +107,17 @@ fn fixture_contains_expected_frame_count() {
         FRAME_BYTES * EXPECTED_FRAMES,
         "reference YUV size drift"
     );
+    let (_, _, noisy_frames) = split_frames(NOISY_ES);
+    assert_eq!(
+        noisy_frames.len(),
+        EXPECTED_FRAMES,
+        "noisy fixture frame count drift"
+    );
+    assert_eq!(
+        NOISY_REF_YUV.len(),
+        FRAME_BYTES * EXPECTED_FRAMES,
+        "noisy reference YUV size drift"
+    );
 }
 
 /// Hard bit-exact check of `oxideav-h264` against libavcodec on a
@@ -169,6 +182,97 @@ fn cabac_high_profile_decodes_bit_exact_vs_ffmpeg() {
     // Final flush — POC reorder may hold the last 1-2 pictures back
     // until EOS. Drain them all so the full display sequence is
     // verified end-to-end.
+    dec.flush().expect("flush");
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        check(&vf, display_idx, None);
+        display_idx += 1;
+    }
+    assert_eq!(
+        display_idx, EXPECTED_FRAMES,
+        "decoder emitted {display_idx} frames, expected {EXPECTED_FRAMES}"
+    );
+}
+
+/// Bit-exact check of `oxideav-h264` against libavcodec on a noisy
+/// High-profile CABAC fixture (same encoder config as the clean
+/// `cabac_high_profile` test but with `noise=alls=20:allf=t` added).
+/// The content complexity exercises CABAC B-slice code paths that the
+/// clean testsrc content did not hit — first B-frame of the GOP errors
+/// with `end_of_slice_flag did not fire before last MB` in the buggy
+/// build.
+///
+/// ## Fixture regeneration
+///
+/// ```sh
+/// ffmpeg -y -f lavfi -i "testsrc=duration=1:size=200x200:rate=25,noise=alls=20:allf=t" \
+///   -vframes 12 -pix_fmt yuv420p -c:v libx264 \
+///   -profile:v high -level 4.0 -preset medium \
+///   -coder 1 -bf 2 -refs 1 -g 12 /tmp/noisy.mp4
+/// ffmpeg -y -i /tmp/noisy.mp4 -c:v copy -bsf:v h264_mp4toannexb -f h264 \
+///   tests/fixtures/cabac_high_200x200_noisy.es
+/// ffmpeg -y -i /tmp/noisy.mp4 -vframes 12 -f rawvideo -pix_fmt yuv420p \
+///   tests/fixtures/cabac_high_200x200_noisy.yuv
+/// ```
+#[test]
+#[ignore = "known CABAC B-slice bug on noisy content; un-ignore once fixed"]
+fn cabac_high_profile_noisy_decodes_bit_exact_vs_ffmpeg() {
+    let (sps, pps, frames) = split_frames(NOISY_ES);
+    assert_eq!(frames.len(), EXPECTED_FRAMES);
+    assert_eq!(
+        NOISY_REF_YUV.len(),
+        FRAME_BYTES * EXPECTED_FRAMES,
+        "noisy reference YUV size drift"
+    );
+
+    let mut params = CodecParameters::video(CodecId::new("h264"));
+    params.extradata.clear();
+    let mut dec = oxideav_h264::decoder::make_decoder(&params).expect("make_decoder");
+
+    let mut header = Vec::new();
+    header.extend_from_slice(&[0, 0, 0, 1]);
+    header.extend_from_slice(&sps);
+    header.extend_from_slice(&[0, 0, 0, 1]);
+    header.extend_from_slice(&pps);
+    let pkt = Packet::new(0, TimeBase::new(1, 25), header);
+    let _ = dec.send_packet(&pkt);
+
+    let mut display_idx = 0usize;
+    let check = |vf: &VideoFrame, display_idx: usize, decode_idx: Option<usize>| {
+        let ours = flatten_yuv420p(vf);
+        let off = display_idx * FRAME_BYTES;
+        assert!(
+            off + FRAME_BYTES <= NOISY_REF_YUV.len(),
+            "decoded past end of noisy reference yuv at display #{display_idx}"
+        );
+        let theirs = &NOISY_REF_YUV[off..off + FRAME_BYTES];
+        if ours != theirs {
+            let (diff, max) = summarise_diff(&ours, theirs);
+            match decode_idx {
+                Some(i) => panic!(
+                    "noisy display #{display_idx} (from decode frame {i}): \
+                     {diff}/{total} bytes differ, max |Δ|={max} — \
+                     libavcodec-bit-exact decode regressed.",
+                    total = FRAME_BYTES
+                ),
+                None => panic!(
+                    "noisy display #{display_idx} (drained after flush): \
+                     {diff}/{total} bytes differ, max |Δ|={max} — \
+                     libavcodec-bit-exact decode regressed.",
+                    total = FRAME_BYTES
+                ),
+            }
+        }
+    };
+    for (decode_idx, frame_bytes) in frames.iter().enumerate() {
+        let pkt = Packet::new(0, TimeBase::new(1, 25), frame_bytes.clone());
+        dec.send_packet(&pkt).unwrap_or_else(|e| {
+            panic!("noisy send_packet on decode frame {decode_idx} failed: {e}")
+        });
+        while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+            check(&vf, display_idx, Some(decode_idx));
+            display_idx += 1;
+        }
+    }
     dec.flush().expect("flush");
     while let Ok(Frame::Video(vf)) = dec.receive_frame() {
         check(&vf, display_idx, None);
