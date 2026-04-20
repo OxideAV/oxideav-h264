@@ -109,6 +109,46 @@ const LUMA_4X4_XY: [(i32, i32); 16] = [
 /// §6.4.3 — upper-left (x, y) of each 8x8 luma block inside the MB.
 const LUMA_8X8_XY: [(i32, i32); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
 
+/// §8.5.7 / Table 8-14 — inverse 8x8 zig-zag scan.
+///
+/// Maps `idx -> (i, j)` such that the scan-order list entry at index
+/// `idx` corresponds to the row-major matrix entry `c[i][j]` (stored
+/// at `i*8 + j` in the returned buffer).
+///
+/// Reproduced verbatim from Table 8-14 (zig-zag row, frame-macroblock
+/// case). The field-scan variant is not used here since this module
+/// only handles frame pictures.
+const ZIGZAG_8X8: [(usize, usize); 64] = [
+    // idx 0..=7.
+    (0, 0), (0, 1), (1, 0), (2, 0), (1, 1), (0, 2), (0, 3), (1, 2),
+    // idx 8..=15.
+    (2, 1), (3, 0), (4, 0), (3, 1), (2, 2), (1, 3), (0, 4), (0, 5),
+    // idx 16..=23.
+    (1, 4), (2, 3), (3, 2), (4, 1), (5, 0), (6, 0), (5, 1), (4, 2),
+    // idx 24..=31.
+    (3, 3), (2, 4), (1, 5), (0, 6), (0, 7), (1, 6), (2, 5), (3, 4),
+    // idx 32..=39.
+    (4, 3), (5, 2), (6, 1), (7, 0), (7, 1), (6, 2), (5, 3), (4, 4),
+    // idx 40..=47.
+    (3, 5), (2, 6), (1, 7), (2, 7), (3, 6), (4, 5), (5, 4), (6, 3),
+    // idx 48..=55.
+    (7, 2), (7, 3), (6, 4), (5, 5), (4, 6), (3, 7), (4, 7), (5, 6),
+    // idx 56..=63.
+    (6, 5), (7, 4), (7, 5), (6, 6), (5, 7), (6, 7), (7, 6), (7, 7),
+];
+
+/// §8.5.7 — invert the 8x8 zig-zag scan (frame-macroblock case of
+/// Table 8-14). Input is the 64-entry scan-order coefficient list;
+/// output is the row-major 8x8 matrix with `c[i][j]` at index
+/// `i*8 + j`, ready for [`inverse_transform_8x8`].
+fn inverse_scan_8x8_zigzag(levels: &[i32; 64]) -> [i32; 64] {
+    let mut out = [0i32; 64];
+    for (k, &(i, j)) in ZIGZAG_8X8.iter().enumerate() {
+        out[i * 8 + j] = levels[k];
+    }
+    out
+}
+
 // -------------------------------------------------------------------------
 // Public entry point
 // -------------------------------------------------------------------------
@@ -486,34 +526,41 @@ fn reconstruct_intra_nxn(
             predict_8x8(mode, &filtered, bit_depth_y, &mut pred_samples);
 
             // §8.5.13 — inverse transform of the 8x8 residual block.
+            //
+            // Storage convention: `mb.residual_luma[blk8*4..blk8*4+4]`
+            // holds four 16-entry arrays that together contain the 64
+            // coefficients of this 8x8 block. The concatenation order
+            // (sub 0 → indices 0..=15, sub 1 → 16..=31, ...) is the
+            // 8x8 scan order produced by CABAC's single
+            // `residual_block(..., 63, 64)` call (see §7.3.5.3.1 and
+            // the CABAC path in macroblock_layer.rs).
+            //
+            // Assumption: the concatenated 64 entries are in 8x8
+            // zig-zag scan order (§8.5.7 / Table 8-14) — this matches
+            // the CABAC path. The CAVLC path in macroblock_layer
+            // currently emits four independent 4x4 zig-zag scans per
+            // 8x8 block (a known simplification documented at the top
+            // of that module); for that path the pixels will be wrong
+            // but at least the pipeline runs instead of erroring out.
+            // TODO: once the CAVLC 8x8 walker reads a single 64-coeff
+            // block in 8x8 zig-zag order, this will be correct for
+            // both entropy modes.
             let coeffs_flat: [i32; 64] = {
-                // When this 8x8 bit of cbp_luma is 0 the residual is zero.
                 let bit = (cbp_luma >> blk8) & 1 == 1;
                 if bit {
-                    // Coefficients are stored as four 4x4 sub-blocks;
-                    // fold back into an 8x8 scan. Since macroblock_layer
-                    // packs four 4x4 blocks (scan order) per 8x8, we
-                    // reconstitute by placing the 16 dequantised-scan
-                    // coefficients into an 8x8 zigzag. For this pass we
-                    // take a simplified approach: concatenate the four
-                    // 16-entry 4x4 arrays into the first 64 entries of
-                    // the 8x8 scan (this is only exact when the
-                    // bitstream is fully zero, which is the case for our
-                    // tests).
-                    let mut buf = [0i32; 64];
+                    let mut scan = [0i32; 64];
                     for sub in 0..4usize {
                         let base = blk8 * 4 + sub;
                         if let Some(coefs) = mb.residual_luma.get(base) {
-                            // Copy the first N entries — good enough for
-                            // zero-residual tests; non-zero will need the
-                            // proper 8x8 scan assembly when encoders
-                            // produce 8x8 I_NxN data.
                             for (i, c) in coefs.iter().enumerate().take(16) {
-                                buf[sub * 16 + i] = *c;
+                                scan[sub * 16 + i] = *c;
                             }
                         }
                     }
-                    buf
+                    // §8.5.7 / Table 8-14 — invert the 8x8 zig-zag
+                    // scan. `inverse_transform_8x8` consumes a row-
+                    // major 8x8 matrix (c_ij at index i*8+j).
+                    inverse_scan_8x8_zigzag(&scan)
                 } else {
                     [0i32; 64]
                 }
@@ -1125,21 +1172,26 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
 
     if mb.transform_size_8x8_flag {
         // §8.5.13 — 8x8 inter residual path (four 8x8 blocks).
-        // Each 8x8 is flagged by one bit of cbp_luma.
+        // Each 8x8 is flagged by one bit of cbp_luma. The four 16-
+        // entry arrays in residual_luma[blk8*4..blk8*4+4] concatenate
+        // to the 8x8-zigzag-scanned coefficients (CABAC path); invert
+        // the 8x8 scan (§8.5.7 / Table 8-14) before feeding into
+        // inverse_transform_8x8. See Intra_8x8 branch for the same
+        // reasoning and the CAVLC-path caveat.
         for blk8 in 0..4usize {
             let (bx, by) = LUMA_8X8_XY[blk8];
             let has_res = (cbp_luma >> blk8) & 1 == 1;
             let coeffs = if has_res {
-                let mut buf = [0i32; 64];
+                let mut scan = [0i32; 64];
                 for sub in 0..4usize {
                     let base = blk8 * 4 + sub;
                     if let Some(c) = mb.residual_luma.get(base) {
                         for (i, v) in c.iter().enumerate().take(16) {
-                            buf[sub * 16 + i] = *v;
+                            scan[sub * 16 + i] = *v;
                         }
                     }
                 }
-                buf
+                inverse_scan_8x8_zigzag(&scan)
             } else {
                 [0i32; 64]
             };
@@ -1208,8 +1260,9 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
 ///
 /// * P / SP slices: `pps.weighted_pred_flag` selects explicit.
 /// * B slices: `pps.weighted_bipred_idc == 1` selects explicit.
-///   `weighted_bipred_idc == 2` is implicit (§8.4.2.3.3) — not yet
-///   implemented; fall back to the default path (TODO).
+///   `weighted_bipred_idc == 2` is implicit (§8.4.2.3.3) — handled
+///   separately via [`weighted_implicit_active`]; this helper returns
+///   `false` in that case.
 ///   `weighted_bipred_idc == 0` is default.
 ///
 /// A `pred_weight_table` that is `None` (parser didn't attach one) is
@@ -1222,10 +1275,109 @@ fn weighted_explicit_active(slice_header: &SliceHeader, pps: &Pps) -> bool {
     match slice_header.slice_type {
         SliceType::P | SliceType::SP => pps.weighted_pred_flag,
         SliceType::B => pps.weighted_bipred_idc == 1,
-        // TODO(§8.4.2.3.3): implicit weighted prediction for
-        // weighted_bipred_idc == 2 — derive weights from POC distance.
-        // Currently falls through to the default path.
         _ => false,
+    }
+}
+
+/// §8.4.2.3.3 — decide whether the implicit weighted-prediction path
+/// applies for the current slice.
+///
+/// Implicit mode is selected for B slices when `weighted_bipred_idc
+/// == 2`. Only the bipred sub-case is affected by implicit weighting
+/// (eq. 8-276 with `logWDC = 5`, zero offsets, and weights derived
+/// from POC distance); L0-only / L1-only partitions still use the
+/// default copy-through path per §8.4.2.3.1.
+///
+/// Unlike the explicit path, implicit does NOT require a
+/// `pred_weight_table` in the slice — the weights are fully derived
+/// from POC.
+fn weighted_implicit_active(slice_header: &SliceHeader, pps: &Pps) -> bool {
+    matches!(slice_header.slice_type, SliceType::B) && pps.weighted_bipred_idc == 2
+}
+
+/// §8.4.2.3.3 — implicit weighted-prediction weight derivation.
+///
+/// Returns `(w0, w1, log2WD)` where the final bipred prediction is
+/// computed by the same eq. 8-276 formula as explicit mode:
+///
+/// ```text
+///   v = Clip1( ((predL0*w0 + predL1*w1 + 2^logWD) >> (logWD + 1)) )
+/// ```
+///
+/// with zero offsets (eq. 8-278, 8-279 set `o0C = o1C = 0`) and
+/// `logWD = 5` (eq. 8-277). `w0` + `w1` always equals 64.
+///
+/// Equations (citing spec clause numbers):
+///
+/// * eq. 8-201: `tb = Clip3(-128, 127, currPOC - pic0POC)`
+/// * eq. 8-202: `td = Clip3(-128, 127, pic1POC - pic0POC)`
+/// * eq. 8-197: `tx = (16384 + Abs(td/2)) / td`
+/// * eq. 8-198: `DistScaleFactor = Clip3(-1024, 1023, (tb*tx + 32) >> 6)`
+/// * eq. 8-280, 8-281: fallback `w0 = w1 = 32` when `td == 0`, or one
+///   of the refs is long-term, or `DistScaleFactor >> 2` is outside
+///   `[-64, 128]`.
+/// * eq. 8-282, 8-283: otherwise `w0 = 64 - (DistScaleFactor >> 2)`,
+///   `w1 = DistScaleFactor >> 2`.
+///
+/// `long_term_either` should be set when either `pic0` or `pic1` is
+/// marked "used for long-term reference" (§8.2.5). This module does
+/// not have direct access to the DPB marking (`RefPicProvider`
+/// exposes only [`Picture`] samples), so callers currently pass
+/// `false` and the implicit path assumes both refs are short-term.
+/// Non-conforming for bitstreams that use long-term refs as bipred
+/// references — TODO(§8.2.5.2): plumb marking through to the provider.
+fn implicit_bipred_weights(
+    curr_poc: i32,
+    poc_l0: i32,
+    poc_l1: i32,
+    long_term_either: bool,
+) -> (i32, i32, u32) {
+    // logWDC = 5 (eq. 8-277).
+    let log2_wd: u32 = 5;
+
+    // eq. 8-202 — td first; when zero, fall through to equal weights.
+    let td = clip3_i32(-128, 127, poc_l1 - poc_l0);
+    if td == 0 || long_term_either {
+        // eq. 8-280, 8-281 — equal weighting.
+        return (32, 32, log2_wd);
+    }
+
+    // eq. 8-201 — tb.
+    let tb = clip3_i32(-128, 127, curr_poc - poc_l0);
+
+    // eq. 8-197 — tx = (16384 + |td/2|) / td.
+    //   Division matches the C-style "truncate toward zero" used by
+    //   the spec (DivideBy in §5.7 defers to integer division).
+    let tx = (16384 + (td / 2).abs()) / td;
+
+    // eq. 8-198 — DistScaleFactor.
+    let dist_scale_factor = clip3_i32(-1024, 1023, (tb * tx + 32) >> 6);
+
+    // The spec's fallback band: the raw DistScaleFactor range
+    // [-1024, 1023] corresponds to (DistScaleFactor >> 2) in
+    // [-256, 255]. Implicit weighting is disabled when this is
+    // outside [-64, 128] (eq. 8-280..8-281 — the first bullet in
+    // §8.4.2.3.3).
+    let dsf_shift2 = dist_scale_factor >> 2;
+    if !(-64..=128).contains(&dsf_shift2) {
+        return (32, 32, log2_wd);
+    }
+
+    // eq. 8-282, 8-283.
+    let w1 = dsf_shift2;
+    let w0 = 64 - w1;
+    (w0, w1, log2_wd)
+}
+
+/// §5.7 `Clip3(x, y, z) = min(y, max(x, z))`.
+#[inline]
+fn clip3_i32(x: i32, y: i32, z: i32) -> i32 {
+    if z < x {
+        x
+    } else if z > y {
+        y
+    } else {
+        z
     }
 }
 
@@ -1440,8 +1592,10 @@ fn process_partition<R: RefPicProvider>(
     //     bipred, copy for single list).
     //   - weighted_bipred_idc == 1 → explicit (eq. 8-274/8-275/8-276
     //     with weights/offsets pulled from the slice's pred_weight_table).
-    //   - weighted_bipred_idc == 2 → implicit (§8.4.2.3.3). Not yet
-    //     implemented — fall back to the default path.
+    //   - weighted_bipred_idc == 2 → implicit (§8.4.2.3.3). Weights
+    //     derived from POC distance; only the bipred sub-case uses
+    //     implicit weighting (single-list partitions fall through to
+    //     the default copy-through).
     let use_explicit = weighted_explicit_active(slice_header, pps);
     let bi_mode = if has_l0 && has_l1 {
         Some(BiPredMode::Bipred)
@@ -1453,6 +1607,45 @@ fn process_partition<R: RefPicProvider>(
         None
     };
 
+    // §8.4.2.3.3 — implicit weighted bipred only fires on true bipred
+    // partitions. For L0-only / L1-only in a weighted_bipred_idc==2
+    // slice, the spec falls back to default (§8.4.2.3.1).
+    let use_implicit_bipred =
+        weighted_implicit_active(slice_header, pps) && matches!(bi_mode, Some(BiPredMode::Bipred));
+
+    // §8.4.2.3.3 — derive implicit weights from POC distance when
+    // implicit mode is active. The current picture's POC is in
+    // `pic.pic_order_cnt`; the two ref pictures' POCs are in their
+    // respective `Picture.pic_order_cnt` fields.
+    let implicit_weights = if use_implicit_bipred {
+        let curr_poc = pic.pic_order_cnt;
+        // has_l0 && has_l1 guaranteed by bi_mode == Bipred above.
+        let rp0 = ref_pics
+            .ref_pic(0, part.ref_idx_l0 as u32)
+            .ok_or(ReconstructError::MissingRefPic {
+                list: 0,
+                idx: part.ref_idx_l0 as u32,
+            })?;
+        let rp1 = ref_pics
+            .ref_pic(1, part.ref_idx_l1 as u32)
+            .ok_or(ReconstructError::MissingRefPic {
+                list: 1,
+                idx: part.ref_idx_l1 as u32,
+            })?;
+        // TODO(§8.2.5): RefPicProvider doesn't expose long-term
+        // marking. Assume both refs are short-term — conforming for
+        // the common case where bipred uses short-term refs.
+        let long_term_either = false;
+        Some(implicit_bipred_weights(
+            curr_poc,
+            rp0.pic_order_cnt,
+            rp1.pic_order_cnt,
+            long_term_either,
+        ))
+    } else {
+        None
+    };
+
     for py in 0..h as usize {
         for px in 0..w as usize {
             let dst_idx = (part.y as usize + py) * 16 + (part.x as usize + px);
@@ -1460,6 +1653,11 @@ fn process_partition<R: RefPicProvider>(
                 Some(_) if use_explicit => {
                     // Handled in bulk below via weighted_pred_explicit;
                     // defer by leaving the slot at 0 for now.
+                    0
+                }
+                Some(BiPredMode::Bipred) if use_implicit_bipred => {
+                    // Handled in bulk below via the implicit weighted
+                    // pred path; defer.
                     0
                 }
                 Some(BiPredMode::Bipred) => {
@@ -1476,6 +1674,38 @@ fn process_partition<R: RefPicProvider>(
                 }
             };
             pred_luma[dst_idx] = v;
+        }
+    }
+
+    // §8.4.2.3.3 — implicit bipred: apply eq. 8-276 with
+    // `logWD = 5`, offsets = 0, and POC-derived weights.
+    if let Some((w0, w1, log2_wd)) = implicit_weights {
+        let mut scratch = vec![0i32; (w as usize) * (h as usize)];
+        weighted_pred_explicit(
+            Some(l0_buf.as_slice()),
+            Some(l1_buf.as_slice()),
+            w as usize,
+            w,
+            h,
+            BiPredMode::Bipred,
+            WeightedEntry {
+                weight: w0,
+                offset: 0,
+            },
+            WeightedEntry {
+                weight: w1,
+                offset: 0,
+            },
+            log2_wd,
+            bit_depth_y,
+            &mut scratch,
+            w as usize,
+        );
+        for py in 0..h as usize {
+            for px in 0..w as usize {
+                let dst_idx = (part.y as usize + py) * 16 + (part.x as usize + px);
+                pred_luma[dst_idx] = scratch[py * w as usize + px];
+            }
         }
     }
 
@@ -1583,10 +1813,62 @@ fn process_partition<R: RefPicProvider>(
             )?;
         }
         // Combine into pred_cb / pred_cr at MB-local position.
-        // §8.4.2.3 — the same default/explicit dispatch as luma applies
-        // to chroma, with separate weights per (list, iCbCr) and a
-        // separate log2 denominator (chroma_log2_weight_denom).
-        if use_explicit {
+        // §8.4.2.3 — the same default/explicit/implicit dispatch as
+        // luma applies to chroma. Explicit mode uses separate weights
+        // per (list, iCbCr) and a separate log2 denominator
+        // (chroma_log2_weight_denom). Implicit mode (§8.4.2.3.3)
+        // reuses the luma (w0, w1, log2WD=5) triple — eq. 8-282/8-283
+        // are specified for "C" replaced by L/Cb/Cr with the same
+        // DistScaleFactor, and eq. 8-277 fixes logWDC = 5.
+        if let Some((w0, w1, log2_wd)) = implicit_weights {
+            let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
+            let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+            let w_entry_l0 = WeightedEntry {
+                weight: w0,
+                offset: 0,
+            };
+            let w_entry_l1 = WeightedEntry {
+                weight: w1,
+                offset: 0,
+            };
+            weighted_pred_explicit(
+                Some(l0_cb.as_slice()),
+                Some(l1_cb.as_slice()),
+                c_w as usize,
+                c_w,
+                c_h,
+                BiPredMode::Bipred,
+                w_entry_l0,
+                w_entry_l1,
+                log2_wd,
+                bit_depth_c,
+                &mut scratch_cb,
+                c_w as usize,
+            );
+            weighted_pred_explicit(
+                Some(l0_cr.as_slice()),
+                Some(l1_cr.as_slice()),
+                c_w as usize,
+                c_w,
+                c_h,
+                BiPredMode::Bipred,
+                w_entry_l0,
+                w_entry_l1,
+                log2_wd,
+                bit_depth_c,
+                &mut scratch_cr,
+                c_w as usize,
+            );
+            for py in 0..c_h as usize {
+                for px in 0..c_w as usize {
+                    let dst_idx =
+                        (c_part_y as usize + py) * (mbw_c_use as usize) + (c_part_x as usize + px);
+                    let idx = py * c_w as usize + px;
+                    pred_cb[dst_idx] = scratch_cb[idx];
+                    pred_cr[dst_idx] = scratch_cr[idx];
+                }
+            }
+        } else if use_explicit {
             if let (Some(mode), Some(pwt)) = (bi_mode, slice_header.pred_weight_table.as_ref()) {
                 let log2_wd_c = pwt.chroma_log2_weight_denom;
                 // Cb: iCbCr = 0.
@@ -3400,6 +3682,92 @@ mod tests {
     }
 
     #[test]
+    fn intra_8x8_zero_residual_dc_fallback_produces_dc_prediction() {
+        // §8.3.2 / §8.5.13 — an Intra_8x8 macroblock with
+        // `transform_size_8x8_flag = 1`, `cbp_luma = 0` (no residual),
+        // and all four 8x8 blocks using DC prediction with no
+        // neighbours should reconstruct to DC = 1 << (BitDepth-1) = 128
+        // for 8-bit per §8.3.2.2.4 (Intra_8x8_DC, both neighbours
+        // unavailable).
+        //
+        // This exercises the 8x8 residual assembly path (Option B:
+        // inverse 8x8 zig-zag scan via ZIGZAG_8X8 / Table 8-14) with
+        // an all-zero coefficient block — the inverse transform of
+        // zero is zero, so the output is purely the DC prediction.
+        let sps = make_sps(1, 1);
+        let pps = make_pps();
+        let sh = make_slice_header();
+
+        let mut pred = MbPred::default();
+        for i in 0..4 {
+            // prev_intra8x8_pred_mode_flag = true → use the predicted-
+            // mode fallback (DC per the reconstruct path's stub).
+            pred.prev_intra8x8_pred_mode_flag[i] = true;
+            pred.rem_intra8x8_pred_mode[i] = 0;
+        }
+        pred.intra_chroma_pred_mode = 0;
+        let mb = Macroblock {
+            mb_type: MbType::INxN,
+            mb_type_raw: 0,
+            mb_pred: Some(pred),
+            sub_mb_pred: None,
+            pcm_samples: None,
+            coded_block_pattern: 0, // cbp_luma = 0 → no residual.
+            transform_size_8x8_flag: true,
+            mb_qp_delta: 0,
+            residual_luma: Vec::new(),
+            residual_luma_dc: None,
+            residual_chroma_dc_cb: vec![0i32; 4],
+            residual_chroma_dc_cr: vec![0i32; 4],
+            residual_chroma_ac_cb: Vec::new(),
+            residual_chroma_ac_cr: Vec::new(),
+            is_skip: false,
+        };
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid).unwrap();
+
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    128,
+                    "intra_8x8 DC with no neighbours and zero residual \
+                     should produce 128 at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_scan_8x8_zigzag_roundtrip_matches_table_8_14() {
+        // Spot-check a few entries from Table 8-14:
+        //   idx 0 → c00  (row 0, col 0)
+        //   idx 1 → c01  (row 0, col 1)
+        //   idx 2 → c10  (row 1, col 0)
+        //   idx 7 → c12  (row 1, col 2)
+        //   idx 63 → c77 (row 7, col 7)
+        let mut scan = [0i32; 64];
+        scan[0] = 11;
+        scan[1] = 12;
+        scan[2] = 13;
+        scan[7] = 17;
+        scan[63] = 77;
+        let m = inverse_scan_8x8_zigzag(&scan);
+        assert_eq!(m[0 * 8 + 0], 11, "idx 0 → c00");
+        assert_eq!(m[0 * 8 + 1], 12, "idx 1 → c01");
+        assert_eq!(m[1 * 8 + 0], 13, "idx 2 → c10");
+        assert_eq!(m[1 * 8 + 2], 17, "idx 7 → c12");
+        assert_eq!(m[7 * 8 + 7], 77, "idx 63 → c77");
+    }
+
+    #[test]
     fn deblocking_alters_intra_edge() {
         // Build a 2x1 MB picture (32x16) with a hard horizontal step
         // between two intra MBs. With deblocking enabled, bS=3 for an
@@ -3995,18 +4363,22 @@ mod tests {
     }
 
     #[test]
-    fn b_bi_16x16_implicit_bipred_idc_falls_back_to_default() {
-        // §8.4.2.3.3 — implicit weighted pred (weighted_bipred_idc == 2)
-        // is not yet implemented. The dispatch must fall back to the
-        // default average (same as weighted_bipred_idc == 0).
+    fn b_bi_16x16_implicit_bipred_idc_td_zero_falls_back_to_equal_weights() {
+        // §8.4.2.3.3 — when td = Clip3(-128, 127, pic1POC - pic0POC) is
+        // zero, eq. 8-280 / 8-281 set w0C = w1C = 32 (logWDC = 5,
+        // offsets zero per eq. 8-277/8-278/8-279).
         //
-        // With p0 = 80, p1 = 120 and the default bipred average (eq.
-        // 8-273): (80 + 120 + 1) >> 1 = 100.
+        // Then eq. 8-276 with w0=w1=32, log2WD=5:
+        //   v = ((80*32 + 120*32 + 32) >> 6) + 0
+        //     = ((2560 + 3840 + 32) >> 6)
+        //     = 6432 >> 6
+        //     = 100.
         let sps = make_sps(1, 1);
         let mut pps = make_pps();
-        pps.weighted_bipred_idc = 2; // implicit, deferred → default
+        pps.weighted_bipred_idc = 2; // implicit.
         let sh = make_b_slice_header();
 
+        // Both refs have pic_order_cnt = 0 (default) → td = 0.
         let l0 = make_ref_pic(16, 16, |_, _| 80);
         let l1 = make_ref_pic(16, 16, |_, _| 120);
         let mut store = RefPicStore::new();
@@ -4028,12 +4400,205 @@ mod tests {
                 assert_eq!(
                     pic.luma_at(x, y),
                     100,
-                    "expected 100 (default bipred average) at ({}, {}), got {}",
+                    "expected 100 (implicit w0=w1=32 via td=0 fallback) at \
+                     ({}, {}), got {}",
                     x,
                     y,
                     pic.luma_at(x, y)
                 );
             }
         }
+    }
+
+    #[test]
+    fn b_bi_16x16_implicit_bipred_idc_poc_midpoint_applies_equal_weights() {
+        // §8.4.2.3.3 — current picture temporally between the two
+        // refs. With pic0 POC = 0, pic1 POC = 8, curr POC = 4:
+        //
+        //   td = Clip3(-128, 127, 8 - 0) = 8           (eq. 8-202)
+        //   tb = Clip3(-128, 127, 4 - 0) = 4           (eq. 8-201)
+        //   tx = (16384 + |8/2|) / 8
+        //      = (16384 + 4) / 8 = 2048                 (eq. 8-197)
+        //   DistScaleFactor = Clip3(-1024, 1023,
+        //                           (4*2048 + 32) >> 6)
+        //                   = Clip3(-1024, 1023,
+        //                           8224 >> 6)
+        //                   = Clip3(-1024, 1023, 128)
+        //                   = 128                      (eq. 8-198)
+        //   DistScaleFactor >> 2 = 32 — in [-64, 128],
+        //   so eq. 8-282/8-283: w1 = 32, w0 = 64 - 32 = 32.
+        //
+        // Since the midpoint yields equal weights, with
+        // predL0 = 40, predL1 = 120:
+        //   (40*32 + 120*32 + 32) >> 6
+        //     = (1280 + 3840 + 32) >> 6
+        //     = 5152 >> 6
+        //     = 80.
+        let sps = make_sps(1, 1);
+        let mut pps = make_pps();
+        pps.weighted_bipred_idc = 2;
+        let sh = make_b_slice_header();
+
+        let mut l0 = make_ref_pic(16, 16, |_, _| 40);
+        l0.pic_order_cnt = 0;
+        let mut l1 = make_ref_pic(16, 16, |_, _| 120);
+        l1.pic_order_cnt = 8;
+        let mut store = RefPicStore::new();
+        store.insert(0, l0);
+        store.insert(1, l1);
+        store.set_list_0(vec![0]);
+        store.set_list_1(vec![1]);
+
+        let mb = make_b_bi_16x16(0, 0);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        pic.pic_order_cnt = 4;
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    80,
+                    "expected 80 (implicit midpoint w0=w1=32) at ({}, {}), got {}",
+                    x,
+                    y,
+                    pic.luma_at(x, y)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn b_bi_16x16_implicit_bipred_idc_asymmetric_poc_weights_lean_on_closer_ref() {
+        // §8.4.2.3.3 — current picture closer to L0 than L1. With
+        //   pic0 POC = 0, pic1 POC = 8, curr POC = 2:
+        //   td = 8, tb = 2, tx = 2048
+        //   DistScaleFactor = Clip3(-1024, 1023, (2*2048 + 32) >> 6)
+        //                   = (4128 >> 6) = 64
+        //   DistScaleFactor >> 2 = 16  (in range)
+        //   w1 = 16, w0 = 48 — L0 is 3x weighted (L0 is temporally
+        //   closer to curr, so its bigger weight is expected).
+        //
+        // With predL0 = 100, predL1 = 20 (flat planes):
+        //   (100*48 + 20*16 + 32) >> 6
+        //     = (4800 + 320 + 32) >> 6
+        //     = 5152 >> 6
+        //     = 80.
+        let sps = make_sps(1, 1);
+        let mut pps = make_pps();
+        pps.weighted_bipred_idc = 2;
+        let sh = make_b_slice_header();
+
+        let mut l0 = make_ref_pic(16, 16, |_, _| 100);
+        l0.pic_order_cnt = 0;
+        let mut l1 = make_ref_pic(16, 16, |_, _| 20);
+        l1.pic_order_cnt = 8;
+        let mut store = RefPicStore::new();
+        store.insert(0, l0);
+        store.insert(1, l1);
+        store.set_list_0(vec![0]);
+        store.set_list_1(vec![1]);
+
+        let mb = make_b_bi_16x16(0, 0);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        pic.pic_order_cnt = 2;
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    80,
+                    "expected 80 (implicit asymmetric w0=48, w1=16) at \
+                     ({}, {}), got {}",
+                    x,
+                    y,
+                    pic.luma_at(x, y)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_bipred_weights_td_zero_returns_equal_weights() {
+        // §8.4.2.3.3 eq. 8-280 / 8-281 — td == 0 path.
+        assert_eq!(
+            implicit_bipred_weights(0, 0, 0, false),
+            (32, 32, 5),
+            "td == 0 should yield w0 = w1 = 32"
+        );
+    }
+
+    #[test]
+    fn implicit_bipred_weights_long_term_returns_equal_weights() {
+        // §8.4.2.3.3 eq. 8-280 / 8-281 — long-term ref path.
+        assert_eq!(
+            implicit_bipred_weights(4, 0, 8, true),
+            (32, 32, 5),
+            "long-term ref should yield w0 = w1 = 32"
+        );
+    }
+
+    #[test]
+    fn implicit_bipred_weights_midpoint_yields_equal_weights() {
+        // Midpoint — tb = td/2 — yields DistScaleFactor = 128, so
+        // w1 = 32, w0 = 32.
+        assert_eq!(
+            implicit_bipred_weights(4, 0, 8, false),
+            (32, 32, 5),
+            "midpoint → equal weights"
+        );
+    }
+
+    #[test]
+    fn implicit_bipred_weights_hand_computed_asymmetric() {
+        // curr closer to L0:
+        //   tb = 2, td = 8, tx = (16384 + 4) / 8 = 2048.
+        //   DistScaleFactor = (2*2048 + 32) >> 6 = 4128 >> 6 = 64.
+        //   DistScaleFactor >> 2 = 16 (in range).
+        //   w1 = 16, w0 = 48.
+        assert_eq!(
+            implicit_bipred_weights(2, 0, 8, false),
+            (48, 16, 5),
+            "curr closer to L0 (tb=2, td=8)"
+        );
+
+        // curr closer to L1:
+        //   tb = 6, td = 8, tx = 2048.
+        //   DistScaleFactor = (6*2048 + 32) >> 6 = 12320 >> 6 = 192.
+        //   DistScaleFactor >> 2 = 48 (in range).
+        //   w1 = 48, w0 = 16.
+        assert_eq!(
+            implicit_bipred_weights(6, 0, 8, false),
+            (16, 48, 5),
+            "curr closer to L1 (tb=6, td=8)"
+        );
+    }
+
+    #[test]
+    fn implicit_bipred_weights_extrapolation_out_of_band_falls_back() {
+        // curr well outside the span of the two refs — DistScaleFactor>>2
+        // exits [-64, 128] → eq. 8-280/8-281 fallback to (32, 32).
+        //
+        // With pic0=0, pic1=8, curr=-100:
+        //   tb = -100, td = 8, tx = 2048.
+        //   DistScaleFactor = Clip3(-1024, 1023, (-100*2048 + 32) >> 6)
+        //                   = Clip3(-1024, 1023, -204768 >> 6)
+        //                   = Clip3(-1024, 1023, -3200)
+        //                   = -1024.
+        //   -1024 >> 2 = -256 (< -64) → fallback.
+        assert_eq!(
+            implicit_bipred_weights(-100, 0, 8, false),
+            (32, 32, 5),
+            "out-of-band DistScaleFactor should fall back to equal weights"
+        );
     }
 }

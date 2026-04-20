@@ -1044,6 +1044,15 @@ pub fn parse_macroblock(
     _current_mb_addr: u32,
 ) -> McblResult<Macroblock> {
     let slice_type = slice_header.slice_type;
+    let dbg = std::env::var("OXIDEAV_H264_DEBUG").is_ok();
+    let mb_addr_dbg = entropy.current_mb_addr;
+    if dbg {
+        let (b, bi) = r.position();
+        eprintln!(
+            "[MB {:>4}] enter cursor=({},{}) slice_type={:?}",
+            mb_addr_dbg, b, bi, slice_type
+        );
+    }
 
     // ---------------------------------------------------------------
     // §7.3.5 — mb_type.
@@ -1058,6 +1067,13 @@ pub fn parse_macroblock(
     } else {
         r.ue()?
     };
+    if dbg {
+        let (b, bi) = r.position();
+        eprintln!(
+            "[MB {:>4}]   after mb_type raw={} cursor=({},{})",
+            mb_addr_dbg, mb_type_raw, b, bi
+        );
+    }
 
     let mb_type = match slice_type {
         SliceType::I | SliceType::SI => MbType::from_i_slice(mb_type_raw)?,
@@ -1136,14 +1152,37 @@ pub fn parse_macroblock(
 
     // ---------------------------------------------------------------
     // §7.3.5 — non-PCM path: sub_mb_pred OR mb_pred.
+    //
+    // Per the spec syntax table, when mb_type == I_NxN AND the PPS
+    // has transform_8x8_mode_flag == 1, `transform_size_8x8_flag` is
+    // read BEFORE `mb_pred(mb_type)` so that the pred-mode loop can
+    // switch to 4 Intra_8x8 entries (vs. 16 Intra_4x4 entries). This
+    // gate is checked again — for the non-I_NxN case — after
+    // coded_block_pattern.
     // ---------------------------------------------------------------
     let mut mb_pred: Option<MbPred> = None;
     let mut sub_mb_pred: Option<SubMbPred> = None;
+    let mut transform_size_8x8_flag = false;
 
     if mb_type.is_sub_mb_path() {
         sub_mb_pred = Some(parse_sub_mb_pred(r, entropy, &mb_type)?);
     } else {
-        mb_pred = Some(parse_mb_pred(r, entropy, &mb_type)?);
+        // §7.3.5 — read transform_size_8x8_flag for I_NxN when allowed.
+        if mb_type.is_i_nxn() && entropy.transform_8x8_mode_flag {
+            transform_size_8x8_flag = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
+                decode_transform_size_8x8_flag(dec, ctxs, &entropy.neighbours)?
+            } else {
+                r.u(1)? == 1
+            };
+        }
+        mb_pred = Some(parse_mb_pred(r, entropy, &mb_type, transform_size_8x8_flag)?);
+    }
+    if dbg {
+        let (b, bi) = r.position();
+        eprintln!(
+            "[MB {:>4}]   after mb_pred/sub_mb_pred mb_type={:?} cursor=({},{})",
+            mb_addr_dbg, mb_type, b, bi
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1165,40 +1204,32 @@ pub fn parse_macroblock(
         cbp_luma = cbp_total & 0x0F;
         cbp_chroma = (cbp_total >> 4) & 0x03;
     }
+    if dbg {
+        let (b, bi) = r.position();
+        eprintln!(
+            "[MB {:>4}]   after CBP total={} luma={} chroma={} cursor=({},{})",
+            mb_addr_dbg, cbp_total, cbp_luma, cbp_chroma, b, bi
+        );
+    }
 
     // ---------------------------------------------------------------
-    // §7.3.5 — transform_size_8x8_flag.
+    // §7.3.5 — transform_size_8x8_flag (second gate, for non-I_NxN).
     //   if (CodedBlockPatternLuma > 0 && transform_8x8_mode_flag &&
-    //       mb_type != I_NxN && ...)
+    //       mb_type != I_NxN && noSubMbPartSizeLessThan8x8Flag &&
+    //       (mb_type != B_Direct_16x16 || direct_8x8_inference_flag))
+    // For the I_NxN case the flag was already read before mb_pred.
     // ---------------------------------------------------------------
-    let transform_size_8x8_flag = if cbp_luma > 0
+    if cbp_luma > 0
         && entropy.transform_8x8_mode_flag
         && !mb_type.is_i_nxn()
         && !mb_type.is_intra_16x16()
     {
-        if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
+        transform_size_8x8_flag = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
             decode_transform_size_8x8_flag(dec, ctxs, &entropy.neighbours)?
         } else {
             r.u(1)? == 1
-        }
-    } else if mb_type.is_i_nxn() && entropy.transform_8x8_mode_flag {
-        // §7.3.5 — when mb_type == I_NxN AND transform_8x8_mode_flag,
-        // the flag is read before mb_pred so that `I_NxN` can switch
-        // to 8x8 intra. We approximate by reading it here as well
-        // (CAVLC bitstream order for I_NxN places the flag just before
-        // coded_block_pattern per the actual syntax table).
-        //
-        // NOTE: for simplicity we don't switch the pred_mode parse
-        // between 4x4 and 8x8 grids in this pass — both branches of
-        // `mb_pred` populate the fields their respective block counts.
-        if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
-            decode_transform_size_8x8_flag(dec, ctxs, &entropy.neighbours)?
-        } else {
-            r.u(1)? == 1
-        }
-    } else {
-        false
-    };
+        };
+    }
 
     // ---------------------------------------------------------------
     // §7.3.5 — mb_qp_delta. Read when any of cbp_luma, cbp_chroma, or
@@ -1215,6 +1246,13 @@ pub fn parse_macroblock(
         0
     };
     entropy.prev_mb_qp_delta_nonzero = mb_qp_delta != 0;
+    if dbg {
+        let (b, bi) = r.position();
+        eprintln!(
+            "[MB {:>4}]   after mb_qp_delta={} t8x8_flag={} cursor=({},{})",
+            mb_addr_dbg, mb_qp_delta, transform_size_8x8_flag, b, bi
+        );
+    }
 
     // ---------------------------------------------------------------
     // §7.3.5.3 — residual(). CABAC path is simplified (per-block decode
@@ -1297,34 +1335,50 @@ fn parse_mb_pred(
     r: &mut BitReader<'_>,
     entropy: &mut EntropyState<'_, '_>,
     mb_type: &MbType,
+    transform_size_8x8_flag: bool,
 ) -> McblResult<MbPred> {
     let mut pred = MbPred::default();
 
     if mb_type.is_i_nxn() {
-        // §7.3.5.1 — Intra_4x4 or Intra_8x8 pred modes.
-        // We parse 16 4x4 entries since the enum doesn't distinguish
-        // 4x4 from 8x8 at this layer (the `transform_size_8x8_flag` in
-        // the outer layer decides which sub-loop is "active"; the
-        // bitstream layout is actually gated by that flag but since we
-        // write 8x8 only when that flag is read AFTER mb_pred, we keep
-        // the 4x4 count here and let the caller ignore unused entries).
-        //
-        // For the common I_NxN + transform_8x8=0 path (4x4 pred), this
-        // is spec-accurate.
-        for i in 0..16 {
-            let flag = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
-                decode_prev_intra_pred_mode_flag(dec, ctxs)?
-            } else {
-                r.u(1)? == 1
-            };
-            pred.prev_intra4x4_pred_mode_flag[i] = flag;
-            if !flag {
-                let rem = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
-                    decode_rem_intra_pred_mode(dec, ctxs)?
+        // §7.3.5.1 — Intra_4x4 (16 blocks) or Intra_8x8 (4 blocks)
+        // pred modes, selected by the PPS `transform_8x8_mode_flag`
+        // + per-MB `transform_size_8x8_flag` gate read immediately
+        // before `mb_pred` (see caller).
+        if transform_size_8x8_flag {
+            // Intra_8x8: 4 luma8x8BlkIdx entries.
+            for i in 0..4 {
+                let flag = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
+                    decode_prev_intra_pred_mode_flag(dec, ctxs)?
                 } else {
-                    r.u(3)?
+                    r.u(1)? == 1
                 };
-                pred.rem_intra4x4_pred_mode[i] = rem as u8;
+                pred.prev_intra8x8_pred_mode_flag[i] = flag;
+                if !flag {
+                    let rem = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
+                        decode_rem_intra_pred_mode(dec, ctxs)?
+                    } else {
+                        r.u(3)?
+                    };
+                    pred.rem_intra8x8_pred_mode[i] = rem as u8;
+                }
+            }
+        } else {
+            // Intra_4x4: 16 luma4x4BlkIdx entries.
+            for i in 0..16 {
+                let flag = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
+                    decode_prev_intra_pred_mode_flag(dec, ctxs)?
+                } else {
+                    r.u(1)? == 1
+                };
+                pred.prev_intra4x4_pred_mode_flag[i] = flag;
+                if !flag {
+                    let rem = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
+                        decode_rem_intra_pred_mode(dec, ctxs)?
+                    } else {
+                        r.u(3)?
+                    };
+                    pred.rem_intra4x4_pred_mode[i] = rem as u8;
+                }
             }
         }
         // Chroma intra pred mode — read when ChromaArrayType ∈ {1, 2}.
@@ -1603,6 +1657,7 @@ fn parse_residual_cavlc_only(
 
     // Short immutable borrow for the nC lookups.
     let grid_ref: Option<&CavlcNcGrid> = entropy.cavlc_nc.as_deref();
+    let dbg = std::env::var("OXIDEAV_H264_DEBUG").is_ok();
 
     // --- Luma DC (Intra_16x16) ---
     if mb_type.is_intra_16x16() {
@@ -1658,6 +1713,13 @@ fn parse_residual_cavlc_only(
                 for sub in 0..4u8 {
                     let blk_idx = blk8 * 4 + sub;
                     let nc = derive_luma(blk_idx, LumaNcKind::Ac, &own_luma_totals, grid_ref);
+                    if dbg {
+                        let (b, bi) = r.position();
+                        eprintln!(
+                            "[MB {:>4}]   luma4x4 blk={} nc={} cursor=({},{})",
+                            current_mb_addr, blk_idx, nc, b, bi
+                        );
+                    }
                     let blk =
                         parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
                     let tc = count_nonzero(&blk);
@@ -1681,14 +1743,42 @@ fn parse_residual_cavlc_only(
                 CoeffTokenContext::ChromaDc422
             };
             let max_dc = if chroma_array_type == 1 { 4 } else { 8 };
+            if dbg {
+                let (b, bi) = r.position();
+                eprintln!(
+                    "[MB {:>4}]   chromaDc cb cursor=({},{})",
+                    current_mb_addr, b, bi
+                );
+            }
             let cb_dc = parse_residual_block_cavlc(r, dc_ctx, 0, max_dc - 1, max_dc)?;
             out.residual_chroma_dc_cb = cb_dc;
+            if dbg {
+                let (b, bi) = r.position();
+                eprintln!(
+                    "[MB {:>4}]   chromaDc cr cursor=({},{})",
+                    current_mb_addr, b, bi
+                );
+            }
             let cr_dc = parse_residual_block_cavlc(r, dc_ctx, 0, max_dc - 1, max_dc)?;
             out.residual_chroma_dc_cr = cr_dc;
+            if dbg {
+                let (b, bi) = r.position();
+                eprintln!(
+                    "[MB {:>4}]   chromaDc done cursor=({},{})",
+                    current_mb_addr, b, bi
+                );
+            }
         }
 
         // Chroma AC 4x4 blocks when cbp_chroma == 2 (per §7.3.5.3).
         if cbp_chroma == 2 {
+            if dbg {
+                let (b, bi) = r.position();
+                eprintln!(
+                    "[MB {:>4}]   chromaAc start cursor=({},{})",
+                    current_mb_addr, b, bi
+                );
+            }
             // Cb plane.
             for blk_idx in 0..num_c_blk as u8 {
                 let nc = derive_chroma(
@@ -2286,6 +2376,65 @@ mod tests {
             cavlc_nc: None,
             current_mb_addr: 0,
             constrained_intra_pred_flag: false,
+        }
+    }
+
+    /// §7.3.5 regression: when mb_type == I_NxN and the PPS has
+    /// `transform_8x8_mode_flag == 1`, a `transform_size_8x8_flag` bit
+    /// must be read BEFORE `mb_pred(mb_type)` so the pred-mode loop can
+    /// iterate 4 Intra_8x8 entries (not 16 Intra_4x4 entries). Before
+    /// the 2026-04-20 fix this flag was (incorrectly) read AFTER
+    /// `mb_pred` and after CBP, which guaranteed a bit-misalignment
+    /// for any High/Extended-profile stream with 8x8 transform on.
+    #[test]
+    fn cavlc_i_nxn_reads_transform_size_8x8_flag_before_mb_pred() {
+        // Build a minimal CAVLC bitstream for I_NxN with the 8x8 path:
+        //   mb_type = 0 → ue(v) "1"
+        //   transform_size_8x8_flag = 1 → u(1) "1"  (BEFORE mb_pred)
+        //   4 prev_intra8x8_pred_mode_flag = 1 → "1" × 4  (not 16)
+        //   intra_chroma_pred_mode = 0 → ue(v) "1"
+        //   coded_block_pattern = 0 (intra codeNum=3) → "00100"
+        //   (cbp=0 → no mb_qp_delta, no residual)
+        // If the fix is absent, `mb_pred` will read 16 u(1)s and then
+        // fail downstream because the cursor is in the wrong place.
+        let mut w = BitWriter::new();
+        w.ue(0); // mb_type = I_NxN
+        w.u(1, 1); // transform_size_8x8_flag = 1
+        for _ in 0..4 {
+            w.u(1, 1); // prev_intra8x8_pred_mode_flag
+        }
+        w.ue(0); // intra_chroma_pred_mode
+        w.ue(3); // coded_block_pattern codeNum=3 → CBP=0 (intra)
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sps = dummy_sps();
+        let mut pps = dummy_pps();
+        // §7.3.5 requires transform_8x8_mode_flag == 1 to exercise the
+        // new code path. Our dummy PPS has no transform_8x8 control by
+        // default; patch via the accessor our tests rely on.
+        pps.extension = Some(crate::pps::PpsExtension {
+            transform_8x8_mode_flag: true,
+            pic_scaling_matrix_present_flag: false,
+            pic_scaling_lists: None,
+            second_chroma_qp_index_offset: 0,
+        });
+        let hdr = dummy_slice_header(SliceType::I);
+        let mut r = BitReader::new(&bytes);
+        let mut entropy = cavlc_entropy();
+        entropy.transform_8x8_mode_flag = true;
+
+        let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        assert_eq!(mb.mb_type, MbType::INxN);
+        assert!(mb.transform_size_8x8_flag);
+        assert_eq!(mb.coded_block_pattern, 0);
+        // mb_pred should have filled the 8x8 flags, not the 4x4 ones.
+        let pred = mb.mb_pred.expect("mb_pred present");
+        for i in 0..4 {
+            assert!(
+                pred.prev_intra8x8_pred_mode_flag[i],
+                "prev_intra8x8_pred_mode_flag[{i}] should have been parsed as 1"
+            );
         }
     }
 

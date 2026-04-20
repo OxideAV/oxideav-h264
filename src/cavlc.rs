@@ -381,8 +381,13 @@ static TABLE_9_5_COL1: [CoeffTokenRow; 62] = [
     (0b00000000001000,     14, (15, 1)),
     // T1=2, TC=15: "0000 0000 0010 10"
     (0b00000000001010,     14, (15, 2)),
-    // T1=3, TC=15: "0000 0000 0000 1"
-    (0b000000000000001,    15, (15, 3)),
+    // T1=3, TC=15: "0000 0000 0000 1" — 13 bits.
+    // BUGFIX 2026-04-20: the length was previously 15, which is two
+    // extra phantom leading zeros — the VLC decoder would then never
+    // match this codeword and instead consume bits for other 13-bit
+    // entries, desyncing the stream for any MB whose nC was in [2,4)
+    // and whose first block was (TC=15, T1=3).
+    (0b0000000000001,      13, (15, 3)),
     // T1=0, TC=16: "0000 0000 0001 11"
     (0b00000000000111,     14, (16, 0)),
     // T1=1, TC=16: "0000 0000 0001 10"
@@ -544,70 +549,82 @@ static TABLE_9_5_COL2: [CoeffTokenRow; 62] = [
 //
 // Rather than encode the subtle offset math, we emit one row per entry
 // from Table 9-5 column "8 <= nC" verbatim.
+//
+// BUGFIX 2026-04-20: the prior transcription of this column stored value
+// tuples as `(TrailingOnes, TotalCoeff)` — i.e. the two columns were
+// swapped relative to all other columns (COL0/COL1/COL2 store
+// `(TotalCoeff, TrailingOnes)`). That broke any CAVLC block with
+// neighbour `nC >= 8` — e.g. once a sufficiently dense MB had been
+// decoded, subsequent blocks that crossed into the COL3 selector
+// produced bogus `(total_coeff, trailing_ones)` pairs like (1, 3) or
+// (0, 1) that fail the `trailing_ones ≤ total_coeff` invariant. The
+// tuples below are now stored as `(TotalCoeff, TrailingOnes)` per the
+// `CoeffTokenRow` contract.
 #[rustfmt::skip]
 static TABLE_9_5_COL3: [CoeffTokenRow; 62] = [
+    // Codeword | (TotalCoeff, TrailingOnes) per Table 9-5 "8 <= nC".
     (0b000011, 6, (0, 0)),
-    (0b000000, 6, (0, 1)),
+    (0b000000, 6, (1, 0)),
     (0b000001, 6, (1, 1)),
-    (0b000100, 6, (0, 2)),
-    (0b000101, 6, (1, 2)),
+    (0b000100, 6, (2, 0)),
+    (0b000101, 6, (2, 1)),
     (0b000110, 6, (2, 2)),
-    (0b001000, 6, (0, 3)),
-    (0b001001, 6, (1, 3)),
-    (0b001010, 6, (2, 3)),
+    (0b001000, 6, (3, 0)),
+    (0b001001, 6, (3, 1)),
+    (0b001010, 6, (3, 2)),
     (0b001011, 6, (3, 3)),
-    (0b001100, 6, (0, 4)),
-    (0b001101, 6, (1, 4)),
-    (0b001110, 6, (2, 4)),
-    (0b001111, 6, (3, 4)),
-    (0b010000, 6, (0, 5)),
-    (0b010001, 6, (1, 5)),
-    (0b010010, 6, (2, 5)),
-    (0b010011, 6, (3, 5)),
-    (0b010100, 6, (0, 6)),
-    (0b010101, 6, (1, 6)),
-    (0b010110, 6, (2, 6)),
-    (0b010111, 6, (3, 6)),
-    (0b011000, 6, (0, 7)),
-    (0b011001, 6, (1, 7)),
-    (0b011010, 6, (2, 7)),
-    (0b011011, 6, (3, 7)),
-    (0b011100, 6, (0, 8)),
-    (0b011101, 6, (1, 8)),
-    (0b011110, 6, (2, 8)),
-    (0b011111, 6, (3, 8)),
-    (0b100000, 6, (0, 9)),
-    (0b100001, 6, (1, 9)),
-    (0b100010, 6, (2, 9)),
-    (0b100011, 6, (3, 9)),
-    (0b100100, 6, (0, 10)),
-    (0b100101, 6, (1, 10)),
-    (0b100110, 6, (2, 10)),
-    (0b100111, 6, (3, 10)),
-    (0b101000, 6, (0, 11)),
-    (0b101001, 6, (1, 11)),
-    (0b101010, 6, (2, 11)),
-    (0b101011, 6, (3, 11)),
-    (0b101100, 6, (0, 12)),
-    (0b101101, 6, (1, 12)),
-    (0b101110, 6, (2, 12)),
-    (0b101111, 6, (3, 12)),
-    (0b110000, 6, (0, 13)),
-    (0b110001, 6, (1, 13)),
-    (0b110010, 6, (2, 13)),
-    (0b110011, 6, (3, 13)),
-    (0b110100, 6, (0, 14)),
-    (0b110101, 6, (1, 14)),
-    (0b110110, 6, (2, 14)),
-    (0b110111, 6, (3, 14)),
-    (0b111000, 6, (0, 15)),
-    (0b111001, 6, (1, 15)),
-    (0b111010, 6, (2, 15)),
-    (0b111011, 6, (3, 15)),
-    (0b111100, 6, (0, 16)),
-    (0b111101, 6, (1, 16)),
-    (0b111110, 6, (2, 16)),
-    (0b111111, 6, (3, 16)),
+    (0b001100, 6, (4, 0)),
+    (0b001101, 6, (4, 1)),
+    (0b001110, 6, (4, 2)),
+    (0b001111, 6, (4, 3)),
+    (0b010000, 6, (5, 0)),
+    (0b010001, 6, (5, 1)),
+    (0b010010, 6, (5, 2)),
+    (0b010011, 6, (5, 3)),
+    (0b010100, 6, (6, 0)),
+    (0b010101, 6, (6, 1)),
+    (0b010110, 6, (6, 2)),
+    (0b010111, 6, (6, 3)),
+    (0b011000, 6, (7, 0)),
+    (0b011001, 6, (7, 1)),
+    (0b011010, 6, (7, 2)),
+    (0b011011, 6, (7, 3)),
+    (0b011100, 6, (8, 0)),
+    (0b011101, 6, (8, 1)),
+    (0b011110, 6, (8, 2)),
+    (0b011111, 6, (8, 3)),
+    (0b100000, 6, (9, 0)),
+    (0b100001, 6, (9, 1)),
+    (0b100010, 6, (9, 2)),
+    (0b100011, 6, (9, 3)),
+    (0b100100, 6, (10, 0)),
+    (0b100101, 6, (10, 1)),
+    (0b100110, 6, (10, 2)),
+    (0b100111, 6, (10, 3)),
+    (0b101000, 6, (11, 0)),
+    (0b101001, 6, (11, 1)),
+    (0b101010, 6, (11, 2)),
+    (0b101011, 6, (11, 3)),
+    (0b101100, 6, (12, 0)),
+    (0b101101, 6, (12, 1)),
+    (0b101110, 6, (12, 2)),
+    (0b101111, 6, (12, 3)),
+    (0b110000, 6, (13, 0)),
+    (0b110001, 6, (13, 1)),
+    (0b110010, 6, (13, 2)),
+    (0b110011, 6, (13, 3)),
+    (0b110100, 6, (14, 0)),
+    (0b110101, 6, (14, 1)),
+    (0b110110, 6, (14, 2)),
+    (0b110111, 6, (14, 3)),
+    (0b111000, 6, (15, 0)),
+    (0b111001, 6, (15, 1)),
+    (0b111010, 6, (15, 2)),
+    (0b111011, 6, (15, 3)),
+    (0b111100, 6, (16, 0)),
+    (0b111101, 6, (16, 1)),
+    (0b111110, 6, (16, 2)),
+    (0b111111, 6, (16, 3)),
 ];
 
 // §9.2.1 — Table 9-5, column `nC == -1` (ChromaDCLevel, ChromaArrayType=1).
@@ -1560,19 +1577,71 @@ mod tests {
 
     #[test]
     fn coeff_token_col3_8_le_nc_samples() {
-        // Column "8 <= nC" is the 6-bit fixed-length column.
+        // Column "8 <= nC" is the 6-bit fixed-length column. Per Table
+        // 9-5, the decoded pair is (TotalCoeff, TrailingOnes).
         let cases: &[(&str, (u32, u32))] = &[
-            ("0000 11", (0, 0)),
-            ("0000 00", (0, 1)),
-            ("0000 01", (1, 1)),
-            ("0001 00", (0, 2)),
-            ("1111 11", (3, 16)),
+            ("0000 11", (0, 0)),  // T1=0, TC=0
+            ("0000 00", (1, 0)),  // T1=0, TC=1
+            ("0000 01", (1, 1)),  // T1=1, TC=1
+            ("0001 00", (2, 0)),  // T1=0, TC=2
+            ("1111 11", (16, 3)), // T1=3, TC=16
         ];
         for (bits, want) in cases {
             let bytes = pack_bits(&[bits]);
             let mut r = BitReader::new(&bytes);
             let got = decode_coeff_token(&mut r, CoeffTokenContext::Numeric(10)).unwrap();
             assert_eq!(got, *want, "bits={bits}");
+        }
+    }
+
+    #[test]
+    fn coeff_token_col1_tc10_t1_2_from_spec() {
+        // Table 9-5 2<=nC<4 row TrailingOnes=2, TotalCoeff=10: "0000 0000 1101".
+        let bytes = pack_bits(&["0000 0000 1101"]);
+        let mut r = BitReader::new(&bytes);
+        let got = decode_coeff_token(&mut r, CoeffTokenContext::Numeric(3)).unwrap();
+        assert_eq!(got, (10, 2));
+    }
+
+    /// Regression test: decoding a length-13 codeword from COL1
+    /// (T1=3, TC=15, "0000 0000 0000 1"). Prior to the 2026-04-20 fix
+    /// the COL1 row had length 15 (two phantom leading zeros), and the
+    /// decoder would never match this codeword.
+    #[test]
+    fn coeff_token_col1_t1_3_tc_15_length_fix() {
+        // Pack 13-bit codeword then pad to byte boundary.
+        let bytes = pack_bits(&["0000 0000 0000 1"]);
+        let mut r = BitReader::new(&bytes);
+        let got = decode_coeff_token(&mut r, CoeffTokenContext::Numeric(3)).unwrap();
+        assert_eq!(got, (15, 3));
+        // Cursor should have advanced exactly 13 bits.
+        let (b, bi) = r.position();
+        assert_eq!((b, bi), (1, 5));
+    }
+
+    /// Regression test for the 2026-04-20 COL3 swap bug: prior to the
+    /// fix the COL3 table stored `(TrailingOnes, TotalCoeff)` instead of
+    /// `(TotalCoeff, TrailingOnes)`. These are rows where the two
+    /// fields differ so a swap would be visible.
+    #[test]
+    fn coeff_token_col3_bugfix_regression() {
+        // (codeword, expected (TotalCoeff, TrailingOnes))
+        let cases: &[(&str, (u32, u32))] = &[
+            ("0000 00", (1, 0)),  // would be (0,1) if swapped
+            ("0001 00", (2, 0)),  // would be (0,2) if swapped
+            ("0010 00", (3, 0)),  // would be (0,3) if swapped
+            ("0010 01", (3, 1)),  // would be (1,3) if swapped — trigger for "trailing_ones=3 for total_coeff=1"
+            ("0011 00", (4, 0)),
+            ("1000 00", (9, 0)),
+            ("1111 00", (16, 0)),
+        ];
+        for (bits, want) in cases {
+            let bytes = pack_bits(&[bits]);
+            let mut r = BitReader::new(&bytes);
+            let got = decode_coeff_token(&mut r, CoeffTokenContext::Numeric(10)).unwrap();
+            assert_eq!(got, *want, "bits={bits}");
+            // Invariant check: TrailingOnes <= TotalCoeff.
+            assert!(got.1 <= got.0, "invariant TrailingOnes<=TotalCoeff violated for bits={bits}");
         }
     }
 
