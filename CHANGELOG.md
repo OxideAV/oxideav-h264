@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-h264/compare/v0.0.4...v0.0.5) - 2026-04-20
+
+### Other
+
+- h264 dpb: wrap ref frame_nums against current slice, not prev_ref (§8.2.4.1)
+- fix CABAC B-slice chroma CBF neighbours and B_8x8 MVD ordering
+- add noisy CABAC High-profile regression fixture (ignored)
+- fix CABAC B-slice intra-in-B context bank
+- fix CABAC predIntra4x4PredMode for inter neighbours
+- fix same-MB neighbour lookup during progressive partition decode
+- fix CABAC intra-4x4 top-right neighbour sample read
+- add per-MB luma/chroma diff summary under OXIDEAV_H264_DIFF_MB env
+- rustfmt sweep
+- flip to hard-assert + add reference YUV
+- regression fixture for CABAC I-slice High-profile desync
+- add CABAC encode path for I-slices (Main-profile IDR)
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-h264/compare/v0.0.3...v0.0.4) - 2026-04-19
 
 ### Other
