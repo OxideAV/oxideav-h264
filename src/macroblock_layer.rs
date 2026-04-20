@@ -541,9 +541,11 @@ static ME_INTRA_420_422: [u8; 48] = [
 #[rustfmt::skip]
 static ME_INTER_420_422: [u8; 48] = [
     // codeNum 0..=47 → CBP value for inter mb (ChromaArrayType 1 or 2).
+    // Transcribed verbatim from ITU-T H.264 (08/2024) Table 9-4(a),
+    // "Inter" column.
      0, 16,  1,  2,  4,  8, 32,  3,  5, 10, 12, 15, 47,  7, 11, 13,
     14,  6,  9, 31, 35, 37, 42, 44, 33, 34, 36, 40, 39, 43, 45, 46,
-    17, 18, 20, 24,  6,  9, 22, 25, 32, 33, 34, 36, 40, 38, 41, 45,
+    17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
 ];
 
 // Table 9-4(b): ChromaArrayType ∈ {0, 3} — CBP is just 4-bit luma.

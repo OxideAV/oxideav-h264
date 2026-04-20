@@ -52,6 +52,16 @@ pub enum SliceDataError {
     Cabac(#[from] CabacError),
     #[error("macroblock_layer: {0}")]
     Macroblock(#[from] MacroblockLayerError),
+    /// A macroblock failed to parse; carries the MB address + bit
+    /// offset at MB entry for diagnostic purposes.
+    #[error("macroblock #{mb_addr} at byte {byte}:bit {bit}: {source}")]
+    MacroblockAt {
+        mb_addr: u32,
+        byte: usize,
+        bit: u8,
+        #[source]
+        source: MacroblockLayerError,
+    },
     /// §7.3.4 — MBAFF (`mb_field_decoding_flag` loop) is not wired yet.
     #[error("MBAFF macroblock layer is not supported in this walker")]
     MbaffNotSupported,
@@ -168,8 +178,16 @@ pub fn parse_slice_data(
                     chroma_array_type,
                     transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
                 };
-                let mb =
-                    parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)?;
+                let (byte, bit) = r.position();
+                let mb = parse_macroblock(
+                    &mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr,
+                )
+                .map_err(|source| SliceDataError::MacroblockAt {
+                    mb_addr: curr_mb_addr,
+                    byte,
+                    bit,
+                    source,
+                })?;
                 macroblocks.push(mb);
                 curr_mb_addr += 1;
             }
@@ -207,7 +225,14 @@ pub fn parse_slice_data(
                 chroma_array_type,
                 transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
             };
-            let mb = parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)?;
+            let (byte, bit) = r.position();
+            let mb = parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)
+                .map_err(|source| SliceDataError::MacroblockAt {
+                    mb_addr: curr_mb_addr,
+                    byte,
+                    bit,
+                    source,
+                })?;
             macroblocks.push(mb);
             curr_mb_addr += 1;
             pending_skip = 0;

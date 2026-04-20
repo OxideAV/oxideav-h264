@@ -109,6 +109,30 @@ fn parse_foreman_p16x16() {
     let sps_snapshot = dec.active_sps().cloned();
     let pps_snapshot = dec.active_pps().cloned();
     if let (Some(sps), Some(pps)) = (sps_snapshot, pps_snapshot) {
+        eprintln!(
+            "  PPS: entropy_coding={} num_ref_idx_l0={} weighted_pred={} \
+             deblocking_ctrl={} constrained_intra={} \
+             transform_8x8={} chroma_qp_offset={}",
+            pps.entropy_coding_mode_flag,
+            pps.num_ref_idx_l0_default_active_minus1,
+            pps.weighted_pred_flag,
+            pps.deblocking_filter_control_present_flag,
+            pps.constrained_intra_pred_flag,
+            pps.transform_8x8_mode_flag(),
+            pps.chroma_qp_index_offset,
+        );
+        if let Some((nut, _, hdr, _, (byte, bit))) = pending_slices.first() {
+            eprintln!(
+                "  first slice: type={} cursor=({},{}) slice_type={:?} \
+                 slice_qp_delta={} disable_dbf={}",
+                nut,
+                byte,
+                bit,
+                hdr.slice_type,
+                hdr.slice_qp_delta,
+                hdr.disable_deblocking_filter_idc,
+            );
+        }
         for (nal_unit_type, _nal_ref_idc, hdr, rbsp, (byte, bit)) in &pending_slices {
             let want_idr = *nal_unit_type == 5;
             match slice_data::parse_slice_data(rbsp, *byte, *bit, hdr, &sps, &pps) {
