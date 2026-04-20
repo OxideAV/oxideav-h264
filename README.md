@@ -45,14 +45,14 @@ no packet is decoded.
 | Slice header | §7.3.3 | parsed (incl. RPLM, pred_weight_table, dec_ref_pic_marking) |
 | Picture Order Count derivation (types 0/1/2) | §8.2.1 | implemented |
 | Slice data + macroblock layer | §7.3.4, §7.3.5 | not implemented |
-| Reference picture marking (sliding window + MMCO) | §7.3.3.3, §8.2.5 | not implemented |
-| Reference picture list construction | §8.2.4 | not implemented |
-| Reference picture list modification (RPLM) | §7.3.3.1, §8.2.4.3 | not implemented |
+| Reference picture marking (sliding window + MMCO) | §7.3.3.3, §8.2.5 | implemented |
+| Reference picture list construction | §8.2.4 | implemented (frame-only; field-pair interleaving partial) |
+| Reference picture list modification (RPLM) | §7.3.3.1, §8.2.4.3 | implemented |
 | Picture order count derivation | §8.2.1 | not implemented |
-| Intra prediction | §8.3 | not implemented |
+| Intra prediction (4x4 / 8x8 / 16x16 / chroma) | §8.3 | implemented (all modes) |
 | Inter prediction (MC, MV derivation, weighted pred) | §8.4 | not implemented |
-| Transform decode + reconstruction | §8.5 | not implemented |
-| Deblocking filter | §8.7 | not implemented |
+| Transform decode + reconstruction | §8.5 | implemented (4x4 / 8x8 / Hadamard DC / chroma DC) |
+| Deblocking filter | §8.7 | implemented (edge-level filter + bS derivation) |
 | CAVLC entropy decode | §9.2 | tables + primitives (residual_block_cavlc loop in place; nC derivation deferred to slice layer) |
 | CABAC entropy decode | §9.3 | engine (init + DecodeDecision/Bypass/Terminate); per-element binarisations deferred to slice layer |
 
