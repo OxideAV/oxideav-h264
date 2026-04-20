@@ -35,6 +35,10 @@ pub mod sei;
 pub mod mb_address;
 pub mod macroblock_layer;
 pub mod slice_data;
+pub mod picture;
+pub mod mb_grid;
+pub mod reconstruct;
+pub mod dpb_output;
 pub mod decoder;
 
 use oxideav_codec::CodecRegistry;
