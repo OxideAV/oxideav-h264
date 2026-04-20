@@ -275,12 +275,29 @@ impl SliceHeader {
     ///
     /// Stops parsing at the end of the slice_header — the remainder of
     /// the RBSP is the slice_data() payload which is handled separately.
+    ///
+    /// Discards the bit-cursor position. Use [`Self::parse_and_tell`]
+    /// when you need the byte + bit offset where slice_data begins.
     pub fn parse(
         rbsp: &[u8],
         sps: &Sps,
         pps: &Pps,
         nal_header: &NalHeader,
     ) -> Result<Self, SliceHeaderError> {
+        Self::parse_and_tell(rbsp, sps, pps, nal_header).map(|(h, _)| h)
+    }
+
+    /// §7.3.3 — parse a `slice_header()` and also return the bit cursor
+    /// at which the slice_data() payload begins. The cursor is
+    /// `(byte_index, bit_index)` where `bit_index ∈ 0..=7` is the
+    /// offset of the next bit to consume within `rbsp[byte_index]`
+    /// (0 = MSB, same convention as [`crate::bitstream::BitReader`]).
+    pub fn parse_and_tell(
+        rbsp: &[u8],
+        sps: &Sps,
+        pps: &Pps,
+        nal_header: &NalHeader,
+    ) -> Result<(Self, (usize, u8)), SliceHeaderError> {
         // Annex F/G/J — MVC/SVC/3D-AVC slice extensions use a
         // different sub-header prefix. We don't parse those.
         let nut = nal_header.nal_unit_type;
@@ -494,37 +511,41 @@ impl SliceHeader {
             slice_group_change_cycle = if bits == 0 { 0 } else { r.u(bits)? };
         }
 
-        Ok(SliceHeader {
-            first_mb_in_slice,
-            slice_type_raw,
-            slice_type,
-            all_slices_same_type,
-            pic_parameter_set_id,
-            colour_plane_id,
-            frame_num,
-            field_pic_flag,
-            bottom_field_flag,
-            idr_pic_id,
-            pic_order_cnt_lsb,
-            delta_pic_order_cnt_bottom,
-            delta_pic_order_cnt,
-            redundant_pic_cnt,
-            direct_spatial_mv_pred_flag,
-            num_ref_idx_active_override_flag,
-            num_ref_idx_l0_active_minus1,
-            num_ref_idx_l1_active_minus1,
-            ref_pic_list_modification,
-            pred_weight_table,
-            dec_ref_pic_marking,
-            cabac_init_idc,
-            slice_qp_delta,
-            sp_for_switch_flag,
-            slice_qs_delta,
-            disable_deblocking_filter_idc,
-            slice_alpha_c0_offset_div2,
-            slice_beta_offset_div2,
-            slice_group_change_cycle,
-        })
+        let cursor = r.position();
+        Ok((
+            SliceHeader {
+                first_mb_in_slice,
+                slice_type_raw,
+                slice_type,
+                all_slices_same_type,
+                pic_parameter_set_id,
+                colour_plane_id,
+                frame_num,
+                field_pic_flag,
+                bottom_field_flag,
+                idr_pic_id,
+                pic_order_cnt_lsb,
+                delta_pic_order_cnt_bottom,
+                delta_pic_order_cnt,
+                redundant_pic_cnt,
+                direct_spatial_mv_pred_flag,
+                num_ref_idx_active_override_flag,
+                num_ref_idx_l0_active_minus1,
+                num_ref_idx_l1_active_minus1,
+                ref_pic_list_modification,
+                pred_weight_table,
+                dec_ref_pic_marking,
+                cabac_init_idc,
+                slice_qp_delta,
+                sp_for_switch_flag,
+                slice_qs_delta,
+                disable_deblocking_filter_idc,
+                slice_alpha_c0_offset_div2,
+                slice_beta_offset_div2,
+                slice_group_change_cycle,
+            },
+            cursor,
+        ))
     }
 
     /// §7.4.3 — `MbaffFrameFlag = mb_adaptive_frame_field_flag && !field_pic_flag`.

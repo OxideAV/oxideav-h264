@@ -13,6 +13,10 @@
 //! printed reason.
 
 use oxideav_h264::decoder::{Decoder, Event};
+use oxideav_h264::mb_grid::MbGrid;
+use oxideav_h264::picture::Picture;
+use oxideav_h264::ref_store::NoRefs;
+use oxideav_h264::{reconstruct, slice_data};
 use std::path::PathBuf;
 
 fn sample_path() -> Option<PathBuf> {
@@ -54,17 +58,34 @@ fn parse_foreman_p16x16() {
     let mut auds = 0usize;
     let mut ignored = 0usize;
     let mut errors: Vec<String> = Vec::new();
+    let mut slice_data_parsed = 0usize;
+    let mut slice_data_errors: Vec<String> = Vec::new();
+    let mut reconstructed = 0usize;
+    let mut reconstruct_errors: Vec<String> = Vec::new();
+    let mut first_idr_luma_sample: Option<i32> = None;
 
+    // Drive the full pipeline. Collect owned data first to detach from
+    // the Decoder borrow before reconstruction (so we can pull SPS/PPS
+    // back out).
+    let mut pending_slices: Vec<(u8, u8, oxideav_h264::slice_header::SliceHeader, Vec<u8>, (usize, u8))> = Vec::new();
     for result in dec.process_annex_b(&bytes) {
         match result {
             Ok(ev) => match ev {
                 Event::SpsStored(_) => sps_stored += 1,
                 Event::PpsStored(_) => pps_stored += 1,
-                Event::Slice { nal_unit_type, .. } => {
+                Event::Slice {
+                    nal_unit_type,
+                    nal_ref_idc,
+                    header,
+                    rbsp,
+                    slice_data_cursor,
+                } => {
                     slices += 1;
                     if nal_unit_type == 5 {
                         idr_slices += 1;
                     }
+                    pending_slices
+                        .push((nal_unit_type, nal_ref_idc, header, rbsp, slice_data_cursor));
                 }
                 Event::Sei(msgs) => sei_msgs += msgs.len(),
                 Event::AccessUnitDelimiter(_) => auds += 1,
@@ -75,6 +96,48 @@ fn parse_foreman_p16x16() {
         }
     }
 
+    // Now drive slice_data parsing + reconstruction for each slice.
+    let sps_snapshot = dec.active_sps().cloned();
+    let pps_snapshot = dec.active_pps().cloned();
+    if let (Some(sps), Some(pps)) = (sps_snapshot, pps_snapshot) {
+        for (nal_unit_type, _nal_ref_idc, hdr, rbsp, (byte, bit)) in &pending_slices {
+            let want_idr = *nal_unit_type == 5;
+            match slice_data::parse_slice_data(rbsp, *byte, *bit, hdr, &sps, &pps) {
+                Ok(sd) => {
+                    slice_data_parsed += 1;
+                    if !want_idr {
+                        continue; // skip reconstruction for P slices (need refs)
+                    }
+                    // Attempt IDR reconstruction.
+                    let width_samples = sps.pic_width_in_mbs() * 16;
+                    let height_samples = sps.frame_height_in_mbs() * 16;
+                    let mut pic = Picture::new(
+                        width_samples,
+                        height_samples,
+                        sps.chroma_array_type(),
+                        sps.bit_depth_luma_minus8 + 8,
+                        sps.bit_depth_chroma_minus8 + 8,
+                    );
+                    let mut grid = MbGrid::new(sps.pic_width_in_mbs(), sps.frame_height_in_mbs());
+                    match reconstruct::reconstruct_slice(
+                        &sd, hdr, &sps, &pps, &NoRefs, &mut pic, &mut grid,
+                    ) {
+                        Ok(()) => {
+                            reconstructed += 1;
+                            if first_idr_luma_sample.is_none() {
+                                // Grab the top-left luma sample as a liveness
+                                // signal — confirms the pipeline wrote pixels.
+                                first_idr_luma_sample = Some(pic.luma_at(0, 0));
+                            }
+                        }
+                        Err(e) => reconstruct_errors.push(format!("{e}")),
+                    }
+                }
+                Err(e) => slice_data_errors.push(format!("{e}")),
+            }
+        }
+    }
+
     eprintln!(
         "foreman_p16x16.264 → SPS:{sps_stored} PPS:{pps_stored} IDR:{idr_slices} \
          slices:{slices} SEI:{sei_msgs} AUD:{auds} ignored:{ignored} errors:{}",
@@ -82,6 +145,24 @@ fn parse_foreman_p16x16() {
     );
     for e in &errors {
         eprintln!("  err: {e}");
+    }
+    eprintln!(
+        "  slice_data parsed: {slice_data_parsed}/{slices} \
+         (errors:{})",
+        slice_data_errors.len()
+    );
+    for e in slice_data_errors.iter().take(3) {
+        eprintln!("    slice_data err: {e}");
+    }
+    eprintln!(
+        "  reconstructed IDR slices: {reconstructed} (errors:{})",
+        reconstruct_errors.len()
+    );
+    for e in reconstruct_errors.iter().take(3) {
+        eprintln!("    reconstruct err: {e}");
+    }
+    if let Some(s) = first_idr_luma_sample {
+        eprintln!("  first IDR top-left luma sample: {s}");
     }
 
     // We expect at least one SPS, one PPS, and one IDR slice.

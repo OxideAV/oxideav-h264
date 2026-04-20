@@ -74,11 +74,13 @@ pub enum Event {
         nal_ref_idc: u8,
         header: SliceHeader,
         /// The full RBSP bytes after the NAL header byte is stripped
-        /// and emulation-prevention bytes removed. This is the same
-        /// slice that was passed to `SliceHeader::parse`. A future
-        /// slice_data layer can reparse the header to resume bit-aligned
-        /// at the start of slice_data().
+        /// and emulation-prevention bytes removed. Together with
+        /// `slice_data_cursor` the caller can pick up at the first bit
+        /// of slice_data() without re-parsing the slice_header.
         rbsp: Vec<u8>,
+        /// `(byte_index, bit_index)` into `rbsp` marking the first bit
+        /// of slice_data(). Feeds `crate::slice_data::parse_slice_data`.
+        slice_data_cursor: (usize, u8),
     },
     /// §7.3.2.3 — parsed SEI messages. May be empty when the SEI RBSP
     /// carries only rbsp_trailing_bits.
@@ -256,7 +258,7 @@ impl Decoder {
 
         // §7.3.3 — parse the slice header using the newly-activated SPS
         // and PPS.
-        let parsed = SliceHeader::parse(rbsp, &sps, &pps, header)?;
+        let (parsed, slice_data_cursor) = SliceHeader::parse_and_tell(rbsp, &sps, &pps, header)?;
 
         // §7.4.1.2.1 — commit activation only after a successful parse
         // so malformed slices can't leave the decoder in a half-activated
@@ -269,6 +271,7 @@ impl Decoder {
             nal_ref_idc: header.nal_ref_idc,
             header: parsed,
             rbsp: rbsp.to_vec(),
+            slice_data_cursor,
         })
     }
 
