@@ -46,6 +46,8 @@ no packet is decoded.
 | Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2; MBAFF + 4:4:4 + CABAC I_PCM termination deferred) |
 | FMO MB address derivation | §8.2.2, §8.2.3 | implemented (all 7 slice_group_map_types + NextMbAddress) |
 | Top-level decoder driver | §7.4.1.2.1 | implemented (events: SPS/PPS stored, AUD, Slice, SEI, end markers, Ignored) |
+| I-slice reconstruction (Picture + MB grid + intra + deblock) | §8 / §6.4 | implemented (I_PCM, Intra_4x4, Intra_8x8, Intra_16x16, chroma; P/B deferred) |
+| DPB output ordering (POC-ordered delivery + bumping) | §C.4 | implemented |
 | Reference picture marking (sliding window + MMCO) | §7.3.3.3, §8.2.5 | implemented |
 | Reference picture list construction | §8.2.4 | implemented (frame-only; field-pair interleaving partial) |
 | Reference picture list modification (RPLM) | §7.3.3.1, §8.2.4.3 | implemented |
