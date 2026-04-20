@@ -20,6 +20,13 @@ PDF. Conformance is verified by behavioural diff (run our decoder
 against synthetic and public-domain real-world streams, compare YUV
 output against an external reference decoder run separately).
 
+The spec PDF itself can't be redistributed (ITU-T copyright) so it
+lives in the private OxideAV/docs repo at
+[`h264/T-REC-H.264-202408-I.pdf`](https://github.com/OxideAV/docs/blob/master/h264/T-REC-H.264-202408-I.pdf).
+Clone that repo next to your `oxideav` checkout if you're an internal
+contributor; otherwise the document is freely downloadable from
+https://www.itu.int/rec/T-REC-H.264 (pick the 2024-08 edition).
+
 ## Specification coverage
 
 This section will grow as the rewrite lands. **Today: nothing

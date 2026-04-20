@@ -13,6 +13,8 @@
 //!
 //! See `README.md` for the spec coverage matrix as it grows.
 
+pub(crate) mod bitstream;
+
 use oxideav_codec::CodecRegistry;
 
 /// Codec id constant — matches the historical `"h264"` id used by
