@@ -42,13 +42,36 @@ pub mod sps;
 pub mod transform;
 pub mod vui;
 
-use oxideav_codec::CodecRegistry;
+pub mod h264_decoder;
+
+use oxideav_codec::{CodecInfo, CodecRegistry};
+use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 /// Codec id constant — matches the historical `"h264"` id used by
 /// containers (MKV `V_MPEG4/ISO/AVC`, MP4 `avc1`, AVI `H264`/`X264`).
 pub const CODEC_ID_STR: &str = "h264";
 
-/// Currently a no-op so the workspace aggregator can keep wiring this
-/// crate in without breaking. Will register a real decoder + encoder
-/// once the spec-driven rebuild has both ends working.
-pub fn register(_codecs: &mut CodecRegistry) {}
+/// Register the H.264 decoder with a codec registry.
+///
+/// Claims the historical FourCCs used by MKV (`V_MPEG4/ISO/AVC` maps
+/// to `AVC1`), MP4 (`avc1`, `avc3`), and AVI (`H264`, `X264`, `h264`).
+pub fn register(reg: &mut CodecRegistry) {
+    let caps = CodecCapabilities::video("h264_sw")
+        .with_lossy(true)
+        .with_intra_only(false)
+        .with_max_size(8192, 8192);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(h264_decoder::make_decoder)
+            .tags([
+                CodecTag::fourcc(b"H264"),
+                CodecTag::fourcc(b"h264"),
+                CodecTag::fourcc(b"AVC1"),
+                CodecTag::fourcc(b"avc1"),
+                CodecTag::fourcc(b"avc3"),
+                CodecTag::fourcc(b"X264"),
+                CodecTag::fourcc(b"x264"),
+            ]),
+    );
+}
