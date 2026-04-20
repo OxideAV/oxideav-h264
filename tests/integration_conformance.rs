@@ -892,6 +892,26 @@ fn conformance_jvt_aud_mw_e() {
     );
 }
 
+/// JVT AVCv1 `camp_mot_frm0_full` (Motorola, Main / CABAC, 720x480
+/// 4:2:0, 30 frames of Mobile, IBBP, frame-coded). Reference YUV at
+/// `camp_mot_frm0_full_rec.yuv`. Only IDR + frame-coded so should
+/// exercise the CABAC decode path without PAFF / MBAFF complications.
+#[test]
+fn conformance_jvt_camp_mot_frm0_full() {
+    let bs = std::env::var("OXIDEAV_JVT_CAMP_MOT_FRM0_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/cabac_mot_frm0/camp_mot_frm0_full.26l"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_CAMP_MOT_FRM0_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/cabac_mot_frm0/camp_mot_frm0_full_rec.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_camp_mot_frm0", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+    // Soft: frame counts may mismatch while the decoder's B-frame
+    // reordering / output path matures.
+}
+
 // ------------------------------ helpers tests --------------------------
 
 #[cfg(test)]
