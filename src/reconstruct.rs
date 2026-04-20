@@ -1,11 +1,14 @@
-//! I-slice reconstruction pipeline.
+//! Slice reconstruction pipeline.
 //!
 //! Integrates parsed `Macroblock` syntax with the intra prediction,
-//! inverse transform, and deblocking modules to produce decoded
-//! samples in a [`Picture`].
+//! inter prediction, inverse transform, and deblocking modules to
+//! produce decoded samples in a [`Picture`].
 //!
 //! Scope:
-//! * I-slices only (all macroblocks are intra).
+//! * I-slices (intra macroblocks), P-slices (P_Skip / P_L0_16x16 /
+//!   P_L0_L0_16x8 / P_L0_L0_8x16 / P_8x8 / P_8x8ref0) and B-slices
+//!   (B_Skip / B_Direct_16x16 / B_Direct_8x8 / B_L0_* / B_L1_* /
+//!   B_Bi_*).
 //! * Frame pictures, non-MBAFF.
 //! * ChromaArrayType ∈ {0, 1, 2}. 4:4:4 (== 3) is explicitly rejected.
 //! * Deblocking is applied as a single picture-level pass after all MBs
@@ -21,16 +24,19 @@ use crate::deblock::{
     alpha_from_index, beta_from_index, derive_boundary_strength, filter_edge,
     tc0_from, BsInputs, EdgeSamples, FilterParams, Plane,
 };
+use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::intra_pred::{
     filter_samples_8x8, predict_16x16, predict_4x4, predict_8x8, predict_chroma,
     ChromaArrayType as IpChromaArrayType, Intra16x16Mode, Intra4x4Mode, Intra8x8Mode,
     IntraChromaMode, Neighbour4x4Availability, Samples16x16, Samples4x4, Samples8x8,
     SamplesChroma,
 };
-use crate::macroblock_layer::{Macroblock, MbType};
-use crate::mb_grid::MbGrid;
+use crate::macroblock_layer::{Macroblock, MbType, SubMbType};
+use crate::mb_grid::{MbGrid, MbInfo};
+use crate::mv_deriv::{derive_mvpred, derive_p_skip_mv, Mv, MvpredInputs, MvpredShape, NeighbourMv};
 use crate::picture::Picture;
 use crate::pps::Pps;
+use crate::ref_store::RefPicProvider;
 use crate::slice_data::SliceData;
 use crate::slice_header::SliceHeader;
 use crate::sps::Sps;
@@ -47,18 +53,20 @@ use thiserror::Error;
 /// Errors surfaced by the reconstruction layer.
 #[derive(Debug, Error)]
 pub enum ReconstructError {
-    #[error("unsupported mb_type for I-slice: {0:?}")]
+    #[error("unsupported mb_type: {0:?}")]
     UnsupportedMbType(String),
     #[error("unsupported ChromaArrayType: {0}")]
     UnsupportedChromaArrayType(u32),
-    #[error("inter macroblock in I-slice (this reconstruction layer handles I-slices only)")]
-    InterInIslice,
     #[error("field / MBAFF pictures are not supported in this reconstruction pass")]
     FieldOrMbaffNotSupported,
     #[error("transform error: {0}")]
     Transform(#[from] TransformError),
     #[error("intra pred error: (internal — out of bounds)")]
     IntraPredOutOfBounds,
+    #[error("reference picture {list}:{idx} not available in the ref store")]
+    MissingRefPic { list: u8, idx: u32 },
+    #[error("unsupported inter mb_type for this scope: {0}")]
+    UnsupportedInterMbType(String),
 }
 
 // -------------------------------------------------------------------------
@@ -98,13 +106,18 @@ const LUMA_8X8_XY: [(i32, i32); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
 // Public entry point
 // -------------------------------------------------------------------------
 
-/// Reconstruct an I-slice into `pic`, updating `grid` with per-MB
-/// metadata for downstream deblocking and reference.
-pub fn reconstruct_slice(
+/// Reconstruct a slice (I / P / B) into `pic`, updating `grid` with
+/// per-MB metadata for downstream deblocking and subsequent-MB
+/// neighbour lookups.
+///
+/// `ref_pics` supplies reference pictures for inter prediction
+/// (§8.4.2). Pass [`crate::ref_store::NoRefs`] for I-only reconstruction.
+pub fn reconstruct_slice<R: RefPicProvider>(
     slice_data: &SliceData,
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
+    ref_pics: &R,
     pic: &mut Picture,
     grid: &mut MbGrid,
 ) -> Result<(), ReconstructError> {
@@ -148,14 +161,10 @@ pub fn reconstruct_slice(
     let mut curr_addr = slice_header.first_mb_in_slice;
     let total = slice_data.macroblocks.len();
     for (idx, mb) in slice_data.macroblocks.iter().enumerate() {
-        // Reject inter MBs early — this module is I-slice only.
-        if !mb.mb_type.is_intra() {
-            return Err(ReconstructError::InterInIslice);
-        }
-
         // Determine this MB's QP_Y (needed for AC transform scaling and
-        // deblocking). For I_PCM we leave QP_Y unchanged per §7.4.5.
-        let mb_qp_y = if mb.mb_type.is_i_pcm() {
+        // deblocking). For I_PCM / P_Skip / B_Skip we leave QP_Y
+        // unchanged per §7.4.5. P_Skip / B_Skip carry no mb_qp_delta.
+        let mb_qp_y = if mb.mb_type.is_i_pcm() || mb.is_skip {
             prev_qp_y
         } else {
             // §8.5.8 eq. 8-309 — QP_Y = ((prev_QP_Y + mb_qp_delta + 52 + QpBdOffsetY)
@@ -168,17 +177,33 @@ pub fn reconstruct_slice(
         };
 
         // Reconstruct this MB's samples.
-        reconstruct_mb(
-            mb,
-            curr_addr,
-            mb_qp_y,
-            chroma_array_type,
-            bit_depth_y,
-            bit_depth_c,
-            pps,
-            pic,
-            grid,
-        )?;
+        if mb.mb_type.is_intra() {
+            reconstruct_mb_intra(
+                mb,
+                curr_addr,
+                mb_qp_y,
+                chroma_array_type,
+                bit_depth_y,
+                bit_depth_c,
+                pps,
+                pic,
+                grid,
+            )?;
+        } else {
+            reconstruct_mb_inter(
+                mb,
+                curr_addr,
+                mb_qp_y,
+                chroma_array_type,
+                bit_depth_y,
+                bit_depth_c,
+                slice_header,
+                pps,
+                ref_pics,
+                pic,
+                grid,
+            )?;
+        }
 
         // Record MB info for future neighbour lookups.
         if let Some(info) = grid.get_mut(curr_addr) {
@@ -221,7 +246,7 @@ pub fn reconstruct_slice(
 // -------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_mb(
+fn reconstruct_mb_intra(
     mb: &Macroblock,
     mb_addr: u32,
     qp_y: i32,
@@ -993,6 +1018,1207 @@ fn chroma_mb_dims(chroma_array_type: u32) -> (u32, u32) {
     }
 }
 
+// =========================================================================
+// §8.4 — Inter-prediction reconstruction
+// =========================================================================
+
+/// §7.4.5 — which reference lists a P/B partition uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartMode {
+    /// Predicted from list 0 only.
+    L0Only,
+    /// Predicted from list 1 only (B slices).
+    L1Only,
+    /// Bi-predicted from both lists (B slices).
+    BiPred,
+    /// Direct mode — no MVD in the bitstream; MVs derived per §8.4.1.2.
+    Direct,
+}
+
+/// A single inter partition (16x16, 16x8, 8x16, or 8x8 sub-partition).
+/// Coordinates are luma-sample offsets inside the MB.
+#[derive(Debug, Clone, Copy)]
+struct InterPartition {
+    /// Origin (x, y) in luma samples, inside the MB (0..=15).
+    x: u8,
+    y: u8,
+    /// Width / height in luma samples (4, 8, or 16).
+    w: u8,
+    h: u8,
+    mode: PartMode,
+    /// Shape flag for MVpred (§8.4.1.3 eq. 8-203..8-206).
+    shape: MvpredShape,
+    /// List-0 reference index. `-1` means "not used".
+    ref_idx_l0: i8,
+    /// List-1 reference index. `-1` means "not used".
+    ref_idx_l1: i8,
+    /// Parsed MVDs (1/4-pel), if present. Zero for direct / skip.
+    mvd_l0: (i32, i32),
+    mvd_l1: (i32, i32),
+}
+
+/// §8.4 — Per-MB inter reconstruction.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_mb_inter<R: RefPicProvider>(
+    mb: &Macroblock,
+    mb_addr: u32,
+    qp_y: i32,
+    chroma_array_type: u32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    slice_header: &SliceHeader,
+    pps: &Pps,
+    ref_pics: &R,
+    pic: &mut Picture,
+    grid: &mut MbGrid,
+) -> Result<(), ReconstructError> {
+    let (mb_x, mb_y) = grid.mb_xy(mb_addr);
+    let mb_px = (mb_x as i32) * 16;
+    let mb_py = (mb_y as i32) * 16;
+
+    // -------- Derive inter partitions --------------------------------
+    let partitions = derive_inter_partitions(mb, slice_header)?;
+
+    // -------- For each partition: MVpred, MV, MC, write prediction ---
+    // Luma prediction samples for the whole MB.
+    let mut pred_luma = [0i32; 256];
+    // Chroma prediction samples: sized per chroma MB dims.
+    let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
+    let mut pred_cb = vec![0i32; (mbw_c as usize) * (mbh_c as usize)];
+    let mut pred_cr = vec![0i32; (mbw_c as usize) * (mbh_c as usize)];
+
+    for part in &partitions {
+        process_partition(
+            part,
+            mb_addr,
+            mb_px,
+            mb_py,
+            chroma_array_type,
+            bit_depth_y,
+            bit_depth_c,
+            slice_header,
+            pps,
+            ref_pics,
+            grid,
+            pic,
+            &mut pred_luma,
+            &mut pred_cb,
+            &mut pred_cr,
+        )?;
+    }
+
+    // -------- Residual add (§8.5 inverse transform) ------------------
+    // P_Skip / B_Skip never carry residual; for all other inter MBs,
+    // the residual walker fills in residual_luma / residual_chroma_*
+    // the same shape as for I_NxN. We re-use the 4x4 transform path
+    // for each 4x4 block, gated by cbp_luma / cbp_chroma, and combine
+    // with pred_luma before writing to the picture.
+    let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
+    let cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
+    let sl4 = default_scaling_list_4x4_flat();
+    let sl8 = default_scaling_list_8x8_flat();
+
+    if mb.transform_size_8x8_flag {
+        // §8.5.13 — 8x8 inter residual path (four 8x8 blocks).
+        // Each 8x8 is flagged by one bit of cbp_luma.
+        for blk8 in 0..4usize {
+            let (bx, by) = LUMA_8X8_XY[blk8];
+            let has_res = (cbp_luma >> blk8) & 1 == 1;
+            let coeffs = if has_res {
+                let mut buf = [0i32; 64];
+                for sub in 0..4usize {
+                    let base = blk8 * 4 + sub;
+                    if let Some(c) = mb.residual_luma.get(base) {
+                        for (i, v) in c.iter().enumerate().take(16) {
+                            buf[sub * 16 + i] = *v;
+                        }
+                    }
+                }
+                buf
+            } else {
+                [0i32; 64]
+            };
+            let residual = inverse_transform_8x8(&coeffs, qp_y, &sl8, bit_depth_y)?;
+            for y in 0..8 {
+                for x in 0..8 {
+                    let v = pred_luma[(by as usize + y) * 16 + (bx as usize + x)]
+                        + residual[y * 8 + x];
+                    pic.set_luma(
+                        mb_px + bx + x as i32,
+                        mb_py + by + y as i32,
+                        clip_sample(v, bit_depth_y),
+                    );
+                }
+            }
+        }
+    } else {
+        // §8.5.12 — 4x4 inter residual path.
+        for blk4 in 0..16usize {
+            let (bx, by) = LUMA_4X4_XY[blk4];
+            let blk8 = blk4 / 4;
+            let has_res = (cbp_luma >> blk8) & 1 == 1;
+            let coeffs_scan = if has_res {
+                mb.residual_luma.get(blk4).copied().unwrap_or([0i32; 16])
+            } else {
+                [0i32; 16]
+            };
+            let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
+            let residual = inverse_transform_4x4(&coeffs, qp_y, &sl4, bit_depth_y)?;
+            for yy in 0..4 {
+                for xx in 0..4 {
+                    let v = pred_luma[(by as usize + yy) * 16 + (bx as usize + xx)]
+                        + residual[yy * 4 + xx];
+                    pic.set_luma(
+                        mb_px + bx + xx as i32,
+                        mb_py + by + yy as i32,
+                        clip_sample(v, bit_depth_y),
+                    );
+                }
+            }
+        }
+    }
+
+    // -------- Chroma residual + write --------------------------------
+    if chroma_array_type != 0 && chroma_array_type != 3 {
+        reconstruct_inter_chroma_residual(
+            mb,
+            qp_y,
+            chroma_array_type,
+            bit_depth_c,
+            mb_px,
+            mb_py,
+            pps,
+            cbp_chroma,
+            &pred_cb,
+            &pred_cr,
+            pic,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// §8.4.2 — motion-compensate a single partition + write into the
+/// MB-local prediction buffers. Also records the MV/ref_idx into the
+/// grid so subsequent MBs' MVpred can see it.
+#[allow(clippy::too_many_arguments)]
+fn process_partition<R: RefPicProvider>(
+    part: &InterPartition,
+    mb_addr: u32,
+    mb_px: i32,
+    mb_py: i32,
+    chroma_array_type: u32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    _slice_header: &SliceHeader,
+    _pps: &Pps,
+    ref_pics: &R,
+    grid: &mut MbGrid,
+    pic: &Picture,
+    pred_luma: &mut [i32; 256],
+    pred_cb: &mut [i32],
+    pred_cr: &mut [i32],
+) -> Result<(), ReconstructError> {
+    let _ = pic; // currently unused; kept for future neighbour queries.
+    // §8.4.1 — derive L0 / L1 MVpreds. For Direct / Skip we compute MVs
+    // up-front via derive_p_skip_mv or a simple spatial-direct stub.
+    // Everything else uses mvLX = mvpLX + mvdLX (eq. 8-174-ish in §8.4.1).
+    let (mv_l0, mv_l1) = derive_partition_mvs(part, mb_addr, grid);
+
+    // Store MVs in the MB grid so future MBs can use them. We store in
+    // the current MB entry (`grid[mb_addr]`). The grid holds per-4x4-
+    // block MVs (16 slots) — fill the slots covered by this partition
+    // per Figure 6-10 / §6.4.3 layout.
+    if let Some(info) = grid.get_mut(mb_addr) {
+        let x0 = part.x as usize / 4;
+        let y0 = part.y as usize / 4;
+        let nx = part.w as usize / 4;
+        let ny = part.h as usize / 4;
+        for dy in 0..ny {
+            for dx in 0..nx {
+                let bx = x0 + dx;
+                let by = y0 + dy;
+                // Figure 6-10 raster — block index for (bx, by) in 4x4.
+                let blk4 = blk4_raster_index(bx as u8, by as u8);
+                if part.mode != PartMode::L1Only {
+                    info.mv_l0[blk4 as usize] = (mv_l0.x as i16, mv_l0.y as i16);
+                }
+                if matches!(part.mode, PartMode::L1Only | PartMode::BiPred | PartMode::Direct) {
+                    info.mv_l1[blk4 as usize] = (mv_l1.x as i16, mv_l1.y as i16);
+                }
+            }
+        }
+        // §7.4.5 — per 8x8 partition refIdx. Update the 8x8 quadrants
+        // this partition covers.
+        let q_x0 = part.x as usize / 8;
+        let q_y0 = part.y as usize / 8;
+        let q_nx = (part.w as usize).max(8) / 8;
+        let q_ny = (part.h as usize).max(8) / 8;
+        for qdy in 0..q_ny {
+            for qdx in 0..q_nx {
+                let qx = q_x0 + qdx;
+                let qy = q_y0 + qdy;
+                if qx < 2 && qy < 2 {
+                    let q_idx = qy * 2 + qx;
+                    if part.mode != PartMode::L1Only {
+                        info.ref_idx_l0[q_idx] = part.ref_idx_l0;
+                    }
+                    if matches!(part.mode, PartMode::L1Only | PartMode::BiPred) {
+                        info.ref_idx_l1[q_idx] = part.ref_idx_l1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Predict pixels for this partition.
+    // §8.4.2.1 — build predPartL0 / predPartL1 by MC from the selected
+    // reference pictures, then combine per §8.4.2.3 (weighted-pred or
+    // default average).
+    let w = part.w as u32;
+    let h = part.h as u32;
+    let part_abs_x = mb_px + part.x as i32;
+    let part_abs_y = mb_py + part.y as i32;
+
+    // Allocate partition-sized scratch buffers.
+    let mut l0_buf = vec![0i32; (w as usize) * (h as usize)];
+    let mut l1_buf = vec![0i32; (w as usize) * (h as usize)];
+    let has_l0 = matches!(
+        part.mode,
+        PartMode::L0Only | PartMode::BiPred | PartMode::Direct
+    ) && part.ref_idx_l0 >= 0;
+    let has_l1 = matches!(
+        part.mode,
+        PartMode::L1Only | PartMode::BiPred | PartMode::Direct
+    ) && part.ref_idx_l1 >= 0;
+
+    if has_l0 {
+        let rp = ref_pics.ref_pic(0, part.ref_idx_l0 as u32).ok_or(
+            ReconstructError::MissingRefPic {
+                list: 0,
+                idx: part.ref_idx_l0 as u32,
+            },
+        )?;
+        mc_luma_partition(rp, part_abs_x, part_abs_y, mv_l0, w, h, bit_depth_y, &mut l0_buf)?;
+    }
+    if has_l1 {
+        let rp = ref_pics.ref_pic(1, part.ref_idx_l1 as u32).ok_or(
+            ReconstructError::MissingRefPic {
+                list: 1,
+                idx: part.ref_idx_l1 as u32,
+            },
+        )?;
+        mc_luma_partition(rp, part_abs_x, part_abs_y, mv_l1, w, h, bit_depth_y, &mut l1_buf)?;
+    }
+
+    // §8.4.2.3 — combine. Default (weighted_pred_flag off) = average
+    // for bipred, copy for single list. Weighted pred is deferred —
+    // we call the default path here (explicit weighted pred is TODO).
+    for py in 0..h as usize {
+        for px in 0..w as usize {
+            let dst_idx =
+                (part.y as usize + py) * 16 + (part.x as usize + px);
+            let v = if has_l0 && has_l1 {
+                // Eq. 8-273.
+                (l0_buf[py * w as usize + px] + l1_buf[py * w as usize + px] + 1) >> 1
+            } else if has_l0 {
+                l0_buf[py * w as usize + px]
+            } else if has_l1 {
+                l1_buf[py * w as usize + px]
+            } else {
+                // Neither L0 nor L1 active (e.g., B_Direct with no usable
+                // refs) — fall back to zero prediction per §8.4.2.3.
+                0
+            };
+            pred_luma[dst_idx] = v;
+        }
+    }
+
+    // Chroma MC. For 4:2:0, chroma MV = mv_luma / 2 in 1/4-pel units
+    // at luma resolution -> 1/8-pel chroma units. §8.4.1.4 / §8.4.2.2.
+    if chroma_array_type == 1 || chroma_array_type == 2 {
+        let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
+        let c_mb_px = mb_px / 2; // 4:2:0 and 4:2:2 both halve width.
+        let c_mb_py = if chroma_array_type == 1 {
+            mb_py / 2
+        } else {
+            mb_py
+        };
+        let c_part_x = part.x as i32 / 2;
+        let c_part_y = if chroma_array_type == 1 {
+            part.y as i32 / 2
+        } else {
+            part.y as i32
+        };
+        let c_w = part.w as u32 / 2;
+        let c_h = if chroma_array_type == 1 {
+            part.h as u32 / 2
+        } else {
+            part.h as u32
+        };
+        // MB width in chroma is always 8 for 4:2:0 / 4:2:2 (Table 6-1).
+        let mbw_c_use = mbw_c;
+        let _ = mbh_c;
+
+        let mut l0_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l0_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l1_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l1_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+        if has_l0 {
+            let rp = ref_pics.ref_pic(0, part.ref_idx_l0 as u32).unwrap();
+            mc_chroma_partition(
+                rp,
+                c_mb_px + c_part_x,
+                c_mb_py + c_part_y,
+                mv_l0,
+                c_w,
+                c_h,
+                chroma_array_type,
+                bit_depth_c,
+                &mut l0_cb,
+                &mut l0_cr,
+            )?;
+        }
+        if has_l1 {
+            let rp = ref_pics.ref_pic(1, part.ref_idx_l1 as u32).unwrap();
+            mc_chroma_partition(
+                rp,
+                c_mb_px + c_part_x,
+                c_mb_py + c_part_y,
+                mv_l1,
+                c_w,
+                c_h,
+                chroma_array_type,
+                bit_depth_c,
+                &mut l1_cb,
+                &mut l1_cr,
+            )?;
+        }
+        // Combine into pred_cb / pred_cr at MB-local position.
+        for py in 0..c_h as usize {
+            for px in 0..c_w as usize {
+                let dst_idx = (c_part_y as usize + py) * (mbw_c_use as usize)
+                    + (c_part_x as usize + px);
+                let idx = py * c_w as usize + px;
+                let (vb, vr) = if has_l0 && has_l1 {
+                    (
+                        (l0_cb[idx] + l1_cb[idx] + 1) >> 1,
+                        (l0_cr[idx] + l1_cr[idx] + 1) >> 1,
+                    )
+                } else if has_l0 {
+                    (l0_cb[idx], l0_cr[idx])
+                } else if has_l1 {
+                    (l1_cb[idx], l1_cr[idx])
+                } else {
+                    (0, 0)
+                };
+                pred_cb[dst_idx] = vb;
+                pred_cr[dst_idx] = vr;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// §8.4.2.2 — motion-compensate one partition's luma plane. `dst`
+/// is the partition-sized output buffer (w * h samples, row-major).
+fn mc_luma_partition(
+    ref_pic: &Picture,
+    part_abs_x: i32,
+    part_abs_y: i32,
+    mv: Mv,
+    w: u32,
+    h: u32,
+    bit_depth: u32,
+    dst: &mut [i32],
+) -> Result<(), ReconstructError> {
+    // §8.4.1.4 — MV is in 1/4-pel luma units. Integer part = mv / 4
+    // (with spec's "truncate toward zero" via i32 division); fractional
+    // part in 0..=3.
+    let mv_x = mv.x;
+    let mv_y = mv.y;
+    let int_x = part_abs_x + (mv_x >> 2);
+    let int_y = part_abs_y + (mv_y >> 2);
+    let x_frac = (mv_x & 3) as u8;
+    let y_frac = (mv_y & 3) as u8;
+
+    interpolate_luma(
+        &ref_pic.luma,
+        ref_pic.width_in_samples as usize,
+        ref_pic.width_in_samples as usize,
+        ref_pic.height_in_samples as usize,
+        int_x,
+        int_y,
+        x_frac,
+        y_frac,
+        w,
+        h,
+        bit_depth,
+        dst,
+        w as usize,
+    )
+    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+    Ok(())
+}
+
+/// §8.4.2.2 — motion-compensate one partition's chroma planes (Cb + Cr).
+/// Writes to two partition-sized scratch buffers. ChromaArrayType is 1
+/// (4:2:0) or 2 (4:2:2). §8.4.1.4 — chroma MVs are in 1/8-pel units for
+/// 4:2:0 / 4:2:2.
+#[allow(clippy::too_many_arguments)]
+fn mc_chroma_partition(
+    ref_pic: &Picture,
+    part_abs_x: i32,
+    part_abs_y: i32,
+    mv: Mv,
+    w: u32,
+    h: u32,
+    chroma_array_type: u32,
+    bit_depth: u32,
+    dst_cb: &mut [i32],
+    dst_cr: &mut [i32],
+) -> Result<(), ReconstructError> {
+    // §8.4.1.4 — chroma MV derivation:
+    // - 4:2:0 (ChromaArrayType == 1): mvC = mv / 2 (both components).
+    // - 4:2:2 (ChromaArrayType == 2): mvC.x = mv.x / 2, mvC.y = mv.y.
+    // The chroma interpolator takes 1/8-pel fractions (0..=7) — per
+    // §8.4.2.2.2 the chroma MV uses 3 fractional bits.
+    let (mv_cx, mv_cy) = match chroma_array_type {
+        1 => (mv.x, mv.y),
+        2 => (mv.x, mv.y * 2), // keep 1/8-pel resolution vertical.
+        _ => (mv.x, mv.y),
+    };
+    // int_x = part_abs_x + (mvC.x >> 3); x_frac = mvC.x & 7.
+    // For 4:2:0 this yields the spec's eq. 8-232 / 8-233 (xFracC / yFracC).
+    let int_x = part_abs_x + (mv_cx >> 3);
+    let int_y = part_abs_y + (mv_cy >> 3);
+    let x_frac = (mv_cx & 7) as u8;
+    let y_frac = (mv_cy & 7) as u8;
+
+    let cw = ref_pic.chroma_width() as usize;
+    let ch = ref_pic.chroma_height() as usize;
+
+    interpolate_chroma(
+        &ref_pic.cb, cw, cw, ch, int_x, int_y, x_frac, y_frac, w, h, bit_depth,
+        dst_cb, w as usize,
+    )
+    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+    interpolate_chroma(
+        &ref_pic.cr, cw, cw, ch, int_x, int_y, x_frac, y_frac, w, h, bit_depth,
+        dst_cr, w as usize,
+    )
+    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+    Ok(())
+}
+
+/// §8.4.1 — derive the L0/L1 MV for a partition.
+///
+/// For P_Skip and B_Direct this is the derivation per §8.4.1.2; for
+/// explicit inter partitions this is mvpLX + mvdLX.
+///
+/// Neighbour MV data is read from the grid. The partition's shape
+/// selects the §8.4.1.3 shortcut (16x8 / 8x16) when applicable.
+fn derive_partition_mvs(
+    part: &InterPartition,
+    mb_addr: u32,
+    grid: &MbGrid,
+) -> (Mv, Mv) {
+    // Build neighbour MVs (A, B, C) relative to the partition origin.
+    // The simple non-MBAFF frame case: A is the 4x4 block immediately
+    // left (within this MB or the left MB if partition is at x=0),
+    // B is the 4x4 block immediately above, C is the 4x4 block
+    // upper-right.
+    let (neigh_a_l0, neigh_b_l0, neigh_c_l0) =
+        neighbour_mvs_for_list(part, mb_addr, grid, 0);
+    let (neigh_a_l1, neigh_b_l1, neigh_c_l1) =
+        neighbour_mvs_for_list(part, mb_addr, grid, 1);
+
+    // Apply §8.4.1.3.2 eq. 8-214..8-216 — if C is unavailable,
+    // substitute D. We don't track D explicitly in the per-partition
+    // context here, so we conservatively fall through to median-of-
+    // (A, B, 0) when C is unavailable. Full D substitution is a TODO.
+
+    let (mv_l0, mv_l1) = match part.mode {
+        PartMode::Direct => {
+            // §8.4.1.2 direct mode — for now use spatial-direct median
+            // with ref_idx = 0. Temporal direct and full spatial direct
+            // precise derivation are deferred.
+            let mvp_l0 = derive_mvpred(&MvpredInputs {
+                neighbour_a: neigh_a_l0,
+                neighbour_b: neigh_b_l0,
+                neighbour_c: neigh_c_l0,
+                current_ref_idx: part.ref_idx_l0.max(0) as i32,
+                shape: MvpredShape::Default,
+            });
+            let mvp_l1 = derive_mvpred(&MvpredInputs {
+                neighbour_a: neigh_a_l1,
+                neighbour_b: neigh_b_l1,
+                neighbour_c: neigh_c_l1,
+                current_ref_idx: part.ref_idx_l1.max(0) as i32,
+                shape: MvpredShape::Default,
+            });
+            (mvp_l0, mvp_l1)
+        }
+        _ => {
+            // §8.4.1.1 — mvLX = mvpLX + mvdLX.
+            // Special-case P_Skip (encoded as PartMode::L0Only with
+            // zero MVD + shape = Default + ref_idx_l0 = 0): invoke
+            // derive_p_skip_mv for the spec-accurate zero-MV
+            // substitution conditions.
+            let mvp_l0 = if part.mode == PartMode::L0Only
+                && part.mvd_l0 == (0, 0)
+                && part.ref_idx_l0 == 0
+                && part.shape == MvpredShape::Default
+                && part.w == 16
+                && part.h == 16
+            {
+                // P_Skip path (§8.4.1.2).
+                let (_, mv) = derive_p_skip_mv(neigh_a_l0, neigh_b_l0, neigh_c_l0);
+                mv
+            } else if part.mode != PartMode::L1Only && part.ref_idx_l0 >= 0 {
+                derive_mvpred(&MvpredInputs {
+                    neighbour_a: neigh_a_l0,
+                    neighbour_b: neigh_b_l0,
+                    neighbour_c: neigh_c_l0,
+                    current_ref_idx: part.ref_idx_l0 as i32,
+                    shape: part.shape,
+                })
+            } else {
+                Mv::ZERO
+            };
+            let mvp_l1 = if part.mode != PartMode::L0Only && part.ref_idx_l1 >= 0 {
+                derive_mvpred(&MvpredInputs {
+                    neighbour_a: neigh_a_l1,
+                    neighbour_b: neigh_b_l1,
+                    neighbour_c: neigh_c_l1,
+                    current_ref_idx: part.ref_idx_l1 as i32,
+                    shape: part.shape,
+                })
+            } else {
+                Mv::ZERO
+            };
+            (
+                Mv::new(mvp_l0.x + part.mvd_l0.0, mvp_l0.y + part.mvd_l0.1),
+                Mv::new(mvp_l1.x + part.mvd_l1.0, mvp_l1.y + part.mvd_l1.1),
+            )
+        }
+    };
+
+    (mv_l0, mv_l1)
+}
+
+/// Figure 6-10 raster mapping — 4x4 block coordinates (bx, by) in
+/// 4x4-block units (0..=3 each) → raster block index (0..=15) used
+/// by MbInfo::mv_l0 / mv_l1.
+#[inline]
+fn blk4_raster_index(bx_b: u8, by_b: u8) -> u8 {
+    // LUMA_4X4_XY is indexed by block index and yields (x, y) in 4-sample
+    // units. Invert via the 8x8-quadrant split (Figure 6-10):
+    //   quadrant = 2*(by_b/2) + (bx_b/2)
+    //   lo index = 2*(by_b%2) + (bx_b%2)
+    //   blk4 = 4 * quadrant + lo
+    let q = 2 * (by_b / 2) + (bx_b / 2);
+    let lo = 2 * (by_b % 2) + (bx_b % 2);
+    4 * q + lo
+}
+
+/// §8.4.1.3.2 — build (A, B, C) NeighbourMv triples for the top-left
+/// 4x4 block of a partition, querying the grid for the previously
+/// decoded neighbour MVs + ref indices.
+///
+/// Non-MBAFF, frame-picture case only. A is the left 4x4 (same row,
+/// one 4x4 to the left); B is the above 4x4; C is above-right (one
+/// 4x4 across a 4-pel boundary).
+fn neighbour_mvs_for_list(
+    part: &InterPartition,
+    mb_addr: u32,
+    grid: &MbGrid,
+    list: u8,
+) -> (NeighbourMv, NeighbourMv, NeighbourMv) {
+    // Partition origin in 4x4 units, relative to MB.
+    let px = part.x as i32 / 4;
+    let py = part.y as i32 / 4;
+    let width = grid.width_in_mbs as i32;
+    let (mb_xx, mb_yy) = grid.mb_xy(mb_addr);
+    let mb_xx = mb_xx as i32;
+    let mb_yy = mb_yy as i32;
+
+    // A = (px-1, py) — left.
+    let a = neighbour_from_block(grid, mb_xx, mb_yy, width, px - 1, py, list);
+    // B = (px, py-1) — above.
+    let b = neighbour_from_block(grid, mb_xx, mb_yy, width, px, py - 1, list);
+    // C = (px + w/4, py - 1) — above-right of the partition.
+    let c_off_x = part.w as i32 / 4;
+    let c = neighbour_from_block(
+        grid, mb_xx, mb_yy, width,
+        px + c_off_x, py - 1, list,
+    );
+    (a, b, c)
+}
+
+/// Fetch a NeighbourMv at (bx, by) in 4x4-block coordinates relative
+/// to the current MB. Negative coordinates cross into adjacent MBs
+/// (§6.4.12). Returns `UNAVAILABLE` if the neighbour lies outside the
+/// picture or hasn't been decoded yet.
+fn neighbour_from_block(
+    grid: &MbGrid,
+    mb_xx: i32,
+    mb_yy: i32,
+    width: i32,
+    bx: i32,
+    by: i32,
+    list: u8,
+) -> NeighbourMv {
+    // Wrap to neighbour MB.
+    let mut nx = mb_xx;
+    let mut ny = mb_yy;
+    let mut bxw = bx;
+    let mut byw = by;
+    if bxw < 0 {
+        nx -= 1;
+        bxw += 4;
+    } else if bxw >= 4 {
+        nx += 1;
+        bxw -= 4;
+    }
+    if byw < 0 {
+        ny -= 1;
+        byw += 4;
+    } else if byw >= 4 {
+        ny += 1;
+        byw -= 4;
+    }
+    if nx < 0 || ny < 0 || nx >= width {
+        return NeighbourMv::UNAVAILABLE;
+    }
+    let addr = (ny as u32) * (width as u32) + (nx as u32);
+    let Some(info) = grid.get(addr) else {
+        return NeighbourMv::UNAVAILABLE;
+    };
+    if !info.available {
+        return NeighbourMv::UNAVAILABLE;
+    }
+    // §8.4.1.3.2 — intra neighbour => treat as unavailable for MVpred.
+    if info.is_intra {
+        return NeighbourMv::UNAVAILABLE;
+    }
+    let blk4 = blk4_raster_index(bxw as u8, byw as u8) as usize;
+    let (mv, ref_idx) = if list == 0 {
+        (info.mv_l0[blk4], info.ref_idx_l0[blk4 / 4])
+    } else {
+        (info.mv_l1[blk4], info.ref_idx_l1[blk4 / 4])
+    };
+    if ref_idx < 0 {
+        return NeighbourMv::UNAVAILABLE;
+    }
+    NeighbourMv {
+        available: true,
+        ref_idx: ref_idx as i32,
+        mv: Mv::new(mv.0 as i32, mv.1 as i32),
+    }
+}
+
+/// §7.4.5 / Tables 7-13, 7-14 — derive the list of inter partitions
+/// for a given macroblock.
+fn derive_inter_partitions(
+    mb: &Macroblock,
+    slice_header: &SliceHeader,
+) -> Result<Vec<InterPartition>, ReconstructError> {
+    use MbType::*;
+    let pred = mb.mb_pred.as_ref();
+    match &mb.mb_type {
+        // --- P slices -------------------------------------------------
+        PSkip => {
+            // §8.4.1.1 — P_Skip is a 16x16 L0 partition with ref_idx = 0
+            // and MVD = (0, 0). The spec-accurate MVs are derived inside
+            // derive_partition_mvs via derive_p_skip_mv.
+            Ok(vec![InterPartition {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                mode: PartMode::L0Only,
+                shape: MvpredShape::Default,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+                mvd_l0: (0, 0),
+                mvd_l1: (0, 0),
+            }])
+        }
+        PL016x16 => {
+            let p = pred.ok_or_else(|| {
+                ReconstructError::UnsupportedInterMbType("P_L0_16x16 without mb_pred".into())
+            })?;
+            let r0 = *p.ref_idx_l0.first().unwrap_or(&0) as i8;
+            let mvd = p.mvd_l0.first().copied().unwrap_or([0, 0]);
+            Ok(vec![InterPartition {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                mode: PartMode::L0Only,
+                shape: MvpredShape::Default,
+                ref_idx_l0: r0,
+                ref_idx_l1: -1,
+                mvd_l0: (mvd[0], mvd[1]),
+                mvd_l1: (0, 0),
+            }])
+        }
+        PL0L016x8 => {
+            let p = pred.ok_or_else(|| {
+                ReconstructError::UnsupportedInterMbType("P_L0_L0_16x8 without mb_pred".into())
+            })?;
+            let r0 = *p.ref_idx_l0.first().unwrap_or(&0) as i8;
+            let r1 = *p.ref_idx_l0.get(1).unwrap_or(&0) as i8;
+            let mvd0 = p.mvd_l0.first().copied().unwrap_or([0, 0]);
+            let mvd1 = p.mvd_l0.get(1).copied().unwrap_or([0, 0]);
+            Ok(vec![
+                InterPartition {
+                    x: 0, y: 0, w: 16, h: 8,
+                    mode: PartMode::L0Only,
+                    shape: MvpredShape::Partition16x8Top,
+                    ref_idx_l0: r0, ref_idx_l1: -1,
+                    mvd_l0: (mvd0[0], mvd0[1]),
+                    mvd_l1: (0, 0),
+                },
+                InterPartition {
+                    x: 0, y: 8, w: 16, h: 8,
+                    mode: PartMode::L0Only,
+                    shape: MvpredShape::Partition16x8Bottom,
+                    ref_idx_l0: r1, ref_idx_l1: -1,
+                    mvd_l0: (mvd1[0], mvd1[1]),
+                    mvd_l1: (0, 0),
+                },
+            ])
+        }
+        PL0L08x16 => {
+            let p = pred.ok_or_else(|| {
+                ReconstructError::UnsupportedInterMbType("P_L0_L0_8x16 without mb_pred".into())
+            })?;
+            let r0 = *p.ref_idx_l0.first().unwrap_or(&0) as i8;
+            let r1 = *p.ref_idx_l0.get(1).unwrap_or(&0) as i8;
+            let mvd0 = p.mvd_l0.first().copied().unwrap_or([0, 0]);
+            let mvd1 = p.mvd_l0.get(1).copied().unwrap_or([0, 0]);
+            Ok(vec![
+                InterPartition {
+                    x: 0, y: 0, w: 8, h: 16,
+                    mode: PartMode::L0Only,
+                    shape: MvpredShape::Partition8x16Left,
+                    ref_idx_l0: r0, ref_idx_l1: -1,
+                    mvd_l0: (mvd0[0], mvd0[1]),
+                    mvd_l1: (0, 0),
+                },
+                InterPartition {
+                    x: 8, y: 0, w: 8, h: 16,
+                    mode: PartMode::L0Only,
+                    shape: MvpredShape::Partition8x16Right,
+                    ref_idx_l0: r1, ref_idx_l1: -1,
+                    mvd_l0: (mvd1[0], mvd1[1]),
+                    mvd_l1: (0, 0),
+                },
+            ])
+        }
+        P8x8 | P8x8Ref0 => {
+            let sm = mb.sub_mb_pred.as_ref().ok_or_else(|| {
+                ReconstructError::UnsupportedInterMbType("P_8x8 without sub_mb_pred".into())
+            })?;
+            let force_ref0 = matches!(mb.mb_type, P8x8Ref0);
+            let mut parts = Vec::new();
+            for mb_part in 0..4usize {
+                let (part_x, part_y) = match mb_part {
+                    0 => (0u8, 0u8),
+                    1 => (8, 0),
+                    2 => (0, 8),
+                    _ => (8, 8),
+                };
+                let sub_type = sm.sub_mb_type[mb_part];
+                let r0 = if force_ref0 {
+                    0i8
+                } else {
+                    sm.ref_idx_l0[mb_part] as i8
+                };
+                // Walk sub-partitions.
+                let sub_parts = sub_mb_partitions(sub_type);
+                for (sub_idx, (sx, sy, sw, sh)) in sub_parts.iter().enumerate() {
+                    let mvd = sm
+                        .mvd_l0[mb_part]
+                        .get(sub_idx)
+                        .copied()
+                        .unwrap_or([0, 0]);
+                    parts.push(InterPartition {
+                        x: part_x + sx,
+                        y: part_y + sy,
+                        w: *sw,
+                        h: *sh,
+                        mode: match sub_type {
+                            SubMbType::BDirect8x8 => PartMode::Direct,
+                            _ => PartMode::L0Only,
+                        },
+                        shape: MvpredShape::Default,
+                        ref_idx_l0: r0,
+                        ref_idx_l1: -1,
+                        mvd_l0: (mvd[0], mvd[1]),
+                        mvd_l1: (0, 0),
+                    });
+                }
+            }
+            Ok(parts)
+        }
+
+        // --- B slices -------------------------------------------------
+        BSkip | BDirect16x16 => {
+            // §8.4.1.2 direct mode — for now treat as a single 16x16
+            // direct partition with ref_idx_{l0,l1} = 0. TODO: full
+            // per-spec derivation for precise temporal/spatial direct.
+            let _ = slice_header;
+            Ok(vec![InterPartition {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                mode: PartMode::Direct,
+                shape: MvpredShape::Default,
+                ref_idx_l0: 0,
+                ref_idx_l1: 0,
+                mvd_l0: (0, 0),
+                mvd_l1: (0, 0),
+            }])
+        }
+        BL016x16 | BL116x16 | BBi16x16 => {
+            let p = pred.ok_or_else(|| {
+                ReconstructError::UnsupportedInterMbType("B_*_16x16 without mb_pred".into())
+            })?;
+            let (mode, r0, r1) = b_dir_refs_16x16(&mb.mb_type, p);
+            let mvd0 = p.mvd_l0.first().copied().unwrap_or([0, 0]);
+            let mvd1 = p.mvd_l1.first().copied().unwrap_or([0, 0]);
+            Ok(vec![InterPartition {
+                x: 0, y: 0, w: 16, h: 16,
+                mode,
+                shape: MvpredShape::Default,
+                ref_idx_l0: r0, ref_idx_l1: r1,
+                mvd_l0: (mvd0[0], mvd0[1]),
+                mvd_l1: (mvd1[0], mvd1[1]),
+            }])
+        }
+        // B 16x8 / 8x16 variants — all combinations of L0/L1/Bi per half.
+        BL0L016x8 | BL1L116x8 | BL0L116x8 | BL1L016x8
+        | BL0Bi16x8 | BL1Bi16x8 | BBiL016x8 | BBiL116x8 | BBiBi16x8 => {
+            let p = pred.ok_or_else(|| {
+                ReconstructError::UnsupportedInterMbType("B_*_16x8 without mb_pred".into())
+            })?;
+            let (m0, m1) = b_dir_for_16x8(&mb.mb_type);
+            let (r0_top, r1_top) = ref_idx_for_part(p, 0, m0);
+            let (r0_bot, r1_bot) = ref_idx_for_part(p, 1, m1);
+            let mvd_l0_top = p.mvd_l0.first().copied().unwrap_or([0, 0]);
+            let mvd_l1_top = p.mvd_l1.first().copied().unwrap_or([0, 0]);
+            let mvd_l0_bot = p.mvd_l0.get(1).copied().unwrap_or([0, 0]);
+            let mvd_l1_bot = p.mvd_l1.get(1).copied().unwrap_or([0, 0]);
+            Ok(vec![
+                InterPartition {
+                    x: 0, y: 0, w: 16, h: 8,
+                    mode: m0, shape: MvpredShape::Partition16x8Top,
+                    ref_idx_l0: r0_top, ref_idx_l1: r1_top,
+                    mvd_l0: (mvd_l0_top[0], mvd_l0_top[1]),
+                    mvd_l1: (mvd_l1_top[0], mvd_l1_top[1]),
+                },
+                InterPartition {
+                    x: 0, y: 8, w: 16, h: 8,
+                    mode: m1, shape: MvpredShape::Partition16x8Bottom,
+                    ref_idx_l0: r0_bot, ref_idx_l1: r1_bot,
+                    mvd_l0: (mvd_l0_bot[0], mvd_l0_bot[1]),
+                    mvd_l1: (mvd_l1_bot[0], mvd_l1_bot[1]),
+                },
+            ])
+        }
+        BL0L08x16 | BL1L18x16 | BL0L18x16 | BL1L08x16
+        | BL0Bi8x16 | BL1Bi8x16 | BBiL08x16 | BBiL18x16 | BBiBi8x16 => {
+            let p = pred.ok_or_else(|| {
+                ReconstructError::UnsupportedInterMbType("B_*_8x16 without mb_pred".into())
+            })?;
+            let (m0, m1) = b_dir_for_8x16(&mb.mb_type);
+            let (r0_l, r1_l) = ref_idx_for_part(p, 0, m0);
+            let (r0_r, r1_r) = ref_idx_for_part(p, 1, m1);
+            let mvd_l0_l = p.mvd_l0.first().copied().unwrap_or([0, 0]);
+            let mvd_l1_l = p.mvd_l1.first().copied().unwrap_or([0, 0]);
+            let mvd_l0_r = p.mvd_l0.get(1).copied().unwrap_or([0, 0]);
+            let mvd_l1_r = p.mvd_l1.get(1).copied().unwrap_or([0, 0]);
+            Ok(vec![
+                InterPartition {
+                    x: 0, y: 0, w: 8, h: 16,
+                    mode: m0, shape: MvpredShape::Partition8x16Left,
+                    ref_idx_l0: r0_l, ref_idx_l1: r1_l,
+                    mvd_l0: (mvd_l0_l[0], mvd_l0_l[1]),
+                    mvd_l1: (mvd_l1_l[0], mvd_l1_l[1]),
+                },
+                InterPartition {
+                    x: 8, y: 0, w: 8, h: 16,
+                    mode: m1, shape: MvpredShape::Partition8x16Right,
+                    ref_idx_l0: r0_r, ref_idx_l1: r1_r,
+                    mvd_l0: (mvd_l0_r[0], mvd_l0_r[1]),
+                    mvd_l1: (mvd_l1_r[0], mvd_l1_r[1]),
+                },
+            ])
+        }
+        B8x8 => {
+            let sm = mb.sub_mb_pred.as_ref().ok_or_else(|| {
+                ReconstructError::UnsupportedInterMbType("B_8x8 without sub_mb_pred".into())
+            })?;
+            let mut parts = Vec::new();
+            for mb_part in 0..4usize {
+                let (part_x, part_y) = match mb_part {
+                    0 => (0u8, 0u8),
+                    1 => (8, 0),
+                    2 => (0, 8),
+                    _ => (8, 8),
+                };
+                let sub_type = sm.sub_mb_type[mb_part];
+                let (mode, r0, r1) = b_sub_mode(sub_type, sm.ref_idx_l0[mb_part] as i8, sm.ref_idx_l1[mb_part] as i8);
+                let sub_parts = sub_mb_partitions(sub_type);
+                for (sub_idx, (sx, sy, sw, sh)) in sub_parts.iter().enumerate() {
+                    let mvd0 = sm.mvd_l0[mb_part].get(sub_idx).copied().unwrap_or([0, 0]);
+                    let mvd1 = sm.mvd_l1[mb_part].get(sub_idx).copied().unwrap_or([0, 0]);
+                    parts.push(InterPartition {
+                        x: part_x + sx,
+                        y: part_y + sy,
+                        w: *sw,
+                        h: *sh,
+                        mode,
+                        shape: MvpredShape::Default,
+                        ref_idx_l0: r0,
+                        ref_idx_l1: r1,
+                        mvd_l0: (mvd0[0], mvd0[1]),
+                        mvd_l1: (mvd1[0], mvd1[1]),
+                    });
+                }
+            }
+            Ok(parts)
+        }
+
+        // Should not arrive here — caller routes intra via the intra path.
+        other => Err(ReconstructError::UnsupportedInterMbType(format!(
+            "{:?}",
+            other
+        ))),
+    }
+}
+
+/// Table 7-18 — sub-partition layout (relative x, y, w, h) per sub_mb_type.
+fn sub_mb_partitions(t: SubMbType) -> Vec<(u8, u8, u8, u8)> {
+    use SubMbType::*;
+    match t {
+        PL08x8 | BDirect8x8 | BL08x8 | BL18x8 | BBi8x8 => vec![(0, 0, 8, 8)],
+        PL08x4 | BL08x4 | BL18x4 | BBi8x4 => vec![(0, 0, 8, 4), (0, 4, 8, 4)],
+        PL04x8 | BL04x8 | BL14x8 | BBi4x8 => vec![(0, 0, 4, 8), (4, 0, 4, 8)],
+        PL04x4 | BL04x4 | BL14x4 | BBi4x4 => vec![
+            (0, 0, 4, 4),
+            (4, 0, 4, 4),
+            (0, 4, 4, 4),
+            (4, 4, 4, 4),
+        ],
+        Reserved(_) => vec![(0, 0, 8, 8)],
+    }
+}
+
+/// Table 7-14 — B_L0/B_L1/B_Bi 16x16 → (mode, ref_idx_l0, ref_idx_l1).
+fn b_dir_refs_16x16(
+    ty: &MbType,
+    p: &crate::macroblock_layer::MbPred,
+) -> (PartMode, i8, i8) {
+    match ty {
+        MbType::BL016x16 => (
+            PartMode::L0Only,
+            *p.ref_idx_l0.first().unwrap_or(&0) as i8,
+            -1,
+        ),
+        MbType::BL116x16 => (
+            PartMode::L1Only,
+            -1,
+            *p.ref_idx_l1.first().unwrap_or(&0) as i8,
+        ),
+        MbType::BBi16x16 => (
+            PartMode::BiPred,
+            *p.ref_idx_l0.first().unwrap_or(&0) as i8,
+            *p.ref_idx_l1.first().unwrap_or(&0) as i8,
+        ),
+        _ => (PartMode::L0Only, 0, -1),
+    }
+}
+
+/// Table 7-14 — 16x8 B variants → (mode_top, mode_bottom).
+fn b_dir_for_16x8(ty: &MbType) -> (PartMode, PartMode) {
+    use MbType::*;
+    match ty {
+        BL0L016x8 => (PartMode::L0Only, PartMode::L0Only),
+        BL1L116x8 => (PartMode::L1Only, PartMode::L1Only),
+        BL0L116x8 => (PartMode::L0Only, PartMode::L1Only),
+        BL1L016x8 => (PartMode::L1Only, PartMode::L0Only),
+        BL0Bi16x8 => (PartMode::L0Only, PartMode::BiPred),
+        BL1Bi16x8 => (PartMode::L1Only, PartMode::BiPred),
+        BBiL016x8 => (PartMode::BiPred, PartMode::L0Only),
+        BBiL116x8 => (PartMode::BiPred, PartMode::L1Only),
+        BBiBi16x8 => (PartMode::BiPred, PartMode::BiPred),
+        _ => (PartMode::L0Only, PartMode::L0Only),
+    }
+}
+
+/// Table 7-14 — 8x16 B variants → (mode_left, mode_right).
+fn b_dir_for_8x16(ty: &MbType) -> (PartMode, PartMode) {
+    use MbType::*;
+    match ty {
+        BL0L08x16 => (PartMode::L0Only, PartMode::L0Only),
+        BL1L18x16 => (PartMode::L1Only, PartMode::L1Only),
+        BL0L18x16 => (PartMode::L0Only, PartMode::L1Only),
+        BL1L08x16 => (PartMode::L1Only, PartMode::L0Only),
+        BL0Bi8x16 => (PartMode::L0Only, PartMode::BiPred),
+        BL1Bi8x16 => (PartMode::L1Only, PartMode::BiPred),
+        BBiL08x16 => (PartMode::BiPred, PartMode::L0Only),
+        BBiL18x16 => (PartMode::BiPred, PartMode::L1Only),
+        BBiBi8x16 => (PartMode::BiPred, PartMode::BiPred),
+        _ => (PartMode::L0Only, PartMode::L0Only),
+    }
+}
+
+/// Helper — per-partition (ref_idx_l0, ref_idx_l1), honouring the mode.
+fn ref_idx_for_part(
+    p: &crate::macroblock_layer::MbPred,
+    idx: usize,
+    mode: PartMode,
+) -> (i8, i8) {
+    let r0 = p.ref_idx_l0.get(idx).copied().unwrap_or(0) as i8;
+    let r1 = p.ref_idx_l1.get(idx).copied().unwrap_or(0) as i8;
+    match mode {
+        PartMode::L0Only => (r0, -1),
+        PartMode::L1Only => (-1, r1),
+        PartMode::BiPred => (r0, r1),
+        PartMode::Direct => (r0, r1),
+    }
+}
+
+/// Table 7-18 — sub_mb_type for B_8x8 → (mode, ref_idx_l0, ref_idx_l1).
+fn b_sub_mode(t: SubMbType, r0: i8, r1: i8) -> (PartMode, i8, i8) {
+    use SubMbType::*;
+    match t {
+        BDirect8x8 => (PartMode::Direct, 0, 0),
+        BL08x8 | BL08x4 | BL04x8 | BL04x4 => (PartMode::L0Only, r0, -1),
+        BL18x8 | BL18x4 | BL14x8 | BL14x4 => (PartMode::L1Only, -1, r1),
+        BBi8x8 | BBi8x4 | BBi4x8 | BBi4x4 => (PartMode::BiPred, r0, r1),
+        _ => (PartMode::L0Only, r0, -1),
+    }
+}
+
+/// §8.5.12 / §8.5.11 — inter chroma residual path: for every 4x4 chroma
+/// block, dequantise AC, combine with the pre-computed pred buffer, and
+/// write out. Shares code with the intra chroma path except the
+/// prediction buffer source.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_inter_chroma_residual(
+    mb: &Macroblock,
+    qp_y: i32,
+    chroma_array_type: u32,
+    bit_depth_c: u32,
+    mb_px: i32,
+    mb_py: i32,
+    pps: &Pps,
+    cbp_chroma: u8,
+    pred_cb: &[i32],
+    pred_cr: &[i32],
+    pic: &mut Picture,
+) -> Result<(), ReconstructError> {
+    let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
+    let c_mb_px = (mb_px / 16) * (mbw_c as i32);
+    let c_mb_py = (mb_py / 16) * (mbh_c as i32);
+
+    // §8.5.8 — QPc per plane.
+    let cb_offset = pps.chroma_qp_index_offset;
+    let cr_offset = pps
+        .extension
+        .as_ref()
+        .map(|e| e.second_chroma_qp_index_offset)
+        .unwrap_or(pps.chroma_qp_index_offset);
+    let qp_cb = qp_y_to_qp_c(qp_y, cb_offset);
+    let qp_cr = qp_y_to_qp_c(qp_y, cr_offset);
+
+    let sl4 = default_scaling_list_4x4_flat();
+    let num_c8x8 = if chroma_array_type == 1 { 1 } else { 2 };
+    let n_ac = 4 * num_c8x8 as usize;
+
+    for plane in 0..2u8 {
+        let qp_c = if plane == 0 { qp_cb } else { qp_cr };
+        let dc_block = if plane == 0 {
+            &mb.residual_chroma_dc_cb
+        } else {
+            &mb.residual_chroma_dc_cr
+        };
+        let dc_flat: [i32; 8] = {
+            let mut a = [0i32; 8];
+            for (i, v) in dc_block.iter().enumerate().take(a.len()) {
+                a[i] = *v;
+            }
+            a
+        };
+        let (dc4, dc8): (Option<[i32; 4]>, Option<[i32; 8]>) = if cbp_chroma > 0 {
+            if chroma_array_type == 1 {
+                let dc4: [i32; 4] = [dc_flat[0], dc_flat[1], dc_flat[2], dc_flat[3]];
+                let out = inverse_hadamard_chroma_dc_420(&dc4, qp_c, &sl4, bit_depth_c)?;
+                (Some(out), None)
+            } else {
+                let out = inverse_hadamard_chroma_dc_422(&dc_flat, qp_c, &sl4, bit_depth_c)?;
+                (None, Some(out))
+            }
+        } else {
+            (Some([0i32; 4]), Some([0i32; 8]))
+        };
+        let ac_blocks = if plane == 0 {
+            &mb.residual_chroma_ac_cb
+        } else {
+            &mb.residual_chroma_ac_cr
+        };
+        for blk in 0..n_ac {
+            let dc_c = if chroma_array_type == 1 {
+                dc4.unwrap()[blk]
+            } else {
+                dc8.unwrap()[blk]
+            };
+            let ac_scan = if cbp_chroma == 2 {
+                ac_blocks.get(blk).copied().unwrap_or([0i32; 16])
+            } else {
+                [0i32; 16]
+            };
+            let mut coeffs = crate::transform::inverse_scan_4x4_zigzag(&ac_scan);
+            coeffs[0] = dc_c;
+            let residual =
+                inverse_transform_4x4_dc_preserved(&coeffs, qp_c, &sl4, bit_depth_c)?;
+            let (bx, by) = chroma_block_xy(chroma_array_type, blk);
+            for yy in 0..4 {
+                for xx in 0..4 {
+                    let pidx = ((by as usize + yy) * (mbw_c as usize))
+                        + (bx as usize + xx);
+                    let pred_v = if plane == 0 {
+                        pred_cb[pidx]
+                    } else {
+                        pred_cr[pidx]
+                    };
+                    let v = clip_sample(
+                        pred_v + residual[yy * 4 + xx],
+                        bit_depth_c,
+                    );
+                    if plane == 0 {
+                        pic.set_cb(c_mb_px + bx + xx as i32, c_mb_py + by + yy as i32, v);
+                    } else {
+                        pic.set_cr(c_mb_px + bx + xx as i32, c_mb_py + by + yy as i32, v);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// Silence "MbInfo unused" if no inter test uses it directly.
+#[allow(dead_code)]
+fn _mb_info_marker(_: MbInfo) {}
+
 // -------------------------------------------------------------------------
 // §8.7 — Deblocking (picture-level pass, simplified)
 // -------------------------------------------------------------------------
@@ -1502,7 +2728,8 @@ fn filter_horizontal_edge_chroma(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macroblock_layer::{Intra16x16, MbPred, Macroblock, MbType, PcmSamples};
+    use crate::macroblock_layer::{Intra16x16, MbPred, Macroblock, MbType, PcmSamples, SubMbPred, SubMbType};
+    use crate::ref_store::{NoRefs, RefPicStore};
     use crate::slice_header::{
         DecRefPicMarking, PredWeightTable, RefPicListModification, SliceHeader, SliceType,
     };
@@ -1667,7 +2894,7 @@ mod tests {
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
-        reconstruct_slice(&slice_data, &sh, &sps, &pps, &mut pic, &mut grid).unwrap();
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid).unwrap();
 
         // Check the gradient pattern is in the luma plane.
         for y in 0..16 {
@@ -1711,7 +2938,7 @@ mod tests {
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
-        reconstruct_slice(&slice_data, &sh, &sps, &pps, &mut pic, &mut grid).unwrap();
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid).unwrap();
 
         for y in 0..16 {
             for x in 0..16 {
@@ -1800,7 +3027,7 @@ mod tests {
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
         let mut grid = MbGrid::new(1, 2);
-        reconstruct_slice(&slice_data, &sh, &sps, &pps, &mut pic, &mut grid).unwrap();
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid).unwrap();
 
         // Top MB row 15 holds the known band.
         for x in 0..16 {
@@ -1889,6 +3116,7 @@ mod tests {
             &sh_off,
             &sps,
             &pps,
+            &NoRefs,
             &mut pic_off,
             &mut grid_off,
         )
@@ -1896,7 +3124,7 @@ mod tests {
 
         let mut pic_on = Picture::new(32, 16, 1, 8, 8);
         let mut grid_on = MbGrid::new(2, 1);
-        reconstruct_slice(&slice_data, &sh, &sps, &pps, &mut pic_on, &mut grid_on).unwrap();
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic_on, &mut grid_on).unwrap();
 
         // We just confirm the two pictures are not equal: the filter
         // did something when enabled. A finer per-sample assertion
@@ -1910,5 +3138,316 @@ mod tests {
             "deblocking filter did not modify any samples, \
              expected at least the edge column to change"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Inter reconstruction tests
+    // ---------------------------------------------------------------------
+
+    /// Build a P-slice header for inter tests.
+    fn make_p_slice_header() -> SliceHeader {
+        let mut sh = make_slice_header();
+        sh.slice_type_raw = 0;
+        sh.slice_type = SliceType::P;
+        sh
+    }
+
+    /// Build a B-slice header.
+    fn make_b_slice_header() -> SliceHeader {
+        let mut sh = make_slice_header();
+        sh.slice_type_raw = 1;
+        sh.slice_type = SliceType::B;
+        sh
+    }
+
+    /// Build a reference picture with luma filled by a closure, chroma
+    /// flat at 128.
+    fn make_ref_pic<F: FnMut(i32, i32) -> i32>(w: u32, h: u32, mut f: F) -> Picture {
+        let mut p = Picture::new(w, h, 1, 8, 8);
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                p.set_luma(x, y, f(x, y));
+            }
+        }
+        for y in 0..(h / 2) as i32 {
+            for x in 0..(w / 2) as i32 {
+                p.set_cb(x, y, 128);
+                p.set_cr(x, y, 128);
+            }
+        }
+        p
+    }
+
+    /// Build a P_L0_16x16 MB with zero residual.
+    fn make_p_l0_16x16(ref_idx: u32, mvd: [i32; 2]) -> Macroblock {
+        let mut pred = MbPred::default();
+        pred.ref_idx_l0 = vec![ref_idx];
+        pred.mvd_l0 = vec![mvd];
+        Macroblock {
+            mb_type: MbType::PL016x16,
+            mb_type_raw: 0,
+            mb_pred: Some(pred),
+            sub_mb_pred: None,
+            pcm_samples: None,
+            coded_block_pattern: 0,
+            transform_size_8x8_flag: false,
+            mb_qp_delta: 0,
+            residual_luma: Vec::new(),
+            residual_luma_dc: None,
+            residual_chroma_dc_cb: vec![0i32; 4],
+            residual_chroma_dc_cr: vec![0i32; 4],
+            residual_chroma_ac_cb: Vec::new(),
+            residual_chroma_ac_cr: Vec::new(),
+            is_skip: false,
+        }
+    }
+
+    #[test]
+    fn p_skip_with_empty_refs_returns_missing_ref_pic() {
+        // P_Skip references L0[0]; with NoRefs (no pictures available)
+        // the reconstruction must surface MissingRefPic.
+        let sps = make_sps(1, 1);
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+        let mb = Macroblock::new_skip(SliceType::P);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        let err = reconstruct_slice(
+            &slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid,
+        )
+        .unwrap_err();
+        match err {
+            ReconstructError::MissingRefPic { list, idx } => {
+                assert_eq!(list, 0);
+                assert_eq!(idx, 0);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p_l0_16x16_zero_mv_copies_reference_plane() {
+        // With MV = (0, 0), MVD = (0, 0), ref_idx = 0, the predicted
+        // MB equals the corresponding 16x16 region of the reference
+        // picture. Zero residual => output == prediction.
+        let sps = make_sps(1, 1);
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+
+        // Reference picture: luma[y * 16 + x] = (y * 16 + x) & 0xFF.
+        let ref_pic = make_ref_pic(16, 16, |x, y| ((y * 16 + x) & 0xFF) as i32);
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        let mb = make_p_l0_16x16(0, [0, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(
+            &slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid,
+        )
+        .unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                let expected = ((y * 16 + x) & 0xFF) as i32;
+                assert_eq!(pic.luma_at(x, y), expected, "mismatch at ({}, {})", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn p_l0_16x16_half_pel_horizontal_mv_matches_6tap() {
+        // MV = (2, 0) in 1/4-pel units => xFrac = 2 (half-pel). The
+        // 6-tap FIR at (x, y) computes:
+        //   b1 = E -5F + 20G + 20H -5I + J
+        //   b  = Clip1_8((b1 + 16) >> 5)
+        // We set the reference row such that a hand-computed cell
+        // result is known.
+        let sps = make_sps(2, 2);
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+
+        let mut ref_pic = Picture::new(32, 32, 1, 8, 8);
+        // Row 8 cols 8..=13 = {10, 20, 30, 40, 50, 60}.
+        for (i, v) in [10, 20, 30, 40, 50, 60].iter().enumerate() {
+            ref_pic.set_luma(8 + i as i32, 8, *v);
+        }
+        for y in 0..16 {
+            for x in 0..16 {
+                ref_pic.set_cb(x, y, 128);
+                ref_pic.set_cr(x, y, 128);
+            }
+        }
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        // Build a 1-MB picture at position (0, 0). MV = (2, 0) in
+        // 1/4-pel units. The MB starts at (0, 0); with xFrac = 2 the
+        // output sample at MB (10, 8) corresponds to the half-pel b
+        // at reference (10, 8), which equals 35 (see inter_pred
+        // luma_half_pel_horizontal_known_sample).
+        let mb = make_p_l0_16x16(0, [2, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(
+            &slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid,
+        )
+        .unwrap();
+        assert_eq!(pic.luma_at(10, 8), 35);
+    }
+
+    #[test]
+    fn p_8x8_with_b_direct_sub_partitions_runs_without_error() {
+        // Synthesize a P_8x8 MB with four 8x8 sub-partitions of
+        // SubMbType::BDirect8x8 (valid for B slices; here we use it
+        // as a dispatch smoke test — the code treats BDirect8x8 as
+        // Direct mode for the P slice too, and since ref_idx = 0 and
+        // MVD = (0, 0) the spatial direct path will pull MV = (0, 0)
+        // with no neighbour MV data). A small reference picture lets
+        // MC complete.
+        let sps = make_sps(1, 1);
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+
+        let ref_pic = make_ref_pic(16, 16, |_, _| 50);
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        let mut smp = SubMbPred::default();
+        for i in 0..4 {
+            smp.sub_mb_type[i] = SubMbType::BDirect8x8;
+            smp.ref_idx_l0[i] = 0;
+            smp.ref_idx_l1[i] = 0;
+            smp.mvd_l0[i] = vec![[0, 0]];
+            smp.mvd_l1[i] = vec![[0, 0]];
+        }
+        let mb = Macroblock {
+            mb_type: MbType::P8x8,
+            mb_type_raw: 3,
+            mb_pred: None,
+            sub_mb_pred: Some(smp),
+            pcm_samples: None,
+            coded_block_pattern: 0,
+            transform_size_8x8_flag: false,
+            mb_qp_delta: 0,
+            residual_luma: Vec::new(),
+            residual_luma_dc: None,
+            residual_chroma_dc_cb: vec![0i32; 4],
+            residual_chroma_dc_cr: vec![0i32; 4],
+            residual_chroma_ac_cb: Vec::new(),
+            residual_chroma_ac_cr: Vec::new(),
+            is_skip: false,
+        };
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(
+            &slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid,
+        )
+        .unwrap();
+        // Zero MV, constant ref plane => output = 50 everywhere.
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pic.luma_at(x, y), 50);
+            }
+        }
+    }
+
+    #[test]
+    fn b_skip_with_two_refs_runs_direct_mode() {
+        // B_Skip triggers direct-mode derivation (§8.4.1.2). With two
+        // reference pictures populated and a single MB, we just make
+        // sure the code path runs and produces plausible output.
+        let sps = make_sps(1, 1);
+        let pps = make_pps();
+        let sh = make_b_slice_header();
+
+        let l0 = make_ref_pic(16, 16, |_, _| 80);
+        let l1 = make_ref_pic(16, 16, |_, _| 120);
+        let mut store = RefPicStore::new();
+        store.insert(0, l0);
+        store.insert(1, l1);
+        store.set_list_0(vec![0]);
+        store.set_list_1(vec![1]);
+
+        let mb = Macroblock::new_skip(SliceType::B);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(
+            &slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid,
+        )
+        .unwrap();
+        // BiPred default average of (80, 120) = 100 (approximately).
+        for y in 0..16 {
+            for x in 0..16 {
+                let v = pic.luma_at(x, y);
+                assert!(
+                    (95..=105).contains(&v),
+                    "expected ~100 at ({}, {}), got {}",
+                    x, y, v
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inter_mb_records_mv_and_ref_idx_in_grid() {
+        // After an inter MB is reconstructed, the MbGrid must carry
+        // the MV + ref_idx so a neighbouring inter MB's MVpred can
+        // consult them.
+        let sps = make_sps(2, 1);
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+
+        let ref_pic = make_ref_pic(32, 16, |_, _| 50);
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        // MB 0: P_L0_16x16 with ref_idx=0, MVD=(4, 8) (i.e., MV = (4, 8)
+        // since no neighbour -> MVpred = (0, 0)).
+        let mb0 = make_p_l0_16x16(0, [4, 8]);
+        // MB 1: P_L0_16x16 — we'll just verify the grid after MB 0.
+        let mb1 = make_p_l0_16x16(0, [0, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb0, mb1],
+            last_mb_addr: 1,
+        };
+        let mut pic = Picture::new(32, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(2, 1);
+        reconstruct_slice(
+            &slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid,
+        )
+        .unwrap();
+
+        let info0 = grid.get(0).unwrap();
+        assert!(info0.available);
+        assert!(!info0.is_intra);
+        assert_eq!(info0.ref_idx_l0, [0, 0, 0, 0]);
+        // Every 4x4 block in MB 0 should carry mv = (4, 8).
+        for blk4 in 0..16 {
+            assert_eq!(info0.mv_l0[blk4], (4i16, 8i16));
+        }
     }
 }
