@@ -6,15 +6,20 @@
 //!
 //! Spec cross-reference (Rec. ITU-T H.264 (08/2024)):
 //!
-//! | payload_type | Syntax      | Semantics   | Meaning                          |
-//! | ------------ | ----------- | ----------- | -------------------------------- |
-//! | 0            | §D.1.2      | §D.2.2      | buffering_period                 |
-//! | 1            | §D.1.3      | §D.2.3      | pic_timing                       |
-//! | 3            | §D.1.5      | §D.2.5      | filler_payload                   |
-//! | 5            | §D.1.7      | §D.2.7      | user_data_unregistered           |
-//! | 6            | §D.1.8      | §D.2.8      | recovery_point                   |
-//! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume  |
-//! | 144          | §D.1.31     | §D.2.35     | content_light_level_info         |
+//! | payload_type | Syntax      | Semantics   | Meaning                            |
+//! | ------------ | ----------- | ----------- | ---------------------------------- |
+//! | 0            | §D.1.2      | §D.2.2      | buffering_period                   |
+//! | 1            | §D.1.3      | §D.2.3      | pic_timing                         |
+//! | 3            | §D.1.5      | §D.2.5      | filler_payload                     |
+//! | 5            | §D.1.7      | §D.2.7      | user_data_unregistered             |
+//! | 6            | §D.1.8      | §D.2.8      | recovery_point                     |
+//! | 19           | §D.1.21     | §D.2.21     | film_grain_characteristics         |
+//! | 23           | §D.1.25     | §D.2.25     | tone_mapping_info                  |
+//! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
+//! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
+//! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume    |
+//! | 144          | §D.1.31     | §D.2.31     | content_light_level_info           |
+//! | 147          | §D.1.32     | §D.2.32     | alternative_transfer_characteristics |
 
 #![allow(dead_code)]
 
@@ -101,11 +106,152 @@ pub struct MasteringDisplayColourVolume {
     pub min_display_mastering_luminance: u32,
 }
 
-/// §D.2.35 — content_light_level_info (HDR10).
+/// §D.2.31 — content_light_level_info (HDR10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContentLightLevelInfo {
     pub max_content_light_level: u16,
     pub max_pic_average_light_level: u16,
+}
+
+/// §D.2.26 — frame_packing_arrangement. Stereoscopic 3D packing info.
+///
+/// When `cancel_flag` is true the message only carries the
+/// identifier plus the trailing `extension_flag`; all other fields
+/// default to zero and should be ignored by consumers.
+///
+/// When `quincunx_sampling_flag == 1` or `ty == 5` (temporal
+/// interleaving) the four grid-position nibbles are not transmitted
+/// and remain zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramePackingArrangement {
+    pub id: u32,
+    pub cancel_flag: bool,
+    pub ty: u8, // 0..=7 packing arrangement type (u(7))
+    pub quincunx_sampling_flag: bool,
+    pub content_interpretation_type: u8,
+    pub spatial_flipping_flag: bool,
+    pub frame0_flipped_flag: bool,
+    pub field_views_flag: bool,
+    pub current_frame_is_frame0_flag: bool,
+    pub frame0_self_contained_flag: bool,
+    pub frame1_self_contained_flag: bool,
+    pub frame0_grid_position_x: u8,
+    pub frame0_grid_position_y: u8,
+    pub frame1_grid_position_x: u8,
+    pub frame1_grid_position_y: u8,
+    pub reserved_byte: u8,
+    pub repetition_period: u32,
+    pub extension_flag: bool,
+}
+
+/// §D.2.27 — display_orientation.
+///
+/// When `cancel_flag` is true all other fields are omitted from the
+/// bitstream and default to zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayOrientation {
+    pub cancel_flag: bool,
+    pub hor_flip: bool,
+    pub ver_flip: bool,
+    /// u(16). Interpreted as counter-clockwise rotation in
+    /// units of 360 / 2^16 degrees (per §D.2.27).
+    pub anticlockwise_rotation: u16,
+    pub repetition_period: u32,
+    pub extension_flag: bool,
+}
+
+/// §D.2.25 — tone_mapping_info. HDR→SDR mapping parameters.
+///
+/// When `cancel_flag` is true no further fields are transmitted
+/// (the body is absent). Otherwise the `model` enum captures the
+/// model-specific payload keyed by `tone_map_model_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToneMappingInfo {
+    pub tone_map_id: u32,
+    pub cancel_flag: bool,
+    pub body: Option<ToneMappingBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToneMappingBody {
+    pub repetition_period: u32,
+    pub coded_data_bit_depth: u8,
+    pub target_bit_depth: u8,
+    pub model_id: u32,
+    pub model: ToneMappingModel,
+}
+
+/// §D.2.25 — per-`tone_map_model_id` payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToneMappingModel {
+    /// model_id = 0 — linear mapping in `[min_value, max_value]`.
+    Linear { min_value: u32, max_value: u32 },
+    /// model_id = 1 — sigmoid mapping.
+    Sigmoid {
+        sigmoid_midpoint: u32,
+        sigmoid_width: u32,
+    },
+    /// model_id = 2 — piecewise mapping via interval start values.
+    ///
+    /// Per §D.2.25 each entry is
+    /// `((coded_data_bit_depth + 7) >> 3) << 3` bits wide and the
+    /// array has `1 << target_bit_depth` entries.
+    StartOfCodedInterval { start_of_coded_interval: Vec<u32> },
+    /// model_id = 3 — piecewise linear mapping via pivot pairs.
+    ///
+    /// Pivot values use
+    /// `((coded_data_bit_depth + 7) >> 3) << 3` bits for
+    /// `coded_pivot_value` and
+    /// `((target_bit_depth + 7) >> 3) << 3` bits for
+    /// `target_pivot_value`.
+    PiecewisePivots {
+        num_pivots: u16,
+        coded_pivot_value: Vec<u32>,
+        target_pivot_value: Vec<u32>,
+    },
+    /// Reserved for future use (model_id >= 4 — e.g. model_id 4 is
+    /// the ISO-speed / exposure parameter set which this first pass
+    /// does not decode).
+    Reserved {
+        model_id: u32,
+        remaining_bytes: Vec<u8>,
+    },
+}
+
+/// §D.2.21 — film_grain_characteristics.
+///
+/// This first pass captures the framing plus the flags that answer
+/// "does this stream signal film grain?". The per-intensity-interval
+/// data (num_intensity_intervals_minus1, num_model_values_minus1,
+/// and the intensity_interval_lower/upper_bound / comp_model_value
+/// arrays) is left as a TODO for a future pass — callers that only
+/// need to know whether grain is present can rely on the cancel
+/// flag plus the `comp_model_present_flag` array we do decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilmGrainCharacteristics {
+    pub cancel_flag: bool,
+    pub body: Option<FilmGrainBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilmGrainBody {
+    pub model_id: u8, // u(2)
+    pub separate_colour_description_present_flag: bool,
+    pub separate_colour_description: Option<FilmGrainSeparateColourDescription>,
+    pub blending_mode_id: u8, // u(2)
+    pub log2_scale_factor: u8, // u(4)
+    /// One flag per colour component (c = 0..=2).
+    pub comp_model_present_flag: [bool; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilmGrainSeparateColourDescription {
+    pub bit_depth_luma_minus8: u8, // u(3)
+    pub bit_depth_chroma_minus8: u8, // u(3)
+    pub full_range_flag: bool,
+    pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
 }
 
 /// Inputs a SEI parser needs beyond the raw payload bytes. Many parsers
@@ -410,7 +556,7 @@ pub fn parse_mastering_display(payload: &[u8]) -> Result<MasteringDisplayColourV
     })
 }
 
-/// §D.2.35 — content_light_level_info (HDR10 metadata).
+/// §D.2.31 — content_light_level_info (HDR10 metadata).
 ///
 /// Syntax (§D.1.31):
 /// ```text
@@ -429,6 +575,382 @@ pub fn parse_content_light_level(payload: &[u8]) -> Result<ContentLightLevelInfo
     })
 }
 
+/// §D.2.26 — frame_packing_arrangement (payload type 45).
+///
+/// Syntax (§D.1.26):
+/// ```text
+/// frame_packing_arrangement( payloadSize ) {
+///   frame_packing_arrangement_id                       ue(v)
+///   frame_packing_arrangement_cancel_flag              u(1)
+///   if( !frame_packing_arrangement_cancel_flag ) {
+///     frame_packing_arrangement_type                   u(7)
+///     quincunx_sampling_flag                           u(1)
+///     content_interpretation_type                      u(6)
+///     spatial_flipping_flag                            u(1)
+///     frame0_flipped_flag                              u(1)
+///     field_views_flag                                 u(1)
+///     current_frame_is_frame0_flag                     u(1)
+///     frame0_self_contained_flag                       u(1)
+///     frame1_self_contained_flag                       u(1)
+///     if( !quincunx_sampling_flag &&
+///         frame_packing_arrangement_type != 5 ) {
+///       frame0_grid_position_x                         u(4)
+///       frame0_grid_position_y                         u(4)
+///       frame1_grid_position_x                         u(4)
+///       frame1_grid_position_y                         u(4)
+///     }
+///     frame_packing_arrangement_reserved_byte          u(8)
+///     frame_packing_arrangement_repetition_period      ue(v)
+///   }
+///   frame_packing_arrangement_extension_flag           u(1)
+/// }
+/// ```
+pub fn parse_frame_packing_arrangement(
+    payload: &[u8],
+) -> Result<FramePackingArrangement, SeiError> {
+    let mut r = BitReader::new(payload);
+    let id = r.ue()?;
+    let cancel_flag = r.u(1)? == 1;
+
+    let mut out = FramePackingArrangement {
+        id,
+        cancel_flag,
+        ty: 0,
+        quincunx_sampling_flag: false,
+        content_interpretation_type: 0,
+        spatial_flipping_flag: false,
+        frame0_flipped_flag: false,
+        field_views_flag: false,
+        current_frame_is_frame0_flag: false,
+        frame0_self_contained_flag: false,
+        frame1_self_contained_flag: false,
+        frame0_grid_position_x: 0,
+        frame0_grid_position_y: 0,
+        frame1_grid_position_x: 0,
+        frame1_grid_position_y: 0,
+        reserved_byte: 0,
+        repetition_period: 0,
+        extension_flag: false,
+    };
+
+    if !cancel_flag {
+        out.ty = r.u(7)? as u8;
+        out.quincunx_sampling_flag = r.u(1)? == 1;
+        out.content_interpretation_type = r.u(6)? as u8;
+        out.spatial_flipping_flag = r.u(1)? == 1;
+        out.frame0_flipped_flag = r.u(1)? == 1;
+        out.field_views_flag = r.u(1)? == 1;
+        out.current_frame_is_frame0_flag = r.u(1)? == 1;
+        out.frame0_self_contained_flag = r.u(1)? == 1;
+        out.frame1_self_contained_flag = r.u(1)? == 1;
+
+        // §D.1.26: the grid positions are transmitted only when the
+        // planes are non-quincunx AND the arrangement is not temporal
+        // interleaving (type 5).
+        if !out.quincunx_sampling_flag && out.ty != 5 {
+            out.frame0_grid_position_x = r.u(4)? as u8;
+            out.frame0_grid_position_y = r.u(4)? as u8;
+            out.frame1_grid_position_x = r.u(4)? as u8;
+            out.frame1_grid_position_y = r.u(4)? as u8;
+        }
+
+        out.reserved_byte = r.u(8)? as u8;
+        out.repetition_period = r.ue()?;
+    }
+
+    out.extension_flag = r.u(1)? == 1;
+    Ok(out)
+}
+
+/// §D.2.27 — display_orientation (payload type 47).
+///
+/// Syntax (§D.1.27):
+/// ```text
+/// display_orientation( payloadSize ) {
+///   display_orientation_cancel_flag               u(1)
+///   if( !display_orientation_cancel_flag ) {
+///     hor_flip                                    u(1)
+///     ver_flip                                    u(1)
+///     anticlockwise_rotation                      u(16)
+///     display_orientation_repetition_period       ue(v)
+///     display_orientation_extension_flag          u(1)
+///   }
+/// }
+/// ```
+pub fn parse_display_orientation(payload: &[u8]) -> Result<DisplayOrientation, SeiError> {
+    let mut r = BitReader::new(payload);
+    let cancel_flag = r.u(1)? == 1;
+    let mut out = DisplayOrientation {
+        cancel_flag,
+        hor_flip: false,
+        ver_flip: false,
+        anticlockwise_rotation: 0,
+        repetition_period: 0,
+        extension_flag: false,
+    };
+    if !cancel_flag {
+        out.hor_flip = r.u(1)? == 1;
+        out.ver_flip = r.u(1)? == 1;
+        out.anticlockwise_rotation = r.u(16)? as u16;
+        out.repetition_period = r.ue()?;
+        out.extension_flag = r.u(1)? == 1;
+    }
+    Ok(out)
+}
+
+/// §D.2.32 — alternative_transfer_characteristics (payload type 147).
+///
+/// Syntax (§D.1.32):
+/// ```text
+/// alternative_transfer_characteristics( payloadSize ) {
+///   preferred_transfer_characteristics    u(8)
+/// }
+/// ```
+///
+/// Per §D.2.32 the single field overrides the VUI
+/// transfer_characteristics for display purposes (for example to
+/// signal HLG or PQ in a stream whose VUI says BT.709).
+pub fn parse_alternative_transfer_characteristics(payload: &[u8]) -> Result<u8, SeiError> {
+    let mut r = BitReader::new(payload);
+    Ok(r.u(8)? as u8)
+}
+
+/// §D.2.25 — tone_mapping_info (payload type 23).
+///
+/// Syntax (§D.1.25):
+/// ```text
+/// tone_mapping_info( payloadSize ) {
+///   tone_map_id                                   ue(v)
+///   tone_map_cancel_flag                          u(1)
+///   if( !tone_map_cancel_flag ) {
+///     tone_map_repetition_period                  ue(v)
+///     coded_data_bit_depth                        u(8)
+///     target_bit_depth                            u(8)
+///     tone_map_model_id                           ue(v)
+///     if( tone_map_model_id == 0 ) {
+///       min_value                                 u(32)
+///       max_value                                 u(32)
+///     }
+///     if( tone_map_model_id == 1 ) {
+///       sigmoid_midpoint                          u(32)
+///       sigmoid_width                             u(32)
+///     }
+///     if( tone_map_model_id == 2 )
+///       for( i = 0; i < ( 1 << target_bit_depth ); i++ )
+///         start_of_coded_interval[ i ]            u(v)
+///     if( tone_map_model_id == 3 ) {
+///       num_pivots                                u(16)
+///       for( i = 0; i < num_pivots; i++ ) {
+///         coded_pivot_value[ i ]                  u(v)
+///         target_pivot_value[ i ]                 u(v)
+///       }
+///     }
+///     if( tone_map_model_id == 4 ) { ... }
+///   }
+/// }
+/// ```
+///
+/// Per §D.2.25:
+/// - `start_of_coded_interval` bit width is
+///   `((coded_data_bit_depth + 7) >> 3) << 3`.
+/// - `coded_pivot_value` bit width is
+///   `((coded_data_bit_depth + 7) >> 3) << 3`.
+/// - `target_pivot_value` bit width is
+///   `((target_bit_depth + 7) >> 3) << 3`.
+///
+/// This implementation decodes model_id 0..=3. model_id 4 (and any
+/// future value) is captured as `ToneMappingModel::Reserved` with
+/// the remaining payload bytes preserved so callers can keep it.
+pub fn parse_tone_mapping_info(payload: &[u8]) -> Result<ToneMappingInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+    let tone_map_id = r.ue()?;
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(ToneMappingInfo {
+            tone_map_id,
+            cancel_flag,
+            body: None,
+        });
+    }
+
+    let repetition_period = r.ue()?;
+    let coded_data_bit_depth = r.u(8)? as u8;
+    let target_bit_depth = r.u(8)? as u8;
+    let model_id = r.ue()?;
+
+    let coded_width = ((coded_data_bit_depth as u32 + 7) >> 3) << 3;
+    let target_width = ((target_bit_depth as u32 + 7) >> 3) << 3;
+
+    let model = match model_id {
+        0 => {
+            let min_value = r.u(32)?;
+            let max_value = r.u(32)?;
+            ToneMappingModel::Linear {
+                min_value,
+                max_value,
+            }
+        }
+        1 => {
+            let sigmoid_midpoint = r.u(32)?;
+            let sigmoid_width = r.u(32)?;
+            ToneMappingModel::Sigmoid {
+                sigmoid_midpoint,
+                sigmoid_width,
+            }
+        }
+        2 => {
+            // Per §D.2.25 there are (1 << target_bit_depth) entries.
+            // Guard against pathological values so we don't allocate
+            // several GB on a corrupted stream.
+            if target_bit_depth > 16 || coded_width == 0 {
+                return Err(SeiError::UnsupportedPayloadType(23));
+            }
+            let count = 1usize << target_bit_depth as usize;
+            let mut vals = Vec::with_capacity(count);
+            for _ in 0..count {
+                vals.push(r.u(coded_width)?);
+            }
+            ToneMappingModel::StartOfCodedInterval {
+                start_of_coded_interval: vals,
+            }
+        }
+        3 => {
+            let num_pivots = r.u(16)? as u16;
+            if coded_width == 0 || target_width == 0 {
+                return Err(SeiError::UnsupportedPayloadType(23));
+            }
+            let mut coded_pivot_value = Vec::with_capacity(num_pivots as usize);
+            let mut target_pivot_value = Vec::with_capacity(num_pivots as usize);
+            for _ in 0..num_pivots {
+                coded_pivot_value.push(r.u(coded_width)?);
+                target_pivot_value.push(r.u(target_width)?);
+            }
+            ToneMappingModel::PiecewisePivots {
+                num_pivots,
+                coded_pivot_value,
+                target_pivot_value,
+            }
+        }
+        _ => {
+            // model_id >= 4: preserve remaining bytes so callers can
+            // keep the payload for later forwarding or custom parsing.
+            let (byte_pos, bit_pos) = r.position();
+            let remaining_bytes = if bit_pos == 0 {
+                payload.get(byte_pos..).unwrap_or(&[]).to_vec()
+            } else {
+                // Skip to next byte boundary before copying; bits
+                // within the partial byte are discarded in this
+                // first pass.
+                payload.get(byte_pos + 1..).unwrap_or(&[]).to_vec()
+            };
+            ToneMappingModel::Reserved {
+                model_id,
+                remaining_bytes,
+            }
+        }
+    };
+
+    Ok(ToneMappingInfo {
+        tone_map_id,
+        cancel_flag,
+        body: Some(ToneMappingBody {
+            repetition_period,
+            coded_data_bit_depth,
+            target_bit_depth,
+            model_id,
+            model,
+        }),
+    })
+}
+
+/// §D.2.21 — film_grain_characteristics (payload type 19).
+///
+/// Syntax (§D.1.21):
+/// ```text
+/// film_grain_characteristics( payloadSize ) {
+///   film_grain_characteristics_cancel_flag                  u(1)
+///   if( !film_grain_characteristics_cancel_flag ) {
+///     film_grain_model_id                                   u(2)
+///     separate_colour_description_present_flag              u(1)
+///     if( separate_colour_description_present_flag ) {
+///       film_grain_bit_depth_luma_minus8                    u(3)
+///       film_grain_bit_depth_chroma_minus8                  u(3)
+///       film_grain_full_range_flag                          u(1)
+///       film_grain_colour_primaries                         u(8)
+///       film_grain_transfer_characteristics                 u(8)
+///       film_grain_matrix_coefficients                      u(8)
+///     }
+///     blending_mode_id                                      u(2)
+///     log2_scale_factor                                     u(4)
+///     for( c = 0; c < 3; c++ )
+///       comp_model_present_flag[ c ]                        u(1)
+///     for( c = 0; c < 3; c++ )
+///       if( comp_model_present_flag[ c ] ) { ... per-c data ... }
+///     film_grain_characteristics_repetition_period          ue(v)
+///   }
+/// }
+/// ```
+///
+/// This pass stops after the three `comp_model_present_flag` bits
+/// — enough to answer "does this stream signal film grain?" and
+/// which components carry a model. The per-intensity-interval body
+/// plus the trailing repetition_period are left for a future pass;
+/// callers that need them should keep the raw payload alongside the
+/// parsed struct.
+pub fn parse_film_grain_characteristics(
+    payload: &[u8],
+) -> Result<FilmGrainCharacteristics, SeiError> {
+    let mut r = BitReader::new(payload);
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(FilmGrainCharacteristics {
+            cancel_flag,
+            body: None,
+        });
+    }
+
+    let model_id = r.u(2)? as u8;
+    let separate_flag = r.u(1)? == 1;
+    let separate_colour_description = if separate_flag {
+        let bit_depth_luma_minus8 = r.u(3)? as u8;
+        let bit_depth_chroma_minus8 = r.u(3)? as u8;
+        let full_range_flag = r.u(1)? == 1;
+        let colour_primaries = r.u(8)? as u8;
+        let transfer_characteristics = r.u(8)? as u8;
+        let matrix_coefficients = r.u(8)? as u8;
+        Some(FilmGrainSeparateColourDescription {
+            bit_depth_luma_minus8,
+            bit_depth_chroma_minus8,
+            full_range_flag,
+            colour_primaries,
+            transfer_characteristics,
+            matrix_coefficients,
+        })
+    } else {
+        None
+    };
+
+    let blending_mode_id = r.u(2)? as u8;
+    let log2_scale_factor = r.u(4)? as u8;
+
+    let mut comp_model_present_flag = [false; 3];
+    for flag in comp_model_present_flag.iter_mut() {
+        *flag = r.u(1)? == 1;
+    }
+
+    Ok(FilmGrainCharacteristics {
+        cancel_flag,
+        body: Some(FilmGrainBody {
+            model_id,
+            separate_colour_description_present_flag: separate_flag,
+            separate_colour_description,
+            blending_mode_id,
+            log2_scale_factor,
+            comp_model_present_flag,
+        }),
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,8 +960,14 @@ pub enum SeiPayload {
     FillerPayload,
     UserDataUnregistered(UserDataUnregistered),
     RecoveryPoint(RecoveryPoint),
+    FilmGrainCharacteristics(FilmGrainCharacteristics),
+    ToneMappingInfo(ToneMappingInfo),
+    FramePackingArrangement(FramePackingArrangement),
+    DisplayOrientation(DisplayOrientation),
     MasteringDisplay(MasteringDisplayColourVolume),
     ContentLightLevel(ContentLightLevelInfo),
+    /// preferred_transfer_characteristics — single u(8) field.
+    AlternativeTransferCharacteristics(u8),
     /// Not parsed — caller keeps the raw payload for later interpretation.
     Unknown {
         payload_type: u32,
@@ -468,12 +996,27 @@ pub fn parse_payload(
             parse_user_data_unregistered(payload)?,
         )),
         6 => Ok(SeiPayload::RecoveryPoint(parse_recovery_point(payload)?)),
+        19 => Ok(SeiPayload::FilmGrainCharacteristics(
+            parse_film_grain_characteristics(payload)?,
+        )),
+        23 => Ok(SeiPayload::ToneMappingInfo(parse_tone_mapping_info(
+            payload,
+        )?)),
+        45 => Ok(SeiPayload::FramePackingArrangement(
+            parse_frame_packing_arrangement(payload)?,
+        )),
+        47 => Ok(SeiPayload::DisplayOrientation(parse_display_orientation(
+            payload,
+        )?)),
         137 => Ok(SeiPayload::MasteringDisplay(parse_mastering_display(
             payload,
         )?)),
         144 => Ok(SeiPayload::ContentLightLevel(parse_content_light_level(
             payload,
         )?)),
+        147 => Ok(SeiPayload::AlternativeTransferCharacteristics(
+            parse_alternative_transfer_characteristics(payload)?,
+        )),
         other => Ok(SeiPayload::Unknown {
             payload_type: other,
             payload: payload.to_vec(),
@@ -713,5 +1256,327 @@ mod tests {
         assert_eq!(num_clock_ts_from_pic_struct(7), 2);
         assert_eq!(num_clock_ts_from_pic_struct(8), 3);
         assert_eq!(num_clock_ts_from_pic_struct(9), 0); // reserved
+    }
+
+    // §D.2.26 — frame_packing_arrangement. Build a payload that
+    // signals side-by-side (type 3), non-quincunx, so the four grid
+    // nibbles are present.
+    //
+    // Field layout (bits):
+    //   id = 0 → ue "1"                              (1)
+    //   cancel_flag = 0                              (1)
+    //   type = 3                                     (7)
+    //   quincunx_sampling_flag = 0                   (1)
+    //   content_interpretation_type = 1              (6)
+    //   spatial_flipping_flag = 0                    (1)
+    //   frame0_flipped_flag = 0                      (1)
+    //   field_views_flag = 0                         (1)
+    //   current_frame_is_frame0_flag = 1             (1)
+    //   frame0_self_contained_flag = 1               (1)
+    //   frame1_self_contained_flag = 0               (1)
+    //   frame0_grid_position_x = 0                   (4)
+    //   frame0_grid_position_y = 0                   (4)
+    //   frame1_grid_position_x = 0                   (4)
+    //   frame1_grid_position_y = 0                   (4)
+    //   reserved_byte = 0                            (8)
+    //   repetition_period = 0 → ue "1"               (1)
+    //   extension_flag = 0                           (1)
+    #[test]
+    fn frame_packing_arrangement_side_by_side() {
+        let fields = [
+            (1, 1),  // ue id=0
+            (0, 1),  // cancel_flag
+            (3, 7),  // type=3 (side-by-side)
+            (0, 1),  // quincunx_sampling_flag
+            (1, 6),  // content_interpretation_type
+            (0, 1),  // spatial_flipping_flag
+            (0, 1),  // frame0_flipped_flag
+            (0, 1),  // field_views_flag
+            (1, 1),  // current_frame_is_frame0_flag
+            (1, 1),  // frame0_self_contained_flag
+            (0, 1),  // frame1_self_contained_flag
+            (0, 4),  // frame0_grid_x
+            (0, 4),  // frame0_grid_y
+            (0, 4),  // frame1_grid_x
+            (0, 4),  // frame1_grid_y
+            (0, 8),  // reserved_byte
+            (1, 1),  // ue repetition_period=0
+            (0, 1),  // extension_flag
+        ];
+        let payload = pack_bits(&fields);
+        let fpa = parse_frame_packing_arrangement(&payload).unwrap();
+        assert_eq!(fpa.id, 0);
+        assert!(!fpa.cancel_flag);
+        assert_eq!(fpa.ty, 3);
+        assert!(!fpa.quincunx_sampling_flag);
+        assert_eq!(fpa.content_interpretation_type, 1);
+        assert!(fpa.current_frame_is_frame0_flag);
+        assert!(fpa.frame0_self_contained_flag);
+        assert!(!fpa.frame1_self_contained_flag);
+        assert_eq!(fpa.frame0_grid_position_x, 0);
+        assert_eq!(fpa.frame1_grid_position_y, 0);
+        assert_eq!(fpa.repetition_period, 0);
+        assert!(!fpa.extension_flag);
+    }
+
+    // §D.2.26 — cancel_flag path skips the body but still reads
+    // extension_flag at the end.
+    #[test]
+    fn frame_packing_arrangement_cancel_path() {
+        let fields = [
+            (1, 1), // ue id=0
+            (1, 1), // cancel_flag = 1
+            (1, 1), // extension_flag = 1
+        ];
+        let payload = pack_bits(&fields);
+        let fpa = parse_frame_packing_arrangement(&payload).unwrap();
+        assert!(fpa.cancel_flag);
+        assert!(fpa.extension_flag);
+        // Body fields default to zero when cancel_flag is set.
+        assert_eq!(fpa.ty, 0);
+        assert_eq!(fpa.repetition_period, 0);
+    }
+
+    // §D.2.26 — type 5 (temporal interleaving) and quincunx=1 cases
+    // both skip the grid positions per the syntax.
+    #[test]
+    fn frame_packing_arrangement_type5_skips_grid() {
+        let fields = [
+            (1, 1), // ue id=0
+            (0, 1), // cancel_flag
+            (5, 7), // type=5 (temporal interleaving)
+            (0, 1), // quincunx
+            (0, 6), // content_interp
+            (0, 1), // spatial_flip
+            (0, 1), // f0_flipped
+            (0, 1), // field_views
+            (0, 1), // current_is_f0
+            (0, 1), // f0_self_contained
+            (0, 1), // f1_self_contained
+            // no grid positions because type == 5
+            (0xAB, 8), // reserved_byte
+            (1, 1),    // ue repetition=0
+            (0, 1),    // extension_flag
+        ];
+        let payload = pack_bits(&fields);
+        let fpa = parse_frame_packing_arrangement(&payload).unwrap();
+        assert_eq!(fpa.ty, 5);
+        assert_eq!(fpa.reserved_byte, 0xAB);
+    }
+
+    // §D.2.27 — display_orientation. Full body: cancel=0, then a
+    // 180-degree rotation (anticlockwise_rotation = 0x8000 =
+    // 2^15 units of 360/2^16 degrees).
+    #[test]
+    fn display_orientation_full_body() {
+        let fields = [
+            (0, 1),      // cancel_flag = 0
+            (1, 1),      // hor_flip
+            (0, 1),      // ver_flip
+            (0x8000, 16), // anticlockwise_rotation
+            (1, 1),      // ue repetition_period = 0
+            (1, 1),      // extension_flag = 1
+        ];
+        let payload = pack_bits(&fields);
+        let dor = parse_display_orientation(&payload).unwrap();
+        assert!(!dor.cancel_flag);
+        assert!(dor.hor_flip);
+        assert!(!dor.ver_flip);
+        assert_eq!(dor.anticlockwise_rotation, 0x8000);
+        assert_eq!(dor.repetition_period, 0);
+        assert!(dor.extension_flag);
+    }
+
+    // §D.2.27 — cancel_flag path reads nothing else.
+    #[test]
+    fn display_orientation_cancel_path() {
+        let payload = pack_bits(&[(1, 1)]);
+        let dor = parse_display_orientation(&payload).unwrap();
+        assert!(dor.cancel_flag);
+        assert!(!dor.hor_flip);
+        assert_eq!(dor.anticlockwise_rotation, 0);
+    }
+
+    // §D.2.32 — single u(8).
+    #[test]
+    fn alternative_transfer_characteristics_pq() {
+        // preferred_transfer_characteristics = 16 (PQ / SMPTE ST 2084).
+        let payload = [16u8];
+        let got = parse_alternative_transfer_characteristics(&payload).unwrap();
+        assert_eq!(got, 16);
+    }
+
+    // §D.2.25 — tone_mapping_info with model_id = 0 (linear).
+    //
+    // tone_map_id = 0 → "1"
+    // cancel_flag = 0
+    // repetition_period = 0 → "1"
+    // coded_data_bit_depth = 10
+    // target_bit_depth = 8
+    // model_id = 0 → "1"
+    // min_value = 0x0000_0100 (u32)
+    // max_value = 0x0000_03FF (u32)
+    #[test]
+    fn tone_mapping_info_linear() {
+        let fields: [(u64, u32); 8] = [
+            (1, 1),            // ue tone_map_id=0
+            (0, 1),            // cancel_flag=0
+            (1, 1),            // ue repetition_period=0
+            (10, 8),           // coded_data_bit_depth
+            (8, 8),            // target_bit_depth
+            (1, 1),            // ue model_id=0
+            (0x0000_0100, 32), // min_value
+            (0x0000_03FF, 32), // max_value
+        ];
+        let packed = pack_bits(&fields);
+        let tmi = parse_tone_mapping_info(&packed).unwrap();
+        assert_eq!(tmi.tone_map_id, 0);
+        assert!(!tmi.cancel_flag);
+        let body = tmi.body.as_ref().expect("body present");
+        assert_eq!(body.repetition_period, 0);
+        assert_eq!(body.coded_data_bit_depth, 10);
+        assert_eq!(body.target_bit_depth, 8);
+        assert_eq!(body.model_id, 0);
+        match &body.model {
+            ToneMappingModel::Linear {
+                min_value,
+                max_value,
+            } => {
+                assert_eq!(*min_value, 0x0000_0100);
+                assert_eq!(*max_value, 0x0000_03FF);
+            }
+            other => panic!("expected Linear, got {:?}", other),
+        }
+    }
+
+    // §D.2.25 — tone_mapping_info cancel_flag path: nothing after
+    // the cancel bit is read.
+    #[test]
+    fn tone_mapping_info_cancel_path() {
+        // tone_map_id = 7 → ue codeword "0001000" (7 bits).
+        // cancel_flag = 1.
+        let fields = [
+            (0b0001000, 7), // ue(7)
+            (1, 1),         // cancel_flag
+        ];
+        let payload = pack_bits(&fields);
+        let tmi = parse_tone_mapping_info(&payload).unwrap();
+        assert_eq!(tmi.tone_map_id, 7);
+        assert!(tmi.cancel_flag);
+        assert!(tmi.body.is_none());
+    }
+
+    // §D.2.21 — film_grain_characteristics.
+    //
+    // cancel_flag = 0
+    // model_id = 1
+    // separate_colour_description_present_flag = 0
+    // blending_mode_id = 0
+    // log2_scale_factor = 4
+    // comp_model_present_flag = [true, false, false]
+    #[test]
+    fn film_grain_characteristics_basic() {
+        let fields = [
+            (0, 1), // cancel_flag
+            (1, 2), // model_id
+            (0, 1), // separate_colour_description_present_flag
+            (0, 2), // blending_mode_id
+            (4, 4), // log2_scale_factor
+            (1, 1), // comp_model_present_flag[0]
+            (0, 1), // comp_model_present_flag[1]
+            (0, 1), // comp_model_present_flag[2]
+        ];
+        let payload = pack_bits(&fields);
+        let fg = parse_film_grain_characteristics(&payload).unwrap();
+        assert!(!fg.cancel_flag);
+        let body = fg.body.as_ref().expect("body present");
+        assert_eq!(body.model_id, 1);
+        assert!(!body.separate_colour_description_present_flag);
+        assert!(body.separate_colour_description.is_none());
+        assert_eq!(body.blending_mode_id, 0);
+        assert_eq!(body.log2_scale_factor, 4);
+        assert_eq!(body.comp_model_present_flag, [true, false, false]);
+    }
+
+    // §D.2.21 — cancel flag leaves body absent.
+    #[test]
+    fn film_grain_characteristics_cancel_path() {
+        let payload = pack_bits(&[(1, 1)]);
+        let fg = parse_film_grain_characteristics(&payload).unwrap();
+        assert!(fg.cancel_flag);
+        assert!(fg.body.is_none());
+    }
+
+    // §D.2.21 — with separate colour description the inner block is
+    // populated.
+    #[test]
+    fn film_grain_characteristics_with_separate_colour() {
+        let fields = [
+            (0, 1), // cancel_flag
+            (2, 2), // model_id
+            (1, 1), // separate_colour_description_present_flag
+            (2, 3), // bit_depth_luma_minus8 (= 10 bit luma)
+            (2, 3), // bit_depth_chroma_minus8
+            (1, 1), // full_range_flag
+            (1, 8), // colour_primaries = 1 (BT.709)
+            (13, 8), // transfer_characteristics = 13
+            (1, 8), // matrix_coefficients = 1
+            (0, 2), // blending_mode_id
+            (3, 4), // log2_scale_factor
+            (1, 1), // comp_model_present_flag[0]
+            (1, 1), // comp_model_present_flag[1]
+            (0, 1), // comp_model_present_flag[2]
+        ];
+        let payload = pack_bits(&fields);
+        let fg = parse_film_grain_characteristics(&payload).unwrap();
+        let body = fg.body.expect("body present");
+        assert_eq!(body.model_id, 2);
+        let scd = body.separate_colour_description.expect("scd present");
+        assert_eq!(scd.bit_depth_luma_minus8, 2);
+        assert_eq!(scd.bit_depth_chroma_minus8, 2);
+        assert!(scd.full_range_flag);
+        assert_eq!(scd.colour_primaries, 1);
+        assert_eq!(scd.transfer_characteristics, 13);
+        assert_eq!(scd.matrix_coefficients, 1);
+        assert_eq!(body.blending_mode_id, 0);
+        assert_eq!(body.log2_scale_factor, 3);
+        assert_eq!(body.comp_model_present_flag, [true, true, false]);
+    }
+
+    // Dispatcher wiring for the new payload types.
+    #[test]
+    fn parse_payload_dispatches_display_orientation() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(1, 1)]); // cancel_flag=1 only
+        let got = parse_payload(47, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::DisplayOrientation(d) => assert!(d.cancel_flag),
+            other => panic!("expected DisplayOrientation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_payload_dispatches_alt_transfer() {
+        let ctx = SeiContext::default();
+        let got = parse_payload(147, &[18u8], &ctx).unwrap();
+        match got {
+            SeiPayload::AlternativeTransferCharacteristics(v) => assert_eq!(v, 18),
+            other => panic!("expected AlternativeTransferCharacteristics, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_payload_dispatches_frame_packing() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[
+            (1, 1), // ue id=0
+            (1, 1), // cancel_flag=1
+            (0, 1), // extension_flag=0
+        ]);
+        let got = parse_payload(45, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::FramePackingArrangement(f) => assert!(f.cancel_flag),
+            other => panic!("expected FramePackingArrangement, got {:?}", other),
+        }
     }
 }

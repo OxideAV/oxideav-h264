@@ -49,6 +49,7 @@ use crate::cabac_ctx::{
     NeighbourCtx, SliceKind,
 };
 use crate::cavlc::{parse_residual_block_cavlc, CavlcError, CoeffTokenContext};
+use crate::mv_deriv::{neighbour_4x4_map, NeighbourSource};
 use crate::pps::Pps;
 use crate::slice_header::{SliceHeader, SliceType};
 use crate::sps::Sps;
@@ -590,6 +591,403 @@ fn parse_cbp_me(r: &mut BitReader<'_>, chroma_array_type: u32, is_intra: bool) -
 }
 
 // ---------------------------------------------------------------------------
+// Per-MB CAVLC neighbour state (§9.2.1.1).
+// ---------------------------------------------------------------------------
+
+/// Per-MB total_coeff values for CAVLC neighbour lookup (§9.2.1.1).
+///
+/// For each decoded MB the CAVLC engine records the per-4x4-block
+/// `TotalCoeff(coeff_token)` values needed by the `nC` derivation of
+/// §9.2.1.1 for the next MB that queries them.
+///
+/// Indexing:
+/// * `luma_total_coeff[i]` — `i` is the luma 4x4 block index per
+///   §6.4.3 Figure 6-10 (raster-scan, so 0..=15).
+/// * `cb_total_coeff[i]` / `cr_total_coeff[i]` — `i` is the chroma 4x4
+///   block index per §6.4.7 (4 blocks for 4:2:0, 8 for 4:2:2).
+///
+/// `is_available` gates reads: an un-decoded neighbour MB must report
+/// `availableFlagN == 0` per §9.2.1.1 step 5.
+#[derive(Debug, Clone, Copy)]
+pub struct CavlcMbNc {
+    /// §6.4.4 / §9.2.1.1 step 5 — true once this MB has been decoded
+    /// and may be consulted as a neighbour by subsequent MBs.
+    pub is_available: bool,
+    /// §9.2.1.1 step 6 — `P_Skip` / `B_Skip` → `nN = 0`.
+    pub is_skip: bool,
+    /// §9.2.1.1 step 6 — `I_PCM` → `nN = 16`.
+    pub is_i_pcm: bool,
+    /// §9.2.1.1 step 6 — true for intra MBs (governs the
+    /// `constrained_intra_pred_flag` availability override).
+    pub is_intra: bool,
+    /// Per-luma-4x4-block `TotalCoeff(coeff_token)` values (§9.2.1.1
+    /// NOTE 1: AC counts only — DC coefficients of Intra_16x16 blocks
+    /// are tracked separately and do NOT contribute).
+    pub luma_total_coeff: [u8; 16],
+    /// Per-chroma-4x4-block `TotalCoeff(coeff_token)` values for Cb
+    /// (sized for 4:2:2; 4:2:0 only uses the first 4 entries).
+    pub cb_total_coeff: [u8; 8],
+    /// Per-chroma-4x4-block `TotalCoeff(coeff_token)` values for Cr.
+    pub cr_total_coeff: [u8; 8],
+}
+
+impl Default for CavlcMbNc {
+    fn default() -> Self {
+        Self {
+            is_available: false,
+            is_skip: false,
+            is_i_pcm: false,
+            is_intra: false,
+            luma_total_coeff: [0; 16],
+            cb_total_coeff: [0; 8],
+            cr_total_coeff: [0; 8],
+        }
+    }
+}
+
+/// Slice-scoped MB grid for CAVLC neighbour lookups (§9.2.1.1).
+///
+/// Sized `pic_size_in_mbs`. The caller is responsible for marking each
+/// MB's slot `is_available = true` once the residual for that MB has
+/// been decoded (§9.2.1.1 relies on `mbAddrN` having already been
+/// decoded — our non-MBAFF raster-scan order guarantees that left and
+/// above neighbours are always decoded before the current MB).
+#[derive(Debug, Clone)]
+pub struct CavlcNcGrid {
+    pub pic_width_in_mbs: u32,
+    pub pic_height_in_mbs: u32,
+    pub mbs: Vec<CavlcMbNc>,
+}
+
+impl CavlcNcGrid {
+    /// Allocate a fresh all-unavailable grid.
+    pub fn new(pic_width_in_mbs: u32, pic_height_in_mbs: u32) -> Self {
+        let len = (pic_width_in_mbs as usize) * (pic_height_in_mbs as usize);
+        Self {
+            pic_width_in_mbs,
+            pic_height_in_mbs,
+            mbs: vec![CavlcMbNc::default(); len],
+        }
+    }
+
+    /// §6.4.9 — left (mbAddrA) and above (mbAddrB) neighbour MB
+    /// addresses in raster scan. `None` when outside the picture.
+    #[inline]
+    pub fn neighbour_mb_addrs(&self, mb_addr: u32) -> (Option<u32>, Option<u32>) {
+        let w = self.pic_width_in_mbs;
+        if w == 0 {
+            return (None, None);
+        }
+        let x = mb_addr % w;
+        let y = mb_addr / w;
+        let a = if x > 0 { Some(mb_addr - 1) } else { None };
+        let b = if y > 0 { Some(mb_addr - w) } else { None };
+        (a, b)
+    }
+}
+
+/// §9.2.1.1 — luma kind selector for the nC derivation. `LumaAc` covers
+/// `Intra16x16ACLevel` and `LumaLevel4x4` (both are 4x4 AC contexts);
+/// `Intra16x16Dc` covers `Intra16x16DCLevel` (step 1 of §9.2.1.1:
+/// `luma4x4BlkIdx = 0` for the DC block).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LumaNcKind {
+    /// 4x4 AC / LumaLevel4x4 — indexed by the block's luma4x4BlkIdx.
+    Ac,
+    /// Intra16x16DCLevel — §9.2.1.1 step 1: `luma4x4BlkIdx = 0`.
+    Intra16x16Dc,
+}
+
+/// §9.2.1.1 ordered steps 4..7 for luma blocks.
+///
+/// Given the current MB's neighbour grid state, derive `nC` for a 4x4
+/// luma block at index `blk_idx` (0..=15). `constrained_intra_pred_flag`
+/// is passed through, though our slice-data walker always runs in a
+/// single slice and we conservatively treat slice-data-partitioning as
+/// absent (so that condition never fires). For Intra16x16DCLevel the
+/// spec fixes `luma4x4BlkIdx = 0` (§9.2.1.1 step 1); callers that want
+/// that behaviour pass `kind = LumaNcKind::Intra16x16Dc` and the
+/// `blk_idx` is ignored.
+fn derive_nc_luma(
+    grid: &CavlcNcGrid,
+    current_mb_addr: u32,
+    blk_idx: u8,
+    kind: LumaNcKind,
+    current_is_intra: bool,
+    constrained_intra_pred_flag: bool,
+) -> i32 {
+    // §9.2.1.1 step 1: for Intra16x16DCLevel the spec fixes
+    // luma4x4BlkIdx = 0.
+    let blk = match kind {
+        LumaNcKind::Intra16x16Dc => 0u8,
+        LumaNcKind::Ac => blk_idx,
+    };
+
+    // §6.4.11.4 — derive blkA/blkB for this luma4x4BlkIdx.
+    let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk);
+    let (a_mb_addr, a_blk) = resolve_luma_neighbour(grid, current_mb_addr, a_src);
+    let (b_mb_addr, b_blk) = resolve_luma_neighbour(grid, current_mb_addr, b_src);
+
+    // §9.2.1.1 step 5 — availability + step 6 — nN derivation.
+    let (avail_a, n_a) = nc_nn_luma(
+        grid,
+        a_mb_addr,
+        a_blk,
+        current_is_intra,
+        constrained_intra_pred_flag,
+    );
+    let (avail_b, n_b) = nc_nn_luma(
+        grid,
+        b_mb_addr,
+        b_blk,
+        current_is_intra,
+        constrained_intra_pred_flag,
+    );
+
+    // §9.2.1.1 step 7 — combine.
+    combine_nc(avail_a, n_a, avail_b, n_b)
+}
+
+/// Turn a `NeighbourSource` (from §6.4.11.4 via `mv_deriv`) into an
+/// `(Option<mb_addr>, block_idx)` pair. `None` means the neighbour MB
+/// lies outside the picture.
+fn resolve_luma_neighbour(
+    grid: &CavlcNcGrid,
+    current_mb_addr: u32,
+    src: NeighbourSource,
+) -> (Option<u32>, u8) {
+    let w = grid.pic_width_in_mbs;
+    let x = if w == 0 { 0 } else { current_mb_addr % w };
+    let y = if w == 0 { 0 } else { current_mb_addr / w };
+    match src {
+        NeighbourSource::InternalBlock(i) => (Some(current_mb_addr), i),
+        NeighbourSource::ExternalLeft(i) => {
+            if x > 0 {
+                (Some(current_mb_addr - 1), i)
+            } else {
+                (None, i)
+            }
+        }
+        NeighbourSource::ExternalAbove(i) => {
+            if y > 0 {
+                (Some(current_mb_addr - w), i)
+            } else {
+                (None, i)
+            }
+        }
+        NeighbourSource::ExternalAboveRight(i) => {
+            if y > 0 && x + 1 < w {
+                (Some(current_mb_addr - w + 1), i)
+            } else {
+                (None, i)
+            }
+        }
+        NeighbourSource::ExternalAboveLeft(i) => {
+            if y > 0 && x > 0 {
+                (Some(current_mb_addr - w - 1), i)
+            } else {
+                (None, i)
+            }
+        }
+    }
+}
+
+/// §9.2.1.1 step 5 + step 6 for a luma 4x4 neighbour. Returns
+/// `(availableFlagN, nN)`.
+fn nc_nn_luma(
+    grid: &CavlcNcGrid,
+    mb_addr: Option<u32>,
+    blk: u8,
+    current_is_intra: bool,
+    constrained_intra_pred_flag: bool,
+) -> (bool, u8) {
+    let Some(addr) = mb_addr else {
+        return (false, 0);
+    };
+    let Some(info) = grid.mbs.get(addr as usize) else {
+        return (false, 0);
+    };
+    if !info.is_available {
+        // §9.2.1.1 step 5 — mbAddrN not (yet) available.
+        return (false, 0);
+    }
+    // §9.2.1.1 step 5 second bullet: constrained_intra_pred_flag + slice
+    // data partitioning interaction. Our decoder does not yet carry the
+    // `nal_unit_type` through to here, and slice_data_partition_b/c NALs
+    // are not parsed, so this branch is inactive — spec-consistent for
+    // streams without partitioning.
+    let _ = (current_is_intra, constrained_intra_pred_flag);
+    // §9.2.1.1 step 6.
+    if info.is_skip {
+        // P_Skip / B_Skip — nN = 0.
+        return (true, 0);
+    }
+    if info.is_i_pcm {
+        // I_PCM — nN = 16.
+        return (true, 16);
+    }
+    let idx = blk as usize;
+    let n = info.luma_total_coeff.get(idx).copied().unwrap_or(0);
+    (true, n)
+}
+
+/// §9.2.1.1 step 6/7 for a chroma AC 4x4 neighbour. The chroma block
+/// layout is 2x1 (4:2:0) or 2x2 (4:2:2) of 4x4 blocks per 8x8 unit —
+/// but since the ITU derivation is expressed in terms of spatial
+/// (xN, yN) locations and Table 6-3, we implement the same neighbour
+/// dispatch directly on the chroma block's (x, y) in the MB's chroma
+/// grid (§6.4.7 eq. 6-21/6-22 for the inverse scan).
+fn derive_nc_chroma_ac(
+    grid: &CavlcNcGrid,
+    current_mb_addr: u32,
+    blk_idx: u8,
+    is_cr: bool,
+    chroma_array_type: u32,
+    current_is_intra: bool,
+    constrained_intra_pred_flag: bool,
+) -> i32 {
+    let max_w: i32 = 8; // MbWidthC for 4:2:0 / 4:2:2 (§6.4.12 eq. 6-32).
+    let max_h: i32 = if chroma_array_type == 2 { 16 } else { 8 }; // eq. 6-33.
+
+    // §6.4.7 eq. 6-21/6-22 — inverse 4x4 chroma block scan.
+    // For 4:2:0 (indices 0..=3, layout 2x2):
+    //   x = (idx % 2) * 4 ; y = (idx / 2) * 4.
+    // For 4:2:2 (indices 0..=7, layout 2x4):
+    //   InverseRasterScan(idx, 4, 4, 8, 0) = (idx % 2) * 4
+    //   InverseRasterScan(idx, 4, 4, 8, 1) = (idx / 2) * 4
+    let x = ((blk_idx as i32) % 2) * 4;
+    let y = ((blk_idx as i32) / 2) * 4;
+
+    // A: (xD, yD) = (-1, 0). B: ( 0, -1). (§6.4.11.5 step 1 → Table 6-2.)
+    let (xa, ya) = (x - 1, y);
+    let (xb, yb) = (x, y - 1);
+    let (a_mb_addr, a_blk) =
+        resolve_chroma_neighbour(grid, current_mb_addr, xa, ya, max_w, max_h);
+    let (b_mb_addr, b_blk) =
+        resolve_chroma_neighbour(grid, current_mb_addr, xb, yb, max_w, max_h);
+
+    let (avail_a, n_a) = nc_nn_chroma(
+        grid,
+        a_mb_addr,
+        a_blk,
+        is_cr,
+        current_is_intra,
+        constrained_intra_pred_flag,
+    );
+    let (avail_b, n_b) = nc_nn_chroma(
+        grid,
+        b_mb_addr,
+        b_blk,
+        is_cr,
+        current_is_intra,
+        constrained_intra_pred_flag,
+    );
+
+    combine_nc(avail_a, n_a, avail_b, n_b)
+}
+
+/// §6.4.12 Table 6-3 dispatch for chroma locations + §6.4.13.2
+/// eq. 6-39 wrap. Returns `(mbAddrN, chroma4x4BlkIdxN)`.
+fn resolve_chroma_neighbour(
+    grid: &CavlcNcGrid,
+    current_mb_addr: u32,
+    xn: i32,
+    yn: i32,
+    max_w: i32,
+    max_h: i32,
+) -> (Option<u32>, u8) {
+    let w = grid.pic_width_in_mbs;
+    let x = if w == 0 { 0 } else { current_mb_addr % w };
+    let y = if w == 0 { 0 } else { current_mb_addr / w };
+
+    // §6.4.12 Table 6-3.
+    let (mb_opt, xw, yw) = if xn < 0 && yn < 0 {
+        // mbAddrD — above-left.
+        let addr = if y > 0 && x > 0 {
+            Some(current_mb_addr - w - 1)
+        } else {
+            None
+        };
+        (addr, xn + max_w, yn + max_h)
+    } else if xn < 0 && (0..max_h).contains(&yn) {
+        // mbAddrA — left.
+        let addr = if x > 0 { Some(current_mb_addr - 1) } else { None };
+        (addr, xn + max_w, yn)
+    } else if (0..max_w).contains(&xn) && yn < 0 {
+        // mbAddrB — above.
+        let addr = if y > 0 { Some(current_mb_addr - w) } else { None };
+        (addr, xn, yn + max_h)
+    } else if (0..max_w).contains(&xn) && (0..max_h).contains(&yn) {
+        // Internal.
+        (Some(current_mb_addr), xn, yn)
+    } else if xn > max_w - 1 && yn < 0 {
+        // mbAddrC — above-right.
+        let addr = if y > 0 && x + 1 < w {
+            Some(current_mb_addr - w + 1)
+        } else {
+            None
+        };
+        (addr, xn - max_w, yn + max_h)
+    } else {
+        // Not available — per Table 6-3 (e.g. xN past right edge within
+        // the MB). Treat as unavailable.
+        (None, 0, 0)
+    };
+    // §6.4.13.2 eq. 6-39 — chroma4x4BlkIdx from (xW, yW).
+    let blk = if mb_opt.is_some() {
+        (2 * (yw / 4) + (xw / 4)) as u8
+    } else {
+        0
+    };
+    (mb_opt, blk)
+}
+
+/// §9.2.1.1 step 5+6 for a chroma AC 4x4 neighbour.
+fn nc_nn_chroma(
+    grid: &CavlcNcGrid,
+    mb_addr: Option<u32>,
+    blk: u8,
+    is_cr: bool,
+    current_is_intra: bool,
+    constrained_intra_pred_flag: bool,
+) -> (bool, u8) {
+    let Some(addr) = mb_addr else {
+        return (false, 0);
+    };
+    let Some(info) = grid.mbs.get(addr as usize) else {
+        return (false, 0);
+    };
+    if !info.is_available {
+        return (false, 0);
+    }
+    let _ = (current_is_intra, constrained_intra_pred_flag);
+    if info.is_skip {
+        return (true, 0);
+    }
+    if info.is_i_pcm {
+        return (true, 16);
+    }
+    let arr = if is_cr {
+        &info.cr_total_coeff
+    } else {
+        &info.cb_total_coeff
+    };
+    let n = arr.get(blk as usize).copied().unwrap_or(0);
+    (true, n)
+}
+
+/// §9.2.1.1 step 7 — combine the two neighbour nN values.
+#[inline]
+fn combine_nc(avail_a: bool, n_a: u8, avail_b: bool, n_b: u8) -> i32 {
+    match (avail_a, avail_b) {
+        (true, true) => (n_a as i32 + n_b as i32 + 1) >> 1,
+        (true, false) => n_a as i32,
+        (false, true) => n_b as i32,
+        (false, false) => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entropy-state abstraction for mb_type parsing.
 // ---------------------------------------------------------------------------
 
@@ -610,6 +1008,19 @@ pub struct EntropyState<'ctx, 'data> {
     /// True when `transform_8x8_mode_flag` is set on the active PPS —
     /// used to gate the `transform_size_8x8_flag` read (§7.3.5).
     pub transform_8x8_mode_flag: bool,
+    /// §9.2.1.1 — CAVLC per-MB total_coeff grid for neighbour lookups.
+    /// Optional so CABAC / unit-test callers that only exercise a
+    /// single MB can leave it unset (in which case nC defaults to 0 —
+    /// spec-consistent for the very first MB of a slice).
+    pub cavlc_nc: Option<&'ctx mut CavlcNcGrid>,
+    /// §9.2.1.1 — MB address of the macroblock currently being parsed.
+    /// Required when `cavlc_nc` is set.
+    pub current_mb_addr: u32,
+    /// §7.4.2.2 — `constrained_intra_pred_flag` from the active PPS.
+    /// Threaded in but currently a no-op (the slice-data-partitioning
+    /// override in §9.2.1.1 step 5 does not apply to the NAL types our
+    /// walker accepts).
+    pub constrained_intra_pred_flag: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -843,13 +1254,36 @@ pub fn parse_macroblock(
     } else {
         parse_residual_cavlc_only(
             r,
-            entropy.chroma_array_type,
+            entropy,
             &mb_type,
             cbp_luma,
             cbp_chroma,
             transform_size_8x8_flag,
             &mut out,
         )?;
+    }
+
+    // §9.2.1.1 — mark this MB's slot "available" in the CAVLC neighbour
+    // grid so subsequent MBs see it when computing nC. We only do this
+    // on the CAVLC path (CABAC doesn't need the grid) — `cavlc_nc` is
+    // `None` in CABAC mode.
+    if entropy.cabac.is_none() {
+        if let Some(grid) = entropy.cavlc_nc.as_deref_mut() {
+            let addr = entropy.current_mb_addr as usize;
+            if let Some(slot) = grid.mbs.get_mut(addr) {
+                slot.is_available = true;
+                slot.is_skip = false;
+                slot.is_intra = mb_type.is_intra();
+                slot.is_i_pcm = mb_type.is_i_pcm();
+                // I_PCM contributes nN = 16 regardless of total_coeff
+                // arrays; zero them so the `is_i_pcm` path takes over.
+                if mb_type.is_i_pcm() {
+                    slot.luma_total_coeff = [0; 16];
+                    slot.cb_total_coeff = [0; 8];
+                    slot.cr_total_coeff = [0; 8];
+                }
+            }
+        }
     }
 
     Ok(out)
@@ -1045,55 +1479,189 @@ fn pad_to_16(v: Vec<i32>) -> [i32; 16] {
     out
 }
 
+/// Count non-zero entries in a decoded residual block — this is the
+/// `TotalCoeff(coeff_token)` value the CAVLC engine decoded. We do
+/// not modify `parse_residual_block_cavlc` to return the token directly
+/// (that would touch `cavlc.rs`, which is out of scope for this
+/// change), so we recover the value here. Post §9.2.2 / §9.2.4 a
+/// non-zero `coeffLevel[i]` always came from a non-zero transform
+/// coefficient level; the reverse also holds, because the levelVal
+/// prelude only writes to `coeffLevel[startIdx + zerosLeft + ... ]`
+/// for indices covered by `TotalCoeff` decoded levels.
+#[inline]
+fn count_nonzero(buf: &[i32]) -> u8 {
+    buf.iter().filter(|&&v| v != 0).count().min(255) as u8
+}
+
+/// §9.2.1.1 / §7.3.5.3.1 — chroma array layout: how many 4x4 chroma
+/// blocks per plane. 4 for 4:2:0, 8 for 4:2:2.
+#[inline]
+fn num_chroma_4x4_blocks(chroma_array_type: u32) -> usize {
+    match chroma_array_type {
+        1 => 4,
+        2 => 8,
+        _ => 0,
+    }
+}
+
 fn parse_residual_cavlc_only(
     r: &mut BitReader<'_>,
-    chroma_array_type: u32,
+    entropy: &mut EntropyState<'_, '_>,
     mb_type: &MbType,
     cbp_luma: u32,
     cbp_chroma: u32,
     transform_size_8x8_flag: bool,
     out: &mut Macroblock,
 ) -> McblResult<()> {
+    let chroma_array_type = entropy.chroma_array_type;
+    let current_mb_addr = entropy.current_mb_addr;
+    let current_is_intra = mb_type.is_intra();
+    let cip = entropy.constrained_intra_pred_flag;
+
+    // Snapshot everything the nC derivation needs. We take a short
+    // immutable borrow of the grid (if present) to compute nC values,
+    // then release the borrow before writing back this MB's state.
+    // Working copy of this MB's own luma totals so in-MB block-to-block
+    // neighbour lookups see the progressively-filled counts.
+    let mut own_luma_totals: [u8; 16] = [0; 16];
+    let mut own_cb_totals: [u8; 8] = [0; 8];
+    let mut own_cr_totals: [u8; 8] = [0; 8];
+
+    // Helper: derive nC for a luma 4x4 block using the neighbour grid
+    // plus this MB's own-block progressively-filled totals. We model
+    // the "current MB as neighbour" branch manually — the grid doesn't
+    // have this MB's entry marked available yet, so a NeighbourSource
+    // of `InternalBlock(i)` falls back to `own_luma_totals[i]`.
+    let derive_luma = |blk_idx: u8,
+                       kind: LumaNcKind,
+                       own: &[u8; 16],
+                       grid: Option<&CavlcNcGrid>|
+     -> i32 {
+        let blk = match kind {
+            LumaNcKind::Intra16x16Dc => 0u8,
+            LumaNcKind::Ac => blk_idx,
+        };
+        let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk);
+        // A:
+        let (avail_a, n_a) = match a_src {
+            NeighbourSource::InternalBlock(i) => (true, own[i as usize]),
+            _ => {
+                let Some(g) = grid else { return 0 };
+                let (addr, bi) = resolve_luma_neighbour(g, current_mb_addr, a_src);
+                nc_nn_luma(g, addr, bi, current_is_intra, cip)
+            }
+        };
+        // B:
+        let (avail_b, n_b) = match b_src {
+            NeighbourSource::InternalBlock(i) => (true, own[i as usize]),
+            _ => {
+                let Some(g) = grid else { return 0 };
+                let (addr, bi) = resolve_luma_neighbour(g, current_mb_addr, b_src);
+                nc_nn_luma(g, addr, bi, current_is_intra, cip)
+            }
+        };
+        combine_nc(avail_a, n_a, avail_b, n_b)
+    };
+
+    // Helper: derive nC for a chroma AC 4x4 block.
+    let derive_chroma = |blk_idx: u8,
+                         is_cr: bool,
+                         own_cb: &[u8; 8],
+                         own_cr: &[u8; 8],
+                         grid: Option<&CavlcNcGrid>|
+     -> i32 {
+        // Geometry of 4x4 chroma block within its plane.
+        let x = ((blk_idx as i32) % 2) * 4;
+        let y = ((blk_idx as i32) / 2) * 4;
+        let max_w: i32 = 8;
+        let max_h: i32 = if chroma_array_type == 2 { 16 } else { 8 };
+        let (xa, ya) = (x - 1, y);
+        let (xb, yb) = (x, y - 1);
+
+        // Classify each neighbour as internal-to-this-MB vs external.
+        // Internal iff (0..max_w).contains(&xN) && (0..max_h).contains(&yN).
+        let own_arr = if is_cr { own_cr } else { own_cb };
+        let (avail_a, n_a) = if xa >= 0 && xa < max_w && ya >= 0 && ya < max_h {
+            // Internal: §6.4.13.2 eq. 6-39.
+            let bi = (2 * (ya / 4) + (xa / 4)) as usize;
+            (true, own_arr[bi])
+        } else {
+            let Some(g) = grid else { return 0 };
+            let (addr, bi) = resolve_chroma_neighbour(g, current_mb_addr, xa, ya, max_w, max_h);
+            nc_nn_chroma(g, addr, bi, is_cr, current_is_intra, cip)
+        };
+        let (avail_b, n_b) = if xb >= 0 && xb < max_w && yb >= 0 && yb < max_h {
+            let bi = (2 * (yb / 4) + (xb / 4)) as usize;
+            (true, own_arr[bi])
+        } else {
+            let Some(g) = grid else { return 0 };
+            let (addr, bi) = resolve_chroma_neighbour(g, current_mb_addr, xb, yb, max_w, max_h);
+            nc_nn_chroma(g, addr, bi, is_cr, current_is_intra, cip)
+        };
+        combine_nc(avail_a, n_a, avail_b, n_b)
+    };
+
+    // Short immutable borrow for the nC lookups.
+    let grid_ref: Option<&CavlcNcGrid> = entropy.cavlc_nc.as_deref();
+
     // --- Luma DC (Intra_16x16) ---
     if mb_type.is_intra_16x16() {
         // §7.3.5.3 — residual_block_cavlc(Intra16x16DCLevel, 0, 15, 16).
-        let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 15, 16)?;
+        // §9.2.1.1 step 1 + NOTE 2: nC for Intra16x16DCLevel uses
+        // luma4x4BlkIdx = 0 and is based on *AC* totals of the
+        // neighbours, i.e. the standard luma derivation.
+        let nc = derive_luma(0, LumaNcKind::Intra16x16Dc, &own_luma_totals, grid_ref);
+        let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
         out.residual_luma_dc = Some(pad_to_16(blk));
+        // NOTE 1 of §9.2.1.1: DC counts do NOT contribute to nN — do
+        // not update own_luma_totals here.
     }
 
     // --- Luma AC / 4x4 blocks / 8x8 blocks ---
     if mb_type.is_intra_16x16() {
-        // 16 AC 4x4 blocks selected by cbp_luma (all present when bit is
-        // set; Intra_16x16 CBP is 0 or 15 meaning all-off / all-on).
         if cbp_luma == 15 {
-            for _ in 0..16 {
-                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 14, 15)?;
+            for blk_idx in 0..16u8 {
+                let nc = derive_luma(blk_idx, LumaNcKind::Ac, &own_luma_totals, grid_ref);
+                let blk =
+                    parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 14, 15)?;
+                let tc = count_nonzero(&blk);
+                own_luma_totals[blk_idx as usize] = tc;
                 out.residual_luma.push(pad_to_16(blk));
             }
         }
     } else if transform_size_8x8_flag {
-        // 4 8x8 blocks. Each 8x8 block's 4 4x4 sub-blocks share a single
-        // residual_block_cavlc with maxNumCoeff=64.
-        // §7.3.5.3 models this as four calls with span 0..=63 but our
-        // cavlc helper tops out at 16 coefficients per block. For the
-        // purposes of this pass we read four 4x4 spans per 8x8 block.
-        for blk8 in 0..4 {
+        // 8x8 transform: we still emit four 4x4-sized passes per 8x8
+        // block in this reader (see function comment). For nC derivation
+        // we use the luma4x4BlkIdx of the per-4x4 sub-block in scan
+        // order — that matches §7.3.5.3.1 when the per-4x4 CAVLC path
+        // is used; for a strict 8x8 decoder the residual would be a
+        // single 64-coeff call, but this code path is a known
+        // simplification (see doc comment at top of this module).
+        for blk8 in 0..4u8 {
             if (cbp_luma >> blk8) & 1 == 1 {
-                for _ in 0..4 {
+                for sub in 0..4u8 {
+                    let blk_idx = blk8 * 4 + sub;
+                    let nc = derive_luma(blk_idx, LumaNcKind::Ac, &own_luma_totals, grid_ref);
                     let blk =
-                        parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 15, 16)?;
+                        parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
+                    let tc = count_nonzero(&blk);
+                    own_luma_totals[blk_idx as usize] = tc;
                     out.residual_luma.push(pad_to_16(blk));
                 }
             }
         }
     } else {
         // 16 4x4 blocks — read only where cbp_luma bit is set (grouped
-        // as 4-blocks-per-cbp_luma-bit as in the spec).
-        for blk8 in 0..4 {
+        // as 4-blocks-per-cbp_luma-bit per §7.3.5.3).
+        for blk8 in 0..4u8 {
             if (cbp_luma >> blk8) & 1 == 1 {
-                for _ in 0..4 {
+                for sub in 0..4u8 {
+                    let blk_idx = blk8 * 4 + sub;
+                    let nc = derive_luma(blk_idx, LumaNcKind::Ac, &own_luma_totals, grid_ref);
                     let blk =
-                        parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 15, 16)?;
+                        parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
+                    let tc = count_nonzero(&blk);
+                    own_luma_totals[blk_idx as usize] = tc;
                     out.residual_luma.push(pad_to_16(blk));
                 }
             }
@@ -1102,9 +1670,10 @@ fn parse_residual_cavlc_only(
 
     // --- Chroma residual ---
     if chroma_array_type == 1 || chroma_array_type == 2 {
-        let num_c8x8 = if chroma_array_type == 1 { 1 } else { 2 };
+        let num_c_blk = num_chroma_4x4_blocks(chroma_array_type);
 
-        // Chroma DC blocks (one per plane).
+        // Chroma DC blocks (one per plane). §9.2.1.1 special cases:
+        // ChromaDCLevel uses nC = -1 (4:2:0) or -2 (4:2:2).
         if cbp_chroma > 0 {
             let dc_ctx = if chroma_array_type == 1 {
                 CoeffTokenContext::ChromaDc420
@@ -1118,15 +1687,46 @@ fn parse_residual_cavlc_only(
             out.residual_chroma_dc_cr = cr_dc;
         }
 
-        // Chroma AC 4x4 blocks (4*num_c8x8 per plane when cbp_chroma == 2).
+        // Chroma AC 4x4 blocks when cbp_chroma == 2 (per §7.3.5.3).
         if cbp_chroma == 2 {
-            let num_ac = 4 * num_c8x8 as usize;
-            for _ in 0..num_ac {
-                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 14, 15)?;
+            // Cb plane.
+            for blk_idx in 0..num_c_blk as u8 {
+                let nc = derive_chroma(
+                    blk_idx,
+                    /*is_cr=*/ false,
+                    &own_cb_totals,
+                    &own_cr_totals,
+                    grid_ref,
+                );
+                let blk = parse_residual_block_cavlc(
+                    r,
+                    CoeffTokenContext::Numeric(nc),
+                    0,
+                    14,
+                    15,
+                )?;
+                let tc = count_nonzero(&blk);
+                own_cb_totals[blk_idx as usize] = tc;
                 out.residual_chroma_ac_cb.push(pad_to_16(blk));
             }
-            for _ in 0..num_ac {
-                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 14, 15)?;
+            // Cr plane.
+            for blk_idx in 0..num_c_blk as u8 {
+                let nc = derive_chroma(
+                    blk_idx,
+                    /*is_cr=*/ true,
+                    &own_cb_totals,
+                    &own_cr_totals,
+                    grid_ref,
+                );
+                let blk = parse_residual_block_cavlc(
+                    r,
+                    CoeffTokenContext::Numeric(nc),
+                    0,
+                    14,
+                    15,
+                )?;
+                let tc = count_nonzero(&blk);
+                own_cr_totals[blk_idx as usize] = tc;
                 out.residual_chroma_ac_cr.push(pad_to_16(blk));
             }
         }
@@ -1137,6 +1737,15 @@ fn parse_residual_cavlc_only(
         return Err(MacroblockLayerError::UnsupportedChromaArrayType(
             chroma_array_type,
         ));
+    }
+
+    // Write the accumulated own-MB totals back to the grid.
+    if let Some(grid) = entropy.cavlc_nc.as_deref_mut() {
+        if let Some(slot) = grid.mbs.get_mut(current_mb_addr as usize) {
+            slot.luma_total_coeff = own_luma_totals;
+            slot.cb_total_coeff = own_cb_totals;
+            slot.cr_total_coeff = own_cr_totals;
+        }
     }
 
     Ok(())
@@ -1674,6 +2283,9 @@ mod tests {
             prev_mb_qp_delta_nonzero: false,
             chroma_array_type: 1,
             transform_8x8_mode_flag: false,
+            cavlc_nc: None,
+            current_mb_addr: 0,
+            constrained_intra_pred_flag: false,
         }
     }
 
@@ -1797,5 +2409,177 @@ mod tests {
         assert_eq!(pcm.luma[1], 1);
         assert_eq!(pcm.chroma_cb[10], 10);
         assert_eq!(pcm.chroma_cr[3], 6);
+    }
+
+    // -----------------------------------------------------------------
+    // §9.2.1.1 — CAVLC nC neighbour derivation tests.
+    // -----------------------------------------------------------------
+
+    /// Populate `grid.mbs[addr]` as a fully-available non-skip, non-PCM
+    /// intra MB with the given per-block total_coeff values.
+    fn fill_mb(grid: &mut CavlcNcGrid, addr: u32, luma_totals: [u8; 16]) {
+        let slot = &mut grid.mbs[addr as usize];
+        slot.is_available = true;
+        slot.is_skip = false;
+        slot.is_i_pcm = false;
+        slot.is_intra = true;
+        slot.luma_total_coeff = luma_totals;
+    }
+
+    #[test]
+    fn nc_top_left_mb_both_neighbours_unavailable() {
+        // §9.2.1.1 step 7: availableFlagA == 0 && availableFlagB == 0 → nC = 0.
+        // First MB of the slice, block 0: neither A (outside left) nor
+        // B (outside top) is available.
+        let grid = CavlcNcGrid::new(4, 4);
+        let nc = derive_nc_luma(&grid, 0, 0, LumaNcKind::Ac, true, false);
+        assert_eq!(nc, 0);
+    }
+
+    #[test]
+    fn nc_mb0_block5_uses_in_mb_neighbours_once_filled() {
+        // §6.4.11.4 — block 5's A = block 4 (internal), B = block 1
+        // (internal). When both neighbours-in-grid are not yet written
+        // (since we only fill mbAddr=0 after the MB is done), the
+        // derivation we do for in-MB neighbours is via the "own"
+        // totals (passed into the closure) — exercised by the integration
+        // path. For the grid-only helper, with nothing filled, these are
+        // InternalBlock(4) / InternalBlock(1) → grid_ref doesn't have
+        // availability because it's the *current* MB being decoded; the
+        // grid entry for mb_addr=0 has is_available=false so the result
+        // is nC=0 — which is the expected "nothing decoded yet" state.
+        let grid = CavlcNcGrid::new(4, 4);
+        let nc = derive_nc_luma(&grid, 0, 5, LumaNcKind::Ac, true, false);
+        // Both neighbours are InternalBlock; they resolve to current MB;
+        // current MB hasn't been marked available yet → nC = 0.
+        assert_eq!(nc, 0);
+    }
+
+    #[test]
+    fn nc_mb1_block0_uses_left_mb_block_per_6_4_11_4() {
+        // §6.4.11.4 — MB 1 block 0 in a 4x4 MB grid: A = left MB
+        // block 5 (eq. 6-38 at wrapped (xW=15, yW=0) = 8*0 + 4*1 + 0 +
+        // 7/4 = 5), B unavailable (top row).
+        let mut grid = CavlcNcGrid::new(4, 4);
+        let mut totals = [0u8; 16];
+        totals[5] = 5; // block 5 of MB 0 had total_coeff = 5
+        fill_mb(&mut grid, 0, totals);
+        let nc = derive_nc_luma(&grid, /*mb_addr=*/ 1, /*blk=*/ 0, LumaNcKind::Ac, true, false);
+        // availableFlagA=1 (nA=5), availableFlagB=0 → nC = nA = 5.
+        assert_eq!(nc, 5);
+    }
+
+    #[test]
+    fn nc_mb4_block0_uses_above_mb_block10() {
+        // MB at (0, 1) in a 4x4 grid = addr 4. Block 0: A unavailable
+        // (left edge), B = MB 0's block at bottom row, first column.
+        // Figure 6-10: bottom-row-left block indices are 10, 11, 14, 15;
+        // eq. 6-38 for (xW=0, yW=15) = 8*(15/8) + 4*0 + 2*((15%8)/4) +
+        // (0%8)/4 = 8 + 0 + 2 + 0 = 10.
+        let mut grid = CavlcNcGrid::new(4, 4);
+        let mut totals = [0u8; 16];
+        totals[10] = 7;
+        fill_mb(&mut grid, 0, totals);
+        let nc = derive_nc_luma(&grid, /*mb_addr=*/ 4, /*blk=*/ 0, LumaNcKind::Ac, true, false);
+        // availableFlagA=0, availableFlagB=1 (nB=7) → nC = 7.
+        assert_eq!(nc, 7);
+    }
+
+    #[test]
+    fn nc_mb5_block0_averages_left_and_above() {
+        // §6.4.11.4 — MB at (1, 1) = addr 5. Block 0 at (x=0, y=0):
+        //   A at (-1, 0) → left MB (MB 4), wrapped (xW=15, yW=0)
+        //     = block 5 (per eq. 6-38).
+        //   B at ( 0, -1) → above MB (MB 1), wrapped (xW=0, yW=15)
+        //     = block 10 (per eq. 6-38).
+        let mut grid = CavlcNcGrid::new(4, 4);
+        let mut t4 = [0u8; 16];
+        t4[5] = 4;
+        fill_mb(&mut grid, 4, t4);
+        let mut t1 = [0u8; 16];
+        t1[10] = 6;
+        fill_mb(&mut grid, 1, t1);
+        let nc = derive_nc_luma(&grid, /*mb_addr=*/ 5, /*blk=*/ 0, LumaNcKind::Ac, true, false);
+        // (nA + nB + 1) >> 1 = (4 + 6 + 1) >> 1 = 5.
+        assert_eq!(nc, 5);
+    }
+
+    #[test]
+    fn nc_skip_neighbour_contributes_zero() {
+        // §9.2.1.1 step 6: P_Skip / B_Skip neighbour → nN = 0 even if
+        // the block slot numerically holds a non-zero total.
+        let mut grid = CavlcNcGrid::new(4, 4);
+        let mut totals = [0u8; 16];
+        totals[5] = 9;
+        fill_mb(&mut grid, 0, totals);
+        // Mark MB 0 as a skip — its total_coeff values must be ignored.
+        grid.mbs[0].is_skip = true;
+        let nc = derive_nc_luma(&grid, 1, 0, LumaNcKind::Ac, true, false);
+        // A = MB 0 blk 5 (nN forced to 0), B = unavailable → nC = 0.
+        assert_eq!(nc, 0);
+    }
+
+    #[test]
+    fn nc_i_pcm_neighbour_contributes_sixteen() {
+        // §9.2.1.1 step 6: I_PCM neighbour → nN = 16.
+        let mut grid = CavlcNcGrid::new(4, 4);
+        fill_mb(&mut grid, 0, [0; 16]); // totals irrelevant for I_PCM.
+        grid.mbs[0].is_i_pcm = true;
+        let nc = derive_nc_luma(&grid, 1, 0, LumaNcKind::Ac, true, false);
+        // A = MB 0 blk 5 (nN=16), B = unavailable → nC = nA = 16.
+        assert_eq!(nc, 16);
+    }
+
+    #[test]
+    fn nc_intra16x16_dc_ignores_block_idx() {
+        // §9.2.1.1 step 1 for Intra16x16DCLevel: luma4x4BlkIdx = 0
+        // regardless of the caller's supplied value. Verify by asking
+        // for a "block 15" neighbour on MB 1 — the derivation should
+        // still use block 0's neighbours (A = MB 0 block 5, B up).
+        let mut grid = CavlcNcGrid::new(4, 4);
+        let mut totals = [0u8; 16];
+        totals[5] = 8;
+        fill_mb(&mut grid, 0, totals);
+        let nc = derive_nc_luma(&grid, 1, 15, LumaNcKind::Intra16x16Dc, true, false);
+        // Equivalent to asking for block 0: A=MB 0 blk 5 = 8, B unavail.
+        assert_eq!(nc, 8);
+    }
+
+    #[test]
+    fn nc_chroma_ac_420_top_left_block_uses_left_mb() {
+        // Chroma 4x4 block 0 in 4:2:0: (x=0, y=0) inside the chroma
+        // plane. A = (-1, 0) → left MB's chroma block at (xW=7, yW=0)
+        // → chroma4x4BlkIdx = 2*(0/4) + 7/4 = 0 + 1 = 1.
+        // B = (0, -1) → above MB's chroma block at (xW=0, yW=7)
+        // → chroma4x4BlkIdx = 2*(7/4) + 0/4 = 2.
+        let mut grid = CavlcNcGrid::new(4, 4);
+        // mb 0: mark available with chroma totals filled.
+        grid.mbs[0].is_available = true;
+        grid.mbs[0].cb_total_coeff[2] = 4; // block 2 (above neighbour from MB 4's POV)
+        let nc = derive_nc_chroma_ac(&grid, /*mb_addr=*/ 4, /*blk=*/ 0, /*is_cr=*/ false, 1, true, false);
+        // MB 4 = (0, 1). A unavailable (left edge), B = MB 0 block 2 (cb=4).
+        assert_eq!(nc, 4);
+    }
+
+    #[test]
+    fn nc_grid_neighbour_mb_addrs_corners() {
+        // Raster-scan left+above neighbour lookup on a 4x4 MB grid.
+        let grid = CavlcNcGrid::new(4, 4);
+        assert_eq!(grid.neighbour_mb_addrs(0), (None, None));
+        assert_eq!(grid.neighbour_mb_addrs(3), (Some(2), None));
+        assert_eq!(grid.neighbour_mb_addrs(4), (None, Some(0)));
+        assert_eq!(grid.neighbour_mb_addrs(5), (Some(4), Some(1)));
+        assert_eq!(grid.neighbour_mb_addrs(15), (Some(14), Some(11)));
+    }
+
+    #[test]
+    fn combine_nc_formula_matches_spec() {
+        // §9.2.1.1 step 7 arithmetic cross-check.
+        assert_eq!(combine_nc(false, 0, false, 0), 0);
+        assert_eq!(combine_nc(true, 5, false, 0), 5);
+        assert_eq!(combine_nc(false, 0, true, 7), 7);
+        assert_eq!(combine_nc(true, 3, true, 4), (3 + 4 + 1) >> 1); // 4
+        assert_eq!(combine_nc(true, 0, true, 0), 0);
+        assert_eq!(combine_nc(true, 16, true, 16), (16 + 16 + 1) >> 1); // 16
     }
 }

@@ -39,7 +39,9 @@ use crate::cabac::{CabacDecoder, CabacError};
 use crate::cabac_ctx::{
     decode_end_of_slice_flag, decode_mb_skip_flag, CabacContexts, NeighbourCtx, SliceKind,
 };
-use crate::macroblock_layer::{parse_macroblock, EntropyState, Macroblock, MacroblockLayerError};
+use crate::macroblock_layer::{
+    parse_macroblock, CavlcNcGrid, EntropyState, Macroblock, MacroblockLayerError,
+};
 use crate::pps::Pps;
 use crate::slice_header::{SliceHeader, SliceType};
 use crate::sps::Sps;
@@ -133,6 +135,19 @@ pub fn parse_slice_data(
     let mut macroblocks: Vec<Macroblock> = Vec::new();
     let mut curr_mb_addr: u32 = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
 
+    // §9.2.1.1 — CAVLC nC neighbour grid, allocated per picture. The
+    // grid is only consulted in the CAVLC path but we allocate it for
+    // the CABAC path too so any future CABAC residual-neighbour work
+    // can re-use the same store.
+    let pic_w_mbs = sps.pic_width_in_mbs_minus1 + 1;
+    let pic_h_mus = sps.pic_height_in_map_units_minus1 + 1;
+    let pic_h_mbs = if sps.frame_mbs_only_flag {
+        pic_h_mus
+    } else {
+        pic_h_mus * 2
+    };
+    let mut cavlc_nc = CavlcNcGrid::new(pic_w_mbs, pic_h_mbs);
+
     if pps.entropy_coding_mode_flag {
         // ---------------------------------------------------------
         // CABAC path (§7.3.4).
@@ -165,6 +180,17 @@ pub fn parse_slice_data(
                     decode_mb_skip_flag(&mut cabac_dec, &mut ctxs, kind, &NeighbourCtx::default())?;
                 if mb_skip_flag {
                     macroblocks.push(Macroblock::new_skip(slice_header.slice_type));
+                    // §9.2.1.1 step 6 — a P_Skip / B_Skip neighbour
+                    // contributes nN = 0. Mark available + is_skip.
+                    if let Some(slot) = cavlc_nc.mbs.get_mut(curr_mb_addr as usize) {
+                        slot.is_available = true;
+                        slot.is_skip = true;
+                        slot.is_intra = false;
+                        slot.is_i_pcm = false;
+                        slot.luma_total_coeff = [0; 16];
+                        slot.cb_total_coeff = [0; 8];
+                        slot.cr_total_coeff = [0; 8];
+                    }
                     curr_mb_addr += 1;
                     skipped = true;
                 }
@@ -177,6 +203,9 @@ pub fn parse_slice_data(
                     prev_mb_qp_delta_nonzero: false,
                     chroma_array_type,
                     transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
+                    cavlc_nc: Some(&mut cavlc_nc),
+                    current_mb_addr: curr_mb_addr,
+                    constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
                 };
                 let (byte, bit) = r.position();
                 let mb = parse_macroblock(
@@ -209,6 +238,16 @@ pub fn parse_slice_data(
                 pending_skip = r.ue()?;
                 for _ in 0..pending_skip {
                     macroblocks.push(Macroblock::new_skip(slice_header.slice_type));
+                    // §9.2.1.1 step 6 — skipped MB contributes nN = 0.
+                    if let Some(slot) = cavlc_nc.mbs.get_mut(curr_mb_addr as usize) {
+                        slot.is_available = true;
+                        slot.is_skip = true;
+                        slot.is_intra = false;
+                        slot.is_i_pcm = false;
+                        slot.luma_total_coeff = [0; 16];
+                        slot.cb_total_coeff = [0; 8];
+                        slot.cr_total_coeff = [0; 8];
+                    }
                     curr_mb_addr += 1;
                 }
             }
@@ -224,6 +263,9 @@ pub fn parse_slice_data(
                 prev_mb_qp_delta_nonzero: false,
                 chroma_array_type,
                 transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
+                cavlc_nc: Some(&mut cavlc_nc),
+                current_mb_addr: curr_mb_addr,
+                constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
             };
             let (byte, bit) = r.position();
             let mb = parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)

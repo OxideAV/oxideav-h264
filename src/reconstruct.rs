@@ -30,7 +30,9 @@ use crate::deblock::{
     alpha_from_index, beta_from_index, derive_boundary_strength, filter_edge, tc0_from, BsInputs,
     EdgeSamples, FilterParams, Plane,
 };
-use crate::inter_pred::{interpolate_chroma, interpolate_luma};
+use crate::inter_pred::{
+    interpolate_chroma, interpolate_luma, weighted_pred_explicit, BiPredMode, WeightedEntry,
+};
 use crate::intra_pred::{
     filter_samples_8x8, predict_16x16, predict_4x4, predict_8x8, predict_chroma,
     ChromaArrayType as IpChromaArrayType, Intra16x16Mode, Intra4x4Mode, Intra8x8Mode,
@@ -45,7 +47,7 @@ use crate::picture::Picture;
 use crate::pps::Pps;
 use crate::ref_store::RefPicProvider;
 use crate::slice_data::SliceData;
-use crate::slice_header::SliceHeader;
+use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sps::Sps;
 use crate::transform::{
     default_scaling_list_4x4_flat, default_scaling_list_8x8_flat, inverse_hadamard_chroma_dc_420,
@@ -1201,6 +1203,97 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     Ok(())
 }
 
+/// §8.4.2.3 — decide whether the explicit weighted-prediction path
+/// applies for the current slice.
+///
+/// * P / SP slices: `pps.weighted_pred_flag` selects explicit.
+/// * B slices: `pps.weighted_bipred_idc == 1` selects explicit.
+///   `weighted_bipred_idc == 2` is implicit (§8.4.2.3.3) — not yet
+///   implemented; fall back to the default path (TODO).
+///   `weighted_bipred_idc == 0` is default.
+///
+/// A `pred_weight_table` that is `None` (parser didn't attach one) is
+/// always treated as "default" — the explicit path would have nothing
+/// to read.
+fn weighted_explicit_active(slice_header: &SliceHeader, pps: &Pps) -> bool {
+    if slice_header.pred_weight_table.is_none() {
+        return false;
+    }
+    match slice_header.slice_type {
+        SliceType::P | SliceType::SP => pps.weighted_pred_flag,
+        SliceType::B => pps.weighted_bipred_idc == 1,
+        // TODO(§8.4.2.3.3): implicit weighted prediction for
+        // weighted_bipred_idc == 2 — derive weights from POC distance.
+        // Currently falls through to the default path.
+        _ => false,
+    }
+}
+
+/// §7.4.3.2 — look up the (weight, offset) for a luma entry in the
+/// pred_weight_table. When `ref_idx < 0` (list not used) the returned
+/// entry is irrelevant; we return a benign default. When the per-entry
+/// flag was 0 (stored as `None`), the inferred values are
+/// `weight = 2^log2_wd, offset = 0`.
+fn luma_weight_entry(
+    pwt: &PredWeightTable,
+    list: u8,
+    ref_idx: i8,
+    log2_wd: u32,
+) -> WeightedEntry {
+    if ref_idx < 0 {
+        return WeightedEntry::default();
+    }
+    let idx = ref_idx as usize;
+    let table = match list {
+        0 => &pwt.luma_weights_l0,
+        _ => &pwt.luma_weights_l1,
+    };
+    match table.get(idx).copied().flatten() {
+        Some((w, o)) => WeightedEntry {
+            weight: w,
+            offset: o,
+        },
+        None => WeightedEntry {
+            // Inferred values per §7.4.3.2.
+            weight: 1i32 << log2_wd,
+            offset: 0,
+        },
+    }
+}
+
+/// §7.4.3.2 — look up the chroma (weight, offset) for a given
+/// (list, iCbCr, ref_idx) entry, applying the same inference rule as
+/// [`luma_weight_entry`].
+fn chroma_weight_entry(
+    pwt: &PredWeightTable,
+    list: u8,
+    i_cb_cr: usize,
+    ref_idx: i8,
+    log2_wd: u32,
+) -> WeightedEntry {
+    if ref_idx < 0 {
+        return WeightedEntry::default();
+    }
+    let idx = ref_idx as usize;
+    let table = match list {
+        0 => &pwt.chroma_weights_l0,
+        _ => &pwt.chroma_weights_l1,
+    };
+    match table.get(idx).copied().flatten() {
+        Some(pair) => {
+            let (w, o) = pair[i_cb_cr];
+            WeightedEntry {
+                weight: w,
+                offset: o,
+            }
+        }
+        None => WeightedEntry {
+            weight: 1i32 << log2_wd,
+            offset: 0,
+        },
+    }
+}
+
 /// §8.4.2 — motion-compensate a single partition + write into the
 /// MB-local prediction buffers. Also records the MV/ref_idx into the
 /// grid so subsequent MBs' MVpred can see it.
@@ -1213,8 +1306,8 @@ fn process_partition<R: RefPicProvider>(
     chroma_array_type: u32,
     bit_depth_y: u32,
     bit_depth_c: u32,
-    _slice_header: &SliceHeader,
-    _pps: &Pps,
+    slice_header: &SliceHeader,
+    pps: &Pps,
     ref_pics: &R,
     grid: &mut MbGrid,
     pic: &Picture,
@@ -1337,25 +1430,95 @@ fn process_partition<R: RefPicProvider>(
         )?;
     }
 
-    // §8.4.2.3 — combine. Default (weighted_pred_flag off) = average
-    // for bipred, copy for single list. Weighted pred is deferred —
-    // we call the default path here (explicit weighted pred is TODO).
+    // §8.4.2.3 — combine L0 / L1 prediction buffers into the final
+    // prediction samples. The mode is selected per §8.4.2.3:
+    //
+    // * P / SP slices: explicit (§8.4.2.3.2) when pps.weighted_pred_flag,
+    //   else default (§8.4.2.3.1 — plain copy of the single list).
+    // * B slices:
+    //   - weighted_bipred_idc == 0 → default (eq. 8-273 average for
+    //     bipred, copy for single list).
+    //   - weighted_bipred_idc == 1 → explicit (eq. 8-274/8-275/8-276
+    //     with weights/offsets pulled from the slice's pred_weight_table).
+    //   - weighted_bipred_idc == 2 → implicit (§8.4.2.3.3). Not yet
+    //     implemented — fall back to the default path.
+    let use_explicit = weighted_explicit_active(slice_header, pps);
+    let bi_mode = if has_l0 && has_l1 {
+        Some(BiPredMode::Bipred)
+    } else if has_l0 {
+        Some(BiPredMode::L0Only)
+    } else if has_l1 {
+        Some(BiPredMode::L1Only)
+    } else {
+        None
+    };
+
     for py in 0..h as usize {
         for px in 0..w as usize {
             let dst_idx = (part.y as usize + py) * 16 + (part.x as usize + px);
-            let v = if has_l0 && has_l1 {
-                // Eq. 8-273.
-                (l0_buf[py * w as usize + px] + l1_buf[py * w as usize + px] + 1) >> 1
-            } else if has_l0 {
-                l0_buf[py * w as usize + px]
-            } else if has_l1 {
-                l1_buf[py * w as usize + px]
-            } else {
-                // Neither L0 nor L1 active (e.g., B_Direct with no usable
-                // refs) — fall back to zero prediction per §8.4.2.3.
-                0
+            let v = match bi_mode {
+                Some(_) if use_explicit => {
+                    // Handled in bulk below via weighted_pred_explicit;
+                    // defer by leaving the slot at 0 for now.
+                    0
+                }
+                Some(BiPredMode::Bipred) => {
+                    // Eq. 8-273 — default bipred average.
+                    (l0_buf[py * w as usize + px] + l1_buf[py * w as usize + px] + 1) >> 1
+                }
+                Some(BiPredMode::L0Only) => l0_buf[py * w as usize + px],
+                Some(BiPredMode::L1Only) => l1_buf[py * w as usize + px],
+                None => {
+                    // Neither L0 nor L1 active (e.g., B_Direct with no
+                    // usable refs) — fall back to zero prediction
+                    // per §8.4.2.3.
+                    0
+                }
             };
             pred_luma[dst_idx] = v;
+        }
+    }
+
+    if use_explicit {
+        if let (Some(mode), Some(pwt)) = (bi_mode, slice_header.pred_weight_table.as_ref()) {
+            // §8.4.2.3.2 — explicit weighted sample prediction for luma.
+            let log2_wd = pwt.luma_log2_weight_denom;
+            let w_l0 = luma_weight_entry(pwt, 0, part.ref_idx_l0, log2_wd);
+            let w_l1 = luma_weight_entry(pwt, 1, part.ref_idx_l1, log2_wd);
+            // Scratch partition-sized buffer so we can use the spec's
+            // dst/dst_stride API directly.
+            let mut scratch = vec![0i32; (w as usize) * (h as usize)];
+            let l0_opt = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
+                Some(l0_buf.as_slice())
+            } else {
+                None
+            };
+            let l1_opt = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
+                Some(l1_buf.as_slice())
+            } else {
+                None
+            };
+            weighted_pred_explicit(
+                l0_opt,
+                l1_opt,
+                w as usize,
+                w,
+                h,
+                mode,
+                w_l0,
+                w_l1,
+                log2_wd,
+                bit_depth_y,
+                &mut scratch,
+                w as usize,
+            );
+            // Copy back into pred_luma at partition-local position.
+            for py in 0..h as usize {
+                for px in 0..w as usize {
+                    let dst_idx = (part.y as usize + py) * 16 + (part.x as usize + px);
+                    pred_luma[dst_idx] = scratch[py * w as usize + px];
+                }
+            }
         }
     }
 
@@ -1420,25 +1583,129 @@ fn process_partition<R: RefPicProvider>(
             )?;
         }
         // Combine into pred_cb / pred_cr at MB-local position.
-        for py in 0..c_h as usize {
-            for px in 0..c_w as usize {
-                let dst_idx =
-                    (c_part_y as usize + py) * (mbw_c_use as usize) + (c_part_x as usize + px);
-                let idx = py * c_w as usize + px;
-                let (vb, vr) = if has_l0 && has_l1 {
-                    (
-                        (l0_cb[idx] + l1_cb[idx] + 1) >> 1,
-                        (l0_cr[idx] + l1_cr[idx] + 1) >> 1,
-                    )
-                } else if has_l0 {
-                    (l0_cb[idx], l0_cr[idx])
-                } else if has_l1 {
-                    (l1_cb[idx], l1_cr[idx])
+        // §8.4.2.3 — the same default/explicit dispatch as luma applies
+        // to chroma, with separate weights per (list, iCbCr) and a
+        // separate log2 denominator (chroma_log2_weight_denom).
+        if use_explicit {
+            if let (Some(mode), Some(pwt)) = (bi_mode, slice_header.pred_weight_table.as_ref()) {
+                let log2_wd_c = pwt.chroma_log2_weight_denom;
+                // Cb: iCbCr = 0.
+                let (w_cb_l0, w_cb_l1) = (
+                    chroma_weight_entry(pwt, 0, 0, part.ref_idx_l0, log2_wd_c),
+                    chroma_weight_entry(pwt, 1, 0, part.ref_idx_l1, log2_wd_c),
+                );
+                // Cr: iCbCr = 1.
+                let (w_cr_l0, w_cr_l1) = (
+                    chroma_weight_entry(pwt, 0, 1, part.ref_idx_l0, log2_wd_c),
+                    chroma_weight_entry(pwt, 1, 1, part.ref_idx_l1, log2_wd_c),
+                );
+
+                let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
+                let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+                let cb_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
+                    Some(l0_cb.as_slice())
                 } else {
-                    (0, 0)
+                    None
                 };
-                pred_cb[dst_idx] = vb;
-                pred_cr[dst_idx] = vr;
+                let cb_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
+                    Some(l1_cb.as_slice())
+                } else {
+                    None
+                };
+                let cr_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
+                    Some(l0_cr.as_slice())
+                } else {
+                    None
+                };
+                let cr_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
+                    Some(l1_cr.as_slice())
+                } else {
+                    None
+                };
+                weighted_pred_explicit(
+                    cb_l0,
+                    cb_l1,
+                    c_w as usize,
+                    c_w,
+                    c_h,
+                    mode,
+                    w_cb_l0,
+                    w_cb_l1,
+                    log2_wd_c,
+                    bit_depth_c,
+                    &mut scratch_cb,
+                    c_w as usize,
+                );
+                weighted_pred_explicit(
+                    cr_l0,
+                    cr_l1,
+                    c_w as usize,
+                    c_w,
+                    c_h,
+                    mode,
+                    w_cr_l0,
+                    w_cr_l1,
+                    log2_wd_c,
+                    bit_depth_c,
+                    &mut scratch_cr,
+                    c_w as usize,
+                );
+                for py in 0..c_h as usize {
+                    for px in 0..c_w as usize {
+                        let dst_idx = (c_part_y as usize + py) * (mbw_c_use as usize)
+                            + (c_part_x as usize + px);
+                        let idx = py * c_w as usize + px;
+                        pred_cb[dst_idx] = scratch_cb[idx];
+                        pred_cr[dst_idx] = scratch_cr[idx];
+                    }
+                }
+            } else {
+                // No pred_weight_table available; fall through to
+                // default (shouldn't happen if use_explicit is set, but
+                // be defensive).
+                for py in 0..c_h as usize {
+                    for px in 0..c_w as usize {
+                        let dst_idx = (c_part_y as usize + py) * (mbw_c_use as usize)
+                            + (c_part_x as usize + px);
+                        let idx = py * c_w as usize + px;
+                        let (vb, vr) = if has_l0 && has_l1 {
+                            (
+                                (l0_cb[idx] + l1_cb[idx] + 1) >> 1,
+                                (l0_cr[idx] + l1_cr[idx] + 1) >> 1,
+                            )
+                        } else if has_l0 {
+                            (l0_cb[idx], l0_cr[idx])
+                        } else if has_l1 {
+                            (l1_cb[idx], l1_cr[idx])
+                        } else {
+                            (0, 0)
+                        };
+                        pred_cb[dst_idx] = vb;
+                        pred_cr[dst_idx] = vr;
+                    }
+                }
+            }
+        } else {
+            for py in 0..c_h as usize {
+                for px in 0..c_w as usize {
+                    let dst_idx =
+                        (c_part_y as usize + py) * (mbw_c_use as usize) + (c_part_x as usize + px);
+                    let idx = py * c_w as usize + px;
+                    let (vb, vr) = if has_l0 && has_l1 {
+                        (
+                            (l0_cb[idx] + l1_cb[idx] + 1) >> 1,
+                            (l0_cr[idx] + l1_cr[idx] + 1) >> 1,
+                        )
+                    } else if has_l0 {
+                        (l0_cb[idx], l0_cr[idx])
+                    } else if has_l1 {
+                        (l1_cb[idx], l1_cr[idx])
+                    } else {
+                        (0, 0)
+                    };
+                    pred_cb[dst_idx] = vb;
+                    pred_cr[dst_idx] = vr;
+                }
             }
         }
     }
@@ -3525,6 +3792,248 @@ mod tests {
         // Every 4x4 block in MB 0 should carry mv = (4, 8).
         for blk4 in 0..16 {
             assert_eq!(info0.mv_l0[blk4], (4i16, 8i16));
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // §8.4.2.3 — Weighted sample prediction dispatch tests
+    // ---------------------------------------------------------------------
+
+    /// Build a pred_weight_table with a single L0/L1 luma/chroma entry.
+    /// `chroma_w_o` is `(cb_weight, cb_offset, cr_weight, cr_offset)`.
+    fn make_pwt_single_entry(
+        log2wd_y: u32,
+        log2wd_c: u32,
+        l0: Option<(i32, i32)>,
+        l1: Option<(i32, i32)>,
+        chroma_l0: Option<(i32, i32, i32, i32)>,
+        chroma_l1: Option<(i32, i32, i32, i32)>,
+    ) -> PredWeightTable {
+        PredWeightTable {
+            luma_log2_weight_denom: log2wd_y,
+            chroma_log2_weight_denom: log2wd_c,
+            luma_weights_l0: vec![l0],
+            chroma_weights_l0: vec![chroma_l0.map(|(a, b, c, d)| [(a, b), (c, d)])],
+            luma_weights_l1: vec![l1],
+            chroma_weights_l1: vec![chroma_l1.map(|(a, b, c, d)| [(a, b), (c, d)])],
+        }
+    }
+
+    #[test]
+    fn p_l0_16x16_explicit_weighted_applies_formula() {
+        // §8.4.2.3.2 eq. 8-274 (L0 only, log2WD >= 1):
+        //   predSampleL0[x, y] = Clip1(((predL0 * w0 + (1<<(log2WD-1))) >> log2WD) + o0)
+        //
+        // With predL0 = 10, w0 = 16, o0 = 4, log2WD = 4:
+        //   (10 * 16 + 8) >> 4 + 4 = (168 >> 4) + 4 = 10 + 4 = 14.
+        let sps = make_sps(1, 1);
+        let mut pps = make_pps();
+        pps.weighted_pred_flag = true;
+        let mut sh = make_p_slice_header();
+        sh.pred_weight_table = Some(make_pwt_single_entry(
+            4,
+            0,
+            Some((16, 4)),
+            None,
+            Some((1 << 0, 0, 1 << 0, 0)),
+            None,
+        ));
+
+        let ref_pic = make_ref_pic(16, 16, |_, _| 10);
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        let mb = make_p_l0_16x16(0, [0, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    14,
+                    "expected 14 at ({}, {}), got {}",
+                    x,
+                    y,
+                    pic.luma_at(x, y)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn p_l0_16x16_weighted_pred_flag_off_matches_default() {
+        // Regression: with weighted_pred_flag = false, the reconstructed
+        // MB must equal the copy-through default path (i.e., the same
+        // output as p_l0_16x16_zero_mv_copies_reference_plane).
+        let sps = make_sps(1, 1);
+        let mut pps = make_pps();
+        pps.weighted_pred_flag = false;
+        // Even if the bitstream had shipped a pred_weight_table with
+        // non-identity weights, weighted_pred_flag=0 must ignore it.
+        let mut sh = make_p_slice_header();
+        sh.pred_weight_table = Some(make_pwt_single_entry(
+            4,
+            0,
+            Some((32, 10)), // would be "*2 + 10" if used
+            None,
+            Some((1 << 0, 0, 1 << 0, 0)),
+            None,
+        ));
+
+        let ref_pic = make_ref_pic(16, 16, |x, y| (y * 16 + x) & 0xFF);
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        let mb = make_p_l0_16x16(0, [0, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                let expected = (y * 16 + x) & 0xFF;
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    expected,
+                    "weighted_pred_flag=off must copy ref; mismatch at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    /// Build a B_Bi_16x16 MB with zero MVDs and the given L0/L1 ref
+    /// indices.
+    fn make_b_bi_16x16(ref_idx_l0: u32, ref_idx_l1: u32) -> Macroblock {
+        let mut pred = MbPred::default();
+        pred.ref_idx_l0 = vec![ref_idx_l0];
+        pred.ref_idx_l1 = vec![ref_idx_l1];
+        pred.mvd_l0 = vec![[0, 0]];
+        pred.mvd_l1 = vec![[0, 0]];
+        Macroblock {
+            mb_type: MbType::BBi16x16,
+            mb_type_raw: 3,
+            mb_pred: Some(pred),
+            sub_mb_pred: None,
+            pcm_samples: None,
+            coded_block_pattern: 0,
+            transform_size_8x8_flag: false,
+            mb_qp_delta: 0,
+            residual_luma: Vec::new(),
+            residual_luma_dc: None,
+            residual_chroma_dc_cb: vec![0i32; 4],
+            residual_chroma_dc_cr: vec![0i32; 4],
+            residual_chroma_ac_cb: Vec::new(),
+            residual_chroma_ac_cr: Vec::new(),
+            is_skip: false,
+        }
+    }
+
+    #[test]
+    fn b_bi_16x16_explicit_weighted_applies_bipred_formula() {
+        // §8.4.2.3.2 eq. 8-276 (bipred):
+        //   v = Clip1(((p0 * w0 + p1 * w1 + (1 << log2WD)) >> (log2WD + 1))
+        //             + ((o0 + o1 + 1) >> 1))
+        //
+        // With p0 = 40, p1 = 80, w0 = w1 = 1, o0 = o1 = 0, log2WD = 1:
+        //   sum = 40 + 80 + 2 = 122
+        //   v = (122 >> 2) + 0 = 30.
+        let sps = make_sps(1, 1);
+        let mut pps = make_pps();
+        pps.weighted_bipred_idc = 1;
+        let mut sh = make_b_slice_header();
+        sh.num_ref_idx_l0_active_minus1 = 0;
+        sh.num_ref_idx_l1_active_minus1 = 0;
+        sh.pred_weight_table = Some(make_pwt_single_entry(
+            1,
+            0,
+            Some((1, 0)),
+            Some((1, 0)),
+            Some((1 << 0, 0, 1 << 0, 0)),
+            Some((1 << 0, 0, 1 << 0, 0)),
+        ));
+
+        let l0 = make_ref_pic(16, 16, |_, _| 40);
+        let l1 = make_ref_pic(16, 16, |_, _| 80);
+        let mut store = RefPicStore::new();
+        store.insert(0, l0);
+        store.insert(1, l1);
+        store.set_list_0(vec![0]);
+        store.set_list_1(vec![1]);
+
+        let mb = make_b_bi_16x16(0, 0);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    30,
+                    "expected 30 at ({}, {}), got {}",
+                    x,
+                    y,
+                    pic.luma_at(x, y)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn b_bi_16x16_implicit_bipred_idc_falls_back_to_default() {
+        // §8.4.2.3.3 — implicit weighted pred (weighted_bipred_idc == 2)
+        // is not yet implemented. The dispatch must fall back to the
+        // default average (same as weighted_bipred_idc == 0).
+        //
+        // With p0 = 80, p1 = 120 and the default bipred average (eq.
+        // 8-273): (80 + 120 + 1) >> 1 = 100.
+        let sps = make_sps(1, 1);
+        let mut pps = make_pps();
+        pps.weighted_bipred_idc = 2; // implicit, deferred → default
+        let sh = make_b_slice_header();
+
+        let l0 = make_ref_pic(16, 16, |_, _| 80);
+        let l1 = make_ref_pic(16, 16, |_, _| 120);
+        let mut store = RefPicStore::new();
+        store.insert(0, l0);
+        store.insert(1, l1);
+        store.set_list_0(vec![0]);
+        store.set_list_1(vec![1]);
+
+        let mb = make_b_bi_16x16(0, 0);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    100,
+                    "expected 100 (default bipred average) at ({}, {}), got {}",
+                    x,
+                    y,
+                    pic.luma_at(x, y)
+                );
+            }
         }
     }
 }

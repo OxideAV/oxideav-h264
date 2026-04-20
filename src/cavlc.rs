@@ -1072,83 +1072,108 @@ fn tz_chroma_422_table(tzvlc_index: u32) -> Option<&'static [(u32, u8, u32)]> {
 // §9.2.3 — Table 9-10 rows (run_before)
 // ------------------------------------------------------------------
 
-// zerosLeft = 1. Short unary: 1→0, 0→1.
+// §9.2.3 Table 9-10 column "zerosLeft = 1". 1-bit unary.
 #[rustfmt::skip]
 static RB_ZL_1: [(u32, u8, u32); 2] = [
-    (0b1, 1, 0),
-    (0b0, 1, 1),
+    (0b1, 1, 0),  // §9.2.3 Table 9-10(zl=1): run_before=0 → "1"
+    (0b0, 1, 1),  // §9.2.3 Table 9-10(zl=1): run_before=1 → "0"
 ];
 
-// zerosLeft = 2.
+// §9.2.3 Table 9-10 column "zerosLeft = 2".
 #[rustfmt::skip]
 static RB_ZL_2: [(u32, u8, u32); 3] = [
-    (0b1,  1, 0),
-    (0b01, 2, 1),
-    (0b00, 2, 2),
+    (0b1,  1, 0),  // §9.2.3 Table 9-10(zl=2): run_before=0 → "1"
+    (0b01, 2, 1),  // §9.2.3 Table 9-10(zl=2): run_before=1 → "01"
+    (0b00, 2, 2),  // §9.2.3 Table 9-10(zl=2): run_before=2 → "00"
 ];
 
-// zerosLeft = 3.
+// §9.2.3 Table 9-10 column "zerosLeft = 3".
 #[rustfmt::skip]
 static RB_ZL_3: [(u32, u8, u32); 4] = [
-    (0b11, 2, 0),
-    (0b10, 2, 1),
-    (0b01, 2, 2),
-    (0b00, 2, 3),
+    (0b11, 2, 0),  // §9.2.3 Table 9-10(zl=3): run_before=0 → "11"
+    (0b10, 2, 1),  // §9.2.3 Table 9-10(zl=3): run_before=1 → "10"
+    (0b01, 2, 2),  // §9.2.3 Table 9-10(zl=3): run_before=2 → "01"
+    (0b00, 2, 3),  // §9.2.3 Table 9-10(zl=3): run_before=3 → "00"
 ];
 
-// zerosLeft = 4.
+// §9.2.3 Table 9-10 column "zerosLeft = 4".
 #[rustfmt::skip]
 static RB_ZL_4: [(u32, u8, u32); 5] = [
-    (0b11,   2, 0),
-    (0b10,   2, 1),
-    (0b01,   2, 2),
-    (0b001,  3, 3),
-    (0b000,  3, 4),
+    (0b11,   2, 0),  // §9.2.3 Table 9-10(zl=4): run_before=0 → "11"
+    (0b10,   2, 1),  // §9.2.3 Table 9-10(zl=4): run_before=1 → "10"
+    (0b01,   2, 2),  // §9.2.3 Table 9-10(zl=4): run_before=2 → "01"
+    (0b001,  3, 3),  // §9.2.3 Table 9-10(zl=4): run_before=3 → "001"
+    (0b000,  3, 4),  // §9.2.3 Table 9-10(zl=4): run_before=4 → "000"
 ];
 
-// zerosLeft = 5.
+// §9.2.3 Table 9-10 column "zerosLeft = 5".
 #[rustfmt::skip]
 static RB_ZL_5: [(u32, u8, u32); 6] = [
-    (0b11,   2, 0),
-    (0b10,   2, 1),
-    (0b011,  3, 2),
-    (0b010,  3, 3),
-    (0b001,  3, 4),
-    (0b000,  3, 5),
+    (0b11,   2, 0),  // §9.2.3 Table 9-10(zl=5): run_before=0 → "11"
+    (0b10,   2, 1),  // §9.2.3 Table 9-10(zl=5): run_before=1 → "10"
+    (0b011,  3, 2),  // §9.2.3 Table 9-10(zl=5): run_before=2 → "011"
+    (0b010,  3, 3),  // §9.2.3 Table 9-10(zl=5): run_before=3 → "010"
+    (0b001,  3, 4),  // §9.2.3 Table 9-10(zl=5): run_before=4 → "001"
+    (0b000,  3, 5),  // §9.2.3 Table 9-10(zl=5): run_before=5 → "000"
 ];
 
-// zerosLeft = 6.
+// §9.2.3 Table 9-10 column "zerosLeft = 6".
+// Note the non-monotone assignment for run_before=1..=6: the spec
+// explicitly orders these as 1→000, 2→001, 3→011, 4→010, 5→101, 6→100.
 #[rustfmt::skip]
 static RB_ZL_6: [(u32, u8, u32); 7] = [
-    (0b11,   2, 0),
-    (0b000,  3, 1),
-    (0b001,  3, 2),
-    (0b011,  3, 3),
-    (0b010,  3, 4),
-    (0b101,  3, 5),
-    (0b100,  3, 6),
+    (0b11,   2, 0),  // §9.2.3 Table 9-10(zl=6): run_before=0 → "11"
+    (0b000,  3, 1),  // §9.2.3 Table 9-10(zl=6): run_before=1 → "000"
+    (0b001,  3, 2),  // §9.2.3 Table 9-10(zl=6): run_before=2 → "001"
+    (0b011,  3, 3),  // §9.2.3 Table 9-10(zl=6): run_before=3 → "011"
+    (0b010,  3, 4),  // §9.2.3 Table 9-10(zl=6): run_before=4 → "010"
+    (0b101,  3, 5),  // §9.2.3 Table 9-10(zl=6): run_before=5 → "101"
+    (0b100,  3, 6),  // §9.2.3 Table 9-10(zl=6): run_before=6 → "100"
 ];
 
-// zerosLeft > 6. Codeword is unary with 3-bit prefix "111..000" pattern:
-//   0=111, 1=110, 2=101, 3=100, 4=011, 5=010, 6=001,
-//   7=0001, 8=00001, ... 14=00000000001
+// §9.2.3 Table 9-10 column "zerosLeft > 6" (the long-form table).
+// Transcribed verbatim from the spec (Rec. ITU-T H.264 (08/2024), p. 226).
+//
+//   run_before  codeword
+//   0           111
+//   1           110
+//   2           101
+//   3           100
+//   4           011
+//   5           010
+//   6           001
+//   7           0001
+//   8           0000 1            (4 zeros, then 1)
+//   9           0000 01           (4 zeros, then 01)
+//   10          0000 001          (4 zeros, then 001)
+//   11          0000 0001         (7 zeros, then 1)
+//   12          0000 0000 1       (8 zeros, then 1)
+//   13          0000 0000 01      (9 zeros, then 1)
+//   14          0000 0000 001     (10 zeros, then 1)
+//
+// NOTE on run_before ∈ 8..=10: the spec writes these as "0000 1",
+// "0000 01", "0000 001" — i.e. a fixed 4-zero prefix followed by an
+// ever-lengthening suffix that re-enters unary territory. That's
+// equivalent to the continuous-unary forms "00001", "000001", "0000001"
+// for lengths 5/6/7 — the total bit-count and bit pattern are the same,
+// so we store them as contiguous integer literals.
 #[rustfmt::skip]
 static RB_ZL_GT_6: [(u32, u8, u32); 15] = [
-    (0b111,              3,  0),
-    (0b110,              3,  1),
-    (0b101,              3,  2),
-    (0b100,              3,  3),
-    (0b011,              3,  4),
-    (0b010,              3,  5),
-    (0b001,              3,  6),
-    (0b0001,             4,  7),
-    (0b00001,            5,  8),
-    (0b000001,           6,  9),
-    (0b0000001,          7, 10),
-    (0b00000001,         8, 11),
-    (0b000000001,        9, 12),
-    (0b0000000001,      10, 13),
-    (0b00000000001,     11, 14),
+    (0b111,              3,  0),  // §9.2.3 Table 9-10(>6): run_before=0 → "111"
+    (0b110,              3,  1),  // §9.2.3 Table 9-10(>6): run_before=1 → "110"
+    (0b101,              3,  2),  // §9.2.3 Table 9-10(>6): run_before=2 → "101"
+    (0b100,              3,  3),  // §9.2.3 Table 9-10(>6): run_before=3 → "100"
+    (0b011,              3,  4),  // §9.2.3 Table 9-10(>6): run_before=4 → "011"
+    (0b010,              3,  5),  // §9.2.3 Table 9-10(>6): run_before=5 → "010"
+    (0b001,              3,  6),  // §9.2.3 Table 9-10(>6): run_before=6 → "001"
+    (0b0001,             4,  7),  // §9.2.3 Table 9-10(>6): run_before=7 → "0001"
+    (0b00001,            5,  8),  // §9.2.3 Table 9-10(>6): run_before=8 → "0000 1"
+    (0b000001,           6,  9),  // §9.2.3 Table 9-10(>6): run_before=9 → "0000 01"
+    (0b0000001,          7, 10),  // §9.2.3 Table 9-10(>6): run_before=10 → "0000 001"
+    (0b00000001,         8, 11),  // §9.2.3 Table 9-10(>6): run_before=11 → "0000 0001"
+    (0b000000001,        9, 12),  // §9.2.3 Table 9-10(>6): run_before=12 → "0000 0000 1"
+    (0b0000000001,      10, 13),  // §9.2.3 Table 9-10(>6): run_before=13 → "0000 0000 01"
+    (0b00000000001,     11, 14),  // §9.2.3 Table 9-10(>6): run_before=14 → "0000 0000 001"
 ];
 
 fn rb_table(zeros_left: u32) -> &'static [(u32, u8, u32)] {
@@ -1750,44 +1775,160 @@ mod tests {
     }
 
     // ---- run_before ----
+    //
+    // All cases below are derived from ITU-T H.264 (08/2024) §9.2.3
+    // Table 9-10, transcribed one entry per row against the spec PDF.
 
-    #[test]
-    fn run_before_short_forms() {
-        // zerosLeft = 1: "1"→0, "0"→1.
-        for (bits, want) in &[("1", 0u32), ("0", 1)] {
-            let bytes = pack_bits(&[bits]);
-            let mut r = BitReader::new(&bytes);
-            assert_eq!(decode_run_before(&mut r, 1).unwrap(), *want);
-        }
-        // zerosLeft = 3: "11"→0, "10"→1, "01"→2, "00"→3.
-        for (bits, want) in &[("11", 0u32), ("10", 1), ("01", 2), ("00", 3)] {
-            let bytes = pack_bits(&[bits]);
-            let mut r = BitReader::new(&bytes);
-            assert_eq!(decode_run_before(&mut r, 3).unwrap(), *want);
-        }
-        // zerosLeft = 6.
-        for (bits, want) in &[("11", 0u32), ("000", 1), ("001", 2), ("100", 6)] {
-            let bytes = pack_bits(&[bits]);
-            let mut r = BitReader::new(&bytes);
-            assert_eq!(decode_run_before(&mut r, 6).unwrap(), *want);
-        }
+    /// Run one decode case: feed `bits` into a BitReader, decode with
+    /// `zeros_left`, and assert the result equals `want`.
+    fn check_rb(bits: &str, zeros_left: u32, want: u32) {
+        let bytes = pack_bits(&[bits]);
+        let mut r = BitReader::new(&bytes);
+        let got = decode_run_before(&mut r, zeros_left)
+            .unwrap_or_else(|e| panic!("decode failed zl={zeros_left} bits={bits:?}: {e}"));
+        assert_eq!(
+            got, want,
+            "zl={zeros_left} bits={bits:?} expected run_before={want} got {got}"
+        );
     }
 
     #[test]
-    fn run_before_long_forms_zl_gt_6() {
-        let cases: &[(&str, u32)] = &[
-            ("111", 0),
-            ("001", 6),
-            ("0001", 7),
-            ("00001", 8),
-            ("0000001", 10),
-            ("00000000001", 14),
-        ];
-        for (bits, want) in cases {
-            let bytes = pack_bits(&[bits]);
-            let mut r = BitReader::new(&bytes);
-            assert_eq!(decode_run_before(&mut r, 10).unwrap(), *want);
+    fn run_before_zl_1_all_entries() {
+        // §9.2.3 Table 9-10 column zerosLeft=1.
+        check_rb("1", 1, 0);
+        check_rb("0", 1, 1);
+    }
+
+    #[test]
+    fn run_before_zl_2_all_entries() {
+        // §9.2.3 Table 9-10 column zerosLeft=2.
+        check_rb("1", 2, 0);
+        check_rb("01", 2, 1);
+        check_rb("00", 2, 2);
+    }
+
+    #[test]
+    fn run_before_zl_3_all_entries() {
+        // §9.2.3 Table 9-10 column zerosLeft=3.
+        check_rb("11", 3, 0);
+        check_rb("10", 3, 1);
+        check_rb("01", 3, 2);
+        check_rb("00", 3, 3);
+    }
+
+    #[test]
+    fn run_before_zl_4_all_entries() {
+        // §9.2.3 Table 9-10 column zerosLeft=4.
+        check_rb("11", 4, 0);
+        check_rb("10", 4, 1);
+        check_rb("01", 4, 2);
+        check_rb("001", 4, 3);
+        check_rb("000", 4, 4);
+    }
+
+    #[test]
+    fn run_before_zl_5_all_entries() {
+        // §9.2.3 Table 9-10 column zerosLeft=5.
+        check_rb("11", 5, 0);
+        check_rb("10", 5, 1);
+        check_rb("011", 5, 2);
+        check_rb("010", 5, 3);
+        check_rb("001", 5, 4);
+        check_rb("000", 5, 5);
+    }
+
+    #[test]
+    fn run_before_zl_6_all_entries() {
+        // §9.2.3 Table 9-10 column zerosLeft=6 — non-monotone ordering.
+        check_rb("11", 6, 0);
+        check_rb("000", 6, 1);
+        check_rb("001", 6, 2);
+        check_rb("011", 6, 3);
+        check_rb("010", 6, 4);
+        check_rb("101", 6, 5);
+        check_rb("100", 6, 6);
+    }
+
+    /// Every entry of Table 9-10 column "zerosLeft > 6" decoded with
+    /// zeros_left=7 (the smallest value that uses the long-form table
+    /// — this is the primary regression covering the
+    /// "no matching run_before codeword (zeros_left=7)" error).
+    ///
+    /// Note: for zeros_left=7, run_before is bounded to 0..=7 by
+    /// bitstream conformance (§9.2.3 step 2 requires the running
+    /// subtraction to remain ≥ 0), but the VLC table itself is shared
+    /// with all zeros_left ≥ 7 and accepts every codeword. We decode
+    /// all 15 rows here to exercise every path through the VLC.
+    #[test]
+    fn run_before_zl_7_decodes_every_long_form_row() {
+        check_rb("111",         7,  0);
+        check_rb("110",         7,  1);
+        check_rb("101",         7,  2);
+        check_rb("100",         7,  3);
+        check_rb("011",         7,  4);
+        check_rb("010",         7,  5);
+        check_rb("001",         7,  6);
+        check_rb("0001",        7,  7);
+        check_rb("00001",       7,  8);
+        check_rb("000001",      7,  9);
+        check_rb("0000001",     7, 10);
+        check_rb("00000001",    7, 11);
+        check_rb("000000001",   7, 12);
+        check_rb("0000000001",  7, 13);
+        check_rb("00000000001", 7, 14);
+    }
+
+    /// Spot-check: zeros_left ∈ {8,9,10,11,12,13,14} share the same VLC
+    /// as zeros_left=7 ("zerosLeft > 6" column of Table 9-10). Verify
+    /// a representative long codeword decodes identically across the
+    /// whole range.
+    #[test]
+    fn run_before_long_form_shared_across_zl_7_to_14() {
+        for zl in 7u32..=14 {
+            check_rb("111",          zl,  0); // shortest
+            check_rb("0001",         zl,  7); // just across the unary boundary
+            check_rb("00000001",     zl, 11);
+            check_rb("00000000001",  zl, 14); // longest (11 bits)
         }
+    }
+
+    /// The two extreme endpoints called out by the spec: run_before=7
+    /// with zeros_left=7, and run_before=14 with zeros_left=14.
+    #[test]
+    fn run_before_endpoint_cases() {
+        check_rb("0001",        7,  7);  // zl=7, rb=7 (tight max)
+        check_rb("00000000001", 14, 14); // zl=14, rb=14 (table max)
+    }
+
+    /// Unknown codewords must surface as CavlcError::UnknownRunBefore.
+    #[test]
+    fn run_before_errors_on_exhausted_stream() {
+        // Feed only zeros — the long-form VLC consumes up to 11 bits
+        // looking for a terminating 1. With fewer bits available the
+        // reader should return a bitstream error (EOF), not a silent
+        // wrong answer.
+        let bytes: [u8; 1] = [0x00];
+        let mut r = BitReader::new(&bytes);
+        let err = decode_run_before(&mut r, 7).unwrap_err();
+        // Either UnknownRunBefore or a Bitstream(Eof) is acceptable;
+        // both indicate the VLC did not match.
+        match err {
+            CavlcError::UnknownRunBefore { zl } => assert_eq!(zl, 7),
+            CavlcError::Bitstream(_) => {}
+            other => panic!("expected UnknownRunBefore or Bitstream, got {other:?}"),
+        }
+    }
+
+    /// zeros_left=0 is a caller-safety path: §9.2.3 says runVal[i]=0
+    /// without reading bits. Verify we honour that and don't consume
+    /// from the reader.
+    #[test]
+    fn run_before_zl_zero_returns_zero_without_reading() {
+        let bytes: [u8; 1] = [0xFF];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(decode_run_before(&mut r, 0).unwrap(), 0);
+        // Reader untouched — we can still pull the 8 bits back out.
+        assert_eq!(r.u(8).unwrap(), 0xFF);
     }
 
     // ---- full block roundtrip ----

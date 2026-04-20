@@ -111,13 +111,21 @@ pub enum MvpredShape {
 
 /// Inputs to the top-level MVpred derivation (§8.4.1.3).
 ///
-/// Per §8.4.1.3.2 the caller is responsible for:
-///   * Applying the C→D substitution (eq. 8-214..8-216): when the
-///     physical neighbour C is not available, replace its
-///     (mv, refIdx, availability) with D's.
-///   * Setting `mv = 0, ref_idx = -1, available = false` for any
-///     neighbour that is Intra-coded or whose predFlagLX is 0
-///     (§8.4.1.3.2).
+/// Per §8.4.1.3.2 the following rules apply and are handled inside
+/// [`derive_mvpred`]:
+///   * C→D substitution (eq. 8-214..8-216): when the physical
+///     neighbour C is not available, the above-left neighbour D
+///     substitutes for C. Callers that can supply D should populate
+///     [`MvpredInputs::neighbour_d`]; callers that don't track D
+///     may leave it at the default (`NeighbourMv::UNAVAILABLE`), in
+///     which case the existing behaviour is preserved (C stays
+///     unavailable and contributes (0,0) per §8.4.1.3.2).
+///   * Unavailable/Intra/predFlagLX=0 neighbours (§8.4.1.3.2): the
+///     caller must set `mv = 0, ref_idx = -1, available = false`.
+///
+/// `neighbour_d` is additive and defaults to
+/// `NeighbourMv::UNAVAILABLE`, so callers that don't populate it
+/// retain pre-substitution behaviour.
 #[derive(Debug, Copy, Clone, Default)]
 pub struct MvpredInputs {
     pub neighbour_a: NeighbourMv,
@@ -127,19 +135,84 @@ pub struct MvpredInputs {
     pub shape: MvpredShape,
 }
 
+impl MvpredInputs {
+    /// Build an `MvpredInputs` from the (A, B, C) neighbour set with
+    /// D left as `NeighbourMv::UNAVAILABLE`. Convenience for callers
+    /// that don't track D.
+    pub fn from_abc(
+        neighbour_a: NeighbourMv,
+        neighbour_b: NeighbourMv,
+        neighbour_c: NeighbourMv,
+        current_ref_idx: i32,
+        shape: MvpredShape,
+    ) -> Self {
+        Self {
+            neighbour_a,
+            neighbour_b,
+            neighbour_c,
+            current_ref_idx,
+            shape,
+        }
+    }
+}
+
 /// §8.4.1.3 — Derive the luma motion vector predictor mvpLX.
 ///
 /// Implements eq. 8-203..8-206 (directional shortcuts) and falls
 /// through to the median process eq. 8-207..8-213 via
 /// [`derive_median_mvpred`].
+///
+/// For callers that track the D (above-left) neighbour, use
+/// [`derive_mvpred_with_d`] to enable the §8.4.1.3.2 eq. 8-214..8-216
+/// C→D substitution. `derive_mvpred` is a thin wrapper that passes
+/// `NeighbourMv::UNAVAILABLE` for D, preserving the historical
+/// behaviour (no substitution).
 pub fn derive_mvpred(inputs: &MvpredInputs) -> Mv {
+    derive_mvpred_with_d(inputs, NeighbourMv::UNAVAILABLE)
+}
+
+/// §8.4.1.3 — Derive mvpLX with an explicit above-left (D) neighbour.
+///
+/// Applies the §8.4.1.3.2 eq. 8-214..8-216 C→D substitution: when
+/// partition C is not available but D is, C's (mv, refIdx, avail)
+/// is replaced by D's before the median-of-3 derivation of
+/// §8.4.1.3.1. Per spec, this substitution applies only to the
+/// neighbour-data derivation feeding the median path; the directional
+/// shortcut shapes (16x8 top/bottom, 8x16 left/right) in §8.4.1.3
+/// eq. 8-203..8-206 address specific neighbours (A or B or C) and
+/// the substitution only affects the C-based 8x16-right shortcut
+/// (mvpLX := mvLXC when refIdxLXC matches). The 16x8-top /
+/// 16x8-bottom / 8x16-left shortcuts don't reference C and are
+/// therefore unaffected.
+///
+/// The C→D substitution is applied for ALL shapes here (including
+/// `Partition8x16Right`, which does consult C, and the `Default`
+/// median path). It is NOT applied for shapes that don't read C
+/// (16x8-top, 16x8-bottom, 8x16-left) — for those the substitution
+/// has no effect regardless of whether it's performed.
+pub fn derive_mvpred_with_d(inputs: &MvpredInputs, neighbour_d: NeighbourMv) -> Mv {
     let MvpredInputs {
         neighbour_a: a,
         neighbour_b: b,
-        neighbour_c: c,
+        neighbour_c: c_raw,
         current_ref_idx,
         shape,
     } = *inputs;
+
+    // §8.4.1.3.2 eq. 8-214..8-216 — if partition C is not available
+    // but D is, substitute D for C:
+    //   mbAddrC        := mbAddrD
+    //   mbPartIdxC     := mbPartIdxD
+    //   subMbPartIdxC  := subMbPartIdxD
+    // Our `NeighbourMv` abstraction already folds
+    // (mbAddr, mbPartIdx, subMbPartIdx) plus Intra / predFlagLX
+    // filtering into a single (available, ref_idx, mv) record, so
+    // the substitution simply copies D's record onto C.
+    let c = if !c_raw.available && neighbour_d.available {
+        neighbour_d
+    } else {
+        c_raw
+    };
 
     // §8.4.1.3 eq. 8-203..8-206 — directional shortcuts that bypass
     // median iff the selected neighbour's refIdx matches. The spec
@@ -238,8 +311,28 @@ fn median3(a: i32, b: i32, c: i32) -> i32 {
 /// Otherwise, the standard §8.4.1.3 median derivation is invoked
 /// with mbPartIdx=0, subMbPartIdx=0, refIdxLX=0, currSubMbType="na".
 ///
+/// Callers that track the D (above-left) neighbour should use
+/// [`derive_p_skip_mv_with_d`] to enable the §8.4.1.3.2
+/// eq. 8-214..8-216 C→D substitution. This wrapper passes
+/// `NeighbourMv::UNAVAILABLE` for D, preserving prior behaviour.
+///
 /// Returns `(refIdxL0 = 0, mvL0)`.
 pub fn derive_p_skip_mv(a: NeighbourMv, b: NeighbourMv, c: NeighbourMv) -> (i32, Mv) {
+    derive_p_skip_mv_with_d(a, b, c, NeighbourMv::UNAVAILABLE)
+}
+
+/// §8.4.1.2 — Luma MV for a P_Skip macroblock with explicit D
+/// (above-left) neighbour for §8.4.1.3.2 C→D substitution.
+///
+/// Same contract as [`derive_p_skip_mv`], but applies the
+/// eq. 8-214..8-216 substitution when C is unavailable and D is
+/// available before invoking the §8.4.1.3.1 median derivation.
+pub fn derive_p_skip_mv_with_d(
+    a: NeighbourMv,
+    b: NeighbourMv,
+    c: NeighbourMv,
+    d: NeighbourMv,
+) -> (i32, Mv) {
     let ref_idx_l0 = 0;
 
     // §8.4.1.2 zero-MV substitution conditions.
@@ -252,11 +345,14 @@ pub fn derive_p_skip_mv(a: NeighbourMv, b: NeighbourMv, c: NeighbourMv) -> (i32,
         return (ref_idx_l0, Mv::ZERO);
     }
 
+    // §8.4.1.3.2 eq. 8-214..8-216 — C→D substitution before median.
+    let c_eff = if !c.available && d.available { d } else { c };
+
     // §8.4.1.2 otherwise — invoke §8.4.1.3 median prediction. The
     // P_Skip case always uses shape = Default (no 16x8 / 8x16
     // directional shortcut, since P_Skip is always a single 16x16
     // partition).
-    let mv = derive_median_mvpred(a, b, c, ref_idx_l0);
+    let mv = derive_median_mvpred(a, b, c_eff, ref_idx_l0);
     (ref_idx_l0, mv)
 }
 
@@ -291,9 +387,59 @@ pub fn derive_b_spatial_direct(
     c_l0: NeighbourMv,
     c_l1: NeighbourMv,
 ) -> (i32, Mv, i32, Mv) {
-    // §8.4.1.2.2 eq. 8-184/8-185 — MinPositive chain.
-    let mut ref_idx_l0 = min_positive(a_l0.ref_idx, min_positive(b_l0.ref_idx, c_l0.ref_idx));
-    let mut ref_idx_l1 = min_positive(a_l1.ref_idx, min_positive(b_l1.ref_idx, c_l1.ref_idx));
+    derive_b_spatial_direct_with_d(
+        a_l0,
+        a_l1,
+        b_l0,
+        b_l1,
+        c_l0,
+        c_l1,
+        NeighbourMv::UNAVAILABLE,
+        NeighbourMv::UNAVAILABLE,
+    )
+}
+
+/// §8.4.1.2.2 — B-slice spatial direct derivation with explicit D
+/// (above-left) neighbours for both lists.
+///
+/// Applies the §8.4.1.3.2 eq. 8-214..8-216 C→D substitution to each
+/// list's C neighbour before invoking the §8.4.1.3.1 median
+/// derivation. Also substitutes D's refIdx into the MinPositive
+/// chain (eq. 8-184/8-185) when C's is unavailable (ref_idx < 0
+/// with available = false is our convention).
+#[allow(clippy::too_many_arguments)]
+pub fn derive_b_spatial_direct_with_d(
+    a_l0: NeighbourMv,
+    a_l1: NeighbourMv,
+    b_l0: NeighbourMv,
+    b_l1: NeighbourMv,
+    c_l0: NeighbourMv,
+    c_l1: NeighbourMv,
+    d_l0: NeighbourMv,
+    d_l1: NeighbourMv,
+) -> (i32, Mv, i32, Mv) {
+    // §8.4.1.3.2 eq. 8-214..8-216 — C→D substitution (per list).
+    let c_l0_eff = if !c_l0.available && d_l0.available {
+        d_l0
+    } else {
+        c_l0
+    };
+    let c_l1_eff = if !c_l1.available && d_l1.available {
+        d_l1
+    } else {
+        c_l1
+    };
+
+    // §8.4.1.2.2 eq. 8-184/8-185 — MinPositive chain, using the
+    // substituted C (eq. 8-214..8-216 output).
+    let mut ref_idx_l0 = min_positive(
+        a_l0.ref_idx,
+        min_positive(b_l0.ref_idx, c_l0_eff.ref_idx),
+    );
+    let mut ref_idx_l1 = min_positive(
+        a_l1.ref_idx,
+        min_positive(b_l1.ref_idx, c_l1_eff.ref_idx),
+    );
 
     // §8.4.1.2.2 eq. 8-188..8-190 — directZeroPredictionFlag.
     let direct_zero = ref_idx_l0 < 0 && ref_idx_l1 < 0;
@@ -309,12 +455,12 @@ pub fn derive_b_spatial_direct(
     let mv_l0 = if direct_zero || ref_idx_l0 < 0 {
         Mv::ZERO
     } else {
-        derive_median_mvpred(a_l0, b_l0, c_l0, ref_idx_l0)
+        derive_median_mvpred(a_l0, b_l0, c_l0_eff, ref_idx_l0)
     };
     let mv_l1 = if direct_zero || ref_idx_l1 < 0 {
         Mv::ZERO
     } else {
-        derive_median_mvpred(a_l1, b_l1, c_l1, ref_idx_l1)
+        derive_median_mvpred(a_l1, b_l1, c_l1_eff, ref_idx_l1)
     };
 
     (ref_idx_l0, mv_l0, ref_idx_l1, mv_l1)
@@ -713,6 +859,144 @@ mod tests {
             ..inputs_left
         };
         assert_eq!(derive_mvpred(&inputs_right), Mv::new(5, 6));
+    }
+
+    // --- §8.4.1.3.2 C→D substitution (eq. 8-214..8-216) --------------------
+
+    #[test]
+    fn mvpred_with_d_no_substitution_when_c_available() {
+        // §8.4.1.3.2: C is available, D is available. The
+        // substitution rule only fires when C is UNavailable, so
+        // this test must produce the same result as the plain
+        // derive_mvpred path (median of A, B, C, with refIdx
+        // matches).
+        let a = NeighbourMv::new(0, Mv::new(10, 20));
+        let b = NeighbourMv::new(0, Mv::new(30, 10));
+        let c = NeighbourMv::new(0, Mv::new(20, 40));
+        let d = NeighbourMv::new(0, Mv::new(999, 999)); // must not affect
+        let inputs = MvpredInputs {
+            neighbour_a: a,
+            neighbour_b: b,
+            neighbour_c: c,
+            current_ref_idx: 0,
+            shape: MvpredShape::Default,
+        };
+        // Expected: median(10,30,20) = 20; median(20,10,40) = 20.
+        assert_eq!(derive_mvpred_with_d(&inputs, d), Mv::new(20, 20));
+        // Sanity: derive_mvpred (D = UNAVAILABLE) gives the same
+        // value here, because substitution doesn't fire when C is
+        // available.
+        assert_eq!(derive_mvpred(&inputs), Mv::new(20, 20));
+    }
+
+    #[test]
+    fn mvpred_with_d_substitutes_when_c_unavailable() {
+        // §8.4.1.3.2 eq. 8-214..8-216: C is not available, D is
+        // available. D's (mv, refIdx) should substitute for C.
+        // All refIdxs match current_ref_idx = 0, so match_count = 3
+        // and we fall through to component-wise median of
+        // (A, B, D) — not (A, B, 0).
+        let a = NeighbourMv::new(0, Mv::new(10, 20));
+        let b = NeighbourMv::new(0, Mv::new(30, 10));
+        let c = NeighbourMv::UNAVAILABLE;
+        let d = NeighbourMv::new(0, Mv::new(20, 40));
+        let inputs = MvpredInputs {
+            neighbour_a: a,
+            neighbour_b: b,
+            neighbour_c: c,
+            current_ref_idx: 0,
+            shape: MvpredShape::Default,
+        };
+        // With substitution: median(10,30,20)=20, median(20,10,40)=20.
+        // Without substitution: C would contribute (0,0), giving
+        // median(10,30,0)=10, median(20,10,0)=10 — which biases low.
+        assert_eq!(derive_mvpred_with_d(&inputs, d), Mv::new(20, 20));
+    }
+
+    #[test]
+    fn mvpred_with_d_falls_through_when_both_c_and_d_unavailable() {
+        // §8.4.1.3.2: when neither C nor D is available, no
+        // substitution occurs. With A available and B unavailable,
+        // the median path runs with C = (0,0), refIdxC = -1. Only
+        // A matches the current_ref_idx, so match_count = 1 and
+        // eq. 8-211 returns mvA.
+        let a = NeighbourMv::new(0, Mv::new(7, -3));
+        let b = NeighbourMv::UNAVAILABLE;
+        let c = NeighbourMv::UNAVAILABLE;
+        let d = NeighbourMv::UNAVAILABLE;
+        let inputs = MvpredInputs {
+            neighbour_a: a,
+            neighbour_b: b,
+            neighbour_c: c,
+            current_ref_idx: 0,
+            shape: MvpredShape::Default,
+        };
+        // §8.4.1.3.1 step 1: B and C both unavailable, A available ->
+        // copy A to B and C -> median(A,A,A) = A = (7, -3).
+        assert_eq!(derive_mvpred_with_d(&inputs, d), Mv::new(7, -3));
+
+        // Second scenario: A also unavailable => median of zeros.
+        let inputs_all_unavail = MvpredInputs {
+            neighbour_a: NeighbourMv::UNAVAILABLE,
+            neighbour_b: NeighbourMv::UNAVAILABLE,
+            neighbour_c: NeighbourMv::UNAVAILABLE,
+            current_ref_idx: 0,
+            shape: MvpredShape::Default,
+        };
+        assert_eq!(
+            derive_mvpred_with_d(&inputs_all_unavail, NeighbourMv::UNAVAILABLE),
+            Mv::ZERO
+        );
+    }
+
+    #[test]
+    fn mvpred_with_d_substitution_not_applied_for_16x8_top() {
+        // §8.4.1.3 eq. 8-203: the 16x8 top directional shortcut
+        // consults B only — it doesn't read C. So whether we apply
+        // the C→D substitution or not, the outcome is identical
+        // when B matches current_ref_idx.
+        //
+        // Here C is unavailable and D is available with a "trap"
+        // MV that differs wildly from B. If the substitution were
+        // (incorrectly) applied to the directional shortcut path
+        // such that it consulted C=D instead of B, we'd get D's MV.
+        // The correct behaviour is to return mvLXB.
+        let a = NeighbourMv::new(1, Mv::new(100, 200));
+        let b = NeighbourMv::new(0, Mv::new(5, 5));
+        let c = NeighbourMv::UNAVAILABLE;
+        let d = NeighbourMv::new(0, Mv::new(-999, -999)); // trap
+        let inputs = MvpredInputs {
+            neighbour_a: a,
+            neighbour_b: b,
+            neighbour_c: c,
+            current_ref_idx: 0,
+            shape: MvpredShape::Partition16x8Top,
+        };
+        // 16x8-top shortcut fires (B available, refIdxLXB matches)
+        // -> mvpLX = mvLXB = (5, 5). D must not leak into the
+        // result.
+        assert_eq!(derive_mvpred_with_d(&inputs, d), Mv::new(5, 5));
+    }
+
+    // --- §8.4.1.3.2 C→D substitution — P_Skip ------------------------------
+
+    #[test]
+    fn p_skip_with_d_substitutes_when_c_unavailable() {
+        // P_Skip median path: A, B available with refIdx 0 and
+        // non-zero MVs; C unavailable; D available. Expect the
+        // substitution to put D in C's place in the median.
+        let a = NeighbourMv::new(0, Mv::new(10, 20));
+        let b = NeighbourMv::new(0, Mv::new(30, 40));
+        let c = NeighbourMv::UNAVAILABLE;
+        let d = NeighbourMv::new(0, Mv::new(50, 60));
+        let (ref_idx, mv) = derive_p_skip_mv_with_d(a, b, c, d);
+        assert_eq!(ref_idx, 0);
+        // With substitution: median(10,30,50)=30, median(20,40,60)=40.
+        assert_eq!(mv, Mv::new(30, 40));
+        // Without substitution: C contributes 0s -> median(10,30,0)=10,
+        // median(20,40,0)=20. So the substitution changed the result.
+        let (_, mv_no_sub) = derive_p_skip_mv(a, b, c);
+        assert_eq!(mv_no_sub, Mv::new(10, 20));
     }
 
     #[test]
