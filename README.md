@@ -37,10 +37,10 @@ no packet is decoded.
 | Spec area | Clause | Status |
 | --------- | ------ | ------ |
 | NAL parsing (Annex B + AVCC) | §7.3.1, §7.4.1, §B.1 | parsed (no extension headers) |
-| Sequence Parameter Set | §7.3.2.1 | parsed (VUI body + scaling_list deferred) |
-| Picture Parameter Set | §7.3.2.2 | parsed (FMO included; scaling_list deferred) |
-| scaling_list body | §7.3.2.1.1.1 | parsed (standalone — not yet wired into SPS/PPS) |
-| VUI parameters (+ HRD) | §E.1 | parsed (standalone — not yet wired into SPS) |
+| Sequence Parameter Set | §7.3.2.1 | parsed (VUI + scaling_list fully integrated) |
+| Picture Parameter Set | §7.3.2.2 | parsed (FMO + scaling_list fully integrated; 4:4:4 via `parse_with_chroma_format`) |
+| scaling_list body | §7.3.2.1.1.1 | integrated into SPS + PPS |
+| VUI parameters (+ HRD) | §E.1 | integrated into SPS |
 | AUD + SEI framing + filler + end-of-seq/stream | §7.3.2.3..7 | parsed (SEI payloads per Annex D deferred) |
 | Slice header | §7.3.3 | parsed (incl. RPLM, pred_weight_table, dec_ref_pic_marking) |
 | Picture Order Count derivation (types 0/1/2) | §8.2.1 | implemented |

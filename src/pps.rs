@@ -3,14 +3,23 @@
 //! Spec-driven implementation of `pic_parameter_set_rbsp()` per ITU-T
 //! Rec. H.264 (08/2024). Flexible Macroblock Ordering (FMO) fields are
 //! parsed in full — the `slice_group_map_type` branching is bounded.
-//! The `scaling_list()` body (§7.3.2.1.1.1) is deferred: we record
-//! `pic_scaling_matrix_present_flag` and stop.
+//! The `scaling_list()` body (§7.3.2.1.1.1) is also parsed in full; it
+//! delegates to [`crate::scaling_list::parse_scaling_list`].
 //!
 //! The parser takes an already-de-emulated RBSP (`emulation_prevention_three_byte`
 //! stripped by [`crate::nal::parse_nal_unit`]). The caller peels off the
 //! NAL header byte before handing us the slice.
+//!
+//! Because the PPS scaling-matrix loop length depends on
+//! `chroma_format_idc` from the active SPS (4:4:4 carries 6 8x8
+//! lists; everything else carries 2), [`Pps::parse`] takes
+//! `chroma_format_idc` as an explicit parameter. For streams with
+//! `pic_scaling_matrix_present_flag == 0` (the common case) the value
+//! is ignored.
 
 use crate::bitstream::{BitError, BitReader};
+use crate::scaling_list::{parse_scaling_list, ScalingListError};
+use crate::sps::ScalingListEntry;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PpsError {
@@ -38,11 +47,19 @@ pub enum PpsError {
     /// §7.4.2.2 — `second_chroma_qp_index_offset` in range -12..=12.
     #[error("second_chroma_qp_index_offset out of range (got {0}, must be -12..=12)")]
     SecondChromaQpIndexOffsetOutOfRange(i32),
-    /// §7.3.2.2 — pic_scaling_list body is deferred; we reject PPSes
-    /// that signal `pic_scaling_matrix_present_flag == 1` until that
-    /// path lands.
-    #[error("pic_scaling_matrix_present_flag == 1 (scaling_list body not yet implemented)")]
-    ScalingMatrixNotSupported,
+    /// §7.3.2.1.1.1 — scaling_list body parse error.
+    #[error("scaling_list: {0}")]
+    ScalingList(#[from] ScalingListError),
+}
+
+/// §7.3.2.2 — PPS scaling matrices.
+///
+/// First 6 entries are 4x4 lists. When `transform_8x8_mode_flag == 1`
+/// the tail carries 8x8 lists — 2 entries when `chroma_format_idc != 3`
+/// (total length 8), 6 entries when `chroma_format_idc == 3` (total 12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PicScalingLists {
+    pub entries: Vec<ScalingListEntry>,
 }
 
 /// §7.4.2.2 — FMO (Flexible Macroblock Ordering) map description.
@@ -83,6 +100,8 @@ pub enum SliceGroupMap {
 pub struct PpsExtension {
     pub transform_8x8_mode_flag: bool,
     pub pic_scaling_matrix_present_flag: bool,
+    /// Parsed scaling lists when `pic_scaling_matrix_present_flag == 1`.
+    pub pic_scaling_lists: Option<PicScalingLists>,
     pub second_chroma_qp_index_offset: i32,
 }
 
@@ -119,7 +138,23 @@ impl Pps {
     /// holds the RBSP body (the bytes *after* the NAL header byte,
     /// emulation-prevention stripped — typically from
     /// [`crate::nal::parse_nal_unit`]).
+    /// Parse with a default `chroma_format_idc == 1` (4:2:0). Equivalent
+    /// to [`Pps::parse_with_chroma_format(rbsp, 1)`]. Safe for the common
+    /// case; for 4:4:4 streams where `pic_scaling_matrix_present_flag`
+    /// might be set, prefer [`Pps::parse_with_chroma_format`].
     pub fn parse(rbsp: &[u8]) -> Result<Self, PpsError> {
+        Self::parse_with_chroma_format(rbsp, 1)
+    }
+
+    /// §7.3.2.2 — parse a `pic_parameter_set_rbsp()` with the
+    /// `chroma_format_idc` of the active SPS. The value is only
+    /// consulted when `pic_scaling_matrix_present_flag == 1` and
+    /// `transform_8x8_mode_flag == 1`: it determines whether the
+    /// 8x8 tail carries 2 lists (4:2:0 / 4:2:2) or 6 lists (4:4:4).
+    pub fn parse_with_chroma_format(
+        rbsp: &[u8],
+        chroma_format_idc: u32,
+    ) -> Result<Self, PpsError> {
         let mut r = BitReader::new(rbsp);
 
         // §7.4.2.2 — pic_parameter_set_id ue(v), 0..=255.
@@ -235,15 +270,36 @@ impl Pps {
         let extension = if r.more_rbsp_data() {
             let transform_8x8_mode_flag = r.u(1)? == 1;
             let pic_scaling_matrix_present_flag = r.u(1)? == 1;
-            if pic_scaling_matrix_present_flag {
-                // TODO(§7.3.2.1.1.1): walk the per-list `scaling_list()`
-                // bodies. Iteration count is
+            let pic_scaling_lists = if pic_scaling_matrix_present_flag {
+                // §7.3.2.2 loop bound:
                 //   6 + ((chroma_format_idc != 3) ? 2 : 6) * transform_8x8_mode_flag
-                // per §7.3.2.2 — note that chroma_format_idc comes from
-                // the active SPS, which we don't have a reference to here.
-                // Deferred until scaling_list support lands.
-                return Err(PpsError::ScalingMatrixNotSupported);
-            }
+                let extra_8x8 = if !transform_8x8_mode_flag {
+                    0
+                } else if chroma_format_idc != 3 {
+                    2
+                } else {
+                    6
+                };
+                let n = 6 + extra_8x8;
+                let mut entries = Vec::with_capacity(n);
+                for i in 0..n {
+                    let present = r.u(1)? == 1;
+                    if !present {
+                        entries.push(ScalingListEntry::NotPresent);
+                    } else {
+                        let size = if i < 6 { 16 } else { 64 };
+                        let result = parse_scaling_list(&mut r, size)?;
+                        entries.push(if result.use_default {
+                            ScalingListEntry::UseDefault
+                        } else {
+                            ScalingListEntry::Explicit(result.scaling_list)
+                        });
+                    }
+                }
+                Some(PicScalingLists { entries })
+            } else {
+                None
+            };
             let second_chroma_qp_index_offset = r.se()?;
             if !(-12..=12).contains(&second_chroma_qp_index_offset) {
                 return Err(PpsError::SecondChromaQpIndexOffsetOutOfRange(
@@ -256,6 +312,7 @@ impl Pps {
             Some(PpsExtension {
                 transform_8x8_mode_flag,
                 pic_scaling_matrix_present_flag,
+                pic_scaling_lists,
                 second_chroma_qp_index_offset,
             })
         } else {
@@ -482,7 +539,52 @@ mod tests {
     }
 
     #[test]
-    fn pps_rejects_scaling_matrix_present() {
+    fn pps_with_scaling_matrix_all_not_present() {
+        // transform_8x8_mode_flag=1 + pic_scaling_matrix_present_flag=1,
+        // all 8 per-list flags 0 (NotPresent). chroma_format_idc=1.
+        let mut w = BitWriter::new();
+        w.ue(0); // pps_id
+        w.ue(0); // sps_id
+        w.u(1, 0); // entropy_coding
+        w.u(1, 0); // bottom_field_pic_order
+        w.ue(0); // num_slice_groups_minus1
+        w.ue(0); // num_ref_idx_l0_default_active_minus1
+        w.ue(0); // num_ref_idx_l1_default_active_minus1
+        w.u(1, 0); // weighted_pred
+        w.u(2, 0); // weighted_bipred_idc
+        w.se(0); // pic_init_qp_minus26
+        w.se(0); // pic_init_qs_minus26
+        w.se(0); // chroma_qp_index_offset
+        w.u(1, 0); // deblocking_filter_control_present
+        w.u(1, 0); // constrained_intra_pred
+        w.u(1, 0); // redundant_pic_cnt_present
+        // Tail:
+        w.u(1, 1); // transform_8x8_mode_flag
+        w.u(1, 1); // pic_scaling_matrix_present_flag
+        // Loop: 6 + 2 = 8 entries, all flags 0.
+        for _ in 0..8 {
+            w.u(1, 0);
+        }
+        w.se(0); // second_chroma_qp_index_offset
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let pps = Pps::parse(&bytes).unwrap();
+        let ext = pps.extension.as_ref().expect("tail present");
+        assert!(ext.transform_8x8_mode_flag);
+        assert!(ext.pic_scaling_matrix_present_flag);
+        let lists = ext.pic_scaling_lists.as_ref().unwrap();
+        assert_eq!(lists.entries.len(), 8);
+        for e in &lists.entries {
+            assert_eq!(*e, ScalingListEntry::NotPresent);
+        }
+    }
+
+    #[test]
+    fn pps_with_scaling_matrix_4x4x4_loop_count() {
+        // chroma_format_idc=3 (4:4:4) + transform_8x8=1 → loop count is
+        // 6 + 6 = 12 entries. Verify Pps::parse_with_chroma_format picks
+        // up the extra 4 entries compared to the default parser.
         let mut w = BitWriter::new();
         w.ue(0);
         w.ue(0);
@@ -499,14 +601,19 @@ mod tests {
         w.u(1, 0);
         w.u(1, 0);
         w.u(1, 0);
-        // Tail with pic_scaling_matrix_present_flag=1.
         w.u(1, 1); // transform_8x8_mode_flag
-        w.u(1, 1); // pic_scaling_matrix_present_flag → unsupported
+        w.u(1, 1); // pic_scaling_matrix_present_flag
+        for _ in 0..12 {
+            w.u(1, 0);
+        }
+        w.se(0);
+        w.trailing();
         let bytes = w.into_bytes();
-        assert_eq!(
-            Pps::parse(&bytes).unwrap_err(),
-            PpsError::ScalingMatrixNotSupported
-        );
+
+        let pps = Pps::parse_with_chroma_format(&bytes, 3).unwrap();
+        let ext = pps.extension.as_ref().unwrap();
+        let lists = ext.pic_scaling_lists.as_ref().unwrap();
+        assert_eq!(lists.entries.len(), 12);
     }
 
     #[test]

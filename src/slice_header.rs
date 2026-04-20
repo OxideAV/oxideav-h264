@@ -836,6 +836,7 @@ mod tests {
             bit_depth_chroma_minus8: 0,
             qpprime_y_zero_transform_bypass_flag: false,
             seq_scaling_matrix_present_flag: false,
+            seq_scaling_lists: None,
             log2_max_frame_num_minus4: 0, // MaxFrameNum = 16, frame_num = 4 bits
             pic_order_cnt_type: 0,
             log2_max_pic_order_cnt_lsb_minus4: 0, // pic_order_cnt_lsb = 4 bits
@@ -853,6 +854,7 @@ mod tests {
             direct_8x8_inference_flag: true,
             frame_cropping: None,
             vui_parameters_present_flag: false,
+            vui: None,
         }
     }
 

@@ -1,15 +1,17 @@
 //! §7.3.2.1 — Sequence Parameter Set parsing.
 //!
 //! Spec-driven implementation of `seq_parameter_set_rbsp()` per ITU-T
-//! Rec. H.264 (08/2024). The VUI body (§E.1) and `scaling_list()` body
-//! (§7.3.2.1.1.1) are deferred to follow-up work — we record whether
-//! they were signalled but don't walk their contents.
+//! Rec. H.264 (08/2024). VUI body (§E.1) and scaling_list body
+//! (§7.3.2.1.1.1) are fully parsed — their bodies delegate to
+//! [`crate::vui`] and [`crate::scaling_list`] respectively.
 //!
 //! The parser takes an already-de-emulated RBSP (`emulation_prevention_three_byte`
 //! stripped by [`crate::nal::parse_nal_unit`]). The caller peels off the
 //! NAL header byte before handing us the slice.
 
 use crate::bitstream::{BitError, BitReader};
+use crate::scaling_list::{parse_scaling_list, ScalingListError, ScalingListResult};
+use crate::vui::{VuiError, VuiParameters};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SpsError {
@@ -39,13 +41,56 @@ pub enum SpsError {
     /// §7.4.2.1.1 — `num_ref_frames_in_pic_order_cnt_cycle` in range 0..=255.
     #[error("num_ref_frames_in_pic_order_cnt_cycle out of range (got {0}, max 255)")]
     NumRefFramesInPocCycleOutOfRange(u32),
-    /// §7.3.2.1.1 — scaling_list body is not yet implemented; SPS with
-    /// `seq_scaling_matrix_present_flag == 1` cannot be fully parsed.
-    #[error("seq_scaling_matrix_present_flag == 1 (scaling_list body not yet implemented)")]
-    ScalingMatrixNotSupported,
     /// §7.3.2.1.1 — `seq_parameter_set_id` range 0..=31.
     #[error("seq_parameter_set_id out of range (got {0}, max 31)")]
     SpsIdOutOfRange(u32),
+    /// §7.3.2.1.1.1 — scaling_list body parse error.
+    #[error("scaling_list: {0}")]
+    ScalingList(#[from] ScalingListError),
+    /// §E.1 — VUI parameters body parse error.
+    #[error("vui_parameters: {0}")]
+    Vui(#[from] VuiError),
+}
+
+/// §7.3.2.1.1 — per-index entry in the SPS scaling-matrix list.
+///
+/// Each slot corresponds to one `seq_scaling_list_present_flag[i]` bit.
+/// When the flag is 0 (`NotPresent`), the decoder inherits per
+/// §7.4.2.1.1.1 Table 7-3 ("fall-back rule A" / "fall-back rule B").
+/// When the flag is 1, the scaling_list body is parsed; if the spec's
+/// `useDefaultScalingMatrixFlag` is triggered we mark `UseDefault`,
+/// otherwise we carry the parsed values in `Explicit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalingListEntry {
+    /// `seq_scaling_list_present_flag[i] == 0` — use the fall-back rule.
+    NotPresent,
+    /// Flag was 1 and `useDefaultScalingMatrixFlag` fired.
+    UseDefault,
+    /// Flag was 1 and explicit values were parsed. Length 16 for i<6,
+    /// length 64 otherwise.
+    Explicit(Vec<i32>),
+}
+
+impl ScalingListEntry {
+    fn from_result(r: ScalingListResult) -> Self {
+        if r.use_default {
+            Self::UseDefault
+        } else {
+            Self::Explicit(r.scaling_list)
+        }
+    }
+}
+
+/// §7.3.2.1.1 — SPS scaling matrices.
+///
+/// The first 6 entries are 4x4 scaling lists (Intra Y, Cb, Cr; Inter Y,
+/// Cb, Cr per Table 7-2). The remaining 0, 2, or 6 entries are 8x8
+/// scaling lists — 0 when `transform_8x8_mode_flag == 0` (this SPS-level
+/// matrix doesn't carry 8x8 lists when the PPS tail wouldn't enable
+/// them), 2 when chroma_format_idc != 3, 6 when chroma_format_idc == 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqScalingLists {
+    pub entries: Vec<ScalingListEntry>,
 }
 
 /// §7.4.2.1.1 — frame cropping offsets. Present when
@@ -89,6 +134,8 @@ pub struct Sps {
     pub bit_depth_chroma_minus8: u32,
     pub qpprime_y_zero_transform_bypass_flag: bool,
     pub seq_scaling_matrix_present_flag: bool,
+    /// §7.3.2.1.1.1 — parsed scaling matrices, when present.
+    pub seq_scaling_lists: Option<SeqScalingLists>,
 
     pub log2_max_frame_num_minus4: u32,
     pub pic_order_cnt_type: u32,
@@ -113,6 +160,8 @@ pub struct Sps {
     pub direct_8x8_inference_flag: bool,
     pub frame_cropping: Option<FrameCropping>,
     pub vui_parameters_present_flag: bool,
+    /// §E.1 — parsed VUI parameters, when signalled.
+    pub vui: Option<VuiParameters>,
 }
 
 impl Sps {
@@ -186,13 +235,29 @@ impl Sps {
             }
             qpprime_y_zero_transform_bypass_flag = r.u(1)? == 1;
             seq_scaling_matrix_present_flag = r.u(1)? == 1;
-            if seq_scaling_matrix_present_flag {
-                // TODO(§7.3.2.1.1.1): parse the scaling_list() body
-                // (for i in 0..((chroma_format_idc != 3) ? 8 : 12)).
-                // Deferred to follow-up work.
-                return Err(SpsError::ScalingMatrixNotSupported);
-            }
         }
+        // §7.3.2.1.1 — scaling_list body outside the chroma-extended gate.
+        // When `seq_scaling_matrix_present_flag` is only set by that gate,
+        // this loop runs exactly when the flag is true.
+        let seq_scaling_lists = if seq_scaling_matrix_present_flag {
+            // §7.3.2.1.1 — loop bound: 8 for chroma_format_idc != 3, 12 for 4:4:4.
+            let n = if chroma_format_idc != 3 { 8 } else { 12 };
+            let mut entries = Vec::with_capacity(n);
+            for i in 0..n {
+                let present = r.u(1)? == 1;
+                if !present {
+                    entries.push(ScalingListEntry::NotPresent);
+                } else {
+                    // First 6 entries are 4x4 (size 16), rest are 8x8 (size 64).
+                    let size = if i < 6 { 16 } else { 64 };
+                    let result = parse_scaling_list(&mut r, size)?;
+                    entries.push(ScalingListEntry::from_result(result));
+                }
+            }
+            Some(SeqScalingLists { entries })
+        } else {
+            None
+        };
 
         // §7.3.2.1.1 — log2_max_frame_num_minus4 ue(v); range 0..=12.
         let log2_max_frame_num_minus4 = r.ue()?;
@@ -267,20 +332,16 @@ impl Sps {
             None
         };
 
-        // §7.3.2.1.1 — vui_parameters_present_flag. VUI body is deferred.
+        // §7.3.2.1.1 / §E.1 — VUI parameters.
         let vui_parameters_present_flag = r.u(1)? == 1;
-        // TODO(§E.1): parse vui_parameters(). Until then, if the flag
-        // is set we simply stop without validating trailing bits — the
-        // remainder of the RBSP may contain VUI + rbsp_trailing_bits
-        // that we don't know how to walk yet.
-        if !vui_parameters_present_flag {
-            // §7.3.2.11 — only when we've consumed every preceding
-            // syntax element can we check the trailing bits.
-            // We intentionally don't require this strictly: some
-            // producers pad with extra zero bytes. If the stop bit
-            // isn't where we expect, don't reject — just stop.
-            let _ = r.rbsp_trailing_bits();
-        }
+        let vui = if vui_parameters_present_flag {
+            Some(VuiParameters::parse(&mut r)?)
+        } else {
+            None
+        };
+        // §7.3.2.11 — trailing stop bit + zero alignment. Some producers
+        // pad with extra zeros; don't reject on mis-match.
+        let _ = r.rbsp_trailing_bits();
 
         Ok(Sps {
             profile_idc,
@@ -293,6 +354,7 @@ impl Sps {
             bit_depth_chroma_minus8,
             qpprime_y_zero_transform_bypass_flag,
             seq_scaling_matrix_present_flag,
+            seq_scaling_lists,
             log2_max_frame_num_minus4,
             pic_order_cnt_type,
             log2_max_pic_order_cnt_lsb_minus4,
@@ -310,6 +372,7 @@ impl Sps {
             direct_8x8_inference_flag,
             frame_cropping,
             vui_parameters_present_flag,
+            vui,
         })
     }
 
@@ -605,7 +668,10 @@ mod tests {
     }
 
     #[test]
-    fn vui_present_stops_parsing_gracefully() {
+    fn vui_present_parses_empty_body() {
+        // SPS with vui_parameters_present_flag == 1 and an "all zeros"
+        // VUI body — every per-section present-flag is 0, so the VUI
+        // body fits in 9 bits (§E.1).
         let mut w = BitWriter::new();
         w.u(8, 66);
         w.u(8, 0);
@@ -622,12 +688,19 @@ mod tests {
         w.u(1, 1); // direct_8x8
         w.u(1, 0); // no crop
         w.u(1, 1); // vui_parameters_present_flag = 1
-        // Deliberately *no* trailing bits / VUI body — parser should
-        // stop without touching the rest.
+        // Empty VUI — 9 flags, all 0.
+        for _ in 0..9 {
+            w.u(1, 0);
+        }
+        w.trailing();
         let bytes = w.into_bytes();
 
         let sps = Sps::parse(&bytes).unwrap();
         assert!(sps.vui_parameters_present_flag);
+        let vui = sps.vui.as_ref().expect("VUI parsed");
+        assert!(vui.aspect_ratio.is_none());
+        assert!(vui.timing_info.is_none());
+        assert!(vui.bitstream_restriction.is_none());
         assert_eq!(sps.pic_width_in_mbs_minus1, 10);
     }
 
@@ -646,22 +719,101 @@ mod tests {
     }
 
     #[test]
-    fn scaling_matrix_present_is_rejected() {
+    fn scaling_matrix_present_parses_all_not_present() {
+        // seq_scaling_matrix_present_flag=1 but every
+        // seq_scaling_list_present_flag[i] is 0 → the parser consumes
+        // 8 flag bits (chroma_format_idc != 3) and yields a
+        // `SeqScalingLists` of 8 `NotPresent` entries.
         let mut w = BitWriter::new();
         w.u(8, 100); // High profile
         w.u(8, 0);
         w.u(8, 40);
         w.ue(0); // sps_id
         w.ue(1); // chroma_format_idc=1
+        w.ue(0); // bit_depth_luma
+        w.ue(0); // bit_depth_chroma
+        w.u(1, 0); // qpprime_y_zero
+        w.u(1, 1); // seq_scaling_matrix_present_flag=1
+        for _ in 0..8 {
+            w.u(1, 0); // seq_scaling_list_present_flag[i] = 0
+        }
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(0); // pic_order_cnt_type
+        w.ue(0); // log2_max_poc_lsb_minus4
+        w.ue(1); // max_num_ref_frames
+        w.u(1, 0); // gaps
+        w.ue(19); // pic_width_in_mbs_minus1
+        w.ue(14); // pic_height_in_map_units_minus1
+        w.u(1, 1); // frame_mbs_only
+        w.u(1, 1); // direct_8x8
+        w.u(1, 0); // frame_cropping=0
+        w.u(1, 0); // vui_parameters_present_flag=0
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sps = Sps::parse(&bytes).unwrap();
+        assert!(sps.seq_scaling_matrix_present_flag);
+        let lists = sps
+            .seq_scaling_lists
+            .as_ref()
+            .expect("scaling lists parsed");
+        assert_eq!(lists.entries.len(), 8);
+        for e in &lists.entries {
+            assert_eq!(*e, ScalingListEntry::NotPresent);
+        }
+    }
+
+    #[test]
+    fn scaling_matrix_explicit_list_is_parsed() {
+        // seq_scaling_matrix_present_flag=1 with entry[0] explicit
+        // (all delta_scale = 0 → all 16 entries equal 8, per §7.3.2.1.1.1
+        // with lastScale / nextScale seeded at 8 and delta_scale=0 each).
+        // Remaining 7 lists NotPresent.
+        let mut w = BitWriter::new();
+        w.u(8, 100);
+        w.u(8, 0);
+        w.u(8, 40);
+        w.ue(0);
+        w.ue(1); // chroma_format_idc
         w.ue(0);
         w.ue(0);
         w.u(1, 0);
-        w.u(1, 1); // seq_scaling_matrix_present_flag=1 → not yet supported
+        w.u(1, 1); // seq_scaling_matrix_present_flag
+        w.u(1, 1); // seq_scaling_list_present_flag[0] = 1
+        for _ in 0..16 {
+            w.se(0); // delta_scale = 0
+        }
+        for _ in 0..7 {
+            w.u(1, 0); // rest NotPresent
+        }
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(1);
+        w.u(1, 0);
+        w.ue(19);
+        w.ue(14);
+        w.u(1, 1);
+        w.u(1, 1);
+        w.u(1, 0);
+        w.u(1, 0);
+        w.trailing();
         let bytes = w.into_bytes();
-        assert_eq!(
-            Sps::parse(&bytes).unwrap_err(),
-            SpsError::ScalingMatrixNotSupported
-        );
+
+        let sps = Sps::parse(&bytes).unwrap();
+        let lists = sps.seq_scaling_lists.as_ref().unwrap();
+        match &lists.entries[0] {
+            ScalingListEntry::Explicit(vals) => {
+                assert_eq!(vals.len(), 16);
+                for v in vals {
+                    assert_eq!(*v, 8);
+                }
+            }
+            other => panic!("expected Explicit, got {:?}", other),
+        }
+        for i in 1..8 {
+            assert_eq!(lists.entries[i], ScalingListEntry::NotPresent);
+        }
     }
 
     #[test]
