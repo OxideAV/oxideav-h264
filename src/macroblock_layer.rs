@@ -1716,20 +1716,40 @@ fn cbf_cond_for(
                 _ => true,
             };
             if !neighbour_has_transblock {
-                return unavail_cbf(current_is_intra, block_type);
+                // §9.3.3.1.1.9 — mbAddrN available, transBlockN not
+                // available (DC block not present for neighbour MB),
+                // mb_type != I_PCM (filtered above) → condTermFlagN = 0.
+                return trans_block_unavail_cbf();
             }
             cbf_mb_level_for(info, block_type, is_cr)
         }
     }
 }
 
-/// §9.3.3.1.1.9 — "neighbour not available" fallback per Table 9-42:
+/// §9.3.3.1.1.9 — "mbAddrN not available" fallback per Table 9-42:
 /// condTermFlag = 0 when the current MB is inter, 1 when intra.
-/// Additionally, for some block categories (ChromaDC when chroma absent,
-/// etc.) the spec says the value is 0. We simplify: intra → 1, else 0.
+///
+/// Call this ONLY when the neighbouring macroblock itself is unavailable
+/// (edge of picture / different slice). Do NOT use this for the case
+/// where mbAddrN is available but its transBlockN is not — per spec,
+/// that path yields condTermFlag = 0 regardless of current_is_intra
+/// (unless mb_type(mbAddrN) = I_PCM, which callers filter earlier). Use
+/// `trans_block_unavail_cbf` for the available-but-no-transblock path.
 #[inline]
 fn unavail_cbf(current_is_intra: bool, _block_type: BlockType) -> bool {
     current_is_intra
+}
+
+/// §9.3.3.1.1.9 — "mbAddrN available but transBlockN not available"
+/// fallback per the spec condTerm rules:
+///   "mbAddrN is available and transBlockN is not available and
+///    mb_type for the macroblock mbAddrN is not equal to I_PCM"
+///   → condTermFlagN = 0.
+/// Callers must have already handled the I_PCM case (→ 1) and the
+/// P_Skip / B_Skip case (→ 0) before invoking this helper.
+#[inline]
+fn trans_block_unavail_cbf() -> bool {
+    false
 }
 
 #[inline]
@@ -4699,6 +4719,28 @@ mod tests {
         // ctxIdxInc = 1 + 2*1 = 3.
         let inc = u32::from(ca) + 2 * u32::from(cb);
         assert_eq!(inc, 3);
+    }
+
+    /// §9.3.3.1.1.9 cat=3 — if neighbour's CodedBlockPatternChroma is 0
+    /// (no chroma DC block), transBlockN not available → condTermFlagN
+    /// = 0. Regression for the MB-level Cb/Cr DC path.
+    #[test]
+    fn cbf_ctx_inc_chroma_dc_neighbour_cbp_chroma_zero_yields_zero() {
+        let mut grid = mk_cabac_grid();
+        // MB 4 (left of MB 5): available, intra, chroma CBP = 0.
+        let slot = &mut grid.mbs[4];
+        slot.available = true;
+        slot.is_intra = true;
+        slot.coded_block_pattern_chroma = 0;
+        slot.cbf_cb_dc = true; // numerically non-zero — irrelevant
+        let curr = CabacMbNeighbourInfo::default();
+        let (ca, _cb) = cabac_cbf_cond_terms(
+            &grid, 5, &curr, /*current_is_intra=*/ true, BlockType::ChromaDc, 0, false,
+        );
+        // Spec §9.3.3.1.1.9 cat=3: mbAddrA available, transBlockA not
+        // available (CodedBlockPatternChroma == 0), mb_type != I_PCM
+        // → condTermA = 0.
+        assert!(!ca, "chroma-CBP=0 neighbour must yield ChromaDC condTermA = 0");
     }
 
     #[test]
