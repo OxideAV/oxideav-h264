@@ -50,11 +50,14 @@ no packet is decoded.
 | Reference picture list modification (RPLM) | §7.3.3.1, §8.2.4.3 | implemented |
 | Picture order count derivation | §8.2.1 | not implemented |
 | Intra prediction (4x4 / 8x8 / 16x16 / chroma) | §8.3 | implemented (all modes) |
-| Inter prediction (MC, MV derivation, weighted pred) | §8.4 | not implemented |
+| Inter prediction — fractional interpolation + weighted pred | §8.4.2 | implemented (luma 6-tap, chroma bilinear, default + explicit weighted) |
+| Inter prediction — MV derivation (MVpred, P/B skip, spatial + temporal direct) | §8.4.1 | implemented |
 | Transform decode + reconstruction | §8.5 | implemented (4x4 / 8x8 / Hadamard DC / chroma DC) |
 | Deblocking filter | §8.7 | implemented (edge-level filter + bS derivation) |
 | CAVLC entropy decode | §9.2 | tables + primitives (residual_block_cavlc loop in place; nC derivation deferred to slice layer) |
-| CABAC entropy decode | §9.3 | engine (init + DecodeDecision/Bypass/Terminate); per-element binarisations deferred to slice layer |
+| CABAC entropy decode — engine | §9.3.1 / §9.3.3.2 | implemented (init + DecodeDecision/Bypass/Terminate) |
+| CABAC entropy decode — per-element binarisations + ctxIdx | §9.3.2 / §9.3.3.1 | implemented (mb_skip/mb_type/mvd/ref_idx/mb_qp_delta/cbp/cbf/sig_coeff/coeff_abs/sign/end_of_slice + intra pred mode flags; sub_mb_type and a few high-index init rows deferred) |
+| SEI payloads (buffering_period, pic_timing, recovery_point, user_data_unreg, filler, mastering_display, content_light_level) | §D.2 | implemented (7 common types; rest deferred) |
 
 ## Goals
 
