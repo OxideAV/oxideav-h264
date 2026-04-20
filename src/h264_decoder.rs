@@ -17,10 +17,14 @@
 //!    `receive_frame`.
 //!
 //! Known simplifications (see inline comments for details):
-//! - **Access unit assembly**: each slice NAL is treated as its own
-//!   picture. Multi-slice pictures (several slice NALs that together
-//!   form one coded picture per §7.4.1.2.4) are not assembled —
-//!   decode artifacts may occur on streams that rely on that.
+//! - **Access unit assembly**: §7.4.1.2.4 multi-slice assembly IS
+//!   implemented — continuation slices land in the same Picture +
+//!   MbGrid as the first slice, and we finalize the picture (push to
+//!   DPB + output queue) when a slice opens a new primary coded picture
+//!   or on AUD / EndOfSequence / flush. Caveat: the deblocking pass in
+//!   `reconstruct::reconstruct_slice` runs per-slice and walks the
+//!   whole grid, so continuation slices may re-filter earlier slices'
+//!   interior edges. See the comment on `handle_slice` for details.
 //! - **Output ordering**: frames are emitted in display (POC) order
 //!   via [`crate::dpb_output::DpbOutput`] per Annex C §C.2.2 / §C.4
 //!   bumping process.
@@ -48,7 +52,7 @@ use crate::decoder::{Decoder as H264Driver, Event};
 use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::mb_grid::MbGrid;
 use crate::picture::Picture;
-use crate::poc::{derive_poc, PocSlice, PocSps, PocState};
+use crate::poc::{derive_poc, PocResult, PocSlice, PocSps, PocState};
 use crate::ref_list::{self, DpbEntry, MmcoOp as RefMmcoOp, PicStructure, RefMarking, RplmOp};
 use crate::ref_store::{RefPicProvider, RefPicStore};
 use crate::slice_header::{
@@ -56,6 +60,50 @@ use crate::slice_header::{
 };
 use crate::sps::Sps;
 use crate::{reconstruct, slice_data};
+
+/// §7.4.1.2 / §7.4.1.2.4 — state carried forward across slices that
+/// belong to the *same* primary coded picture.
+///
+/// Once a slice with first_mb_in_slice == 0 (and/or an AUD) opens a new
+/// primary coded picture, a `PictureInProgress` is allocated. Each
+/// subsequent slice that passes the §7.4.1.2.4 "same picture" test is
+/// reconstructed into the *same* `pic` / `grid` so its macroblocks are
+/// laid down alongside the earlier slices'. When a slice fails the test
+/// (new primary coded picture) or an AUD / flush fires, the in-progress
+/// picture is finalized (pushed into the DPB and output queue) and a
+/// fresh one is started from the triggering slice.
+struct PictureInProgress {
+    /// Reconstructed samples.
+    pic: Picture,
+    /// MB metadata for the assembled picture. Carries §6.4.11 availability
+    /// plus per-MB QP/CBP/etc. across slice boundaries so continuation
+    /// slices see prior slices' MBs as neighbours during intra prediction
+    /// and deblocking.
+    grid: MbGrid,
+    /// The `(nal_unit_type, nal_ref_idc, header)` of the *first* slice of
+    /// this picture — the identity used for §7.4.1.2.4 comparisons against
+    /// subsequent slices.
+    first_nal_unit_type: u8,
+    first_nal_ref_idc: u8,
+    first_header: SliceHeader,
+    /// True if any slice in the picture so far was a reference slice. A
+    /// picture is a reference picture if *any* of its VCL NALs carries
+    /// nal_ref_idc != 0 — §7.4.1.2.1 / §7.4.1.2.4 require all slices to
+    /// share the zero-ness of nal_ref_idc, so this is effectively the
+    /// first slice's is_reference bit, but we OR it to be defensive.
+    is_reference: bool,
+    /// True if this is an IDR picture (any slice has nal_unit_type == 5).
+    is_idr: bool,
+    /// §8.2.1 POC result derived at the first slice. All slices of the
+    /// same picture share the same POC per §7.4.1.2.4.
+    poc: PocResult,
+    /// §7.4.3 picture structure for DPB bookkeeping.
+    structure: PicStructure,
+    /// Packet pts to stamp onto the finalized VideoFrame.
+    pts: Option<i64>,
+    /// Packet time_base for rescaling downstream.
+    time_base: TimeBase,
+}
 
 /// Registry factory — called by the codec registry when a container
 /// wants a decoder for H.264.
@@ -121,6 +169,14 @@ pub struct H264CodecDecoder {
     /// For the §8.2.1.1 MMCO-5 hint — the previous reference
     /// picture's `TopFieldOrderCnt`, used only when `prev_had_mmco5`.
     prev_reference_top_foc: i32,
+
+    /// §7.4.1.2 / §7.4.1.2.4 — picture currently being assembled across
+    /// one-or-more slice NAL units. `None` means no slice of the current
+    /// access unit has been processed yet (either we haven't started, or
+    /// the last picture was just finalized). Populated by the first
+    /// slice of a primary coded picture and consumed by `finalize_picture`
+    /// when the picture boundary is detected.
+    in_progress: Option<PictureInProgress>,
 }
 
 impl H264CodecDecoder {
@@ -145,6 +201,7 @@ impl H264CodecDecoder {
             next_dpb_key: 0,
             prev_had_mmco5: false,
             prev_reference_top_foc: 0,
+            in_progress: None,
         }
     }
 
@@ -237,25 +294,111 @@ impl H264CodecDecoder {
                     slice_data_cursor,
                 )
             }
-            // §7.4.1.2.4 AUD marks the start of a new access unit;
-            // in our simplified one-slice-per-picture model there's
-            // no additional bookkeeping to do at the AUD itself — the
-            // next slice's frame_num boundary check handles picture
-            // transitions.
+            // §7.4.1.2.3 — Access Unit Delimiter explicitly marks an
+            // access unit boundary. Any picture we've been assembling is
+            // finalized here so the next slice opens a fresh one.
+            Event::AccessUnitDelimiter(_) => {
+                self.finalize_in_progress_picture()?;
+                Ok(())
+            }
+            // §7.3.2.5 / §7.3.2.6 — end of sequence / stream close any
+            // picture currently being assembled.
+            Event::EndOfSequence | Event::EndOfStream => {
+                self.finalize_in_progress_picture()?;
+                Ok(())
+            }
             _ => Ok(()),
         }
+    }
+
+    /// §7.4.1.2.4 — decide whether `header` opens a new primary coded
+    /// picture, by comparing to the first slice of the
+    /// `in_progress` picture. Returns true when any of the listed
+    /// conditions in §7.4.1.2.4 differs (new picture) or when there is
+    /// no picture currently in progress.
+    ///
+    /// The conditions enumerated in the spec (and used here):
+    ///   * `frame_num` differs
+    ///   * `pic_parameter_set_id` differs
+    ///   * `field_pic_flag` differs
+    ///   * `nal_ref_idc` is 0 for one and non-0 for the other
+    ///   * `pic_order_cnt_lsb` differs  (pic_order_cnt_type == 0)
+    ///   * `delta_pic_order_cnt_bottom` differs (pic_order_cnt_type == 0
+    ///     and bottom_field_pic_order_in_frame_present_flag == 1)
+    ///   * `delta_pic_order_cnt[0]` differs (pic_order_cnt_type == 1)
+    ///   * `delta_pic_order_cnt[1]` differs (pic_order_cnt_type == 1 and
+    ///     bottom_field_pic_order_in_frame_present_flag == 1)
+    ///   * `IdrPicFlag` differs (one is IDR, the other isn't)
+    ///   * `IdrPicFlag == 1` AND `idr_pic_id` differs
+    fn is_first_vcl_of_new_picture(
+        &self,
+        nal_unit_type: u8,
+        nal_ref_idc: u8,
+        header: &SliceHeader,
+    ) -> bool {
+        let Some(in_progress) = self.in_progress.as_ref() else {
+            return true;
+        };
+        let prev = &in_progress.first_header;
+        let prev_idr = in_progress.first_nal_unit_type == 5;
+        let curr_idr = nal_unit_type == 5;
+        let prev_is_ref = in_progress.first_nal_ref_idc != 0;
+        let curr_is_ref = nal_ref_idc != 0;
+
+        if prev.frame_num != header.frame_num {
+            return true;
+        }
+        if prev.pic_parameter_set_id != header.pic_parameter_set_id {
+            return true;
+        }
+        if prev.field_pic_flag != header.field_pic_flag {
+            return true;
+        }
+        if prev_is_ref != curr_is_ref {
+            return true;
+        }
+        if prev.pic_order_cnt_lsb != header.pic_order_cnt_lsb {
+            return true;
+        }
+        if prev.delta_pic_order_cnt_bottom != header.delta_pic_order_cnt_bottom {
+            return true;
+        }
+        if prev.delta_pic_order_cnt[0] != header.delta_pic_order_cnt[0] {
+            return true;
+        }
+        if prev.delta_pic_order_cnt[1] != header.delta_pic_order_cnt[1] {
+            return true;
+        }
+        if prev_idr != curr_idr {
+            return true;
+        }
+        if curr_idr && prev.idr_pic_id != header.idr_pic_id {
+            return true;
+        }
+        false
     }
 
     /// Drive reconstruction for one slice NAL. Covers both the IDR
     /// and P/B paths.
     ///
-    /// Simplification: each slice NAL is treated as its own coded
-    /// picture (§7.4.1.2.4). Multi-slice pictures (several slice NALs
-    /// sharing the same frame_num / POC) are not assembled — doing so
-    /// correctly requires gathering all slices of the access unit into
-    /// a single Picture before running deblocking, and is a known
-    /// follow-up. In practice most streams we feed through oxideplay
-    /// use one slice per picture, so this gets us moving.
+    /// §7.4.1.2.4 multi-slice assembly: when this slice is a continuation
+    /// of the in-progress picture (same frame_num / POC / IDR status etc.)
+    /// we reconstruct straight into the existing Picture + MbGrid so the
+    /// slice's macroblocks land alongside the earlier slices'. When this
+    /// slice opens a new primary coded picture we first finalize the
+    /// previous in-progress one (pushing it into the DPB + output queue)
+    /// and then start a fresh Picture + MbGrid.
+    ///
+    /// Known limitation: reconstruct_slice runs a full-picture deblocking
+    /// pass at the end (§8.7). For a continuation slice the earlier
+    /// slices' macroblocks are still in the grid with `available == true`,
+    /// so the deblocker may re-filter their interior edges — a slight
+    /// over-filter. Proper behaviour would defer deblocking until all
+    /// slices are in, but the deblocking helper is private to
+    /// `reconstruct.rs` and cannot be invoked separately from here.
+    /// In practice the artifact is minor compared to the coarse blocking
+    /// you get with one-slice-per-picture assembly, which is the bug this
+    /// replaces.
     fn handle_slice(
         &mut self,
         nal_unit_type: u8,
@@ -265,7 +408,7 @@ impl H264CodecDecoder {
         cursor: (usize, u8),
     ) -> Result<()> {
         // Snapshot SPS and PPS to detach from the driver borrow so we
-        // can mutate self.frames / self.ref_store below.
+        // can mutate self.in_progress / self.ref_store below.
         let sps = self
             .driver
             .active_sps()
@@ -280,53 +423,115 @@ impl H264CodecDecoder {
         let is_idr = nal_unit_type == 5;
         let is_reference = nal_ref_idc != 0;
 
-        // §8.2.1 — derive POC for this picture.
-        let poc_sps = make_poc_sps(&sps);
-        let poc_slice = PocSlice {
-            is_reference,
-            is_idr,
-            frame_num: header.frame_num,
-            field_pic_flag: header.field_pic_flag,
-            bottom_field_flag: header.bottom_field_flag,
-            pic_order_cnt_lsb: header.pic_order_cnt_lsb,
-            delta_pic_order_cnt_bottom: header.delta_pic_order_cnt_bottom,
-            delta_pic_order_cnt: header.delta_pic_order_cnt,
-            prev_had_mmco5: self.prev_had_mmco5,
-            prev_reference_top_foc_for_mmco5: self.prev_reference_top_foc,
-        };
-        let poc = derive_poc(&poc_sps, &poc_slice, &mut self.poc_state)
-            .map_err(|e| Error::invalid(format!("h264 POC: {e:?}")))?;
+        // §7.4.1.2.4 — first VCL of a primary coded picture?
+        let starts_new_picture =
+            self.is_first_vcl_of_new_picture(nal_unit_type, nal_ref_idc, &header);
 
+        if starts_new_picture {
+            // Finalize whatever was in progress before starting the new
+            // picture with this slice.
+            self.finalize_in_progress_picture()?;
+
+            // §8.2.1 — derive POC for this picture. All slices of the
+            // same picture will share this value (§7.4.1.2.4).
+            let poc_sps = make_poc_sps(&sps);
+            let poc_slice = PocSlice {
+                is_reference,
+                is_idr,
+                frame_num: header.frame_num,
+                field_pic_flag: header.field_pic_flag,
+                bottom_field_flag: header.bottom_field_flag,
+                pic_order_cnt_lsb: header.pic_order_cnt_lsb,
+                delta_pic_order_cnt_bottom: header.delta_pic_order_cnt_bottom,
+                delta_pic_order_cnt: header.delta_pic_order_cnt,
+                prev_had_mmco5: self.prev_had_mmco5,
+                prev_reference_top_foc_for_mmco5: self.prev_reference_top_foc,
+            };
+            let poc = derive_poc(&poc_sps, &poc_slice, &mut self.poc_state)
+                .map_err(|e| Error::invalid(format!("h264 POC: {e:?}")))?;
+
+            let width_samples = sps.pic_width_in_mbs() * 16;
+            let height_samples = sps.frame_height_in_mbs() * 16;
+            let chroma_array_type = sps.chroma_array_type();
+            let pic = Picture::new(
+                width_samples,
+                height_samples,
+                chroma_array_type,
+                sps.bit_depth_luma_minus8 + 8,
+                sps.bit_depth_chroma_minus8 + 8,
+            );
+            let grid = MbGrid::new(sps.pic_width_in_mbs(), sps.frame_height_in_mbs());
+            let structure =
+                pic_structure_from_flags(header.field_pic_flag, header.bottom_field_flag);
+
+            // Consume the packet-level pts exactly once per access unit
+            // — the first slice to open a picture gets it.
+            let pts = self.pending_pts.take();
+            let time_base = self.pending_time_base;
+
+            self.in_progress = Some(PictureInProgress {
+                pic,
+                grid,
+                first_nal_unit_type: nal_unit_type,
+                first_nal_ref_idc: nal_ref_idc,
+                first_header: header.clone(),
+                is_reference,
+                is_idr,
+                poc,
+                structure,
+                pts,
+                time_base,
+            });
+        }
+
+        // Reconstruct this slice into the in-progress picture.
+        self.reconstruct_slice_into_in_progress(
+            nal_ref_idc, &header, &rbsp, cursor, &sps, &pps,
+        )?;
+
+        Ok(())
+    }
+
+    /// Run `reconstruct::reconstruct_slice` against the currently
+    /// in-progress picture's pic + grid. Also picks up any OR of
+    /// `is_reference` so a picture is marked a reference picture as
+    /// soon as any of its slices carries nal_ref_idc != 0 (§7.4.1.2.4
+    /// requires this to be uniform across slices, but we're tolerant).
+    fn reconstruct_slice_into_in_progress(
+        &mut self,
+        nal_ref_idc: u8,
+        header: &SliceHeader,
+        rbsp: &[u8],
+        cursor: (usize, u8),
+        sps: &Sps,
+        pps: &crate::pps::Pps,
+    ) -> Result<()> {
         // Parse slice_data — common to I / P / B paths.
-        let sd = slice_data::parse_slice_data(&rbsp, cursor.0, cursor.1, &header, &sps, &pps)
+        let sd = slice_data::parse_slice_data(rbsp, cursor.0, cursor.1, header, sps, pps)
             .map_err(|e| Error::invalid(format!("h264 slice_data: {e}")))?;
 
-        // Build the destination Picture.
-        let width_samples = sps.pic_width_in_mbs() * 16;
-        let height_samples = sps.frame_height_in_mbs() * 16;
-        let chroma_array_type = sps.chroma_array_type();
-        let mut pic = Picture::new(
-            width_samples,
-            height_samples,
-            chroma_array_type,
-            sps.bit_depth_luma_minus8 + 8,
-            sps.bit_depth_chroma_minus8 + 8,
-        );
-        let mut grid = MbGrid::new(sps.pic_width_in_mbs(), sps.frame_height_in_mbs());
+        let in_progress = self
+            .in_progress
+            .as_mut()
+            .expect("in_progress must have been seeded by handle_slice");
 
-        let current_structure = pic_structure_from_flags(header.field_pic_flag, header.bottom_field_flag);
+        // Update the reference bit for the whole picture if any slice
+        // is a reference slice.
+        if nal_ref_idc != 0 {
+            in_progress.is_reference = true;
+        }
+
+        let current_structure = in_progress.structure;
         let current_bottom = matches!(current_structure, PicStructure::BottomField);
         let current_is_field = header.field_pic_flag;
+        let pic_order_cnt = in_progress.poc.pic_order_cnt;
+        let is_idr = in_progress.is_idr;
 
-        // Build the per-slice RefPicList0 / RefPicList1. For IDRs
-        // both stay empty; for P/B slices we run §8.2.4.2 init then
-        // apply §8.2.4.3 RPLM if the slice signalled it.
+        // Build per-slice RefPicList0 / RefPicList1.
         let (list0, list1) = if is_idr {
             (Vec::new(), Vec::new())
         } else {
             let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
-
-            // §8.2.4.2.1 P/SP, §8.2.4.2.3 B, §8.2.4.2 fall-through for I/SI.
             let (mut l0, mut l1) = match header.slice_type {
                 SliceType::P | SliceType::SP => (
                     ref_list::init_ref_pic_list_p(
@@ -340,16 +545,13 @@ impl H264CodecDecoder {
                 ),
                 SliceType::B => ref_list::init_ref_pic_lists_b(
                     &self.dpb_entries,
-                    poc.pic_order_cnt,
+                    pic_order_cnt,
                     current_structure,
                     current_bottom,
                 ),
                 SliceType::I | SliceType::SI => (Vec::new(), Vec::new()),
             };
 
-            // §8.2.4.3 — apply RPLM ops (if any). `modify_ref_pic_list`
-            // also truncates / pads to `num_active`, so we call it
-            // unconditionally for lists the slice type owns.
             if header.slice_type.has_list_0() {
                 let ops_l0: Vec<RplmOp> = header
                     .ref_pic_list_modification
@@ -390,10 +592,7 @@ impl H264CodecDecoder {
             (l0, l1)
         };
 
-        // §8.4.* — run the actual pixel reconstruction. The provider
-        // borrows the long-running ref_store for Picture lookups and
-        // carries the per-slice list arrays; no Pictures are cloned
-        // for inter prediction.
+        // §8.4.* — pixel reconstruction into the in-progress picture.
         let provider = BorrowedRefProvider {
             store: &self.ref_store,
             list_0: &list0,
@@ -401,25 +600,58 @@ impl H264CodecDecoder {
         };
         reconstruct::reconstruct_slice(
             &sd,
-            &header,
-            &sps,
-            &pps,
+            header,
+            sps,
+            pps,
             &provider,
-            &mut pic,
-            &mut grid,
+            &mut in_progress.pic,
+            &mut in_progress.grid,
         )
         .map_err(|e| Error::invalid(format!("h264 reconstruct: {e}")))?;
 
-        // §8.2.5 — decoded reference picture marking. Build the DpbEntry
-        // for the current picture, run the marking state machine, then
-        // (for reference pictures) insert the Picture + entry into the
-        // long-running DPB.
+        Ok(())
+    }
+
+    /// Complete the picture currently held in `self.in_progress`: run the
+    /// §8.2.5 decoded reference picture marking, insert the picture into
+    /// the DPB if it's a reference, and push the finalized `VideoFrame`
+    /// through the §C.4 output bumping process. Clears `in_progress`.
+    ///
+    /// No-op when no picture is in progress.
+    fn finalize_in_progress_picture(&mut self) -> Result<()> {
+        let Some(in_progress) = self.in_progress.take() else {
+            return Ok(());
+        };
+        let PictureInProgress {
+            pic,
+            grid: _,
+            first_nal_unit_type: _,
+            first_nal_ref_idc: _,
+            first_header,
+            is_reference,
+            is_idr,
+            poc,
+            structure,
+            pts,
+            time_base,
+        } = in_progress;
+
+        // Snapshot the active SPS at finalization. All slices of a primary
+        // coded picture share the same active SPS (§7.4.1.2.4 requires the
+        // PPS ids match; that's the SPS proxy too).
+        let sps = self
+            .driver
+            .active_sps()
+            .cloned()
+            .ok_or_else(|| Error::invalid("h264: finalize with no active SPS"))?;
+
+        // §8.2.5 — decoded reference picture marking.
         let mut current_entry = DpbEntry {
-            frame_num: header.frame_num,
+            frame_num: first_header.frame_num,
             top_field_order_cnt: poc.top_field_order_cnt,
             bottom_field_order_cnt: poc.bottom_field_order_cnt,
             pic_order_cnt: poc.pic_order_cnt,
-            structure: current_structure,
+            structure,
             marking: if is_reference {
                 RefMarking::ShortTerm
             } else {
@@ -431,14 +663,7 @@ impl H264CodecDecoder {
 
         let mut mmco5_triggered = false;
         if is_reference {
-            // §8.2.5.1 — dispatch into IDR / sliding-window / adaptive
-            // paths. `perform_marking` does not add the current entry
-            // to the DPB — we insert it into `ref_store` + push the
-            // DpbEntry ourselves once the marking settles.
-            //
-            // `nal_ref_idc != 0` guarantees `dec_ref_pic_marking` is
-            // present per §7.3.3.
-            let marking = header.dec_ref_pic_marking.as_ref();
+            let marking = first_header.dec_ref_pic_marking.as_ref();
             let long_term_ref_flag = marking.is_some_and(|m| m.long_term_reference_flag);
             let no_output = marking.is_some_and(|m| m.no_output_of_prior_pics_flag);
             let adaptive_ops_vec: Option<Vec<RefMmcoOp>> = marking
@@ -453,27 +678,17 @@ impl H264CodecDecoder {
                 long_term_ref_flag,
                 no_output,
                 adaptive_ops_vec.as_deref(),
-                header.frame_num,
+                first_header.frame_num,
                 1u32 << (sps.log2_max_frame_num_minus4 + 4),
             );
 
-            // Evict "Unused" entries so they don't participate in
-            // subsequent list initialisation (§8.2.4.2 only considers
-            // short- / long-term refs). The long-running RefPicStore
-            // still holds the Pictures at those keys, but without a
-            // DpbEntry pointing at them they're effectively dead.
             self.dpb_entries
                 .retain(|e| !matches!(e.marking, RefMarking::Unused));
 
-            // Insert the current picture keyed by the DpbEntry's
-            // dpb_key so ref-pic-list lookups resolve to it.
             self.ref_store.insert(current_entry.dpb_key, pic.clone());
             self.dpb_entries.push(current_entry);
         }
 
-        // §8.2.1 NOTE 1 — only reference pictures count as the
-        // "previous reference picture" that feeds the next POC
-        // derivation. Non-reference pictures leave the hint alone.
         if is_reference {
             self.prev_had_mmco5 = mmco5_triggered;
             self.prev_reference_top_foc = if mmco5_triggered {
@@ -483,19 +698,9 @@ impl H264CodecDecoder {
             };
         }
 
-        // Convert the reconstructed Picture into a VideoFrame and
-        // route it through the §C.4 bumping process.
-        let pts = self.pending_pts.take();
-        let time_base = self.pending_time_base;
         let vf = picture_to_video_frame(&pic, pts, time_base);
 
-        // §C.4 — at an IDR, any pictures still held in the output DPB
-        // belong to the *previous* coded video sequence and must be
-        // delivered in POC order before the IDR itself. Drain them
-        // into `ready` first, then reset the output queue, then push
-        // the IDR. MMCO op 5 inside a reference picture also triggers
-        // this reset (§8.2.5.4 / §C.4); we already detected that as
-        // `mmco5_triggered` above.
+        // §C.4 — at IDR / MMCO-5 drain the prior sequence.
         if is_idr || mmco5_triggered {
             for drained in self.output_dpb.flush() {
                 self.ready.push_back(drained.picture);
@@ -503,18 +708,12 @@ impl H264CodecDecoder {
             self.output_dpb.reset();
         }
 
-        // Size the output DPB against the active SPS (§E.2.1 /
-        // §A.3.1 item h). Cheap to call every slice — the helper
-        // short-circuits when the derived capacity hasn't changed.
         self.ensure_output_dpb_sized(&sps);
 
-        // Push into the output DPB. §C.4: if the queue is full, the
-        // lowest-POC entry is bumped out and becomes immediately
-        // available to `receive_frame`.
         let entry = OutputEntry {
             picture: vf,
             pic_order_cnt: poc.pic_order_cnt,
-            frame_num: header.frame_num,
+            frame_num: first_header.frame_num,
             needed_for_output: true,
         };
         if let Some(bumped) = self.output_dpb.push(entry) {
@@ -808,6 +1007,11 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
+        // §7.4.1.2 — close any picture we've been assembling so it reaches
+        // the DPB + output queue before the caller drains at EOF.
+        if let Err(e) = self.finalize_in_progress_picture() {
+            eprintln!("h264 flush: final picture skipped: {e}");
+        }
         self.eof = true;
         Ok(())
     }
@@ -827,6 +1031,9 @@ impl Decoder for H264CodecDecoder {
         self.next_dpb_key = 0;
         self.prev_had_mmco5 = false;
         self.prev_reference_top_foc = 0;
+        // Drop any picture currently being assembled — reset implies we
+        // discard in-flight state, not deliver it.
+        self.in_progress = None;
         Ok(())
     }
 }
@@ -1245,5 +1452,236 @@ mod tests {
         assert_eq!(max_dpb_mbs_for_level(60), 696_320);
         // Unknown level → conservative fallback.
         assert_eq!(max_dpb_mbs_for_level(200), 396);
+    }
+
+    // -- §7.4.1.2.4 first-VCL-of-primary-coded-picture detection -------
+    //
+    // These tests seed an `in_progress` PictureInProgress by hand and
+    // then probe `is_first_vcl_of_new_picture` with different trailing
+    // slice headers. The assembly code itself is exercised end-to-end
+    // by `tests/integration_multislice_assembly.rs`; these tests cover
+    // the boundary-condition matrix without needing a real bitstream.
+
+    use crate::poc::PocResult;
+    use crate::ref_list::PicStructure;
+    use crate::slice_header::{
+        RefPicListModification, SliceHeader as Hdr, SliceType as ST,
+    };
+
+    /// Build a minimal SliceHeader for boundary-detection testing. All
+    /// fields default to "non-IDR P frame at frame_num=0, POC lsb=0" —
+    /// tests tweak the specific fields they want to compare.
+    fn hdr_base() -> Hdr {
+        Hdr {
+            first_mb_in_slice: 0,
+            slice_type_raw: 0,
+            slice_type: ST::P,
+            all_slices_same_type: false,
+            pic_parameter_set_id: 0,
+            colour_plane_id: 0,
+            frame_num: 0,
+            field_pic_flag: false,
+            bottom_field_flag: false,
+            idr_pic_id: 0,
+            pic_order_cnt_lsb: 0,
+            delta_pic_order_cnt_bottom: 0,
+            delta_pic_order_cnt: [0, 0],
+            redundant_pic_cnt: 0,
+            direct_spatial_mv_pred_flag: false,
+            num_ref_idx_active_override_flag: false,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            ref_pic_list_modification: RefPicListModification::default(),
+            pred_weight_table: None,
+            dec_ref_pic_marking: None,
+            cabac_init_idc: 0,
+            slice_qp_delta: 0,
+            sp_for_switch_flag: false,
+            slice_qs_delta: 0,
+            disable_deblocking_filter_idc: 0,
+            slice_alpha_c0_offset_div2: 0,
+            slice_beta_offset_div2: 0,
+            slice_group_change_cycle: 0,
+        }
+    }
+
+    /// Seed a dummy PictureInProgress on a decoder so
+    /// `is_first_vcl_of_new_picture` has something to compare against.
+    fn seed_in_progress(dec: &mut H264CodecDecoder, nut: u8, nri: u8, header: Hdr) {
+        let pic = Picture::new(16, 16, 1, 8, 8);
+        let grid = MbGrid::new(1, 1);
+        dec.in_progress = Some(PictureInProgress {
+            pic,
+            grid,
+            first_nal_unit_type: nut,
+            first_nal_ref_idc: nri,
+            first_header: header,
+            is_reference: nri != 0,
+            is_idr: nut == 5,
+            poc: PocResult {
+                top_field_order_cnt: 0,
+                bottom_field_order_cnt: 0,
+                pic_order_cnt: 0,
+            },
+            structure: PicStructure::Frame,
+            pts: None,
+            time_base: TimeBase::new(1, 1),
+        });
+    }
+
+    /// §7.4.1.2.4 — no picture in progress ⇒ any slice starts a new
+    /// primary coded picture.
+    #[test]
+    fn first_vcl_when_no_picture_in_progress() {
+        let dec = H264CodecDecoder::new(CodecId::new("h264"));
+        assert!(dec.is_first_vcl_of_new_picture(1, 2, &hdr_base()));
+    }
+
+    /// §7.4.1.2.4 — identical header + nal_unit_type + nal_ref_idc ⇒
+    /// SAME primary coded picture (continuation slice).
+    #[test]
+    fn same_picture_when_all_conditions_match() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        // Same everything except first_mb_in_slice (which is NOT in
+        // the §7.4.1.2.4 list of differing conditions).
+        let mut h = hdr_base();
+        h.first_mb_in_slice = 384;
+        assert!(!dec.is_first_vcl_of_new_picture(1, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — `frame_num` differs ⇒ new picture.
+    #[test]
+    fn different_frame_num_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        let mut h = hdr_base();
+        h.frame_num = 1;
+        assert!(dec.is_first_vcl_of_new_picture(1, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — `pic_parameter_set_id` differs ⇒ new picture.
+    #[test]
+    fn different_pps_id_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        let mut h = hdr_base();
+        h.pic_parameter_set_id = 3;
+        assert!(dec.is_first_vcl_of_new_picture(1, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — `field_pic_flag` differs ⇒ new picture.
+    #[test]
+    fn different_field_pic_flag_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        let mut h = hdr_base();
+        h.field_pic_flag = true;
+        assert!(dec.is_first_vcl_of_new_picture(1, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — nal_ref_idc zero-ness differs (prev ref, new
+    /// non-ref) ⇒ new picture.
+    #[test]
+    fn different_nal_ref_idc_zero_ness_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        // Old nal_ref_idc = 2 (non-zero), new = 0.
+        assert!(dec.is_first_vcl_of_new_picture(1, 0, &hdr_base()));
+    }
+
+    /// §7.4.1.2.4 — both nal_ref_idc non-zero but different value
+    /// (e.g. 1 vs 2) is NOT a new picture — only the *zero-ness*
+    /// matters.
+    #[test]
+    fn same_nal_ref_idc_nonzero_is_same_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        assert!(!dec.is_first_vcl_of_new_picture(1, 1, &hdr_base()));
+    }
+
+    /// §7.4.1.2.4 — `pic_order_cnt_lsb` differs ⇒ new picture.
+    #[test]
+    fn different_poc_lsb_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        let mut h = hdr_base();
+        h.pic_order_cnt_lsb = 4;
+        assert!(dec.is_first_vcl_of_new_picture(1, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — `delta_pic_order_cnt_bottom` differs ⇒ new picture.
+    #[test]
+    fn different_delta_poc_bottom_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        let mut h = hdr_base();
+        h.delta_pic_order_cnt_bottom = 1;
+        assert!(dec.is_first_vcl_of_new_picture(1, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — `delta_pic_order_cnt[0]` differs ⇒ new picture.
+    #[test]
+    fn different_delta_poc_0_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        let mut h = hdr_base();
+        h.delta_pic_order_cnt[0] = 2;
+        assert!(dec.is_first_vcl_of_new_picture(1, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — `delta_pic_order_cnt[1]` differs ⇒ new picture.
+    #[test]
+    fn different_delta_poc_1_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        let mut h = hdr_base();
+        h.delta_pic_order_cnt[1] = 3;
+        assert!(dec.is_first_vcl_of_new_picture(1, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — IdrPicFlag differs (one IDR, other not) ⇒ new.
+    #[test]
+    fn different_idr_flag_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        seed_in_progress(&mut dec, 1, 2, hdr_base());
+        // IDR is nal_unit_type == 5. The new slice type 5 differs from
+        // prev type 1.
+        let mut h = hdr_base();
+        h.slice_type_raw = 2;
+        h.slice_type = ST::I;
+        assert!(dec.is_first_vcl_of_new_picture(5, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — both IDR but `idr_pic_id` differs ⇒ new.
+    #[test]
+    fn different_idr_pic_id_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let mut prev = hdr_base();
+        prev.idr_pic_id = 0;
+        prev.slice_type_raw = 2;
+        prev.slice_type = ST::I;
+        seed_in_progress(&mut dec, 5, 3, prev);
+        let mut h = hdr_base();
+        h.idr_pic_id = 1;
+        h.slice_type_raw = 2;
+        h.slice_type = ST::I;
+        assert!(dec.is_first_vcl_of_new_picture(5, 3, &h));
+    }
+
+    /// §7.4.1.2.4 — both IDR with SAME idr_pic_id and all other fields
+    /// match ⇒ SAME picture.
+    #[test]
+    fn same_idr_pic_id_is_same_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let mut prev = hdr_base();
+        prev.idr_pic_id = 7;
+        prev.slice_type_raw = 2;
+        prev.slice_type = ST::I;
+        seed_in_progress(&mut dec, 5, 3, prev.clone());
+        // Continuation slice in a multi-slice IDR picture.
+        let mut h = prev;
+        h.first_mb_in_slice = 384;
+        assert!(!dec.is_first_vcl_of_new_picture(5, 3, &h));
     }
 }

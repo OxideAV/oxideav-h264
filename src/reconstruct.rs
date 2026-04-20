@@ -151,6 +151,40 @@ fn inverse_scan_8x8_zigzag(levels: &[i32; 64]) -> [i32; 64] {
 }
 
 // -------------------------------------------------------------------------
+// §6.4.1 — per-MB sample-origin derivation (frame pictures only)
+// -------------------------------------------------------------------------
+//
+// For non-MBAFF frame pictures, the MB's origin is simply
+// `(mb_x * 16, mb_y * 16)` per eqs. (6-3)/(6-4), where `(mb_x, mb_y)` is
+// the raster position. In MBAFF frames the origin is derived from
+// eqs. (6-5)..(6-10) and the MB's `mb_field_decoding_flag`.
+//
+// The `y_step` returned in the MBAFF / field-MB case is documentation
+// for Phase 3 deblocking / neighbouring-sample reads; for Phase 2 the
+// sample-write path still uses y_step = 1 (i.e. field MBs overwrite
+// the starting 16 rows instead of interleaving with the pair partner).
+// This is documented as a known-wrong-pixels limitation in the module
+// doc comment; it just avoids out-of-bounds writes and doesn't error.
+
+/// §6.4.1 — MB origin `(mb_px, mb_py)` in luma samples. Handles both
+/// non-MBAFF (eqs. 6-3 / 6-4) and MBAFF (eqs. 6-5..6-10) cases.
+fn mb_sample_origin(
+    grid: &MbGrid,
+    mb_addr: u32,
+    mbaff_frame_flag: bool,
+    mb_field_decoding_flag: bool,
+) -> (i32, i32) {
+    if mbaff_frame_flag {
+        let (x, y) =
+            crate::mb_address::mbaff_mb_to_sample_xy(mb_addr, grid.width_in_mbs, mb_field_decoding_flag);
+        (x as i32, y as i32)
+    } else {
+        let (mb_x, mb_y) = grid.mb_xy(mb_addr);
+        ((mb_x as i32) * 16, (mb_y as i32) * 16)
+    }
+}
+
+// -------------------------------------------------------------------------
 // Public entry point
 // -------------------------------------------------------------------------
 
@@ -176,11 +210,17 @@ pub fn reconstruct_slice<R: RefPicProvider>(
             chroma_array_type,
         ));
     }
-    if slice_header.field_pic_flag
-        || (sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag)
-    {
+    // §7.4.2.1.1 — MbaffFrameFlag = mb_adaptive_frame_field_flag &&
+    // !field_pic_flag. Field-only pictures (`field_pic_flag == 1`) still
+    // aren't handled by this reconstruction pass — MBAFF frames are, as
+    // of Phase 2, with the caveats documented in the `mb_address` MBAFF
+    // helpers (field-MB samples are placed at their pair-local start
+    // row per §6.4.1 eq. 6-10 but without the y-stride=2 interleave
+    // with the pair partner — that's a Phase-3 refinement).
+    if slice_header.field_pic_flag {
         return Err(ReconstructError::FieldOrMbaffNotSupported);
     }
+    let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
 
     // §7.4.2.1 — bit depths (8..=14 supported by the transform module).
     let bit_depth_y = 8 + sps.bit_depth_luma_minus8;
@@ -206,9 +246,19 @@ pub fn reconstruct_slice<R: RefPicProvider>(
     let deblock_enabled = slice_header.disable_deblocking_filter_idc != 1;
 
     // -------- Walk macroblocks --------------------------------------
-    let mut curr_addr = slice_header.first_mb_in_slice;
+    // §7.4.2.1 / §7.3.4 — starting CurrMbAddr = first_mb_in_slice *
+    // (1 + MbaffFrameFlag): in MBAFF the slice header's first_mb_in_slice
+    // is in pair units so the first raw MB address is double.
+    let mut curr_addr = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
     let total = slice_data.macroblocks.len();
     for (idx, mb) in slice_data.macroblocks.iter().enumerate() {
+        // §7.4.4 — per-MB mb_field_decoding_flag (shared within an
+        // MBAFF pair, `false` for non-MBAFF).
+        let mb_field_decoding_flag = slice_data
+            .mb_field_decoding_flags
+            .get(idx)
+            .copied()
+            .unwrap_or(false);
         // Determine this MB's QP_Y (needed for AC transform scaling and
         // deblocking). For I_PCM / P_Skip / B_Skip we leave QP_Y
         // unchanged per §7.4.5. P_Skip / B_Skip carry no mb_qp_delta.
@@ -237,6 +287,8 @@ pub fn reconstruct_slice<R: RefPicProvider>(
                 pps,
                 pic,
                 grid,
+                mbaff_frame_flag,
+                mb_field_decoding_flag,
             )?;
         } else {
             reconstruct_mb_inter(
@@ -252,6 +304,8 @@ pub fn reconstruct_slice<R: RefPicProvider>(
                 ref_pics,
                 pic,
                 grid,
+                mbaff_frame_flag,
+                mb_field_decoding_flag,
             )?;
         }
 
@@ -315,10 +369,13 @@ fn reconstruct_mb_intra(
     pps: &Pps,
     pic: &mut Picture,
     grid: &mut MbGrid,
+    mbaff_frame_flag: bool,
+    mb_field_decoding_flag: bool,
 ) -> Result<(), ReconstructError> {
-    let (mb_x, mb_y) = grid.mb_xy(mb_addr);
-    let mb_px = (mb_x as i32) * 16;
-    let mb_py = (mb_y as i32) * 16;
+    // §6.4.1 — MB sample origin (non-MBAFF eqs. 6-3/6-4 or MBAFF eqs.
+    // 6-5..6-10 depending on `mb_field_decoding_flag`).
+    let (mb_px, mb_py) =
+        mb_sample_origin(grid, mb_addr, mbaff_frame_flag, mb_field_decoding_flag);
 
     match &mb.mb_type {
         MbType::IPcm => {
@@ -333,9 +390,17 @@ fn reconstruct_mb_intra(
                 }
             }
             // Chroma (4:2:0 → 8x8, 4:2:2 → 8x16).
+            // §6.2 Table 6-1 — chroma MB origin = luma origin divided by
+            // (SubWidthC, SubHeightC). For 4:2:0: (mb_px/2, mb_py/2);
+            // for 4:2:2: (mb_px/2, mb_py). For MBAFF field MBs where
+            // `mb_py` is an odd pair-local offset (e.g. yO+1), the
+            // division is correct in spirit — the chroma pair has the
+            // same field-interleave structure. For Phase 2 we accept
+            // the rounding error in the rare field-MB I_PCM case.
             let (cw, ch) = chroma_mb_dims(chroma_array_type);
-            let c_mb_x = (mb_x as i32) * (cw as i32);
-            let c_mb_y = (mb_y as i32) * (ch as i32);
+            let (sub_w, sub_h) = chroma_subsample(chroma_array_type);
+            let c_mb_x = mb_px / sub_w;
+            let c_mb_y = mb_py / sub_h;
             let mut k = 0usize;
             for y in 0..ch {
                 for x in 0..cw {
@@ -1370,6 +1435,19 @@ fn chroma_mb_dims(chroma_array_type: u32) -> (u32, u32) {
     }
 }
 
+/// §6.2 / Table 6-1 — (SubWidthC, SubHeightC): luma:chroma sample ratio
+/// per ChromaArrayType. ChromaArrayType 0 (monochrome) returns `(1, 1)`
+/// as a safe fallback; ChromaArrayType 3 (4:4:4) returns `(1, 1)`.
+#[inline]
+fn chroma_subsample(chroma_array_type: u32) -> (i32, i32) {
+    match chroma_array_type {
+        1 => (2, 2),
+        2 => (2, 1),
+        3 => (1, 1),
+        _ => (1, 1),
+    }
+}
+
 // =========================================================================
 // §8.4 — Inter-prediction reconstruction
 // =========================================================================
@@ -1424,10 +1502,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     ref_pics: &R,
     pic: &mut Picture,
     grid: &mut MbGrid,
+    mbaff_frame_flag: bool,
+    mb_field_decoding_flag: bool,
 ) -> Result<(), ReconstructError> {
-    let (mb_x, mb_y) = grid.mb_xy(mb_addr);
-    let mb_px = (mb_x as i32) * 16;
-    let mb_py = (mb_y as i32) * 16;
+    // §6.4.1 — MB sample origin (MBAFF-aware).
+    let (mb_px, mb_py) =
+        mb_sample_origin(grid, mb_addr, mbaff_frame_flag, mb_field_decoding_flag);
 
     // -------- Derive inter partitions --------------------------------
     let partitions = derive_inter_partitions(mb, slice_header)?;
@@ -5270,5 +5350,148 @@ mod tests {
             (32, 32, 5),
             "out-of-band DistScaleFactor should fall back to equal weights"
         );
+    }
+
+    // =====================================================================
+    // §6.4.1 / §6.4.10 — MBAFF reconstruction (Phase 2)
+    // =====================================================================
+
+    /// Build an SPS with `mb_adaptive_frame_field_flag` enabled, at
+    /// the given picture dimensions.
+    fn make_mbaff_sps(w_mbs: u32, h_map_units: u32) -> Sps {
+        let mut sps = make_sps(w_mbs, h_map_units);
+        sps.mb_adaptive_frame_field_flag = true;
+        sps.frame_mbs_only_flag = false;
+        sps
+    }
+
+    #[test]
+    fn reconstruct_slice_accepts_mbaff_frames() {
+        // §7.4.2.1.1 — MbaffFrameFlag = mb_adaptive_frame_field_flag &&
+        // !field_pic_flag. Phase 2 removes the blanket rejection: a
+        // minimal two-MB MBAFF pair (one frame + one frame MB) should
+        // reconstruct without erroring.
+        let sps = make_mbaff_sps(1, 1); // 1 MB wide, 1 map-unit tall → 2 MBs tall.
+        let pps = make_pps();
+        let sh = make_slice_header();
+        let mb0 = make_empty_ipcm_mb();
+        let mb1 = make_empty_ipcm_mb();
+        let slice_data = SliceData {
+            macroblocks: vec![mb0, mb1],
+            mb_field_decoding_flags: vec![false, false], // frame-coded pair
+            last_mb_addr: 1,
+        };
+        // FrameHeightInMbs = 2 * 1 = 2; picture is 16x32 luma.
+        let mut pic = Picture::new(16, 32, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 2);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid)
+            .expect("MBAFF frame reconstruction must no longer error");
+    }
+
+    #[test]
+    fn reconstruct_mbaff_frame_mb_pair_places_samples_in_stacked_layout() {
+        // §6.4.1 eqs. 6-7/6-8 — for frame-coded MBs in an MBAFF frame,
+        // the top MB's samples occupy rows 0..16 and the bottom MB's
+        // samples occupy rows 16..32 at column 0.
+        let sps = make_mbaff_sps(1, 1);
+        let pps = make_pps();
+        let sh = make_slice_header();
+        let mut mb_top = make_empty_ipcm_mb();
+        let mut mb_bot = make_empty_ipcm_mb();
+        // Tag the two MBs with distinct constant luma values so we can
+        // detect placement.
+        for v in mb_top.pcm_samples.as_mut().unwrap().luma.iter_mut() {
+            *v = 10;
+        }
+        for v in mb_bot.pcm_samples.as_mut().unwrap().luma.iter_mut() {
+            *v = 20;
+        }
+        let slice_data = SliceData {
+            macroblocks: vec![mb_top, mb_bot],
+            mb_field_decoding_flags: vec![false, false],
+            last_mb_addr: 1,
+        };
+        let mut pic = Picture::new(16, 32, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 2);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid).unwrap();
+
+        // Top MB @ rows 0..16 → value 10.
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    10,
+                    "frame-MB pair top: expected 10 at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+        // Bottom MB @ rows 16..32 → value 20.
+        for y in 16..32 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    20,
+                    "frame-MB pair bottom: expected 20 at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_mbaff_field_mb_pair_does_not_error() {
+        // §6.4.1 eqs. 6-9/6-10 — field MBs start at y = yO or yO + 1
+        // within the pair. For Phase 2 we verify the reconstruction
+        // doesn't error on a field-coded MBAFF pair; pixel-accurate
+        // y-stride=2 interleave is a Phase-3 follow-up.
+        let sps = make_mbaff_sps(1, 1);
+        let pps = make_pps();
+        let sh = make_slice_header();
+        let mb_top = make_empty_ipcm_mb();
+        let mb_bot = make_empty_ipcm_mb();
+        let slice_data = SliceData {
+            macroblocks: vec![mb_top, mb_bot],
+            mb_field_decoding_flags: vec![true, true], // field-coded pair
+            last_mb_addr: 1,
+        };
+        let mut pic = Picture::new(16, 32, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 2);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid)
+            .expect("MBAFF field pair reconstruction must no longer error");
+    }
+
+    #[test]
+    fn reconstruct_mbaff_intra16x16_pair_dc_fills_both_mbs() {
+        // Pure intra_16x16 DC (mode 2). With no neighbours, DC defaults
+        // to 1 << (BitDepth-1) = 128 per §8.3.3.3 eq. 8-121.
+        // Both MBs should fill their regions with 128.
+        let sps = make_mbaff_sps(1, 1);
+        let pps = make_pps();
+        let sh = make_slice_header();
+        let mb_top = make_intra16x16_dc_mb(2);
+        let mb_bot = make_intra16x16_dc_mb(2);
+        let slice_data = SliceData {
+            macroblocks: vec![mb_top, mb_bot],
+            mb_field_decoding_flags: vec![false, false],
+            last_mb_addr: 1,
+        };
+        let mut pic = Picture::new(16, 32, 1, 8, 8);
+        let mut grid = MbGrid::new(1, 2);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid).unwrap();
+
+        for y in 0..32 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.luma_at(x, y),
+                    128,
+                    "intra-16x16 DC fallback in MBAFF: expected 128 at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
     }
 }

@@ -405,6 +405,270 @@ pub fn next_mb_address(
     i
 }
 
+// =========================================================================
+// §6.4.1 / §6.4.10 / §6.4.11.1 — MBAFF addressing helpers
+// =========================================================================
+//
+// When MbaffFrameFlag == 1 (§7.4.2.1.1 — i.e. `mb_adaptive_frame_field_flag`
+// in the SPS is 1 and the slice header's `field_pic_flag` is 0) macroblocks
+// are arranged in vertical pairs. Given CurrMbAddr:
+//   * currMbFrameFlag   = !mb_field_decoding_flag  (frame-coded MB when true)
+//   * mbIsTopMbFlag     = (CurrMbAddr % 2 == 0)    (top MB of its pair)
+//   * pairIdx           = CurrMbAddr / 2           (pair raster index)
+// The pair origin in the frame is `(xO, yO)` from §6.4.1 eqs. (6-5)/(6-6):
+//   xO = (pairIdx % PicWidthInMbs) * 16
+//   yO = (pairIdx / PicWidthInMbs) * 32
+// Within the pair (§6.4.1 eqs. 6-7..6-10):
+//   * Frame MB: x = xO, y = yO + (CurrMbAddr % 2) * 16.
+//   * Field MB: x = xO, y = yO + (CurrMbAddr % 2). (Field MB samples are
+//     then placed every 2 rows starting from this y — i.e. interleaved
+//     with the pair partner.)
+//
+// §6.4.10 specifies the neighbour pair addresses (A/B/C/D) relative to
+// the top MB of the current pair; these are used downstream by §6.4.11.1
+// to derive the per-MB neighbour addresses accounting for the
+// current+neighbour `mb_field_decoding_flag` combination.
+
+/// §6.4.10 — derive `(currMbFrameFlag, mbIsTopMbFlag)` for the MB at
+/// `curr_mb_addr` in an MBAFF frame picture.
+///
+/// * `currMbFrameFlag` == `true` when the MB is frame-coded
+///   (`mb_field_decoding_flag` is 0).
+/// * `mbIsTopMbFlag` == `true` when the MB is the top of its pair
+///   (`CurrMbAddr % 2 == 0`).
+pub fn mb_pair_flags(curr_mb_addr: u32, mb_field_decoding_flag: bool) -> (bool, bool) {
+    let mb_is_top = curr_mb_addr % 2 == 0;
+    let curr_frame = !mb_field_decoding_flag;
+    (curr_frame, mb_is_top)
+}
+
+/// §6.4.1 — inverse macroblock-to-sample mapping for MBAFF frame
+/// pictures. Returns `(x, y)` — the upper-left luma-sample coordinate
+/// of `curr_mb_addr` within the frame.
+///
+/// For field-coded MBs, the returned `y` is the starting row; the MB's
+/// samples occupy rows `y, y+2, y+4, ...` (every 2 rows) per eqs.
+/// (6-9)/(6-10) — the caller is responsible for applying the
+/// `y_step = 2` stride.
+///
+/// For frame-coded MBs, `y` is the MB origin and the samples are
+/// contiguous (`y_step = 1`).
+pub fn mbaff_mb_to_sample_xy(
+    curr_mb_addr: u32,
+    pic_width_in_mbs: u32,
+    mb_field_decoding_flag: bool,
+) -> (u32, u32) {
+    if pic_width_in_mbs == 0 {
+        return (0, 0);
+    }
+    let pair_idx = curr_mb_addr / 2;
+    // §6.4.1 eqs. (6-5)/(6-6) via `InverseRasterScan(a, 16, 32, PicW, e)`
+    // which expands to x = (a % (PicW/16)) * 16, y = (a / (PicW/16)) * 32.
+    // Here `pic_width_in_mbs = PicW / 16`.
+    let x_o = (pair_idx % pic_width_in_mbs) * 16;
+    let y_o = (pair_idx / pic_width_in_mbs) * 32;
+    let bot = curr_mb_addr % 2; // 0 for top, 1 for bottom.
+    if mb_field_decoding_flag {
+        // §6.4.1 eqs. (6-9)/(6-10) — field MB starting row offset by 0 or 1.
+        (x_o, y_o + bot)
+    } else {
+        // §6.4.1 eqs. (6-7)/(6-8) — frame MB stacked at 0 or 16.
+        (x_o, y_o + bot * 16)
+    }
+}
+
+/// §6.4.1 — y-stride used to step between rows within an MBAFF MB.
+/// * Frame-coded MB → stride of 1 (samples at y, y+1, y+2, ...).
+/// * Field-coded MB → stride of 2 (samples at y, y+2, y+4, ..., i.e.
+///   interleaved with the pair partner — §6.4.1 note under eq. 6-10).
+#[inline]
+pub fn mbaff_y_step(mb_field_decoding_flag: bool) -> u32 {
+    if mb_field_decoding_flag {
+        2
+    } else {
+        1
+    }
+}
+
+/// §6.4.10 — neighbour macroblock pair addresses for the pair
+/// containing `curr_mb_addr` in an MBAFF frame picture.
+///
+/// Returns `[A, B, C, D]` where each entry is the `mbAddr` of the
+/// **top macroblock** of the neighbouring pair (to the left, above,
+/// above-right, above-left respectively), or `None` when the neighbour
+/// is outside the picture.
+///
+/// The spec formulas (for the pair-level addresses) are:
+/// * `mbAddrA = 2 * ( CurrMbAddr / 2 - 1 )`
+///   — invalid when `( CurrMbAddr / 2 ) % PicWidthInMbs == 0`.
+/// * `mbAddrB = 2 * ( CurrMbAddr / 2 - PicWidthInMbs )`
+/// * `mbAddrC = 2 * ( CurrMbAddr / 2 - PicWidthInMbs + 1 )`
+///   — invalid when `( CurrMbAddr / 2 + 1 ) % PicWidthInMbs == 0`.
+/// * `mbAddrD = 2 * ( CurrMbAddr / 2 - PicWidthInMbs - 1 )`
+///   — invalid when `( CurrMbAddr / 2 ) % PicWidthInMbs == 0`.
+///
+/// Each addition is also guarded against "address > CurrMbAddr" per
+/// §6.4.8 ("the macroblock is marked as not available" when mbAddr is
+/// less than 0 or greater than CurrMbAddr). We enforce that by using
+/// integer underflow guards.
+///
+/// This function does NOT further disambiguate the per-MB neighbour
+/// within the pair — that is a §6.4.11.1 (MBAFF case) follow-up using
+/// Tables 6-4/6-5 depending on current+neighbour mb_field_decoding_flag
+/// and mbIsTopMbFlag. The pair-level base addresses are all a Phase-2
+/// consumer needs to build a best-effort lookup.
+pub fn mbaff_pair_neighbour_addrs(
+    curr_mb_addr: u32,
+    pic_width_in_mbs: u32,
+) -> [Option<u32>; 4] {
+    if pic_width_in_mbs == 0 {
+        return [None; 4];
+    }
+    let pair_idx = curr_mb_addr / 2;
+    let pair_col = pair_idx % pic_width_in_mbs;
+    let pair_row = pair_idx / pic_width_in_mbs;
+
+    // A: left pair. Not available when pair_col == 0.
+    let a = if pair_col > 0 {
+        Some(2 * (pair_idx - 1))
+    } else {
+        None
+    };
+    // B: above pair. Not available when pair_row == 0.
+    let b = if pair_row > 0 {
+        Some(2 * (pair_idx - pic_width_in_mbs))
+    } else {
+        None
+    };
+    // C: above-right pair. Not available when pair_row == 0 or
+    // (pair_idx / 2 + 1) % PicWidthInMbs == 0 (i.e. at right edge).
+    let c = if pair_row > 0 && pair_col + 1 < pic_width_in_mbs {
+        Some(2 * (pair_idx - pic_width_in_mbs + 1))
+    } else {
+        None
+    };
+    // D: above-left pair.
+    let d = if pair_row > 0 && pair_col > 0 {
+        Some(2 * (pair_idx - pic_width_in_mbs - 1))
+    } else {
+        None
+    };
+    [a, b, c, d]
+}
+
+/// §6.4.11.1 (MBAFF case) — best-effort neighbour MB address derivation
+/// for the current MB in an MBAFF frame picture. Consumers use this
+/// for intra-pred neighbour lookup (§8.3.1.1 / §8.3.2.1).
+///
+/// The spec's full Table 6-4 disambiguates the per-MB neighbour (top or
+/// bottom of the neighbour pair) based on the 4-way combination of
+/// (current frame-or-field, current top-or-bottom, neighbour frame-or-
+/// field, neighbour top-or-bottom). For this phase we use a common-case
+/// approximation:
+///
+/// * **Left neighbour A**: same-pair role of the left pair's MB —
+///   take mb_addr mapped across pair boundary at the same within-pair
+///   index (top<->top, bottom<->bottom). For frame/frame and field/field
+///   pairings this matches Table 6-4; for mixed pairings the result
+///   falls back to the pair's top MB (mb_addr even), which is the Table
+///   6-4 fallback for the common cases.
+/// * **Above neighbour B**: the bottom MB of the above pair
+///   (mb_addr + 1) when current is the top of its pair; otherwise
+///   (current is bottom) the current MB's own top. This matches the
+///   common case in Table 6-4 where the above-pair's bottom MB is the
+///   row immediately above the current pair.
+///
+/// Cases where this approximation is wrong (e.g. frame<->field mixed
+/// pairs near the top of the picture) should be treated as "neighbour
+/// unavailable" by the caller if correctness matters — this is
+/// documented as a Phase-3 refinement.
+///
+/// `mb_field_decoding_flag_grid` — per-MB flag, length
+/// `pic_size_in_mbs`. Pass the grid from the parsed SliceData.
+pub fn mbaff_neighbour_addrs(
+    curr_mb_addr: u32,
+    pic_width_in_mbs: u32,
+    mb_field_decoding_flag_grid: &[bool],
+) -> [Option<u32>; 4] {
+    let pair_neighbours = mbaff_pair_neighbour_addrs(curr_mb_addr, pic_width_in_mbs);
+    let mb_is_top = curr_mb_addr % 2 == 0;
+    let curr_field = mb_field_decoding_flag_grid
+        .get(curr_mb_addr as usize)
+        .copied()
+        .unwrap_or(false);
+
+    // Return Some(addr) only when within grid bounds. Helper closure.
+    let in_bounds = |addr: u32| -> Option<u32> {
+        if (addr as usize) < mb_field_decoding_flag_grid.len() {
+            Some(addr)
+        } else {
+            None
+        }
+    };
+
+    // §6.4.11.1 (MBAFF) approximation, per doc-comment:
+    //
+    //   A (left): map to the neighbour pair's top MB when current is
+    //   top, or the bottom MB when current is bottom. For mixed-mode
+    //   pairs this is a Phase-2 approximation.
+    //   B (above): bottom MB of above pair when current is top;
+    //   else current-pair top MB when current is bottom.
+    //   C (above-right): top MB of the above-right pair — conservative.
+    //   D (above-left): top MB of the above-left pair — conservative.
+    let pair_a = pair_neighbours[0];
+    let pair_b = pair_neighbours[1];
+    let pair_c = pair_neighbours[2];
+    let pair_d = pair_neighbours[3];
+
+    let a = pair_a.and_then(|base| {
+        let neigh_field = mb_field_decoding_flag_grid
+            .get(base as usize)
+            .copied()
+            .unwrap_or(false);
+        // Same-pair-role mapping when the two pairs share
+        // mb_field_decoding_flag; otherwise fall back to the pair's top
+        // MB (the Table 6-4 common-case fallback).
+        if neigh_field == curr_field {
+            let off = if mb_is_top { 0 } else { 1 };
+            in_bounds(base + off)
+        } else {
+            in_bounds(base)
+        }
+    });
+
+    let b = if mb_is_top {
+        // Current top → B is bottom of above pair (base + 1).
+        pair_b.and_then(|base| in_bounds(base + 1))
+    } else {
+        // Current bottom → B is current-pair top = curr_mb_addr - 1.
+        if curr_mb_addr > 0 {
+            in_bounds(curr_mb_addr - 1)
+        } else {
+            None
+        }
+    };
+
+    let c = if mb_is_top {
+        // Current top → C is bottom of above-right pair.
+        pair_c.and_then(|base| in_bounds(base + 1))
+    } else {
+        // Current bottom → C is top of current-right pair (if present).
+        // This differs from §6.4.11.1 but is conservative: unavailable
+        // C lets the caller fall back to D per Table 6-3.
+        None
+    };
+
+    let d = if mb_is_top {
+        // Current top → D is bottom of above-left pair.
+        pair_d.and_then(|base| in_bounds(base + 1))
+    } else {
+        // Current bottom → D is top of left pair (same pair column).
+        pair_a
+    };
+
+    [a, b, c, d]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,5 +1072,182 @@ mod tests {
         );
         let map = map_unit_to_slice_group_map(&pps, 3, 3, 0, false).unwrap();
         assert_eq!(map, vec![0, 0, 0]);
+    }
+
+    // =====================================================================
+    // §6.4.1 / §6.4.10 — MBAFF addressing helpers
+    // =====================================================================
+
+    // --- §6.4.10 `mb_pair_flags` ---
+
+    #[test]
+    fn mb_pair_flags_top_frame() {
+        // CurrMbAddr 0 — top of pair 0, frame-coded.
+        let (frame, top) = mb_pair_flags(0, false);
+        assert!(frame, "mb_field_decoding_flag=0 → currMbFrameFlag=1");
+        assert!(top, "CurrMbAddr % 2 == 0 → mbIsTopMbFlag=1");
+    }
+
+    #[test]
+    fn mb_pair_flags_bottom_field() {
+        // CurrMbAddr 1 — bottom of pair 0, field-coded.
+        let (frame, top) = mb_pair_flags(1, true);
+        assert!(!frame, "mb_field_decoding_flag=1 → currMbFrameFlag=0");
+        assert!(!top, "CurrMbAddr % 2 == 1 → mbIsTopMbFlag=0");
+    }
+
+    #[test]
+    fn mb_pair_flags_pair_three_bottom_frame() {
+        // CurrMbAddr 7 — bottom of pair 3, frame-coded.
+        let (frame, top) = mb_pair_flags(7, false);
+        assert!(frame);
+        assert!(!top);
+    }
+
+    // --- §6.4.1 `mbaff_mb_to_sample_xy` ---
+
+    #[test]
+    fn mbaff_xy_frame_top_of_first_pair() {
+        // PicW = 4 MBs. Pair 0 top: (0, 0). Frame-coded.
+        let (x, y) = mbaff_mb_to_sample_xy(0, 4, false);
+        assert_eq!((x, y), (0, 0));
+    }
+
+    #[test]
+    fn mbaff_xy_frame_bottom_of_first_pair() {
+        // Pair 0 bottom (frame): y = 0 + 1*16 = 16.
+        let (x, y) = mbaff_mb_to_sample_xy(1, 4, false);
+        assert_eq!((x, y), (0, 16));
+    }
+
+    #[test]
+    fn mbaff_xy_field_top_of_first_pair() {
+        // Pair 0 top (field): y = 0 + 0 = 0.
+        let (x, y) = mbaff_mb_to_sample_xy(0, 4, true);
+        assert_eq!((x, y), (0, 0));
+    }
+
+    #[test]
+    fn mbaff_xy_field_bottom_of_first_pair() {
+        // Pair 0 bottom (field): y = 0 + 1 = 1 (interleaved — next row).
+        let (x, y) = mbaff_mb_to_sample_xy(1, 4, true);
+        assert_eq!((x, y), (0, 1));
+    }
+
+    #[test]
+    fn mbaff_xy_second_pair_top_frame() {
+        // PicW = 4. Pair 1 is at column 1 of row 0 → xO=16, yO=0.
+        // MB 2 = top of pair 1, frame.
+        let (x, y) = mbaff_mb_to_sample_xy(2, 4, false);
+        assert_eq!((x, y), (16, 0));
+    }
+
+    #[test]
+    fn mbaff_xy_second_row_pair_top_frame() {
+        // PicW = 4, so row 1 starts at pair 4 = mb_addr 8.
+        let (x, y) = mbaff_mb_to_sample_xy(8, 4, false);
+        assert_eq!((x, y), (0, 32));
+    }
+
+    #[test]
+    fn mbaff_xy_y_step_helper() {
+        assert_eq!(mbaff_y_step(false), 1, "frame MB → stride 1");
+        assert_eq!(mbaff_y_step(true), 2, "field MB → stride 2");
+    }
+
+    #[test]
+    fn mbaff_xy_zero_width_is_safe() {
+        // Degenerate input — should not panic; returns (0, 0).
+        let (x, y) = mbaff_mb_to_sample_xy(5, 0, false);
+        assert_eq!((x, y), (0, 0));
+    }
+
+    // --- §6.4.10 `mbaff_pair_neighbour_addrs` + `mbaff_neighbour_addrs` ---
+
+    #[test]
+    fn pair_neighbours_top_left_corner_all_none() {
+        // CurrMbAddr=0, pair 0, row=0 col=0. No neighbours.
+        let ns = mbaff_pair_neighbour_addrs(0, 4);
+        assert_eq!(ns, [None, None, None, None]);
+    }
+
+    #[test]
+    fn pair_neighbours_interior_has_all_four() {
+        // PicW=4, row_pair=1, col=2 → pair_idx = 6 → mb_addr top = 12.
+        let ns = mbaff_pair_neighbour_addrs(12, 4);
+        // A = 2*(6-1) = 10 ; B = 2*(6-4) = 4 ; C = 2*(6-4+1) = 6 ;
+        // D = 2*(6-4-1) = 2.
+        assert_eq!(ns, [Some(10), Some(4), Some(6), Some(2)]);
+    }
+
+    #[test]
+    fn pair_neighbours_same_for_top_and_bottom_of_pair() {
+        // §6.4.10: "mbAddrA..D have identical values regardless whether
+        // the current macroblock is the top or bottom macroblock of the
+        // pair".
+        let top = mbaff_pair_neighbour_addrs(12, 4);
+        let bot = mbaff_pair_neighbour_addrs(13, 4);
+        assert_eq!(top, bot);
+    }
+
+    #[test]
+    fn pair_neighbours_right_edge_no_c() {
+        // PicW=4, pair at col=3 → pair_idx = 7 (row 1) → mb_addr top=14.
+        // A = 2*(7-1) = 12 ; B = 2*(7-4) = 6 ;
+        // C invalid (col+1 == PicW) ;
+        // D = 2*(7-4-1) = 4.
+        let ns = mbaff_pair_neighbour_addrs(14, 4);
+        assert_eq!(ns, [Some(12), Some(6), None, Some(4)]);
+    }
+
+    #[test]
+    fn pair_neighbours_left_edge_no_a_d() {
+        // PicW=4, pair at col=0 → pair_idx = 4 → mb_addr top=8.
+        // A invalid; B = 2*(4-4) = 0 ; C = 2*(4-4+1) = 2 ; D invalid.
+        let ns = mbaff_pair_neighbour_addrs(8, 4);
+        assert_eq!(ns, [None, Some(0), Some(2), None]);
+    }
+
+    #[test]
+    fn neighbour_addrs_uniform_field_pair_at_interior() {
+        // PicW=4, flags = all frame. MB at addr=12 (top of pair 6,
+        // row 1 col 2). Expect A→10 (same top of left pair),
+        // B→5 (bottom of above pair 2), C→7 (bottom of above-right),
+        // D→3 (bottom of above-left).
+        let flags = vec![false; 16];
+        let n = mbaff_neighbour_addrs(12, 4, &flags);
+        assert_eq!(n, [Some(10), Some(5), Some(7), Some(3)]);
+    }
+
+    #[test]
+    fn neighbour_addrs_top_left_corner_all_none() {
+        let flags = vec![false; 16];
+        let n = mbaff_neighbour_addrs(0, 4, &flags);
+        assert_eq!(n, [None, None, None, None]);
+    }
+
+    #[test]
+    fn neighbour_addrs_bottom_within_same_pair() {
+        // Bottom MB of an interior pair. B must be the top MB of the
+        // same pair (curr - 1). A must be left pair's bottom (same
+        // within-pair role).
+        let flags = vec![false; 16];
+        let n = mbaff_neighbour_addrs(13, 4, &flags);
+        // A: pair A = 10. curr is bottom, same flags → 10+1 = 11.
+        // B: curr bottom → within-pair top = 12.
+        // C: currently returns None for bottom (conservative).
+        // D: currently returns pair A top (10).
+        assert_eq!(n, [Some(11), Some(12), None, Some(10)]);
+    }
+
+    #[test]
+    fn neighbour_addrs_left_edge_has_only_above() {
+        // PicW=4, row 1 col 0 → mb_addr 8 top. A/D should be None.
+        // B = bottom of pair above = addr 1. C = top of above-right
+        // pair (flag-dependent); uniform-frame, current top → C is
+        // bottom of above-right pair = addr 3.
+        let flags = vec![false; 16];
+        let n = mbaff_neighbour_addrs(8, 4, &flags);
+        assert_eq!(n, [None, Some(1), Some(3), None]);
     }
 }
