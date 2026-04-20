@@ -1144,7 +1144,8 @@ fn reconstruct_intra_nxn(
             || debug_mb == Some(mb_addr);
         if debug {
             eprintln!(
-                "RECON MB0 I_NxN: cbp_luma={:#x} qp_y={} mb_type_raw={} cbp={:#x} entropy={}",
+                "RECON MB{} I_NxN: cbp_luma={:#x} qp_y={} mb_type_raw={} cbp={:#x} entropy={}",
+                mb_addr,
                 cbp_luma,
                 qp_y,
                 mb.mb_type_raw,

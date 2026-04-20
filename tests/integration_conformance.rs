@@ -528,6 +528,18 @@ fn run_conformance_with_reference(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    // Optional: dump our concatenated decoded YUV frames for offline
+    // diff against the reference / ffmpeg output. Useful when chasing
+    // CABAC context or deblocking regressions.
+    if let Ok(path) = std::env::var("OXIDEAV_H264_DUMP_OURS_YUV") {
+        let mut buf = Vec::new();
+        for f in &ours_frames {
+            buf.extend_from_slice(f);
+        }
+        let _ = std::fs::write(&path, &buf);
+        eprintln!("[{name}] wrote ours yuv to {}", path);
+    }
+
     let mut matched = 0usize;
     let mut first_mismatch: Option<FrameDiff> = None;
     let mut dumped_mb = false;

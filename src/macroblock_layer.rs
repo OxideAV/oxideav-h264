@@ -1599,8 +1599,10 @@ fn cbf_cond_for(
                 // CrIntra16x16Ac cat 1/2/7/8/11/12: the neighbour's 4x4
                 // luma block is "available" only when the 8x8 CBP bit
                 // covering `luma4x4BlkIdxN` is set. If the CBP bit is
-                // clear, transBlockN is not available → condTermFlagN
-                // comes from `unavail_cbf(current_is_intra)`.
+                // clear, transBlockN is not available → per spec
+                // condTermFlagN = 0 ("mbAddrN available AND transBlockN
+                // not available AND mb_type != I_PCM"; I_PCM is
+                // filtered earlier in this match arm).
                 match block_type {
                     BlockType::Luma4x4
                     | BlockType::Luma16x16Ac
@@ -1619,6 +1621,20 @@ fn cbf_cond_for(
                             _ => info.coded_block_pattern_luma,
                         };
                         if ((cbp >> blk8) & 1) == 0 {
+                            // §9.3.3.1.1.9 spec-correct condTermFlagN
+                            // for "mbAddrN available AND transBlockN not
+                            // available AND mb_type != I_PCM" is 0.
+                            // Applying that here (trans_block_unavail_cbf())
+                            // improves foreman_p16x16 (first-diff MB#0 →
+                            // MB#8, max|Δ| 255 → 229) but breaks
+                            // CABA1_SVA_B — there's a compensating CABAC
+                            // state-engine divergence we haven't yet
+                            // pinned down. For now keep the conservative
+                            // `unavail_cbf(current_is_intra)` fallback.
+                            // TODO: investigate which other ctxIdxInc
+                            // path is wrong; swap this to
+                            // `trans_block_unavail_cbf()` once that's
+                            // fixed.
                             return unavail_cbf(current_is_intra, block_type);
                         }
                         // transform_size_8x8_flag gate: for ctxBlockCat ∈
@@ -4699,7 +4715,12 @@ mod tests {
     #[test]
     fn cbf_ctx_inc_both_coded() {
         // MB 5: A = MB 4, B = MB 1. Fill both with cbf_luma_4x4 = true
-        // across all blocks.
+        // across all blocks. (Note: the current implementation's
+        // §9.3.3.1.1.9 cbp-bit gate is bypassed via `unavail_cbf`
+        // returning 1 for intra when cbp bit = 0, which happens to
+        // produce condTermFlag = 1 here too — see the `#[ignore]`d
+        // regression tests at the bottom of this module for the
+        // spec-correct semantics and the known compensating-bug gap.)
         let mut grid = mk_cabac_grid();
         for addr in [4, 1] {
             let slot = &mut grid.mbs[addr as usize];
@@ -4755,6 +4776,62 @@ mod tests {
             &grid, 1, &curr, true, BlockType::Luma4x4, 0, false,
         );
         assert!(ca);
+    }
+
+    /// §9.3.3.1.1.9 cat=1/2 — when neighbour MB is available, NOT I_PCM,
+    /// and its cbp_luma bit for the 8x8 containing luma4x4BlkIdxN is 0,
+    /// transBlockN is "not available" and condTermFlagN = 0 regardless
+    /// of whether the current MB is intra.
+    ///
+    /// **Known gap**: the current decoder uses `unavail_cbf` here which
+    /// returns 1 for intra, not 0. Switching to the spec-correct
+    /// `trans_block_unavail_cbf` alone improves `foreman_p16x16` but
+    /// breaks `CABA1_SVA_B` — some OTHER §9.3.3.1.1.* path has a
+    /// compensating bug we haven't pinned down yet. This test is
+    /// `#[ignore]`d so it doesn't fail CI, but documents the spec rule.
+    #[test]
+    #[ignore = "known gap: compensating bug elsewhere prevents adoption of spec-correct condTerm=0"]
+    fn cbf_luma4x4_neighbour_cbp_bit_zero_should_yield_zero() {
+        let mut grid = mk_cabac_grid();
+        // MB 4 (left of MB 5): available, intra I_NxN, cbp_luma=0x3
+        // (8x8 #0 and #1 coded). Blk 13 is in 8x8 #3 (bit 3 = 0) so its
+        // transBlockN should be "not available" for cat 1/2.
+        let slot = &mut grid.mbs[4];
+        slot.available = true;
+        slot.is_intra = true;
+        slot.coded_block_pattern_luma = 0x3;
+        slot.cbf_luma_4x4[13] = true; // deliberately non-zero — irrelevant
+        let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
+        // Blk 8 of MB 5 at (0, 8) — left neighbour maps to MB 4 blk 13.
+        let (ca, _cb) = cabac_cbf_cond_terms(
+            &grid, 5, &curr, /*current_is_intra=*/ true,
+            BlockType::Luma4x4, 8, false,
+        );
+        // Per spec the condTerm should be 0. Current implementation
+        // returns true (1) via `unavail_cbf` because swapping to the
+        // spec-correct `trans_block_unavail_cbf()` triggers a state
+        // divergence elsewhere.
+        assert!(!ca, "spec §9.3.3.1.1.9 says condTermA = 0 when neighbour cbp bit is 0");
+    }
+
+    /// Same spec rule for cat=4 (ChromaAc): when neighbour
+    /// CodedBlockPatternChroma != 2, transBlockN is not available and
+    /// condTerm = 0 (not `unavail_cbf(intra)` = 1).
+    #[test]
+    #[ignore = "known gap: same compensating bug as cbf_luma4x4_neighbour_cbp_bit_zero_should_yield_zero"]
+    fn cbf_chroma_ac_neighbour_cbp_chroma_neq_2_should_yield_zero() {
+        let mut grid = mk_cabac_grid();
+        let slot = &mut grid.mbs[4];
+        slot.available = true;
+        slot.is_intra = true;
+        slot.coded_block_pattern_chroma = 1; // != 2 → transBlockN not available
+        slot.cbf_cb_ac[0] = true; // deliberately non-zero — irrelevant
+        let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
+        let (ca, _cb) = cabac_cbf_cond_terms(
+            &grid, 5, &curr, /*current_is_intra=*/ true,
+            BlockType::ChromaAc, 0, false,
+        );
+        assert!(!ca, "spec §9.3.3.1.1.9 cat=4 says condTermA = 0 when neighbour cbp_chroma != 2");
     }
 
     #[test]
