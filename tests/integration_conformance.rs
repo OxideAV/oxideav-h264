@@ -455,6 +455,46 @@ fn run_conformance(name: &str, path: &Path) -> Option<StreamReport> {
         }
     };
 
+    run_conformance_with_reference(name, path, &reference)
+}
+
+/// Same as `run_conformance` but takes a precomputed reference YUV
+/// (raw 4:2:0 planar) rather than shelling out to ffmpeg. Used by
+/// JVT-AI conformance vectors that ship their own reference output.
+fn run_conformance_with_ref_file(
+    name: &str,
+    bitstream: &Path,
+    ref_yuv: &Path,
+) -> Option<StreamReport> {
+    if !bitstream.exists() {
+        eprintln!("[{name}] skip: bitstream not found at {}", bitstream.display());
+        return None;
+    }
+    if !ref_yuv.exists() {
+        eprintln!("[{name}] skip: reference YUV not found at {}", ref_yuv.display());
+        return None;
+    }
+    eprintln!(
+        "[{name}] starting conformance check: {} (ref: {})",
+        bitstream.display(),
+        ref_yuv.display()
+    );
+    let reference = match std::fs::read(ref_yuv) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[{name}] skip: failed to read reference YUV: {e}");
+            return None;
+        }
+    };
+    run_conformance_with_reference(name, bitstream, &reference)
+}
+
+fn run_conformance_with_reference(
+    name: &str,
+    path: &Path,
+    reference: &[u8],
+) -> Option<StreamReport> {
+
     // Decode through us.
     let (w, h, ours_frames) = decoder_yuv(path);
     let our_plane_bytes = (w as usize) * (h as usize) * 3 / 2;
@@ -824,6 +864,32 @@ fn conformance_summary_all_streams() {
         );
     }
     eprintln!("===================================================================================================");
+}
+
+// ------------------------------ JVT conformance vectors ----------------
+
+/// JVT AVCv1 `AUD_MW_E` conformance vector (Mcubeworks, Baseline / CAVLC,
+/// QCIF 176x144, 100 frames of foreman, IDR-only, Access Unit Delimiters).
+/// Ships with a reference YUV in the zip under `AUD_MW_E_rec.qcif`.
+/// After extracting the zip to /tmp/aud_mw_e/ (or setting the env vars),
+/// this test compares our decode against the reference byte-by-byte.
+#[test]
+fn conformance_jvt_aud_mw_e() {
+    let bs = std::env::var("OXIDEAV_JVT_AUD_MW_E_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/aud_mw_e/AUD_MW_E.264"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_AUD_MW_E_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/aud_mw_e/AUD_MW_E_rec.qcif"));
+    let Some(report) = run_conformance_with_ref_file("jvt_AUD_MW_E", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+    assert_eq!(
+        report.ours_frames, report.ffmpeg_frames,
+        "frame-count mismatch: ours={} ref={}",
+        report.ours_frames, report.ffmpeg_frames
+    );
 }
 
 // ------------------------------ helpers tests --------------------------
