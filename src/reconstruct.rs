@@ -496,6 +496,280 @@ fn reconstruct_intra_16x16(
 // §8.3.1 / §8.3.2 — Intra_4x4 / Intra_8x8 luma
 // -------------------------------------------------------------------------
 
+/// §6.4.4 — "is this MB available for prediction?" for the §8.3.1.1 /
+/// §8.3.2.1 pred-mode derivation. Returns `false` when the neighbour
+/// lies outside the picture, when it hasn't been decoded yet (per the
+/// MbGrid `available` flag), or when `constrained_intra_pred_flag` is 1
+/// and the neighbour is inter-coded (§8.3.1.1 step 2 bullet 3/4).
+fn intra_neighbour_mb_info<'a>(
+    grid: &'a MbGrid,
+    mb_addr: Option<u32>,
+    constrained_intra_pred: bool,
+) -> Option<&'a MbInfo> {
+    let addr = mb_addr?;
+    let info = grid.get(addr)?;
+    if !info.available {
+        return None;
+    }
+    if constrained_intra_pred && !info.is_intra {
+        // §8.3.1.1 steps 2 bullets 3 & 4 / §8.3.2.1 step 2 bullets 3 & 4
+        // — an inter-coded neighbour is treated as unavailable for the
+        // purposes of the dcPredModePredictedFlag derivation.
+        return None;
+    }
+    Some(info)
+}
+
+/// §7.4.5 — does the parsed mb_type_raw field on an MbInfo correspond
+/// to an Intra_4x4 / I_NxN (with `transform_size_8x8_flag` == 0) or
+/// Intra_8x8 (with the flag set) macroblock? The grid only stores the
+/// raw mb_type value, the slice-type it was parsed under (I, P, SP, B)
+/// is not recorded — so we map the known I-slice I_NxN row (0) and the
+/// P-slice remap (5) and the B-slice remap (23) as I_NxN candidates.
+/// Any other `mb_type_raw` on an intra neighbour is either Intra_16x16
+/// or I_PCM and does NOT contribute its 4x4/8x8 pred modes.
+fn mb_is_intra_nxn(info: &MbInfo) -> bool {
+    info.is_intra
+        && !info.is_i_pcm
+        && matches!(info.mb_type_raw, 0 | 5 | 23)
+}
+
+/// §8.3.1.1 — is `info.mb_type_raw` an Intra_4x4 MB (i.e. I_NxN with
+/// `transform_size_8x8_flag` == 0)?
+fn mb_is_intra_4x4(info: &MbInfo) -> bool {
+    mb_is_intra_nxn(info) && !info.transform_size_8x8_flag
+}
+
+/// §8.3.2.1 — is `info.mb_type_raw` an Intra_8x8 MB (i.e. I_NxN with
+/// `transform_size_8x8_flag` == 1)?
+fn mb_is_intra_8x8(info: &MbInfo) -> bool {
+    mb_is_intra_nxn(info) && info.transform_size_8x8_flag
+}
+
+/// §6.4.11.4 / Table 6-3 / §6.4.13.1 — derive (neighbour MB address,
+/// neighbour 4x4 block index) for direction `N ∈ {A, B}` of the 4x4
+/// block at position `(x, y)` inside the current MB.
+///
+/// For non-MBAFF frame pictures only (the scope of this module).
+/// Returns `None` when the neighbour lies outside the picture.
+fn neighbour_4x4_addr(
+    grid: &MbGrid,
+    mb_addr: u32,
+    bx: i32,
+    by: i32,
+    xd: i32,
+    yd: i32,
+) -> Option<(u32, usize)> {
+    // Eq. 6-25 / 6-26.
+    let xn = bx + xd;
+    let yn = by + yd;
+    // Table 6-3 (non-MBAFF frame path).
+    let [mb_a, mb_b, _mb_c, mb_d] = grid.neighbour_mb_addrs(mb_addr);
+    let mb_n = if xn < 0 && yn < 0 {
+        mb_d
+    } else if xn < 0 && (0..16).contains(&yn) {
+        mb_a
+    } else if (0..16).contains(&xn) && yn < 0 {
+        mb_b
+    } else if (0..16).contains(&xn) && (0..16).contains(&yn) {
+        Some(mb_addr)
+    } else {
+        // Other Table 6-3 cases yield mbAddrC or "not available"; for a
+        // 4x4 block of a 16x16 MB with (xD, yD) in {(-1, 0), (0, -1)},
+        // those branches are unreachable.
+        None
+    };
+    let addr = mb_n?;
+    // Eq. 6-34 / 6-35: (xW, yW) relative to the neighbour MB.
+    let xw = (xn + 16) % 16;
+    let yw = (yn + 16) % 16;
+    // Eq. 6-38.
+    let blk = (8 * (yw / 8) + 4 * (xw / 8) + 2 * ((yw % 8) / 4) + ((xw % 8) / 4)) as usize;
+    Some((addr, blk))
+}
+
+/// §6.4.11.2 / Table 6-3 / §6.4.13.3 — derive (neighbour MB address,
+/// neighbour 8x8 block index) for direction `N ∈ {A, B}` of the 8x8
+/// block with index `blk8` (raster 0..=3) in the current MB.
+fn neighbour_8x8_addr(
+    grid: &MbGrid,
+    mb_addr: u32,
+    blk8: usize,
+    xd: i32,
+    yd: i32,
+) -> Option<(u32, usize)> {
+    // Eq. 6-23 / 6-24.
+    let xn = ((blk8 as i32) % 2) * 8 + xd;
+    let yn = ((blk8 as i32) / 2) * 8 + yd;
+    let [mb_a, mb_b, _mb_c, mb_d] = grid.neighbour_mb_addrs(mb_addr);
+    let mb_n = if xn < 0 && yn < 0 {
+        mb_d
+    } else if xn < 0 && (0..16).contains(&yn) {
+        mb_a
+    } else if (0..16).contains(&xn) && yn < 0 {
+        mb_b
+    } else if (0..16).contains(&xn) && (0..16).contains(&yn) {
+        Some(mb_addr)
+    } else {
+        None
+    };
+    let addr = mb_n?;
+    let xw = (xn + 16) % 16;
+    let yw = (yn + 16) % 16;
+    // Eq. 6-40.
+    let blk = (2 * (yw / 8) + (xw / 8)) as usize;
+    Some((addr, blk))
+}
+
+/// §8.3.1.1 — for neighbour direction N (A or B), return
+/// `intraMxMPredModeN` as specified in step 3 of the derivation.
+///
+/// `dc_pred_flag` is the step-2 `dcPredModePredictedFlag`.
+fn intra_mxm_pred_mode_for_neighbour_4x4(
+    grid: &MbGrid,
+    dc_pred_flag: bool,
+    neighbour: Option<(u32, usize)>,
+    constrained_intra_pred: bool,
+) -> u8 {
+    if dc_pred_flag {
+        // §8.3.1.1 step 3 bullet 1 — DC fallback.
+        return 2;
+    }
+    let Some((addr, blk)) = neighbour else {
+        return 2;
+    };
+    let Some(info) = intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred) else {
+        return 2;
+    };
+    if mb_is_intra_4x4(info) {
+        // §8.3.1.1 step 3 bullet 2 sub-bullet 1.
+        info.intra_4x4_pred_modes[blk]
+    } else if mb_is_intra_8x8(info) {
+        // §8.3.1.1 step 3 bullet 2 sub-bullet 2 — neighbour is
+        // Intra_8x8: intraMxMPredModeN = Intra8x8PredMode[ blk >> 2 ].
+        info.intra_8x8_pred_modes[blk >> 2]
+    } else {
+        // Neighbour is Intra_16x16 / I_PCM / Inter → DC per §8.3.1.1
+        // step 3 bullet 1 ("not coded in Intra_4x4 or Intra_8x8").
+        2
+    }
+}
+
+/// §8.3.2.1 — same as [`intra_mxm_pred_mode_for_neighbour_4x4`] but
+/// for the Intra_8x8 derivation. When the neighbour MB is coded in
+/// Intra_4x4, the spec specifies a per-direction sub-index `n`
+/// (§8.3.2.1 eq. 8-72): N == A ⇒ n = 1 (in the frame / non-MBAFF case);
+/// N == B ⇒ n = 2. We expose `n_for_4x4` so the caller supplies the
+/// right value.
+fn intra_mxm_pred_mode_for_neighbour_8x8(
+    grid: &MbGrid,
+    dc_pred_flag: bool,
+    neighbour: Option<(u32, usize)>,
+    constrained_intra_pred: bool,
+    n_for_4x4: usize,
+) -> u8 {
+    if dc_pred_flag {
+        return 2;
+    }
+    let Some((addr, blk)) = neighbour else {
+        return 2;
+    };
+    let Some(info) = intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred) else {
+        return 2;
+    };
+    if mb_is_intra_8x8(info) {
+        info.intra_8x8_pred_modes[blk]
+    } else if mb_is_intra_4x4(info) {
+        // §8.3.2.1 eq. 8-72: intraMxMPredModeN =
+        // Intra4x4PredMode[ luma8x8BlkIdxN * 4 + n ]. Non-MBAFF frame:
+        // n = 1 for A, 2 for B.
+        let sub_idx = blk * 4 + n_for_4x4;
+        info.intra_4x4_pred_modes[sub_idx]
+    } else {
+        2
+    }
+}
+
+/// §8.3.1.1 — compute `Intra4x4PredMode[luma4x4BlkIdx]` for block
+/// `block_idx` of the current MB using the parsed
+/// `prev_intra4x4_pred_mode_flag` / `rem_intra4x4_pred_mode` plus the
+/// neighbour 4x4 / 8x8 pred modes already recorded in the grid.
+fn derive_intra_4x4_pred_mode(
+    grid: &MbGrid,
+    mb_addr: u32,
+    block_idx: usize,
+    pred: &crate::macroblock_layer::MbPred,
+    constrained_intra_pred: bool,
+) -> u8 {
+    let (bx, by) = LUMA_4X4_XY[block_idx];
+    // §6.4.11.4 step 1 / Table 6-2: A → (xD, yD) = (-1, 0); B → (0, -1).
+    let na = neighbour_4x4_addr(grid, mb_addr, bx, by, -1, 0);
+    let nb = neighbour_4x4_addr(grid, mb_addr, bx, by, 0, -1);
+
+    // §8.3.1.1 step 2.
+    let mb_a = intra_neighbour_mb_info(grid, na.map(|(a, _)| a), constrained_intra_pred);
+    let mb_b = intra_neighbour_mb_info(grid, nb.map(|(a, _)| a), constrained_intra_pred);
+    let dc_pred_flag = mb_a.is_none() || mb_b.is_none();
+
+    // §8.3.1.1 step 3.
+    let mode_a =
+        intra_mxm_pred_mode_for_neighbour_4x4(grid, dc_pred_flag, na, constrained_intra_pred);
+    let mode_b =
+        intra_mxm_pred_mode_for_neighbour_4x4(grid, dc_pred_flag, nb, constrained_intra_pred);
+
+    // §8.3.1.1 step 4, eq. 8-41.
+    let predicted = mode_a.min(mode_b);
+    if pred.prev_intra4x4_pred_mode_flag[block_idx] {
+        predicted
+    } else {
+        let rem = pred.rem_intra4x4_pred_mode[block_idx];
+        if rem < predicted {
+            rem
+        } else {
+            rem + 1
+        }
+    }
+}
+
+/// §8.3.2.1 — compute `Intra8x8PredMode[luma8x8BlkIdx]` for 8x8 block
+/// `blk8` of the current MB. Mirror of
+/// [`derive_intra_4x4_pred_mode`] but with the 8x8-specific neighbour
+/// table and the `n` sub-index of eq. 8-72.
+fn derive_intra_8x8_pred_mode(
+    grid: &MbGrid,
+    mb_addr: u32,
+    blk8: usize,
+    pred: &crate::macroblock_layer::MbPred,
+    constrained_intra_pred: bool,
+) -> u8 {
+    // §6.4.11.2 step 1 / Table 6-2: A → (xD, yD) = (-1, 0); B → (0, -1).
+    let na = neighbour_8x8_addr(grid, mb_addr, blk8, -1, 0);
+    let nb = neighbour_8x8_addr(grid, mb_addr, blk8, 0, -1);
+
+    let mb_a = intra_neighbour_mb_info(grid, na.map(|(a, _)| a), constrained_intra_pred);
+    let mb_b = intra_neighbour_mb_info(grid, nb.map(|(a, _)| a), constrained_intra_pred);
+    let dc_pred_flag = mb_a.is_none() || mb_b.is_none();
+
+    // Non-MBAFF frame path of §8.3.2.1 eq. 8-72: n = 1 for A, n = 2 for B.
+    let mode_a =
+        intra_mxm_pred_mode_for_neighbour_8x8(grid, dc_pred_flag, na, constrained_intra_pred, 1);
+    let mode_b =
+        intra_mxm_pred_mode_for_neighbour_8x8(grid, dc_pred_flag, nb, constrained_intra_pred, 2);
+
+    // §8.3.2.1 step 4, eq. 8-73.
+    let predicted = mode_a.min(mode_b);
+    if pred.prev_intra8x8_pred_mode_flag[blk8] {
+        predicted
+    } else {
+        let rem = pred.rem_intra8x8_pred_mode[blk8];
+        if rem < predicted {
+            rem
+        } else {
+            rem + 1
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_intra_nxn(
     mb: &Macroblock,
@@ -503,7 +777,7 @@ fn reconstruct_intra_nxn(
     bit_depth_y: u32,
     mb_px: i32,
     mb_py: i32,
-    _mb_addr: u32,
+    mb_addr: u32,
     sps: &Sps,
     pps: &Pps,
     pic: &mut Picture,
@@ -517,19 +791,34 @@ fn reconstruct_intra_nxn(
     let sl4 = select_scaling_list_4x4(0, sps, pps);
     let sl8 = select_scaling_list_8x8(0, sps, pps);
     let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
+    let cip = pps.constrained_intra_pred_flag;
+
+    // The Intra_4x4/Intra_8x8 pred-mode derivation consults the
+    // already-set `intra_4x4_pred_modes` / `intra_8x8_pred_modes` of
+    // the current MB for neighbours falling inside it. Ensure the
+    // current MB's grid entry is marked available + intra + with the
+    // correct `mb_type_raw` and `transform_size_8x8_flag` BEFORE we
+    // start per-block derivation, so a later-block's A / B lookup
+    // into this same MB succeeds. (reconstruct_slice sets these again
+    // at the end of the per-MB loop — doing it here is idempotent.)
+    if let Some(info) = grid.get_mut(mb_addr) {
+        info.available = true;
+        info.is_intra = true;
+        info.is_i_pcm = false;
+        info.mb_type_raw = mb.mb_type_raw;
+        info.transform_size_8x8_flag = mb.transform_size_8x8_flag;
+        // Reset the per-block pred-mode arrays so stale entries from
+        // a previously-reconstructed picture can't bleed through.
+        info.intra_4x4_pred_modes = [0; 16];
+        info.intra_8x8_pred_modes = [0; 4];
+    }
 
     if mb.transform_size_8x8_flag {
         // §8.3.2 — Intra_8x8 path.
         for blk8 in 0..4usize {
             let (bx, by) = LUMA_8X8_XY[blk8];
-            // §8.3.2.1 — derive Intra_8x8 prediction mode.
-            // For simplicity this implementation uses the raw array
-            // filled by the parser. A fully-spec pass would compute
-            // the predicted mode and combine with
-            // prev_intra8x8_pred_mode_flag / rem_intra8x8_pred_mode.
-            let mode_idx = pred.prev_intra8x8_pred_mode_flag[blk8]
-                .then_some(2u8) // predicted-mode fallback: DC (§8.3.2.1 default)
-                .unwrap_or(pred.rem_intra8x8_pred_mode[blk8]);
+            // §8.3.2.1 — derive Intra_8x8 prediction mode per eq. 8-73.
+            let mode_idx = derive_intra_8x8_pred_mode(grid, mb_addr, blk8, pred, cip);
             let mode = Intra8x8Mode::from_index(mode_idx).unwrap_or(Intra8x8Mode::Dc);
 
             // Gather neighbour samples for this 8x8 block.
@@ -589,8 +878,9 @@ fn reconstruct_intra_nxn(
                 }
             }
 
-            // Track intra_8x8_pred_modes in the grid.
-            if let Some(info) = grid.get_mut(_mb_addr) {
+            // Track intra_8x8_pred_modes in the grid BEFORE the next
+            // 8x8 block is derived — its neighbour lookup reads this.
+            if let Some(info) = grid.get_mut(mb_addr) {
                 info.intra_8x8_pred_modes[blk8] = mode.as_index();
             }
         }
@@ -598,16 +888,8 @@ fn reconstruct_intra_nxn(
         // §8.3.1 — Intra_4x4 path.
         for block_idx in 0..16usize {
             let (bx, by) = LUMA_4X4_XY[block_idx];
-            // §8.3.1.1 — derive Intra_4x4 prediction mode.
-            let mode_idx = if pred.prev_intra4x4_pred_mode_flag[block_idx] {
-                // Predicted-mode fallback: DC. Full derivation (§8.3.1.1
-                // eq. 8-29 / 8-30) requires the neighbour 4x4 block
-                // modes; we approximate with DC which is the default
-                // assignment for both-unavailable neighbours.
-                2u8
-            } else {
-                pred.rem_intra4x4_pred_mode[block_idx]
-            };
+            // §8.3.1.1 — derive Intra_4x4 prediction mode per eq. 8-41.
+            let mode_idx = derive_intra_4x4_pred_mode(grid, mb_addr, block_idx, pred, cip);
             let mode = Intra4x4Mode::from_index(mode_idx).unwrap_or(Intra4x4Mode::Dc);
 
             // Gather neighbour samples for this 4x4 block.
@@ -639,8 +921,9 @@ fn reconstruct_intra_nxn(
                 bit_depth_y,
             );
 
-            // Track intra_4x4_pred_modes in the grid.
-            if let Some(info) = grid.get_mut(_mb_addr) {
+            // Track intra_4x4_pred_modes in the grid BEFORE the next
+            // 4x4 block is derived — its neighbour lookup reads this.
+            if let Some(info) = grid.get_mut(mb_addr) {
                 info.intra_4x4_pred_modes[block_idx] = mode.as_index();
             }
         }
@@ -3552,6 +3835,7 @@ mod tests {
         let mb = make_empty_ipcm_mb();
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -3590,6 +3874,7 @@ mod tests {
         let mb = make_intra16x16_dc_mb(2); // pred_mode 2 = DC
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -3651,12 +3936,30 @@ mod tests {
 
         // Second MB: I_NxN (Intra_4x4), 16 blocks, all Vertical (mode 0),
         // zero residual. cbp_luma == 0 so residual_luma is empty.
+        //
+        // §8.3.1.1 derivation (eq. 8-41) for every 4x4 block:
+        //   * Left-column blocks {0, 2, 8, 10}: neighbour A lies in the
+        //     MB to the left which doesn't exist (1-wide picture) →
+        //     dcPredModePredictedFlag = 1 → predIntra4x4PredMode = 2
+        //     (DC). Choose prev_flag = false, rem = 0: 0 < 2 →
+        //     Intra4x4PredMode = 0 (Vertical). ✓
+        //   * All other blocks: predIntra4x4PredMode = 0 because either
+        //     B is the top I_PCM MB (contributes 2 via the
+        //     "not Intra_4x4/8x8" rule) and A is an already-Vertical
+        //     4x4 block inside this MB (contributes 0), or both A and B
+        //     lie inside this MB and both previously decoded as
+        //     Vertical. Choose prev_flag = true → Intra4x4PredMode = 0
+        //     (Vertical). ✓
         let mut pred = MbPred::default();
-        // All flags: prev_intra4x4_pred_mode_flag = false,
-        // rem_intra4x4_pred_mode = 0 (Vertical).
         for i in 0..16 {
-            pred.prev_intra4x4_pred_mode_flag[i] = false;
-            pred.rem_intra4x4_pred_mode[i] = 0;
+            let left_col = matches!(i, 0 | 2 | 8 | 10);
+            if left_col {
+                pred.prev_intra4x4_pred_mode_flag[i] = false;
+                pred.rem_intra4x4_pred_mode[i] = 0;
+            } else {
+                pred.prev_intra4x4_pred_mode_flag[i] = true;
+                pred.rem_intra4x4_pred_mode[i] = 0;
+            }
         }
         pred.intra_chroma_pred_mode = 0; // DC
         let mb_bot = Macroblock {
@@ -3679,6 +3982,7 @@ mod tests {
 
         let slice_data = SliceData {
             macroblocks: vec![mb_top, mb_bot],
+            mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
@@ -3709,10 +4013,14 @@ mod tests {
     fn intra_8x8_zero_residual_dc_fallback_produces_dc_prediction() {
         // §8.3.2 / §8.5.13 — an Intra_8x8 macroblock with
         // `transform_size_8x8_flag = 1`, `cbp_luma = 0` (no residual),
-        // and all four 8x8 blocks using DC prediction with no
-        // neighbours should reconstruct to DC = 1 << (BitDepth-1) = 128
-        // for 8-bit per §8.3.2.2.4 (Intra_8x8_DC, both neighbours
-        // unavailable).
+        // at the top-left of a single-MB picture. With no neighbours
+        // (blk8=0) the §8.3.2.1 derivation sets dcPredModePredictedFlag
+        // = 1 and hence predIntra8x8PredMode = 2 (DC). For blocks 1, 2,
+        // and 3 the earlier blocks are already DC, so the derivation
+        // again yields 2. With prev_intra8x8_pred_mode_flag = 1 for all
+        // four blocks, Intra8x8PredMode[i] = predIntra8x8PredMode = 2,
+        // and the §8.3.2.2.4 "neighbours unavailable" branch gives the
+        // DC value 1 << (BitDepth-1) = 128 for 8-bit.
         //
         // This exercises the 8x8 residual assembly path (Option B:
         // inverse 8x8 zig-zag scan via ZIGZAG_8X8 / Table 8-14) with
@@ -3724,8 +4032,10 @@ mod tests {
 
         let mut pred = MbPred::default();
         for i in 0..4 {
-            // prev_intra8x8_pred_mode_flag = true → use the predicted-
-            // mode fallback (DC per the reconstruct path's stub).
+            // §8.3.2.1 eq. 8-73: prev_intra8x8_pred_mode_flag = 1 selects
+            // Intra8x8PredMode = predIntra8x8PredMode. For the top-left
+            // MB with no available A/B neighbours the derivation yields
+            // DC = 2 for every block.
             pred.prev_intra8x8_pred_mode_flag[i] = true;
             pred.rem_intra8x8_pred_mode[i] = 0;
         }
@@ -3749,6 +4059,7 @@ mod tests {
         };
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -3767,6 +4078,328 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // §8.3.1.1 / §8.3.2.1 — intra pred-mode derivation unit tests.
+    //
+    // Each test builds a minimal MbGrid + MbPred and exercises
+    // [`derive_intra_4x4_pred_mode`] / [`derive_intra_8x8_pred_mode`]
+    // directly so we can pin down the `predIntra4x4PredMode` / eq. 8-41
+    // branches independently of the full reconstruction pipeline.
+    // ---------------------------------------------------------------------
+
+    /// Build an MbInfo flagged as an already-reconstructed Intra_4x4 MB
+    /// with all 16 4x4 pred modes set to `mode`.
+    fn mk_intra4x4_info(mode: u8) -> MbInfo {
+        MbInfo {
+            available: true,
+            is_intra: true,
+            is_i_pcm: false,
+            mb_type_raw: 0,
+            transform_size_8x8_flag: false,
+            intra_4x4_pred_modes: [mode; 16],
+            ..MbInfo::default()
+        }
+    }
+
+    /// Build an MbInfo flagged as an already-reconstructed Intra_8x8 MB.
+    fn mk_intra8x8_info(mode: u8) -> MbInfo {
+        MbInfo {
+            available: true,
+            is_intra: true,
+            is_i_pcm: false,
+            mb_type_raw: 0,
+            transform_size_8x8_flag: true,
+            intra_8x8_pred_modes: [mode; 4],
+            ..MbInfo::default()
+        }
+    }
+
+    #[test]
+    fn intra_4x4_derivation_top_left_block0_with_no_neighbours_predicts_dc() {
+        // Isolated 1x1 picture, block 0 of the sole MB. Both mbAddrA and
+        // mbAddrB are "not available" → dcPredModePredictedFlag = 1 →
+        // predIntra4x4PredMode = 2 (DC). With prev_flag = 1,
+        // Intra4x4PredMode[0] = predIntra4x4PredMode = 2. The old
+        // hard-coded "DC fallback on prev_flag=1" path happens to agree
+        // for this corner case — confirming the new derivation does
+        // not regress it.
+        let grid = MbGrid::new(1, 1);
+        let mut pred = MbPred::default();
+        pred.prev_intra4x4_pred_mode_flag[0] = true;
+        let mode = derive_intra_4x4_pred_mode(&grid, 0, 0, &pred, false);
+        assert_eq!(mode, 2, "expected DC when both A and B are unavailable");
+    }
+
+    #[test]
+    fn intra_4x4_derivation_within_mb_uses_a_block_pred_mode() {
+        // Single MB; block 0 has already been assigned Vertical (0) in
+        // the grid. Block 1 lies immediately to its right:
+        //   * A neighbour: current MB, block 0 → Intra4x4PredMode = 0.
+        //   * B neighbour: mbAddrB not available → intraMxMPredModeB = 2
+        //     via step 2's dcPredModePredictedFlag route (A available
+        //     but B not → dcPredFlag = 1, forcing both sides to 2).
+        //
+        // Wait — A is current-MB-self, which is always "available" in
+        // the §6.4.11 sense because §6.4.4 marks it available before the
+        // block-level derivation runs. But the test picture is 1x1 at
+        // the TOP of the picture, so mbAddrB really is unavailable →
+        // dcPredFlag = 1 → predicted = 2 → rem_intra4x4_pred_mode[1]
+        // dominates. With rem = 3 and pred = 2, actual = rem+1 = 4.
+        let mut grid = MbGrid::new(1, 1);
+        if let Some(info) = grid.get_mut(0) {
+            *info = mk_intra4x4_info(0);
+        }
+        let mut pred = MbPred::default();
+        pred.prev_intra4x4_pred_mode_flag[1] = false;
+        pred.rem_intra4x4_pred_mode[1] = 3;
+        // predicted = 2 (DC), rem = 3, 3 < 2 is false → actual = 3 + 1 = 4.
+        let mode = derive_intra_4x4_pred_mode(&grid, 0, 1, &pred, false);
+        assert_eq!(mode, 4);
+    }
+
+    #[test]
+    fn intra_4x4_derivation_rem_less_than_predicted_yields_rem() {
+        // 2-wide grid, current MB at addr 1. Left neighbour (addr 0) is
+        // an already-set Intra_4x4 MB with every 4x4 pred mode = 5
+        // (Vertical_Right). For block 0 of the current MB:
+        //   * A: left MB, 4x4 block at (xW=15, yW=0) → eq. 6-38 ⇒
+        //     blk = 8*0 + 4*1 + 2*0 + (7/4 = 1) = 5. Mode of that block
+        //     = 5.
+        //   * B: mbAddrB is not available (top row) → dcPredFlag = 1 →
+        //     forces both to DC = 2.
+        //
+        // Since B is unavailable, dcPredFlag = 1 and predicted = 2. With
+        // prev_flag = false and rem = 0, 0 < 2 → actual = 0 (Vertical).
+        let mut grid = MbGrid::new(2, 1);
+        if let Some(info) = grid.get_mut(0) {
+            *info = mk_intra4x4_info(5);
+        }
+        let mut pred = MbPred::default();
+        pred.prev_intra4x4_pred_mode_flag[0] = false;
+        pred.rem_intra4x4_pred_mode[0] = 0;
+        let mode = derive_intra_4x4_pred_mode(&grid, 1, 0, &pred, false);
+        assert_eq!(mode, 0);
+    }
+
+    #[test]
+    fn intra_4x4_derivation_both_neighbours_intra_4x4_uses_min_of_modes() {
+        // 3x3 grid, current MB at centre (addr 4). Left MB (addr 3) has
+        // all 4x4 modes = 7, top MB (addr 1) has all 4x4 modes = 3.
+        // Block 0 of current MB:
+        //   * A: mbAddrA = addr 3, luma4x4BlkIdxA from (15, 0): blk =
+        //     8*(0/8)+4*(15/8)+2*((0%8)/4)+((15%8)/4) = 0+4+0+1 = 5. Mode
+        //     = 7.
+        //   * B: mbAddrB = addr 1, luma4x4BlkIdxB from (0, 15): blk =
+        //     8*(15/8)+4*(0/8)+2*((15%8)/4)+((0%8)/4) = 8+0+2+0 = 10.
+        //     Mode = 3.
+        //   * predIntra4x4PredMode = min(7, 3) = 3.
+        // prev_flag = false, rem = 1 → 1 < 3 → actual = 1 (Horizontal).
+        let mut grid = MbGrid::new(3, 3);
+        if let Some(info) = grid.get_mut(3) {
+            *info = mk_intra4x4_info(7);
+        }
+        if let Some(info) = grid.get_mut(1) {
+            *info = mk_intra4x4_info(3);
+        }
+        let mut pred = MbPred::default();
+        pred.prev_intra4x4_pred_mode_flag[0] = false;
+        pred.rem_intra4x4_pred_mode[0] = 1;
+        let mode = derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false);
+        assert_eq!(mode, 1);
+    }
+
+    #[test]
+    fn intra_4x4_derivation_rem_equal_or_greater_than_predicted_adds_one() {
+        // Same 3x3 geometry, predicted = 3. With rem = 3:
+        //   3 < 3 is false → actual = rem + 1 = 4.
+        // With rem = 5: 5 < 3 is false → actual = 6.
+        let mut grid = MbGrid::new(3, 3);
+        if let Some(info) = grid.get_mut(3) {
+            *info = mk_intra4x4_info(7);
+        }
+        if let Some(info) = grid.get_mut(1) {
+            *info = mk_intra4x4_info(3);
+        }
+        let mut pred = MbPred::default();
+        pred.prev_intra4x4_pred_mode_flag[0] = false;
+        pred.rem_intra4x4_pred_mode[0] = 3;
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 4);
+        pred.rem_intra4x4_pred_mode[0] = 5;
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 6);
+    }
+
+    #[test]
+    fn intra_4x4_derivation_constrained_intra_pred_treats_inter_as_unavailable() {
+        // Current MB at addr 1. Left MB is AVAILABLE but INTER-coded.
+        // With constrained_intra_pred_flag = 0 (off) the inter neighbour
+        // is consulted by the availability check → dcPredFlag depends
+        // on whether mbAddrA is "available", which it is for picture
+        // geometry. §8.3.1.1 step 3 then sets intraMxMPredModeA = 2
+        // (inter → "not coded in Intra_4x4 or Intra_8x8"). And mbAddrB
+        // is out of picture → dcPredFlag = 1 anyway.
+        //
+        // To observe the flag's effect we instead place the current MB
+        // at (x=1, y=1) of a 3x3 grid with an inter-coded left neighbour
+        // AND an intra top neighbour. Without CIPred: both A and B
+        // available, A=inter → mode=2 via step 3, B=intra_4x4 → its
+        // recorded mode. With CIPred=1: A is treated as unavailable →
+        // dcPredFlag = 1 → both A and B forced to 2.
+        let mut grid = MbGrid::new(3, 3);
+        // Left neighbour (addr 3): inter (is_intra = false).
+        if let Some(info) = grid.get_mut(3) {
+            info.available = true;
+            info.is_intra = false;
+        }
+        // Top neighbour (addr 1): intra 4x4, all modes = 6.
+        if let Some(info) = grid.get_mut(1) {
+            *info = mk_intra4x4_info(6);
+        }
+        let mut pred = MbPred::default();
+        pred.prev_intra4x4_pred_mode_flag[0] = true; // use predicted mode
+        // Without constrained_intra_pred_flag: A=inter contributes 2
+        // (step 3 bullet 1 via "not Intra_4x4 or Intra_8x8"), B=6.
+        // predicted = min(2, 6) = 2. With prev_flag=true → 2.
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 2);
+        // With constrained_intra_pred_flag = 1: A treated as
+        // unavailable → dcPredFlag = 1 → both sides 2 → predicted = 2.
+        // Same output 2 here. Swap in an intra left neighbour with
+        // mode 0 and re-run to confirm CIPred really changes the
+        // predicted mode when it matters.
+        if let Some(info) = grid.get_mut(3) {
+            // Now left is intra, all modes 0 → predicted = min(0, 6) = 0.
+            *info = mk_intra4x4_info(0);
+        }
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 0);
+        // Even with CIPred=1, because the neighbour IS intra it remains
+        // available for intra prediction → same result 0.
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, true), 0);
+        // Switch left back to inter; with CIPred=1 it becomes
+        // unavailable → dcPredFlag = 1 → predicted = 2.
+        if let Some(info) = grid.get_mut(3) {
+            info.available = true;
+            info.is_intra = false;
+        }
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, true), 2);
+    }
+
+    #[test]
+    fn intra_4x4_derivation_intra_16x16_neighbour_contributes_dc() {
+        // §8.3.1.1 step 3 bullet 1: an Intra_16x16 neighbour is "not
+        // coded in Intra_4x4 or Intra_8x8" → intraMxMPredModeN = 2.
+        let mut grid = MbGrid::new(3, 3);
+        // Left = Intra_16x16 MB (I slice row 1 → mb_type_raw = 1..=24).
+        if let Some(info) = grid.get_mut(3) {
+            info.available = true;
+            info.is_intra = true;
+            info.is_i_pcm = false;
+            info.mb_type_raw = 4; // Intra_16x16 variant.
+            info.intra_4x4_pred_modes = [5; 16]; // ignored by derivation.
+        }
+        // Top = Intra_4x4 with modes = 7.
+        if let Some(info) = grid.get_mut(1) {
+            *info = mk_intra4x4_info(7);
+        }
+        let mut pred = MbPred::default();
+        pred.prev_intra4x4_pred_mode_flag[0] = true;
+        // A = Intra_16x16 → 2, B = Intra_4x4[10] = 7. predicted = min(2, 7) = 2.
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 2);
+    }
+
+    #[test]
+    fn intra_4x4_derivation_intra_8x8_neighbour_uses_blk_shr_2() {
+        // §8.3.1.1 step 3 sub-bullet 2: when a neighbour MB is coded in
+        // Intra_8x8, intraMxMPredModeN = Intra8x8PredMode[ blk >> 2 ].
+        let mut grid = MbGrid::new(3, 3);
+        // Left = Intra_8x8 with blk-8x8 modes [1, 2, 3, 4].
+        if let Some(info) = grid.get_mut(3) {
+            info.available = true;
+            info.is_intra = true;
+            info.is_i_pcm = false;
+            info.mb_type_raw = 0;
+            info.transform_size_8x8_flag = true;
+            info.intra_8x8_pred_modes = [1, 2, 3, 4];
+        }
+        // Top = Intra_4x4 with modes = 6.
+        if let Some(info) = grid.get_mut(1) {
+            *info = mk_intra4x4_info(6);
+        }
+        // Current MB at addr 4, block 0 at (0, 0).
+        // A neighbour: left MB, (xW=15, yW=0), luma4x4BlkIdxN via
+        // eq. 6-38 = 8*0 + 4*1 + 2*0 + 1 = 5. 5 >> 2 = 1 →
+        // intra_8x8_pred_modes[1] = 2.
+        // B: top MB, (xW=0, yW=15), luma4x4BlkIdxN = 10. Top MB is
+        // Intra_4x4 → intra_4x4_pred_modes[10] = 6.
+        // predicted = min(2, 6) = 2.
+        let mut pred = MbPred::default();
+        pred.prev_intra4x4_pred_mode_flag[0] = true;
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 2);
+    }
+
+    #[test]
+    fn intra_8x8_derivation_top_left_blk_0_with_no_neighbours_predicts_dc() {
+        // Single-MB picture, blk 0, no A/B neighbours → predicted = 2.
+        let grid = MbGrid::new(1, 1);
+        let mut pred = MbPred::default();
+        pred.prev_intra8x8_pred_mode_flag[0] = true;
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 0, 0, &pred, false), 2);
+    }
+
+    #[test]
+    fn intra_8x8_derivation_both_neighbours_intra_8x8_uses_min_of_modes() {
+        // 3x3 grid, current at addr 4.
+        // Left (addr 3) Intra_8x8 with modes [3, 3, 3, 3].
+        // Top (addr 1) Intra_8x8 with modes [7, 7, 7, 7].
+        // blk8=0 of current: A=(xW=15, yW=0) → blk = 2*0 + 15/8 = 1.
+        // Mode of left blk 1 = 3.
+        // B=(xW=0, yW=15) → blk = 2*(15/8) + 0 = 2. Mode = 7.
+        // predicted = min(3, 7) = 3.
+        let mut grid = MbGrid::new(3, 3);
+        if let Some(info) = grid.get_mut(3) {
+            *info = mk_intra8x8_info(3);
+        }
+        if let Some(info) = grid.get_mut(1) {
+            *info = mk_intra8x8_info(7);
+        }
+        let mut pred = MbPred::default();
+        pred.prev_intra8x8_pred_mode_flag[0] = true;
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false), 3);
+        // rem = 2 (< 3) with prev_flag=false → actual = 2.
+        pred.prev_intra8x8_pred_mode_flag[0] = false;
+        pred.rem_intra8x8_pred_mode[0] = 2;
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false), 2);
+        // rem = 4 (>= 3) → actual = 5.
+        pred.rem_intra8x8_pred_mode[0] = 4;
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false), 5);
+    }
+
+    #[test]
+    fn intra_8x8_derivation_intra_4x4_neighbour_uses_eq_8_72_sub_indices() {
+        // §8.3.2.1 eq. 8-72: when the neighbour MB is Intra_4x4,
+        // intraMxMPredModeN = Intra4x4PredMode[ luma8x8BlkIdxN * 4 + n ]
+        // with n = 1 for A and n = 2 for B (non-MBAFF frame path).
+        // Current MB at addr 4 of a 3x3 grid, blk8 = 0.
+        // A = left MB, luma8x8BlkIdxA computed:
+        //   xN=-1, yN=0 → (xW=15, yW=0) → eq. 6-40 → 2*0 + 15/8 = 1.
+        // So A uses intra_4x4_pred_modes[1 * 4 + 1] = intra_4x4_pred_modes[5].
+        let mut grid = MbGrid::new(3, 3);
+        if let Some(info) = grid.get_mut(3) {
+            *info = mk_intra4x4_info(0);
+            // Seed a distinctive value at block 5 of the left MB.
+            info.intra_4x4_pred_modes[5] = 4;
+        }
+        // Top MB = Intra_4x4. luma8x8BlkIdxB: xN=0, yN=-1 → (xW=0, yW=15)
+        // → 2*(15/8) + 0 = 2. n=2 for B → intra_4x4_pred_modes[2*4 + 2]
+        // = intra_4x4_pred_modes[10].
+        if let Some(info) = grid.get_mut(1) {
+            *info = mk_intra4x4_info(0);
+            info.intra_4x4_pred_modes[10] = 6;
+        }
+        // predicted = min(4, 6) = 4.
+        let mut pred = MbPred::default();
+        pred.prev_intra8x8_pred_mode_flag[0] = true;
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false), 4);
     }
 
     #[test]
@@ -3847,6 +4480,7 @@ mod tests {
         let mb1 = mk(right_luma);
         let slice_data = SliceData {
             macroblocks: vec![mb0, mb1],
+            mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
         };
         let mut pic_off = Picture::new(32, 16, 1, 8, 8);
@@ -3963,6 +4597,7 @@ mod tests {
         let mb = Macroblock::new_skip(SliceType::P);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -3996,6 +4631,7 @@ mod tests {
         let mb = make_p_l0_16x16(0, [0, 0]);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -4044,6 +4680,7 @@ mod tests {
         let mb = make_p_l0_16x16(0, [2, 0]);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -4097,6 +4734,7 @@ mod tests {
         };
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -4130,6 +4768,7 @@ mod tests {
         let mb = Macroblock::new_skip(SliceType::B);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -4171,6 +4810,7 @@ mod tests {
         let mb1 = make_p_l0_16x16(0, [0, 0]);
         let slice_data = SliceData {
             macroblocks: vec![mb0, mb1],
+            mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
         };
         let mut pic = Picture::new(32, 16, 1, 8, 8);
@@ -4239,6 +4879,7 @@ mod tests {
         let mb = make_p_l0_16x16(0, [0, 0]);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -4286,6 +4927,7 @@ mod tests {
         let mb = make_p_l0_16x16(0, [0, 0]);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -4367,6 +5009,7 @@ mod tests {
         let mb = make_b_bi_16x16(0, 0);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -4414,6 +5057,7 @@ mod tests {
         let mb = make_b_bi_16x16(0, 0);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -4476,6 +5120,7 @@ mod tests {
         let mb = make_b_bi_16x16(0, 0);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -4530,6 +5175,7 @@ mod tests {
         let mb = make_b_bi_16x16(0, 0);
         let slice_data = SliceData {
             macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);

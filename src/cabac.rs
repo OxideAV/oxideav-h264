@@ -196,6 +196,9 @@ pub struct CabacDecoder<'a> {
     /// §9.3.1.2 — `codIOffset`, initialised from `read_bits(9)`.
     cod_i_offset: u32,
     reader: BitReader<'a>,
+    /// Running count of bins decoded (decision + bypass + terminate).
+    /// Used only for debug instrumentation, never affects decoding.
+    bin_count: u64,
 }
 
 impl<'a> core::fmt::Debug for CabacDecoder<'a> {
@@ -222,7 +225,14 @@ impl<'a> CabacDecoder<'a> {
             cod_i_range: 510,
             cod_i_offset,
             reader,
+            bin_count: 0,
         })
+    }
+
+    /// Total number of bins decoded so far (decision + bypass + terminate).
+    /// Exposed for debug instrumentation.
+    pub fn bin_count(&self) -> u64 {
+        self.bin_count
     }
 
     /// Cursor into the underlying reader — exposed for slice-layer code
@@ -284,6 +294,7 @@ impl<'a> CabacDecoder<'a> {
         }
 
         self.renorm_d()?;
+        self.bin_count = self.bin_count.wrapping_add(1);
         Ok(bin_val)
     }
 
@@ -299,12 +310,14 @@ impl<'a> CabacDecoder<'a> {
     ///       binVal = 0
     pub fn decode_bypass(&mut self) -> CabacResult<u8> {
         self.cod_i_offset = (self.cod_i_offset << 1) | self.reader.u(1)?;
-        if self.cod_i_offset >= self.cod_i_range {
+        let bin = if self.cod_i_offset >= self.cod_i_range {
             self.cod_i_offset -= self.cod_i_range;
-            Ok(1)
+            1
         } else {
-            Ok(0)
-        }
+            0
+        };
+        self.bin_count = self.bin_count.wrapping_add(1);
+        Ok(bin)
     }
 
     /// §9.3.3.2.4 — DecodeTerminate. Special path for `end_of_slice_flag`
@@ -319,15 +332,17 @@ impl<'a> CabacDecoder<'a> {
     ///       RenormD()
     pub fn decode_terminate(&mut self) -> CabacResult<u8> {
         self.cod_i_range -= 2;
-        if self.cod_i_offset >= self.cod_i_range {
+        let bin = if self.cod_i_offset >= self.cod_i_range {
             // Terminated. Per spec: "no renormalization is carried out, and
             // CABAC decoding is terminated". The last inserted bit is the
             // rbsp_stop_one_bit when decoding end_of_slice_flag.
-            Ok(1)
+            1
         } else {
             self.renorm_d()?;
-            Ok(0)
-        }
+            0
+        };
+        self.bin_count = self.bin_count.wrapping_add(1);
+        Ok(bin)
     }
 
     /// §9.3.3.2.2 — RenormD. Called after DecodeDecision whenever

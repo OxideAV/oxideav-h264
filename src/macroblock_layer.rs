@@ -117,6 +117,20 @@ pub struct Intra16x16 {
 /// Any remaining mb_type value that we don't distinguish is stored as
 /// `Reserved { raw, .. }` — the dispatch fields (num_mb_part, is_intra,
 /// etc.) are precomputed so the caller can still route correctly.
+/// §7.4.5 Table 7-13 / 7-14 — MbPartPredMode / SubMbPredMode values
+/// used to gate ref_idx / mvd presence in mb_pred / sub_mb_pred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MbPartPredMode {
+    /// Inter list-0 prediction.
+    PredL0,
+    /// Inter list-1 prediction.
+    PredL1,
+    /// Inter bipred (both list 0 and list 1).
+    BiPred,
+    /// B_Direct_16x16 / B_Skip / B_Direct_8x8 — no ref_idx / mvd.
+    Direct,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MbType {
     // --- I / SI slices (Table 7-11) ---
@@ -221,6 +235,79 @@ impl MbType {
     /// and not I_NxN / Intra_16x16 (§7.3.5).
     pub fn is_sub_mb_path(&self) -> bool {
         matches!(self, MbType::P8x8 | MbType::P8x8Ref0 | MbType::B8x8)
+    }
+
+    /// §7.4.5 Tables 7-13 / 7-14 — `MbPartPredMode(mb_type, mbPartIdx)`.
+    ///
+    /// Returns `None` for mbPartIdx ≥ NumMbPart, for sub-mb path MBs
+    /// (where the per-partition mode is carried by sub_mb_type), and for
+    /// intra MBs that don't have a list-based prediction mode.
+    pub fn mb_part_pred_mode(&self, mb_part_idx: usize) -> Option<MbPartPredMode> {
+        use MbPartPredMode::*;
+        use MbType::*;
+        if mb_part_idx >= self.num_mb_part() as usize {
+            return None;
+        }
+        match self {
+            // P inter (Table 7-13).
+            PL016x16 | PSkip => Some(PredL0),
+            PL0L016x8 | PL0L08x16 => Some(PredL0),
+            // P_8x8 / P_8x8ref0: sub_mb path uses sub_mb_type; here we
+            // return None so the caller falls back to sub_mb_pred.
+            P8x8 | P8x8Ref0 => None,
+            // B inter (Table 7-14).
+            BDirect16x16 | BSkip => Some(Direct),
+            BL016x16 => Some(PredL0),
+            BL116x16 => Some(PredL1),
+            BBi16x16 => Some(BiPred),
+            BL0L016x8 | BL0L08x16 => Some(PredL0),
+            BL1L116x8 | BL1L18x16 => Some(PredL1),
+            BL0L116x8 | BL0L18x16 => {
+                if mb_part_idx == 0 {
+                    Some(PredL0)
+                } else {
+                    Some(PredL1)
+                }
+            }
+            BL1L016x8 | BL1L08x16 => {
+                if mb_part_idx == 0 {
+                    Some(PredL1)
+                } else {
+                    Some(PredL0)
+                }
+            }
+            BL0Bi16x8 | BL0Bi8x16 => {
+                if mb_part_idx == 0 {
+                    Some(PredL0)
+                } else {
+                    Some(BiPred)
+                }
+            }
+            BL1Bi16x8 | BL1Bi8x16 => {
+                if mb_part_idx == 0 {
+                    Some(PredL1)
+                } else {
+                    Some(BiPred)
+                }
+            }
+            BBiL016x8 | BBiL08x16 => {
+                if mb_part_idx == 0 {
+                    Some(BiPred)
+                } else {
+                    Some(PredL0)
+                }
+            }
+            BBiL116x8 | BBiL18x16 => {
+                if mb_part_idx == 0 {
+                    Some(BiPred)
+                } else {
+                    Some(PredL1)
+                }
+            }
+            BBiBi16x8 | BBiBi8x16 => Some(BiPred),
+            B8x8 => None,
+            INxN | Intra16x16(_) | IPcm | Reserved(_) => None,
+        }
     }
 
     /// §7.4.5 — `CodedBlockPatternLuma` for Intra_16x16 variants.
@@ -394,6 +481,22 @@ impl SubMbType {
             12 => SubMbType::BBi4x4,
             _ => SubMbType::Reserved(raw),
         })
+    }
+
+    /// §7.4.5.2 Tables 7-17 / 7-18 — `SubMbPredMode(sub_mb_type)`.
+    pub fn sub_mb_pred_mode(&self) -> Option<MbPartPredMode> {
+        use MbPartPredMode::*;
+        use SubMbType::*;
+        match self {
+            // P (Table 7-17) — all Pred_L0.
+            PL08x8 | PL08x4 | PL04x8 | PL04x4 => Some(PredL0),
+            // B (Table 7-18).
+            BDirect8x8 => Some(Direct),
+            BL08x8 | BL08x4 | BL04x8 | BL04x4 => Some(PredL0),
+            BL18x8 | BL18x4 | BL14x8 | BL14x4 => Some(PredL1),
+            BBi8x8 | BBi8x4 | BBi4x8 | BBi4x4 => Some(BiPred),
+            Reserved(_) => None,
+        }
     }
 }
 
@@ -1021,6 +1124,18 @@ pub struct EntropyState<'ctx, 'data> {
     /// override in §9.2.1.1 step 5 does not apply to the NAL types our
     /// walker accepts).
     pub constrained_intra_pred_flag: bool,
+    /// §7.3.3 / §7.3.5.1 — active `num_ref_idx_l0_active_minus1` for the
+    /// current slice (from the slice header, possibly overridden by
+    /// `num_ref_idx_active_override_flag`). Used to gate / size ref_idx_l0
+    /// parsing per the syntax rule in §7.3.5.1 / §7.3.5.2.
+    pub num_ref_idx_l0_active_minus1: u32,
+    /// §7.3.3 / §7.3.5.1 — active `num_ref_idx_l1_active_minus1` (B slices).
+    pub num_ref_idx_l1_active_minus1: u32,
+    /// §7.3.4 / §7.4.4 — `MbaffFrameFlag`. When 0, `mb_field_decoding_flag`
+    /// equals `field_pic_flag`, i.e. the "mb_field != field_pic" gate in
+    /// §7.3.5.1 / §7.3.5.2 never fires. We don't currently support MBAFF
+    /// decoding, so parsers should assume this is false.
+    pub mbaff_frame_flag: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,7 +1154,7 @@ pub fn parse_macroblock(
     r: &mut BitReader<'_>,
     entropy: &mut EntropyState<'_, '_>,
     slice_header: &SliceHeader,
-    _sps: &Sps,
+    sps: &Sps,
     _pps: &Pps,
     _current_mb_addr: u32,
 ) -> McblResult<Macroblock> {
@@ -1218,12 +1333,41 @@ pub fn parse_macroblock(
     //       mb_type != I_NxN && noSubMbPartSizeLessThan8x8Flag &&
     //       (mb_type != B_Direct_16x16 || direct_8x8_inference_flag))
     // For the I_NxN case the flag was already read before mb_pred.
+    //
+    // §7.3.5 — `noSubMbPartSizeLessThan8x8Flag` is computed during the
+    // sub_mb_pred pass:
+    //   1) it starts at 1;
+    //   2) for each sub_mb_type != B_Direct_8x8, if NumSubMbPart > 1,
+    //      set it to 0;
+    //   3) for each sub_mb_type == B_Direct_8x8, if
+    //      !direct_8x8_inference_flag, set it to 0.
+    // When the MB is on the mb_pred (non-sub_mb) path the flag is
+    // always 1 (there are no sub-partitions to invalidate it).
     // ---------------------------------------------------------------
-    if cbp_luma > 0
+    let direct_8x8_inference_flag = sps.direct_8x8_inference_flag;
+    let no_sub_lt_8x8 = if let Some(sub) = sub_mb_pred.as_ref() {
+        let mut flag = true;
+        for i in 0..4 {
+            let sub_t = sub.sub_mb_type[i];
+            if matches!(sub_t, SubMbType::BDirect8x8) {
+                if !direct_8x8_inference_flag {
+                    flag = false;
+                }
+            } else if sub_t.num_sub_mb_part() > 1 {
+                flag = false;
+            }
+        }
+        flag
+    } else {
+        true
+    };
+    let t8x8_gate = cbp_luma > 0
         && entropy.transform_8x8_mode_flag
         && !mb_type.is_i_nxn()
         && !mb_type.is_intra_16x16()
-    {
+        && no_sub_lt_8x8
+        && (!matches!(mb_type, MbType::BDirect16x16) || direct_8x8_inference_flag);
+    if t8x8_gate {
         transform_size_8x8_flag = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
             decode_transform_size_8x8_flag(dec, ctxs, &entropy.neighbours)?
         } else {
@@ -1401,52 +1545,86 @@ fn parse_mb_pred(
             pred.intra_chroma_pred_mode = mode as u8;
         }
     } else {
-        // Inter — NumMbPart partitions × ref_idx + MVD lists.
+        // Inter — §7.3.5.1 `mb_pred()` for non-sub_mb, non-Direct cases.
+        //
+        // The spec's inner conditions are:
+        //   - ref_idx_l0 present when  (num_ref_idx_l0_active_minus1 > 0
+        //       || mb_field_decoding_flag != field_pic_flag)
+        //       && MbPartPredMode != Pred_L1.
+        //   - ref_idx_l1 present when  (num_ref_idx_l1_active_minus1 > 0
+        //       || mb_field_decoding_flag != field_pic_flag)
+        //       && MbPartPredMode != Pred_L0.
+        //   - mvd_l0 present when MbPartPredMode != Pred_L1.
+        //   - mvd_l1 present when MbPartPredMode != Pred_L0.
+        // Direct is only reachable via B_Direct_16x16 / B_Skip (no
+        // mb_pred fields); we don't enter this branch for those.
+        //
+        // MBAFF is not currently supported in our pipeline
+        // (`mbaff_frame_flag == false`), so the "mb_field !=
+        // field_pic" condition simplifies away.
         let num_parts = mb_type.num_mb_part() as usize;
-        let num_ref_l0_m1 = 0u32; // We don't parameterise; CAVLC reads
-                                  // `te(v)` anyway (handled below).
-                                  // §7.3.5.1 — ref_idx_l0[mbPartIdx] for mbPartIdx < NumMbPart
-                                  // when num_ref_idx_l0_active_minus1 > 0 (or mb_field override).
-                                  // We approximate by reading when slice has list 0.
-        if entropy.slice_kind != SliceKind::I && entropy.slice_kind != SliceKind::SI {
+        let mbaff_override = entropy.mbaff_frame_flag;
+        let ref_l0_present = entropy.num_ref_idx_l0_active_minus1 > 0 || mbaff_override;
+        let ref_l1_present = entropy.num_ref_idx_l1_active_minus1 > 0 || mbaff_override;
+        let x_l0 = entropy.num_ref_idx_l0_active_minus1;
+        let x_l1 = entropy.num_ref_idx_l1_active_minus1;
+
+        // ref_idx_l0.
+        for part in 0..num_parts {
+            let mode = mb_type.mb_part_pred_mode(part);
+            if ref_l0_present && mode != Some(MbPartPredMode::PredL1) {
+                let v = if entropy.cabac.is_some() {
+                    0
+                } else {
+                    r.te(x_l0)?
+                };
+                pred.ref_idx_l0.push(v);
+            } else {
+                pred.ref_idx_l0.push(0);
+            }
+        }
+        // ref_idx_l1.
+        for part in 0..num_parts {
+            let mode = mb_type.mb_part_pred_mode(part);
+            if ref_l1_present && mode != Some(MbPartPredMode::PredL0)
+                && mode != Some(MbPartPredMode::Direct)
+                && entropy.slice_kind == SliceKind::B
             {
-                // list 0 always present for P/B.
-                for _ in 0..num_parts {
-                    let v = if entropy.cabac.is_some() {
-                        // With num_ref_l0_active_minus1 > 0 assumed →
-                        // ref_idx would be decoded via CABAC; we have a
-                        // helper but it needs neighbour ref state. For
-                        // now return 0 as a placeholder (spec-accurate
-                        // when num_ref_idx_l0_active_minus1 == 0).
-                        0
-                    } else {
-                        r.te(num_ref_l0_m1)?
-                    };
-                    pred.ref_idx_l0.push(v);
-                }
+                let v = if entropy.cabac.is_some() {
+                    0
+                } else {
+                    r.te(x_l1)?
+                };
+                pred.ref_idx_l1.push(v);
+            } else {
+                pred.ref_idx_l1.push(0);
             }
-            if entropy.slice_kind == SliceKind::B {
-                for _ in 0..num_parts {
-                    let v = if entropy.cabac.is_some() {
-                        0
-                    } else {
-                        r.te(num_ref_l0_m1)?
-                    };
-                    pred.ref_idx_l1.push(v);
-                }
-            }
-            // §7.3.5.1 — mvd_l0[mbPartIdx][0..2].
-            for _ in 0..num_parts {
+        }
+        // mvd_l0.
+        for part in 0..num_parts {
+            let mode = mb_type.mb_part_pred_mode(part);
+            if mode != Some(MbPartPredMode::PredL1)
+                && mode != Some(MbPartPredMode::Direct)
+            {
                 let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
                 let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
                 pred.mvd_l0.push([mx, my]);
+            } else {
+                pred.mvd_l0.push([0, 0]);
             }
-            if entropy.slice_kind == SliceKind::B {
-                for _ in 0..num_parts {
-                    let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
-                    let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
-                    pred.mvd_l1.push([mx, my]);
-                }
+        }
+        // mvd_l1.
+        for part in 0..num_parts {
+            let mode = mb_type.mb_part_pred_mode(part);
+            if mode != Some(MbPartPredMode::PredL0)
+                && mode != Some(MbPartPredMode::Direct)
+                && entropy.slice_kind == SliceKind::B
+            {
+                let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
+                let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
+                pred.mvd_l1.push([mx, my]);
+            } else {
+                pred.mvd_l1.push([0, 0]);
             }
         }
     }
@@ -1465,6 +1643,7 @@ fn parse_sub_mb_pred(
 ) -> McblResult<SubMbPred> {
     let mut out = SubMbPred::default();
     let is_b = matches!(mb_type, MbType::B8x8);
+    let is_p8x8_ref0 = matches!(mb_type, MbType::P8x8Ref0);
 
     // 4 sub_mb_type entries.
     for i in 0..4 {
@@ -1483,34 +1662,91 @@ fn parse_sub_mb_pred(
         };
     }
 
-    // ref_idx_l0 for each of the 4 partitions.
+    // §7.3.5.2 — ref_idx_l0 gate:
+    //   (num_ref_idx_l0_active_minus1 > 0 ||
+    //     mb_field_decoding_flag != field_pic_flag) &&
+    //   mb_type != P_8x8ref0 &&
+    //   sub_mb_type[i] != B_Direct_8x8 &&
+    //   SubMbPredMode(sub_mb_type[i]) != Pred_L1
+    let mbaff_override = entropy.mbaff_frame_flag;
+    let ref_l0_present = entropy.num_ref_idx_l0_active_minus1 > 0 || mbaff_override;
+    let ref_l1_present = entropy.num_ref_idx_l1_active_minus1 > 0 || mbaff_override;
+    let x_l0 = entropy.num_ref_idx_l0_active_minus1;
+    let x_l1 = entropy.num_ref_idx_l1_active_minus1;
+
     for i in 0..4 {
-        let v = if entropy.cabac.is_some() { 0 } else { r.te(0)? };
+        let sub = out.sub_mb_type[i];
+        let mode = sub.sub_mb_pred_mode();
+        let is_direct_sub = matches!(sub, SubMbType::BDirect8x8);
+        let gated = ref_l0_present
+            && !is_p8x8_ref0
+            && !is_direct_sub
+            && mode != Some(MbPartPredMode::PredL1);
+        let v = if gated {
+            if entropy.cabac.is_some() {
+                0
+            } else {
+                r.te(x_l0)?
+            }
+        } else {
+            0
+        };
         out.ref_idx_l0[i] = v;
     }
+    // ref_idx_l1 — B-slice only.
+    //   (num_ref_idx_l1_active_minus1 > 0 ||
+    //     mb_field_decoding_flag != field_pic_flag) &&
+    //   sub_mb_type[i] != B_Direct_8x8 &&
+    //   SubMbPredMode(sub_mb_type[i]) != Pred_L0
     if is_b {
         for i in 0..4 {
-            let v = if entropy.cabac.is_some() { 0 } else { r.te(0)? };
+            let sub = out.sub_mb_type[i];
+            let mode = sub.sub_mb_pred_mode();
+            let is_direct_sub = matches!(sub, SubMbType::BDirect8x8);
+            let gated = ref_l1_present
+                && !is_direct_sub
+                && mode != Some(MbPartPredMode::PredL0);
+            let v = if gated {
+                if entropy.cabac.is_some() {
+                    0
+                } else {
+                    r.te(x_l1)?
+                }
+            } else {
+                0
+            };
             out.ref_idx_l1[i] = v;
         }
     }
 
-    // MVDs — NumSubMbPart entries per partition.
+    // §7.3.5.2 — mvd_l0 gate: sub_mb_type != B_Direct_8x8 &&
+    // SubMbPredMode != Pred_L1.
     for i in 0..4 {
-        let n = out.sub_mb_type[i].num_sub_mb_part() as usize;
-        for _ in 0..n {
-            let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
-            let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
-            out.mvd_l0[i].push([mx, my]);
-        }
-    }
-    if is_b {
-        for i in 0..4 {
-            let n = out.sub_mb_type[i].num_sub_mb_part() as usize;
+        let sub = out.sub_mb_type[i];
+        let mode = sub.sub_mb_pred_mode();
+        let is_direct_sub = matches!(sub, SubMbType::BDirect8x8);
+        if !is_direct_sub && mode != Some(MbPartPredMode::PredL1) {
+            let n = sub.num_sub_mb_part() as usize;
             for _ in 0..n {
                 let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
                 let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
-                out.mvd_l1[i].push([mx, my]);
+                out.mvd_l0[i].push([mx, my]);
+            }
+        }
+    }
+    // mvd_l1 gate: sub_mb_type != B_Direct_8x8 && SubMbPredMode != Pred_L0.
+    if is_b {
+        for i in 0..4 {
+            let sub = out.sub_mb_type[i];
+            let mode = sub.sub_mb_pred_mode();
+            let is_direct_sub = matches!(sub, SubMbType::BDirect8x8);
+            if !is_direct_sub && mode != Some(MbPartPredMode::PredL0) {
+                let n = sub.num_sub_mb_part() as usize;
+                for _ in 0..n {
+                    let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
+                    let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
+                    out.mvd_l1[i].push([mx, my]);
+                }
             }
         }
     }
@@ -2376,6 +2612,9 @@ mod tests {
             cavlc_nc: None,
             current_mb_addr: 0,
             constrained_intra_pred_flag: false,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            mbaff_frame_flag: false,
         }
     }
 
@@ -2730,5 +2969,279 @@ mod tests {
         assert_eq!(combine_nc(true, 3, true, 4), (3 + 4 + 1) >> 1); // 4
         assert_eq!(combine_nc(true, 0, true, 0), 0);
         assert_eq!(combine_nc(true, 16, true, 16), (16 + 16 + 1) >> 1); // 16
+    }
+
+    // -----------------------------------------------------------------
+    // Regression: §7.3.5.1 / §7.3.5.2 ref_idx / mvd gating.
+    //
+    // Before this round `parse_mb_pred` unconditionally read a 1-bit
+    // ref_idx_l0 per partition on every inter MB (even when
+    // num_ref_idx_l0_active_minus1 == 0, in which case the syntax
+    // element must not be present at all per §7.3.5.1). That produced
+    // 1-bit desyncs that showed up downstream as bogus mb_type / CBP
+    // values on subsequent MBs.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cavlc_p_l0_16x16_with_single_ref_reads_no_ref_idx() {
+        // PL0_16x16 with num_ref_idx_l0_active_minus1 == 0: no
+        // ref_idx_l0 bits should be consumed; only mvd_l0 x/y.
+        //
+        // Build:
+        //   mb_type = 0 → ue(v) "1"
+        //   (no ref_idx)
+        //   mvd_l0[0][0] = 0 → se(v) codeNum=0 "1"
+        //   mvd_l0[0][1] = 0 → se(v) codeNum=0 "1"
+        //   coded_block_pattern (inter codeNum=0 → CBP=0) → "1"
+        //   (cbp=0 → no mb_qp_delta, no residual)
+        let mut w = BitWriter::new();
+        w.ue(0); // mb_type = P_L0_16x16
+        // mvd x, y
+        w.ue(0); // mvd x = 0
+        w.ue(0); // mvd y = 0
+        w.ue(0); // CBP inter codeNum=0 → 0
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::P);
+        let mut r = BitReader::new(&bytes);
+        let mut entropy = cavlc_entropy();
+        entropy.slice_kind = SliceKind::P;
+        entropy.num_ref_idx_l0_active_minus1 = 0;
+        let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        assert_eq!(mb.mb_type, MbType::PL016x16);
+        assert_eq!(mb.coded_block_pattern, 0);
+        let pred = mb.mb_pred.expect("mb_pred");
+        // ref_idx_l0 should have been filled with the default (0) — no
+        // bits consumed.
+        assert_eq!(pred.ref_idx_l0.len(), 1);
+        assert_eq!(pred.ref_idx_l0[0], 0);
+        // MVD was read.
+        assert_eq!(pred.mvd_l0.len(), 1);
+        assert_eq!(pred.mvd_l0[0], [0, 0]);
+    }
+
+    #[test]
+    fn cavlc_p_l0_16x16_with_two_refs_reads_ref_idx_te() {
+        // PL0_16x16 with num_ref_idx_l0_active_minus1 == 1: one bit
+        // (inverted) for ref_idx_l0 per §9.1.2 eq. 9-3.
+        //
+        // Build:
+        //   mb_type = 0 → ue(v) "1"
+        //   ref_idx_l0[0] = 1 → te(1) = read 1 bit; codeNum = !b.
+        //     write b=0 → value=1.
+        //   mvd_l0[0][0] = 0 → "1"
+        //   mvd_l0[0][1] = 0 → "1"
+        //   CBP inter codeNum=0 → "1"
+        let mut w = BitWriter::new();
+        w.ue(0); // mb_type = P_L0_16x16
+        w.u(1, 0); // ref_idx_l0 te(1), b=0 → value 1.
+        w.ue(0); // mvd x
+        w.ue(0); // mvd y
+        w.ue(0); // CBP inter codeNum=0 → 0
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::P);
+        let mut r = BitReader::new(&bytes);
+        let mut entropy = cavlc_entropy();
+        entropy.slice_kind = SliceKind::P;
+        entropy.num_ref_idx_l0_active_minus1 = 1;
+        let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        assert_eq!(mb.mb_type, MbType::PL016x16);
+        let pred = mb.mb_pred.expect("mb_pred");
+        assert_eq!(pred.ref_idx_l0[0], 1);
+    }
+
+    #[test]
+    fn mb_part_pred_mode_p_slice_cases() {
+        // Table 7-13.
+        assert_eq!(
+            MbType::PL016x16.mb_part_pred_mode(0),
+            Some(MbPartPredMode::PredL0)
+        );
+        assert_eq!(MbType::PL016x16.mb_part_pred_mode(1), None);
+        assert_eq!(
+            MbType::PL0L016x8.mb_part_pred_mode(0),
+            Some(MbPartPredMode::PredL0)
+        );
+        assert_eq!(
+            MbType::PL0L016x8.mb_part_pred_mode(1),
+            Some(MbPartPredMode::PredL0)
+        );
+        // P8x8 / P_8x8ref0 — sub_mb path, so mb-level mode is None.
+        assert_eq!(MbType::P8x8.mb_part_pred_mode(0), None);
+        assert_eq!(MbType::P8x8Ref0.mb_part_pred_mode(0), None);
+    }
+
+    #[test]
+    fn mb_part_pred_mode_b_slice_cases() {
+        // Table 7-14 — mixed-list partitions hit both Pred_L0 and Pred_L1.
+        assert_eq!(
+            MbType::BL016x16.mb_part_pred_mode(0),
+            Some(MbPartPredMode::PredL0)
+        );
+        assert_eq!(
+            MbType::BL116x16.mb_part_pred_mode(0),
+            Some(MbPartPredMode::PredL1)
+        );
+        assert_eq!(
+            MbType::BBi16x16.mb_part_pred_mode(0),
+            Some(MbPartPredMode::BiPred)
+        );
+        assert_eq!(
+            MbType::BDirect16x16.mb_part_pred_mode(0),
+            Some(MbPartPredMode::Direct)
+        );
+        // B_L0_L1_16x8 — part0=L0, part1=L1.
+        assert_eq!(
+            MbType::BL0L116x8.mb_part_pred_mode(0),
+            Some(MbPartPredMode::PredL0)
+        );
+        assert_eq!(
+            MbType::BL0L116x8.mb_part_pred_mode(1),
+            Some(MbPartPredMode::PredL1)
+        );
+        // B_Bi_L0_8x16 — part0=BiPred, part1=L0.
+        assert_eq!(
+            MbType::BBiL08x16.mb_part_pred_mode(0),
+            Some(MbPartPredMode::BiPred)
+        );
+        assert_eq!(
+            MbType::BBiL08x16.mb_part_pred_mode(1),
+            Some(MbPartPredMode::PredL0)
+        );
+    }
+
+    #[test]
+    fn sub_mb_pred_mode_p_and_b_tables() {
+        // Table 7-17 — all P sub_mb_types are Pred_L0.
+        assert_eq!(
+            SubMbType::PL08x8.sub_mb_pred_mode(),
+            Some(MbPartPredMode::PredL0)
+        );
+        assert_eq!(
+            SubMbType::PL04x4.sub_mb_pred_mode(),
+            Some(MbPartPredMode::PredL0)
+        );
+        // Table 7-18.
+        assert_eq!(
+            SubMbType::BDirect8x8.sub_mb_pred_mode(),
+            Some(MbPartPredMode::Direct)
+        );
+        assert_eq!(
+            SubMbType::BL08x8.sub_mb_pred_mode(),
+            Some(MbPartPredMode::PredL0)
+        );
+        assert_eq!(
+            SubMbType::BL18x4.sub_mb_pred_mode(),
+            Some(MbPartPredMode::PredL1)
+        );
+        assert_eq!(
+            SubMbType::BBi4x4.sub_mb_pred_mode(),
+            Some(MbPartPredMode::BiPred)
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Regression: §9.1 te(v) with x_max == 0 is a no-op.
+    //
+    // The earlier implementation fell through to ue(v) when x_max ==
+    // 0, which could eat extra bits from the bitstream (any 1-bit
+    // prefix encoded codeNum=0, so "lucky" cases were hiding the bug).
+    // -----------------------------------------------------------------
+    #[test]
+    fn te_x_max_zero_consumes_no_bits() {
+        let bytes = [0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.te(0).unwrap(), 0);
+        // Reader should still be at bit 0.
+        let (byte, bit) = r.position();
+        assert_eq!((byte, bit), (0, 0));
+    }
+
+    // -----------------------------------------------------------------
+    // Re-audit of Tables 9-4(a)/(b) vs the ITU-T 08/2024 spec.
+    //
+    // Below we assert the full 48-row Table 9-4(a) (both intra and
+    // inter columns) and the full 16-row Table 9-4(b), so any future
+    // typo that corrupts a row is caught by the unit tests without
+    // having to re-run integration fixtures.
+    // -----------------------------------------------------------------
+    #[test]
+    fn table_9_4a_intra_420_422_full_row_audit() {
+        let expected: [u8; 48] = [
+            47, 31, 15, 0, 23, 27, 29, 30, 7, 11, 13, 14, 39, 43, 45, 46, 16, 3, 5, 10, 12, 19,
+            21, 26, 28, 35, 37, 42, 44, 1, 2, 4, 8, 17, 18, 20, 24, 6, 9, 22, 25, 32, 33, 34, 36,
+            40, 38, 41,
+        ];
+        for i in 0..48 {
+            assert_eq!(ME_INTRA_420_422[i], expected[i], "row {i}");
+        }
+    }
+
+    #[test]
+    fn table_9_4a_inter_420_422_full_row_audit() {
+        let expected: [u8; 48] = [
+            0, 16, 1, 2, 4, 8, 32, 3, 5, 10, 12, 15, 47, 7, 11, 13, 14, 6, 9, 31, 35, 37, 42, 44,
+            33, 34, 36, 40, 39, 43, 45, 46, 17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22,
+            25, 38, 41,
+        ];
+        for i in 0..48 {
+            assert_eq!(ME_INTER_420_422[i], expected[i], "row {i}");
+        }
+    }
+
+    #[test]
+    fn table_9_4b_intra_0_3_full_row_audit() {
+        let expected: [u8; 16] = [15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9];
+        for i in 0..16 {
+            assert_eq!(ME_INTRA_0_3[i], expected[i], "row {i}");
+        }
+    }
+
+    #[test]
+    fn table_9_4b_inter_0_3_full_row_audit() {
+        let expected: [u8; 16] = [0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9];
+        for i in 0..16 {
+            assert_eq!(ME_INTER_0_3[i], expected[i], "row {i}");
+        }
+    }
+
+    // mb_type boundary tests — catch off-by-one in the I/P/B remap.
+    #[test]
+    fn p_slice_mb_type_boundary_cases() {
+        // Table 7-13 rows 0..=4 are P-specific.
+        assert_eq!(MbType::from_p_slice(0).unwrap(), MbType::PL016x16);
+        assert_eq!(MbType::from_p_slice(4).unwrap(), MbType::P8x8Ref0);
+        // Row 5 is remapped to I_NxN (I row 0).
+        assert_eq!(MbType::from_p_slice(5).unwrap(), MbType::INxN);
+        // Row 30 is the max (remapped to I row 25 = I_PCM).
+        assert_eq!(MbType::from_p_slice(30).unwrap(), MbType::IPcm);
+        // Row 31 is out of range (31-5=26, and Table 7-11 max is 25).
+        assert!(matches!(
+            MbType::from_p_slice(31).unwrap_err(),
+            MacroblockLayerError::MbTypeOutOfRange(31)
+        ));
+    }
+
+    #[test]
+    fn b_slice_mb_type_boundary_cases() {
+        // Table 7-14 rows 0..=22 are B-specific.
+        assert_eq!(MbType::from_b_slice(0).unwrap(), MbType::BDirect16x16);
+        assert_eq!(MbType::from_b_slice(22).unwrap(), MbType::B8x8);
+        // Row 23 is remapped to I_NxN.
+        assert_eq!(MbType::from_b_slice(23).unwrap(), MbType::INxN);
+        // Row 48 is the max (remapped to I row 25 = I_PCM).
+        assert_eq!(MbType::from_b_slice(48).unwrap(), MbType::IPcm);
+        // Row 49 is out of range.
+        assert!(matches!(
+            MbType::from_b_slice(49).unwrap_err(),
+            MacroblockLayerError::MbTypeOutOfRange(49)
+        ));
     }
 }

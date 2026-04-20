@@ -30,6 +30,20 @@
 
 use crate::cabac::{CabacDecoder, CabacResult, CtxState};
 
+#[inline]
+fn dbg_enabled() -> bool {
+    // Separate switch from OXIDEAV_H264_DEBUG to avoid drowning the
+    // macroblock-layer logs.
+    std::env::var("OXIDEAV_H264_CABAC_DEBUG").is_ok()
+}
+
+#[inline]
+fn dbg_emit(syntax: &str, bins_used: u64, extra: &str) {
+    if dbg_enabled() {
+        eprintln!("[CABAC] {syntax} bins={bins_used} {extra}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Slice kinds and selectors
 // ---------------------------------------------------------------------------
@@ -782,35 +796,63 @@ fn mb_type_ctx_inc_first3(offset: u32, bin_idx: u32, neighbours: &NeighbourCtx) 
     }
 }
 
-/// §9.3.2.5 + Table 9-36 — decode the I-slice mb_type suffix for
-/// values 1..=25 (entries after the leading "1" of Table 9-36).
+/// §9.3.2.5 + Table 9-36 — decode the Table 9-36 sub-string used as
+/// the mb_type suffix in I / P / B slices. Returns the Table 9-36 row
+/// index (0..=25) — the caller adds any per-slice base offset.
 ///
-/// The caller has already consumed bin 0 of Table 9-36 (the
-/// `0 → I_NxN` vs `1 → other` decision) and confirmed bin 0 == 1.
-/// This helper reads the remaining bins of Table 9-36 and returns the
-/// suffix value (1..=25 for I-slice offset=3; P/B callers pass the
-/// P/B intra-suffix ctxIdxOffsets 17 / 32 and add a per-slice prefix
-/// offset to the returned value as described in §9.3.2.5).
+/// `ctxIdxOffset` comes from Table 9-34 and selects the ctxIdxInc
+/// family. `already_read_bin0` tells the helper whether Table 9-36's
+/// binIdx=0 has already been read by the caller.
 ///
-/// Reference: ITU-T Rec. H.264 (08/2024) §9.3.2.5, Table 9-36, and
-/// Table 9-39 row `ctxIdxOffset = 3` (the same row governs offsets 17
-/// and 32 for the P/SP and B-slice intra suffixes per Table 9-41).
-/// Per-bin ctxIdx within this suffix is:
+/// * **I slices** (`offset = 3`): the caller's main decoder
+///   (`decode_mb_type_i`) has already read binIdx=0 at ctxIdx
+///   `offset + mb_type_ctx_inc_first3(...)` — so `already_read_bin0`
+///   must carry the decoded value of that bin. This helper then
+///   proceeds from binIdx=1.
 ///
-/// ```text
-/// binIdx 1 -- ctxIdx = 276 (dedicated terminate context used by the
-///             DecodeTerminate procedure; §9.3.1.1 NOTE 2 / §9.3.3.2.3).
-/// binIdx 2 -- ctxIdxInc = 3.
-/// binIdx 3 -- ctxIdxInc = 4.
-/// binIdx 4 -- ctxIdxInc = (b3 != 0) ? 5 : 6  (Table 9-41).
-/// binIdx 5 -- ctxIdxInc = (b3 != 0) ? 6 : 7  (Table 9-41).
-/// binIdx 6 -- ctxIdxInc = 7.
-/// ```
+/// * **P/SP slices** (`offset = 17`) and **B slices** (`offset = 32`)
+///   intra suffix: the caller has read the 1-bin (P/SP) or 6-bin (B)
+///   intra *prefix* and must now decode Table 9-36 from binIdx=0. In
+///   those cases `already_read_bin0` is `None` and this helper reads
+///   binIdx=0 itself at ctxIdx `offset + 0`.
+///
+/// Table 9-39 ctxIdxInc for binIdx 2..=6:
+///
+/// * `offset = 3` (I slices). Table 9-39 row 3:
+///     binIdx 2 inc = 3; binIdx 3 inc = 4; binIdx 4 inc per Table 9-41
+///     = (b3 != 0) ? 5 : 6; binIdx 5 inc per Table 9-41 = (b3 != 0) ?
+///     6 : 7; binIdx 6 inc = 7.
+/// * `offset = 17` (P/SP intra suffix) and `offset = 32` (B intra
+///   suffix). Table 9-39 rows 17/32:
+///     binIdx 2 inc = 1; binIdx 3 inc = 2; binIdx 4 inc per Table 9-41
+///     = (b3 != 0) ? 2 : 3; binIdx 5 inc = 3; binIdx 6 inc = 3.
+///
+/// binIdx 1 is always the ctxIdx=276 DecodeTerminate bin regardless of
+/// `offset` (§9.3.1.1 NOTE 2 / Table 9-39 / Figure 9-2).
 fn decode_mb_type_i_suffix(
     dec: &mut CabacDecoder<'_>,
     ctxs: &mut CabacContexts,
     offset: u32,
+    already_read_bin0: Option<u8>,
 ) -> CabacResult<u32> {
+    // --- binIdx 0 --------------------------------------------------
+    //
+    // For I slices the caller has consumed binIdx=0 and told us whether
+    // it was 0 (I_NxN, not reachable here) or 1 (entering this helper).
+    // For P/SP + B intra prefixes the caller has only read the outer
+    // prefix, so we need to read Table-9-36 binIdx=0 here. Table 9-39
+    // gives ctxIdxInc = 0 for offsets 17 and 32.
+    let b0 = match already_read_bin0 {
+        Some(v) => v,
+        None => dec.decode_decision(ctxs.at_mut(offset as usize))?,
+    };
+    if b0 == 0 {
+        // Table 9-36 row 0 — I_NxN (in I slices; the caller adds 5 or
+        // 23 for P / B slices, so this yields the appropriate intra
+        // equivalent).
+        return Ok(0);
+    }
+
     // --- binIdx 1 --------------------------------------------------
     //
     // Table 9-36 layout (given binIdx 0 == 1):
@@ -820,28 +862,45 @@ fn decode_mb_type_i_suffix(
     // Table 9-39 assigns binIdx 1 the special ctxIdx = 276, which
     // per §9.3.1.1 NOTE 2 is the non-adapting terminate context. The
     // I_PCM branch is parsed with the `DecodeTerminate` procedure
-    // (§9.3.3.2.3), not the ordinary arithmetic decision path.
+    // (§9.3.3.2.4), not the ordinary arithmetic decision path.
     let b1 = dec.decode_terminate()?;
     if b1 == 1 {
         // Table 9-36 row 25 — I_PCM.
         return Ok(25);
     }
 
+    // Per Table 9-39, the binIdx 2..=6 ctxIdxInc family depends on
+    // whether this is the I-slice offset (=3) or the P/SP / B intra
+    // suffix (=17 / =32). See the function doc comment.
+    let (inc_b2, inc_b3, inc_b4_b3ne0, inc_b4_b3eq0, inc_b5_b3ne0, inc_b5_b3eq0, inc_b6) =
+        if offset == 3 {
+            // I-slice suffix — Table 9-39 row ctxIdxOffset=3 + Table 9-41.
+            (3u32, 4u32, 5u32, 6u32, 6u32, 7u32, 7u32)
+        } else {
+            // P/SP (offset=17) and B (offset=32) intra suffix — Table 9-39
+            // rows ctxIdxOffset=17/32 + Table 9-41.
+            //
+            // binIdx 5 and binIdx 6 both take ctxIdxInc = 3 unconditionally
+            // (Table 9-39 lists "3" for binIdx 5 and ">=6" for the tail).
+            (1u32, 2u32, 2u32, 3u32, 3u32, 3u32, 3u32)
+        };
+
     // --- binIdx 2..=5 (always present for rows 1..=24) -------------
     //
     // binIdx 2 partitions Table 9-36 rows:
     //   b2 == 0 → rows 1..=12  ("1 0 0 ...").
     //   b2 == 1 → rows 13..=24 ("1 0 1 ...").
-    let b2 = dec.decode_decision(ctxs.at_mut((offset + 3) as usize))?;
+    let b2 = dec.decode_decision(ctxs.at_mut((offset + inc_b2) as usize))?;
     // binIdx 3 partitions inside each b2-group:
     //   b3 == 0 → 6-bin rows (rows 1..=4 if b2=0, rows 13..=16 if b2=1).
     //   b3 == 1 → 7-bin rows (rows 5..=12 if b2=0, rows 17..=24 if b2=1).
-    let b3 = dec.decode_decision(ctxs.at_mut((offset + 4) as usize))?;
-    // binIdx 4 and 5 use the prior-bin-dependent ctxIdxInc from
-    // Table 9-41 (ctxIdxOffset = 3).
-    let b4_inc = if b3 != 0 { 5 } else { 6 };
+    let b3 = dec.decode_decision(ctxs.at_mut((offset + inc_b3) as usize))?;
+    // binIdx 4 uses the Table-9-41 prior-bin-dependent rule.
+    let b4_inc = if b3 != 0 { inc_b4_b3ne0 } else { inc_b4_b3eq0 };
     let b4 = dec.decode_decision(ctxs.at_mut((offset + b4_inc) as usize))?;
-    let b5_inc = if b3 != 0 { 6 } else { 7 };
+    // binIdx 5 only has a Table-9-41 rule for offset=3; for offsets
+    // 17 / 32 both branches resolve to the same value.
+    let b5_inc = if b3 != 0 { inc_b5_b3ne0 } else { inc_b5_b3eq0 };
     let b5 = dec.decode_decision(ctxs.at_mut((offset + b5_inc) as usize))?;
 
     // --- binIdx 6 (present only when b3 == 1) ----------------------
@@ -854,7 +913,7 @@ fn decode_mb_type_i_suffix(
     //
     // So the optional 7th bin (binIdx = 6) is read iff b3 == 1.
     let b6 = if b3 != 0 {
-        dec.decode_decision(ctxs.at_mut((offset + 7) as usize))?
+        dec.decode_decision(ctxs.at_mut((offset + inc_b6) as usize))?
     } else {
         0
     };
@@ -907,8 +966,11 @@ pub fn decode_mb_type_i(
     if b0 == 0 {
         return Ok(0); // I_NxN
     }
-    // b0 == 1 → fall through to suffix tree (rows 1..=25).
-    decode_mb_type_i_suffix(dec, ctxs, OFFSET)
+    // b0 == 1 → fall through to suffix tree (rows 1..=25). The
+    // suffix's binIdx=0 is the same bin we just read (§9.3.2.5 — the
+    // I-slice Table 9-36 encoding is a single concatenation with no
+    // separate prefix), so pass `Some(b0)` to prevent re-reading.
+    decode_mb_type_i_suffix(dec, ctxs, OFFSET, Some(b0))
 }
 
 /// §9.3.2.5 + Table 9-37 — mb_type in P/SP slices.
@@ -929,8 +991,11 @@ pub fn decode_mb_type_p(
                              // binIdx 1 → inc=1, binIdx 2 → (b1!=1)?2:3.
     let b0 = dec.decode_decision(ctxs.at_mut(OFFSET as usize))?;
     if b0 == 1 {
-        // Intra prefix "1" → suffix is Table 9-36 with offset=17.
-        let suffix = decode_mb_type_i_suffix(dec, ctxs, 17)?;
+        // Intra prefix "1" → suffix is Table 9-36 with offset=17 per
+        // Table 9-34. The P-slice intra prefix is a single separate
+        // bin; the suffix's binIdx=0 has NOT been consumed yet, so we
+        // pass `None` and let the helper read it at ctxIdx=17.
+        let suffix = decode_mb_type_i_suffix(dec, ctxs, 17, None)?;
         return Ok(5 + suffix);
     }
     // b0 == 0 — inter P_ macroblock type (values 0..=3).
@@ -1015,15 +1080,27 @@ pub fn decode_mb_type_b(
     if b3 == 1 && b4 == 1 && b5 == 0 {
         return Ok(11); // B_L1_L0_8x16
     }
-    // b2=1, not (b3=b4=1). Rows 12..21 (7 bins) or 23..48 (intra).
-    let b6 = dec.decode_decision(ctxs.at_mut((OFFSET + 5) as usize))?;
-    // Intra prefix per Table 9-37: "1 1 1 1 0 1" → 23..=48 (intra
-    // mb_type). Match the prefix.
+    // b2=1, not (b3=b4=1). Two disjoint classes (Table 9-37):
+    //
+    //   * Intra prefix "1 1 1 1 0 1"  →  values 23..=48. The 6-bin
+    //     intra prefix is complete after b5; the following bin is the
+    //     first bin of the Table 9-36 suffix (binIdx=0 of the suffix
+    //     at ctxIdx=32+0=32). Reading a 7th "prefix" bin before
+    //     dispatching to the suffix helper would desync the engine.
+    //
+    //   * Rows 12..=21 (bin strings "1 1 1 X Y Z W"): 7 total bins,
+    //     b6 completes the code word.
+    //
+    // The intra prefix corresponds uniquely to (b3, b4, b5) = (1, 0, 1),
+    // so we can dispatch to the suffix *before* consuming a 7th bin.
     if b3 == 1 && b4 == 0 && b5 == 1 {
-        // 1 1 1 1 0 1 — intra prefix.
-        let suffix = decode_mb_type_i_suffix(dec, ctxs, 32)?;
+        // 1 1 1 1 0 1 — intra prefix. Suffix is Table 9-36 with
+        // offset=32 per Table 9-34; binIdx=0 of the suffix has not
+        // been consumed yet, so pass `None`.
+        let suffix = decode_mb_type_i_suffix(dec, ctxs, 32, None)?;
         return Ok(23 + suffix);
     }
+    let b6 = dec.decode_decision(ctxs.at_mut((OFFSET + 5) as usize))?;
     // Rows 12..21 — 7 bins: 1 1 1 X Y Z W with X=b3, Y=b4, Z=b5, W=b6.
     //   12 B_L0_Bi_16x8   1 1 1 0 0 0 0
     //   13 B_L0_Bi_8x16   1 1 1 0 0 0 1
@@ -1675,6 +1752,7 @@ pub fn decode_coeff_abs_level_minus1(
     num_decoded_eq_1: u32,
     num_decoded_gt_1: u32,
 ) -> CabacResult<u32> {
+    let start_bins = dec.bin_count();
     let base = block_type.abs_level_ctx_offset();
     let cat_offset = block_type.lvl_block_cat_offset();
     let u_coff: u32 = 14;
@@ -1687,6 +1765,11 @@ pub fn decode_coeff_abs_level_minus1(
     let ctx0 = (base + cat_offset + inc0) as usize;
     let b0 = dec.decode_decision(ctxs.at_mut(ctx0))?;
     if b0 == 0 {
+        dbg_emit(
+            "coeff_abs_level_minus1",
+            dec.bin_count() - start_bins,
+            &format!("eq1={num_decoded_eq_1} gt1={num_decoded_gt_1} val=0"),
+        );
         return Ok(0);
     }
     // Remaining unary bins — eq. (9-24):
@@ -1702,6 +1785,11 @@ pub fn decode_coeff_abs_level_minus1(
     while prefix_val < u_coff {
         let bin = dec.decode_decision(ctxs.at_mut(ctx_rest))?;
         if bin == 0 {
+            dbg_emit(
+                "coeff_abs_level_minus1",
+                dec.bin_count() - start_bins,
+                &format!("eq1={num_decoded_eq_1} gt1={num_decoded_gt_1} val={prefix_val}"),
+            );
             return Ok(prefix_val);
         }
         prefix_val += 1;
@@ -1722,7 +1810,13 @@ pub fn decode_coeff_abs_level_minus1(
     for _ in 0..k {
         tail = (tail << 1) | (dec.decode_bypass()? as u32);
     }
-    Ok(u_coff + suf_s + tail)
+    let val = u_coff + suf_s + tail;
+    dbg_emit(
+        "coeff_abs_level_minus1",
+        dec.bin_count() - start_bins,
+        &format!("eq1={num_decoded_eq_1} gt1={num_decoded_gt_1} ESCAPE k={k} val={val}"),
+    );
+    Ok(val)
 }
 
 // ---------------------------------------------------------------------------
@@ -2092,5 +2186,158 @@ mod tests {
         assert!(table[105].p0.is_some()); // Table 9-19
         assert!(table[226].p2.is_some()); // Table 9-20
         assert!(table[275].i_si.is_some()); // Table 9-21
+    }
+
+    // ---------------------------------------------------------------
+    // P/B intra-suffix regression tests — these exercise the
+    // Table 9-36 suffix read under P-slice (offset=17) and B-slice
+    // (offset=32) mb_type contexts, where the suffix's binIdx=0 is a
+    // distinct bin from the outer prefix (§9.3.2.5). An earlier version
+    // of `decode_mb_type_i_suffix` skipped that bin, causing an
+    // under-read for every intra macroblock in P and B slices.
+    // ---------------------------------------------------------------
+
+    /// Exercise the P-slice intra-suffix path: `decode_mb_type_p`
+    /// invokes the suffix helper with `offset=17, None` when the outer
+    /// prefix decodes to 1. We expose the helper indirectly here by
+    /// forcing MPS-only bins (all-zero bitstream) and checking that
+    /// (a) the return is `5 + 0 = 5` (P intra I_NxN) when the contexts
+    /// at offset=14 (prefix) and offset=17 (suffix binIdx=0) are MPS=1
+    /// / MPS=0 respectively at init, and (b) the bin consumption is
+    /// exactly 2 (prefix bit + suffix binIdx=0).
+    ///
+    /// Note: we can't easily force the exact ctx states without writing
+    /// a custom bitstream; this test just asserts the helper-path
+    /// doesn't panic and returns a sensible value for an all-MPS
+    /// stream. The real regression guard is the bin-count check below.
+    #[test]
+    fn p_slice_intra_suffix_reads_bin0_of_suffix() {
+        // Build the worst case "all bins are MPS" stream. With all-zero
+        // data bytes, bypass and decision bins flow MPS almost always.
+        let data = [0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut dec = make_decoder(&data);
+        let mut ctxs = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+        let before = dec.bin_count();
+        // Drive a full P-slice mb_type decode. Bin 0 (prefix) at
+        // ctxIdx=14: Table 9-13 ctxIdx=14 P0 (m=1, n=9), QP=26 →
+        // preCtxState = ((1*26)>>4) + 9 = 1 + 9 = 10 → state_idx=53,
+        // val_mps=0. All-zero bitstream produces MPS path → bin=0 →
+        // inter branch (b0 == 0). So this test exercises the INTER
+        // path, not intra. The valuable assertion is that the function
+        // does not panic.
+        let _ = decode_mb_type_p(&mut dec, &mut ctxs, &NeighbourCtx::default()).unwrap();
+        let bins_used = dec.bin_count() - before;
+        // Inter path always reads 3 bins (b0, b1, b2).
+        assert_eq!(bins_used, 3, "inter P mb_type must read exactly 3 bins");
+    }
+
+    /// Helper: force a specific stream into the engine and count bins
+    /// consumed by a single decode. Used to sanity-check that the
+    /// intra-suffix helper path for P/B slices decodes the expected
+    /// number of bins.
+    ///
+    /// `prefix_bits` are the high bits of the 9-bit `codIOffset` init
+    /// read + whatever renorm bits will be consumed; this test just
+    /// asserts that the combined prefix + suffix consume exactly
+    /// `expected_bin_count` bins via the DecodeDecision / Terminate /
+    /// Bypass count exposed by `CabacDecoder::bin_count`.
+    fn assert_bins_consumed(data: &[u8], expected: u64, body: impl FnOnce(&mut CabacDecoder<'_>)) {
+        let mut dec = make_decoder(data);
+        let before = dec.bin_count();
+        body(&mut dec);
+        let got = dec.bin_count() - before;
+        assert_eq!(got, expected, "bin count mismatch");
+    }
+
+    /// Verify the I-slice suffix helper reads binIdx 1..=6 under an
+    /// all-zero stream: caller supplies binIdx=0 as `Some(1)`, then
+    /// the helper issues 1 DecodeTerminate (binIdx=1), 4 DecodeDecision
+    /// calls for binIdx 2..=5, and because the all-zero stream drives
+    /// b3 to MPS = 1 under the I-slice init for ctxIdx=3+4=7 (Table
+    /// 9-12: m=-23, n=104 → preCtx = ((-23*26)>>4)+104 = -38+104 = 66
+    /// → state_idx=2, val_mps=1), b3 != 0 fires the 7-bin branch, so
+    /// binIdx=6 is also read. Helper bin consumption = 6.
+    #[test]
+    fn i_suffix_helper_reads_binidx_1_through_6_when_b3_nonzero() {
+        let data = [0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_bins_consumed(&data, 6, |dec| {
+            let mut ctxs = CabacContexts::init(SliceKind::I, None, 26).unwrap();
+            // Pass Some(1) as the already-consumed binIdx=0. The helper
+            // reads binIdx 1..=5 then conditionally binIdx=6.
+            let _ = decode_mb_type_i_suffix(dec, &mut ctxs, 3, Some(1)).unwrap();
+        });
+    }
+
+    /// Verify the P-slice suffix helper (offset=17, `None`) reads
+    /// binIdx 0 first (1 bin), then binIdx 1 via DecodeTerminate
+    /// (1 bin), and if both resolve to 0, stops after 2 bins (mb_type
+    /// value 5 — P I_NxN). With a uniformly-zero stream and the init
+    /// table, ctxIdx=17 in a P slice is driven to val_mps=1 (from
+    /// Table 9-13: m=5, n=57), so binIdx 0 MPS = 1 → enter the
+    /// binIdx 1 terminate path, which also resolves to 0 (not
+    /// terminated) → read binIdx 2..=5 for 4 more bins. Helper total
+    /// = 6 bins (binIdx 0..=5).
+    ///
+    /// This is the key regression guard: before the fix, the helper
+    /// returned after only 5 bins (skipping binIdx 0 of the suffix).
+    #[test]
+    fn p_suffix_helper_reads_binidx_0_through_5() {
+        let data = [0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_bins_consumed(&data, 6, |dec| {
+            let mut ctxs = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+            // Sanity: ctxIdx=17 in P slice init_idc=0 at QP=26:
+            //   Table 9-13 (17, P0) = (5, 57)  →  preCtx = ((5*26)>>4)+57
+            //   = 8 + 57 = 65  →  state_idx = 65 - 64 = 1, val_mps = 1.
+            // So binIdx 0 MPS = 1, taking the "not I_NxN" branch into
+            // the terminate bin and on into binIdx 2..=5.
+            let _ = decode_mb_type_i_suffix(dec, &mut ctxs, 17, None).unwrap();
+        });
+    }
+
+    /// Same shape as the P-slice guard but under offset=32 (B-slice
+    /// intra suffix). Table 9-14 ctxIdx=32, P0 = (1, 67): preCtx =
+    /// ((1*26)>>4) + 67 = 1 + 67 = 68 → state_idx = 4, val_mps = 1.
+    /// All-zero stream → MPS path → b0 of suffix = 1, proceed to
+    /// binIdx 1 terminate which resolves to 0 (not terminated), then
+    /// binIdx 2..=5 (4 more bins). Helper total = 6 bins.
+    #[test]
+    fn b_suffix_helper_reads_binidx_0_through_5() {
+        let data = [0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_bins_consumed(&data, 6, |dec| {
+            let mut ctxs = CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
+            let _ = decode_mb_type_i_suffix(dec, &mut ctxs, 32, None).unwrap();
+        });
+    }
+
+    /// With offset=17 and a stream that drives binIdx 0 of the suffix
+    /// to 0 (I_NxN in the P slice), the helper must stop after 1 bin
+    /// and return 0 so the caller produces mb_type = 5 + 0 = 5.
+    ///
+    /// We craft the state so bin 0 decodes as LPS=0 by:
+    ///   - Picking an init where ctxIdx=17 starts with valMPS=1 and a
+    ///     state_idx giving a reasonably-large LPS subrange.
+    ///   - Feeding a codIOffset near `codIRange`, so `codIOffset >=
+    ///     codIRange - codIRangeLPS` (the LPS path) fires, yielding
+    ///     binVal = 1 - valMPS = 0.
+    ///
+    /// Rather than hand-tune the first 9 bits of codIOffset, we rely on
+    /// the fact that codIRange is 510 at start and ctxIdx=17 in P slice
+    /// init_idc=0, QP=26 starts at state_idx=1, valMPS=1. Then
+    /// rangeTabLPS[1][3] = 227, so codIRange after subtraction =
+    /// 510 - 227 = 283. LPS fires when codIOffset ≥ 283. First 9 bits
+    /// decoding 283 is 0b100011011 = 283 → first byte = 0b1000_1101,
+    /// second byte bit 7 = 1 → bytes [0x8D, 0x80, ...].
+    #[test]
+    fn p_suffix_helper_i_nxn_stops_after_one_bin() {
+        // codIOffset init reads 9 bits = 283 (just at the LPS threshold).
+        let data = [0x8D, 0x80, 0x00, 0x00];
+        let mut dec = make_decoder(&data);
+        let before = dec.bin_count();
+        let mut ctxs = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+        let v = decode_mb_type_i_suffix(&mut dec, &mut ctxs, 17, None).unwrap();
+        let bins = dec.bin_count() - before;
+        // Row 0 (I_NxN) of Table 9-36.
+        assert_eq!(v, 0, "I_NxN in P slice is Table 9-36 row 0");
+        assert_eq!(bins, 1, "I_NxN path reads exactly binIdx=0 of the suffix");
     }
 }

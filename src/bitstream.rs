@@ -137,12 +137,16 @@ impl<'a> BitReader<'a> {
         })
     }
 
-    /// §7.2 `te(v)`. Truncated Exp-Golomb (§9.1.2): when the syntax
-    /// element's range upper bound `x_max` is 1, a single inverted bit
-    /// (read 0 → value 1, read 1 → value 0) is parsed. Otherwise it
-    /// falls through to `ue(v)`.
+    /// §7.2 `te(v)`. Truncated Exp-Golomb (§9.1.2, eq. 9-3).
+    ///
+    /// - If `x_max == 0`, no bits are read — the value is always 0.
+    /// - If `x_max == 1`, a single inverted bit is parsed
+    ///   (`codeNum = !read_bits(1)`).
+    /// - Otherwise (`x_max > 1`), it falls through to `ue(v)`.
     pub fn te(&mut self, x_max: u32) -> BitResult<u32> {
-        if x_max == 1 {
+        if x_max == 0 {
+            Ok(0)
+        } else if x_max == 1 {
             Ok(if self.u(1)? == 0 { 1 } else { 0 })
         } else {
             self.ue()
@@ -326,6 +330,18 @@ mod tests {
         // x_max > 1 falls through to ue().
         let mut r = BitReader::new(&[0b0100_0000]);
         assert_eq!(r.te(7).unwrap(), 1);
+    }
+
+    #[test]
+    fn te_x_max_zero_consumes_no_bits() {
+        // §9.1.2 eq. 9-3 degenerate case: when the range is {0} (i.e.
+        // x_max == 0), no bits are read and the value is 0. The
+        // pre-fix behaviour was to fall through to ue() and eat bits.
+        let mut r = BitReader::new(&[0xFFu8, 0xFFu8]);
+        assert_eq!(r.te(0).unwrap(), 0);
+        // Reader should still be at (0, 0) since nothing was consumed.
+        let (byte, bit) = r.position();
+        assert_eq!((byte, bit), (0, 0));
     }
 
     #[test]
