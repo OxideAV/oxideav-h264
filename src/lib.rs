@@ -25,9 +25,13 @@ pub mod poc;
 pub(crate) mod cavlc;
 pub(crate) mod cabac;
 pub mod intra_pred;
+pub mod inter_pred;
+pub mod mv_deriv;
 pub mod transform;
 pub mod deblock;
 pub mod ref_list;
+pub(crate) mod cabac_ctx;
+pub mod sei;
 
 use oxideav_codec::CodecRegistry;
 
