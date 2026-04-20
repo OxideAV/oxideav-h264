@@ -782,145 +782,113 @@ fn mb_type_ctx_inc_first3(offset: u32, bin_idx: u32, neighbours: &NeighbourCtx) 
     }
 }
 
-/// §9.3.2.5 + Table 9-36 — decode the 6- or 7-bin I-slice mb_type
-/// suffix (0..=25).
+/// §9.3.2.5 + Table 9-36 — decode the I-slice mb_type suffix for
+/// values 1..=25 (entries after the leading "1" of Table 9-36).
+///
+/// The caller has already consumed bin 0 of Table 9-36 (the
+/// `0 → I_NxN` vs `1 → other` decision) and confirmed bin 0 == 1.
+/// This helper reads the remaining bins of Table 9-36 and returns the
+/// suffix value (1..=25 for I-slice offset=3; P/B callers pass the
+/// P/B intra-suffix ctxIdxOffsets 17 / 32 and add a per-slice prefix
+/// offset to the returned value as described in §9.3.2.5).
+///
+/// Reference: ITU-T Rec. H.264 (08/2024) §9.3.2.5, Table 9-36, and
+/// Table 9-39 row `ctxIdxOffset = 3` (the same row governs offsets 17
+/// and 32 for the P/SP and B-slice intra suffixes per Table 9-41).
+/// Per-bin ctxIdx within this suffix is:
+///
+/// ```text
+/// binIdx 1 -- ctxIdx = 276 (dedicated terminate context used by the
+///             DecodeTerminate procedure; §9.3.1.1 NOTE 2 / §9.3.3.2.3).
+/// binIdx 2 -- ctxIdxInc = 3.
+/// binIdx 3 -- ctxIdxInc = 4.
+/// binIdx 4 -- ctxIdxInc = (b3 != 0) ? 5 : 6  (Table 9-41).
+/// binIdx 5 -- ctxIdxInc = (b3 != 0) ? 6 : 7  (Table 9-41).
+/// binIdx 6 -- ctxIdxInc = 7.
+/// ```
 fn decode_mb_type_i_suffix(
     dec: &mut CabacDecoder<'_>,
     ctxs: &mut CabacContexts,
     offset: u32,
 ) -> CabacResult<u32> {
-    // bin 0 consumes a bin at ctxIdx = offset + ctxIdxInc(bin 0). The
-    // caller has already consumed the prefix "1" of the I-slice
-    // mb_type (handled outside or, for pure I-slice decoding, inside
-    // this function's wrapper). We parse the Table 9-36 tree here on
-    // top of a 0/1 root.
-
-    // Bin 0 — decide I_NxN (0) vs anything else (1). ctxIdxInc comes
-    // from the caller's bin 0 derivation. For I-slice-only (offset=3),
-    // the caller already provided bin 0 via `mb_type_ctx_inc_first3`.
+    // --- binIdx 1 --------------------------------------------------
     //
-    // This helper assumes bin 0 has just been read externally. For
-    // simplicity we re-read bin 0 here (it is idempotent when this is
-    // the only top-level I-slice mb_type entry point).
+    // Table 9-36 layout (given binIdx 0 == 1):
+    //   binIdx 1 == 1 → Table 9-36 row 25 (I_PCM), bin string "1 1".
+    //   binIdx 1 == 0 → Table 9-36 rows 1..=24 (I_16x16_*), 6 or 7 bins.
     //
-    // Implementation note: the "outer" I-slice decoder `decode_mb_type_i`
-    // inlines the full walk, including bin 0, so this helper is only
-    // invoked for the suffix after a 1-prefix in P/B slices.
-    //
-    // The function below implements the 25-entry suffix tree (values
-    // 1..=25 in Table 9-36). Returned value is 1..=25; caller adds any
-    // prefix-based offset (e.g. +5 for P/SP intra, +23 for B intra).
-
-    // bin after the outer "1": indicates I_16x16 (0) vs I_PCM (1).
-    let ctx1 = ctxs.at_mut((offset + 1) as usize);
-    let b1 = dec.decode_decision(ctx1)?;
+    // Table 9-39 assigns binIdx 1 the special ctxIdx = 276, which
+    // per §9.3.1.1 NOTE 2 is the non-adapting terminate context. The
+    // I_PCM branch is parsed with the `DecodeTerminate` procedure
+    // (§9.3.3.2.3), not the ordinary arithmetic decision path.
+    let b1 = dec.decode_terminate()?;
     if b1 == 1 {
-        // I_PCM terminator — Table 9-36 row 25.
-        let t = dec.decode_terminate()?;
-        // Spec: "for parsing the value of the corresponding bin from
-        // the bitstream, the arithmetic decoding process for decisions
-        // before termination ... is applied." A terminate=1 confirms
-        // I_PCM; terminate=0 should not occur here because the tree
-        // demands the terminator bit — but we still handle by
-        // returning I_PCM either way since the bin was consumed.
-        // I_PCM corresponds to mb_type value 25 in I slices.
-        let _ = t;
+        // Table 9-36 row 25 — I_PCM.
         return Ok(25);
     }
 
-    // b1 == 0: I_16x16_X_Y_Z. Now four more bins select the rest.
-    // Table 9-36: bins 2..6 encode the index as follows:
-    //   b2 -> CBP_luma high bit,
-    //   b3/b4 -> CBP_chroma (2 bits),
-    //   b5/b6 -> AC flag + msb luma.
-    // Rather than following the flat table bit-by-bit, we decode four
-    // bins sequentially using the Table 9-39 ctxIdxInc schedule for
-    // offset 3 which is: bin 1=276 (I_PCM marker, handled above), bin
-    // 2=3, bin 3=4, bin 4=(b3!=0)?5:6, bin 5=(b3!=0)?6:7, bin 6=7.
+    // --- binIdx 2..=5 (always present for rows 1..=24) -------------
     //
-    // After the "I_PCM?" test, the remaining bins in the suffix tree
-    // encode I_16x16 sub-type 0..=24 in the exact bit order of
-    // Table 9-36 rows 1..24. Decode 5 bins, then walk Table 9-36.
+    // binIdx 2 partitions Table 9-36 rows:
+    //   b2 == 0 → rows 1..=12  ("1 0 0 ...").
+    //   b2 == 1 → rows 13..=24 ("1 0 1 ...").
     let b2 = dec.decode_decision(ctxs.at_mut((offset + 3) as usize))?;
+    // binIdx 3 partitions inside each b2-group:
+    //   b3 == 0 → 6-bin rows (rows 1..=4 if b2=0, rows 13..=16 if b2=1).
+    //   b3 == 1 → 7-bin rows (rows 5..=12 if b2=0, rows 17..=24 if b2=1).
     let b3 = dec.decode_decision(ctxs.at_mut((offset + 4) as usize))?;
-    let b4_offset = if b3 != 0 { 5 } else { 6 };
-    let b4 = dec.decode_decision(ctxs.at_mut((offset + b4_offset) as usize))?;
-    let b5_offset = if b3 != 0 { 6 } else { 7 };
-    let b5 = dec.decode_decision(ctxs.at_mut((offset + b5_offset) as usize))?;
-    // Optional 6th bin when b3 == 0 (rows 5..12, 17..24).
-    // Table 9-36 row lengths: rows 1..4 and 13..16 use 6 bins (after
-    // the 1-prefix: 5 more bins); rows 5..12 and 17..24 use 7 bins
-    // (so 6 more bins after the prefix). Since we are past the "1" and
-    // "0" prefix (b1==0), we already read 4 suffix bins (b2..b5). Rows
-    // with length 6 terminate now; rows with length 7 need one more
-    // bin.
+    // binIdx 4 and 5 use the prior-bin-dependent ctxIdxInc from
+    // Table 9-41 (ctxIdxOffset = 3).
+    let b4_inc = if b3 != 0 { 5 } else { 6 };
+    let b4 = dec.decode_decision(ctxs.at_mut((offset + b4_inc) as usize))?;
+    let b5_inc = if b3 != 0 { 6 } else { 7 };
+    let b5 = dec.decode_decision(ctxs.at_mut((offset + b5_inc) as usize))?;
+
+    // --- binIdx 6 (present only when b3 == 1) ----------------------
     //
-    // Actually Table 9-36 shows row "1 0 0 0 0 0" = 6 bits total. The
-    // first bin (1) is the top-level "non-I_NxN" branch; then "0" is
-    // b1; then four more bins. The 7-bit rows have an extra bin after
-    // the first five. Re-derive total length from b2..b5 values:
-    //   - If b2 == 0 and b3 == 0: 7-bit rows 5..12 or 5..12.
-    //   - Else: 6-bit rows 1..4 or 13..16.
-    // Better: just decode the 7th bin when required, using b3 test as
-    // per Table 9-39.
-    let need_extra = b3 == 0;
-    let b6 = if need_extra {
+    // Table 9-36 row lengths (after the leading "1"):
+    //   Rows 1..=4   "0 0 0 X Y"       — 5 suffix bins, b3 = 0.
+    //   Rows 5..=12  "0 0 1 X Y Z"     — 6 suffix bins, b3 = 1.
+    //   Rows 13..=16 "0 1 0 X Y"       — 5 suffix bins, b3 = 0.
+    //   Rows 17..=24 "0 1 1 X Y Z"     — 6 suffix bins, b3 = 1.
+    //
+    // So the optional 7th bin (binIdx = 6) is read iff b3 == 1.
+    let b6 = if b3 != 0 {
         dec.decode_decision(ctxs.at_mut((offset + 7) as usize))?
     } else {
         0
     };
 
-    // Map (b2,b3,b4,b5,b6) -> Table 9-36 row number (1..=24).
-    // Table 9-36 after prefix "1 0":
-    //   row 1  (I_16x16_0_0_0): 0 0 0 0
-    //   row 2  (I_16x16_1_0_0): 0 0 0 1
-    //   row 3  (I_16x16_2_0_0): 0 0 1 0
-    //   row 4  (I_16x16_3_0_0): 0 0 1 1
-    //   row 5  (I_16x16_0_1_0): 0 1 0 0 0
-    //   row 6  (I_16x16_1_1_0): 0 1 0 0 1
-    //   row 7  (I_16x16_2_1_0): 0 1 0 1 0
-    //   row 8  (I_16x16_3_1_0): 0 1 0 1 1
-    //   row 9  (I_16x16_0_2_0): 0 1 1 0 0
-    //   row 10 (I_16x16_1_2_0): 0 1 1 0 1
-    //   row 11 (I_16x16_2_2_0): 0 1 1 1 0
-    //   row 12 (I_16x16_3_2_0): 0 1 1 1 1
-    //   row 13..16 CBP_luma=1, CBP_chroma=0 (same tree with b2=1).
-    //   row 17..24 CBP_luma=1, CBP_chroma={1,2}.
-    //
-    // b2 = CBP_luma high bit. b3 = "is CBP_chroma != 0". If b3==1 we
-    // have 4-bit tail (b4 = CBP_chroma high bit, b5/b6 = Intra16x16PredMode).
-    let val = if b3 == 0 {
-        // b3==0: CBP_chroma=0.
-        // value = 1 + (b2 * 12) + (b4 << 1) + b5  when b6 absent? no,
-        // b6 is present when b3 == 0 (see need_extra above). Actually
-        // looking at Table 9-36: rows 1..4 (b2=0, b3=0) have 4-bit
-        // tail (b2,b3,b4,b5) totaling 6 bins with prefix — but that
-        // would mean no b6. Let me re-examine.
-        //
-        // Rows 1..4: "1 0 0 0 X Y" — 6 bins. After "1 0" that's b2=0,
-        // b3=0, then b4=X, b5=Y. No b6.
-        // Rows 5..12: "1 0 0 1 X Y Z" — 7 bins. After "1 0": b2=0,
-        // b3=1, b4=X, b5=Y, b6=Z.
-        //
-        // So b6 is present when b3 == 1, not when b3 == 0. Re-correct
-        // `need_extra`:
-        debug_assert!(!need_extra);
-        let tail = (b4 << 1) | b5;
-        1 + tail as u32
+    Ok(mb_type_i_suffix_value(b2, b3, b4, b5, b6))
+}
+
+/// §9.3.2.5 + Table 9-36 — map the decoded suffix bins of an
+/// I-slice mb_type (rows 1..=24) to the mb_type value. Row 25
+/// (I_PCM) is handled separately by the caller (binIdx 1 == 1).
+///
+/// Letting `base = 12 * b2` (so rows 1..=12 use base=0 and rows
+/// 13..=24 use base=12), Table 9-36 simplifies to:
+///
+///   * b3 == 0 (6-bin rows, Intra16x16PredMode = `(b4<<1)|b5`):
+///       `value = base + 1 + ((b4 << 1) | b5)`
+///
+///   * b3 == 1 (7-bin rows, CodedBlockPatternChroma selector = `b4`,
+///              Intra16x16PredMode = `(b5<<1)|b6`):
+///       `value = base + 5 + 4*b4 + ((b5 << 1) | b6)`
+///
+/// Verification of every row of Table 9-36 (rows 1..=24) is in the
+/// unit test `mb_type_i_suffix_value_matches_table_9_36`.
+fn mb_type_i_suffix_value(b2: u8, b3: u8, b4: u8, b5: u8, b6: u8) -> u32 {
+    let base = 12u32 * (b2 as u32);
+    if b3 == 0 {
+        // 6-bin rows (rows 1..=4 or 13..=16): tail (b4,b5) is the
+        // 2-bit Intra16x16PredMode.
+        base + 1 + (((b4 as u32) << 1) | (b5 as u32))
     } else {
-        // b3 == 1: 7-bit row. b4 selects CBP_chroma bit, b5/b6 select
-        // Intra16x16PredMode.
-        let chroma_bit = b4;
-        let pred = (b5 << 1) | b6;
-        // Rows 5..12: b2=0, b3=1 → base = 5 + 4*chroma_bit + pred.
-        5 + 4 * (chroma_bit as u32) + pred as u32
-    };
-    // Branch for b2 == 1 (rows 13..24).
-    if b2 == 1 {
-        // Add 12 for the "high bit" of intra-16x16 MB code.
-        Ok(val + 12)
-    } else {
-        Ok(val)
+        // 7-bin rows (rows 5..=12 or 17..=24): b4 is the chroma
+        // selector bit (CodedBlockPatternChroma is 1 when b4=0, 2 when
+        // b4=1), and (b5,b6) is the 2-bit Intra16x16PredMode.
+        base + 5 + 4 * (b4 as u32) + (((b5 as u32) << 1) | (b6 as u32))
     }
 }
 
@@ -1931,6 +1899,80 @@ mod tests {
         let neighbours = NeighbourCtx::default();
         let mb_type = decode_mb_type_i(&mut dec, &mut ctxs, &neighbours).unwrap();
         assert_eq!(mb_type, 0);
+    }
+
+    /// ITU-T Rec. H.264 (08/2024) §9.3.2.5, Table 9-36 — verify the
+    /// (b2, b3, b4, b5, b6) → mb_type value mapping for every row of
+    /// Table 9-36 that reaches `mb_type_i_suffix_value` (rows 1..=24).
+    ///
+    /// The expected bin sequences come directly from Table 9-36 (each
+    /// row in the spec is "1 binIdx1 binIdx2 ..."); the leading "1" is
+    /// consumed by `decode_mb_type_i` (binIdx 0) and the next bin
+    /// selects I_PCM vs I_16x16_*. For rows 1..=24 binIdx 1 is 0 and
+    /// rows 1..=24 then decompose as (b2, b3, b4, b5[, b6]) below.
+    ///
+    /// Row 0 (I_NxN) and row 25 (I_PCM) do not reach this helper; they
+    /// are covered by `mb_type_i_i_nxn` and by the early-return path
+    /// in `decode_mb_type_i_suffix`.
+    #[test]
+    fn mb_type_i_suffix_value_matches_table_9_36() {
+        // (expected_value, b2, b3, b4, b5, b6) — b6 is 0 whenever
+        // b3 == 0 (the 6-bin rows do not read a binIdx 6).
+        let cases: &[(u32, u8, u8, u8, u8, u8)] = &[
+            // Rows 1..=4: "1 0 0 0 X Y" — b2=0, b3=0.
+            (1,  0, 0, 0, 0, 0),  // I_16x16_0_0_0 — "1 0 0 0 0 0"
+            (2,  0, 0, 0, 1, 0),  // I_16x16_1_0_0 — "1 0 0 0 0 1"
+            (3,  0, 0, 1, 0, 0),  // I_16x16_2_0_0 — "1 0 0 0 1 0"
+            (4,  0, 0, 1, 1, 0),  // I_16x16_3_0_0 — "1 0 0 0 1 1"
+            // Rows 5..=12: "1 0 0 1 X Y Z" — b2=0, b3=1.
+            (5,  0, 1, 0, 0, 0),  // I_16x16_0_1_0 — "1 0 0 1 0 0 0"
+            (6,  0, 1, 0, 0, 1),  // I_16x16_1_1_0 — "1 0 0 1 0 0 1"
+            (7,  0, 1, 0, 1, 0),  // I_16x16_2_1_0 — "1 0 0 1 0 1 0"
+            (8,  0, 1, 0, 1, 1),  // I_16x16_3_1_0 — "1 0 0 1 0 1 1"
+            (9,  0, 1, 1, 0, 0),  // I_16x16_0_2_0 — "1 0 0 1 1 0 0"
+            (10, 0, 1, 1, 0, 1),  // I_16x16_1_2_0 — "1 0 0 1 1 0 1"
+            (11, 0, 1, 1, 1, 0),  // I_16x16_2_2_0 — "1 0 0 1 1 1 0"
+            (12, 0, 1, 1, 1, 1),  // I_16x16_3_2_0 — "1 0 0 1 1 1 1"
+            // Rows 13..=16: "1 0 1 0 X Y" — b2=1, b3=0.
+            (13, 1, 0, 0, 0, 0),  // I_16x16_0_0_1 — "1 0 1 0 0 0"
+            (14, 1, 0, 0, 1, 0),  // I_16x16_1_0_1 — "1 0 1 0 0 1"
+            (15, 1, 0, 1, 0, 0),  // I_16x16_2_0_1 — "1 0 1 0 1 0"
+            (16, 1, 0, 1, 1, 0),  // I_16x16_3_0_1 — "1 0 1 0 1 1"
+            // Rows 17..=24: "1 0 1 1 X Y Z" — b2=1, b3=1.
+            (17, 1, 1, 0, 0, 0),  // I_16x16_0_1_1 — "1 0 1 1 0 0 0"
+            (18, 1, 1, 0, 0, 1),  // I_16x16_1_1_1 — "1 0 1 1 0 0 1"
+            (19, 1, 1, 0, 1, 0),  // I_16x16_2_1_1 — "1 0 1 1 0 1 0"
+            (20, 1, 1, 0, 1, 1),  // I_16x16_3_1_1 — "1 0 1 1 0 1 1"
+            (21, 1, 1, 1, 0, 0),  // I_16x16_0_2_1 — "1 0 1 1 1 0 0"
+            (22, 1, 1, 1, 0, 1),  // I_16x16_1_2_1 — "1 0 1 1 1 0 1"
+            (23, 1, 1, 1, 1, 0),  // I_16x16_2_2_1 — "1 0 1 1 1 1 0"
+            (24, 1, 1, 1, 1, 1),  // I_16x16_3_2_1 — "1 0 1 1 1 1 1"
+        ];
+        for &(expected, b2, b3, b4, b5, b6) in cases {
+            let got = mb_type_i_suffix_value(b2, b3, b4, b5, b6);
+            assert_eq!(
+                got, expected,
+                "mb_type_i_suffix_value({b2},{b3},{b4},{b5},{b6}) = {got}, want {expected}"
+            );
+        }
+        // Exhaustive cardinality: every (b2, b3, b4, b5, b6) with b3=0
+        // (b6 must be zero — not read) or b3=1 should produce a unique
+        // value in 1..=24.
+        let mut seen = std::collections::BTreeSet::new();
+        for b2 in 0..=1u8 {
+            for b4 in 0..=1u8 {
+                for b5 in 0..=1u8 {
+                    // b3 = 0, b6 forced to 0.
+                    seen.insert(mb_type_i_suffix_value(b2, 0, b4, b5, 0));
+                    // b3 = 1, b6 ∈ {0, 1}.
+                    for b6 in 0..=1u8 {
+                        seen.insert(mb_type_i_suffix_value(b2, 1, b4, b5, b6));
+                    }
+                }
+            }
+        }
+        let expected_set: std::collections::BTreeSet<u32> = (1u32..=24).collect();
+        assert_eq!(seen, expected_set);
     }
 
     #[test]
