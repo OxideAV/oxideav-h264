@@ -892,6 +892,28 @@ fn conformance_jvt_aud_mw_e() {
     );
 }
 
+/// JVT AVCv1 `CABA1_SVA_B` (SVA & Tsinghua, Main / CABAC, QCIF foreman,
+/// 17 IDR-only frames, frame-coded). Ships with reference YUV AND a
+/// bit-level trace file — usable as ground truth for CABAC debugging.
+#[test]
+fn conformance_jvt_caba1_sva_b() {
+    let bs = std::env::var("OXIDEAV_JVT_CABA1_SVA_B_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/caba1_sva_b/CABA1_SVA_B.264"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_CABA1_SVA_B_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/caba1_sva_b/CABA1_SVA_B_rec.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_CABA1_SVA_B", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+    assert_eq!(
+        report.ours_frames, report.ffmpeg_frames,
+        "frame-count mismatch: ours={} ref={}",
+        report.ours_frames, report.ffmpeg_frames
+    );
+}
+
 /// JVT AVCv1 `camp_mot_frm0_full` (Motorola, Main / CABAC, 720x480
 /// 4:2:0, 30 frames of Mobile, IBBP, frame-coded). Reference YUV at
 /// `camp_mot_frm0_full_rec.yuv`. Only IDR + frame-coded so should
