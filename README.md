@@ -37,8 +37,8 @@ no packet is decoded.
 | Spec area | Clause | Status |
 | --------- | ------ | ------ |
 | NAL parsing (Annex B + AVCC) | §7.3.1, §7.4.1, §B.1 | parsed (no extension headers) |
-| Sequence Parameter Set | §7.3.2.1 | not implemented |
-| Picture Parameter Set | §7.3.2.2 | not implemented |
+| Sequence Parameter Set | §7.3.2.1 | parsed (VUI body + scaling_list deferred) |
+| Picture Parameter Set | §7.3.2.2 | parsed (FMO included; scaling_list deferred) |
 | Slice header | §7.3.3 | not implemented |
 | Slice data + macroblock layer | §7.3.4, §7.3.5 | not implemented |
 | Reference picture marking (sliding window + MMCO) | §7.3.3.3, §8.2.5 | not implemented |
@@ -49,8 +49,8 @@ no packet is decoded.
 | Inter prediction (MC, MV derivation, weighted pred) | §8.4 | not implemented |
 | Transform decode + reconstruction | §8.5 | not implemented |
 | Deblocking filter | §8.7 | not implemented |
-| CAVLC entropy decode | §9.2 | not implemented |
-| CABAC entropy decode | §9.3 | not implemented |
+| CAVLC entropy decode | §9.2 | tables + primitives (residual_block_cavlc loop in place; nC derivation deferred to slice layer) |
+| CABAC entropy decode | §9.3 | engine (init + DecodeDecision/Bypass/Terminate); per-element binarisations deferred to slice layer |
 
 ## Goals
 
