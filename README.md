@@ -39,7 +39,11 @@ no packet is decoded.
 | NAL parsing (Annex B + AVCC) | §7.3.1, §7.4.1, §B.1 | parsed (no extension headers) |
 | Sequence Parameter Set | §7.3.2.1 | parsed (VUI body + scaling_list deferred) |
 | Picture Parameter Set | §7.3.2.2 | parsed (FMO included; scaling_list deferred) |
-| Slice header | §7.3.3 | not implemented |
+| scaling_list body | §7.3.2.1.1.1 | parsed (standalone — not yet wired into SPS/PPS) |
+| VUI parameters (+ HRD) | §E.1 | parsed (standalone — not yet wired into SPS) |
+| AUD + SEI framing + filler + end-of-seq/stream | §7.3.2.3..7 | parsed (SEI payloads per Annex D deferred) |
+| Slice header | §7.3.3 | parsed (incl. RPLM, pred_weight_table, dec_ref_pic_marking) |
+| Picture Order Count derivation (types 0/1/2) | §8.2.1 | implemented |
 | Slice data + macroblock layer | §7.3.4, §7.3.5 | not implemented |
 | Reference picture marking (sliding window + MMCO) | §7.3.3.3, §8.2.5 | not implemented |
 | Reference picture list construction | §8.2.4 | not implemented |
