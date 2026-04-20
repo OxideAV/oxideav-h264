@@ -14,33 +14,33 @@
 //! See `README.md` for the spec coverage matrix as it grows.
 
 pub(crate) mod bitstream;
-pub mod nal;
-pub mod sps;
-pub mod pps;
-pub mod scaling_list;
-pub mod vui;
-pub mod slice_header;
-pub mod non_vcl;
-pub mod poc;
-pub(crate) mod cavlc;
 pub(crate) mod cabac;
-pub mod intra_pred;
-pub mod inter_pred;
-pub mod mv_deriv;
-pub mod transform;
-pub mod deblock;
-pub mod ref_list;
 pub(crate) mod cabac_ctx;
-pub mod sei;
-pub mod mb_address;
-pub mod macroblock_layer;
-pub mod slice_data;
-pub mod picture;
-pub mod mb_grid;
-pub mod ref_store;
-pub mod reconstruct;
-pub mod dpb_output;
+pub(crate) mod cavlc;
+pub mod deblock;
 pub mod decoder;
+pub mod dpb_output;
+pub mod inter_pred;
+pub mod intra_pred;
+pub mod macroblock_layer;
+pub mod mb_address;
+pub mod mb_grid;
+pub mod mv_deriv;
+pub mod nal;
+pub mod non_vcl;
+pub mod picture;
+pub mod poc;
+pub mod pps;
+pub mod reconstruct;
+pub mod ref_list;
+pub mod ref_store;
+pub mod scaling_list;
+pub mod sei;
+pub mod slice_data;
+pub mod slice_header;
+pub mod sps;
+pub mod transform;
+pub mod vui;
 
 use oxideav_codec::CodecRegistry;
 

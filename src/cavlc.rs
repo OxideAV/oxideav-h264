@@ -1176,7 +1176,9 @@ pub fn decode_coeff_token(
     let table = ctx.select_table();
     match decode_vlc(r, table)? {
         Some(v) => Ok(v),
-        None => Err(CavlcError::UnknownCoeffToken { nc: ctx.nc_for_error() }),
+        None => Err(CavlcError::UnknownCoeffToken {
+            nc: ctx.nc_for_error(),
+        }),
     }
 }
 
@@ -1668,12 +1670,7 @@ mod tests {
     #[test]
     fn total_zeros_luma_tzvlc_1_samples() {
         // Table 9-7 column tzVlcIndex=1.
-        let cases: &[(&str, u32)] = &[
-            ("1", 0),
-            ("011", 1),
-            ("010", 2),
-            ("0011", 3),
-        ];
+        let cases: &[(&str, u32)] = &[("1", 0), ("011", 1), ("010", 2), ("0011", 3)];
         for (bits, want) in cases {
             let bytes = pack_bits(&[bits]);
             let mut r = BitReader::new(&bytes);
@@ -1703,10 +1700,7 @@ mod tests {
     #[test]
     fn total_zeros_luma_tzvlc_15_samples() {
         // Table 9-8 column tzVlcIndex=15: just 1 bit — 0 or 1.
-        let cases: &[(&str, u32)] = &[
-            ("0", 0),
-            ("1", 1),
-        ];
+        let cases: &[(&str, u32)] = &[("0", 0), ("1", 1)];
         for (bits, want) in cases {
             let bytes = pack_bits(&[bits]);
             let mut r = BitReader::new(&bytes);
@@ -1986,14 +1980,8 @@ mod tests {
             "1",       // run_before[1] = 0 (zl=2)
         ]);
         let mut r = BitReader::new(&bytes);
-        let coeff = parse_residual_block_cavlc(
-            &mut r,
-            CoeffTokenContext::Numeric(0),
-            0,
-            15,
-            16,
-        )
-        .unwrap();
+        let coeff =
+            parse_residual_block_cavlc(&mut r, CoeffTokenContext::Numeric(0), 0, 15, 16).unwrap();
 
         let mut expected = vec![0i32; 16];
         expected[2] = 3;
@@ -2008,14 +1996,8 @@ mod tests {
         // bits consumed. Column 0, TotalCoeff=0, TrailingOnes=0 → "1".
         let bytes = pack_bits(&["1"]);
         let mut r = BitReader::new(&bytes);
-        let coeff = parse_residual_block_cavlc(
-            &mut r,
-            CoeffTokenContext::Numeric(0),
-            0,
-            15,
-            16,
-        )
-        .unwrap();
+        let coeff =
+            parse_residual_block_cavlc(&mut r, CoeffTokenContext::Numeric(0), 0, 15, 16).unwrap();
         assert_eq!(coeff, vec![0; 16]);
     }
 
@@ -2035,14 +2017,8 @@ mod tests {
         //   §9.2.4: coeffNum = -1 + 0 + 1 = 0 → coeff_level[0] = -1. Good.
         let bytes = pack_bits(&["01", "1", "1"]);
         let mut r = BitReader::new(&bytes);
-        let coeff = parse_residual_block_cavlc(
-            &mut r,
-            CoeffTokenContext::Numeric(0),
-            0,
-            15,
-            16,
-        )
-        .unwrap();
+        let coeff =
+            parse_residual_block_cavlc(&mut r, CoeffTokenContext::Numeric(0), 0, 15, 16).unwrap();
         let mut expected = vec![0i32; 16];
         expected[0] = -1;
         assert_eq!(coeff, expected);

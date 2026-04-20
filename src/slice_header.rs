@@ -499,9 +499,7 @@ impl SliceHeader {
 
         // §7.3.3 — slice_group_change_cycle u(v) when FMO map types 3..=5.
         let mut slice_group_change_cycle: u32 = 0;
-        if pps.num_slice_groups_minus1 > 0
-            && is_changing_map_type(pps)
-        {
+        if pps.num_slice_groups_minus1 > 0 && is_changing_map_type(pps) {
             // §7.4.3 eq. (7-37): bits = Ceil(Log2(PicSizeInMapUnits /
             // SliceGroupChangeRate + 1)).
             let pic_size_in_map_units = sps.pic_width_in_mbs() * sps.pic_height_in_map_units();
@@ -631,11 +629,8 @@ fn parse_pred_weight_table(
         0
     };
 
-    let (luma_weights_l0, chroma_weights_l0) = parse_weight_list(
-        r,
-        num_ref_idx_l0_active_minus1,
-        chroma_array_type,
-    )?;
+    let (luma_weights_l0, chroma_weights_l0) =
+        parse_weight_list(r, num_ref_idx_l0_active_minus1, chroma_array_type)?;
 
     // §7.3.3.2 — list 1 branch only for B slices (slice_type % 5 == 1).
     let (luma_weights_l1, chroma_weights_l1) = if slice_type.has_list_1() {
@@ -661,13 +656,7 @@ fn parse_weight_list(
     r: &mut BitReader<'_>,
     num_ref_idx_minus1: u32,
     chroma_array_type: u32,
-) -> Result<
-    (
-        Vec<Option<(i32, i32)>>,
-        Vec<Option<[(i32, i32); 2]>>,
-    ),
-    SliceHeaderError,
-> {
+) -> Result<(Vec<Option<(i32, i32)>>, Vec<Option<[(i32, i32); 2]>>), SliceHeaderError> {
     let count = num_ref_idx_minus1 as usize + 1;
     let mut luma = Vec::with_capacity(count);
     let mut chroma = Vec::with_capacity(if chroma_array_type != 0 { count } else { 0 });
@@ -868,7 +857,7 @@ mod tests {
             offset_for_ref_frame: Vec::new(),
             max_num_ref_frames: 1,
             gaps_in_frame_num_value_allowed_flag: false,
-            pic_width_in_mbs_minus1: 19, // 320px / 16
+            pic_width_in_mbs_minus1: 19,        // 320px / 16
             pic_height_in_map_units_minus1: 14, // 240px / 16
             frame_mbs_only_flag: true,
             mb_adaptive_frame_field_flag: false,
@@ -942,11 +931,11 @@ mod tests {
         w.ue(0); // first_mb_in_slice
         w.ue(7); // slice_type = 7 (I, all same)
         w.ue(0); // pic_parameter_set_id
-        // no colour_plane_id (separate_colour_plane_flag=0)
+                 // no colour_plane_id (separate_colour_plane_flag=0)
         w.u(4, 0); // frame_num (4 bits)
-        // frame_mbs_only_flag=1 → no field/bottom field flags
-        // IdrPicFlag = 0 → no idr_pic_id
-        // poc_type=0 → pic_order_cnt_lsb (4 bits)
+                   // frame_mbs_only_flag=1 → no field/bottom field flags
+                   // IdrPicFlag = 0 → no idr_pic_id
+                   // poc_type=0 → pic_order_cnt_lsb (4 bits)
         w.u(4, 0);
         // bottom_field_pic_order_in_frame_present_flag=0 → no delta bottom
         // redundant_pic_cnt_present_flag=0 → none
@@ -960,9 +949,9 @@ mod tests {
         w.u(1, 0);
         // entropy_coding_mode=0 AND slice is I → no cabac_init_idc.
         w.se(0); // slice_qp_delta
-        // not SP/SI → no sp_for_switch/qs_delta.
-        // deblocking_filter_control_present_flag=0 → no deblocking fields.
-        // num_slice_groups_minus1=0 → no slice_group_change_cycle.
+                 // not SP/SI → no sp_for_switch/qs_delta.
+                 // deblocking_filter_control_present_flag=0 → no deblocking fields.
+                 // num_slice_groups_minus1=0 → no slice_group_change_cycle.
 
         let bytes = w.into_bytes();
         let hdr = SliceHeader::parse(&bytes, &sps, &pps, &nh).unwrap();
@@ -1042,17 +1031,17 @@ mod tests {
         w.ue(0); // pps_id
         w.u(4, 3); // frame_num = 3
         w.u(4, 6); // pic_order_cnt_lsb = 6
-        // redundant_pic_cnt_present_flag=0
-        // P slice → num_ref_idx_active_override_flag
+                   // redundant_pic_cnt_present_flag=0
+                   // P slice → num_ref_idx_active_override_flag
         w.u(1, 1); // override = 1
         w.ue(2); // num_ref_idx_l0_active_minus1 = 2
-        // no l1
-        // ref_pic_list_modification for P (has list 0, no list 1):
+                 // no l1
+                 // ref_pic_list_modification for P (has list 0, no list 1):
         w.u(1, 0); // ref_pic_list_modification_flag_l0 = 0
-        // weighted_pred_flag=0 AND slice_type=P: no pred_weight_table.
-        // nal_ref_idc != 0 → dec_ref_pic_marking():
+                   // weighted_pred_flag=0 AND slice_type=P: no pred_weight_table.
+                   // nal_ref_idc != 0 → dec_ref_pic_marking():
         w.u(1, 0); // adaptive_ref_pic_marking_mode_flag
-        // entropy_coding_mode=0 → no cabac_init_idc
+                   // entropy_coding_mode=0 → no cabac_init_idc
         w.se(1); // slice_qp_delta
 
         let bytes = w.into_bytes();
@@ -1082,32 +1071,32 @@ mod tests {
         w.ue(0); // pps_id
         w.u(4, 5); // frame_num
         w.u(4, 10); // pic_order_cnt_lsb
-        // redundant_pic_cnt_present_flag=0
-        // B → direct_spatial_mv_pred_flag
+                    // redundant_pic_cnt_present_flag=0
+                    // B → direct_spatial_mv_pred_flag
         w.u(1, 1);
         // P/SP/B → num_ref_idx_active_override_flag
         w.u(1, 0); // no override
-        // ref_pic_list_modification:
+                   // ref_pic_list_modification:
         w.u(1, 0); // list 0 flag
         w.u(1, 0); // list 1 flag
-        // pred_weight_table (ChromaArrayType=1 for 4:2:0):
+                   // pred_weight_table (ChromaArrayType=1 for 4:2:0):
         w.ue(1); // luma_log2_weight_denom = 1
         w.ue(0); // chroma_log2_weight_denom = 0
-        // list 0: one entry
+                 // list 0: one entry
         w.u(1, 1); // luma_weight_l0_flag
         w.se(2); // luma_weight_l0
         w.se(-1); // luma_offset_l0
         w.u(1, 0); // chroma_weight_l0_flag = 0
-        // list 1: one entry (B has list 1)
+                   // list 1: one entry (B has list 1)
         w.u(1, 0); // luma_weight_l1_flag = 0
         w.u(1, 1); // chroma_weight_l1_flag = 1
         w.se(3); // chroma_weight_l1[0][0] (Cb weight)
         w.se(0); // chroma_offset_l1[0][0]
         w.se(-2); // chroma_weight_l1[0][1] (Cr weight)
         w.se(1); // chroma_offset_l1[0][1]
-        // nal_ref_idc != 0 → dec_ref_pic_marking:
+                 // nal_ref_idc != 0 → dec_ref_pic_marking:
         w.u(1, 0); // sliding window
-        // entropy=0 and B (not I/SI): cabac_init_idc present only with CABAC, so skip.
+                   // entropy=0 and B (not I/SI): cabac_init_idc present only with CABAC, so skip.
         w.se(0); // slice_qp_delta
 
         let bytes = w.into_bytes();
@@ -1136,12 +1125,12 @@ mod tests {
         w.ue(0); // pps_id
         w.u(4, 1); // frame_num
         w.u(4, 4); // pic_order_cnt_lsb
-        // no redundant_pic_cnt
-        // P: num_ref_idx_active_override_flag
+                   // no redundant_pic_cnt
+                   // P: num_ref_idx_active_override_flag
         w.u(1, 0);
         // ref_pic_list_modification:
         w.u(1, 0); // flag_l0 = 0
-        // dec_ref_pic_marking (non-IDR):
+                   // dec_ref_pic_marking (non-IDR):
         w.u(1, 1); // adaptive_ref_pic_marking_mode_flag = 1
         w.ue(1); // MMCO 1
         w.ue(5); // difference_of_pic_nums_minus1
@@ -1179,9 +1168,9 @@ mod tests {
         w.ue(0); // pps_id
         w.u(4, 2); // frame_num
         w.u(4, 2); // pic_order_cnt_lsb
-        // no redundant
+                   // no redundant
         w.u(1, 0); // num_ref_idx_active_override_flag = 0
-        // ref_pic_list_modification:
+                   // ref_pic_list_modification:
         w.u(1, 1); // flag_l0 = 1
         w.ue(0); // idc = 0 Subtract
         w.ue(1); // abs_diff - 1 = 1
@@ -1190,7 +1179,7 @@ mod tests {
         w.ue(2); // idc = 2 LongTerm
         w.ue(4);
         w.ue(3); // idc = 3 terminate
-        // nal_ref_idc != 0 → dec_ref_pic_marking (non-IDR, sliding window):
+                 // nal_ref_idc != 0 → dec_ref_pic_marking (non-IDR, sliding window):
         w.u(1, 0);
         w.se(0); // slice_qp_delta
 
@@ -1220,15 +1209,15 @@ mod tests {
         w.ue(0); // pps_id
         w.u(4, 0); // frame_num
         w.u(4, 0); // pic_order_cnt_lsb
-        // no redundant
-        // I → no override / no direct_spatial
-        // I → no ref_pic_list_modification for list 0, no list 1.
-        // nal_ref_idc != 0: dec_ref_pic_marking (non-IDR sliding window).
+                   // no redundant
+                   // I → no override / no direct_spatial
+                   // I → no ref_pic_list_modification for list 0, no list 1.
+                   // nal_ref_idc != 0: dec_ref_pic_marking (non-IDR sliding window).
         w.u(1, 0);
         // I + CAVLC: no cabac_init_idc.
         w.se(0); // slice_qp_delta
-        // no SP/SI fields
-        // deblocking group present:
+                 // no SP/SI fields
+                 // deblocking group present:
         w.ue(0); // disable_deblocking_filter_idc = 0
         w.se(-2); // slice_alpha_c0_offset_div2
         w.se(3); // slice_beta_offset_div2
@@ -1279,11 +1268,11 @@ mod tests {
         w.ue(7); // I all same
         w.ue(0); // pps_id
         w.u(4, 0); // frame_num
-        // frame_mbs_only=0 → field_pic_flag, then bottom_field_flag if set.
+                   // frame_mbs_only=0 → field_pic_flag, then bottom_field_flag if set.
         w.u(1, 1); // field_pic_flag = 1
         w.u(1, 1); // bottom_field_flag = 1
         w.u(4, 0); // pic_order_cnt_lsb
-        // dec_ref_pic_marking:
+                   // dec_ref_pic_marking:
         w.u(1, 0);
         w.se(0);
 
@@ -1306,8 +1295,8 @@ mod tests {
         w.ue(0); // pps_id
         w.u(4, 1); // frame_num
         w.u(4, 0); // pic_order_cnt_lsb
-        // no redundant
-        // P → num_ref_idx_active_override_flag
+                   // no redundant
+                   // P → num_ref_idx_active_override_flag
         w.u(1, 0);
         // ref_pic_list_modification (list 0 only):
         w.u(1, 0);
@@ -1399,7 +1388,7 @@ mod tests {
         // dec_ref_pic_marking non-IDR
         w.u(1, 0);
         w.se(0); // slice_qp_delta
-        // num_slice_groups_minus1 > 0 AND map type is Changing → read cycle.
+                 // num_slice_groups_minus1 > 0 AND map type is Changing → read cycle.
         w.u(9, 123); // slice_group_change_cycle = 123
 
         let bytes = w.into_bytes();

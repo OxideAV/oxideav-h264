@@ -311,7 +311,7 @@ pub fn parse_pic_timing(payload: &[u8], ctx: &SeiContext) -> Result<PicTiming, S
 /// is the safest choice: no clockTimestamp flags are read.
 fn num_clock_ts_from_pic_struct(pic_struct: u8) -> u8 {
     match pic_struct {
-        0 | 1 | 2 => 1,
+        0..=2 => 1,
         3 | 4 | 7 => 2,
         5 | 6 | 8 => 3,
         _ => 0,
@@ -441,7 +441,10 @@ pub enum SeiPayload {
     MasteringDisplay(MasteringDisplayColourVolume),
     ContentLightLevel(ContentLightLevelInfo),
     /// Not parsed — caller keeps the raw payload for later interpretation.
-    Unknown { payload_type: u32, payload: Vec<u8> },
+    Unknown {
+        payload_type: u32,
+        payload: Vec<u8>,
+    },
 }
 
 /// §D.1.1 sei_payload() dispatch for the subset of payload types we

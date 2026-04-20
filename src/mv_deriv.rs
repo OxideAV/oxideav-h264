@@ -89,8 +89,10 @@ impl NeighbourMv {
 /// of a specific neighbour *when its refIdx matches*. Otherwise we
 /// fall through to median (§8.4.1.3.1).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum MvpredShape {
     /// Default: median of A, B, C (§8.4.1.3.1).
+    #[default]
     Default,
     /// 16x8 top partition, mbPartIdx == 0: mvpLX = mvLXB if
     /// refIdxLXB == refIdxLX (eq. 8-203), else median.
@@ -106,11 +108,6 @@ pub enum MvpredShape {
     Partition8x16Right,
 }
 
-impl Default for MvpredShape {
-    fn default() -> Self {
-        MvpredShape::Default
-    }
-}
 
 /// Inputs to the top-level MVpred derivation (§8.4.1.3).
 ///
@@ -295,14 +292,8 @@ pub fn derive_b_spatial_direct(
     c_l1: NeighbourMv,
 ) -> (i32, Mv, i32, Mv) {
     // §8.4.1.2.2 eq. 8-184/8-185 — MinPositive chain.
-    let mut ref_idx_l0 = min_positive(
-        a_l0.ref_idx,
-        min_positive(b_l0.ref_idx, c_l0.ref_idx),
-    );
-    let mut ref_idx_l1 = min_positive(
-        a_l1.ref_idx,
-        min_positive(b_l1.ref_idx, c_l1.ref_idx),
-    );
+    let mut ref_idx_l0 = min_positive(a_l0.ref_idx, min_positive(b_l0.ref_idx, c_l0.ref_idx));
+    let mut ref_idx_l1 = min_positive(a_l1.ref_idx, min_positive(b_l1.ref_idx, c_l1.ref_idx));
 
     // §8.4.1.2.2 eq. 8-188..8-190 — directZeroPredictionFlag.
     let direct_zero = ref_idx_l0 < 0 && ref_idx_l1 < 0;
@@ -524,10 +515,10 @@ pub fn neighbour_4x4_map(current_block_idx: u8) -> [NeighbourSource; 4] {
 
     // Table 6-2 offsets (xD, yD) for A, B, C, D.
     let offsets: [(i32, i32); 4] = [
-        (-1, 0),                    // A
-        (0, -1),                    // B
-        (PRED_PART_WIDTH, -1),      // C
-        (-1, -1),                   // D
+        (-1, 0),               // A
+        (0, -1),               // B
+        (PRED_PART_WIDTH, -1), // C
+        (-1, -1),              // D
     ];
 
     let mut out = [NeighbourSource::InternalBlock(0); 4];
@@ -814,8 +805,7 @@ mod tests {
         let b_l1 = NeighbourMv::UNAVAILABLE;
         let c_l1 = NeighbourMv::UNAVAILABLE;
 
-        let (r0, mv0, r1, mv1) =
-            derive_b_spatial_direct(a_l0, a_l1, b_l0, b_l1, c_l0, c_l1);
+        let (r0, mv0, r1, mv1) = derive_b_spatial_direct(a_l0, a_l1, b_l0, b_l1, c_l0, c_l1);
         assert_eq!(r0, 2);
         // L1 all unavailable -> MinPositive = -1 for L1. But L0 is
         // valid (>= 0), so directZeroPredictionFlag = 0. L1's MV is
@@ -855,8 +845,7 @@ mod tests {
         let b_l1 = NeighbourMv::new(1, Mv::new(-12, -16));
         let c_l1 = NeighbourMv::new(1, Mv::new(-8, -4));
 
-        let (r0, mv0, r1, mv1) =
-            derive_b_spatial_direct(a_l0, a_l1, b_l0, b_l1, c_l0, c_l1);
+        let (r0, mv0, r1, mv1) = derive_b_spatial_direct(a_l0, a_l1, b_l0, b_l1, c_l0, c_l1);
         assert_eq!(r0, 0);
         assert_eq!(r1, 1);
         // L0 all match refIdx 0 -> median of (4,12,8) = 8;
@@ -919,21 +908,21 @@ mod tests {
     #[test]
     fn inverse_4x4_luma_scan_figure_6_10() {
         // Per figure 6-10:
-        assert_eq!(inverse_4x4_luma_scan(0),  (0,  0));
-        assert_eq!(inverse_4x4_luma_scan(1),  (4,  0));
-        assert_eq!(inverse_4x4_luma_scan(2),  (0,  4));
-        assert_eq!(inverse_4x4_luma_scan(3),  (4,  4));
-        assert_eq!(inverse_4x4_luma_scan(4),  (8,  0));
-        assert_eq!(inverse_4x4_luma_scan(5),  (12, 0));
-        assert_eq!(inverse_4x4_luma_scan(6),  (8,  4));
-        assert_eq!(inverse_4x4_luma_scan(7),  (12, 4));
-        assert_eq!(inverse_4x4_luma_scan(8),  (0,  8));
-        assert_eq!(inverse_4x4_luma_scan(9),  (4,  8));
-        assert_eq!(inverse_4x4_luma_scan(10), (0,  12));
-        assert_eq!(inverse_4x4_luma_scan(11), (4,  12));
-        assert_eq!(inverse_4x4_luma_scan(12), (8,  8));
+        assert_eq!(inverse_4x4_luma_scan(0), (0, 0));
+        assert_eq!(inverse_4x4_luma_scan(1), (4, 0));
+        assert_eq!(inverse_4x4_luma_scan(2), (0, 4));
+        assert_eq!(inverse_4x4_luma_scan(3), (4, 4));
+        assert_eq!(inverse_4x4_luma_scan(4), (8, 0));
+        assert_eq!(inverse_4x4_luma_scan(5), (12, 0));
+        assert_eq!(inverse_4x4_luma_scan(6), (8, 4));
+        assert_eq!(inverse_4x4_luma_scan(7), (12, 4));
+        assert_eq!(inverse_4x4_luma_scan(8), (0, 8));
+        assert_eq!(inverse_4x4_luma_scan(9), (4, 8));
+        assert_eq!(inverse_4x4_luma_scan(10), (0, 12));
+        assert_eq!(inverse_4x4_luma_scan(11), (4, 12));
+        assert_eq!(inverse_4x4_luma_scan(12), (8, 8));
         assert_eq!(inverse_4x4_luma_scan(13), (12, 8));
-        assert_eq!(inverse_4x4_luma_scan(14), (8,  12));
+        assert_eq!(inverse_4x4_luma_scan(14), (8, 12));
         assert_eq!(inverse_4x4_luma_scan(15), (12, 12));
     }
 

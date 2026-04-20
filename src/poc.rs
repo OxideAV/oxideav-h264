@@ -344,7 +344,10 @@ fn derive_type1(
     let (d0, d1) = if sps.delta_pic_order_always_zero_flag {
         (0i64, 0i64)
     } else {
-        (slice.delta_pic_order_cnt[0] as i64, slice.delta_pic_order_cnt[1] as i64)
+        (
+            slice.delta_pic_order_cnt[0] as i64,
+            slice.delta_pic_order_cnt[1] as i64,
+        )
     };
     let offset_top_to_bottom = sps.offset_for_top_to_bottom_field as i64;
 
@@ -647,12 +650,7 @@ mod tests {
 
     // -------- §8.2.1.2 (type 1) ------------------------------------
 
-    fn sps_type1(
-        cycle: Vec<i32>,
-        off_nonref: i32,
-        off_t2b: i32,
-        always_zero: bool,
-    ) -> PocSps {
+    fn sps_type1(cycle: Vec<i32>, off_nonref: i32, off_t2b: i32, always_zero: bool) -> PocSps {
         PocSps {
             pic_order_cnt_type: 1,
             log2_max_frame_num_minus4: 0, // MaxFrameNum = 16.

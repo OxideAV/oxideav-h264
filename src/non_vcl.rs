@@ -207,7 +207,7 @@ mod tests {
     // padding the final byte with zeros. Used by AUD trailing-bits
     // tests to construct exact bit patterns.
     fn pack_bits(bits: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity((bits.len() + 7) / 8);
+        let mut out = Vec::with_capacity(bits.len().div_ceil(8));
         let mut cur: u8 = 0;
         let mut n: u8 = 0;
         for &b in bits {

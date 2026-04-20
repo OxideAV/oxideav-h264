@@ -186,10 +186,7 @@ impl MbType {
 
     /// §7.4.5 — true for any intra macroblock.
     pub fn is_intra(&self) -> bool {
-        matches!(
-            self,
-            MbType::INxN | MbType::Intra16x16(_) | MbType::IPcm
-        )
+        matches!(self, MbType::INxN | MbType::Intra16x16(_) | MbType::IPcm)
     }
 
     /// §7.4.5 — true for P_Skip / B_Skip.
@@ -209,10 +206,9 @@ impl MbType {
             P8x8 | P8x8Ref0 => 4,
             // B inter.
             BDirect16x16 | BSkip | BL016x16 | BL116x16 | BBi16x16 => 1,
-            BL0L016x8 | BL0L08x16 | BL1L116x8 | BL1L18x16 | BL0L116x8
-            | BL0L18x16 | BL1L016x8 | BL1L08x16 | BL0Bi16x8 | BL0Bi8x16
-            | BL1Bi16x8 | BL1Bi8x16 | BBiL016x8 | BBiL08x16 | BBiL116x8
-            | BBiL18x16 | BBiBi16x8 | BBiBi8x16 => 2,
+            BL0L016x8 | BL0L08x16 | BL1L116x8 | BL1L18x16 | BL0L116x8 | BL0L18x16 | BL1L016x8
+            | BL1L08x16 | BL0Bi16x8 | BL0Bi8x16 | BL1Bi16x8 | BL1Bi8x16 | BBiL016x8 | BBiL08x16
+            | BBiL116x8 | BBiL18x16 | BBiBi16x8 | BBiBi8x16 => 2,
             B8x8 => 4,
             Reserved(_) => 1,
         }
@@ -563,11 +559,7 @@ static ME_INTER_0_3: [u8; 16] = [
 
 /// §9.1.2 — `me(v)` for coded_block_pattern. Reads ue(v), indexes the
 /// appropriate table per (ChromaArrayType, is_intra).
-fn parse_cbp_me(
-    r: &mut BitReader<'_>,
-    chroma_array_type: u32,
-    is_intra: bool,
-) -> McblResult<u32> {
+fn parse_cbp_me(r: &mut BitReader<'_>, chroma_array_type: u32, is_intra: bool) -> McblResult<u32> {
     let k = r.ue()?;
     let val = if chroma_array_type == 1 || chroma_array_type == 2 {
         let idx = k as usize;
@@ -644,12 +636,8 @@ pub fn parse_macroblock(
     // ---------------------------------------------------------------
     let mb_type_raw = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
         match slice_type {
-            SliceType::I | SliceType::SI => {
-                decode_mb_type_i(dec, ctxs, &entropy.neighbours)?
-            }
-            SliceType::P | SliceType::SP => {
-                decode_mb_type_p(dec, ctxs, &entropy.neighbours)?
-            }
+            SliceType::I | SliceType::SI => decode_mb_type_i(dec, ctxs, &entropy.neighbours)?,
+            SliceType::P | SliceType::SP => decode_mb_type_p(dec, ctxs, &entropy.neighbours)?,
             SliceType::B => decode_mb_type_b(dec, ctxs, &entropy.neighbours)?,
         }
     } else {
@@ -690,9 +678,11 @@ pub fn parse_macroblock(
             1 => (64, 64),
             2 => (128, 128),
             3 => (256, 256),
-            _ => return Err(MacroblockLayerError::UnsupportedChromaArrayType(
-                entropy.chroma_array_type,
-            )),
+            _ => {
+                return Err(MacroblockLayerError::UnsupportedChromaArrayType(
+                    entropy.chroma_array_type,
+                ))
+            }
         };
         let mut luma = Vec::with_capacity(256);
         for _ in 0..256 {
@@ -753,12 +743,7 @@ pub fn parse_macroblock(
         cbp_total = cbp_luma | (cbp_chroma << 4);
     } else {
         cbp_total = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
-            decode_coded_block_pattern(
-                dec,
-                ctxs,
-                &entropy.neighbours,
-                entropy.chroma_array_type,
-            )?
+            decode_coded_block_pattern(dec, ctxs, &entropy.neighbours, entropy.chroma_array_type)?
         } else {
             parse_cbp_me(r, entropy.chroma_array_type, mb_type.is_intra())?
         };
@@ -804,8 +789,7 @@ pub fn parse_macroblock(
     // §7.3.5 — mb_qp_delta. Read when any of cbp_luma, cbp_chroma, or
     // Intra_16x16 mb_type are present.
     // ---------------------------------------------------------------
-    let needs_qp_delta =
-        cbp_luma > 0 || cbp_chroma > 0 || mb_type.is_intra_16x16();
+    let needs_qp_delta = cbp_luma > 0 || cbp_chroma > 0 || mb_type.is_intra_16x16();
     let mb_qp_delta = if needs_qp_delta {
         if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
             decode_mb_qp_delta(dec, ctxs, entropy.prev_mb_qp_delta_nonzero)?
@@ -914,9 +898,9 @@ fn parse_mb_pred(
         let num_parts = mb_type.num_mb_part() as usize;
         let num_ref_l0_m1 = 0u32; // We don't parameterise; CAVLC reads
                                   // `te(v)` anyway (handled below).
-        // §7.3.5.1 — ref_idx_l0[mbPartIdx] for mbPartIdx < NumMbPart
-        // when num_ref_idx_l0_active_minus1 > 0 (or mb_field override).
-        // We approximate by reading when slice has list 0.
+                                  // §7.3.5.1 — ref_idx_l0[mbPartIdx] for mbPartIdx < NumMbPart
+                                  // when num_ref_idx_l0_active_minus1 > 0 (or mb_field override).
+                                  // We approximate by reading when slice has list 0.
         if entropy.slice_kind != SliceKind::I && entropy.slice_kind != SliceKind::SI {
             {
                 // list 0 always present for P/B.
@@ -946,30 +930,14 @@ fn parse_mb_pred(
             }
             // §7.3.5.1 — mvd_l0[mbPartIdx][0..2].
             for _ in 0..num_parts {
-                let mx = if entropy.cabac.is_some() {
-                    0
-                } else {
-                    r.se()?
-                };
-                let my = if entropy.cabac.is_some() {
-                    0
-                } else {
-                    r.se()?
-                };
+                let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
+                let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
                 pred.mvd_l0.push([mx, my]);
             }
             if entropy.slice_kind == SliceKind::B {
                 for _ in 0..num_parts {
-                    let mx = if entropy.cabac.is_some() {
-                        0
-                    } else {
-                        r.se()?
-                    };
-                    let my = if entropy.cabac.is_some() {
-                        0
-                    } else {
-                        r.se()?
-                    };
+                    let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
+                    let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
                     pred.mvd_l1.push([mx, my]);
                 }
             }
@@ -1010,20 +978,12 @@ fn parse_sub_mb_pred(
 
     // ref_idx_l0 for each of the 4 partitions.
     for i in 0..4 {
-        let v = if entropy.cabac.is_some() {
-            0
-        } else {
-            r.te(0)?
-        };
+        let v = if entropy.cabac.is_some() { 0 } else { r.te(0)? };
         out.ref_idx_l0[i] = v;
     }
     if is_b {
         for i in 0..4 {
-            let v = if entropy.cabac.is_some() {
-                0
-            } else {
-                r.te(0)?
-            };
+            let v = if entropy.cabac.is_some() { 0 } else { r.te(0)? };
             out.ref_idx_l1[i] = v;
         }
     }
@@ -1032,16 +992,8 @@ fn parse_sub_mb_pred(
     for i in 0..4 {
         let n = out.sub_mb_type[i].num_sub_mb_part() as usize;
         for _ in 0..n {
-            let mx = if entropy.cabac.is_some() {
-                0
-            } else {
-                r.se()?
-            };
-            let my = if entropy.cabac.is_some() {
-                0
-            } else {
-                r.se()?
-            };
+            let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
+            let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
             out.mvd_l0[i].push([mx, my]);
         }
     }
@@ -1049,16 +1001,8 @@ fn parse_sub_mb_pred(
         for i in 0..4 {
             let n = out.sub_mb_type[i].num_sub_mb_part() as usize;
             for _ in 0..n {
-                let mx = if entropy.cabac.is_some() {
-                    0
-                } else {
-                    r.se()?
-                };
-                let my = if entropy.cabac.is_some() {
-                    0
-                } else {
-                    r.se()?
-                };
+                let mx = if entropy.cabac.is_some() { 0 } else { r.se()? };
+                let my = if entropy.cabac.is_some() { 0 } else { r.se()? };
                 out.mvd_l1[i].push([mx, my]);
             }
         }
@@ -1094,13 +1038,7 @@ fn parse_residual_cavlc_only(
     // --- Luma DC (Intra_16x16) ---
     if mb_type.is_intra_16x16() {
         // §7.3.5.3 — residual_block_cavlc(Intra16x16DCLevel, 0, 15, 16).
-        let blk = parse_residual_block_cavlc(
-            r,
-            CoeffTokenContext::Numeric(0),
-            0,
-            15,
-            16,
-        )?;
+        let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 15, 16)?;
         out.residual_luma_dc = Some(pad_to_16(blk));
     }
 
@@ -1110,13 +1048,7 @@ fn parse_residual_cavlc_only(
         // set; Intra_16x16 CBP is 0 or 15 meaning all-off / all-on).
         if cbp_luma == 15 {
             for _ in 0..16 {
-                let blk = parse_residual_block_cavlc(
-                    r,
-                    CoeffTokenContext::Numeric(0),
-                    0,
-                    14,
-                    15,
-                )?;
+                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 14, 15)?;
                 out.residual_luma.push(pad_to_16(blk));
             }
         }
@@ -1129,13 +1061,8 @@ fn parse_residual_cavlc_only(
         for blk8 in 0..4 {
             if (cbp_luma >> blk8) & 1 == 1 {
                 for _ in 0..4 {
-                    let blk = parse_residual_block_cavlc(
-                        r,
-                        CoeffTokenContext::Numeric(0),
-                        0,
-                        15,
-                        16,
-                    )?;
+                    let blk =
+                        parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 15, 16)?;
                     out.residual_luma.push(pad_to_16(blk));
                 }
             }
@@ -1146,13 +1073,8 @@ fn parse_residual_cavlc_only(
         for blk8 in 0..4 {
             if (cbp_luma >> blk8) & 1 == 1 {
                 for _ in 0..4 {
-                    let blk = parse_residual_block_cavlc(
-                        r,
-                        CoeffTokenContext::Numeric(0),
-                        0,
-                        15,
-                        16,
-                    )?;
+                    let blk =
+                        parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 15, 16)?;
                     out.residual_luma.push(pad_to_16(blk));
                 }
             }
@@ -1171,21 +1093,9 @@ fn parse_residual_cavlc_only(
                 CoeffTokenContext::ChromaDc422
             };
             let max_dc = if chroma_array_type == 1 { 4 } else { 8 };
-            let cb_dc = parse_residual_block_cavlc(
-                r,
-                dc_ctx,
-                0,
-                max_dc - 1,
-                max_dc,
-            )?;
+            let cb_dc = parse_residual_block_cavlc(r, dc_ctx, 0, max_dc - 1, max_dc)?;
             out.residual_chroma_dc_cb = cb_dc;
-            let cr_dc = parse_residual_block_cavlc(
-                r,
-                dc_ctx,
-                0,
-                max_dc - 1,
-                max_dc,
-            )?;
+            let cr_dc = parse_residual_block_cavlc(r, dc_ctx, 0, max_dc - 1, max_dc)?;
             out.residual_chroma_dc_cr = cr_dc;
         }
 
@@ -1193,23 +1103,11 @@ fn parse_residual_cavlc_only(
         if cbp_chroma == 2 {
             let num_ac = 4 * num_c8x8 as usize;
             for _ in 0..num_ac {
-                let blk = parse_residual_block_cavlc(
-                    r,
-                    CoeffTokenContext::Numeric(0),
-                    0,
-                    14,
-                    15,
-                )?;
+                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 14, 15)?;
                 out.residual_chroma_ac_cb.push(pad_to_16(blk));
             }
             for _ in 0..num_ac {
-                let blk = parse_residual_block_cavlc(
-                    r,
-                    CoeffTokenContext::Numeric(0),
-                    0,
-                    14,
-                    15,
-                )?;
+                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(0), 0, 14, 15)?;
                 out.residual_chroma_ac_cr.push(pad_to_16(blk));
             }
         }
@@ -1343,9 +1241,7 @@ mod tests {
     }
 
     pub(super) fn dummy_slice_header(slice_type: SliceType) -> SliceHeader {
-        use crate::slice_header::{
-            DecRefPicMarking, RefPicListModification,
-        };
+        use crate::slice_header::{DecRefPicMarking, RefPicListModification};
         SliceHeader {
             first_mb_in_slice: 0,
             slice_type_raw: match slice_type {
@@ -1573,9 +1469,14 @@ mod tests {
         let mut entropy = cavlc_entropy();
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
-        assert!(matches!(mb.mb_type, MbType::Intra16x16(Intra16x16 {
-            pred_mode: 0, cbp_luma: 0, cbp_chroma: 0
-        })));
+        assert!(matches!(
+            mb.mb_type,
+            MbType::Intra16x16(Intra16x16 {
+                pred_mode: 0,
+                cbp_luma: 0,
+                cbp_chroma: 0
+            })
+        ));
         assert_eq!(mb.coded_block_pattern, 0);
         assert!(mb.residual_luma_dc.is_some());
         assert!(mb.residual_luma.is_empty());
@@ -1592,7 +1493,7 @@ mod tests {
         //   256 u(8) luma + 64 u(8) Cb + 64 u(8) Cr.
         let mut w = BitWriter::new();
         w.ue(25); // mb_type
-        // Align to byte.
+                  // Align to byte.
         while w.bit_pos != 0 {
             w.u(1, 0);
         }

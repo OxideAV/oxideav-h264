@@ -95,7 +95,10 @@ pub enum Event {
     /// §7.3.1 values 13..=16, 19..=21, 22..=23, and all unspecified
     /// ranges 0 / 24..=31). Caller may inspect the raw NAL bytes
     /// (including the header byte).
-    Ignored { nal_unit_type: u8, nal_bytes: Vec<u8> },
+    Ignored {
+        nal_unit_type: u8,
+        nal_bytes: Vec<u8>,
+    },
 }
 
 /// Top-level H.264 decoder driver. See the module docs for activation
@@ -513,12 +516,12 @@ mod tests {
         w.ue(pps_id); // pic_parameter_set_id
         w.u(4, 0); // frame_num (4 bits)
         w.u(4, 0); // pic_order_cnt_lsb (4 bits)
-        // nal_ref_idc != 0 → dec_ref_pic_marking(): sliding window
+                   // nal_ref_idc != 0 → dec_ref_pic_marking(): sliding window
         w.u(1, 0);
         w.se(0); // slice_qp_delta
-        // No rbsp_trailing_bits here — the slice_data follows in a real
-        // stream; for tests we just let the parser read exactly what it
-        // needs. Append a padding byte so the reader never runs out.
+                 // No rbsp_trailing_bits here — the slice_data follows in a real
+                 // stream; for tests we just let the parser read exactly what it
+                 // needs. Append a padding byte so the reader never runs out.
         w.u(8, 0x80);
         w.into_bytes()
     }
@@ -572,11 +575,17 @@ mod tests {
         stream.extend_from_slice(&[0, 0, 0, 1]);
         stream.extend_from_slice(&aud_nal);
 
-        let events: Vec<_> = dec.process_annex_b(&stream).collect::<Result<_, _>>().unwrap();
+        let events: Vec<_> = dec
+            .process_annex_b(&stream)
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], Event::SpsStored(0)));
         assert!(matches!(events[1], Event::PpsStored(0)));
-        assert!(matches!(events[2], Event::AccessUnitDelimiter(PrimaryPicType(0))));
+        assert!(matches!(
+            events[2],
+            Event::AccessUnitDelimiter(PrimaryPicType(0))
+        ));
         assert!(dec.active_sps_id().is_none());
         assert!(dec.active_pps_id().is_none());
     }
@@ -584,13 +593,21 @@ mod tests {
     #[test]
     fn slice_activates_sps_and_pps() {
         let mut dec = Decoder::new();
-        let _ = dec.process_nal(&build_nal(7, 3, &build_minimal_sps_rbsp(0))).unwrap();
-        let _ = dec.process_nal(&build_nal(8, 3, &build_minimal_pps_rbsp(0, 0))).unwrap();
+        let _ = dec
+            .process_nal(&build_nal(7, 3, &build_minimal_sps_rbsp(0)))
+            .unwrap();
+        let _ = dec
+            .process_nal(&build_nal(8, 3, &build_minimal_pps_rbsp(0, 0)))
+            .unwrap();
         // Non-IDR I-slice referencing PPS id 0.
         let slice_nal = build_nal(1, 3, &build_minimal_i_slice_rbsp(0));
         let ev = dec.process_nal(&slice_nal).unwrap();
         match ev {
-            Event::Slice { header, nal_unit_type, .. } => {
+            Event::Slice {
+                header,
+                nal_unit_type,
+                ..
+            } => {
                 assert_eq!(nal_unit_type, 1);
                 assert_eq!(header.pic_parameter_set_id, 0);
             }
@@ -614,8 +631,12 @@ mod tests {
     fn slice_referencing_unknown_pps_is_rejected() {
         // Store only PPS 0, but the slice references PPS 5.
         let mut dec = Decoder::new();
-        let _ = dec.process_nal(&build_nal(7, 3, &build_minimal_sps_rbsp(0))).unwrap();
-        let _ = dec.process_nal(&build_nal(8, 3, &build_minimal_pps_rbsp(0, 0))).unwrap();
+        let _ = dec
+            .process_nal(&build_nal(7, 3, &build_minimal_sps_rbsp(0)))
+            .unwrap();
+        let _ = dec
+            .process_nal(&build_nal(8, 3, &build_minimal_pps_rbsp(0, 0)))
+            .unwrap();
         let slice_nal = build_nal(1, 3, &build_minimal_i_slice_rbsp(5));
         let err = dec.process_nal(&slice_nal).unwrap_err();
         assert!(matches!(err, DecoderError::UnknownPps(5)));
@@ -625,7 +646,9 @@ mod tests {
     fn slice_referencing_pps_with_unknown_sps_is_rejected() {
         // PPS 0 points to SPS id 4, which we never stored.
         let mut dec = Decoder::new();
-        let _ = dec.process_nal(&build_nal(8, 3, &build_minimal_pps_rbsp(0, 4))).unwrap();
+        let _ = dec
+            .process_nal(&build_nal(8, 3, &build_minimal_pps_rbsp(0, 4)))
+            .unwrap();
         let slice_nal = build_nal(1, 3, &build_minimal_i_slice_rbsp(0));
         let err = dec.process_nal(&slice_nal).unwrap_err();
         assert!(matches!(err, DecoderError::UnknownSps(4)));
@@ -690,7 +713,10 @@ mod tests {
         stream.extend_from_slice(&aud_nal);
 
         let mut dec = Decoder::new();
-        let evs: Vec<_> = dec.process_annex_b(&stream).collect::<Result<_, _>>().unwrap();
+        let evs: Vec<_> = dec
+            .process_annex_b(&stream)
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(evs.len(), 3);
         assert!(matches!(evs[0], Event::SpsStored(0)));
         assert!(matches!(evs[1], Event::PpsStored(0)));

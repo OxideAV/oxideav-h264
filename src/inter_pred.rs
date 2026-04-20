@@ -16,6 +16,11 @@
 //!   (edge replication), so the caller does NOT need to pad.
 
 #![allow(dead_code)]
+// Spec-driven APIs that mirror §8.4.2 signatures legitimately take
+// many parameters (src + stride + width + height + int coords + frac
+// coords + block size + bit_depth + dst + stride, per the spec's
+// argument lists). Suppress clippy's too_many_arguments here.
+#![allow(clippy::too_many_arguments)]
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InterPredError {
@@ -49,14 +54,7 @@ fn clip1(x: i32, bit_depth: u32) -> i32 {
 /// Fetch a single reference-plane sample with edge replication, per
 /// §8.4.2.2.1 eq. 8-239 / 8-240.
 #[inline]
-fn ref_sample(
-    src: &[i32],
-    src_stride: usize,
-    src_w: usize,
-    src_h: usize,
-    x: i32,
-    y: i32,
-) -> i32 {
+fn ref_sample(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y: i32) -> i32 {
     let cx = clip3(0, src_w as i32 - 1, x) as usize;
     let cy = clip3(0, src_h as i32 - 1, y) as usize;
     src[cy * src_stride + cx]
@@ -77,14 +75,7 @@ fn tap6(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32) -> i32 {
 /// integer location (`x`, `y`) by applying the 6-tap FIR horizontally:
 /// `E - 5F + 20G + 20H - 5I + J` with E=(x-2,y)..J=(x+3,y).
 #[inline]
-fn horiz_b1(
-    src: &[i32],
-    src_stride: usize,
-    src_w: usize,
-    src_h: usize,
-    x: i32,
-    y: i32,
-) -> i32 {
+fn horiz_b1(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y: i32) -> i32 {
     let s0 = ref_sample(src, src_stride, src_w, src_h, x - 2, y);
     let s1 = ref_sample(src, src_stride, src_w, src_h, x - 1, y);
     let s2 = ref_sample(src, src_stride, src_w, src_h, x, y);
@@ -98,14 +89,7 @@ fn horiz_b1(
 /// by applying the 6-tap FIR vertically: `A - 5C + 20G + 20M - 5R + T`
 /// with A=(x,y-2)..T=(x,y+3).
 #[inline]
-fn vert_h1(
-    src: &[i32],
-    src_stride: usize,
-    src_w: usize,
-    src_h: usize,
-    x: i32,
-    y: i32,
-) -> i32 {
+fn vert_h1(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y: i32) -> i32 {
     let s0 = ref_sample(src, src_stride, src_w, src_h, x, y - 2);
     let s1 = ref_sample(src, src_stride, src_w, src_h, x, y - 1);
     let s2 = ref_sample(src, src_stride, src_w, src_h, x, y);
@@ -121,14 +105,7 @@ fn vert_h1(
 /// cc, dd, h1, m1, ee, ff are all horizontal-FIR intermediates at
 /// x = (target) and y = (-2..3 relative to target).
 #[inline]
-fn j1_at(
-    src: &[i32],
-    src_stride: usize,
-    src_w: usize,
-    src_h: usize,
-    x: i32,
-    y: i32,
-) -> i32 {
+fn j1_at(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y: i32) -> i32 {
     // Re-use horiz_b1 at six different y lines.
     let b_m2 = horiz_b1(src, src_stride, src_w, src_h, x, y - 2);
     let b_m1 = horiz_b1(src, src_stride, src_w, src_h, x, y - 1);
@@ -162,27 +139,21 @@ fn luma_pred_one(
 
     // Half-pel horizontal sample b at (ix, iy): Clip1Y((b1 + 16) >> 5).
     #[inline]
-    fn b_at(
-        s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32, bd: u32,
-    ) -> i32 {
+    fn b_at(s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32, bd: u32) -> i32 {
         let b1 = horiz_b1(s, st, w, h, x, y);
         clip1((b1 + 16) >> 5, bd)
     }
 
     // Half-pel vertical sample h at (ix, iy): Clip1Y((h1 + 16) >> 5).
     #[inline]
-    fn h_at(
-        s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32, bd: u32,
-    ) -> i32 {
+    fn h_at(s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32, bd: u32) -> i32 {
         let h1 = vert_h1(s, st, w, h, x, y);
         clip1((h1 + 16) >> 5, bd)
     }
 
     // Half-pel diagonal sample j at (ix, iy): Clip1Y((j1 + 512) >> 10).
     #[inline]
-    fn j_at(
-        s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32, bd: u32,
-    ) -> i32 {
+    fn j_at(s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32, bd: u32) -> i32 {
         let j1 = j1_at(s, st, w, h, x, y);
         clip1((j1 + 512) >> 10, bd)
     }
@@ -400,12 +371,8 @@ pub fn interpolate_chroma(
             let sd = ref_sample(src, src_stride, src_width, src_height, ix + 1, iy + 1);
 
             // Eq. 8-270.
-            let v = (w8mxf * w8myf * sa
-                + xf * w8myf * sb
-                + w8mxf * yf * sc
-                + xf * yf * sd
-                + 32)
-                >> 6;
+            let v =
+                (w8mxf * w8myf * sa + xf * w8myf * sb + w8mxf * yf * sc + xf * yf * sd + 32) >> 6;
             dst[(yl as usize) * dst_stride + xl as usize] = v;
             // Note: chroma bilinear result is already in [0, (1<<BitDepthC)-1]
             // when A..D are — no separate Clip1C is specified.
@@ -497,8 +464,7 @@ pub fn weighted_pred_explicit(
                     let p = l0[y * stride + x];
                     let v = if log2_wd >= 1 {
                         // Eq. 8-274, branch logWD>=1.
-                        ((p * weight_l0.weight + (1i32 << (log2_wd - 1)))
-                            >> log2_wd)
+                        ((p * weight_l0.weight + (1i32 << (log2_wd - 1))) >> log2_wd)
                             + weight_l0.offset
                     } else {
                         // Eq. 8-274, branch logWD==0.
@@ -515,8 +481,7 @@ pub fn weighted_pred_explicit(
                     let p = l1[y * stride + x];
                     // Eq. 8-275.
                     let v = if log2_wd >= 1 {
-                        ((p * weight_l1.weight + (1i32 << (log2_wd - 1)))
-                            >> log2_wd)
+                        ((p * weight_l1.weight + (1i32 << (log2_wd - 1))) >> log2_wd)
                             + weight_l1.offset
                     } else {
                         p * weight_l1.weight + weight_l1.offset
@@ -533,11 +498,9 @@ pub fn weighted_pred_explicit(
                     let p0 = l0[y * stride + x];
                     let p1 = l1[y * stride + x];
                     // Eq. 8-276.
-                    let sum = p0 * weight_l0.weight
-                        + p1 * weight_l1.weight
-                        + (1i32 << log2_wd);
-                    let v = (sum >> (log2_wd + 1))
-                        + ((weight_l0.offset + weight_l1.offset + 1) >> 1);
+                    let sum = p0 * weight_l0.weight + p1 * weight_l1.weight + (1i32 << log2_wd);
+                    let v =
+                        (sum >> (log2_wd + 1)) + ((weight_l0.offset + weight_l1.offset + 1) >> 1);
                     dst[y * dst_stride + x] = clip1(v, bit_depth);
                 }
             }
@@ -570,8 +533,7 @@ mod tests {
     fn luma_integer_4x4_copy() {
         let src = make_plane(16, 16, |x, y| (x + y) & 0xff);
         let mut dst = vec![0i32; 4 * 4];
-        interpolate_luma(&src, 16, 16, 16, 4, 4, 0, 0, 4, 4, 8, &mut dst, 4)
-            .unwrap();
+        interpolate_luma(&src, 16, 16, 16, 4, 4, 0, 0, 4, 4, 8, &mut dst, 4).unwrap();
         for y in 0..4 {
             for x in 0..4 {
                 assert_eq!(dst[y * 4 + x], ((x + 4 + y + 4) & 0xff) as i32);
@@ -581,10 +543,9 @@ mod tests {
 
     #[test]
     fn luma_integer_8x8_copy() {
-        let src = make_plane(32, 32, |x, y| ((x * 3 + y * 5) & 0xff) as i32);
+        let src = make_plane(32, 32, |x, y| (x * 3 + y * 5) & 0xff);
         let mut dst = vec![0i32; 8 * 8];
-        interpolate_luma(&src, 32, 32, 32, 8, 10, 0, 0, 8, 8, 8, &mut dst, 8)
-            .unwrap();
+        interpolate_luma(&src, 32, 32, 32, 8, 10, 0, 0, 8, 8, 8, &mut dst, 8).unwrap();
         for y in 0..8 {
             for x in 0..8 {
                 let ex = ((8 + x as i32) * 3 + (10 + y as i32) * 5) & 0xff;
@@ -595,10 +556,9 @@ mod tests {
 
     #[test]
     fn luma_integer_16x16_copy() {
-        let src = make_plane(64, 64, |x, y| ((x ^ y) & 0xff) as i32);
+        let src = make_plane(64, 64, |x, y| (x ^ y) & 0xff);
         let mut dst = vec![0i32; 16 * 16];
-        interpolate_luma(&src, 64, 64, 64, 12, 20, 0, 0, 16, 16, 8, &mut dst, 16)
-            .unwrap();
+        interpolate_luma(&src, 64, 64, 64, 12, 20, 0, 0, 16, 16, 8, &mut dst, 16).unwrap();
         for y in 0..16 {
             for x in 0..16 {
                 let ex = ((12 + x as i32) ^ (20 + y as i32)) & 0xff;
@@ -614,8 +574,7 @@ mod tests {
         // Constant plane -> 6-tap FIR yields constant: (1-5+20+20-5+1)*v/32 = 32v/32 = v.
         let src = make_plane(32, 32, |_, _| 128);
         let mut dst = vec![0i32; 4 * 4];
-        interpolate_luma(&src, 32, 32, 32, 10, 10, 2, 0, 4, 4, 8, &mut dst, 4)
-            .unwrap();
+        interpolate_luma(&src, 32, 32, 32, 10, 10, 2, 0, 4, 4, 8, &mut dst, 4).unwrap();
         for v in &dst {
             assert_eq!(*v, 128);
         }
@@ -639,8 +598,22 @@ mod tests {
         // Compute just one sample (4x4 block is fine — other pixels depend
         // on zeros around, but we check only the target pixel (0,0) which
         // corresponds to ix=10,iy=10).
-        interpolate_luma(&src, 32, 32, 32, 10, 10, 2, 0, 4, 4, 8, &mut vec![0i32; 16], 4)
-            .unwrap();
+        interpolate_luma(
+            &src,
+            32,
+            32,
+            32,
+            10,
+            10,
+            2,
+            0,
+            4,
+            4,
+            8,
+            &mut [0i32; 16],
+            4,
+        )
+        .unwrap();
         // Recompute for that pixel explicitly:
         let mut dst_one = vec![0i32; 16];
         interpolate_luma(&src, 32, 32, 32, 10, 10, 2, 0, 4, 4, 8, &mut dst_one, 4).unwrap();
@@ -654,8 +627,7 @@ mod tests {
     fn luma_half_pel_vertical_constant() {
         let src = make_plane(32, 32, |_, _| 200);
         let mut dst = vec![0i32; 4 * 4];
-        interpolate_luma(&src, 32, 32, 32, 10, 10, 0, 2, 4, 4, 8, &mut dst, 4)
-            .unwrap();
+        interpolate_luma(&src, 32, 32, 32, 10, 10, 0, 2, 4, 4, 8, &mut dst, 4).unwrap();
         for v in &dst {
             assert_eq!(*v, 200);
         }
@@ -686,8 +658,7 @@ mod tests {
         // So j1 = 32 * (32*v) = 1024*v. j = Clip1((1024v + 512) >> 10) = v.
         let src = make_plane(32, 32, |_, _| 100);
         let mut dst = vec![0i32; 4 * 4];
-        interpolate_luma(&src, 32, 32, 32, 10, 10, 2, 2, 4, 4, 8, &mut dst, 4)
-            .unwrap();
+        interpolate_luma(&src, 32, 32, 32, 10, 10, 2, 2, 4, 4, 8, &mut dst, 4).unwrap();
         for v in &dst {
             assert_eq!(*v, 100);
         }
@@ -769,13 +740,12 @@ mod tests {
 
     #[test]
     fn chroma_integer_copy() {
-        let src = make_plane(16, 16, |x, y| ((x * 7 + y) & 0xff) as i32);
+        let src = make_plane(16, 16, |x, y| (x * 7 + y) & 0xff);
         let mut dst = vec![0i32; 4 * 4];
-        interpolate_chroma(&src, 16, 16, 16, 2, 3, 0, 0, 4, 4, 8, &mut dst, 4)
-            .unwrap();
+        interpolate_chroma(&src, 16, 16, 16, 2, 3, 0, 0, 4, 4, 8, &mut dst, 4).unwrap();
         for y in 0..4 {
             for x in 0..4 {
-                let ex = (((2 + x as i32) * 7 + (3 + y as i32)) & 0xff) as i32;
+                let ex = ((2 + x as i32) * 7 + (3 + y as i32)) & 0xff;
                 assert_eq!(dst[y * 4 + x], ex);
             }
         }
@@ -806,21 +776,19 @@ mod tests {
         src[3 * 8 + 3] = 40;
         let mut dst = vec![0i32; 16];
         // int_x=2, int_y=2, so output[0] uses (2,2), (3,2), (2,3), (3,3).
-        interpolate_chroma(&src, 8, 8, 8, 2, 2, 4, 4, 4, 4, 8, &mut dst, 4)
-            .unwrap();
+        interpolate_chroma(&src, 8, 8, 8, 2, 2, 4, 4, 4, 4, 8, &mut dst, 4).unwrap();
         assert_eq!(dst[0], 25);
     }
 
     #[test]
     fn chroma_bilinear_zero_frac_passthrough() {
         // xFrac=yFrac=0 -> output = (64*A + 32)>>6 = A (since 32<64).
-        let src = make_plane(16, 16, |x, y| ((x * 11 + y * 13) & 0xff) as i32);
+        let src = make_plane(16, 16, |x, y| (x * 11 + y * 13) & 0xff);
         let mut dst = vec![0i32; 4 * 4];
-        interpolate_chroma(&src, 16, 16, 16, 1, 2, 0, 0, 4, 4, 8, &mut dst, 4)
-            .unwrap();
+        interpolate_chroma(&src, 16, 16, 16, 1, 2, 0, 0, 4, 4, 8, &mut dst, 4).unwrap();
         for y in 0..4 {
             for x in 0..4 {
-                let ex = (((1 + x as i32) * 11 + (2 + y as i32) * 13) & 0xff) as i32;
+                let ex = ((1 + x as i32) * 11 + (2 + y as i32) * 13) & 0xff;
                 assert_eq!(dst[y * 4 + x], ex);
             }
         }
@@ -882,7 +850,10 @@ mod tests {
             4,
             4,
             BiPredMode::L0Only,
-            WeightedEntry { weight: 64, offset: 10 },
+            WeightedEntry {
+                weight: 64,
+                offset: 10,
+            },
             WeightedEntry::default(),
             6,
             8,
@@ -906,7 +877,10 @@ mod tests {
             4,
             4,
             BiPredMode::L0Only,
-            WeightedEntry { weight: 2, offset: 5 },
+            WeightedEntry {
+                weight: 2,
+                offset: 5,
+            },
             WeightedEntry::default(),
             0,
             8,
@@ -932,7 +906,10 @@ mod tests {
             4,
             BiPredMode::L1Only,
             WeightedEntry::default(),
-            WeightedEntry { weight: 32, offset: -5 },
+            WeightedEntry {
+                weight: 32,
+                offset: -5,
+            },
             5,
             8,
             &mut dst,
@@ -958,8 +935,14 @@ mod tests {
             4,
             4,
             BiPredMode::Bipred,
-            WeightedEntry { weight: 32, offset: 0 },
-            WeightedEntry { weight: 32, offset: 0 },
+            WeightedEntry {
+                weight: 32,
+                offset: 0,
+            },
+            WeightedEntry {
+                weight: 32,
+                offset: 0,
+            },
             5,
             8,
             &mut dst,
@@ -985,8 +968,14 @@ mod tests {
             4,
             4,
             BiPredMode::Bipred,
-            WeightedEntry { weight: 32, offset: 5 },
-            WeightedEntry { weight: 32, offset: 7 },
+            WeightedEntry {
+                weight: 32,
+                offset: 5,
+            },
+            WeightedEntry {
+                weight: 32,
+                offset: 7,
+            },
             5,
             8,
             &mut dst,
@@ -1010,7 +999,10 @@ mod tests {
             4,
             4,
             BiPredMode::L0Only,
-            WeightedEntry { weight: 64, offset: 100 },
+            WeightedEntry {
+                weight: 64,
+                offset: 100,
+            },
             WeightedEntry::default(),
             6,
             8,
@@ -1034,7 +1026,10 @@ mod tests {
             4,
             4,
             BiPredMode::L0Only,
-            WeightedEntry { weight: 64, offset: -100 },
+            WeightedEntry {
+                weight: 64,
+                offset: -100,
+            },
             WeightedEntry::default(),
             6,
             8,
@@ -1115,8 +1110,7 @@ mod tests {
         let mut src = vec![0i32; 8 * 8];
         src[3 * 8 + 3] = 64; // corner D when int=(2,2)
         let mut dst = vec![0i32; 16];
-        interpolate_chroma(&src, 8, 8, 8, 2, 2, 7, 7, 4, 4, 8, &mut dst, 4)
-            .unwrap();
+        interpolate_chroma(&src, 8, 8, 8, 2, 2, 7, 7, 4, 4, 8, &mut dst, 4).unwrap();
         assert_eq!(dst[0], 49);
     }
 }

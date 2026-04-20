@@ -151,10 +151,7 @@ impl Pps {
     /// consulted when `pic_scaling_matrix_present_flag == 1` and
     /// `transform_8x8_mode_flag == 1`: it determines whether the
     /// 8x8 tail carries 2 lists (4:2:0 / 4:2:2) or 6 lists (4:4:4).
-    pub fn parse_with_chroma_format(
-        rbsp: &[u8],
-        chroma_format_idc: u32,
-    ) -> Result<Self, PpsError> {
+    pub fn parse_with_chroma_format(rbsp: &[u8], chroma_format_idc: u32) -> Result<Self, PpsError> {
         let mut r = BitReader::new(rbsp);
 
         // §7.4.2.2 — pic_parameter_set_id ue(v), 0..=255.
@@ -210,7 +207,7 @@ impl Pps {
                         bottom_right,
                     }
                 }
-                3 | 4 | 5 => {
+                3..=5 => {
                     let change_direction_flag = r.u(1)? == 1;
                     let change_rate_minus1 = r.ue()?;
                     SliceGroupMap::Changing {
@@ -260,7 +257,9 @@ impl Pps {
         let pic_init_qs_minus26 = r.se()?;
         let chroma_qp_index_offset = r.se()?;
         if !(-12..=12).contains(&chroma_qp_index_offset) {
-            return Err(PpsError::ChromaQpIndexOffsetOutOfRange(chroma_qp_index_offset));
+            return Err(PpsError::ChromaQpIndexOffsetOutOfRange(
+                chroma_qp_index_offset,
+            ));
         }
         let deblocking_filter_control_present_flag = r.u(1)? == 1;
         let constrained_intra_pred_flag = r.u(1)? == 1;
@@ -512,7 +511,7 @@ mod tests {
         w.u(1, 1); // deblocking_filter_control_present_flag
         w.u(1, 0); // constrained_intra_pred_flag
         w.u(1, 1); // redundant_pic_cnt_present_flag
-        // more_rbsp_data() is true → tail follows.
+                   // more_rbsp_data() is true → tail follows.
         w.u(1, 1); // transform_8x8_mode_flag
         w.u(1, 0); // pic_scaling_matrix_present_flag
         w.se(-3); // second_chroma_qp_index_offset
@@ -558,10 +557,10 @@ mod tests {
         w.u(1, 0); // deblocking_filter_control_present
         w.u(1, 0); // constrained_intra_pred
         w.u(1, 0); // redundant_pic_cnt_present
-        // Tail:
+                   // Tail:
         w.u(1, 1); // transform_8x8_mode_flag
         w.u(1, 1); // pic_scaling_matrix_present_flag
-        // Loop: 6 + 2 = 8 entries, all flags 0.
+                   // Loop: 6 + 2 = 8 entries, all flags 0.
         for _ in 0..8 {
             w.u(1, 0);
         }
@@ -664,7 +663,7 @@ mod tests {
         w.ue(2); // num_slice_groups_minus1 = 2
         w.ue(6); // slice_group_map_type = 6 (explicit)
         w.ue(3); // pic_size_in_map_units_minus1 = 3
-        // ceil_log2(3) = 2 bits per slice_group_id.
+                 // ceil_log2(3) = 2 bits per slice_group_id.
         w.u(2, 0);
         w.u(2, 1);
         w.u(2, 2);

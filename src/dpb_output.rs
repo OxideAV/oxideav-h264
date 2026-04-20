@@ -120,8 +120,11 @@ impl<P> DpbOutput<P> {
     /// marked "needed for output" is emitted.
     pub fn flush(&mut self) -> Vec<OutputEntry<P>> {
         // Sort ascending by POC, tie-break by frame_num (§C.4 NOTE).
-        self.entries
-            .sort_by(|a, b| a.pic_order_cnt.cmp(&b.pic_order_cnt).then(a.frame_num.cmp(&b.frame_num)));
+        self.entries.sort_by(|a, b| {
+            a.pic_order_cnt
+                .cmp(&b.pic_order_cnt)
+                .then(a.frame_num.cmp(&b.frame_num))
+        });
         let mut out = std::mem::take(&mut self.entries);
         for e in out.iter_mut() {
             e.needed_for_output = false;

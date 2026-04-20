@@ -24,6 +24,10 @@
 //! for frame-only coded streams, which is the common case.
 
 #![allow(dead_code)]
+// Spec-driven §8.2.4 / §8.2.5 ops legitimately take many parameters
+// (DPB + slice + POC + frame_num + MMCO ops + marking flags). Suppress
+// clippy's too_many_arguments.
+#![allow(clippy::too_many_arguments)]
 
 /// Marking state of a decoded picture in the DPB.
 ///
@@ -252,7 +256,7 @@ pub fn init_ref_pic_list_p(
             )
         })
         .collect();
-    long.sort_by(|a, b| a.0.cmp(&b.0));
+    long.sort_by_key(|a| a.0);
 
     let mut out: Vec<u32> = Vec::with_capacity(short.len() + long.len());
     out.extend(short.into_iter().map(|(_, k)| k));
@@ -309,10 +313,10 @@ pub fn init_ref_pic_lists_b(
 
     // RefPicList0: st_less desc by POC, then st_geq asc by POC.
     st_less.sort_by(|a, b| b.0.cmp(&a.0));
-    st_geq.sort_by(|a, b| a.0.cmp(&b.0));
+    st_geq.sort_by_key(|a| a.0);
 
     // RefPicList1: st_greater asc, then st_leq desc.
-    st_greater.sort_by(|a, b| a.0.cmp(&b.0));
+    st_greater.sort_by_key(|a| a.0);
     st_leq.sort_by(|a, b| b.0.cmp(&a.0));
 
     // Long-term refs, ascending LongTermPicNum (shared by both lists).
@@ -326,7 +330,7 @@ pub fn init_ref_pic_lists_b(
             )
         })
         .collect();
-    long.sort_by(|a, b| a.0.cmp(&b.0));
+    long.sort_by_key(|a| a.0);
 
     let mut list0: Vec<u32> = Vec::new();
     list0.extend(st_less.iter().map(|(_, k)| *k));
@@ -451,27 +455,21 @@ pub fn modify_ref_pic_list(
                     .map(|e| e.dpb_key)
                     .unwrap_or(u32::MAX);
 
-                splice_into_list(
-                    list,
-                    ref_idx_lx,
-                    num_active as usize,
-                    target_key,
-                    |k| {
-                        // PicNumF filter — for this routine, the
-                        // "short-term matching" path should skip the
-                        // entry we just inserted. An entry that isn't
-                        // marked short-term gets PicNumF = MaxPicNum
-                        // (per §8.2.4.3.1), which won't equal any
-                        // short-term picNumLX — so we only need to
-                        // suppress re-matching the same dpb_key. The
-                        // spec uses the "PicNumF(RefPicListX[cIdx]) !=
-                        // picNumLX" test; we implement the equivalent
-                        // "dbp_key != target" check because an entry
-                        // at a new list index corresponds to exactly
-                        // one DPB pic per our mapping.
-                        k != target_key
-                    },
-                );
+                splice_into_list(list, ref_idx_lx, num_active as usize, target_key, |k| {
+                    // PicNumF filter — for this routine, the
+                    // "short-term matching" path should skip the
+                    // entry we just inserted. An entry that isn't
+                    // marked short-term gets PicNumF = MaxPicNum
+                    // (per §8.2.4.3.1), which won't equal any
+                    // short-term picNumLX — so we only need to
+                    // suppress re-matching the same dpb_key. The
+                    // spec uses the "PicNumF(RefPicListX[cIdx]) !=
+                    // picNumLX" test; we implement the equivalent
+                    // "dbp_key != target" check because an entry
+                    // at a new list index corresponds to exactly
+                    // one DPB pic per our mapping.
+                    k != target_key
+                });
                 ref_idx_lx += 1;
             }
             RplmOp::LongTerm(long_term_pic_num) => {
@@ -770,8 +768,7 @@ pub fn perform_marking(
 
     match adaptive_ops {
         Some(ops) => {
-            let mmco5 =
-                apply_mmco(dpb, ops, current_entry, current_frame_num, max_frame_num);
+            let mmco5 = apply_mmco(dpb, ops, current_entry, current_frame_num, max_frame_num);
             // §8.2.5.1 step 3 — if current not marked as long-term by
             // MMCO 6, mark it as short-term.
             if !matches!(current_entry.marking, RefMarking::LongTerm) {
@@ -1010,11 +1007,7 @@ mod tests {
     // §8.2.5.3 — sliding window.
     #[test]
     fn sliding_window_evicts_oldest() {
-        let mut dpb = vec![
-            st_frame(1, 0, 1),
-            st_frame(2, 0, 2),
-            st_frame(3, 0, 3),
-        ];
+        let mut dpb = vec![st_frame(1, 0, 1), st_frame(2, 0, 2), st_frame(3, 0, 3)];
         // max_num_ref=2 with 3 short-term refs ⇒ evict smallest
         // FrameNumWrap = 1 (dpb_key=1).
         sliding_window_marking(&mut dpb, 2, 4, 16);
@@ -1082,11 +1075,7 @@ mod tests {
     // §8.2.5.4.4 — MMCO 4 (set MaxLongTermFrameIdx).
     #[test]
     fn mmco_set_max_long_term_idx() {
-        let mut dpb = vec![
-            lt_frame(0, 0, 10),
-            lt_frame(3, 0, 13),
-            lt_frame(7, 0, 17),
-        ];
+        let mut dpb = vec![lt_frame(0, 0, 10), lt_frame(3, 0, 13), lt_frame(7, 0, 17)];
         let mut current = st_frame(5, 0, 5);
         // max_long_term_frame_idx_plus1 = 4 ⇒ MaxLTFI = 3.
         // LTs with ltfi > 3 (only ltfi=7) get marked unused.
@@ -1168,17 +1157,18 @@ mod tests {
     // §8.2.5.1 — non-IDR sliding-window path.
     #[test]
     fn marking_non_idr_sliding_window() {
-        let mut dpb = vec![
-            st_frame(1, 0, 1),
-            st_frame(2, 0, 2),
-            st_frame(3, 0, 3),
-        ];
+        let mut dpb = vec![st_frame(1, 0, 1), st_frame(2, 0, 2), st_frame(3, 0, 3)];
         let mut current = st_frame(4, 0, 4);
         let mmco5 = perform_marking(
             &mut dpb,
             &mut current,
             2, // max_num_ref_frames
-            false, false, false, None, 4, 16,
+            false,
+            false,
+            false,
+            None,
+            4,
+            16,
         );
         assert!(!mmco5);
         // Oldest ST (frame_num=1) evicted.

@@ -40,9 +40,7 @@ fn sample_path() -> Option<PathBuf> {
 #[test]
 fn parse_foreman_p16x16() {
     let Some(path) = sample_path() else {
-        eprintln!(
-            "skip: set OXIDEAV_SAMPLES_H264_FOREMAN or place the file at the default path"
-        );
+        eprintln!("skip: set OXIDEAV_SAMPLES_H264_FOREMAN or place the file at the default path");
         return;
     };
 
@@ -67,7 +65,13 @@ fn parse_foreman_p16x16() {
     // Drive the full pipeline. Collect owned data first to detach from
     // the Decoder borrow before reconstruction (so we can pull SPS/PPS
     // back out).
-    let mut pending_slices: Vec<(u8, u8, oxideav_h264::slice_header::SliceHeader, Vec<u8>, (usize, u8))> = Vec::new();
+    let mut pending_slices: Vec<(
+        u8,
+        u8,
+        oxideav_h264::slice_header::SliceHeader,
+        Vec<u8>,
+        (usize, u8),
+    )> = Vec::new();
     for result in dec.process_annex_b(&bytes) {
         match result {
             Ok(ev) => match ev {
@@ -84,8 +88,13 @@ fn parse_foreman_p16x16() {
                     if nal_unit_type == 5 {
                         idr_slices += 1;
                     }
-                    pending_slices
-                        .push((nal_unit_type, nal_ref_idc, header, rbsp, slice_data_cursor));
+                    pending_slices.push((
+                        nal_unit_type,
+                        nal_ref_idc,
+                        header,
+                        rbsp,
+                        slice_data_cursor,
+                    ));
                 }
                 Event::Sei(msgs) => sei_msgs += msgs.len(),
                 Event::AccessUnitDelimiter(_) => auds += 1,

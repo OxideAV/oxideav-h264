@@ -501,7 +501,10 @@ mod tests {
         // Length 0x05 but only 2 bytes of payload.
         let stream = [0x00, 0x00, 0x00, 0x05, 0xaa, 0xbb];
         let mut split = AvccSplitter::new(&stream, 4).unwrap();
-        assert_eq!(split.next().unwrap().unwrap_err(), NalError::TruncatedAvccPayload);
+        assert_eq!(
+            split.next().unwrap().unwrap_err(),
+            NalError::TruncatedAvccPayload
+        );
     }
 
     #[test]
@@ -509,7 +512,10 @@ mod tests {
         // Less than 4 bytes left for the length.
         let stream = [0x00, 0x00];
         let mut split = AvccSplitter::new(&stream, 4).unwrap();
-        assert_eq!(split.next().unwrap().unwrap_err(), NalError::TruncatedAvccLength);
+        assert_eq!(
+            split.next().unwrap().unwrap_err(),
+            NalError::TruncatedAvccLength
+        );
     }
 
     #[test]

@@ -193,12 +193,8 @@ impl Sps {
         }
         let level_idc = r.u(8)? as u8;
 
-        let constraint_set_flags = cs0
-            | (cs1 << 1)
-            | (cs2 << 2)
-            | (cs3 << 3)
-            | (cs4 << 4)
-            | (cs5 << 5);
+        let constraint_set_flags =
+            cs0 | (cs1 << 1) | (cs2 << 2) | (cs3 << 3) | (cs4 << 4) | (cs5 << 5);
 
         // §7.3.2.1.1 — seq_parameter_set_id ue(v); semantics clamp to 0..=31.
         let seq_parameter_set_id = r.ue()?;
@@ -262,7 +258,9 @@ impl Sps {
         // §7.3.2.1.1 — log2_max_frame_num_minus4 ue(v); range 0..=12.
         let log2_max_frame_num_minus4 = r.ue()?;
         if log2_max_frame_num_minus4 > 12 {
-            return Err(SpsError::Log2MaxFrameNumOutOfRange(log2_max_frame_num_minus4));
+            return Err(SpsError::Log2MaxFrameNumOutOfRange(
+                log2_max_frame_num_minus4,
+            ));
         }
 
         // §7.3.2.1.1 — pic_order_cnt_type ue(v); range 0..=2.
@@ -484,11 +482,11 @@ mod tests {
     ) -> Vec<u8> {
         let mut w = BitWriter::new();
         w.u(8, 66); // profile_idc — Baseline
-        // constraint_set0..5_flag = 0, reserved_zero_2bits = 00
+                    // constraint_set0..5_flag = 0, reserved_zero_2bits = 00
         w.u(8, 0);
         w.u(8, level_idc as u32); // level_idc
         w.ue(0); // seq_parameter_set_id
-        // no chroma-extended fields for profile 66
+                 // no chroma-extended fields for profile 66
         w.ue(0); // log2_max_frame_num_minus4
         w.ue(0); // pic_order_cnt_type
         w.ue(0); // log2_max_pic_order_cnt_lsb_minus4 (since poc_type==0)
@@ -548,7 +546,7 @@ mod tests {
         // profile_idc=77 (Main); pic_order_cnt_type=1 with a short cycle.
         let mut w = BitWriter::new();
         w.u(8, 77); // profile_idc
-        // constraint_set0_flag=1, rest=0; reserved_zero_2bits=0.
+                    // constraint_set0_flag=1, rest=0; reserved_zero_2bits=0.
         w.u(1, 1);
         for _ in 0..5 {
             w.u(1, 0);
@@ -606,7 +604,7 @@ mod tests {
         // group. Use 4:2:0 (idc=1), 8-bit, no scaling matrix.
         let mut w = BitWriter::new();
         w.u(8, 100); // profile_idc=High
-        // Baseline had cs* flags 0; here set cs3_flag to 1.
+                     // Baseline had cs* flags 0; here set cs3_flag to 1.
         w.u(1, 0);
         w.u(1, 0);
         w.u(1, 0);
@@ -617,7 +615,7 @@ mod tests {
         w.u(8, 41); // level_idc
         w.ue(0); // seq_parameter_set_id
         w.ue(1); // chroma_format_idc=1 (4:2:0)
-        // chroma_format_idc != 3, so no separate_colour_plane_flag.
+                 // chroma_format_idc != 3, so no separate_colour_plane_flag.
         w.ue(2); // bit_depth_luma_minus8=2 → 10-bit
         w.ue(2); // bit_depth_chroma_minus8=2
         w.u(1, 0); // qpprime_y_zero_transform_bypass_flag
@@ -630,8 +628,8 @@ mod tests {
         w.ue(67); // pic_height_in_map_units_minus1 → 1088px/16=68
         w.u(1, 1); // frame_mbs_only_flag
         w.u(1, 1); // direct_8x8_inference_flag
-        // Frame cropping: crop 0/0/0/8 samples. CropUnitY=2 for 4:2:0 frame_mbs_only=1,
-        // so crop_bottom_offset=4 → 8-sample crop.
+                   // Frame cropping: crop 0/0/0/8 samples. CropUnitY=2 for 4:2:0 frame_mbs_only=1,
+                   // so crop_bottom_offset=4 → 8-sample crop.
         w.u(1, 1); // frame_cropping_flag
         w.ue(0);
         w.ue(0);
@@ -688,7 +686,7 @@ mod tests {
         w.u(1, 1); // direct_8x8
         w.u(1, 0); // no crop
         w.u(1, 1); // vui_parameters_present_flag = 1
-        // Empty VUI — 9 flags, all 0.
+                   // Empty VUI — 9 flags, all 0.
         for _ in 0..9 {
             w.u(1, 0);
         }

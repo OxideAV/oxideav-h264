@@ -348,8 +348,14 @@ fn predict_4x4_horizontal(s: &Samples4x4, out: &mut [i32; 16]) {
 fn predict_4x4_dc(s: &Samples4x4, bit_depth: u32, out: &mut [i32; 16]) {
     let dc = if s.availability.top && s.availability.left {
         // (8-48)
-        (s.top[0] + s.top[1] + s.top[2] + s.top[3]
-            + s.left[0] + s.left[1] + s.left[2] + s.left[3]
+        (s.top[0]
+            + s.top[1]
+            + s.top[2]
+            + s.top[3]
+            + s.left[0]
+            + s.left[1]
+            + s.left[2]
+            + s.left[3]
             + 4)
             >> 3
     } else if s.availability.left {
@@ -1146,12 +1152,8 @@ fn chroma_dc_subblock(
     let top_avail = s.availability.top;
     let left_avail = s.availability.left;
 
-    let sum_top = || -> i32 {
-        s.top[x_o] + s.top[x_o + 1] + s.top[x_o + 2] + s.top[x_o + 3]
-    };
-    let sum_left = || -> i32 {
-        s.left[y_o] + s.left[y_o + 1] + s.left[y_o + 2] + s.left[y_o + 3]
-    };
+    let sum_top = || -> i32 { s.top[x_o] + s.top[x_o + 1] + s.top[x_o + 2] + s.top[x_o + 3] };
+    let sum_left = || -> i32 { s.left[y_o] + s.left[y_o + 1] + s.left[y_o + 2] + s.left[y_o + 3] };
 
     if x_o == 0 && y_o == 0 {
         // (xO, yO) == (0, 0): use both top and left. §8.3.4.1
@@ -1812,7 +1814,13 @@ mod tests {
             0,
         );
         let mut out = vec![0i32; 64];
-        predict_chroma(IntraChromaMode::Dc, &s, ChromaArrayType::Yuv420, 8, &mut out);
+        predict_chroma(
+            IntraChromaMode::Dc,
+            &s,
+            ChromaArrayType::Yuv420,
+            8,
+            &mut out,
+        );
         // Top-left 4x4 (x=0..4, y=0..4) should all be 23.
         for y in 0..4 {
             for x in 0..4 {
@@ -1841,7 +1849,13 @@ mod tests {
         let mut s = mk_chroma_420(vec![0; 8], vec![0; 8], 0);
         s.availability = no_avail();
         let mut out = vec![0i32; 64];
-        predict_chroma(IntraChromaMode::Dc, &s, ChromaArrayType::Yuv420, 8, &mut out);
+        predict_chroma(
+            IntraChromaMode::Dc,
+            &s,
+            ChromaArrayType::Yuv420,
+            8,
+            &mut out,
+        );
         for v in out.iter() {
             assert_eq!(*v, 128);
         }

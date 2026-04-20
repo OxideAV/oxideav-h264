@@ -22,7 +22,9 @@ pub const EXTENDED_SAR: u8 = 255;
 pub enum VuiError {
     #[error("bitstream read failed: {0}")]
     Bitstream(#[from] BitError),
-    #[error("aspect_ratio_idc=255 (Extended_SAR) requires 16+16 trailing bits — got truncated input")]
+    #[error(
+        "aspect_ratio_idc=255 (Extended_SAR) requires 16+16 trailing bits — got truncated input"
+    )]
     ExtendedSarTruncated,
     #[error("invalid HRD cpb_cnt_minus1 (got {0}, max 31)")]
     HrdCpbCountOutOfRange(u32),
@@ -295,7 +297,11 @@ mod tests {
         let mut nbits: u32 = 0;
         for &(val, w) in bits {
             assert!(w <= 32);
-            let masked = if w == 32 { val } else { val & ((1u32 << w) - 1) };
+            let masked = if w == 32 {
+                val
+            } else {
+                val & ((1u32 << w) - 1)
+            };
             acc = (acc << w) | masked as u64;
             nbits += w;
             while nbits >= 8 {
@@ -383,16 +389,16 @@ mod tests {
     fn aspect_ratio_idc_1_no_extended() {
         // aspect=1, aspect_ratio_idc=1 (1:1). Remaining 6 flags = 0.
         let bits = vec![
-            (1, 1),  // aspect_ratio_info_present_flag
-            (1, 8),  // aspect_ratio_idc = 1
-            (0, 1),  // overscan
-            (0, 1),  // video
-            (0, 1),  // chroma
-            (0, 1),  // timing
-            (0, 1),  // nal_hrd
-            (0, 1),  // vcl_hrd
-            (0, 1),  // pic_struct
-            (0, 1),  // bitstream_restriction
+            (1, 1), // aspect_ratio_info_present_flag
+            (1, 8), // aspect_ratio_idc = 1
+            (0, 1), // overscan
+            (0, 1), // video
+            (0, 1), // chroma
+            (0, 1), // timing
+            (0, 1), // nal_hrd
+            (0, 1), // vcl_hrd
+            (0, 1), // pic_struct
+            (0, 1), // bitstream_restriction
         ];
         let bytes = pack_bits(&bits);
         let mut r = BitReader::new(&bytes);

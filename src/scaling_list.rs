@@ -79,7 +79,11 @@ pub fn parse_scaling_list(
                 use_default = true;
             }
         }
-        let entry = if next_scale == 0 { last_scale } else { next_scale };
+        let entry = if next_scale == 0 {
+            last_scale
+        } else {
+            next_scale
+        };
         scaling_list.push(entry);
         last_scale = entry;
     }
@@ -103,7 +107,11 @@ mod tests {
         for &(val, w) in bits {
             assert!(w <= 32);
             // mask val to w bits
-            let masked = if w == 32 { val } else { val & ((1u32 << w) - 1) };
+            let masked = if w == 32 {
+                val
+            } else {
+                val & ((1u32 << w) - 1)
+            };
             acc = (acc << w) | masked as u64;
             nbits += w;
             while nbits >= 8 {

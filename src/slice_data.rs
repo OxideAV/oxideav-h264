@@ -39,9 +39,7 @@ use crate::cabac::{CabacDecoder, CabacError};
 use crate::cabac_ctx::{
     decode_end_of_slice_flag, decode_mb_skip_flag, CabacContexts, NeighbourCtx, SliceKind,
 };
-use crate::macroblock_layer::{
-    parse_macroblock, EntropyState, Macroblock, MacroblockLayerError,
-};
+use crate::macroblock_layer::{parse_macroblock, EntropyState, Macroblock, MacroblockLayerError};
 use crate::pps::Pps;
 use crate::slice_header::{SliceHeader, SliceType};
 use crate::sps::Sps;
@@ -104,8 +102,7 @@ pub fn parse_slice_data(
 ) -> SliceDataResult<SliceData> {
     // MBAFF check. §7.3.4: the walker is stepped in MB pairs when
     // MbaffFrameFlag == 1. We reject that case here.
-    let mbaff_frame_flag =
-        sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
+    let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
     if mbaff_frame_flag {
         return Err(SliceDataError::MbaffNotSupported);
     }
@@ -124,8 +121,7 @@ pub fn parse_slice_data(
     }
 
     let mut macroblocks: Vec<Macroblock> = Vec::new();
-    let mut curr_mb_addr: u32 =
-        slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
+    let mut curr_mb_addr: u32 = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
 
     if pps.entropy_coding_mode_flag {
         // ---------------------------------------------------------
@@ -155,12 +151,8 @@ pub fn parse_slice_data(
         loop {
             let mut skipped = false;
             if !slice_header.slice_type.is_intra() {
-                let mb_skip_flag = decode_mb_skip_flag(
-                    &mut cabac_dec,
-                    &mut ctxs,
-                    kind,
-                    &NeighbourCtx::default(),
-                )?;
+                let mb_skip_flag =
+                    decode_mb_skip_flag(&mut cabac_dec, &mut ctxs, kind, &NeighbourCtx::default())?;
                 if mb_skip_flag {
                     macroblocks.push(Macroblock::new_skip(slice_header.slice_type));
                     curr_mb_addr += 1;
@@ -176,14 +168,8 @@ pub fn parse_slice_data(
                     chroma_array_type,
                     transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
                 };
-                let mb = parse_macroblock(
-                    &mut r,
-                    &mut entropy,
-                    slice_header,
-                    sps,
-                    pps,
-                    curr_mb_addr,
-                )?;
+                let mb =
+                    parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)?;
                 macroblocks.push(mb);
                 curr_mb_addr += 1;
             }
@@ -204,8 +190,7 @@ pub fn parse_slice_data(
             if !slice_header.slice_type.is_intra() && pending_skip == 0 {
                 pending_skip = r.ue()?;
                 for _ in 0..pending_skip {
-                    macroblocks
-                        .push(Macroblock::new_skip(slice_header.slice_type));
+                    macroblocks.push(Macroblock::new_skip(slice_header.slice_type));
                     curr_mb_addr += 1;
                 }
             }
@@ -222,14 +207,7 @@ pub fn parse_slice_data(
                 chroma_array_type,
                 transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
             };
-            let mb = parse_macroblock(
-                &mut r,
-                &mut entropy,
-                slice_header,
-                sps,
-                pps,
-                curr_mb_addr,
-            )?;
+            let mb = parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)?;
             macroblocks.push(mb);
             curr_mb_addr += 1;
             pending_skip = 0;
@@ -247,11 +225,7 @@ pub fn parse_slice_data(
 
 /// Construct a `BitReader` positioned at the given (byte, bit) within
 /// `rbsp`. Returns an `Eof` when the position is past the end.
-fn position_reader(
-    rbsp: &[u8],
-    byte: usize,
-    bit: u8,
-) -> SliceDataResult<BitReader<'_>> {
+fn position_reader(rbsp: &[u8], byte: usize, bit: u8) -> SliceDataResult<BitReader<'_>> {
     if byte > rbsp.len() || bit >= 8 {
         return Err(SliceDataError::Bitstream(BitError::Eof));
     }

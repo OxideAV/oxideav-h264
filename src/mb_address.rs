@@ -193,13 +193,12 @@ pub fn map_unit_to_slice_group_map(
                     // §8.2.2.4 box-out — eq. (8-20). num_slice_groups_minus1
                     // is required to be 1 for types 3/4/5.
                     let dir = *change_direction_flag as i32; // 0 or 1
-                    // Initialise: mapUnitToSliceGroupMap[i] = 1 for all i.
+                                                             // Initialise: mapUnitToSliceGroupMap[i] = 1 for all i.
                     for i in 0..n {
                         out[i] = 1;
                     }
                     let pic_width = pic_width_in_mbs as i32;
-                    let pic_height =
-                        (pic_size_in_map_units / pic_width_in_mbs) as i32;
+                    let pic_height = (pic_size_in_map_units / pic_width_in_mbs) as i32;
                     let mut x: i32 = (pic_width - dir) / 2;
                     let mut y: i32 = (pic_height - dir) / 2;
                     let mut left_bound: i32 = x;
@@ -272,18 +271,13 @@ pub fn map_unit_to_slice_group_map(
                         mapunits_in_slice_group0
                     };
                     let dir = *change_direction_flag as u32;
-                    let pic_height =
-                        pic_size_in_map_units / pic_width_in_mbs;
+                    let pic_height = pic_size_in_map_units / pic_width_in_mbs;
                     let mut k: u32 = 0;
                     for j in 0..pic_width_in_mbs {
                         for i in 0..pic_height {
                             let lin = (i * pic_width_in_mbs + j) as usize;
                             if lin < n {
-                                out[lin] = if k < size_of_upper_left {
-                                    dir
-                                } else {
-                                    1 - dir
-                                };
+                                out[lin] = if k < size_of_upper_left { dir } else { 1 - dir };
                             }
                             k += 1;
                         }
@@ -564,9 +558,7 @@ mod tests {
         // 0..=7  → group 0 (both rectangles, 0 wins).
         // 8..=11 → group 1.
         // 12..=15 → group 2 (leftover).
-        let expected = vec![
-            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
-        ];
+        let expected = vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
         assert_eq!(map, expected);
     }
 
@@ -635,9 +627,7 @@ mod tests {
         );
         // PicSize=16, rate=2, cycle=3 → MapUnitsInSliceGroup0=6.
         let map = map_unit_to_slice_group_map(&pps, 16, 4, 3, false).unwrap();
-        let expected = vec![
-            0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        ];
+        let expected = vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
         assert_eq!(map, expected);
     }
 
@@ -654,9 +644,7 @@ mod tests {
             }),
         );
         let map = map_unit_to_slice_group_map(&pps, 16, 4, 3, false).unwrap();
-        let expected = vec![
-            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0,
-        ];
+        let expected = vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
         assert_eq!(map, expected);
     }
 

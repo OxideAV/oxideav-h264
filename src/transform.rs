@@ -192,14 +192,42 @@ pub fn default_scaling_list_8x8_flat() -> [i32; 64] {
 /// Table 8-13, zig-zag row. `scan[k] = (i, j)` where k is the scan
 /// index and (i, j) is the 2-D position in the 4x4 coefficient block.
 const ZIGZAG_4X4: [(usize, usize); 16] = [
-    (0, 0), (0, 1), (1, 0), (2, 0), (1, 1), (0, 2), (0, 3), (1, 2),
-    (2, 1), (3, 0), (3, 1), (2, 2), (1, 3), (2, 3), (3, 2), (3, 3),
+    (0, 0),
+    (0, 1),
+    (1, 0),
+    (2, 0),
+    (1, 1),
+    (0, 2),
+    (0, 3),
+    (1, 2),
+    (2, 1),
+    (3, 0),
+    (3, 1),
+    (2, 2),
+    (1, 3),
+    (2, 3),
+    (3, 2),
+    (3, 3),
 ];
 
 /// Table 8-13, field scan row.
 const FIELD_4X4: [(usize, usize); 16] = [
-    (0, 0), (1, 0), (0, 1), (2, 0), (3, 0), (1, 1), (2, 1), (3, 1),
-    (0, 2), (1, 2), (2, 2), (3, 2), (0, 3), (1, 3), (2, 3), (3, 3),
+    (0, 0),
+    (1, 0),
+    (0, 1),
+    (2, 0),
+    (3, 0),
+    (1, 1),
+    (2, 1),
+    (3, 1),
+    (0, 2),
+    (1, 2),
+    (2, 2),
+    (3, 2),
+    (0, 3),
+    (1, 3),
+    (2, 3),
+    (3, 3),
 ];
 
 /// §8.5.6 — invert zig-zag scan; transforms a 16-entry scan-order list
@@ -692,10 +720,14 @@ pub fn inverse_hadamard_chroma_dc_422(
     //         [1, -1]]           (2x2 on the 2-column side)
     //
     // Apply Hv to the left (combines rows).
-    let c00 = dc_coeffs[0]; let c01 = dc_coeffs[1];
-    let c10 = dc_coeffs[2]; let c11 = dc_coeffs[3];
-    let c20 = dc_coeffs[4]; let c21 = dc_coeffs[5];
-    let c30 = dc_coeffs[6]; let c31 = dc_coeffs[7];
+    let c00 = dc_coeffs[0];
+    let c01 = dc_coeffs[1];
+    let c10 = dc_coeffs[2];
+    let c11 = dc_coeffs[3];
+    let c20 = dc_coeffs[4];
+    let c21 = dc_coeffs[5];
+    let c30 = dc_coeffs[6];
+    let c31 = dc_coeffs[7];
     let t00 = c00 + c10 + c20 + c30;
     let t01 = c01 + c11 + c21 + c31;
     let t10 = c00 + c10 - c20 - c30;
@@ -706,10 +738,14 @@ pub fn inverse_hadamard_chroma_dc_422(
     let t31 = c01 - c11 + c21 - c31;
     // Apply Hh to the right (combines columns).
     let f = [
-        t00 + t01, t00 - t01,
-        t10 + t11, t10 - t11,
-        t20 + t21, t20 - t21,
-        t30 + t31, t30 - t31,
+        t00 + t01,
+        t00 - t01,
+        t10 + t11,
+        t10 - t11,
+        t20 + t21,
+        t20 - t21,
+        t30 + t31,
+        t30 - t31,
     ];
 
     // §8.5.11.2 — scaling path with qPDC = qP + 3 (Eq. 8-327).
@@ -1153,13 +1189,17 @@ mod tests {
         }
         let block = inverse_scan_4x4_zigzag(&levels);
         // Verify per Table 8-13: idx 0 -> c00, idx 1 -> c01, idx 2 -> c10, etc.
-        assert_eq!(block[0 * 4 + 0], 0);
-        assert_eq!(block[0 * 4 + 1], 1);
-        assert_eq!(block[1 * 4 + 0], 2);
-        assert_eq!(block[2 * 4 + 0], 3);
-        assert_eq!(block[1 * 4 + 1], 4);
-        assert_eq!(block[0 * 4 + 2], 5);
-        assert_eq!(block[3 * 4 + 3], 15);
+        // (row, col) matrix notation — clippy's identity_op lint would
+        // fire on the explicit `row * 4 + col` form when either is 0,
+        // but matrix coordinates read more naturally here.
+        let at = |row: usize, col: usize| block[row * 4 + col];
+        assert_eq!(at(0, 0), 0);
+        assert_eq!(at(0, 1), 1);
+        assert_eq!(at(1, 0), 2);
+        assert_eq!(at(2, 0), 3);
+        assert_eq!(at(1, 1), 4);
+        assert_eq!(at(0, 2), 5);
+        assert_eq!(at(3, 3), 15);
     }
 
     // ------------ NormAdjust spot checks (Tables 8-4, 8-5) --------------
@@ -1171,7 +1211,7 @@ mod tests {
         assert_eq!(norm_adjust_4x4(0, 1, 1), 16); // (1,1) class
         assert_eq!(norm_adjust_4x4(0, 0, 1), 13); // other
         assert_eq!(norm_adjust_4x4(0, 2, 3), 13); // other
-        // Row 5 (qP%6=5): v = [18, 29, 23].
+                                                  // Row 5 (qP%6=5): v = [18, 29, 23].
         assert_eq!(norm_adjust_4x4(5, 0, 0), 18);
         assert_eq!(norm_adjust_4x4(5, 3, 3), 29);
         assert_eq!(norm_adjust_4x4(5, 2, 1), 23);
@@ -1180,17 +1220,17 @@ mod tests {
     #[test]
     fn norm_adjust_8x8_spot_checks() {
         // Row 0: v = [20, 18, 32, 19, 25, 24].
-        assert_eq!(norm_adjust_8x8(0, 0, 0), 20);   // (i%4,j%4)=(0,0)
-        assert_eq!(norm_adjust_8x8(0, 4, 4), 20);   // (i%4,j%4)=(0,0) again
-        assert_eq!(norm_adjust_8x8(0, 1, 1), 18);   // (i%2,j%2)=(1,1)
+        assert_eq!(norm_adjust_8x8(0, 0, 0), 20); // (i%4,j%4)=(0,0)
+        assert_eq!(norm_adjust_8x8(0, 4, 4), 20); // (i%4,j%4)=(0,0) again
+        assert_eq!(norm_adjust_8x8(0, 1, 1), 18); // (i%2,j%2)=(1,1)
         assert_eq!(norm_adjust_8x8(0, 3, 3), 18);
-        assert_eq!(norm_adjust_8x8(0, 2, 2), 32);   // (i%4,j%4)=(2,2)
+        assert_eq!(norm_adjust_8x8(0, 2, 2), 32); // (i%4,j%4)=(2,2)
         assert_eq!(norm_adjust_8x8(0, 6, 6), 32);
-        assert_eq!(norm_adjust_8x8(0, 0, 1), 19);   // (i%4,j%2)=(0,1)
-        assert_eq!(norm_adjust_8x8(0, 1, 0), 19);   // (i%2,j%4)=(1,0)
-        assert_eq!(norm_adjust_8x8(0, 0, 2), 25);   // (i%4,j%4)=(0,2)
-        assert_eq!(norm_adjust_8x8(0, 2, 0), 25);   // (i%4,j%4)=(2,0)
-        // "otherwise" class:
+        assert_eq!(norm_adjust_8x8(0, 0, 1), 19); // (i%4,j%2)=(0,1)
+        assert_eq!(norm_adjust_8x8(0, 1, 0), 19); // (i%2,j%4)=(1,0)
+        assert_eq!(norm_adjust_8x8(0, 0, 2), 25); // (i%4,j%4)=(0,2)
+        assert_eq!(norm_adjust_8x8(0, 2, 0), 25); // (i%4,j%4)=(2,0)
+                                                  // "otherwise" class:
         assert_eq!(norm_adjust_8x8(0, 1, 2), 24);
         assert_eq!(norm_adjust_8x8(0, 2, 1), 24);
         assert_eq!(norm_adjust_8x8(0, 2, 3), 24);

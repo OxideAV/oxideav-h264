@@ -131,7 +131,7 @@ impl<'a> BitReader<'a> {
     pub fn se(&mut self) -> BitResult<i32> {
         let k = self.read_codenum()?;
         Ok(if k & 1 == 1 {
-            ((k + 1) / 2) as i32
+            k.div_ceil(2) as i32
         } else {
             -((k / 2) as i32)
         })

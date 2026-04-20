@@ -261,10 +261,7 @@ mod tests {
         let g = MbGrid::new(4, 4);
         // Position (3, 2), addr 11.
         // Left=10, above=7, above-right=None (x+1 out of range), above-left=6.
-        assert_eq!(
-            g.neighbour_mb_addrs(11),
-            [Some(10), Some(7), None, Some(6)]
-        );
+        assert_eq!(g.neighbour_mb_addrs(11), [Some(10), Some(7), None, Some(6)]);
     }
 
     #[test]

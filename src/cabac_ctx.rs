@@ -146,8 +146,14 @@ const TBL_9_12: &[(usize, InitCell)] = &[
     (3, InitCell::all((20, -15), (20, -15), (20, -15), (20, -15))),
     (4, InitCell::all((2, 54), (2, 54), (2, 54), (2, 54))),
     (5, InitCell::all((3, 74), (3, 74), (3, 74), (3, 74))),
-    (6, InitCell::all((-28, 127), (-28, 127), (-28, 127), (-28, 127))),
-    (7, InitCell::all((-23, 104), (-23, 104), (-23, 104), (-23, 104))),
+    (
+        6,
+        InitCell::all((-28, 127), (-28, 127), (-28, 127), (-28, 127)),
+    ),
+    (
+        7,
+        InitCell::all((-23, 104), (-23, 104), (-23, 104), (-23, 104)),
+    ),
     (8, InitCell::all((-6, 53), (-6, 53), (-6, 53), (-6, 53))),
     (9, InitCell::all((-1, 54), (-1, 54), (-1, 54), (-1, 54))),
     (10, InitCell::all((7, 51), (7, 51), (7, 51), (7, 51))),
@@ -242,18 +248,48 @@ const TBL_9_18: &[(usize, InitCell)] = &[
     (70, InitCell::all((0, 11), (0, 45), (13, 15), (7, 34))),
     (71, InitCell::all((1, 55), (-4, 78), (7, 51), (-9, 88))),
     (72, InitCell::all((0, 69), (-3, 96), (2, 80), (-20, 127))),
-    (73, InitCell::all((-17, 127), (-27, 126), (-39, 127), (-36, 127))),
-    (74, InitCell::all((-13, 102), (-28, 98), (-18, 91), (-17, 91))),
+    (
+        73,
+        InitCell::all((-17, 127), (-27, 126), (-39, 127), (-36, 127)),
+    ),
+    (
+        74,
+        InitCell::all((-13, 102), (-28, 98), (-18, 91), (-17, 91)),
+    ),
     (75, InitCell::all((0, 82), (-25, 101), (-17, 96), (-14, 95))),
     (76, InitCell::all((-7, 74), (-23, 67), (-26, 81), (-25, 84))),
-    (77, InitCell::all((-21, 107), (-28, 82), (-35, 98), (-25, 86))),
-    (78, InitCell::all((-27, 127), (-20, 94), (-24, 102), (-12, 89))),
-    (79, InitCell::all((-31, 127), (-16, 83), (-23, 97), (-17, 91))),
-    (80, InitCell::all((-24, 127), (-22, 110), (-27, 119), (-31, 127))),
-    (81, InitCell::all((-18, 95), (-21, 91), (-24, 99), (-14, 76))),
-    (82, InitCell::all((-27, 127), (-18, 102), (-21, 110), (-18, 103))),
-    (83, InitCell::all((-21, 114), (-13, 93), (-18, 102), (-13, 90))),
-    (84, InitCell::all((-30, 127), (-29, 127), (-36, 127), (-37, 127))),
+    (
+        77,
+        InitCell::all((-21, 107), (-28, 82), (-35, 98), (-25, 86)),
+    ),
+    (
+        78,
+        InitCell::all((-27, 127), (-20, 94), (-24, 102), (-12, 89)),
+    ),
+    (
+        79,
+        InitCell::all((-31, 127), (-16, 83), (-23, 97), (-17, 91)),
+    ),
+    (
+        80,
+        InitCell::all((-24, 127), (-22, 110), (-27, 119), (-31, 127)),
+    ),
+    (
+        81,
+        InitCell::all((-18, 95), (-21, 91), (-24, 99), (-14, 76)),
+    ),
+    (
+        82,
+        InitCell::all((-27, 127), (-18, 102), (-21, 110), (-18, 103)),
+    ),
+    (
+        83,
+        InitCell::all((-21, 114), (-13, 93), (-18, 102), (-13, 90)),
+    ),
+    (
+        84,
+        InitCell::all((-30, 127), (-29, 127), (-36, 127), (-37, 127)),
+    ),
     (85, InitCell::all((-17, 123), (-7, 92), (0, 80), (11, 80))),
     (86, InitCell::all((-12, 115), (-5, 89), (-5, 89), (5, 76))),
     (87, InitCell::all((-16, 122), (-7, 96), (-7, 94), (2, 84))),
@@ -261,11 +297,20 @@ const TBL_9_18: &[(usize, InitCell)] = &[
     (89, InitCell::all((-12, 63), (-3, 46), (0, 39), (-6, 55))),
     (90, InitCell::all((-2, 68), (-1, 65), (0, 65), (4, 61))),
     (91, InitCell::all((-15, 84), (-1, 57), (-15, 84), (-14, 83))),
-    (92, InitCell::all((-13, 104), (-9, 93), (-35, 127), (-37, 127))),
+    (
+        92,
+        InitCell::all((-13, 104), (-9, 93), (-35, 127), (-37, 127)),
+    ),
     (93, InitCell::all((-3, 70), (-3, 74), (-2, 73), (-5, 79))),
-    (94, InitCell::all((-8, 93), (-9, 92), (-12, 104), (-11, 104))),
+    (
+        94,
+        InitCell::all((-8, 93), (-9, 92), (-12, 104), (-11, 104)),
+    ),
     (95, InitCell::all((-10, 90), (-8, 87), (-9, 91), (-11, 91))),
-    (96, InitCell::all((-30, 127), (-23, 126), (-31, 127), (-30, 127))),
+    (
+        96,
+        InitCell::all((-30, 127), (-23, 126), (-31, 127), (-30, 127)),
+    ),
     (97, InitCell::all((-1, 74), (5, 54), (3, 55), (0, 65))),
     (98, InitCell::all((-6, 97), (6, 60), (7, 56), (-2, 79))),
     (99, InitCell::all((-7, 91), (6, 59), (7, 55), (0, 72))),
@@ -273,18 +318,27 @@ const TBL_9_18: &[(usize, InitCell)] = &[
     (101, InitCell::all((-4, 56), (-1, 48), (-3, 53), (-6, 56))),
     (102, InitCell::all((-5, 82), (0, 68), (0, 68), (3, 68))),
     (103, InitCell::all((-7, 76), (-4, 69), (-7, 74), (-8, 71))),
-    (104, InitCell::all((-22, 125), (-8, 88), (-9, 88), (-13, 98))),
+    (
+        104,
+        InitCell::all((-22, 125), (-8, 88), (-9, 88), (-13, 98)),
+    ),
 ];
 
 // Table 9-19 — ctxIdx 105..=165.
 const TBL_9_19: &[(usize, InitCell)] = &[
     (105, InitCell::all((-7, 93), (-2, 85), (-13, 103), (-4, 86))),
-    (106, InitCell::all((-11, 87), (-6, 78), (-13, 91), (-12, 88))),
+    (
+        106,
+        InitCell::all((-11, 87), (-6, 78), (-13, 91), (-12, 88)),
+    ),
     (107, InitCell::all((-3, 77), (-1, 75), (-9, 89), (-5, 82))),
     (108, InitCell::all((-5, 71), (-7, 77), (-14, 92), (-3, 72))),
     (109, InitCell::all((-4, 63), (2, 54), (-8, 76), (-4, 67))),
     (110, InitCell::all((-4, 68), (5, 50), (-12, 87), (-8, 72))),
-    (111, InitCell::all((-12, 84), (-3, 68), (-23, 110), (-16, 89))),
+    (
+        111,
+        InitCell::all((-12, 84), (-3, 68), (-23, 110), (-16, 89)),
+    ),
     (112, InitCell::all((-7, 62), (1, 50), (-24, 105), (-9, 69))),
     (113, InitCell::all((-7, 65), (6, 42), (-10, 78), (-1, 59))),
     (114, InitCell::all((8, 61), (-4, 81), (-20, 112), (5, 66))),
@@ -306,15 +360,24 @@ const TBL_9_19: &[(usize, InitCell)] = &[
     (130, InitCell::all((7, 50), (-2, 73), (-3, 75), (-11, 83))),
     (131, InitCell::all((28, 19), (13, 46), (32, 20), (9, 52))),
     (132, InitCell::all((16, 33), (9, 49), (30, 22), (0, 67))),
-    (133, InitCell::all((14, 62), (-7, 100), (-44, 127), (-5, 90))),
+    (
+        133,
+        InitCell::all((14, 62), (-7, 100), (-44, 127), (-5, 90)),
+    ),
     (134, InitCell::all((-13, 108), (9, 53), (0, 54), (1, 67))),
     (135, InitCell::all((-15, 100), (2, 53), (-5, 61), (-15, 72))),
     (136, InitCell::all((-13, 101), (5, 53), (0, 58), (-5, 75))),
     (137, InitCell::all((-13, 91), (-2, 61), (-1, 60), (-8, 80))),
     (138, InitCell::all((-12, 94), (0, 56), (-3, 61), (-21, 83))),
     (139, InitCell::all((-10, 88), (0, 56), (-8, 67), (-21, 64))),
-    (140, InitCell::all((-16, 84), (-13, 63), (-25, 84), (-13, 31))),
-    (141, InitCell::all((-10, 86), (-5, 60), (-14, 74), (-25, 64))),
+    (
+        140,
+        InitCell::all((-16, 84), (-13, 63), (-25, 84), (-13, 31)),
+    ),
+    (
+        141,
+        InitCell::all((-10, 86), (-5, 60), (-14, 74), (-25, 64)),
+    ),
     (142, InitCell::all((-7, 83), (-1, 62), (-5, 65), (-29, 94))),
     (143, InitCell::all((-13, 87), (4, 57), (5, 52), (9, 75))),
     (144, InitCell::all((-19, 94), (-6, 69), (2, 57), (17, 63))),
@@ -373,11 +436,17 @@ const TBL_9_20: &[(usize, InitCell)] = &[
     (193, InitCell::all((17, 46), (22, 31), (0, 0), (20, 33))),
     (194, InitCell::all((0, 89), (-1, 84), (27, 36), (8, 63))),
     (195, InitCell::all((26, -19), (25, 7), (33, -25), (35, -18))),
-    (196, InitCell::all((22, -17), (30, -7), (34, -30), (33, -25))),
+    (
+        196,
+        InitCell::all((22, -17), (30, -7), (34, -30), (33, -25)),
+    ),
     (197, InitCell::all((26, -17), (28, 3), (36, -28), (28, -3))),
     (198, InitCell::all((30, -25), (28, 4), (38, -28), (24, 10))),
     (199, InitCell::all((28, -20), (32, 0), (38, -27), (27, 0))),
-    (200, InitCell::all((33, -23), (34, -1), (34, -18), (34, -14))),
+    (
+        200,
+        InitCell::all((33, -23), (34, -1), (34, -18), (34, -14)),
+    ),
     (201, InitCell::all((37, -27), (30, 6), (35, -16), (52, -44))),
     (202, InitCell::all((33, -23), (30, 6), (34, -14), (39, -24))),
     (203, InitCell::all((40, -28), (32, 9), (32, -8), (19, 17))),
@@ -403,12 +472,18 @@ const TBL_9_20: &[(usize, InitCell)] = &[
     (223, InitCell::all((27, 37), (9, 64), (16, 56), (14, 56))),
     (224, InitCell::all((21, 60), (-1, 94), (11, 73), (15, 57))),
     (225, InitCell::all((12, 68), (-2, 89), (10, 67), (26, 38))),
-    (226, InitCell::all((2, 97), (-9, 108), (-10, 116), (-24, 127))),
+    (
+        226,
+        InitCell::all((2, 97), (-9, 108), (-10, 116), (-24, 127)),
+    ),
 ];
 
 // Table 9-21 — ctxIdx 227..=275.
 const TBL_9_21: &[(usize, InitCell)] = &[
-    (227, InitCell::all((-3, 71), (-6, 76), (-23, 112), (-24, 115))),
+    (
+        227,
+        InitCell::all((-3, 71), (-6, 76), (-23, 112), (-24, 115)),
+    ),
     (228, InitCell::all((-6, 42), (-2, 44), (-15, 71), (-22, 82))),
     (229, InitCell::all((-5, 50), (0, 45), (-7, 61), (-9, 62))),
     (230, InitCell::all((-3, 54), (0, 52), (0, 53), (0, 53))),
@@ -417,27 +492,51 @@ const TBL_9_21: &[(usize, InitCell)] = &[
     (233, InitCell::all((1, 63), (-4, 70), (-9, 80), (-13, 89))),
     (234, InitCell::all((-2, 72), (-4, 75), (-9, 84), (-13, 94))),
     (235, InitCell::all((-1, 74), (-8, 82), (-10, 87), (-11, 92))),
-    (236, InitCell::all((-9, 91), (-17, 102), (-34, 127), (-29, 127))),
-    (237, InitCell::all((-5, 67), (-9, 77), (-21, 101), (-21, 100))),
+    (
+        236,
+        InitCell::all((-9, 91), (-17, 102), (-34, 127), (-29, 127)),
+    ),
+    (
+        237,
+        InitCell::all((-5, 67), (-9, 77), (-21, 101), (-21, 100)),
+    ),
     (238, InitCell::all((-5, 27), (3, 24), (-3, 39), (-14, 57))),
     (239, InitCell::all((-3, 39), (0, 42), (-5, 53), (-12, 67))),
     (240, InitCell::all((-2, 44), (0, 48), (-7, 61), (-11, 71))),
     (241, InitCell::all((0, 46), (0, 55), (-11, 75), (-10, 77))),
-    (242, InitCell::all((-16, 64), (-6, 59), (-15, 77), (-21, 85))),
+    (
+        242,
+        InitCell::all((-16, 64), (-6, 59), (-15, 77), (-21, 85)),
+    ),
     (243, InitCell::all((-8, 68), (-7, 71), (-17, 91), (-16, 88))),
-    (244, InitCell::all((-10, 78), (-12, 83), (-25, 107), (-23, 104))),
-    (245, InitCell::all((-6, 77), (-11, 87), (-25, 111), (-15, 98))),
-    (246, InitCell::all((-10, 86), (-30, 119), (-28, 122), (-37, 127))),
+    (
+        244,
+        InitCell::all((-10, 78), (-12, 83), (-25, 107), (-23, 104)),
+    ),
+    (
+        245,
+        InitCell::all((-6, 77), (-11, 87), (-25, 111), (-15, 98)),
+    ),
+    (
+        246,
+        InitCell::all((-10, 86), (-30, 119), (-28, 122), (-37, 127)),
+    ),
     (247, InitCell::all((-12, 92), (1, 58), (-11, 76), (-10, 82))),
     (248, InitCell::all((-15, 55), (-3, 29), (-10, 44), (-8, 48))),
     (249, InitCell::all((-10, 60), (-1, 36), (-10, 52), (-8, 61))),
     (250, InitCell::all((-6, 62), (1, 38), (-10, 57), (-8, 66))),
     (251, InitCell::all((-4, 65), (2, 43), (-9, 58), (-7, 70))),
-    (252, InitCell::all((-12, 73), (-6, 55), (-16, 72), (-14, 75))),
+    (
+        252,
+        InitCell::all((-12, 73), (-6, 55), (-16, 72), (-14, 75)),
+    ),
     (253, InitCell::all((-8, 76), (0, 58), (-7, 69), (-10, 79))),
     (254, InitCell::all((-7, 80), (0, 64), (-4, 69), (-9, 83))),
     (255, InitCell::all((-9, 88), (-3, 74), (-5, 74), (-12, 92))),
-    (256, InitCell::all((-17, 110), (-10, 90), (-9, 86), (-18, 108))),
+    (
+        256,
+        InitCell::all((-17, 110), (-10, 90), (-9, 86), (-18, 108)),
+    ),
     (257, InitCell::all((-11, 97), (0, 70), (2, 66), (-4, 79))),
     (258, InitCell::all((-20, 84), (-4, 29), (-9, 34), (-22, 69))),
     (259, InitCell::all((-11, 79), (5, 31), (1, 32), (-16, 75))),
@@ -446,7 +545,10 @@ const TBL_9_21: &[(usize, InitCell)] = &[
     (262, InitCell::all((-13, 86), (-2, 58), (-2, 55), (-13, 78))),
     (263, InitCell::all((-13, 96), (-3, 72), (-2, 67), (-9, 83))),
     (264, InitCell::all((-11, 97), (-3, 81), (0, 73), (-4, 81))),
-    (265, InitCell::all((-19, 117), (-11, 97), (-8, 89), (-13, 99))),
+    (
+        265,
+        InitCell::all((-19, 117), (-11, 97), (-8, 89), (-13, 99)),
+    ),
     (266, InitCell::all((-8, 78), (0, 58), (3, 52), (-13, 81))),
     (267, InitCell::all((-5, 33), (8, 5), (7, 4), (-6, 38))),
     (268, InitCell::all((-4, 48), (10, 14), (10, 8), (-13, 62))),
@@ -485,8 +587,8 @@ fn init_table() -> &'static [InitCell; NUM_CTX_IDX] {
     TABLE.get_or_init(|| {
         let mut arr = [InitCell::none(); NUM_CTX_IDX];
         for table in &[
-            TBL_9_12, TBL_9_13, TBL_9_14, TBL_9_15, TBL_9_16, TBL_9_17,
-            TBL_9_18, TBL_9_19, TBL_9_20, TBL_9_21,
+            TBL_9_12, TBL_9_13, TBL_9_14, TBL_9_15, TBL_9_16, TBL_9_17, TBL_9_18, TBL_9_19,
+            TBL_9_20, TBL_9_21,
         ] {
             for (idx, cell) in *table {
                 arr[*idx] = *cell;
@@ -521,7 +623,13 @@ impl CabacContexts {
         slice_qp_y: i32,
     ) -> CabacResult<Self> {
         let table = init_table();
-        let mut ctx = vec![CtxState { state_idx: 0, val_mps: 0 }; NUM_CTX_IDX];
+        let mut ctx = vec![
+            CtxState {
+                state_idx: 0,
+                val_mps: 0
+            };
+            NUM_CTX_IDX
+        ];
         for (idx, cell) in table.iter().enumerate() {
             if let Some((m, n)) = cell.pick(slice_kind, cabac_init_idc) {
                 ctx[idx] = CtxState::init(m, n, slice_qp_y)?;
@@ -529,7 +637,10 @@ impl CabacContexts {
         }
         // §9.3.1.1 NOTE 2 — ctxIdx 276 is hardcoded as pStateIdx=63,
         // valMPS=0 (used by end_of_slice_flag and I_PCM terminator).
-        ctx[276] = CtxState { state_idx: 63, val_mps: 0 };
+        ctx[276] = CtxState {
+            state_idx: 63,
+            val_mps: 0,
+        };
         Ok(Self {
             contexts: ctx,
             slice_kind,
@@ -604,9 +715,8 @@ pub fn decode_mb_skip_flag(
     slice_kind: SliceKind,
     neighbours: &NeighbourCtx,
 ) -> CabacResult<bool> {
-    let offset = mb_skip_flag_ctx_offset(slice_kind).expect(
-        "mb_skip_flag is not decoded on I/SI slices; caller must gate",
-    );
+    let offset = mb_skip_flag_ctx_offset(slice_kind)
+        .expect("mb_skip_flag is not decoded on I/SI slices; caller must gate");
     // §9.3.3.1.1.1 — condTermFlagN = 0 if mbAddrN unavailable or
     // mb_skip_flag[mbAddrN] == 1; else 1.
     let cond_a = u32::from(neighbours.available_left && !neighbours.mb_skip_flag_left);
@@ -661,11 +771,7 @@ fn mb_type_cond_term_flag(offset: u32, neighbours: &NeighbourCtx, is_left: bool)
 }
 
 /// §9.3.3.1.1.3 — derive ctxIdxInc for the first 3 bins of mb_type.
-fn mb_type_ctx_inc_first3(
-    offset: u32,
-    bin_idx: u32,
-    neighbours: &NeighbourCtx,
-) -> u32 {
+fn mb_type_ctx_inc_first3(offset: u32, bin_idx: u32, neighbours: &NeighbourCtx) -> u32 {
     // Bin 0 uses the neighbour-derived increment; subsequent bins use
     // the fixed increments from Table 9-39 (bin 1, bin 2, etc).
     if bin_idx == 0 {
@@ -851,9 +957,9 @@ pub fn decode_mb_type_p(
     let cond_a = u32::from(neighbours.available_left);
     let cond_b = u32::from(neighbours.available_above);
     let _ = cond_a + cond_b; // Table 9-39 offset=14 uses inc=0 for bin 0
-    // Table 9-39 row for ctxIdxOffset=14: binIdx 0 → inc=0,
-    // binIdx 1 → inc=1, binIdx 2 → (b1!=1)?2:3.
-    let b0 = dec.decode_decision(ctxs.at_mut((OFFSET + 0) as usize))?;
+                             // Table 9-39 row for ctxIdxOffset=14: binIdx 0 → inc=0,
+                             // binIdx 1 → inc=1, binIdx 2 → (b1!=1)?2:3.
+    let b0 = dec.decode_decision(ctxs.at_mut(OFFSET as usize))?;
     if b0 == 1 {
         // Intra prefix "1" → suffix is Table 9-36 with offset=17.
         let suffix = decode_mb_type_i_suffix(dec, ctxs, 17)?;
@@ -961,11 +1067,7 @@ pub fn decode_mb_type_b(
     //   19 B_Bi_L1_8x16   1 1 1 0 1 1 1
     //   20 B_Bi_Bi_16x8   1 1 1 1 0 0 0
     //   21 B_Bi_Bi_8x16   1 1 1 1 0 0 1
-    let val = 12
-        + ((b3 as u32) << 3)
-        + ((b4 as u32) << 2)
-        + ((b5 as u32) << 1)
-        + (b6 as u32);
+    let val = 12 + ((b3 as u32) << 3) + ((b4 as u32) << 2) + ((b5 as u32) << 1) + (b6 as u32);
     Ok(val)
 }
 
@@ -1458,22 +1560,69 @@ pub fn decode_coded_block_pattern(
 /// (significant_frame, significant_field, last). Values from document
 /// page 273.
 static TBL_9_43: [(u8, u8, u8); 63] = [
-    (0, 0, 0),   (1, 1, 1),   (2, 1, 1),   (3, 2, 1),
-    (4, 2, 1),   (5, 3, 1),   (5, 3, 1),   (4, 4, 1),
-    (4, 5, 1),   (3, 6, 1),   (3, 7, 1),   (4, 7, 1),
-    (4, 7, 1),   (4, 8, 1),   (5, 4, 1),   (5, 5, 1),
-    (4, 6, 2),   (4, 9, 2),   (4, 10, 2),  (4, 10, 2),
-    (3, 8, 2),   (3, 11, 2),  (6, 12, 2),  (7, 11, 2),
-    (7, 9, 2),   (7, 9, 2),   (8, 10, 2),  (9, 10, 2),
-    (10, 8, 2),  (9, 11, 2),  (8, 12, 2),  (7, 11, 2),
-    (7, 9, 3),   (6, 9, 3),   (11, 10, 3), (12, 10, 3),
-    (13, 8, 3),  (11, 11, 3), (6, 12, 3),  (7, 11, 3),
-    (8, 9, 4),   (9, 9, 4),   (14, 10, 4), (10, 10, 4),
-    (9, 8, 4),   (8, 13, 4),  (6, 13, 4),  (11, 9, 4),
-    (12, 9, 5),  (13, 10, 5), (11, 10, 5), (6, 8, 5),
-    (9, 13, 6),  (14, 13, 6), (10, 9, 6),  (9, 9, 6),
-    (11, 10, 7), (12, 10, 7), (13, 14, 7), (11, 14, 7),
-    (14, 14, 8), (10, 14, 8), (12, 14, 8),
+    (0, 0, 0),
+    (1, 1, 1),
+    (2, 1, 1),
+    (3, 2, 1),
+    (4, 2, 1),
+    (5, 3, 1),
+    (5, 3, 1),
+    (4, 4, 1),
+    (4, 5, 1),
+    (3, 6, 1),
+    (3, 7, 1),
+    (4, 7, 1),
+    (4, 7, 1),
+    (4, 8, 1),
+    (5, 4, 1),
+    (5, 5, 1),
+    (4, 6, 2),
+    (4, 9, 2),
+    (4, 10, 2),
+    (4, 10, 2),
+    (3, 8, 2),
+    (3, 11, 2),
+    (6, 12, 2),
+    (7, 11, 2),
+    (7, 9, 2),
+    (7, 9, 2),
+    (8, 10, 2),
+    (9, 10, 2),
+    (10, 8, 2),
+    (9, 11, 2),
+    (8, 12, 2),
+    (7, 11, 2),
+    (7, 9, 3),
+    (6, 9, 3),
+    (11, 10, 3),
+    (12, 10, 3),
+    (13, 8, 3),
+    (11, 11, 3),
+    (6, 12, 3),
+    (7, 11, 3),
+    (8, 9, 4),
+    (9, 9, 4),
+    (14, 10, 4),
+    (10, 10, 4),
+    (9, 8, 4),
+    (8, 13, 4),
+    (6, 13, 4),
+    (11, 9, 4),
+    (12, 9, 5),
+    (13, 10, 5),
+    (11, 10, 5),
+    (6, 8, 5),
+    (9, 13, 6),
+    (14, 13, 6),
+    (10, 9, 6),
+    (9, 9, 6),
+    (11, 10, 7),
+    (12, 10, 7),
+    (13, 14, 7),
+    (11, 14, 7),
+    (14, 14, 8),
+    (10, 14, 8),
+    (12, 14, 8),
 ];
 
 /// §9.3.3.1.3 — significant_coeff_flag ctxIdxInc per equation (9-21)
@@ -1488,7 +1637,11 @@ fn sig_coeff_inc(block_type: BlockType, level_list_idx: u32, field: bool) -> u32
         }
         5 | 9 | 13 => {
             let row = TBL_9_43[level_list_idx as usize];
-            if field { row.1 as u32 } else { row.0 as u32 }
+            if field {
+                row.1 as u32
+            } else {
+                row.0 as u32
+            }
         }
         _ => {
             // eq. (9-21): ctxIdxInc = levelListIdx.
@@ -1570,7 +1723,11 @@ pub fn decode_coeff_abs_level_minus1(
     }
     // Remaining unary bins — eq. (9-24):
     //   ctxIdxInc = 5 + Min(4 - (cat==3?1:0), num_gt_1)
-    let cat_minus = if block_type.ctx_block_cat() == 3 { 1 } else { 0 };
+    let cat_minus = if block_type.ctx_block_cat() == 3 {
+        1
+    } else {
+        0
+    };
     let inc_rest = 5 + core::cmp::min(4u32 - cat_minus, num_decoded_gt_1);
     let ctx_rest = (base + cat_offset + inc_rest) as usize;
     let mut prefix_val: u32 = 1;
@@ -1675,7 +1832,10 @@ mod tests {
         let ctxs = CabacContexts::init(SliceKind::I, None, 26).unwrap();
         assert_eq!(
             ctxs.at(0),
-            &CtxState { state_idx: 46, val_mps: 0 }
+            &CtxState {
+                state_idx: 46,
+                val_mps: 0
+            }
         );
     }
 
@@ -1686,7 +1846,10 @@ mod tests {
         let ctxs = CabacContexts::init(SliceKind::P, Some(0), 30).unwrap();
         assert_eq!(
             ctxs.at(11),
-            &CtxState { state_idx: 12, val_mps: 1 }
+            &CtxState {
+                state_idx: 12,
+                val_mps: 1
+            }
         );
     }
 
@@ -1696,7 +1859,10 @@ mod tests {
         // §9.3.1.1 NOTE 2.
         assert_eq!(
             ctxs.at(276),
-            &CtxState { state_idx: 63, val_mps: 0 }
+            &CtxState {
+                state_idx: 63,
+                val_mps: 0
+            }
         );
     }
 
@@ -1707,7 +1873,10 @@ mod tests {
         let ctxs = CabacContexts::init(SliceKind::B, Some(2), 26).unwrap();
         assert_eq!(
             ctxs.at(11),
-            &CtxState { state_idx: 0, val_mps: 0 }
+            &CtxState {
+                state_idx: 0,
+                val_mps: 0
+            }
         );
     }
 

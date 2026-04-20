@@ -110,24 +110,18 @@ static RANGE_TAB_LPS: [[u8; 4]; 64] = [
 /// Table 9-45 column `transIdxLPS` — next `pStateIdx` after decoding an LPS.
 static TRANS_IDX_LPS: [u8; 64] = [
     // pStateIdx  0..15
-    0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9, 11, 11, 12,
-    // pStateIdx 16..31
-    13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21, 21, 22, 22, 23, 24,
-    // pStateIdx 32..47
-    24, 25, 26, 26, 27, 27, 28, 29, 29, 30, 30, 30, 31, 32, 32, 33,
-    // pStateIdx 48..63
+    0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9, 11, 11, 12, // pStateIdx 16..31
+    13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21, 21, 22, 22, 23, 24, // pStateIdx 32..47
+    24, 25, 26, 26, 27, 27, 28, 29, 29, 30, 30, 30, 31, 32, 32, 33, // pStateIdx 48..63
     33, 33, 34, 34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63,
 ];
 
 /// Table 9-45 column `transIdxMPS` — next `pStateIdx` after decoding an MPS.
 static TRANS_IDX_MPS: [u8; 64] = [
     // pStateIdx  0..15
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-    // pStateIdx 16..31
-    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
-    // pStateIdx 32..47
-    33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
-    // pStateIdx 48..63
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // pStateIdx 16..31
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, // pStateIdx 32..47
+    33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, // pStateIdx 48..63
     49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 ];
 
@@ -172,10 +166,7 @@ impl CtxState {
         } else {
             ((pre - 64) as u8, 1u8)
         };
-        Ok(Self {
-            state_idx,
-            val_mps,
-        })
+        Ok(Self { state_idx, val_mps })
     }
 }
 
@@ -272,8 +263,7 @@ impl<'a> CabacDecoder<'a> {
     pub fn decode_decision(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
         // §9.3.3.2.1 equations (9-25) / (9-26).
         let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
-        let cod_i_range_lps =
-            RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
+        let cod_i_range_lps = RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
         self.cod_i_range -= cod_i_range_lps;
 
         let bin_val: u8;
@@ -374,7 +364,13 @@ mod tests {
         // Clip3(1,126,17) = 17; preCtxState <= 63 so
         //   pStateIdx = 63 - 17 = 46, valMPS = 0.
         let c = CtxState::init(20, -15, 26).unwrap();
-        assert_eq!(c, CtxState { state_idx: 46, val_mps: 0 });
+        assert_eq!(
+            c,
+            CtxState {
+                state_idx: 46,
+                val_mps: 0
+            }
+        );
     }
 
     #[test]
@@ -383,7 +379,13 @@ mod tests {
         // ((2*26)>>4)+54 = (52>>4)+54 = 3 + 54 = 57.
         // 57 <= 63 → pStateIdx = 63 - 57 = 6, valMPS = 0.
         let c = CtxState::init(2, 54, 26).unwrap();
-        assert_eq!(c, CtxState { state_idx: 6, val_mps: 0 });
+        assert_eq!(
+            c,
+            CtxState {
+                state_idx: 6,
+                val_mps: 0
+            }
+        );
     }
 
     #[test]
@@ -394,7 +396,13 @@ mod tests {
         // (floor division). -46 + 127 = 81. Clip3(1,126,81)=81.
         // 81 > 63 → pStateIdx = 81 - 64 = 17, valMPS = 1.
         let c = CtxState::init(-28, 127, 26).unwrap();
-        assert_eq!(c, CtxState { state_idx: 17, val_mps: 1 });
+        assert_eq!(
+            c,
+            CtxState {
+                state_idx: 17,
+                val_mps: 1
+            }
+        );
     }
 
     #[test]
@@ -403,7 +411,13 @@ mod tests {
         // ((20*0)>>4) + (-15) = -15. Clip3(1,126,-15) = 1.
         // preCtxState=1 <= 63 → pStateIdx = 63-1 = 62, valMPS=0.
         let c = CtxState::init(20, -15, 0).unwrap();
-        assert_eq!(c, CtxState { state_idx: 62, val_mps: 0 });
+        assert_eq!(
+            c,
+            CtxState {
+                state_idx: 62,
+                val_mps: 0
+            }
+        );
     }
 
     #[test]
@@ -412,7 +426,13 @@ mod tests {
         // ((20*51)>>4)+(-15) = (1020>>4)-15 = 63 - 15 = 48.
         // preCtxState=48 <= 63 → pStateIdx = 63-48 = 15, valMPS=0.
         let c = CtxState::init(20, -15, 51).unwrap();
-        assert_eq!(c, CtxState { state_idx: 15, val_mps: 0 });
+        assert_eq!(
+            c,
+            CtxState {
+                state_idx: 15,
+                val_mps: 0
+            }
+        );
     }
 
     #[test]
@@ -479,10 +499,19 @@ mod tests {
     fn decode_decision_mps_path_no_renorm() {
         let data = [0x00, 0x00];
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
-        let mut ctx = CtxState { state_idx: 0, val_mps: 0 };
+        let mut ctx = CtxState {
+            state_idx: 0,
+            val_mps: 0,
+        };
         let bin = dec.decode_decision(&mut ctx).unwrap();
         assert_eq!(bin, 0);
-        assert_eq!(ctx, CtxState { state_idx: 1, val_mps: 0 });
+        assert_eq!(
+            ctx,
+            CtxState {
+                state_idx: 1,
+                val_mps: 0
+            }
+        );
         assert_eq!(dec.cod_i_range(), 270);
         assert_eq!(dec.cod_i_offset(), 0);
     }
@@ -503,10 +532,19 @@ mod tests {
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
         dec.cod_i_range = 270;
         dec.cod_i_offset = 0;
-        let mut ctx = CtxState { state_idx: 1, val_mps: 0 };
+        let mut ctx = CtxState {
+            state_idx: 1,
+            val_mps: 0,
+        };
         let bin = dec.decode_decision(&mut ctx).unwrap();
         assert_eq!(bin, 0);
-        assert_eq!(ctx, CtxState { state_idx: 2, val_mps: 0 });
+        assert_eq!(
+            ctx,
+            CtxState {
+                state_idx: 2,
+                val_mps: 0
+            }
+        );
         assert_eq!(dec.cod_i_range(), 284);
         assert_eq!(dec.cod_i_offset(), 0);
     }
@@ -533,10 +571,19 @@ mod tests {
         let data = [0b1111_1110u8, 0b1000_0000];
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
         assert_eq!(dec.cod_i_offset(), 509);
-        let mut ctx = CtxState { state_idx: 0, val_mps: 0 };
+        let mut ctx = CtxState {
+            state_idx: 0,
+            val_mps: 0,
+        };
         let bin = dec.decode_decision(&mut ctx).unwrap();
         assert_eq!(bin, 1);
-        assert_eq!(ctx, CtxState { state_idx: 0, val_mps: 1 });
+        assert_eq!(
+            ctx,
+            CtxState {
+                state_idx: 0,
+                val_mps: 1
+            }
+        );
         assert_eq!(dec.cod_i_range(), 480);
         assert_eq!(dec.cod_i_offset(), 478);
     }
