@@ -550,11 +550,42 @@ pub fn inverse_scan_4x4_zigzag(levels: &[i32; 16]) -> [i32; 16] {
     out
 }
 
+/// §8.5.6 / §7.3.5.3.3 — invert the zig-zag scan for an AC-only block
+/// (Intra_16x16 AC, Chroma AC). Input `levels[0..=14]` holds the
+/// coefficient at spec scan positions 1..=15 respectively (startIdx=1).
+/// Slot `levels[15]` is ignored. Position (0, 0) of the output matrix
+/// (spec scan 0, the DC slot) is set to 0; the caller must overwrite it
+/// with the pre-scaled DC value per §8.5.10 / §8.5.11.2.
+pub fn inverse_scan_4x4_zigzag_ac(levels: &[i32; 16]) -> [i32; 16] {
+    let mut out = [0i32; 16];
+    // Spec scan k (k=1..=15) -> ZIGZAG_4X4[k]; input slot k-1 holds level.
+    for k in 1..16 {
+        let (i, j) = ZIGZAG_4X4[k];
+        out[i * 4 + j] = levels[k - 1];
+    }
+    out
+}
+
 /// §8.5.6 — invert the informative field scan for 4x4 blocks.
 pub fn inverse_scan_4x4_field(levels: &[i32; 16]) -> [i32; 16] {
     let mut out = [0i32; 16];
     for (k, &(i, j)) in FIELD_4X4.iter().enumerate() {
         out[i * 4 + j] = levels[k];
+    }
+    out
+}
+
+/// §8.5.6 / §7.3.5.3.3 — invert the informative field scan for an AC-only
+/// block (Intra_16x16 AC, Chroma AC). Input `levels[0..=14]` holds the
+/// coefficient at spec scan positions 1..=15 respectively (startIdx=1).
+/// Slot `levels[15]` is ignored. Position (0, 0) of the output matrix
+/// (spec scan 0, the DC slot) is set to 0; the caller must overwrite it
+/// with the pre-scaled DC value per §8.5.10 / §8.5.11.2.
+pub fn inverse_scan_4x4_field_ac(levels: &[i32; 16]) -> [i32; 16] {
+    let mut out = [0i32; 16];
+    for k in 1..16 {
+        let (i, j) = FIELD_4X4[k];
+        out[i * 4 + j] = levels[k - 1];
     }
     out
 }
@@ -2072,6 +2103,79 @@ mod tests {
         assert_eq!(at(2, 0), 3);
         assert_eq!(at(1, 1), 4);
         assert_eq!(at(0, 2), 5);
+        assert_eq!(at(3, 3), 15);
+    }
+
+    #[test]
+    fn zigzag_ac_scan_maps_slot_to_spec_positions_1_through_15() {
+        // §7.3.5.3.3 Intra16x16ACLevel / ChromaACLevel use startIdx=1,
+        // so parser-slot k ∈ 0..=14 holds the coefficient at spec scan
+        // position (k + 1). `inverse_scan_4x4_zigzag_ac` must dispatch
+        // slot k to ZIGZAG_4X4[k + 1]. Slot 15 is padding and is
+        // ignored. Matrix position (0, 0) is reserved for the DC slot
+        // and must be zero.
+        let mut levels = [0i32; 16];
+        for k in 0..=14 {
+            levels[k] = (k + 1) as i32; // spec scan pos k+1 -> value k+1
+        }
+        levels[15] = 12345; // must be ignored
+        let block = inverse_scan_4x4_zigzag_ac(&levels);
+        let at = |row: usize, col: usize| block[row * 4 + col];
+        // DC slot untouched.
+        assert_eq!(at(0, 0), 0);
+        // slot 0 (spec pos 1) -> ZIGZAG_4X4[1] = (0, 1).
+        assert_eq!(at(0, 1), 1);
+        // slot 1 (spec pos 2) -> ZIGZAG_4X4[2] = (1, 0).
+        assert_eq!(at(1, 0), 2);
+        // slot 2 (spec pos 3) -> ZIGZAG_4X4[3] = (2, 0).
+        assert_eq!(at(2, 0), 3);
+        // slot 3 (spec pos 4) -> ZIGZAG_4X4[4] = (1, 1).
+        assert_eq!(at(1, 1), 4);
+        // slot 4 (spec pos 5) -> ZIGZAG_4X4[5] = (0, 2).
+        assert_eq!(at(0, 2), 5);
+        // slot 14 (spec pos 15) -> ZIGZAG_4X4[15] = (3, 3).
+        assert_eq!(at(3, 3), 15);
+        // Ensure slot[15] padding was ignored (DC (0,0) would otherwise
+        // collide with it only if we erroneously mapped slot 15 there).
+        assert_ne!(at(0, 0), 12345);
+    }
+
+    #[test]
+    fn zigzag_ac_scan_matches_zigzag_with_shift() {
+        // Cross-check: for any AC levels at slots 0..=14, using the
+        // AC scan must be equivalent to calling the full scan on a
+        // [0, levels[0], levels[1], ..., levels[14]] array.
+        let mut ac_levels = [0i32; 16];
+        for k in 0..=14 {
+            ac_levels[k] = (100 + k as i32) * if k % 2 == 0 { 1 } else { -1 };
+        }
+        let mut shifted = [0i32; 16];
+        for k in 0..=14 {
+            shifted[k + 1] = ac_levels[k];
+        }
+        let via_ac = inverse_scan_4x4_zigzag_ac(&ac_levels);
+        let via_shifted = inverse_scan_4x4_zigzag(&shifted);
+        assert_eq!(via_ac, via_shifted);
+    }
+
+    #[test]
+    fn field_ac_scan_maps_slot_to_spec_positions_1_through_15() {
+        // Mirror of the zigzag_ac test for the informative field scan
+        // (Table 8-13 second column).
+        let mut levels = [0i32; 16];
+        for k in 0..=14 {
+            levels[k] = (k + 1) as i32;
+        }
+        levels[15] = 9999;
+        let block = inverse_scan_4x4_field_ac(&levels);
+        let at = |row: usize, col: usize| block[row * 4 + col];
+        // DC slot untouched.
+        assert_eq!(at(0, 0), 0);
+        // FIELD_4X4[1] = (1, 0) per §8.5.6.
+        assert_eq!(at(1, 0), 1);
+        // FIELD_4X4[2] = (0, 1).
+        assert_eq!(at(0, 1), 2);
+        // FIELD_4X4[15] = (3, 3).
         assert_eq!(at(3, 3), 15);
     }
 

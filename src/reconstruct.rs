@@ -684,6 +684,10 @@ fn reconstruct_intra_16x16(
     // Residual layout from macroblock_layer:
     //   For Intra_16x16: when cbp_luma == 15, residual_luma has 16
     //   entries in the 4x4 raster-Z order (same as LUMA_4X4_XY indices).
+    //   Each entry holds the 15 AC coefficients at parser slots 0..=14,
+    //   corresponding to spec scan positions 1..=15 (startIdx=1 for
+    //   Intra16x16ACLevel per §7.3.5.3.3 / Table 9-42). Slot 15 is
+    //   unused (padding by `pad_to_16`).
     //   When cbp_luma == 0, residual_luma is empty (only DC).
     for block_idx in 0..16usize {
         let (bx, by) = LUMA_4X4_XY[block_idx];
@@ -695,8 +699,8 @@ fn reconstruct_intra_16x16(
                 .get(block_idx)
                 .copied()
                 .unwrap_or([0i32; 16]);
-            // AC is in scan order; inverse zig-zag first.
-            crate::transform::inverse_scan_4x4_zigzag(&ac)
+            // AC values at slots 0..=14 are spec scan positions 1..=15.
+            crate::transform::inverse_scan_4x4_zigzag_ac(&ac)
         } else {
             [0i32; 16]
         };
@@ -1382,7 +1386,8 @@ fn reconstruct_chroma_intra(
             } else {
                 [0i32; 16]
             };
-            let mut coeffs = crate::transform::inverse_scan_4x4_zigzag(&ac_scan);
+            // Chroma AC: parser slots 0..=14 are spec scan positions 1..=15.
+            let mut coeffs = crate::transform::inverse_scan_4x4_zigzag_ac(&ac_scan);
             coeffs[0] = dc_c;
             let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?;
 
@@ -3610,7 +3615,8 @@ fn reconstruct_inter_chroma_residual(
             } else {
                 [0i32; 16]
             };
-            let mut coeffs = crate::transform::inverse_scan_4x4_zigzag(&ac_scan);
+            // Chroma AC: parser slots 0..=14 are spec scan positions 1..=15.
+            let mut coeffs = crate::transform::inverse_scan_4x4_zigzag_ac(&ac_scan);
             coeffs[0] = dc_c;
             let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?;
             let (bx, by) = chroma_block_xy(chroma_array_type, blk);
