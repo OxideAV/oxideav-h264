@@ -32,6 +32,15 @@ pub struct MbInfo {
     pub is_intra: bool,
     /// §7.4.5 — true for I_PCM.
     pub is_i_pcm: bool,
+    /// §7.4.5 — true when this MB's prediction is Intra_4x4 or
+    /// Intra_8x8 (i.e. `MbPartPredMode == Intra_4x4/8x8`, aka the
+    /// I_NxN mnemonic). Required by §8.3.1.1 step 3 to distinguish
+    /// I_NxN from Intra_16x16 / I_PCM neighbours when consulting
+    /// `intra_4x4_pred_modes` / `intra_8x8_pred_modes`. The raw
+    /// `mb_type_raw` value alone is ambiguous across slice types
+    /// (e.g. raw = 5 is Intra_16x16 in I slices but I_NxN after the
+    /// P-slice remap).
+    pub is_intra_nxn: bool,
     /// Raw mb_type value from the bitstream (for diagnostics).
     pub mb_type_raw: u32,
     /// §7.4.5 — QP_Y post-adjustment for this macroblock.
@@ -69,6 +78,7 @@ impl Default for MbInfo {
             available: false,
             is_intra: false,
             is_i_pcm: false,
+            is_intra_nxn: false,
             mb_type_raw: 0,
             qp_y: 0,
             cbp_luma: 0,

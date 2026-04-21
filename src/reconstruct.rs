@@ -485,6 +485,7 @@ pub fn reconstruct_slice<R: RefPicProvider>(
             info.available = true;
             info.is_intra = mb.mb_type.is_intra();
             info.is_i_pcm = mb.mb_type.is_i_pcm();
+            info.is_intra_nxn = mb.mb_type.is_i_nxn();
             info.mb_type_raw = mb.mb_type_raw;
             info.qp_y = mb_qp_y;
             info.cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
@@ -764,18 +765,19 @@ fn intra_neighbour_mb_info<'a>(
     Some(info)
 }
 
-/// §7.4.5 — does the parsed mb_type_raw field on an MbInfo correspond
-/// to an Intra_4x4 / I_NxN (with `transform_size_8x8_flag` == 0) or
-/// Intra_8x8 (with the flag set) macroblock? The grid only stores the
-/// raw mb_type value, the slice-type it was parsed under (I, P, SP, B)
-/// is not recorded — so we map the known I-slice I_NxN row (0) and the
-/// P-slice remap (5) and the B-slice remap (23) as I_NxN candidates.
-/// Any other `mb_type_raw` on an intra neighbour is either Intra_16x16
-/// or I_PCM and does NOT contribute its 4x4/8x8 pred modes.
+/// §7.4.5 — is this MB's prediction coded as Intra_4x4 or Intra_8x8
+/// (i.e. `MbPartPredMode == Intra_4x4 / Intra_8x8`, aka the I_NxN
+/// mnemonic)? Used by §8.3.1.1 step 3 to decide whether a neighbour
+/// contributes `intra_4x4_pred_modes[...]` / `intra_8x8_pred_modes[...]`
+/// (returns `true`) or falls back to Intra_4x4_DC (`intraMxMPredModeN = 2`)
+/// because the neighbour is Intra_16x16 / I_PCM.
+///
+/// We rely on the `is_intra_nxn` flag populated by the caller from
+/// `MbType::is_i_nxn()` rather than `mb_type_raw`, because the raw
+/// bitstream value has different meanings per slice type (e.g. raw=5
+/// is Intra_16x16 in I slices but the I_NxN P-slice remap value).
 fn mb_is_intra_nxn(info: &MbInfo) -> bool {
-    info.is_intra
-        && !info.is_i_pcm
-        && matches!(info.mb_type_raw, 0 | 5 | 23)
+    info.is_intra && !info.is_i_pcm && info.is_intra_nxn
 }
 
 /// §8.3.1.1 — is `info.mb_type_raw` an Intra_4x4 MB (i.e. I_NxN with
@@ -1050,6 +1052,7 @@ fn reconstruct_intra_nxn(
         info.available = true;
         info.is_intra = true;
         info.is_i_pcm = false;
+        info.is_intra_nxn = true;
         info.mb_type_raw = mb.mb_type_raw;
         info.transform_size_8x8_flag = mb.transform_size_8x8_flag;
         // Reset the per-block pred-mode arrays so stale entries from
@@ -4756,6 +4759,7 @@ mod tests {
             available: true,
             is_intra: true,
             is_i_pcm: false,
+            is_intra_nxn: true,
             mb_type_raw: 0,
             transform_size_8x8_flag: false,
             intra_4x4_pred_modes: [mode; 16],
@@ -4769,6 +4773,7 @@ mod tests {
             available: true,
             is_intra: true,
             is_i_pcm: false,
+            is_intra_nxn: true,
             mb_type_raw: 0,
             transform_size_8x8_flag: true,
             intra_8x8_pred_modes: [mode; 4],
@@ -4954,6 +4959,7 @@ mod tests {
             info.available = true;
             info.is_intra = true;
             info.is_i_pcm = false;
+            info.is_intra_nxn = false; // Intra_16x16, NOT I_NxN.
             info.mb_type_raw = 4; // Intra_16x16 variant.
             info.intra_4x4_pred_modes = [5; 16]; // ignored by derivation.
         }
@@ -4964,6 +4970,45 @@ mod tests {
         let mut pred = MbPred::default();
         pred.prev_intra4x4_pred_mode_flag[0] = true;
         // A = Intra_16x16 → 2, B = Intra_4x4[10] = 7. predicted = min(2, 7) = 2.
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 2);
+    }
+
+    /// Regression test: in I slices `mb_type_raw = 5` is
+    /// `I_16x16_0_1_0` (Intra_16x16) per Table 7-11 — NOT I_NxN. The
+    /// pre-fix `mb_is_intra_nxn` used
+    /// `matches!(mb_type_raw, 0 | 5 | 23)` (intended for P/B slice
+    /// remaps) which incorrectly classified an I-slice Intra_16x16
+    /// neighbour as Intra_4x4. That made its stored (but meaningless)
+    /// `intra_4x4_pred_modes[...]` leak into §8.3.1.1 step 3 instead
+    /// of the spec's Intra_4x4_DC fallback. This reproduces the
+    /// exact scenario from `jvt_CABA1_SVA_B` frame 8 MB 27, whose
+    /// top neighbour MB 16 is an I-slice Intra_16x16 with raw=5.
+    #[test]
+    fn intra_4x4_derivation_i_slice_raw5_is_intra_16x16_not_i_nxn() {
+        let mut grid = MbGrid::new(3, 3);
+        // Top neighbour (addr 1): I-slice Intra_16x16 with raw=5.
+        // Its `intra_4x4_pred_modes` are uninitialised from the
+        // parser's point of view (we never write them for I_16x16).
+        // Seed them with a non-DC value to prove the derivation
+        // does NOT use them.
+        if let Some(info) = grid.get_mut(1) {
+            info.available = true;
+            info.is_intra = true;
+            info.is_i_pcm = false;
+            info.is_intra_nxn = false; // I_16x16 → false.
+            info.mb_type_raw = 5; // I_16x16_0_1_0.
+            info.intra_4x4_pred_modes = [7; 16]; // must be ignored.
+            info.intra_8x8_pred_modes = [7; 4];
+        }
+        // Left neighbour (addr 3): Intra_4x4, all modes = 3.
+        if let Some(info) = grid.get_mut(3) {
+            *info = mk_intra4x4_info(3);
+        }
+        let mut pred = MbPred::default();
+        pred.prev_intra4x4_pred_mode_flag[0] = true;
+        // A (left, I_NxN) → 3. B (top, I_16x16) → 2 (DC). Predicted
+        // = min(3, 2) = 2. Bug would have yielded B = 7 →
+        // predicted = min(3, 7) = 3.
         assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 2);
     }
 
