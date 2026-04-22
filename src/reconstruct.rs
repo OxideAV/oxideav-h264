@@ -3789,6 +3789,100 @@ fn pixel_to_mb_addr(
     }
 }
 
+/// §8.7.2.1 — `different_ref_or_mv` test for a pair of 4x4 luma blocks
+/// straddling one edge, when neither side is intra/SP/SI and neither side
+/// has nonzero transform coeffs. Returns `true` when bS should be 1 per
+/// the fourth bullet of §8.7.2.1:
+///
+///   * the two blocks use different reference pictures, or
+///   * the two blocks use a different number of motion vectors
+///     (one list-only vs bi-pred), or
+///   * any motion vector component between the two blocks differs by
+///     more than 3 in quarter-sample units (i.e. `|Δ| >= 4`).
+///
+/// `p_in_mb_x`, `p_in_mb_y`, `q_in_mb_x`, `q_in_mb_y` are picture-
+/// relative pixel coordinates modulo 16 inside each MB; from them the
+/// per-4x4-block MV / per-8x8 ref_idx indices are derived.
+fn different_ref_or_mv_luma(
+    p_info: &MbInfo,
+    q_info: &MbInfo,
+    p_in_mb_x: u32,
+    p_in_mb_y: u32,
+    q_in_mb_x: u32,
+    q_in_mb_y: u32,
+) -> bool {
+    // 4x4 block index inside the MB follows the §6.4.3 Figure 6-10
+    // Z-scan — NOT simple raster. Reuse `blk4_raster_index`, which
+    // inverts (bx, by)_4x4 back to the Z-scan luma block index used
+    // throughout the grid (see `mv_l0`/`ref_idx_l0` storage).
+    let p_blk4 = blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+    let q_blk4 = blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+    // ref_idx is tracked per 8x8 partition in raster order 0..=3:
+    //   ref_idx_l0[qy*2 + qx] with qx = bx_in_mb/8, qy = by_in_mb/8.
+    let p_blk8 = ((p_in_mb_y / 8) * 2 + (p_in_mb_x / 8)) as usize;
+    let q_blk8 = ((q_in_mb_y / 8) * 2 + (q_in_mb_x / 8)) as usize;
+    let p_ref0 = p_info.ref_idx_l0[p_blk8];
+    let q_ref0 = q_info.ref_idx_l0[q_blk8];
+    let p_ref1 = p_info.ref_idx_l1[p_blk8];
+    let q_ref1 = q_info.ref_idx_l1[q_blk8];
+    let p_has_l0 = p_ref0 >= 0;
+    let q_has_l0 = q_ref0 >= 0;
+    let p_has_l1 = p_ref1 >= 0;
+    let q_has_l1 = q_ref1 >= 0;
+
+    // Different number of motion vectors on the edge.
+    if (p_has_l0 != q_has_l0) || (p_has_l1 != q_has_l1) {
+        return true;
+    }
+
+    // Same list usage — compare per-list MVs and refs.
+    let p_mv0 = p_info.mv_l0[p_blk4];
+    let q_mv0 = q_info.mv_l0[q_blk4];
+    let p_mv1 = p_info.mv_l1[p_blk4];
+    let q_mv1 = q_info.mv_l1[q_blk4];
+
+    // The spec treats "reference picture" identity by comparing
+    // RefPicList entries; we approximate by comparing ref_idx values
+    // within each list. This is exact for P slices (only L0 is used
+    // and a single active ref list). For B slices with the two lists
+    // reordered differently it can miss some "different picture" cases,
+    // but the common case of the same-list same-index matches.
+    let bi = p_has_l0 && p_has_l1;
+    if bi {
+        // Bi-predicted: eq. 8-470 — (a1) different ref on either list,
+        // or (a2) |Δmv| >= 4 on either list, with the spec's symmetric
+        // swap (p's L0 matches q's L0 and p's L1 matches q's L1, OR the
+        // swapped pairing does).
+        let straight = p_ref0 == q_ref0
+            && p_ref1 == q_ref1
+            && mv_delta_below_4(p_mv0, q_mv0)
+            && mv_delta_below_4(p_mv1, q_mv1);
+        let swapped = p_ref0 == q_ref1
+            && p_ref1 == q_ref0
+            && mv_delta_below_4(p_mv0, q_mv1)
+            && mv_delta_below_4(p_mv1, q_mv0);
+        !(straight || swapped)
+    } else if p_has_l0 {
+        // L0-only (typical P-slice case).
+        p_ref0 != q_ref0 || !mv_delta_below_4(p_mv0, q_mv0)
+    } else if p_has_l1 {
+        // L1-only.
+        p_ref1 != q_ref1 || !mv_delta_below_4(p_mv1, q_mv1)
+    } else {
+        // Neither list active — no MV info; keep bS=0 for this edge
+        // (the intra/coef bullets would have handled any interesting
+        // cases).
+        false
+    }
+}
+
+/// Sub-predicate of §8.7.2.1: `true` iff both MV components differ by
+/// < 4 in quarter-sample units.
+#[inline]
+fn mv_delta_below_4(a: (i16, i16), b: (i16, i16)) -> bool {
+    (a.0 as i32 - b.0 as i32).abs() < 4 && (a.1 as i32 - b.1 as i32).abs() < 4
+}
+
 #[allow(clippy::too_many_arguments)]
 fn deblock_plane_luma(
     pic: &mut Picture,
@@ -3853,13 +3947,26 @@ fn deblock_plane_luma(
                         _ => continue,
                     };
                     let is_mb_edge = p_addr != q_addr;
+                    // §8.7.2.1 fourth bullet: inter-coded edges pick up
+                    // bS=1 when the two 4x4 blocks disagree on ref pic /
+                    // MV count / MV component delta (>=4 in qpel units).
+                    // Coordinates modulo 16 give the per-MB 4x4 index.
+                    let p_in_mb_x = (edge_x - 1).rem_euclid(16) as u32;
+                    let p_in_mb_y = y0.rem_euclid(16) as u32;
+                    let q_in_mb_x = edge_x.rem_euclid(16) as u32;
+                    let q_in_mb_y = y0.rem_euclid(16) as u32;
+                    let diff_ref_mv = !p_info.is_intra
+                        && !q_info.is_intra
+                        && different_ref_or_mv_luma(
+                            p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
+                        );
                     let bs = derive_boundary_strength(BsInputs {
                         p_is_intra: p_info.is_intra,
                         q_is_intra: q_info.is_intra,
                         is_mb_edge,
                         is_sp_or_si: false,
                         either_has_nonzero_coeffs: p_info.cbp_luma != 0 || q_info.cbp_luma != 0,
-                        different_ref_or_mv: false,
+                        different_ref_or_mv: diff_ref_mv,
                         mixed_mode_edge: false,
                         vertical_edge: true,
                         mbaff_or_field: mbaff_frame_flag,
@@ -3909,13 +4016,23 @@ fn deblock_plane_luma(
                         _ => continue,
                     };
                     let is_mb_edge = p_addr != q_addr;
+                    // §8.7.2.1 fourth bullet (see vertical path).
+                    let p_in_mb_x = x0.rem_euclid(16) as u32;
+                    let p_in_mb_y = (edge_y - 1).rem_euclid(16) as u32;
+                    let q_in_mb_x = x0.rem_euclid(16) as u32;
+                    let q_in_mb_y = edge_y.rem_euclid(16) as u32;
+                    let diff_ref_mv = !p_info.is_intra
+                        && !q_info.is_intra
+                        && different_ref_or_mv_luma(
+                            p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
+                        );
                     let bs = derive_boundary_strength(BsInputs {
                         p_is_intra: p_info.is_intra,
                         q_is_intra: q_info.is_intra,
                         is_mb_edge,
                         is_sp_or_si: false,
                         either_has_nonzero_coeffs: p_info.cbp_luma != 0 || q_info.cbp_luma != 0,
-                        different_ref_or_mv: false,
+                        different_ref_or_mv: diff_ref_mv,
                         mixed_mode_edge: false,
                         vertical_edge: false,
                         mbaff_or_field: mbaff_frame_flag,
