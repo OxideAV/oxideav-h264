@@ -65,13 +65,28 @@ pub enum RefList {
 /// -1 (so the "refIdxL0A == 0 AND mvA == 0" condition is also false),
 /// and should therefore fall through to median §8.4.1.3.
 ///
+/// `partition_available` tracks §6.4.11.1 (sub-)partition availability:
+/// the neighbour partition is "not available" if it is a later partition
+/// of the current MB in decoding order (still undecoded) — even though
+/// `mb_available` may be true. The §8.4.1.3.2 eq. 8-214..8-216 C→D
+/// substitution is gated on THIS bit (partition-level availability),
+/// not on `mb_available`, nor on `available`:
+///   * an intra neighbour whose MB has been decoded is partition-
+///     available per §6.4.11.1 (no substitution) and just contributes
+///     mv=0, refIdx=-1 to the median (step 4 of §8.4.1.3.2);
+///   * a later-partition-of-same-MB neighbour is partition-
+///     unavailable per §6.4.11.1 (substitution fires) and we pull
+///     D in its place.
+///
 /// Callers that don't care about the §8.4.1.1 distinction may leave
-/// `mb_available` at its default (which tracks `available`); the
-/// default preserves pre-fix behaviour for all MVpred paths.
+/// `mb_available` and `partition_available` at their defaults (which
+/// both track `available`); the default preserves pre-fix behaviour
+/// for all MVpred paths.
 #[derive(Debug, Copy, Clone, Default)]
 pub struct NeighbourMv {
     pub available: bool,
     pub mb_available: bool,
+    pub partition_available: bool,
     pub ref_idx: i32,
     pub mv: Mv,
 }
@@ -80,6 +95,7 @@ impl NeighbourMv {
     pub const UNAVAILABLE: NeighbourMv = NeighbourMv {
         available: false,
         mb_available: false,
+        partition_available: false,
         ref_idx: -1,
         mv: Mv::ZERO,
     };
@@ -88,23 +104,54 @@ impl NeighbourMv {
         NeighbourMv {
             available: ref_idx >= 0,
             mb_available: ref_idx >= 0,
+            partition_available: ref_idx >= 0,
             ref_idx,
             mv,
         }
     }
 
     /// §8.4.1.1 constructor — an intra (or predFlagLX=0) neighbour
-    /// whose mbAddr IS available in the §6.4.5 sense. Returns a
-    /// NeighbourMv with `available=false` (so MVpred treats it as
-    /// unusable, mv=0, refIdx=-1) but `mb_available=true` so the
-    /// §8.4.1.1 "mbAddrA is not available" check does NOT trigger
-    /// zero-forcing. This is the piece §8.4.1.3.2 step 2a (mvLXN=0,
-    /// refIdxLXN=-1) folds into the MVpred abstraction, with the
-    /// mbAddr-availability bit kept separate for P_Skip's zero-force.
+    /// whose mbAddr IS available in the §6.4.5 sense AND whose
+    /// partition is available per §6.4.11.1 (i.e. the neighbour MB
+    /// has been fully decoded). Returns a NeighbourMv with
+    /// `available=false` (so MVpred treats it as unusable, mv=0,
+    /// refIdx=-1) but `mb_available=true` and `partition_available=
+    /// true`: the §8.4.1.1 "mbAddrA is not available" check does NOT
+    /// trigger zero-forcing, and the §8.4.1.3.2 C→D substitution does
+    /// NOT fire (step 2a's intra filtering has already collapsed mv=0,
+    /// ref=-1 for the median's C slot).
+    ///
+    /// This is the §8.4.1.3.2 step 2a folding of (intra / predFlagLX=0)
+    /// neighbours into the MVpred abstraction.
     pub const fn intra_but_mb_available() -> Self {
         NeighbourMv {
             available: false,
             mb_available: true,
+            partition_available: true,
+            ref_idx: -1,
+            mv: Mv::ZERO,
+        }
+    }
+
+    /// §6.4.11.1 / §8.4.1.3.2 constructor — a neighbour that is a
+    /// later (sub-)partition of the CURRENT in-flight macroblock in
+    /// decoding order, so it hasn't been decoded yet. Its mbAddr IS
+    /// the current MB's address (i.e. available in the §6.4.5 sense)
+    /// but the partition itself is NOT available per §6.4.11.1 → the
+    /// §8.4.1.3.2 eq. 8-214..8-216 C→D substitution fires for this
+    /// neighbour if it is the C slot.
+    ///
+    /// Used by neighbour lookups for 4x4 / 8x8 / 4x8 / 8x4 sub-macro-
+    /// block partitions inside a P_8x8 or B_8x8 MB: when the C
+    /// neighbour's position falls in a not-yet-decoded sub-partition
+    /// of the current MB, C is partition-unavailable and D must
+    /// substitute. See frame-1 MB 53 sub-partition-2 block-3 in the
+    /// AUD_MW_E conformance trace for the motivating regression.
+    pub const fn partition_not_yet_decoded_same_mb() -> Self {
+        NeighbourMv {
+            available: false,
+            mb_available: true,
+            partition_available: false,
             ref_idx: -1,
             mv: Mv::ZERO,
         }
@@ -235,11 +282,23 @@ pub fn derive_mvpred_with_d(inputs: &MvpredInputs, neighbour_d: NeighbourMv) -> 
     //   mbAddrC        := mbAddrD
     //   mbPartIdxC     := mbPartIdxD
     //   subMbPartIdxC  := subMbPartIdxD
-    // Our `NeighbourMv` abstraction already folds
-    // (mbAddr, mbPartIdx, subMbPartIdx) plus Intra / predFlagLX
-    // filtering into a single (available, ref_idx, mv) record, so
-    // the substitution simply copies D's record onto C.
-    let c = if !c_raw.available && neighbour_d.available {
+    //
+    // The "partition C is not available" test refers to §6.4.11.1
+    // (sub-)partition availability, which includes two cases:
+    //   (1) mbAddrC itself is not available per §6.4.5 (outside the
+    //       picture / different slice), AND
+    //   (2) the partition mbAddrC\mbPartIdxC\subMbPartIdxC has not
+    //       yet been decoded — e.g. it is a later sub-partition of
+    //       the CURRENT in-flight MB.
+    // It does NOT refer to the §8.4.1.3.2 step 2a filtering that
+    // collapses intra-coded or predFlagLX==0 neighbours to (mvLXN=0,
+    // refIdxLXN=-1): an intra neighbour whose MB has been decoded
+    // still has an available partition per §6.4.11.1.
+    //
+    // `NeighbourMv::partition_available` tracks §6.4.11.1 partition-
+    // level availability independently of MVpred-usability; gate the
+    // substitution on that bit.
+    let c = if !c_raw.partition_available && neighbour_d.partition_available {
         neighbour_d
     } else {
         c_raw
@@ -392,7 +451,13 @@ pub fn derive_p_skip_mv_with_d(
     }
 
     // §8.4.1.3.2 eq. 8-214..8-216 — C→D substitution before median.
-    let c_eff = if !c.available && d.available { d } else { c };
+    // Gated on §6.4.11.1 partition-level availability; see
+    // `derive_mvpred_with_d` for the full rationale.
+    let c_eff = if !c.partition_available && d.partition_available {
+        d
+    } else {
+        c
+    };
 
     // §8.4.1.2 otherwise — invoke §8.4.1.3 median prediction. The
     // P_Skip case always uses shape = Default (no 16x8 / 8x16
@@ -465,12 +530,14 @@ pub fn derive_b_spatial_direct_with_d(
     d_l1: NeighbourMv,
 ) -> (i32, Mv, i32, Mv) {
     // §8.4.1.3.2 eq. 8-214..8-216 — C→D substitution (per list).
-    let c_l0_eff = if !c_l0.available && d_l0.available {
+    // Gated on §6.4.11.1 partition-level availability; see
+    // `derive_mvpred_with_d` for the full rationale.
+    let c_l0_eff = if !c_l0.partition_available && d_l0.partition_available {
         d_l0
     } else {
         c_l0
     };
-    let c_l1_eff = if !c_l1.available && d_l1.available {
+    let c_l1_eff = if !c_l1.partition_available && d_l1.partition_available {
         d_l1
     } else {
         c_l1
@@ -993,6 +1060,80 @@ mod tests {
             derive_mvpred_with_d(&inputs_all_unavail, NeighbourMv::UNAVAILABLE),
             Mv::ZERO
         );
+    }
+
+    #[test]
+    fn mvpred_with_d_no_substitution_when_c_is_intra_but_mb_available() {
+        // §8.4.1.3.2 eq. 8-214..8-216 gates C→D substitution on
+        // §6.4.11.1 partition-level availability, NOT on MVpred-
+        // usability. An intra neighbour C has an available partition
+        // (its MB is decoded; §6.4.11.1 says "available") but is
+        // unavailable for MVpred (step 2a collapses it to mv=0,
+        // ref=-1). D must NOT substitute in that case — the intra C
+        // contributes (0, 0) to the median.
+        //
+        // This is the AUD_MW_E frame 2 MB #25 scenario: the 8x16 right
+        // partition's C neighbour falls inside an I-coded MB (MB 15),
+        // forcing the shortcut test `refIdxLXC == refIdxLX` to fail
+        // and the median path to run with C contributing zero. Prior
+        // to the fix we substituted D's MV (pulling from the above
+        // MB's later partition), which produced the wrong pmv.
+        let a = NeighbourMv::new(0, Mv::new(11, 7)); // left partition
+        let b = NeighbourMv::new(0, Mv::new(7, 8)); // above
+        let c_intra = NeighbourMv::intra_but_mb_available();
+        let d = NeighbourMv::new(0, Mv::new(7, 8)); // above-left — "trap" for bug regression
+        let inputs = MvpredInputs {
+            neighbour_a: a,
+            neighbour_b: b,
+            neighbour_c: c_intra,
+            current_ref_idx: 0,
+            shape: MvpredShape::Partition8x16Right,
+        };
+        // 8x16-right shortcut: C is unavailable for MVpred (intra,
+        // ref=-1) -> shortcut bypass does NOT fire (-1 != 0) -> median
+        // path. A and B match ref=0, C doesn't (ref=-1). match_count=2,
+        // so per-component median with C contributing 0:
+        //   median(11, 7, 0) = 7
+        //   median( 7, 8, 0) = 7
+        // Not (7, 8) that D-substitution would have produced!
+        assert_eq!(derive_mvpred_with_d(&inputs, d), Mv::new(7, 7));
+    }
+
+    #[test]
+    fn mvpred_with_d_substitutes_when_c_partition_not_yet_decoded() {
+        // §6.4.11.1 / §8.4.1.3.2: C partition is within the current
+        // (in-flight) MB but hasn't been decoded yet (e.g. a later
+        // sub-MB partition during P_8x8 decoding). That partition is
+        // NOT available per §6.4.11.1 -> D substitutes.
+        //
+        // This is the AUD_MW_E frame 1 MB #53 sub-partition-2 block-3
+        // scenario: while decoding sub 2 block 3 (P_L0_4x4 at origin
+        // (4, 12) within MB 53), the C neighbour position falls in
+        // sub 3 (not yet decoded). Without substitution we'd mislabel
+        // C as "inter predFlagLX=0" and leak a zero into the median.
+        let a = NeighbourMv::new(0, Mv::new(14, 6));
+        let b = NeighbourMv::new(0, Mv::new(13, 3));
+        let c_not_yet_decoded = NeighbourMv::partition_not_yet_decoded_same_mb();
+        let d = NeighbourMv::new(0, Mv::new(14, 4));
+        let inputs = MvpredInputs {
+            neighbour_a: a,
+            neighbour_b: b,
+            neighbour_c: c_not_yet_decoded,
+            current_ref_idx: 0,
+            shape: MvpredShape::Default,
+        };
+        // Substitution fires: C := D = (14, 4) ref=0. match_count=3,
+        // so per-component median:
+        //   median(14, 13, 14) = 14
+        //   median( 6,  3,  4) =  4
+        assert_eq!(derive_mvpred_with_d(&inputs, d), Mv::new(14, 4));
+
+        // Sanity: without D, C contributes 0 -> median(14,13,0)=13,
+        // median(6,3,0)=3 -> (13, 3). So D's substitution changes the
+        // result.
+        let (_r, mv_no_d) = (0, derive_mvpred(&inputs));
+        let _ = _r;
+        assert_eq!(mv_no_d, Mv::new(13, 3));
     }
 
     #[test]

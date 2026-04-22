@@ -3077,10 +3077,12 @@ fn neighbour_from_block(
         return NeighbourMv::UNAVAILABLE;
     }
     // §8.4.1.3.2 — intra neighbour => mvLXN = 0, refIdxLXN = -1 for
-    // MVpred, but mbAddrN IS available in the §6.4.5 sense. P_Skip's
-    // §8.4.1.1 zero-forcing checks the mbAddr-availability bit, not
-    // the MVpred-availability bit; see `NeighbourMv::mb_available` /
-    // `derive_p_skip_mv_with_d` for why the distinction matters.
+    // MVpred, but mbAddrN IS available in the §6.4.5 sense AND (for
+    // a decoded neighbour MB) its partition is available per §6.4.11.1.
+    // P_Skip's §8.4.1.1 zero-forcing checks the mbAddr-availability
+    // bit, not the MVpred-availability bit; see
+    // `NeighbourMv::mb_available` / `derive_p_skip_mv_with_d` for why
+    // the distinction matters.
     if info.is_intra {
         return NeighbourMv::intra_but_mb_available();
     }
@@ -3091,16 +3093,29 @@ fn neighbour_from_block(
         (info.mv_l1[blk4], info.ref_idx_l1[blk4 / 4])
     };
     if ref_idx < 0 {
-        // Inter MB but this 8x8 partition didn't use list LX
-        // (predFlagLX=0 per §8.4.1.3.2). The mbAddr is still available
-        // in the §6.4.5 sense, but the neighbour contributes mv=0,
-        // refIdx=-1 to MVpred. For P_Skip this is structurally the
-        // same as the intra case.
+        // Inter MB with ref_idx == -1. Two disjoint cases:
+        //   (a) Within the CURRENT in-flight MB: the 8x8 partition
+        //       that would cover (bxw, byw) hasn't been decoded yet
+        //       (its ref_idx is still the default -1). Per §6.4.11.1
+        //       the partition is NOT AVAILABLE, and the §8.4.1.3.2
+        //       eq. 8-214..8-216 C→D substitution must fire when this
+        //       neighbour is the C slot.
+        //   (b) In a DIFFERENT (already-decoded) MB: the partition is
+        //       available per §6.4.11.1, but predFlagLX==0 at this
+        //       8x8 (spec step 2a filtering — the MB is inter but
+        //       that particular partition didn't use list LX). The
+        //       substitution must NOT fire; this neighbour just
+        //       contributes mv=0, refIdx=-1 to the median.
+        // Distinguish via `is_same_mb`.
+        if is_same_mb {
+            return NeighbourMv::partition_not_yet_decoded_same_mb();
+        }
         return NeighbourMv::intra_but_mb_available();
     }
     NeighbourMv {
         available: true,
         mb_available: true,
+        partition_available: true,
         ref_idx: ref_idx as i32,
         mv: Mv::new(mv.0 as i32, mv.1 as i32),
     }
