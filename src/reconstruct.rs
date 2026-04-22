@@ -491,6 +491,8 @@ pub fn reconstruct_slice<R: RefPicProvider>(
             info.cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
             info.cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
             info.transform_size_8x8_flag = mb.transform_size_8x8_flag;
+            info.luma_nonzero_4x4 = compute_luma_nonzero_mask(mb);
+            info.chroma_nonzero_4x4 = compute_chroma_nonzero_mask(mb, chroma_array_type);
             if let Some(pred) = mb.mb_pred.as_ref() {
                 info.intra_chroma_pred_mode = pred.intra_chroma_pred_mode;
             }
@@ -3672,6 +3674,155 @@ fn reconstruct_inter_chroma_residual(
 fn _mb_info_marker(_: MbInfo) {}
 
 // -------------------------------------------------------------------------
+// §8.7 — per-block nonzero-coefficient bitmap helpers
+// -------------------------------------------------------------------------
+
+/// §8.7.2.1 — derive the per-4x4 luma nonzero-coefficient mask for
+/// the current MB from the parsed residual data. Bit `z` (indexed by
+/// §6.4.3 Figure 6-10 Z-scan) is set iff the 4x4 block at Z-scan
+/// position `z` has at least one non-zero AC (or AC+DC) transform
+/// coefficient level. I_PCM is treated as "all blocks coded" since
+/// its samples are carried directly with no transform block CBF test.
+///
+/// The mask drives the deblock boundary-strength derivation: the
+/// third bullet of §8.7.2.1 ("either adjacent 4x4 block contains
+/// non-zero transform coefficient levels" → bS = 2) requires
+/// per-block granularity rather than the MB-level `cbp_luma != 0`
+/// check, which is too coarse (MBs with a single coded 8x8 quadrant
+/// would incorrectly trigger bS = 2 on edges of the three other
+/// quadrants' coded-block-free 4x4 blocks).
+fn compute_luma_nonzero_mask(mb: &Macroblock) -> u16 {
+    // I_PCM — the spec treats I_PCM as having all transform blocks
+    // coded for BS purposes (first bullet equivalence, §8.7.2.1).
+    if mb.mb_type.is_i_pcm() {
+        return 0xFFFF;
+    }
+    let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
+    // For Intra_16x16, the 16 AC blocks are always present when
+    // `cbp_luma` for the Intra_16x16 level is 15; then per-4x4
+    // granularity comes from the parsed AC coefficients themselves.
+    // The DC block is not a 4x4 transform block per §8.7.2.1 — it
+    // does NOT contribute to the per-4x4 bit. (Per NOTE 1 in
+    // §9.2.1.1 CAVLC: DC is tracked separately.)
+    if let MbType::Intra16x16(cfg) = &mb.mb_type {
+        let mut mask = 0u16;
+        if cfg.cbp_luma == 15 {
+            // residual_luma has 16 entries in raster-Z order.
+            for (blk_idx, block) in mb.residual_luma.iter().enumerate().take(16) {
+                // AC coefficients at slots 0..=14 (slot 15 is padding).
+                // Slot 0 is spec scan position 1 (AC, not DC).
+                let any_nz = block.iter().take(15).any(|c| *c != 0);
+                if any_nz {
+                    mask |= 1 << blk_idx;
+                }
+            }
+        }
+        return mask;
+    }
+    // 8x8 transform: residual_luma has 4 entries per set cbp bit,
+    // each entry holding 16 of the 64 scan positions. For the bS
+    // derivation, every 4x4 inside an 8x8 transform block shares the
+    // 8x8's "nonzero" status.
+    if mb.transform_size_8x8_flag {
+        let mut mask = 0u16;
+        // Mapping: 8x8 quadrant q → four 4x4 Z-scan indices.
+        // Quadrants 0..=3 at (bx=0,by=0),(bx=8,by=0),(bx=0,by=8),(bx=8,by=8).
+        // The four 4x4s in that 8x8 are Z-scan indices q*4..q*4+3
+        // (not to be confused with raster position — §6.4.3 Z-scan
+        // groups blk4 indices in quadrants of 4 consecutive values).
+        for quad in 0..4usize {
+            if (cbp_luma >> quad) & 1 == 0 {
+                continue;
+            }
+            let set_before = (cbp_luma & ((1u8 << quad) - 1)).count_ones() as usize;
+            let base_slot = set_before * 4;
+            // Whole-8x8 nonzero iff any of the four 16-entry chunks
+            // carries a non-zero coefficient.
+            let mut any_nz = false;
+            for sub in 0..4usize {
+                let slot = base_slot + sub;
+                if let Some(c) = mb.residual_luma.get(slot) {
+                    if c.iter().any(|v| *v != 0) {
+                        any_nz = true;
+                        break;
+                    }
+                }
+            }
+            if any_nz {
+                // All four 4x4s in the quadrant inherit the 8x8 flag.
+                for z in (quad * 4)..(quad * 4 + 4) {
+                    mask |= 1 << z;
+                }
+            }
+        }
+        return mask;
+    }
+    // 4x4 transform (Inter / I_NxN). residual_luma has 4 entries per
+    // set cbp bit, in ascending quadrant order. Each entry is one
+    // 4x4 block's 16-coefficient array.
+    let mut mask = 0u16;
+    for quad in 0..4usize {
+        if (cbp_luma >> quad) & 1 == 0 {
+            continue;
+        }
+        let set_before = (cbp_luma & ((1u8 << quad) - 1)).count_ones() as usize;
+        let base_slot = set_before * 4;
+        for sub in 0..4usize {
+            let slot = base_slot + sub;
+            if let Some(c) = mb.residual_luma.get(slot) {
+                if c.iter().any(|v| *v != 0) {
+                    // Z-scan position of this 4x4 block.
+                    let z = quad * 4 + sub;
+                    mask |= 1 << z;
+                }
+            }
+        }
+    }
+    mask
+}
+
+/// §8.7.2.1 — per-4x4 chroma nonzero-coefficient mask, laid out as
+/// two 8-bit planes in a u16: low byte = Cb, high byte = Cr. For
+/// 4:2:0 only bits 0..=3 (Cb) and 8..=11 (Cr) are populated (four
+/// 4x4 chroma blocks per plane); for 4:2:2 bits 0..=7 / 8..=15 are
+/// populated (eight 4x4 blocks per plane). ChromaArrayType == 3
+/// (4:4:4) is not modelled here; callers that use the chroma deblock
+/// path for 4:4:4 should consult the luma mask instead.
+fn compute_chroma_nonzero_mask(mb: &Macroblock, chroma_array_type: u32) -> u16 {
+    // I_PCM: treat all chroma blocks as coded, consistent with luma.
+    if mb.mb_type.is_i_pcm() {
+        return 0xFFFF;
+    }
+    if chroma_array_type != 1 && chroma_array_type != 2 {
+        return 0;
+    }
+    // cbp_chroma == 0 → no coded AC (and DC). cbp_chroma == 1 → only
+    // DC coded. cbp_chroma == 2 → DC + all AC blocks coded.
+    // Per §8.7.2.1 the 4x4 AC granularity matters — inspect the
+    // parser's `residual_chroma_ac_*` entries to set per-block bits.
+    let cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
+    if cbp_chroma < 2 {
+        return 0;
+    }
+    // Per-plane 4x4 count: 4 for 4:2:0, 8 for 4:2:2.
+    let num_chroma_blocks = if chroma_array_type == 1 { 4 } else { 8 };
+    let mut mask = 0u16;
+    for (plane, ac) in [&mb.residual_chroma_ac_cb, &mb.residual_chroma_ac_cr]
+        .iter()
+        .enumerate()
+    {
+        let shift = if plane == 0 { 0 } else { 8 };
+        for (blk, coeffs) in ac.iter().enumerate().take(num_chroma_blocks) {
+            let any_nz = coeffs.iter().any(|v| *v != 0);
+            if any_nz {
+                mask |= 1u16 << (shift + blk as u32);
+            }
+        }
+    }
+    mask
+}
+
+// -------------------------------------------------------------------------
 // §8.7 — Deblocking (picture-level pass, simplified)
 // -------------------------------------------------------------------------
 
@@ -3960,17 +4111,34 @@ fn deblock_plane_luma(
                         && different_ref_or_mv_luma(
                             p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
                         );
+                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
+                    // Consult the per-block mask set at reconstruct-time.
+                    let p_blk4_z =
+                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+                    let q_blk4_z =
+                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                     let bs = derive_boundary_strength(BsInputs {
                         p_is_intra: p_info.is_intra,
                         q_is_intra: q_info.is_intra,
                         is_mb_edge,
                         is_sp_or_si: false,
-                        either_has_nonzero_coeffs: p_info.cbp_luma != 0 || q_info.cbp_luma != 0,
+                        either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                         different_ref_or_mv: diff_ref_mv,
                         mixed_mode_edge: false,
                         vertical_edge: true,
                         mbaff_or_field: mbaff_frame_flag,
                     });
+                    if std::env::var_os("OXIDEAV_H264_DEBLOCK_TRACE").is_some() {
+                        eprintln!(
+                            "DBL V x={edge_x} y0={y0} bs={bs} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={} p_nz={} q_nz={} p_cbp={:#x} q_cbp={:#x} diff_ref_mv={} p_qp={} q_qp={}",
+                            p_info.is_intra, q_info.is_intra,
+                            p_has_nz, q_has_nz,
+                            p_info.cbp_luma, q_info.cbp_luma,
+                            diff_ref_mv, p_info.qp_y, q_info.qp_y,
+                        );
+                    }
                     if bs == 0 {
                         continue;
                     }
@@ -4026,12 +4194,19 @@ fn deblock_plane_luma(
                         && different_ref_or_mv_luma(
                             p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
                         );
+                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
+                    let p_blk4_z =
+                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+                    let q_blk4_z =
+                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                     let bs = derive_boundary_strength(BsInputs {
                         p_is_intra: p_info.is_intra,
                         q_is_intra: q_info.is_intra,
                         is_mb_edge,
                         is_sp_or_si: false,
-                        either_has_nonzero_coeffs: p_info.cbp_luma != 0 || q_info.cbp_luma != 0,
+                        either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                         different_ref_or_mv: diff_ref_mv,
                         mixed_mode_edge: false,
                         vertical_edge: false,
@@ -4140,14 +4315,35 @@ fn deblock_plane_chroma(
                             _ => continue,
                         };
                         let is_mb_edge = p_addr != q_addr;
+                        // §8.7.2.1 last paragraph — for ChromaArrayType
+                        // ∈ {1, 2} the chroma edge bS inherits from the
+                        // corresponding luma edge at the mapped luma
+                        // coordinate (chroma-x * SubWidthC, chroma-y *
+                        // SubHeightC).
+                        let p_in_mb_x = (lp_x).rem_euclid(16) as u32;
+                        let p_in_mb_y = (ly).rem_euclid(16) as u32;
+                        let q_in_mb_x = (lq_x).rem_euclid(16) as u32;
+                        let q_in_mb_y = (ly).rem_euclid(16) as u32;
+                        let diff_ref_mv = !p_info.is_intra
+                            && !q_info.is_intra
+                            && different_ref_or_mv_luma(
+                                p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
+                            );
+                        let p_blk4_z =
+                            blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
+                                as usize;
+                        let q_blk4_z =
+                            blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
+                                as usize;
+                        let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                        let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                         let bs = derive_boundary_strength(BsInputs {
                             p_is_intra: p_info.is_intra,
                             q_is_intra: q_info.is_intra,
                             is_mb_edge,
                             is_sp_or_si: false,
-                            either_has_nonzero_coeffs: p_info.cbp_chroma != 0
-                                || q_info.cbp_chroma != 0,
-                            different_ref_or_mv: false,
+                            either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+                            different_ref_or_mv: diff_ref_mv,
                             mixed_mode_edge: false,
                             vertical_edge: true,
                             mbaff_or_field: mbaff_frame_flag,
@@ -4197,14 +4393,32 @@ fn deblock_plane_chroma(
                             _ => continue,
                         };
                         let is_mb_edge = p_addr != q_addr;
+                        // §8.7.2.1 last paragraph — chroma bS inherits
+                        // from the corresponding luma edge.
+                        let p_in_mb_x = lx.rem_euclid(16) as u32;
+                        let p_in_mb_y = lp_y.rem_euclid(16) as u32;
+                        let q_in_mb_x = lx.rem_euclid(16) as u32;
+                        let q_in_mb_y = lq_y.rem_euclid(16) as u32;
+                        let diff_ref_mv = !p_info.is_intra
+                            && !q_info.is_intra
+                            && different_ref_or_mv_luma(
+                                p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
+                            );
+                        let p_blk4_z =
+                            blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
+                                as usize;
+                        let q_blk4_z =
+                            blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
+                                as usize;
+                        let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                        let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                         let bs = derive_boundary_strength(BsInputs {
                             p_is_intra: p_info.is_intra,
                             q_is_intra: q_info.is_intra,
                             is_mb_edge,
                             is_sp_or_si: false,
-                            either_has_nonzero_coeffs: p_info.cbp_chroma != 0
-                                || q_info.cbp_chroma != 0,
-                            different_ref_or_mv: false,
+                            either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+                            different_ref_or_mv: diff_ref_mv,
                             mixed_mode_edge: false,
                             vertical_edge: false,
                             mbaff_or_field: mbaff_frame_flag,

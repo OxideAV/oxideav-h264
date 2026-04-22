@@ -49,6 +49,24 @@ pub struct MbInfo {
     pub cbp_luma: u8,
     /// CodedBlockPatternChroma — 0, 1, or 2 (per §7.4.5).
     pub cbp_chroma: u8,
+    /// §8.7.2.1 — per-4x4-luma-block nonzero-coefficient bitmap, indexed
+    /// by §6.4.3 Figure 6-10 Z-scan (bit `n` = 4x4 block at Z-scan
+    /// position `n`). Used by the deblock boundary-strength derivation:
+    /// the third bullet of §8.7.2.1 asks whether either adjacent 4x4
+    /// block carries non-zero transform coefficients, which is a
+    /// stricter test than the MB-level `cbp_luma != 0`.
+    ///
+    /// For Intra_16x16 MBs the DC block always has coefficients by
+    /// construction; `cbp_luma != 0` implies AC blocks have coefficients
+    /// too; for I_PCM the flag is treated as "all blocks have coeffs"
+    /// by the deblock walker.
+    pub luma_nonzero_4x4: u16,
+    /// §8.7.2.1 per-4x4-chroma-block nonzero bitmap. Layout mirrors
+    /// the (plane, blk4) pair: low 8 bits = Cb (2 per chroma MB row),
+    /// next 8 = Cr. For 4:2:0 only bits 0..=3 and 8..=11 are populated
+    /// (four 4x4 chroma blocks per plane); for 4:2:2 bits 0..=7 and
+    /// 8..=15.
+    pub chroma_nonzero_4x4: u16,
     /// §8.3.1.1 / §8.3.2.1 — Intra_4x4 / Intra_8x8 prediction modes per
     /// 4x4 (or 8x8) block within the MB. For 4x4 we fill 16 entries in
     /// raster order; for 8x8 we fill the first 4 entries of the 8x8
@@ -83,6 +101,8 @@ impl Default for MbInfo {
             qp_y: 0,
             cbp_luma: 0,
             cbp_chroma: 0,
+            luma_nonzero_4x4: 0,
+            chroma_nonzero_4x4: 0,
             intra_4x4_pred_modes: [0; 16],
             intra_8x8_pred_modes: [0; 4],
             intra_chroma_pred_mode: 0,
