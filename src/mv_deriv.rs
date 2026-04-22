@@ -342,7 +342,26 @@ pub fn derive_median_mvpred(
 ) -> Mv {
     // §8.4.1.3.1 step 1, eq. 8-207..8-210: when both B and C are
     // unavailable but A is available, replace B and C with A.
-    let (a_eff, b_eff, c_eff) = if !b.available && !c.available && a.available {
+    //
+    // "Not available" here refers to §6.4.11 (sub-)partition-level
+    // availability — the partition exists in the picture and has been
+    // decoded. It does NOT refer to the §8.4.1.3.2 step 2a filtering
+    // that collapses intra or predFlagLX==0 neighbours to (mv=0,
+    // ref=-1): those neighbours still have an available partition
+    // per §6.4.11. Gate the replacement on `partition_available`.
+    //
+    // This is exactly the same distinction as the C→D substitution in
+    // §8.4.1.3.2 eq. 8-214..8-216. See the commit message for fix
+    // §8.4.1.3.2 C→D substitution trigger (partition-level vs
+    // MVpred-filtered availability). Frame-18 MB #80 sub-MB 0 in
+    // AUD_MW_E is the motivating regression: its B and C neighbours
+    // live in an intra MB (#69) whose partition is available, while A
+    // is an inter neighbour with a non-matching refIdx; the median
+    // must therefore be median(mvA.x, 0, 0), not A copied to B and C.
+    let (a_eff, b_eff, c_eff) = if !b.partition_available
+        && !c.partition_available
+        && a.partition_available
+    {
         (a, a, a)
     } else {
         (a, b, c)
