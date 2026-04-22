@@ -3780,11 +3780,20 @@ fn deblock_plane_luma(
 ) {
     let w = pic.width_in_samples as i32;
     let h = pic.height_in_samples as i32;
+    let mb_w = grid.width_in_mbs as i32;
+    let mb_h = grid.height_in_mbs as i32;
 
-    // Vertical edges: between 4x4 blocks horizontally (x = 4, 8, 12, ...).
-    // §8.7.1: "Filtering process for block edges" — the edge is between
-    // p-side (left, x=edge-1..edge-4) and q-side (right, x=edge..edge+3).
-    // We iterate 4x4 rows within each MB row.
+    // §8.7.1 — "Filtering process for block edges". Order:
+    // for each MB in raster scan:
+    //   filter 4 vertical luma edges (left-to-right: x = mb_x*16 + {0, 4, 8, 12}),
+    //   then 4 horizontal luma edges (top-to-bottom: y = mb_y*16 + {0, 4, 8, 12}).
+    // This order is observable — e.g. the right-MB-edge strong filter at
+    // MB (n+1) reads p-side samples that were already modified by the
+    // previous MB's horizontal edges.
+    //
+    // The edge at x = mb_x*16 is the LEFT MB-boundary; it is skipped at
+    // the picture left edge (mb_x == 0) because there is no p-side MB.
+    // Similarly y = mb_y*16 is skipped at the top edge.
     //
     // MBAFF note: we use [`pixel_to_mb_addr`] to resolve the per-sample
     // MB address. `mbaff_or_field` is passed through to bS derivation —
@@ -3792,98 +3801,120 @@ fn deblock_plane_luma(
     // pictures. Mixed-mode edges (one frame-MB + one field-MB across a
     // horizontal pair boundary) are NOT detected here; that's part of
     // the future-work simplification.
-    for edge_x in (4..w).step_by(4) {
-        for y0 in (0..h).step_by(4) {
-            let p_addr = match pixel_to_mb_addr(
-                grid, edge_x - 1, y0, mbaff_frame_flag, mb_field_flags,
-            ) {
-                Some(a) => a,
-                None => continue,
-            };
-            let q_addr = match pixel_to_mb_addr(
-                grid, edge_x, y0, mbaff_frame_flag, mb_field_flags,
-            ) {
-                Some(a) => a,
-                None => continue,
-            };
-            let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
-                (Some(p), Some(q)) if p.available && q.available => (p, q),
-                _ => continue,
-            };
-            let is_mb_edge = p_addr != q_addr;
-            let bs = derive_boundary_strength(BsInputs {
-                p_is_intra: p_info.is_intra,
-                q_is_intra: q_info.is_intra,
-                is_mb_edge,
-                is_sp_or_si: false,
-                either_has_nonzero_coeffs: p_info.cbp_luma != 0 || q_info.cbp_luma != 0,
-                different_ref_or_mv: false,
-                mixed_mode_edge: false,
-                vertical_edge: true,
-                mbaff_or_field: mbaff_frame_flag,
-            });
-            if bs == 0 {
-                continue;
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            // --- 4 vertical edges of this MB, in left-to-right order ---
+            for edge_off in 0..4 {
+                let edge_x = mb_x * 16 + edge_off * 4;
+                if edge_x == 0 || edge_x >= w {
+                    continue; // picture left edge or past right boundary
+                }
+                // Each vertical edge has four 4-row "segments" in this MB.
+                for seg in 0..4 {
+                    let y0 = mb_y * 16 + seg * 4;
+                    if y0 >= h {
+                        break;
+                    }
+                    let p_addr = match pixel_to_mb_addr(
+                        grid, edge_x - 1, y0, mbaff_frame_flag, mb_field_flags,
+                    ) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    let q_addr = match pixel_to_mb_addr(
+                        grid, edge_x, y0, mbaff_frame_flag, mb_field_flags,
+                    ) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
+                        (Some(p), Some(q)) if p.available && q.available => (p, q),
+                        _ => continue,
+                    };
+                    let is_mb_edge = p_addr != q_addr;
+                    let bs = derive_boundary_strength(BsInputs {
+                        p_is_intra: p_info.is_intra,
+                        q_is_intra: q_info.is_intra,
+                        is_mb_edge,
+                        is_sp_or_si: false,
+                        either_has_nonzero_coeffs: p_info.cbp_luma != 0 || q_info.cbp_luma != 0,
+                        different_ref_or_mv: false,
+                        mixed_mode_edge: false,
+                        vertical_edge: true,
+                        mbaff_or_field: mbaff_frame_flag,
+                    });
+                    if bs == 0 {
+                        continue;
+                    }
+                    filter_vertical_edge_luma(
+                        pic,
+                        edge_x,
+                        y0,
+                        bs,
+                        p_info.qp_y,
+                        q_info.qp_y,
+                        alpha_off,
+                        beta_off,
+                        bit_depth,
+                    );
+                }
             }
-            filter_vertical_edge_luma(
-                pic,
-                edge_x,
-                y0,
-                bs,
-                p_info.qp_y,
-                q_info.qp_y,
-                alpha_off,
-                beta_off,
-                bit_depth,
-            );
-        }
-    }
 
-    // Horizontal edges.
-    for edge_y in (4..h).step_by(4) {
-        for x0 in (0..w).step_by(4) {
-            let p_addr = match pixel_to_mb_addr(
-                grid, x0, edge_y - 1, mbaff_frame_flag, mb_field_flags,
-            ) {
-                Some(a) => a,
-                None => continue,
-            };
-            let q_addr = match pixel_to_mb_addr(
-                grid, x0, edge_y, mbaff_frame_flag, mb_field_flags,
-            ) {
-                Some(a) => a,
-                None => continue,
-            };
-            let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
-                (Some(p), Some(q)) if p.available && q.available => (p, q),
-                _ => continue,
-            };
-            let is_mb_edge = p_addr != q_addr;
-            let bs = derive_boundary_strength(BsInputs {
-                p_is_intra: p_info.is_intra,
-                q_is_intra: q_info.is_intra,
-                is_mb_edge,
-                is_sp_or_si: false,
-                either_has_nonzero_coeffs: p_info.cbp_luma != 0 || q_info.cbp_luma != 0,
-                different_ref_or_mv: false,
-                mixed_mode_edge: false,
-                vertical_edge: false,
-                mbaff_or_field: mbaff_frame_flag,
-            });
-            if bs == 0 {
-                continue;
+            // --- 4 horizontal edges of this MB, in top-to-bottom order ---
+            for edge_off in 0..4 {
+                let edge_y = mb_y * 16 + edge_off * 4;
+                if edge_y == 0 || edge_y >= h {
+                    continue;
+                }
+                for seg in 0..4 {
+                    let x0 = mb_x * 16 + seg * 4;
+                    if x0 >= w {
+                        break;
+                    }
+                    let p_addr = match pixel_to_mb_addr(
+                        grid, x0, edge_y - 1, mbaff_frame_flag, mb_field_flags,
+                    ) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    let q_addr = match pixel_to_mb_addr(
+                        grid, x0, edge_y, mbaff_frame_flag, mb_field_flags,
+                    ) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
+                        (Some(p), Some(q)) if p.available && q.available => (p, q),
+                        _ => continue,
+                    };
+                    let is_mb_edge = p_addr != q_addr;
+                    let bs = derive_boundary_strength(BsInputs {
+                        p_is_intra: p_info.is_intra,
+                        q_is_intra: q_info.is_intra,
+                        is_mb_edge,
+                        is_sp_or_si: false,
+                        either_has_nonzero_coeffs: p_info.cbp_luma != 0 || q_info.cbp_luma != 0,
+                        different_ref_or_mv: false,
+                        mixed_mode_edge: false,
+                        vertical_edge: false,
+                        mbaff_or_field: mbaff_frame_flag,
+                    });
+                    if bs == 0 {
+                        continue;
+                    }
+                    filter_horizontal_edge_luma(
+                        pic,
+                        x0,
+                        edge_y,
+                        bs,
+                        p_info.qp_y,
+                        q_info.qp_y,
+                        alpha_off,
+                        beta_off,
+                        bit_depth,
+                    );
+                }
             }
-            filter_horizontal_edge_luma(
-                pic,
-                x0,
-                edge_y,
-                bs,
-                p_info.qp_y,
-                q_info.qp_y,
-                alpha_off,
-                beta_off,
-                bit_depth,
-            );
         }
     }
     // Consumer markers for deblock helpers
@@ -3917,102 +3948,142 @@ fn deblock_plane_chroma(
         return;
     }
 
-    // For each plane (0 = Cb, 1 = Cr) do vertical then horizontal edges.
+    // For each plane (0 = Cb, 1 = Cr) the edges of each MB are filtered
+    // in raster scan order: four vertical chroma edges, then four
+    // horizontal chroma edges (§8.7.1). For 4:2:0 chroma (SubWidthC =
+    // SubHeightC = 2) the MB's chroma block is 8x8 and only two edges
+    // of each orientation apply (the 4-sample boundaries at chroma
+    // offsets 0 and 4). For 4:2:2 the chroma MB block is 8x16 so four
+    // horizontal edges apply but only two vertical ones.
+    //
     // MBAFF: use pixel_to_mb_addr with the luma coordinate derived from
     // chroma position via (SubWidthC, SubHeightC) for uniform MBAFF
     // addressing — see deblock_plane_luma for scope-limit discussion.
+    let mb_w = grid.width_in_mbs as i32;
+    let mb_h = grid.height_in_mbs as i32;
+    // Chroma MB dims in chroma samples:
+    // SubWidthC=1 → chroma MB is 16 wide; SubWidthC=2 → 8 wide.
+    // SubHeightC=1 → 16 tall; SubHeightC=2 → 8 tall.
+    let chroma_mb_w = 16 / sub_w.max(1);
+    let chroma_mb_h = 16 / sub_h.max(1);
     for plane in 0..2u8 {
-        for edge_x in (4..cw).step_by(4) {
-            for y0 in (0..ch).step_by(4) {
-                let lp_x = (edge_x - 1) * sub_w;
-                let lq_x = edge_x * sub_w;
-                let ly = y0 * sub_h;
-                let p_addr = match pixel_to_mb_addr(
-                    grid, lp_x, ly, mbaff_frame_flag, mb_field_flags,
-                ) {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let q_addr = match pixel_to_mb_addr(
-                    grid, lq_x, ly, mbaff_frame_flag, mb_field_flags,
-                ) {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
-                    (Some(p), Some(q)) if p.available && q.available => (p, q),
-                    _ => continue,
-                };
-                let is_mb_edge = p_addr != q_addr;
-                let bs = derive_boundary_strength(BsInputs {
-                    p_is_intra: p_info.is_intra,
-                    q_is_intra: q_info.is_intra,
-                    is_mb_edge,
-                    is_sp_or_si: false,
-                    either_has_nonzero_coeffs: p_info.cbp_chroma != 0 || q_info.cbp_chroma != 0,
-                    different_ref_or_mv: false,
-                    mixed_mode_edge: false,
-                    vertical_edge: true,
-                    mbaff_or_field: mbaff_frame_flag,
-                });
-                if bs == 0 {
-                    continue;
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                // Vertical chroma edges: chroma-x = mb_x*chroma_mb_w + {0, 4, ...}
+                // For 4:2:0 / 4:2:2, only offsets {0, 4} are valid (chroma MB 8 wide).
+                for edge_off in (0..chroma_mb_w).step_by(4) {
+                    let edge_x = mb_x * chroma_mb_w + edge_off;
+                    if edge_x == 0 || edge_x >= cw {
+                        continue;
+                    }
+                    // Segments of 4 chroma rows each.
+                    for seg_off in (0..chroma_mb_h).step_by(4) {
+                        let y0 = mb_y * chroma_mb_h + seg_off;
+                        if y0 >= ch {
+                            break;
+                        }
+                        let lp_x = (edge_x - 1) * sub_w;
+                        let lq_x = edge_x * sub_w;
+                        let ly = y0 * sub_h;
+                        let p_addr = match pixel_to_mb_addr(
+                            grid, lp_x, ly, mbaff_frame_flag, mb_field_flags,
+                        ) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let q_addr = match pixel_to_mb_addr(
+                            grid, lq_x, ly, mbaff_frame_flag, mb_field_flags,
+                        ) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
+                            (Some(p), Some(q)) if p.available && q.available => (p, q),
+                            _ => continue,
+                        };
+                        let is_mb_edge = p_addr != q_addr;
+                        let bs = derive_boundary_strength(BsInputs {
+                            p_is_intra: p_info.is_intra,
+                            q_is_intra: q_info.is_intra,
+                            is_mb_edge,
+                            is_sp_or_si: false,
+                            either_has_nonzero_coeffs: p_info.cbp_chroma != 0
+                                || q_info.cbp_chroma != 0,
+                            different_ref_or_mv: false,
+                            mixed_mode_edge: false,
+                            vertical_edge: true,
+                            mbaff_or_field: mbaff_frame_flag,
+                        });
+                        if bs == 0 {
+                            continue;
+                        }
+                        let qp_avg = chroma_qp_avg(
+                            p_info.qp_y,
+                            q_info.qp_y,
+                            if plane == 0 { cb_offset } else { cr_offset },
+                        );
+                        filter_vertical_edge_chroma(
+                            pic, plane, edge_x, y0, bs, qp_avg, alpha_off, beta_off, bit_depth,
+                        );
+                    }
                 }
-                let qp_avg = chroma_qp_avg(
-                    p_info.qp_y,
-                    q_info.qp_y,
-                    if plane == 0 { cb_offset } else { cr_offset },
-                );
-                filter_vertical_edge_chroma(
-                    pic, plane, edge_x, y0, bs, qp_avg, alpha_off, beta_off, bit_depth,
-                );
-            }
-        }
 
-        for edge_y in (4..ch).step_by(4) {
-            for x0 in (0..cw).step_by(4) {
-                let lx = x0 * sub_w;
-                let lp_y = (edge_y - 1) * sub_h;
-                let lq_y = edge_y * sub_h;
-                let p_addr = match pixel_to_mb_addr(
-                    grid, lx, lp_y, mbaff_frame_flag, mb_field_flags,
-                ) {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let q_addr = match pixel_to_mb_addr(
-                    grid, lx, lq_y, mbaff_frame_flag, mb_field_flags,
-                ) {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
-                    (Some(p), Some(q)) if p.available && q.available => (p, q),
-                    _ => continue,
-                };
-                let is_mb_edge = p_addr != q_addr;
-                let bs = derive_boundary_strength(BsInputs {
-                    p_is_intra: p_info.is_intra,
-                    q_is_intra: q_info.is_intra,
-                    is_mb_edge,
-                    is_sp_or_si: false,
-                    either_has_nonzero_coeffs: p_info.cbp_chroma != 0 || q_info.cbp_chroma != 0,
-                    different_ref_or_mv: false,
-                    mixed_mode_edge: false,
-                    vertical_edge: false,
-                    mbaff_or_field: mbaff_frame_flag,
-                });
-                if bs == 0 {
-                    continue;
+                // Horizontal chroma edges.
+                for edge_off in (0..chroma_mb_h).step_by(4) {
+                    let edge_y = mb_y * chroma_mb_h + edge_off;
+                    if edge_y == 0 || edge_y >= ch {
+                        continue;
+                    }
+                    for seg_off in (0..chroma_mb_w).step_by(4) {
+                        let x0 = mb_x * chroma_mb_w + seg_off;
+                        if x0 >= cw {
+                            break;
+                        }
+                        let lx = x0 * sub_w;
+                        let lp_y = (edge_y - 1) * sub_h;
+                        let lq_y = edge_y * sub_h;
+                        let p_addr = match pixel_to_mb_addr(
+                            grid, lx, lp_y, mbaff_frame_flag, mb_field_flags,
+                        ) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let q_addr = match pixel_to_mb_addr(
+                            grid, lx, lq_y, mbaff_frame_flag, mb_field_flags,
+                        ) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
+                            (Some(p), Some(q)) if p.available && q.available => (p, q),
+                            _ => continue,
+                        };
+                        let is_mb_edge = p_addr != q_addr;
+                        let bs = derive_boundary_strength(BsInputs {
+                            p_is_intra: p_info.is_intra,
+                            q_is_intra: q_info.is_intra,
+                            is_mb_edge,
+                            is_sp_or_si: false,
+                            either_has_nonzero_coeffs: p_info.cbp_chroma != 0
+                                || q_info.cbp_chroma != 0,
+                            different_ref_or_mv: false,
+                            mixed_mode_edge: false,
+                            vertical_edge: false,
+                            mbaff_or_field: mbaff_frame_flag,
+                        });
+                        if bs == 0 {
+                            continue;
+                        }
+                        let qp_avg = chroma_qp_avg(
+                            p_info.qp_y,
+                            q_info.qp_y,
+                            if plane == 0 { cb_offset } else { cr_offset },
+                        );
+                        filter_horizontal_edge_chroma(
+                            pic, plane, x0, edge_y, bs, qp_avg, alpha_off, beta_off, bit_depth,
+                        );
+                    }
                 }
-                let qp_avg = chroma_qp_avg(
-                    p_info.qp_y,
-                    q_info.qp_y,
-                    if plane == 0 { cb_offset } else { cr_offset },
-                );
-                filter_horizontal_edge_chroma(
-                    pic, plane, x0, edge_y, bs, qp_avg, alpha_off, beta_off, bit_depth,
-                );
             }
         }
     }
