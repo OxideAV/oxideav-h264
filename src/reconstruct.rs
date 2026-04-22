@@ -3076,13 +3076,13 @@ fn neighbour_from_block(
     if !is_same_mb && !info.available {
         return NeighbourMv::UNAVAILABLE;
     }
-    // §8.4.1.3.2 — intra neighbour => treat as unavailable for MVpred.
-    // For the current (in-flight) MB we know it is inter (we only enter
-    // this function from the inter-reconstruction path) so `is_intra`
-    // being false is guaranteed regardless of whether `available` was
-    // set yet.
+    // §8.4.1.3.2 — intra neighbour => mvLXN = 0, refIdxLXN = -1 for
+    // MVpred, but mbAddrN IS available in the §6.4.5 sense. P_Skip's
+    // §8.4.1.1 zero-forcing checks the mbAddr-availability bit, not
+    // the MVpred-availability bit; see `NeighbourMv::mb_available` /
+    // `derive_p_skip_mv_with_d` for why the distinction matters.
     if info.is_intra {
-        return NeighbourMv::UNAVAILABLE;
+        return NeighbourMv::intra_but_mb_available();
     }
     let blk4 = blk4_raster_index(bxw as u8, byw as u8) as usize;
     let (mv, ref_idx) = if list == 0 {
@@ -3091,10 +3091,16 @@ fn neighbour_from_block(
         (info.mv_l1[blk4], info.ref_idx_l1[blk4 / 4])
     };
     if ref_idx < 0 {
-        return NeighbourMv::UNAVAILABLE;
+        // Inter MB but this 8x8 partition didn't use list LX
+        // (predFlagLX=0 per §8.4.1.3.2). The mbAddr is still available
+        // in the §6.4.5 sense, but the neighbour contributes mv=0,
+        // refIdx=-1 to MVpred. For P_Skip this is structurally the
+        // same as the intra case.
+        return NeighbourMv::intra_but_mb_available();
     }
     NeighbourMv {
         available: true,
+        mb_available: true,
         ref_idx: ref_idx as i32,
         mv: Mv::new(mv.0 as i32, mv.1 as i32),
     }

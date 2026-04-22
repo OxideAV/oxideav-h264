@@ -55,11 +55,23 @@ pub enum RefList {
 /// mvLXN = 0 and refIdxLXN = -1 — the caller is expected to fold all
 /// those cases into `available = false, ref_idx = -1, mv = (0,0)`.
 ///
-/// Note: `available = true` with `ref_idx = -1` is impossible in the
-/// spec's model; keep the invariant `available == (ref_idx >= 0)`.
+/// `mb_available` additionally records whether the *macroblock address*
+/// mbAddrN itself is available per §6.4.5 (i.e. within the picture and
+/// in the same slice), independent of the intra / predFlagLX filtering
+/// that collapses into `available`. The distinction is required by
+/// §8.4.1.1 P_Skip: the zero-MV substitution condition "mbAddrA is not
+/// available" is about the mbAddr, NOT about whether A is usable for
+/// MVpred. An intra neighbour has an available mbAddr but refIdxLXA =
+/// -1 (so the "refIdxL0A == 0 AND mvA == 0" condition is also false),
+/// and should therefore fall through to median §8.4.1.3.
+///
+/// Callers that don't care about the §8.4.1.1 distinction may leave
+/// `mb_available` at its default (which tracks `available`); the
+/// default preserves pre-fix behaviour for all MVpred paths.
 #[derive(Debug, Copy, Clone, Default)]
 pub struct NeighbourMv {
     pub available: bool,
+    pub mb_available: bool,
     pub ref_idx: i32,
     pub mv: Mv,
 }
@@ -67,6 +79,7 @@ pub struct NeighbourMv {
 impl NeighbourMv {
     pub const UNAVAILABLE: NeighbourMv = NeighbourMv {
         available: false,
+        mb_available: false,
         ref_idx: -1,
         mv: Mv::ZERO,
     };
@@ -74,8 +87,26 @@ impl NeighbourMv {
     pub const fn new(ref_idx: i32, mv: Mv) -> Self {
         NeighbourMv {
             available: ref_idx >= 0,
+            mb_available: ref_idx >= 0,
             ref_idx,
             mv,
+        }
+    }
+
+    /// §8.4.1.1 constructor — an intra (or predFlagLX=0) neighbour
+    /// whose mbAddr IS available in the §6.4.5 sense. Returns a
+    /// NeighbourMv with `available=false` (so MVpred treats it as
+    /// unusable, mv=0, refIdx=-1) but `mb_available=true` so the
+    /// §8.4.1.1 "mbAddrA is not available" check does NOT trigger
+    /// zero-forcing. This is the piece §8.4.1.3.2 step 2a (mvLXN=0,
+    /// refIdxLXN=-1) folds into the MVpred abstraction, with the
+    /// mbAddr-availability bit kept separate for P_Skip's zero-force.
+    pub const fn intra_but_mb_available() -> Self {
+        NeighbourMv {
+            available: false,
+            mb_available: true,
+            ref_idx: -1,
+            mv: Mv::ZERO,
         }
     }
 }
@@ -335,9 +366,24 @@ pub fn derive_p_skip_mv_with_d(
 ) -> (i32, Mv) {
     let ref_idx_l0 = 0;
 
-    // §8.4.1.2 zero-MV substitution conditions.
-    let force_zero = !a.available
-        || !b.available
+    // §8.4.1.1 zero-MV substitution conditions.
+    //
+    // The first two clauses ("mbAddrA is not available" /
+    // "mbAddrB is not available") refer to §6.4.5 macroblock-address
+    // availability — NOT to whether the neighbour is usable for
+    // MVpred. An intra neighbour has an AVAILABLE mbAddr but its
+    // refIdxLXN is set to −1 per §8.4.1.3.2, which causes the third
+    // (A) or fourth (B) clause to NOT trigger ("refIdxL0A == 0"
+    // evaluates false on −1). In that situation we fall through to
+    // the §8.4.1.3 median path, contributing mv = (0, 0) for the
+    // intra slot.
+    //
+    // `mb_available` distinguishes the two: it is true when mbAddrN
+    // itself is within the picture and the same slice, regardless of
+    // intra filtering. `available` continues to mean "usable for
+    // MVpred" (i.e. inter, predFlagLX=1 for the relevant list).
+    let force_zero = !a.mb_available
+        || !b.mb_available
         || (a.ref_idx == 0 && a.mv == Mv::ZERO)
         || (b.ref_idx == 0 && b.mv == Mv::ZERO);
 
@@ -1074,6 +1120,63 @@ mod tests {
         // current_ref_idx = 0; only B and C match -> match_count = 2
         // -> median branch. median(5,10,20) = 10, same for y.
         assert_eq!(mv, Mv::new(10, 10));
+    }
+
+    #[test]
+    fn p_skip_a_intra_does_not_force_zero() {
+        // §8.4.1.1 regression: an INTRA left neighbour has
+        // mbAddrA available (§6.4.5) but refIdxL0A = −1 and mvL0A = 0
+        // (§8.4.1.3.2). The P_Skip zero-forcing conditions:
+        //   - mbAddrA not available: FALSE (mbAddr is available)
+        //   - refIdxL0A == 0 AND mvL0A == 0: FALSE (refIdx is −1)
+        // So the zero-forcing does NOT trigger and we proceed to the
+        // §8.4.1.3 median derivation with A contributing (0, 0) /
+        // refIdx = −1 (so A does not match current refIdx = 0).
+        //
+        // This is the AUD_MW_E frame 1 MB 78 scenario: MB 78 is
+        // P_Skip whose A neighbour (MB 77) is an intra I_16x16 MB
+        // embedded in a P-slice. Prior to the fix, we set A's
+        // `available = false` for both cases, causing the "mbAddrA
+        // not available" zero-force to fire and producing mv = 0 when
+        // the spec expected a median-predicted (non-zero) MV.
+        let a_intra = NeighbourMv::intra_but_mb_available();
+        let b = NeighbourMv::new(0, Mv::new(10, 10));
+        let c = NeighbourMv::new(0, Mv::new(20, 20));
+        let (ref_idx, mv) = derive_p_skip_mv(a_intra, b, c);
+        assert_eq!(ref_idx, 0);
+        // current_ref_idx = 0. A unavailable-for-MVpred (ref=−1), B
+        // and C match refIdx=0 => match_count=2 (not exactly 1) =>
+        // median branch. Contributions: A (0,0) since available=false
+        // contributes 0 per §8.4.1.3.2; B=(10,10); C=(20,20).
+        // median(0,10,20) = 10, median(0,10,20) = 10.
+        assert_eq!(mv, Mv::new(10, 10));
+    }
+
+    #[test]
+    fn p_skip_b_intra_does_not_force_zero() {
+        // Symmetric: intra top (B) neighbour.
+        let a = NeighbourMv::new(0, Mv::new(10, 10));
+        let b_intra = NeighbourMv::intra_but_mb_available();
+        let c = NeighbourMv::new(0, Mv::new(20, 20));
+        let (ref_idx, mv) = derive_p_skip_mv(a, b_intra, c);
+        assert_eq!(ref_idx, 0);
+        // median(10, 0, 20) = 10, 10.
+        assert_eq!(mv, Mv::new(10, 10));
+    }
+
+    #[test]
+    fn p_skip_a_unavailable_still_forces_zero() {
+        // Ensure the mb_available=false path (true §6.4.5
+        // unavailability — mbAddr outside the picture or different
+        // slice) continues to trigger zero-forcing. Only the intra
+        // path is affected by the fix; this boundary case must
+        // remain stable.
+        let a = NeighbourMv::UNAVAILABLE; // mb_available = false
+        let b = NeighbourMv::new(0, Mv::new(10, 10));
+        let c = NeighbourMv::new(0, Mv::new(20, 20));
+        let (ref_idx, mv) = derive_p_skip_mv(a, b, c);
+        assert_eq!(ref_idx, 0);
+        assert_eq!(mv, Mv::ZERO);
     }
 
     // --- §8.4.1.2.2 B spatial direct --------------------------------------
