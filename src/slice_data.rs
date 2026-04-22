@@ -198,6 +198,10 @@ pub fn parse_slice_data(
         // path it is updated each iteration to mb_skip_flag when the
         // slice isn't I/SI.
         let mut prev_mb_skipped = false;
+        // §9.3.3.1.1.5 — per-slice rolling flag for mb_qp_delta bin 0
+        // ctxIdxInc. Initial value is 0 at the start of a slice
+        // (per §9.3.3.1.1.5).
+        let mut prev_mb_qp_delta_nonzero_slice = false;
         // MBAFF: the flag is decoded once per MB pair but applies to
         // both MBs. `pending_pair_flag` holds the top MB's flag so the
         // bottom MB gets the same value without a second read.
@@ -209,9 +213,33 @@ pub fn parse_slice_data(
         loop {
             let mut skipped = false;
             let mut mb_skip_flag_this_iter = false;
+            // §9.3.3.1.1.1 — mb_skip_flag's ctxIdxInc uses the A/B
+            // neighbours' own `mb_skip_flag` (per spec: condTermFlagN = 0
+            // if mbAddrN is not available, or mb_skip_flag[mbAddrN] == 1;
+            // else 1). Build a minimal NeighbourCtx snapshot that covers
+            // the skip-flag path; the full snapshot (inter/intra/CBP)
+            // rebuilds below once we know the MB is not skipped.
+            let mut skip_nctx = NeighbourCtx::default();
+            let (skip_a_addr, skip_b_addr) = cabac_nb.neighbour_mb_addrs(curr_mb_addr);
+            if let Some(a) = skip_a_addr {
+                if let Some(info) = cabac_nb.mbs.get(a as usize) {
+                    if info.available {
+                        skip_nctx.available_left = true;
+                        skip_nctx.mb_skip_flag_left = info.is_skip;
+                    }
+                }
+            }
+            if let Some(b) = skip_b_addr {
+                if let Some(info) = cabac_nb.mbs.get(b as usize) {
+                    if info.available {
+                        skip_nctx.available_above = true;
+                        skip_nctx.mb_skip_flag_above = info.is_skip;
+                    }
+                }
+            }
             if !slice_header.slice_type.is_intra() {
                 let mb_skip_flag =
-                    decode_mb_skip_flag(&mut cabac_dec, &mut ctxs, kind, &NeighbourCtx::default())?;
+                    decode_mb_skip_flag(&mut cabac_dec, &mut ctxs, kind, &skip_nctx)?;
                 mb_skip_flag_this_iter = mb_skip_flag;
                 if mb_skip_flag {
                     // §7.4.4 — mb_field_decoding_flag for this MB is
@@ -234,6 +262,46 @@ pub fn parse_slice_data(
                         slot.cb_total_coeff = [0; 8];
                         slot.cr_total_coeff = [0; 8];
                     }
+                    // §9.3.3.1.1.1 — mirror the availability / skip flag
+                    // into the CABAC neighbour grid so subsequent MBs see
+                    // the correct condTermFlag for mb_skip_flag and
+                    // downstream syntax elements.
+                    if let Some(slot) = cabac_nb.mbs.get_mut(curr_mb_addr as usize) {
+                        slot.available = true;
+                        slot.is_skip = true;
+                        slot.is_intra = false;
+                        slot.is_i_pcm = false;
+                        slot.is_i_nxn = false;
+                        slot.coded_block_pattern_luma = 0;
+                        slot.coded_block_pattern_chroma = 0;
+                        slot.cbf_luma_4x4 = [false; 16];
+                        slot.cbf_cb_dc = false;
+                        slot.cbf_cr_dc = false;
+                        slot.cbf_cb_ac = [false; 8];
+                        slot.cbf_cr_ac = [false; 8];
+                        slot.cbf_luma_16x16_dc = false;
+                        slot.cbf_luma_16x16_ac = [false; 16];
+                        slot.cbf_cb_16x16_dc = false;
+                        slot.cbf_cb_16x16_ac = [false; 16];
+                        slot.cbf_cb_luma_4x4 = [false; 16];
+                        slot.cbf_cr_16x16_dc = false;
+                        slot.cbf_cr_16x16_ac = [false; 16];
+                        slot.cbf_cr_luma_4x4 = [false; 16];
+                        slot.transform_size_8x8_flag = false;
+                        slot.intra_chroma_pred_mode = 0;
+                        // Skip neighbours contribute mvd=0 / ref_idx=0
+                        // per §9.3.3.1.1.6 / .7.
+                        slot.mvd_l0_x = [0; 16];
+                        slot.mvd_l0_y = [0; 16];
+                        slot.mvd_l1_x = [0; 16];
+                        slot.mvd_l1_y = [0; 16];
+                        slot.ref_idx_l0 = [0; 4];
+                        slot.ref_idx_l1 = [0; 4];
+                    }
+                    // §9.3.3.1.1.5 — a P_Skip / B_Skip previous MB
+                    // forces mb_qp_delta ctxIdxInc to 0 on the next
+                    // coded MB; reset the rolling flag.
+                    prev_mb_qp_delta_nonzero_slice = false;
                     // If we just completed a pair (odd CurrMbAddr),
                     // clear the pending_pair_flag — the next iteration
                     // starts a new pair.
@@ -310,7 +378,7 @@ pub fn parse_slice_data(
                     cabac: Some((&mut cabac_dec, &mut ctxs)),
                     slice_kind: kind,
                     neighbours: nctx,
-                    prev_mb_qp_delta_nonzero: false,
+                    prev_mb_qp_delta_nonzero: prev_mb_qp_delta_nonzero_slice,
                     chroma_array_type,
                     transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
                     cavlc_nc: Some(&mut cavlc_nc),
@@ -334,6 +402,9 @@ pub fn parse_slice_data(
                     bit,
                     source,
                 })?;
+                // §9.3.3.1.1.5 — carry the rolling flag forward for
+                // the next MB's mb_qp_delta ctxIdxInc.
+                prev_mb_qp_delta_nonzero_slice = entropy.prev_mb_qp_delta_nonzero;
                 macroblocks.push(mb);
                 mb_field_decoding_flags.push(flag);
                 if mbaff_frame_flag && curr_mb_addr % 2 == 1 {

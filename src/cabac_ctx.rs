@@ -997,14 +997,12 @@ pub fn decode_mb_type_p(
     neighbours: &NeighbourCtx,
 ) -> CabacResult<u32> {
     const OFFSET: u32 = 14;
-    // §9.3.3.1.1.3 bin 0 uses offset=14 rule which has no special
-    // neighbour filtering — condTermFlagN = 1 whenever available.
-    let cond_a = u32::from(neighbours.available_left);
-    let cond_b = u32::from(neighbours.available_above);
-    let _ = cond_a + cond_b; // Table 9-39 offset=14 uses inc=0 for bin 0
-                             // Table 9-39 row for ctxIdxOffset=14: binIdx 0 → inc=0,
-                             // binIdx 1 → inc=1, binIdx 2 → (b1!=1)?2:3.
-    let b0 = dec.decode_decision(ctxs.at_mut(OFFSET as usize))?;
+    // §9.3.3.1.1.3 — bin 0 ctxIdxInc uses the P-slice rule (neighbour
+    // is any listed inter type → condTermFlag=0, else 1). binIdx 1 and
+    // binIdx 2 use the fixed Table 9-39 increments (1 and
+    // (b1!=1)?2:3) — see `mb_type_ctx_inc_first3`.
+    let inc0 = mb_type_ctx_inc_first3(OFFSET, 0, neighbours);
+    let b0 = dec.decode_decision(ctxs.at_mut((OFFSET + inc0) as usize))?;
     if b0 == 1 {
         // Intra prefix "1" → suffix is Table 9-36 with offset=17 per
         // Table 9-34. The P-slice intra prefix is a single separate

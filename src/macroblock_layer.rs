@@ -2011,6 +2011,10 @@ pub fn parse_macroblock(
         for _ in 0..num_cr {
             cr.push(r.u(bit_depth_c)?);
         }
+        // §9.3.3.1.1.5 — I_PCM forces the next MB's mb_qp_delta
+        // ctxIdxInc to 0. Reset the rolling flag so the slice walker
+        // propagates the correct state.
+        entropy.prev_mb_qp_delta_nonzero = false;
         return Ok(Macroblock {
             mb_type,
             mb_type_raw,
