@@ -255,36 +255,31 @@ const TBL_9_16: &[(usize, InitCell)] = &[
     (401, InitCell::all((25, 50), (14, 59), (21, 54), (17, 61))),
 ];
 
-// Table 9-17 — ctxIdx 60..=69 (I only per current conformance behaviour).
+// Table 9-17 — ctxIdx 60..=69.
 //
-// NOTE — Per Table 9-11 of the 08/2024 spec, `mb_qp_delta` (60..=63),
+// Per Table 9-11 of the 08/2024 spec, `mb_qp_delta` (60..=63),
 // `intra_chroma_pred_mode` (64..=67), `prev_intra*_pred_mode_flag` (68),
 // and `rem_intra*_pred_mode` (69) all reference Table 9-17 for every
-// slice type, and Table 9-17 has a single (m, n) column. Spec-literal
-// reading would apply `::same` here, but empirically `::i`-only (i.e.
-// leaving ctx 60..=69 at default state for P/SP/B slices) better
-// matches the conformance streams we decode — see the round-30 note
-// in the commit log.
+// slice type, and Table 9-17 has a single (m, n) column — so the same
+// (m, n) pair initialises each context for I, SI, P, SP, and B slices.
 //
-// ROUND-31 FINDINGS (with bin-trace instrumentation, see
-// OXIDEAV_H264_BIN_TRACE env var). The spec-literal fix (::same for
-// 60..=63) is functionally correct at the mb_qp_delta level — in
-// CABA2_SVA_B Pic 1 MB 6, applying ::same decodes mb_qp_delta=0 in
-// 1 bin (matches JM: "Delta QP=0") vs. ::i's wrong 2-bin decode of
-// value=1 at default (state_idx=0, mps=0). However, applying ::same
-// to 60..=63 alone increases the CABA2 byte-diff count from 20553
-// to 29871 on frame 1 because the first pixel mismatch is still at
-// MB 7 (now decoded as not-skipped with wrong mb_type P_L0_L0_16x8
-// instead of the expected P_8x8). Applying ::same to 64..=69 (the
-// rest of Table 9-17) regresses the first-diff from MB#7 back to
-// MB#0, implying another compensating bug hides in P-slice
-// residual / intra-pred-mode decoding. Round 32 should isolate that
-// compensating bug before re-introducing Table 9-17 ::same.
+// mb_qp_delta (60..=63) uses ::same (round-32 fix): this is the
+// spec-literal behaviour and is required to correctly decode
+// mb_qp_delta bin 0 on P-slices (the default state_idx=0 / mps=0 that
+// `::i` leaves in place for P/SP/B slices produces the wrong MPS for
+// bin 0 of mb_qp_delta, mis-decoding value 0 as value 1 on QP-stable
+// streams such as CABA2_SVA_B).
+//
+// 64..=69 currently stay on `::i` because applying `::same` to the
+// intra-pred-mode / chroma-pred-mode groups regresses other P-slice
+// streams. These bins are only exercised on intra-coded MBs inside
+// P slices, so the mismatch is tolerated until a separate round
+// isolates the compensating bug.
 const TBL_9_17: &[(usize, InitCell)] = &[
-    (60, InitCell::i((0, 41))),
-    (61, InitCell::i((0, 63))),
-    (62, InitCell::i((0, 63))),
-    (63, InitCell::i((0, 63))),
+    (60, InitCell::same((0, 41))),
+    (61, InitCell::same((0, 63))),
+    (62, InitCell::same((0, 63))),
+    (63, InitCell::same((0, 63))),
     (64, InitCell::i((-9, 83))),
     (65, InitCell::i((4, 86))),
     (66, InitCell::i((0, 97))),
@@ -822,21 +817,6 @@ fn mb_type_cond_term_flag(offset: u32, neighbours: &NeighbourCtx, is_left: bool)
                 neighbours.above_is_i_nxn
             }
         }
-        14 => {
-            // "mb_type for the macroblock mbAddrN is equal to P_Skip"
-            //
-            // Spec §9.3.3.1.1.3 (08/2024) does NOT list offset=14 in the
-            // filtered-to-0 cases, implying condTermFlagN = 1 for any
-            // available neighbour at offset=14. The spec text is
-            // ambiguous — the JM reference implementation matches the
-            // adjacent-row pattern (B_Skip/B_Direct for offset=27), and
-            // treats P_Skip neighbours as filtered at offset=14.
-            if is_left {
-                neighbours.left_is_p_or_b_skip
-            } else {
-                neighbours.above_is_p_or_b_skip
-            }
-        }
         27 => {
             // "mb_type for mbAddrN is B_Skip or B_Direct_16x16"
             if is_left {
@@ -1045,15 +1025,16 @@ pub fn decode_mb_type_i(
 pub fn decode_mb_type_p(
     dec: &mut CabacDecoder<'_>,
     ctxs: &mut CabacContexts,
-    neighbours: &NeighbourCtx,
+    _neighbours: &NeighbourCtx,
 ) -> CabacResult<u32> {
     const OFFSET: u32 = 14;
-    // §9.3.3.1.1.3 — bin 0 ctxIdxInc uses the P-slice rule (neighbour
-    // is any listed inter type → condTermFlag=0, else 1). binIdx 1 and
-    // binIdx 2 use the fixed Table 9-39 increments (1 and the Table
-    // 9-41 formula for binIdx 2) — see `mb_type_ctx_inc_first3`.
-    let inc0 = mb_type_ctx_inc_first3(OFFSET, 0, neighbours);
-    let b0 = dec.decode_decision(ctxs.at_mut((OFFSET + inc0) as usize))?;
+    // Table 9-39 (08/2024) row ctxIdxOffset=14:
+    //   binIdx 0 → 0 (fixed — no "clause 9.3.3.1.1.3" reference, unlike
+    //                 ctxIdxOffsets 0, 3, 27 which DO use neighbour-
+    //                 derived increments per §9.3.3.1.1.3)
+    //   binIdx 1 → 1 (fixed)
+    //   binIdx 2 → (b1 != 1) ? 2 : 3 (Table 9-41)
+    let b0 = dec.decode_decision(ctxs.at_mut(OFFSET as usize))?;
     if b0 == 1 {
         // Intra prefix "1" → suffix is Table 9-36 with offset=17 per
         // Table 9-34. The P-slice intra prefix is a single separate
