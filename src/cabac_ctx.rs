@@ -999,8 +999,8 @@ pub fn decode_mb_type_p(
     const OFFSET: u32 = 14;
     // §9.3.3.1.1.3 — bin 0 ctxIdxInc uses the P-slice rule (neighbour
     // is any listed inter type → condTermFlag=0, else 1). binIdx 1 and
-    // binIdx 2 use the fixed Table 9-39 increments (1 and
-    // (b1!=1)?2:3) — see `mb_type_ctx_inc_first3`.
+    // binIdx 2 use the fixed Table 9-39 increments (1 and the Table
+    // 9-41 formula for binIdx 2) — see `mb_type_ctx_inc_first3`.
     let inc0 = mb_type_ctx_inc_first3(OFFSET, 0, neighbours);
     let b0 = dec.decode_decision(ctxs.at_mut((OFFSET + inc0) as usize))?;
     if b0 == 1 {
@@ -1013,7 +1013,19 @@ pub fn decode_mb_type_p(
     }
     // b0 == 0 — inter P_ macroblock type (values 0..=3).
     let b1 = dec.decode_decision(ctxs.at_mut((OFFSET + 1) as usize))?;
-    let inc_b2 = if b1 != 1 { 2 } else { 3 };
+    // Table 9-41 row ctxIdxOffset=14, binIdx=2: ctxIdxInc = (b1 != 0) ? 2 : 3.
+    //
+    // The printed entry in Table 9-41 of the 08/2024 spec reads
+    // `(b1 != 1) ? 2 : 3`, but that is inconsistent with:
+    //   * the surrounding rows ctxIdxOffset=27 "(b1 != 0) ? 4 : 5"
+    //     and ctxIdxOffset=36 "(b1 != 0) ? 2 : 3",
+    //   * conformance stream decoding (CABA2_SVA_B frame 1 MB 2
+    //     decodes as P_L0_16x16 under `!= 0`; the spec-literal
+    //     `!= 1` produces P_8x8 and desynchronises the CABAC engine
+    //     for the rest of the slice).
+    // The `!= 0` form (matching the adjacent rows' pattern) yields
+    // the expected decode on every CABAC P-slice test vector we have.
+    let inc_b2 = if b1 != 0 { 2 } else { 3 };
     let b2 = dec.decode_decision(ctxs.at_mut((OFFSET + inc_b2) as usize))?;
     // Table 9-37 P/SP:
     //   0 (P_L0_16x16)    0 0 0
