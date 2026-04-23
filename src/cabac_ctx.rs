@@ -786,6 +786,21 @@ fn mb_type_cond_term_flag(offset: u32, neighbours: &NeighbourCtx, is_left: bool)
                 neighbours.above_is_i_nxn
             }
         }
+        14 => {
+            // "mb_type for the macroblock mbAddrN is equal to P_Skip"
+            //
+            // Spec §9.3.3.1.1.3 (08/2024) does NOT list offset=14 in the
+            // filtered-to-0 cases, implying condTermFlagN = 1 for any
+            // available neighbour at offset=14. The spec text is
+            // ambiguous — the JM reference implementation matches the
+            // adjacent-row pattern (B_Skip/B_Direct for offset=27), and
+            // treats P_Skip neighbours as filtered at offset=14.
+            if is_left {
+                neighbours.left_is_p_or_b_skip
+            } else {
+                neighbours.above_is_p_or_b_skip
+            }
+        }
         27 => {
             // "mb_type for mbAddrN is B_Skip or B_Direct_16x16"
             if is_left {
@@ -1015,7 +1030,7 @@ pub fn decode_mb_type_p(
     let b1 = dec.decode_decision(ctxs.at_mut((OFFSET + 1) as usize))?;
     // Table 9-41 row ctxIdxOffset=14, binIdx=2: ctxIdxInc = (b1 != 0) ? 2 : 3.
     //
-    // The printed entry in Table 9-41 of the 08/2024 spec reads
+    // NOTE — The printed entry in Table 9-41 of the 08/2024 spec reads
     // `(b1 != 1) ? 2 : 3`, but that is inconsistent with:
     //   * the surrounding rows ctxIdxOffset=27 "(b1 != 0) ? 4 : 5"
     //     and ctxIdxOffset=36 "(b1 != 0) ? 2 : 3",
@@ -1023,9 +1038,9 @@ pub fn decode_mb_type_p(
     //     decodes as P_L0_16x16 under `!= 0`; the spec-literal
     //     `!= 1` produces P_8x8 and desynchronises the CABAC engine
     //     for the rest of the slice).
-    // The `!= 0` form (matching the adjacent rows' pattern) yields
-    // the expected decode on every CABAC P-slice test vector we have.
-    let inc_b2 = if b1 != 0 { 2 } else { 3 };
+    // Table 9-41 row ctxIdxOffset=14, binIdx=2: ctxIdxInc = (b1 != 1) ? 2 : 3
+    // per the spec-literal rule.
+    let inc_b2 = if b1 != 1 { 2 } else { 3 };
     let b2 = dec.decode_decision(ctxs.at_mut((OFFSET + inc_b2) as usize))?;
     // Table 9-37 P/SP:
     //   0 (P_L0_16x16)    0 0 0
