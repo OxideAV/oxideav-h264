@@ -51,6 +51,17 @@ pub trait RefPicProvider {
     fn ref_list_0_longterm(&self) -> &[bool] {
         &[]
     }
+
+    /// §8.4.1.2.2 — parallel to `ref_list_0_longterm` but for
+    /// RefPicList1. Used by B-slice spatial direct mode (colZeroFlag
+    /// is suppressed when `RefPicList1[0]` is a long-term reference).
+    ///
+    /// Default returns an empty slice — call sites that do not need
+    /// this derivation (I/P/SP/SI slice reconstruction, B-slice
+    /// temporal direct) need not override.
+    fn ref_list_1_longterm(&self) -> &[bool] {
+        &[]
+    }
 }
 
 /// A caller-supplied store mapping list indices to decoded pictures.

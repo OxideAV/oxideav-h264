@@ -681,13 +681,14 @@ impl H264CodecDecoder {
             in_progress.pic.ref_list_1_pocs = list_1_pocs.clone();
             in_progress.pic.ref_list_1_longterm = list_1_longterm.clone();
         }
-        let _ = (list_1_pocs, list_1_longterm);
+        let _ = list_1_pocs;
         let provider = BorrowedRefProvider {
             store: &self.ref_store,
             list_0: &list0,
             list_1: &list1,
             list_0_pocs,
             list_0_longterm,
+            list_1_longterm,
         };
         reconstruct::reconstruct_slice_no_deblock(
             &sd,
@@ -918,6 +919,9 @@ struct BorrowedRefProvider<'a> {
     list_0_pocs: Vec<i32>,
     /// §8.4.1.2.3 — long-term flag parallel to `list_0_pocs`.
     list_0_longterm: Vec<bool>,
+    /// §8.4.1.2.2 — long-term flag for RefPicList1. Spatial-direct
+    /// mode suppresses colZeroFlag when `RefPicList1[0]` is long-term.
+    list_1_longterm: Vec<bool>,
 }
 
 impl RefPicProvider for BorrowedRefProvider<'_> {
@@ -937,6 +941,10 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
 
     fn ref_list_0_longterm(&self) -> &[bool] {
         &self.list_0_longterm
+    }
+
+    fn ref_list_1_longterm(&self) -> &[bool] {
+        &self.list_1_longterm
     }
 }
 

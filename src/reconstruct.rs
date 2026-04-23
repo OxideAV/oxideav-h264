@@ -41,7 +41,8 @@ use crate::intra_pred::{
 use crate::macroblock_layer::{Macroblock, MbType, SubMbType};
 use crate::mb_grid::{MbGrid, MbInfo};
 use crate::mv_deriv::{
-    derive_mvpred_with_d, derive_p_skip_mv_with_d, Mv, MvpredInputs, MvpredShape, NeighbourMv,
+    derive_b_spatial_direct_with_d, derive_median_mvpred, derive_mvpred_with_d,
+    derive_p_skip_mv_with_d, Mv, MvpredInputs, MvpredShape, NeighbourMv,
 };
 use crate::picture::Picture;
 use crate::pps::Pps;
@@ -2056,7 +2057,8 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     );
 
     // -------- Derive inter partitions --------------------------------
-    let partitions = derive_inter_partitions(mb, slice_header, sps, ref_pics, pic, mb_addr)?;
+    let partitions =
+        derive_inter_partitions(mb, slice_header, sps, ref_pics, pic, mb_addr, grid, current_slice_id)?;
 
     // Test-only OXIDEAV_H264_RECON_DEBUG / OXIDEAV_H264_RECON_DEBUG_MB
     // instrumentation — prints per-MB + per-partition inter reconstruct
@@ -3444,6 +3446,8 @@ fn derive_inter_partitions<R: RefPicProvider>(
     ref_pics: &R,
     pic: &Picture,
     mb_addr: u32,
+    grid: &MbGrid,
+    current_slice_id: i32,
 ) -> Result<Vec<InterPartition>, ReconstructError> {
     use MbType::*;
     let pred = mb.mb_pred.as_ref();
@@ -3616,9 +3620,7 @@ fn derive_inter_partitions<R: RefPicProvider>(
         BSkip | BDirect16x16 => {
             // §8.4.1.2 direct mode — expand into sub-partitions with
             // precomputed MVs derived per §8.4.1.2.3 (temporal) or
-            // §8.4.1.2.2 (spatial). The spatial path still falls back
-            // to the median derivation inside `derive_partition_mvs`
-            // for partitions left with `precomputed_mv = None`.
+            // §8.4.1.2.2 (spatial).
             let is_skip = matches!(mb.mb_type, BSkip);
             if !slice_header.direct_spatial_mv_pred_flag {
                 Ok(build_temporal_direct_partitions(
@@ -3629,20 +3631,18 @@ fn derive_inter_partitions<R: RefPicProvider>(
                     is_skip,
                 ))
             } else {
-                Ok(vec![InterPartition {
-                    x: 0,
-                    y: 0,
-                    w: 16,
-                    h: 16,
-                    mode: PartMode::Direct,
-                    shape: MvpredShape::Default,
-                    ref_idx_l0: 0,
-                    ref_idx_l1: 0,
-                    mvd_l0: (0, 0),
-                    mvd_l1: (0, 0),
+                Ok(build_spatial_direct_partitions(
+                    sps,
+                    ref_pics,
+                    pic,
+                    mb_addr,
+                    grid,
+                    current_slice_id,
+                    0,
+                    0,
+                    16,
                     is_skip,
-                    precomputed_mv: None,
-                }])
+                ))
             }
         }
         BL016x16 | BL116x16 | BBi16x16 => {
@@ -3772,14 +3772,28 @@ fn derive_inter_partitions<R: RefPicProvider>(
                 // direct-mode derivation per `direct_spatial_mv_pred_flag`.
                 // Temporal direct (flag == 0) fills in precomputed MVs
                 // from the colocated block (same as B_Direct_16x16,
-                // restricted to this 8x8). Spatial direct still uses
-                // the median derivation from `derive_partition_mvs`.
-                if matches!(sub_type, SubMbType::BDirect8x8)
-                    && !slice_header.direct_spatial_mv_pred_flag
-                {
-                    parts.extend(build_temporal_direct_sub_partitions(
-                        sps, ref_pics, pic, mb_addr, part_x, part_y,
-                    ));
+                // restricted to this 8x8). Spatial direct (flag == 1)
+                // derives refIdxLX via MinPositive(A,B,C) and applies
+                // colZeroFlag (§8.4.1.2.2).
+                if matches!(sub_type, SubMbType::BDirect8x8) {
+                    if !slice_header.direct_spatial_mv_pred_flag {
+                        parts.extend(build_temporal_direct_sub_partitions(
+                            sps, ref_pics, pic, mb_addr, part_x, part_y,
+                        ));
+                    } else {
+                        parts.extend(build_spatial_direct_partitions(
+                            sps,
+                            ref_pics,
+                            pic,
+                            mb_addr,
+                            grid,
+                            current_slice_id,
+                            part_x,
+                            part_y,
+                            8,
+                            false,
+                        ));
+                    }
                     continue;
                 }
 
@@ -4085,6 +4099,254 @@ fn build_temporal_direct_sub_partitions<R: RefPicProvider>(
         }
     }
     partitions
+}
+
+/// §8.4.1.2.2 — B-slice spatial direct mode partition builder.
+///
+/// Given a direct-mode region of size `region_size` samples at
+/// (`region_x`, `region_y`) inside the current MB (a full 16x16
+/// for `B_Direct_16x16`/`B_Skip`, or an 8x8 sub-MB for `B_Direct_8x8`),
+/// derives `refIdxL0`, `refIdxL1` and the per-sub-block motion vectors
+/// with the `colZeroFlag` short-circuit applied.
+///
+/// Implements:
+/// 1. MinPositive chain on MB-level (A, B, C) neighbour refIdxLX
+///    (eq. 8-184/8-185), then the directZeroPredictionFlag fallback
+///    (eq. 8-188..8-190) if both result in < 0.
+/// 2. For every 8x8 sub-block (when `direct_8x8_inference_flag == 1`)
+///    or 4x4 sub-block (when 0), mvpLX is derived from the same
+///    MB-level neighbours via `derive_median_mvpred`.
+/// 3. `colZeroFlag` (§8.4.1.2.2 step 7): if RefPicList1[0] is a
+///    short-term picture and the colocated block's predicted L0 or L1
+///    MV satisfies `|mvCol| <= 1` with `refIdxCol == 0`, force the
+///    corresponding list's MV to zero (for that sub-block only).
+///
+/// Note — the MB-level neighbour lookup uses the partition origin at
+/// the MB's top-left (block (0, 0)) with width = region_size / 4 so
+/// that C sits above-right of the region. This matches the spec's
+/// "(mbPartIdx, subMbPartIdx) = (0, 0)" rule for refIdx derivation.
+fn build_spatial_direct_partitions<R: RefPicProvider>(
+    sps: &Sps,
+    ref_pics: &R,
+    _pic: &Picture,
+    mb_addr: u32,
+    grid: &MbGrid,
+    current_slice_id: i32,
+    region_x: u8,
+    region_y: u8,
+    region_size: u8,
+    is_skip: bool,
+) -> Vec<InterPartition> {
+    // §8.4.1.2.2 step 2-3 — derive refIdxLXN, mvLXN from §8.4.1.3.2
+    // invoked with **mbPartIdx = 0, subMbPartIdx = 0** — i.e. the
+    // neighbours of the macroblock's top-left 16x16 partition. This
+    // is invariant in the size/position of the direct region (NOTE 1).
+    // Even for a B_Direct_8x8 sub-MB at (8, 0) the neighbours probed
+    // are the MB-level (A, B, C), not the sub-MB's.
+    let neighbour_probe = InterPartition {
+        x: 0,
+        y: 0,
+        w: 16,
+        h: 16,
+        mode: PartMode::Direct,
+        shape: MvpredShape::Default,
+        ref_idx_l0: 0,
+        ref_idx_l1: 0,
+        mvd_l0: (0, 0),
+        mvd_l1: (0, 0),
+        is_skip,
+        precomputed_mv: None,
+    };
+    let (a_l0, b_l0, c_l0, d_l0) =
+        neighbour_mvs_for_list(&neighbour_probe, mb_addr, grid, 0, current_slice_id);
+    let (a_l1, b_l1, c_l1, d_l1) =
+        neighbour_mvs_for_list(&neighbour_probe, mb_addr, grid, 1, current_slice_id);
+
+    // §8.4.1.2.2 step 4 — MinPositive chain to pick refIdxLX. This
+    // mirrors the pre-step-5 derivation inside
+    // `derive_b_spatial_direct_with_d`; we redo it here so we can
+    // observe whether BOTH refs were < 0 (i.e. directZeroPredictionFlag
+    // should fire) before the helper's step-5 fallback collapses them
+    // to 0.
+    fn min_positive(x: i32, y: i32) -> i32 {
+        if x >= 0 && y >= 0 {
+            x.min(y)
+        } else {
+            x.max(y)
+        }
+    }
+    // §8.4.1.3.2 eq. 8-214..8-216 — C→D substitution when C is
+    // unavailable (partition_available == false).
+    let c_l0_eff = if !c_l0.partition_available && d_l0.partition_available {
+        d_l0
+    } else {
+        c_l0
+    };
+    let c_l1_eff = if !c_l1.partition_available && d_l1.partition_available {
+        d_l1
+    } else {
+        c_l1
+    };
+
+    let ref_l0_minp = min_positive(
+        a_l0.ref_idx,
+        min_positive(b_l0.ref_idx, c_l0_eff.ref_idx),
+    );
+    let ref_l1_minp = min_positive(
+        a_l1.ref_idx,
+        min_positive(b_l1.ref_idx, c_l1_eff.ref_idx),
+    );
+
+    // §8.4.1.2.2 step 5 — directZeroPredictionFlag = both refs < 0.
+    let direct_zero_both = ref_l0_minp < 0 && ref_l1_minp < 0;
+    let ref_idx_l0_final: i8 = if direct_zero_both {
+        0
+    } else if ref_l0_minp < 0 {
+        -1
+    } else {
+        ref_l0_minp as i8
+    };
+    let ref_idx_l1_final: i8 = if direct_zero_both {
+        0
+    } else if ref_l1_minp < 0 {
+        -1
+    } else {
+        ref_l1_minp as i8
+    };
+
+    // Keep the MB-level MVs from the helper for debug / symmetry —
+    // not used directly (we recompute per sub-block via
+    // `derive_median_mvpred` below).
+    let _ = derive_b_spatial_direct_with_d(a_l0, a_l1, b_l0, b_l1, c_l0, c_l1, d_l0, d_l1);
+
+    // §8.4.1.2.2 step 7 — colZeroFlag requires RefPicList1[0] to be a
+    // short-term reference and the colocated block to have a small
+    // zero-like MV with ref_idx_l0 == 0.
+    let col_pic_is_short_term = !ref_pics
+        .ref_list_1_longterm()
+        .first()
+        .copied()
+        .unwrap_or(false);
+    let col_pic = ref_pics.ref_pic(1, 0);
+
+    // Granularity inside the region: 8x8 when direct_8x8_inference_flag,
+    // else 4x4.
+    let use_8x8 = sps.direct_8x8_inference_flag;
+    let block_size: u8 = if use_8x8 { 8 } else { 4 };
+    // Guard: if the region is smaller than the block size, fall back
+    // to one region-sized block.
+    let step = block_size.min(region_size) as usize;
+    let block_size = step as u8;
+    let n_per_row = (region_size as usize) / step;
+
+    let mut partitions = Vec::with_capacity(n_per_row * n_per_row);
+    for by in 0..n_per_row {
+        for bx in 0..n_per_row {
+            let x = region_x + (bx * step) as u8;
+            let y = region_y + (by * step) as u8;
+
+            // §8.4.1.2.2 step 6 — per-block colZeroFlag derivation.
+            // `blk4` is the 4x4 block index within the MB covering
+            // (x, y). For 8x8-granularity direct mode the spec uses
+            // 5 * mbPartIdx (blocks 0, 5, 10, 15 — one per 8x8
+            // quadrant); for 4x4 it's the raster index of the actual
+            // 4x4 block.
+            let bx4 = x / 4;
+            let by4 = y / 4;
+            let col_blk4: usize = if use_8x8 {
+                let mb_part_idx = 2 * ((y / 8) as usize) + ((x / 8) as usize);
+                5 * mb_part_idx
+            } else {
+                blk4_raster_index(bx4, by4) as usize
+            };
+
+            let col_zero_flag = col_pic_is_short_term
+                && col_pic.is_some_and(|cp| is_colocated_zero_mv(cp, mb_addr, col_blk4));
+
+            // §8.4.1.2.2 mv derivation (NOTE 3: mvLX returned from
+            // §8.4.1.3 is identical for all 4x4 sub-partitions of the
+            // same MB — so we compute these outside of the inner loop
+            // in principle; they're inside to keep the flow linear).
+            //
+            // Rules:
+            //   - directZeroPredictionFlag == 1 ⇒ both mvLX = 0.
+            //   - refIdxLX < 0 ⇒ mvLX = 0 (list not used).
+            //   - refIdxLX == 0 && colZeroFlag ⇒ mvLX = 0.
+            //   - otherwise mvLX = derive_median_mvpred(A, B, C_eff,
+            //     refIdxLX).
+            let mv_l0 = if direct_zero_both || ref_idx_l0_final < 0 {
+                Mv::ZERO
+            } else if ref_idx_l0_final == 0 && col_zero_flag {
+                Mv::ZERO
+            } else {
+                derive_median_mvpred(a_l0, b_l0, c_l0_eff, ref_idx_l0_final as i32)
+            };
+            let mv_l1 = if direct_zero_both || ref_idx_l1_final < 0 {
+                Mv::ZERO
+            } else if ref_idx_l1_final == 0 && col_zero_flag {
+                Mv::ZERO
+            } else {
+                derive_median_mvpred(a_l1, b_l1, c_l1_eff, ref_idx_l1_final as i32)
+            };
+
+            // Build the partition mode: if only L0 is valid we should
+            // emit an L0-only MC (not bi-predict), and vice versa.
+            let mode = match (ref_idx_l0_final >= 0, ref_idx_l1_final >= 0) {
+                (true, true) => PartMode::Direct,
+                (true, false) => PartMode::L0Only,
+                (false, true) => PartMode::L1Only,
+                (false, false) => PartMode::Direct, // directZero
+            };
+
+            partitions.push(InterPartition {
+                x,
+                y,
+                w: block_size,
+                h: block_size,
+                mode,
+                shape: MvpredShape::Default,
+                ref_idx_l0: ref_idx_l0_final,
+                ref_idx_l1: ref_idx_l1_final,
+                mvd_l0: (0, 0),
+                mvd_l1: (0, 0),
+                is_skip,
+                precomputed_mv: Some((mv_l0, mv_l1)),
+            });
+        }
+    }
+    partitions
+}
+
+/// §8.4.1.2.2 step 7 — colZeroFlag "small zero-like MV" check.
+///
+/// §8.4.1.2.1 rules for picking mvCol/refIdxCol from the colocated
+/// block:
+///   1. If the colocated macroblock is intra, mvCol = (0, 0),
+///      refIdxCol = -1. Then colZeroFlag is 0 (refIdxCol != 0).
+///   2. Else if predFlagL0Col == 1, (mvCol, refIdxCol) = L0 values.
+///   3. Else (predFlagL0Col == 0, predFlagL1Col == 1), (mvCol,
+///      refIdxCol) = L1 values.
+///
+/// colZeroFlag becomes 1 iff refIdxCol == 0 && |mvCol| <= 1 in both
+/// components.
+fn is_colocated_zero_mv(col_pic: &Picture, mb_addr: u32, col_blk4: usize) -> bool {
+    let l0 = col_pic.colocated_l0(mb_addr, col_blk4);
+    let l1 = col_pic.colocated_l1(mb_addr, col_blk4);
+
+    // Intra colocated: mvCol = 0, refIdxCol = -1 ⇒ colZeroFlag = 0.
+    let is_intra = l0.as_ref().map(|t| t.2).unwrap_or(false)
+        || l1.as_ref().map(|t| t.2).unwrap_or(false);
+    if is_intra {
+        return false;
+    }
+
+    // Pick L0 when its refIdx is valid; else L1; else no data.
+    let (mv, ref_idx) = match (l0, l1) {
+        (Some((mv, rf, _)), _) if rf >= 0 => (mv, rf),
+        (_, Some((mv, rf, _))) if rf >= 0 => (mv, rf),
+        _ => return false,
+    };
+    ref_idx == 0 && mv.0.abs() <= 1 && mv.1.abs() <= 1
 }
 
 /// Table 7-14 — B_L0/B_L1/B_Bi 16x16 → (mode, ref_idx_l0, ref_idx_l1).
