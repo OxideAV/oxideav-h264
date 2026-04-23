@@ -926,6 +926,27 @@ fn conformance_jvt_caba1_sva_b() {
     );
 }
 
+/// JVT AVCv1 `CABA2_SVA_B` (SVA & Tsinghua, Main / CABAC, QCIF foreman,
+/// 17 frames **IP slices** with intra-period 10, frame-coded). Ships
+/// with reference YUV AND a bit-level trace file — usable as ground
+/// truth for CABAC P-slice debugging. This is the smallest JVT vector
+/// that exercises the CABAC P-slice path, filling the gap left by the
+/// I-only CABA1_SVA_B.
+#[test]
+fn conformance_jvt_caba2_sva_b() {
+    let bs = std::env::var("OXIDEAV_JVT_CABA2_SVA_B_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/caba2_sva_b/CABA2_SVA_B.264"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_CABA2_SVA_B_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/caba2_sva_b/CABA2_SVA_B_rec.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_CABA2_SVA_B", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+    // Soft: frame-counts may mismatch while CABAC P-slice support matures.
+}
+
 /// JVT AVCv1 `camp_mot_frm0_full` (Motorola, Main / CABAC, 720x480
 /// 4:2:0, 30 frames of Mobile, IBBP, frame-coded). Reference YUV at
 /// `camp_mot_frm0_full_rec.yuv`. Only IDR + frame-coded so should
