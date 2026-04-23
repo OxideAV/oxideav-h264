@@ -4303,6 +4303,8 @@ fn different_ref_or_mv_luma(
     p_in_mb_y: u32,
     q_in_mb_x: u32,
     q_in_mb_y: u32,
+    ref_list_0_pocs: &[i32],
+    ref_list_1_pocs: &[i32],
 ) -> bool {
     // 4x4 block index inside the MB follows the §6.4.3 Figure 6-10
     // Z-scan — NOT simple raster. Reuse `blk4_raster_index`, which
@@ -4323,8 +4325,31 @@ fn different_ref_or_mv_luma(
     let p_has_l1 = p_ref1 >= 0;
     let q_has_l1 = q_ref1 >= 0;
 
-    // Different number of motion vectors on the edge.
-    if (p_has_l0 != q_has_l0) || (p_has_l1 != q_has_l1) {
+    // §8.7.2.1 NOTE 1 — picture identity is by POC (actual referenced
+    // picture), NOT by list+index. Resolve each ref_idx to its POC
+    // through the current slice's RefPicList0 / RefPicList1 snapshot.
+    // Missing entries (shouldn't happen for valid streams) fall back
+    // to a sentinel that won't compare equal to any real POC.
+    let poc_sentinel: i32 = i32::MIN;
+    let poc_of = |list_pocs: &[i32], idx: i8| -> i32 {
+        if idx < 0 {
+            return poc_sentinel;
+        }
+        list_pocs.get(idx as usize).copied().unwrap_or(poc_sentinel)
+    };
+    let p_pic0 = poc_of(ref_list_0_pocs, p_ref0);
+    let q_pic0 = poc_of(ref_list_0_pocs, q_ref0);
+    let p_pic1 = poc_of(ref_list_1_pocs, p_ref1);
+    let q_pic1 = poc_of(ref_list_1_pocs, q_ref1);
+
+    // "Number of motion vectors" per §8.7.2.1 NOTE 2 is
+    // PredFlagL0[part] + PredFlagL1[part]. Two edges with the same
+    // count but different list usage (one side L0-only, other L1-only)
+    // are only considered "different" if their referenced pictures
+    // differ.
+    let p_count = (p_has_l0 as u8) + (p_has_l1 as u8);
+    let q_count = (q_has_l0 as u8) + (q_has_l1 as u8);
+    if p_count != q_count {
         return true;
     }
 
@@ -4334,33 +4359,80 @@ fn different_ref_or_mv_luma(
     let p_mv1 = p_info.mv_l1[p_blk4];
     let q_mv1 = q_info.mv_l1[q_blk4];
 
-    // The spec treats "reference picture" identity by comparing
-    // RefPicList entries; we approximate by comparing ref_idx values
-    // within each list. This is exact for P slices (only L0 is used
-    // and a single active ref list). For B slices with the two lists
-    // reordered differently it can miss some "different picture" cases,
-    // but the common case of the same-list same-index matches.
     let bi = p_has_l0 && p_has_l1;
     if bi {
-        // Bi-predicted: eq. 8-470 — (a1) different ref on either list,
-        // or (a2) |Δmv| >= 4 on either list, with the spec's symmetric
-        // swap (p's L0 matches q's L0 and p's L1 matches q's L1, OR the
-        // swapped pairing does).
-        let straight = p_ref0 == q_ref0
-            && p_ref1 == q_ref1
-            && mv_delta_below_4(p_mv0, q_mv0)
-            && mv_delta_below_4(p_mv1, q_mv1);
-        let swapped = p_ref0 == q_ref1
-            && p_ref1 == q_ref0
-            && mv_delta_below_4(p_mv0, q_mv1)
-            && mv_delta_below_4(p_mv1, q_mv0);
-        !(straight || swapped)
+        // §8.7.2.1 bS=1 block — bi-predicted edges. Split by whether p
+        // and q reference the "same two pictures" or two different
+        // pairs; in both cases the test considers the straight and
+        // swapped pairings (since L0/L1 assignment is reference-list
+        // ordering, not picture identity).
+        //
+        // Case A: same two reference pictures on both sides (possibly
+        // with L0/L1 swapped between p and q) — spec's "two motion
+        // vectors for the same reference picture" double-test: for
+        // diff_ref_mv to fire, BOTH the straight and swapped Δmv
+        // tests must each reach 4 quarter-pels.
+        //
+        // Case B: p and q reference different picture pairs — returns
+        // "different reference pictures" = true.
+        //
+        // Case C: p uses two DIFFERENT pictures and q uses the SAME
+        // two pictures (only the matching pairing is checked, not the
+        // swapped, since the swapped pairing would pair p's L0 mv with
+        // q's L1 mv for a DIFFERENT picture — nonsensical per spec).
+        let straight_refs_match = p_pic0 == q_pic0 && p_pic1 == q_pic1;
+        let swapped_refs_match = p_pic0 == q_pic1 && p_pic1 == q_pic0;
+
+        if !straight_refs_match && !swapped_refs_match {
+            // Case B: different picture sets → bS=1.
+            return true;
+        }
+
+        let straight_mv_ok =
+            mv_delta_below_4(p_mv0, q_mv0) && mv_delta_below_4(p_mv1, q_mv1);
+        let swapped_mv_ok =
+            mv_delta_below_4(p_mv0, q_mv1) && mv_delta_below_4(p_mv1, q_mv0);
+
+        // If L0[p] and L1[p] refer to distinct pictures (and same for
+        // q), the spec's "two motion vectors and two different ref
+        // pictures" clause applies: for EITHER referenced picture,
+        // |Δmv| >= 4 triggers bS=1. That's equivalent to saying at
+        // least one of the matching-ref-pairings has a big Δmv.
+        //
+        // Spec straight pairing is valid when straight_refs_match;
+        // the swapped pairing is valid when swapped_refs_match.
+        // If both refs in the pair are the SAME picture (p_pic0 ==
+        // p_pic1), we have the spec's "same reference picture" clause
+        // and must require BOTH pairings to fail (the stricter double
+        // test). Otherwise (distinct pictures), it's sufficient that
+        // ANY valid pairing fails.
+        let same_ref = p_pic0 == p_pic1 && q_pic0 == q_pic1;
+        if same_ref {
+            // Spec: "two motion vectors for the same reference picture"
+            // — requires both tests to fail (i.e., neither pairing has
+            // all Δmvs below 4) for diff_ref_mv=true.
+            return !(straight_mv_ok || swapped_mv_ok);
+        }
+
+        // Distinct reference pictures in the pair. Check the matching
+        // pairing; swapped pairing only if refs match when swapped.
+        let straight_fails = straight_refs_match && !straight_mv_ok;
+        let swapped_fails = swapped_refs_match && !swapped_mv_ok;
+        straight_fails || swapped_fails
     } else if p_has_l0 {
-        // L0-only (typical P-slice case).
-        p_ref0 != q_ref0 || !mv_delta_below_4(p_mv0, q_mv0)
+        // L0-only on both sides (typical P-slice case). Both point to
+        // an L0-indexed picture; "different pictures" is per POC, and
+        // MV delta drives the rest.
+        if p_pic0 != q_pic0 {
+            return true;
+        }
+        !mv_delta_below_4(p_mv0, q_mv0)
     } else if p_has_l1 {
-        // L1-only.
-        p_ref1 != q_ref1 || !mv_delta_below_4(p_mv1, q_mv1)
+        // L1-only on both sides.
+        if p_pic1 != q_pic1 {
+            return true;
+        }
+        !mv_delta_below_4(p_mv1, q_mv1)
     } else {
         // Neither list active — no MV info; keep bS=0 for this edge
         // (the intra/coef bullets would have handled any interesting
@@ -4390,6 +4462,12 @@ fn deblock_plane_luma(
     let h = pic.height_in_samples as i32;
     let mb_w = grid.width_in_mbs as i32;
     let mb_h = grid.height_in_mbs as i32;
+    // §8.7.2.1 NOTE 1 — picture-identity comparison is by POC of the
+    // referenced picture, not by list+index. Snapshot the picture's
+    // RefPicList0/1 POCs so `different_ref_or_mv_luma` can resolve
+    // ref_idx values to actual picture identities.
+    let ref_list_0_pocs = pic.ref_list_0_pocs.clone();
+    let ref_list_1_pocs = pic.ref_list_1_pocs.clone();
 
     // §8.7.1 — "Filtering process for block edges". Order:
     // for each MB in raster scan:
@@ -4440,6 +4518,19 @@ fn deblock_plane_luma(
                         _ => continue,
                     };
                     let is_mb_edge = p_addr != q_addr;
+                    // §8.7 — when transform_size_8x8_flag is set on the
+                    // current (q-side) macroblock, the internal 4x4-only
+                    // luma edges at offsets 4 and 12 are NOT filtered
+                    // (only solid-bold 8-sample edges are). Offset 0 is
+                    // an MB boundary, offset 8 is the 8x8 boundary, so
+                    // both are always filtered when enabled. For Baseline
+                    // / Main profiles (no 8x8 transform) this is a no-op.
+                    if !is_mb_edge
+                        && (edge_off == 1 || edge_off == 3)
+                        && q_info.transform_size_8x8_flag
+                    {
+                        continue;
+                    }
                     // §8.7.2.1 fourth bullet: inter-coded edges pick up
                     // bS=1 when the two 4x4 blocks disagree on ref pic /
                     // MV count / MV component delta (>=4 in qpel units).
@@ -4451,7 +4542,14 @@ fn deblock_plane_luma(
                     let diff_ref_mv = !p_info.is_intra
                         && !q_info.is_intra
                         && different_ref_or_mv_luma(
-                            p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
+                            p_info,
+                            q_info,
+                            p_in_mb_x,
+                            p_in_mb_y,
+                            q_in_mb_x,
+                            q_in_mb_y,
+                            &ref_list_0_pocs,
+                            &ref_list_1_pocs,
                         );
                     // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
                     // Consult the per-block mask set at reconstruct-time.
@@ -4472,15 +4570,6 @@ fn deblock_plane_luma(
                         vertical_edge: true,
                         mbaff_or_field: mbaff_frame_flag,
                     });
-                    if std::env::var_os("OXIDEAV_H264_DEBLOCK_TRACE").is_some() {
-                        eprintln!(
-                            "DBL V x={edge_x} y0={y0} bs={bs} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={} p_nz={} q_nz={} p_cbp={:#x} q_cbp={:#x} diff_ref_mv={} p_qp={} q_qp={}",
-                            p_info.is_intra, q_info.is_intra,
-                            p_has_nz, q_has_nz,
-                            p_info.cbp_luma, q_info.cbp_luma,
-                            diff_ref_mv, p_info.qp_y, q_info.qp_y,
-                        );
-                    }
                     if bs == 0 {
                         continue;
                     }
@@ -4526,6 +4615,16 @@ fn deblock_plane_luma(
                         _ => continue,
                     };
                     let is_mb_edge = p_addr != q_addr;
+                    // §8.7 — same 8x8-transform skip as vertical path:
+                    // for the internal 4x4-only horizontal edges at
+                    // offsets 4 and 12, skip when transform_size_8x8_flag
+                    // is set on the current (q-side) MB.
+                    if !is_mb_edge
+                        && (edge_off == 1 || edge_off == 3)
+                        && q_info.transform_size_8x8_flag
+                    {
+                        continue;
+                    }
                     // §8.7.2.1 fourth bullet (see vertical path).
                     let p_in_mb_x = x0.rem_euclid(16) as u32;
                     let p_in_mb_y = (edge_y - 1).rem_euclid(16) as u32;
@@ -4534,7 +4633,14 @@ fn deblock_plane_luma(
                     let diff_ref_mv = !p_info.is_intra
                         && !q_info.is_intra
                         && different_ref_or_mv_luma(
-                            p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
+                            p_info,
+                            q_info,
+                            p_in_mb_x,
+                            p_in_mb_y,
+                            q_in_mb_x,
+                            q_in_mb_y,
+                            &ref_list_0_pocs,
+                            &ref_list_1_pocs,
                         );
                     // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
                     let p_blk4_z =
@@ -4598,6 +4704,9 @@ fn deblock_plane_chroma(
         .as_ref()
         .map(|e| e.second_chroma_qp_index_offset)
         .unwrap_or(pps.chroma_qp_index_offset);
+    // §8.7.2.1 NOTE 1 — see deblock_plane_luma.
+    let ref_list_0_pocs = pic.ref_list_0_pocs.clone();
+    let ref_list_1_pocs = pic.ref_list_1_pocs.clone();
     let (sub_w, sub_h) = chroma_subsample(pic.chroma_array_type);
     if sub_w == 0 || pic.chroma_array_type == 0 {
         return;
@@ -4678,7 +4787,14 @@ fn deblock_plane_chroma(
                             let diff_ref_mv = !p_info.is_intra
                                 && !q_info.is_intra
                                 && different_ref_or_mv_luma(
-                                    p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
+                                    p_info,
+                                    q_info,
+                                    p_in_mb_x,
+                                    p_in_mb_y,
+                                    q_in_mb_x,
+                                    q_in_mb_y,
+                                    &ref_list_0_pocs,
+                                    &ref_list_1_pocs,
                                 );
                             let p_blk4_z =
                                 blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
@@ -4775,7 +4891,14 @@ fn deblock_plane_chroma(
                             let diff_ref_mv = !p_info.is_intra
                                 && !q_info.is_intra
                                 && different_ref_or_mv_luma(
-                                    p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
+                                    p_info,
+                                    q_info,
+                                    p_in_mb_x,
+                                    p_in_mb_y,
+                                    q_in_mb_x,
+                                    q_in_mb_y,
+                                    &ref_list_0_pocs,
+                                    &ref_list_1_pocs,
                                 );
                             let p_blk4_z =
                                 blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
