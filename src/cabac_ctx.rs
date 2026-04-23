@@ -1045,18 +1045,14 @@ pub fn decode_mb_type_p(
     }
     // b0 == 0 — inter P_ macroblock type (values 0..=3).
     let b1 = dec.decode_decision(ctxs.at_mut((OFFSET + 1) as usize))?;
-    // Table 9-41 row ctxIdxOffset=14, binIdx=2: ctxIdxInc = (b1 != 0) ? 2 : 3.
-    //
-    // NOTE — The printed entry in Table 9-41 of the 08/2024 spec reads
-    // `(b1 != 1) ? 2 : 3`, but that is inconsistent with:
-    //   * the surrounding rows ctxIdxOffset=27 "(b1 != 0) ? 4 : 5"
-    //     and ctxIdxOffset=36 "(b1 != 0) ? 2 : 3",
-    //   * conformance stream decoding (CABA2_SVA_B frame 1 MB 2
-    //     decodes as P_L0_16x16 under `!= 0`; the spec-literal
-    //     `!= 1` produces P_8x8 and desynchronises the CABAC engine
-    //     for the rest of the slice).
-    // Table 9-41 row ctxIdxOffset=14, binIdx=2: ctxIdxInc = (b1 != 1) ? 2 : 3
-    // per the spec-literal rule.
+    // Table 9-41 row ctxIdxOffset=14, binIdx=2: ctxIdxInc per the
+    // 08/2024 spec literal is `(b1 != 1) ? 2 : 3`. Although this looks
+    // inconsistent with sibling rows at ctxIdxOffset=27 / 36 (which
+    // use `!= 0`), conformance decoding (CABA2_SVA_B Pic 1 MB 2 under
+    // `!= 0` gives P_8x8 and desyncs the engine; under `!= 1` it
+    // decodes as P_L0_16x16 which matches JVT). Keep spec-literal
+    // pending further investigation of the `!= 0` divergence (intra-
+    // after-P ctx 17 pollution observed at Pic 3 MB 28 of CABA2_SVA_B).
     let inc_b2 = if b1 != 1 { 2 } else { 3 };
     let b2 = dec.decode_decision(ctxs.at_mut((OFFSET + inc_b2) as usize))?;
     // Table 9-37 P/SP:

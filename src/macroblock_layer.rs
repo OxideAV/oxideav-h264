@@ -1366,31 +1366,38 @@ fn cabac_ref_idx_cond_terms(
     let left_mb = if x > 0 { grid.mbs.get((current_mb_addr - 1) as usize) } else { None };
     let above_mb = if y > 0 { grid.mbs.get((current_mb_addr - w) as usize) } else { None };
 
-    // Map (part, direction) → (neighbour_mb, neighbour_part).
-    // `None` for neighbour_mb means "current MB".
-    let (a_mb, a_part): (Option<&CabacMbNeighbourInfo>, u8) = match part8x8 {
-        0 => (left_mb, 1),
-        1 => (Some(current_mb), 0),
-        2 => (left_mb, 3),
-        3 => (Some(current_mb), 2),
-        _ => (None, 0),
+    // Map (part, direction) → (neighbour_mb, neighbour_part, is_internal).
+    // `is_internal = true` means the neighbour is another 8x8 partition
+    // of the *current* MB (already decoded earlier in the same syntax
+    // walk). For internal neighbours we do NOT gate on `available` —
+    // that flag tracks "this MB has been fully parsed" and is only
+    // valid for *external* (left / above) neighbour MBs. The partial
+    // ref_idx_l0/l1 arrays in `current_mb` are always trustworthy for
+    // already-decoded partitions, analogous to `cabac_mvd_abs_sum`
+    // which also ignores `available` for in-MB neighbour reads.
+    let (a_mb, a_part, a_internal): (Option<&CabacMbNeighbourInfo>, u8, bool) = match part8x8 {
+        0 => (left_mb, 1, false),
+        1 => (Some(current_mb), 0, true),
+        2 => (left_mb, 3, false),
+        3 => (Some(current_mb), 2, true),
+        _ => (None, 0, false),
     };
-    let (b_mb, b_part): (Option<&CabacMbNeighbourInfo>, u8) = match part8x8 {
-        0 => (above_mb, 2),
-        1 => (above_mb, 3),
-        2 => (Some(current_mb), 0),
-        3 => (Some(current_mb), 1),
-        _ => (None, 0),
+    let (b_mb, b_part, b_internal): (Option<&CabacMbNeighbourInfo>, u8, bool) = match part8x8 {
+        0 => (above_mb, 2, false),
+        1 => (above_mb, 3, false),
+        2 => (Some(current_mb), 0, true),
+        3 => (Some(current_mb), 1, true),
+        _ => (None, 0, false),
     };
 
-    let cond = |mb: Option<&CabacMbNeighbourInfo>, part: u8| -> bool {
+    let cond = |mb: Option<&CabacMbNeighbourInfo>, part: u8, internal: bool| -> bool {
         let Some(info) = mb else { return false };
-        if !info.available { return false }
+        if !internal && !info.available { return false }
         if info.is_skip || info.is_intra { return false }
         let arr = if list == 0 { info.ref_idx_l0 } else { info.ref_idx_l1 };
         arr[part as usize] > 0
     };
-    (cond(a_mb, a_part), cond(b_mb, b_part))
+    (cond(a_mb, a_part, a_internal), cond(b_mb, b_part, b_internal))
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,12 +1949,27 @@ pub fn parse_macroblock(
     // §7.3.5 — mb_type.
     // CAVLC: ue(v). CABAC: per-slice-type decoder in cabac_ctx.
     // ---------------------------------------------------------------
+    let dbg_mb_enter = std::env::var("OXIDEAV_H264_MB_TRACE").ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let dbg_mb_enter_on = dbg_mb_enter == Some(entropy.current_mb_addr);
+    // OXIDEAV_H264_MBTYPE_TRACE=1 — dump every (mb_addr, mb_type_raw,
+    // bins_consumed, slice_type) tuple for cross-referencing against
+    // JM's JVT trace when chasing CABAC state divergences. Emits
+    // regardless of OXIDEAV_H264_MB_TRACE so the caller sees all MBs
+    // of every slice in one pass.
+    let dbg_mb_type_all = std::env::var_os("OXIDEAV_H264_MBTYPE_TRACE").is_some();
     let mb_type_raw = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
-        match slice_type {
+        let bins_before = dec.bin_count();
+        let v = match slice_type {
             SliceType::I | SliceType::SI => decode_mb_type_i(dec, ctxs, &entropy.neighbours)?,
             SliceType::P | SliceType::SP => decode_mb_type_p(dec, ctxs, &entropy.neighbours)?,
             SliceType::B => decode_mb_type_b(dec, ctxs, &entropy.neighbours)?,
+        };
+        if dbg_mb_enter_on || dbg_mb_type_all {
+            eprintln!("[MBTYPE {}] raw={} bins_consumed={} slice={:?}",
+                     entropy.current_mb_addr, v, dec.bin_count() - bins_before, slice_type);
         }
+        v
     } else {
         r.ue()?
     };

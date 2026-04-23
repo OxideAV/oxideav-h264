@@ -253,6 +253,16 @@ pub fn parse_slice_data(
                 let mb_skip_flag =
                     decode_mb_skip_flag(&mut cabac_dec, &mut ctxs, kind, &skip_nctx)?;
                 mb_skip_flag_this_iter = mb_skip_flag;
+                // OXIDEAV_H264_SKIP_TRACE=1 — dump every mb_skip_flag
+                // decision with its neighbour condTermFlags for
+                // cross-referencing against JM's JVT trace. Useful
+                // when chasing CABAC state divergences at specific MBs.
+                if std::env::var_os("OXIDEAV_H264_SKIP_TRACE").is_some() {
+                    eprintln!("[SKIP {}] flag={} avail_L={} skip_L={} avail_A={} skip_A={}",
+                             curr_mb_addr, mb_skip_flag,
+                             skip_nctx.available_left, skip_nctx.mb_skip_flag_left,
+                             skip_nctx.available_above, skip_nctx.mb_skip_flag_above);
+                }
                 if mb_skip_flag {
                     // §7.4.4 — mb_field_decoding_flag for this MB is
                     // not read here. If this MB is the top of a pair
