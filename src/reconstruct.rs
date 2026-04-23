@@ -1778,6 +1778,31 @@ struct InterPartition {
     /// shape, mvd, ref_idx) but MUST use the standard MVpred derivation
     /// per §8.4.1.3 — not the P_Skip zero-forcing conditions.
     is_skip: bool,
+    /// §8.4.1.2.3 — pre-computed L0/L1 MV for temporal-direct partitions.
+    /// When `Some`, these override the §8.4.1 derivation in
+    /// `derive_partition_mvs` (which would otherwise invoke median
+    /// prediction). `None` for explicit inter partitions and for
+    /// spatial-direct partitions that still go through the median path.
+    precomputed_mv: Option<(Mv, Mv)>,
+}
+
+impl Default for InterPartition {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16,
+            mode: PartMode::L0Only,
+            shape: MvpredShape::Default,
+            ref_idx_l0: -1,
+            ref_idx_l1: -1,
+            mvd_l0: (0, 0),
+            mvd_l1: (0, 0),
+            is_skip: false,
+            precomputed_mv: None,
+        }
+    }
 }
 
 /// §8.4 — Per-MB inter reconstruction.
@@ -1813,7 +1838,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     );
 
     // -------- Derive inter partitions --------------------------------
-    let partitions = derive_inter_partitions(mb, slice_header)?;
+    let partitions = derive_inter_partitions(mb, slice_header, sps, ref_pics, pic, mb_addr)?;
 
     // Test-only OXIDEAV_H264_RECON_DEBUG / OXIDEAV_H264_RECON_DEBUG_MB
     // instrumentation — prints per-MB + per-partition inter reconstruct
@@ -2869,6 +2894,11 @@ fn mc_chroma_partition(
 /// Neighbour MV data is read from the grid. The partition's shape
 /// selects the §8.4.1.3 shortcut (16x8 / 8x16) when applicable.
 fn derive_partition_mvs(part: &InterPartition, mb_addr: u32, grid: &MbGrid) -> (Mv, Mv) {
+    // §8.4.1.2.3 — direct-mode partitions may carry pre-computed L0/L1
+    // MVs (e.g. temporal direct). Honour them directly.
+    if let Some((mv_l0, mv_l1)) = part.precomputed_mv {
+        return (mv_l0, mv_l1);
+    }
     // Build neighbour MVs (A, B, C, D) relative to the partition origin.
     // The simple non-MBAFF frame case: A is the 4x4 block immediately
     // left (within this MB or the left MB if partition is at x=0),
@@ -3125,9 +3155,13 @@ fn neighbour_from_block(
 
 /// §7.4.5 / Tables 7-13, 7-14 — derive the list of inter partitions
 /// for a given macroblock.
-fn derive_inter_partitions(
+fn derive_inter_partitions<R: RefPicProvider>(
     mb: &Macroblock,
     slice_header: &SliceHeader,
+    sps: &Sps,
+    ref_pics: &R,
+    pic: &Picture,
+    mb_addr: u32,
 ) -> Result<Vec<InterPartition>, ReconstructError> {
     use MbType::*;
     let pred = mb.mb_pred.as_ref();
@@ -3149,6 +3183,7 @@ fn derive_inter_partitions(
                 mvd_l0: (0, 0),
                 mvd_l1: (0, 0),
                 is_skip: true,
+                precomputed_mv: None,
             }])
         }
         PL016x16 => {
@@ -3169,6 +3204,7 @@ fn derive_inter_partitions(
                 mvd_l0: (mvd[0], mvd[1]),
                 mvd_l1: (0, 0),
                 is_skip: false,
+                precomputed_mv: None,
             }])
         }
         PL0L016x8 => {
@@ -3192,6 +3228,7 @@ fn derive_inter_partitions(
                     mvd_l0: (mvd0[0], mvd0[1]),
                     mvd_l1: (0, 0),
                     is_skip: false,
+                    precomputed_mv: None,
                 },
                 InterPartition {
                     x: 0,
@@ -3205,6 +3242,7 @@ fn derive_inter_partitions(
                     mvd_l0: (mvd1[0], mvd1[1]),
                     mvd_l1: (0, 0),
                     is_skip: false,
+                    precomputed_mv: None,
                 },
             ])
         }
@@ -3229,6 +3267,7 @@ fn derive_inter_partitions(
                     mvd_l0: (mvd0[0], mvd0[1]),
                     mvd_l1: (0, 0),
                     is_skip: false,
+                    precomputed_mv: None,
                 },
                 InterPartition {
                     x: 8,
@@ -3242,6 +3281,7 @@ fn derive_inter_partitions(
                     mvd_l0: (mvd1[0], mvd1[1]),
                     mvd_l1: (0, 0),
                     is_skip: false,
+                    precomputed_mv: None,
                 },
             ])
         }
@@ -3283,6 +3323,7 @@ fn derive_inter_partitions(
                         mvd_l0: (mvd[0], mvd[1]),
                         mvd_l1: (0, 0),
                         is_skip: false,
+                        precomputed_mv: None,
                     });
                 }
             }
@@ -3291,23 +3332,36 @@ fn derive_inter_partitions(
 
         // --- B slices -------------------------------------------------
         BSkip | BDirect16x16 => {
-            // §8.4.1.2 direct mode — for now treat as a single 16x16
-            // direct partition with ref_idx_{l0,l1} = 0. TODO: full
-            // per-spec derivation for precise temporal/spatial direct.
-            let _ = slice_header;
-            Ok(vec![InterPartition {
-                x: 0,
-                y: 0,
-                w: 16,
-                h: 16,
-                mode: PartMode::Direct,
-                shape: MvpredShape::Default,
-                ref_idx_l0: 0,
-                ref_idx_l1: 0,
-                mvd_l0: (0, 0),
-                mvd_l1: (0, 0),
-                is_skip: matches!(mb.mb_type, BSkip),
-            }])
+            // §8.4.1.2 direct mode — expand into sub-partitions with
+            // precomputed MVs derived per §8.4.1.2.3 (temporal) or
+            // §8.4.1.2.2 (spatial). The spatial path still falls back
+            // to the median derivation inside `derive_partition_mvs`
+            // for partitions left with `precomputed_mv = None`.
+            let is_skip = matches!(mb.mb_type, BSkip);
+            if !slice_header.direct_spatial_mv_pred_flag {
+                Ok(build_temporal_direct_partitions(
+                    sps,
+                    ref_pics,
+                    pic,
+                    mb_addr,
+                    is_skip,
+                ))
+            } else {
+                Ok(vec![InterPartition {
+                    x: 0,
+                    y: 0,
+                    w: 16,
+                    h: 16,
+                    mode: PartMode::Direct,
+                    shape: MvpredShape::Default,
+                    ref_idx_l0: 0,
+                    ref_idx_l1: 0,
+                    mvd_l0: (0, 0),
+                    mvd_l1: (0, 0),
+                    is_skip,
+                    precomputed_mv: None,
+                }])
+            }
         }
         BL016x16 | BL116x16 | BBi16x16 => {
             let p = pred.ok_or_else(|| {
@@ -3328,6 +3382,7 @@ fn derive_inter_partitions(
                 mvd_l0: (mvd0[0], mvd0[1]),
                 mvd_l1: (mvd1[0], mvd1[1]),
                 is_skip: false,
+                precomputed_mv: None,
             }])
         }
         // B 16x8 / 8x16 variants — all combinations of L0/L1/Bi per half.
@@ -3356,6 +3411,7 @@ fn derive_inter_partitions(
                     mvd_l0: (mvd_l0_top[0], mvd_l0_top[1]),
                     mvd_l1: (mvd_l1_top[0], mvd_l1_top[1]),
                     is_skip: false,
+                    precomputed_mv: None,
                 },
                 InterPartition {
                     x: 0,
@@ -3369,6 +3425,7 @@ fn derive_inter_partitions(
                     mvd_l0: (mvd_l0_bot[0], mvd_l0_bot[1]),
                     mvd_l1: (mvd_l1_bot[0], mvd_l1_bot[1]),
                     is_skip: false,
+                    precomputed_mv: None,
                 },
             ])
         }
@@ -3397,6 +3454,7 @@ fn derive_inter_partitions(
                     mvd_l0: (mvd_l0_l[0], mvd_l0_l[1]),
                     mvd_l1: (mvd_l1_l[0], mvd_l1_l[1]),
                     is_skip: false,
+                    precomputed_mv: None,
                 },
                 InterPartition {
                     x: 8,
@@ -3410,6 +3468,7 @@ fn derive_inter_partitions(
                     mvd_l0: (mvd_l0_r[0], mvd_l0_r[1]),
                     mvd_l1: (mvd_l1_r[0], mvd_l1_r[1]),
                     is_skip: false,
+                    precomputed_mv: None,
                 },
             ])
         }
@@ -3447,6 +3506,7 @@ fn derive_inter_partitions(
                         mvd_l0: (mvd0[0], mvd0[1]),
                         mvd_l1: (mvd1[0], mvd1[1]),
                         is_skip: false,
+                        precomputed_mv: None,
                     });
                 }
             }
@@ -3473,6 +3533,144 @@ fn sub_mb_partitions(t: SubMbType) -> Vec<(u8, u8, u8, u8)> {
         }
         Reserved(_) => vec![(0, 0, 8, 8)],
     }
+}
+
+/// §8.4.1.2.3 — expand a B_Skip / B_Direct_16x16 macroblock into
+/// temporal-direct sub-partitions with pre-computed L0/L1 MVs.
+///
+/// The granularity follows `sps.direct_8x8_inference_flag`:
+///   - flag == 1: four 8x8 partitions (coarser derivation).
+///   - flag == 0: sixteen 4x4 partitions (fine derivation).
+///
+/// Each partition looks up the colocated (same mbAddr, same block)
+/// block's L0 MV in `RefPicList1[0]`, then applies eq. 8-197..8-200
+/// scaling using the POC of the current picture, `RefPicList1[0]`
+/// (pic1), and `RefPicList0[0]` (pic0) — we assume refIdxL0 = 0 for
+/// all direct-mode partitions, which is the common IBBP case.
+///
+/// If the colocated picture or its motion data is unavailable
+/// (e.g. very first reference picture, or the provider didn't ship
+/// grids), the partition falls back to (0, 0) MVs with refIdx = 0, 0 —
+/// a best-effort that is still closer to correct than the old
+/// spatial-median-of-(0,0) stub.
+fn build_temporal_direct_partitions<R: RefPicProvider>(
+    sps: &Sps,
+    ref_pics: &R,
+    pic: &Picture,
+    mb_addr: u32,
+    is_skip: bool,
+) -> Vec<InterPartition> {
+    let curr_poc = pic.pic_order_cnt;
+    // RefPicList0[0] and RefPicList1[0] pictures for temporal scaling.
+    let poc_l0 = ref_pics.ref_pic_poc(0, 0).unwrap_or(curr_poc);
+    let poc_l1 = ref_pics.ref_pic_poc(1, 0).unwrap_or(curr_poc);
+    let col = ref_pics.ref_pic(1, 0);
+
+    let use_8x8 = sps.direct_8x8_inference_flag;
+    let block_size: u8 = if use_8x8 { 8 } else { 4 };
+    let step = block_size as usize;
+    let n_per_row = 16usize / step;
+
+    // Pre-compute the §8.4.1.2.3 tb / td / DistScaleFactor values.
+    // pic1 = RefPicList1[0], pic0 = RefPicList0[0], currPicOrField = curr_poc.
+    // eq. 8-201: tb = Clip3(-128, 127, DiffPicOrderCnt(curr, pic0))
+    // eq. 8-202: td = Clip3(-128, 127, DiffPicOrderCnt(pic1, pic0))
+    let tb = clip3_i32(-128, 127, curr_poc - poc_l0);
+    let td_raw = poc_l1 - poc_l0;
+    let td = clip3_i32(-128, 127, td_raw);
+
+    let mut partitions = Vec::with_capacity(n_per_row * n_per_row);
+    for by in 0..n_per_row {
+        for bx in 0..n_per_row {
+            let x = (bx * step) as u8;
+            let y = (by * step) as u8;
+
+            // Colocated block lookup. For §8.4.1.2.3 the colocated
+            // block is at the same (mbAddr, block position) in
+            // RefPicList1[0]. We pick the 4x4 block in the top-left
+            // corner of this sub-partition as the representative block.
+            // For 8x8 direct_8x8_inference the spec permits using the
+            // top-left 4x4 as the colocated block for the whole 8x8
+            // (see the NOTE in §8.4.1.2.3).
+            let col_blk4 = {
+                let bx4 = bx * (step / 4);
+                let by4 = by * (step / 4);
+                blk4_raster_index(bx4 as u8, by4 as u8) as usize
+            };
+
+            // Read colocated motion info. We read L0 first; if the
+            // colocated block was coded with L0 only (refIdx>=0), we
+            // use its L0 MV. If the colocated L0 is unavailable (refIdx
+            // < 0 or intra), fall back to L1. If both are unavailable
+            // (intra), the block is "zero colZeroFlag" per §8.4.1.2.3
+            // and we use (0, 0) MVs.
+            let (mv_col, col_ref_is_available, col_is_intra) = if let Some(col_pic) = col {
+                let l0 = col_pic.colocated_l0(mb_addr, col_blk4);
+                let l1 = col_pic.colocated_l1(mb_addr, col_blk4);
+                let is_intra = l0.as_ref().map(|t| t.2).unwrap_or(false);
+                if is_intra {
+                    ((0i16, 0i16), false, true)
+                } else if let Some((mv, ref_idx, _)) = l0 {
+                    if ref_idx >= 0 {
+                        (mv, true, false)
+                    } else if let Some((mvl1, ref_idx_l1, _)) = l1 {
+                        (mvl1, ref_idx_l1 >= 0, false)
+                    } else {
+                        ((0, 0), false, false)
+                    }
+                } else {
+                    ((0, 0), false, false)
+                }
+            } else {
+                ((0, 0), false, false)
+            };
+
+            // Apply eq. 8-197..8-200 if td != 0 and the col ref is
+            // usable. Else use (mvCol, 0) per eq. 8-195/8-196.
+            let (mv_l0, mv_l1) = if !col_ref_is_available || td == 0 {
+                (
+                    Mv::new(mv_col.0 as i32, mv_col.1 as i32),
+                    Mv::ZERO,
+                )
+            } else {
+                // eq. 8-197: tx = (16384 + Abs(td/2)) / td
+                let tx = (16384 + (td.abs() / 2)) / td;
+                // eq. 8-198: DistScaleFactor = Clip3(-1024, 1023, (tb*tx + 32) >> 6)
+                let dsf = clip3_i32(-1024, 1023, (tb * tx + 32) >> 6);
+                // eq. 8-199: mvL0 = (DistScaleFactor * mvCol + 128) >> 8
+                // eq. 8-200: mvL1 = mvL0 - mvCol
+                let mvx_l0 = ((dsf * (mv_col.0 as i32)) + 128) >> 8;
+                let mvy_l0 = ((dsf * (mv_col.1 as i32)) + 128) >> 8;
+                let mvx_l1 = mvx_l0 - (mv_col.0 as i32);
+                let mvy_l1 = mvy_l0 - (mv_col.1 as i32);
+                (Mv::new(mvx_l0, mvy_l0), Mv::new(mvx_l1, mvy_l1))
+            };
+
+            // §8.4.1.2.3 — colZeroFlag determines refIdxL0 inference.
+            // For now we use refIdxL0 = 0, refIdxL1 = 0 (IBBP common
+            // case). Proper MapColToList0 requires tracking which
+            // L0 ref picture the colocated block pointed to AND
+            // finding the index of that same picture in the current
+            // slice's RefPicList0 — deferred.
+            let _ = col_is_intra;
+            partitions.push(InterPartition {
+                x,
+                y,
+                w: block_size,
+                h: block_size,
+                mode: PartMode::Direct,
+                shape: MvpredShape::Default,
+                ref_idx_l0: 0,
+                ref_idx_l1: 0,
+                mvd_l0: (0, 0),
+                mvd_l1: (0, 0),
+                is_skip,
+                precomputed_mv: Some((mv_l0, mv_l1)),
+            });
+        }
+    }
+
+    partitions
 }
 
 /// Table 7-14 — B_L0/B_L1/B_Bi 16x16 → (mode, ref_idx_l0, ref_idx_l1).

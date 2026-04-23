@@ -35,6 +35,27 @@ pub struct Picture {
     /// Set by caller after reconstruction.
     pub pic_order_cnt: i32,
     pub frame_num: u32,
+    /// §8.4.1.2.3 — co-located motion data for temporal-direct
+    /// derivation. When populated, `mv_l0_grid[mb_addr * 16 + blk4]`
+    /// holds the list-0 MV (in 1/4-pel units) of the 4x4 block, and
+    /// `ref_idx_l0_grid[mb_addr * 4 + blk8]` holds the list-0 refIdx
+    /// (−1 when the list is not used). `is_intra_grid[mb_addr]` flags
+    /// intra-coded macroblocks (colZeroFlag wants to treat intra as
+    /// "L0 unavailable").
+    ///
+    /// The grids are sized as:
+    ///   - `mv_*_grid`: `width_in_mbs * height_in_mbs * 16`
+    ///   - `ref_idx_*_grid`: `width_in_mbs * height_in_mbs * 4`
+    ///   - `is_intra_grid`: `width_in_mbs * height_in_mbs`
+    ///
+    /// Absent for I-only pictures or for pictures whose motion data is
+    /// not needed by later B slices.
+    pub mb_width_in_picture: u32,
+    pub mv_l0_grid: Vec<(i16, i16)>,
+    pub mv_l1_grid: Vec<(i16, i16)>,
+    pub ref_idx_l0_grid: Vec<i8>,
+    pub ref_idx_l1_grid: Vec<i8>,
+    pub is_intra_grid: Vec<bool>,
 }
 
 impl Picture {
@@ -65,6 +86,12 @@ impl Picture {
             cr: vec![0; chroma_len],
             pic_order_cnt: 0,
             frame_num: 0,
+            mb_width_in_picture: 0,
+            mv_l0_grid: Vec::new(),
+            mv_l1_grid: Vec::new(),
+            ref_idx_l0_grid: Vec::new(),
+            ref_idx_l1_grid: Vec::new(),
+            is_intra_grid: Vec::new(),
         }
     }
 
@@ -171,6 +198,45 @@ impl Picture {
         }
         let idx = (yi as usize) * (cw as usize) + (xi as usize);
         self.cr[idx] = v;
+    }
+
+    /// Fetch the colocated L0 MV + refIdx for the 4x4 block at
+    /// (`mb_addr`, `blk4`). Returns `None` if motion data was not
+    /// populated for this picture (e.g. I-only pic) or `mb_addr` /
+    /// `blk4` is out of range.
+    ///
+    /// `blk4` uses the Figure 6-10 raster index (0..=15).
+    pub fn colocated_l0(&self, mb_addr: u32, blk4: usize) -> Option<((i16, i16), i8, bool)> {
+        if self.mv_l0_grid.is_empty() {
+            return None;
+        }
+        let mv_idx = (mb_addr as usize).checked_mul(16)?.checked_add(blk4)?;
+        let mv = *self.mv_l0_grid.get(mv_idx)?;
+        let ref_idx = *self.ref_idx_l0_grid.get((mb_addr as usize) * 4 + (blk4 / 4))?;
+        let is_intra = self
+            .is_intra_grid
+            .get(mb_addr as usize)
+            .copied()
+            .unwrap_or(false);
+        Some((mv, ref_idx, is_intra))
+    }
+
+    /// Fetch the colocated L1 MV + refIdx. Used when the colocated
+    /// block has predFlagL0 == 0 and the caller needs to fall back on
+    /// its L1 MV per §8.4.1.2.3.
+    pub fn colocated_l1(&self, mb_addr: u32, blk4: usize) -> Option<((i16, i16), i8, bool)> {
+        if self.mv_l1_grid.is_empty() {
+            return None;
+        }
+        let mv_idx = (mb_addr as usize).checked_mul(16)?.checked_add(blk4)?;
+        let mv = *self.mv_l1_grid.get(mv_idx)?;
+        let ref_idx = *self.ref_idx_l1_grid.get((mb_addr as usize) * 4 + (blk4 / 4))?;
+        let is_intra = self
+            .is_intra_grid
+            .get(mb_addr as usize)
+            .copied()
+            .unwrap_or(false);
+        Some((mv, ref_idx, is_intra))
     }
 }
 

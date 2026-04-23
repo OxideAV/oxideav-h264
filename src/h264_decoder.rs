@@ -593,6 +593,12 @@ impl H264CodecDecoder {
         };
 
         // §8.4.* — pixel reconstruction into the in-progress picture.
+        // Stamp the current picture's POC + frame_num so §8.4.1.2.3
+        // temporal-direct derivation can consult it. Idempotent across
+        // the slices of a coded picture (§7.4.1.2.4 requires POC
+        // consistency).
+        in_progress.pic.pic_order_cnt = in_progress.poc.pic_order_cnt;
+        in_progress.pic.frame_num = header.frame_num;
         let provider = BorrowedRefProvider {
             store: &self.ref_store,
             list_0: &list0,
@@ -623,8 +629,8 @@ impl H264CodecDecoder {
             return Ok(());
         };
         let PictureInProgress {
-            pic,
-            grid: _,
+            mut pic,
+            grid,
             first_nal_unit_type: _,
             first_nal_ref_idc: _,
             first_header,
@@ -635,6 +641,13 @@ impl H264CodecDecoder {
             pts,
             time_base,
         } = in_progress;
+
+        // §8.4.1.2.3 temporal direct needs the colocated block's MVs
+        // of any B slice that references this picture. Snapshot the
+        // decoded MV grid into the Picture so `ref_store` carries it
+        // forward. Idempotent: overwrites whatever was in the Picture
+        // before.
+        snapshot_grid_into_picture(&mut pic, &grid);
 
         // Snapshot the active SPS at finalization. All slices of a primary
         // coded picture share the same active SPS (§7.4.1.2.4 requires the
@@ -1035,6 +1048,42 @@ impl Decoder for H264CodecDecoder {
         // discard in-flight state, not deliver it.
         self.in_progress = None;
         Ok(())
+    }
+}
+
+/// §8.4.1.2.3 — snapshot the per-4x4-block motion data from the
+/// freshly-decoded picture's [`MbGrid`] into its [`Picture`] so
+/// subsequent B slices can consult the colocated block for temporal
+/// direct mode.
+///
+/// The `Picture`'s sample buffer already contains the decoded samples;
+/// this only populates the optional mv / refIdx / intra grids. Called
+/// by `finalize_in_progress_picture` whether the picture is a
+/// reference or not — non-reference pictures never feed a later B
+/// slice, but the per-picture cost of the copy is tiny and it keeps
+/// the code path uniform.
+fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
+    let w = grid.width_in_mbs as usize;
+    let h = grid.height_in_mbs as usize;
+    let nmb = w * h;
+    pic.mb_width_in_picture = grid.width_in_mbs;
+    pic.mv_l0_grid = vec![(0i16, 0i16); nmb * 16];
+    pic.mv_l1_grid = vec![(0i16, 0i16); nmb * 16];
+    pic.ref_idx_l0_grid = vec![-1i8; nmb * 4];
+    pic.ref_idx_l1_grid = vec![-1i8; nmb * 4];
+    pic.is_intra_grid = vec![false; nmb];
+    for (addr, info) in grid.info.iter().enumerate() {
+        let base_mv = addr * 16;
+        let base_r = addr * 4;
+        for blk4 in 0..16 {
+            pic.mv_l0_grid[base_mv + blk4] = info.mv_l0[blk4];
+            pic.mv_l1_grid[base_mv + blk4] = info.mv_l1[blk4];
+        }
+        for blk8 in 0..4 {
+            pic.ref_idx_l0_grid[base_r + blk8] = info.ref_idx_l0[blk8];
+            pic.ref_idx_l1_grid[base_r + blk8] = info.ref_idx_l1[blk8];
+        }
+        pic.is_intra_grid[addr] = info.is_intra;
     }
 }
 

@@ -27,6 +27,13 @@ use crate::picture::Picture;
 /// [`crate::reconstruct::ReconstructError::MissingRefPic`].
 pub trait RefPicProvider {
     fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture>;
+
+    /// §8.4.1.2.3 — POC of the picture at `(list, idx)`.
+    /// Default implementation delegates to `ref_pic`. Callers can
+    /// override for efficiency.
+    fn ref_pic_poc(&self, list: u8, idx: u32) -> Option<i32> {
+        self.ref_pic(list, idx).map(|p| p.pic_order_cnt)
+    }
 }
 
 /// A caller-supplied store mapping list indices to decoded pictures.
