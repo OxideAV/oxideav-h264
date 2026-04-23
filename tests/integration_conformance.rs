@@ -1123,6 +1123,21 @@ jvt_test!(conformance_jvt_ba_mw_d,       "jvt_BA_MW_D",       "OXIDEAV_JVT_BA_MW
 jvt_test!(conformance_jvt_mr1_bt_a,      "jvt_MR1_BT_A",      "OXIDEAV_JVT_MR1_BT_A_BS",      "/tmp/MR1_BT_A/MR1_BT_A.h264",        "OXIDEAV_JVT_MR1_BT_A_REF",      "/tmp/MR1_BT_A/MR1_BT_A.yuv");
 jvt_test!(conformance_jvt_fm1_bt_b,      "jvt_FM1_BT_B",      "OXIDEAV_JVT_FM1_BT_B_BS",      "/tmp/FM1_BT_B/FM1_BT_B.h264",        "OXIDEAV_JVT_FM1_BT_B_REF",      "/tmp/FM1_BT_B/FM1_BT_B.yuv");
 
+jvt_test!(conformance_jvt_ba2_sony_f,      "jvt_BA2_Sony_F",       "OXIDEAV_JVT_BA2_SONY_F_BS",       "/tmp/BA2_Sony_F/BA2_Sony_F.jsv",         "OXIDEAV_JVT_BA2_SONY_F_REF",       "/tmp/BA2_Sony_F/BA2_Sony_F.yuv");
+jvt_test!(conformance_jvt_ba3_sva_c,       "jvt_BA3_SVA_C",        "OXIDEAV_JVT_BA3_SVA_C_BS",        "/tmp/BA3_SVA_C/BA3_SVA_C.264",           "OXIDEAV_JVT_BA3_SVA_C_REF",        "/tmp/BA3_SVA_C/BA3_SVA_C_rec.yuv");
+jvt_test!(conformance_jvt_bamq1_jvc_c,     "jvt_BAMQ1_JVC_C",      "OXIDEAV_JVT_BAMQ1_JVC_C_BS",      "/tmp/BAMQ1_JVC_C/BAMQ1_JVC_C.264",       "OXIDEAV_JVT_BAMQ1_JVC_C_REF",      "/tmp/BAMQ1_JVC_C/BAMQ1_JVC_C.yuv");
+jvt_test!(conformance_jvt_basqp1_sony_c,   "jvt_BASQP1_Sony_C",    "OXIDEAV_JVT_BASQP1_SONY_C_BS",    "/tmp/BASQP1_Sony_C/BASQP1_Sony_C.jsv",   "OXIDEAV_JVT_BASQP1_SONY_C_REF",    "/tmp/BASQP1_Sony_C/BASQP1_Sony_C.yuv");
+jvt_test!(conformance_jvt_caba1_sony_d,    "jvt_CABA1_Sony_D",     "OXIDEAV_JVT_CABA1_SONY_D_BS",     "/tmp/CABA1_Sony_D/CABA1_Sony_D.jsv",     "OXIDEAV_JVT_CABA1_SONY_D_REF",     "/tmp/CABA1_Sony_D/CABA1_Sony_D.yuv");
+jvt_test!(conformance_jvt_caba2_sony_e,    "jvt_CABA2_Sony_E",     "OXIDEAV_JVT_CABA2_SONY_E_BS",     "/tmp/CABA2_Sony_E/CABA2_Sony_E.jsv",     "OXIDEAV_JVT_CABA2_SONY_E_REF",     "/tmp/CABA2_Sony_E/CABA2_Sony_E.yuv");
+jvt_test!(conformance_jvt_caba3_sony_c,    "jvt_CABA3_Sony_C",     "OXIDEAV_JVT_CABA3_SONY_C_BS",     "/tmp/CABA3_Sony_C/CABA3_Sony_C.jsv",     "OXIDEAV_JVT_CABA3_SONY_C_REF",     "/tmp/CABA3_Sony_C/CABA3_Sony_C.yuv");
+jvt_test!(conformance_jvt_cabref3_sand_d,  "jvt_CABREF3_Sand_D",   "OXIDEAV_JVT_CABREF3_SAND_D_BS",   "/tmp/CABREF3_Sand_D/CABREF3_Sand_D.264", "OXIDEAV_JVT_CABREF3_SAND_D_REF",   "/tmp/CABREF3_Sand_D/CABREF3_Sand_D.yuv");
+jvt_test!(conformance_jvt_canl1_sva_b,     "jvt_CANL1_SVA_B",      "OXIDEAV_JVT_CANL1_SVA_B_BS",      "/tmp/CANL1_SVA_B/CANL1_SVA_B.264",       "OXIDEAV_JVT_CANL1_SVA_B_REF",      "/tmp/CANL1_SVA_B/CANL1_SVA_B_rec.yuv");
+jvt_test!(conformance_jvt_canl1_sony_e,    "jvt_CANL1_Sony_E",     "OXIDEAV_JVT_CANL1_SONY_E_BS",     "/tmp/CANL1_Sony_E/CANL1_Sony_E.jsv",     "OXIDEAV_JVT_CANL1_SONY_E_REF",     "/tmp/CANL1_Sony_E/CANL1_Sony_E.yuv");
+jvt_test!(conformance_jvt_canl1_toshiba_g, "jvt_CANL1_TOSHIBA_G",  "OXIDEAV_JVT_CANL1_TOSHIBA_G_BS",  "/tmp/CANL1_TOSHIBA_G/CANL1_TOSHIBA_G.264","OXIDEAV_JVT_CANL1_TOSHIBA_G_REF", "/tmp/CANL1_TOSHIBA_G/CANL1_TOSHIBA_G_dec.yuv");
+jvt_test!(conformance_jvt_canl3_sony_c,    "jvt_CANL3_Sony_C",     "OXIDEAV_JVT_CANL3_SONY_C_BS",     "/tmp/CANL3_Sony_C/CANL3_Sony_C.jsv",     "OXIDEAV_JVT_CANL3_SONY_C_REF",     "/tmp/CANL3_Sony_C/CANL3_Sony_C.yuv");
+jvt_test!(conformance_jvt_caqp1_sony_b,    "jvt_CAQP1_Sony_B",     "OXIDEAV_JVT_CAQP1_SONY_B_BS",     "/tmp/CAQP1_Sony_B/CAQP1_Sony_B.jsv",     "OXIDEAV_JVT_CAQP1_SONY_B_REF",     "/tmp/CAQP1_Sony_B/CAQP1_Sony_B.yuv");
+jvt_test!(conformance_jvt_cacqp3_sony_d,   "jvt_CACQP3_Sony_D",    "OXIDEAV_JVT_CACQP3_SONY_D_BS",    "/tmp/CACQP3_Sony_D/CACQP3_Sony_D.jsv",   "OXIDEAV_JVT_CACQP3_SONY_D_REF",    "/tmp/CACQP3_Sony_D/CACQP3_Sony_D.yuv");
+
 // ------------------------------ helpers tests --------------------------
 
 #[cfg(test)]
