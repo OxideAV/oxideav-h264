@@ -265,6 +265,21 @@ const TBL_9_16: &[(usize, InitCell)] = &[
 // leaving ctx 60..=69 at default state for P/SP/B slices) better
 // matches the conformance streams we decode — see the round-30 note
 // in the commit log.
+//
+// ROUND-31 FINDINGS (with bin-trace instrumentation, see
+// OXIDEAV_H264_BIN_TRACE env var). The spec-literal fix (::same for
+// 60..=63) is functionally correct at the mb_qp_delta level — in
+// CABA2_SVA_B Pic 1 MB 6, applying ::same decodes mb_qp_delta=0 in
+// 1 bin (matches JM: "Delta QP=0") vs. ::i's wrong 2-bin decode of
+// value=1 at default (state_idx=0, mps=0). However, applying ::same
+// to 60..=63 alone increases the CABA2 byte-diff count from 20553
+// to 29871 on frame 1 because the first pixel mismatch is still at
+// MB 7 (now decoded as not-skipped with wrong mb_type P_L0_L0_16x8
+// instead of the expected P_8x8). Applying ::same to 64..=69 (the
+// rest of Table 9-17) regresses the first-diff from MB#7 back to
+// MB#0, implying another compensating bug hides in P-slice
+// residual / intra-pred-mode decoding. Round 32 should isolate that
+// compensating bug before re-introducing Table 9-17 ::same.
 const TBL_9_17: &[(usize, InitCell)] = &[
     (60, InitCell::i((0, 41))),
     (61, InitCell::i((0, 63))),

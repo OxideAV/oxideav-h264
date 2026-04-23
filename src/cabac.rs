@@ -62,6 +62,16 @@
 
 use crate::bitstream::{BitError, BitReader};
 
+/// `OXIDEAV_H264_BIN_TRACE` — when set (any value), every call to
+/// `decode_decision`, `decode_bypass`, and `decode_terminate` emits a
+/// line to stderr capturing the full pre/post engine state and the
+/// decoded bin. Intended for bisecting CABAC divergences against the
+/// JM `_trace.txt` oracle.
+#[inline]
+fn bin_trace_enabled() -> bool {
+    std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some()
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CabacError {
     #[error("bitstream read failed: {0}")]
@@ -301,6 +311,17 @@ impl<'a> CabacDecoder<'a> {
         self.cod_i_offset
     }
 
+    /// Current `codIRange` — exposed for debug-only external callers
+    /// (bin-trace MB boundary markers).
+    pub fn debug_range(&self) -> u32 {
+        self.cod_i_range
+    }
+
+    /// Current `codIOffset` — exposed for debug-only external callers.
+    pub fn debug_offset(&self) -> u32 {
+        self.cod_i_offset
+    }
+
     /// §9.3.3.2.1 — DecodeDecision. Returns the decoded bin (0 or 1)
     /// and updates `ctx` in place per §9.3.3.2.1.1 (Table 9-45).
     ///
@@ -319,6 +340,17 @@ impl<'a> CabacDecoder<'a> {
     ///       pStateIdx   = transIdxMPS[pStateIdx]
     ///   RenormD()
     pub fn decode_decision(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
+        // Debug: capture pre-state before we mutate anything. `ctx` does
+        // not carry a ctxIdx (we only see the `(state, mps)` pair), so the
+        // caller is responsible for any richer trace line. We still emit a
+        // minimal per-bin trace gated on OXIDEAV_H264_BIN_TRACE that
+        // covers every decision bin with the engine-visible state.
+        let trace_on = bin_trace_enabled();
+        let pre_state = ctx.state_idx;
+        let pre_mps = ctx.val_mps;
+        let pre_range = self.cod_i_range;
+        let pre_offset = self.cod_i_offset;
+
         // §9.3.3.2.1 equations (9-25) / (9-26).
         let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
         let cod_i_range_lps = RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
@@ -343,6 +375,15 @@ impl<'a> CabacDecoder<'a> {
 
         self.renorm_d()?;
         self.bin_count = self.bin_count.wrapping_add(1);
+        if trace_on {
+            eprintln!(
+                "[BIN {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_offset={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_offset={:>4}",
+                self.bin_count,
+                pre_state, pre_mps, pre_range, pre_offset,
+                bin_val,
+                ctx.state_idx, ctx.val_mps, self.cod_i_range, self.cod_i_offset,
+            );
+        }
         Ok(bin_val)
     }
 
@@ -357,6 +398,9 @@ impl<'a> CabacDecoder<'a> {
     ///   else:
     ///       binVal = 0
     pub fn decode_bypass(&mut self) -> CabacResult<u8> {
+        let trace_on = bin_trace_enabled();
+        let pre_range = self.cod_i_range;
+        let pre_offset = self.cod_i_offset;
         self.cod_i_offset = (self.cod_i_offset << 1) | self.reader.u(1)?;
         let bin = if self.cod_i_offset >= self.cod_i_range {
             self.cod_i_offset -= self.cod_i_range;
@@ -365,6 +409,15 @@ impl<'a> CabacDecoder<'a> {
             0
         };
         self.bin_count = self.bin_count.wrapping_add(1);
+        if trace_on {
+            eprintln!(
+                "[BIN {:>8}] BP pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
+                self.bin_count,
+                pre_range, pre_offset,
+                bin,
+                self.cod_i_range, self.cod_i_offset,
+            );
+        }
         Ok(bin)
     }
 
@@ -379,6 +432,9 @@ impl<'a> CabacDecoder<'a> {
     ///       binVal = 0
     ///       RenormD()
     pub fn decode_terminate(&mut self) -> CabacResult<u8> {
+        let trace_on = bin_trace_enabled();
+        let pre_range = self.cod_i_range;
+        let pre_offset = self.cod_i_offset;
         self.cod_i_range -= 2;
         let bin = if self.cod_i_offset >= self.cod_i_range {
             // Terminated. Per spec: "no renormalization is carried out, and
@@ -390,6 +446,15 @@ impl<'a> CabacDecoder<'a> {
             0
         };
         self.bin_count = self.bin_count.wrapping_add(1);
+        if trace_on {
+            eprintln!(
+                "[BIN {:>8}] TT pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
+                self.bin_count,
+                pre_range, pre_offset,
+                bin,
+                self.cod_i_range, self.cod_i_offset,
+            );
+        }
         Ok(bin)
     }
 

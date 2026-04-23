@@ -211,6 +211,18 @@ pub fn parse_slice_data(
         // for coded_block_flag / ref_idx / mvd on subsequent MBs.
         let mut cabac_nb = CabacNeighbourGrid::new(pic_w_mbs, pic_h_mbs);
         loop {
+            // Debug marker for bin-level trace: emit a MB-boundary line
+            // (gated on OXIDEAV_H264_BIN_TRACE) so downstream tooling can
+            // slice the bin trace into MB segments.
+            if std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some() {
+                eprintln!(
+                    "[MB-BOUNDARY] curr_mb_addr={} bin_count={} range={} offset={}",
+                    curr_mb_addr,
+                    cabac_dec.bin_count(),
+                    cabac_dec.debug_range(),
+                    cabac_dec.debug_offset(),
+                );
+            }
             let mut skipped = false;
             let mut mb_skip_flag_this_iter = false;
             // §9.3.3.1.1.1 — mb_skip_flag's ctxIdxInc uses the A/B
