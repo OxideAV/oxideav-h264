@@ -1050,6 +1050,54 @@ fn conformance_jvt_cabast3_sony_e() {
     print_report(&report);
 }
 
+/// JVT AVCv1 `HCMP1_HHI_A` (HHI, Main / CABAC, CIF Paris, 250 frames
+/// IPB with hierarchical GOP size 16 + ref-pic-list reorder).
+#[test]
+fn conformance_jvt_hcmp1_hhi_a() {
+    let bs = std::env::var("OXIDEAV_JVT_HCMP1_HHI_A_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/HCMP1_HHI_A/HCMP1_HHI_A.264"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_HCMP1_HHI_A_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/HCMP1_HHI_A/HCMP1_HHI_A.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_HCMP1_HHI_A", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+}
+
+/// JVT AVCv1 `CAMA1_Sony_C` (Sony, Main / CABAC, 720x480 Cheer,
+/// 5 frames I-only, **MBAFF**). Field-coding path.
+#[test]
+fn conformance_jvt_cama1_sony_c() {
+    let bs = std::env::var("OXIDEAV_JVT_CAMA1_SONY_C_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CAMA1_Sony_C/CAMA1_Sony_C.jsv"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_CAMA1_SONY_C_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CAMA1_Sony_C/CAMA1_Sony_C.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_CAMA1_Sony_C", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+}
+
+/// JVT AVCv1 `CAPA1_TOSHIBA_B` (Toshiba, Main / CABAC, CIF mobile,
+/// 90 frames I/P/B, **Picture-AFF (PAFF)**).
+#[test]
+fn conformance_jvt_capa1_toshiba_b() {
+    let bs = std::env::var("OXIDEAV_JVT_CAPA1_TOSHIBA_B_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CAPA1_TOSHIBA_B/CAPA1_TOSHIBA_B.264"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_CAPA1_TOSHIBA_B_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CAPA1_TOSHIBA_B/CAPA1_TOSHIBA_B_dec.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_CAPA1_TOSHIBA_B", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+}
+
 // ------------------------------ helpers tests --------------------------
 
 #[cfg(test)]
