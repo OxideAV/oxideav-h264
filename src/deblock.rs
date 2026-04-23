@@ -161,12 +161,18 @@ const TC0_PRIME: [[u8; 3]; 52] = [
     // indexA 0..=9 — all zeros.
     [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
     [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
-    // indexA 10..=15 — all zeros.
-    [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
-    // indexA 16..=22 — all zeros.
+    // indexA 10..=16 — all zeros.
     [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
-    // indexA 23..=25.
-    [1, 0, 0],   // 23
+    // indexA 17..=20: bS=3 goes to 1; bS=1/bS=2 stay 0.
+    [0, 0, 1],   // 17
+    [0, 0, 1],   // 18
+    [0, 0, 1],   // 19
+    [0, 0, 1],   // 20
+    // indexA 21..=22: bS=2 also goes to 1.
+    [0, 1, 1],   // 21
+    [0, 1, 1],   // 22
+    // indexA 23..=25: bS=1 also goes to 1 (all three = 1).
+    [1, 1, 1],   // 23
     [1, 1, 1],   // 24
     [1, 1, 1],   // 25
     // indexA 26..=29.
@@ -556,13 +562,21 @@ mod tests {
     #[test]
     fn tc0_table_spotcheck() {
         // Values from Table 8-17 (main + concluded), 08/2024 edition.
-        // bs=1, indexA=0..22 → 0
+        // bs=1, indexA=0..22 → 0; bs=2, 0..20 → 0; bs=3, 0..16 → 0.
         assert_eq!(tc0_from(1, 0, 8), 0);
         assert_eq!(tc0_from(1, 22, 8), 0);
-        // bs=1, indexA=23 → 1; bs=2, indexA=23 → 0; bs=3, indexA=23 → 0
+        // indexA=17: bs=3 becomes 1, bs=1/2 still 0.
+        assert_eq!(tc0_from(1, 17, 8), 0);
+        assert_eq!(tc0_from(2, 17, 8), 0);
+        assert_eq!(tc0_from(3, 17, 8), 1);
+        // indexA=21: bs=2 becomes 1.
+        assert_eq!(tc0_from(1, 21, 8), 0);
+        assert_eq!(tc0_from(2, 21, 8), 1);
+        assert_eq!(tc0_from(3, 21, 8), 1);
+        // indexA=23: bs=1 also becomes 1 — all three are 1.
         assert_eq!(tc0_from(1, 23, 8), 1);
-        assert_eq!(tc0_from(2, 23, 8), 0);
-        assert_eq!(tc0_from(3, 23, 8), 0);
+        assert_eq!(tc0_from(2, 23, 8), 1);
+        assert_eq!(tc0_from(3, 23, 8), 1);
         // indexA=24 → (1, 1, 1).
         assert_eq!(tc0_from(1, 24, 8), 1);
         assert_eq!(tc0_from(2, 24, 8), 1);
@@ -601,15 +615,22 @@ mod tests {
     fn tc0_table_every_entry_matches_spec() {
         // Full transcription check: Table 8-17 main (indexA 0..=25) and
         // concluded (indexA 26..=51). Each row-major.
-        // indexA 0..=22 — all zero.
-        for idx in 0..=22 {
+        // bS=3 is zero for idx 0..=16, bS=2 zero for 0..=20, bS=1 zero for
+        // 0..=22 (per the main-table spec ordering).
+        for idx in 0..=16 {
             assert_eq!(tc0_from(1, idx, 8), 0, "bS=1 idxA={}", idx);
             assert_eq!(tc0_from(2, idx, 8), 0, "bS=2 idxA={}", idx);
             assert_eq!(tc0_from(3, idx, 8), 0, "bS=3 idxA={}", idx);
         }
-        // (bS=1, bS=2, bS=3) rows for indexA=23..=51.
-        let expected: [(i32, i32, i32, i32); 29] = [
-            (23, 1,  0,  0),
+        // (bS=1, bS=2, bS=3) rows for indexA=17..=51.
+        let expected: [(i32, i32, i32, i32); 35] = [
+            (17, 0,  0,  1),
+            (18, 0,  0,  1),
+            (19, 0,  0,  1),
+            (20, 0,  0,  1),
+            (21, 0,  1,  1),
+            (22, 0,  1,  1),
+            (23, 1,  1,  1),
             (24, 1,  1,  1),
             (25, 1,  1,  1),
             (26, 1,  1,  1),
