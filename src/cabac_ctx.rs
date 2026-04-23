@@ -1028,6 +1028,22 @@ pub fn decode_mb_type_p(
     _neighbours: &NeighbourCtx,
 ) -> CabacResult<u32> {
     const OFFSET: u32 = 14;
+    // OXIDEAV_H264_CTX17_TRACE=1 — dump ctxs 14..=17 before each
+    // mb_type_p decode. Used when investigating P-slice intra-suffix
+    // decoding vs JVT trace (e.g. CABA2_SVA_B Pic 3 MB 28).
+    if std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some() {
+        let c14 = ctxs.at(14);
+        let c15 = ctxs.at(15);
+        let c16 = ctxs.at(16);
+        let c17 = ctxs.at(17);
+        eprintln!(
+            "[CTX17] pre mb_type_p: c14=({},{}) c15=({},{}) c16=({},{}) c17=({},{})",
+            c14.state_idx, c14.val_mps,
+            c15.state_idx, c15.val_mps,
+            c16.state_idx, c16.val_mps,
+            c17.state_idx, c17.val_mps,
+        );
+    }
     // Table 9-39 (08/2024) row ctxIdxOffset=14:
     //   binIdx 0 → 0 (fixed — no "clause 9.3.3.1.1.3" reference, unlike
     //                 ctxIdxOffsets 0, 3, 27 which DO use neighbour-

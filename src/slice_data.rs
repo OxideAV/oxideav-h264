@@ -193,6 +193,13 @@ pub fn parse_slice_data(
             },
             slice_qp_y,
         )?;
+        if std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some() {
+            let c17 = ctxs.at(17);
+            eprintln!("[CTX17] slice init: kind={:?} init_idc={} qp_y={} num_ref_l0_active_minus1={} c17=({},{})",
+                kind, slice_header.cabac_init_idc, slice_qp_y,
+                slice_header.num_ref_idx_l0_active_minus1,
+                c17.state_idx, c17.val_mps);
+        }
 
         // §7.3.4 — prevMbSkipped is initialised to 0; in the CABAC
         // path it is updated each iteration to mb_skip_flag when the
