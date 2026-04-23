@@ -304,6 +304,10 @@ pub fn parse_slice_data(
                         slot.is_intra = false;
                         slot.is_i_pcm = false;
                         slot.is_i_nxn = false;
+                        // §9.3.3.1.1.3 — B_Skip is one of the two mb_types
+                        // that trigger condTermFlag = 0 at ctxIdxOffset=27
+                        // bin 0 for the next MB's mb_type decode.
+                        slot.is_b_skip_or_direct = matches!(kind, SliceKind::B);
                         slot.coded_block_pattern_luma = 0;
                         slot.coded_block_pattern_chroma = 0;
                         slot.cbf_luma_4x4 = [false; 16];
@@ -384,6 +388,7 @@ pub fn parse_slice_data(
                             nctx.left_cbp_luma = info.coded_block_pattern_luma;
                             nctx.left_cbp_chroma = info.coded_block_pattern_chroma;
                             nctx.left_is_i_nxn = info.is_i_nxn;
+                            nctx.left_is_b_skip_or_direct = info.is_b_skip_or_direct;
                             nctx.left_intra_chroma_pred_mode_nonzero =
                                 info.intra_chroma_pred_mode != 0;
                             nctx.left_transform_8x8 = info.transform_size_8x8_flag;
@@ -400,6 +405,7 @@ pub fn parse_slice_data(
                             nctx.above_cbp_luma = info.coded_block_pattern_luma;
                             nctx.above_cbp_chroma = info.coded_block_pattern_chroma;
                             nctx.above_is_i_nxn = info.is_i_nxn;
+                            nctx.above_is_b_skip_or_direct = info.is_b_skip_or_direct;
                             nctx.above_intra_chroma_pred_mode_nonzero =
                                 info.intra_chroma_pred_mode != 0;
                             nctx.above_transform_8x8 = info.transform_size_8x8_flag;

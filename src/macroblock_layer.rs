@@ -212,6 +212,14 @@ impl MbType {
         matches!(self, MbType::PSkip | MbType::BSkip)
     }
 
+    /// §9.3.3.1.1.3 — true for `B_Skip` / `B_Direct_16x16`. Used by the
+    /// `mb_type` ctxIdxInc derivation at ctxIdxOffset = 27 (Bin 0
+    /// condTerm). The spec marks these two mb_types specially because
+    /// they are the "no residual inter" cases on a B slice.
+    pub fn is_b_skip_or_direct(&self) -> bool {
+        matches!(self, MbType::BSkip | MbType::BDirect16x16)
+    }
+
     /// §7.4.5 — `NumMbPart(mb_type)` — 1, 2, or 4. Intra mbs return 1.
     pub fn num_mb_part(&self) -> u8 {
         use MbType::*;
@@ -1248,6 +1256,10 @@ pub struct CabacMbNeighbourInfo {
     /// §9.3.3.1.1.3 — mb_type == I_NxN (I_4x4 / I_8x8) for this MB,
     /// used by the next MB's mb_type ctxIdxInc derivation.
     pub is_i_nxn: bool,
+    /// §9.3.3.1.1.3 — mb_type is `B_Skip` or `B_Direct_16x16` for this
+    /// MB. Used by the next MB's `mb_type` ctxIdxInc derivation at
+    /// ctxIdxOffset = 27 (Bin 0 condTerm goes to 0 on such neighbours).
+    pub is_b_skip_or_direct: bool,
     /// §9.3.3.1.1.8 — intra_chroma_pred_mode of this MB (0..=3). The
     /// next MB's ctxIdxInc derivation consults whether this is non-zero.
     pub intra_chroma_pred_mode: u8,
@@ -1285,6 +1297,7 @@ impl Default for CabacMbNeighbourInfo {
             coded_block_pattern_luma: 0,
             coded_block_pattern_chroma: 0,
             is_i_nxn: false,
+            is_b_skip_or_direct: false,
             intra_chroma_pred_mode: 0,
             transform_size_8x8_flag: false,
         }
@@ -2270,6 +2283,7 @@ pub fn parse_macroblock(
                 slot.coded_block_pattern_luma = (cbp_total & 0x0F) as u8;
                 slot.coded_block_pattern_chroma = ((cbp_total >> 4) & 0x03) as u8;
                 slot.is_i_nxn = mb_type.is_i_nxn();
+                slot.is_b_skip_or_direct = mb_type.is_b_skip_or_direct();
                 slot.transform_size_8x8_flag = transform_size_8x8_flag;
                 if let Some(pred) = out.mb_pred.as_ref() {
                     slot.intra_chroma_pred_mode = pred.intra_chroma_pred_mode;
@@ -2453,7 +2467,15 @@ fn parse_mb_pred(
         // presence — an absent ref_idx is inferred to 0 per §7.4.5.1.
         for part in 0..num_parts {
             let mode = mb_type.mb_part_pred_mode(part);
-            if ref_l0_present && mode != Some(MbPartPredMode::PredL1) {
+            // §7.3.5.1 gate: the ref_idx_l0 syntax element is present only
+            // when the partition is Pred_L0 or BiPred. B_Direct_16x16 /
+            // B_Skip carry mode == Direct and must NOT read ref_idx here —
+            // the ref indices come from the §8.4.1.2 direct-mode derivation
+            // at reconstruct time.
+            if ref_l0_present
+                && mode != Some(MbPartPredMode::PredL1)
+                && mode != Some(MbPartPredMode::Direct)
+            {
                 let v = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
                     // §9.3.3.1.1.6 eq. 9-14 — (condTermA, condTermB).
                     let (ca, cb) = neighbour_ref_idx_gt_0(
@@ -3901,6 +3923,7 @@ fn parse_residual_cabac_only(
             slot.is_intra = current_is_intra;
             slot.is_i_pcm = mb_type.is_i_pcm();
             slot.is_skip = mb_type.is_skip();
+            slot.is_b_skip_or_direct = mb_type.is_b_skip_or_direct();
             slot.cbf_luma_4x4 = curr_cbf.cbf_luma_4x4;
             slot.cbf_cb_dc = curr_cbf.cbf_cb_dc;
             slot.cbf_cr_dc = curr_cbf.cbf_cr_dc;
@@ -5404,7 +5427,10 @@ mod tests {
         // ref_idx_l0.
         for part in 0..num_parts {
             let mode = mb_type.mb_part_pred_mode(part);
-            if ref_l0_present && mode != Some(MbPartPredMode::PredL1) {
+            if ref_l0_present
+                && mode != Some(MbPartPredMode::PredL1)
+                && mode != Some(MbPartPredMode::Direct)
+            {
                 let v = decode_ref_idx_lx(&mut dec, &mut ctxs, false, false).unwrap();
                 pred.ref_idx_l0.push(v);
             } else {
