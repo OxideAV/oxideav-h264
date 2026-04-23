@@ -3119,27 +3119,39 @@ fn neighbour_from_block(
         return NeighbourMv::intra_but_mb_available();
     }
     let blk4 = blk4_raster_index(bxw as u8, byw as u8) as usize;
+    let q_idx = blk4 / 4;
     let (mv, ref_idx) = if list == 0 {
-        (info.mv_l0[blk4], info.ref_idx_l0[blk4 / 4])
+        (info.mv_l0[blk4], info.ref_idx_l0[q_idx])
     } else {
-        (info.mv_l1[blk4], info.ref_idx_l1[blk4 / 4])
+        (info.mv_l1[blk4], info.ref_idx_l1[q_idx])
     };
     if ref_idx < 0 {
-        // Inter MB with ref_idx == -1. Two disjoint cases:
-        //   (a) Within the CURRENT in-flight MB: the 8x8 partition
-        //       that would cover (bxw, byw) hasn't been decoded yet
-        //       (its ref_idx is still the default -1). Per §6.4.11.1
-        //       the partition is NOT AVAILABLE, and the §8.4.1.3.2
-        //       eq. 8-214..8-216 C→D substitution must fire when this
-        //       neighbour is the C slot.
-        //   (b) In a DIFFERENT (already-decoded) MB: the partition is
-        //       available per §6.4.11.1, but predFlagLX==0 at this
-        //       8x8 (spec step 2a filtering — the MB is inter but
-        //       that particular partition didn't use list LX). The
-        //       substitution must NOT fire; this neighbour just
-        //       contributes mv=0, refIdx=-1 to the median.
-        // Distinguish via `is_same_mb`.
-        if is_same_mb {
+        // Inter MB with refIdxLX == -1. Two disjoint cases:
+        //   (a) Within the CURRENT in-flight MB AND the 8x8 partition
+        //       containing (bxw, byw) has NOT been decoded yet — both
+        //       ref_idx_l0[q] and ref_idx_l1[q] are still the default
+        //       -1. Per §6.4.11.1 the partition is NOT AVAILABLE, and
+        //       the §8.4.1.3.2 eq. 8-214..8-216 C→D substitution must
+        //       fire when this neighbour is the C slot.
+        //   (b) The partition IS decoded (either a different MB, or
+        //       within the current MB with the OTHER list's refIdx set
+        //       meaning the partition chose predFlagLX==0 for this
+        //       list). Per §6.4.11.1 the partition IS available, but
+        //       §8.4.1.3.2 step 2a collapses its (mv, refIdx) to
+        //       (0, -1) for the median. The C→D substitution must NOT
+        //       fire for this case.
+        //
+        // Distinguish same-MB (a) from (b) by inspecting the OTHER
+        // list's refIdx at the same 8x8 quadrant: if that's also -1,
+        // the partition has not been decoded; if it's >= 0, the
+        // partition IS decoded but chose single-list prediction on the
+        // other list.
+        let other_ref_idx = if list == 0 {
+            info.ref_idx_l1[q_idx]
+        } else {
+            info.ref_idx_l0[q_idx]
+        };
+        if is_same_mb && other_ref_idx < 0 {
             return NeighbourMv::partition_not_yet_decoded_same_mb();
         }
         return NeighbourMv::intra_but_mb_available();
