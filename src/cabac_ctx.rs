@@ -263,29 +263,27 @@ const TBL_9_16: &[(usize, InitCell)] = &[
 // slice type, and Table 9-17 has a single (m, n) column — so the same
 // (m, n) pair initialises each context for I, SI, P, SP, and B slices.
 //
-// mb_qp_delta (60..=63) uses ::same (round-32 fix): this is the
-// spec-literal behaviour and is required to correctly decode
-// mb_qp_delta bin 0 on P-slices (the default state_idx=0 / mps=0 that
-// `::i` leaves in place for P/SP/B slices produces the wrong MPS for
-// bin 0 of mb_qp_delta, mis-decoding value 0 as value 1 on QP-stable
-// streams such as CABA2_SVA_B).
-//
-// 64..=69 currently stay on `::i` because applying `::same` to the
-// intra-pred-mode / chroma-pred-mode groups regresses other P-slice
-// streams. These bins are only exercised on intra-coded MBs inside
-// P slices, so the mismatch is tolerated until a separate round
-// isolates the compensating bug.
+// All ten entries use ::same. Initially 64..=69 were gated on ::i
+// (I-slice only) to work around a then-unknown compensating bug on
+// intra-coded MBs inside P slices. Round 35 traced that bug to this
+// same init mismatch: intra MBs inside P slices on CABA2_SVA_B
+// (frame 3 MB 28) entered `prev_intra4x4_pred_mode_flag` decode with
+// ctxIdx 68 at default (state=0, mps=0) and mis-decoded flag=0 (LPS
+// loop) instead of flag=1 (MPS loop), inflating the MB's bit budget
+// by 21 bits and cascading pixel divergence from that MB onward.
+// Applying the literal ::same fix matches JM's per-MB bit budget on
+// MB 28 of frame 3 and should be the correct spec behaviour.
 const TBL_9_17: &[(usize, InitCell)] = &[
     (60, InitCell::same((0, 41))),
     (61, InitCell::same((0, 63))),
     (62, InitCell::same((0, 63))),
     (63, InitCell::same((0, 63))),
-    (64, InitCell::i((-9, 83))),
-    (65, InitCell::i((4, 86))),
-    (66, InitCell::i((0, 97))),
-    (67, InitCell::i((-7, 72))),
-    (68, InitCell::i((13, 41))),
-    (69, InitCell::i((3, 62))),
+    (64, InitCell::same((-9, 83))),
+    (65, InitCell::same((4, 86))),
+    (66, InitCell::same((0, 97))),
+    (67, InitCell::same((-7, 72))),
+    (68, InitCell::same((13, 41))),
+    (69, InitCell::same((3, 62))),
 ];
 
 // Table 9-18 — ctxIdx 70..=104 (applies to I/SI and all three init_idc).

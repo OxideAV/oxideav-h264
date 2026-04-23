@@ -222,12 +222,15 @@ pub fn parse_slice_data(
             // (gated on OXIDEAV_H264_BIN_TRACE) so downstream tooling can
             // slice the bin trace into MB segments.
             if std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some() {
+                let (bp_byte, bp_bit) = cabac_dec.position();
+                let bit_pos = bp_byte * 8 + bp_bit as usize;
                 eprintln!(
-                    "[MB-BOUNDARY] curr_mb_addr={} bin_count={} range={} offset={}",
+                    "[MB-BOUNDARY] curr_mb_addr={} bin_count={} range={} offset={} bit_pos={}",
                     curr_mb_addr,
                     cabac_dec.bin_count(),
                     cabac_dec.debug_range(),
                     cabac_dec.debug_offset(),
+                    bit_pos,
                 );
             }
             let mut skipped = false;
