@@ -1098,6 +1098,31 @@ fn conformance_jvt_capa1_toshiba_b() {
     print_report(&report);
 }
 
+macro_rules! jvt_test {
+    ($fn:ident, $name:literal, $bs_env:literal, $bs:literal, $ref_env:literal, $ref:literal) => {
+        #[test]
+        fn $fn() {
+            let bs = std::env::var($bs_env).map(PathBuf::from).unwrap_or_else(|_| PathBuf::from($bs));
+            let ref_yuv = std::env::var($ref_env).map(PathBuf::from).unwrap_or_else(|_| PathBuf::from($ref));
+            let Some(report) = run_conformance_with_ref_file($name, &bs, &ref_yuv) else { return; };
+            print_report(&report);
+        }
+    };
+}
+
+jvt_test!(conformance_jvt_sva_fm1_e,     "jvt_SVA_FM1_E",     "OXIDEAV_JVT_SVA_FM1_E_BS",     "/tmp/SVA_FM1_E/SVA_FM1_E.264",       "OXIDEAV_JVT_SVA_FM1_E_REF",     "/tmp/SVA_FM1_E/SVA_FM1_E_rec.yuv");
+jvt_test!(conformance_jvt_sva_nl1_b,     "jvt_SVA_NL1_B",     "OXIDEAV_JVT_SVA_NL1_B_BS",     "/tmp/SVA_NL1_B/SVA_NL1_B.264",       "OXIDEAV_JVT_SVA_NL1_B_REF",     "/tmp/SVA_NL1_B/SVA_NL1_B_rec.yuv");
+jvt_test!(conformance_jvt_sva_ba1_b,     "jvt_SVA_BA1_B",     "OXIDEAV_JVT_SVA_BA1_B_BS",     "/tmp/SVA_BA1_B/SVA_BA1_B.264",       "OXIDEAV_JVT_SVA_BA1_B_REF",     "/tmp/SVA_BA1_B/SVA_BA1_B_rec.yuv");
+jvt_test!(conformance_jvt_ba1_sony_d,    "jvt_BA1_Sony_D",    "OXIDEAV_JVT_BA1_SONY_D_BS",    "/tmp/BA1_Sony_D/BA1_Sony_D.jsv",     "OXIDEAV_JVT_BA1_SONY_D_REF",    "/tmp/BA1_Sony_D/BA1_Sony_D.yuv");
+jvt_test!(conformance_jvt_ba1_ft_c,      "jvt_BA1_FT_C",      "OXIDEAV_JVT_BA1_FT_C_BS",      "/tmp/BA1_FT_C/BA1_FT_C.264",         "OXIDEAV_JVT_BA1_FT_C_REF",      "/tmp/BA1_FT_C/BA1_FT_C.yuv");
+jvt_test!(conformance_jvt_nl1_sony_d,    "jvt_NL1_Sony_D",    "OXIDEAV_JVT_NL1_SONY_D_BS",    "/tmp/NL1_Sony_D/NL1_Sony_D.jsv",     "OXIDEAV_JVT_NL1_SONY_D_REF",    "/tmp/NL1_Sony_D/NL1_Sony_D.yuv");
+jvt_test!(conformance_jvt_nrf_mw_e,      "jvt_NRF_MW_E",      "OXIDEAV_JVT_NRF_MW_E_BS",      "/tmp/NRF_MW_E/NRF_MW_E.264",         "OXIDEAV_JVT_NRF_MW_E_REF",      "/tmp/NRF_MW_E/NRF_MW_E_rec.qcif");
+jvt_test!(conformance_jvt_midr_mw_d,     "jvt_MIDR_MW_D",     "OXIDEAV_JVT_MIDR_MW_D_BS",     "/tmp/MIDR_MW_D/MIDR_MW_D.264",       "OXIDEAV_JVT_MIDR_MW_D_REF",     "/tmp/MIDR_MW_D/MIDR_MW_D_rec.qcif");
+jvt_test!(conformance_jvt_banm_mw_d,     "jvt_BANM_MW_D",     "OXIDEAV_JVT_BANM_MW_D_BS",     "/tmp/BANM_MW_D/BANM_MW_D.264",       "OXIDEAV_JVT_BANM_MW_D_REF",     "/tmp/BANM_MW_D/BANM_MW_D_rec.qcif");
+jvt_test!(conformance_jvt_ba_mw_d,       "jvt_BA_MW_D",       "OXIDEAV_JVT_BA_MW_D_BS",       "/tmp/BA_MW_D/BA_MW_D.264",           "OXIDEAV_JVT_BA_MW_D_REF",       "/tmp/BA_MW_D/BA_MW_D_rec.qcif");
+jvt_test!(conformance_jvt_mr1_bt_a,      "jvt_MR1_BT_A",      "OXIDEAV_JVT_MR1_BT_A_BS",      "/tmp/MR1_BT_A/MR1_BT_A.h264",        "OXIDEAV_JVT_MR1_BT_A_REF",      "/tmp/MR1_BT_A/MR1_BT_A.yuv");
+jvt_test!(conformance_jvt_fm1_bt_b,      "jvt_FM1_BT_B",      "OXIDEAV_JVT_FM1_BT_B_BS",      "/tmp/FM1_BT_B/FM1_BT_B.h264",        "OXIDEAV_JVT_FM1_BT_B_REF",      "/tmp/FM1_BT_B/FM1_BT_B.yuv");
+
 // ------------------------------ helpers tests --------------------------
 
 #[cfg(test)]
