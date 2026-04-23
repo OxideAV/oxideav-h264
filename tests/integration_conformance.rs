@@ -1018,6 +1018,38 @@ fn conformance_jvt_sl1_sva_b() {
     print_report(&report);
 }
 
+/// JVT AVCv1 `CABACI3_Sony_B` (Sony, Main / CABAC, QCIF foreman,
+/// 300 frames IPB, **4 slices per picture, 5 reference frames**).
+#[test]
+fn conformance_jvt_cabaci3_sony_b() {
+    let bs = std::env::var("OXIDEAV_JVT_CABACI3_SONY_B_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CABACI3_Sony_B/CABACI3_Sony_B.jsv"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_CABACI3_SONY_B_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CABACI3_Sony_B/CABACI3_Sony_B.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_CABACI3_Sony_B", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+}
+
+/// JVT AVCv1 `CABAST3_Sony_E` (Sony, Main / CABAC, CIF Mobile,
+/// 300 frames IPB, **4 slices per picture, multiple slice types per pic**).
+#[test]
+fn conformance_jvt_cabast3_sony_e() {
+    let bs = std::env::var("OXIDEAV_JVT_CABAST3_SONY_E_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CABAST3_Sony_E/CABAST3_Sony_E.jsv"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_CABAST3_SONY_E_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CABAST3_Sony_E/CABAST3_Sony_E.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_CABAST3_Sony_E", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+}
+
 // ------------------------------ helpers tests --------------------------
 
 #[cfg(test)]
