@@ -967,6 +967,57 @@ fn conformance_jvt_camp_mot_frm0_full() {
     // reordering / output path matures.
 }
 
+/// JVT AVCv1 `CABA3_SVA_B` (SVA & Tsinghua, Main / CABAC, QCIF foreman,
+/// 33 frames IPB with B-slices, intra-period 10, frame-coded, 1 slice
+/// per picture). Adds B-frame CABAC coverage on top of CABA2's IP-only.
+#[test]
+fn conformance_jvt_caba3_sva_b() {
+    let bs = std::env::var("OXIDEAV_JVT_CABA3_SVA_B_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CABA3_SVA_B/CABA3_SVA_B.264"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_CABA3_SVA_B_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/CABA3_SVA_B/CABA3_SVA_B_rec.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_CABA3_SVA_B", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+}
+
+/// JVT AVCv1 `SVA_Base_B` (SVA & Tsinghua, Baseline / CAVLC, QCIF
+/// foreman, 17 frames IP, **3 slices per picture**, intra-period 0).
+/// Exercises multi-slice picture assembly.
+#[test]
+fn conformance_jvt_sva_base_b() {
+    let bs = std::env::var("OXIDEAV_JVT_SVA_BASE_B_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/SVA_Base_B/SVA_Base_B.264"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_SVA_BASE_B_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/SVA_Base_B/SVA_Base_B_rec.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_SVA_Base_B", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+}
+
+/// JVT AVCv1 `SL1_SVA_B` (SVA & Tsinghua, Main? / CAVLC, QCIF foreman,
+/// 33 frames IPB with B-slices, 3 slices per picture). Exercises
+/// multi-slice + B-frame CAVLC.
+#[test]
+fn conformance_jvt_sl1_sva_b() {
+    let bs = std::env::var("OXIDEAV_JVT_SL1_SVA_B_BS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/SL1_SVA_B/SL1_SVA_B.264"));
+    let ref_yuv = std::env::var("OXIDEAV_JVT_SL1_SVA_B_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/SL1_SVA_B/SL1_SVA_B_rec.yuv"));
+    let Some(report) = run_conformance_with_ref_file("jvt_SL1_SVA_B", &bs, &ref_yuv) else {
+        return;
+    };
+    print_report(&report);
+}
+
 // ------------------------------ helpers tests --------------------------
 
 #[cfg(test)]
