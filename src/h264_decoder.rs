@@ -599,10 +599,68 @@ impl H264CodecDecoder {
         // consistency).
         in_progress.pic.pic_order_cnt = in_progress.poc.pic_order_cnt;
         in_progress.pic.frame_num = header.frame_num;
+
+        // §8.4.1.2.3 — precompute POCs + long-term flags for the
+        // slice's RefPicList0. A later B-slice uses this picture as
+        // the colocated picture and invokes MapColToList0 which
+        // requires picture-identity lookup (by POC) back into the
+        // list that was active when this picture was decoded.
+        let list_0_pocs: Vec<i32> = list0
+            .iter()
+            .map(|&key| {
+                self.ref_store
+                    .get_by_key(key)
+                    .map(|p| p.pic_order_cnt)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let list_0_longterm: Vec<bool> = list0
+            .iter()
+            .map(|&key| {
+                self.dpb_entries
+                    .iter()
+                    .find(|e| e.dpb_key == key)
+                    .map(|e| e.is_long_term())
+                    .unwrap_or(false)
+            })
+            .collect();
+        let list_1_pocs: Vec<i32> = list1
+            .iter()
+            .map(|&key| {
+                self.ref_store
+                    .get_by_key(key)
+                    .map(|p| p.pic_order_cnt)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let list_1_longterm: Vec<bool> = list1
+            .iter()
+            .map(|&key| {
+                self.dpb_entries
+                    .iter()
+                    .find(|e| e.dpb_key == key)
+                    .map(|e| e.is_long_term())
+                    .unwrap_or(false)
+            })
+            .collect();
+        // Idempotent across slices: once set for a picture, only
+        // update if still empty (shared lists across slices of one
+        // primary coded picture have the same POCs — but RPLM may
+        // differ. Using the first non-empty snapshot matches the
+        // common "first slice wins" convention for primary MB 0).
+        if in_progress.pic.ref_list_0_pocs.is_empty() {
+            in_progress.pic.ref_list_0_pocs = list_0_pocs.clone();
+            in_progress.pic.ref_list_0_longterm = list_0_longterm.clone();
+            in_progress.pic.ref_list_1_pocs = list_1_pocs.clone();
+            in_progress.pic.ref_list_1_longterm = list_1_longterm.clone();
+        }
+        let _ = (list_1_pocs, list_1_longterm);
         let provider = BorrowedRefProvider {
             store: &self.ref_store,
             list_0: &list0,
             list_1: &list1,
+            list_0_pocs,
+            list_0_longterm,
         };
         reconstruct::reconstruct_slice(
             &sd,
@@ -778,6 +836,11 @@ struct BorrowedRefProvider<'a> {
     store: &'a RefPicStore,
     list_0: &'a [u32],
     list_1: &'a [u32],
+    /// §8.4.1.2.3 — precomputed POCs of the pictures in `list_0`,
+    /// supplied to the temporal-direct MapColToList0 derivation.
+    list_0_pocs: Vec<i32>,
+    /// §8.4.1.2.3 — long-term flag parallel to `list_0_pocs`.
+    list_0_longterm: Vec<bool>,
 }
 
 impl RefPicProvider for BorrowedRefProvider<'_> {
@@ -789,6 +852,14 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
         };
         let key = *keys.get(idx as usize)?;
         self.store.get_by_key(key)
+    }
+
+    fn ref_list_0_pocs(&self) -> &[i32] {
+        &self.list_0_pocs
+    }
+
+    fn ref_list_0_longterm(&self) -> &[bool] {
+        &self.list_0_longterm
     }
 }
 

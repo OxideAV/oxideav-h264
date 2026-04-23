@@ -56,6 +56,26 @@ pub struct Picture {
     pub ref_idx_l0_grid: Vec<i8>,
     pub ref_idx_l1_grid: Vec<i8>,
     pub is_intra_grid: Vec<bool>,
+    /// §8.4.1.2.3 — per-slice snapshot of POCs in the slice's
+    /// RefPicList0 that was used when this picture was decoded.
+    /// Needed by a later B-slice's temporal-direct derivation to map
+    /// this picture's colocated block's refIdxL0 back to a concrete
+    /// picture identity (its POC), which is then matched against the
+    /// current slice's RefPicList0 to produce refIdxL0 for the current
+    /// block (MapColToList0 of eq. 8-191).
+    ///
+    /// Snapshotted at reconstruction time per slice; if the picture
+    /// comprises multiple slices we keep the first non-empty value
+    /// (all slices of a coded picture share reference pictures modulo
+    /// RPLM — near-enough for I/P pictures used as colocated).
+    pub ref_list_0_pocs: Vec<i32>,
+    pub ref_list_1_pocs: Vec<i32>,
+    /// §8.4.1.2.3 — whether the picture at position `k` in
+    /// `ref_list_0_pocs` / `ref_list_1_pocs` is a long-term reference.
+    /// Parallel arrays to the `_pocs` arrays above. Needed for the
+    /// eq. 8-195 short-circuit.
+    pub ref_list_0_longterm: Vec<bool>,
+    pub ref_list_1_longterm: Vec<bool>,
 }
 
 impl Picture {
@@ -92,6 +112,10 @@ impl Picture {
             ref_idx_l0_grid: Vec::new(),
             ref_idx_l1_grid: Vec::new(),
             is_intra_grid: Vec::new(),
+            ref_list_0_pocs: Vec::new(),
+            ref_list_1_pocs: Vec::new(),
+            ref_list_0_longterm: Vec::new(),
+            ref_list_1_longterm: Vec::new(),
         }
     }
 

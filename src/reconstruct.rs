@@ -3485,6 +3485,22 @@ fn derive_inter_partitions<R: RefPicProvider>(
                     _ => (8, 8),
                 };
                 let sub_type = sm.sub_mb_type[mb_part];
+
+                // §8.4.1.2 — B_Direct_8x8 sub-MB: dispatch to the
+                // direct-mode derivation per `direct_spatial_mv_pred_flag`.
+                // Temporal direct (flag == 0) fills in precomputed MVs
+                // from the colocated block (same as B_Direct_16x16,
+                // restricted to this 8x8). Spatial direct still uses
+                // the median derivation from `derive_partition_mvs`.
+                if matches!(sub_type, SubMbType::BDirect8x8)
+                    && !slice_header.direct_spatial_mv_pred_flag
+                {
+                    parts.extend(build_temporal_direct_sub_partitions(
+                        sps, ref_pics, pic, mb_addr, part_x, part_y,
+                    ));
+                    continue;
+                }
+
                 let (mode, r0, r1) = b_sub_mode(
                     sub_type,
                     sm.ref_idx_l0[mb_part] as i8,
@@ -3535,6 +3551,116 @@ fn sub_mb_partitions(t: SubMbType) -> Vec<(u8, u8, u8, u8)> {
     }
 }
 
+/// §8.4.1.2.3 — derive one temporal-direct partition's `(refIdxL0,
+/// mvL0, mvL1)` for a single (mbAddr, block) colocated position.
+///
+/// Returns `Some((ref_idx_l0, mv_l0, mv_l1))` when the colocated
+/// picture is available; `None` if the provider didn't ship motion
+/// data (caller should fall back to (0,0,0,0)).
+fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
+    ref_pics: &R,
+    mb_addr: u32,
+    col_blk4: usize,
+    curr_poc: i32,
+) -> Option<(i8, Mv, Mv)> {
+    // §8.4.1.2.1 / Table 8-6 — colPic = RefPicList1[0] (frame-only
+    // decode — field / AFRM coding paths deferred).
+    let col_pic = ref_pics.ref_pic(1, 0)?;
+    let poc_pic1 = col_pic.pic_order_cnt;
+
+    // §8.4.1.2.1 — read (mvCol, refIdxCol) from the colocated block.
+    // Rule: if predFlagL0Col = 1, use L0; else if predFlagL1Col = 1,
+    // use L1; else (intra) mvCol = 0, refIdxCol = -1.
+    let l0 = col_pic.colocated_l0(mb_addr, col_blk4);
+    let l1 = col_pic.colocated_l1(mb_addr, col_blk4);
+    let is_intra = l0.as_ref().map(|t| t.2).unwrap_or(false)
+        || l1.as_ref().map(|t| t.2).unwrap_or(false);
+
+    // Extract (mvCol, refIdxCol, which_list) — "which_list" is the
+    // colocated picture's list index (0 or 1) the MV came from,
+    // needed to look up the referenced picture's POC later.
+    let (mv_col_i16, ref_idx_col, used_l1) = if is_intra {
+        ((0i16, 0i16), -1i8, false)
+    } else {
+        match (l0, l1) {
+            (Some((mv, rf, _)), _) if rf >= 0 => (mv, rf, false),
+            (_, Some((mv, rf, _))) if rf >= 0 => (mv, rf, true),
+            _ => ((0, 0), -1, false),
+        }
+    };
+
+    // §8.4.1.2.3 eq. 8-191 — refIdxL0 = (refIdxCol < 0) ? 0 :
+    //                                     MapColToList0(refIdxCol).
+    // MapColToList0: find the index in the current slice's
+    // RefPicList0 that refers to the picture the colocated block
+    // pointed at. We match by POC (picture identity).
+    //
+    // To perform that lookup, we need the colocated picture's
+    // reference list POCs. Those are snapshotted into the Picture
+    // struct at reconstruction time (`ref_list_0_pocs` /
+    // `ref_list_1_pocs`).
+    let curr_list0_pocs = ref_pics.ref_list_0_pocs();
+    let curr_list0_lt = ref_pics.ref_list_0_longterm();
+    let ref_idx_l0: i8 = if ref_idx_col < 0 {
+        0
+    } else {
+        let col_list = if used_l1 {
+            &col_pic.ref_list_1_pocs
+        } else {
+            &col_pic.ref_list_0_pocs
+        };
+        // POC of the picture the colocated block referenced.
+        match col_list.get(ref_idx_col as usize).copied() {
+            Some(ref_poc) => {
+                // Lowest-valued index in current slice's RefPicList0
+                // whose picture has the same POC (picture identity).
+                match curr_list0_pocs.iter().position(|&p| p == ref_poc) {
+                    Some(idx) => idx as i8,
+                    None => 0, // Fallback: pic not in current L0 → 0.
+                }
+            }
+            None => 0,
+        }
+    };
+
+    // pic0 = RefPicList0[refIdxL0] of the current slice.
+    let poc_pic0 = ref_pics
+        .ref_pic_poc(0, ref_idx_l0 as u32)
+        .unwrap_or(curr_poc);
+
+    // §8.4.1.2.3 eq. 8-195/8-196 short-circuit:
+    //   (a) refIdxL0 picture is long-term,
+    //   (b) DiffPicOrderCnt(pic1, pic0) == 0.
+    // Either triggers: mvL0 = mvCol, mvL1 = 0.
+    let pic0_is_long_term = curr_list0_lt
+        .get(ref_idx_l0 as usize)
+        .copied()
+        .unwrap_or(false);
+    let mv_col = Mv::new(mv_col_i16.0 as i32, mv_col_i16.1 as i32);
+
+    if pic0_is_long_term || poc_pic1 == poc_pic0 {
+        return Some((ref_idx_l0, mv_col, Mv::ZERO));
+    }
+
+    // eq. 8-201/8-202.
+    let tb = clip3_i32(-128, 127, curr_poc - poc_pic0);
+    let td = clip3_i32(-128, 127, poc_pic1 - poc_pic0);
+    if td == 0 {
+        return Some((ref_idx_l0, mv_col, Mv::ZERO));
+    }
+
+    // eq. 8-197/8-198/8-199/8-200.
+    // tx = (16384 + Abs(td/2)) / td
+    // Per spec §5.7 "/" truncates toward zero; Rust i32/i32 matches.
+    let tx = (16384 + (td / 2).abs()) / td;
+    let dsf = clip3_i32(-1024, 1023, (tb * tx + 32) >> 6);
+    let mvx_l0 = ((dsf * mv_col.x) + 128) >> 8;
+    let mvy_l0 = ((dsf * mv_col.y) + 128) >> 8;
+    let mv_l0 = Mv::new(mvx_l0, mvy_l0);
+    let mv_l1 = Mv::new(mv_l0.x - mv_col.x, mv_l0.y - mv_col.y);
+    Some((ref_idx_l0, mv_l0, mv_l1))
+}
+
 /// §8.4.1.2.3 — expand a B_Skip / B_Direct_16x16 macroblock into
 /// temporal-direct sub-partitions with pre-computed L0/L1 MVs.
 ///
@@ -3542,17 +3668,17 @@ fn sub_mb_partitions(t: SubMbType) -> Vec<(u8, u8, u8, u8)> {
 ///   - flag == 1: four 8x8 partitions (coarser derivation).
 ///   - flag == 0: sixteen 4x4 partitions (fine derivation).
 ///
-/// Each partition looks up the colocated (same mbAddr, same block)
-/// block's L0 MV in `RefPicList1[0]`, then applies eq. 8-197..8-200
-/// scaling using the POC of the current picture, `RefPicList1[0]`
-/// (pic1), and `RefPicList0[0]` (pic0) — we assume refIdxL0 = 0 for
-/// all direct-mode partitions, which is the common IBBP case.
-///
-/// If the colocated picture or its motion data is unavailable
-/// (e.g. very first reference picture, or the provider didn't ship
-/// grids), the partition falls back to (0, 0) MVs with refIdx = 0, 0 —
-/// a best-effort that is still closer to correct than the old
-/// spatial-median-of-(0,0) stub.
+/// Per partition:
+///   1. Read (mvCol, refIdxCol) from the colocated block in
+///      RefPicList1[0] (§8.4.1.2.1).
+///   2. refIdxL0 = (refIdxCol < 0) ? 0 : MapColToList0(refIdxCol)
+///      (eq. 8-191), refIdxL1 = 0 (eq. 8-192). MapColToList0 is
+///      performed by matching POCs between the colocated picture's
+///      per-slice RefPicList0 snapshot and the current slice's
+///      RefPicList0.
+///   3. If pic0 is long-term or DiffPicOrderCnt(pic1, pic0) == 0:
+///      mvL0 = mvCol, mvL1 = 0 (eq. 8-195/8-196).
+///   4. Else apply temporal scaling (eq. 8-197..8-200).
 fn build_temporal_direct_partitions<R: RefPicProvider>(
     sps: &Sps,
     ref_pics: &R,
@@ -3561,23 +3687,10 @@ fn build_temporal_direct_partitions<R: RefPicProvider>(
     is_skip: bool,
 ) -> Vec<InterPartition> {
     let curr_poc = pic.pic_order_cnt;
-    // RefPicList0[0] and RefPicList1[0] pictures for temporal scaling.
-    let poc_l0 = ref_pics.ref_pic_poc(0, 0).unwrap_or(curr_poc);
-    let poc_l1 = ref_pics.ref_pic_poc(1, 0).unwrap_or(curr_poc);
-    let col = ref_pics.ref_pic(1, 0);
-
     let use_8x8 = sps.direct_8x8_inference_flag;
     let block_size: u8 = if use_8x8 { 8 } else { 4 };
     let step = block_size as usize;
     let n_per_row = 16usize / step;
-
-    // Pre-compute the §8.4.1.2.3 tb / td / DistScaleFactor values.
-    // pic1 = RefPicList1[0], pic0 = RefPicList0[0], currPicOrField = curr_poc.
-    // eq. 8-201: tb = Clip3(-128, 127, DiffPicOrderCnt(curr, pic0))
-    // eq. 8-202: td = Clip3(-128, 127, DiffPicOrderCnt(pic1, pic0))
-    let tb = clip3_i32(-128, 127, curr_poc - poc_l0);
-    let td_raw = poc_l1 - poc_l0;
-    let td = clip3_i32(-128, 127, td_raw);
 
     let mut partitions = Vec::with_capacity(n_per_row * n_per_row);
     for by in 0..n_per_row {
@@ -3585,74 +3698,28 @@ fn build_temporal_direct_partitions<R: RefPicProvider>(
             let x = (bx * step) as u8;
             let y = (by * step) as u8;
 
-            // Colocated block lookup. For §8.4.1.2.3 the colocated
-            // block is at the same (mbAddr, block position) in
-            // RefPicList1[0]. We pick the 4x4 block in the top-left
-            // corner of this sub-partition as the representative block.
-            // For 8x8 direct_8x8_inference the spec permits using the
-            // top-left 4x4 as the colocated block for the whole 8x8
-            // (see the NOTE in §8.4.1.2.3).
-            let col_blk4 = {
-                let bx4 = bx * (step / 4);
-                let by4 = by * (step / 4);
-                blk4_raster_index(bx4 as u8, by4 as u8) as usize
-            };
-
-            // Read colocated motion info. We read L0 first; if the
-            // colocated block was coded with L0 only (refIdx>=0), we
-            // use its L0 MV. If the colocated L0 is unavailable (refIdx
-            // < 0 or intra), fall back to L1. If both are unavailable
-            // (intra), the block is "zero colZeroFlag" per §8.4.1.2.3
-            // and we use (0, 0) MVs.
-            let (mv_col, col_ref_is_available, col_is_intra) = if let Some(col_pic) = col {
-                let l0 = col_pic.colocated_l0(mb_addr, col_blk4);
-                let l1 = col_pic.colocated_l1(mb_addr, col_blk4);
-                let is_intra = l0.as_ref().map(|t| t.2).unwrap_or(false);
-                if is_intra {
-                    ((0i16, 0i16), false, true)
-                } else if let Some((mv, ref_idx, _)) = l0 {
-                    if ref_idx >= 0 {
-                        (mv, true, false)
-                    } else if let Some((mvl1, ref_idx_l1, _)) = l1 {
-                        (mvl1, ref_idx_l1 >= 0, false)
-                    } else {
-                        ((0, 0), false, false)
-                    }
-                } else {
-                    ((0, 0), false, false)
-                }
+            // §8.4.1.2.1 luma4x4BlkIdx — the 4x4 block index within
+            // the colocated MB that supplies (mvCol, refIdxCol):
+            //   - direct_8x8_inference_flag == 1: luma4x4BlkIdx =
+            //     5 * mbPartIdx, i.e. block indices 0, 5, 10, 15
+            //     (diagonal — one per 8x8 quadrant).
+            //   - direct_8x8_inference_flag == 0: luma4x4BlkIdx =
+            //     4 * mbPartIdx + subMbPartIdx — every 4x4 queried
+            //     independently.
+            let col_blk4 = if use_8x8 {
+                // mbPartIdx = 2*by + bx (by, bx each in 0..=1).
+                let mb_part_idx = 2 * by + bx;
+                5 * mb_part_idx
             } else {
-                ((0, 0), false, false)
+                // 4x4 granularity: raster position (bx, by) in
+                // units of 4-sample blocks.
+                blk4_raster_index(bx as u8, by as u8) as usize
             };
 
-            // Apply eq. 8-197..8-200 if td != 0 and the col ref is
-            // usable. Else use (mvCol, 0) per eq. 8-195/8-196.
-            let (mv_l0, mv_l1) = if !col_ref_is_available || td == 0 {
-                (
-                    Mv::new(mv_col.0 as i32, mv_col.1 as i32),
-                    Mv::ZERO,
-                )
-            } else {
-                // eq. 8-197: tx = (16384 + Abs(td/2)) / td
-                let tx = (16384 + (td.abs() / 2)) / td;
-                // eq. 8-198: DistScaleFactor = Clip3(-1024, 1023, (tb*tx + 32) >> 6)
-                let dsf = clip3_i32(-1024, 1023, (tb * tx + 32) >> 6);
-                // eq. 8-199: mvL0 = (DistScaleFactor * mvCol + 128) >> 8
-                // eq. 8-200: mvL1 = mvL0 - mvCol
-                let mvx_l0 = ((dsf * (mv_col.0 as i32)) + 128) >> 8;
-                let mvy_l0 = ((dsf * (mv_col.1 as i32)) + 128) >> 8;
-                let mvx_l1 = mvx_l0 - (mv_col.0 as i32);
-                let mvy_l1 = mvy_l0 - (mv_col.1 as i32);
-                (Mv::new(mvx_l0, mvy_l0), Mv::new(mvx_l1, mvy_l1))
-            };
+            let (ref_idx_l0, mv_l0, mv_l1) =
+                derive_temporal_direct_mvs_for_block(ref_pics, mb_addr, col_blk4, curr_poc)
+                    .unwrap_or((0, Mv::ZERO, Mv::ZERO));
 
-            // §8.4.1.2.3 — colZeroFlag determines refIdxL0 inference.
-            // For now we use refIdxL0 = 0, refIdxL1 = 0 (IBBP common
-            // case). Proper MapColToList0 requires tracking which
-            // L0 ref picture the colocated block pointed to AND
-            // finding the index of that same picture in the current
-            // slice's RefPicList0 — deferred.
-            let _ = col_is_intra;
             partitions.push(InterPartition {
                 x,
                 y,
@@ -3660,7 +3727,7 @@ fn build_temporal_direct_partitions<R: RefPicProvider>(
                 h: block_size,
                 mode: PartMode::Direct,
                 shape: MvpredShape::Default,
-                ref_idx_l0: 0,
+                ref_idx_l0,
                 ref_idx_l1: 0,
                 mvd_l0: (0, 0),
                 mvd_l1: (0, 0),
@@ -3670,6 +3737,71 @@ fn build_temporal_direct_partitions<R: RefPicProvider>(
         }
     }
 
+    partitions
+}
+
+/// §8.4.1.2.3 — derive temporal-direct partitions for one B_Direct_8x8
+/// sub-macroblock located at (`part_x`, `part_y`) within the current
+/// MB (both in luma samples, multiples of 8).
+///
+/// Mirrors [`build_temporal_direct_partitions`] but only covers the
+/// 8x8 area of the sub-MB. The granularity inside the 8x8 still
+/// follows `direct_8x8_inference_flag`:
+///   - flag == 1: one 8x8 partition.
+///   - flag == 0: four 4x4 partitions.
+fn build_temporal_direct_sub_partitions<R: RefPicProvider>(
+    sps: &Sps,
+    ref_pics: &R,
+    pic: &Picture,
+    mb_addr: u32,
+    part_x: u8,
+    part_y: u8,
+) -> Vec<InterPartition> {
+    let curr_poc = pic.pic_order_cnt;
+    let use_8x8 = sps.direct_8x8_inference_flag;
+    let block_size: u8 = if use_8x8 { 8 } else { 4 };
+    let step = block_size as usize;
+    let n_per_row = 8usize / step;
+
+    // §8.4.1.2.1 — for B_Direct_8x8, mbPartIdx is fixed by the
+    // sub-macroblock position: 2*(part_y/8) + (part_x/8).
+    let mb_part_idx = 2 * ((part_y / 8) as usize) + ((part_x / 8) as usize);
+
+    let mut partitions = Vec::with_capacity(n_per_row * n_per_row);
+    for sy in 0..n_per_row {
+        for sx in 0..n_per_row {
+            let x = part_x + (sx * step) as u8;
+            let y = part_y + (sy * step) as u8;
+
+            // §8.4.1.2.1 luma4x4BlkIdx.
+            let col_blk4 = if use_8x8 {
+                5 * mb_part_idx
+            } else {
+                // subMbPartIdx = 2*sy + sx for 4x4 granularity.
+                let sub_mb_part_idx = 2 * sy + sx;
+                4 * mb_part_idx + sub_mb_part_idx
+            };
+
+            let (ref_idx_l0, mv_l0, mv_l1) =
+                derive_temporal_direct_mvs_for_block(ref_pics, mb_addr, col_blk4, curr_poc)
+                    .unwrap_or((0, Mv::ZERO, Mv::ZERO));
+
+            partitions.push(InterPartition {
+                x,
+                y,
+                w: block_size,
+                h: block_size,
+                mode: PartMode::Direct,
+                shape: MvpredShape::Default,
+                ref_idx_l0,
+                ref_idx_l1: 0,
+                mvd_l0: (0, 0),
+                mvd_l1: (0, 0),
+                is_skip: false,
+                precomputed_mv: Some((mv_l0, mv_l1)),
+            });
+        }
+    }
     partitions
 }
 

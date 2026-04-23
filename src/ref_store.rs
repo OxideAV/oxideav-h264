@@ -34,6 +34,23 @@ pub trait RefPicProvider {
     fn ref_pic_poc(&self, list: u8, idx: u32) -> Option<i32> {
         self.ref_pic(list, idx).map(|p| p.pic_order_cnt)
     }
+
+    /// §8.4.1.2.3 — POCs of the current slice's full RefPicList0.
+    /// Used by the MapColToList0 derivation in temporal direct mode
+    /// to locate the index in the current slice's RefPicList0 that
+    /// matches a colocated picture's per-block L0 reference.
+    ///
+    /// Default returns an empty slice — call sites that do not need
+    /// this derivation (I/P slice reconstruction) need not override.
+    fn ref_list_0_pocs(&self) -> &[i32] {
+        &[]
+    }
+
+    /// §8.4.1.2.3 — parallel to `ref_list_0_pocs`: whether entry `k`
+    /// is a long-term reference in the current slice.
+    fn ref_list_0_longterm(&self) -> &[bool] {
+        &[]
+    }
 }
 
 /// A caller-supplied store mapping list indices to decoded pictures.

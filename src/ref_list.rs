@@ -161,7 +161,7 @@ impl DpbEntry {
     }
 
     /// True if this entry is a long-term reference.
-    fn is_long_term(&self) -> bool {
+    pub fn is_long_term(&self) -> bool {
         matches!(self.marking, RefMarking::LongTerm)
     }
 
