@@ -4419,20 +4419,23 @@ fn different_ref_or_mv_luma(
         let straight_fails = straight_refs_match && !straight_mv_ok;
         let swapped_fails = swapped_refs_match && !swapped_mv_ok;
         straight_fails || swapped_fails
-    } else if p_has_l0 {
-        // L0-only on both sides (typical P-slice case). Both point to
-        // an L0-indexed picture; "different pictures" is per POC, and
-        // MV delta drives the rest.
-        if p_pic0 != q_pic0 {
+    } else if p_has_l0 || p_has_l1 {
+        // §8.7.2.1 "one motion vector is used to predict p0 and one
+        // motion vector is used to predict q0" clause. p_count == q_count
+        // == 1 here (we're past the bi branch and the count-mismatch
+        // early return). Single-prediction can still come from different
+        // lists on the two sides, so resolve which list each side uses
+        // and match picture by POC, not by list index.
+        //
+        // NOTE 1 of §8.7.2.1: the reference picture is determined by
+        // actual picture identity (POC), without regard to list or list
+        // index.
+        let (p_pic, p_mv) = if p_has_l0 { (p_pic0, p_mv0) } else { (p_pic1, p_mv1) };
+        let (q_pic, q_mv) = if q_has_l0 { (q_pic0, q_mv0) } else { (q_pic1, q_mv1) };
+        if p_pic != q_pic {
             return true;
         }
-        !mv_delta_below_4(p_mv0, q_mv0)
-    } else if p_has_l1 {
-        // L1-only on both sides.
-        if p_pic1 != q_pic1 {
-            return true;
-        }
-        !mv_delta_below_4(p_mv1, q_mv1)
+        !mv_delta_below_4(p_mv, q_mv)
     } else {
         // Neither list active — no MV info; keep bS=0 for this edge
         // (the intra/coef bullets would have handled any interesting
