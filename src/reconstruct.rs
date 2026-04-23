@@ -2515,12 +2515,27 @@ fn process_partition<R: RefPicProvider>(
                     // both just like BiPred.
                     if part.mode != PartMode::L1Only {
                         info.ref_idx_l0[q_idx] = part.ref_idx_l0;
+                        // §8.7.2.1 NOTE 1 — also capture the POC of the
+                        // referenced picture so later slices (with possibly
+                        // different RefPicList0) can compare picture identity
+                        // cross-slice without consulting a picture-wide
+                        // snapshot that may belong to a different slice.
+                        if part.ref_idx_l0 >= 0 {
+                            info.ref_poc_l0[q_idx] = ref_pics
+                                .ref_pic_poc(0, part.ref_idx_l0 as u32)
+                                .unwrap_or(i32::MIN);
+                        }
                     }
                     if matches!(
                         part.mode,
                         PartMode::L1Only | PartMode::BiPred | PartMode::Direct
                     ) {
                         info.ref_idx_l1[q_idx] = part.ref_idx_l1;
+                        if part.ref_idx_l1 >= 0 {
+                            info.ref_poc_l1[q_idx] = ref_pics
+                                .ref_pic_poc(1, part.ref_idx_l1 as u32)
+                                .unwrap_or(i32::MIN);
+                        }
                     }
                 }
             }
@@ -4558,8 +4573,6 @@ fn different_ref_or_mv_luma(
     p_in_mb_y: u32,
     q_in_mb_x: u32,
     q_in_mb_y: u32,
-    ref_list_0_pocs: &[i32],
-    ref_list_1_pocs: &[i32],
 ) -> bool {
     // 4x4 block index inside the MB follows the §6.4.3 Figure 6-10
     // Z-scan — NOT simple raster. Reuse `blk4_raster_index`, which
@@ -4581,21 +4594,17 @@ fn different_ref_or_mv_luma(
     let q_has_l1 = q_ref1 >= 0;
 
     // §8.7.2.1 NOTE 1 — picture identity is by POC (actual referenced
-    // picture), NOT by list+index. Resolve each ref_idx to its POC
-    // through the current slice's RefPicList0 / RefPicList1 snapshot.
-    // Missing entries (shouldn't happen for valid streams) fall back
-    // to a sentinel that won't compare equal to any real POC.
+    // picture), NOT by list+index. Read the resolved POCs stored in
+    // MbInfo directly: each side's ref_idx was looked up through *its
+    // own slice's* RefPicListX at reconstruct-time, avoiding the
+    // multi-slice cross-reference bug that a single picture-wide
+    // snapshot would introduce (CABAST3_Sony_E: slice 1 = P, slice 2 = B
+    // with distinct lists).
     let poc_sentinel: i32 = i32::MIN;
-    let poc_of = |list_pocs: &[i32], idx: i8| -> i32 {
-        if idx < 0 {
-            return poc_sentinel;
-        }
-        list_pocs.get(idx as usize).copied().unwrap_or(poc_sentinel)
-    };
-    let p_pic0 = poc_of(ref_list_0_pocs, p_ref0);
-    let q_pic0 = poc_of(ref_list_0_pocs, q_ref0);
-    let p_pic1 = poc_of(ref_list_1_pocs, p_ref1);
-    let q_pic1 = poc_of(ref_list_1_pocs, q_ref1);
+    let p_pic0 = if p_has_l0 { p_info.ref_poc_l0[p_blk8] } else { poc_sentinel };
+    let q_pic0 = if q_has_l0 { q_info.ref_poc_l0[q_blk8] } else { poc_sentinel };
+    let p_pic1 = if p_has_l1 { p_info.ref_poc_l1[p_blk8] } else { poc_sentinel };
+    let q_pic1 = if q_has_l1 { q_info.ref_poc_l1[q_blk8] } else { poc_sentinel };
 
     // "Number of motion vectors" per §8.7.2.1 NOTE 2 is
     // PredFlagL0[part] + PredFlagL1[part]. Two edges with the same
@@ -4721,11 +4730,12 @@ fn deblock_plane_luma(
     let mb_w = grid.width_in_mbs as i32;
     let mb_h = grid.height_in_mbs as i32;
     // §8.7.2.1 NOTE 1 — picture-identity comparison is by POC of the
-    // referenced picture, not by list+index. Snapshot the picture's
-    // RefPicList0/1 POCs so `different_ref_or_mv_luma` can resolve
-    // ref_idx values to actual picture identities.
-    let ref_list_0_pocs = pic.ref_list_0_pocs.clone();
-    let ref_list_1_pocs = pic.ref_list_1_pocs.clone();
+    // referenced picture, not by list+index. Each MB's per-partition POCs
+    // are stored in `MbInfo::ref_poc_l0/l1` (populated during inter
+    // reconstruction through the *current slice's* ref list), so
+    // `different_ref_or_mv_luma` can read them directly without a
+    // picture-wide snapshot that would be wrong for multi-slice pictures
+    // where slices have different ref lists.
 
     // §8.7.1 — "Filtering process for block edges". Order:
     // for each MB in raster scan:
@@ -4806,8 +4816,6 @@ fn deblock_plane_luma(
                             p_in_mb_y,
                             q_in_mb_x,
                             q_in_mb_y,
-                            &ref_list_0_pocs,
-                            &ref_list_1_pocs,
                         );
                     // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
                     // Consult the per-block mask set at reconstruct-time.
@@ -4897,8 +4905,6 @@ fn deblock_plane_luma(
                             p_in_mb_y,
                             q_in_mb_x,
                             q_in_mb_y,
-                            &ref_list_0_pocs,
-                            &ref_list_1_pocs,
                         );
                     // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
                     let p_blk4_z =
@@ -4962,9 +4968,8 @@ fn deblock_plane_chroma(
         .as_ref()
         .map(|e| e.second_chroma_qp_index_offset)
         .unwrap_or(pps.chroma_qp_index_offset);
-    // §8.7.2.1 NOTE 1 — see deblock_plane_luma.
-    let ref_list_0_pocs = pic.ref_list_0_pocs.clone();
-    let ref_list_1_pocs = pic.ref_list_1_pocs.clone();
+    // §8.7.2.1 NOTE 1 — see deblock_plane_luma; `different_ref_or_mv_luma`
+    // reads per-MB POCs directly from `MbInfo::ref_poc_l0/l1`.
     let (sub_w, sub_h) = chroma_subsample(pic.chroma_array_type);
     if sub_w == 0 || pic.chroma_array_type == 0 {
         return;
@@ -5051,8 +5056,6 @@ fn deblock_plane_chroma(
                                     p_in_mb_y,
                                     q_in_mb_x,
                                     q_in_mb_y,
-                                    &ref_list_0_pocs,
-                                    &ref_list_1_pocs,
                                 );
                             let p_blk4_z =
                                 blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
@@ -5155,8 +5158,6 @@ fn deblock_plane_chroma(
                                     p_in_mb_y,
                                     q_in_mb_x,
                                     q_in_mb_y,
-                                    &ref_list_0_pocs,
-                                    &ref_list_1_pocs,
                                 );
                             let p_blk4_z =
                                 blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)

@@ -88,6 +88,20 @@ pub struct MbInfo {
     pub ref_idx_l0: [i8; 4],
     /// Per-8x8-partition list-1 ref_idx. `-1` means "L1 not used".
     pub ref_idx_l1: [i8; 4],
+    /// §8.7.2.1 NOTE 1 — per-8x8-partition POC of the list-0 referenced
+    /// picture, resolved at reconstruct-time through the *current slice's*
+    /// RefPicList0. `i32::MIN` = "unset / L0 not used".
+    ///
+    /// Stored directly here (rather than looked up via
+    /// `Picture::ref_list_0_pocs` at deblock time) because different slices
+    /// of a single primary coded picture may have different ref lists; the
+    /// picture-level deblock pass walks MBs across slice boundaries and so
+    /// must resolve each side's ref_idx through its *own* slice's list.
+    /// Multi-slice-type pictures (CABAST3_Sony_E) exercise this.
+    pub ref_poc_l0: [i32; 4],
+    /// Per-8x8-partition POC of the list-1 referenced picture.
+    /// `i32::MIN` = "unset / L1 not used".
+    pub ref_poc_l1: [i32; 4],
     /// §6.4.8 third bullet — slice identity used to mark a neighbour as
     /// "not available" when it belongs to a different slice than the
     /// current macroblock. Monotonically assigned within a primary coded
@@ -121,6 +135,10 @@ impl Default for MbInfo {
             // §8.4.1.3.2 — "not used" => refIdx = -1.
             ref_idx_l0: [-1; 4],
             ref_idx_l1: [-1; 4],
+            // i32::MIN sentinel means "unset" — never compares equal to any
+            // real POC, matching the `poc_sentinel` semantics in deblocking.
+            ref_poc_l0: [i32::MIN; 4],
+            ref_poc_l1: [i32::MIN; 4],
             // §6.4.8 — unset until the MB is reconstructed (prevents
             // pre-decode MBs from being treated as in-slice neighbours).
             slice_id: -1,
