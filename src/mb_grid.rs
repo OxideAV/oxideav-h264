@@ -88,6 +88,15 @@ pub struct MbInfo {
     pub ref_idx_l0: [i8; 4],
     /// Per-8x8-partition list-1 ref_idx. `-1` means "L1 not used".
     pub ref_idx_l1: [i8; 4],
+    /// §6.4.8 third bullet — slice identity used to mark a neighbour as
+    /// "not available" when it belongs to a different slice than the
+    /// current macroblock. Monotonically assigned within a primary coded
+    /// picture (0, 1, 2, …) — the raw
+    /// `first_mb_in_slice` can't be used directly because it doesn't
+    /// increase monotonically across different slice groups.
+    ///
+    /// `-1` sentinel means "unset" (MB not yet decoded in this picture).
+    pub slice_id: i32,
 }
 
 impl Default for MbInfo {
@@ -112,6 +121,9 @@ impl Default for MbInfo {
             // §8.4.1.3.2 — "not used" => refIdx = -1.
             ref_idx_l0: [-1; 4],
             ref_idx_l1: [-1; 4],
+            // §6.4.8 — unset until the MB is reconstructed (prevents
+            // pre-decode MBs from being treated as in-slice neighbours).
+            slice_id: -1,
         }
     }
 }

@@ -374,6 +374,50 @@ pub fn reconstruct_slice<R: RefPicProvider>(
     pic: &mut Picture,
     grid: &mut MbGrid,
 ) -> Result<(), ReconstructError> {
+    reconstruct_slice_no_deblock(slice_data, slice_header, sps, pps, ref_pics, pic, grid)?;
+
+    // §8.7 picture-level deblock for the single-slice-per-picture case.
+    // Callers doing multi-slice assembly must use
+    // `reconstruct_slice_no_deblock` + `deblock_picture_full` at picture
+    // finalization time so the deblocker runs exactly once, after all
+    // slices have deposited their MBs into the shared grid.
+    let bit_depth_y = 8 + sps.bit_depth_luma_minus8;
+    let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
+    let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
+    let deblock_enabled = slice_header.disable_deblocking_filter_idc != 1;
+    let deblock_env_off = std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok();
+    if deblock_enabled && !deblock_env_off {
+        let alpha_off = slice_header.slice_alpha_c0_offset_div2 * 2;
+        let beta_off = slice_header.slice_beta_offset_div2 * 2;
+        deblock_picture_full(
+            pic,
+            grid,
+            alpha_off,
+            beta_off,
+            bit_depth_y,
+            bit_depth_c,
+            pps,
+            mbaff_frame_flag,
+            &slice_data.mb_field_decoding_flags,
+        );
+    }
+    Ok(())
+}
+
+/// §8.4 slice reconstruction without the §8.7 deblocking pass — meant
+/// for multi-slice picture assembly where several slices share a
+/// `Picture` + `MbGrid`. Callers must invoke [`deblock_picture_full`]
+/// exactly once after the final slice of the picture has been
+/// reconstructed so the deblocker sees the fully-populated grid.
+pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
+    slice_data: &SliceData,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    ref_pics: &R,
+    pic: &mut Picture,
+    grid: &mut MbGrid,
+) -> Result<(), ReconstructError> {
     // -------- Preconditions -----------------------------------------
     let chroma_array_type = sps.chroma_array_type();
     if chroma_array_type == 3 {
@@ -446,6 +490,11 @@ pub fn reconstruct_slice<R: RefPicProvider>(
         };
 
         // Reconstruct this MB's samples.
+        // §6.4.8 — the current MB's slice identity (used to reject
+        // cross-slice neighbours in §8.3.1.1 intra-pred-mode derivation).
+        // `first_mb_in_slice` is unique per slice of a primary coded
+        // picture and already carried on the slice header (§7.3.3).
+        let current_slice_id = slice_header.first_mb_in_slice as i32;
         if mb.mb_type.is_intra() {
             reconstruct_mb_intra(
                 mb,
@@ -460,6 +509,7 @@ pub fn reconstruct_slice<R: RefPicProvider>(
                 grid,
                 mbaff_frame_flag,
                 mb_field_decoding_flag,
+                current_slice_id,
             )?;
         } else {
             reconstruct_mb_inter(
@@ -477,6 +527,7 @@ pub fn reconstruct_slice<R: RefPicProvider>(
                 grid,
                 mbaff_frame_flag,
                 mb_field_decoding_flag,
+                current_slice_id,
             )?;
         }
 
@@ -496,6 +547,14 @@ pub fn reconstruct_slice<R: RefPicProvider>(
             if let Some(pred) = mb.mb_pred.as_ref() {
                 info.intra_chroma_pred_mode = pred.intra_chroma_pred_mode;
             }
+            // §6.4.8 third bullet — stamp this MB with the slice it
+            // belongs to. `first_mb_in_slice` serves as a unique slice
+            // identifier within a primary coded picture (§7.3.3 —
+            // different values across the picture's slices) without
+            // requiring a separate counter threaded through the decoder.
+            // The cast is safe: first_mb_in_slice <= 2^16 for any valid
+            // H.264 picture size (Table A-1 MaxMbs).
+            info.slice_id = slice_header.first_mb_in_slice as i32;
         }
 
         prev_qp_y = mb_qp_y;
@@ -511,24 +570,54 @@ pub fn reconstruct_slice<R: RefPicProvider>(
         }
     }
 
-    // -------- Deblocking (§8.7) picture-level pass ------------------
-    // OXIDEAV_H264_NO_DEBLOCK — test-only knob to skip the §8.7 pass.
-    let deblock_env_off = std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok();
-    if deblock_enabled && !deblock_env_off {
-        deblock_picture(
-            pic,
-            grid,
-            alpha_off,
-            beta_off,
-            bit_depth_y,
-            bit_depth_c,
-            pps,
-            mbaff_frame_flag,
-            &slice_data.mb_field_decoding_flags,
-        );
-    }
-
+    // Deblocking is deferred so a multi-slice picture only runs §8.7 once,
+    // after every slice has contributed to the shared Picture + MbGrid.
+    // Single-slice callers should use `reconstruct_slice` instead, which
+    // wraps this helper and invokes the deblocker.
+    let _ = (deblock_enabled, alpha_off, beta_off, bit_depth_y, bit_depth_c);
     Ok(())
+}
+
+/// §8.7 picture-level deblocking filter entry point for multi-slice
+/// callers. Deferring the deblocking pass until the whole picture has
+/// been decoded means the right-/bottom-neighbour MBs of the last MB in
+/// an early slice aren't seen as "unavailable" when the filter runs, and
+/// — critically — already-deblocked edges aren't re-filtered by the
+/// next slice's own deblock pass.
+///
+/// `alpha_off` / `beta_off` are the §7.4.3 `slice_alpha_c0_offset_div2`
+/// and `slice_beta_offset_div2` values doubled into the final loop-filter
+/// offsets, taken from the first slice of the picture. Multi-slice
+/// pictures that vary these per slice are a known simplification; the
+/// conformance streams we target use uniform deblock offsets across the
+/// picture.
+#[allow(clippy::too_many_arguments)]
+pub fn deblock_picture_full(
+    pic: &mut Picture,
+    grid: &MbGrid,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    pps: &Pps,
+    mbaff_frame_flag: bool,
+    mb_field_flags: &[bool],
+) {
+    let deblock_env_off = std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok();
+    if deblock_env_off {
+        return;
+    }
+    deblock_picture(
+        pic,
+        grid,
+        alpha_off,
+        beta_off,
+        bit_depth_y,
+        bit_depth_c,
+        pps,
+        mbaff_frame_flag,
+        mb_field_flags,
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -549,6 +638,7 @@ fn reconstruct_mb_intra(
     grid: &mut MbGrid,
     mbaff_frame_flag: bool,
     mb_field_decoding_flag: bool,
+    current_slice_id: i32,
 ) -> Result<(), ReconstructError> {
     // §6.4.1 — MB sample origin (non-MBAFF eqs. 6-3/6-4 or MBAFF eqs.
     // 6-5..6-10 depending on `mb_field_decoding_flag`).
@@ -614,11 +704,14 @@ fn reconstruct_mb_intra(
                 sps,
                 pps,
                 pic,
+                grid,
+                current_slice_id,
             )?;
         }
         MbType::INxN => {
             reconstruct_intra_nxn(
                 mb, qp_y, bit_depth_y, mb_px, mb_py, mb_addr, &writer, sps, pps, pic, grid,
+                current_slice_id,
             )?;
             reconstruct_chroma_intra(
                 mb,
@@ -631,6 +724,8 @@ fn reconstruct_mb_intra(
                 sps,
                 pps,
                 pic,
+                grid,
+                current_slice_id,
             )?;
         }
         _ => {
@@ -665,9 +760,11 @@ fn reconstruct_intra_16x16(
     sps: &Sps,
     pps: &Pps,
     pic: &mut Picture,
+    grid: &MbGrid,
+    current_slice_id: i32,
 ) -> Result<(), ReconstructError> {
     // -------- §8.3.3 — 16x16 prediction -----------------------------
-    let samples = gather_samples_16x16(pic, mb_px, mb_py);
+    let samples = gather_samples_16x16(pic, grid, mb_px, mb_py, current_slice_id);
     let mode = Intra16x16Mode::from_index(pred_mode_idx).ok_or_else(|| {
         ReconstructError::UnsupportedMbType(format!("Intra_16x16 pred_mode {}", pred_mode_idx))
     })?;
@@ -734,6 +831,8 @@ fn reconstruct_intra_16x16(
         sps,
         pps,
         pic,
+        grid,
+        current_slice_id,
     )?;
 
     Ok(())
@@ -743,15 +842,24 @@ fn reconstruct_intra_16x16(
 // §8.3.1 / §8.3.2 — Intra_4x4 / Intra_8x8 luma
 // -------------------------------------------------------------------------
 
-/// §6.4.4 — "is this MB available for prediction?" for the §8.3.1.1 /
-/// §8.3.2.1 pred-mode derivation. Returns `false` when the neighbour
-/// lies outside the picture, when it hasn't been decoded yet (per the
-/// MbGrid `available` flag), or when `constrained_intra_pred_flag` is 1
-/// and the neighbour is inter-coded (§8.3.1.1 step 2 bullet 3/4).
+/// §6.4.8 / §6.4.4 — "is this MB available for prediction?" for the
+/// §8.3.1.1 / §8.3.2.1 pred-mode derivation. Returns `None` when the
+/// neighbour lies outside the picture, when it hasn't been decoded yet
+/// (per the MbGrid `available` flag), when `constrained_intra_pred_flag`
+/// is 1 and the neighbour is inter-coded (§8.3.1.1 step 2 bullet 3/4),
+/// or when the neighbour belongs to a different slice than the current
+/// macroblock (§6.4.8 third bullet).
+///
+/// `current_slice_id` selects the slice identity to compare against —
+/// pass the value that will be stamped into the *current* MB's
+/// `MbInfo::slice_id`. Pass `-1` in unit tests / standalone callers that
+/// don't care about slice boundaries; the slice filter is disabled when
+/// either side of the comparison is `-1` (unstamped).
 fn intra_neighbour_mb_info<'a>(
     grid: &'a MbGrid,
     mb_addr: Option<u32>,
     constrained_intra_pred: bool,
+    current_slice_id: i32,
 ) -> Option<&'a MbInfo> {
     let addr = mb_addr?;
     let info = grid.get(addr)?;
@@ -762,6 +870,12 @@ fn intra_neighbour_mb_info<'a>(
         // §8.3.1.1 steps 2 bullets 3 & 4 / §8.3.2.1 step 2 bullets 3 & 4
         // — an inter-coded neighbour is treated as unavailable for the
         // purposes of the dcPredModePredictedFlag derivation.
+        return None;
+    }
+    // §6.4.8 third bullet — neighbours in a different slice are marked
+    // "not available". The `-1` sentinel skips this check so unit tests
+    // and pre-slice-id callers keep their old semantics.
+    if current_slice_id >= 0 && info.slice_id >= 0 && info.slice_id != current_slice_id {
         return None;
     }
     Some(info)
@@ -878,6 +992,7 @@ fn intra_mxm_pred_mode_for_neighbour_4x4(
     dc_pred_flag: bool,
     neighbour: Option<(u32, usize)>,
     constrained_intra_pred: bool,
+    current_slice_id: i32,
 ) -> u8 {
     if dc_pred_flag {
         // §8.3.1.1 step 3 bullet 1 — DC fallback.
@@ -886,7 +1001,7 @@ fn intra_mxm_pred_mode_for_neighbour_4x4(
     let Some((addr, blk)) = neighbour else {
         return 2;
     };
-    let Some(info) = intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred) else {
+    let Some(info) = intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred, current_slice_id) else {
         return 2;
     };
     if mb_is_intra_4x4(info) {
@@ -915,6 +1030,7 @@ fn intra_mxm_pred_mode_for_neighbour_8x8(
     neighbour: Option<(u32, usize)>,
     constrained_intra_pred: bool,
     n_for_4x4: usize,
+    current_slice_id: i32,
 ) -> u8 {
     if dc_pred_flag {
         return 2;
@@ -922,7 +1038,7 @@ fn intra_mxm_pred_mode_for_neighbour_8x8(
     let Some((addr, blk)) = neighbour else {
         return 2;
     };
-    let Some(info) = intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred) else {
+    let Some(info) = intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred, current_slice_id) else {
         return 2;
     };
     if mb_is_intra_8x8(info) {
@@ -948,6 +1064,7 @@ fn derive_intra_4x4_pred_mode(
     block_idx: usize,
     pred: &crate::macroblock_layer::MbPred,
     constrained_intra_pred: bool,
+    current_slice_id: i32,
 ) -> u8 {
     let (bx, by) = LUMA_4X4_XY[block_idx];
     // §6.4.11.4 step 1 / Table 6-2: A → (xD, yD) = (-1, 0); B → (0, -1).
@@ -955,19 +1072,19 @@ fn derive_intra_4x4_pred_mode(
     let nb = neighbour_4x4_addr(grid, mb_addr, bx, by, 0, -1);
 
     // §8.3.1.1 step 2.
-    let mb_a = intra_neighbour_mb_info(grid, na.map(|(a, _)| a), constrained_intra_pred);
-    let mb_b = intra_neighbour_mb_info(grid, nb.map(|(a, _)| a), constrained_intra_pred);
+    let mb_a = intra_neighbour_mb_info(grid, na.map(|(a, _)| a), constrained_intra_pred, current_slice_id);
+    let mb_b = intra_neighbour_mb_info(grid, nb.map(|(a, _)| a), constrained_intra_pred, current_slice_id);
     let dc_pred_flag = mb_a.is_none() || mb_b.is_none();
 
     // §8.3.1.1 step 3.
     let mode_a =
-        intra_mxm_pred_mode_for_neighbour_4x4(grid, dc_pred_flag, na, constrained_intra_pred);
+        intra_mxm_pred_mode_for_neighbour_4x4(grid, dc_pred_flag, na, constrained_intra_pred, current_slice_id);
     let mode_b =
-        intra_mxm_pred_mode_for_neighbour_4x4(grid, dc_pred_flag, nb, constrained_intra_pred);
+        intra_mxm_pred_mode_for_neighbour_4x4(grid, dc_pred_flag, nb, constrained_intra_pred, current_slice_id);
 
     // §8.3.1.1 step 4, eq. 8-41.
     let predicted = mode_a.min(mode_b);
-    if pred.prev_intra4x4_pred_mode_flag[block_idx] {
+    let actual = if pred.prev_intra4x4_pred_mode_flag[block_idx] {
         predicted
     } else {
         let rem = pred.rem_intra4x4_pred_mode[block_idx];
@@ -976,7 +1093,8 @@ fn derive_intra_4x4_pred_mode(
         } else {
             rem + 1
         }
-    }
+    };
+    actual
 }
 
 /// §8.3.2.1 — compute `Intra8x8PredMode[luma8x8BlkIdx]` for 8x8 block
@@ -989,20 +1107,21 @@ fn derive_intra_8x8_pred_mode(
     blk8: usize,
     pred: &crate::macroblock_layer::MbPred,
     constrained_intra_pred: bool,
+    current_slice_id: i32,
 ) -> u8 {
     // §6.4.11.2 step 1 / Table 6-2: A → (xD, yD) = (-1, 0); B → (0, -1).
     let na = neighbour_8x8_addr(grid, mb_addr, blk8, -1, 0);
     let nb = neighbour_8x8_addr(grid, mb_addr, blk8, 0, -1);
 
-    let mb_a = intra_neighbour_mb_info(grid, na.map(|(a, _)| a), constrained_intra_pred);
-    let mb_b = intra_neighbour_mb_info(grid, nb.map(|(a, _)| a), constrained_intra_pred);
+    let mb_a = intra_neighbour_mb_info(grid, na.map(|(a, _)| a), constrained_intra_pred, current_slice_id);
+    let mb_b = intra_neighbour_mb_info(grid, nb.map(|(a, _)| a), constrained_intra_pred, current_slice_id);
     let dc_pred_flag = mb_a.is_none() || mb_b.is_none();
 
     // Non-MBAFF frame path of §8.3.2.1 eq. 8-72: n = 1 for A, n = 2 for B.
     let mode_a =
-        intra_mxm_pred_mode_for_neighbour_8x8(grid, dc_pred_flag, na, constrained_intra_pred, 1);
+        intra_mxm_pred_mode_for_neighbour_8x8(grid, dc_pred_flag, na, constrained_intra_pred, 1, current_slice_id);
     let mode_b =
-        intra_mxm_pred_mode_for_neighbour_8x8(grid, dc_pred_flag, nb, constrained_intra_pred, 2);
+        intra_mxm_pred_mode_for_neighbour_8x8(grid, dc_pred_flag, nb, constrained_intra_pred, 2, current_slice_id);
 
     // §8.3.2.1 step 4, eq. 8-73.
     let predicted = mode_a.min(mode_b);
@@ -1031,6 +1150,7 @@ fn reconstruct_intra_nxn(
     pps: &Pps,
     pic: &mut Picture,
     grid: &mut MbGrid,
+    current_slice_id: i32,
 ) -> Result<(), ReconstructError> {
     let pred = mb
         .mb_pred
@@ -1061,6 +1181,10 @@ fn reconstruct_intra_nxn(
         // a previously-reconstructed picture can't bleed through.
         info.intra_4x4_pred_modes = [0; 16];
         info.intra_8x8_pred_modes = [0; 4];
+        // §6.4.8 — stamp slice_id eagerly so
+        // `intra_neighbour_mb_info` / `same_slice_at` see the current MB
+        // as in-slice when later blocks of this same MB consult it.
+        info.slice_id = current_slice_id;
     }
 
     if mb.transform_size_8x8_flag {
@@ -1068,11 +1192,11 @@ fn reconstruct_intra_nxn(
         for blk8 in 0..4usize {
             let (bx, by) = LUMA_8X8_XY[blk8];
             // §8.3.2.1 — derive Intra_8x8 prediction mode per eq. 8-73.
-            let mode_idx = derive_intra_8x8_pred_mode(grid, mb_addr, blk8, pred, cip);
+            let mode_idx = derive_intra_8x8_pred_mode(grid, mb_addr, blk8, pred, cip, current_slice_id);
             let mode = Intra8x8Mode::from_index(mode_idx).unwrap_or(Intra8x8Mode::Dc);
 
             // Gather neighbour samples for this 8x8 block.
-            let raw = gather_samples_8x8(pic, mb_px + bx, mb_py + by, blk8);
+            let raw = gather_samples_8x8(pic, grid, mb_px + bx, mb_py + by, blk8, current_slice_id);
             let filtered = filter_samples_8x8(&raw, bit_depth_y);
             let mut pred_samples = [0i32; 64];
             predict_8x8(mode, &filtered, bit_depth_y, &mut pred_samples);
@@ -1180,11 +1304,12 @@ fn reconstruct_intra_nxn(
         for block_idx in 0..16usize {
             let (bx, by) = LUMA_4X4_XY[block_idx];
             // §8.3.1.1 — derive Intra_4x4 prediction mode per eq. 8-41.
-            let mode_idx = derive_intra_4x4_pred_mode(grid, mb_addr, block_idx, pred, cip);
+            let mode_idx = derive_intra_4x4_pred_mode(grid, mb_addr, block_idx, pred, cip, current_slice_id);
             let mode = Intra4x4Mode::from_index(mode_idx).unwrap_or(Intra4x4Mode::Dc);
 
             // Gather neighbour samples for this 4x4 block.
-            let samples = gather_samples_4x4(pic, mb_px + bx, mb_py + by, block_idx);
+            let samples =
+                gather_samples_4x4(pic, grid, mb_px + bx, mb_py + by, block_idx, current_slice_id);
             let mut pred_samples = [0i32; 16];
             predict_4x4(mode, &samples, bit_depth_y, &mut pred_samples);
 
@@ -1282,6 +1407,8 @@ fn reconstruct_chroma_intra(
     sps: &Sps,
     pps: &Pps,
     pic: &mut Picture,
+    grid: &MbGrid,
+    current_slice_id: i32,
 ) -> Result<(), ReconstructError> {
     // Monochrome: no chroma work to do.
     if chroma_array_type == 0 {
@@ -1330,10 +1457,29 @@ fn reconstruct_chroma_intra(
     let sl4_cb = select_scaling_list_4x4(1, sps, pps);
     let sl4_cr = select_scaling_list_4x4(2, sps, pps);
 
+    // §8.3.4 subwidth / subheight used to project chroma coordinates
+    // back to picture-absolute luma so the slice-id check in
+    // `gather_samples_chroma` hits the right grid MB.
+    let (sub_width_c, sub_height_c) = match chroma_array_type {
+        1 => (2, 2), // 4:2:0
+        2 => (2, 1), // 4:2:2
+        _ => (1, 1),
+    };
+
     // Per plane: gather samples, predict, inverse-transform residual,
     // combine.
     for plane in 0..2u8 {
-        let samples = gather_samples_chroma(pic, c_mb_px, c_mb_py, ct, plane);
+        let samples = gather_samples_chroma(
+            pic,
+            grid,
+            c_mb_px,
+            c_mb_py,
+            ct,
+            plane,
+            current_slice_id,
+            sub_width_c,
+            sub_height_c,
+        );
         let out_len = (mbw_c as usize) * (mbh_c as usize);
         let mut pred_samples = vec![0i32; out_len];
         predict_chroma(chroma_mode, &samples, ct, bit_depth_c, &mut pred_samples);
@@ -1454,10 +1600,17 @@ fn chroma_block_xy(chroma_array_type: u32, blk: usize) -> (i32, i32) {
 /// (mb_px, mb_py). Availability derived solely from picture boundaries
 /// — full §6.4.11 availability (including constrained_intra_pred)
 /// should be layered by the caller when needed.
-fn gather_samples_16x16(pic: &Picture, mb_px: i32, mb_py: i32) -> Samples16x16 {
-    let left_avail = mb_px > 0;
-    let top_avail = mb_py > 0;
-    let tl_avail = left_avail && top_avail;
+fn gather_samples_16x16(
+    pic: &Picture,
+    grid: &MbGrid,
+    mb_px: i32,
+    mb_py: i32,
+    current_slice_id: i32,
+) -> Samples16x16 {
+    let left_avail = mb_px > 0 && same_slice_at(grid, mb_px - 1, mb_py, current_slice_id);
+    let top_avail = mb_py > 0 && same_slice_at(grid, mb_px, mb_py - 1, current_slice_id);
+    let tl_avail =
+        mb_px > 0 && mb_py > 0 && same_slice_at(grid, mb_px - 1, mb_py - 1, current_slice_id);
 
     let top_left = if tl_avail {
         pic.luma_at(mb_px - 1, mb_py - 1)
@@ -1505,10 +1658,18 @@ fn gather_samples_16x16(pic: &Picture, mb_px: i32, mb_py: i32) -> Samples16x16 {
 /// is marked "not available for Intra_4x4 prediction"; the §8.3.1.2
 /// substitution rule (copy p[3, -1] into p[4..7, -1]) then kicks in
 /// inside the intra-pred helpers.
-fn gather_samples_4x4(pic: &Picture, bx: i32, by: i32, block_idx: usize) -> Samples4x4 {
-    let left_avail = bx > 0;
-    let top_avail = by > 0;
-    let tl_avail = left_avail && top_avail;
+fn gather_samples_4x4(
+    pic: &Picture,
+    grid: &MbGrid,
+    bx: i32,
+    by: i32,
+    block_idx: usize,
+    current_slice_id: i32,
+) -> Samples4x4 {
+    let left_avail = bx > 0 && same_slice_at(grid, bx - 1, by, current_slice_id);
+    let top_avail = by > 0 && same_slice_at(grid, bx, by - 1, current_slice_id);
+    let tl_avail =
+        bx > 0 && by > 0 && same_slice_at(grid, bx - 1, by - 1, current_slice_id);
     // Top-right availability: the 4 samples at (bx+4..=bx+7, by-1) must
     // (a) lie in an above-row (i.e. `top_avail`), (b) fit inside the
     // picture horizontally, AND (c) come from a 4x4 block that has
@@ -1518,8 +1679,10 @@ fn gather_samples_4x4(pic: &Picture, bx: i32, by: i32, block_idx: usize) -> Samp
     // 7/13/15 need samples from the right-neighbour macroblock which
     // hasn't been decoded yet when the current MB is being processed.
     let tr_scan_ok = !matches!(block_idx, 3 | 7 | 11 | 13 | 15);
-    let tr_avail =
-        top_avail && tr_scan_ok && (bx + 4 < pic.width_in_samples as i32);
+    let tr_avail = by > 0
+        && tr_scan_ok
+        && (bx + 4 < pic.width_in_samples as i32)
+        && same_slice_at(grid, bx + 4, by - 1, current_slice_id);
 
     let top_left = if tl_avail {
         pic.luma_at(bx - 1, by - 1)
@@ -1562,6 +1725,38 @@ fn gather_samples_4x4(pic: &Picture, bx: i32, by: i32, block_idx: usize) -> Samp
     }
 }
 
+/// §6.4.8 — is the macroblock containing picture-absolute luma sample
+/// `(x, y)` in the same slice as the current macroblock?
+///
+/// `current_slice_id < 0` is the "don't-know / don't-care" escape hatch
+/// that keeps legacy / unit-test callers' semantics unchanged. A grid
+/// entry with `slice_id == -1` means the MB was either never
+/// reconstructed or pre-dates slice-id stamping (e.g., the current MB
+/// being reconstructed — `reconstruct_intra_nxn`'s preamble stamps
+/// `slice_id` along with `available`); we treat it as "match" so the
+/// check only rejects MBs explicitly stamped with a different slice.
+/// Out-of-picture coordinates answer `true` so the caller's own
+/// picture-boundary check remains the single source of truth for that
+/// case.
+fn same_slice_at(grid: &MbGrid, x: i32, y: i32, current_slice_id: i32) -> bool {
+    if current_slice_id < 0 {
+        return true;
+    }
+    if x < 0 || y < 0 {
+        return true;
+    }
+    let mb_x = (x >> 4) as u32;
+    let mb_y = (y >> 4) as u32;
+    if mb_x >= grid.width_in_mbs || mb_y >= grid.height_in_mbs {
+        return true;
+    }
+    let addr = mb_y * grid.width_in_mbs + mb_x;
+    match grid.get(addr) {
+        Some(info) if info.slice_id >= 0 => info.slice_id == current_slice_id,
+        _ => true,
+    }
+}
+
 /// §8.3.2 — reference samples for an 8x8 block at (bx, by).
 ///
 /// `blk8` is the luma8x8BlkIdx (0..=3) of this 8x8 block within its
@@ -1571,13 +1766,23 @@ fn gather_samples_4x4(pic: &Picture, bx: i32, by: i32, block_idx: usize) -> Samp
 /// so its top-right is always "not available" regardless of the
 /// picture bounds. The §8.3.2.2 substitution rule (copy p[7, -1] into
 /// p[8..15, -1]) then applies inside `filter_samples_8x8`.
-fn gather_samples_8x8(pic: &Picture, bx: i32, by: i32, blk8: usize) -> Samples8x8 {
-    let left_avail = bx > 0;
-    let top_avail = by > 0;
-    let tl_avail = left_avail && top_avail;
+fn gather_samples_8x8(
+    pic: &Picture,
+    grid: &MbGrid,
+    bx: i32,
+    by: i32,
+    blk8: usize,
+    current_slice_id: i32,
+) -> Samples8x8 {
+    let left_avail = bx > 0 && same_slice_at(grid, bx - 1, by, current_slice_id);
+    let top_avail = by > 0 && same_slice_at(grid, bx, by - 1, current_slice_id);
+    let tl_avail =
+        bx > 0 && by > 0 && same_slice_at(grid, bx - 1, by - 1, current_slice_id);
     let tr_scan_ok = blk8 != 3;
-    let tr_avail =
-        top_avail && tr_scan_ok && (bx + 8 < pic.width_in_samples as i32);
+    let tr_avail = by > 0
+        && tr_scan_ok
+        && (bx + 8 < pic.width_in_samples as i32)
+        && same_slice_at(grid, bx + 8, by - 1, current_slice_id);
 
     let top_left = if tl_avail {
         pic.luma_at(bx - 1, by - 1)
@@ -1623,16 +1828,28 @@ fn gather_samples_8x8(pic: &Picture, bx: i32, by: i32, blk8: usize) -> Samples8x
 /// §8.3.4 — chroma reference samples for plane `plane` (0 = Cb, 1 = Cr).
 fn gather_samples_chroma(
     pic: &Picture,
+    grid: &MbGrid,
     c_mb_px: i32,
     c_mb_py: i32,
     ct: IpChromaArrayType,
     plane: u8,
+    current_slice_id: i32,
+    sub_width_c: i32,
+    sub_height_c: i32,
 ) -> SamplesChroma {
     let w = ct.width();
     let h = ct.height();
-    let left_avail = c_mb_px > 0;
-    let top_avail = c_mb_py > 0;
-    let tl_avail = left_avail && top_avail;
+    // Chroma (c_mb_px, c_mb_py) → picture-absolute luma sample coordinate
+    // so we can look the owning MB up in the slice grid.
+    let to_lx = |cx: i32| cx * sub_width_c;
+    let to_ly = |cy: i32| cy * sub_height_c;
+    let left_avail = c_mb_px > 0
+        && same_slice_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py), current_slice_id);
+    let top_avail = c_mb_py > 0
+        && same_slice_at(grid, to_lx(c_mb_px), to_ly(c_mb_py - 1), current_slice_id);
+    let tl_avail = c_mb_px > 0
+        && c_mb_py > 0
+        && same_slice_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py - 1), current_slice_id);
 
     let fetch = |x: i32, y: i32| -> i32 {
         if plane == 0 {
@@ -1822,6 +2039,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     grid: &mut MbGrid,
     mbaff_frame_flag: bool,
     mb_field_decoding_flag: bool,
+    current_slice_id: i32,
 ) -> Result<(), ReconstructError> {
     // §6.4.1 — MB sample origin (MBAFF-aware).
     let (mb_px, mb_py) =
@@ -1879,6 +2097,13 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     let mut pred_cb = vec![0i32; (mbw_c as usize) * (mbh_c as usize)];
     let mut pred_cr = vec![0i32; (mbw_c as usize) * (mbh_c as usize)];
 
+    // §6.4.8 — stamp the current MB's slice identity eagerly so that
+    // later partitions' MVpred neighbour lookups (within the same MB)
+    // see this MB as in-slice via `same_slice_at` / `neighbour_from_block`.
+    if let Some(info) = grid.get_mut(mb_addr) {
+        info.slice_id = current_slice_id;
+    }
+
     for part in &partitions {
         process_partition(
             part,
@@ -1897,6 +2122,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             &mut pred_cb,
             &mut pred_cr,
             inter_debug,
+            current_slice_id,
         )?;
     }
 
@@ -2229,12 +2455,13 @@ fn process_partition<R: RefPicProvider>(
     pred_cb: &mut [i32],
     pred_cr: &mut [i32],
     inter_debug: bool,
+    current_slice_id: i32,
 ) -> Result<(), ReconstructError> {
     let _ = pic; // currently unused; kept for future neighbour queries.
                  // §8.4.1 — derive L0 / L1 MVpreds. For Direct / Skip we compute MVs
                  // up-front via derive_p_skip_mv or a simple spatial-direct stub.
                  // Everything else uses mvLX = mvpLX + mvdLX (eq. 8-174-ish in §8.4.1).
-    let (mv_l0, mv_l1) = derive_partition_mvs(part, mb_addr, grid);
+    let (mv_l0, mv_l1) = derive_partition_mvs(part, mb_addr, grid, current_slice_id);
     if inter_debug {
         eprintln!(
             "    derived mv_l0={:?} mv_l1={:?} for part@({},{} {}x{})",
@@ -2893,7 +3120,12 @@ fn mc_chroma_partition(
 ///
 /// Neighbour MV data is read from the grid. The partition's shape
 /// selects the §8.4.1.3 shortcut (16x8 / 8x16) when applicable.
-fn derive_partition_mvs(part: &InterPartition, mb_addr: u32, grid: &MbGrid) -> (Mv, Mv) {
+fn derive_partition_mvs(
+    part: &InterPartition,
+    mb_addr: u32,
+    grid: &MbGrid,
+    current_slice_id: i32,
+) -> (Mv, Mv) {
     // §8.4.1.2.3 — direct-mode partitions may carry pre-computed L0/L1
     // MVs (e.g. temporal direct). Honour them directly.
     if let Some((mv_l0, mv_l1)) = part.precomputed_mv {
@@ -2909,9 +3141,9 @@ fn derive_partition_mvs(part: &InterPartition, mb_addr: u32, grid: &MbGrid) -> (
     // substitution applied inside `derive_mvpred_with_d` /
     // `derive_p_skip_mv_with_d`.
     let (neigh_a_l0, neigh_b_l0, neigh_c_l0, neigh_d_l0) =
-        neighbour_mvs_for_list(part, mb_addr, grid, 0);
+        neighbour_mvs_for_list(part, mb_addr, grid, 0, current_slice_id);
     let (neigh_a_l1, neigh_b_l1, neigh_c_l1, neigh_d_l1) =
-        neighbour_mvs_for_list(part, mb_addr, grid, 1);
+        neighbour_mvs_for_list(part, mb_addr, grid, 1, current_slice_id);
 
     let (mv_l0, mv_l1) = match part.mode {
         PartMode::Direct => {
@@ -3026,6 +3258,7 @@ fn neighbour_mvs_for_list(
     mb_addr: u32,
     grid: &MbGrid,
     list: u8,
+    current_slice_id: i32,
 ) -> (NeighbourMv, NeighbourMv, NeighbourMv, NeighbourMv) {
     // Partition origin in 4x4 units, relative to MB.
     let px = part.x as i32 / 4;
@@ -3036,15 +3269,23 @@ fn neighbour_mvs_for_list(
     let mb_yy = mb_yy as i32;
 
     // A = (px-1, py) — left.
-    let a = neighbour_from_block(grid, mb_addr, mb_xx, mb_yy, width, px - 1, py, list);
+    let a = neighbour_from_block(
+        grid, mb_addr, mb_xx, mb_yy, width, px - 1, py, list, current_slice_id,
+    );
     // B = (px, py-1) — above.
-    let b = neighbour_from_block(grid, mb_addr, mb_xx, mb_yy, width, px, py - 1, list);
+    let b = neighbour_from_block(
+        grid, mb_addr, mb_xx, mb_yy, width, px, py - 1, list, current_slice_id,
+    );
     // C = (px + w/4, py - 1) — above-right of the partition.
     let c_off_x = part.w as i32 / 4;
-    let c = neighbour_from_block(grid, mb_addr, mb_xx, mb_yy, width, px + c_off_x, py - 1, list);
+    let c = neighbour_from_block(
+        grid, mb_addr, mb_xx, mb_yy, width, px + c_off_x, py - 1, list, current_slice_id,
+    );
     // D = (px - 1, py - 1) — above-left (used for §8.4.1.3.2 C→D
     // substitution). Only consulted when C is unavailable.
-    let d = neighbour_from_block(grid, mb_addr, mb_xx, mb_yy, width, px - 1, py - 1, list);
+    let d = neighbour_from_block(
+        grid, mb_addr, mb_xx, mb_yy, width, px - 1, py - 1, list, current_slice_id,
+    );
     (a, b, c, d)
 }
 
@@ -3070,6 +3311,7 @@ fn neighbour_from_block(
     bx: i32,
     by: i32,
     list: u8,
+    current_slice_id: i32,
 ) -> NeighbourMv {
     // Wrap to neighbour MB.
     let mut nx = mb_xx;
@@ -3106,6 +3348,19 @@ fn neighbour_from_block(
     // right-MB neighbour not yet decoded).
     let is_same_mb = addr == curr_mb_addr;
     if !is_same_mb && !info.available {
+        return NeighbourMv::UNAVAILABLE;
+    }
+    // §6.4.8 third bullet — neighbours that belong to a different slice
+    // than the current MB are marked not available. The current MB is
+    // always in-slice (same as itself), and the `-1` escape hatch in
+    // `same_slice_at` makes legacy callers that don't stamp slice_ids
+    // see the old behaviour. Skip the check for same-MB lookups so
+    // in-flight partitions of the current MB remain accessible.
+    if !is_same_mb
+        && current_slice_id >= 0
+        && info.slice_id >= 0
+        && info.slice_id != current_slice_id
+    {
         return NeighbourMv::UNAVAILABLE;
     }
     // §8.4.1.3.2 — intra neighbour => mvLXN = 0, refIdxLXN = -1 for
@@ -5733,7 +5988,7 @@ mod tests {
         let grid = MbGrid::new(1, 1);
         let mut pred = MbPred::default();
         pred.prev_intra4x4_pred_mode_flag[0] = true;
-        let mode = derive_intra_4x4_pred_mode(&grid, 0, 0, &pred, false);
+        let mode = derive_intra_4x4_pred_mode(&grid, 0, 0, &pred, false, -1);
         assert_eq!(mode, 2, "expected DC when both A and B are unavailable");
     }
 
@@ -5760,7 +6015,7 @@ mod tests {
         pred.prev_intra4x4_pred_mode_flag[1] = false;
         pred.rem_intra4x4_pred_mode[1] = 3;
         // predicted = 2 (DC), rem = 3, 3 < 2 is false → actual = 3 + 1 = 4.
-        let mode = derive_intra_4x4_pred_mode(&grid, 0, 1, &pred, false);
+        let mode = derive_intra_4x4_pred_mode(&grid, 0, 1, &pred, false, -1);
         assert_eq!(mode, 4);
     }
 
@@ -5784,7 +6039,7 @@ mod tests {
         let mut pred = MbPred::default();
         pred.prev_intra4x4_pred_mode_flag[0] = false;
         pred.rem_intra4x4_pred_mode[0] = 0;
-        let mode = derive_intra_4x4_pred_mode(&grid, 1, 0, &pred, false);
+        let mode = derive_intra_4x4_pred_mode(&grid, 1, 0, &pred, false, -1);
         assert_eq!(mode, 0);
     }
 
@@ -5811,7 +6066,7 @@ mod tests {
         let mut pred = MbPred::default();
         pred.prev_intra4x4_pred_mode_flag[0] = false;
         pred.rem_intra4x4_pred_mode[0] = 1;
-        let mode = derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false);
+        let mode = derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1);
         assert_eq!(mode, 1);
     }
 
@@ -5830,9 +6085,9 @@ mod tests {
         let mut pred = MbPred::default();
         pred.prev_intra4x4_pred_mode_flag[0] = false;
         pred.rem_intra4x4_pred_mode[0] = 3;
-        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 4);
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1), 4);
         pred.rem_intra4x4_pred_mode[0] = 5;
-        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 6);
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1), 6);
     }
 
     #[test]
@@ -5866,7 +6121,7 @@ mod tests {
         // Without constrained_intra_pred_flag: A=inter contributes 2
         // (step 3 bullet 1 via "not Intra_4x4 or Intra_8x8"), B=6.
         // predicted = min(2, 6) = 2. With prev_flag=true → 2.
-        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 2);
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1), 2);
         // With constrained_intra_pred_flag = 1: A treated as
         // unavailable → dcPredFlag = 1 → both sides 2 → predicted = 2.
         // Same output 2 here. Swap in an intra left neighbour with
@@ -5876,17 +6131,17 @@ mod tests {
             // Now left is intra, all modes 0 → predicted = min(0, 6) = 0.
             *info = mk_intra4x4_info(0);
         }
-        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 0);
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1), 0);
         // Even with CIPred=1, because the neighbour IS intra it remains
         // available for intra prediction → same result 0.
-        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, true), 0);
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, true, -1), 0);
         // Switch left back to inter; with CIPred=1 it becomes
         // unavailable → dcPredFlag = 1 → predicted = 2.
         if let Some(info) = grid.get_mut(3) {
             info.available = true;
             info.is_intra = false;
         }
-        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, true), 2);
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, true, -1), 2);
     }
 
     #[test]
@@ -5910,7 +6165,7 @@ mod tests {
         let mut pred = MbPred::default();
         pred.prev_intra4x4_pred_mode_flag[0] = true;
         // A = Intra_16x16 → 2, B = Intra_4x4[10] = 7. predicted = min(2, 7) = 2.
-        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 2);
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1), 2);
     }
 
     /// Regression test: in I slices `mb_type_raw = 5` is
@@ -5949,7 +6204,7 @@ mod tests {
         // A (left, I_NxN) → 3. B (top, I_16x16) → 2 (DC). Predicted
         // = min(3, 2) = 2. Bug would have yielded B = 7 →
         // predicted = min(3, 7) = 3.
-        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 2);
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1), 2);
     }
 
     #[test]
@@ -5979,7 +6234,7 @@ mod tests {
         // predicted = min(2, 6) = 2.
         let mut pred = MbPred::default();
         pred.prev_intra4x4_pred_mode_flag[0] = true;
-        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false), 2);
+        assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1), 2);
     }
 
     #[test]
@@ -5988,7 +6243,7 @@ mod tests {
         let grid = MbGrid::new(1, 1);
         let mut pred = MbPred::default();
         pred.prev_intra8x8_pred_mode_flag[0] = true;
-        assert_eq!(derive_intra_8x8_pred_mode(&grid, 0, 0, &pred, false), 2);
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 0, 0, &pred, false, -1), 2);
     }
 
     #[test]
@@ -6009,14 +6264,14 @@ mod tests {
         }
         let mut pred = MbPred::default();
         pred.prev_intra8x8_pred_mode_flag[0] = true;
-        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false), 3);
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false, -1), 3);
         // rem = 2 (< 3) with prev_flag=false → actual = 2.
         pred.prev_intra8x8_pred_mode_flag[0] = false;
         pred.rem_intra8x8_pred_mode[0] = 2;
-        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false), 2);
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false, -1), 2);
         // rem = 4 (>= 3) → actual = 5.
         pred.rem_intra8x8_pred_mode[0] = 4;
-        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false), 5);
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false, -1), 5);
     }
 
     #[test]
@@ -6044,7 +6299,7 @@ mod tests {
         // predicted = min(4, 6) = 4.
         let mut pred = MbPred::default();
         pred.prev_intra8x8_pred_mode_flag[0] = true;
-        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false), 4);
+        assert_eq!(derive_intra_8x8_pred_mode(&grid, 4, 0, &pred, false, -1), 4);
     }
 
     #[test]
@@ -7520,7 +7775,7 @@ mod tests {
 
         // flag=0: inter-left contributes 2, top contributes 0 →
         // predicted = min(2, 0) = 0 (Vertical).
-        let mode_unconstrained = derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false);
+        let mode_unconstrained = derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1);
         assert_eq!(
             mode_unconstrained, 0,
             "flag=0: inter-left → mode 2; top=0 → min = 0"
@@ -7528,7 +7783,7 @@ mod tests {
 
         // flag=1: inter-left treated as unavailable → dcPredFlag = 1
         // → predicted = 2 regardless of top → actual = 2.
-        let mode_constrained = derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, true);
+        let mode_constrained = derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, true, -1);
         assert_eq!(
             mode_constrained, 2,
             "flag=1: inter-left unavailable → DC fallback (mode 2)"
@@ -7635,8 +7890,9 @@ mod tests {
         // Map luma4x4BlkIdx -> (bx, by) inside MB 0 (LUMA_4X4_XY).
         let xy = super::LUMA_4X4_XY;
 
+        let grid = crate::mb_grid::MbGrid::new(4, 2);
         for (idx, (bx, by)) in xy.iter().copied().enumerate() {
-            let s = super::gather_samples_4x4(&pic, bx, by, idx);
+            let s = super::gather_samples_4x4(&pic, &grid, bx, by, idx, -1);
             let expected = match idx {
                 // Scan-order "top-right not yet decoded" set.
                 3 | 7 | 11 | 13 | 15 => false,
@@ -7662,8 +7918,9 @@ mod tests {
     #[test]
     fn gather_samples_8x8_top_right_unavailable_for_blk3() {
         let pic = Picture::new(64, 32, 1, 8, 8);
+        let grid = crate::mb_grid::MbGrid::new(4, 2);
         // LUMA_8X8_XY[3] == (8, 8).
-        let s = super::gather_samples_8x8(&pic, 8, 8, 3);
+        let s = super::gather_samples_8x8(&pic, &grid, 8, 8, 3, -1);
         assert!(
             !s.availability.top_right,
             "blk8 3: tr should be false (right-neighbour MB not decoded)"
@@ -7671,7 +7928,7 @@ mod tests {
         // And blk8 == 2 at (0, 8) — top-right here is block 1 within
         // the current MB, which HAS been decoded; report true (the
         // top row is also inside the picture).
-        let s2 = super::gather_samples_8x8(&pic, 0, 8, 2);
+        let s2 = super::gather_samples_8x8(&pic, &grid, 0, 8, 2, -1);
         assert!(s2.availability.top_right);
     }
 

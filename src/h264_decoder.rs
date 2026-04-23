@@ -103,6 +103,22 @@ struct PictureInProgress {
     pts: Option<i64>,
     /// Packet time_base for rescaling downstream.
     time_base: TimeBase,
+    /// §8.7 deblocking state from the *first* slice of the picture.
+    /// Multi-slice pictures that vary deblocking_filter_idc / alpha_off /
+    /// beta_off per slice are a known simplification — the JVT
+    /// conformance streams we target encode uniform per-picture
+    /// deblock offsets. Kept so `finalize_in_progress_picture` can run
+    /// the §8.7 pass exactly once, after every slice has populated the
+    /// shared Picture + MbGrid.
+    deblock_enabled: bool,
+    deblock_alpha_off: i32,
+    deblock_beta_off: i32,
+    /// §7.4.4 — per-MB `mb_field_decoding_flag` aggregated across every
+    /// slice of the picture, indexed by picture-level macroblock
+    /// address. `slice_data.mb_field_decoding_flags` is slice-local so
+    /// we copy it into this picture-wide vector using the raw
+    /// CurrMbAddr walk the slice data parser produced.
+    mb_field_flags: Vec<bool>,
 }
 
 /// Registry factory — called by the codec registry when a container
@@ -469,6 +485,13 @@ impl H264CodecDecoder {
             let pts = self.pending_pts.take();
             let time_base = self.pending_time_base;
 
+            let deblock_enabled = header.disable_deblocking_filter_idc != 1;
+            let deblock_alpha_off = header.slice_alpha_c0_offset_div2 * 2;
+            let deblock_beta_off = header.slice_beta_offset_div2 * 2;
+            let mb_count =
+                (sps.pic_width_in_mbs() * sps.frame_height_in_mbs()) as usize;
+            let mb_field_flags = vec![false; mb_count];
+
             self.in_progress = Some(PictureInProgress {
                 pic,
                 grid,
@@ -481,6 +504,10 @@ impl H264CodecDecoder {
                 structure,
                 pts,
                 time_base,
+                deblock_enabled,
+                deblock_alpha_off,
+                deblock_beta_off,
+                mb_field_flags,
             });
         }
 
@@ -662,7 +689,7 @@ impl H264CodecDecoder {
             list_0_pocs,
             list_0_longterm,
         };
-        reconstruct::reconstruct_slice(
+        reconstruct::reconstruct_slice_no_deblock(
             &sd,
             header,
             sps,
@@ -672,6 +699,21 @@ impl H264CodecDecoder {
             &mut in_progress.grid,
         )
         .map_err(|e| Error::invalid(format!("h264 reconstruct: {e}")))?;
+
+        // §7.4.4 — copy this slice's per-MB mb_field_decoding_flag
+        // values into the picture-wide array so `finalize_in_progress_picture`
+        // can hand the whole picture's flags to the deblocker in one shot.
+        // `sd.macroblocks[i]` corresponds to macroblock address
+        // `first_mb_in_slice * (1 + MbaffFrameFlag) + i` in the raster /
+        // slice-group-0 walk.
+        let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !header.field_pic_flag;
+        let mut curr_addr = (header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag))) as usize;
+        for flag in sd.mb_field_decoding_flags.iter().copied() {
+            if let Some(slot) = in_progress.mb_field_flags.get_mut(curr_addr) {
+                *slot = flag;
+            }
+            curr_addr = curr_addr.saturating_add(1);
+        }
 
         Ok(())
     }
@@ -698,6 +740,10 @@ impl H264CodecDecoder {
             structure,
             pts,
             time_base,
+            deblock_enabled,
+            deblock_alpha_off,
+            deblock_beta_off,
+            mb_field_flags,
         } = in_progress;
 
         // §8.4.1.2.3 temporal direct needs the colocated block's MVs
@@ -715,6 +761,37 @@ impl H264CodecDecoder {
             .active_sps()
             .cloned()
             .ok_or_else(|| Error::invalid("h264: finalize with no active SPS"))?;
+        let pps = self
+            .driver
+            .active_pps()
+            .cloned()
+            .ok_or_else(|| Error::invalid("h264: finalize with no active PPS"))?;
+
+        // §8.7 — one picture-level deblocking pass, AFTER every slice of
+        // this primary coded picture has populated the shared
+        // Picture + MbGrid. Running it per-slice (the old behaviour)
+        // would re-filter already-deblocked edges when a later slice's
+        // pass revisits them with more MBs marked `available`, corrupting
+        // the pixels near slice boundaries. Multi-slice pictures are
+        // exercised by the JVT SVA_Base_B (CAVLC IP, 3 slices/pic) and
+        // SL1_SVA_B (CAVLC IPB, 3 slices/pic) conformance streams.
+        let bit_depth_y = 8 + sps.bit_depth_luma_minus8;
+        let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
+        let mbaff_frame_flag =
+            sps.mb_adaptive_frame_field_flag && !first_header.field_pic_flag;
+        if deblock_enabled {
+            reconstruct::deblock_picture_full(
+                &mut pic,
+                &grid,
+                deblock_alpha_off,
+                deblock_beta_off,
+                bit_depth_y,
+                bit_depth_c,
+                &pps,
+                mbaff_frame_flag,
+                &mb_field_flags,
+            );
+        }
 
         // §8.2.5 — decoded reference picture marking.
         let mut current_entry = DpbEntry {
@@ -1646,6 +1723,10 @@ mod tests {
             structure: PicStructure::Frame,
             pts: None,
             time_base: TimeBase::new(1, 1),
+            deblock_enabled: false,
+            deblock_alpha_off: 0,
+            deblock_beta_off: 0,
+            mb_field_flags: Vec::new(),
         });
     }
 
