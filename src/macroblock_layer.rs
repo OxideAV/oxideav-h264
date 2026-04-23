@@ -83,6 +83,23 @@ pub enum MacroblockLayerError {
     /// Unsupported ChromaArrayType for the residual walker.
     #[error("ChromaArrayType {0} not supported in residual walker")]
     UnsupportedChromaArrayType(u32),
+    /// §7.3.5 / §9.3.1.2 — I_PCM macroblock encountered in CABAC mode.
+    /// Reading the `pcm_sample_*` bits and re-initialising the CABAC
+    /// engine (codIRange = 510, codIOffset = read_bits(9)) cannot happen
+    /// inside `parse_macroblock()` because the underlying rbsp buffer
+    /// and the `CabacDecoder` ownership live at the slice-data walker
+    /// level. Callers must catch this variant, read the PCM samples
+    /// from the bitstream at `(cabac_byte_pos, cabac_bit_pos)` (the
+    /// byte/bit cursor of the CABAC engine's internal reader *after*
+    /// the I_PCM bin terminated — byte-align first, then read 256 luma
+    /// + 2 * MbWidthC * MbHeightC chroma samples), then rebuild the
+    /// `CabacDecoder` with `CabacDecoder::new(BitReader::new(...))`
+    /// positioned after the PCM payload.
+    #[error("I_PCM macroblock in CABAC mode requires slice-level reinit at byte {cabac_byte_pos} bit {cabac_bit_pos}")]
+    IPcmNeedsCabacReinit {
+        cabac_byte_pos: usize,
+        cabac_bit_pos: u8,
+    },
 }
 
 pub type McblResult<T> = Result<T, MacroblockLayerError>;
@@ -2004,11 +2021,21 @@ pub fn parse_macroblock(
     // §7.3.5 — I_PCM path.
     // ---------------------------------------------------------------
     if mb_type.is_i_pcm() {
-        // Byte-align in CAVLC mode. CABAC already renormalises to bit
-        // boundaries; byte alignment for I_PCM in CABAC uses a different
-        // path (§9.3.1.2) not supported in this pass.
-        if entropy.cabac.is_some() {
-            return Err(MacroblockLayerError::UnsupportedChromaArrayType(999));
+        // §9.3.1.2 — in CABAC mode, I_PCM triggers a re-init of the
+        // arithmetic decoding engine (codIRange=510, codIOffset=
+        // read_bits(9)) after any pcm_alignment_zero_bit and all
+        // pcm_sample_luma / pcm_sample_chroma bits. That re-init and
+        // the raw PCM sample read must happen at the slice-data layer
+        // (which owns the rbsp buffer and the `CabacDecoder`): surface
+        // the CABAC engine's current reader cursor so the slice-data
+        // walker can locate the PCM payload in the rbsp and rebuild
+        // the decoder. See `MacroblockLayerError::IPcmNeedsCabacReinit`.
+        if let Some((dec, _)) = entropy.cabac.as_ref() {
+            let (byte, bit) = dec.position();
+            return Err(MacroblockLayerError::IPcmNeedsCabacReinit {
+                cabac_byte_pos: byte,
+                cabac_bit_pos: bit,
+            });
         }
         while !r.byte_aligned() {
             // §7.3.5: pcm_alignment_zero_bit shall be 0. We tolerate

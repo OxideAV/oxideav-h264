@@ -48,7 +48,7 @@ use crate::cabac_ctx::{
 };
 use crate::macroblock_layer::{
     parse_macroblock, CabacNeighbourGrid, CavlcNcGrid, EntropyState, Macroblock,
-    MacroblockLayerError,
+    MacroblockLayerError, MbType, PcmSamples,
 };
 use crate::pps::Pps;
 use crate::slice_header::{SliceHeader, SliceType};
@@ -431,18 +431,169 @@ pub fn parse_slice_data(
                     pic_width_in_mbs: pic_w_mbs,
                 };
                 let (byte, bit) = r.position();
-                let mb = parse_macroblock(
+                let mb_result = parse_macroblock(
                     &mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr,
-                )
-                .map_err(|source| SliceDataError::MacroblockAt {
-                    mb_addr: curr_mb_addr,
-                    byte,
-                    bit,
-                    source,
-                })?;
+                );
                 // §9.3.3.1.1.5 — carry the rolling flag forward for
-                // the next MB's mb_qp_delta ctxIdxInc.
-                prev_mb_qp_delta_nonzero_slice = entropy.prev_mb_qp_delta_nonzero;
+                // the next MB's mb_qp_delta ctxIdxInc. The entropy
+                // borrow ends with `parse_macroblock` returning; read
+                // the flag before we drop it. For I_PCM (handled in
+                // the error arm below), this value is overridden to 0
+                // per §9.3.3.1.1.5.
+                let next_qp_delta_flag = entropy.prev_mb_qp_delta_nonzero;
+                drop(entropy);
+                let mut next_qp_delta_flag = next_qp_delta_flag;
+                let mb = match mb_result {
+                    Ok(m) => m,
+                    Err(MacroblockLayerError::IPcmNeedsCabacReinit {
+                        cabac_byte_pos,
+                        cabac_bit_pos,
+                    }) => {
+                        // §7.3.5 / §9.3.1.2 — I_PCM macroblock under
+                        // CABAC. The arithmetic decoder has consumed
+                        // the mb_type bins (including the I_PCM
+                        // terminator bin via DecodeTerminate); its
+                        // reader cursor is at
+                        // (cabac_byte_pos, cabac_bit_pos) inside the
+                        // CABAC segment (which itself starts at
+                        // `byte_pos` inside `rbsp`). The PCM payload
+                        // is read AS RAW BITS from the rbsp: first
+                        // byte-align (pcm_alignment_zero_bit), then
+                        // 256 * bit_depth_luma luma samples, then
+                        // 2 * MbWidthC * MbHeightC * bit_depth_chroma
+                        // chroma samples. After the PCM payload, the
+                        // CABAC engine is re-initialised (codIRange=
+                        // 510, codIOffset=read_bits(9)) — context
+                        // states are NOT re-initialised.
+                        let pcm_abs_byte = byte_pos + cabac_byte_pos;
+                        let mut pcm_r = position_reader(rbsp, pcm_abs_byte, cabac_bit_pos)?;
+                        while !pcm_r.byte_aligned() {
+                            // pcm_alignment_zero_bit — tolerate any value.
+                            let _ = pcm_r.u(1)?;
+                        }
+                        let bit_depth_y: u32 = 8 + sps.bit_depth_luma_minus8;
+                        let bit_depth_c: u32 = 8 + sps.bit_depth_chroma_minus8;
+                        // §6.2 Table 6-1 — chroma sample counts per MB.
+                        let (num_cb, num_cr): (usize, usize) = match chroma_array_type {
+                            0 => (0, 0),
+                            1 => (64, 64),    // 4:2:0 → 2 * 8 * 8
+                            2 => (128, 128),  // 4:2:2 → 2 * 8 * 16
+                            3 => (256, 256),  // 4:4:4 → 2 * 16 * 16
+                            other => {
+                                return Err(SliceDataError::MacroblockAt {
+                                    mb_addr: curr_mb_addr,
+                                    byte,
+                                    bit,
+                                    source: MacroblockLayerError::UnsupportedChromaArrayType(
+                                        other,
+                                    ),
+                                });
+                            }
+                        };
+                        let mut luma = Vec::with_capacity(256);
+                        for _ in 0..256 {
+                            luma.push(pcm_r.u(bit_depth_y)?);
+                        }
+                        let mut cb = Vec::with_capacity(num_cb);
+                        for _ in 0..num_cb {
+                            cb.push(pcm_r.u(bit_depth_c)?);
+                        }
+                        let mut cr = Vec::with_capacity(num_cr);
+                        for _ in 0..num_cr {
+                            cr.push(pcm_r.u(bit_depth_c)?);
+                        }
+                        // `pcm_r` is now positioned at the byte right
+                        // after the last PCM sample. PCM is read with
+                        // bit_depth-granular reads that sum to a byte
+                        // multiple when bit_depth is 8, but in general
+                        // higher bit depths don't guarantee byte
+                        // alignment. §9.3.1.2 says the re-init reads
+                        // `read_bits(9)` which does not require byte
+                        // alignment — the CABAC engine's BitReader can
+                        // start at any bit position.
+                        let (pcm_end_byte, pcm_end_bit) = pcm_r.position();
+                        // §9.3.1.2 — re-initialise the arithmetic
+                        // decoding engine from the post-PCM position.
+                        // Contexts (pStateIdx/valMPS) are preserved
+                        // per §9.3.1 (only 9.3.1.2 is invoked, not
+                        // 9.3.1.1).
+                        let post_pcm_r = position_reader(rbsp, pcm_end_byte, pcm_end_bit)?;
+                        cabac_dec = CabacDecoder::new(post_pcm_r)?;
+                        // §9.3.3.1.1.5 — after I_PCM, the next MB's
+                        // mb_qp_delta ctxIdxInc initial value is 0
+                        // (PrevMbAddr's mb_qp_delta is not carried
+                        // forward through I_PCM).
+                        next_qp_delta_flag = false;
+                        // Mark this MB in the CABAC neighbour grid so
+                        // subsequent MBs see its availability + I_PCM
+                        // classification (§9.3.3.1.1.* — I_PCM has
+                        // specific condTerm rules, e.g. all CBFs = 1).
+                        if let Some(slot) = cabac_nb.mbs.get_mut(curr_mb_addr as usize) {
+                            slot.available = true;
+                            slot.is_intra = true;
+                            slot.is_i_pcm = true;
+                            slot.is_skip = false;
+                            slot.is_i_nxn = false;
+                            slot.is_b_skip_or_direct = false;
+                            // I_PCM contributes cbf=1 for all blocks.
+                            slot.cbf_luma_4x4 = [true; 16];
+                            slot.cbf_cb_dc = true;
+                            slot.cbf_cr_dc = true;
+                            slot.cbf_cb_ac = [true; 8];
+                            slot.cbf_cr_ac = [true; 8];
+                            slot.cbf_luma_16x16_dc = true;
+                            slot.cbf_luma_16x16_ac = [true; 16];
+                            slot.cbf_cb_16x16_dc = true;
+                            slot.cbf_cb_16x16_ac = [true; 16];
+                            slot.cbf_cb_luma_4x4 = [true; 16];
+                            slot.cbf_cr_16x16_dc = true;
+                            slot.cbf_cr_16x16_ac = [true; 16];
+                            slot.cbf_cr_luma_4x4 = [true; 16];
+                            slot.coded_block_pattern_luma = 0x0F;
+                            slot.coded_block_pattern_chroma = 2;
+                            slot.intra_chroma_pred_mode = 0;
+                            slot.transform_size_8x8_flag = false;
+                        }
+                        // Build a minimal I_PCM Macroblock — reconstruction
+                        // can use `pcm_samples` directly per §8.3.5
+                        // (I_PCM samples are copied straight to the
+                        // output with no prediction / transform).
+                        Macroblock {
+                            mb_type: MbType::IPcm,
+                            mb_type_raw: 25,
+                            mb_pred: None,
+                            sub_mb_pred: None,
+                            pcm_samples: Some(PcmSamples {
+                                luma,
+                                chroma_cb: cb,
+                                chroma_cr: cr,
+                            }),
+                            coded_block_pattern: 0,
+                            transform_size_8x8_flag: false,
+                            mb_qp_delta: 0,
+                            residual_luma: Vec::new(),
+                            residual_luma_dc: None,
+                            residual_chroma_dc_cb: Vec::new(),
+                            residual_chroma_dc_cr: Vec::new(),
+                            residual_chroma_ac_cb: Vec::new(),
+                            residual_chroma_ac_cr: Vec::new(),
+                            residual_cb_luma_like: Vec::new(),
+                            residual_cr_luma_like: Vec::new(),
+                            residual_cb_16x16_dc: None,
+                            residual_cr_16x16_dc: None,
+                            is_skip: false,
+                        }
+                    }
+                    Err(source) => {
+                        return Err(SliceDataError::MacroblockAt {
+                            mb_addr: curr_mb_addr,
+                            byte,
+                            bit,
+                            source,
+                        });
+                    }
+                };
+                prev_mb_qp_delta_nonzero_slice = next_qp_delta_flag;
                 macroblocks.push(mb);
                 mb_field_decoding_flags.push(flag);
                 if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
