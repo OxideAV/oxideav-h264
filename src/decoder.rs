@@ -81,6 +81,18 @@ pub enum Event {
         /// `(byte_index, bit_index)` into `rbsp` marking the first bit
         /// of slice_data(). Feeds `crate::slice_data::parse_slice_data`.
         slice_data_cursor: (usize, u8),
+        /// §7.4.1.2.1 — the PPS activated by this slice, captured at
+        /// slice-header parse time. Snapshotting here avoids a "latest
+        /// PPS wins" race when PPSs with the same id are re-transmitted
+        /// across an access unit boundary (e.g. JVT CACQP3 repeatedly
+        /// re-sends PPS id 0 with a different `chroma_qp_index_offset`).
+        /// Consumers should prefer this snapshot over
+        /// [`Decoder::active_pps`] when reconstructing the slice.
+        pps: Pps,
+        /// §7.4.1.2.1 — the SPS referenced by the activated PPS, captured
+        /// at slice-header parse time. Mirrors the snapshot rationale for
+        /// `pps` above (though SPS re-transmission is rarer in practice).
+        sps: Sps,
     },
     /// §7.3.2.3 — parsed SEI messages. May be empty when the SEI RBSP
     /// carries only rbsp_trailing_bits.
@@ -275,6 +287,8 @@ impl Decoder {
             header: parsed,
             rbsp: rbsp.to_vec(),
             slice_data_cursor,
+            pps,
+            sps,
         })
     }
 

@@ -83,6 +83,7 @@ fn parse_foreman_p16x16() {
                     header,
                     rbsp,
                     slice_data_cursor,
+                    ..
                 } => {
                     slices += 1;
                     if nal_unit_type == 5 {

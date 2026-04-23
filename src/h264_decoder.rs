@@ -119,6 +119,14 @@ struct PictureInProgress {
     /// we copy it into this picture-wide vector using the raw
     /// CurrMbAddr walk the slice data parser produced.
     mb_field_flags: Vec<bool>,
+    /// §7.4.1.2.1 — SPS + PPS snapshots captured at the first slice's
+    /// header-parse time. Used by `finalize_in_progress_picture` for
+    /// deblocking instead of reading the driver's current "active"
+    /// parameter sets, which may have been overwritten by a later PPS
+    /// NAL carrying the same id but different scaling / qp-offset
+    /// values (JVT CACQP3 exercises this path).
+    sps: Sps,
+    pps: crate::pps::Pps,
 }
 
 /// Registry factory — called by the codec registry when a container
@@ -300,6 +308,8 @@ impl H264CodecDecoder {
                 header,
                 rbsp,
                 slice_data_cursor,
+                pps,
+                sps,
             } => {
                 self.last_slice = Some(header.clone());
                 self.handle_slice(
@@ -308,6 +318,8 @@ impl H264CodecDecoder {
                     header,
                     rbsp,
                     slice_data_cursor,
+                    sps,
+                    pps,
                 )
             }
             // §7.4.1.2.3 — Access Unit Delimiter explicitly marks an
@@ -422,20 +434,12 @@ impl H264CodecDecoder {
         header: SliceHeader,
         rbsp: Vec<u8>,
         cursor: (usize, u8),
+        sps: Sps,
+        pps: crate::pps::Pps,
     ) -> Result<()> {
-        // Snapshot SPS and PPS to detach from the driver borrow so we
-        // can mutate self.in_progress / self.ref_store below.
-        let sps = self
-            .driver
-            .active_sps()
-            .cloned()
-            .ok_or_else(|| Error::invalid("h264: slice with no active SPS"))?;
-        let pps = self
-            .driver
-            .active_pps()
-            .cloned()
-            .ok_or_else(|| Error::invalid("h264: slice with no active PPS"))?;
-
+        // The SPS and PPS have been snapshotted at slice-header parse
+        // time (see [`Event::Slice::pps`] for why — same-id PPS
+        // re-transmission at access-unit boundaries, as in JVT CACQP3).
         let is_idr = nal_unit_type == 5;
         let is_reference = nal_ref_idc != 0;
 
@@ -508,6 +512,8 @@ impl H264CodecDecoder {
                 deblock_alpha_off,
                 deblock_beta_off,
                 mb_field_flags,
+                sps: sps.clone(),
+                pps: pps.clone(),
             });
         }
 
@@ -745,6 +751,8 @@ impl H264CodecDecoder {
             deblock_alpha_off,
             deblock_beta_off,
             mb_field_flags,
+            sps,
+            pps,
         } = in_progress;
 
         // §8.4.1.2.3 temporal direct needs the colocated block's MVs
@@ -754,19 +762,12 @@ impl H264CodecDecoder {
         // before.
         snapshot_grid_into_picture(&mut pic, &grid);
 
-        // Snapshot the active SPS at finalization. All slices of a primary
-        // coded picture share the same active SPS (§7.4.1.2.4 requires the
-        // PPS ids match; that's the SPS proxy too).
-        let sps = self
-            .driver
-            .active_sps()
-            .cloned()
-            .ok_or_else(|| Error::invalid("h264: finalize with no active SPS"))?;
-        let pps = self
-            .driver
-            .active_pps()
-            .cloned()
-            .ok_or_else(|| Error::invalid("h264: finalize with no active PPS"))?;
+        // SPS and PPS were snapshotted at the first slice's header-parse
+        // time (via [`Event::Slice`]). Using the driver's current
+        // `active_pps()` here would be wrong whenever a later NAL
+        // overwrites `pps_by_id[id]` before the picture is finalized
+        // — as happens in JVT CACQP3 where every access unit re-sends
+        // PPS id 0 with a different `chroma_qp_index_offset`.
 
         // §8.7 — one picture-level deblocking pass, AFTER every slice of
         // this primary coded picture has populated the shared
@@ -1673,6 +1674,66 @@ mod tests {
         RefPicListModification, SliceHeader as Hdr, SliceType as ST,
     };
 
+    /// Minimal SPS for the seed helpers — exact field values do not
+    /// matter since the seeded in-progress picture is never actually
+    /// reconstructed; these tests only exercise
+    /// `is_first_vcl_of_new_picture` which consults the slice header.
+    fn test_sps() -> crate::sps::Sps {
+        crate::sps::Sps {
+            profile_idc: 66,
+            constraint_set_flags: 0,
+            level_idc: 10,
+            seq_parameter_set_id: 0,
+            chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            qpprime_y_zero_transform_bypass_flag: false,
+            seq_scaling_matrix_present_flag: false,
+            seq_scaling_lists: None,
+            log2_max_frame_num_minus4: 0,
+            pic_order_cnt_type: 0,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            delta_pic_order_always_zero_flag: false,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_ref_frame: Vec::new(),
+            max_num_ref_frames: 1,
+            gaps_in_frame_num_value_allowed_flag: false,
+            pic_width_in_mbs_minus1: 0,
+            pic_height_in_map_units_minus1: 0,
+            frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
+            direct_8x8_inference_flag: false,
+            frame_cropping: None,
+            vui_parameters_present_flag: false,
+            vui: None,
+        }
+    }
+
+    fn test_pps() -> crate::pps::Pps {
+        crate::pps::Pps {
+            pic_parameter_set_id: 0,
+            seq_parameter_set_id: 0,
+            entropy_coding_mode_flag: false,
+            bottom_field_pic_order_in_frame_present_flag: false,
+            num_slice_groups_minus1: 0,
+            slice_group_map: None,
+            num_ref_idx_l0_default_active_minus1: 0,
+            num_ref_idx_l1_default_active_minus1: 0,
+            weighted_pred_flag: false,
+            weighted_bipred_idc: 0,
+            pic_init_qp_minus26: 0,
+            pic_init_qs_minus26: 0,
+            chroma_qp_index_offset: 0,
+            deblocking_filter_control_present_flag: false,
+            constrained_intra_pred_flag: false,
+            redundant_pic_cnt_present_flag: false,
+            extension: None,
+        }
+    }
+
     /// Build a minimal SliceHeader for boundary-detection testing. All
     /// fields default to "non-IDR P frame at frame_num=0, POC lsb=0" —
     /// tests tweak the specific fields they want to compare.
@@ -1735,6 +1796,8 @@ mod tests {
             deblock_alpha_off: 0,
             deblock_beta_off: 0,
             mb_field_flags: Vec::new(),
+            sps: test_sps(),
+            pps: test_pps(),
         });
     }
 
