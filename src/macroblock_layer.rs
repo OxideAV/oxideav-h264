@@ -1283,6 +1283,12 @@ pub struct CabacMbNeighbourInfo {
     /// §9.3.3.1.1.10 — transform_size_8x8_flag of this MB, used by the
     /// next MB's transform_size_8x8_flag ctxIdxInc derivation.
     pub transform_size_8x8_flag: bool,
+    /// §9.3.3.1.1.2 — `mb_field_decoding_flag` of this MB, consulted by
+    /// the next pair's `mb_field_decoding_flag` ctxIdxInc derivation.
+    /// Tracks whether the MB (pair) was field-coded. Recorded only when
+    /// the MB is marked `available` (otherwise condTermFlagN = 0 per
+    /// the spec's "not available" rule).
+    pub mb_field_decoding_flag: bool,
 }
 
 impl Default for CabacMbNeighbourInfo {
@@ -1317,6 +1323,7 @@ impl Default for CabacMbNeighbourInfo {
             is_b_skip_or_direct: false,
             intra_chroma_pred_mode: 0,
             transform_size_8x8_flag: false,
+            mb_field_decoding_flag: false,
         }
     }
 }

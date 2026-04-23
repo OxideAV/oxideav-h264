@@ -50,6 +50,7 @@ use crate::macroblock_layer::{
     parse_macroblock, CabacNeighbourGrid, CavlcNcGrid, EntropyState, Macroblock,
     MacroblockLayerError, MbType, PcmSamples,
 };
+use crate::mb_address::mbaff_pair_neighbour_addrs;
 use crate::pps::Pps;
 use crate::slice_header::{SliceHeader, SliceType};
 use crate::sps::Sps;
@@ -304,6 +305,11 @@ pub fn parse_slice_data(
                         slot.is_intra = false;
                         slot.is_i_pcm = false;
                         slot.is_i_nxn = false;
+                        // §9.3.3.1.1.2 — record mb_field_decoding_flag
+                        // for the next pair's ctxIdxInc derivation. Skipped
+                        // MBs inherit their pair flag (see `flag` above,
+                        // which applies to both MBs of the pair in MBAFF).
+                        slot.mb_field_decoding_flag = flag;
                         // §9.3.3.1.1.3 — B_Skip is one of the two mb_types
                         // that trigger condTermFlag = 0 at ctxIdxOffset=27
                         // bin 0 for the next MB's mb_type decode.
@@ -360,6 +366,9 @@ pub fn parse_slice_data(
                     let flag = decode_mb_field_decoding_flag_cabac(
                         &mut cabac_dec,
                         &mut ctxs,
+                        &cabac_nb,
+                        curr_mb_addr,
+                        pic_w_mbs,
                     )?;
                     pending_pair_flag = Some(flag);
                     // Retroactively patch the top MB of this pair if
@@ -535,6 +544,11 @@ pub fn parse_slice_data(
                             slot.is_skip = false;
                             slot.is_i_nxn = false;
                             slot.is_b_skip_or_direct = false;
+                            // §9.3.3.1.1.2 — record the pair flag for the
+                            // next pair's ctxIdxInc derivation. In MBAFF
+                            // both MBs of a pair share this flag.
+                            slot.mb_field_decoding_flag =
+                                pending_pair_flag.unwrap_or(false);
                             // I_PCM contributes cbf=1 for all blocks.
                             slot.cbf_luma_4x4 = [true; 16];
                             slot.cbf_cb_dc = true;
@@ -596,6 +610,15 @@ pub fn parse_slice_data(
                 prev_mb_qp_delta_nonzero_slice = next_qp_delta_flag;
                 macroblocks.push(mb);
                 mb_field_decoding_flags.push(flag);
+                // §9.3.3.1.1.2 — record mb_field_decoding_flag in the
+                // CABAC neighbour grid so the next pair's ctxIdxInc
+                // derivation can read it. parse_macroblock already set
+                // `available = true` for coded MBs; I_PCM / skip paths
+                // populate this field in their own slot-update blocks
+                // above.
+                if let Some(slot) = cabac_nb.mbs.get_mut(curr_mb_addr as usize) {
+                    slot.mb_field_decoding_flag = flag;
+                }
                 if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
                     pending_pair_flag = None;
                 }
@@ -749,21 +772,49 @@ pub fn parse_slice_data(
 }
 
 /// §7.3.4 + §9.3.3.1.1.2 — decode `mb_field_decoding_flag` as ae(v) in
-/// CABAC. Phase-1 uses ctxIdxInc = 0 (both condTermFlagA and
-/// condTermFlagB = 0) because MBAFF neighbour addressing (§6.4.10) is
-/// not wired yet; a proper decoder must consult the left + above MB
-/// pair's mb_field_decoding_flag to set ctxIdxInc ∈ {0,1,2}. The
-/// value still round-trips correctly for streams whose neighbours are
-/// all frame pairs (the common case at pair 0).
+/// CABAC. The ctxIdxInc is derived per §9.3.3.1.1.2:
+///
+/// Let condTermFlagN (N = A / B) be:
+///   * If mbAddrN is not available, OR mbAddrN is a frame macroblock,
+///     OR mbAddrN is a skipped macroblock coded in frame mode,
+///     condTermFlagN = 0.
+///   * Otherwise (mbAddrN is coded in field mode): condTermFlagN = 1.
+///
+/// ctxIdxInc = condTermFlagA + condTermFlagB.
+///
+/// The neighbour addresses here are the **pair-level** neighbours
+/// (§6.4.10 / `mbaff_pair_neighbour_addrs`). We consult the top MB of
+/// each neighbour pair: its `mb_field_decoding_flag` (which, per spec,
+/// is set once per pair and shared by both MBs of the pair) is the
+/// "N is coded in field mode" condition.
 ///
 /// Per Table 9-34: ctxIdxOffset = 70, binarization FL with cMax = 1,
 /// so a single decode_decision call.
 fn decode_mb_field_decoding_flag_cabac(
     dec: &mut CabacDecoder<'_>,
     ctxs: &mut CabacContexts,
+    grid: &CabacNeighbourGrid,
+    curr_mb_addr: u32,
+    pic_width_in_mbs: u32,
 ) -> SliceDataResult<bool> {
     const CTX_IDX_OFFSET: usize = 70;
-    let ctx_idx_inc: usize = 0; // Phase-1 default; see doc-comment.
+    let [a_top, b_top, _c, _d] = mbaff_pair_neighbour_addrs(curr_mb_addr, pic_width_in_mbs);
+    // condTermFlagN = 1 iff mbAddrN is available AND field-coded.
+    // "Skipped + frame-coded" is covered automatically: `available` is
+    // set for skipped MBs, and their `mb_field_decoding_flag` is
+    // either the pair flag (if the pair was field-coded) or false, so
+    // the single "is field-coded?" predicate captures both branches.
+    let cond_term = |addr_opt: Option<u32>| -> u32 {
+        let Some(addr) = addr_opt else { return 0 };
+        let Some(info) = grid.mbs.get(addr as usize) else { return 0 };
+        if !info.available {
+            return 0;
+        }
+        if info.mb_field_decoding_flag { 1 } else { 0 }
+    };
+    let cond_a = cond_term(a_top);
+    let cond_b = cond_term(b_top);
+    let ctx_idx_inc = (cond_a + cond_b) as usize;
     let ctx_idx = CTX_IDX_OFFSET + ctx_idx_inc;
     let bin = dec.decode_decision(ctxs.at_mut(ctx_idx))?;
     Ok(bin != 0)
