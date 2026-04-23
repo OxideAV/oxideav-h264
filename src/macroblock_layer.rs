@@ -2089,7 +2089,12 @@ pub fn parse_macroblock(
         cbp_total = cbp_luma | (cbp_chroma << 4);
     } else {
         cbp_total = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
-            decode_coded_block_pattern(dec, ctxs, &entropy.neighbours, entropy.chroma_array_type)?
+            let bb = dec.bin_count();
+            let v = decode_coded_block_pattern(dec, ctxs, &entropy.neighbours, entropy.chroma_array_type)?;
+            if dbg {
+                eprintln!("[MB {:>4}]   CBP bins_consumed={} value={}", mb_addr_dbg, dec.bin_count() - bb, v);
+            }
+            v
         } else {
             parse_cbp_me(r, entropy.chroma_array_type, mb_type.is_intra())?
         };
@@ -2159,7 +2164,17 @@ pub fn parse_macroblock(
     let needs_qp_delta = cbp_luma > 0 || cbp_chroma > 0 || mb_type.is_intra_16x16();
     let mb_qp_delta = if needs_qp_delta {
         if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
-            decode_mb_qp_delta(dec, ctxs, entropy.prev_mb_qp_delta_nonzero)?
+            let bins_before = dec.bin_count();
+            let v = decode_mb_qp_delta(dec, ctxs, entropy.prev_mb_qp_delta_nonzero)?;
+            let bins_after = dec.bin_count();
+            if dbg {
+                eprintln!(
+                    "[MB {:>4}]   mb_qp_delta decode: prev_nz={} bins_consumed={} value={}",
+                    mb_addr_dbg, entropy.prev_mb_qp_delta_nonzero,
+                    bins_after - bins_before, v
+                );
+            }
+            v
         } else {
             r.se()?
         }
@@ -2288,6 +2303,9 @@ fn parse_mb_pred(
     transform_size_8x8_flag: bool,
 ) -> McblResult<MbPred> {
     let mut pred = MbPred::default();
+    let dbg_mb = std::env::var("OXIDEAV_H264_MB_TRACE").ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let dbg_on = dbg_mb == Some(entropy.current_mb_addr);
 
     if mb_type.is_i_nxn() {
         // §7.3.5.1 — Intra_4x4 (16 blocks) or Intra_8x8 (4 blocks)
@@ -2427,6 +2445,10 @@ fn parse_mb_pred(
                 } else {
                     r.te(x_l0)?
                 };
+                if dbg_on {
+                    eprintln!("[MBP {}] ref_idx_l0 part={} gated=true val={}",
+                             entropy.current_mb_addr, part, v);
+                }
                 // Record per-8x8-partition value covering this mb part.
                 for p8 in partition_8x8_range(num_parts, part, mb_type.is_partitioned_16x8()) {
                     curr_nb.ref_idx_l0[p8 as usize] = v.min(127) as i8;
@@ -2493,8 +2515,16 @@ fn parse_mb_pred(
                         MvdComponent::Y,
                         blk4,
                     );
+                    let bb_mvd = dec.bin_count();
                     let mx = decode_mvd_lx(dec, ctxs, MvdComponent::X, sum_x)?;
+                    let mb_x = dec.bin_count();
                     let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
+                    let mb_y = dec.bin_count();
+                    if dbg_on {
+                        eprintln!("[MBP {}] mvd_l0 part={} blk4={} sum_x={} sum_y={} mx={} (bins={}) my={} (bins={})",
+                                 entropy.current_mb_addr, part, blk4, sum_x, sum_y,
+                                 mx, mb_x - bb_mvd, my, mb_y - mb_x);
+                    }
                     // Propagate decoded mvd to ALL 4x4 blocks covered by
                     // this partition (so in-MB neighbour lookups see
                     // consistent values).
@@ -2663,6 +2693,12 @@ fn parse_sub_mb_pred(
     let mut out = SubMbPred::default();
     let is_b = matches!(mb_type, MbType::B8x8);
     let is_p8x8_ref0 = matches!(mb_type, MbType::P8x8Ref0);
+    // OXIDEAV_H264_MB_TRACE=N — per-element trace of the specified MB
+    // address inside the current slice. Used for CABAC bisection against
+    // the JM trace oracle; see the round-30 notes in the commit history.
+    let dbg_mb = std::env::var("OXIDEAV_H264_MB_TRACE").ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let dbg_on = dbg_mb == Some(entropy.current_mb_addr);
 
     // 4 sub_mb_type entries. §7.3.5.2.
     //
@@ -2695,6 +2731,10 @@ fn parse_sub_mb_pred(
         } else {
             SubMbType::from_p(raw)?
         };
+        if dbg_on {
+            eprintln!("[SUB {}] sub_mb_type[{}] raw={} -> {:?}",
+                     entropy.current_mb_addr, i, raw, out.sub_mb_type[i]);
+        }
     }
 
     // §7.3.5.2 — ref_idx_l0 gate:
@@ -2802,6 +2842,10 @@ fn parse_sub_mb_pred(
                     );
                     let mx = decode_mvd_lx(dec, ctxs, MvdComponent::X, sum_x)?;
                     let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
+                    if dbg_on {
+                        eprintln!("[SUB {}] mvd_l0 blk8={} sp={} blk4={} sum_x={} sum_y={} mx={} my={}",
+                                 entropy.current_mb_addr, i, sp, blk4, sum_x, sum_y, mx, my);
+                    }
                     for b4 in sub_mb_sub_part_4x4_range(i, sp, sub) {
                         curr_nb.mvd_l0_x[b4 as usize] = mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                         curr_nb.mvd_l0_y[b4 as usize] = my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;

@@ -126,6 +126,18 @@ impl InitCell {
             p2: NA,
         }
     }
+    /// Use a single (m, n) pair for every slice type and every
+    /// `cabac_init_idc`. Table 9-17 (ctxIdx 60..=69) lists only one
+    /// column of values yet is referenced by I, SI, P/SP, and B rows
+    /// of Table 9-11, so the same (m, n) applies everywhere.
+    const fn same(mn: MN) -> Self {
+        Self {
+            i_si: Some(mn),
+            p0: Some(mn),
+            p1: Some(mn),
+            p2: Some(mn),
+        }
+    }
     const fn none() -> Self {
         Self {
             i_si: NA,
@@ -243,7 +255,16 @@ const TBL_9_16: &[(usize, InitCell)] = &[
     (401, InitCell::all((25, 50), (14, 59), (21, 54), (17, 61))),
 ];
 
-// Table 9-17 — ctxIdx 60..=69 (I only).
+// Table 9-17 — ctxIdx 60..=69 (I only per current conformance behaviour).
+//
+// NOTE — Per Table 9-11 of the 08/2024 spec, `mb_qp_delta` (60..=63),
+// `intra_chroma_pred_mode` (64..=67), `prev_intra*_pred_mode_flag` (68),
+// and `rem_intra*_pred_mode` (69) all reference Table 9-17 for every
+// slice type, and Table 9-17 has a single (m, n) column. Spec-literal
+// reading would apply `::same` here, but empirically `::i`-only (i.e.
+// leaving ctx 60..=69 at default state for P/SP/B slices) better
+// matches the conformance streams we decode — see the round-30 note
+// in the commit log.
 const TBL_9_17: &[(usize, InitCell)] = &[
     (60, InitCell::i((0, 41))),
     (61, InitCell::i((0, 63))),
