@@ -856,14 +856,35 @@ impl H264CodecDecoder {
             self.dpb_entries
                 .retain(|e| !matches!(e.marking, RefMarking::Unused));
 
+            // §7.4.1.2.4 / §8.2.1 NOTE 1 — when the current picture
+            // carries MMCO 5, its frame_num is inferred to 0 and its
+            // Top/BottomFieldOrderCnt (hence PicOrderCnt) are reset
+            // to post-subtraction values for *all* subsequent uses —
+            // reference-picture-list construction included. Store the
+            // post-reset values in the DPB so §8.2.4.1 PicNum /
+            // FrameNumWrap arithmetic on later slices sees the
+            // spec-sanctioned zeroed identity.
+            if mmco5_triggered {
+                let temp = current_entry.pic_order_cnt;
+                current_entry.frame_num = 0;
+                current_entry.top_field_order_cnt -= temp;
+                current_entry.bottom_field_order_cnt -= temp;
+                current_entry.pic_order_cnt = current_entry
+                    .top_field_order_cnt
+                    .min(current_entry.bottom_field_order_cnt);
+            }
+
             self.ref_store.insert(current_entry.dpb_key, pic.clone());
             self.dpb_entries.push(current_entry);
         }
 
         if is_reference {
             self.prev_had_mmco5 = mmco5_triggered;
+            // §8.2.1.1 — prevPicOrderCntLsb after an MMCO-5 picture is
+            // the post-reset TopFieldOrderCnt (§8.2.1 NOTE 1 subtracts
+            // tempPicOrderCnt from Top/BottomFieldOrderCnt after decode).
             self.prev_reference_top_foc = if mmco5_triggered {
-                poc.top_field_order_cnt
+                poc.top_field_order_cnt - poc.pic_order_cnt
             } else {
                 0
             };
@@ -893,9 +914,35 @@ impl H264CodecDecoder {
 
         self.ensure_output_dpb_sized(&sps);
 
+        // §8.2.1 NOTE 1 — after decoding of the MMCO-5 picture:
+        //   tempPicOrderCnt = PicOrderCnt(CurrPic);
+        //   TopFieldOrderCnt -= tempPicOrderCnt;
+        //   BottomFieldOrderCnt -= tempPicOrderCnt;
+        // For a frame (field_pic_flag == 0 and TopFOC == BotFOC) this
+        // zeros both, so PicOrderCnt(CurrPic) for output ordering
+        // becomes 0. Downstream POC-ordered bumping MUST see the
+        // post-reset POC — otherwise the MMCO-5 picture is sorted by
+        // its pre-reset POC (ordinarily the largest in the outgoing
+        // CVS) and later CVS pictures, which use POC starting from 0
+        // again, are bumped ahead of it.
+        let output_poc = if mmco5_triggered {
+            let temp = poc.pic_order_cnt;
+            let top_after = poc.top_field_order_cnt - temp;
+            let bot_after = poc.bottom_field_order_cnt - temp;
+            if first_header.field_pic_flag && first_header.bottom_field_flag {
+                bot_after
+            } else if first_header.field_pic_flag {
+                top_after
+            } else {
+                top_after.min(bot_after)
+            }
+        } else {
+            poc.pic_order_cnt
+        };
+
         let entry = OutputEntry {
             picture: vf,
-            pic_order_cnt: poc.pic_order_cnt,
+            pic_order_cnt: output_poc,
             frame_num: first_header.frame_num,
             needed_for_output: true,
         };
@@ -1148,18 +1195,19 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
 /// pair for sizing [`DpbOutput`] from the active SPS.
 ///
 /// Preferred source is the VUI `bitstream_restriction` block
-/// (§E.2.1). When it's absent we infer a sensible default:
+/// (§E.2.1). When it's absent we infer the spec default per
+/// §A.3.1:
 ///   1. `max_dec_frame_buffering` ← Annex A Table A-1 per-level
 ///      cap, i.e. Min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)
 ///      (§A.3.1 item h).
-///   2. `max_num_reorder_frames` ← `sps.max_num_ref_frames`, clamped
-///      to the buffering cap. This is a *pragmatic* default: the
-///      spec allows max_num_reorder_frames up to MaxDpbFrames but
-///      streams without a `bitstream_restriction` block typically
-///      don't reorder further than their reference-count ceiling.
-///      Using MaxDpbFrames directly would force the decoder to hold
-///      pictures far longer than the stream actually requires, which
-///      breaks low-latency consumers that flush one frame at a time.
+///   2. `max_num_reorder_frames` ← inferred to `max_dec_frame_buffering`
+///      when the VUI `bitstream_restriction` flag is absent
+///      (§A.3.1 item j / §E.2.1 — unspecified defaults to maximum).
+///      A smaller upper bound breaks streams that issue an MMCO-5
+///      deep into a POC range because §C.4 bumps pictures by POC in
+///      a single CVS, and clipping the reorder window prematurely
+///      forces out-of-POC-order emission when a later CVS reuses
+///      the low POC range.
 ///
 /// Both values floor at 1 so `DpbOutput::push` can always bump when
 /// the queue is full (cap of 0 would deadlock the queue).
@@ -1180,12 +1228,11 @@ fn output_dpb_sizing(sps: &Sps) -> (u32, u32) {
         .max(1);
     let max_dpb_frames = (max_dpb_mbs / pic_size_mbs).min(16).max(1);
 
-    // Pragmatic reorder default when the VUI block is absent: use
-    // max_num_ref_frames (§7.4.2.1.1). A stream with
-    // max_num_ref_frames == 1 never reorders; a B-capable stream
-    // typically signals reorder explicitly via VUI.
-    let reorder = sps.max_num_ref_frames.max(1).min(max_dpb_frames);
-    (reorder, max_dpb_frames)
+    // §A.3.1 item j — when bitstream_restriction is absent, the
+    // spec's default for `max_num_reorder_frames` is the full
+    // buffering cap. Under-sizing it would clamp POC reordering and
+    // bump pictures in decode order instead of POC order.
+    (max_dpb_frames, max_dpb_frames)
 }
 
 /// Annex A Table A-1 — `MaxDpbMbs` per `level_idc`.
@@ -1791,11 +1838,10 @@ mod tests {
 
     /// Annex A Table A-1 fallback — when VUI is absent, use the
     /// level-derived MaxDpbMbs cap as `max_dec_frame_buffering`, and
-    /// `sps.max_num_ref_frames` (clamped to the cap) as the reorder
-    /// window. Level 3.0 (level_idc == 30) has MaxDpbMbs = 8100; for
-    /// a 176x144 (11x9 MB) picture that's Min(8100/99, 16) = 16.
-    /// With `max_num_ref_frames == 4` in the fabricated SPS the
-    /// expected result is (4, 16).
+    /// (per §A.3.1 item j) infer `max_num_reorder_frames` equal to
+    /// that cap (maximum reorder window). Level 3.0 (level_idc == 30)
+    /// has MaxDpbMbs = 8100; for a 176x144 (11x9 MB) picture that's
+    /// Min(8100/99, 16) = 16 on both values.
     #[test]
     fn dpb_sizing_falls_back_to_level_default() {
         use crate::sps::Sps;
@@ -1832,9 +1878,9 @@ mod tests {
             vui: None,
         };
         // PicSize = 11 * 9 = 99; 8100 / 99 = 81 → capped at 16
-        // (max_dec_frame_buffering). Reorder defaults to
-        // max_num_ref_frames = 4 clamped to 16 → 4.
-        assert_eq!(output_dpb_sizing(&sps), (4, 16));
+        // (max_dec_frame_buffering). Reorder inferred to match
+        // buffering per §A.3.1 item j.
+        assert_eq!(output_dpb_sizing(&sps), (16, 16));
     }
 
     /// Annex A Table A-1 — per-level MaxDpbMbs sanity. Levels that
