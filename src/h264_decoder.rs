@@ -863,7 +863,13 @@ impl H264CodecDecoder {
             // reference-picture-list construction included. Store the
             // post-reset values in the DPB so §8.2.4.1 PicNum /
             // FrameNumWrap arithmetic on later slices sees the
-            // spec-sanctioned zeroed identity.
+            // spec-sanctioned zeroed identity. The same reset must be
+            // applied to the Picture that is inserted into `ref_store`
+            // so that downstream POC-based queries (ref_pic_poc /
+            // weighted bipred / temporal-direct) see the post-reset
+            // identity too — otherwise later slices referencing this
+            // picture compare against its pre-reset POC and mis-identify
+            // picture identity at deblock-time.
             if mmco5_triggered {
                 let temp = current_entry.pic_order_cnt;
                 current_entry.frame_num = 0;
@@ -872,6 +878,8 @@ impl H264CodecDecoder {
                 current_entry.pic_order_cnt = current_entry
                     .top_field_order_cnt
                     .min(current_entry.bottom_field_order_cnt);
+                pic.pic_order_cnt = current_entry.pic_order_cnt;
+                pic.frame_num = 0;
             }
 
             self.ref_store.insert(current_entry.dpb_key, pic.clone());
