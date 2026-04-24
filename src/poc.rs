@@ -283,10 +283,22 @@ fn derive_type1(
         state.prev_frame_num_offset
     };
 
+    // §7.4.1.2.4 — when the previous picture carried MMCO-5, its
+    // frame_num is inferred to 0 for the purposes of subsequent
+    // PrevRefFrameNum comparisons. Without this override the
+    // wrap-detection (prev_frame_num > slice.frame_num) would fire
+    // against the pre-reset MMCO-5 frame_num and inflate
+    // FrameNumOffset by MaxFrameNum.
+    let prev_frame_num: i64 = if slice.prev_had_mmco5 {
+        0
+    } else {
+        state.prev_frame_num as i64
+    };
+
     // eq. 8-6 — FrameNumOffset.
     let frame_num_offset: i64 = if slice.is_idr {
         0
-    } else if (state.prev_frame_num as i64) > (slice.frame_num as i64) {
+    } else if prev_frame_num > (slice.frame_num as i64) {
         prev_frame_num_offset + max_frame_num
     } else {
         prev_frame_num_offset
@@ -410,10 +422,18 @@ fn derive_type2(
         state.prev_frame_num_offset
     };
 
+    // §7.4.1.2.4 — see derive_type1; the MMCO-5 picture's frame_num
+    // is inferred to 0 before computing FrameNumOffset.
+    let prev_frame_num: i64 = if slice.prev_had_mmco5 {
+        0
+    } else {
+        state.prev_frame_num as i64
+    };
+
     // eq. 8-11 — FrameNumOffset.
     let frame_num_offset: i64 = if slice.is_idr {
         0
-    } else if (state.prev_frame_num as i64) > (slice.frame_num as i64) {
+    } else if prev_frame_num > (slice.frame_num as i64) {
         prev_frame_num_offset + max_frame_num
     } else {
         prev_frame_num_offset
