@@ -193,6 +193,16 @@ pub struct H264CodecDecoder {
     /// For the §8.2.1.1 MMCO-5 hint — the previous reference
     /// picture's `TopFieldOrderCnt`, used only when `prev_had_mmco5`.
     prev_reference_top_foc: i32,
+    /// §8.2.5.2 — `PrevRefFrameNum` kept for the gap-in-frame_num
+    /// detection / non-existing reference-frame synthesis. Holds the
+    /// `frame_num` of the most recent *reference* picture decoded in
+    /// the current coded video sequence. Reset on IDR.
+    ///
+    /// When the next picture arrives with `frame_num` not equal to
+    /// `(prev_ref_frame_num + 1) mod MaxFrameNum`, the spec §8.2.5.2
+    /// procedure inserts synthetic "non-existing" short-term reference
+    /// frames for each missing `frame_num` value.
+    prev_ref_frame_num: Option<u32>,
 
     /// §7.4.1.2 / §7.4.1.2.4 — picture currently being assembled across
     /// one-or-more slice NAL units. `None` means no slice of the current
@@ -225,6 +235,7 @@ impl H264CodecDecoder {
             next_dpb_key: 0,
             prev_had_mmco5: false,
             prev_reference_top_foc: 0,
+            prev_ref_frame_num: None,
             in_progress: None,
         }
     }
@@ -451,6 +462,16 @@ impl H264CodecDecoder {
             // Finalize whatever was in progress before starting the new
             // picture with this slice.
             self.finalize_in_progress_picture()?;
+
+            // §8.2.5.2 — gaps in frame_num. When the stream signals a
+            // gap (`frame_num != (PrevRefFrameNum + 1) mod MaxFrameNum`)
+            // and the SPS allows gaps, synthesize "non-existing" short-term
+            // reference frames for each missing value to keep the
+            // sliding window + RPLM picNumX arithmetic aligned with the
+            // encoder's view of the DPB.
+            if !is_idr && sps.gaps_in_frame_num_value_allowed_flag {
+                self.fill_frame_num_gap(&sps, header.frame_num)?;
+            }
 
             // §8.2.1 — derive POC for this picture. All slices of the
             // same picture will share this value (§7.4.1.2.4).
@@ -846,6 +867,18 @@ impl H264CodecDecoder {
             } else {
                 0
             };
+            // §8.2.5.2 — remember this reference picture's `frame_num`
+            // so the next access unit can detect (and fill) any gap.
+            // MMCO-5 resets the CVS, so `prev_ref_frame_num` is cleared
+            // per §8.2.1 NOTE 1 / §8.2.5.4.5.
+            self.prev_ref_frame_num = if mmco5_triggered {
+                // Per §8.2.5.4.5 the picture that carried MMCO 5 is
+                // renumbered to frame_num 0; treat its successor as if
+                // it were the frame after frame_num 0.
+                Some(0)
+            } else {
+                Some(first_header.frame_num)
+            };
         }
 
         let vf = picture_to_video_frame(&pic, pts, time_base);
@@ -906,6 +939,168 @@ impl H264CodecDecoder {
         self.next_dpb_key = self.next_dpb_key.wrapping_add(1);
         k
     }
+
+    /// §8.2.5.2 — synthesise "non-existing" short-term reference frames
+    /// to fill a gap between `PrevRefFrameNum` and the current picture's
+    /// `frame_num`. Each synthetic frame advances the sliding-window
+    /// eviction state (§8.2.5.3) and the POC-state `prev_frame_num` for
+    /// `pic_order_cnt_type` 1/2, matching the encoder's assumption that
+    /// those references exist in the DPB when it emits RPLM / MMCO ops
+    /// targeting their PicNum values.
+    ///
+    /// The synthetic picture's pixel samples are marked "not available
+    /// for prediction of other pictures" per §8.2.5.2; we still insert
+    /// a placeholder [`Picture`] in the ref store so any erroneous
+    /// motion-compensation reference produces neutral (gray) output
+    /// rather than a crash. Conformant streams do not actually sample
+    /// a non-existing reference's pixels.
+    fn fill_frame_num_gap(&mut self, sps: &Sps, current_frame_num: u32) -> Result<()> {
+        let max_frame_num: u32 = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
+        // §8.2.5.2 is a no-op when the previous reference picture is
+        // the immediate predecessor (or when no reference has yet been
+        // seen — we let the first non-IDR reference picture seed
+        // `prev_ref_frame_num`).
+        let Some(prev) = self.prev_ref_frame_num else {
+            return Ok(());
+        };
+        let mut expected = (prev + 1) % max_frame_num;
+        if expected == current_frame_num {
+            return Ok(());
+        }
+
+        let width_samples = sps.pic_width_in_mbs() * 16;
+        let height_samples = sps.frame_height_in_mbs() * 16;
+        let chroma_array_type = sps.chroma_array_type();
+        let bit_depth_y = sps.bit_depth_luma_minus8 + 8;
+        let bit_depth_c = sps.bit_depth_chroma_minus8 + 8;
+
+        // Guard against a runaway loop from a bogus `current_frame_num`;
+        // the spec allows up to MaxFrameNum iterations.
+        let mut iterations: u32 = 0;
+        while expected != current_frame_num && iterations < max_frame_num {
+            // §8.2.5.2 — a neutral placeholder picture. Samples are
+            // mid-grey (2^(bit_depth-1)) because the spec only guarantees
+            // "not available for prediction"; mid-grey keeps any
+            // accidental reference from producing wildly out-of-range
+            // residuals.
+            let pic = gray_picture(
+                width_samples,
+                height_samples,
+                chroma_array_type,
+                bit_depth_y,
+                bit_depth_c,
+            );
+
+            // §8.2.1.3 POC type 2 (and also §8.2.1.2 type 1) treat each
+            // non-existing frame as a reference picture with its own
+            // `frame_num`, so step the POC state's `prev_frame_num` and
+            // `prev_frame_num_offset` exactly as a real reference would.
+            if matches!(sps.pic_order_cnt_type, 1 | 2) {
+                let prev_fnum_offset = self.poc_state.prev_frame_num_offset;
+                let new_offset = if self.poc_state.prev_frame_num > expected {
+                    prev_fnum_offset + max_frame_num as i64
+                } else {
+                    prev_fnum_offset
+                };
+                self.poc_state.prev_frame_num_offset = new_offset;
+            }
+            self.poc_state.prev_frame_num = expected;
+
+            // Derive a POC for the non-existing frame so RefPicList
+            // construction for B slices (unused here but kept correct
+            // in general) has a consistent ordering key.
+            let (top_foc, bot_foc, poc_value) = non_existing_poc(sps, &self.poc_state, expected);
+
+            // §8.2.5.2 — apply the sliding window before adding, so the
+            // DPB never exceeds `max_num_ref_frames` short+long refs.
+            ref_list::sliding_window_marking(
+                &mut self.dpb_entries,
+                sps.max_num_ref_frames,
+                expected,
+                max_frame_num,
+            );
+            self.dpb_entries
+                .retain(|e| !matches!(e.marking, RefMarking::Unused));
+
+            let key = self.mint_dpb_key();
+            let entry = DpbEntry {
+                frame_num: expected,
+                top_field_order_cnt: top_foc,
+                bottom_field_order_cnt: bot_foc,
+                pic_order_cnt: poc_value,
+                structure: PicStructure::Frame,
+                marking: RefMarking::ShortTerm,
+                long_term_frame_idx: 0,
+                dpb_key: key,
+            };
+            self.ref_store.insert(key, pic);
+            self.dpb_entries.push(entry);
+
+            self.prev_ref_frame_num = Some(expected);
+            expected = (expected + 1) % max_frame_num;
+            iterations += 1;
+        }
+
+        Ok(())
+    }
+}
+
+/// §8.2.1 — compute `(TopFieldOrderCnt, BottomFieldOrderCnt, PicOrderCnt)`
+/// for a synthetic non-existing reference frame. Only type 2 and type 1
+/// need real values; type 0 is left at (0, 0, 0) since non-existing
+/// frames with type 0 are never used to predict other pictures' POCs.
+fn non_existing_poc(sps: &Sps, state: &PocState, frame_num: u32) -> (i32, i32, i32) {
+    match sps.pic_order_cnt_type {
+        2 => {
+            // §8.2.1.3 treats a reference picture as
+            // `2 * (FrameNumOffset + frame_num)`. We use the already-
+            // updated `prev_frame_num_offset` because the caller has
+            // stepped it for this non-existing frame.
+            let poc =
+                2 * (state.prev_frame_num_offset + frame_num as i64);
+            let poc = poc.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            (poc, poc, poc)
+        }
+        1 => {
+            // A conservative stand-in — type-1 streams rarely hit the
+            // gap path and we do not need pixel-exact reproduction of
+            // the expectedPicOrderCnt arithmetic here.
+            (0, 0, 0)
+        }
+        _ => (0, 0, 0),
+    }
+}
+
+/// §8.2.5.2 — mid-grey placeholder picture for a synthetic non-existing
+/// reference frame. Samples are set to `2^(bit_depth - 1)` per plane so
+/// that accidental motion-compensation references produce neutral
+/// output instead of zeroes (which would bias the residual).
+fn gray_picture(
+    width_samples: u32,
+    height_samples: u32,
+    chroma_array_type: u32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+) -> Picture {
+    let mut p = Picture::new(
+        width_samples,
+        height_samples,
+        chroma_array_type,
+        bit_depth_y,
+        bit_depth_c,
+    );
+    let grey_y: i32 = 1 << (bit_depth_y.saturating_sub(1));
+    let grey_c: i32 = 1 << (bit_depth_c.saturating_sub(1));
+    for v in p.luma.iter_mut() {
+        *v = grey_y;
+    }
+    for v in p.cb.iter_mut() {
+        *v = grey_c;
+    }
+    for v in p.cr.iter_mut() {
+        *v = grey_c;
+    }
+    p
 }
 
 /// Per-slice [`RefPicProvider`] that borrows pictures from a long-running
@@ -1201,6 +1396,7 @@ impl Decoder for H264CodecDecoder {
         self.next_dpb_key = 0;
         self.prev_had_mmco5 = false;
         self.prev_reference_top_foc = 0;
+        self.prev_ref_frame_num = None;
         // Drop any picture currently being assembled — reset implies we
         // discard in-flight state, not deliver it.
         self.in_progress = None;
