@@ -765,7 +765,14 @@ fn reconstruct_intra_16x16(
     current_slice_id: i32,
 ) -> Result<(), ReconstructError> {
     // -------- §8.3.3 — 16x16 prediction -----------------------------
-    let samples = gather_samples_16x16(pic, grid, mb_px, mb_py, current_slice_id);
+    let samples = gather_samples_16x16(
+        pic,
+        grid,
+        mb_px,
+        mb_py,
+        current_slice_id,
+        pps.constrained_intra_pred_flag,
+    );
     let mode = Intra16x16Mode::from_index(pred_mode_idx).ok_or_else(|| {
         ReconstructError::UnsupportedMbType(format!("Intra_16x16 pred_mode {}", pred_mode_idx))
     })?;
@@ -1197,7 +1204,15 @@ fn reconstruct_intra_nxn(
             let mode = Intra8x8Mode::from_index(mode_idx).unwrap_or(Intra8x8Mode::Dc);
 
             // Gather neighbour samples for this 8x8 block.
-            let raw = gather_samples_8x8(pic, grid, mb_px + bx, mb_py + by, blk8, current_slice_id);
+            let raw = gather_samples_8x8(
+                pic,
+                grid,
+                mb_px + bx,
+                mb_py + by,
+                blk8,
+                current_slice_id,
+                cip,
+            );
             let filtered = filter_samples_8x8(&raw, bit_depth_y);
             let mut pred_samples = [0i32; 64];
             predict_8x8(mode, &filtered, bit_depth_y, &mut pred_samples);
@@ -1309,8 +1324,15 @@ fn reconstruct_intra_nxn(
             let mode = Intra4x4Mode::from_index(mode_idx).unwrap_or(Intra4x4Mode::Dc);
 
             // Gather neighbour samples for this 4x4 block.
-            let samples =
-                gather_samples_4x4(pic, grid, mb_px + bx, mb_py + by, block_idx, current_slice_id);
+            let samples = gather_samples_4x4(
+                pic,
+                grid,
+                mb_px + bx,
+                mb_py + by,
+                block_idx,
+                current_slice_id,
+                cip,
+            );
             let mut pred_samples = [0i32; 16];
             predict_4x4(mode, &samples, bit_depth_y, &mut pred_samples);
 
@@ -1480,6 +1502,7 @@ fn reconstruct_chroma_intra(
             current_slice_id,
             sub_width_c,
             sub_height_c,
+            pps.constrained_intra_pred_flag,
         );
         let out_len = (mbw_c as usize) * (mbh_c as usize);
         let mut pred_samples = vec![0i32; out_len];
@@ -1607,11 +1630,18 @@ fn gather_samples_16x16(
     mb_px: i32,
     mb_py: i32,
     current_slice_id: i32,
+    constrained_intra_pred: bool,
 ) -> Samples16x16 {
-    let left_avail = mb_px > 0 && same_slice_at(grid, mb_px - 1, mb_py, current_slice_id);
-    let top_avail = mb_py > 0 && same_slice_at(grid, mb_px, mb_py - 1, current_slice_id);
-    let tl_avail =
-        mb_px > 0 && mb_py > 0 && same_slice_at(grid, mb_px - 1, mb_py - 1, current_slice_id);
+    let left_avail = mb_px > 0
+        && same_slice_at(grid, mb_px - 1, mb_py, current_slice_id)
+        && cip_ok_at(grid, mb_px - 1, mb_py, constrained_intra_pred);
+    let top_avail = mb_py > 0
+        && same_slice_at(grid, mb_px, mb_py - 1, current_slice_id)
+        && cip_ok_at(grid, mb_px, mb_py - 1, constrained_intra_pred);
+    let tl_avail = mb_px > 0
+        && mb_py > 0
+        && same_slice_at(grid, mb_px - 1, mb_py - 1, current_slice_id)
+        && cip_ok_at(grid, mb_px - 1, mb_py - 1, constrained_intra_pred);
 
     let top_left = if tl_avail {
         pic.luma_at(mb_px - 1, mb_py - 1)
@@ -1666,11 +1696,18 @@ fn gather_samples_4x4(
     by: i32,
     block_idx: usize,
     current_slice_id: i32,
+    constrained_intra_pred: bool,
 ) -> Samples4x4 {
-    let left_avail = bx > 0 && same_slice_at(grid, bx - 1, by, current_slice_id);
-    let top_avail = by > 0 && same_slice_at(grid, bx, by - 1, current_slice_id);
-    let tl_avail =
-        bx > 0 && by > 0 && same_slice_at(grid, bx - 1, by - 1, current_slice_id);
+    let left_avail = bx > 0
+        && same_slice_at(grid, bx - 1, by, current_slice_id)
+        && cip_ok_at(grid, bx - 1, by, constrained_intra_pred);
+    let top_avail = by > 0
+        && same_slice_at(grid, bx, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx, by - 1, constrained_intra_pred);
+    let tl_avail = bx > 0
+        && by > 0
+        && same_slice_at(grid, bx - 1, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx - 1, by - 1, constrained_intra_pred);
     // Top-right availability: the 4 samples at (bx+4..=bx+7, by-1) must
     // (a) lie in an above-row (i.e. `top_avail`), (b) fit inside the
     // picture horizontally, AND (c) come from a 4x4 block that has
@@ -1683,7 +1720,8 @@ fn gather_samples_4x4(
     let tr_avail = by > 0
         && tr_scan_ok
         && (bx + 4 < pic.width_in_samples as i32)
-        && same_slice_at(grid, bx + 4, by - 1, current_slice_id);
+        && same_slice_at(grid, bx + 4, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx + 4, by - 1, constrained_intra_pred);
 
     let top_left = if tl_avail {
         pic.luma_at(bx - 1, by - 1)
@@ -1758,6 +1796,46 @@ fn same_slice_at(grid: &MbGrid, x: i32, y: i32, current_slice_id: i32) -> bool {
     }
 }
 
+/// §8.3.1.2 / §8.3.2.2 / §8.3.3.1 / §8.3.4.1 — "constrained_intra_pred
+/// rejection": with `pps.constrained_intra_pred_flag == 1`, a sample
+/// p[x, y] that lies inside a macroblock coded using an Inter prediction
+/// mode is marked as "not available for Intra prediction".
+///
+/// `(x, y)` are picture-absolute luma sample coordinates. For chroma
+/// callers, pass the chroma coordinates scaled up to luma (the spec's
+/// rule applies to the macroblock, not the individual sample plane).
+///
+/// Returns `false` (neighbour unavailable) when constrained_intra_pred
+/// applies. Returns `true` in all other cases — including out-of-picture
+/// coordinates and unstamped grid entries, leaving the caller's other
+/// availability checks as the source of truth.
+fn cip_ok_at(
+    grid: &MbGrid,
+    x: i32,
+    y: i32,
+    constrained_intra_pred: bool,
+) -> bool {
+    if !constrained_intra_pred {
+        return true;
+    }
+    if x < 0 || y < 0 {
+        return true;
+    }
+    let mb_x = (x >> 4) as u32;
+    let mb_y = (y >> 4) as u32;
+    if mb_x >= grid.width_in_mbs || mb_y >= grid.height_in_mbs {
+        return true;
+    }
+    let addr = mb_y * grid.width_in_mbs + mb_x;
+    match grid.get(addr) {
+        // Neighbour is an already-decoded inter MB — samples unavailable
+        // under constrained_intra_pred per §8.3.1.2 / §8.3.2.2 /
+        // §8.3.3.1 / §8.3.4.1.
+        Some(info) if info.available && !info.is_intra => false,
+        _ => true,
+    }
+}
+
 /// §8.3.2 — reference samples for an 8x8 block at (bx, by).
 ///
 /// `blk8` is the luma8x8BlkIdx (0..=3) of this 8x8 block within its
@@ -1774,16 +1852,24 @@ fn gather_samples_8x8(
     by: i32,
     blk8: usize,
     current_slice_id: i32,
+    constrained_intra_pred: bool,
 ) -> Samples8x8 {
-    let left_avail = bx > 0 && same_slice_at(grid, bx - 1, by, current_slice_id);
-    let top_avail = by > 0 && same_slice_at(grid, bx, by - 1, current_slice_id);
-    let tl_avail =
-        bx > 0 && by > 0 && same_slice_at(grid, bx - 1, by - 1, current_slice_id);
+    let left_avail = bx > 0
+        && same_slice_at(grid, bx - 1, by, current_slice_id)
+        && cip_ok_at(grid, bx - 1, by, constrained_intra_pred);
+    let top_avail = by > 0
+        && same_slice_at(grid, bx, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx, by - 1, constrained_intra_pred);
+    let tl_avail = bx > 0
+        && by > 0
+        && same_slice_at(grid, bx - 1, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx - 1, by - 1, constrained_intra_pred);
     let tr_scan_ok = blk8 != 3;
     let tr_avail = by > 0
         && tr_scan_ok
         && (bx + 8 < pic.width_in_samples as i32)
-        && same_slice_at(grid, bx + 8, by - 1, current_slice_id);
+        && same_slice_at(grid, bx + 8, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx + 8, by - 1, constrained_intra_pred);
 
     let top_left = if tl_avail {
         pic.luma_at(bx - 1, by - 1)
@@ -1837,6 +1923,7 @@ fn gather_samples_chroma(
     current_slice_id: i32,
     sub_width_c: i32,
     sub_height_c: i32,
+    constrained_intra_pred: bool,
 ) -> SamplesChroma {
     let w = ct.width();
     let h = ct.height();
@@ -1845,12 +1932,15 @@ fn gather_samples_chroma(
     let to_lx = |cx: i32| cx * sub_width_c;
     let to_ly = |cy: i32| cy * sub_height_c;
     let left_avail = c_mb_px > 0
-        && same_slice_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py), current_slice_id);
+        && same_slice_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py), current_slice_id)
+        && cip_ok_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py), constrained_intra_pred);
     let top_avail = c_mb_py > 0
-        && same_slice_at(grid, to_lx(c_mb_px), to_ly(c_mb_py - 1), current_slice_id);
+        && same_slice_at(grid, to_lx(c_mb_px), to_ly(c_mb_py - 1), current_slice_id)
+        && cip_ok_at(grid, to_lx(c_mb_px), to_ly(c_mb_py - 1), constrained_intra_pred);
     let tl_avail = c_mb_px > 0
         && c_mb_py > 0
-        && same_slice_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py - 1), current_slice_id);
+        && same_slice_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py - 1), current_slice_id)
+        && cip_ok_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py - 1), constrained_intra_pred);
 
     let fetch = |x: i32, y: i32| -> i32 {
         if plane == 0 {
@@ -8155,7 +8245,7 @@ mod tests {
 
         let grid = crate::mb_grid::MbGrid::new(4, 2);
         for (idx, (bx, by)) in xy.iter().copied().enumerate() {
-            let s = super::gather_samples_4x4(&pic, &grid, bx, by, idx, -1);
+            let s = super::gather_samples_4x4(&pic, &grid, bx, by, idx, -1, false);
             let expected = match idx {
                 // Scan-order "top-right not yet decoded" set.
                 3 | 7 | 11 | 13 | 15 => false,
@@ -8183,7 +8273,7 @@ mod tests {
         let pic = Picture::new(64, 32, 1, 8, 8);
         let grid = crate::mb_grid::MbGrid::new(4, 2);
         // LUMA_8X8_XY[3] == (8, 8).
-        let s = super::gather_samples_8x8(&pic, &grid, 8, 8, 3, -1);
+        let s = super::gather_samples_8x8(&pic, &grid, 8, 8, 3, -1, false);
         assert!(
             !s.availability.top_right,
             "blk8 3: tr should be false (right-neighbour MB not decoded)"
@@ -8191,7 +8281,7 @@ mod tests {
         // And blk8 == 2 at (0, 8) — top-right here is block 1 within
         // the current MB, which HAS been decoded; report true (the
         // top row is also inside the picture).
-        let s2 = super::gather_samples_8x8(&pic, &grid, 0, 8, 2, -1);
+        let s2 = super::gather_samples_8x8(&pic, &grid, 0, 8, 2, -1, false);
         assert!(s2.availability.top_right);
     }
 
