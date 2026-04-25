@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/OxideAV/oxideav-h264/compare/v0.1.0...v0.1.1) - 2026-04-25
+
+### Other
+
+- release v0.1.0 ([#3](https://github.com/OxideAV/oxideav-h264/pull/3))
+
 ## [0.1.0](https://github.com/OxideAV/oxideav-h264/compare/v0.0.4...v0.1.0) - 2026-04-25
 
 ### Other
