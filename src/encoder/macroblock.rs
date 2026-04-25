@@ -1,10 +1,11 @@
 //! §7.3.5 — macroblock_layer emit (encoder side, I_16x16 path).
 //!
-//! Round-2 scope: every macroblock is `I_16x16`. Luma uses one of the
+//! Round-3 scope: every macroblock is `I_16x16`. Luma uses one of the
 //! four §8.3.3 modes (DC / V / H / Plane); chroma uses one of the four
-//! §8.3.4 modes (DC / V / H / Plane). `cbp_luma` is still 0 (no luma
-//! AC residual); `cbp_chroma` ranges over {0, 1, 2}: 0 = no chroma
-//! residual, 1 = chroma DC only, 2 = chroma DC + AC.
+//! §8.3.4 modes (DC / V / H / Plane). `cbp_luma` is now {0, 15}: 0 when
+//! the per-MB luma AC quantizes entirely to zero, 15 when at least one
+//! 4x4 AC block carries a non-zero level (the spec only allows 0 or 15
+//! for Intra_16x16 — §7.4.5.1). `cbp_chroma` ranges over {0, 1, 2}.
 //!
 //! Emitted syntax for one MB:
 //!
@@ -15,7 +16,8 @@
 //!   coded_block_pattern me(v)   -- absent for Intra_16x16; CBP carried in mb_type
 //!   mb_qp_delta se(v)           -- present for every Intra_16x16 (luma DC always)
 //!   residual_block(LumaDC, 0..15, max=16)
-//!   -- LumaAC blocks omitted (cbp_luma == 0)
+//!   if cbp_luma == 15:
+//!     for blk in 0..16: residual_block(Intra16x16ACLevel[blk], 0..14, max=15)
 //!   if cbp_chroma > 0:
 //!     residual_block(ChromaDCLevelCb, 0..3, max=4)
 //!     residual_block(ChromaDCLevelCr, 0..3, max=4)
@@ -45,6 +47,17 @@ pub struct I16x16McbConfig {
     /// `(blk4x4_y * 4 + blk4x4_x)`. The encoder applies the zig-zag
     /// scan internally before CAVLC.
     pub luma_dc_levels_raster: [i32; 16],
+    /// Per-4x4-block luma AC levels in §6.4.3 raster-Z order (matches
+    /// `crate::reconstruct::LUMA_4X4_XY` indexing). Each block carries
+    /// 15 AC coefficients in scan order with the AC-only layout
+    /// (positions 0..=14, slot 15 unused — see `zigzag_scan_4x4_ac`).
+    /// Used only when `cbp_luma == 15`.
+    pub luma_ac_levels: [[i32; 16]; 16],
+    /// Per-luma-AC-block `nC` (CAVLC neighbour context). Used only when
+    /// `cbp_luma == 15`. The encoder must pre-compute these via the
+    /// §9.2.1.1 derivation — they cascade through the MB as TotalCoeff
+    /// of earlier blocks lands.
+    pub luma_ac_nc: [i32; 16],
     /// 4 quantized chroma DC levels (Cb), in the same row-major order
     /// the inverse Hadamard expects. Ignored when `cbp_chroma == 0`.
     pub chroma_dc_cb: [i32; 4],
@@ -105,7 +118,25 @@ pub fn write_intra16x16_mb(
     // §7.3.5.3 — Intra_16x16 luma DC block.
     let scan = zigzag_scan_4x4(&cfg.luma_dc_levels_raster);
     encode_residual_block_cavlc(w, nc_ctx, 16, &scan)?;
-    // cbp_luma == 0 → no Intra16x16ACLevel blocks.
+
+    // §7.3.5.3 — Intra_16x16 luma AC blocks. cbp_luma == 15 sends all
+    // 16 AC blocks (one per 4x4 sub-block, in §6.4.3 raster-Z order).
+    // Each block emits the 15 AC coefficients at scan positions 1..=15
+    // (startIdx=1, endIdx=15, maxNumCoeff=15 — see §7.3.5.3.3 +
+    // Table 9-42). The encoder has already packed these into AC-only
+    // scan order via `zigzag_scan_4x4_ac` (positions 0..=14 of each
+    // `luma_ac_levels[blk]`; slot 15 is unused padding).
+    if cfg.cbp_luma == 15 {
+        for blk in 0..16usize {
+            let nc = cfg.luma_ac_nc[blk];
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(nc),
+                15,
+                &cfg.luma_ac_levels[blk][..15],
+            )?;
+        }
+    }
 
     // §7.3.5.3 — Chroma residual.
     if cfg.cbp_chroma > 0 {

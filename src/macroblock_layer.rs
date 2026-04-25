@@ -858,7 +858,7 @@ impl CavlcNcGrid {
 /// `Intra16x16Dc` covers `Intra16x16DCLevel` (step 1 of §9.2.1.1:
 /// `luma4x4BlkIdx = 0` for the DC block).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LumaNcKind {
+pub(crate) enum LumaNcKind {
     /// 4x4 AC / LumaLevel4x4 — indexed by the block's luma4x4BlkIdx.
     Ac,
     /// Intra16x16DCLevel — §9.2.1.1 step 1: `luma4x4BlkIdx = 0`.
@@ -875,7 +875,7 @@ enum LumaNcKind {
 /// spec fixes `luma4x4BlkIdx = 0` (§9.2.1.1 step 1); callers that want
 /// that behaviour pass `kind = LumaNcKind::Intra16x16Dc` and the
 /// `blk_idx` is ignored.
-fn derive_nc_luma(
+pub(crate) fn derive_nc_luma(
     grid: &CavlcNcGrid,
     current_mb_addr: u32,
     blk_idx: u8,

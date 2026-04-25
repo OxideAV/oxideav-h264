@@ -1,8 +1,8 @@
 //! H.264 / AVC **encoder** — Baseline profile, IDR-only, I_16x16
-//! (DC/V/H/Plane) with chroma DC + AC residual.
+//! (DC/V/H/Plane) with full luma DC + AC residual and chroma DC + AC.
 //!
-//! Round-2 scope (round-1 was DC-luma only, no chroma residual; see
-//! `STATUS.md`):
+//! Round-3 scope (round-1 was DC-luma only; round-2 added the chroma
+//! residual + multi-mode I_16x16; see `STATUS.md`):
 //!
 //! * **Profile:** Baseline (`profile_idc = 66`), 4:2:0, 8-bit, single
 //!   slice per picture, no FMO.
@@ -14,10 +14,11 @@
 //!   selected per MB by minimum-SAD.
 //! * **Transforms:** 4x4 integer transform + 4x4 luma-DC Hadamard +
 //!   2x2 chroma-DC Hadamard. Flat scaling lists.
-//! * **CBP:** `cbp_luma` is still 0 (no luma AC residual). `cbp_chroma`
-//!   is 1 (chroma DC) by default; promoted to 2 (chroma DC + AC) when
-//!   the AC residual on either plane carries non-zero levels.
-//! * **Entropy:** CAVLC.
+//! * **CBP:** `cbp_luma` ∈ {0, 15} (per §7.4.5.1 for Intra_16x16) —
+//!   promoted to 15 whenever any 4x4 luma AC block has a non-zero
+//!   coefficient. `cbp_chroma` ∈ {0, 1, 2}.
+//! * **Entropy:** CAVLC, with per-MB neighbour grid (`CavlcNcGrid`)
+//!   driving §9.2.1.1 nC derivation for AC blocks.
 //! * **In-loop filter:** disabled (`disable_deblocking_filter_idc = 1`).
 //!
 //! Spec references throughout cite ITU-T Rec. H.264 (08/2024).
@@ -48,11 +49,36 @@ use crate::encoder::transform::{
     forward_core_4x4, forward_hadamard_2x2, forward_hadamard_4x4, quantize_4x4_ac,
     quantize_chroma_dc, quantize_luma_dc, zigzag_scan_4x4_ac,
 };
+use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
 use crate::nal::NalUnitType;
 use crate::transform::{
     inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16, inverse_scan_4x4_zigzag_ac,
     inverse_transform_4x4_dc_preserved, qp_y_to_qp_c, FLAT_4X4_16,
 };
+
+/// §6.4.3 / Figure 6-10 — luma 4x4 block scan: index 0..=15 → (x, y)
+/// offset of the block inside a macroblock (in 4-sample units, *not*
+/// pixels). This mirrors `crate::reconstruct::LUMA_4X4_XY` but in
+/// 4x4-block coordinates so the encoder can index the per-block AC
+/// arrays directly.
+const LUMA_4X4_BLK: [(usize, usize); 16] = [
+    (0, 0),
+    (1, 0),
+    (0, 1),
+    (1, 1),
+    (2, 0),
+    (3, 0),
+    (2, 1),
+    (3, 1),
+    (0, 2),
+    (1, 2),
+    (0, 3),
+    (1, 3),
+    (2, 2),
+    (3, 2),
+    (2, 3),
+    (3, 3),
+];
 
 /// One encoded YUV 4:2:0 frame's worth of input planes. All planes are
 /// 8-bit, row-major. Width and height must be multiples of 16 (no
@@ -161,6 +187,14 @@ impl Encoder {
         let qp_y = self.cfg.qp;
         let qp_c = qp_y_to_qp_c(qp_y, pps_cfg.chroma_qp_index_offset);
 
+        // §9.2.1.1 — neighbour grid for CAVLC nC derivation. Encoder
+        // mirrors what the decoder will reconstruct as it walks the MBs:
+        // mark each MB's slot `is_available = true` after encode and
+        // store the per-4x4 luma-AC TotalCoeff. The decoder uses the
+        // same procedure to pick CAVLC tables, so we must match it
+        // bit-exactly to avoid mis-parsing.
+        let mut nc_grid = CavlcNcGrid::new(width_mbs, height_mbs);
+
         // Iterate MBs in raster order.
         for mb_y in 0..height_mbs {
             for mb_x in 0..width_mbs {
@@ -176,6 +210,7 @@ impl Encoder {
                     &mut recon_u,
                     &mut recon_v,
                     &mut sw,
+                    &mut nc_grid,
                 );
             }
         }
@@ -216,6 +251,7 @@ impl Encoder {
         recon_u: &mut [u8],
         recon_v: &mut [u8],
         sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
     ) {
         let width = self.cfg.width as usize;
         let height = self.cfg.height as usize;
@@ -279,15 +315,60 @@ impl Encoder {
         let dc_hadamard = forward_hadamard_4x4(&dc_coeffs);
         let dc_levels = quantize_luma_dc(&dc_hadamard, qp_y, true);
 
-        // Round-2 still uses cbp_luma == 0: discard luma AC. The
-        // inverse path uses only the DC reconstruction (matches
-        // §8.5.10 / §8.5.12 with all AC coefficients == 0).
+        // §8.5.10 — luma AC residual. Quantize each 4x4 block's AC
+        // (positions 1..15 of the row-major coefficient block; position
+        // 0 is the DC and is handled separately by the Hadamard above).
+        // Pack into AC-only scan order (15 entries each) ready for
+        // CAVLC emit.
+        //
+        // Ordering note: §6.4.3 raster-Z order (`LUMA_4X4_BLK`) is what
+        // the decoder consumes when `cbp_luma == 15`. The local
+        // `coeffs_4x4[blk]` array above is keyed by simple row-major
+        // (`blk = by*4 + bx`); we re-index here.
+        let mut luma_ac_levels = [[0i32; 16]; 16];
+        let mut luma_ac_quant_raster = [[0i32; 16]; 16]; // for inverse path
+        let mut any_luma_ac_nz = false;
+        for blkz in 0..16usize {
+            let (bx, by) = LUMA_4X4_BLK[blkz];
+            let raster = by * 4 + bx;
+            let z = quantize_4x4_ac(&coeffs_4x4[raster], qp_y, true);
+            luma_ac_quant_raster[raster] = z;
+            // AC scan layout for the bitstream (positions 0..=14).
+            let scan_ac = zigzag_scan_4x4_ac(&z);
+            luma_ac_levels[blkz] = scan_ac;
+            if scan_ac.iter().any(|&v| v != 0) {
+                any_luma_ac_nz = true;
+            }
+        }
+        // §7.4.5.1 — for Intra_16x16 cbp_luma is 0 or 15 only.
+        let cbp_luma: u8 = if any_luma_ac_nz { 15 } else { 0 };
+
+        // §8.5.10 reconstruction: inverse Hadamard on the DC levels +
+        // per-block inverse 4x4 with c[0,0] overwritten by the matching
+        // pre-scaled DC entry. When `cbp_luma == 0` the AC is zeroed —
+        // matching what the decoder will see (no AC blocks in the
+        // bitstream → empty residual_luma → coeffs[1..] = 0).
         let inv_dc = inverse_hadamard_luma_dc_16x16(&dc_levels, qp_y, &FLAT_4X4_16, 8)
             .expect("luma DC inverse");
+        #[allow(clippy::needless_range_loop)] // raster row-major over 16 4x4 blocks
         for blk in 0..16usize {
             let bx = blk % 4;
             let by = blk / 4;
-            let mut coeffs_in = [0i32; 16];
+            // Build the inverse coefficient block: AC from the
+            // already-quantized levels (only when cbp_luma == 15 will
+            // they actually reach the decoder — otherwise zero them
+            // here so the encoder recon matches what the decoder will
+            // produce).
+            let mut coeffs_in = if cbp_luma == 15 {
+                // Re-build the pre-AC-scan coeff matrix the decoder
+                // produces by `inverse_scan_4x4_zigzag_ac` from the
+                // AC-only layout. Identical to taking the original
+                // `luma_ac_quant_raster[blk]` (which already has slot 0
+                // zeroed by `quantize_4x4_ac`).
+                luma_ac_quant_raster[blk]
+            } else {
+                [0i32; 16]
+            };
             coeffs_in[0] = inv_dc[by * 4 + bx];
             let r = inverse_transform_4x4_dc_preserved(&coeffs_in, qp_y, &FLAT_4X4_16, 8)
                 .expect("inverse 4x4");
@@ -379,19 +460,77 @@ impl Encoder {
         }
         let _ = chroma_height;
 
-        // ------- Emit MB syntax -------
+        // ------- Build CAVLC neighbour-grid view + per-block nC ------
+        // §9.2.1.1: nC for each AC residual block is derived from the
+        // neighbour A (left) and B (above) blocks. The decoder will use
+        // its own CavlcNcGrid for this; the encoder must match.
+        //
+        // Strategy: mark this MB available *before* emit and
+        // progressively fill `luma_total_coeff[blk]` with the
+        // TotalCoeff of each AC block as we enumerate them. Internal
+        // neighbours then read the correct partial state via
+        // `derive_nc_luma`'s `NeighbourSource::InternalBlock` →
+        // `nc_nn_luma` → `info.luma_total_coeff[blk]` chain. External
+        // neighbours read from previously-encoded MBs (already filled
+        // by an earlier iteration of this loop).
+        let width_mbs = self.cfg.width / 16;
+        let mb_addr = (mb_y as u32) * width_mbs + (mb_x as u32);
+        // NOTE: order of operations matters. We need to set
+        // `is_available = true` and `is_intra = true` for the current
+        // MB *before* deriving any nC values that might reference its
+        // own internal blocks.
+        {
+            let cur = &mut nc_grid.mbs[mb_addr as usize];
+            cur.is_available = true;
+            cur.is_intra = true;
+            cur.is_skip = false;
+            cur.is_i_pcm = false;
+            cur.luma_total_coeff = [0u8; 16]; // start fresh
+        }
+
         // §9.2.1.1 NOTE 1: nC for Intra16x16DCLevel uses *AC* TotalCoeff
-        // of neighbour luma4x4 block 0. With cbp_luma == 0 always, the
-        // AC TotalCoeff is identically zero, so nC = 0 across the
-        // picture — the encoder mirrors the decoder.
-        let nc_dc = 0;
+        // of neighbour luma4x4 block 0 (the DC's "blk_idx" is fixed to
+        // 0 by step 1). The neighbour A/B for block 0 are the
+        // corresponding blocks of the left / above MBs. `derive_nc_luma`
+        // with `LumaNcKind::Intra16x16Dc` does this lookup.
+        let nc_dc = derive_nc_luma(nc_grid, mb_addr, 0, LumaNcKind::Intra16x16Dc, true, false);
+
+        // Per-AC-block nC, in §6.4.3 raster-Z order. We compute every
+        // entry up-front (using the freshly-zeroed own_luma_totals on
+        // this MB) then progressively update the grid as we encode each
+        // block, recomputing the next block's nC from the updated state.
+        let mut luma_ac_nc = [0i32; 16];
+        let mut own_totals = [0u8; 16];
+        for blkz in 0..16u8 {
+            // Update grid view of own MB before computing this block's
+            // nC, so internal neighbours read the right TotalCoeff.
+            nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+            let nc = derive_nc_luma(nc_grid, mb_addr, blkz, LumaNcKind::Ac, true, false);
+            luma_ac_nc[blkz as usize] = nc;
+            // Update own_totals with this block's TotalCoeff so the
+            // next block's nC sees it.
+            if cbp_luma == 15 {
+                let tc = luma_ac_levels[blkz as usize]
+                    .iter()
+                    .filter(|&&v| v != 0)
+                    .count() as u8;
+                own_totals[blkz as usize] = tc;
+            }
+        }
+        // Final write of TotalCoeff into the grid for this MB so future
+        // MBs see the correct neighbour state.
+        nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+
+        // ------- Emit MB syntax -------
         let mb_cfg = I16x16McbConfig {
             pred_mode: best_luma_mode.as_u8(),
             intra_chroma_pred_mode: best_chroma_mode.as_u8(),
-            cbp_luma: 0,
+            cbp_luma,
             cbp_chroma,
             mb_qp_delta: 0,
             luma_dc_levels_raster: dc_levels,
+            luma_ac_levels,
+            luma_ac_nc,
             chroma_dc_cb: u_dc_levels,
             chroma_dc_cr: v_dc_levels,
             chroma_ac_cb: u_ac_levels,

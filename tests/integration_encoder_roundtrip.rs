@@ -482,3 +482,156 @@ fn ffmpeg_decode_matches_encoder_recon() {
         ff_u.len()
     );
 }
+
+/// Round-3 — luma AC residual lift. Uses a 64x64 noisy test source
+/// designed to *force* significant AC: every pixel is a hash of (i, j).
+/// A DC-only encoder sees pure noise and quantizes the residual to ~MB
+/// average; an AC-capable encoder reproduces a much sharper image.
+fn make_noisy_64x64() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let w = 64usize;
+    let h = 64usize;
+    let mut y = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            // Deterministic high-frequency pattern.
+            y[j * w + i] = ((i * 17 + j * 23 + (i ^ j) * 7) % 200 + 28) as u8;
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+    (y, u, v)
+}
+
+#[test]
+fn round3_ac_residual_lifts_psnr_on_noisy_picture() {
+    let (y, u, v) = make_noisy_64x64();
+    let frame = YuvFrame {
+        width: 64,
+        height: 64,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let mut cfg = EncoderConfig::new(64, 64);
+    cfg.qp = 18; // Low QP so AC actually survives quantization.
+    let enc = Encoder::new(cfg);
+    let out = enc.encode_idr(&frame);
+
+    // Self-roundtrip first (validates encoder recon == decoder recon).
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), out.annex_b.clone()).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let frame_out = dec.receive_frame().expect("receive_frame");
+    let vf = match frame_out {
+        Frame::Video(vf) => vf,
+        other => panic!("expected Frame::Video, got {:?}", other),
+    };
+    for (k, (&a, &b)) in vf.planes[0].data.iter().zip(out.recon_y.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "luma sample {k}: decoded={a} encoder_recon={b}",
+        );
+    }
+
+    let psnr = {
+        let m = mse_y(&y, &out.recon_y);
+        if m == 0.0 {
+            99.0
+        } else {
+            10.0 * (255.0 * 255.0 / m).log10()
+        }
+    };
+    eprintln!(
+        "round-3 noisy 64x64 (QP=18): stream={} bytes, PSNR Y={:.2}",
+        out.annex_b.len(),
+        psnr
+    );
+    // With AC residual the encoder should clear ~34 dB on this content
+    // (DC-only Round 2 capped around 14 dB on noise).
+    assert!(psnr >= 34.0, "PSNR {psnr:.2} dB below round-3 floor 34");
+
+    // Comparison run at QP=26 — looser quantization so we can see the
+    // gap between DC-only (round-2) and DC+AC (round-3) reconstruction
+    // on the same input.
+    let mut cfg2 = EncoderConfig::new(64, 64);
+    cfg2.qp = 26;
+    let out2 = Encoder::new(cfg2).encode_idr(&frame);
+    let psnr_qp26 = {
+        let m = mse_y(&y, &out2.recon_y);
+        if m == 0.0 {
+            99.0
+        } else {
+            10.0 * (255.0 * 255.0 / m).log10()
+        }
+    };
+    eprintln!(
+        "round-3 noisy 64x64 (QP=26): stream={} bytes, PSNR Y={:.2}",
+        out2.annex_b.len(),
+        psnr_qp26
+    );
+}
+
+#[test]
+fn round3_ffmpeg_decode_noisy_picture_matches() {
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: ffmpeg not at /opt/homebrew/bin/ffmpeg");
+        return;
+    }
+    let (y, u, v) = make_noisy_64x64();
+    let frame = YuvFrame {
+        width: 64,
+        height: 64,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let mut cfg = EncoderConfig::new(64, 64);
+    cfg.qp = 18;
+    let enc = Encoder::new(cfg);
+    let out = enc.encode_idr(&frame);
+
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!(
+        "oxideav_h264_enc_noisy_{}.h264",
+        std::process::id()
+    ));
+    let yuv_path = tmpdir.join(format!("oxideav_h264_enc_noisy_{}.yuv", std::process::id()));
+    std::fs::write(&h264_path, &out.annex_b).expect("write h264");
+
+    let status = std::process::Command::new(ffmpeg)
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("h264")
+        .arg("-i")
+        .arg(&h264_path)
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed");
+    let raw = std::fs::read(&yuv_path).expect("read yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+
+    let y_len = 64 * 64;
+    let c_len = 32 * 32;
+    assert_eq!(raw.len(), y_len + 2 * c_len);
+    let ff_y = &raw[0..y_len];
+    for (k, (&a, &b)) in ff_y.iter().zip(out.recon_y.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "ffmpeg luma {k}: ff={a} enc_recon={b}",
+        );
+    }
+    eprintln!(
+        "round-3 ffmpeg interop (noisy, QP=18): stream={} bytes, bit-exact match",
+        out.annex_b.len()
+    );
+}
