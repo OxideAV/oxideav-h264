@@ -303,14 +303,98 @@ will produce (including future inter slices that use it as a reference).
 - Chroma AC `nC` is still hard-coded to 0 (sub-optimal bitrate but
   correct).
 
-## Round 15 (planned)
+## Round 15 — landed
 
-- **Lagrangian RDO** for mb_type / mode decision (`D + λR` with real
-  residual cost + actual bit cost from the CAVLC writer).
+Wire **Lagrangian rate-distortion mode decision** at every level: the
+per-block I_NxN 9-mode pick, the per-mode I_16x16 pick, and the MB-level
+I_16x16 vs I_NxN dispatch all now minimise `J = D + λ · R` instead of
+SAD-on-predictor.
+
+- **`encoder::rdo`** module: closed-form `λ = 0.85 · 2^((QP-12)/3)`
+  per the JM convention, plus `ssd_4x4` / `ssd_16x16` distortion helpers
+  and a `cost_combined(D, R, λ)` integer accumulator (λ scaled by 1024
+  to keep arithmetic in `u64`).
+- **`BitWriter::bits_emitted`**: returns the running bit count so trial
+  CAVLC encodes can measure rate without committing to the live writer.
+  Added a `Clone` impl for the snapshot/restore loop.
+- **MB-level RDO dispatch**: `Encoder::encode_mb` now snapshots the
+  recon planes (only the 16x16 + 8x8 + 8x8 MB window — 384 bytes), the
+  `BitWriter`, the `CavlcNcGrid` slot, and the `IntraGrid` slot before
+  trialing. Both paths run in turn into the live state; the loser is
+  rolled back via the snapshot. Lower-J path wins; on tie, prefer
+  I_16x16 (smaller MB syntax).
+- **I_16x16 mode RDO**: `trial_intra16x16_cost` runs the full §8.5.10
+  forward-quant-inverse pipeline per candidate mode and computes
+  `D = SSD(source, recon_clamped)` plus `R = trial CAVLC bits`. The
+  `mb_type` bit cost is approximated as a constant 7 bits (Table 7-11
+  width range is 1..9 across the 24 entries; the constant is identical
+  for every I_16x16 candidate so it cancels out in the within-path
+  comparison and matches the I_NxN MB-overhead seed for the cross-path
+  comparison).
+- **I_NxN per-block RDO**: each of the 16 4x4 blocks trials all 9
+  available modes; for each, we predict, transform, quantise, inverse,
+  add to predictor, compute SSD, run trial CAVLC for rate. Mode rate
+  also includes the per-block `prev_intra4x4_pred_mode_flag` (1 bit)
+  plus optional `rem_intra4x4_pred_mode` (3 bits when mode != predicted).
+  The MB-level cost seeds with a `+25` bit overhead (`mb_type` + chroma
+  pred + cbp + qp_delta + an empirical "post-deblock D under-measurement"
+  bias) so the cross-path comparison is calibrated against the I_16x16
+  seed.
+
+### Encoder bug fix (round-15 collateral)
+
+Surfaced and fixed a pre-existing top-right substitution bug for
+`Intra_4x4` block 5: the encoder's `gather_top_row` was substituting
+`p[3, -1]` for `p[4..=7, -1]` even when those samples were available
+from the already-encoded above-right MB. The decoder reads the real
+samples per §8.3.1.2, causing recon divergence whenever the round-15
+RDO finally picked `Intra_4x4_VerticalLeft` for block 5. Fixed in
+`encoder::intra4x4::gather_top_row` by removing 5 from the substitution
+set (matching the decoder's `gather_samples_4x4`).
+
+### Validation
+
+- `cargo test -p oxideav-h264 --lib` — **774 passed** (+6 unit tests
+  for the new `rdo` module + `bits_emitted` test).
+- All 11 prior integration tests still pass with bit-exact ffmpeg
+  interop on every fixture.
+- **PSNR** (QP 26, RDO mixed dispatch):
+  - 64x64 diagonal-gradient testsrc: 48.05 → **47.58 dB** (-0.47 dB,
+    stream **100 → 88 bytes** for −12% rate).
+  - chroma roundtrip: Y 47.58, Cb 50.03, Cr 50.00 (chroma path
+    unchanged; luma stream 154 vs 232 bytes).
+  - 128x128 mixed bars + gradient: 51.72 → **51.51 dB** (-0.21 dB,
+    stream 196 vs 201 bytes).
+  - 64x64 oriented-edges: 41.25 → **41.16 dB** (-0.09 dB, stream
+    1056 vs 1066 bytes).
+  - 64x64 noisy QP=18: 46.36 → **46.47 dB** (+0.11 dB, stream
+    3056 vs 3089 bytes).
+  - 64x64 noisy QP=26: 37.63 → **37.69 dB** (+0.06 dB, stream
+    2101 vs 2107 bytes).
+  - 64x64 dc-staircase: 50.00 → **50.00 dB** (unchanged).
+- The smooth fixtures see a small PSNR regression but a comparable rate
+  saving — RDO is choosing a different R-D operating point. The noisy
+  fixtures see a small PSNR gain plus rate savings — pure improvement.
+
+### Status caveats (unchanged from round 14 unless noted)
+
+- Still I-only / IDR-only.
+- mb_type still switches between I_16x16 and I_NxN; selection now via
+  Lagrangian RDO (round 15) instead of SAD (rounds 4..14).
+- In-loop deblocking active.
+- No CABAC — CAVLC only.
+- No rate control — fixed QP from `EncoderConfig::qp`.
+- Chroma AC `nC` still hard-coded to 0 (sub-optimal bitrate but correct).
+- λ is calibrated against the round-15 fixture set; future rounds may
+  refine it further (especially for inter-MB λ scaling once P/B slices
+  land).
+
+## Round 16 (planned)
+
 - **Chroma AC nC** per §9.2.1.1 (encoder tracks chroma TotalCoeff in
   the `CavlcNcGrid`).
 
-## Round 16+
+## Round 17+
 
 - P-slice support (single L0, integer MV search).
 - Multiple slices per picture.

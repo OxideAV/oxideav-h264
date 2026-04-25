@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 /// MSB-first bit writer used by every encoder syntax module.
+#[derive(Clone)]
 pub struct BitWriter {
     bytes: Vec<u8>,
     /// Position of the next bit to write within the current byte
@@ -47,6 +48,21 @@ impl BitWriter {
 
     pub fn byte_aligned(&self) -> bool {
         self.bit_pos == 0
+    }
+
+    /// Total number of bits written so far.
+    ///
+    /// Useful for **rate measurement** in Lagrangian RDO: encode a
+    /// candidate residual to a scratch [`BitWriter`], read the delta in
+    /// `bits_emitted()` against the writer's pre-encode state, and use
+    /// the result as the rate term `R` in `J = D + λ · R`.
+    pub fn bits_emitted(&self) -> usize {
+        let full_bytes = if self.bit_pos == 0 {
+            self.bytes.len()
+        } else {
+            self.bytes.len() - 1
+        };
+        full_bytes * 8 + self.bit_pos as usize
     }
 
     /// §7.2 `u(n)`. `bits` ≤ 32. Lower-order `bits` of `value` are
@@ -223,6 +239,24 @@ mod tests {
         // ue(0) = "1", trailing produces nothing extra (already pads).
         // Combined byte = "1 1 000000" = 0xC0
         assert_eq!(w.into_bytes(), vec![0b1100_0000]);
+    }
+
+    #[test]
+    fn bits_emitted_tracks_writes() {
+        let mut w = BitWriter::new();
+        assert_eq!(w.bits_emitted(), 0);
+        w.u(1, 1);
+        assert_eq!(w.bits_emitted(), 1);
+        w.u(3, 0b010);
+        assert_eq!(w.bits_emitted(), 4);
+        w.u(4, 0b1100);
+        assert_eq!(w.bits_emitted(), 8);
+        w.u(8, 0b1111_0000);
+        assert_eq!(w.bits_emitted(), 16);
+        // Mid-byte position must be tracked.
+        let mut w2 = BitWriter::new();
+        w2.u(13, 0);
+        assert_eq!(w2.bits_emitted(), 13);
     }
 
     #[test]

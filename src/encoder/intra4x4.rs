@@ -199,20 +199,21 @@ pub fn gather_top_row(
     //
     // Per §8.3.1.2 the substitution rule fills p[4..7] with p[3,-1]
     // *only* when the original p[4..7,-1] is "not available". To keep
-    // bit-exact match with the decoder's neighbour-sample gather, we
-    // perform the substitution for the same blocks the decoder would:
-    //   * block index 3, 7, 11, 15 → top-right inside MB but NOT yet
-    //     encoded in raster-Z order → substitute.
-    //   * block index 5, 13 → top-right would be in the MB to the
-    //     right (not yet encoded) when at top edge → substitute.
-    //   * Otherwise → real samples.
+    // bit-exact match with the decoder's neighbour-sample gather
+    // (`crate::reconstruct::gather_samples_4x4`), we perform the
+    // substitution for the same blocks the decoder would:
+    //   * block index 3, 7, 11, 13, 15 → top-right not yet decoded in
+    //     §6.4.3 raster-Z order → substitute.
+    //   * Otherwise → real samples (block 5 reads from the above-right
+    //     MB which IS already encoded; the round-15 RDO trial finally
+    //     exposed an old encoder bug that listed block 5 here too).
     //
     // The caller passes `(bx, by)` so we can recompute the block index.
     let blk = LUMA_4X4_XY
         .iter()
         .position(|&(x, y)| x == bx && y == by)
         .unwrap_or(0);
-    let need_substitute = matches!(blk, 3 | 5 | 7 | 11 | 13 | 15);
+    let need_substitute = matches!(blk, 3 | 7 | 11 | 13 | 15);
     // Also substitute when the would-be-fetched samples are off the
     // picture's right edge (last MB column with bx+4..bx+8 spilling
     // beyond row above us).
