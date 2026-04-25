@@ -1,9 +1,12 @@
 //! §7.3.3 — slice_header emit (encoder side, IDR I-slice path).
 //!
-//! Round-1 minimal slice header for an IDR I-slice in a Baseline stream:
-//! POC type 0, no FMO, no MMCO (just `long_term_reference_flag=0`),
-//! `disable_deblocking_filter_idc=1` (skip in-loop deblocking — keeps
-//! the encoder reconstruction loop simple).
+//! Round-14: in-loop deblocking is enabled by default
+//! (`disable_deblocking_filter_idc=0`). The PPS's
+//! `deblocking_filter_control_present_flag=1` lets the slice header
+//! drive the loop-filter state. Round-1..13 emitted
+//! `disable_deblocking_filter_idc=1` to keep the encoder simple; we now
+//! mirror what the decoder produces so the encoder's local recon stays
+//! aligned with what downstream decoders see.
 
 use crate::encoder::bitstream::BitWriter;
 
@@ -26,6 +29,16 @@ pub struct IdrSliceHeaderConfig {
     pub poc_lsb_bits: u32,
     /// `slice_qp_delta` per §7.4.3.
     pub slice_qp_delta: i32,
+    /// §7.4.3 — `disable_deblocking_filter_idc` ∈ {0, 1, 2}. 0 = filter
+    /// across slice boundaries, 1 = no filtering, 2 = filter except on
+    /// slice boundaries. Our single-slice encoder uses 0.
+    pub disable_deblocking_filter_idc: u32,
+    /// §7.4.3 — `slice_alpha_c0_offset_div2` ∈ -6..=6. Only emitted when
+    /// `disable_deblocking_filter_idc != 1`.
+    pub slice_alpha_c0_offset_div2: i32,
+    /// §7.4.3 — `slice_beta_offset_div2` ∈ -6..=6. Only emitted when
+    /// `disable_deblocking_filter_idc != 1`.
+    pub slice_beta_offset_div2: i32,
 }
 
 /// Emit the bits of a single IDR I-slice header into the supplied
@@ -55,10 +68,18 @@ pub fn write_idr_i_slice_header(w: &mut BitWriter, cfg: &IdrSliceHeaderConfig) {
     w.se(cfg.slice_qp_delta);
     // No sp_for_switch_flag, slice_qs_delta — not SP/SI.
 
-    // §7.3.3 — deblocking_filter_control_present_flag == 1 in our PPS.
-    // Set disable_deblocking_filter_idc = 1 → skip deblocking entirely;
-    // round-1 encoder does not implement the in-loop filter.
-    w.ue(1);
+    // §7.3.3 — deblocking_filter_control_present_flag == 1 in our PPS,
+    // so we always emit `disable_deblocking_filter_idc`. When the IDC
+    // is not 1 (i.e. some form of filtering is enabled), the alpha-c0
+    // and beta offsets follow.
+    debug_assert!(cfg.disable_deblocking_filter_idc <= 2);
+    debug_assert!((-6..=6).contains(&cfg.slice_alpha_c0_offset_div2));
+    debug_assert!((-6..=6).contains(&cfg.slice_beta_offset_div2));
+    w.ue(cfg.disable_deblocking_filter_idc);
+    if cfg.disable_deblocking_filter_idc != 1 {
+        w.se(cfg.slice_alpha_c0_offset_div2);
+        w.se(cfg.slice_beta_offset_div2);
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +121,9 @@ mod tests {
                 pic_order_cnt_lsb: 0,
                 poc_lsb_bits: sps.log2_max_pic_order_cnt_lsb_minus4 + 4,
                 slice_qp_delta: 0,
+                disable_deblocking_filter_idc: 1,
+                slice_alpha_c0_offset_div2: 0,
+                slice_beta_offset_div2: 0,
             },
         );
         // Append a trivial slice_data placeholder + rbsp_trailing_bits so

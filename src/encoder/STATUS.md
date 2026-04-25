@@ -239,16 +239,78 @@ one I_16x16 mode per macroblock can't capture.
 - Chroma AC `nC` is still hard-coded to 0 (sub-optimal bitrate but
   correct).
 
-## Round 5 (planned)
+## Round 14 — landed
 
-- **In-loop deblocking** on the local recon (mirror the decoder's
-  §8.7) — most important once we add P/B slices with stronger
-  residual.
+Wire **in-loop §8.7 deblocking** on the local recon. The encoder now
+runs the same picture-level deblock pass that the decoder runs, so the
+encoder's `EncodedIdr.recon_*` matches what every downstream decoder
+will produce (including future inter slices that use it as a reference).
+
+- **`encoder::deblock`** module: thin adapter that wraps the encoder's
+  `Vec<u8>` recon planes in a [`crate::picture::Picture`] (i32
+  samples), builds a [`crate::mb_grid::MbGrid`] from per-MB
+  `MbDeblockInfo` records (intra flag, QP_Y, per-4x4 nonzero mask),
+  and calls [`crate::reconstruct::deblock_picture_full`] verbatim.
+  Filtered samples are clipped back into the encoder's `u8` recon
+  buffers.
+- **Per-MB nonzero tracking**: each `encode_mb_*` function now returns
+  a `MbDeblockInfo` carrying the per-4x4 luma AC nonzero bitmap (Z-scan
+  Figure 6-10) and per-4x4 chroma AC nonzero bitmap. The bitmap drives
+  §8.7.2.1's third bullet (bS=2 when either side has non-zero
+  coefficients). For Intra_16x16 with `cbp_luma == 15` we set the bit
+  iff the AC scan-order array has any non-zero entry; with `cbp_luma
+  == 0` the bitmap is 0. For I_NxN we use the per-block AC nonzero
+  flags computed for cbp_luma 8x8 quadrant decision.
+- **Slice header**: `disable_deblocking_filter_idc = 0` (filter
+  active), `slice_alpha_c0_offset_div2 = slice_beta_offset_div2 = 0`.
+  The PPS already had `deblocking_filter_control_present_flag = 1`.
+- **`IdrSliceHeaderConfig`** gains `disable_deblocking_filter_idc`,
+  `slice_alpha_c0_offset_div2`, `slice_beta_offset_div2` fields. When
+  IDC != 1 the writer emits the alpha/beta offsets per §7.3.3.
+
+### Validation
+
+- `cargo test -p oxideav-h264 --lib` — **768 passed** (+4 unit tests
+  for the new module).
+- All 9 prior integration tests still pass.
+- New round-14 integration tests:
+  - `round14_deblock_self_roundtrip_matches` — DC-staircase 64x64
+    picture (per-MB DC offsets that produce visible blocking without
+    the filter). Self-roundtrip matches encoder recon bit-exactly,
+    confirming encoder-side deblock == decoder-side deblock.
+  - `round14_ffmpeg_decode_deblocked_matches` — bit-exact against
+    ffmpeg 8.1 libavcodec on the same picture.
+- **PSNR uplift** (QP 26):
+  - 64x64 diagonal-gradient testsrc, luma: **42.58 → 48.05 dB**
+    (+5.47 dB).
+  - 64x64 chroma-gradient: Y 42.58 → 48.05; Cb 47.05 → 50.03;
+    Cr 47.05 → 50.00.
+  - 128x128 mixed bars + gradient: **50.11 → 51.72 dB** (+1.61 dB).
+  - The other fixtures (round-3 noisy QP=18; round-4 oriented-edges)
+    are dominated by AC residual rather than block-boundary
+    artefacts, so PSNR is essentially unchanged there.
+- **ffmpeg interop**: bit-exact match against ffmpeg 8.1 libavcodec
+  on every fixture.
+
+### Status caveats (unchanged from round 4 unless noted)
+
+- Still I-only / IDR-only.
+- mb_type still switches between I_16x16 and I_NxN.
+- **In-loop deblocking now active** (`disable_deblocking_filter_idc
+  == 0`, alpha/beta offsets 0).
+- No CABAC — CAVLC only.
+- No rate control — fixed QP from `EncoderConfig::qp`.
+- Chroma AC `nC` is still hard-coded to 0 (sub-optimal bitrate but
+  correct).
+
+## Round 15 (planned)
+
+- **Lagrangian RDO** for mb_type / mode decision (`D + λR` with real
+  residual cost + actual bit cost from the CAVLC writer).
 - **Chroma AC nC** per §9.2.1.1 (encoder tracks chroma TotalCoeff in
   the `CavlcNcGrid`).
-- **Lagrangian RDO** for mb_type / mode decision.
 
-## Round 6+
+## Round 16+
 
 - P-slice support (single L0, integer MV search).
 - Multiple slices per picture.

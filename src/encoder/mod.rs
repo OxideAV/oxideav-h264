@@ -23,7 +23,9 @@
 //!   - `cbp_chroma` ∈ {0, 1, 2}.
 //! * **Entropy:** CAVLC, with per-MB neighbour grid (`CavlcNcGrid`)
 //!   driving §9.2.1.1 nC derivation for AC blocks.
-//! * **In-loop filter:** disabled (`disable_deblocking_filter_idc = 1`).
+//! * **In-loop filter:** §8.7 deblock applied to local recon as a
+//!   picture-level pass after every MB has been emitted (round-14).
+//!   `disable_deblocking_filter_idc = 0`, alpha/beta offsets = 0.
 //!
 //! Spec references throughout cite ITU-T Rec. H.264 (08/2024).
 
@@ -31,6 +33,7 @@
 
 pub mod bitstream;
 pub mod cavlc;
+pub mod deblock;
 pub mod intra4x4;
 pub mod intra_pred;
 pub mod macroblock;
@@ -42,6 +45,9 @@ pub mod transform;
 
 use crate::cavlc::CoeffTokenContext;
 use crate::encoder::bitstream::BitWriter;
+use crate::encoder::deblock::{
+    chroma_nz_mask_from_blocks, deblock_recon, luma_nz_mask_from_blocks, MbDeblockInfo,
+};
 use crate::encoder::intra4x4::{
     availability as i4x4_avail, predict_4x4, sad_4x4, Intra4x4Mode, LUMA_4X4_XY as I4X4_XY,
 };
@@ -317,6 +323,12 @@ impl Encoder {
                 pic_order_cnt_lsb: 0,
                 poc_lsb_bits: sps_cfg.log2_max_poc_lsb_minus4 + 4,
                 slice_qp_delta: 0, // total QP = pic_init_qp_minus26 + 26
+                // §7.4.3 / round 14 — enable in-loop deblocking. We
+                // mirror the decoder's §8.7 pass on the local recon so
+                // EncodedIdr.recon_* matches what the decoder produces.
+                disable_deblocking_filter_idc: 0,
+                slice_alpha_c0_offset_div2: 0,
+                slice_beta_offset_div2: 0,
             },
         );
 
@@ -340,10 +352,16 @@ impl Encoder {
         // `predIntra4x4PredMode` per §8.3.1.1 step 4.
         let mut intra_grid = IntraGrid::new(width_mbs as usize, height_mbs as usize);
 
+        // §8.7 deblock info, one entry per MB (raster order). Filled by
+        // the per-MB encode functions; consumed after the slice loop by
+        // the picture-level deblock pass.
+        let mut mb_deblock_infos: Vec<MbDeblockInfo> =
+            vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
+
         // Iterate MBs in raster order.
         for mb_y in 0..height_mbs {
             for mb_x in 0..width_mbs {
-                self.encode_mb(
+                let dbl = self.encode_mb(
                     frame,
                     mb_x as usize,
                     mb_y as usize,
@@ -358,6 +376,8 @@ impl Encoder {
                     &mut nc_grid,
                     &mut intra_grid,
                 );
+                let mb_addr = (mb_y * width_mbs + mb_x) as usize;
+                mb_deblock_infos[mb_addr] = dbl;
             }
         }
 
@@ -365,6 +385,25 @@ impl Encoder {
         sw.rbsp_trailing_bits();
         let slice_rbsp = sw.into_bytes();
         stream.extend_from_slice(&build_nal_unit(3, NalUnitType::SliceIdr, &slice_rbsp));
+
+        // §8.7 — picture-level in-loop deblocking. Runs *after* every MB
+        // has been reconstructed, both because the spec defines the
+        // filter per picture and because the encoder's intra-prediction
+        // step (which reads `recon_y` for neighbours) must see the
+        // pre-filter samples — same as the decoder.
+        deblock_recon(
+            self.cfg.width,
+            self.cfg.height,
+            chroma_width as u32,
+            chroma_height as u32,
+            &mut recon_y,
+            &mut recon_u,
+            &mut recon_v,
+            &mb_deblock_infos,
+            pps_cfg.chroma_qp_index_offset,
+            width_mbs,
+            height_mbs,
+        );
 
         EncodedIdr {
             annex_b: stream,
@@ -408,7 +447,7 @@ impl Encoder {
         sw: &mut BitWriter,
         nc_grid: &mut CavlcNcGrid,
         intra_grid: &mut IntraGrid,
-    ) {
+    ) -> MbDeblockInfo {
         let width = self.cfg.width as usize;
         let height = self.cfg.height as usize;
 
@@ -451,7 +490,7 @@ impl Encoder {
                 sw,
                 nc_grid,
                 intra_grid,
-            );
+            )
         } else {
             self.encode_mb_intra16x16(
                 frame,
@@ -467,7 +506,7 @@ impl Encoder {
                 sw,
                 nc_grid,
                 intra_grid,
-            );
+            )
         }
     }
 
@@ -523,7 +562,7 @@ impl Encoder {
         sw: &mut BitWriter,
         nc_grid: &mut CavlcNcGrid,
         intra_grid: &mut IntraGrid,
-    ) {
+    ) -> MbDeblockInfo {
         let width = self.cfg.width as usize;
         let height = self.cfg.height as usize;
 
@@ -816,6 +855,46 @@ impl Encoder {
         let slot = intra_grid.slot_mut(mb_x, mb_y);
         slot.available = true;
         slot.is_i_nxn = false;
+
+        // §8.7.2.1 — per-4x4 nonzero mask for the deblock walker.
+        // Intra_16x16: when cbp_luma == 15 every 4x4 block transmits its
+        // (DC + AC) coefficients and the DC plane guarantees the block
+        // contains a non-zero coefficient. The deblock walker treats any
+        // nonzero block (DC or AC) as "either has nonzero coeffs", which
+        // promotes bS from 0 → 2 on internal edges. So we set the bit
+        // for every block when cbp_luma == 15. When cbp_luma == 0 the
+        // DC Hadamard levels may still be non-zero, but the spec's per-
+        // 4x4 nonzero check (§8.7.2.1 third bullet) reads from the
+        // luma4x4 blocks — for Intra_16x16 the DC plane is a separate
+        // block (Intra16x16DCLevel) that the decoder marks as nonzero on
+        // own_luma_total set by the DC's TotalCoeff. We reflect this
+        // closely by setting all 16 bits when cbp_luma == 15 (AC nonzero
+        // anywhere) — DC-only Intra_16x16 (cbp_luma == 0) leaves the
+        // mask at 0, matching the spec's per-4x4 view: AC of those
+        // blocks is identically zero so the bS=2 rule fires only on
+        // edges where the OTHER side has AC.
+        let luma_nonzero_4x4 = if cbp_luma == 15 {
+            // Per-block nonzero: bit set iff the AC scan-order array
+            // has at least one non-zero entry.
+            let mut nz = [false; 16];
+            for (blkz, scan_ac) in luma_ac_levels.iter().enumerate() {
+                nz[blkz] = scan_ac.iter().any(|&v| v != 0);
+            }
+            luma_nz_mask_from_blocks(&nz)
+        } else {
+            0
+        };
+        // Chroma per-block AC nonzero (4 blocks × 2 planes).
+        let cb_nz: [bool; 4] =
+            std::array::from_fn(|i| cbp_chroma == 2 && u_ac_levels[i].iter().any(|&v| v != 0));
+        let cr_nz: [bool; 4] =
+            std::array::from_fn(|i| cbp_chroma == 2 && v_ac_levels[i].iter().any(|&v| v != 0));
+        MbDeblockInfo {
+            is_intra: true,
+            qp_y,
+            luma_nonzero_4x4,
+            chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+        }
     }
 
     /// I_NxN (Intra_4x4) path: per-block 9-mode prediction, full luma
@@ -836,7 +915,7 @@ impl Encoder {
         sw: &mut BitWriter,
         nc_grid: &mut CavlcNcGrid,
         intra_grid: &mut IntraGrid,
-    ) {
+    ) -> MbDeblockInfo {
         let width = self.cfg.width as usize;
         let width_mbs = (self.cfg.width / 16) as usize;
 
@@ -1113,6 +1192,22 @@ impl Encoder {
 
         // intra_grid was updated incrementally above; nothing else to
         // commit here.
+
+        // §8.7.2.1 — per-4x4 nonzero mask. For I_NxN the per-block
+        // nonzero status is exactly the per-block AC scan flags computed
+        // earlier (`blk_has_nz`); blocks in zero-cbp 8x8 quadrants are
+        // already false there.
+        let luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
+        let cb_nz: [bool; 4] =
+            std::array::from_fn(|i| cbp_chroma == 2 && u_ac_levels[i].iter().any(|&v| v != 0));
+        let cr_nz: [bool; 4] =
+            std::array::from_fn(|i| cbp_chroma == 2 && v_ac_levels[i].iter().any(|&v| v != 0));
+        MbDeblockInfo {
+            is_intra: true,
+            qp_y,
+            luma_nonzero_4x4,
+            chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+        }
     }
 }
 
