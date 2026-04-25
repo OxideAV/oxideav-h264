@@ -1106,10 +1106,10 @@ mod tests {
              imply 2x2 chroma for 4:2:0)"
         );
         // Integer-position copy: each output equals src at the given int.
-        assert_eq!(dst[0], ((4 * 2 + 4) & 0xff) as i32);
-        assert_eq!(dst[1], ((5 * 2 + 4) & 0xff) as i32);
-        assert_eq!(dst[2], ((4 * 2 + 5) & 0xff) as i32);
-        assert_eq!(dst[3], ((5 * 2 + 5) & 0xff) as i32);
+        assert_eq!(dst[0], ((4 * 2 + 4) & 0xff));
+        assert_eq!(dst[1], ((5 * 2 + 4) & 0xff));
+        assert_eq!(dst[2], ((4 * 2 + 5) & 0xff));
+        assert_eq!(dst[3], ((5 * 2 + 5) & 0xff));
     }
 
     #[test]

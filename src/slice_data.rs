@@ -453,6 +453,10 @@ pub fn parse_slice_data(
                 // the error arm below), this value is overridden to 0
                 // per §9.3.3.1.1.5.
                 let next_qp_delta_flag = entropy.prev_mb_qp_delta_nonzero;
+                // `entropy` holds re-borrows of cabac_dec / ctxs / cavlc_nc /
+                // cabac_nb; explicit drop ends those re-borrows before the
+                // I_PCM-recover branch below reuses cabac_dec / cabac_nb.
+                #[allow(clippy::drop_non_drop)] // releases EntropyState's reborrows
                 drop(entropy);
                 let mut next_qp_delta_flag = next_qp_delta_flag;
                 let mb = match mb_result {

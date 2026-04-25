@@ -539,17 +539,18 @@ mod tests {
         // cpb_cnt_minus1 = 0; bit_rate_scale = 2, cpb_size_scale = 3.
         // One SchedSelIdx entry: bit_rate_value_minus1=7, cpb_size_value_minus1=15, cbr=0.
         // Lengths: 23,23,23,24.
-        let mut bits: Vec<(u32, u32)> = Vec::new();
-        bits.push(ue_bits(0)); // cpb_cnt_minus1
-        bits.push((2, 4)); // bit_rate_scale
-        bits.push((3, 4)); // cpb_size_scale
-        bits.push(ue_bits(7)); // bit_rate_value_minus1
-        bits.push(ue_bits(15)); // cpb_size_value_minus1
-        bits.push((0, 1)); // cbr_flag
-        bits.push((23, 5));
-        bits.push((23, 5));
-        bits.push((23, 5));
-        bits.push((24, 5));
+        let bits: Vec<(u32, u32)> = vec![
+            ue_bits(0),  // cpb_cnt_minus1
+            (2, 4),      // bit_rate_scale
+            (3, 4),      // cpb_size_scale
+            ue_bits(7),  // bit_rate_value_minus1
+            ue_bits(15), // cpb_size_value_minus1
+            (0, 1),      // cbr_flag
+            (23, 5),
+            (23, 5),
+            (23, 5),
+            (24, 5),
+        ];
         let bytes = pack_bits(&bits);
         let mut r = BitReader::new(&bytes);
         let hrd = HrdParameters::parse(&mut r).unwrap();
@@ -568,8 +569,7 @@ mod tests {
     #[test]
     fn hrd_cpb_cnt_out_of_range_rejected() {
         // cpb_cnt_minus1 = 32 → out-of-range. ue_bits(32) is a valid ue code.
-        let mut bits: Vec<(u32, u32)> = Vec::new();
-        bits.push(ue_bits(32));
+        let bits: Vec<(u32, u32)> = vec![ue_bits(32)];
         let bytes = pack_bits(&bits);
         let mut r = BitReader::new(&bytes);
         let err = HrdParameters::parse(&mut r).unwrap_err();
@@ -579,23 +579,24 @@ mod tests {
     #[test]
     fn hrd_two_sched_sel_idx() {
         // cpb_cnt_minus1 = 1 → two CPBs.
-        let mut bits: Vec<(u32, u32)> = Vec::new();
-        bits.push(ue_bits(1)); // cpb_cnt_minus1 = 1
-        bits.push((0, 4));
-        bits.push((0, 4));
-        // idx 0
-        bits.push(ue_bits(1));
-        bits.push(ue_bits(2));
-        bits.push((1, 1));
-        // idx 1
-        bits.push(ue_bits(3));
-        bits.push(ue_bits(4));
-        bits.push((0, 1));
-        // lengths
-        bits.push((20, 5));
-        bits.push((20, 5));
-        bits.push((20, 5));
-        bits.push((20, 5));
+        let bits: Vec<(u32, u32)> = vec![
+            ue_bits(1), // cpb_cnt_minus1 = 1
+            (0, 4),
+            (0, 4),
+            // idx 0
+            ue_bits(1),
+            ue_bits(2),
+            (1, 1),
+            // idx 1
+            ue_bits(3),
+            ue_bits(4),
+            (0, 1),
+            // lengths
+            (20, 5),
+            (20, 5),
+            (20, 5),
+            (20, 5),
+        ];
         let bytes = pack_bits(&bits);
         let mut r = BitReader::new(&bytes);
         let hrd = HrdParameters::parse(&mut r).unwrap();

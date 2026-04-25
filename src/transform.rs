@@ -1361,7 +1361,7 @@ mod tests {
         let r2 = (6016 + 32) >> 6; // = 94
         let r3 = (5312 + 32) >> 6; // = 83
         for i in 0..4 {
-            assert_eq!(out[i * 4 + 0], r0, "row {} col 0", i);
+            assert_eq!(out[i * 4], r0, "row {} col 0", i);
             assert_eq!(out[i * 4 + 1], r1, "row {} col 1", i);
             assert_eq!(out[i * 4 + 2], r2, "row {} col 2", i);
             assert_eq!(out[i * 4 + 3], r3, "row {} col 3", i);
@@ -1401,8 +1401,8 @@ mod tests {
         let r2 = (-1280 + 32) >> 6; // -20 (arithmetic shift)
         let r3 = (-2560 + 32) >> 6; // -40
         for j in 0..4 {
-            assert_eq!(out[0 * 4 + j], r0, "row 0 col {}", j);
-            assert_eq!(out[1 * 4 + j], r1, "row 1 col {}", j);
+            assert_eq!(out[j], r0, "row 0 col {}", j);
+            assert_eq!(out[4 + j], r1, "row 1 col {}", j);
             assert_eq!(out[2 * 4 + j], r2, "row 2 col {}", j);
             assert_eq!(out[3 * 4 + j], r3, "row 3 col {}", j);
         }
@@ -1894,7 +1894,7 @@ mod tests {
     fn select_4x4_sps_explicit_entries_are_returned_verbatim() {
         let mut sps = minimal_sps();
         sps.seq_scaling_matrix_present_flag = true;
-        let custom: Vec<i32> = (0..16).map(|k| (k + 1) as i32).collect(); // 1..=16
+        let custom: Vec<i32> = (0..16).map(|k| k + 1).collect(); // 1..=16
         sps.seq_scaling_lists = Some(crate::sps::SeqScalingLists {
             entries: vec![
                 ScalingListEntry::Explicit(custom.clone()),
@@ -2092,8 +2092,8 @@ mod tests {
         // A scan-order list of 0..16 should map to a 4x4 matrix whose
         // entries, when read back in zig-zag, give 0..16.
         let mut levels = [0i32; 16];
-        for k in 0..16 {
-            levels[k] = k as i32;
+        for (k, slot) in levels.iter_mut().enumerate() {
+            *slot = k as i32;
         }
         let block = inverse_scan_4x4_zigzag(&levels);
         // Verify per Table 8-13: idx 0 -> c00, idx 1 -> c01, idx 2 -> c10, etc.
@@ -2119,8 +2119,8 @@ mod tests {
         // ignored. Matrix position (0, 0) is reserved for the DC slot
         // and must be zero.
         let mut levels = [0i32; 16];
-        for k in 0..=14 {
-            levels[k] = (k + 1) as i32; // spec scan pos k+1 -> value k+1
+        for (k, slot) in levels.iter_mut().enumerate().take(15) {
+            *slot = (k + 1) as i32; // spec scan pos k+1 -> value k+1
         }
         levels[15] = 12345; // must be ignored
         let block = inverse_scan_4x4_zigzag_ac(&levels);
@@ -2150,13 +2150,11 @@ mod tests {
         // AC scan must be equivalent to calling the full scan on a
         // [0, levels[0], levels[1], ..., levels[14]] array.
         let mut ac_levels = [0i32; 16];
-        for k in 0..=14 {
-            ac_levels[k] = (100 + k as i32) * if k % 2 == 0 { 1 } else { -1 };
+        for (k, slot) in ac_levels.iter_mut().enumerate().take(15) {
+            *slot = (100 + k as i32) * if k % 2 == 0 { 1 } else { -1 };
         }
         let mut shifted = [0i32; 16];
-        for k in 0..=14 {
-            shifted[k + 1] = ac_levels[k];
-        }
+        shifted[1..16].copy_from_slice(&ac_levels[..15]);
         let via_ac = inverse_scan_4x4_zigzag_ac(&ac_levels);
         let via_shifted = inverse_scan_4x4_zigzag(&shifted);
         assert_eq!(via_ac, via_shifted);
@@ -2167,8 +2165,8 @@ mod tests {
         // Mirror of the zigzag_ac test for the informative field scan
         // (Table 8-13 second column).
         let mut levels = [0i32; 16];
-        for k in 0..=14 {
-            levels[k] = (k + 1) as i32;
+        for (k, slot) in levels.iter_mut().enumerate().take(15) {
+            *slot = (k + 1) as i32;
         }
         levels[15] = 9999;
         let block = inverse_scan_4x4_field_ac(&levels);

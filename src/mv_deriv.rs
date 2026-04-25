@@ -6,18 +6,18 @@
 //!
 //! Clean-room implementation from ITU-T Rec. H.264 (08/2024):
 //! - §8.4.1.1  Derivation process for motion vector components and
-//!             reference indices (entry point — dispatches to subclauses).
+//!   reference indices (entry point — dispatches to subclauses).
 //! - §8.4.1.2  Luma MV for P_Skip (eq. 8-174 trivial refIdx=0, zero
-//!             MVpred substitution conditions).
+//!   MVpred substitution conditions).
 //! - §8.4.1.2.2 Spatial direct mode for B slices (eq. 8-184..8-190).
 //! - §8.4.1.2.3 Temporal direct mode for B slices (eq. 8-191..8-202).
 //! - §8.4.1.3  Luma motion vector prediction — the MVpred dispatch
-//!             (16x8 / 8x16 special cases, else median).
+//!   (16x8 / 8x16 special cases, else median).
 //! - §8.4.1.3.1 Median luma MV prediction (eq. 8-207..8-213).
 //! - §6.4.11.7 Derivation process for neighbouring partitions — the
-//!             (A, B, C, D) lookup. For 4x4-block-sized partitions,
-//!             combined with §6.4.3 (inverse 4x4 luma block scan,
-//!             eq. 6-17/6-18) and §6.4.13.1 (eq. 6-38).
+//!   (A, B, C, D) lookup. For 4x4-block-sized partitions,
+//!   combined with §6.4.3 (inverse 4x4 luma block scan,
+//!   eq. 6-17/6-18) and §6.4.13.1 (eq. 6-38).
 
 #![allow(dead_code)]
 
@@ -760,12 +760,15 @@ fn luma_4x4_blk_idx(x: i32, y: i32) -> u8 {
 ///   * B : (xD, yD) = ( 0, -1)
 ///   * C : (xD, yD) = (predPartWidth, -1)   // here predPartWidth = 4
 ///   * D : (xD, yD) = (-1, -1)
-/// and per §6.4.12 Table 6-3 the cross-MB dispatch is:
+///
+/// And per §6.4.12 Table 6-3 the cross-MB dispatch is:
+///
 ///   xN<0, yN<0       -> mbAddrD (above-left)
 ///   xN<0, 0..maxH-1  -> mbAddrA (left)
 ///   0..maxW-1, yN<0  -> mbAddrB (above)
 ///   0..maxW-1 inside -> CurrMbAddr (internal)
 ///   xN>maxW-1, yN<0  -> mbAddrC (above-right)
+///
 /// For luma, maxW = maxH = 16. The internal 4x4 index inside the
 /// selected MB is computed by §6.4.13.1 eq. 6-38 on the wrapped
 /// location (eq. 6-34/6-35).

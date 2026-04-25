@@ -58,6 +58,11 @@ pub type DecoderResult<T> = Result<T, DecoderError>;
 ///
 /// The decoder is a pass-through for everything below the slice header;
 /// slice_data parsing is deferred to a future layer.
+// Boxing `header`/`sps` would force every consumer to deref through
+// `Box<…>` when destructuring `Event::Slice { header, sps, .. }`. The
+// enum is public and pattern-matched everywhere, so we accept the size
+// asymmetry here rather than break the external API.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Event {
     /// SPS parsed and stored. Payload is `seq_parameter_set_id`.

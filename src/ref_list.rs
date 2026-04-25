@@ -243,7 +243,7 @@ pub fn init_ref_pic_list_p(
             )
         })
         .collect();
-    short.sort_by(|a, b| b.0.cmp(&a.0));
+    short.sort_by_key(|e| std::cmp::Reverse(e.0));
 
     // 2. Long-term, ascending LongTermPicNum.
     let mut long: Vec<(i32, u32)> = dpb
@@ -312,12 +312,12 @@ pub fn init_ref_pic_lists_b(
     }
 
     // RefPicList0: st_less desc by POC, then st_geq asc by POC.
-    st_less.sort_by(|a, b| b.0.cmp(&a.0));
+    st_less.sort_by_key(|e| std::cmp::Reverse(e.0));
     st_geq.sort_by_key(|a| a.0);
 
     // RefPicList1: st_greater asc, then st_leq desc.
     st_greater.sort_by_key(|a| a.0);
-    st_leq.sort_by(|a, b| b.0.cmp(&a.0));
+    st_leq.sort_by_key(|e| std::cmp::Reverse(e.0));
 
     // Long-term refs, ascending LongTermPicNum (shared by both lists).
     let mut long: Vec<(i32, u32)> = dpb
@@ -608,7 +608,7 @@ pub fn sliding_window_marking(
 /// Returns `true` if MMCO 5 was applied — caller then resets POC /
 /// frame_num state per §8.2.1 NOTE 1.
 pub fn apply_mmco(
-    dpb: &mut Vec<DpbEntry>,
+    dpb: &mut [DpbEntry],
     ops: &[MmcoOp],
     current_entry_ref: &mut DpbEntry,
     current_frame_num: u32,
@@ -737,8 +737,9 @@ pub fn apply_mmco(
 /// Returns `true` iff MMCO 5 was triggered. `no_output_of_prior_pics_flag`
 /// is accepted here for future use (it affects output decisions in
 /// Annex C, not marking) and currently unused.
+#[allow(clippy::too_many_arguments)]
 pub fn perform_marking(
-    dpb: &mut Vec<DpbEntry>,
+    dpb: &mut [DpbEntry],
     current_entry: &mut DpbEntry,
     max_num_ref_frames: u32,
     is_idr: bool,

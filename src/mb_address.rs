@@ -121,6 +121,7 @@ pub fn map_unit_to_slice_group_map(
             //          ( ( ( i / PicWidthInMbs ) *
             //              ( num_slice_groups_minus1 + 1 ) ) / 2 ) )
             //        % ( num_slice_groups_minus1 + 1 )
+            #[allow(clippy::needless_range_loop)] // spec §8.2.2.2 eq. (8-18)
             for i in 0..n {
                 let i_u = i as u32;
                 let x = i_u % pic_width_in_mbs;
@@ -136,8 +137,8 @@ pub fn map_unit_to_slice_group_map(
         } => {
             // eq. (8-19). Initialise every map unit to num_slice_groups_minus1,
             // then paint foreground rectangles in decreasing iGroup order.
-            for i in 0..n {
-                out[i] = num_slice_groups_minus1;
+            for slot in out.iter_mut().take(n) {
+                *slot = num_slice_groups_minus1;
             }
             // iGroup goes from num_slice_groups_minus1 - 1 down to 0.
             // num_slice_groups_minus1 >= 1 here because we early-returned
@@ -194,8 +195,8 @@ pub fn map_unit_to_slice_group_map(
                     // is required to be 1 for types 3/4/5.
                     let dir = *change_direction_flag as i32; // 0 or 1
                                                              // Initialise: mapUnitToSliceGroupMap[i] = 1 for all i.
-                    for i in 0..n {
-                        out[i] = 1;
+                    for slot in out.iter_mut().take(n) {
+                        *slot = 1;
                     }
                     let pic_width = pic_width_in_mbs as i32;
                     let pic_height = (pic_size_in_map_units / pic_width_in_mbs) as i32;
@@ -255,8 +256,8 @@ pub fn map_unit_to_slice_group_map(
                         mapunits_in_slice_group0
                     };
                     let dir = *change_direction_flag as u32;
-                    for i in 0..n {
-                        out[i] = if (i as u32) < size_of_upper_left {
+                    for (i, slot) in out.iter_mut().enumerate().take(n) {
+                        *slot = if (i as u32) < size_of_upper_left {
                             dir
                         } else {
                             1 - dir
@@ -351,10 +352,10 @@ pub fn mb_to_slice_group_map(
     if mbaff_frame_flag {
         // §8.2.2.8 eq. (8-25): i / 2.
         let mut out = vec![0u32; pic_size_in_mbs];
-        for i in 0..pic_size_in_mbs {
+        for (i, slot) in out.iter_mut().enumerate() {
             let mu = i / 2;
             if mu < n_map_units {
-                out[i] = map_unit_map[mu];
+                *slot = map_unit_map[mu];
             }
         }
         out
@@ -365,10 +366,10 @@ pub fn mb_to_slice_group_map(
         let w = pic_width_in_mbs as usize;
         let two_w = 2 * w;
         let mut out = vec![0u32; pic_size_in_mbs];
-        for i in 0..pic_size_in_mbs {
+        for (i, slot) in out.iter_mut().enumerate() {
             let mu = (i / two_w) * w + (i % w);
             if mu < n_map_units {
-                out[i] = map_unit_map[mu];
+                *slot = map_unit_map[mu];
             }
         }
         out

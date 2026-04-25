@@ -65,13 +65,14 @@ fn parse_foreman_p16x16() {
     // Drive the full pipeline. Collect owned data first to detach from
     // the Decoder borrow before reconstruction (so we can pull SPS/PPS
     // back out).
-    let mut pending_slices: Vec<(
+    type PendingSlice = (
         u8,
         u8,
         oxideav_h264::slice_header::SliceHeader,
         Vec<u8>,
         (usize, u8),
-    )> = Vec::new();
+    );
+    let mut pending_slices: Vec<PendingSlice> = Vec::new();
     for result in dec.process_annex_b(&bytes) {
         match result {
             Ok(ev) => match ev {

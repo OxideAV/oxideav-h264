@@ -863,13 +863,13 @@ fn mb_type_ctx_inc_first3(offset: u32, bin_idx: u32, neighbours: &NeighbourCtx) 
 /// Table 9-39 ctxIdxInc for binIdx 2..=6:
 ///
 /// * `offset = 3` (I slices). Table 9-39 row 3:
-///     binIdx 2 inc = 3; binIdx 3 inc = 4; binIdx 4 inc per Table 9-41
-///     = (b3 != 0) ? 5 : 6; binIdx 5 inc per Table 9-41 = (b3 != 0) ?
-///     6 : 7; binIdx 6 inc = 7.
+///   binIdx 2 inc = 3; binIdx 3 inc = 4; binIdx 4 inc per Table 9-41
+///   = (b3 != 0) ? 5 : 6; binIdx 5 inc per Table 9-41 = (b3 != 0) ?
+///   6 : 7; binIdx 6 inc = 7.
 /// * `offset = 17` (P/SP intra suffix) and `offset = 32` (B intra
 ///   suffix). Table 9-39 rows 17/32:
-///     binIdx 2 inc = 1; binIdx 3 inc = 2; binIdx 4 inc per Table 9-41
-///     = (b3 != 0) ? 2 : 3; binIdx 5 inc = 3; binIdx 6 inc = 3.
+///   binIdx 2 inc = 1; binIdx 3 inc = 2; binIdx 4 inc per Table 9-41
+///   = (b3 != 0) ? 2 : 3; binIdx 5 inc = 3; binIdx 6 inc = 3.
 ///
 /// binIdx 1 is always the ctxIdx=276 DecodeTerminate bin regardless of
 /// `offset` (§9.3.1.1 NOTE 2 / Table 9-39 / Figure 9-2).
@@ -973,11 +973,11 @@ fn decode_mb_type_i_suffix(
 /// 13..=24 use base=12), Table 9-36 simplifies to:
 ///
 ///   * b3 == 0 (6-bin rows, Intra16x16PredMode = `(b4<<1)|b5`):
-///       `value = base + 1 + ((b4 << 1) | b5)`
+///     `value = base + 1 + ((b4 << 1) | b5)`
 ///
 ///   * b3 == 1 (7-bin rows, CodedBlockPatternChroma selector = `b4`,
-///              Intra16x16PredMode = `(b5<<1)|b6`):
-///       `value = base + 5 + 4*b4 + ((b5 << 1) | b6)`
+///     Intra16x16PredMode = `(b5<<1)|b6`):
+///     `value = base + 5 + 4*b4 + ((b5 << 1) | b6)`
 ///
 /// Verification of every row of Table 9-36 (rows 1..=24) is in the
 /// unit test `mb_type_i_suffix_value_matches_table_9_36`.
@@ -2972,14 +2972,11 @@ mod tests {
                 let ctx_idx: usize = match i {
                     0 => 36, // binIdx 0 → inc 0
                     1 => 37, // binIdx 1 → inc 1
-                    2 => {
+                    2
                         // binIdx 2 → Table 9-41
-                        if b1 != 0 {
+                        if b1 != 0 => {
                             36 + 2
-                        } else {
-                            36 + 3
                         }
-                    }
                     _ => 36 + 3, // binIdx 3..=5 → inc 3
                 };
                 out.push((ctx_idx, bit));

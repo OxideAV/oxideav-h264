@@ -297,8 +297,8 @@ fn top_row_4x4(s: &Samples4x4) -> [i32; 8] {
         p[4..8].copy_from_slice(&s.top_right);
     } else if s.availability.top {
         // §8.3.1.2 substitution rule.
-        for i in 4..8 {
-            p[i] = s.top[3];
+        for slot in &mut p[4..8] {
+            *slot = s.top[3];
         }
     }
     p
@@ -593,8 +593,8 @@ fn top_row_8x8_raw(s: &Samples8x8) -> [i32; 16] {
         // marked as 'not available for Intra_8x8 prediction,' and the
         // sample p[7, -1] is marked as 'available for Intra_8x8
         // prediction,' the sample value of p[7, -1] is substituted".
-        for i in 8..16 {
-            p[i] = s.top[7];
+        for slot in &mut p[8..16] {
+            *slot = s.top[7];
         }
     }
     p
@@ -671,7 +671,8 @@ pub fn filter_samples_8x8(raw: &Samples8x8, _bit_depth: u32) -> Samples8x8 {
         } else {
             (3 * raw.left[0] + raw.left[1] + 2) >> 2
         };
-        // p'[-1, y], y = 1..6: (8-87)
+        // p'[-1, y], y = 1..6: (8-87) — indexed loop matches spec eq.
+        #[allow(clippy::needless_range_loop)] // spec §8.3.2.2.1 eq. (8-87)
         for y in 1..7 {
             filt_left[y] = (raw.left[y - 1] + 2 * raw.left[y] + raw.left[y + 1] + 2) >> 2;
         }
@@ -1570,13 +1571,7 @@ mod tests {
                 } else {
                     (p[x + y] + 2 * p[x + y + 1] + p[x + y + 2] + 2) >> 2
                 };
-                assert_eq!(
-                    out[at4(x, y)],
-                    expected as i32,
-                    "DDL mismatch at ({}, {})",
-                    x,
-                    y
-                );
+                assert_eq!(out[at4(x, y)], expected, "DDL mismatch at ({}, {})", x, y);
             }
         }
     }

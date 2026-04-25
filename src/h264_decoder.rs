@@ -162,6 +162,7 @@ pub struct H264CodecDecoder {
     /// 2. entries drained from the queue at an IDR / MMCO-5 so the
     ///    previous sequence's pictures are delivered in POC order
     ///    *before* the new sequence's first frames (§C.4).
+    ///
     /// Also used to carry the `flush()` drain at EOF.
     ready: VecDeque<VideoFrame>,
     /// Packet-level pts passed on the most recent `send_packet`. We
@@ -436,6 +437,7 @@ impl H264CodecDecoder {
     /// In practice the artifact is minor compared to the coarse blocking
     /// you get with one-slice-per-picture assembly, which is the bug this
     /// replaces.
+    #[allow(clippy::too_many_arguments)] // mirrors Event::Slice's flat layout
     fn handle_slice(
         &mut self,
         nal_unit_type: u8,
@@ -1231,7 +1233,7 @@ fn output_dpb_sizing(sps: &Sps) -> (u32, u32) {
         .pic_width_in_mbs()
         .saturating_mul(sps.frame_height_in_mbs())
         .max(1);
-    let max_dpb_frames = (max_dpb_mbs / pic_size_mbs).min(16).max(1);
+    let max_dpb_frames = (max_dpb_mbs / pic_size_mbs).clamp(1, 16);
 
     // §A.3.1 item j — when bitstream_restriction is absent, the
     // spec's default for `max_num_reorder_frames` is the full

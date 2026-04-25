@@ -275,9 +275,7 @@ fn derive_type1(
     //   — if the previous picture had MMCO-5, prevFrameNumOffset = 0.
     //   — otherwise it equals FrameNumOffset of the previous picture.
     // (For IDRs, prevFrameNumOffset is irrelevant — FrameNumOffset = 0.)
-    let prev_frame_num_offset: i64 = if slice.is_idr {
-        0
-    } else if slice.prev_had_mmco5 {
+    let prev_frame_num_offset: i64 = if slice.is_idr || slice.prev_had_mmco5 {
         0
     } else {
         state.prev_frame_num_offset
@@ -414,9 +412,7 @@ fn derive_type2(
     let max_frame_num: i64 = 1i64 << (sps.log2_max_frame_num_minus4 + 4);
 
     // §8.2.1.3 — prevFrameNumOffset (same rule as type 1).
-    let prev_frame_num_offset: i64 = if slice.is_idr {
-        0
-    } else if slice.prev_had_mmco5 {
+    let prev_frame_num_offset: i64 = if slice.is_idr || slice.prev_had_mmco5 {
         0
     } else {
         state.prev_frame_num_offset

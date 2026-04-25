@@ -870,6 +870,7 @@ fn reconstruct_intra_16x16(
     //   Intra16x16ACLevel per §7.3.5.3.3 / Table 9-42). Slot 15 is
     //   unused (padding by `pad_to_16`).
     //   When cbp_luma == 0, residual_luma is empty (only DC).
+    #[allow(clippy::needless_range_loop)] // spec §8.5.10 raster-Z 4x4 walk
     for block_idx in 0..16usize {
         let (bx, by) = LUMA_4X4_XY[block_idx];
         // Dequantised AC coefficients for this 4x4 block. c[0,0] is
@@ -936,12 +937,12 @@ fn reconstruct_intra_16x16(
 /// `MbInfo::slice_id`. Pass `-1` in unit tests / standalone callers that
 /// don't care about slice boundaries; the slice filter is disabled when
 /// either side of the comparison is `-1` (unstamped).
-fn intra_neighbour_mb_info<'a>(
-    grid: &'a MbGrid,
+fn intra_neighbour_mb_info(
+    grid: &MbGrid,
     mb_addr: Option<u32>,
     constrained_intra_pred: bool,
     current_slice_id: i32,
-) -> Option<&'a MbInfo> {
+) -> Option<&MbInfo> {
     let addr = mb_addr?;
     let info = grid.get(addr)?;
     if !info.available {
@@ -1189,7 +1190,8 @@ fn derive_intra_4x4_pred_mode(
 
     // §8.3.1.1 step 4, eq. 8-41.
     let predicted = mode_a.min(mode_b);
-    let actual = if pred.prev_intra4x4_pred_mode_flag[block_idx] {
+
+    if pred.prev_intra4x4_pred_mode_flag[block_idx] {
         predicted
     } else {
         let rem = pred.rem_intra4x4_pred_mode[block_idx];
@@ -1198,8 +1200,7 @@ fn derive_intra_4x4_pred_mode(
         } else {
             rem + 1
         }
-    };
-    actual
+    }
 }
 
 /// §8.3.2.1 — compute `Intra8x8PredMode[luma8x8BlkIdx]` for 8x8 block
@@ -1316,6 +1317,7 @@ fn reconstruct_intra_nxn(
 
     if mb.transform_size_8x8_flag {
         // §8.3.2 — Intra_8x8 path.
+        #[allow(clippy::needless_range_loop)] // spec §8.3.2 8x8 block walk
         for blk8 in 0..4usize {
             let (bx, by) = LUMA_8X8_XY[blk8];
             // §8.3.2.1 — derive Intra_8x8 prediction mode per eq. 8-73.
@@ -1436,6 +1438,7 @@ fn reconstruct_intra_nxn(
                 }
             }
         }
+        #[allow(clippy::needless_range_loop)] // spec §8.3.1.1 raster-Z 4x4 walk
         for block_idx in 0..16usize {
             let (bx, by) = LUMA_4X4_XY[block_idx];
             // §8.3.1.1 — derive Intra_4x4 prediction mode per eq. 8-41.
@@ -2091,16 +2094,16 @@ fn gather_samples_chroma(
         0
     };
     let mut top = vec![0i32; w];
-    for x in 0..w {
-        top[x] = if top_avail {
+    for (x, slot) in top.iter_mut().enumerate() {
+        *slot = if top_avail {
             fetch(c_mb_px + x as i32, c_mb_py - 1)
         } else {
             0
         };
     }
     let mut left = vec![0i32; h];
-    for y in 0..h {
-        left[y] = if left_avail {
+    for (y, slot) in left.iter_mut().enumerate() {
+        *slot = if left_avail {
             fetch(c_mb_px - 1, c_mb_py + y as i32)
         } else {
             0
@@ -2389,6 +2392,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         // the 8x8 scan (§8.5.7 / Table 8-14) before feeding into
         // inverse_transform_8x8. See Intra_8x8 branch for the same
         // reasoning and the CAVLC-path caveat.
+        #[allow(clippy::needless_range_loop)] // spec §8.5.13 4×8x8 walk
         for blk8 in 0..4usize {
             let (bx, by) = LUMA_8X8_XY[blk8];
             let has_res = (cbp_luma >> blk8) & 1 == 1;
@@ -2427,6 +2431,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         }
     } else {
         // §8.5.12 — 4x4 inter residual path.
+        #[allow(clippy::needless_range_loop)] // spec §8.5.12 raster-Z 4x4 walk
         for blk4 in 0..16usize {
             let (bx, by) = LUMA_4X4_XY[blk4];
             let blk8 = blk4 / 4;
@@ -4531,16 +4536,18 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
             //   - refIdxLX == 0 && colZeroFlag ⇒ mvLX = 0.
             //   - otherwise mvLX = derive_median_mvpred(A, B, C_eff,
             //     refIdxLX).
-            let mv_l0 = if direct_zero_both || ref_idx_l0_final < 0 {
-                Mv::ZERO
-            } else if ref_idx_l0_final == 0 && col_zero_flag {
+            let mv_l0 = if direct_zero_both
+                || ref_idx_l0_final < 0
+                || (ref_idx_l0_final == 0 && col_zero_flag)
+            {
                 Mv::ZERO
             } else {
                 derive_median_mvpred(a_l0, b_l0, c_l0_eff, ref_idx_l0_final as i32)
             };
-            let mv_l1 = if direct_zero_both || ref_idx_l1_final < 0 {
-                Mv::ZERO
-            } else if ref_idx_l1_final == 0 && col_zero_flag {
+            let mv_l1 = if direct_zero_both
+                || ref_idx_l1_final < 0
+                || (ref_idx_l1_final == 0 && col_zero_flag)
+            {
                 Mv::ZERO
             } else {
                 derive_median_mvpred(a_l1, b_l1, c_l1_eff, ref_idx_l1_final as i32)
@@ -6166,8 +6173,8 @@ mod tests {
     fn make_empty_ipcm_mb() -> Macroblock {
         let mut luma = vec![0u32; 256];
         // Unique gradient so we can detect correct placement.
-        for i in 0..256 {
-            luma[i] = (i as u32) & 0xFF;
+        for (i, slot) in luma.iter_mut().enumerate() {
+            *slot = (i as u32) & 0xFF;
         }
         let cb = vec![100u32; 64];
         let cr = vec![200u32; 64];
@@ -6871,10 +6878,10 @@ mod tests {
         scan[7] = 17;
         scan[63] = 77;
         let m = inverse_scan_8x8_zigzag(&scan);
-        assert_eq!(m[0 * 8 + 0], 11, "idx 0 → c00");
-        assert_eq!(m[0 * 8 + 1], 12, "idx 1 → c01");
-        assert_eq!(m[1 * 8 + 0], 13, "idx 2 → c10");
-        assert_eq!(m[1 * 8 + 2], 17, "idx 7 → c12");
+        assert_eq!(m[0], 11, "idx 0 → c00");
+        assert_eq!(m[1], 12, "idx 1 → c01");
+        assert_eq!(m[8], 13, "idx 2 → c10");
+        assert_eq!(m[8 + 2], 17, "idx 7 → c12");
         assert_eq!(m[7 * 8 + 7], 77, "idx 63 → c77");
     }
 
@@ -7023,9 +7030,11 @@ mod tests {
 
     /// Build a P_L0_16x16 MB with zero residual.
     fn make_p_l0_16x16(ref_idx: u32, mvd: [i32; 2]) -> Macroblock {
-        let mut pred = MbPred::default();
-        pred.ref_idx_l0 = vec![ref_idx];
-        pred.mvd_l0 = vec![mvd];
+        let pred = MbPred {
+            ref_idx_l0: vec![ref_idx],
+            mvd_l0: vec![mvd],
+            ..MbPred::default()
+        };
         Macroblock {
             mb_type: MbType::PL016x16,
             mb_type_raw: 0,
@@ -7299,9 +7308,11 @@ mod tests {
         store.set_list_0(vec![0]);
 
         // Build a P_L0_L0_16x8 MB with top MVD=(16,0), bottom MVD=(0,0).
-        let mut pred = crate::macroblock_layer::MbPred::default();
-        pred.ref_idx_l0 = vec![0, 0];
-        pred.mvd_l0 = vec![[16, 0], [0, 0]];
+        let pred = crate::macroblock_layer::MbPred {
+            ref_idx_l0: vec![0, 0],
+            mvd_l0: vec![[16, 0], [0, 0]],
+            ..crate::macroblock_layer::MbPred::default()
+        };
         let mb = Macroblock {
             mb_type: MbType::PL0L016x8,
             mb_type_raw: 1,
@@ -7654,11 +7665,13 @@ mod tests {
     /// Build a B_Bi_16x16 MB with zero MVDs and the given L0/L1 ref
     /// indices.
     fn make_b_bi_16x16(ref_idx_l0: u32, ref_idx_l1: u32) -> Macroblock {
-        let mut pred = MbPred::default();
-        pred.ref_idx_l0 = vec![ref_idx_l0];
-        pred.ref_idx_l1 = vec![ref_idx_l1];
-        pred.mvd_l0 = vec![[0, 0]];
-        pred.mvd_l1 = vec![[0, 0]];
+        let pred = MbPred {
+            ref_idx_l0: vec![ref_idx_l0],
+            ref_idx_l1: vec![ref_idx_l1],
+            mvd_l0: vec![[0, 0]],
+            mvd_l1: vec![[0, 0]],
+            ..MbPred::default()
+        };
         Macroblock {
             mb_type: MbType::BBi16x16,
             mb_type_raw: 3,
@@ -8164,7 +8177,7 @@ mod tests {
 
         // Top MB (mb_addr = 0): writes rows 0, 2, 4, …, 30.
         for k in 0..16 {
-            let y = (k * 2) as i32;
+            let y = k * 2;
             for x in 0..16 {
                 assert_eq!(
                     pic.luma_at(x, y),
@@ -8178,7 +8191,7 @@ mod tests {
         }
         // Bottom MB (mb_addr = 1): writes rows 1, 3, 5, …, 31.
         for k in 0..16 {
-            let y = (k * 2 + 1) as i32;
+            let y = k * 2 + 1;
             for x in 0..16 {
                 assert_eq!(
                     pic.luma_at(x, y),
@@ -8551,10 +8564,12 @@ mod tests {
                     residual_luma.push([0i32; 16]);
                 }
             }
-            let mut mb_pred = MbPred::default();
-            mb_pred.prev_intra4x4_pred_mode_flag = [true; 16];
-            mb_pred.rem_intra4x4_pred_mode = [0; 16];
-            mb_pred.intra_chroma_pred_mode = 0;
+            let mb_pred = MbPred {
+                prev_intra4x4_pred_mode_flag: [true; 16],
+                rem_intra4x4_pred_mode: [0; 16],
+                intra_chroma_pred_mode: 0,
+                ..MbPred::default()
+            };
             let mb = Macroblock {
                 mb_type: MbType::INxN,
                 mb_type_raw: 0,

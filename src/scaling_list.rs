@@ -178,8 +178,7 @@ mod tests {
         // → useDefaultScalingMatrixFlag = true. Subsequent iterations
         // skip the delta_scale read (nextScale == 0) and all entries
         // become lastScale = 8.
-        let mut bits: Vec<(u32, u32)> = Vec::new();
-        bits.push(se_bits(-8));
+        let bits: Vec<(u32, u32)> = vec![se_bits(-8)];
         let bytes = pack_bits(&bits);
         let mut r = BitReader::new(&bytes);
         let res = parse_scaling_list(&mut r, 16).unwrap();
@@ -191,8 +190,7 @@ mod tests {
     fn non_zero_delta_at_j0_does_not_set_use_default() {
         // delta_scale = 2 at j=0 → nextScale = 10. use_default stays false.
         // Then 15 × delta = 0 keeps nextScale = 10 through every step.
-        let mut bits: Vec<(u32, u32)> = Vec::new();
-        bits.push(se_bits(2));
+        let mut bits: Vec<(u32, u32)> = vec![se_bits(2)];
         for _ in 0..15 {
             bits.push(se_bits(0));
         }
@@ -211,11 +209,7 @@ mod tests {
         //   j=2 delta=0 → next=8, entry=8, last=8
         //   j=3 delta=+4 → next=12, entry=12, last=12
         //   j=4..15 delta=0 → next stays 12, entry=12
-        let mut bits: Vec<(u32, u32)> = Vec::new();
-        bits.push(se_bits(2));
-        bits.push(se_bits(-2));
-        bits.push(se_bits(0));
-        bits.push(se_bits(4));
+        let mut bits: Vec<(u32, u32)> = vec![se_bits(2), se_bits(-2), se_bits(0), se_bits(4)];
         for _ in 4..16 {
             bits.push(se_bits(0));
         }
@@ -250,9 +244,7 @@ mod tests {
         //   j=1 delta=-10 → next=(10-10+256)%256=0. j!=0 so use_default stays false.
         //                   entry = lastScale = 10 (since next==0), last=10
         //   j=2..15: nextScale is 0 → skip delta_scale read. entry = last = 10.
-        let mut bits: Vec<(u32, u32)> = Vec::new();
-        bits.push(se_bits(2));
-        bits.push(se_bits(-10));
+        let bits: Vec<(u32, u32)> = vec![se_bits(2), se_bits(-10)];
         let bytes = pack_bits(&bits);
         let mut r = BitReader::new(&bytes);
         let res = parse_scaling_list(&mut r, 16).unwrap();

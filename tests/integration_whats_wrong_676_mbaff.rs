@@ -39,10 +39,10 @@ fn sample_path() -> Option<PathBuf> {
 /// body (after the 8-byte header). Supports size=1 (largesize) and
 /// size=0 (to EOF).
 fn find_box<'a>(buf: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
-    find_box_inner(buf, path, 0)
+    find_box_inner(buf, path)
 }
 
-fn find_box_inner<'a>(buf: &'a [u8], path: &[&[u8; 4]], depth: usize) -> Option<&'a [u8]> {
+fn find_box_inner<'a>(buf: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
     if path.is_empty() {
         return Some(buf);
     }
@@ -103,13 +103,13 @@ fn find_box_inner<'a>(buf: &'a [u8], path: &[&[u8; 4]], depth: usize) -> Option<
                     ]) as usize;
                     if entry_size <= child_body.len() && entry_size >= 8 + 78 {
                         let inner = &child_body[8 + 78..entry_size];
-                        if let Some(found) = find_box_inner(inner, &path[1..], depth + 1) {
+                        if let Some(found) = find_box_inner(inner, &path[1..]) {
                             return Some(found);
                         }
                     }
                 }
             }
-            if let Some(found) = find_box_inner(child_body, &path[1..], depth + 1) {
+            if let Some(found) = find_box_inner(child_body, &path[1..]) {
                 return Some(found);
             }
         }
@@ -138,9 +138,13 @@ fn first_chunk_offset(buf: &[u8]) -> Option<u64> {
     None
 }
 
+/// avcC record (ISO/IEC 14496-15 §5.2.4.1):
+/// `length_size`, SPS NAL units, PPS NAL units.
+type AvccRecord = (usize, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// Parse the avcC record (ISO/IEC 14496-15 §5.2.4.1) returning:
 /// (length_size_minus_one + 1, SPS NAL units, PPS NAL units).
-fn parse_avcc(avcc: &[u8]) -> Option<(usize, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+fn parse_avcc(avcc: &[u8]) -> Option<AvccRecord> {
     if avcc.len() < 7 {
         return None;
     }

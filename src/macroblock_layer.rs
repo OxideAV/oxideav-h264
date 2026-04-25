@@ -91,7 +91,7 @@ pub enum MacroblockLayerError {
     /// from the bitstream at `(cabac_byte_pos, cabac_bit_pos)` (the
     /// byte/bit cursor of the CABAC engine's internal reader *after*
     /// the I_PCM bin terminated — byte-align first, then read 256 luma
-    /// + 2 * MbWidthC * MbHeightC chroma samples), then rebuild the
+    /// plus 2 * MbWidthC * MbHeightC chroma samples), then rebuild the
     /// `CabacDecoder` with `CabacDecoder::new(BitReader::new(...))`
     /// positioned after the PCM payload.
     #[error("I_PCM macroblock in CABAC mode requires slice-level reinit at byte {cabac_byte_pos} bit {cabac_bit_pos}")]
@@ -782,7 +782,7 @@ fn parse_cbp_me(r: &mut BitReader<'_>, chroma_array_type: u32, is_intra: bool) -
 ///
 /// `is_available` gates reads: an un-decoded neighbour MB must report
 /// `availableFlagN == 0` per §9.2.1.1 step 5.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CavlcMbNc {
     /// §6.4.4 / §9.2.1.1 step 5 — true once this MB has been decoded
     /// and may be consulted as a neighbour by subsequent MBs.
@@ -810,22 +810,6 @@ pub struct CavlcMbNc {
     /// §7.3.5.3 / §9.2.1.1 — per-4x4 Cr block `TotalCoeff` for
     /// ChromaArrayType == 3.
     pub cr_luma_total_coeff: [u8; 16],
-}
-
-impl Default for CavlcMbNc {
-    fn default() -> Self {
-        Self {
-            is_available: false,
-            is_skip: false,
-            is_i_pcm: false,
-            is_intra: false,
-            luma_total_coeff: [0; 16],
-            cb_total_coeff: [0; 8],
-            cr_total_coeff: [0; 8],
-            cb_luma_total_coeff: [0; 16],
-            cr_luma_total_coeff: [0; 16],
-        }
-    }
 }
 
 /// Slice-scoped MB grid for CAVLC neighbour lookups (§9.2.1.1).
@@ -941,7 +925,7 @@ fn resolve_luma_neighbour(
 ) -> (Option<u32>, u8) {
     let w = grid.pic_width_in_mbs;
     let x = if w == 0 { 0 } else { current_mb_addr % w };
-    let y = if w == 0 { 0 } else { current_mb_addr / w };
+    let y = current_mb_addr.checked_div(w).unwrap_or(0);
     match src {
         NeighbourSource::InternalBlock(i) => (Some(current_mb_addr), i),
         NeighbourSource::ExternalLeft(i) => {
@@ -1116,7 +1100,7 @@ fn resolve_chroma_neighbour(
 ) -> (Option<u32>, u8) {
     let w = grid.pic_width_in_mbs;
     let x = if w == 0 { 0 } else { current_mb_addr % w };
-    let y = if w == 0 { 0 } else { current_mb_addr / w };
+    let y = current_mb_addr.checked_div(w).unwrap_or(0);
 
     // §6.4.12 Table 6-3.
     let (mb_opt, xw, yw) = if xn < 0 && yn < 0 {
@@ -1408,7 +1392,7 @@ fn cabac_ref_idx_cond_terms(
 ) -> (bool, bool) {
     let w = grid.width_in_mbs;
     let x = if w == 0 { 0 } else { current_mb_addr % w };
-    let y = if w == 0 { 0 } else { current_mb_addr / w };
+    let y = current_mb_addr.checked_div(w).unwrap_or(0);
     let left_mb = if x > 0 {
         grid.mbs.get((current_mb_addr - 1) as usize)
     } else {
@@ -1500,7 +1484,7 @@ fn cabac_mvd_abs_sum(
 ) -> u32 {
     let w = grid.width_in_mbs;
     let x0 = if w == 0 { 0 } else { current_mb_addr % w };
-    let y0 = if w == 0 { 0 } else { current_mb_addr / w };
+    let y0 = current_mb_addr.checked_div(w).unwrap_or(0);
     let (bx, by) = blk4x4_xy(blk4x4);
 
     // Neighbour A: (bx-1, by); Neighbour B: (bx, by-1).
@@ -1590,7 +1574,7 @@ fn cabac_cbf_cond_terms(
 ) -> (bool, bool) {
     let w = grid.width_in_mbs;
     let x = if w == 0 { 0 } else { current_mb_addr % w };
-    let y = if w == 0 { 0 } else { current_mb_addr / w };
+    let y = current_mb_addr.checked_div(w).unwrap_or(0);
 
     // Compute in-MB A / B neighbour block coordinates for this block type.
     // For luma 4x4 / 16x16AC blocks (indexed 0..=15): use §6.4.11.4.
@@ -2403,13 +2387,12 @@ pub fn parse_macroblock(
 
     // §7.3.5.3 — residual block = residual_block_cavlc or
     // residual_block_cabac depending on entropy_coding_mode_flag.
-    if entropy.cabac.is_some() {
+    if let Some((cabac, ctxs)) = entropy.cabac.as_mut() {
         // Split the borrow: `cabac` and `cabac_nb` are both fields of
         // `entropy` but we need both mutably in the residual walker.
         let current_mb_addr = entropy.current_mb_addr;
         let chroma_at = entropy.chroma_array_type;
         let current_is_intra = mb_type.is_intra();
-        let (cabac, ctxs) = entropy.cabac.as_mut().unwrap();
         let nb_grid = entropy.cabac_nb.as_deref_mut();
         parse_residual_cabac_only(
             cabac,
@@ -2610,8 +2593,10 @@ fn parse_mb_pred(
         // this to allow internal 8x8 #1/#2/#3 ref_idx lookups to see
         // their already-decoded siblings, and for in-MB 4x4 mvd
         // neighbour lookups (mvd[0] → mvd[1] etc.).
-        let mut curr_nb = CabacMbNeighbourInfo::default();
-        curr_nb.available = false; // not yet — still decoding this MB
+        let mut curr_nb = CabacMbNeighbourInfo {
+            available: false, // not yet — still decoding this MB
+            ..CabacMbNeighbourInfo::default()
+        };
 
         // ref_idx_l0. §7.3.5.1 gate: (num_ref_idx_l0_active_minus1 > 0 ||
         //   mb_field_decoding_flag != field_pic_flag) &&
@@ -3153,12 +3138,10 @@ fn sub_mb_sub_part_4x4(i: usize, sp: usize, sub: SubMbType) -> u8 {
                 } else {
                     2
                 }
+            } else if sp == 0 {
+                0
             } else {
-                if sp == 0 {
-                    0
-                } else {
-                    1
-                }
+                1
             }
         }
         4 => sp as u8,
@@ -3179,12 +3162,10 @@ fn sub_mb_sub_part_4x4_range(i: usize, sp: usize, sub: SubMbType) -> Vec<u8> {
                 } else {
                     vec![base + 2, base + 3]
                 }
+            } else if sp == 0 {
+                vec![base, base + 2]
             } else {
-                if sp == 0 {
-                    vec![base, base + 2]
-                } else {
-                    vec![base + 1, base + 3]
-                }
+                vec![base + 1, base + 3]
             }
         }
         4 => vec![base + sp as u8],
@@ -3575,37 +3556,11 @@ fn parse_residual_cavlc_only(
                         }
                     }
                 }
-            } else if transform_size_8x8_flag {
-                for blk8 in 0..4u8 {
-                    if (cbp_luma >> blk8) & 1 == 1 {
-                        for sub in 0..4u8 {
-                            let blk_idx = blk8 * 4 + sub;
-                            let nc = derive_plane_luma_like(
-                                blk_idx,
-                                plane_is_cr,
-                                &own_cb_luma_totals,
-                                &own_cr_luma_totals,
-                                grid_ref,
-                            );
-                            let blk = parse_residual_block_cavlc(
-                                r,
-                                CoeffTokenContext::Numeric(nc),
-                                0,
-                                15,
-                                16,
-                            )?;
-                            let tc = count_nonzero(&blk);
-                            if plane_is_cr {
-                                own_cr_luma_totals[blk_idx as usize] = tc;
-                                out.residual_cr_luma_like.push(pad_to_16(blk));
-                            } else {
-                                own_cb_luma_totals[blk_idx as usize] = tc;
-                                out.residual_cb_luma_like.push(pad_to_16(blk));
-                            }
-                        }
-                    }
-                }
             } else {
+                // §7.3.5.3 — both transform_size_8x8 and 4x4 paths
+                // currently walk the 16 × 4x4 layout (8x8 fast-path is
+                // a TODO; until then the two arms emit identical
+                // syntax, which is what the unit tests verify).
                 for blk8 in 0..4u8 {
                     if (cbp_luma >> blk8) & 1 == 1 {
                         for sub in 0..4u8 {
@@ -3666,7 +3621,7 @@ fn parse_residual_cavlc_only(
 /// Drives the four-stage CABAC residual loop:
 ///   1. coded_block_flag (§9.3.3.1.1.9 / Table 9-42)
 ///      — skipped when `maxNumCoeff == 64` and ChromaArrayType != 3
-///        (8x8 blocks have coded_block_flag inferred from CBP).
+///      (8x8 blocks have coded_block_flag inferred from CBP).
 ///   2. significance map: for scan position `i ∈ startIdx..numCoeff-1`
 ///      read `significant_coeff_flag[i]` and, if set,
 ///      `last_significant_coeff_flag[i]`. Hitting a "last" truncates
@@ -3775,16 +3730,18 @@ fn parse_residual_cabac_only(
     cbp_chroma: u32,
     transform_size_8x8_flag: bool,
     out: &mut Macroblock,
-    mut nb_grid: Option<&mut CabacNeighbourGrid>,
+    nb_grid: Option<&mut CabacNeighbourGrid>,
     current_mb_addr: u32,
     current_is_intra: bool,
 ) -> McblResult<()> {
     // Scratch for this MB's accumulating CBF state; committed back to
     // the grid at the end of the function.
-    let mut curr_cbf = CabacMbNeighbourInfo::default();
-    curr_cbf.is_intra = current_is_intra;
-    curr_cbf.is_i_pcm = mb_type.is_i_pcm();
-    curr_cbf.is_skip = mb_type.is_skip();
+    let mut curr_cbf = CabacMbNeighbourInfo {
+        is_intra: current_is_intra,
+        is_i_pcm: mb_type.is_i_pcm(),
+        is_skip: mb_type.is_skip(),
+        ..CabacMbNeighbourInfo::default()
+    };
     // Snapshot the neighbour grid (immutable) for CBF lookups.
     let grid_snap: Option<CabacNeighbourGrid> = nb_grid.as_deref().cloned();
     let grid_ref: Option<&CabacNeighbourGrid> = grid_snap.as_ref();
@@ -4239,7 +4196,7 @@ fn parse_residual_cabac_only(
     }
 
     // Commit this MB's final CBF state (and availability) to the grid.
-    if let Some(grid) = nb_grid.as_deref_mut() {
+    if let Some(grid) = nb_grid {
         if let Some(slot) = grid.mbs.get_mut(current_mb_addr as usize) {
             slot.available = true;
             slot.is_intra = current_is_intra;
@@ -5459,8 +5416,10 @@ mod tests {
         // decoding Cr AC block 1 (iCbCr=1) we should read
         // `curr_cbf.cbf_cr_ac[0]` instead.
         let grid = mk_cabac_grid();
-        let mut curr = CabacMbNeighbourInfo::default();
-        curr.is_intra = true;
+        let mut curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..CabacMbNeighbourInfo::default()
+        };
         curr.cbf_cb_ac[0] = true;
         curr.cbf_cr_ac[0] = false;
         // ChromaAc blk_idx=1 is at (4, 0) → A=(3, 0) internal block 0.
@@ -6533,8 +6492,10 @@ mod tests {
     /// plane CBF queries to the plane-specific neighbour arrays.
     #[test]
     fn cabac_444_cbf_helpers_route_per_plane() {
-        let mut info = CabacMbNeighbourInfo::default();
-        info.available = true;
+        let mut info = CabacMbNeighbourInfo {
+            available: true,
+            ..CabacMbNeighbourInfo::default()
+        };
         info.cbf_luma_4x4[3] = true;
         info.cbf_cb_luma_4x4[3] = false;
         info.cbf_cr_luma_4x4[3] = true;

@@ -369,7 +369,7 @@ fn compare_frame(idx: usize, ours: &[u8], theirs: &[u8], width: u32, height: u32
 
     let first_plane_xy = first.and_then(|o| byte_offset_to_plane_xy(o, width, height));
     let first_mb = first_plane_xy.map(|(plane, x, y)| {
-        let pic_width_in_mbs = (width + 15) / 16;
+        let pic_width_in_mbs = width.div_ceil(16);
         let (_mb_x, _mb_y, mb_addr, xi, yi) = plane_xy_to_mb_coords(plane, x, y, pic_width_in_mbs);
         (mb_addr, xi, yi)
     });
@@ -390,7 +390,7 @@ fn compare_frame(idx: usize, ours: &[u8], theirs: &[u8], width: u32, height: u32
 /// buffer. The MB origin in the Y plane is `(mb_x * 16, mb_y * 16)` and
 /// we clip to the actual picture dimensions so edge MBs don't over-read.
 fn dump_luma_mb(label: &str, buf: &[u8], mb_addr: u32, width: u32, height: u32) {
-    let pic_width_in_mbs = (width + 15) / 16;
+    let pic_width_in_mbs = width.div_ceil(16);
     let mb_y = mb_addr / pic_width_in_mbs;
     let mb_x = mb_addr % pic_width_in_mbs;
     let x0 = (mb_x * 16) as usize;
@@ -609,7 +609,7 @@ fn print_frame_diff(name: &str, d: &FrameDiff, width: u32) {
     );
     if let (Some((plane, x, y)), Some((mb_addr, xi, yi))) = (d.first_diff_plane_xy, d.first_diff_mb)
     {
-        let pic_width_in_mbs = (width + 15) / 16;
+        let pic_width_in_mbs = width.div_ceil(16);
         let mb_y = mb_addr / pic_width_in_mbs;
         let mb_x = mb_addr % pic_width_in_mbs;
         eprintln!(
@@ -667,12 +667,8 @@ fn print_report(r: &StreamReport) {
         if let (Some((plane, x, y)), Some((mb_addr, xi, yi))) =
             (d.first_diff_plane_xy, d.first_diff_mb)
         {
-            let pic_width_in_mbs = r.geometry.map(|(w, _)| (w + 15) / 16).unwrap_or(0);
-            let mb_y = if pic_width_in_mbs > 0 {
-                mb_addr / pic_width_in_mbs
-            } else {
-                0
-            };
+            let pic_width_in_mbs = r.geometry.map(|(w, _)| w.div_ceil(16)).unwrap_or(0);
+            let mb_y = mb_addr.checked_div(pic_width_in_mbs).unwrap_or(0);
             let mb_x = if pic_width_in_mbs > 0 {
                 mb_addr % pic_width_in_mbs
             } else {
@@ -849,7 +845,7 @@ fn conformance_summary_all_streams() {
         };
         let first_str = match (&r.first_mismatch, r.geometry) {
             (Some(d), Some((w, _))) => {
-                let pic_width_in_mbs = (w + 15) / 16;
+                let pic_width_in_mbs = w.div_ceil(16);
                 if let (Some((plane, x, y)), Some((mb_addr, _, _))) =
                     (d.first_diff_plane_xy, d.first_diff_mb)
                 {
@@ -1747,7 +1743,7 @@ mod helpers_tests {
         ours[y_size + 1] = 3;
 
         // Cr diffs: 3 samples, max 20.
-        ours[y_size + c_size + 0] = 1;
+        ours[y_size + c_size] = 1;
         ours[y_size + c_size + 2] = 20;
         ours[y_size + c_size + 3] = 4;
 
