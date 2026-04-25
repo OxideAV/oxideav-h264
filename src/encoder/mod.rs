@@ -37,6 +37,7 @@ pub mod deblock;
 pub mod intra4x4;
 pub mod intra_pred;
 pub mod macroblock;
+pub mod me;
 pub mod nal;
 pub mod pps;
 pub mod rdo;
@@ -57,18 +58,24 @@ use crate::encoder::intra_pred::{
     predict_16x16, predict_chroma_8x8, sad_8x8, I16x16Mode, IntraChromaMode,
 };
 use crate::encoder::macroblock::{
-    write_i_nxn_mb, write_intra16x16_mb, I16x16McbConfig, INxNMcbConfig,
+    write_i_nxn_mb, write_intra16x16_mb, write_p_l0_16x16_mb, I16x16McbConfig, INxNMcbConfig,
+    PL016x16McbConfig,
 };
+use crate::encoder::me::search_integer_16x16;
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::rdo::{cost_combined, lambda_ssd, ssd_16x16, ssd_4x4};
-use crate::encoder::slice::{write_idr_i_slice_header, IdrSliceHeaderConfig};
+use crate::encoder::slice::{
+    write_idr_i_slice_header, write_p_slice_header, IdrSliceHeaderConfig, PSliceHeaderConfig,
+};
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
     forward_core_4x4, forward_hadamard_2x2, forward_hadamard_4x4, quantize_4x4, quantize_4x4_ac,
     quantize_chroma_dc, quantize_luma_dc, zigzag_scan_4x4, zigzag_scan_4x4_ac,
 };
+use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
+use crate::mv_deriv::{Mv, MvpredInputs, NeighbourMv};
 use crate::nal::NalUnitType;
 use crate::transform::{
     inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16, inverse_scan_4x4_zigzag_ac,
@@ -1048,6 +1055,7 @@ impl Encoder {
                 qp_y,
                 luma_nonzero_4x4,
                 chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+                ..Default::default()
             },
         }
     }
@@ -1428,6 +1436,7 @@ impl Encoder {
                 qp_y,
                 luma_nonzero_4x4,
                 chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+                ..Default::default()
             },
         }
     }
@@ -1441,6 +1450,234 @@ pub struct EncodedIdr {
     pub recon_v: Vec<u8>,
     pub recon_width: u32,
     pub recon_height: u32,
+}
+
+/// Output of [`Encoder::encode_p`] — a single P-slice access unit and
+/// the matching reconstruction. Same layout as [`EncodedIdr`] except
+/// the bitstream contains only the slice NAL (no SPS/PPS — those were
+/// emitted by the IDR).
+pub struct EncodedP {
+    pub annex_b: Vec<u8>,
+    pub recon_y: Vec<u8>,
+    pub recon_u: Vec<u8>,
+    pub recon_v: Vec<u8>,
+    pub recon_width: u32,
+    pub recon_height: u32,
+    /// `frame_num` of this P-frame. Increments from the IDR's 0.
+    pub frame_num: u32,
+    /// `pic_order_cnt_lsb` of this P-frame.
+    pub pic_order_cnt_lsb: u32,
+}
+
+/// Per-MB encoder-side MV / refIdx slot for the §8.4.1.3 mvp neighbour
+/// grid. Round-16 single-MV-per-MB simplification: each MB carries one
+/// 16x16 partition's mv + ref_idx (or `Intra` flag).
+#[derive(Debug, Clone, Copy)]
+struct MvGridSlot {
+    /// True once this MB has been encoded (so subsequent MBs can read it).
+    available: bool,
+    /// True for intra-coded MBs (their mvp contribution is mv=0, ref=-1).
+    is_intra: bool,
+    /// L0 reference index (always 0 in our single-ref P-slice).
+    ref_idx_l0: i32,
+    /// L0 motion vector in 1/4-pel units (mv = mv_pel * 4).
+    mv_l0: Mv,
+}
+
+impl Default for MvGridSlot {
+    fn default() -> Self {
+        Self {
+            available: false,
+            is_intra: false,
+            ref_idx_l0: -1,
+            mv_l0: Mv::ZERO,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MvGrid {
+    width_mbs: usize,
+    slots: Vec<MvGridSlot>,
+}
+
+impl MvGrid {
+    fn new(width_mbs: usize, height_mbs: usize) -> Self {
+        Self {
+            width_mbs,
+            slots: vec![MvGridSlot::default(); width_mbs * height_mbs],
+        }
+    }
+    fn slot(&self, mb_x: usize, mb_y: usize) -> &MvGridSlot {
+        &self.slots[mb_y * self.width_mbs + mb_x]
+    }
+    fn slot_mut(&mut self, mb_x: usize, mb_y: usize) -> &mut MvGridSlot {
+        &mut self.slots[mb_y * self.width_mbs + mb_x]
+    }
+}
+
+/// Build the (A, B, C, D) NeighbourMv records for the current MB
+/// (mb_x, mb_y) — single 16x16 partition. Per §6.4.11.7 the four
+/// neighbours of a 16x16 partition are:
+///
+/// * A: the 16x16 partition immediately to the left (mb_x - 1, mb_y).
+/// * B: the 16x16 partition immediately above (mb_x, mb_y - 1).
+/// * C: the 16x16 partition above-right (mb_x + 1, mb_y - 1).
+/// * D: the 16x16 partition above-left (mb_x - 1, mb_y - 1).
+///
+/// Each neighbour is "MVpred-usable" iff its MB is encoded AND not intra.
+/// Intra neighbours collapse to (mv=0, ref=-1) per §8.4.1.3.2 step 2a.
+fn neighbour_mvs_16x16(
+    grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+) -> (NeighbourMv, NeighbourMv, NeighbourMv, NeighbourMv) {
+    let make = |maybe: Option<&MvGridSlot>| -> NeighbourMv {
+        match maybe {
+            Some(s) if s.available => {
+                if s.is_intra {
+                    // §8.4.1.3.2 step 2a: intra neighbour collapses.
+                    NeighbourMv::intra_but_mb_available()
+                } else {
+                    NeighbourMv {
+                        available: true,
+                        mb_available: true,
+                        partition_available: true,
+                        ref_idx: s.ref_idx_l0,
+                        mv: s.mv_l0,
+                    }
+                }
+            }
+            _ => NeighbourMv::UNAVAILABLE,
+        }
+    };
+    let a = if mb_x > 0 {
+        Some(grid.slot(mb_x - 1, mb_y))
+    } else {
+        None
+    };
+    let b = if mb_y > 0 {
+        Some(grid.slot(mb_x, mb_y - 1))
+    } else {
+        None
+    };
+    let c = if mb_y > 0 && mb_x + 1 < grid.width_mbs {
+        Some(grid.slot(mb_x + 1, mb_y - 1))
+    } else {
+        None
+    };
+    let d = if mb_x > 0 && mb_y > 0 {
+        Some(grid.slot(mb_x - 1, mb_y - 1))
+    } else {
+        None
+    };
+    (make(a), make(b), make(c), make(d))
+}
+
+/// Per §8.4.1.3 + the §8.4.1.3.2 C→D substitution — derive the MVpred
+/// for a single 16x16 P_L0 partition at (mb_x, mb_y).
+fn mvp_for_16x16(grid: &MvGrid, mb_x: usize, mb_y: usize, ref_idx: i32) -> Mv {
+    let (a, b, c, d) = neighbour_mvs_16x16(grid, mb_x, mb_y);
+    let inputs = MvpredInputs::from_abc(a, b, c, ref_idx, Default::default());
+    crate::mv_deriv::derive_mvpred_with_d(&inputs, d)
+}
+
+/// Per §8.4.1.2 — derive the (refIdxL0, mvL0) for a P_Skip MB at
+/// (mb_x, mb_y). With the C→D substitution.
+fn p_skip_mv(grid: &MvGrid, mb_x: usize, mb_y: usize) -> (i32, Mv) {
+    let (a, b, c, d) = neighbour_mvs_16x16(grid, mb_x, mb_y);
+    crate::mv_deriv::derive_p_skip_mv_with_d(a, b, c, d)
+}
+
+/// Round-16 — generate the inter predictor for one 16x16 luma MB at
+/// (mb_x, mb_y), using mv_l0 (in 1/4-pel units) against the reference
+/// luma plane. Output is `[i32; 256]` row-major (16 rows of 16 samples
+/// each).
+///
+/// For integer-pel MVs (mv_l0 is a multiple of 4), `x_frac == y_frac
+/// == 0` and the call simplifies to a clipped copy.
+fn build_inter_pred_luma(
+    ref_y: &[u8],
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    mv: Mv,
+) -> [i32; 256] {
+    // Convert ref to i32 plane.
+    let stride = ref_w as usize;
+    let h = ref_h as usize;
+    let ref_i32: Vec<i32> = ref_y.iter().take(stride * h).map(|&v| v as i32).collect();
+
+    let mv_int_x = mv.x >> 2;
+    let mv_int_y = mv.y >> 2;
+    let x_frac = (mv.x & 3) as u8;
+    let y_frac = (mv.y & 3) as u8;
+    let int_x = (mb_x * 16) as i32 + mv_int_x;
+    let int_y = (mb_y * 16) as i32 + mv_int_y;
+
+    let mut dst = [0i32; 256];
+    interpolate_luma(
+        &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, 16, 16, 8, &mut dst, 16,
+    )
+    .expect("luma interpolation");
+    dst
+}
+
+/// Round-16 — generate the inter predictor for one 8x8 chroma MB
+/// (4:2:0) at (mb_x, mb_y), using `mv_l0` (luma 1/4-pel units; chroma
+/// derives 1/8-pel units per §8.4.1.4 for 4:2:0).
+fn build_inter_pred_chroma(
+    ref_c: &[u8],
+    ref_cw: u32,
+    ref_ch: u32,
+    mb_x: usize,
+    mb_y: usize,
+    mv: Mv,
+) -> [i32; 64] {
+    let stride = ref_cw as usize;
+    let h = ref_ch as usize;
+    let ref_i32: Vec<i32> = ref_c.iter().take(stride * h).map(|&v| v as i32).collect();
+
+    // §8.4.1.4 / eq. 8-228..8-231 — chroma MV is luma MV (4:2:0).
+    // xIntC = mb_x*8 + (mvC >> 3); xFracC = mvC & 7. mvC = mv (luma 1/4-pel).
+    let mv_cx = mv.x;
+    let mv_cy = mv.y;
+    let int_x = (mb_x * 8) as i32 + (mv_cx >> 3);
+    let int_y = (mb_y * 8) as i32 + (mv_cy >> 3);
+    let x_frac = (mv_cx & 7) as u8;
+    let y_frac = (mv_cy & 7) as u8;
+
+    let mut dst = [0i32; 64];
+    interpolate_chroma(
+        &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, 8, 8, 8, &mut dst, 8,
+    )
+    .expect("chroma interpolation");
+    dst
+}
+
+/// Encode the chroma residual for one P_L0 MB given the chroma
+/// inter predictor (instead of the intra predictor used by
+/// [`encode_chroma_residual`]). Same machinery as the intra path —
+/// shared via a small wrapper; we just need an `i32` predictor.
+///
+/// Returns `(dc_levels, ac_levels, recon_residual)` matching
+/// [`encode_chroma_residual`]'s signature.
+fn encode_chroma_residual_inter(
+    src_plane: &[u8],
+    chroma_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    pred: &[i32; 64],
+    qp_c: i32,
+) -> ([i32; 4], [[i32; 16]; 4], [i32; 64]) {
+    // Re-use the intra path — its only assumption on the predictor is
+    // that it's a `[i32; 64]` row-major 8x8 block. The is_intra=true
+    // rounding flag in the AC quantization differs slightly from inter,
+    // but for round-16 we accept the intra rounding for chroma (the
+    // bitstream is correct either way; only the rate-distortion trade-
+    // off shifts marginally).
+    encode_chroma_residual(src_plane, chroma_stride, mb_x, mb_y, pred, qp_c)
 }
 
 /// Encode one chroma plane's residual (DC + AC) for an 8x8 chroma MB,
@@ -1671,4 +1908,571 @@ fn trial_intra16x16_cost(
         }
     }
     cost_combined(d, bits, lambda)
+}
+
+// ===========================================================================
+// Round-16 — P-slice (inter) encoder.
+// ===========================================================================
+
+impl Encoder {
+    /// Round-16 — encode one P-frame using `prev` as the reference. Emits
+    /// just the slice NAL (caller has already emitted SPS/PPS via the IDR).
+    ///
+    /// Strategy per MB:
+    ///   1. Run integer-pel motion estimation around (0, 0) ±range.
+    ///   2. Build the inter predictor (luma 6-tap reduces to integer copy
+    ///      for our integer-pel MVs; chroma bilinear with 0..=4 frac).
+    ///   3. Compute the residual against the predictor, run forward 4x4 +
+    ///      AC quantization (no luma DC Hadamard for inter MBs).
+    ///   4. Decide P_Skip vs P_L0_16x16: P_Skip when chosen MV equals
+    ///      the §8.4.1.2-derived skip-MV AND CBP would be 0.
+    ///   5. (Round-16 simplification) No intra-fallback RDO yet — we trust
+    ///      the inter path. Future round can add it.
+    ///
+    /// The bitstream emits an `mb_skip_run` ue(v) before each coded MB
+    /// (per §7.3.4 CAVLC), counting the consecutive P_Skip MBs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_p(
+        &self,
+        frame: &YuvFrame<'_>,
+        prev: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+    ) -> EncodedP {
+        assert_eq!(frame.width, self.cfg.width);
+        assert_eq!(frame.height, self.cfg.height);
+        assert_eq!(prev.width, self.cfg.width);
+        assert_eq!(prev.height, self.cfg.height);
+        let width_mbs = self.cfg.width / 16;
+        let height_mbs = self.cfg.height / 16;
+        let chroma_width = (self.cfg.width / 2) as usize;
+        let chroma_height = (self.cfg.height / 2) as usize;
+
+        // SPS/PPS are not re-emitted for non-IDR slices. Caller already
+        // shipped them with the IDR.
+        let mut stream: Vec<u8> = Vec::new();
+
+        let log2_max_frame_num_minus4: u32 = 4;
+        let log2_max_poc_lsb_minus4: u32 = 4;
+        let chroma_qp_index_offset: i32 = 0;
+
+        let mut sw = BitWriter::new();
+        write_p_slice_header(
+            &mut sw,
+            &PSliceHeaderConfig {
+                first_mb_in_slice: 0,
+                slice_type_raw: 5, // P, all-same-type
+                pic_parameter_set_id: 0,
+                frame_num,
+                frame_num_bits: log2_max_frame_num_minus4 + 4,
+                pic_order_cnt_lsb,
+                poc_lsb_bits: log2_max_poc_lsb_minus4 + 4,
+                slice_qp_delta: 0,
+                disable_deblocking_filter_idc: 0,
+                slice_alpha_c0_offset_div2: 0,
+                slice_beta_offset_div2: 0,
+                nal_ref_idc: 2,
+            },
+        );
+
+        // Reconstruction state for THIS picture.
+        let mut recon_y = vec![0u8; (self.cfg.width * self.cfg.height) as usize];
+        let mut recon_u = vec![0u8; chroma_width * chroma_height];
+        let mut recon_v = vec![0u8; chroma_width * chroma_height];
+
+        let qp_y = self.cfg.qp;
+        let qp_c = qp_y_to_qp_c(qp_y, chroma_qp_index_offset);
+
+        let mut nc_grid = CavlcNcGrid::new(width_mbs, height_mbs);
+        let mut intra_grid = IntraGrid::new(width_mbs as usize, height_mbs as usize);
+        let mut mv_grid = MvGrid::new(width_mbs as usize, height_mbs as usize);
+
+        let mut mb_deblock_infos: Vec<MbDeblockInfo> =
+            vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
+
+        // §7.3.4 CAVLC P-slice walker — emit `mb_skip_run` before each
+        // coded MB. We accumulate skips and flush them just before writing
+        // a coded MB (or at end-of-slice). Note: the spec also requires
+        // an `mb_skip_run` even at the *very end* of a slice if the last
+        // MBs were skips — we always emit one final `mb_skip_run` to
+        // ensure consistency.
+        let mut pending_skip: u32 = 0;
+
+        for mb_y in 0..height_mbs as usize {
+            for mb_x in 0..width_mbs as usize {
+                let mb_addr = mb_y * width_mbs as usize + mb_x;
+
+                // Decide P_Skip vs P_L0_16x16 for this MB.
+                let dbl = self.encode_p_mb(
+                    frame,
+                    prev,
+                    mb_x,
+                    mb_y,
+                    qp_y,
+                    qp_c,
+                    chroma_width,
+                    chroma_height,
+                    &mut recon_y,
+                    &mut recon_u,
+                    &mut recon_v,
+                    &mut sw,
+                    &mut nc_grid,
+                    &mut intra_grid,
+                    &mut mv_grid,
+                    &mut pending_skip,
+                );
+                mb_deblock_infos[mb_addr] = dbl;
+            }
+        }
+
+        // Flush any trailing skip run.
+        if pending_skip > 0 {
+            sw.ue(pending_skip);
+            pending_skip = 0;
+        }
+        let _ = pending_skip;
+
+        // §7.3.2.8 / §7.3.2.9 — slice_data trailing bits.
+        sw.rbsp_trailing_bits();
+        let slice_rbsp = sw.into_bytes();
+        stream.extend_from_slice(&build_nal_unit(2, NalUnitType::SliceNonIdr, &slice_rbsp));
+
+        // §8.7 — picture-level in-loop deblocking.
+        deblock_recon(
+            self.cfg.width,
+            self.cfg.height,
+            chroma_width as u32,
+            chroma_height as u32,
+            &mut recon_y,
+            &mut recon_u,
+            &mut recon_v,
+            &mb_deblock_infos,
+            chroma_qp_index_offset,
+            width_mbs,
+            height_mbs,
+        );
+
+        EncodedP {
+            annex_b: stream,
+            recon_y,
+            recon_u,
+            recon_v,
+            recon_width: self.cfg.width,
+            recon_height: self.cfg.height,
+            frame_num,
+            pic_order_cnt_lsb,
+        }
+    }
+
+    /// Encode one P-slice macroblock: run ME, build inter predictor,
+    /// transmit residual (or skip if equivalent). Updates `mv_grid`,
+    /// `nc_grid`, `intra_grid`, the recon planes, and `pending_skip`.
+    /// Returns the deblock info for the §8.7 pass.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_p_mb(
+        &self,
+        frame: &YuvFrame<'_>,
+        prev: &EncodedFrameRef<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mv_grid: &mut MvGrid,
+        pending_skip: &mut u32,
+    ) -> MbDeblockInfo {
+        let width = self.cfg.width as usize;
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let mb_addr = mb_y * width_mbs + mb_x;
+
+        // 1. Motion estimation (integer-pel, ±16).
+        let me = search_integer_16x16(
+            frame.y,
+            width,
+            self.cfg.width,
+            self.cfg.height,
+            prev.recon_y,
+            prev.width as usize,
+            prev.width,
+            prev.height,
+            mb_x,
+            mb_y,
+            16,
+            16,
+        );
+        let chosen_mv = Mv::new(me.mv_x, me.mv_y);
+
+        // 2. Compute MVpred + skip-MV for this MB position.
+        let mvp = mvp_for_16x16(mv_grid, mb_x, mb_y, 0);
+        let (skip_ref, skip_mv) = p_skip_mv(mv_grid, mb_x, mb_y);
+
+        // 3. Build the inter predictor against the chosen MV.
+        let pred_y =
+            build_inter_pred_luma(prev.recon_y, prev.width, prev.height, mb_x, mb_y, chosen_mv);
+        let chroma_w = prev.width / 2;
+        let chroma_h = prev.height / 2;
+        let pred_u =
+            build_inter_pred_chroma(prev.recon_u, chroma_w, chroma_h, mb_x, mb_y, chosen_mv);
+        let pred_v =
+            build_inter_pred_chroma(prev.recon_v, chroma_w, chroma_h, mb_x, mb_y, chosen_mv);
+
+        // 4. Compute the luma residual, transform, AC-quantize, inverse,
+        //    and reconstruct.
+        let inter_luma = forward_inter_luma(frame.y, width, mb_x, mb_y, &pred_y, qp_y);
+        let luma_4x4_levels_scan = inter_luma.levels_scan;
+        let luma_4x4_quant_raster = inter_luma.quant_raster;
+        let blk_has_nz = inter_luma.blk_has_nz;
+        let recon_block_residual = inter_luma.recon_residual;
+
+        // 5. Decide cbp_luma (per 8x8 quadrant).
+        let mut cbp_luma: u8 = 0;
+        for blk8 in 0..4usize {
+            let any_nz = (0..4).any(|sub| blk_has_nz[blk8 * 4 + sub]);
+            if any_nz {
+                cbp_luma |= 1u8 << blk8;
+            }
+        }
+
+        // 6. Encode chroma residual against the inter predictor.
+        let (u_dc_levels, u_ac_levels, u_recon_residual) =
+            encode_chroma_residual_inter(frame.u, chroma_width, mb_x, mb_y, &pred_u, qp_c);
+        let (v_dc_levels, v_ac_levels, v_recon_residual) =
+            encode_chroma_residual_inter(frame.v, chroma_width, mb_x, mb_y, &pred_v, qp_c);
+        let any_dc_nz = u_dc_levels.iter().any(|&v| v != 0) || v_dc_levels.iter().any(|&v| v != 0);
+        let any_ac_nz = u_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0))
+            || v_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0));
+        let cbp_chroma: u8 = if any_ac_nz {
+            2
+        } else if any_dc_nz {
+            1
+        } else {
+            0
+        };
+
+        // 7. P_Skip eligibility:
+        //    * chosen MV must equal the §8.4.1.2 skip-MV
+        //    * cbp_luma == 0 AND cbp_chroma == 0
+        //    * skip_ref_idx == 0 (always 0 for our single-ref slice)
+        let _ = skip_ref;
+        let is_skip = chosen_mv == skip_mv && cbp_luma == 0 && cbp_chroma == 0;
+
+        if is_skip {
+            // P_Skip: do NOT emit any MB syntax; just bump pending_skip
+            // and update grid state for neighbour lookups.
+            *pending_skip += 1;
+
+            // Update mv_grid: P_Skip MB carries its derived (skip_mv, ref=0).
+            *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
+                available: true,
+                is_intra: false,
+                ref_idx_l0: 0,
+                mv_l0: skip_mv,
+            };
+
+            // Update intra_grid: P_Skip is not intra, not I_NxN.
+            let s = intra_grid.slot_mut(mb_x, mb_y);
+            s.available = true;
+            s.is_i_nxn = false;
+
+            // Update nc_grid: P_Skip neighbour contributes nN=0 (§9.2.1.1
+            // step 6).
+            {
+                let cur = &mut nc_grid.mbs[mb_addr];
+                cur.is_available = true;
+                cur.is_intra = false;
+                cur.is_skip = true;
+                cur.is_i_pcm = false;
+                cur.luma_total_coeff = [0u8; 16];
+                cur.cb_total_coeff = [0u8; 8];
+                cur.cr_total_coeff = [0u8; 8];
+            }
+
+            // Apply the inter predictor to the recon (no residual).
+            for j in 0..16usize {
+                for i in 0..16usize {
+                    let py = mb_y * 16 + j;
+                    let px = mb_x * 16 + i;
+                    recon_y[py * width + px] = pred_y[j * 16 + i].clamp(0, 255) as u8;
+                }
+            }
+            for j in 0..8usize {
+                for i in 0..8usize {
+                    let cy = mb_y * 8 + j;
+                    let cx = mb_x * 8 + i;
+                    recon_u[cy * chroma_width + cx] = pred_u[j * 8 + i].clamp(0, 255) as u8;
+                    recon_v[cy * chroma_width + cx] = pred_v[j * 8 + i].clamp(0, 255) as u8;
+                }
+            }
+            let _ = chroma_height;
+
+            // Populate per-4x4 MV + per-8x8 ref_idx for the deblock
+            // walker's different_ref_or_mv_luma. P_Skip uses skip_mv +
+            // ref=0; ref_poc=0 (POC of the single IDR ref).
+            let mv_t = (
+                skip_mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                skip_mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            );
+            return MbDeblockInfo {
+                is_intra: false,
+                qp_y,
+                luma_nonzero_4x4: 0,
+                chroma_nonzero_4x4: 0,
+                mv_l0: [mv_t; 16],
+                ref_idx_l0: [0; 4],
+                ref_poc_l0: [0; 4],
+            };
+        }
+
+        // P_L0_16x16: flush any pending skip-run, then emit the coded MB.
+        sw.ue(*pending_skip);
+        *pending_skip = 0;
+
+        // mvd = chosen_mv - mvp.
+        let mvd_x = chosen_mv.x - mvp.x;
+        let mvd_y = chosen_mv.y - mvp.y;
+
+        // Apply luma reconstruction now that cbp_luma is known.
+        // For 8x8 quadrants whose cbp bit is 0, the decoder reconstructs
+        // pred + 0 (no residual). Mirror that here.
+        for blk8 in 0..4usize {
+            let send = (cbp_luma >> blk8) & 1 == 1;
+            for sub in 0..4usize {
+                let blk = blk8 * 4 + sub;
+                let (bx, by) = LUMA_4X4_BLK[blk];
+                let bx_pix = bx * 4;
+                let by_pix = by * 4;
+                for j in 0..4usize {
+                    for i in 0..4usize {
+                        let p = pred_y[(by_pix + j) * 16 + bx_pix + i];
+                        let r = if send {
+                            recon_block_residual[blk][j * 4 + i]
+                        } else {
+                            0
+                        };
+                        let py = mb_y * 16 + by_pix + j;
+                        let px = mb_x * 16 + bx_pix + i;
+                        recon_y[py * width + px] = (p + r).clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        for j in 0..8usize {
+            for i in 0..8usize {
+                let cy = mb_y * 8 + j;
+                let cx = mb_x * 8 + i;
+                let pu = pred_u[j * 8 + i];
+                let pv = pred_v[j * 8 + i];
+                let res_u = if cbp_chroma == 0 {
+                    0
+                } else {
+                    u_recon_residual[j * 8 + i]
+                };
+                let res_v = if cbp_chroma == 0 {
+                    0
+                } else {
+                    v_recon_residual[j * 8 + i]
+                };
+                recon_u[cy * chroma_width + cx] = (pu + res_u).clamp(0, 255) as u8;
+                recon_v[cy * chroma_width + cx] = (pv + res_v).clamp(0, 255) as u8;
+            }
+        }
+        let _ = chroma_height;
+
+        // CAVLC neighbour-grid update (per §9.2.1.1).
+        {
+            let cur = &mut nc_grid.mbs[mb_addr];
+            cur.is_available = true;
+            cur.is_intra = false;
+            cur.is_skip = false;
+            cur.is_i_pcm = false;
+            cur.luma_total_coeff = [0u8; 16];
+        }
+
+        let mut luma_4x4_nc = [0i32; 16];
+        let mut own_totals = [0u8; 16];
+        for blk in 0..16usize {
+            let blk8 = blk / 4;
+            nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
+            let nc = derive_nc_luma(
+                nc_grid,
+                mb_addr as u32,
+                blk as u8,
+                LumaNcKind::Ac,
+                true,
+                false,
+            );
+            luma_4x4_nc[blk] = nc;
+            if (cbp_luma >> blk8) & 1 == 1 {
+                let tc = luma_4x4_levels_scan[blk]
+                    .iter()
+                    .filter(|&&v| v != 0)
+                    .count() as u8;
+                own_totals[blk] = tc;
+            } else {
+                own_totals[blk] = 0;
+            }
+        }
+        nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
+
+        // Emit the MB syntax.
+        let mb_cfg = PL016x16McbConfig {
+            mvd_l0_x: mvd_x,
+            mvd_l0_y: mvd_y,
+            cbp_luma,
+            cbp_chroma,
+            mb_qp_delta: 0,
+            luma_4x4_levels: luma_4x4_levels_scan,
+            luma_4x4_nc,
+            chroma_dc_cb: u_dc_levels,
+            chroma_dc_cr: v_dc_levels,
+            chroma_ac_cb: u_ac_levels,
+            chroma_ac_cr: v_ac_levels,
+        };
+        let _ = luma_4x4_quant_raster; // already folded into recon_block_residual
+        write_p_l0_16x16_mb(sw, &mb_cfg, 0).expect("write P_L0_16x16 mb");
+
+        // Update mv_grid + intra_grid for subsequent MBs.
+        *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
+            available: true,
+            is_intra: false,
+            ref_idx_l0: 0,
+            mv_l0: chosen_mv,
+        };
+        let s = intra_grid.slot_mut(mb_x, mb_y);
+        s.available = true;
+        s.is_i_nxn = false;
+
+        // Per-4x4 nonzero mask for the §8.7 deblock walker.
+        let luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
+        let cb_nz: [bool; 4] =
+            std::array::from_fn(|i| cbp_chroma == 2 && u_ac_levels[i].iter().any(|&v| v != 0));
+        let cr_nz: [bool; 4] =
+            std::array::from_fn(|i| cbp_chroma == 2 && v_ac_levels[i].iter().any(|&v| v != 0));
+
+        let mv_t = (
+            chosen_mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            chosen_mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        );
+        MbDeblockInfo {
+            is_intra: false,
+            qp_y,
+            luma_nonzero_4x4,
+            chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+            mv_l0: [mv_t; 16],
+            ref_idx_l0: [0; 4],
+            ref_poc_l0: [0; 4],
+        }
+    }
+}
+
+/// Borrowed view of a previously-encoded frame's reconstruction. Used as
+/// the reference for [`Encoder::encode_p`].
+pub struct EncodedFrameRef<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub recon_y: &'a [u8],
+    pub recon_u: &'a [u8],
+    pub recon_v: &'a [u8],
+}
+
+impl<'a> From<&'a EncodedIdr> for EncodedFrameRef<'a> {
+    fn from(e: &'a EncodedIdr) -> Self {
+        Self {
+            width: e.recon_width,
+            height: e.recon_height,
+            recon_y: &e.recon_y,
+            recon_u: &e.recon_u,
+            recon_v: &e.recon_v,
+        }
+    }
+}
+
+impl<'a> From<&'a EncodedP> for EncodedFrameRef<'a> {
+    fn from(e: &'a EncodedP) -> Self {
+        Self {
+            width: e.recon_width,
+            height: e.recon_height,
+            recon_y: &e.recon_y,
+            recon_u: &e.recon_u,
+            recon_v: &e.recon_v,
+        }
+    }
+}
+
+/// Forward-quantize-inverse output for one inter MB's luma residual.
+///
+/// * `levels_scan[blk]` — the 16 coefficients in zig-zag scan order for
+///   CAVLC emit.
+/// * `quant_raster[blk]` — the same coefficients in 4x4 raster (for
+///   inverse path / debug).
+/// * `blk_has_nz[blk]` — true iff the block has at least one non-zero
+///   coefficient (drives cbp_luma quadrant decision).
+/// * `recon_residual[blk]` — the reconstructed 16 sample residuals for
+///   this 4x4 block (post-inverse), ready to be added to the predictor.
+struct InterLumaForward {
+    levels_scan: [[i32; 16]; 16],
+    quant_raster: [[i32; 16]; 16],
+    blk_has_nz: [bool; 16],
+    recon_residual: [[i32; 16]; 16],
+}
+
+/// Forward 4x4 + AC quantization for an inter MB's luma residual. Inter
+/// MBs do NOT use the Intra_16x16 luma DC Hadamard — every 4x4 block is
+/// transmitted as a full DC+AC residual block.
+fn forward_inter_luma(
+    src_y: &[u8],
+    src_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    pred: &[i32; 256],
+    qp_y: i32,
+) -> InterLumaForward {
+    // Build sample residual against the predictor.
+    let mut residual = [0i32; 256];
+    for j in 0..16usize {
+        for i in 0..16usize {
+            let s = src_y[(mb_y * 16 + j) * src_stride + (mb_x * 16 + i)] as i32;
+            residual[j * 16 + i] = s - pred[j * 16 + i];
+        }
+    }
+
+    let mut levels_scan = [[0i32; 16]; 16];
+    let mut quant_raster = [[0i32; 16]; 16];
+    let mut blk_has_nz = [false; 16];
+    let mut recon_residual = [[0i32; 16]; 16];
+
+    for blkz in 0..16usize {
+        let (bx, by) = LUMA_4X4_BLK[blkz];
+        let mut block = [0i32; 16];
+        for j in 0..4 {
+            for i in 0..4 {
+                block[j * 4 + i] = residual[(by * 4 + j) * 16 + bx * 4 + i];
+            }
+        }
+        // Forward 4x4 + full quantize (includes DC; inter uses the
+        // standard quantizer per §8.5.10).
+        let w = forward_core_4x4(&block);
+        let z = quantize_4x4(&w, qp_y, false);
+        let scan = zigzag_scan_4x4(&z);
+        levels_scan[blkz] = scan;
+        quant_raster[blkz] = z;
+        blk_has_nz[blkz] = z.iter().any(|&v| v != 0);
+
+        // Inverse path so we know the recon's residual for the block.
+        let r = inverse_transform_4x4(&z, qp_y, &FLAT_4X4_16, 8).expect("inv 4x4");
+        recon_residual[blkz] = r;
+    }
+    InterLumaForward {
+        levels_scan,
+        quant_raster,
+        blk_has_nz,
+        recon_residual,
+    }
 }

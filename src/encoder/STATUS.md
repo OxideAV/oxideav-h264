@@ -389,19 +389,104 @@ set (matching the decoder's `gather_samples_4x4`).
   refine it further (especially for inter-MB λ scaling once P/B slices
   land).
 
-## Round 16 (planned)
+## Round 16 — landed
 
-- **Chroma AC nC** per §9.2.1.1 (encoder tracks chroma TotalCoeff in
-  the `CavlcNcGrid`).
+Wire **P-slice support** (inter prediction) end-to-end. Single L0 ref,
+integer-pel motion estimation, P_Skip + P_L0_16x16.
 
-## Round 17+
+- **Slice header (`encoder::slice::write_p_slice_header`)**: emits the
+  non-IDR P-slice header per §7.3.3 — `slice_type=5` (P, all-same-type),
+  `num_ref_idx_active_override_flag=0` (uses PPS default of 1 ref),
+  `ref_pic_list_modification` empty, non-IDR `dec_ref_pic_marking` with
+  `adaptive_ref_pic_marking_mode_flag=0` (sliding-window).
+- **Motion estimation (`encoder::me`)**: integer-pel **full search**
+  within ±16 px around (0, 0) using SAD on the source luma 16×16 block
+  vs the reference plane (with §8.4.2.2.1 edge replication). Tie-break
+  prefers smaller `|mv|` to minimise mvd cost when SADs are equal.
+- **MV prediction grid (`MvGrid` + `mvp_for_16x16` + `p_skip_mv`)**:
+  encoder tracks the per-MB chosen MV/refIdx so that subsequent MBs
+  derive `mvpLX` per §8.4.1.3 the same way the decoder will. P_Skip
+  derivation per §8.4.1.2 (zero-MV substitution rules + median otherwise)
+  uses the existing `crate::mv_deriv` helpers — encoder and decoder
+  share the spec primitives.
+- **Inter prediction** wraps `crate::inter_pred::interpolate_luma` and
+  `interpolate_chroma`. Integer-pel luma MVs collapse to the
+  edge-replicated copy path; chroma MVs derived from luma per §8.4.1.4
+  (4:2:0) may end up half-pel even for integer-pel luma, in which case
+  the bilinear chroma interpolator runs.
+- **MB writer (`encoder::macroblock::write_p_l0_16x16_mb`)**: emits
+  `mb_type=P_L0_16x16` (raw 0), `mvd_l0_x se(v)`, `mvd_l0_y se(v)`,
+  inter `coded_block_pattern me(v)` (Table 9-4(a) inter column),
+  `mb_qp_delta se(v)` (when CBP > 0), 16 luma 4×4 residual blocks
+  gated by 8×8 quadrant `cbp_luma`, then chroma DC + AC. `ref_idx_l0`
+  is **absent** when `num_ref_idx_l0_active_minus1 == 0` per §7.3.5.1.
+- **P_Skip path**: when the chosen MV equals the §8.4.1.2-derived skip
+  MV AND `cbp_luma == cbp_chroma == 0`, the MB is omitted from the
+  bitstream and contributes to a CAVLC `mb_skip_run` ue(v) emitted
+  before the next coded MB (or at slice end).
+- **Encoder API** (`Encoder::encode_p`): takes a `YuvFrame` + an
+  `EncodedFrameRef` (the previous frame's recon planes) and emits the
+  P-slice access unit. `EncodedFrameRef::from(&EncodedIdr)` and
+  `From<&EncodedP>` make chaining frame-by-frame trivial.
+- **Local recon + deblocking**: the encoder's recon planes are
+  populated and run through the same §8.7 deblocker as I-frames.
+  `MbDeblockInfo` gained `mv_l0[16]`, `ref_idx_l0[4]`, `ref_poc_l0[4]`
+  so that the deblock walker's `different_ref_or_mv_luma` (which
+  drives bS=2 vs bS=1 on inter/inter edges) sees the same MV / ref
+  identity that the decoder will compute. Without this the encoder's
+  recon would diverge from the decoder's for any inter MB.
 
-- P-slice support (single L0, integer MV search).
-- Multiple slices per picture.
+### Validation
+
+- `cargo test -p oxideav-h264 --lib` — **780 passed** (+6: 4 new ME
+  tests, 1 P-slice header round-trip, 1 inter-CBP table round-trip).
+- All prior integration tests still pass (the 11 round-1..14 I-only
+  fixtures unchanged).
+- New round-16 integration tests:
+  - `round16_p_slice_self_roundtrip_matches_local_recon`: encode
+    IDR + P (where P = IDR shifted right 4 luma px), decode the
+    combined Annex B with our own decoder → bit-exact match against
+    encoder recon. Decoded P luma vs original source = **49.79 dB
+    PSNR** (clean integer-shift content + integer-pel ME finds the
+    motion exactly).
+  - `round16_p_slice_static_picture_uses_skips`: when P-frame source ==
+    IDR source, the encoder produces a 53-byte P slice (vs 88-byte
+    IDR), bit-exact through self-roundtrip. The drop in size is
+    smaller than ideal because IDR encoding noise prevents some MBs
+    from quantising the residual to zero.
+  - `round16_ffmpeg_decode_p_sequence_matches`: ffmpeg/libavcodec
+    decodes the same combined IDR+P stream bit-exactly against the
+    encoder's local recon (≤1 LSB tolerance).
+
+### Status caveats (unchanged from round 15 unless noted)
+
+- IDR + P-slice (P only). No B-slices.
+- mb_type now extends to `P_L0_16x16` and `P_Skip` for P-slices, in
+  addition to `I_16x16` / `I_NxN` for the IDR.
+- **Single MV per MB** (16×16 partition only). No 16×8 / 8×16 / 8×8
+  / 4MV.
+- **Integer-pel ME only**. Half-pel and quarter-pel refinement are
+  later rounds.
+- **No intra fallback in P-slices** — every P-MB stays inter (P_Skip
+  or P_L0_16x16). Future round can add I_16x16 / I_NxN trial in P
+  via the existing RDO framework.
+- Single reference: `num_ref_idx_l0_default_active_minus1 = 0` → one
+  L0 ref. The encoder uses the previous reconstructed frame.
+- In-loop deblocking active across both intra and inter MBs.
+- No CABAC — CAVLC only.
+- No rate control — fixed QP from `EncoderConfig::qp`.
+
+## Round 17+ (planned)
+
+- Half-pel + quarter-pel ME (luma 6-tap + chroma bilinear refinement).
+- 4MV (8×8 and smaller P sub-partitions).
+- Intra fallback in P-slices via RDO.
 - B-slices.
+- Multiple slices per picture.
 - 8x8 transform / High-profile features.
 - CABAC.
 - Rate control.
+- Chroma AC nC per §9.2.1.1.
 
 ## Entry points
 

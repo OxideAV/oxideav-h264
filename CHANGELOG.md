@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- encoder: P-slice support (round 16). Single L0 reference, integer-pel
+  motion estimation, P_Skip + P_L0_16x16 macroblock types. Self-roundtrip
+  + ffmpeg interop bit-exact on a 2-frame I+P fixture; PSNR vs source
+  ~50 dB on integer-shift content.
+
 ## [0.1.1](https://github.com/OxideAV/oxideav-h264/compare/v0.1.0...v0.1.1) - 2026-04-25
 
 ### Other

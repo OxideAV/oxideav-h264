@@ -37,7 +37,7 @@ use crate::reconstruct::deblock_picture_full;
 /// * `mv_l0`/`mv_l1`/`ref_idx_*`/`ref_poc_*` are unused for intra-only
 ///   content — `different_ref_or_mv_luma` short-circuits on
 ///   `is_intra && q_is_intra`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct MbDeblockInfo {
     pub is_intra: bool,
     pub qp_y: i32,
@@ -51,6 +51,32 @@ pub struct MbDeblockInfo {
     /// §8.7.2.1 — per-4x4-chroma-block nonzero bitmap. For 4:2:0 only
     /// bits 0..=3 (Cb) and 8..=11 (Cr) are populated.
     pub chroma_nonzero_4x4: u16,
+    /// Round-16: §8.4.1 per-4x4-block L0 MV (1/4-pel units). Used by
+    /// the deblock walker's `different_ref_or_mv_luma` to derive
+    /// boundary strength on inter/inter edges. For intra MBs this is
+    /// unused. For our P_L0_16x16 / P_Skip path the same MV is
+    /// replicated to all 16 4x4 blocks.
+    pub mv_l0: [(i16, i16); 16],
+    /// Round-16: §7.4.5.1 per-8x8-partition L0 ref_idx. `-1` for intra.
+    pub ref_idx_l0: [i8; 4],
+    /// Round-16: §8.7.2.1 NOTE 1 per-8x8-partition L0 referenced POC.
+    /// `i32::MIN` for intra / L0 unused. For our single-IDR-ref encoder
+    /// every P MB references POC 0.
+    pub ref_poc_l0: [i32; 4],
+}
+
+impl Default for MbDeblockInfo {
+    fn default() -> Self {
+        Self {
+            is_intra: false,
+            qp_y: 0,
+            luma_nonzero_4x4: 0,
+            chroma_nonzero_4x4: 0,
+            mv_l0: [(0, 0); 16],
+            ref_idx_l0: [-1; 4],
+            ref_poc_l0: [i32::MIN; 4],
+        }
+    }
 }
 
 /// Wrap the encoder's recon planes + per-MB facts into a [`Picture`] +
@@ -122,10 +148,12 @@ pub fn deblock_recon(
         // §6.4.8 third bullet — single slice, slice_id 0 throughout, so
         // no "different slice" neighbour rejections fire.
         mb.slice_id = 0;
-        // ref_poc_l0/l1 stay at i32::MIN (their sentinel) since we're
-        // intra-only — `different_ref_or_mv_luma` is gated on
-        // `!is_intra` and never runs.
-        let _ = mb;
+        // Round-16: per-4x4 mv / per-8x8 ref_idx + ref_poc for inter MBs.
+        // For intra MBs the encoder leaves ref_idx = -1 and the deblock
+        // walker's `different_ref_or_mv_luma` is gated on !is_intra.
+        mb.mv_l0 = info.mv_l0;
+        mb.ref_idx_l0 = info.ref_idx_l0;
+        mb.ref_poc_l0 = info.ref_poc_l0;
     }
     // For unset entries (fully zeroed regions of the grid in pictures
     // that don't fill a power-of-2 — shouldn't happen given the encoder
@@ -244,12 +272,14 @@ mod tests {
                 qp_y: 26,
                 luma_nonzero_4x4: 0,
                 chroma_nonzero_4x4: 0,
+                ..Default::default()
             },
             MbDeblockInfo {
                 is_intra: true,
                 qp_y: 26,
                 luma_nonzero_4x4: 0,
                 chroma_nonzero_4x4: 0,
+                ..Default::default()
             },
         ];
         deblock_recon(32, 16, 16, 8, &mut y, &mut u, &mut v, &mb_infos, 0, 2, 1);
@@ -281,12 +311,14 @@ mod tests {
                 qp_y: 26,
                 luma_nonzero_4x4: 0,
                 chroma_nonzero_4x4: 0,
+                ..Default::default()
             },
             MbDeblockInfo {
                 is_intra: true,
                 qp_y: 26,
                 luma_nonzero_4x4: 0,
                 chroma_nonzero_4x4: 0,
+                ..Default::default()
             },
         ];
         deblock_recon(32, 16, 16, 8, &mut yy, &mut uu, &mut vv, &mb_infos, 0, 2, 1);
