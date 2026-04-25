@@ -245,6 +245,17 @@ pub fn quantize_4x4(w: &[i32; 16], qp: i32, is_intra: bool) -> [i32; 16] {
     z
 }
 
+/// Quantize the AC coefficients of a 4x4 block (positions 1..15 in
+/// row-major). The DC at index 0 is forced to zero in the output —
+/// the caller is expected to handle DC separately (Intra_16x16 DC
+/// path runs through the Hadamard, Inter and Intra_4x4 will use the
+/// regular `quantize_4x4`).
+pub fn quantize_4x4_ac(w: &[i32; 16], qp: i32, is_intra: bool) -> [i32; 16] {
+    let mut z = quantize_4x4(w, qp, is_intra);
+    z[0] = 0;
+    z
+}
+
 // ---------------------------------------------------------------------------
 // §8.5.10 — Intra_16x16 luma DC: forward 4x4 Hadamard + quantization.
 // ---------------------------------------------------------------------------
@@ -381,6 +392,27 @@ pub fn zigzag_scan_4x4(coeffs: &[i32; 16]) -> [i32; 16] {
     out
 }
 
+/// Pack a 4x4 row-major coefficient block into AC-only scan order
+/// (matches `inverse_scan_4x4_zigzag_ac`). The 15 AC positions land in
+/// slots `[0..=14]`; slot 15 is set to zero. The DC at row-major index
+/// 0 is dropped (callers using this function are emitting the AC-only
+/// `residual_block_cavlc(..., startIdx=1, endIdx=15, maxNumCoeff=15)`
+/// stream per §7.3.5.3.1).
+pub fn zigzag_scan_4x4_ac(coeffs: &[i32; 16]) -> [i32; 16] {
+    let mut out = [0i32; 16];
+    // Walk every raster position; AC positions (raster != 0 with
+    // ZIGZAG_4X4_FWD[raster] != 0) land at scan_index - 1 in the
+    // AC-only stream. The decoder's reverse pass is in
+    // `inverse_scan_4x4_zigzag_ac`.
+    for raster in 1..16 {
+        let scan = ZIGZAG_4X4_FWD[raster];
+        // scan == 0 only for raster == 0, which we skip.
+        debug_assert!(scan >= 1);
+        out[scan - 1] = coeffs[raster];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +471,28 @@ mod tests {
         let scan = zigzag_scan_4x4(&raster);
         let raster_back = inverse_scan_4x4_zigzag(&scan);
         assert_eq!(raster_back, raster);
+    }
+
+    #[test]
+    fn zigzag_ac_round_trip() {
+        // Forward AC scan of a row-major block -> decoder's inverse AC
+        // scan -> matrix that matches the input modulo c[0,0] (which is
+        // dropped on the encoder side and overwritten by the caller on
+        // the decoder side).
+        use crate::transform::inverse_scan_4x4_zigzag_ac;
+        let raster: [i32; 16] = [99, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let scan_ac = zigzag_scan_4x4_ac(&raster);
+        let raster_back = inverse_scan_4x4_zigzag_ac(&scan_ac);
+        // c[0,0] must be 0 on the decoder side (it consumes startIdx=1).
+        assert_eq!(raster_back[0], 0);
+        // All other positions must round-trip.
+        for k in 1..16 {
+            assert_eq!(
+                raster_back[k], raster[k],
+                "k={k} expected {} got {}",
+                raster[k], raster_back[k]
+            );
+        }
     }
 
     /// Round-trip a uniform 16x16 sample residual through the full

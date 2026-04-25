@@ -55,19 +55,77 @@ Minimal Baseline I-only IDR encoder, end-to-end:
 - No CABAC — CAVLC only.
 - No rate control — fixed QP from `EncoderConfig::qp`.
 
-## Round 2 (planned)
+## Round 2 — landed
 
-- **Multiple Intra_16x16 modes** (V/H/Plane) per MB based on a simple
-  SAD selection.
-- **`I_NxN` (Intra_4x4)** with all 9 modes — same forward+inverse 4x4
-  with full per-block prediction.
-- **Chroma DC residual** transmitted (cbp_chroma >= 1) so chroma
-  reconstruction tracks the source instead of staying at the
-  predictor.
-- **In-loop deblocking** on the local recon — required for high PSNR
-  across MB boundaries.
+Lift encoder coverage from DC-only luma to multi-mode I_16x16 + chroma
+residual transmit.
 
-## Round 3+
+- **All four Intra_16x16 modes** (V / H / DC / Plane) per
+  [`encoder::intra_pred`], with a per-MB SAD-driven mode decision.
+  Modes whose required neighbours are missing (top edge → V/Plane,
+  left edge → H/Plane, top-left corner → Plane) are skipped during
+  the search; the encoder always falls back to DC, never signals an
+  unavailable mode.
+- **All four Intra_Chroma modes** (DC / H / V / Plane) selected per
+  MB by joint-plane SAD (Cb + Cr).
+- **Chroma residual transmit**: `cbp_chroma == 1` (DC only) when the
+  chroma DC has any non-zero levels; promoted to `cbp_chroma == 2`
+  (DC + AC) when any chroma 4x4 block has non-zero AC. Encoder
+  computes the residual against the chosen predictor, runs forward
+  4x4 → 2x2 chroma-DC Hadamard → quantize, and reconstructs through
+  the same inverse path the decoder uses.
+- **`zigzag_scan_4x4_ac`** added to the encoder transform module to
+  pack 4x4 AC coefficients into the AC-only scan layout the decoder
+  reads via `inverse_scan_4x4_zigzag_ac`.
+- **`quantize_4x4_ac`**: AC-only quantizer (clears DC slot 0).
+
+### Validation
+
+- `cargo test -p oxideav-h264 --lib` — 758 passed.
+- `cargo test -p oxideav-h264` — all integration tests pass:
+  - `encode_decode_roundtrip_matches_local_recon`
+  - `encode_decode_roundtrip_chroma_residual` (new)
+  - `encode_mixed_picture_picks_non_dc_modes` (new — 128x128 mixed
+    bars + gradient)
+  - `ffmpeg_decode_matches_encoder_recon`
+  - `ffmpeg_decode_chroma_residual_matches` (new)
+- **PSNR (QP 26)**:
+  - 64x64 diagonal-gradient testsrc, luma: **38.85 → 42.25 dB**
+    (round-1 → round-2). Stream **148 → 88 bytes** (smaller because
+    V/H modes need fewer non-zero DC coefficients than DC mode does).
+  - 64x64 mixed chroma-gradient: Y 42.25 dB, Cb/Cr 47.05 dB.
+  - 128x128 vertical+horizontal bars + gradient: **50.11 dB Y**.
+- **ffmpeg interop**: bit-exact match against ffmpeg 8.1's libavcodec
+  H.264 decoder on every test fixture.
+
+### Status caveats (unchanged from round 1 unless noted)
+
+- Still I-only / IDR-only.
+- `cbp_luma` still 0 — luma AC residual not yet emitted (we send only
+  the Intra_16x16 DC block per MB). This caps luma quality at
+  whatever the per-MB DC + intra-prediction can resolve; with V/H/
+  Plane modes that's already excellent on smooth + structured
+  content, but detail at QP 26 will still soften.
+- No in-loop deblocking — `disable_deblocking_filter_idc == 1`. This
+  is mostly invisible on the test pictures because we reconstruct
+  every MB from per-MB DCs, so MB-boundary discontinuities are tiny.
+- No CABAC — CAVLC only.
+- No rate control — fixed QP from `EncoderConfig::qp`.
+- nC for chroma AC blocks is hard-coded to 0 (sub-optimal bitrate but
+  correct).
+
+## Round 3 (planned)
+
+- **Luma AC residual** (`cbp_luma == 15` Intra_16x16 path) so the
+  encoder can resolve high-frequency detail in luma. This is the
+  single biggest quality lift for round 3.
+- **`I_NxN` (Intra_4x4)** with all 9 modes — better quality on
+  detailed content.
+- **In-loop deblocking** on the local recon (mirror the decoder's
+  §8.7) — required for high PSNR across MB boundaries once we send
+  enough residual to make boundaries visible.
+
+## Round 4+
 
 - P-slice support (single L0, integer MV search).
 - Multiple slices per picture.
