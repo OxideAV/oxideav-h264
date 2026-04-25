@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/OxideAV/oxideav-h264/compare/v0.0.4...v0.1.0) - 2026-04-25
+
+### Other
+
+- fix clippy 1.95 lints
+- promote to 0.1.0
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- bump thiserror 1 → 2
+- sync Picture identity with DPB entry on MMCO-5
+- honour §7.4.1.2.4 MMCO-5 prevFrameNum reset in POC types 1 & 2
+- fix MMCO-5 POC reset for output ordering and DPB identity
+- insert non-existing refs on frame_num gaps (§8.2.5.2)
+- fix §8.3.1.2 / §8.3.2.2 / §8.3.3.1 / §8.3.4.1 constrained_intra_pred
+- Add 15 more JVT vectors — 5 fully pixel-exact, inc. LS_SVA_D 1700/1700
+- Add 14 JVT vectors — 13 pixel-exact on first run, 1307 more exact frames
+- snapshot activated PPS/SPS on Slice event (§7.4.1.2.1)
+- Add 14 JVT vectors — 12 pixel-exact on first run, 2034 new exact frames
+- fix Table 8-17 tC0 values for indexA 17..=23 (spec transcription)
+- Add 12 JVT CAVLC conformance vectors — 10 pixel-exact on first run
+- derive mb_field_decoding_flag ctxIdxInc per §9.3.3.1.1.2
+- implement I_PCM macroblock handling in CABAC mode (§7.3.5 / §9.3.1.2)
+- implement spatial direct MV derivation (§8.4.1.2.2) for B_Skip / B_Direct
+- Add JVT vectors: HCMP1 (hierarchical GOP + ref reorder), CAMA1 (MBAFF), CAPA1 (PAFF)
+- resolve deblocking ref-picture identity per-slice not per-picture
+- Add JVT CABACI3_Sony_B + CABAST3_Sony_E: multi-slice CABAC coverage
+- honour slice boundaries in neighbour availability for multi-slice pictures
+- Add 3 JVT conformance vectors: CABA3 (CABAC IPB), SVA_Base_B + SL1_SVA_B (multi-slice)
+- fix bS for single-pred B-slice edges with swapped lists
+- fix bS derivation with per-POC picture-identity compare
+- fix MVpred same-MB partition-availability for single-list predictions
+- proper §8.4.1.2.3 temporal-direct with MapColToList0 and B_Direct_8x8
+- fix B-slice ref_idx_l0 gate + mb_type condTerm on B_Skip/B_Direct_16x16
+- implement §8.4.1.2.3 temporal direct MV derivation
+- fix Table 9-17 init for ctxIdx 64..=69 (intra-pred-mode contexts)
+- add CTX17 debug trace for P-slice mb_type investigation
+- fix ref_idx condTermFlag for in-MB 8x8 partition neighbours
+- fix P-slice mb_type binIdx=0 ctxIdxInc + Table 9-17 mb_qp_delta init
+- add bin-level trace instrumentation + Round 31 CABA2 analysis
+- add MB-level trace instrumentation + InitCell::same helper
+- add P_Skip filter to P-slice mb_type ctxIdxInc (§9.3.3.1.1.3)
+- use '(b1 != 0) ? 2 : 3' for P-slice mb_type binIdx 2
+- Add JVT CABA2_SVA_B: CABAC P-slice conformance with trace file
+- §9.3.3.1.1.1 / .1.1.3 / .1.1.5: thread CABAC per-slice neighbour state
+- Remove accidental [workspace] marker from Cargo.toml
+- chroma 4:2:0 per-sub-segment bS derivation
+- per-4x4 nonzero-coef mask + chroma bS inherit path
+- wire inter-edge bS=1 MV-delta / ref-mismatch test
+- median step-1 replacement is partition-level, not MVpred-level
+- C→D substitution is partition-level, not MVpred-level
+- P_Skip intra neighbour must not zero-force MVpred
+- Deblock per-MB iteration order fix (§8.7.1)
+- distinguish I-slice Intra_16x16 raw=5 from I_NxN neighbour
+- Fix AC scan off-by-one for Intra_16x16 & Chroma AC blocks
+- CABAC §9.3.3.1.1.9: fix cbf_cond_for cbp-bit branch + unify cbf lookup
+- Round 17: investigate §9.3.3.1.1.9 CBF cbp-bit gate (known gap)
+- CABAC coded_block_flag MB-level DC availability + engine spec audit
+- CABAC CBP + coded_block_flag ctxIdxInc fixes per §9.3.3.1.1.4/9
+- Add JVT CABA1_SVA_B: CABAC conformance WITH bit-level trace file
+- Add JVT CABAC frame-coded conformance: camp_mot_frm0 (Mobile 720x480)
+- Add JVT conformance harness: AUD_MW_E (Baseline/CAVLC, foreman QCIF)
+- Round 14: P/B MVpred fixes + deblock Table 8-17 + 4:4:4 chroma parse
+- Latent CABAC Cb/Cr mixup + chroma DC transform bugs (§8.5.11.2)
+- Pixel-accuracy fixes + enhanced conformance diagnostics + sub_mb_type CABAC
+- CABAC sub_mb_type + neighbour grid + MBAFF field stride + conformance harness
+- CABAC inter syntax + MBAFF Phase 2 + multi-slice picture assembly
+- Inter CAVLC fixes (100% parse on 5 streams) + CABAC suffix + MBAFF phase 1 + intra neighbour pred
+- CAVLC Table 9-5 Col1 length fix + DpbOutput reorder + scaling lists wired
+- CAVLC table + transform_8x8 ordering fixes + DPB wiring + recon polish
+- CAVLC nC + run_before tables + weighted pred + more SEI + C→D MVpred
+- Wire receive_frame + fix CABAC mb_type_i binarisation
+- Add CABAC residual walker (§7.3.5.3.3) — foreman decodes end-to-end
+- Fix ME_INTER_420_422 tail + surface MB index in slice_data errors
+- Register h264 codec decoder in the registry
+- rustfmt + clippy pass: auto-fixes + scoped too_many_arguments allows
+- Expose slice_data bit cursor + wire end-to-end in integration test
+- Add integration test: parse foreman_p16x16.264 (ffmpeg sample)
+- Add inter MC reconstruction path (P + B slices)
+- Pre-stub ref_store module for inter MC reference picture access
+- Add I-slice reconstruction pipeline + POC-ordered output queue
+- Pre-stub picture / mb_grid / reconstruct / dpb_output modules
+- Add slice_data, macroblock_layer, FMO MB address, top-level Decoder
+- point spec link at new video/h264/ path
+- Pre-stub slice_data / macroblock_layer / mb_address / decoder modules
+- Wire VUI + scaling_list into SPS/PPS
+- Add inter prediction, MV derivation, CABAC binarisations, SEI payloads
+- Pre-stub inter_pred / mv_deriv / cabac_ctx / sei modules
+- aim for complete H.264, widening from the common subset
+- Add intra prediction, inverse transform, deblocking, ref list + marking
+- Pre-stub intra_pred / transform / deblock / ref_list modules
+- Add slice_header, scaling_list, VUI, non-VCL parsers, POC derivation
+- Pre-stub slice_header / scaling_list / vui / non_vcl / poc modules
+- Add §7.3.2.1 SPS, §7.3.2.2 PPS, §9.2 CAVLC, §9.3 CABAC
+- Pre-stub sps/pps/cavlc/cabac modules
+- Add §7.3.1/§B.1 NAL unit parsing + Annex B / AVCC framing
+- Add §7.2 bitstream reader (u/i/f/ue/se/te + RBSP helpers)
+- Reset to empty skeleton for spec-driven rewrite
+
 ### Removed
 
 - **Entire previous implementation.** The pre-rewrite codebase decodes
