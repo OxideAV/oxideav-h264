@@ -269,10 +269,15 @@ pub fn parse_slice_data(
                 // cross-referencing against JM's JVT trace. Useful
                 // when chasing CABAC state divergences at specific MBs.
                 if std::env::var_os("OXIDEAV_H264_SKIP_TRACE").is_some() {
-                    eprintln!("[SKIP {}] flag={} avail_L={} skip_L={} avail_A={} skip_A={}",
-                             curr_mb_addr, mb_skip_flag,
-                             skip_nctx.available_left, skip_nctx.mb_skip_flag_left,
-                             skip_nctx.available_above, skip_nctx.mb_skip_flag_above);
+                    eprintln!(
+                        "[SKIP {}] flag={} avail_L={} skip_L={} avail_A={} skip_A={}",
+                        curr_mb_addr,
+                        mb_skip_flag,
+                        skip_nctx.available_left,
+                        skip_nctx.mb_skip_flag_left,
+                        skip_nctx.available_above,
+                        skip_nctx.mb_skip_flag_above
+                    );
                 }
                 if mb_skip_flag {
                     // §7.4.4 — mb_field_decoding_flag for this MB is
@@ -360,8 +365,7 @@ pub fn parse_slice_data(
                 // (CurrMbAddr % 2 == 1 && prevMbSkipped). The flag
                 // applies to both MBs of the pair.
                 if mbaff_frame_flag
-                    && (curr_mb_addr % 2 == 0
-                        || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
+                    && (curr_mb_addr % 2 == 0 || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
                 {
                     let flag = decode_mb_field_decoding_flag_cabac(
                         &mut cabac_dec,
@@ -440,9 +444,8 @@ pub fn parse_slice_data(
                     pic_width_in_mbs: pic_w_mbs,
                 };
                 let (byte, bit) = r.position();
-                let mb_result = parse_macroblock(
-                    &mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr,
-                );
+                let mb_result =
+                    parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr);
                 // §9.3.3.1.1.5 — carry the rolling flag forward for
                 // the next MB's mb_qp_delta ctxIdxInc. The entropy
                 // borrow ends with `parse_macroblock` returning; read
@@ -485,17 +488,15 @@ pub fn parse_slice_data(
                         // §6.2 Table 6-1 — chroma sample counts per MB.
                         let (num_cb, num_cr): (usize, usize) = match chroma_array_type {
                             0 => (0, 0),
-                            1 => (64, 64),    // 4:2:0 → 2 * 8 * 8
-                            2 => (128, 128),  // 4:2:2 → 2 * 8 * 16
-                            3 => (256, 256),  // 4:4:4 → 2 * 16 * 16
+                            1 => (64, 64),   // 4:2:0 → 2 * 8 * 8
+                            2 => (128, 128), // 4:2:2 → 2 * 8 * 16
+                            3 => (256, 256), // 4:4:4 → 2 * 16 * 16
                             other => {
                                 return Err(SliceDataError::MacroblockAt {
                                     mb_addr: curr_mb_addr,
                                     byte,
                                     bit,
-                                    source: MacroblockLayerError::UnsupportedChromaArrayType(
-                                        other,
-                                    ),
+                                    source: MacroblockLayerError::UnsupportedChromaArrayType(other),
                                 });
                             }
                         };
@@ -547,8 +548,7 @@ pub fn parse_slice_data(
                             // §9.3.3.1.1.2 — record the pair flag for the
                             // next pair's ctxIdxInc derivation. In MBAFF
                             // both MBs of a pair share this flag.
-                            slot.mb_field_decoding_flag =
-                                pending_pair_flag.unwrap_or(false);
+                            slot.mb_field_decoding_flag = pending_pair_flag.unwrap_or(false);
                             // I_PCM contributes cbf=1 for all blocks.
                             slot.cbf_luma_4x4 = [true; 16];
                             slot.cbf_cb_dc = true;
@@ -698,8 +698,7 @@ pub fn parse_slice_data(
             // macroblock_layer() when (CurrMbAddr % 2 == 0) or
             // (CurrMbAddr % 2 == 1 && prevMbSkipped).
             if mbaff_frame_flag
-                && (curr_mb_addr % 2 == 0
-                    || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
+                && (curr_mb_addr % 2 == 0 || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
             {
                 let flag = r.u(1)? != 0;
                 pending_pair_flag = Some(flag);
@@ -732,11 +731,11 @@ pub fn parse_slice_data(
             let (byte, bit) = r.position();
             let mb = parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)
                 .map_err(|source| SliceDataError::MacroblockAt {
-                    mb_addr: curr_mb_addr,
-                    byte,
-                    bit,
-                    source,
-                })?;
+                mb_addr: curr_mb_addr,
+                byte,
+                bit,
+                source,
+            })?;
             macroblocks.push(mb);
             mb_field_decoding_flags.push(flag);
             // CAVLC: the per-iteration mb_skip_run update is what
@@ -806,11 +805,17 @@ fn decode_mb_field_decoding_flag_cabac(
     // the single "is field-coded?" predicate captures both branches.
     let cond_term = |addr_opt: Option<u32>| -> u32 {
         let Some(addr) = addr_opt else { return 0 };
-        let Some(info) = grid.mbs.get(addr as usize) else { return 0 };
+        let Some(info) = grid.mbs.get(addr as usize) else {
+            return 0;
+        };
         if !info.available {
             return 0;
         }
-        if info.mb_field_decoding_flag { 1 } else { 0 }
+        if info.mb_field_decoding_flag {
+            1
+        } else {
+            0
+        }
     };
     let cond_a = cond_term(a_top);
     let cond_b = cond_term(b_top);
@@ -1103,7 +1108,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.u(1, 1); // mb_field_decoding_flag = 1 (top of pair, even addr)
         append_i_nxn_mb(&mut w); // top MB
-        // No mb_field_decoding_flag at the bottom (top wasn't skipped).
+                                 // No mb_field_decoding_flag at the bottom (top wasn't skipped).
         append_i_nxn_mb(&mut w); // bottom MB
         w.trailing();
         let bytes = w.into_bytes();
@@ -1151,7 +1156,7 @@ mod tests {
         // same flag.
         let mut w = BitWriter::new();
         w.ue(1); // mb_skip_run = 1 → top MB skipped
-        // Now CurrMbAddr = 1 (bottom of pair), prevMbSkipped = true.
+                 // Now CurrMbAddr = 1 (bottom of pair), prevMbSkipped = true.
         w.u(1, 1); // mb_field_decoding_flag = 1 (read at bottom)
         w.ue(5); // mb_type = 5 on P = I_NxN
         for _ in 0..16 {

@@ -1640,7 +1640,7 @@ mod tests {
     #[test]
     fn coeff_token_col1_11bit_length_fix() {
         let cases: &[(&str, (u32, u32))] = &[
-            ("0000 0001 111", (7, 0)),   // §9.2.1 Table 9-5 col "2<=nC<4"
+            ("0000 0001 111", (7, 0)), // §9.2.1 Table 9-5 col "2<=nC<4"
             ("0000 0001 011", (8, 0)),
             ("0000 0001 110", (8, 1)),
             ("0000 0001 101", (8, 2)),
@@ -1691,10 +1691,10 @@ mod tests {
     fn coeff_token_col3_bugfix_regression() {
         // (codeword, expected (TotalCoeff, TrailingOnes))
         let cases: &[(&str, (u32, u32))] = &[
-            ("0000 00", (1, 0)),  // would be (0,1) if swapped
-            ("0001 00", (2, 0)),  // would be (0,2) if swapped
-            ("0010 00", (3, 0)),  // would be (0,3) if swapped
-            ("0010 01", (3, 1)),  // would be (1,3) if swapped — trigger for "trailing_ones=3 for total_coeff=1"
+            ("0000 00", (1, 0)), // would be (0,1) if swapped
+            ("0001 00", (2, 0)), // would be (0,2) if swapped
+            ("0010 00", (3, 0)), // would be (0,3) if swapped
+            ("0010 01", (3, 1)), // would be (1,3) if swapped — trigger for "trailing_ones=3 for total_coeff=1"
             ("0011 00", (4, 0)),
             ("1000 00", (9, 0)),
             ("1111 00", (16, 0)),
@@ -1705,7 +1705,10 @@ mod tests {
             let got = decode_coeff_token(&mut r, CoeffTokenContext::Numeric(10)).unwrap();
             assert_eq!(got, *want, "bits={bits}");
             // Invariant check: TrailingOnes <= TotalCoeff.
-            assert!(got.1 <= got.0, "invariant TrailingOnes<=TotalCoeff violated for bits={bits}");
+            assert!(
+                got.1 <= got.0,
+                "invariant TrailingOnes<=TotalCoeff violated for bits={bits}"
+            );
         }
     }
 
@@ -2169,20 +2172,20 @@ mod tests {
     /// all 15 rows here to exercise every path through the VLC.
     #[test]
     fn run_before_zl_7_decodes_every_long_form_row() {
-        check_rb("111",         7,  0);
-        check_rb("110",         7,  1);
-        check_rb("101",         7,  2);
-        check_rb("100",         7,  3);
-        check_rb("011",         7,  4);
-        check_rb("010",         7,  5);
-        check_rb("001",         7,  6);
-        check_rb("0001",        7,  7);
-        check_rb("00001",       7,  8);
-        check_rb("000001",      7,  9);
-        check_rb("0000001",     7, 10);
-        check_rb("00000001",    7, 11);
-        check_rb("000000001",   7, 12);
-        check_rb("0000000001",  7, 13);
+        check_rb("111", 7, 0);
+        check_rb("110", 7, 1);
+        check_rb("101", 7, 2);
+        check_rb("100", 7, 3);
+        check_rb("011", 7, 4);
+        check_rb("010", 7, 5);
+        check_rb("001", 7, 6);
+        check_rb("0001", 7, 7);
+        check_rb("00001", 7, 8);
+        check_rb("000001", 7, 9);
+        check_rb("0000001", 7, 10);
+        check_rb("00000001", 7, 11);
+        check_rb("000000001", 7, 12);
+        check_rb("0000000001", 7, 13);
         check_rb("00000000001", 7, 14);
     }
 
@@ -2193,10 +2196,10 @@ mod tests {
     #[test]
     fn run_before_long_form_shared_across_zl_7_to_14() {
         for zl in 7u32..=14 {
-            check_rb("111",          zl,  0); // shortest
-            check_rb("0001",         zl,  7); // just across the unary boundary
-            check_rb("00000001",     zl, 11);
-            check_rb("00000000001",  zl, 14); // longest (11 bits)
+            check_rb("111", zl, 0); // shortest
+            check_rb("0001", zl, 7); // just across the unary boundary
+            check_rb("00000001", zl, 11);
+            check_rb("00000000001", zl, 14); // longest (11 bits)
         }
     }
 
@@ -2204,7 +2207,7 @@ mod tests {
     /// with zeros_left=7, and run_before=14 with zeros_left=14.
     #[test]
     fn run_before_endpoint_cases() {
-        check_rb("0001",        7,  7);  // zl=7, rb=7 (tight max)
+        check_rb("0001", 7, 7); // zl=7, rb=7 (tight max)
         check_rb("00000000001", 14, 14); // zl=14, rb=14 (table max)
     }
 
@@ -2491,14 +2494,20 @@ mod tests {
         //   No run_before reads (all zerosLeft=0).
         let bytes = pack_bits(&[
             "00000001111", // coeff_token (7, 0) col1 11-bit
-            "1",            // level_prefix=0 for levelVal[0]=2 (first-after)
-            "1", "0",       // level_prefix=0, suffix=0 for levelVal[1]=1
-            "1", "0",       // levelVal[2]=1
-            "1", "0",       // levelVal[3]=1
-            "1", "0",       // levelVal[4]=1
-            "1", "0",       // levelVal[5]=1
-            "1", "0",       // levelVal[6]=1
-            "000001",       // total_zeros=0 tzVlc=7
+            "1",           // level_prefix=0 for levelVal[0]=2 (first-after)
+            "1",
+            "0", // level_prefix=0, suffix=0 for levelVal[1]=1
+            "1",
+            "0", // levelVal[2]=1
+            "1",
+            "0", // levelVal[3]=1
+            "1",
+            "0", // levelVal[4]=1
+            "1",
+            "0", // levelVal[5]=1
+            "1",
+            "0",      // levelVal[6]=1
+            "000001", // total_zeros=0 tzVlc=7
         ]);
         let mut r = BitReader::new(&bytes);
         let coeff =

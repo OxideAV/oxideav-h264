@@ -1036,10 +1036,14 @@ pub fn decode_mb_type_p(
         let c17 = ctxs.at(17);
         eprintln!(
             "[CTX17] pre mb_type_p: c14=({},{}) c15=({},{}) c16=({},{}) c17=({},{})",
-            c14.state_idx, c14.val_mps,
-            c15.state_idx, c15.val_mps,
-            c16.state_idx, c16.val_mps,
-            c17.state_idx, c17.val_mps,
+            c14.state_idx,
+            c14.val_mps,
+            c15.state_idx,
+            c15.val_mps,
+            c16.state_idx,
+            c16.val_mps,
+            c17.state_idx,
+            c17.val_mps,
         );
     }
     // Table 9-39 (08/2024) row ctxIdxOffset=14:
@@ -1632,23 +1636,28 @@ pub fn decode_coded_block_pattern(
     //   * mb_type == I_PCM
     //   * (neighbour ≠ current) and (not skip) and (CBP bit set)
     // Otherwise condTermFlagN = 1.
-    let cond_ext = |avail: bool, is_i_pcm: bool, is_skip: bool, cbp_luma: u8, bit_idx_n: u32| -> u32 {
-        if !avail {
-            return 0;
-        }
-        if is_i_pcm {
-            // Spec: I_PCM → condTermFlagN = 0.
-            return 0;
-        }
-        if is_skip {
-            // Not skip'd → fall to bit check; skip'd → spec's "not P_Skip/B_Skip"
-            // predicate fails, so the cbp-bit branch does not apply, and
-            // the "Otherwise" branch yields condTermFlagN = 1.
-            return 1;
-        }
-        let bit_set = ((cbp_luma >> bit_idx_n) & 1) != 0;
-        if bit_set { 0 } else { 1 }
-    };
+    let cond_ext =
+        |avail: bool, is_i_pcm: bool, is_skip: bool, cbp_luma: u8, bit_idx_n: u32| -> u32 {
+            if !avail {
+                return 0;
+            }
+            if is_i_pcm {
+                // Spec: I_PCM → condTermFlagN = 0.
+                return 0;
+            }
+            if is_skip {
+                // Not skip'd → fall to bit check; skip'd → spec's "not P_Skip/B_Skip"
+                // predicate fails, so the cbp-bit branch does not apply, and
+                // the "Otherwise" branch yields condTermFlagN = 1.
+                return 1;
+            }
+            let bit_set = ((cbp_luma >> bit_idx_n) & 1) != 0;
+            if bit_set {
+                0
+            } else {
+                1
+            }
+        };
 
     // §6.4.11.2 / §6.4.3 Figure 6-11 — neighbour 8x8 block of
     // luma8x8BlkIdx. Each binIdx (= luma8x8BlkIdx) maps to an
@@ -1670,7 +1679,11 @@ pub fn decode_coded_block_pattern(
             1 => {
                 // Left neighbour is block 0 of the current MB.
                 let b_k = prev_bins[0];
-                if b_k != 0 { 0 } else { 1 }
+                if b_k != 0 {
+                    0
+                } else {
+                    1
+                }
             }
             2 => cond_ext(
                 neighbours.available_left,
@@ -1682,7 +1695,11 @@ pub fn decode_coded_block_pattern(
             3 => {
                 // Left neighbour is block 2 of the current MB.
                 let b_k = prev_bins[2];
-                if b_k != 0 { 0 } else { 1 }
+                if b_k != 0 {
+                    0
+                } else {
+                    1
+                }
             }
             _ => 0,
         };
@@ -1706,12 +1723,20 @@ pub fn decode_coded_block_pattern(
             2 => {
                 // Above neighbour is block 0 of the current MB.
                 let b_k = prev_bins[0];
-                if b_k != 0 { 0 } else { 1 }
+                if b_k != 0 {
+                    0
+                } else {
+                    1
+                }
             }
             3 => {
                 // Above neighbour is block 1 of the current MB.
                 let b_k = prev_bins[1];
-                if b_k != 0 { 0 } else { 1 }
+                if b_k != 0 {
+                    0
+                } else {
+                    1
+                }
             }
             _ => 0,
         };
@@ -1732,26 +1757,31 @@ pub fn decode_coded_block_pattern(
         //   * avail && !skip &&
         //       (binIdx==0 ? cbp_chroma==0 : cbp_chroma != 2) → 0.
         //   * else → avail-and-not-skip ? 1 : 0.
-        let chroma_cond = |avail: bool, is_i_pcm: bool, is_skip: bool, cbp_chroma: u8, bin_idx: u32| -> u32 {
-            if !avail {
-                return 0;
-            }
-            if is_i_pcm {
-                return 1;
-            }
-            if is_skip {
-                return 0;
-            }
-            // Predicate from spec: flag=0 when
-            //   binIdx==0 && cbp_chroma==0
-            //   binIdx==1 && cbp_chroma != 2
-            let zero_branch = match bin_idx {
-                0 => cbp_chroma == 0,
-                1 => cbp_chroma != 2,
-                _ => false,
+        let chroma_cond =
+            |avail: bool, is_i_pcm: bool, is_skip: bool, cbp_chroma: u8, bin_idx: u32| -> u32 {
+                if !avail {
+                    return 0;
+                }
+                if is_i_pcm {
+                    return 1;
+                }
+                if is_skip {
+                    return 0;
+                }
+                // Predicate from spec: flag=0 when
+                //   binIdx==0 && cbp_chroma==0
+                //   binIdx==1 && cbp_chroma != 2
+                let zero_branch = match bin_idx {
+                    0 => cbp_chroma == 0,
+                    1 => cbp_chroma != 2,
+                    _ => false,
+                };
+                if zero_branch {
+                    0
+                } else {
+                    1
+                }
             };
-            if zero_branch { 0 } else { 1 }
-        };
         // binIdx 0.
         let cond_a0 = chroma_cond(
             neighbours.available_left,
@@ -2370,33 +2400,33 @@ mod tests {
         // b3 == 0 (the 6-bin rows do not read a binIdx 6).
         let cases: &[(u32, u8, u8, u8, u8, u8)] = &[
             // Rows 1..=4: "1 0 0 0 X Y" — b2=0, b3=0.
-            (1,  0, 0, 0, 0, 0),  // I_16x16_0_0_0 — "1 0 0 0 0 0"
-            (2,  0, 0, 0, 1, 0),  // I_16x16_1_0_0 — "1 0 0 0 0 1"
-            (3,  0, 0, 1, 0, 0),  // I_16x16_2_0_0 — "1 0 0 0 1 0"
-            (4,  0, 0, 1, 1, 0),  // I_16x16_3_0_0 — "1 0 0 0 1 1"
+            (1, 0, 0, 0, 0, 0), // I_16x16_0_0_0 — "1 0 0 0 0 0"
+            (2, 0, 0, 0, 1, 0), // I_16x16_1_0_0 — "1 0 0 0 0 1"
+            (3, 0, 0, 1, 0, 0), // I_16x16_2_0_0 — "1 0 0 0 1 0"
+            (4, 0, 0, 1, 1, 0), // I_16x16_3_0_0 — "1 0 0 0 1 1"
             // Rows 5..=12: "1 0 0 1 X Y Z" — b2=0, b3=1.
-            (5,  0, 1, 0, 0, 0),  // I_16x16_0_1_0 — "1 0 0 1 0 0 0"
-            (6,  0, 1, 0, 0, 1),  // I_16x16_1_1_0 — "1 0 0 1 0 0 1"
-            (7,  0, 1, 0, 1, 0),  // I_16x16_2_1_0 — "1 0 0 1 0 1 0"
-            (8,  0, 1, 0, 1, 1),  // I_16x16_3_1_0 — "1 0 0 1 0 1 1"
-            (9,  0, 1, 1, 0, 0),  // I_16x16_0_2_0 — "1 0 0 1 1 0 0"
-            (10, 0, 1, 1, 0, 1),  // I_16x16_1_2_0 — "1 0 0 1 1 0 1"
-            (11, 0, 1, 1, 1, 0),  // I_16x16_2_2_0 — "1 0 0 1 1 1 0"
-            (12, 0, 1, 1, 1, 1),  // I_16x16_3_2_0 — "1 0 0 1 1 1 1"
+            (5, 0, 1, 0, 0, 0),  // I_16x16_0_1_0 — "1 0 0 1 0 0 0"
+            (6, 0, 1, 0, 0, 1),  // I_16x16_1_1_0 — "1 0 0 1 0 0 1"
+            (7, 0, 1, 0, 1, 0),  // I_16x16_2_1_0 — "1 0 0 1 0 1 0"
+            (8, 0, 1, 0, 1, 1),  // I_16x16_3_1_0 — "1 0 0 1 0 1 1"
+            (9, 0, 1, 1, 0, 0),  // I_16x16_0_2_0 — "1 0 0 1 1 0 0"
+            (10, 0, 1, 1, 0, 1), // I_16x16_1_2_0 — "1 0 0 1 1 0 1"
+            (11, 0, 1, 1, 1, 0), // I_16x16_2_2_0 — "1 0 0 1 1 1 0"
+            (12, 0, 1, 1, 1, 1), // I_16x16_3_2_0 — "1 0 0 1 1 1 1"
             // Rows 13..=16: "1 0 1 0 X Y" — b2=1, b3=0.
-            (13, 1, 0, 0, 0, 0),  // I_16x16_0_0_1 — "1 0 1 0 0 0"
-            (14, 1, 0, 0, 1, 0),  // I_16x16_1_0_1 — "1 0 1 0 0 1"
-            (15, 1, 0, 1, 0, 0),  // I_16x16_2_0_1 — "1 0 1 0 1 0"
-            (16, 1, 0, 1, 1, 0),  // I_16x16_3_0_1 — "1 0 1 0 1 1"
+            (13, 1, 0, 0, 0, 0), // I_16x16_0_0_1 — "1 0 1 0 0 0"
+            (14, 1, 0, 0, 1, 0), // I_16x16_1_0_1 — "1 0 1 0 0 1"
+            (15, 1, 0, 1, 0, 0), // I_16x16_2_0_1 — "1 0 1 0 1 0"
+            (16, 1, 0, 1, 1, 0), // I_16x16_3_0_1 — "1 0 1 0 1 1"
             // Rows 17..=24: "1 0 1 1 X Y Z" — b2=1, b3=1.
-            (17, 1, 1, 0, 0, 0),  // I_16x16_0_1_1 — "1 0 1 1 0 0 0"
-            (18, 1, 1, 0, 0, 1),  // I_16x16_1_1_1 — "1 0 1 1 0 0 1"
-            (19, 1, 1, 0, 1, 0),  // I_16x16_2_1_1 — "1 0 1 1 0 1 0"
-            (20, 1, 1, 0, 1, 1),  // I_16x16_3_1_1 — "1 0 1 1 0 1 1"
-            (21, 1, 1, 1, 0, 0),  // I_16x16_0_2_1 — "1 0 1 1 1 0 0"
-            (22, 1, 1, 1, 0, 1),  // I_16x16_1_2_1 — "1 0 1 1 1 0 1"
-            (23, 1, 1, 1, 1, 0),  // I_16x16_2_2_1 — "1 0 1 1 1 1 0"
-            (24, 1, 1, 1, 1, 1),  // I_16x16_3_2_1 — "1 0 1 1 1 1 1"
+            (17, 1, 1, 0, 0, 0), // I_16x16_0_1_1 — "1 0 1 1 0 0 0"
+            (18, 1, 1, 0, 0, 1), // I_16x16_1_1_1 — "1 0 1 1 0 0 1"
+            (19, 1, 1, 0, 1, 0), // I_16x16_2_1_1 — "1 0 1 1 0 1 0"
+            (20, 1, 1, 0, 1, 1), // I_16x16_3_1_1 — "1 0 1 1 0 1 1"
+            (21, 1, 1, 1, 0, 0), // I_16x16_0_2_1 — "1 0 1 1 1 0 0"
+            (22, 1, 1, 1, 0, 1), // I_16x16_1_2_1 — "1 0 1 1 1 0 1"
+            (23, 1, 1, 1, 1, 0), // I_16x16_2_2_1 — "1 0 1 1 1 1 0"
+            (24, 1, 1, 1, 1, 1), // I_16x16_3_2_1 — "1 0 1 1 1 1 1"
         ];
         for &(expected, b2, b3, b4, b5, b6) in cases {
             let got = mb_type_i_suffix_value(b2, b3, b4, b5, b6);
@@ -2720,7 +2750,7 @@ mod tests {
         cod_i_range: u32,
         first_bit_flag: bool,
         bits_outstanding: u64,
-        bits: Vec<u8>,     // accumulating bit queue, MSB-first within each byte
+        bits: Vec<u8>,       // accumulating bit queue, MSB-first within each byte
         bit_pos_in_byte: u8, // 0..=7; 0 means next bit goes to MSB of the last byte
     }
 
@@ -2783,8 +2813,7 @@ mod tests {
         /// `CabacDecoder::decode_decision` state transitions.
         fn encode_decision(&mut self, ctx: &mut crate::cabac::CtxState, bin: u8) {
             let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
-            let cod_i_range_lps =
-                crate::cabac::RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
+            let cod_i_range_lps = crate::cabac::RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
             self.cod_i_range -= cod_i_range_lps;
             if bin != ctx.val_mps {
                 // LPS branch.
@@ -2941,12 +2970,17 @@ mod tests {
             let mut b1: u8 = 0;
             for (i, &bit) in bs.iter().enumerate() {
                 let ctx_idx: usize = match i {
-                    0 => 36,           // binIdx 0 → inc 0
-                    1 => 37,           // binIdx 1 → inc 1
-                    2 => {             // binIdx 2 → Table 9-41
-                        if b1 != 0 { 36 + 2 } else { 36 + 3 }
+                    0 => 36, // binIdx 0 → inc 0
+                    1 => 37, // binIdx 1 → inc 1
+                    2 => {
+                        // binIdx 2 → Table 9-41
+                        if b1 != 0 {
+                            36 + 2
+                        } else {
+                            36 + 3
+                        }
                     }
-                    _ => 36 + 3,       // binIdx 3..=5 → inc 3
+                    _ => 36 + 3, // binIdx 3..=5 → inc 3
                 };
                 out.push((ctx_idx, bit));
                 if i == 1 {
@@ -2958,19 +2992,19 @@ mod tests {
 
         // Table 9-38 B sub_mb_type bin strings.
         let cases: [(&[u8], u32); 13] = [
-            (&[0], 0),                            // B_Direct_8x8
-            (&[1, 0, 0], 1),                      // B_L0_8x8
-            (&[1, 0, 1], 2),                      // B_L1_8x8
-            (&[1, 1, 0, 0, 0], 3),                // B_Bi_8x8
-            (&[1, 1, 0, 0, 1], 4),                // B_L0_8x4
-            (&[1, 1, 0, 1, 0], 5),                // B_L0_4x8
-            (&[1, 1, 0, 1, 1], 6),                // B_L1_8x4
-            (&[1, 1, 1, 0, 0, 0], 7),             // B_L1_4x8
-            (&[1, 1, 1, 0, 0, 1], 8),             // B_Bi_8x4
-            (&[1, 1, 1, 0, 1, 0], 9),             // B_Bi_4x8
-            (&[1, 1, 1, 0, 1, 1], 10),            // B_L0_4x4
-            (&[1, 1, 1, 1, 0], 11),               // B_L1_4x4
-            (&[1, 1, 1, 1, 1], 12),               // B_Bi_4x4
+            (&[0], 0),                 // B_Direct_8x8
+            (&[1, 0, 0], 1),           // B_L0_8x8
+            (&[1, 0, 1], 2),           // B_L1_8x8
+            (&[1, 1, 0, 0, 0], 3),     // B_Bi_8x8
+            (&[1, 1, 0, 0, 1], 4),     // B_L0_8x4
+            (&[1, 1, 0, 1, 0], 5),     // B_L0_4x8
+            (&[1, 1, 0, 1, 1], 6),     // B_L1_8x4
+            (&[1, 1, 1, 0, 0, 0], 7),  // B_L1_4x8
+            (&[1, 1, 1, 0, 0, 1], 8),  // B_Bi_8x4
+            (&[1, 1, 1, 0, 1, 0], 9),  // B_Bi_4x8
+            (&[1, 1, 1, 0, 1, 1], 10), // B_L0_4x4
+            (&[1, 1, 1, 1, 0], 11),    // B_L1_4x4
+            (&[1, 1, 1, 1, 1], 12),    // B_Bi_4x4
         ];
         for &(bs, expected) in &cases {
             let bins = build(bs);

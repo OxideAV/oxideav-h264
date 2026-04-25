@@ -14,7 +14,7 @@
 //!      some slices, AND never more than the stream has primary coded
 //!      pictures even with multiple slices per picture).
 
-use oxideav_codec::Decoder as _;
+use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 use oxideav_h264::nal::AnnexBSplitter;

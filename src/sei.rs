@@ -238,7 +238,7 @@ pub struct FilmGrainBody {
     pub model_id: u8, // u(2)
     pub separate_colour_description_present_flag: bool,
     pub separate_colour_description: Option<FilmGrainSeparateColourDescription>,
-    pub blending_mode_id: u8, // u(2)
+    pub blending_mode_id: u8,  // u(2)
     pub log2_scale_factor: u8, // u(4)
     /// One flag per colour component (c = 0..=2).
     pub comp_model_present_flag: [bool; 3],
@@ -246,7 +246,7 @@ pub struct FilmGrainBody {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FilmGrainSeparateColourDescription {
-    pub bit_depth_luma_minus8: u8, // u(3)
+    pub bit_depth_luma_minus8: u8,   // u(3)
     pub bit_depth_chroma_minus8: u8, // u(3)
     pub full_range_flag: bool,
     pub colour_primaries: u8,
@@ -1284,24 +1284,24 @@ mod tests {
     #[test]
     fn frame_packing_arrangement_side_by_side() {
         let fields = [
-            (1, 1),  // ue id=0
-            (0, 1),  // cancel_flag
-            (3, 7),  // type=3 (side-by-side)
-            (0, 1),  // quincunx_sampling_flag
-            (1, 6),  // content_interpretation_type
-            (0, 1),  // spatial_flipping_flag
-            (0, 1),  // frame0_flipped_flag
-            (0, 1),  // field_views_flag
-            (1, 1),  // current_frame_is_frame0_flag
-            (1, 1),  // frame0_self_contained_flag
-            (0, 1),  // frame1_self_contained_flag
-            (0, 4),  // frame0_grid_x
-            (0, 4),  // frame0_grid_y
-            (0, 4),  // frame1_grid_x
-            (0, 4),  // frame1_grid_y
-            (0, 8),  // reserved_byte
-            (1, 1),  // ue repetition_period=0
-            (0, 1),  // extension_flag
+            (1, 1), // ue id=0
+            (0, 1), // cancel_flag
+            (3, 7), // type=3 (side-by-side)
+            (0, 1), // quincunx_sampling_flag
+            (1, 6), // content_interpretation_type
+            (0, 1), // spatial_flipping_flag
+            (0, 1), // frame0_flipped_flag
+            (0, 1), // field_views_flag
+            (1, 1), // current_frame_is_frame0_flag
+            (1, 1), // frame0_self_contained_flag
+            (0, 1), // frame1_self_contained_flag
+            (0, 4), // frame0_grid_x
+            (0, 4), // frame0_grid_y
+            (0, 4), // frame1_grid_x
+            (0, 4), // frame1_grid_y
+            (0, 8), // reserved_byte
+            (1, 1), // ue repetition_period=0
+            (0, 1), // extension_flag
         ];
         let payload = pack_bits(&fields);
         let fpa = parse_frame_packing_arrangement(&payload).unwrap();
@@ -1370,12 +1370,12 @@ mod tests {
     #[test]
     fn display_orientation_full_body() {
         let fields = [
-            (0, 1),      // cancel_flag = 0
-            (1, 1),      // hor_flip
-            (0, 1),      // ver_flip
+            (0, 1),       // cancel_flag = 0
+            (1, 1),       // hor_flip
+            (0, 1),       // ver_flip
             (0x8000, 16), // anticlockwise_rotation
-            (1, 1),      // ue repetition_period = 0
-            (1, 1),      // extension_flag = 1
+            (1, 1),       // ue repetition_period = 0
+            (1, 1),       // extension_flag = 1
         ];
         let payload = pack_bits(&fields);
         let dor = parse_display_orientation(&payload).unwrap();
@@ -1512,20 +1512,20 @@ mod tests {
     #[test]
     fn film_grain_characteristics_with_separate_colour() {
         let fields = [
-            (0, 1), // cancel_flag
-            (2, 2), // model_id
-            (1, 1), // separate_colour_description_present_flag
-            (2, 3), // bit_depth_luma_minus8 (= 10 bit luma)
-            (2, 3), // bit_depth_chroma_minus8
-            (1, 1), // full_range_flag
-            (1, 8), // colour_primaries = 1 (BT.709)
+            (0, 1),  // cancel_flag
+            (2, 2),  // model_id
+            (1, 1),  // separate_colour_description_present_flag
+            (2, 3),  // bit_depth_luma_minus8 (= 10 bit luma)
+            (2, 3),  // bit_depth_chroma_minus8
+            (1, 1),  // full_range_flag
+            (1, 8),  // colour_primaries = 1 (BT.709)
             (13, 8), // transfer_characteristics = 13
-            (1, 8), // matrix_coefficients = 1
-            (0, 2), // blending_mode_id
-            (3, 4), // log2_scale_factor
-            (1, 1), // comp_model_present_flag[0]
-            (1, 1), // comp_model_present_flag[1]
-            (0, 1), // comp_model_present_flag[2]
+            (1, 8),  // matrix_coefficients = 1
+            (0, 2),  // blending_mode_id
+            (3, 4),  // log2_scale_factor
+            (1, 1),  // comp_model_present_flag[0]
+            (1, 1),  // comp_model_present_flag[1]
+            (0, 1),  // comp_model_present_flag[2]
         ];
         let payload = pack_bits(&fields);
         let fg = parse_film_grain_characteristics(&payload).unwrap();
@@ -1561,7 +1561,10 @@ mod tests {
         let got = parse_payload(147, &[18u8], &ctx).unwrap();
         match got {
             SeiPayload::AlternativeTransferCharacteristics(v) => assert_eq!(v, 18),
-            other => panic!("expected AlternativeTransferCharacteristics, got {:?}", other),
+            other => panic!(
+                "expected AlternativeTransferCharacteristics, got {:?}",
+                other
+            ),
         }
     }
 

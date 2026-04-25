@@ -24,7 +24,7 @@
 //! `OXIDEAV_SAMPLES_H264_FOREMAN` or the hardcoded author default;
 //! skip if neither exists.
 
-use oxideav_codec::Decoder as _;
+use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 use std::path::PathBuf;
@@ -39,15 +39,17 @@ fn sample_path() -> Option<PathBuf> {
     let default = PathBuf::from(
         "/home/magicaltux/projects/oxideav/samples/samples.ffmpeg.org/V-codecs/h264/foreman_p16x16.264",
     );
-    if default.exists() { Some(default) } else { None }
+    if default.exists() {
+        Some(default)
+    } else {
+        None
+    }
 }
 
 #[test]
 fn decode_p_slices_yields_frames() {
     let Some(path) = sample_path() else {
-        eprintln!(
-            "skip: set OXIDEAV_SAMPLES_H264_FOREMAN or place the file at the default path"
-        );
+        eprintln!("skip: set OXIDEAV_SAMPLES_H264_FOREMAN or place the file at the default path");
         return;
     };
 

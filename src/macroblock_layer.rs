@@ -43,11 +43,10 @@ use crate::cabac::{CabacDecoder, CabacError};
 use crate::cabac_ctx::{
     decode_coded_block_flag, decode_coded_block_pattern, decode_coeff_abs_level_minus1,
     decode_coeff_sign_flag, decode_intra_chroma_pred_mode, decode_last_significant_coeff_flag,
-    decode_mb_qp_delta, decode_mb_type_b, decode_mb_type_i, decode_mb_type_p,
-    decode_mvd_lx, decode_prev_intra_pred_mode_flag, decode_ref_idx_lx,
-    decode_rem_intra_pred_mode, decode_significant_coeff_flag,
-    decode_transform_size_8x8_flag, BlockType, CabacContexts, MvdComponent, NeighbourCtx,
-    SliceKind,
+    decode_mb_qp_delta, decode_mb_type_b, decode_mb_type_i, decode_mb_type_p, decode_mvd_lx,
+    decode_prev_intra_pred_mode_flag, decode_ref_idx_lx, decode_rem_intra_pred_mode,
+    decode_significant_coeff_flag, decode_transform_size_8x8_flag, BlockType, CabacContexts,
+    MvdComponent, NeighbourCtx, SliceKind,
 };
 use crate::cavlc::{parse_residual_block_cavlc, CavlcError, CoeffTokenContext};
 use crate::mv_deriv::{neighbour_4x4_map, NeighbourSource};
@@ -1027,8 +1026,12 @@ fn nc_nn_plane_luma_like(
     current_is_intra: bool,
     constrained_intra_pred_flag: bool,
 ) -> (bool, u8) {
-    let Some(addr) = mb_addr else { return (false, 0) };
-    let Some(info) = grid.mbs.get(addr as usize) else { return (false, 0) };
+    let Some(addr) = mb_addr else {
+        return (false, 0);
+    };
+    let Some(info) = grid.mbs.get(addr as usize) else {
+        return (false, 0);
+    };
     if !info.is_available {
         return (false, 0);
     }
@@ -1078,10 +1081,8 @@ fn derive_nc_chroma_ac(
     // A: (xD, yD) = (-1, 0). B: ( 0, -1). (§6.4.11.5 step 1 → Table 6-2.)
     let (xa, ya) = (x - 1, y);
     let (xb, yb) = (x, y - 1);
-    let (a_mb_addr, a_blk) =
-        resolve_chroma_neighbour(grid, current_mb_addr, xa, ya, max_w, max_h);
-    let (b_mb_addr, b_blk) =
-        resolve_chroma_neighbour(grid, current_mb_addr, xb, yb, max_w, max_h);
+    let (a_mb_addr, a_blk) = resolve_chroma_neighbour(grid, current_mb_addr, xa, ya, max_w, max_h);
+    let (b_mb_addr, b_blk) = resolve_chroma_neighbour(grid, current_mb_addr, xb, yb, max_w, max_h);
 
     let (avail_a, n_a) = nc_nn_chroma(
         grid,
@@ -1128,11 +1129,19 @@ fn resolve_chroma_neighbour(
         (addr, xn + max_w, yn + max_h)
     } else if xn < 0 && (0..max_h).contains(&yn) {
         // mbAddrA — left.
-        let addr = if x > 0 { Some(current_mb_addr - 1) } else { None };
+        let addr = if x > 0 {
+            Some(current_mb_addr - 1)
+        } else {
+            None
+        };
         (addr, xn + max_w, yn)
     } else if (0..max_w).contains(&xn) && yn < 0 {
         // mbAddrB — above.
-        let addr = if y > 0 { Some(current_mb_addr - w) } else { None };
+        let addr = if y > 0 {
+            Some(current_mb_addr - w)
+        } else {
+            None
+        };
         (addr, xn, yn + max_h)
     } else if (0..max_w).contains(&xn) && (0..max_h).contains(&yn) {
         // Internal.
@@ -1400,8 +1409,16 @@ fn cabac_ref_idx_cond_terms(
     let w = grid.width_in_mbs;
     let x = if w == 0 { 0 } else { current_mb_addr % w };
     let y = if w == 0 { 0 } else { current_mb_addr / w };
-    let left_mb = if x > 0 { grid.mbs.get((current_mb_addr - 1) as usize) } else { None };
-    let above_mb = if y > 0 { grid.mbs.get((current_mb_addr - w) as usize) } else { None };
+    let left_mb = if x > 0 {
+        grid.mbs.get((current_mb_addr - 1) as usize)
+    } else {
+        None
+    };
+    let above_mb = if y > 0 {
+        grid.mbs.get((current_mb_addr - w) as usize)
+    } else {
+        None
+    };
 
     // Map (part, direction) → (neighbour_mb, neighbour_part, is_internal).
     // `is_internal = true` means the neighbour is another 8x8 partition
@@ -1429,12 +1446,23 @@ fn cabac_ref_idx_cond_terms(
 
     let cond = |mb: Option<&CabacMbNeighbourInfo>, part: u8, internal: bool| -> bool {
         let Some(info) = mb else { return false };
-        if !internal && !info.available { return false }
-        if info.is_skip || info.is_intra { return false }
-        let arr = if list == 0 { info.ref_idx_l0 } else { info.ref_idx_l1 };
+        if !internal && !info.available {
+            return false;
+        }
+        if info.is_skip || info.is_intra {
+            return false;
+        }
+        let arr = if list == 0 {
+            info.ref_idx_l0
+        } else {
+            info.ref_idx_l1
+        };
         arr[part as usize] > 0
     };
-    (cond(a_mb, a_part, a_internal), cond(b_mb, b_part, b_internal))
+    (
+        cond(a_mb, a_part, a_internal),
+        cond(b_mb, b_part, b_internal),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1492,31 +1520,41 @@ fn cabac_mvd_abs_sum(
                 (0, MvdComponent::X) => current_mb.mvd_l0_x[idx],
                 (0, MvdComponent::Y) => current_mb.mvd_l0_y[idx],
                 (1, MvdComponent::X) => current_mb.mvd_l1_x[idx],
-                _                    => current_mb.mvd_l1_y[idx],
+                _ => current_mb.mvd_l1_y[idx],
             };
             return v.unsigned_abs() as u32;
         }
         // External neighbour lookup.
         let (nbr_mb_addr, nxn, nyn) = if xn < 0 && yn >= 0 {
-            if x0 == 0 { return 0 }
+            if x0 == 0 {
+                return 0;
+            }
             (current_mb_addr - 1, xn + 16, yn)
         } else if xn >= 0 && yn < 0 {
-            if y0 == 0 { return 0 }
+            if y0 == 0 {
+                return 0;
+            }
             (current_mb_addr - w, xn, yn + 16)
         } else {
             // Corner diagonal (xn<0 && yn<0) — not used by (A, B).
             return 0;
         };
-        let Some(info) = grid.mbs.get(nbr_mb_addr as usize) else { return 0 };
-        if !info.available { return 0 }
+        let Some(info) = grid.mbs.get(nbr_mb_addr as usize) else {
+            return 0;
+        };
+        if !info.available {
+            return 0;
+        }
         // §9.3.3.1.1.7: skip / intra / unavailable neighbours contribute 0.
-        if info.is_skip || info.is_intra { return 0 }
+        if info.is_skip || info.is_intra {
+            return 0;
+        }
         let idx = blk4x4_idx(nxn, nyn) as usize;
         let v = match (list, comp) {
             (0, MvdComponent::X) => info.mvd_l0_x[idx],
             (0, MvdComponent::Y) => info.mvd_l0_y[idx],
             (1, MvdComponent::X) => info.mvd_l1_x[idx],
-            _                    => info.mvd_l1_y[idx],
+            _ => info.mvd_l1_y[idx],
         };
         v.unsigned_abs() as u32
     };
@@ -1568,30 +1606,60 @@ fn cabac_cbf_cond_terms(
         | BlockType::CrLuma4x4
         | BlockType::CrIntra16x16Ac => {
             let (bx, by) = blk4x4_xy(blk_idx);
-            (CbfLoc::Internal4x4(bx - 1, by), CbfLoc::Internal4x4(bx, by - 1))
+            (
+                CbfLoc::Internal4x4(bx - 1, by),
+                CbfLoc::Internal4x4(bx, by - 1),
+            )
         }
         BlockType::ChromaAc | BlockType::Cb8x8 | BlockType::Cr8x8 => {
             // Chroma 4x4 layout (4:2:0 = 2x2, 4:2:2 = 2x4).
             let cx = ((blk_idx as i32) % 2) * 4;
             let cy = ((blk_idx as i32) / 2) * 4;
-            (CbfLoc::InternalChromaAc(cx - 1, cy, blk_idx), CbfLoc::InternalChromaAc(cx, cy - 1, blk_idx))
+            (
+                CbfLoc::InternalChromaAc(cx - 1, cy, blk_idx),
+                CbfLoc::InternalChromaAc(cx, cy - 1, blk_idx),
+            )
         }
         BlockType::ChromaDc
         | BlockType::Luma16x16Dc
         | BlockType::CbIntra16x16Dc
-        | BlockType::CrIntra16x16Dc => {
-            (CbfLoc::MbLevel, CbfLoc::MbLevel)
-        }
+        | BlockType::CrIntra16x16Dc => (CbfLoc::MbLevel, CbfLoc::MbLevel),
         // Luma 8x8 (4:4:4 style) and reserved combos fall back to
         // MB-level (conservative but spec-consistent for the block
         // categories we instantiate from macroblock_layer.rs).
         _ => (CbfLoc::MbLevel, CbfLoc::MbLevel),
     };
 
-    let left_addr = if x > 0 { Some(current_mb_addr - 1) } else { None };
-    let above_addr = if y > 0 { Some(current_mb_addr - w) } else { None };
-    let cond_a = cbf_cond_for(grid, current_mb, current_is_intra, block_type, a_loc, left_addr, true, is_cr);
-    let cond_b = cbf_cond_for(grid, current_mb, current_is_intra, block_type, b_loc, above_addr, false, is_cr);
+    let left_addr = if x > 0 {
+        Some(current_mb_addr - 1)
+    } else {
+        None
+    };
+    let above_addr = if y > 0 {
+        Some(current_mb_addr - w)
+    } else {
+        None
+    };
+    let cond_a = cbf_cond_for(
+        grid,
+        current_mb,
+        current_is_intra,
+        block_type,
+        a_loc,
+        left_addr,
+        true,
+        is_cr,
+    );
+    let cond_b = cbf_cond_for(
+        grid,
+        current_mb,
+        current_is_intra,
+        block_type,
+        b_loc,
+        above_addr,
+        false,
+        is_cr,
+    );
     (cond_a, cond_b)
 }
 
@@ -1632,11 +1700,21 @@ fn cbf_cond_for(
                 let Some(info) = grid.mbs.get(addr as usize) else {
                     return unavail_cbf(current_is_intra, block_type);
                 };
-                if !info.available { return unavail_cbf(current_is_intra, block_type) }
-                if info.is_i_pcm { return true } // I_PCM → cbf = 1 everywhere.
-                if info.is_skip { return false }
+                if !info.available {
+                    return unavail_cbf(current_is_intra, block_type);
+                }
+                if info.is_i_pcm {
+                    return true;
+                } // I_PCM → cbf = 1 everywhere.
+                if info.is_skip {
+                    return false;
+                }
                 // Wrap coordinates into the neighbour MB (eq. 6-34/6-35).
-                let (wx, wy) = if is_left_dir { (xn + 16, yn) } else { (xn, yn + 16) };
+                let (wx, wy) = if is_left_dir {
+                    (xn + 16, yn)
+                } else {
+                    (xn, yn + 16)
+                };
                 let bi = blk4x4_idx(wx, wy) as usize;
                 // §9.3.3.1.1.9 — transBlockN availability for Luma4x4 /
                 // Luma16x16Ac / CbLuma4x4 / CrLuma4x4 / CbIntra16x16Ac /
@@ -1680,7 +1758,9 @@ fn cbf_cond_for(
                         // t8x8 == 1. We don't hit cat=5 here (Luma8x8 is
                         // MbLevel for CBF in our dispatcher). Same spec
                         // rule: transBlockN not available → condTermFlagN = 0.
-                        if info.transform_size_8x8_flag && matches!(block_type, BlockType::Luma4x4 | BlockType::Luma16x16Ac) {
+                        if info.transform_size_8x8_flag
+                            && matches!(block_type, BlockType::Luma4x4 | BlockType::Luma16x16Ac)
+                        {
                             return trans_block_unavail_cbf();
                         }
                     }
@@ -1704,14 +1784,19 @@ fn cbf_cond_for(
                 let Some(info) = grid.mbs.get(addr as usize) else {
                     return unavail_cbf(current_is_intra, block_type);
                 };
-                if !info.available { return unavail_cbf(current_is_intra, block_type) }
-                if info.is_i_pcm { return true }
-                if info.is_skip { return false }
+                if !info.available {
+                    return unavail_cbf(current_is_intra, block_type);
+                }
+                if info.is_i_pcm {
+                    return true;
+                }
+                if info.is_skip {
+                    return false;
+                }
                 // §9.3.3.1.1.9 ctxBlockCat=4 (Chroma AC) — the 4x4
                 // chroma block is available only when
                 // CodedBlockPatternChroma == 2 for the neighbour MB.
-                if matches!(block_type, BlockType::ChromaAc)
-                    && info.coded_block_pattern_chroma != 2
+                if matches!(block_type, BlockType::ChromaAc) && info.coded_block_pattern_chroma != 2
                 {
                     // §9.3.3.1.1.9 — transBlockN not available →
                     // condTermFlagN = 0 (spec rule, bullet 2 under the
@@ -1723,7 +1808,11 @@ fn cbf_cond_for(
                 // Wrap: for chroma plane of width 8 / height 8 (4:2:0) or
                 // 16 (4:2:2). For simplicity always wrap by 8; the blk
                 // index we query is in the first 4 slots for 4:2:0.
-                let (wx, wy) = if is_left_dir { (xn + 8, yn) } else { (xn, yn + 8) };
+                let (wx, wy) = if is_left_dir {
+                    (xn + 8, yn)
+                } else {
+                    (xn, yn + 8)
+                };
                 let bi = (2 * (wy / 4) + (wx / 4)) as usize;
                 cbf_chroma_ac_for(info, block_type, bi.min(7), is_cr)
             }
@@ -1735,9 +1824,15 @@ fn cbf_cond_for(
             let Some(info) = grid.mbs.get(addr as usize) else {
                 return unavail_cbf(current_is_intra, block_type);
             };
-            if !info.available { return unavail_cbf(current_is_intra, block_type) }
-            if info.is_i_pcm { return true }
-            if info.is_skip { return false }
+            if !info.available {
+                return unavail_cbf(current_is_intra, block_type);
+            }
+            if info.is_i_pcm {
+                return true;
+            }
+            if info.is_skip {
+                return false;
+            }
             // §9.3.3.1.1.9 — transBlockN availability for MB-level DC
             // blocks depends on whether the neighbour MB carries the
             // matching DC plane. If it does not, transBlockN is
@@ -1754,9 +1849,7 @@ fn cbf_cond_for(
             // * ctxBlockCat=6 (CbIntra16x16Dc) / =10 (CrIntra16x16Dc) —
             //   same Intra_16x16 gate as cat=0, in 4:4:4.
             let neighbour_has_transblock = match block_type {
-                BlockType::Luma16x16Dc
-                | BlockType::CbIntra16x16Dc
-                | BlockType::CrIntra16x16Dc => {
+                BlockType::Luma16x16Dc | BlockType::CbIntra16x16Dc | BlockType::CrIntra16x16Dc => {
                     // Present only when neighbour is Intra_16x16. Our
                     // `cbf_luma_16x16_dc` / `cbf_c?_16x16_dc` already
                     // encode that path: they're only set inside the
@@ -1986,7 +2079,8 @@ pub fn parse_macroblock(
     // §7.3.5 — mb_type.
     // CAVLC: ue(v). CABAC: per-slice-type decoder in cabac_ctx.
     // ---------------------------------------------------------------
-    let dbg_mb_enter = std::env::var("OXIDEAV_H264_MB_TRACE").ok()
+    let dbg_mb_enter = std::env::var("OXIDEAV_H264_MB_TRACE")
+        .ok()
         .and_then(|v| v.parse::<u32>().ok());
     let dbg_mb_enter_on = dbg_mb_enter == Some(entropy.current_mb_addr);
     // OXIDEAV_H264_MBTYPE_TRACE=1 — dump every (mb_addr, mb_type_raw,
@@ -2003,8 +2097,13 @@ pub fn parse_macroblock(
             SliceType::B => decode_mb_type_b(dec, ctxs, &entropy.neighbours)?,
         };
         if dbg_mb_enter_on || dbg_mb_type_all {
-            eprintln!("[MBTYPE {}] raw={} bins_consumed={} slice={:?}",
-                     entropy.current_mb_addr, v, dec.bin_count() - bins_before, slice_type);
+            eprintln!(
+                "[MBTYPE {}] raw={} bins_consumed={} slice={:?}",
+                entropy.current_mb_addr,
+                v,
+                dec.bin_count() - bins_before,
+                slice_type
+            );
         }
         v
     } else {
@@ -2136,7 +2235,12 @@ pub fn parse_macroblock(
                 r.u(1)? == 1
             };
         }
-        mb_pred = Some(parse_mb_pred(r, entropy, &mb_type, transform_size_8x8_flag)?);
+        mb_pred = Some(parse_mb_pred(
+            r,
+            entropy,
+            &mb_type,
+            transform_size_8x8_flag,
+        )?);
     }
     if dbg {
         let (b, bi) = r.position();
@@ -2159,9 +2263,19 @@ pub fn parse_macroblock(
     } else {
         cbp_total = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
             let bb = dec.bin_count();
-            let v = decode_coded_block_pattern(dec, ctxs, &entropy.neighbours, entropy.chroma_array_type)?;
+            let v = decode_coded_block_pattern(
+                dec,
+                ctxs,
+                &entropy.neighbours,
+                entropy.chroma_array_type,
+            )?;
             if dbg {
-                eprintln!("[MB {:>4}]   CBP bins_consumed={} value={}", mb_addr_dbg, dec.bin_count() - bb, v);
+                eprintln!(
+                    "[MB {:>4}]   CBP bins_consumed={} value={}",
+                    mb_addr_dbg,
+                    dec.bin_count() - bb,
+                    v
+                );
             }
             v
         } else {
@@ -2239,8 +2353,10 @@ pub fn parse_macroblock(
             if dbg {
                 eprintln!(
                     "[MB {:>4}]   mb_qp_delta decode: prev_nz={} bins_consumed={} value={}",
-                    mb_addr_dbg, entropy.prev_mb_qp_delta_nonzero,
-                    bins_after - bins_before, v
+                    mb_addr_dbg,
+                    entropy.prev_mb_qp_delta_nonzero,
+                    bins_after - bins_before,
+                    v
                 );
             }
             v
@@ -2373,7 +2489,8 @@ fn parse_mb_pred(
     transform_size_8x8_flag: bool,
 ) -> McblResult<MbPred> {
     let mut pred = MbPred::default();
-    let dbg_mb = std::env::var("OXIDEAV_H264_MB_TRACE").ok()
+    let dbg_mb = std::env::var("OXIDEAV_H264_MB_TRACE")
+        .ok()
         .and_then(|v| v.parse::<u32>().ok());
     let dbg_on = dbg_mb == Some(entropy.current_mb_addr);
 
@@ -2418,7 +2535,6 @@ fn parse_mb_pred(
                     pred.rem_intra4x4_pred_mode[i] = rem as u8;
                 }
             }
-
         }
         // Chroma intra pred mode — read when ChromaArrayType ∈ {1, 2}.
         if matches!(entropy.chroma_array_type, 1 | 2) {
@@ -2478,7 +2594,11 @@ fn parse_mb_pred(
                 (2, 0) => 0,
                 (2, 1) => {
                     // Need to tell 16x8 vs 8x16 apart.
-                    if mb_type.is_partitioned_16x8() { 2 } else { 1 }
+                    if mb_type.is_partitioned_16x8() {
+                        2
+                    } else {
+                        1
+                    }
                 }
                 (4, p) => p as u8,
                 _ => 0,
@@ -2524,8 +2644,10 @@ fn parse_mb_pred(
                     r.te(x_l0)?
                 };
                 if dbg_on {
-                    eprintln!("[MBP {}] ref_idx_l0 part={} gated=true val={}",
-                             entropy.current_mb_addr, part, v);
+                    eprintln!(
+                        "[MBP {}] ref_idx_l0 part={} gated=true val={}",
+                        entropy.current_mb_addr, part, v
+                    );
                 }
                 // Record per-8x8-partition value covering this mb part.
                 for p8 in partition_8x8_range(num_parts, part, mb_type.is_partitioned_16x8()) {
@@ -2541,7 +2663,8 @@ fn parse_mb_pred(
         //   MbPartPredMode != Pred_L0 (and not Direct).
         for part in 0..num_parts {
             let mode = mb_type.mb_part_pred_mode(part);
-            if ref_l1_present && mode != Some(MbPartPredMode::PredL0)
+            if ref_l1_present
+                && mode != Some(MbPartPredMode::PredL0)
                 && mode != Some(MbPartPredMode::Direct)
                 && entropy.slice_kind == SliceKind::B
             {
@@ -2569,9 +2692,7 @@ fn parse_mb_pred(
         // Direct). CABAC: §9.3.3.1.1.7 UEG3; CAVLC: se(v).
         for part in 0..num_parts {
             let mode = mb_type.mb_part_pred_mode(part);
-            if mode != Some(MbPartPredMode::PredL1)
-                && mode != Some(MbPartPredMode::Direct)
-            {
+            if mode != Some(MbPartPredMode::PredL1) && mode != Some(MbPartPredMode::Direct) {
                 let (mx, my) = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
                     // §9.3.3.1.1.7: for MB-level partitions (16x16/16x8/8x16)
                     // only the top-left 4x4 of the partition carries the
@@ -2607,8 +2728,10 @@ fn parse_mb_pred(
                     // this partition (so in-MB neighbour lookups see
                     // consistent values).
                     for b4 in mb_part_4x4_range(num_parts, part, mb_type.is_partitioned_16x8()) {
-                        curr_nb.mvd_l0_x[b4 as usize] = mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                        curr_nb.mvd_l0_y[b4 as usize] = my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        curr_nb.mvd_l0_x[b4 as usize] =
+                            mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        curr_nb.mvd_l0_y[b4 as usize] =
+                            my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                     }
                     (mx, my)
                 } else {
@@ -2648,8 +2771,10 @@ fn parse_mb_pred(
                     let mx = decode_mvd_lx(dec, ctxs, MvdComponent::X, sum_x)?;
                     let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
                     for b4 in mb_part_4x4_range(num_parts, part, mb_type.is_partitioned_16x8()) {
-                        curr_nb.mvd_l1_x[b4 as usize] = mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                        curr_nb.mvd_l1_y[b4 as usize] = my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        curr_nb.mvd_l1_x[b4 as usize] =
+                            mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        curr_nb.mvd_l1_y[b4 as usize] =
+                            my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                     }
                     (mx, my)
                 } else {
@@ -2688,10 +2813,10 @@ fn parse_mb_pred(
 fn partition_8x8_range(num_parts: usize, part: usize, is_16x8: bool) -> Vec<u8> {
     match (num_parts, part, is_16x8) {
         (1, _, _) => vec![0, 1, 2, 3],
-        (2, 0, true) => vec![0, 1],   // 16x8 top
-        (2, 1, true) => vec![2, 3],   // 16x8 bottom
-        (2, 0, false) => vec![0, 2],  // 8x16 left
-        (2, 1, false) => vec![1, 3],  // 8x16 right
+        (2, 0, true) => vec![0, 1],  // 16x8 top
+        (2, 1, true) => vec![2, 3],  // 16x8 bottom
+        (2, 0, false) => vec![0, 2], // 8x16 left
+        (2, 1, false) => vec![1, 3], // 8x16 right
         (4, p, _) => vec![p as u8],
         _ => vec![0],
     }
@@ -2701,10 +2826,10 @@ fn partition_8x8_range(num_parts: usize, part: usize, is_16x8: bool) -> Vec<u8> 
 fn mb_part_4x4_range(num_parts: usize, part: usize, is_16x8: bool) -> Vec<u8> {
     match (num_parts, part, is_16x8) {
         (1, _, _) => (0..16u8).collect(),
-        (2, 0, true) => vec![0, 1, 2, 3, 4, 5, 6, 7],            // 16x8 top half
-        (2, 1, true) => vec![8, 9, 10, 11, 12, 13, 14, 15],      // 16x8 bottom half
-        (2, 0, false) => vec![0, 1, 2, 3, 8, 9, 10, 11],         // 8x16 left half
-        (2, 1, false) => vec![4, 5, 6, 7, 12, 13, 14, 15],       // 8x16 right half
+        (2, 0, true) => vec![0, 1, 2, 3, 4, 5, 6, 7], // 16x8 top half
+        (2, 1, true) => vec![8, 9, 10, 11, 12, 13, 14, 15], // 16x8 bottom half
+        (2, 0, false) => vec![0, 1, 2, 3, 8, 9, 10, 11], // 8x16 left half
+        (2, 1, false) => vec![4, 5, 6, 7, 12, 13, 14, 15], // 8x16 right half
         (4, 0, _) => vec![0, 1, 2, 3],
         (4, 1, _) => vec![4, 5, 6, 7],
         (4, 2, _) => vec![8, 9, 10, 11],
@@ -2741,7 +2866,9 @@ fn neighbour_ref_idx_gt_0(
     part8x8: u8,
 ) -> (bool, bool) {
     let Some(g) = grid else { return (false, false) };
-    if g.width_in_mbs == 0 { return (false, false) }
+    if g.width_in_mbs == 0 {
+        return (false, false);
+    }
     cabac_ref_idx_cond_terms(g, current_mb_addr, current_mb, list, part8x8)
 }
 
@@ -2755,7 +2882,9 @@ fn neighbour_mvd_abs_sum(
     blk4x4: u8,
 ) -> u32 {
     let Some(g) = grid else { return 0 };
-    if g.width_in_mbs == 0 { return 0 }
+    if g.width_in_mbs == 0 {
+        return 0;
+    }
     cabac_mvd_abs_sum(g, current_mb_addr, current_mb, list, comp, blk4x4)
 }
 
@@ -2774,7 +2903,8 @@ fn parse_sub_mb_pred(
     // OXIDEAV_H264_MB_TRACE=N — per-element trace of the specified MB
     // address inside the current slice. Used for CABAC bisection against
     // the JM trace oracle; see the round-30 notes in the commit history.
-    let dbg_mb = std::env::var("OXIDEAV_H264_MB_TRACE").ok()
+    let dbg_mb = std::env::var("OXIDEAV_H264_MB_TRACE")
+        .ok()
         .and_then(|v| v.parse::<u32>().ok());
     let dbg_on = dbg_mb == Some(entropy.current_mb_addr);
 
@@ -2810,8 +2940,10 @@ fn parse_sub_mb_pred(
             SubMbType::from_p(raw)?
         };
         if dbg_on {
-            eprintln!("[SUB {}] sub_mb_type[{}] raw={} -> {:?}",
-                     entropy.current_mb_addr, i, raw, out.sub_mb_type[i]);
+            eprintln!(
+                "[SUB {}] sub_mb_type[{}] raw={} -> {:?}",
+                entropy.current_mb_addr, i, raw, out.sub_mb_type[i]
+            );
         }
     }
 
@@ -2867,9 +2999,7 @@ fn parse_sub_mb_pred(
             let sub = out.sub_mb_type[i];
             let mode = sub.sub_mb_pred_mode();
             let is_direct_sub = matches!(sub, SubMbType::BDirect8x8);
-            let gated = ref_l1_present
-                && !is_direct_sub
-                && mode != Some(MbPartPredMode::PredL0);
+            let gated = ref_l1_present && !is_direct_sub && mode != Some(MbPartPredMode::PredL0);
             let v = if gated {
                 if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
                     let (ca, cb) = neighbour_ref_idx_gt_0(
@@ -2921,12 +3051,16 @@ fn parse_sub_mb_pred(
                     let mx = decode_mvd_lx(dec, ctxs, MvdComponent::X, sum_x)?;
                     let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
                     if dbg_on {
-                        eprintln!("[SUB {}] mvd_l0 blk8={} sp={} blk4={} sum_x={} sum_y={} mx={} my={}",
-                                 entropy.current_mb_addr, i, sp, blk4, sum_x, sum_y, mx, my);
+                        eprintln!(
+                            "[SUB {}] mvd_l0 blk8={} sp={} blk4={} sum_x={} sum_y={} mx={} my={}",
+                            entropy.current_mb_addr, i, sp, blk4, sum_x, sum_y, mx, my
+                        );
                     }
                     for b4 in sub_mb_sub_part_4x4_range(i, sp, sub) {
-                        curr_nb.mvd_l0_x[b4 as usize] = mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                        curr_nb.mvd_l0_y[b4 as usize] = my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        curr_nb.mvd_l0_x[b4 as usize] =
+                            mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        curr_nb.mvd_l0_y[b4 as usize] =
+                            my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                     }
                     (mx, my)
                 } else {
@@ -2966,8 +3100,10 @@ fn parse_sub_mb_pred(
                         let mx = decode_mvd_lx(dec, ctxs, MvdComponent::X, sum_x)?;
                         let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
                         for b4 in sub_mb_sub_part_4x4_range(i, sp, sub) {
-                            curr_nb.mvd_l1_x[b4 as usize] = mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                            curr_nb.mvd_l1_y[b4 as usize] = my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            curr_nb.mvd_l1_x[b4 as usize] =
+                                mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            curr_nb.mvd_l1_y[b4 as usize] =
+                                my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                         }
                         (mx, my)
                     } else {
@@ -3012,9 +3148,17 @@ fn sub_mb_sub_part_4x4(i: usize, sp: usize, sub: SubMbType) -> u8 {
             // 8x4: sub-part 0 covers [0,1] (top), 1 covers [2,3] (bot).
             // 4x8: sub-part 0 covers [0,2] (left), 1 covers [1,3] (right).
             if sub.is_8x4() {
-                if sp == 0 { 0 } else { 2 }
+                if sp == 0 {
+                    0
+                } else {
+                    2
+                }
             } else {
-                if sp == 0 { 0 } else { 1 }
+                if sp == 0 {
+                    0
+                } else {
+                    1
+                }
             }
         }
         4 => sp as u8,
@@ -3030,9 +3174,17 @@ fn sub_mb_sub_part_4x4_range(i: usize, sp: usize, sub: SubMbType) -> Vec<u8> {
         1 => vec![base, base + 1, base + 2, base + 3],
         2 => {
             if sub.is_8x4() {
-                if sp == 0 { vec![base, base + 1] } else { vec![base + 2, base + 3] }
+                if sp == 0 {
+                    vec![base, base + 1]
+                } else {
+                    vec![base + 2, base + 3]
+                }
             } else {
-                if sp == 0 { vec![base, base + 2] } else { vec![base + 1, base + 3] }
+                if sp == 0 {
+                    vec![base, base + 2]
+                } else {
+                    vec![base + 1, base + 3]
+                }
             }
         }
         4 => vec![base + sp as u8],
@@ -3114,36 +3266,33 @@ fn parse_residual_cavlc_only(
     // the "current MB as neighbour" branch manually — the grid doesn't
     // have this MB's entry marked available yet, so a NeighbourSource
     // of `InternalBlock(i)` falls back to `own_luma_totals[i]`.
-    let derive_luma = |blk_idx: u8,
-                       kind: LumaNcKind,
-                       own: &[u8; 16],
-                       grid: Option<&CavlcNcGrid>|
-     -> i32 {
-        let blk = match kind {
-            LumaNcKind::Intra16x16Dc => 0u8,
-            LumaNcKind::Ac => blk_idx,
+    let derive_luma =
+        |blk_idx: u8, kind: LumaNcKind, own: &[u8; 16], grid: Option<&CavlcNcGrid>| -> i32 {
+            let blk = match kind {
+                LumaNcKind::Intra16x16Dc => 0u8,
+                LumaNcKind::Ac => blk_idx,
+            };
+            let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk);
+            // A:
+            let (avail_a, n_a) = match a_src {
+                NeighbourSource::InternalBlock(i) => (true, own[i as usize]),
+                _ => {
+                    let Some(g) = grid else { return 0 };
+                    let (addr, bi) = resolve_luma_neighbour(g, current_mb_addr, a_src);
+                    nc_nn_luma(g, addr, bi, current_is_intra, cip)
+                }
+            };
+            // B:
+            let (avail_b, n_b) = match b_src {
+                NeighbourSource::InternalBlock(i) => (true, own[i as usize]),
+                _ => {
+                    let Some(g) = grid else { return 0 };
+                    let (addr, bi) = resolve_luma_neighbour(g, current_mb_addr, b_src);
+                    nc_nn_luma(g, addr, bi, current_is_intra, cip)
+                }
+            };
+            combine_nc(avail_a, n_a, avail_b, n_b)
         };
-        let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk);
-        // A:
-        let (avail_a, n_a) = match a_src {
-            NeighbourSource::InternalBlock(i) => (true, own[i as usize]),
-            _ => {
-                let Some(g) = grid else { return 0 };
-                let (addr, bi) = resolve_luma_neighbour(g, current_mb_addr, a_src);
-                nc_nn_luma(g, addr, bi, current_is_intra, cip)
-            }
-        };
-        // B:
-        let (avail_b, n_b) = match b_src {
-            NeighbourSource::InternalBlock(i) => (true, own[i as usize]),
-            _ => {
-                let Some(g) = grid else { return 0 };
-                let (addr, bi) = resolve_luma_neighbour(g, current_mb_addr, b_src);
-                nc_nn_luma(g, addr, bi, current_is_intra, cip)
-            }
-        };
-        combine_nc(avail_a, n_a, avail_b, n_b)
-    };
 
     // Helper: derive nC for a chroma AC 4x4 block.
     let derive_chroma = |blk_idx: u8,
@@ -3237,8 +3386,7 @@ fn parse_residual_cavlc_only(
         if cbp_luma == 15 {
             for blk_idx in 0..16u8 {
                 let nc = derive_luma(blk_idx, LumaNcKind::Ac, &own_luma_totals, grid_ref);
-                let blk =
-                    parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 14, 15)?;
+                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 14, 15)?;
                 let tc = count_nonzero(&blk);
                 own_luma_totals[blk_idx as usize] = tc;
                 out.residual_luma.push(pad_to_16(blk));
@@ -3348,13 +3496,7 @@ fn parse_residual_cavlc_only(
                     &own_cr_totals,
                     grid_ref,
                 );
-                let blk = parse_residual_block_cavlc(
-                    r,
-                    CoeffTokenContext::Numeric(nc),
-                    0,
-                    14,
-                    15,
-                )?;
+                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 14, 15)?;
                 let tc = count_nonzero(&blk);
                 own_cb_totals[blk_idx as usize] = tc;
                 out.residual_chroma_ac_cb.push(pad_to_16(blk));
@@ -3368,13 +3510,7 @@ fn parse_residual_cavlc_only(
                     &own_cr_totals,
                     grid_ref,
                 );
-                let blk = parse_residual_block_cavlc(
-                    r,
-                    CoeffTokenContext::Numeric(nc),
-                    0,
-                    14,
-                    15,
-                )?;
+                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 14, 15)?;
                 let tc = count_nonzero(&blk);
                 own_cr_totals[blk_idx as usize] = tc;
                 out.residual_chroma_ac_cr.push(pad_to_16(blk));
@@ -3402,13 +3538,7 @@ fn parse_residual_cavlc_only(
                     &own_cr_luma_totals,
                     grid_ref,
                 );
-                let blk = parse_residual_block_cavlc(
-                    r,
-                    CoeffTokenContext::Numeric(nc),
-                    0,
-                    15,
-                    16,
-                )?;
+                let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
                 if plane_is_cr {
                     out.residual_cr_16x16_dc = Some(pad_to_16(blk));
                 } else {
@@ -3568,7 +3698,13 @@ fn parse_residual_block_cabac(
     // §7.3.5.3.3 — coded_block_flag is suppressed for 8x8 blocks unless
     // we're in 4:4:4 (where 8x8 CBP semantics differ).
     let coded = if max_num_coeff != 64 || chroma_array_type == 3 {
-        decode_coded_block_flag(cabac, ctxs, block_type, neighbour_cbf_left, neighbour_cbf_above)?
+        decode_coded_block_flag(
+            cabac,
+            ctxs,
+            block_type,
+            neighbour_cbf_left,
+            neighbour_cbf_above,
+        )?
     } else {
         true
     };
@@ -3613,8 +3749,7 @@ fn parse_residual_block_cabac(
         if !significant[pos as usize] {
             continue;
         }
-        let abs_m1 =
-            decode_coeff_abs_level_minus1(cabac, ctxs, block_type, num_eq1, num_gt1)?;
+        let abs_m1 = decode_coeff_abs_level_minus1(cabac, ctxs, block_type, num_eq1, num_gt1)?;
         let sign = decode_coeff_sign_flag(cabac)?;
         let val = ((abs_m1 + 1) as i32) * if sign { -1 } else { 1 };
         out[pos as usize] = val;
@@ -3658,14 +3793,28 @@ fn parse_residual_cabac_only(
     if mb_type.is_intra_16x16() {
         let (ca, cb) = if let Some(g) = grid_ref {
             let (a, b) = cabac_cbf_cond_terms(
-                g, current_mb_addr, &curr_cbf, current_is_intra,
-                BlockType::Luma16x16Dc, 0, false);
+                g,
+                current_mb_addr,
+                &curr_cbf,
+                current_is_intra,
+                BlockType::Luma16x16Dc,
+                0,
+                false,
+            );
             (Some(a), Some(b))
         } else {
             (None, None)
         };
         let (blk, coded) = parse_residual_block_cabac(
-            cabac, ctxs, BlockType::Luma16x16Dc, 0, 15, 16, chroma_array_type, ca, cb,
+            cabac,
+            ctxs,
+            BlockType::Luma16x16Dc,
+            0,
+            15,
+            16,
+            chroma_array_type,
+            ca,
+            cb,
         )?;
         curr_cbf.cbf_luma_16x16_dc = coded;
         out.residual_luma_dc = Some(pad_to_16(blk));
@@ -3677,14 +3826,28 @@ fn parse_residual_cabac_only(
             for blk_idx in 0..16u8 {
                 let (ca, cb) = if let Some(g) = grid_ref {
                     let (a, b) = cabac_cbf_cond_terms(
-                        g, current_mb_addr, &curr_cbf, current_is_intra,
-                        BlockType::Luma16x16Ac, blk_idx, false);
+                        g,
+                        current_mb_addr,
+                        &curr_cbf,
+                        current_is_intra,
+                        BlockType::Luma16x16Ac,
+                        blk_idx,
+                        false,
+                    );
                     (Some(a), Some(b))
                 } else {
                     (None, None)
                 };
                 let (blk, coded) = parse_residual_block_cabac(
-                    cabac, ctxs, BlockType::Luma16x16Ac, 0, 14, 15, chroma_array_type, ca, cb,
+                    cabac,
+                    ctxs,
+                    BlockType::Luma16x16Ac,
+                    0,
+                    14,
+                    15,
+                    chroma_array_type,
+                    ca,
+                    cb,
                 )?;
                 curr_cbf.cbf_luma_16x16_ac[blk_idx as usize] = coded;
                 out.residual_luma.push(pad_to_16(blk));
@@ -3696,7 +3859,15 @@ fn parse_residual_cabac_only(
                 // 8x8 block: CBF is inferred from CBP (not decoded), so
                 // no neighbour lookup needed for the CBF itself.
                 let (blk, coded) = parse_residual_block_cabac(
-                    cabac, ctxs, BlockType::Luma8x8, 0, 63, 64, chroma_array_type, None, None,
+                    cabac,
+                    ctxs,
+                    BlockType::Luma8x8,
+                    0,
+                    63,
+                    64,
+                    chroma_array_type,
+                    None,
+                    None,
                 )?;
                 // Propagate the inferred coded flag to the four 4x4
                 // sub-blocks for CBF neighbour tracking.
@@ -3721,14 +3892,28 @@ fn parse_residual_cabac_only(
                     let blk_idx = blk8 * 4 + sub;
                     let (ca, cb) = if let Some(g) = grid_ref {
                         let (a, b) = cabac_cbf_cond_terms(
-                            g, current_mb_addr, &curr_cbf, current_is_intra,
-                            BlockType::Luma4x4, blk_idx, false);
+                            g,
+                            current_mb_addr,
+                            &curr_cbf,
+                            current_is_intra,
+                            BlockType::Luma4x4,
+                            blk_idx,
+                            false,
+                        );
                         (Some(a), Some(b))
                     } else {
                         (None, None)
                     };
                     let (blk, coded) = parse_residual_block_cabac(
-                        cabac, ctxs, BlockType::Luma4x4, 0, 15, 16, chroma_array_type, ca, cb,
+                        cabac,
+                        ctxs,
+                        BlockType::Luma4x4,
+                        0,
+                        15,
+                        16,
+                        chroma_array_type,
+                        ca,
+                        cb,
                     )?;
                     curr_cbf.cbf_luma_4x4[blk_idx as usize] = coded;
                     out.residual_luma.push(pad_to_16(blk));
@@ -3748,30 +3933,56 @@ fn parse_residual_cabac_only(
             // Compute separately for Cb (iCbCr=0) and Cr (iCbCr=1).
             let (ca_cb, cb_cb) = if let Some(g) = grid_ref {
                 let (a, b) = cabac_cbf_cond_terms(
-                    g, current_mb_addr, &curr_cbf, current_is_intra,
-                    BlockType::ChromaDc, 0, false);
+                    g,
+                    current_mb_addr,
+                    &curr_cbf,
+                    current_is_intra,
+                    BlockType::ChromaDc,
+                    0,
+                    false,
+                );
                 (Some(a), Some(b))
             } else {
                 (None, None)
             };
             let (cb_dc, cb_coded) = parse_residual_block_cabac(
-                cabac, ctxs, BlockType::ChromaDc, 0, max_dc - 1, max_dc, chroma_array_type,
-                ca_cb, cb_cb,
+                cabac,
+                ctxs,
+                BlockType::ChromaDc,
+                0,
+                max_dc - 1,
+                max_dc,
+                chroma_array_type,
+                ca_cb,
+                cb_cb,
             )?;
             curr_cbf.cbf_cb_dc = cb_coded;
             out.residual_chroma_dc_cb = cb_dc;
 
             let (ca_cr, cb_cr) = if let Some(g) = grid_ref {
                 let (a, b) = cabac_cbf_cond_terms(
-                    g, current_mb_addr, &curr_cbf, current_is_intra,
-                    BlockType::ChromaDc, 0, true);
+                    g,
+                    current_mb_addr,
+                    &curr_cbf,
+                    current_is_intra,
+                    BlockType::ChromaDc,
+                    0,
+                    true,
+                );
                 (Some(a), Some(b))
             } else {
                 (None, None)
             };
             let (cr_dc, cr_coded) = parse_residual_block_cabac(
-                cabac, ctxs, BlockType::ChromaDc, 0, max_dc - 1, max_dc, chroma_array_type,
-                ca_cr, cb_cr,
+                cabac,
+                ctxs,
+                BlockType::ChromaDc,
+                0,
+                max_dc - 1,
+                max_dc,
+                chroma_array_type,
+                ca_cr,
+                cb_cr,
             )?;
             curr_cbf.cbf_cr_dc = cr_coded;
             out.residual_chroma_dc_cr = cr_dc;
@@ -3782,14 +3993,28 @@ fn parse_residual_cabac_only(
             for blk_idx in 0..num_ac as u8 {
                 let (ca, cb) = if let Some(g) = grid_ref {
                     let (a, b) = cabac_cbf_cond_terms(
-                        g, current_mb_addr, &curr_cbf, current_is_intra,
-                        BlockType::ChromaAc, blk_idx, false);
+                        g,
+                        current_mb_addr,
+                        &curr_cbf,
+                        current_is_intra,
+                        BlockType::ChromaAc,
+                        blk_idx,
+                        false,
+                    );
                     (Some(a), Some(b))
                 } else {
                     (None, None)
                 };
                 let (blk, coded) = parse_residual_block_cabac(
-                    cabac, ctxs, BlockType::ChromaAc, 0, 14, 15, chroma_array_type, ca, cb,
+                    cabac,
+                    ctxs,
+                    BlockType::ChromaAc,
+                    0,
+                    14,
+                    15,
+                    chroma_array_type,
+                    ca,
+                    cb,
                 )?;
                 curr_cbf.cbf_cb_ac[blk_idx as usize] = coded;
                 out.residual_chroma_ac_cb.push(pad_to_16(blk));
@@ -3797,14 +4022,28 @@ fn parse_residual_cabac_only(
             for blk_idx in 0..num_ac as u8 {
                 let (ca, cb) = if let Some(g) = grid_ref {
                     let (a, b) = cabac_cbf_cond_terms(
-                        g, current_mb_addr, &curr_cbf, current_is_intra,
-                        BlockType::ChromaAc, blk_idx, true);
+                        g,
+                        current_mb_addr,
+                        &curr_cbf,
+                        current_is_intra,
+                        BlockType::ChromaAc,
+                        blk_idx,
+                        true,
+                    );
                     (Some(a), Some(b))
                 } else {
                     (None, None)
                 };
                 let (blk, coded) = parse_residual_block_cabac(
-                    cabac, ctxs, BlockType::ChromaAc, 0, 14, 15, chroma_array_type, ca, cb,
+                    cabac,
+                    ctxs,
+                    BlockType::ChromaAc,
+                    0,
+                    14,
+                    15,
+                    chroma_array_type,
+                    ca,
+                    cb,
                 )?;
                 curr_cbf.cbf_cr_ac[blk_idx as usize] = coded;
                 out.residual_chroma_ac_cr.push(pad_to_16(blk));
@@ -3839,14 +4078,28 @@ fn parse_residual_cabac_only(
             if mb_type.is_intra_16x16() {
                 let (ca, cb) = if let Some(g) = grid_ref {
                     let (a, b) = cabac_cbf_cond_terms(
-                        g, current_mb_addr, &curr_cbf, current_is_intra,
-                        bt_dc, 0, plane_is_cr);
+                        g,
+                        current_mb_addr,
+                        &curr_cbf,
+                        current_is_intra,
+                        bt_dc,
+                        0,
+                        plane_is_cr,
+                    );
                     (Some(a), Some(b))
                 } else {
                     (None, None)
                 };
                 let (blk, coded) = parse_residual_block_cabac(
-                    cabac, ctxs, bt_dc, 0, 15, 16, chroma_array_type, ca, cb,
+                    cabac,
+                    ctxs,
+                    bt_dc,
+                    0,
+                    15,
+                    16,
+                    chroma_array_type,
+                    ca,
+                    cb,
                 )?;
                 if plane_is_cr {
                     curr_cbf.cbf_cr_16x16_dc = coded;
@@ -3863,14 +4116,28 @@ fn parse_residual_cabac_only(
                     for blk_idx in 0..16u8 {
                         let (ca, cb) = if let Some(g) = grid_ref {
                             let (a, b) = cabac_cbf_cond_terms(
-                                g, current_mb_addr, &curr_cbf, current_is_intra,
-                                bt_ac, blk_idx, plane_is_cr);
+                                g,
+                                current_mb_addr,
+                                &curr_cbf,
+                                current_is_intra,
+                                bt_ac,
+                                blk_idx,
+                                plane_is_cr,
+                            );
                             (Some(a), Some(b))
                         } else {
                             (None, None)
                         };
                         let (blk, coded) = parse_residual_block_cabac(
-                            cabac, ctxs, bt_ac, 0, 14, 15, chroma_array_type, ca, cb,
+                            cabac,
+                            ctxs,
+                            bt_ac,
+                            0,
+                            14,
+                            15,
+                            chroma_array_type,
+                            ca,
+                            cb,
                         )?;
                         if plane_is_cr {
                             curr_cbf.cbf_cr_16x16_ac[blk_idx as usize] = coded;
@@ -3889,8 +4156,15 @@ fn parse_residual_cabac_only(
                         // == 3 → coded_block_flag IS coded per
                         // §7.3.5.3.3).
                         let (blk, coded) = parse_residual_block_cabac(
-                            cabac, ctxs, bt_8x8, 0, 63, 64, chroma_array_type,
-                            None, None,
+                            cabac,
+                            ctxs,
+                            bt_8x8,
+                            0,
+                            63,
+                            64,
+                            chroma_array_type,
+                            None,
+                            None,
                         )?;
                         // Propagate coded flag to the four 4x4 sub-
                         // blocks so subsequent intra-MB neighbour
@@ -3923,14 +4197,28 @@ fn parse_residual_cabac_only(
                             let blk_idx = blk8 * 4 + sub;
                             let (ca, cb) = if let Some(g) = grid_ref {
                                 let (a, b) = cabac_cbf_cond_terms(
-                                    g, current_mb_addr, &curr_cbf, current_is_intra,
-                                    bt_4x4, blk_idx, plane_is_cr);
+                                    g,
+                                    current_mb_addr,
+                                    &curr_cbf,
+                                    current_is_intra,
+                                    bt_4x4,
+                                    blk_idx,
+                                    plane_is_cr,
+                                );
                                 (Some(a), Some(b))
                             } else {
                                 (None, None)
                             };
                             let (blk, coded) = parse_residual_block_cabac(
-                                cabac, ctxs, bt_4x4, 0, 15, 16, chroma_array_type, ca, cb,
+                                cabac,
+                                ctxs,
+                                bt_4x4,
+                                0,
+                                15,
+                                16,
+                                chroma_array_type,
+                                ca,
+                                cb,
                             )?;
                             if plane_is_cr {
                                 curr_cbf.cbf_cr_luma_4x4[blk_idx as usize] = coded;
@@ -4517,7 +4805,14 @@ mod tests {
         let mut totals = [0u8; 16];
         totals[5] = 5; // block 5 of MB 0 had total_coeff = 5
         fill_mb(&mut grid, 0, totals);
-        let nc = derive_nc_luma(&grid, /*mb_addr=*/ 1, /*blk=*/ 0, LumaNcKind::Ac, true, false);
+        let nc = derive_nc_luma(
+            &grid,
+            /*mb_addr=*/ 1,
+            /*blk=*/ 0,
+            LumaNcKind::Ac,
+            true,
+            false,
+        );
         // availableFlagA=1 (nA=5), availableFlagB=0 → nC = nA = 5.
         assert_eq!(nc, 5);
     }
@@ -4533,7 +4828,14 @@ mod tests {
         let mut totals = [0u8; 16];
         totals[10] = 7;
         fill_mb(&mut grid, 0, totals);
-        let nc = derive_nc_luma(&grid, /*mb_addr=*/ 4, /*blk=*/ 0, LumaNcKind::Ac, true, false);
+        let nc = derive_nc_luma(
+            &grid,
+            /*mb_addr=*/ 4,
+            /*blk=*/ 0,
+            LumaNcKind::Ac,
+            true,
+            false,
+        );
         // availableFlagA=0, availableFlagB=1 (nB=7) → nC = 7.
         assert_eq!(nc, 7);
     }
@@ -4552,7 +4854,14 @@ mod tests {
         let mut t1 = [0u8; 16];
         t1[10] = 6;
         fill_mb(&mut grid, 1, t1);
-        let nc = derive_nc_luma(&grid, /*mb_addr=*/ 5, /*blk=*/ 0, LumaNcKind::Ac, true, false);
+        let nc = derive_nc_luma(
+            &grid,
+            /*mb_addr=*/ 5,
+            /*blk=*/ 0,
+            LumaNcKind::Ac,
+            true,
+            false,
+        );
         // (nA + nB + 1) >> 1 = (4 + 6 + 1) >> 1 = 5.
         assert_eq!(nc, 5);
     }
@@ -4609,7 +4918,9 @@ mod tests {
         // mb 0: mark available with chroma totals filled.
         grid.mbs[0].is_available = true;
         grid.mbs[0].cb_total_coeff[2] = 4; // block 2 (above neighbour from MB 4's POV)
-        let nc = derive_nc_chroma_ac(&grid, /*mb_addr=*/ 4, /*blk=*/ 0, /*is_cr=*/ false, 1, true, false);
+        let nc = derive_nc_chroma_ac(
+            &grid, /*mb_addr=*/ 4, /*blk=*/ 0, /*is_cr=*/ false, 1, true, false,
+        );
         // MB 4 = (0, 1). A unavailable (left edge), B = MB 0 block 2 (cb=4).
         assert_eq!(nc, 4);
     }
@@ -4749,12 +5060,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// Populate MB `addr` with uniform mvd_l0 (x, y).
-    fn fill_inter_mvd(
-        grid: &mut CabacNeighbourGrid,
-        addr: u32,
-        mvd_x: i16,
-        mvd_y: i16,
-    ) {
+    fn fill_inter_mvd(grid: &mut CabacNeighbourGrid, addr: u32, mvd_x: i16, mvd_y: i16) {
         let slot = &mut grid.mbs[addr as usize];
         slot.available = true;
         slot.is_intra = false;
@@ -4835,7 +5141,13 @@ mod tests {
         let grid = mk_cabac_grid();
         let curr = CabacMbNeighbourInfo::default();
         let (ca, cb) = cabac_cbf_cond_terms(
-            &grid, 0, &curr, /*current_is_intra=*/ false, BlockType::Luma4x4, 0, false,
+            &grid,
+            0,
+            &curr,
+            /*current_is_intra=*/ false,
+            BlockType::Luma4x4,
+            0,
+            false,
         );
         assert!(!ca);
         assert!(!cb);
@@ -4851,7 +5163,13 @@ mod tests {
             ..Default::default()
         };
         let (ca, cb) = cabac_cbf_cond_terms(
-            &grid, 0, &curr, /*current_is_intra=*/ true, BlockType::Luma4x4, 0, false,
+            &grid,
+            0,
+            &curr,
+            /*current_is_intra=*/ true,
+            BlockType::Luma4x4,
+            0,
+            false,
         );
         assert!(ca);
         assert!(cb);
@@ -4875,9 +5193,7 @@ mod tests {
         // For current MB 5, block 0's neighbour A = MB 4 block at
         // wrapped (xN=-1+16=15, yN=0) → block idx = 5.
         // Neighbour B = MB 1 block at (xN=0, yN=-1+16=15) → idx = 10.
-        let (ca, cb) = cabac_cbf_cond_terms(
-            &grid, 5, &curr, true, BlockType::Luma4x4, 0, false,
-        );
+        let (ca, cb) = cabac_cbf_cond_terms(&grid, 5, &curr, true, BlockType::Luma4x4, 0, false);
         assert!(ca);
         assert!(cb);
         // ctxIdxInc = 1 + 2*1 = 3.
@@ -4899,12 +5215,21 @@ mod tests {
         slot.cbf_cb_dc = true; // numerically non-zero — irrelevant
         let curr = CabacMbNeighbourInfo::default();
         let (ca, _cb) = cabac_cbf_cond_terms(
-            &grid, 5, &curr, /*current_is_intra=*/ true, BlockType::ChromaDc, 0, false,
+            &grid,
+            5,
+            &curr,
+            /*current_is_intra=*/ true,
+            BlockType::ChromaDc,
+            0,
+            false,
         );
         // Spec §9.3.3.1.1.9 cat=3: mbAddrA available, transBlockA not
         // available (CodedBlockPatternChroma == 0), mb_type != I_PCM
         // → condTermA = 0.
-        assert!(!ca, "chroma-CBP=0 neighbour must yield ChromaDC condTermA = 0");
+        assert!(
+            !ca,
+            "chroma-CBP=0 neighbour must yield ChromaDC condTermA = 0"
+        );
     }
 
     #[test]
@@ -4914,10 +5239,11 @@ mod tests {
         grid.mbs[4].available = true;
         grid.mbs[4].is_i_pcm = true;
         grid.mbs[4].is_intra = true; // I_PCM is intra
-        let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
-        let (ca, _cb) = cabac_cbf_cond_terms(
-            &grid, 1, &curr, true, BlockType::Luma4x4, 0, false,
-        );
+        let curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..Default::default()
+        };
+        let (ca, _cb) = cabac_cbf_cond_terms(&grid, 1, &curr, true, BlockType::Luma4x4, 0, false);
         assert!(ca);
     }
 
@@ -4937,14 +5263,25 @@ mod tests {
         slot.is_intra = true;
         slot.coded_block_pattern_luma = 0x3;
         slot.cbf_luma_4x4[13] = true; // deliberately non-zero — irrelevant
-        let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
+        let curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..Default::default()
+        };
         // Blk 8 of MB 5 at (0, 8) — left neighbour maps to MB 4 blk 13.
         let (ca, _cb) = cabac_cbf_cond_terms(
-            &grid, 5, &curr, /*current_is_intra=*/ true,
-            BlockType::Luma4x4, 8, false,
+            &grid,
+            5,
+            &curr,
+            /*current_is_intra=*/ true,
+            BlockType::Luma4x4,
+            8,
+            false,
         );
         // Per spec the condTerm must be 0.
-        assert!(!ca, "spec §9.3.3.1.1.9 says condTermA = 0 when neighbour cbp bit is 0");
+        assert!(
+            !ca,
+            "spec §9.3.3.1.1.9 says condTermA = 0 when neighbour cbp bit is 0"
+        );
     }
 
     /// Same spec rule for cat=4 (ChromaAc): when neighbour
@@ -4958,12 +5295,23 @@ mod tests {
         slot.is_intra = true;
         slot.coded_block_pattern_chroma = 1; // != 2 → transBlockN not available
         slot.cbf_cb_ac[0] = true; // deliberately non-zero — irrelevant
-        let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
+        let curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..Default::default()
+        };
         let (ca, _cb) = cabac_cbf_cond_terms(
-            &grid, 5, &curr, /*current_is_intra=*/ true,
-            BlockType::ChromaAc, 0, false,
+            &grid,
+            5,
+            &curr,
+            /*current_is_intra=*/ true,
+            BlockType::ChromaAc,
+            0,
+            false,
         );
-        assert!(!ca, "spec §9.3.3.1.1.9 cat=4 says condTermA = 0 when neighbour cbp_chroma != 2");
+        assert!(
+            !ca,
+            "spec §9.3.3.1.1.9 cat=4 says condTermA = 0 when neighbour cbp_chroma != 2"
+        );
     }
 
     #[test]
@@ -4973,9 +5321,7 @@ mod tests {
         grid.mbs[4].is_skip = true;
         grid.mbs[4].cbf_luma_4x4 = [true; 16]; // numerically non-zero
         let curr = CabacMbNeighbourInfo::default();
-        let (ca, _cb) = cabac_cbf_cond_terms(
-            &grid, 1, &curr, false, BlockType::Luma4x4, 0, false,
-        );
+        let (ca, _cb) = cabac_cbf_cond_terms(&grid, 1, &curr, false, BlockType::Luma4x4, 0, false);
         assert!(!ca);
     }
 
@@ -4989,8 +5335,13 @@ mod tests {
         curr.cbf_luma_4x4[4] = true;
         curr.cbf_luma_4x4[1] = false;
         let (ca, cb) = cabac_cbf_cond_terms(
-            &grid, 0, &curr, /*current_is_intra=*/ false,
-            BlockType::Luma4x4, 5, false,
+            &grid,
+            0,
+            &curr,
+            /*current_is_intra=*/ false,
+            BlockType::Luma4x4,
+            5,
+            false,
         );
         assert!(ca, "A (internal block 4) has cbf=true");
         assert!(!cb, "B (internal block 1) has cbf=false");
@@ -5045,13 +5396,28 @@ mod tests {
         grid.mbs[0].coded_block_pattern_chroma = 1;
         grid.mbs[0].cbf_cb_dc = true;
         grid.mbs[0].cbf_cr_dc = false;
-        let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
+        let curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..Default::default()
+        };
         // MB 1 = right neighbour of MB 0. A = MB 0, B = unavailable (row 0).
         let (ca_cb, _cb_cb) = cabac_cbf_cond_terms(
-            &grid, 1, &curr, true, BlockType::ChromaDc, 0, /*is_cr=*/false,
+            &grid,
+            1,
+            &curr,
+            true,
+            BlockType::ChromaDc,
+            0,
+            /*is_cr=*/ false,
         );
         let (ca_cr, _cb_cr) = cabac_cbf_cond_terms(
-            &grid, 1, &curr, true, BlockType::ChromaDc, 0, /*is_cr=*/true,
+            &grid,
+            1,
+            &curr,
+            true,
+            BlockType::ChromaDc,
+            0,
+            /*is_cr=*/ true,
         );
         assert!(ca_cb, "Cb DC should see neighbour cbf_cb_dc=true");
         assert!(!ca_cr, "Cr DC should see neighbour cbf_cr_dc=false");
@@ -5073,13 +5439,14 @@ mod tests {
         // goes to left-MB chroma block index 1 (wrap xn=-1+8=7 → idx 1).
         grid.mbs[0].cbf_cb_ac[1] = true;
         grid.mbs[0].cbf_cr_ac[1] = false;
-        let curr = CabacMbNeighbourInfo { is_intra: true, ..Default::default() };
-        let (ca_cb, _cb_cb) = cabac_cbf_cond_terms(
-            &grid, 1, &curr, true, BlockType::ChromaAc, 0, false,
-        );
-        let (ca_cr, _cb_cr) = cabac_cbf_cond_terms(
-            &grid, 1, &curr, true, BlockType::ChromaAc, 0, true,
-        );
+        let curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..Default::default()
+        };
+        let (ca_cb, _cb_cb) =
+            cabac_cbf_cond_terms(&grid, 1, &curr, true, BlockType::ChromaAc, 0, false);
+        let (ca_cr, _cb_cr) =
+            cabac_cbf_cond_terms(&grid, 1, &curr, true, BlockType::ChromaAc, 0, true);
         assert!(ca_cb, "Cb AC should see neighbour cbf_cb_ac=true");
         assert!(!ca_cr, "Cr AC should see neighbour cbf_cr_ac=false");
     }
@@ -5097,12 +5464,10 @@ mod tests {
         curr.cbf_cb_ac[0] = true;
         curr.cbf_cr_ac[0] = false;
         // ChromaAc blk_idx=1 is at (4, 0) → A=(3, 0) internal block 0.
-        let (ca_cb, _cb_cb) = cabac_cbf_cond_terms(
-            &grid, 0, &curr, true, BlockType::ChromaAc, 1, false,
-        );
-        let (ca_cr, _cb_cr) = cabac_cbf_cond_terms(
-            &grid, 0, &curr, true, BlockType::ChromaAc, 1, true,
-        );
+        let (ca_cb, _cb_cb) =
+            cabac_cbf_cond_terms(&grid, 0, &curr, true, BlockType::ChromaAc, 1, false);
+        let (ca_cr, _cb_cr) =
+            cabac_cbf_cond_terms(&grid, 0, &curr, true, BlockType::ChromaAc, 1, true);
         assert!(ca_cb, "Cb AC internal should see cbf_cb_ac[0]=true");
         assert!(!ca_cr, "Cr AC internal should see cbf_cr_ac[0]=false");
     }
@@ -5132,7 +5497,7 @@ mod tests {
         //   (cbp=0 → no mb_qp_delta, no residual)
         let mut w = BitWriter::new();
         w.ue(0); // mb_type = P_L0_16x16
-        // mvd x, y
+                 // mvd x, y
         w.ue(0); // mvd x = 0
         w.ue(0); // mvd y = 0
         w.ue(0); // CBP inter codeNum=0 → 0
@@ -5311,9 +5676,9 @@ mod tests {
     #[test]
     fn table_9_4a_intra_420_422_full_row_audit() {
         let expected: [u8; 48] = [
-            47, 31, 15, 0, 23, 27, 29, 30, 7, 11, 13, 14, 39, 43, 45, 46, 16, 3, 5, 10, 12, 19,
-            21, 26, 28, 35, 37, 42, 44, 1, 2, 4, 8, 17, 18, 20, 24, 6, 9, 22, 25, 32, 33, 34, 36,
-            40, 38, 41,
+            47, 31, 15, 0, 23, 27, 29, 30, 7, 11, 13, 14, 39, 43, 45, 46, 16, 3, 5, 10, 12, 19, 21,
+            26, 28, 35, 37, 42, 44, 1, 2, 4, 8, 17, 18, 20, 24, 6, 9, 22, 25, 32, 33, 34, 36, 40,
+            38, 41,
         ];
         for i in 0..48 {
             assert_eq!(ME_INTRA_420_422[i], expected[i], "row {i}");
@@ -5324,8 +5689,8 @@ mod tests {
     fn table_9_4a_inter_420_422_full_row_audit() {
         let expected: [u8; 48] = [
             0, 16, 1, 2, 4, 8, 32, 3, 5, 10, 12, 15, 47, 7, 11, 13, 14, 6, 9, 31, 35, 37, 42, 44,
-            33, 34, 36, 40, 39, 43, 45, 46, 17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22,
-            25, 38, 41,
+            33, 34, 36, 40, 39, 43, 45, 46, 17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25,
+            38, 41,
         ];
         for i in 0..48 {
             assert_eq!(ME_INTER_420_422[i], expected[i], "row {i}");
@@ -5517,11 +5882,7 @@ mod tests {
     /// Standalone oracle for a single `decode_mvd_lx` invocation against a
     /// fresh CABAC stream + context snapshot — used to compute the bin
     /// count / return value that `parse_mb_pred` MUST reproduce.
-    fn oracle_single_mvd(
-        data: &[u8],
-        slice_kind: SliceKind,
-        comp: MvdComponent,
-    ) -> (i32, u64) {
+    fn oracle_single_mvd(data: &[u8], slice_kind: SliceKind, comp: MvdComponent) -> (i32, u64) {
         let mut dec = CabacDecoder::new(BitReader::new(data)).unwrap();
         let cabac_init_idc = match slice_kind {
             SliceKind::I | SliceKind::SI => None,
@@ -5543,14 +5904,12 @@ mod tests {
         // the result matches the oracle invocation sequence on the same
         // stream with the same gating decisions.
         let data: [u8; 16] = [
-            0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED,
-            0x00, 0xFF, 0x80, 0x01, 0x22, 0x44, 0x88, 0x77,
+            0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED, 0x00, 0xFF, 0x80, 0x01, 0x22, 0x44,
+            0x88, 0x77,
         ];
         let mb_type = MbType::PL016x16;
-        let (pred, bins) =
-            run_cabac_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
-        let (expected, oracle_bins) =
-            oracle_mb_pred_calls(&data, SliceKind::P, &mb_type, 0, 0);
+        let (pred, bins) = run_cabac_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
+        let (expected, oracle_bins) = oracle_mb_pred_calls(&data, SliceKind::P, &mb_type, 0, 0);
         assert_eq!(pred.ref_idx_l0, expected.ref_idx_l0);
         assert_eq!(pred.mvd_l0, expected.mvd_l0);
         assert_eq!(pred.mvd_l1, expected.mvd_l1);
@@ -5570,14 +5929,12 @@ mod tests {
     #[test]
     fn cabac_p_l0_16x16_multi_ref_reads_ref_idx() {
         let data: [u8; 16] = [
-            0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED,
-            0x00, 0xFF, 0x80, 0x01, 0x22, 0x44, 0x88, 0x77,
+            0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED, 0x00, 0xFF, 0x80, 0x01, 0x22, 0x44,
+            0x88, 0x77,
         ];
         let mb_type = MbType::PL016x16;
-        let (pred, bins) =
-            run_cabac_mb_pred(&data, SliceKind::P, &mb_type, 2, 0);
-        let (expected, oracle_bins) =
-            oracle_mb_pred_calls(&data, SliceKind::P, &mb_type, 2, 0);
+        let (pred, bins) = run_cabac_mb_pred(&data, SliceKind::P, &mb_type, 2, 0);
+        let (expected, oracle_bins) = oracle_mb_pred_calls(&data, SliceKind::P, &mb_type, 2, 0);
         assert_eq!(pred.ref_idx_l0, expected.ref_idx_l0);
         assert_eq!(pred.mvd_l0, expected.mvd_l0);
         assert_eq!(bins, oracle_bins);
@@ -5585,8 +5942,7 @@ mod tests {
         // Bin-count regression: this path MUST consume strictly more
         // bins than the single-ref path on the same bitstream — the
         // extra bins are decode_ref_idx_lx's unary prefix.
-        let (_, bins_single_ref) =
-            run_cabac_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
+        let (_, bins_single_ref) = run_cabac_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
         assert!(
             bins > bins_single_ref,
             "multi-ref path must read ref_idx bins (got {bins} vs single-ref {bins_single_ref})",
@@ -5601,16 +5957,14 @@ mod tests {
     #[test]
     fn cabac_b_l0_l1_16x8_per_list_gating() {
         let data: [u8; 16] = [
-            0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED,
-            0x00, 0xFF, 0x80, 0x01, 0x22, 0x44, 0x88, 0x77,
+            0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED, 0x00, 0xFF, 0x80, 0x01, 0x22, 0x44,
+            0x88, 0x77,
         ];
         let mb_type = MbType::BL0L116x8;
         // num_ref_idx_l{0,1}_active_minus1 > 0 → ref_idx is present for
         // each list on its matching partition.
-        let (pred, bins) =
-            run_cabac_mb_pred(&data, SliceKind::B, &mb_type, 2, 2);
-        let (expected, oracle_bins) =
-            oracle_mb_pred_calls(&data, SliceKind::B, &mb_type, 2, 2);
+        let (pred, bins) = run_cabac_mb_pred(&data, SliceKind::B, &mb_type, 2, 2);
+        let (expected, oracle_bins) = oracle_mb_pred_calls(&data, SliceKind::B, &mb_type, 2, 2);
         assert_eq!(pred.ref_idx_l0, expected.ref_idx_l0);
         assert_eq!(pred.ref_idx_l1, expected.ref_idx_l1);
         assert_eq!(pred.mvd_l0, expected.mvd_l0);
@@ -5647,27 +6001,27 @@ mod tests {
         let streams: &[[u8; 16]] = &[
             [0x00; 16],
             [0xFF; 16],
-            [0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED,
-             0x00, 0xFF, 0x80, 0x01, 0x22, 0x44, 0x88, 0x77],
-            [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-             0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF],
+            [
+                0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED, 0x00, 0xFF, 0x80, 0x01, 0x22, 0x44,
+                0x88, 0x77,
+            ],
+            [
+                0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+                0xCD, 0xEF,
+            ],
         ];
         let mb_type = MbType::PL016x16;
         for (i, data) in streams.iter().enumerate() {
-            let (pred, _) =
-                run_cabac_mb_pred(data, SliceKind::P, &mb_type, 0, 0);
+            let (pred, _) = run_cabac_mb_pred(data, SliceKind::P, &mb_type, 0, 0);
             // Oracle: decode_mvd_lx called standalone on the same stream
             // (fresh context, fresh engine) gives the first mvd X
             // exactly; chaining two calls gives (X, Y). parse_mb_pred
             // issues the identical pair for part 0 since ref_idx_l0 is
             // gated out (num_ref_idx_l0_active_minus1 == 0).
             let mut dec = CabacDecoder::new(BitReader::new(data)).unwrap();
-            let mut ctxs =
-                CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
-            let mx = decode_mvd_lx(&mut dec, &mut ctxs, MvdComponent::X, 0)
-                .unwrap();
-            let my = decode_mvd_lx(&mut dec, &mut ctxs, MvdComponent::Y, 0)
-                .unwrap();
+            let mut ctxs = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+            let mx = decode_mvd_lx(&mut dec, &mut ctxs, MvdComponent::X, 0).unwrap();
+            let my = decode_mvd_lx(&mut dec, &mut ctxs, MvdComponent::Y, 0).unwrap();
             assert_eq!(
                 pred.mvd_l0[0],
                 [mx, my],
@@ -5678,8 +6032,7 @@ mod tests {
             // zero stub (the stub case would return [0, 0] on every
             // stream — which we'd detect here because at least one of
             // our streams produces a non-zero mvd).
-            let (single_mx, bins_mx) =
-                oracle_single_mvd(data, SliceKind::P, MvdComponent::X);
+            let (single_mx, bins_mx) = oracle_single_mvd(data, SliceKind::P, MvdComponent::X);
             assert!(
                 bins_mx > 0,
                 "stream #{i}: decode_mvd_lx must consume ≥1 bin",
@@ -5696,8 +6049,7 @@ mod tests {
         // a tautology. Confirm the combined harness is discriminating.
         let mut any_nonzero = false;
         for data in streams {
-            let (pred, _) =
-                run_cabac_mb_pred(data, SliceKind::P, &mb_type, 0, 0);
+            let (pred, _) = run_cabac_mb_pred(data, SliceKind::P, &mb_type, 0, 0);
             if pred.mvd_l0[0][0] != 0 || pred.mvd_l0[0][1] != 0 {
                 any_nonzero = true;
                 break;
@@ -5774,8 +6126,7 @@ mod tests {
         // 4 sub-MB parts).
         let data: [u8; 16] = [0xFF; 16];
         let mb_type = MbType::P8x8;
-        let (_pred, bins) =
-            run_cabac_sub_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
+        let (_pred, bins) = run_cabac_sub_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
         assert!(
             bins >= 4,
             "P-slice sub_mb_type must consume ≥ 4 bins (one per part) — got {bins}",
@@ -5788,22 +6139,19 @@ mod tests {
     #[test]
     fn cabac_sub_mb_type_p_matches_standalone_p_decoder() {
         let data: [u8; 16] = [
-            0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED,
-            0x00, 0xFF, 0x80, 0x01, 0x22, 0x44, 0x88, 0x77,
+            0xA5, 0x5A, 0x3C, 0xC3, 0x81, 0x7E, 0x12, 0xED, 0x00, 0xFF, 0x80, 0x01, 0x22, 0x44,
+            0x88, 0x77,
         ];
         let mb_type = MbType::P8x8;
-        let (pred, _) =
-            run_cabac_sub_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
+        let (pred, _) = run_cabac_sub_mb_pred(&data, SliceKind::P, &mb_type, 0, 0);
 
         // Oracle: invoke decode_sub_mb_type_p four times on a fresh
         // engine over the same data — must yield the same 4 raw values.
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
-        let mut ctxs =
-            CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+        let mut ctxs = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
         let mut expected_raws = [0u32; 4];
         for r in expected_raws.iter_mut() {
-            *r = crate::cabac_ctx::decode_sub_mb_type_p(&mut dec, &mut ctxs)
-                .unwrap();
+            *r = crate::cabac_ctx::decode_sub_mb_type_p(&mut dec, &mut ctxs).unwrap();
         }
         // Map raw to SubMbType via from_p (§7.3.5.2).
         for (i, &raw) in expected_raws.iter().enumerate() {
@@ -5820,12 +6168,11 @@ mod tests {
     #[test]
     fn cabac_sub_mb_type_b_matches_standalone_b_decoder() {
         let data: [u8; 16] = [
-            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+            0xCD, 0xEF,
         ];
         let mb_type = MbType::B8x8;
-        let (pred, bins) =
-            run_cabac_sub_mb_pred(&data, SliceKind::B, &mb_type, 0, 0);
+        let (pred, bins) = run_cabac_sub_mb_pred(&data, SliceKind::B, &mb_type, 0, 0);
         assert!(
             bins >= 4,
             "B-slice sub_mb_type must consume ≥ 4 bins (one per part) — got {bins}",
@@ -5834,12 +6181,10 @@ mod tests {
         // Oracle: invoke decode_sub_mb_type_b four times on a fresh
         // engine over the same data — must yield the same 4 raw values.
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
-        let mut ctxs =
-            CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
+        let mut ctxs = CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
         let mut expected_raws = [0u32; 4];
         for r in expected_raws.iter_mut() {
-            *r = crate::cabac_ctx::decode_sub_mb_type_b(&mut dec, &mut ctxs)
-                .unwrap();
+            *r = crate::cabac_ctx::decode_sub_mb_type_b(&mut dec, &mut ctxs).unwrap();
         }
         for (i, &raw) in expected_raws.iter().enumerate() {
             let expected = SubMbType::from_b(raw).unwrap();
@@ -5857,16 +6202,12 @@ mod tests {
     #[test]
     fn cabac_sub_mb_type_not_stubbed_zero_bins() {
         let data: [u8; 16] = [
-            0x80, 0x00, 0x01, 0xFE, 0x7F, 0x55, 0xAA, 0x33,
-            0xCC, 0x11, 0xEE, 0x00, 0xFF, 0x00, 0xFF, 0x00,
+            0x80, 0x00, 0x01, 0xFE, 0x7F, 0x55, 0xAA, 0x33, 0xCC, 0x11, 0xEE, 0x00, 0xFF, 0x00,
+            0xFF, 0x00,
         ];
-        let (_, p_bins) = run_cabac_sub_mb_pred(
-            &data, SliceKind::P, &MbType::P8x8, 0, 0,
-        );
+        let (_, p_bins) = run_cabac_sub_mb_pred(&data, SliceKind::P, &MbType::P8x8, 0, 0);
         assert!(p_bins > 0, "P sub_mb_type must consume bins (got 0)");
-        let (_, b_bins) = run_cabac_sub_mb_pred(
-            &data, SliceKind::B, &MbType::B8x8, 0, 0,
-        );
+        let (_, b_bins) = run_cabac_sub_mb_pred(&data, SliceKind::B, &MbType::B8x8, 0, 0);
         assert!(b_bins > 0, "B sub_mb_type must consume bins (got 0)");
     }
 
@@ -5911,8 +6252,8 @@ mod tests {
     fn cavlc_intra_16x16_444_all_zero_dc() {
         let mut w = BitWriter::new();
         w.ue(1); // mb_type = 1 → Intra_16x16_0_0_0 (pred=0, cbp_luma=0, cbp_chroma=0)
-        // §7.3.5.1: intra_chroma_pred_mode is only read when
-        // ChromaArrayType == 1 || 2 — NOT for 4:4:4.
+                 // §7.3.5.1: intra_chroma_pred_mode is only read when
+                 // ChromaArrayType == 1 || 2 — NOT for 4:4:4.
         w.se(0); // mb_qp_delta
         w.u(1, 1); // Y DC coeff_token TotalCoeff=0 (nC<2) = "1"
         w.u(1, 1); // Cb DC coeff_token TotalCoeff=0 = "1"
@@ -5963,8 +6304,8 @@ mod tests {
         let mut w = BitWriter::new();
         w.ue(13); // mb_type = 13 → Intra_16x16_0_0_15 (pred=0, cbp_luma=15, cbp_chroma=0)
         w.se(0); // mb_qp_delta
-        // Y: DC + 16 AC. Cb: DC + 16 AC. Cr: DC + 16 AC.
-        // Each block TotalCoeff=0 → coeff_token = "1" (nC<2 column).
+                 // Y: DC + 16 AC. Cb: DC + 16 AC. Cr: DC + 16 AC.
+                 // Each block TotalCoeff=0 → coeff_token = "1" (nC<2 column).
         for _ in 0..(3 * 17) {
             w.u(1, 1);
         }
@@ -6053,13 +6394,13 @@ mod tests {
 
         let mut w = BitWriter::new();
         w.ue(0); // mb_type = P_L0_16x16 (inter, one 16x16 partition)
-        // mb_pred: since num_ref_idx_l0_active_minus1 == 0 and not MBAFF,
-        // no ref_idx_l0 is read. MVD_l0 per component with value 0:
+                 // mb_pred: since num_ref_idx_l0_active_minus1 == 0 and not MBAFF,
+                 // no ref_idx_l0 is read. MVD_l0 per component with value 0:
         w.se(0); // mvd_l0[0][0][0]  (x)
         w.se(0); // mvd_l0[0][0][1]  (y)
         w.ue(0); // coded_block_pattern codeNum=0 → CBP 0 (inter)
-        // cbp_luma == 0 AND cbp_chroma == 0 AND not Intra_16x16 →
-        // mb_qp_delta is NOT read, residual block entirely skipped.
+                 // cbp_luma == 0 AND cbp_chroma == 0 AND not Intra_16x16 →
+                 // mb_qp_delta is NOT read, residual block entirely skipped.
         w.trailing();
         let bytes = w.into_bytes();
 
@@ -6146,10 +6487,9 @@ mod tests {
         let data: [u8; 32] = [
             // CABAC engine state: codIRange=510, codIOffset = first 9 bits.
             // Pad enough for several decode_decision calls.
-            0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
         ];
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
         let mut ctxs = CabacContexts::init(SliceKind::I, None, 26).unwrap();
@@ -6162,17 +6502,9 @@ mod tests {
             cbp_chroma: 0,
         });
         let res = parse_residual_cabac_only(
-            &mut dec,
-            &mut ctxs,
-            /*chroma_array_type=*/ 3,
-            &mb_type,
-            /*cbp_luma=*/ 0,
-            /*cbp_chroma=*/ 0,
-            /*transform_size_8x8_flag=*/ false,
-            &mut out,
-            /*nb_grid=*/ None,
-            /*current_mb_addr=*/ 0,
-            /*current_is_intra=*/ true,
+            &mut dec, &mut ctxs, /*chroma_array_type=*/ 3, &mb_type, /*cbp_luma=*/ 0,
+            /*cbp_chroma=*/ 0, /*transform_size_8x8_flag=*/ false, &mut out,
+            /*nb_grid=*/ None, /*current_mb_addr=*/ 0, /*current_is_intra=*/ true,
         );
         // The 4:4:4 branch must return Ok (possibly with all-zero
         // residual blocks) — NOT UnsupportedChromaArrayType.

@@ -602,22 +602,7 @@ mod tests {
         // Compute just one sample (4x4 block is fine — other pixels depend
         // on zeros around, but we check only the target pixel (0,0) which
         // corresponds to ix=10,iy=10).
-        interpolate_luma(
-            &src,
-            32,
-            32,
-            32,
-            10,
-            10,
-            2,
-            0,
-            4,
-            4,
-            8,
-            &mut [0i32; 16],
-            4,
-        )
-        .unwrap();
+        interpolate_luma(&src, 32, 32, 32, 10, 10, 2, 0, 4, 4, 8, &mut [0i32; 16], 4).unwrap();
         // Recompute for that pixel explicitly:
         let mut dst_one = vec![0i32; 16];
         interpolate_luma(&src, 32, 32, 32, 10, 10, 2, 0, 4, 4, 8, &mut dst_one, 4).unwrap();
@@ -1132,9 +1117,7 @@ mod tests {
         // Luma 4x8 sub-partition -> chroma 2x4 for 4:2:0. Regression.
         let src = make_plane(16, 16, |x, y| x + y);
         let mut dst = vec![0i32; 2 * 4];
-        assert!(
-            interpolate_chroma(&src, 16, 16, 16, 2, 2, 0, 0, 2, 4, 8, &mut dst, 2).is_ok()
-        );
+        assert!(interpolate_chroma(&src, 16, 16, 16, 2, 2, 0, 0, 2, 4, 8, &mut dst, 2).is_ok());
     }
 
     #[test]

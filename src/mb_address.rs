@@ -517,10 +517,7 @@ pub fn mbaff_y_step(mb_field_decoding_flag: bool) -> u32 {
 /// Tables 6-4/6-5 depending on current+neighbour mb_field_decoding_flag
 /// and mbIsTopMbFlag. The pair-level base addresses are all a Phase-2
 /// consumer needs to build a best-effort lookup.
-pub fn mbaff_pair_neighbour_addrs(
-    curr_mb_addr: u32,
-    pic_width_in_mbs: u32,
-) -> [Option<u32>; 4] {
+pub fn mbaff_pair_neighbour_addrs(curr_mb_addr: u32, pic_width_in_mbs: u32) -> [Option<u32>; 4] {
     if pic_width_in_mbs == 0 {
         return [None; 4];
     }

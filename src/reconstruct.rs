@@ -51,10 +51,9 @@ use crate::slice_data::SliceData;
 use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sps::Sps;
 use crate::transform::{
-    inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422,
-    inverse_hadamard_luma_dc_16x16, inverse_transform_4x4, inverse_transform_4x4_dc_preserved,
-    inverse_transform_8x8, qp_y_to_qp_c, select_scaling_list_4x4, select_scaling_list_8x8,
-    TransformError,
+    inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422, inverse_hadamard_luma_dc_16x16,
+    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_y_to_qp_c,
+    select_scaling_list_4x4, select_scaling_list_8x8, TransformError,
 };
 
 use thiserror::Error;
@@ -122,21 +121,77 @@ const LUMA_8X8_XY: [(i32, i32); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
 /// only handles frame pictures.
 const ZIGZAG_8X8: [(usize, usize); 64] = [
     // idx 0..=7.
-    (0, 0), (0, 1), (1, 0), (2, 0), (1, 1), (0, 2), (0, 3), (1, 2),
+    (0, 0),
+    (0, 1),
+    (1, 0),
+    (2, 0),
+    (1, 1),
+    (0, 2),
+    (0, 3),
+    (1, 2),
     // idx 8..=15.
-    (2, 1), (3, 0), (4, 0), (3, 1), (2, 2), (1, 3), (0, 4), (0, 5),
+    (2, 1),
+    (3, 0),
+    (4, 0),
+    (3, 1),
+    (2, 2),
+    (1, 3),
+    (0, 4),
+    (0, 5),
     // idx 16..=23.
-    (1, 4), (2, 3), (3, 2), (4, 1), (5, 0), (6, 0), (5, 1), (4, 2),
+    (1, 4),
+    (2, 3),
+    (3, 2),
+    (4, 1),
+    (5, 0),
+    (6, 0),
+    (5, 1),
+    (4, 2),
     // idx 24..=31.
-    (3, 3), (2, 4), (1, 5), (0, 6), (0, 7), (1, 6), (2, 5), (3, 4),
+    (3, 3),
+    (2, 4),
+    (1, 5),
+    (0, 6),
+    (0, 7),
+    (1, 6),
+    (2, 5),
+    (3, 4),
     // idx 32..=39.
-    (4, 3), (5, 2), (6, 1), (7, 0), (7, 1), (6, 2), (5, 3), (4, 4),
+    (4, 3),
+    (5, 2),
+    (6, 1),
+    (7, 0),
+    (7, 1),
+    (6, 2),
+    (5, 3),
+    (4, 4),
     // idx 40..=47.
-    (3, 5), (2, 6), (1, 7), (2, 7), (3, 6), (4, 5), (5, 4), (6, 3),
+    (3, 5),
+    (2, 6),
+    (1, 7),
+    (2, 7),
+    (3, 6),
+    (4, 5),
+    (5, 4),
+    (6, 3),
     // idx 48..=55.
-    (7, 2), (7, 3), (6, 4), (5, 5), (4, 6), (3, 7), (4, 7), (5, 6),
+    (7, 2),
+    (7, 3),
+    (6, 4),
+    (5, 5),
+    (4, 6),
+    (3, 7),
+    (4, 7),
+    (5, 6),
     // idx 56..=63.
-    (6, 5), (7, 4), (7, 5), (6, 6), (5, 7), (6, 7), (7, 6), (7, 7),
+    (6, 5),
+    (7, 4),
+    (7, 5),
+    (6, 6),
+    (5, 7),
+    (6, 7),
+    (7, 6),
+    (7, 7),
 ];
 
 /// §8.5.7 — invert the 8x8 zig-zag scan (frame-macroblock case of
@@ -181,8 +236,11 @@ fn mb_sample_origin(
     mb_field_decoding_flag: bool,
 ) -> (i32, i32) {
     if mbaff_frame_flag {
-        let (x, y) =
-            crate::mb_address::mbaff_mb_to_sample_xy(mb_addr, grid.width_in_mbs, mb_field_decoding_flag);
+        let (x, y) = crate::mb_address::mbaff_mb_to_sample_xy(
+            mb_addr,
+            grid.width_in_mbs,
+            mb_field_decoding_flag,
+        );
         (x as i32, y as i32)
     } else {
         let (mb_x, mb_y) = grid.mb_xy(mb_addr);
@@ -575,7 +633,13 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
     // after every slice has contributed to the shared Picture + MbGrid.
     // Single-slice callers should use `reconstruct_slice` instead, which
     // wraps this helper and invokes the deblocker.
-    let _ = (deblock_enabled, alpha_off, beta_off, bit_depth_y, bit_depth_c);
+    let _ = (
+        deblock_enabled,
+        alpha_off,
+        beta_off,
+        bit_depth_y,
+        bit_depth_c,
+    );
     Ok(())
 }
 
@@ -643,8 +707,7 @@ fn reconstruct_mb_intra(
 ) -> Result<(), ReconstructError> {
     // §6.4.1 — MB sample origin (non-MBAFF eqs. 6-3/6-4 or MBAFF eqs.
     // 6-5..6-10 depending on `mb_field_decoding_flag`).
-    let (mb_px, mb_py) =
-        mb_sample_origin(grid, mb_addr, mbaff_frame_flag, mb_field_decoding_flag);
+    let (mb_px, mb_py) = mb_sample_origin(grid, mb_addr, mbaff_frame_flag, mb_field_decoding_flag);
     let writer = MbWriter::new(
         grid,
         mb_addr,
@@ -711,7 +774,17 @@ fn reconstruct_mb_intra(
         }
         MbType::INxN => {
             reconstruct_intra_nxn(
-                mb, qp_y, bit_depth_y, mb_px, mb_py, mb_addr, &writer, sps, pps, pic, grid,
+                mb,
+                qp_y,
+                bit_depth_y,
+                mb_px,
+                mb_py,
+                mb_addr,
+                &writer,
+                sps,
+                pps,
+                pic,
+                grid,
                 current_slice_id,
             )?;
             reconstruct_chroma_intra(
@@ -1009,7 +1082,9 @@ fn intra_mxm_pred_mode_for_neighbour_4x4(
     let Some((addr, blk)) = neighbour else {
         return 2;
     };
-    let Some(info) = intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred, current_slice_id) else {
+    let Some(info) =
+        intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred, current_slice_id)
+    else {
         return 2;
     };
     if mb_is_intra_4x4(info) {
@@ -1046,7 +1121,9 @@ fn intra_mxm_pred_mode_for_neighbour_8x8(
     let Some((addr, blk)) = neighbour else {
         return 2;
     };
-    let Some(info) = intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred, current_slice_id) else {
+    let Some(info) =
+        intra_neighbour_mb_info(grid, Some(addr), constrained_intra_pred, current_slice_id)
+    else {
         return 2;
     };
     if mb_is_intra_8x8(info) {
@@ -1080,15 +1157,35 @@ fn derive_intra_4x4_pred_mode(
     let nb = neighbour_4x4_addr(grid, mb_addr, bx, by, 0, -1);
 
     // §8.3.1.1 step 2.
-    let mb_a = intra_neighbour_mb_info(grid, na.map(|(a, _)| a), constrained_intra_pred, current_slice_id);
-    let mb_b = intra_neighbour_mb_info(grid, nb.map(|(a, _)| a), constrained_intra_pred, current_slice_id);
+    let mb_a = intra_neighbour_mb_info(
+        grid,
+        na.map(|(a, _)| a),
+        constrained_intra_pred,
+        current_slice_id,
+    );
+    let mb_b = intra_neighbour_mb_info(
+        grid,
+        nb.map(|(a, _)| a),
+        constrained_intra_pred,
+        current_slice_id,
+    );
     let dc_pred_flag = mb_a.is_none() || mb_b.is_none();
 
     // §8.3.1.1 step 3.
-    let mode_a =
-        intra_mxm_pred_mode_for_neighbour_4x4(grid, dc_pred_flag, na, constrained_intra_pred, current_slice_id);
-    let mode_b =
-        intra_mxm_pred_mode_for_neighbour_4x4(grid, dc_pred_flag, nb, constrained_intra_pred, current_slice_id);
+    let mode_a = intra_mxm_pred_mode_for_neighbour_4x4(
+        grid,
+        dc_pred_flag,
+        na,
+        constrained_intra_pred,
+        current_slice_id,
+    );
+    let mode_b = intra_mxm_pred_mode_for_neighbour_4x4(
+        grid,
+        dc_pred_flag,
+        nb,
+        constrained_intra_pred,
+        current_slice_id,
+    );
 
     // §8.3.1.1 step 4, eq. 8-41.
     let predicted = mode_a.min(mode_b);
@@ -1121,15 +1218,37 @@ fn derive_intra_8x8_pred_mode(
     let na = neighbour_8x8_addr(grid, mb_addr, blk8, -1, 0);
     let nb = neighbour_8x8_addr(grid, mb_addr, blk8, 0, -1);
 
-    let mb_a = intra_neighbour_mb_info(grid, na.map(|(a, _)| a), constrained_intra_pred, current_slice_id);
-    let mb_b = intra_neighbour_mb_info(grid, nb.map(|(a, _)| a), constrained_intra_pred, current_slice_id);
+    let mb_a = intra_neighbour_mb_info(
+        grid,
+        na.map(|(a, _)| a),
+        constrained_intra_pred,
+        current_slice_id,
+    );
+    let mb_b = intra_neighbour_mb_info(
+        grid,
+        nb.map(|(a, _)| a),
+        constrained_intra_pred,
+        current_slice_id,
+    );
     let dc_pred_flag = mb_a.is_none() || mb_b.is_none();
 
     // Non-MBAFF frame path of §8.3.2.1 eq. 8-72: n = 1 for A, n = 2 for B.
-    let mode_a =
-        intra_mxm_pred_mode_for_neighbour_8x8(grid, dc_pred_flag, na, constrained_intra_pred, 1, current_slice_id);
-    let mode_b =
-        intra_mxm_pred_mode_for_neighbour_8x8(grid, dc_pred_flag, nb, constrained_intra_pred, 2, current_slice_id);
+    let mode_a = intra_mxm_pred_mode_for_neighbour_8x8(
+        grid,
+        dc_pred_flag,
+        na,
+        constrained_intra_pred,
+        1,
+        current_slice_id,
+    );
+    let mode_b = intra_mxm_pred_mode_for_neighbour_8x8(
+        grid,
+        dc_pred_flag,
+        nb,
+        constrained_intra_pred,
+        2,
+        current_slice_id,
+    );
 
     // §8.3.2.1 step 4, eq. 8-73.
     let predicted = mode_a.min(mode_b);
@@ -1200,7 +1319,8 @@ fn reconstruct_intra_nxn(
         for blk8 in 0..4usize {
             let (bx, by) = LUMA_8X8_XY[blk8];
             // §8.3.2.1 — derive Intra_8x8 prediction mode per eq. 8-73.
-            let mode_idx = derive_intra_8x8_pred_mode(grid, mb_addr, blk8, pred, cip, current_slice_id);
+            let mode_idx =
+                derive_intra_8x8_pred_mode(grid, mb_addr, blk8, pred, cip, current_slice_id);
             let mode = Intra8x8Mode::from_index(mode_idx).unwrap_or(Intra8x8Mode::Dc);
 
             // Gather neighbour samples for this 8x8 block.
@@ -1245,8 +1365,7 @@ fn reconstruct_intra_nxn(
                     // `blk8` to the array index by counting set bits
                     // below it in `cbp_luma` (§7.3.5.3 CAVLC / CABAC
                     // both push sequentially).
-                    let set_before =
-                        (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                    let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
                     let base_slot = set_before * 4;
                     let mut scan = [0i32; 64];
                     for sub in 0..4usize {
@@ -1320,7 +1439,8 @@ fn reconstruct_intra_nxn(
         for block_idx in 0..16usize {
             let (bx, by) = LUMA_4X4_XY[block_idx];
             // §8.3.1.1 — derive Intra_4x4 prediction mode per eq. 8-41.
-            let mode_idx = derive_intra_4x4_pred_mode(grid, mb_addr, block_idx, pred, cip, current_slice_id);
+            let mode_idx =
+                derive_intra_4x4_pred_mode(grid, mb_addr, block_idx, pred, cip, current_slice_id);
             let mode = Intra4x4Mode::from_index(mode_idx).unwrap_or(Intra4x4Mode::Dc);
 
             // Gather neighbour samples for this 4x4 block.
@@ -1809,12 +1929,7 @@ fn same_slice_at(grid: &MbGrid, x: i32, y: i32, current_slice_id: i32) -> bool {
 /// applies. Returns `true` in all other cases — including out-of-picture
 /// coordinates and unstamped grid entries, leaving the caller's other
 /// availability checks as the source of truth.
-fn cip_ok_at(
-    grid: &MbGrid,
-    x: i32,
-    y: i32,
-    constrained_intra_pred: bool,
-) -> bool {
+fn cip_ok_at(grid: &MbGrid, x: i32, y: i32, constrained_intra_pred: bool) -> bool {
     if !constrained_intra_pred {
         return true;
     }
@@ -1933,14 +2048,34 @@ fn gather_samples_chroma(
     let to_ly = |cy: i32| cy * sub_height_c;
     let left_avail = c_mb_px > 0
         && same_slice_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py), current_slice_id)
-        && cip_ok_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py), constrained_intra_pred);
+        && cip_ok_at(
+            grid,
+            to_lx(c_mb_px - 1),
+            to_ly(c_mb_py),
+            constrained_intra_pred,
+        );
     let top_avail = c_mb_py > 0
         && same_slice_at(grid, to_lx(c_mb_px), to_ly(c_mb_py - 1), current_slice_id)
-        && cip_ok_at(grid, to_lx(c_mb_px), to_ly(c_mb_py - 1), constrained_intra_pred);
+        && cip_ok_at(
+            grid,
+            to_lx(c_mb_px),
+            to_ly(c_mb_py - 1),
+            constrained_intra_pred,
+        );
     let tl_avail = c_mb_px > 0
         && c_mb_py > 0
-        && same_slice_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py - 1), current_slice_id)
-        && cip_ok_at(grid, to_lx(c_mb_px - 1), to_ly(c_mb_py - 1), constrained_intra_pred);
+        && same_slice_at(
+            grid,
+            to_lx(c_mb_px - 1),
+            to_ly(c_mb_py - 1),
+            current_slice_id,
+        )
+        && cip_ok_at(
+            grid,
+            to_lx(c_mb_px - 1),
+            to_ly(c_mb_py - 1),
+            constrained_intra_pred,
+        );
 
     let fetch = |x: i32, y: i32| -> i32 {
         if plane == 0 {
@@ -2133,8 +2268,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     current_slice_id: i32,
 ) -> Result<(), ReconstructError> {
     // §6.4.1 — MB sample origin (MBAFF-aware).
-    let (mb_px, mb_py) =
-        mb_sample_origin(grid, mb_addr, mbaff_frame_flag, mb_field_decoding_flag);
+    let (mb_px, mb_py) = mb_sample_origin(grid, mb_addr, mbaff_frame_flag, mb_field_decoding_flag);
     // §6.4.1 eq. (6-10) — MBAFF field-MB y-stride writer.
     let writer = MbWriter::new(
         grid,
@@ -2147,8 +2281,16 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     );
 
     // -------- Derive inter partitions --------------------------------
-    let partitions =
-        derive_inter_partitions(mb, slice_header, sps, ref_pics, pic, mb_addr, grid, current_slice_id)?;
+    let partitions = derive_inter_partitions(
+        mb,
+        slice_header,
+        sps,
+        ref_pics,
+        pic,
+        mb_addr,
+        grid,
+        current_slice_id,
+    )?;
 
     // Test-only OXIDEAV_H264_RECON_DEBUG / OXIDEAV_H264_RECON_DEBUG_MB
     // instrumentation — prints per-MB + per-partition inter reconstruct
@@ -2175,8 +2317,17 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             eprintln!(
                 "  part[{}] x={} y={} w={} h={} mode={:?} shape={:?} \
                  ref_l0={} ref_l1={} mvd_l0={:?} mvd_l1={:?}",
-                i, p.x, p.y, p.w, p.h, p.mode, p.shape, p.ref_idx_l0, p.ref_idx_l1,
-                p.mvd_l0, p.mvd_l1,
+                i,
+                p.x,
+                p.y,
+                p.w,
+                p.h,
+                p.mode,
+                p.shape,
+                p.ref_idx_l0,
+                p.ref_idx_l1,
+                p.mvd_l0,
+                p.mvd_l1,
             );
         }
     }
@@ -2245,8 +2396,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
                 // `residual_luma` is compacted by the parser —
                 // quadrants with cbp_luma bit cleared are skipped, so
                 // index by set-bits-below-blk8 (see Intra_NxN path).
-                let set_before =
-                    (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
                 let base_slot = set_before * 4;
                 let mut scan = [0i32; 64];
                 for sub in 0..4usize {
@@ -2286,8 +2436,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
                 // pushes 4 entries per cbp_luma bit that is set in
                 // low-bit-first order, so the array index is (number
                 // of set bits below blk8) * 4 + (blk4 % 4), not blk4.
-                let set_before =
-                    (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
                 let compact_idx = set_before * 4 + (blk4 % 4);
                 mb.residual_luma
                     .get(compact_idx)
@@ -2466,12 +2615,7 @@ fn clip3_i32(x: i32, y: i32, z: i32) -> i32 {
 /// entry is irrelevant; we return a benign default. When the per-entry
 /// flag was 0 (stored as `None`), the inferred values are
 /// `weight = 2^log2_wd, offset = 0`.
-fn luma_weight_entry(
-    pwt: &PredWeightTable,
-    list: u8,
-    ref_idx: i8,
-    log2_wd: u32,
-) -> WeightedEntry {
+fn luma_weight_entry(pwt: &PredWeightTable, list: u8, ref_idx: i8, log2_wd: u32) -> WeightedEntry {
     if ref_idx < 0 {
         return WeightedEntry::default();
     }
@@ -2559,7 +2703,10 @@ fn process_partition<R: RefPicProvider>(
             "    derived mv_l0={:?} mv_l1={:?} for part@({},{} {}x{})",
             (mv_l0.x, mv_l0.y),
             (mv_l1.x, mv_l1.y),
-            part.x, part.y, part.w, part.h
+            part.x,
+            part.y,
+            part.w,
+            part.h
         );
     }
 
@@ -2729,34 +2876,35 @@ fn process_partition<R: RefPicProvider>(
     // implicit mode is active. The current picture's POC is in
     // `pic.pic_order_cnt`; the two ref pictures' POCs are in their
     // respective `Picture.pic_order_cnt` fields.
-    let implicit_weights = if use_implicit_bipred {
-        let curr_poc = pic.pic_order_cnt;
-        // has_l0 && has_l1 guaranteed by bi_mode == Bipred above.
-        let rp0 = ref_pics
-            .ref_pic(0, part.ref_idx_l0 as u32)
-            .ok_or(ReconstructError::MissingRefPic {
-                list: 0,
-                idx: part.ref_idx_l0 as u32,
-            })?;
-        let rp1 = ref_pics
-            .ref_pic(1, part.ref_idx_l1 as u32)
-            .ok_or(ReconstructError::MissingRefPic {
-                list: 1,
-                idx: part.ref_idx_l1 as u32,
-            })?;
-        // TODO(§8.2.5): RefPicProvider doesn't expose long-term
-        // marking. Assume both refs are short-term — conforming for
-        // the common case where bipred uses short-term refs.
-        let long_term_either = false;
-        Some(implicit_bipred_weights(
-            curr_poc,
-            rp0.pic_order_cnt,
-            rp1.pic_order_cnt,
-            long_term_either,
-        ))
-    } else {
-        None
-    };
+    let implicit_weights =
+        if use_implicit_bipred {
+            let curr_poc = pic.pic_order_cnt;
+            // has_l0 && has_l1 guaranteed by bi_mode == Bipred above.
+            let rp0 = ref_pics.ref_pic(0, part.ref_idx_l0 as u32).ok_or(
+                ReconstructError::MissingRefPic {
+                    list: 0,
+                    idx: part.ref_idx_l0 as u32,
+                },
+            )?;
+            let rp1 = ref_pics.ref_pic(1, part.ref_idx_l1 as u32).ok_or(
+                ReconstructError::MissingRefPic {
+                    list: 1,
+                    idx: part.ref_idx_l1 as u32,
+                },
+            )?;
+            // TODO(§8.2.5): RefPicProvider doesn't expose long-term
+            // marking. Assume both refs are short-term — conforming for
+            // the common case where bipred uses short-term refs.
+            let long_term_either = false;
+            Some(implicit_bipred_weights(
+                curr_poc,
+                rp0.pic_order_cnt,
+                rp1.pic_order_cnt,
+                long_term_either,
+            ))
+        } else {
+            None
+        };
 
     for py in 0..h as usize {
         for px in 0..w as usize {
@@ -3291,29 +3439,26 @@ fn derive_partition_mvs(
             // apply to them. Prior to fixing this, a P_L0_16x16 whose
             // left neighbour was a P_Skip / zero-MV MB would have its
             // MVpred wrongly forced to zero. `is_skip` disambiguates.
-            let mvp_l0 = if part.is_skip
-                && part.mode == PartMode::L0Only
-                && part.w == 16
-                && part.h == 16
-            {
-                // P_Skip path (§8.4.1.2), with §8.4.1.3.2 C→D substitution.
-                let (_, mv) =
-                    derive_p_skip_mv_with_d(neigh_a_l0, neigh_b_l0, neigh_c_l0, neigh_d_l0);
-                mv
-            } else if part.mode != PartMode::L1Only && part.ref_idx_l0 >= 0 {
-                derive_mvpred_with_d(
-                    &MvpredInputs {
-                        neighbour_a: neigh_a_l0,
-                        neighbour_b: neigh_b_l0,
-                        neighbour_c: neigh_c_l0,
-                        current_ref_idx: part.ref_idx_l0 as i32,
-                        shape: part.shape,
-                    },
-                    neigh_d_l0,
-                )
-            } else {
-                Mv::ZERO
-            };
+            let mvp_l0 =
+                if part.is_skip && part.mode == PartMode::L0Only && part.w == 16 && part.h == 16 {
+                    // P_Skip path (§8.4.1.2), with §8.4.1.3.2 C→D substitution.
+                    let (_, mv) =
+                        derive_p_skip_mv_with_d(neigh_a_l0, neigh_b_l0, neigh_c_l0, neigh_d_l0);
+                    mv
+                } else if part.mode != PartMode::L1Only && part.ref_idx_l0 >= 0 {
+                    derive_mvpred_with_d(
+                        &MvpredInputs {
+                            neighbour_a: neigh_a_l0,
+                            neighbour_b: neigh_b_l0,
+                            neighbour_c: neigh_c_l0,
+                            current_ref_idx: part.ref_idx_l0 as i32,
+                            shape: part.shape,
+                        },
+                        neigh_d_l0,
+                    )
+                } else {
+                    Mv::ZERO
+                };
             let mvp_l1 = if part.mode != PartMode::L0Only && part.ref_idx_l1 >= 0 {
                 derive_mvpred_with_d(
                     &MvpredInputs {
@@ -3377,21 +3522,53 @@ fn neighbour_mvs_for_list(
 
     // A = (px-1, py) — left.
     let a = neighbour_from_block(
-        grid, mb_addr, mb_xx, mb_yy, width, px - 1, py, list, current_slice_id,
+        grid,
+        mb_addr,
+        mb_xx,
+        mb_yy,
+        width,
+        px - 1,
+        py,
+        list,
+        current_slice_id,
     );
     // B = (px, py-1) — above.
     let b = neighbour_from_block(
-        grid, mb_addr, mb_xx, mb_yy, width, px, py - 1, list, current_slice_id,
+        grid,
+        mb_addr,
+        mb_xx,
+        mb_yy,
+        width,
+        px,
+        py - 1,
+        list,
+        current_slice_id,
     );
     // C = (px + w/4, py - 1) — above-right of the partition.
     let c_off_x = part.w as i32 / 4;
     let c = neighbour_from_block(
-        grid, mb_addr, mb_xx, mb_yy, width, px + c_off_x, py - 1, list, current_slice_id,
+        grid,
+        mb_addr,
+        mb_xx,
+        mb_yy,
+        width,
+        px + c_off_x,
+        py - 1,
+        list,
+        current_slice_id,
     );
     // D = (px - 1, py - 1) — above-left (used for §8.4.1.3.2 C→D
     // substitution). Only consulted when C is unavailable.
     let d = neighbour_from_block(
-        grid, mb_addr, mb_xx, mb_yy, width, px - 1, py - 1, list, current_slice_id,
+        grid,
+        mb_addr,
+        mb_xx,
+        mb_yy,
+        width,
+        px - 1,
+        py - 1,
+        list,
+        current_slice_id,
     );
     (a, b, c, d)
 }
@@ -3714,11 +3891,7 @@ fn derive_inter_partitions<R: RefPicProvider>(
             let is_skip = matches!(mb.mb_type, BSkip);
             if !slice_header.direct_spatial_mv_pred_flag {
                 Ok(build_temporal_direct_partitions(
-                    sps,
-                    ref_pics,
-                    pic,
-                    mb_addr,
-                    is_skip,
+                    sps, ref_pics, pic, mb_addr, is_skip,
                 ))
             } else {
                 Ok(build_spatial_direct_partitions(
@@ -3959,8 +4132,8 @@ fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
     // use L1; else (intra) mvCol = 0, refIdxCol = -1.
     let l0 = col_pic.colocated_l0(mb_addr, col_blk4);
     let l1 = col_pic.colocated_l1(mb_addr, col_blk4);
-    let is_intra = l0.as_ref().map(|t| t.2).unwrap_or(false)
-        || l1.as_ref().map(|t| t.2).unwrap_or(false);
+    let is_intra =
+        l0.as_ref().map(|t| t.2).unwrap_or(false) || l1.as_ref().map(|t| t.2).unwrap_or(false);
 
     // Extract (mvCol, refIdxCol, which_list) — "which_list" is the
     // colocated picture's list index (0 or 1) the MV came from,
@@ -4278,14 +4451,8 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
         c_l1
     };
 
-    let ref_l0_minp = min_positive(
-        a_l0.ref_idx,
-        min_positive(b_l0.ref_idx, c_l0_eff.ref_idx),
-    );
-    let ref_l1_minp = min_positive(
-        a_l1.ref_idx,
-        min_positive(b_l1.ref_idx, c_l1_eff.ref_idx),
-    );
+    let ref_l0_minp = min_positive(a_l0.ref_idx, min_positive(b_l0.ref_idx, c_l0_eff.ref_idx));
+    let ref_l1_minp = min_positive(a_l1.ref_idx, min_positive(b_l1.ref_idx, c_l1_eff.ref_idx));
 
     // §8.4.1.2.2 step 5 — directZeroPredictionFlag = both refs < 0.
     let direct_zero_both = ref_l0_minp < 0 && ref_l1_minp < 0;
@@ -4424,8 +4591,8 @@ fn is_colocated_zero_mv(col_pic: &Picture, mb_addr: u32, col_blk4: usize) -> boo
     let l1 = col_pic.colocated_l1(mb_addr, col_blk4);
 
     // Intra colocated: mvCol = 0, refIdxCol = -1 ⇒ colZeroFlag = 0.
-    let is_intra = l0.as_ref().map(|t| t.2).unwrap_or(false)
-        || l1.as_ref().map(|t| t.2).unwrap_or(false);
+    let is_intra =
+        l0.as_ref().map(|t| t.2).unwrap_or(false) || l1.as_ref().map(|t| t.2).unwrap_or(false);
     if is_intra {
         return false;
     }
@@ -4884,7 +5051,7 @@ fn pixel_to_mb_addr(
     }
     let pair_top_addr = (pair_row as u32 * 2) * grid.width_in_mbs + mb_x as u32;
     let bot_addr = pair_top_addr + grid.width_in_mbs; // bottom MB of the pair
-    // Inspect the top MB's mb_field_decoding_flag (shared within a pair).
+                                                      // Inspect the top MB's mb_field_decoding_flag (shared within a pair).
     let pair_field = mb_field_flags
         .get(pair_top_addr as usize)
         .copied()
@@ -4953,10 +5120,26 @@ fn different_ref_or_mv_luma(
     // snapshot would introduce (CABAST3_Sony_E: slice 1 = P, slice 2 = B
     // with distinct lists).
     let poc_sentinel: i32 = i32::MIN;
-    let p_pic0 = if p_has_l0 { p_info.ref_poc_l0[p_blk8] } else { poc_sentinel };
-    let q_pic0 = if q_has_l0 { q_info.ref_poc_l0[q_blk8] } else { poc_sentinel };
-    let p_pic1 = if p_has_l1 { p_info.ref_poc_l1[p_blk8] } else { poc_sentinel };
-    let q_pic1 = if q_has_l1 { q_info.ref_poc_l1[q_blk8] } else { poc_sentinel };
+    let p_pic0 = if p_has_l0 {
+        p_info.ref_poc_l0[p_blk8]
+    } else {
+        poc_sentinel
+    };
+    let q_pic0 = if q_has_l0 {
+        q_info.ref_poc_l0[q_blk8]
+    } else {
+        poc_sentinel
+    };
+    let p_pic1 = if p_has_l1 {
+        p_info.ref_poc_l1[p_blk8]
+    } else {
+        poc_sentinel
+    };
+    let q_pic1 = if q_has_l1 {
+        q_info.ref_poc_l1[q_blk8]
+    } else {
+        poc_sentinel
+    };
 
     // "Number of motion vectors" per §8.7.2.1 NOTE 2 is
     // PredFlagL0[part] + PredFlagL1[part]. Two edges with the same
@@ -5004,10 +5187,8 @@ fn different_ref_or_mv_luma(
             return true;
         }
 
-        let straight_mv_ok =
-            mv_delta_below_4(p_mv0, q_mv0) && mv_delta_below_4(p_mv1, q_mv1);
-        let swapped_mv_ok =
-            mv_delta_below_4(p_mv0, q_mv1) && mv_delta_below_4(p_mv1, q_mv0);
+        let straight_mv_ok = mv_delta_below_4(p_mv0, q_mv0) && mv_delta_below_4(p_mv1, q_mv1);
+        let swapped_mv_ok = mv_delta_below_4(p_mv0, q_mv1) && mv_delta_below_4(p_mv1, q_mv0);
 
         // If L0[p] and L1[p] refer to distinct pictures (and same for
         // q), the spec's "two motion vectors and two different ref
@@ -5046,8 +5227,16 @@ fn different_ref_or_mv_luma(
         // NOTE 1 of §8.7.2.1: the reference picture is determined by
         // actual picture identity (POC), without regard to list or list
         // index.
-        let (p_pic, p_mv) = if p_has_l0 { (p_pic0, p_mv0) } else { (p_pic1, p_mv1) };
-        let (q_pic, q_mv) = if q_has_l0 { (q_pic0, q_mv0) } else { (q_pic1, q_mv1) };
+        let (p_pic, p_mv) = if p_has_l0 {
+            (p_pic0, p_mv0)
+        } else {
+            (p_pic1, p_mv1)
+        };
+        let (q_pic, q_mv) = if q_has_l0 {
+            (q_pic0, q_mv0)
+        } else {
+            (q_pic1, q_mv1)
+        };
         if p_pic != q_pic {
             return true;
         }
@@ -5122,13 +5311,21 @@ fn deblock_plane_luma(
                         break;
                     }
                     let p_addr = match pixel_to_mb_addr(
-                        grid, edge_x - 1, y0, mbaff_frame_flag, mb_field_flags,
+                        grid,
+                        edge_x - 1,
+                        y0,
+                        mbaff_frame_flag,
+                        mb_field_flags,
                     ) {
                         Some(a) => a,
                         None => continue,
                     };
                     let q_addr = match pixel_to_mb_addr(
-                        grid, edge_x, y0, mbaff_frame_flag, mb_field_flags,
+                        grid,
+                        edge_x,
+                        y0,
+                        mbaff_frame_flag,
+                        mb_field_flags,
                     ) {
                         Some(a) => a,
                         None => continue,
@@ -5162,12 +5359,7 @@ fn deblock_plane_luma(
                     let diff_ref_mv = !p_info.is_intra
                         && !q_info.is_intra
                         && different_ref_or_mv_luma(
-                            p_info,
-                            q_info,
-                            p_in_mb_x,
-                            p_in_mb_y,
-                            q_in_mb_x,
-                            q_in_mb_y,
+                            p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
                         );
                     // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
                     // Consult the per-block mask set at reconstruct-time.
@@ -5217,13 +5409,21 @@ fn deblock_plane_luma(
                         break;
                     }
                     let p_addr = match pixel_to_mb_addr(
-                        grid, x0, edge_y - 1, mbaff_frame_flag, mb_field_flags,
+                        grid,
+                        x0,
+                        edge_y - 1,
+                        mbaff_frame_flag,
+                        mb_field_flags,
                     ) {
                         Some(a) => a,
                         None => continue,
                     };
                     let q_addr = match pixel_to_mb_addr(
-                        grid, x0, edge_y, mbaff_frame_flag, mb_field_flags,
+                        grid,
+                        x0,
+                        edge_y,
+                        mbaff_frame_flag,
+                        mb_field_flags,
                     ) {
                         Some(a) => a,
                         None => continue,
@@ -5251,12 +5451,7 @@ fn deblock_plane_luma(
                     let diff_ref_mv = !p_info.is_intra
                         && !q_info.is_intra
                         && different_ref_or_mv_luma(
-                            p_info,
-                            q_info,
-                            p_in_mb_x,
-                            p_in_mb_y,
-                            q_in_mb_x,
-                            q_in_mb_y,
+                            p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
                         );
                     // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
                     let p_blk4_z =
@@ -5375,13 +5570,21 @@ fn deblock_plane_chroma(
                             let lq_x = edge_x * sub_w;
                             let ly = y0 * sub_h;
                             let p_addr = match pixel_to_mb_addr(
-                                grid, lp_x, ly, mbaff_frame_flag, mb_field_flags,
+                                grid,
+                                lp_x,
+                                ly,
+                                mbaff_frame_flag,
+                                mb_field_flags,
                             ) {
                                 Some(a) => a,
                                 None => continue,
                             };
                             let q_addr = match pixel_to_mb_addr(
-                                grid, lq_x, ly, mbaff_frame_flag, mb_field_flags,
+                                grid,
+                                lq_x,
+                                ly,
+                                mbaff_frame_flag,
+                                mb_field_flags,
                             ) {
                                 Some(a) => a,
                                 None => continue,
@@ -5402,12 +5605,7 @@ fn deblock_plane_chroma(
                             let diff_ref_mv = !p_info.is_intra
                                 && !q_info.is_intra
                                 && different_ref_or_mv_luma(
-                                    p_info,
-                                    q_info,
-                                    p_in_mb_x,
-                                    p_in_mb_y,
-                                    q_in_mb_x,
-                                    q_in_mb_y,
+                                    p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
                                 );
                             let p_blk4_z =
                                 blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
@@ -5479,13 +5677,21 @@ fn deblock_plane_chroma(
                             let lp_y = (edge_y - 1) * sub_h;
                             let lq_y = edge_y * sub_h;
                             let p_addr = match pixel_to_mb_addr(
-                                grid, lx, lp_y, mbaff_frame_flag, mb_field_flags,
+                                grid,
+                                lx,
+                                lp_y,
+                                mbaff_frame_flag,
+                                mb_field_flags,
                             ) {
                                 Some(a) => a,
                                 None => continue,
                             };
                             let q_addr = match pixel_to_mb_addr(
-                                grid, lx, lq_y, mbaff_frame_flag, mb_field_flags,
+                                grid,
+                                lx,
+                                lq_y,
+                                mbaff_frame_flag,
+                                mb_field_flags,
                             ) {
                                 Some(a) => a,
                                 None => continue,
@@ -5504,12 +5710,7 @@ fn deblock_plane_chroma(
                             let diff_ref_mv = !p_info.is_intra
                                 && !q_info.is_intra
                                 && different_ref_or_mv_luma(
-                                    p_info,
-                                    q_info,
-                                    p_in_mb_x,
-                                    p_in_mb_y,
-                                    q_in_mb_x,
-                                    q_in_mb_y,
+                                    p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y,
                                 );
                             let p_blk4_z =
                                 blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
@@ -6471,9 +6672,9 @@ mod tests {
         }
         let mut pred = MbPred::default();
         pred.prev_intra4x4_pred_mode_flag[0] = true; // use predicted mode
-        // Without constrained_intra_pred_flag: A=inter contributes 2
-        // (step 3 bullet 1 via "not Intra_4x4 or Intra_8x8"), B=6.
-        // predicted = min(2, 6) = 2. With prev_flag=true → 2.
+                                                     // Without constrained_intra_pred_flag: A=inter contributes 2
+                                                     // (step 3 bullet 1 via "not Intra_4x4 or Intra_8x8"), B=6.
+                                                     // predicted = min(2, 6) = 2. With prev_flag=true → 2.
         assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1), 2);
         // With constrained_intra_pred_flag = 1: A treated as
         // unavailable → dcPredFlag = 1 → both sides 2 → predicted = 2.
@@ -8339,8 +8540,8 @@ mod tests {
             // residual block.
             let mut first_entry = [0i32; 16];
             first_entry[0] = 4; // AC path, with scaling -> non-zero.
-            // Fill the array with the number of entries the parser
-            // would emit: 4 per set cbp_luma bit, placed sequentially.
+                                // Fill the array with the number of entries the parser
+                                // would emit: 4 per set cbp_luma bit, placed sequentially.
             let n = (cbp & 0x0F).count_ones() as usize * 4;
             let mut residual_luma = Vec::with_capacity(n);
             for i in 0..n {
@@ -8384,8 +8585,7 @@ mod tests {
             };
             let mut pic = Picture::new(16, 16, 1, 8, 8);
             let mut grid = MbGrid::new(1, 1);
-            reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid)
-                .unwrap();
+            reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid).unwrap();
 
             // Block N of MB 0 occupies (bx, by) = LUMA_4X4_XY[N].
             // Sum the 16 samples in that block and assert non-flat

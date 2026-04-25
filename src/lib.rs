@@ -44,8 +44,8 @@ pub mod vui;
 
 pub mod h264_decoder;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// Codec id constant — matches the historical `"h264"` id used by
 /// containers (MKV `V_MPEG4/ISO/AVC`, MP4 `avc1`, AVI `H264`/`X264`).

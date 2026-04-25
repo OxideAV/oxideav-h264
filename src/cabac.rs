@@ -871,11 +871,20 @@ mod tests {
         //    range=240. state_idx=0 → valMPS=1, transIdxLPS[0]=0.
         //    RenormD: 240<256 → read 1 bit (next byte bit 6 = 0).
         //      range=480, offset=(239<<1)|0=478.
-        let mut ctx1 = CtxState { state_idx: 0, val_mps: 0 };
+        let mut ctx1 = CtxState {
+            state_idx: 0,
+            val_mps: 0,
+        };
         assert_eq!(dec.decode_decision(&mut ctx1).unwrap(), 1);
         assert_eq!(dec.cod_i_range(), 480);
         assert_eq!(dec.cod_i_offset(), 478);
-        assert_eq!(ctx1, CtxState { state_idx: 0, val_mps: 1 });
+        assert_eq!(
+            ctx1,
+            CtxState {
+                state_idx: 0,
+                val_mps: 1
+            }
+        );
         assert_eq!(dec.bin_count(), 1);
 
         // 2) Now with range=480, pick state_idx=5 val_mps=1:
@@ -884,11 +893,20 @@ mod tests {
         //    offset=478-295=183, range=185, state_idx=transIdxLPS[5]=4.
         //    RenormD: 185<256 → read 1 bit (byte 1 bit 5 = 0).
         //      range=370, offset=(183<<1)|0=366.
-        let mut ctx2 = CtxState { state_idx: 5, val_mps: 1 };
+        let mut ctx2 = CtxState {
+            state_idx: 5,
+            val_mps: 1,
+        };
         assert_eq!(dec.decode_decision(&mut ctx2).unwrap(), 0);
         assert_eq!(dec.cod_i_range(), 370);
         assert_eq!(dec.cod_i_offset(), 366);
-        assert_eq!(ctx2, CtxState { state_idx: TRANS_IDX_LPS[5], val_mps: 1 });
+        assert_eq!(
+            ctx2,
+            CtxState {
+                state_idx: TRANS_IDX_LPS[5],
+                val_mps: 1
+            }
+        );
         assert_eq!(dec.bin_count(), 2);
     }
 
@@ -940,7 +958,10 @@ mod tests {
         // Next decision should still decode correctly: state_idx=0,
         // val_mps=0 → codIRangeLPS=240 (from row 0 col 3 since
         // (508>>6)&3 = 7&3 = 3). 508-240=268 ≥ codIOffset=0 → MPS.
-        let mut ctx = CtxState { state_idx: 0, val_mps: 0 };
+        let mut ctx = CtxState {
+            state_idx: 0,
+            val_mps: 0,
+        };
         assert_eq!(dec.decode_decision(&mut ctx).unwrap(), 0);
         assert_eq!(dec.cod_i_range(), 268);
         assert_eq!(dec.cod_i_offset(), 0);
@@ -964,12 +985,16 @@ mod tests {
             assert!(
                 TRANS_IDX_LPS[i] as usize <= i,
                 "transIdxLPS[{}] = {} must be <= {}",
-                i, TRANS_IDX_LPS[i], i,
+                i,
+                TRANS_IDX_LPS[i],
+                i,
             );
             assert!(
                 TRANS_IDX_MPS[i] as usize >= i,
                 "transIdxMPS[{}] = {} must be >= {}",
-                i, TRANS_IDX_MPS[i], i,
+                i,
+                TRANS_IDX_MPS[i],
+                i,
             );
         }
     }

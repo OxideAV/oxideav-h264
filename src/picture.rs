@@ -236,7 +236,9 @@ impl Picture {
         }
         let mv_idx = (mb_addr as usize).checked_mul(16)?.checked_add(blk4)?;
         let mv = *self.mv_l0_grid.get(mv_idx)?;
-        let ref_idx = *self.ref_idx_l0_grid.get((mb_addr as usize) * 4 + (blk4 / 4))?;
+        let ref_idx = *self
+            .ref_idx_l0_grid
+            .get((mb_addr as usize) * 4 + (blk4 / 4))?;
         let is_intra = self
             .is_intra_grid
             .get(mb_addr as usize)
@@ -254,7 +256,9 @@ impl Picture {
         }
         let mv_idx = (mb_addr as usize).checked_mul(16)?.checked_add(blk4)?;
         let mv = *self.mv_l1_grid.get(mv_idx)?;
-        let ref_idx = *self.ref_idx_l1_grid.get((mb_addr as usize) * 4 + (blk4 / 4))?;
+        let ref_idx = *self
+            .ref_idx_l1_grid
+            .get((mb_addr as usize) * 4 + (blk4 / 4))?;
         let is_intra = self
             .is_intra_grid
             .get(mb_addr as usize)

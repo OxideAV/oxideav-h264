@@ -1,4 +1,4 @@
-//! H.264 decoder scaffold exposed through the `oxideav_codec::Decoder`
+//! H.264 decoder scaffold exposed through the `oxideav_core::Decoder`
 //! trait so containers + players can route packets at us.
 //!
 //! What this scaffold currently does:
@@ -42,7 +42,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
     VideoPlane,
@@ -265,9 +265,7 @@ impl H264CodecDecoder {
             return Err(Error::invalid("h264: extradata shorter than avcC header"));
         }
         if extra[0] != 1 {
-            return Err(Error::invalid(
-                "h264: avcC configurationVersion must be 1",
-            ));
+            return Err(Error::invalid("h264: avcC configurationVersion must be 1"));
         }
         self.length_size = Some((extra[4] & 0x03) + 1);
         let num_sps = (extra[5] & 0x1f) as usize;
@@ -513,8 +511,7 @@ impl H264CodecDecoder {
             let deblock_enabled = header.disable_deblocking_filter_idc != 1;
             let deblock_alpha_off = header.slice_alpha_c0_offset_div2 * 2;
             let deblock_beta_off = header.slice_beta_offset_div2 * 2;
-            let mb_count =
-                (sps.pic_width_in_mbs() * sps.frame_height_in_mbs()) as usize;
+            let mb_count = (sps.pic_width_in_mbs() * sps.frame_height_in_mbs()) as usize;
             let mb_field_flags = vec![false; mb_count];
 
             self.in_progress = Some(PictureInProgress {
@@ -539,9 +536,7 @@ impl H264CodecDecoder {
         }
 
         // Reconstruct this slice into the in-progress picture.
-        self.reconstruct_slice_into_in_progress(
-            nal_ref_idc, &header, &rbsp, cursor, &sps, &pps,
-        )?;
+        self.reconstruct_slice_into_in_progress(nal_ref_idc, &header, &rbsp, cursor, &sps, &pps)?;
 
         Ok(())
     }
@@ -800,8 +795,7 @@ impl H264CodecDecoder {
         // SL1_SVA_B (CAVLC IPB, 3 slices/pic) conformance streams.
         let bit_depth_y = 8 + sps.bit_depth_luma_minus8;
         let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
-        let mbaff_frame_flag =
-            sps.mb_adaptive_frame_field_flag && !first_header.field_pic_flag;
+        let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !first_header.field_pic_flag;
         if deblock_enabled {
             reconstruct::deblock_picture_full(
                 &mut pic,
@@ -1111,8 +1105,7 @@ fn non_existing_poc(sps: &Sps, state: &PocState, frame_num: u32) -> (i32, i32, i
             // `2 * (FrameNumOffset + frame_num)`. We use the already-
             // updated `prev_frame_num_offset` because the caller has
             // stepped it for this non-existing frame.
-            let poc =
-                2 * (state.prev_frame_num_offset + frame_num as i64);
+            let poc = 2 * (state.prev_frame_num_offset + frame_num as i64);
             let poc = poc.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
             (poc, poc, poc)
         }
@@ -1220,7 +1213,11 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
 /// Both values floor at 1 so `DpbOutput::push` can always bump when
 /// the queue is full (cap of 0 would deadlock the queue).
 fn output_dpb_sizing(sps: &Sps) -> (u32, u32) {
-    if let Some(br) = sps.vui.as_ref().and_then(|v| v.bitstream_restriction.as_ref()) {
+    if let Some(br) = sps
+        .vui
+        .as_ref()
+        .and_then(|v| v.bitstream_restriction.as_ref())
+    {
         // §E.2.1 — max_dec_frame_buffering must be ≥ max_num_reorder_frames.
         // Clamp to at least 1 so the queue can ever bump.
         let reorder = br.max_num_reorder_frames;
@@ -1707,8 +1704,8 @@ mod tests {
 
         dec.flush().expect("flush");
 
-        let tags: Vec<u8> = std::iter::from_fn(|| dec.receive_frame().ok().map(|f| vf_tag(&f)))
-            .collect();
+        let tags: Vec<u8> =
+            std::iter::from_fn(|| dec.receive_frame().ok().map(|f| vf_tag(&f))).collect();
         // POC ascending: 1, 2, 3 → tags 0xA1, 0xA2, 0xA0.
         assert_eq!(tags, vec![0xA1, 0xA2, 0xA0]);
     }
@@ -1763,8 +1760,8 @@ mod tests {
         // EOF drains the IDR itself too.
         dec.flush().expect("flush");
 
-        let tags: Vec<u8> = std::iter::from_fn(|| dec.receive_frame().ok().map(|f| vf_tag(&f)))
-            .collect();
+        let tags: Vec<u8> =
+            std::iter::from_fn(|| dec.receive_frame().ok().map(|f| vf_tag(&f))).collect();
         // Sequence 1 in POC order (0, 1, 2, 4) → tags [1, 4, 3, 2]
         // followed by sequence 2's IDR (100).
         assert_eq!(tags, vec![1, 4, 3, 2, 100]);
@@ -1920,9 +1917,7 @@ mod tests {
 
     use crate::poc::PocResult;
     use crate::ref_list::PicStructure;
-    use crate::slice_header::{
-        RefPicListModification, SliceHeader as Hdr, SliceType as ST,
-    };
+    use crate::slice_header::{RefPicListModification, SliceHeader as Hdr, SliceType as ST};
 
     /// Minimal SPS for the seed helpers — exact field values do not
     /// matter since the seeded in-progress picture is never actually

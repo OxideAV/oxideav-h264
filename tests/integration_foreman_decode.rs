@@ -1,4 +1,4 @@
-//! End-to-end decode smoke test through the `oxideav_codec::Decoder`
+//! End-to-end decode smoke test through the `oxideav_core::Decoder`
 //! trait, using `foreman_p16x16.264` — the same Annex B sample used by
 //! `integration_foreman.rs`, but exercising the public trait surface
 //! instead of the internal Picture pipeline.
@@ -11,7 +11,7 @@
 //! `OXIDEAV_SAMPLES_H264_FOREMAN` (or a hardcoded author default) and
 //! skips if the sample is missing.
 
-use oxideav_codec::Decoder as _;
+use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 use std::path::PathBuf;
@@ -26,15 +26,17 @@ fn sample_path() -> Option<PathBuf> {
     let default = PathBuf::from(
         "/home/magicaltux/projects/oxideav/samples/samples.ffmpeg.org/V-codecs/h264/foreman_p16x16.264",
     );
-    if default.exists() { Some(default) } else { None }
+    if default.exists() {
+        Some(default)
+    } else {
+        None
+    }
 }
 
 #[test]
 fn decode_foreman_p16x16_first_idr_through_trait() {
     let Some(path) = sample_path() else {
-        eprintln!(
-            "skip: set OXIDEAV_SAMPLES_H264_FOREMAN or place the file at the default path"
-        );
+        eprintln!("skip: set OXIDEAV_SAMPLES_H264_FOREMAN or place the file at the default path");
         return;
     };
 
@@ -82,7 +84,10 @@ fn decode_foreman_p16x16_first_idr_through_trait() {
     // that not all samples are zero (a black or unwritten buffer would
     // be a red flag for foreman, which opens on the speaker's face).
     let has_nonzero = vf.planes[0].data.iter().any(|&b| b != 0);
-    assert!(has_nonzero, "luma plane was all zero — reconstruction likely did not run");
+    assert!(
+        has_nonzero,
+        "luma plane was all zero — reconstruction likely did not run"
+    );
 
     // pts carried through from the packet.
     assert_eq!(vf.pts, Some(0));

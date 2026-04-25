@@ -12,7 +12,7 @@
 //! * §7.4.1.2.4 — detection of first VCL NAL unit of a primary coded
 //!   picture (the list of conditions we compare)
 
-use oxideav_codec::Decoder as _;
+use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 use oxideav_h264::nal::AnnexBSplitter;
@@ -28,7 +28,11 @@ fn foreman_path() -> Option<PathBuf> {
     let default = PathBuf::from(
         "/home/magicaltux/projects/oxideav/samples/samples.ffmpeg.org/V-codecs/h264/foreman_p16x16.264",
     );
-    if default.exists() { Some(default) } else { None }
+    if default.exists() {
+        Some(default)
+    } else {
+        None
+    }
 }
 
 fn moonlight_path() -> Option<PathBuf> {
@@ -41,7 +45,11 @@ fn moonlight_path() -> Option<PathBuf> {
     let default = PathBuf::from(
         "/home/magicaltux/projects/oxideav/samples/samples.ffmpeg.org/V-codecs/h264/moonlight.264",
     );
-    if default.exists() { Some(default) } else { None }
+    if default.exists() {
+        Some(default)
+    } else {
+        None
+    }
 }
 
 /// Drive `bytes` as a single Annex B packet through the decoder, flush,

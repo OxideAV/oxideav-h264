@@ -1357,9 +1357,9 @@ mod tests {
 
         // Expected column values (constant over rows).
         let r0 = (20288 + 32) >> 6; // = 20320 >> 6 = 317
-        let r1 = (9344 + 32) >> 6;  // = 146
-        let r2 = (6016 + 32) >> 6;  // = 94
-        let r3 = (5312 + 32) >> 6;  // = 83
+        let r1 = (9344 + 32) >> 6; // = 146
+        let r2 = (6016 + 32) >> 6; // = 94
+        let r3 = (5312 + 32) >> 6; // = 83
         for i in 0..4 {
             assert_eq!(out[i * 4 + 0], r0, "row {} col 0", i);
             assert_eq!(out[i * 4 + 1], r1, "row {} col 1", i);
@@ -1431,7 +1431,11 @@ mod tests {
         let sl = default_scaling_list_4x4_flat();
         for qp in 0..=51 {
             let out = inverse_transform_4x4(&coeffs, qp, &sl, 8).unwrap();
-            assert_eq!(out, [0i32; 16], "zero input must produce zero output (qP={})", qp);
+            assert_eq!(
+                out, [0i32; 16],
+                "zero input must produce zero output (qP={})",
+                qp
+            );
         }
     }
 
@@ -1982,11 +1986,11 @@ mod tests {
                 ScalingListEntry::NotPresent,
                 ScalingListEntry::NotPresent,
                 ScalingListEntry::Explicit(explicit.clone()), // 8x8 i=6 (Intra_Y)
-                ScalingListEntry::NotPresent,                  // 8x8 i=7 (Inter_Y)
-                ScalingListEntry::NotPresent,                  // 8x8 i=8 (Intra_Cb)
-                ScalingListEntry::NotPresent,                  // 8x8 i=9 (Inter_Cb)
-                ScalingListEntry::NotPresent,                  // 8x8 i=10 (Intra_Cr)
-                ScalingListEntry::NotPresent,                  // 8x8 i=11 (Inter_Cr)
+                ScalingListEntry::NotPresent,                 // 8x8 i=7 (Inter_Y)
+                ScalingListEntry::NotPresent,                 // 8x8 i=8 (Intra_Cb)
+                ScalingListEntry::NotPresent,                 // 8x8 i=9 (Inter_Cb)
+                ScalingListEntry::NotPresent,                 // 8x8 i=10 (Intra_Cr)
+                ScalingListEntry::NotPresent,                 // 8x8 i=11 (Inter_Cr)
             ],
         });
         let pps = minimal_pps();

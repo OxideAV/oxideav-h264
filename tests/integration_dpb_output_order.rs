@@ -17,7 +17,7 @@
 //!   * §C.2.2 — "Storage and output of decoded pictures"
 //!   * §C.4   — "Bumping process" / output timing
 
-use oxideav_codec::Decoder as _;
+use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Error};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 

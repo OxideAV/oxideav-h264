@@ -95,9 +95,12 @@ fn find_box_inner<'a>(buf: &'a [u8], path: &[&[u8; 4]], depth: usize) -> Option<
                 // Descend into ANY sample entry: parse it as a box,
                 // then inside that box skip the 78-byte preamble.
                 if child_body.len() >= 8 {
-                    let entry_size =
-                        u32::from_be_bytes([child_body[0], child_body[1], child_body[2], child_body[3]])
-                            as usize;
+                    let entry_size = u32::from_be_bytes([
+                        child_body[0],
+                        child_body[1],
+                        child_body[2],
+                        child_body[3],
+                    ]) as usize;
                     if entry_size <= child_body.len() && entry_size >= 8 + 78 {
                         let inner = &child_body[8 + 78..entry_size];
                         if let Some(found) = find_box_inner(inner, &path[1..], depth + 1) {
@@ -181,9 +184,7 @@ fn parse_avcc(avcc: &[u8]) -> Option<(usize, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
 #[test]
 fn whats_wrong_676_mbaff_slice_data_no_longer_rejected() {
     let Some(path) = sample_path() else {
-        eprintln!(
-            "skip: set OXIDEAV_SAMPLES_H264_WHATS_WRONG or place file at the default path"
-        );
+        eprintln!("skip: set OXIDEAV_SAMPLES_H264_WHATS_WRONG or place file at the default path");
         return;
     };
 
@@ -193,7 +194,9 @@ fn whats_wrong_676_mbaff_slice_data_no_longer_rejected() {
     // Find avcC
     let avcc = find_box(
         &bytes,
-        &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd", b"avcC"],
+        &[
+            b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd", b"avcC",
+        ],
     )
     .expect("avcC box");
     let (length_size, sps_list, pps_list) = parse_avcc(avcc).expect("parse avcC");
@@ -214,8 +217,8 @@ fn whats_wrong_676_mbaff_slice_data_no_longer_rejected() {
     {
         let mut i = 0usize;
         while i + 8 <= bytes.len() {
-            let size = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
-                as usize;
+            let size =
+                u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
             let ty = &bytes[i + 4..i + 8];
             let (hdr_len, box_len) = if size == 1 && i + 16 <= bytes.len() {
                 let ls = u64::from_be_bytes([
@@ -246,8 +249,9 @@ fn whats_wrong_676_mbaff_slice_data_no_longer_rejected() {
 
     // First sample offset (absolute file offset from stco). If we
     // can't find stco, assume samples start right after mdat header.
-    let first_sample_off =
-        first_chunk_offset(&bytes).map(|o| o as usize).unwrap_or(mdat_start_file);
+    let first_sample_off = first_chunk_offset(&bytes)
+        .map(|o| o as usize)
+        .unwrap_or(mdat_start_file);
     eprintln!(
         "mdat: {:#x}..{:#x}, first_sample={:#x}",
         mdat_start_file, mdat_end_file, first_sample_off
@@ -316,10 +320,7 @@ fn whats_wrong_676_mbaff_slice_data_no_longer_rejected() {
         "SPS profile={} level={} mbaff={} frame_mbs_only={}",
         sps.profile_idc, sps.level_idc, sps.mb_adaptive_frame_field_flag, sps.frame_mbs_only_flag,
     );
-    assert!(
-        sps.mb_adaptive_frame_field_flag,
-        "fixture must be MBAFF"
-    );
+    assert!(sps.mb_adaptive_frame_field_flag, "fixture must be MBAFF");
     assert!(!sps.frame_mbs_only_flag, "fixture must allow fields");
 
     assert!(!slices.is_empty(), "no slices extracted");

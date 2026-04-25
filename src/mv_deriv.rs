@@ -166,8 +166,7 @@ impl NeighbourMv {
 /// The three special directional cases bypass median and take the MV
 /// of a specific neighbour *when its refIdx matches*. Otherwise we
 /// fall through to median (§8.4.1.3.1).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum MvpredShape {
     /// Default: median of A, B, C (§8.4.1.3.1).
     #[default]
@@ -185,7 +184,6 @@ pub enum MvpredShape {
     /// refIdxLXC == refIdxLX (eq. 8-206), else median.
     Partition8x16Right,
 }
-
 
 /// Inputs to the top-level MVpred derivation (§8.4.1.3).
 ///
@@ -358,14 +356,12 @@ pub fn derive_median_mvpred(
     // live in an intra MB (#69) whose partition is available, while A
     // is an inter neighbour with a non-matching refIdx; the median
     // must therefore be median(mvA.x, 0, 0), not A copied to B and C.
-    let (a_eff, b_eff, c_eff) = if !b.partition_available
-        && !c.partition_available
-        && a.partition_available
-    {
-        (a, a, a)
-    } else {
-        (a, b, c)
-    };
+    let (a_eff, b_eff, c_eff) =
+        if !b.partition_available && !c.partition_available && a.partition_available {
+            (a, a, a)
+        } else {
+            (a, b, c)
+        };
 
     // §8.4.1.3.1 step 2 — count how many of A/B/C match current
     // refIdxLX. Matching requires the neighbour to be available
@@ -564,14 +560,8 @@ pub fn derive_b_spatial_direct_with_d(
 
     // §8.4.1.2.2 eq. 8-184/8-185 — MinPositive chain, using the
     // substituted C (eq. 8-214..8-216 output).
-    let mut ref_idx_l0 = min_positive(
-        a_l0.ref_idx,
-        min_positive(b_l0.ref_idx, c_l0_eff.ref_idx),
-    );
-    let mut ref_idx_l1 = min_positive(
-        a_l1.ref_idx,
-        min_positive(b_l1.ref_idx, c_l1_eff.ref_idx),
-    );
+    let mut ref_idx_l0 = min_positive(a_l0.ref_idx, min_positive(b_l0.ref_idx, c_l0_eff.ref_idx));
+    let mut ref_idx_l1 = min_positive(a_l1.ref_idx, min_positive(b_l1.ref_idx, c_l1_eff.ref_idx));
 
     // §8.4.1.2.2 eq. 8-188..8-190 — directZeroPredictionFlag.
     let direct_zero = ref_idx_l0 < 0 && ref_idx_l1 < 0;
