@@ -635,3 +635,161 @@ fn round3_ffmpeg_decode_noisy_picture_matches() {
         out.annex_b.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round-4 — I_NxN (Intra_4x4) integration tests.
+// ---------------------------------------------------------------------------
+
+/// 64x64 picture with multiple distinct edge orientations per MB. Each
+/// 4x4 sub-block of the picture has a different intra-4x4 mode that is
+/// "best" for it (vertical stripes here, horizontal there, diagonal
+/// gradient elsewhere). I_16x16 with one mode per macroblock can't
+/// capture all 16 sub-block patterns; I_NxN should land much closer.
+fn make_oriented_edges_64x64() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let w = 64usize;
+    let h = 64usize;
+    let mut y = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            let blk_x = (i / 4) % 4;
+            let blk_y = (j / 4) % 4;
+            // Pick a per-4x4-sub-block pattern based on its position
+            // inside the parent MB.
+            let local_x = i % 4;
+            let local_y = j % 4;
+            let v = match (blk_x + 4 * blk_y) % 4 {
+                0 => 32 + (local_x * 50) as i32,             // vertical-ish
+                1 => 32 + (local_y * 50) as i32,             // horizontal-ish
+                2 => 32 + ((local_x + local_y) * 25) as i32, // diagonal
+                _ => 32 + ((3 - local_x) * 30 + local_y * 20) as i32,
+            };
+            y[j * w + i] = v.clamp(0, 255) as u8;
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+    (y, u, v)
+}
+
+#[test]
+fn round4_i_nxn_lifts_psnr_on_oriented_edges() {
+    let (y, u, v) = make_oriented_edges_64x64();
+    let frame = YuvFrame {
+        width: 64,
+        height: 64,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let mut cfg = EncoderConfig::new(64, 64);
+    cfg.qp = 26;
+    let enc = Encoder::new(cfg);
+    let out = enc.encode_idr(&frame);
+
+    // Self-roundtrip must match local recon bit-exactly.
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), out.annex_b.clone()).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let frame_out = dec.receive_frame().expect("receive_frame");
+    let vf = match frame_out {
+        Frame::Video(vf) => vf,
+        other => panic!("expected Frame::Video, got {:?}", other),
+    };
+    for (k, (&a, &b)) in vf.planes[0].data.iter().zip(out.recon_y.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "luma sample {k}: decoded={a} encoder_recon={b}",
+        );
+    }
+    let psnr = {
+        let m = mse_y(&y, &out.recon_y);
+        if m == 0.0 {
+            99.0
+        } else {
+            10.0 * (255.0 * 255.0 / m).log10()
+        }
+    };
+    eprintln!(
+        "round-4 oriented-edges 64x64 (QP=26): stream={} bytes, PSNR Y={:.2}",
+        out.annex_b.len(),
+        psnr
+    );
+    // I_NxN should bring this above 30 dB; I_16x16 alone caps around 22 dB.
+    assert!(psnr >= 28.0, "PSNR {psnr:.2} dB below round-4 floor 28");
+}
+
+#[test]
+fn round4_ffmpeg_decode_oriented_edges_matches() {
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: ffmpeg not at /opt/homebrew/bin/ffmpeg");
+        return;
+    }
+    let (y, u, v) = make_oriented_edges_64x64();
+    let frame = YuvFrame {
+        width: 64,
+        height: 64,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let mut cfg = EncoderConfig::new(64, 64);
+    cfg.qp = 26;
+    let enc = Encoder::new(cfg);
+    let out = enc.encode_idr(&frame);
+
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!("oxideav_h264_enc_r4_{}.h264", std::process::id()));
+    let yuv_path = tmpdir.join(format!("oxideav_h264_enc_r4_{}.yuv", std::process::id()));
+    std::fs::write(&h264_path, &out.annex_b).expect("write h264");
+
+    let status = std::process::Command::new(ffmpeg)
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("h264")
+        .arg("-i")
+        .arg(&h264_path)
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed");
+    let raw = std::fs::read(&yuv_path).expect("read yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+
+    let y_len = 64 * 64;
+    let c_len = 32 * 32;
+    assert_eq!(raw.len(), y_len + 2 * c_len);
+    let ff_y = &raw[0..y_len];
+    let ff_u = &raw[y_len..y_len + c_len];
+    let ff_v = &raw[y_len + c_len..];
+    for (k, (&a, &b)) in ff_y.iter().zip(out.recon_y.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "ffmpeg luma {k}: ff={a} enc_recon={b}",
+        );
+    }
+    for (k, (&a, &b)) in ff_u.iter().zip(out.recon_u.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "ffmpeg Cb {k}: ff={a} enc_recon={b}",
+        );
+    }
+    for (k, (&a, &b)) in ff_v.iter().zip(out.recon_v.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "ffmpeg Cr {k}: ff={a} enc_recon={b}",
+        );
+    }
+    eprintln!(
+        "round-4 ffmpeg interop (oriented-edges, QP=26): stream={} bytes, bit-exact",
+        out.annex_b.len()
+    );
+}

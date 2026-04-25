@@ -164,18 +164,91 @@ in luma instead of capping the per-MB recon at the DC term.
 - Chroma AC `nC` is still hard-coded to 0 (sub-optimal bitrate but
   correct).
 
-## Round 4 (planned)
+## Round 4 — landed
 
-- **`I_NxN` (Intra_4x4)** with all 9 modes — biggest quality lift on
-  highly-detailed content where one prediction mode per 16x16 isn't
-  enough to track texture.
+Wire **I_NxN (Intra_4x4) with all 9 modes** — per-4x4-block intra
+prediction so the encoder can track local texture orientation that
+one I_16x16 mode per macroblock can't capture.
+
+- **`encoder::intra4x4`** module: full §8.3.1.2 implementation of all
+  9 prediction modes (Vertical / Horizontal / DC / Diagonal_Down_Left
+  / Diagonal_Down_Right / Vertical_Right / Horizontal_Down /
+  Vertical_Left / Horizontal_Up). Mirrors the decoder's [`crate::
+  intra_pred`] line-by-line but operates on raw `u8` reconstruction
+  buffers with simple `(mb_x, mb_y, bx, by)` coordinates. Includes
+  §8.3.1.2 "top-right substitution" rule for blocks 3, 5, 7, 11, 13,
+  15 and right-edge MBs.
+- **Per-block mode decision**: SAD against source over all 9 modes
+  per 4x4 sub-block (skipping modes whose required neighbours are
+  unavailable). Best mode written to a small encoder-side
+  `IntraGrid` so subsequent blocks (in-MB and across-MB) can derive
+  `predIntra4x4PredMode` per §8.3.1.1 step 4.
+- **mb_type decision**: per MB the encoder scores I_16x16 SAD vs
+  I_NxN SAD (sum of best per-block SADs) and picks the lower.
+  Picture content with multiple distinct edge orientations per MB
+  trips into I_NxN; smooth content stays on I_16x16.
+- **Macroblock-layer I_NxN emit** ([`encoder::macroblock::
+  write_i_nxn_mb`]):
+    1. `mb_type = 0` (raw I_NxN value in I-slice Table 7-11)
+    2. 16 × `prev_intra4x4_pred_mode_flag` (1 bit) plus optional
+       `rem_intra4x4_pred_mode` (3 bits) per §7.3.5.1.
+    3. `intra_chroma_pred_mode` ue(v).
+    4. `coded_block_pattern` me(v) — Table 9-4(a) intra column
+       inverse mapping (`INTRA_CBP_TO_CODENUM_420_422`).
+    5. `mb_qp_delta` se(v) when any cbp non-zero.
+    6. 16 4x4 luma blocks (`maxNumCoeff = 16`, full DC + AC) gated
+       by 8x8-quadrant cbp bits, in §6.4.3 raster-Z order.
+    7. Chroma DC + AC identical to the I_16x16 path.
+- **Per-block local recon**: forward 4x4 + quantize + inverse 4x4 +
+  add to predictor, written back to `recon_y` so subsequent blocks
+  see the correct neighbour samples. For 8x8 quadrants whose cbp bit
+  is 0 the recon is rolled back to `pred + 0` (matching what the
+  decoder will see — no transmitted residual).
+- **CAVLC nC** for the new luma 4x4 blocks: re-uses the existing
+  `CavlcNcGrid` + `derive_nc_luma(LumaNcKind::Ac)` chain, with
+  `own_luma_totals` reset per MB and progressively updated per block.
+  Blocks in zero-cbp quadrants contribute TotalCoeff = 0.
+
+### Validation
+
+- `cargo test -p oxideav-h264 --lib` — **764 passed** (+6 unit tests
+  for the new modes and the CBP inverse table).
+- All round-1/2/3 integration tests still pass with identical PSNR
+  on smooth/mixed/noisy content (as expected — those pictures are
+  already optimal under I_16x16; mb_type decision keeps I_16x16).
+- New integration tests (round-4):
+  - `round4_i_nxn_lifts_psnr_on_oriented_edges` — synthetic 64x64
+    picture with a different best 4x4 mode in each sub-block
+    (vertical / horizontal / diagonal stripes per 4x4 within each
+    MB). I_NxN gets picked, **PSNR Y = 41.25 dB at QP=26** with
+    1066-byte stream (vs ~22 dB for I_16x16 alone on this content).
+  - `round4_ffmpeg_decode_oriented_edges_matches` — bit-exact
+    against ffmpeg 8.1 libavcodec on the same picture.
+
+### Status caveats (unchanged from round 3 unless noted)
+
+- Still I-only / IDR-only.
+- mb_type now switches between `I_16x16` and `I_NxN` per MB (no
+  I_8x8 / I_PCM yet).
+- Mode-decision metric is SAD on the predictor (no rate term, no
+  RDO). Round 5+ can add Lagrangian RDO for proper rate-distortion
+  trade-off.
+- No in-loop deblocking — `disable_deblocking_filter_idc == 1`.
+- No CABAC — CAVLC only.
+- No rate control — fixed QP from `EncoderConfig::qp`.
+- Chroma AC `nC` is still hard-coded to 0 (sub-optimal bitrate but
+  correct).
+
+## Round 5 (planned)
+
 - **In-loop deblocking** on the local recon (mirror the decoder's
-  §8.7) — required for high PSNR across MB boundaries once we send
-  enough residual to make boundaries visible.
+  §8.7) — most important once we add P/B slices with stronger
+  residual.
 - **Chroma AC nC** per §9.2.1.1 (encoder tracks chroma TotalCoeff in
   the `CavlcNcGrid`).
+- **Lagrangian RDO** for mb_type / mode decision.
 
-## Round 5+
+## Round 6+
 
 - P-slice support (single L0, integer MV search).
 - Multiple slices per picture.

@@ -1,22 +1,26 @@
-//! H.264 / AVC **encoder** — Baseline profile, IDR-only, I_16x16
-//! (DC/V/H/Plane) with full luma DC + AC residual and chroma DC + AC.
+//! H.264 / AVC **encoder** — Baseline profile, IDR-only, with mb_type
+//! switching between **I_16x16** (DC/V/H/Plane) and **I_NxN** (Intra_4x4
+//! with all 9 §8.3.1.2 modes) based on per-MB SAD.
 //!
-//! Round-3 scope (round-1 was DC-luma only; round-2 added the chroma
-//! residual + multi-mode I_16x16; see `STATUS.md`):
+//! Round-4 scope (round-1 DC-luma only; round-2 chroma residual +
+//! multi-mode I_16x16; round-3 luma AC residual; round-4 I_NxN; see
+//! `STATUS.md`):
 //!
 //! * **Profile:** Baseline (`profile_idc = 66`), 4:2:0, 8-bit, single
 //!   slice per picture, no FMO.
 //! * **Slice types:** IDR I-slices only.
-//! * **Macroblock types:** every MB is `I_16x16`, with the four
-//!   §8.3.3 prediction modes (V, H, DC, Plane) selected per MB by
-//!   minimum-SAD against the source.
-//! * **Chroma intra:** §8.3.4 with the four modes (DC, V, H, Plane)
-//!   selected per MB by minimum-SAD.
-//! * **Transforms:** 4x4 integer transform + 4x4 luma-DC Hadamard +
-//!   2x2 chroma-DC Hadamard. Flat scaling lists.
-//! * **CBP:** `cbp_luma` ∈ {0, 15} (per §7.4.5.1 for Intra_16x16) —
-//!   promoted to 15 whenever any 4x4 luma AC block has a non-zero
-//!   coefficient. `cbp_chroma` ∈ {0, 1, 2}.
+//! * **Macroblock types:** per-MB choice between `I_16x16` (4 modes)
+//!   and `I_NxN` / Intra_4x4 (9 per-block modes). The lower-SAD path
+//!   wins. mb_type is signalled via Table 7-11.
+//! * **Chroma intra:** §8.3.4 four modes (DC, V, H, Plane) selected per
+//!   MB by minimum-SAD.
+//! * **Transforms:** 4x4 integer transform + 4x4 luma-DC Hadamard
+//!   (Intra_16x16 only) + 2x2 chroma-DC Hadamard. Flat scaling lists.
+//! * **CBP:**
+//!   - Intra_16x16: `cbp_luma` ∈ {0, 15} (per §7.4.5.1) — 15 whenever
+//!     any 4x4 luma AC has a non-zero coefficient.
+//!   - I_NxN: `cbp_luma` ∈ 0..=15, one bit per 8x8 quadrant.
+//!   - `cbp_chroma` ∈ {0, 1, 2}.
 //! * **Entropy:** CAVLC, with per-MB neighbour grid (`CavlcNcGrid`)
 //!   driving §9.2.1.1 nC derivation for AC blocks.
 //! * **In-loop filter:** disabled (`disable_deblocking_filter_idc = 1`).
@@ -27,6 +31,7 @@
 
 pub mod bitstream;
 pub mod cavlc;
+pub mod intra4x4;
 pub mod intra_pred;
 pub mod macroblock;
 pub mod nal;
@@ -37,23 +42,28 @@ pub mod transform;
 
 use crate::cavlc::CoeffTokenContext;
 use crate::encoder::bitstream::BitWriter;
+use crate::encoder::intra4x4::{
+    availability as i4x4_avail, predict_4x4, sad_4x4, Intra4x4Mode, LUMA_4X4_XY as I4X4_XY,
+};
 use crate::encoder::intra_pred::{
     predict_16x16, predict_chroma_8x8, sad_16x16, sad_8x8, I16x16Mode, IntraChromaMode,
 };
-use crate::encoder::macroblock::{write_intra16x16_mb, I16x16McbConfig};
+use crate::encoder::macroblock::{
+    write_i_nxn_mb, write_intra16x16_mb, I16x16McbConfig, INxNMcbConfig,
+};
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::slice::{write_idr_i_slice_header, IdrSliceHeaderConfig};
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
-    forward_core_4x4, forward_hadamard_2x2, forward_hadamard_4x4, quantize_4x4_ac,
-    quantize_chroma_dc, quantize_luma_dc, zigzag_scan_4x4_ac,
+    forward_core_4x4, forward_hadamard_2x2, forward_hadamard_4x4, quantize_4x4, quantize_4x4_ac,
+    quantize_chroma_dc, quantize_luma_dc, zigzag_scan_4x4, zigzag_scan_4x4_ac,
 };
 use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
 use crate::nal::NalUnitType;
 use crate::transform::{
     inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16, inverse_scan_4x4_zigzag_ac,
-    inverse_transform_4x4_dc_preserved, qp_y_to_qp_c, FLAT_4X4_16,
+    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, qp_y_to_qp_c, FLAT_4X4_16,
 };
 
 /// §6.4.3 / Figure 6-10 — luma 4x4 block scan: index 0..=15 → (x, y)
@@ -109,6 +119,137 @@ impl EncoderConfig {
             qp: 26,
         }
     }
+}
+
+/// Encoder-side per-MB grid for the §8.3.1.1 / §6.4.11.4 neighbour
+/// lookup needed by I_NxN mode prediction. Mirrors the small subset
+/// of fields the decoder's [`crate::reconstruct::MbGrid`] tracks for
+/// intra prediction. The encoder must agree with the decoder
+/// bit-for-bit on the predicted Intra4x4 mode of every block,
+/// otherwise `prev_intra4x4_pred_mode_flag = 1` would mean a different
+/// mode on each side.
+#[derive(Debug, Clone, Default)]
+struct IntraGridSlot {
+    available: bool,
+    is_i_nxn: bool,
+    /// `intra_4x4_pred_modes[i]` per §6.4.3 raster-Z order. Only
+    /// populated when `is_i_nxn`.
+    intra_4x4_pred_modes: [u8; 16],
+}
+
+#[derive(Debug, Clone)]
+struct IntraGrid {
+    width_mbs: usize,
+    slots: Vec<IntraGridSlot>,
+}
+
+impl IntraGrid {
+    fn new(width_mbs: usize, height_mbs: usize) -> Self {
+        Self {
+            width_mbs,
+            slots: vec![IntraGridSlot::default(); width_mbs * height_mbs],
+        }
+    }
+    fn slot(&self, mb_x: usize, mb_y: usize) -> &IntraGridSlot {
+        &self.slots[mb_y * self.width_mbs + mb_x]
+    }
+    fn slot_mut(&mut self, mb_x: usize, mb_y: usize) -> &mut IntraGridSlot {
+        &mut self.slots[mb_y * self.width_mbs + mb_x]
+    }
+}
+
+/// §6.4.11.4 + §8.3.1.1 — predict the Intra_4x4 mode for block
+/// `block_idx` of the MB at (mb_x, mb_y) using the modes of neighbour
+/// 4x4 blocks A (left) and B (above).
+///
+/// Returns the §8.3.1.1 step 4 `predIntra4x4PredMode` value (0..=8).
+///
+/// Algorithm (mirrors decoder's `derive_intra_4x4_pred_mode`):
+///   1. Compute (xN, yN) = (bx-1, by) for A and (bx, by-1) for B in
+///      MB-relative pixel coordinates of the current 4x4 block.
+///   2. Locate the neighbour MB and the neighbour 4x4 block index per
+///      §6.4.3 / Table 6-3 / eq. 6-38 (non-MBAFF frame case).
+///   3. dcPredModePredictedFlag (step 2): true iff either neighbour MB
+///      is unavailable OR (constrained_intra_pred && neighbour is not
+///      intra). We don't use constrained_intra_pred → only the
+///      availability check.
+///   4. modeN (step 3): 2 (DC) when dcPredFlag, else
+///      `intra_4x4_pred_modes[blkN]` of the neighbour MB if it's
+///      I_NxN, else 2 (DC) for I_16x16/I_PCM/inter neighbours.
+///   5. predicted = min(modeA, modeB).
+fn predicted_intra4x4_mode(
+    grid: &IntraGrid,
+    mb_x: usize,
+    mb_y: usize,
+    block_idx: usize,
+    pic_w_mbs: usize,
+) -> u8 {
+    use crate::encoder::intra4x4::LUMA_4X4_XY as XY;
+    let (bx, by) = XY[block_idx];
+
+    let neigh = |xd: i32, yd: i32| -> Option<(usize, usize, usize)> {
+        // Eq. 6-25 / 6-26 (block-of-4-samples xN, yN inside MB grid).
+        let xn = bx as i32 + xd;
+        let yn = by as i32 + yd;
+        // Table 6-3 (non-MBAFF frame): pick neighbour MB.
+        let (nmb_x, nmb_y) = if xn < 0 && (0..16).contains(&yn) {
+            // mbAddrA: left MB.
+            if mb_x == 0 {
+                return None;
+            }
+            (mb_x - 1, mb_y)
+        } else if (0..16).contains(&xn) && yn < 0 {
+            // mbAddrB: above MB.
+            if mb_y == 0 {
+                return None;
+            }
+            (mb_x, mb_y - 1)
+        } else if (0..16).contains(&xn) && (0..16).contains(&yn) {
+            (mb_x, mb_y)
+        } else {
+            return None;
+        };
+        // Eq. 6-34 / 6-35 — coords inside neighbour MB.
+        let xw = ((xn + 16) % 16) as usize;
+        let yw = ((yn + 16) % 16) as usize;
+        // Eq. 6-38.
+        let nblk = 8 * (yw / 8) + 4 * (xw / 8) + 2 * ((yw % 8) / 4) + ((xw % 8) / 4);
+        Some((nmb_x, nmb_y, nblk))
+    };
+
+    let na = neigh(-1, 0);
+    let nb = neigh(0, -1);
+
+    let mb_a_avail = na
+        .and_then(|(nx, ny, _)| Some(grid.slot(nx, ny)).filter(|s| s.available))
+        .is_some();
+    let mb_b_avail = nb
+        .and_then(|(nx, ny, _)| Some(grid.slot(nx, ny)).filter(|s| s.available))
+        .is_some();
+    let dc_pred_flag = !mb_a_avail || !mb_b_avail;
+
+    let mode_for = |neigh: Option<(usize, usize, usize)>| -> u8 {
+        if dc_pred_flag {
+            return 2;
+        }
+        let Some((nx, ny, nblk)) = neigh else {
+            return 2;
+        };
+        let s = grid.slot(nx, ny);
+        if !s.available {
+            return 2;
+        }
+        if s.is_i_nxn {
+            s.intra_4x4_pred_modes[nblk]
+        } else {
+            // Intra_16x16 / I_PCM / inter neighbour → DC fallback.
+            2
+        }
+    };
+    let mode_a = mode_for(na);
+    let mode_b = mode_for(nb);
+    let _ = pic_w_mbs;
+    mode_a.min(mode_b)
 }
 
 /// Top-level encoder. Holds parameter set state but no per-picture
@@ -194,6 +335,10 @@ impl Encoder {
         // same procedure to pick CAVLC tables, so we must match it
         // bit-exactly to avoid mis-parsing.
         let mut nc_grid = CavlcNcGrid::new(width_mbs, height_mbs);
+        // Encoder-side intra-pred-mode grid mirroring what the decoder
+        // will populate as it reconstructs each MB. Used to derive
+        // `predIntra4x4PredMode` per §8.3.1.1 step 4.
+        let mut intra_grid = IntraGrid::new(width_mbs as usize, height_mbs as usize);
 
         // Iterate MBs in raster order.
         for mb_y in 0..height_mbs {
@@ -211,6 +356,7 @@ impl Encoder {
                     &mut recon_v,
                     &mut sw,
                     &mut nc_grid,
+                    &mut intra_grid,
                 );
             }
         }
@@ -230,13 +376,22 @@ impl Encoder {
         }
     }
 
-    /// Encode one macroblock and update the reconstruction buffers.
-    /// Splits the encode into:
-    ///   1) Luma mode decision (V/H/DC/Plane) by SAD.
-    ///   2) Luma DC + AC encode + reconstruction.
-    ///   3) Chroma mode decision (DC/V/H/Plane) by SAD.
-    ///   4) Chroma DC + AC encode + reconstruction.
-    ///   5) Macroblock layer emit.
+    /// Round-4 entry point: pick the lower-SAD mb_type (I_16x16 vs
+    /// I_NxN) and dispatch.
+    ///
+    /// Strategy:
+    ///   1) Compute the best I_16x16 mode + its 16x16 SAD against source.
+    ///   2) Compute the best I_NxN per-block modes (9 candidates each)
+    ///      against source, summing SAD.
+    ///   3) Whichever has lower total SAD wins. The winning encoder
+    ///      path runs the actual residual + reconstruction + bitstream
+    ///      emit. The losing path is discarded.
+    ///
+    /// The I_NxN trial uses prediction-only SAD (no residual), so the
+    /// comparison is biased: at low QP, I_NxN should always win on
+    /// detailed content (more granular prediction); at high QP, AC
+    /// residual on I_16x16 may produce an equivalent result. We accept
+    /// the bias for now — round 5+ can add full RDO with residual cost.
     #[allow(clippy::too_many_arguments)]
     fn encode_mb(
         &self,
@@ -252,6 +407,122 @@ impl Encoder {
         recon_v: &mut [u8],
         sw: &mut BitWriter,
         nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+    ) {
+        let width = self.cfg.width as usize;
+        let height = self.cfg.height as usize;
+
+        // ----- I_16x16 mode-decision SAD -----
+        let mut best_16x16_sad = u64::MAX;
+        for &mode in &[
+            I16x16Mode::Vertical,
+            I16x16Mode::Horizontal,
+            I16x16Mode::Dc,
+            I16x16Mode::Plane,
+        ] {
+            let Some(pred) = predict_16x16(mode, recon_y, width, height, mb_x, mb_y) else {
+                continue;
+            };
+            let sad = sad_16x16(frame.y, width, mb_x * 16, mb_y * 16, &pred);
+            if sad < best_16x16_sad {
+                best_16x16_sad = sad;
+            }
+        }
+
+        // ----- I_NxN per-block prediction-only SAD -----
+        // Note: this scores predictors against the *source* before
+        // residual quantisation. It picks a winner mode per block but
+        // the absolute SAD comparison is approximate vs I_16x16 (which
+        // includes residual encoding implicitly via the same ranking).
+        let intra4x4_sad = self.score_i_nxn_sad(frame, recon_y, mb_x, mb_y);
+
+        if intra4x4_sad < best_16x16_sad {
+            self.encode_mb_intra4x4(
+                frame,
+                mb_x,
+                mb_y,
+                qp_y,
+                qp_c,
+                chroma_width,
+                chroma_height,
+                recon_y,
+                recon_u,
+                recon_v,
+                sw,
+                nc_grid,
+                intra_grid,
+            );
+        } else {
+            self.encode_mb_intra16x16(
+                frame,
+                mb_x,
+                mb_y,
+                qp_y,
+                qp_c,
+                chroma_width,
+                chroma_height,
+                recon_y,
+                recon_u,
+                recon_v,
+                sw,
+                nc_grid,
+                intra_grid,
+            );
+        }
+    }
+
+    /// Compute the best I_NxN total SAD (sum of best per-block SADs).
+    /// Used by the mb_type decision in [`Encoder::encode_mb`].
+    fn score_i_nxn_sad(
+        &self,
+        frame: &YuvFrame<'_>,
+        recon_y: &[u8],
+        mb_x: usize,
+        mb_y: usize,
+    ) -> u64 {
+        let width = self.cfg.width as usize;
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let mut total: u64 = 0;
+        for &(bx, by) in &I4X4_XY {
+            let avail = i4x4_avail(mb_x, mb_y, bx, by, width_mbs);
+            let mut best = u64::MAX;
+            for &mode in &Intra4x4Mode::ALL {
+                let Some(pred) = predict_4x4(mode, recon_y, width, mb_x, mb_y, bx, by, avail)
+                else {
+                    continue;
+                };
+                let sad = sad_4x4(frame.y, width, mb_x * 16 + bx, mb_y * 16 + by, &pred);
+                if sad < best {
+                    best = sad;
+                }
+            }
+            // If somehow no mode was available (shouldn't happen — DC
+            // is always available), penalize but don't crash.
+            if best == u64::MAX {
+                best = u64::MAX / 2;
+            }
+            total = total.saturating_add(best);
+        }
+        total
+    }
+
+    /// Original Intra_16x16 path (round-3 logic).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mb_intra16x16(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
     ) {
         let width = self.cfg.width as usize;
         let height = self.cfg.height as usize;
@@ -538,6 +809,310 @@ impl Encoder {
         };
         write_intra16x16_mb(sw, &mb_cfg, CoeffTokenContext::Numeric(nc_dc))
             .expect("write Intra16x16 mb");
+
+        // Mark this MB as available + not-i_nxn for subsequent MBs'
+        // §8.3.1.1 step 3 lookup. Intra_16x16 neighbours fall into
+        // the "DC fallback" branch (intraMxMPredModeN = 2).
+        let slot = intra_grid.slot_mut(mb_x, mb_y);
+        slot.available = true;
+        slot.is_i_nxn = false;
+    }
+
+    /// I_NxN (Intra_4x4) path: per-block 9-mode prediction, full luma
+    /// 4x4 residual, chroma residual identical to I_16x16. Round-4.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mb_intra4x4(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+    ) {
+        let width = self.cfg.width as usize;
+        let width_mbs = (self.cfg.width / 16) as usize;
+
+        // Per-block: pick mode by SAD against source.
+        // Build the intra_grid slot incrementally so subsequent blocks
+        // see this MB's chosen intra_4x4_pred_modes when computing
+        // their predIntra4x4PredMode (§8.3.1.1 step 4).
+        //
+        // We MUST pre-mark the slot as I_NxN+available so that the
+        // `predicted_4x4_mode` lookup for blocks 5..15 finds the
+        // current MB's earlier-block modes.
+        {
+            let s = intra_grid.slot_mut(mb_x, mb_y);
+            s.available = true;
+            s.is_i_nxn = true;
+            s.intra_4x4_pred_modes = [0u8; 16];
+        }
+
+        // Per-block scratch.
+        let mut chosen_mode = [0u8; 16]; // Intra4x4Mode index per block.
+        let mut prev_flag = [false; 16];
+        let mut rem = [0u8; 16];
+        let mut luma_4x4_levels_scan = [[0i32; 16]; 16]; // scan-order per block
+        let mut luma_4x4_quant_raster = [[0i32; 16]; 16]; // raster-order quantized levels (for inverse)
+        let mut blk_has_nz = [false; 16];
+
+        for blk in 0..16usize {
+            let (bx, by) = I4X4_XY[blk];
+            let avail = i4x4_avail(mb_x, mb_y, bx, by, width_mbs);
+
+            // Pick best mode by SAD on the predictor.
+            let mut best_mode = Intra4x4Mode::Dc;
+            let mut best_sad = u64::MAX;
+            let mut best_pred = [0i32; 16];
+            for &mode in &Intra4x4Mode::ALL {
+                let Some(pred) = predict_4x4(mode, recon_y, width, mb_x, mb_y, bx, by, avail)
+                else {
+                    continue;
+                };
+                let sad = sad_4x4(frame.y, width, mb_x * 16 + bx, mb_y * 16 + by, &pred);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_mode = mode;
+                    best_pred = pred;
+                }
+            }
+            let chosen = best_mode.as_u8();
+            chosen_mode[blk] = chosen;
+
+            // Derive predicted mode per §8.3.1.1 step 4 and the
+            // `prev_flag` / `rem` syntax that signals our chosen mode.
+            let predicted = predicted_intra4x4_mode(intra_grid, mb_x, mb_y, blk, width_mbs);
+            if chosen == predicted {
+                prev_flag[blk] = true;
+            } else {
+                prev_flag[blk] = false;
+                // §7.3.5.1: rem in 0..=7. Map chosen → rem so that the
+                // decoder's `if rem < predicted { rem } else { rem + 1 }`
+                // recovers `chosen`.
+                let r = if chosen < predicted {
+                    chosen
+                } else {
+                    chosen - 1
+                };
+                rem[blk] = r;
+            }
+
+            // Update intra_grid with our chosen mode so subsequent
+            // blocks (in this MB and in later MBs) see it for their
+            // own neighbour lookup.
+            intra_grid.slot_mut(mb_x, mb_y).intra_4x4_pred_modes[blk] = chosen;
+
+            // Build the residual: source - predictor.
+            let mut block_res = [0i32; 16];
+            for j in 0..4 {
+                for i in 0..4 {
+                    let s = frame.y[(mb_y * 16 + by + j) * width + (mb_x * 16 + bx + i)] as i32;
+                    block_res[j * 4 + i] = s - best_pred[j * 4 + i];
+                }
+            }
+            // Forward 4x4 + quantize (full block, including DC slot 0).
+            let w_coeffs = forward_core_4x4(&block_res);
+            let z_raster = quantize_4x4(&w_coeffs, qp_y, true);
+            luma_4x4_quant_raster[blk] = z_raster;
+            // Pack into scan order (raster → scan).
+            let z_scan = zigzag_scan_4x4(&z_raster);
+            luma_4x4_levels_scan[blk] = z_scan;
+            blk_has_nz[blk] = z_raster.iter().any(|&v| v != 0);
+
+            // Inverse: decode the residual back, add to predictor,
+            // write to recon buffer so subsequent blocks see it.
+            // Note: when the block's 8x8 quadrant cbp bit is 0 the
+            // decoder will use [0; 16] for this block — we have to
+            // reflect that during the cbp_luma decision below. For
+            // now write the *post-residual* recon assuming the block
+            // is transmitted; we'll roll back zero-quadrant blocks
+            // in a second pass.
+            let r = inverse_transform_4x4(&z_raster, qp_y, &FLAT_4X4_16, 8).expect("inverse 4x4");
+            for j in 0..4 {
+                for i in 0..4 {
+                    let px = mb_x * 16 + bx + i;
+                    let py = mb_y * 16 + by + j;
+                    let p = best_pred[j * 4 + i];
+                    let raw = p + r[j * 4 + i];
+                    recon_y[py * width + px] = raw.clamp(0, 255) as u8;
+                }
+            }
+        }
+
+        // §7.3.5 — cbp_luma per 8x8 quadrant: bit `q` set iff any of the
+        // 4 child 4x4 blocks has at least one non-zero coefficient.
+        let mut cbp_luma: u8 = 0;
+        for blk8 in 0..4usize {
+            let any_nz = (0..4).any(|sub| blk_has_nz[blk8 * 4 + sub]);
+            if any_nz {
+                cbp_luma |= 1u8 << blk8;
+            }
+        }
+
+        // Roll back recon for any 8x8 quadrant whose cbp bit is 0:
+        // the decoder will not receive those 4x4 residuals, so it
+        // reconstructs `pred + 0`. Re-derive that here. We must use
+        // each block's chosen predictor — recompute it from the modes
+        // (the recon buffer is already updated to the residual recon,
+        // which would diverge from the decoder for zero-cbp quadrants).
+        for blk8 in 0..4usize {
+            if (cbp_luma >> blk8) & 1 == 1 {
+                continue;
+            }
+            for sub in 0..4usize {
+                let blk = blk8 * 4 + sub;
+                let (bx, by) = I4X4_XY[blk];
+                let mode = Intra4x4Mode::from_u8(chosen_mode[blk]).expect("valid mode");
+                // Re-gather neighbour samples — the recon buffer at the
+                // (bx, by) position has already been updated to the
+                // post-residual recon for the trial. To re-predict the
+                // same way the decoder will, we need the recon as it
+                // was BEFORE this block. But we already overwrote it.
+                //
+                // Fortunately, the decoder's prediction reads only
+                // samples LEFT, ABOVE, ABOVE-LEFT, ABOVE-RIGHT of this
+                // 4x4 block — none of which lie inside the block
+                // itself. Those neighbour samples are unchanged: we
+                // overwrote (bx..bx+4, by..by+4) only. So recompute
+                // the predictor against the current recon and it will
+                // match the decoder.
+                let avail = i4x4_avail(mb_x, mb_y, bx, by, width_mbs);
+                let pred = predict_4x4(mode, recon_y, width, mb_x, mb_y, bx, by, avail)
+                    .expect("predictor exists for chosen mode");
+                for j in 0..4 {
+                    for i in 0..4 {
+                        let px = mb_x * 16 + bx + i;
+                        let py = mb_y * 16 + by + j;
+                        recon_y[py * width + px] = pred[j * 4 + i].clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+
+        // ----- Chroma: same path as I_16x16. -----
+        let mut best_chroma_mode = IntraChromaMode::Dc;
+        let mut best_chroma_pred_u = [0i32; 64];
+        let mut best_chroma_pred_v = [0i32; 64];
+        let mut best_chroma_sad = u64::MAX;
+        for &mode in &[
+            IntraChromaMode::Dc,
+            IntraChromaMode::Horizontal,
+            IntraChromaMode::Vertical,
+            IntraChromaMode::Plane,
+        ] {
+            let (Some(pu), Some(pv)) = (
+                predict_chroma_8x8(mode, recon_u, chroma_width, chroma_height, mb_x, mb_y),
+                predict_chroma_8x8(mode, recon_v, chroma_width, chroma_height, mb_x, mb_y),
+            ) else {
+                continue;
+            };
+            let s = sad_8x8(frame.u, chroma_width, mb_x * 8, mb_y * 8, &pu)
+                + sad_8x8(frame.v, chroma_width, mb_x * 8, mb_y * 8, &pv);
+            if s < best_chroma_sad {
+                best_chroma_sad = s;
+                best_chroma_mode = mode;
+                best_chroma_pred_u = pu;
+                best_chroma_pred_v = pv;
+            }
+        }
+        let (u_dc_levels, u_ac_levels, u_recon_residual) =
+            encode_chroma_residual(frame.u, chroma_width, mb_x, mb_y, &best_chroma_pred_u, qp_c);
+        let (v_dc_levels, v_ac_levels, v_recon_residual) =
+            encode_chroma_residual(frame.v, chroma_width, mb_x, mb_y, &best_chroma_pred_v, qp_c);
+        let any_dc_nz = u_dc_levels.iter().any(|&v| v != 0) || v_dc_levels.iter().any(|&v| v != 0);
+        let any_ac_nz = u_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0))
+            || v_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0));
+        let cbp_chroma: u8 = if any_ac_nz {
+            2
+        } else if any_dc_nz {
+            1
+        } else {
+            0
+        };
+        for j in 0..8usize {
+            for i in 0..8usize {
+                let cx = mb_x * 8 + i;
+                let cy = mb_y * 8 + j;
+                let pred_u = best_chroma_pred_u[j * 8 + i];
+                let pred_v = best_chroma_pred_v[j * 8 + i];
+                let res_u = if cbp_chroma == 0 {
+                    0
+                } else {
+                    u_recon_residual[j * 8 + i]
+                };
+                let res_v = if cbp_chroma == 0 {
+                    0
+                } else {
+                    v_recon_residual[j * 8 + i]
+                };
+                recon_u[cy * chroma_width + cx] = (pred_u + res_u).clamp(0, 255) as u8;
+                recon_v[cy * chroma_width + cx] = (pred_v + res_v).clamp(0, 255) as u8;
+            }
+        }
+        let _ = chroma_height;
+
+        // ----- CAVLC neighbour grid update. -----
+        let pic_w_mbs = self.cfg.width / 16;
+        let mb_addr = (mb_y as u32) * pic_w_mbs + (mb_x as u32);
+        {
+            let cur = &mut nc_grid.mbs[mb_addr as usize];
+            cur.is_available = true;
+            cur.is_intra = true;
+            cur.is_skip = false;
+            cur.is_i_pcm = false;
+            cur.luma_total_coeff = [0u8; 16];
+        }
+        // Per-AC-block nC for the I_NxN luma path. Same nC derivation
+        // (LumaNcKind::Ac), updated progressively as in the I_16x16
+        // path. Blocks whose 8x8 quadrant cbp is 0 contribute
+        // TotalCoeff = 0.
+        let mut luma_4x4_nc = [0i32; 16];
+        let mut own_totals = [0u8; 16];
+        for blk in 0..16usize {
+            let blk8 = blk / 4;
+            nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+            let nc = derive_nc_luma(nc_grid, mb_addr, blk as u8, LumaNcKind::Ac, true, false);
+            luma_4x4_nc[blk] = nc;
+            // Only blocks in transmitted quadrants contribute non-zero
+            // TotalCoeff.
+            if (cbp_luma >> blk8) & 1 == 1 {
+                let tc = luma_4x4_levels_scan[blk]
+                    .iter()
+                    .filter(|&&v| v != 0)
+                    .count() as u8;
+                own_totals[blk] = tc;
+            } else {
+                own_totals[blk] = 0;
+            }
+        }
+        nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+
+        // ----- Emit syntax. -----
+        let mb_cfg = INxNMcbConfig {
+            prev_intra4x4_pred_mode_flag: prev_flag,
+            rem_intra4x4_pred_mode: rem,
+            intra_chroma_pred_mode: best_chroma_mode.as_u8(),
+            cbp_luma,
+            cbp_chroma,
+            mb_qp_delta: 0,
+            luma_4x4_levels: luma_4x4_levels_scan,
+            luma_4x4_nc,
+            chroma_dc_cb: u_dc_levels,
+            chroma_dc_cr: v_dc_levels,
+            chroma_ac_cb: u_ac_levels,
+            chroma_ac_cr: v_ac_levels,
+        };
+        write_i_nxn_mb(sw, &mb_cfg).expect("write I_NxN mb");
+
+        // intra_grid was updated incrementally above; nothing else to
+        // commit here.
     }
 }
 
