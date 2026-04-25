@@ -68,7 +68,7 @@ pub enum CoeffTokenContext {
 
 impl CoeffTokenContext {
     /// Map the context to the coeff_token table to use. See Table 9-5.
-    fn select_table(self) -> &'static [CoeffTokenRow] {
+    pub(crate) fn select_table(self) -> &'static [CoeffTokenRow] {
         match self {
             CoeffTokenContext::Numeric(nc) => {
                 if nc < 2 {
@@ -131,7 +131,7 @@ fn decode_vlc<T: Copy>(
 // ------------------------------------------------------------------
 
 /// (total_coeff, trailing_ones). TotalCoeff spans 0..=16; TrailingOnes 0..=3.
-type CoeffTokenRow = (u32, u8, (u32, u32));
+pub(crate) type CoeffTokenRow = (u32, u8, (u32, u32));
 
 // §9.2.1 — Table 9-5, column `0 <= nC < 2`. 62 rows.
 // Each tuple is (codeword bits, codeword length, (TotalCoeff, TrailingOnes))
@@ -1051,7 +1051,7 @@ static TZ_CHROMA_422_TZVLC_7: [(u32, u8, u32); 2] = [
     (0b1, 1, 1),
 ];
 
-fn tz_luma_table(tzvlc_index: u32) -> Option<&'static [(u32, u8, u32)]> {
+pub(crate) fn tz_luma_table(tzvlc_index: u32) -> Option<&'static [(u32, u8, u32)]> {
     Some(match tzvlc_index {
         1 => &TZ_LUMA_TZVLC_1,
         2 => &TZ_LUMA_TZVLC_2,
@@ -1072,7 +1072,7 @@ fn tz_luma_table(tzvlc_index: u32) -> Option<&'static [(u32, u8, u32)]> {
     })
 }
 
-fn tz_chroma_420_table(tzvlc_index: u32) -> Option<&'static [(u32, u8, u32)]> {
+pub(crate) fn tz_chroma_420_table(tzvlc_index: u32) -> Option<&'static [(u32, u8, u32)]> {
     Some(match tzvlc_index {
         1 => &TZ_CHROMA_420_TZVLC_1,
         2 => &TZ_CHROMA_420_TZVLC_2,
@@ -1081,7 +1081,7 @@ fn tz_chroma_420_table(tzvlc_index: u32) -> Option<&'static [(u32, u8, u32)]> {
     })
 }
 
-fn tz_chroma_422_table(tzvlc_index: u32) -> Option<&'static [(u32, u8, u32)]> {
+pub(crate) fn tz_chroma_422_table(tzvlc_index: u32) -> Option<&'static [(u32, u8, u32)]> {
     Some(match tzvlc_index {
         1 => &TZ_CHROMA_422_TZVLC_1,
         2 => &TZ_CHROMA_422_TZVLC_2,
@@ -1202,7 +1202,7 @@ static RB_ZL_GT_6: [(u32, u8, u32); 15] = [
     (0b00000000001,     11, 14),  // §9.2.3 Table 9-10(>6): run_before=14 → "0000 0000 001"
 ];
 
-fn rb_table(zeros_left: u32) -> &'static [(u32, u8, u32)] {
+pub(crate) fn rb_table(zeros_left: u32) -> &'static [(u32, u8, u32)] {
     match zeros_left {
         1 => &RB_ZL_1,
         2 => &RB_ZL_2,

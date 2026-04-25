@@ -44,6 +44,8 @@ pub mod vui;
 
 pub mod h264_decoder;
 
+pub mod encoder;
+
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 use oxideav_core::{CodecInfo, CodecRegistry};
 
