@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-h264/compare/v0.1.1...v0.1.2) - 2026-04-26
+
+### Other
+
+- adopt slim VideoFrame shape
+- P-slice support — single L0, integer-pel ME (round 16)
+- Lagrangian RDO mode decision + intra4x4 blk-5 fix (round 15)
+- in-loop §8.7 deblocking on local recon (round 14)
+- I_NxN (Intra_4x4) all 9 modes + per-MB mb_type decision (round 4)
+- I_16x16 luma AC residual transmit (round 3)
+- I_16x16 V/H/DC/Plane modes + chroma residual (round 2)
+- Baseline I_16x16 IDR scaffold (round 1)
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - encoder: P-slice support (round 16). Single L0 reference, integer-pel
