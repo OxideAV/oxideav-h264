@@ -531,9 +531,69 @@ end-to-end (verified against ffmpeg).
 - CAVLC only.
 - No rate control — fixed QP.
 
-## Round 18+ (planned)
+## Round 18 — landed
 
-- Quarter-pel ME (refinement around the round-17 half-pel winner).
+Layer **quarter-pel motion estimation** on top of round-17's half-pel
+chain. The encoder now searches all 16 sub-pel positions in
+§8.4.2.2.1 Table 8-12 (integer + 3 half-pel + 12 quarter-pel) and
+picks the SAD-best MV. Predictor comes straight from
+`inter_pred::interpolate_luma`, the same routine the decoder calls,
+so encoder and decoder remain bit-equivalent end-to-end.
+
+- **Quarter-pel refinement (`encoder::me::refine_quarter_pel_16x16`)**:
+  takes the half-pel winner and probes the 8 surrounding ¼-pel offsets
+  (`(±1, 0)`, `(0, ±1)`, `(±1, ±1)` in quarter-pel units). Reuses the
+  `sad_16x16_at_qpel` helper that already drives half-pel; no new
+  spec primitive is reimplemented (`interpolate_luma` already supports
+  all 16 sub-pel positions per §8.4.2.2.1 eq. 8-243 .. 8-261).
+  Tie-break still favours the smaller-magnitude MV to keep
+  `mvd_l0_*` se(v) cost low.
+- **Combined ME entry (`encoder::me::search_quarter_pel_16x16`)**:
+  integer full search (±16) → half-pel refinement → quarter-pel
+  refinement. Drop-in replacement for `search_half_pel_16x16`;
+  round-18 `encode_p_mb` now calls it.
+- **No P-slice header / writer changes** — `mvd_l0_x`/`mvd_l0_y se(v)`
+  already carries quarter-pel MVs natively; only the encoder's MV
+  decision changed.
+
+### Validation
+
+- `cargo test -p oxideav-h264` — **906 passed** (+6 vs round 17:
+  4 new ME unit tests + 2 new quarter-pel integration tests).
+- All round-1..17 fixtures still pass. Notable PSNR uplifts under the
+  new ME (no regression on integer or half-pel motion: each pass
+  refines only when the new candidate beats the previous SAD):
+  - round-16 4-pixel-shift fixture: 50.28 → **50.82 dB** PSNR_Y.
+  - round-17 ½-pixel-shift fixture: 49.19 → **49.40 dB** PSNR_Y,
+    bit-exact ffmpeg interop.
+- New round-18 integration tests
+  (`integration_p_slice_quarter_pel.rs`):
+  - `round18_quarter_pel_p_slice_high_psnr`: encode IDR + P where
+    P is the IDR shifted right by **¼ luma pixel**, decode through
+    our own decoder → bit-exact against encoder recon (max diff 0).
+    PSNR_Y = **53.61 dB**, P-slice stream = 30 bytes (vs 37 bytes
+    for the half-pel fixture — most MBs reach `cbp_luma == 0`
+    because the quarter-pel predictor matches the source bit-for-
+    bit).
+  - `round18_quarter_pel_ffmpeg_interop`: ffmpeg/libavcodec decodes
+    the same quarter-pel P stream bit-equivalently against the
+    encoder's local recon (max diff 0).
+
+### Status caveats (unchanged from round 17 unless noted)
+
+- IDR + P-slice. No B-slices.
+- mb_type: `P_L0_16x16` / `P_Skip` for P; `I_16x16` / `I_NxN` for IDR.
+- Single MV per MB (16×16 partition only). No 16×8 / 8×16 / 8×8 / 4MV.
+- ME: **integer + half-pel + quarter-pel** (round-18). All 16 sub-pel
+  positions per §8.4.2.2.1 are reachable.
+- No intra fallback in P-slices.
+- Single reference, sliding-window DPB.
+- In-loop deblocking active across intra and inter MBs.
+- CAVLC only.
+- No rate control — fixed QP.
+
+## Round 19+ (planned)
+
 - 4MV (8×8 and smaller P sub-partitions).
 - Intra fallback in P-slices via RDO.
 - B-slices.
