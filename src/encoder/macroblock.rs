@@ -480,6 +480,140 @@ pub fn write_p_l0_16x16_mb(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// P_8x8 (4MV: four 8x8 sub-MB partitions, each PL08x8) — round 19.
+// ---------------------------------------------------------------------------
+
+/// Configuration for one P_8x8 macroblock with all four sub-blocks
+/// using `sub_mb_type = PL08x8` (one MV per 8x8 partition — i.e. the
+/// classic "4MV" mode). Round-19 keeps the simpler PL08x4/PL04x8/
+/// PL04x4 sub-modes for later rounds.
+///
+/// Layout per §7.3.5 / §7.3.5.2 with `mb_type == P_8x8` (raw value 3
+/// in P-slice Table 7-13) and four `sub_mb_type` entries (raw value 0
+/// → PL08x8 in Table 7-17):
+///
+/// ```text
+///   mb_type = 3                          (ue(v) → P_8x8)
+///   for i in 0..4: sub_mb_type[i] = 0    (ue(v) → PL08x8)
+///   for i in 0..4:  ref_idx_l0[i]        (te(v); ABSENT when num_ref_idx_l0_active_minus1 == 0)
+///   for i in 0..4:  mvd_l0[i] = (x, y)   (se(v), se(v))
+///   coded_block_pattern                  (me(v); inter Table 9-4(a))
+///   if cbp_luma > 0 || cbp_chroma > 0:
+///     mb_qp_delta                        (se(v))
+///   for each 8x8 quadrant where bit cbp_luma>>blk8 set:
+///     for each of 4 child 4x4 blocks:    residual_block(0..15, 16)
+///   if cbp_chroma >= 1: chroma DC Cb, Cr
+///   if cbp_chroma == 2: chroma AC Cb (4), Cr (4)
+/// ```
+///
+/// `mvd_l0` are in **quarter-pel units** per §7.4.5.1 / §8.4.1.4.
+pub struct P8x8AllPL08x8McbConfig {
+    /// Per-8x8-partition mvd (quarter-pel units), in §6.4.3 8x8
+    /// raster order: (0=TL, 1=TR, 2=BL, 3=BR). Same order as
+    /// `LUMA_4X4_BLK[blk*4]` indexes the top-left 4x4 of each 8x8.
+    pub mvd_l0: [(i32, i32); 4],
+    /// `cbp_luma` ∈ 0..=15.
+    pub cbp_luma: u8,
+    /// `cbp_chroma` ∈ {0, 1, 2}.
+    pub cbp_chroma: u8,
+    /// `mb_qp_delta` per §7.4.5. Range -26..=25 for 8-bit. Only emitted
+    /// when (`cbp_luma > 0 || cbp_chroma > 0`).
+    pub mb_qp_delta: i32,
+    /// 16 4x4 luma residual blocks in §6.4.3 raster-Z order. Same
+    /// layout as `PL016x16McbConfig::luma_4x4_levels`.
+    pub luma_4x4_levels: [[i32; 16]; 16],
+    /// Per-luma-4x4-block `nC` (CAVLC neighbour context).
+    pub luma_4x4_nc: [i32; 16],
+    /// 4 quantized chroma DC levels (Cb).
+    pub chroma_dc_cb: [i32; 4],
+    /// 4 quantized chroma DC levels (Cr).
+    pub chroma_dc_cr: [i32; 4],
+    /// Per-4x4-block chroma AC levels (Cb).
+    pub chroma_ac_cb: [[i32; 16]; 4],
+    /// Per-4x4-block chroma AC levels (Cr).
+    pub chroma_ac_cr: [[i32; 16]; 4],
+}
+
+/// Emit one P_8x8 macroblock with all four sub_mb_type set to
+/// `PL08x8` (CAVLC, P-slice). See [`P8x8AllPL08x8McbConfig`] for the
+/// syntax layout.
+pub fn write_p_8x8_all_pl08x8_mb(
+    w: &mut BitWriter,
+    cfg: &P8x8AllPL08x8McbConfig,
+    num_ref_idx_l0_active_minus1: u32,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+
+    // §7.4.5 — Table 7-13: P_8x8 mb_type raw = 3 in P-slice.
+    w.ue(3);
+
+    // §7.3.5.2 sub_mb_pred(): four sub_mb_type entries, all
+    // PL08x8 (raw 0) here.
+    for _ in 0..4 {
+        w.ue(0);
+    }
+
+    // §7.3.5.2 ref_idx_l0 — gated by (num_ref_idx_l0_active_minus1 > 0)
+    // and (sub_mb_type[i] != B_Direct_8x8) and (SubMbPredMode != Pred_L1).
+    // PL08x8 has SubMbPredMode == Pred_L0, so the only gate is the
+    // num_ref_idx check. Round-19 single-ref → absent.
+    if num_ref_idx_l0_active_minus1 > 0 {
+        for _ in 0..4 {
+            w.te(num_ref_idx_l0_active_minus1, 0);
+        }
+    }
+
+    // §7.3.5.2 mvd_l0 — for each 8x8 partition, NumSubMbPart(PL08x8) == 1
+    // mvd. Emit four (mvd_x, mvd_y) pairs.
+    for &(mvd_x, mvd_y) in cfg.mvd_l0.iter() {
+        w.se(mvd_x);
+        w.se(mvd_y);
+    }
+
+    // §7.3.5 — coded_block_pattern me(v) using the inter table.
+    let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
+    w.ue(codenum);
+
+    // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
+    let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
+    if needs_qp_delta {
+        w.se(cfg.mb_qp_delta);
+    }
+
+    // §7.3.5.3 — luma residual: 16 4x4 blocks grouped by 8x8 quadrant.
+    for blk8 in 0..4u8 {
+        if (cfg.cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                let nc = cfg.luma_4x4_nc[blk];
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(nc),
+                    16,
+                    &cfg.luma_4x4_levels[blk],
+                )?;
+            }
+        }
+    }
+
+    // §7.3.5.3 — chroma residual: same structure as I_16x16 / P_L0_16x16.
+    if cfg.cbp_chroma > 0 {
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
+    }
+    if cfg.cbp_chroma == 2 {
+        for blk in &cfg.chroma_ac_cb {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+        for blk in &cfg.chroma_ac_cr {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

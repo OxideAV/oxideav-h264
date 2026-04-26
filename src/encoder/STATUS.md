@@ -592,9 +592,59 @@ so encoder and decoder remain bit-equivalent end-to-end.
 - CAVLC only.
 - No rate control — fixed QP.
 
-## Round 19+ (planned)
+## Round 19 — landed
 
-- 4MV (8×8 and smaller P sub-partitions).
+**4MV (P_8x8 with `sub_mb_type = PL08x8`)** — adds the per-8x8-
+partition motion-compensation mode, gated by a content-driven SAD
+heuristic so smooth content stays on the round-16 1MV path.
+
+- **Per-8x8 ME** (`encoder::me::search_quarter_pel_8x8`) mirrors the
+  round-18 quarter-pel chain but on 8×8 sub-blocks:
+  integer-pel ±range full search → ½-pel refinement → ¼-pel
+  refinement, all SAD-based against the same `interpolate_luma` the
+  decoder uses (so encoder and decoder agree bit-for-bit on the
+  predictor for any sub-pel MV).
+- **MV grid extended** (`MvGridSlot::{mv_l0_8x8, ref_idx_l0_8x8}`)
+  to track per-8x8 MVs / refs. P_L0_16x16 / P_Skip MBs fill all
+  four 8x8 entries with the same value, preserving exact round-16
+  / 17 / 18 neighbour reads.
+- **Per-partition MVpred** (`mvp_for_p_8x8_partition`) walks the
+  §8.4.1.3 (A, B, C, D) neighbours of an 8x8 partition, supporting
+  within-MB neighbour reads of already-decoded sub-partitions
+  (sub-blocks decode in raster order 0→1→2→3) and falling back to
+  the §8.4.1.3.2 C→D substitution when the C neighbour is in a
+  not-yet-decoded sub-partition of the current MB.
+- **Bitstream emit** (`encoder::macroblock::write_p_8x8_all_pl08x8_mb`)
+  → `mb_type ue(3)` (P_8x8, Table 7-13) + 4× `sub_mb_type ue(0)`
+  (PL08x8, Table 7-17) + 4× `(mvd_l0_x se(v), mvd_l0_y se(v))` +
+  inter `coded_block_pattern me(v)` + optional `mb_qp_delta` +
+  the same residual layout as P_L0_16x16. Single-reference path
+  (`num_ref_idx_l0_active_minus1 == 0`) → ref_idx absent.
+- **Mode decision**: 4MV picked iff
+  `me_16x16_sad >= 1024 && me_4mv_sad_sum * 10 < me_16x16_sad * 7`
+  (≥30% SAD reduction over a non-trivial 1MV residual). The two
+  gates protect rounds 16/17/18 fixtures (smooth content → both
+  paths converge to the same MV → 1MV wins → no regression).
+
+### Validation
+
+- `cargo test -p oxideav-h264` — **911 passed** (was 906).
+- Round 16/17/18 PSNR fixtures unchanged: 50.82 / 49.40 / 53.61 dB.
+- New round-19 fixture (`integration_p_slice_4mv.rs`,
+  `round19_4mv_p_slice_high_psnr_on_sub_mb_motion`):
+  source has each 8x8 sub-block of every 16x16 MB shifted by a
+  *different* integer-pel amount. **Local recon PSNR_Y = 40.95 dB**,
+  decoder PSNR_Y = 40.95 dB (max enc/dec diff 0).
+- ffmpeg interop (`round19_4mv_ffmpeg_interop`):
+  libavcodec decodes the 4MV P-frame **bit-equivalently** against
+  the encoder's local recon (max diff 0).
+- 3 new unit tests in `me::tests` covering per-8x8 ME (zero motion +
+  per-sub-block motion recovery + `p_8x8_pred_bits`).
+
+## Round 20+ (planned)
+
+- 4MV further sub-partitions (PL08x4 / PL04x8 / PL04x4).
+- Per-8x8 MV trial within RDO (currently a SAD heuristic).
 - Intra fallback in P-slices via RDO.
 - B-slices.
 - Multiple slices per picture.

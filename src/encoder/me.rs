@@ -37,7 +37,11 @@
 //! quarter-pel paths inherit replication from
 //! [`inter_pred::interpolate_luma`].
 //!
-//! 4MV partitions are deferred to later rounds.
+//! Round-19 adds **per-8x8 ME** ([`search_quarter_pel_8x8`]) for the
+//! 4MV / P_8x8 path: same three-stage refinement, but on each 8×8
+//! sub-block of an MB independently. The encoder's caller decides 1MV
+//! vs 4MV via a SAD heuristic so smooth content stays on the
+//! converged 1MV path with zero regression.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -441,6 +445,227 @@ pub fn p_l0_16x16_pred_bits(mvd_x: i32, mvd_y: i32) -> u64 {
     w.bits_emitted() as u64
 }
 
+/// Trial-encode the P_8x8 mb_pred syntax (mb_type + 4× sub_mb_type +
+/// 4× mvd_l0) for the simple "all sub_mb_type = PL08x8" 4MV variant.
+/// `ref_idx` is absent when `num_ref_idx_l0_active_minus1 == 0` (round
+/// 19 single-ref). Returns the bit count.
+pub fn p_8x8_pred_bits(mvds: &[(i32, i32); 4]) -> u64 {
+    let mut w = BitWriter::new();
+    w.ue(3); // mb_type = P_8x8 (Table 7-13)
+    for _ in 0..4 {
+        w.ue(0); // sub_mb_type = PL08x8 (Table 7-17)
+    }
+    for &(mvd_x, mvd_y) in mvds.iter() {
+        w.se(mvd_x);
+        w.se(mvd_y);
+    }
+    w.bits_emitted() as u64
+}
+
+// ===========================================================================
+// Round-19 — per-8x8 motion estimation (4MV / P_L0_8x8).
+// ===========================================================================
+
+/// SAD between an 8×8 source block at `(src_mb_x*16 + sub_x*8,
+/// src_mb_y*16 + sub_y*8)` and a quarter-pel-positioned 8×8 reference
+/// predictor produced by [`interpolate_luma`]. `(sub_x, sub_y) ∈ {0, 1}`
+/// selects one of the four 8×8 sub-blocks of the MB.
+fn sad_8x8_at_qpel(
+    src_y: &[u8],
+    src_stride: usize,
+    src_mb_x: usize,
+    src_mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+    ref_i32: &[i32],
+    ref_stride: usize,
+    ref_w: usize,
+    ref_h: usize,
+    mv_qpel_x: i32,
+    mv_qpel_y: i32,
+) -> u32 {
+    let origin_x = (src_mb_x * 16 + sub_x * 8) as i32;
+    let origin_y = (src_mb_y * 16 + sub_y * 8) as i32;
+    let int_x = origin_x + (mv_qpel_x >> 2);
+    let int_y = origin_y + (mv_qpel_y >> 2);
+    let x_frac = (mv_qpel_x & 3) as u8;
+    let y_frac = (mv_qpel_y & 3) as u8;
+    let mut pred = [0i32; 64];
+    interpolate_luma(
+        ref_i32, ref_stride, ref_w, ref_h, int_x, int_y, x_frac, y_frac, 8, 8, 8, &mut pred, 8,
+    )
+    .expect("luma interpolation 8x8");
+    let mut sad = 0u32;
+    let src_origin_y = src_mb_y * 16 + sub_y * 8;
+    let src_origin_x = src_mb_x * 16 + sub_x * 8;
+    for j in 0..8usize {
+        let row_src_off = (src_origin_y + j) * src_stride + src_origin_x;
+        for i in 0..8usize {
+            let s = src_y[row_src_off + i] as i32;
+            let p = pred[j * 8 + i].clamp(0, 255);
+            sad = sad.saturating_add((s - p).unsigned_abs());
+        }
+    }
+    sad
+}
+
+/// Integer-pel SAD for an 8×8 block at integer reference `(int_x, int_y)`.
+/// Edge replication via clamping.
+fn sad_8x8_at_int(
+    src_y: &[u8],
+    src_stride: usize,
+    src_mb_x: usize,
+    src_mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: i32,
+    ref_h: i32,
+    int_x: i32,
+    int_y: i32,
+) -> u32 {
+    let mut sad = 0u32;
+    let src_origin_y = src_mb_y * 16 + sub_y * 8;
+    let src_origin_x = src_mb_x * 16 + sub_x * 8;
+    for j in 0..8i32 {
+        let ry = (int_y + j).clamp(0, ref_h - 1) as usize;
+        let row_ref_off = ry * ref_stride;
+        let row_src_off = (src_origin_y + j as usize) * src_stride + src_origin_x;
+        for i in 0..8i32 {
+            let rx = (int_x + i).clamp(0, ref_w - 1) as usize;
+            let s = src_y[row_src_off + i as usize] as i32;
+            let r = ref_y[row_ref_off + rx] as i32;
+            sad = sad.saturating_add((s - r).unsigned_abs());
+        }
+    }
+    sad
+}
+
+/// §8.4.2.2.1 — Run integer + half-pel + quarter-pel ME for one **8x8**
+/// sub-block. `(sub_x, sub_y) ∈ {0, 1}` selects which 8x8 inside the MB
+/// at `(mb_x, mb_y)`. Returns the best MV in quarter-pel units.
+///
+/// Mirrors the structure of [`search_quarter_pel_16x16`] but with 8x8
+/// SAD against an 8x8 predictor. Search is centred at MV (0, 0).
+#[allow(clippy::too_many_arguments)]
+pub fn search_quarter_pel_8x8(
+    src_y: &[u8],
+    src_stride: usize,
+    _src_w: u32,
+    _src_h: u32,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+    range_x: i32,
+    range_y: i32,
+) -> MeResult {
+    let ref_w_i = ref_w as i32;
+    let ref_h_i = ref_h as i32;
+    let ref_w_us = ref_w as usize;
+    let ref_h_us = ref_h as usize;
+    let centre_x = (mb_x * 16 + sub_x * 8) as i32;
+    let centre_y = (mb_y * 16 + sub_y * 8) as i32;
+
+    // 1. Integer-pel full search.
+    let mut best_sad = u32::MAX;
+    let mut best_dx = 0i32;
+    let mut best_dy = 0i32;
+    let mut best_mv_cost = u32::MAX;
+    for dy in -range_y..=range_y {
+        for dx in -range_x..=range_x {
+            let int_x = centre_x + dx;
+            let int_y = centre_y + dy;
+            let sad = sad_8x8_at_int(
+                src_y, src_stride, mb_x, mb_y, sub_x, sub_y, ref_y, ref_stride, ref_w_i, ref_h_i,
+                int_x, int_y,
+            );
+            let mv_cost = (dx.unsigned_abs()) + (dy.unsigned_abs());
+            if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
+                best_sad = sad;
+                best_dx = dx;
+                best_dy = dy;
+                best_mv_cost = mv_cost;
+            }
+        }
+    }
+    let mut best_mv_x = best_dx * 4;
+    let mut best_mv_y = best_dy * 4;
+
+    // Promote ref to i32 for the sub-pel SAD path.
+    let ref_i32: Vec<i32> = ref_y
+        .iter()
+        .take(ref_stride * ref_h_us)
+        .map(|&v| v as i32)
+        .collect();
+
+    // 2. Half-pel refinement.
+    let mut best_mv_cost = (best_mv_x.unsigned_abs()) + (best_mv_y.unsigned_abs());
+    const HALF_OFFS: [(i32, i32); 8] = [
+        (-2, -2),
+        (0, -2),
+        (2, -2),
+        (-2, 0),
+        (2, 0),
+        (-2, 2),
+        (0, 2),
+        (2, 2),
+    ];
+    for &(dx, dy) in &HALF_OFFS {
+        let mv_x = best_mv_x + dx;
+        let mv_y = best_mv_y + dy;
+        let sad = sad_8x8_at_qpel(
+            src_y, src_stride, mb_x, mb_y, sub_x, sub_y, &ref_i32, ref_stride, ref_w_us, ref_h_us,
+            mv_x, mv_y,
+        );
+        let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
+        if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
+            best_sad = sad;
+            best_mv_x = mv_x;
+            best_mv_y = mv_y;
+            best_mv_cost = mv_cost;
+        }
+    }
+
+    // 3. Quarter-pel refinement.
+    const QUARTER_OFFS: [(i32, i32); 8] = [
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+    ];
+    for &(dx, dy) in &QUARTER_OFFS {
+        let mv_x = best_mv_x + dx;
+        let mv_y = best_mv_y + dy;
+        let sad = sad_8x8_at_qpel(
+            src_y, src_stride, mb_x, mb_y, sub_x, sub_y, &ref_i32, ref_stride, ref_w_us, ref_h_us,
+            mv_x, mv_y,
+        );
+        let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
+        if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
+            best_sad = sad;
+            best_mv_x = mv_x;
+            best_mv_y = mv_y;
+            best_mv_cost = mv_cost;
+        }
+    }
+
+    MeResult {
+        mv_x: best_mv_x,
+        mv_y: best_mv_y,
+        sad: best_sad,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +918,77 @@ mod tests {
         assert_eq!(qpel.mv_x, 16);
         assert_eq!(qpel.mv_y, 0);
         assert_eq!(qpel.sad, 0);
+    }
+
+    // ---- Round-19 — per-8x8 ME tests ----
+
+    #[test]
+    fn search_8x8_zero_motion_on_identical_frames() {
+        let src = make_solid_frame(64, 64, 100);
+        let r = make_solid_frame(64, 64, 100);
+        // Run ME for all four 8x8 sub-blocks of MB (1, 1).
+        for sub_idx in 0..4usize {
+            let sub_x = sub_idx % 2;
+            let sub_y = sub_idx / 2;
+            let m =
+                search_quarter_pel_8x8(&src, 64, 64, 64, &r, 64, 64, 64, 1, 1, sub_x, sub_y, 4, 4);
+            assert_eq!(m.mv_x, 0, "sub_idx={sub_idx}");
+            assert_eq!(m.mv_y, 0, "sub_idx={sub_idx}");
+            assert_eq!(m.sad, 0, "sub_idx={sub_idx}");
+        }
+    }
+
+    #[test]
+    fn search_8x8_finds_per_subblock_motion() {
+        // Build a reference where each 8x8 of MB (1, 1) takes its
+        // samples from a *different* shifted position in the
+        // reference. Per-8x8 ME must recover each sub-block's MV
+        // independently.
+        //
+        // mvs[sub_idx]: the encoder MV (in integer pel) that yields
+        // SAD = 0 for that sub-block — i.e. src(dst) = ref(dst + mv).
+        let mvs: [(i32, i32); 4] = [(2, 0), (-2, 0), (0, 2), (0, -2)];
+        let mut src = vec![100u8; 64 * 64];
+        let mut r = vec![100u8; 64 * 64];
+        // Ref texture: simple per-pixel signature so SAD can find a
+        // unique match.
+        for j in 0..64 {
+            for i in 0..64 {
+                r[j * 64 + i] = ((i * 7 + j * 11) & 0xff) as u8;
+            }
+        }
+        for (sub_idx, &(mvx, mvy)) in mvs.iter().enumerate() {
+            let sub_x = sub_idx % 2;
+            let sub_y = sub_idx / 2;
+            for j in 0..8i32 {
+                for i in 0..8i32 {
+                    let dst_x = (16 + sub_x as i32 * 8) + i;
+                    let dst_y = (16 + sub_y as i32 * 8) + j;
+                    // Source = ref(dst + mv). Encoder must recover this MV.
+                    let src_x = (dst_x + mvx).clamp(0, 63) as usize;
+                    let src_y = (dst_y + mvy).clamp(0, 63) as usize;
+                    src[(dst_y as usize) * 64 + dst_x as usize] = r[src_y * 64 + src_x];
+                }
+            }
+        }
+        // Per-sub-block ME must pick MV = (mvx, mvy) * 4 (qpel units).
+        for (sub_idx, &(mvx, mvy)) in mvs.iter().enumerate() {
+            let sub_x = sub_idx % 2;
+            let sub_y = sub_idx / 2;
+            let m =
+                search_quarter_pel_8x8(&src, 64, 64, 64, &r, 64, 64, 64, 1, 1, sub_x, sub_y, 4, 4);
+            assert_eq!(m.mv_x, mvx * 4, "sub_idx={sub_idx} mv=({mvx}, {mvy})");
+            assert_eq!(m.mv_y, mvy * 4, "sub_idx={sub_idx}");
+            assert_eq!(m.sad, 0, "sub_idx={sub_idx}");
+        }
+    }
+
+    #[test]
+    fn p_8x8_pred_bits_simple() {
+        // mb_type ue(3) = ue(v) for 3 → 5 bits ("00100").
+        // sub_mb_type ue(0) = 1 bit each, ×4 = 4 bits.
+        // 4× (se(0), se(0)) = 8 × 1 bit = 8 bits.
+        // Total = 5 + 4 + 8 = 17 bits.
+        assert_eq!(p_8x8_pred_bits(&[(0, 0); 4]), 17);
     }
 }
