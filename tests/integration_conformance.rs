@@ -152,8 +152,14 @@ fn videoframe_to_yuv420p(vf: &oxideav_core::VideoFrame) -> Vec<u8> {
     let h = vf.planes[0].data.len() / w;
     let cw = w / 2;
     let ch = h / 2;
-    assert_eq!(vf.planes[1].stride, cw, "Cb stride must be width/2 (Yuv420P)");
-    assert_eq!(vf.planes[2].stride, cw, "Cr stride must be width/2 (Yuv420P)");
+    assert_eq!(
+        vf.planes[1].stride, cw,
+        "Cb stride must be width/2 (Yuv420P)"
+    );
+    assert_eq!(
+        vf.planes[2].stride, cw,
+        "Cr stride must be width/2 (Yuv420P)"
+    );
 
     let mut out = Vec::with_capacity(w * h + 2 * cw * ch);
     pack_plane(&mut out, &vf.planes[0].data, vf.planes[0].stride, w, h);

@@ -1,36 +1,46 @@
-//! §8.4 — Motion estimation (encoder side, integer-pel).
+//! §8.4 — Motion estimation (encoder side).
 //!
-//! Round-16 introduces a minimal **integer-pel motion estimation** for
-//! P-slice support. Search strategy:
+//! Round-16 introduced a minimal **integer-pel motion estimation** for
+//! P-slice support. Round-17 layers **half-pel refinement** on top using
+//! the §8.4.2.2.1 6-tap luma interpolator (the same interpolator the
+//! decoder uses, so encoder and decoder agree bit-for-bit on the
+//! predictor for any half-pel MV the encoder picks).
 //!
-//! * Centre at (0, 0) — i.e. the predicted MV (PredMV is the same when
-//!   no neighbour MVs are available, which is the common case for our
-//!   single-reference encoder + sliding-window DPB).
-//! * **Square diamond / full search** within `±range_x` / `±range_y`
-//!   pixels. Picks the (mv_x, mv_y) minimising **SAD** between the
-//!   source 16×16 luma block and the integer-pel reference block.
-//! * Reference-picture edge replication is via [`Self::sample_clipped`],
-//!   matching §8.4.2.2.1 eq. 8-239 / 8-240. So MVs that point outside
-//!   the picture are still legal — the decoder will replicate the same
-//!   way through `inter_pred::interpolate_luma` at integer fractional
-//!   coords.
+//! Search strategy (16×16 luma):
 //!
-//! Half-pel and 4MV refinement are deferred to a later round. Here we
-//! stay strictly integer-pel single-MV-per-MB.
+//! 1. **Integer-pel full search** centred at (0, 0) within
+//!    `±range_x` / `±range_y` pixels. Picks the integer (dx, dy)
+//!    minimising SAD against the 16×16 source block.
+//! 2. **Half-pel refinement** around the integer winner: try the 8
+//!    half-pel neighbours, keep the best by SAD against the 6-tap
+//!    interpolated predictor.
+//!
+//! All MVs are returned in **quarter-pel units** (mv = pel × 4), matching
+//! `mvd_l0_*` syntax in §7.4.5.1 and the decoder's expectations in
+//! §8.4.1.2. Integer-pel MVs are multiples of 4; half-pel MVs are
+//! multiples of 2.
+//!
+//! Reference-picture edge replication is via §8.4.2.2.1 eq. 8-239 /
+//! 8-240. The integer-pel SAD path uses local clamping; the half-pel
+//! path inherits replication from `inter_pred::interpolate_luma`.
+//!
+//! Quarter-pel refinement and 4MV partitions are deferred to later
+//! rounds.
 
 #![allow(clippy::too_many_arguments)]
 
 use crate::encoder::bitstream::BitWriter;
+use crate::inter_pred::interpolate_luma;
 
 /// Result of motion estimation for one MB partition.
 #[derive(Debug, Clone, Copy)]
 pub struct MeResult {
     /// Best MV in **quarter-pel units** (encoded as `mv = mv_pel * 4`),
-    /// so the bitstream can carry it directly. For integer-pel ME this
-    /// is always a multiple of 4.
+    /// so the bitstream can carry it directly. Integer-pel ME yields
+    /// multiples of 4; half-pel refinement can introduce multiples of 2.
     pub mv_x: i32,
     pub mv_y: i32,
-    /// SAD of the chosen (mv_x, mv_y) integer-pel block.
+    /// SAD of the chosen (mv_x, mv_y) predictor block.
     pub sad: u32,
 }
 
@@ -123,6 +133,165 @@ pub fn search_integer_16x16(
     }
 }
 
+/// Compute SAD between a 16×16 source block and a 16×16 reference
+/// predictor produced by the §8.4.2.2.1 6-tap interpolator at the
+/// fractional MV `(mv_qpel_x, mv_qpel_y)` (quarter-pel units, anchored
+/// at MB origin `(mb_x*16, mb_y*16)`). The predictor is built via
+/// `interpolate_luma`, which transparently handles edge replication.
+fn sad_16x16_at_qpel(
+    src_y: &[u8],
+    src_stride: usize,
+    src_mb_x: usize,
+    src_mb_y: usize,
+    ref_i32: &[i32],
+    ref_stride: usize,
+    ref_w: usize,
+    ref_h: usize,
+    mb_x: usize,
+    mb_y: usize,
+    mv_qpel_x: i32,
+    mv_qpel_y: i32,
+) -> u32 {
+    let int_x = (mb_x * 16) as i32 + (mv_qpel_x >> 2);
+    let int_y = (mb_y * 16) as i32 + (mv_qpel_y >> 2);
+    let x_frac = (mv_qpel_x & 3) as u8;
+    let y_frac = (mv_qpel_y & 3) as u8;
+    let mut pred = [0i32; 256];
+    interpolate_luma(
+        ref_i32, ref_stride, ref_w, ref_h, int_x, int_y, x_frac, y_frac, 16, 16, 8, &mut pred, 16,
+    )
+    .expect("luma interpolation");
+
+    let mut sad = 0u32;
+    for j in 0..16usize {
+        let row_src_off = (src_mb_y * 16 + j) * src_stride + src_mb_x * 16;
+        for i in 0..16usize {
+            let s = src_y[row_src_off + i] as i32;
+            let p = pred[j * 16 + i].clamp(0, 255);
+            sad = sad.saturating_add((s - p).unsigned_abs());
+        }
+    }
+    sad
+}
+
+/// §8.4.2.2.1 — Half-pel refinement around an integer-pel best MV.
+///
+/// `start_mv_qpel_x` / `start_mv_qpel_y` are the quarter-pel-unit MV
+/// returned by [`search_integer_16x16`] (multiples of 4). This routine
+/// tries the 8 surrounding **half-pel** offsets `(±2, 0)`, `(0, ±2)`,
+/// `(±2, ±2)` (still in quarter-pel units, so `±2` = ½-pel). The 6-tap
+/// interpolator from §8.4.2.2.1 (eq. 8-241..8-247) is applied via
+/// [`interpolate_luma`]. Returns the best MV by SAD; ties prefer the
+/// smaller (|mvd_x| + |mvd_y|) magnitude relative to PredMV at (0, 0)
+/// to keep mvd-bit cost low.
+///
+/// Note: chroma cost is intentionally not factored in — chroma 1/8-pel
+/// derives mechanically from the luma MV (§8.4.1.4) and the chroma
+/// bilinear filter is a much smoother surface.
+pub fn refine_half_pel_16x16(
+    src_y: &[u8],
+    src_stride: usize,
+    src_w: u32,
+    src_h: u32,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    start_mv_qpel_x: i32,
+    start_mv_qpel_y: i32,
+    start_sad: u32,
+) -> MeResult {
+    let _ = src_w;
+    let _ = src_h;
+    let ref_w_us = ref_w as usize;
+    let ref_h_us = ref_h as usize;
+    // Promote the reference plane to i32 once for `interpolate_luma`.
+    let ref_i32: Vec<i32> = ref_y
+        .iter()
+        .take(ref_stride * ref_h_us)
+        .map(|&v| v as i32)
+        .collect();
+
+    let mut best_mv_x = start_mv_qpel_x;
+    let mut best_mv_y = start_mv_qpel_y;
+    let mut best_sad = start_sad;
+    let mut best_mv_cost = (start_mv_qpel_x.unsigned_abs()) + (start_mv_qpel_y.unsigned_abs());
+
+    // 8 half-pel neighbours (in quarter-pel units, ±2 = ½-pel).
+    const HALF_OFFS: [(i32, i32); 8] = [
+        (-2, -2),
+        (0, -2),
+        (2, -2),
+        (-2, 0),
+        (2, 0),
+        (-2, 2),
+        (0, 2),
+        (2, 2),
+    ];
+    for &(dx, dy) in &HALF_OFFS {
+        let mv_x = start_mv_qpel_x + dx;
+        let mv_y = start_mv_qpel_y + dy;
+        let sad = sad_16x16_at_qpel(
+            src_y, src_stride, mb_x, mb_y, &ref_i32, ref_stride, ref_w_us, ref_h_us, mb_x, mb_y,
+            mv_x, mv_y,
+        );
+        let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
+        if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
+            best_sad = sad;
+            best_mv_x = mv_x;
+            best_mv_y = mv_y;
+            best_mv_cost = mv_cost;
+        }
+    }
+
+    MeResult {
+        mv_x: best_mv_x,
+        mv_y: best_mv_y,
+        sad: best_sad,
+    }
+}
+
+/// Convenience wrapper: integer-pel full search (±range) followed by
+/// half-pel refinement around the integer winner. Returns the refined
+/// MV in quarter-pel units. Equivalent to calling
+/// [`search_integer_16x16`] then [`refine_half_pel_16x16`].
+pub fn search_half_pel_16x16(
+    src_y: &[u8],
+    src_stride: usize,
+    src_w: u32,
+    src_h: u32,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    range_x: i32,
+    range_y: i32,
+) -> MeResult {
+    let int_best = search_integer_16x16(
+        src_y, src_stride, src_w, src_h, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, range_x,
+        range_y,
+    );
+    refine_half_pel_16x16(
+        src_y,
+        src_stride,
+        src_w,
+        src_h,
+        ref_y,
+        ref_stride,
+        ref_w,
+        ref_h,
+        mb_x,
+        mb_y,
+        int_best.mv_x,
+        int_best.mv_y,
+        int_best.sad,
+    )
+}
+
 /// Trial-encode the L0 P_L0_16x16 mb_pred syntax (mb_type + mvd_l0)
 /// to measure its bit cost for RDO. `ref_idx_l0` is implicit when
 /// `num_ref_idx_l0_active_minus1 == 0` — no `te(v)` is emitted.
@@ -185,6 +354,97 @@ mod tests {
         let r = make_solid_frame(32, 32, 100);
         let m = search_integer_16x16(&src, 32, 32, 32, &r, 32, 32, 32, 1, 1, 16, 16);
         assert_eq!(m.sad, 0);
+    }
+
+    // ---- Half-pel refinement tests ----
+
+    /// Apply the spec's horizontal half-pel filter (eq. 8-241/8-242)
+    /// at integer position (x, y), with edge-replicated reference
+    /// samples — this is what the decoder will compute for x_frac = 2,
+    /// y_frac = 0 at the same coordinate.
+    fn b_at(plane: &[u8], stride: usize, w: i32, h: i32, x: i32, y: i32) -> i32 {
+        let s = |xx: i32| -> i32 {
+            let cx = xx.clamp(0, w - 1) as usize;
+            let cy = y.clamp(0, h - 1) as usize;
+            plane[cy * stride + cx] as i32
+        };
+        let b1 = s(x - 2) - 5 * s(x - 1) + 20 * s(x) + 20 * s(x + 1) - 5 * s(x + 2) + s(x + 3);
+        ((b1 + 16) >> 5).clamp(0, 255)
+    }
+
+    #[test]
+    fn half_pel_refinement_finds_horizontal_half_pel_motion() {
+        // Reference: linear ramp in x, constant per y. The 6-tap FIR
+        // applied at any position with xFrac=2 returns the linearly
+        // interpolated value at (x+½), which is `(r[x]+r[x+1])/2` for
+        // a linear ramp. Source at MB (1,1) is exactly the half-pel-
+        // right interpolation of the reference at the same MB.
+        // Integer (0,0) SAD is non-zero (offset by ½-pel of slope);
+        // mv_qpel=+2 reproduces the source bit-exactly.
+        let mut r = vec![0u8; 64 * 64];
+        for j in 0..64 {
+            for i in 0..64 {
+                // Slope of 3 per pixel in x, range stays in [0, 255]
+                // for i in 0..64 → 0..189 plus a +30 bias.
+                r[j * 64 + i] = (30 + i * 3).clamp(0, 255) as u8;
+            }
+        }
+        let mut src = vec![0u8; 64 * 64];
+        for j in 0..16i32 {
+            for i in 0..16i32 {
+                let x = 16 + i;
+                let y = 16 + j;
+                src[(y as usize) * 64 + x as usize] = b_at(&r, 64, 64, 64, x, y) as u8;
+            }
+        }
+        let res = search_half_pel_16x16(&src, 64, 64, 64, &r, 64, 64, 64, 1, 1, 4, 4);
+        assert_eq!(res.mv_x, 2, "expected mv_x = +½ pel (qpel +2)");
+        assert_eq!(res.mv_y, 0, "expected mv_y = 0");
+        assert_eq!(res.sad, 0, "predictor should match the synthetic source");
+    }
+
+    #[test]
+    fn half_pel_refinement_keeps_integer_when_better() {
+        // Identical frames — the integer (0, 0) MV gives SAD = 0.
+        // Half-pel refinement must NOT replace it (no neighbour can
+        // beat 0). Tie-break must prefer the smaller-magnitude MV
+        // (which is the integer winner here).
+        let src = vec![123u8; 64 * 64];
+        let r = vec![123u8; 64 * 64];
+        let res = search_half_pel_16x16(&src, 64, 64, 64, &r, 64, 64, 64, 1, 1, 4, 4);
+        assert_eq!(res.mv_x, 0);
+        assert_eq!(res.mv_y, 0);
+        assert_eq!(res.sad, 0);
+    }
+
+    #[test]
+    fn half_pel_refinement_preserves_integer_winner_on_clean_integer_motion() {
+        // Reference shifted +4 pel from source. Integer search returns
+        // (16, 0) qpel. Half-pel refinement should NOT degrade — it
+        // must find SAD <= the integer one.
+        let mut src = vec![100u8; 64 * 64];
+        let mut r = vec![100u8; 64 * 64];
+        for j in 16..32 {
+            for i in 16..32 {
+                let v = if ((i + j) % 2) == 0 { 200u8 } else { 50 };
+                src[j * 64 + i] = v;
+                r[j * 64 + i + 4] = v;
+            }
+        }
+        let int_only = search_integer_16x16(&src, 64, 64, 64, &r, 64, 64, 64, 1, 1, 8, 8);
+        let refined = search_half_pel_16x16(&src, 64, 64, 64, &r, 64, 64, 64, 1, 1, 8, 8);
+        assert_eq!(int_only.mv_x, 16);
+        assert!(
+            refined.sad <= int_only.sad,
+            "half-pel refinement must not degrade SAD: int={} refined={}",
+            int_only.sad,
+            refined.sad,
+        );
+        // For perfectly integer motion, the half-pel offsets cannot
+        // beat SAD=0; refinement should keep the integer MV.
+        assert_eq!(refined.mv_x, 16);
+        assert_eq!(refined.mv_y, 0);
+        assert_eq!(refined.sad, 0);
     }
 
     #[test]

@@ -61,7 +61,7 @@ use crate::encoder::macroblock::{
     write_i_nxn_mb, write_intra16x16_mb, write_p_l0_16x16_mb, I16x16McbConfig, INxNMcbConfig,
     PL016x16McbConfig,
 };
-use crate::encoder::me::search_integer_16x16;
+use crate::encoder::me::search_half_pel_16x16;
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::rdo::{cost_combined, lambda_ssd, ssd_16x16, ssd_4x4};
@@ -2092,8 +2092,12 @@ impl Encoder {
         let width_mbs = (self.cfg.width / 16) as usize;
         let mb_addr = mb_y * width_mbs + mb_x;
 
-        // 1. Motion estimation (integer-pel, ±16).
-        let me = search_integer_16x16(
+        // 1. Motion estimation: integer-pel full search ±16 followed by
+        //    §8.4.2.2.1 half-pel refinement against the 6-tap
+        //    interpolated predictor. Encoder and decoder agree on the
+        //    predictor for half-pel MVs because the refinement uses the
+        //    same `interpolate_luma` the decoder calls.
+        let me = search_half_pel_16x16(
             frame.y,
             width,
             self.cfg.width,

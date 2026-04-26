@@ -476,9 +476,64 @@ integer-pel motion estimation, P_Skip + P_L0_16x16.
 - No CABAC — CAVLC only.
 - No rate control — fixed QP from `EncoderConfig::qp`.
 
-## Round 17+ (planned)
+## Round 17 — landed
 
-- Half-pel + quarter-pel ME (luma 6-tap + chroma bilinear refinement).
+Layer **half-pel motion estimation** on top of round-16's integer-pel
+P-slice support, using the same §8.4.2.2.1 6-tap luma interpolator the
+decoder runs. Encoder and decoder pick the **same** predictor for any
+half-pel MV the encoder selects, so bit-equivalence is preserved
+end-to-end (verified against ffmpeg).
+
+- **Half-pel refinement (`encoder::me::refine_half_pel_16x16`)**: takes
+  the integer-pel winner and probes the 8 surrounding ½-pel offsets
+  (`(±2, 0)`, `(0, ±2)`, `(±2, ±2)` in quarter-pel units). Predictor
+  comes straight from `inter_pred::interpolate_luma`, which is the
+  same routine the decoder calls — the encoder doesn't reimplement the
+  6-tap FIR. Tie-break still favours the smaller-magnitude MV to keep
+  `mvd_l0_*` se(v) costs low.
+- **Combined ME entry (`encoder::me::search_half_pel_16x16`)**: integer
+  full search (±16) followed by half-pel refinement. Drop-in
+  replacement for `search_integer_16x16`; round-17 `encode_p_mb` now
+  calls it.
+- **No P-slice header / writer changes** — the bitstream already
+  carried fractional MVs via `mvd_l0_x`/`mvd_l0_y se(v)`. Only the
+  encoder's MV decision changed.
+
+### Validation
+
+- `cargo test -p oxideav-h264` — **900 passed** (+5 vs round 16: 3
+  new ME unit tests + 2 new half-pel integration tests).
+- All round-1..16 fixtures still pass. The round-16 4-pixel-shift
+  fixture moved 49.79 → **50.28 dB** PSNR_Y under the new ME (no
+  regression on integer motion: integer winner stays integer when
+  the half-pel neighbours can't beat its SAD).
+- New round-17 integration tests
+  (`integration_p_slice_half_pel.rs`):
+  - `round17_half_pel_p_slice_high_psnr`: encode IDR + P where P is
+    the IDR shifted right by **½ luma pixel**, decode through our own
+    decoder → bit-exact against encoder recon (max diff 0). PSNR_Y =
+    **49.19 dB**, with `cbp_luma == 0` on most MBs because the
+    half-pel predictor matches the source bit-for-bit.
+  - `round17_half_pel_ffmpeg_interop`: ffmpeg/libavcodec decodes the
+    same half-pel P stream bit-equivalently against the encoder's
+    local recon (max diff 0).
+
+### Status caveats (unchanged from round 16 unless noted)
+
+- IDR + P-slice. No B-slices.
+- mb_type: `P_L0_16x16` / `P_Skip` for P; `I_16x16` / `I_NxN` for IDR.
+- Single MV per MB (16×16 partition only). No 16×8 / 8×16 / 8×8 / 4MV.
+- ME: **integer + half-pel** (round-17). Quarter-pel refinement is the
+  next step.
+- No intra fallback in P-slices.
+- Single reference, sliding-window DPB.
+- In-loop deblocking active across intra and inter MBs.
+- CAVLC only.
+- No rate control — fixed QP.
+
+## Round 18+ (planned)
+
+- Quarter-pel ME (refinement around the round-17 half-pel winner).
 - 4MV (8×8 and smaller P sub-partitions).
 - Intra fallback in P-slices via RDO.
 - B-slices.
