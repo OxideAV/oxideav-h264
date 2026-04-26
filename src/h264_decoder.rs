@@ -44,8 +44,7 @@ use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
-    VideoPlane,
+    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::decoder::{Decoder as H264Driver, Event};
@@ -906,7 +905,13 @@ impl H264CodecDecoder {
             };
         }
 
-        let vf = picture_to_video_frame(&pic, pts, time_base);
+        // `time_base` was previously stamped onto the VideoFrame for
+        // downstream rescaling; the slim VideoFrame shape only carries
+        // pts + planes now, so the time base lives on the stream's
+        // CodecParameters instead. Bind to `_` to keep the destructure
+        // total and document the intent.
+        let _ = time_base;
+        let vf = picture_to_video_frame(&pic, pts);
 
         // §C.4 — at IDR / MMCO-5 drain the prior sequence.
         if is_idr || mmco5_triggered {
@@ -1497,18 +1502,11 @@ fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
 /// Convert a reconstructed [`Picture`] to a [`VideoFrame`]. Samples are
 /// clamped to 8-bit (0..=255) for now; higher bit depths will get
 /// dedicated pixel formats later.
-fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, time_base: TimeBase) -> VideoFrame {
-    let format = match (pic.chroma_array_type, pic.bit_depth_luma) {
-        (0, 8) => PixelFormat::Gray8,
-        (1, 8) => PixelFormat::Yuv420P,
-        (2, 8) => PixelFormat::Yuv422P,
-        (3, 8) => PixelFormat::Yuv444P,
-        // Fall back to 4:2:0 for higher bit depths — samples are still
-        // clamped to 8-bit below, which is lossy but keeps the pipeline
-        // moving. High-bit-depth streams need a wider pixel format later.
-        _ => PixelFormat::Yuv420P,
-    };
-
+///
+/// The slim `VideoFrame` shape only carries `pts` + `planes`; the pixel
+/// format / resolution / time_base live on the stream's
+/// [`CodecParameters`] (set by the decoder from the SPS).
+fn picture_to_video_frame(pic: &Picture, pts: Option<i64>) -> VideoFrame {
     let w = pic.width_in_samples as usize;
     let cw = pic.chroma_width() as usize;
 
@@ -1532,14 +1530,7 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, time_base: TimeBase) 
         });
     }
 
-    VideoFrame {
-        format,
-        width: pic.width_in_samples,
-        height: pic.height_in_samples,
-        pts,
-        time_base,
-        planes,
-    }
+    VideoFrame { pts, planes }
 }
 
 #[cfg(test)]
@@ -1566,11 +1557,7 @@ mod tests {
     /// without carrying real pixel data.
     fn vf(tag: u8) -> VideoFrame {
         VideoFrame {
-            format: PixelFormat::Gray8,
-            width: 1,
-            height: 1,
             pts: None,
-            time_base: TimeBase::new(1, 1),
             planes: vec![VideoPlane {
                 stride: 1,
                 data: vec![tag],

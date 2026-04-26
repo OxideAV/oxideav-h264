@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use oxideav_core::Decoder as _;
-use oxideav_core::{CodecId, Error, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, Error, Frame, Packet, TimeBase};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
 // -------------------------- ffmpeg plumbing --------------------------
@@ -111,9 +111,11 @@ fn decoder_yuv(path: &Path) -> (u32, u32, Vec<Vec<u8>>) {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Video(vf)) => {
+                // Slim VideoFrame: derive geometry from the luma plane.
+                // Our decoder packs stride == width, data == stride * height.
                 if frames.is_empty() {
-                    width = vf.width;
-                    height = vf.height;
+                    width = vf.planes[0].stride as u32;
+                    height = (vf.planes[0].data.len() / vf.planes[0].stride) as u32;
                 }
                 frames.push(videoframe_to_yuv420p(&vf));
             }
@@ -137,17 +139,21 @@ fn decoder_yuv(path: &Path) -> (u32, u32, Vec<Vec<u8>>) {
 /// If the frame's plane strides are larger than `width`/`chroma_width`
 /// (padding on the right), we copy row-by-row to strip the padding so
 /// the resulting buffer matches ffmpeg exactly.
+///
+/// The slim `VideoFrame` carries only `pts` + `planes`; the format /
+/// geometry that used to live on the frame now sits on the stream's
+/// `CodecParameters`. The harness recovers width/height from the luma
+/// plane (our H.264 decoder packs stride == width and emits exactly
+/// `stride * height` bytes per plane), and the 3-plane / chroma-half
+/// pattern is the format check.
 fn videoframe_to_yuv420p(vf: &oxideav_core::VideoFrame) -> Vec<u8> {
-    assert_eq!(
-        vf.format,
-        PixelFormat::Yuv420P,
-        "harness expects Yuv420P output"
-    );
     assert_eq!(vf.planes.len(), 3, "yuv420p requires 3 planes");
-    let w = vf.width as usize;
-    let h = vf.height as usize;
+    let w = vf.planes[0].stride;
+    let h = vf.planes[0].data.len() / w;
     let cw = w / 2;
     let ch = h / 2;
+    assert_eq!(vf.planes[1].stride, cw, "Cb stride must be width/2 (Yuv420P)");
+    assert_eq!(vf.planes[2].stride, cw, "Cr stride must be width/2 (Yuv420P)");
 
     let mut out = Vec::with_capacity(w * h + 2 * cw * ch);
     pack_plane(&mut out, &vf.planes[0].data, vf.planes[0].stride, w, h);

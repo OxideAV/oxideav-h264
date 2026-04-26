@@ -14,7 +14,7 @@
 //!  * No spurious decoder errors; the stream parses end-to-end.
 
 use oxideav_core::Decoder as _;
-use oxideav_core::{CodecId, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::{Encoder, EncoderConfig, YuvFrame};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
@@ -88,9 +88,11 @@ fn encode_decode_roundtrip_matches_local_recon() {
         Frame::Video(vf) => vf,
         other => panic!("expected Frame::Video, got {:?}", other),
     };
-    assert_eq!(vf.format, PixelFormat::Yuv420P);
-    assert_eq!(vf.width, 64);
-    assert_eq!(vf.height, 64);
+    // Slim VideoFrame: derive 64x64 Yuv420P geometry from plane stride
+    // + 3-plane layout. Format/resolution live on stream params now.
+    assert_eq!(vf.planes.len(), 3, "expected Yuv420P (3-plane) layout");
+    assert_eq!(vf.planes[0].stride, 64);
+    assert_eq!(vf.planes[0].data.len(), 64 * 64);
 
     // Compare per-plane to the encoder's recon. Allow a tiny tolerance
     // (off-by-one due to integer rounding in the deblocking-disabled
@@ -169,7 +171,8 @@ fn encode_decode_roundtrip_chroma_residual() {
         Frame::Video(vf) => vf,
         other => panic!("expected Frame::Video, got {:?}", other),
     };
-    assert_eq!(vf.format, PixelFormat::Yuv420P);
+    // Yuv420P stand-in: 3-plane layout. Format tag is on stream params.
+    assert_eq!(vf.planes.len(), 3, "expected Yuv420P (3-plane) layout");
 
     // Bit-exact match between decoder output and encoder local recon.
     for (k, (&a, &b)) in vf.planes[0].data.iter().zip(out.recon_y.iter()).enumerate() {

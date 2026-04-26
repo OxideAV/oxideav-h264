@@ -25,7 +25,7 @@
 //! skip if neither exists.
 
 use oxideav_core::Decoder as _;
-use oxideav_core::{CodecId, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 use std::path::PathBuf;
 
@@ -87,22 +87,24 @@ fn decode_p_slices_yields_frames() {
 
     // Every frame that did make it through must have the expected
     // 176x144 YUV 4:2:0 geometry. This catches regressions in the
-    // Picture → VideoFrame conversion.
+    // Picture → VideoFrame conversion. The slim VideoFrame carries
+    // only pts + planes; geometry is asserted via plane stride and
+    // data length (stride == width, data == stride * height), and the
+    // 3-plane / chroma-half pattern stands in for the format tag.
     for (i, vf) in frames.iter().enumerate() {
-        assert_eq!(vf.format, PixelFormat::Yuv420P, "frame {i} wrong format");
-        assert_eq!(vf.width, 176, "frame {i} wrong width");
-        assert_eq!(vf.height, 144, "frame {i} wrong height");
-        assert_eq!(vf.planes.len(), 3, "frame {i} missing planes");
+        assert_eq!(vf.planes.len(), 3, "frame {i} missing planes (Yuv420P)");
+        assert_eq!(vf.planes[0].stride, 176, "frame {i} luma stride");
         assert_eq!(vf.planes[0].data.len(), 176 * 144, "frame {i} luma size");
+        assert_eq!(vf.planes[1].stride, 88, "frame {i} cb stride");
         assert_eq!(vf.planes[1].data.len(), 88 * 72, "frame {i} cb size");
+        assert_eq!(vf.planes[2].stride, 88, "frame {i} cr stride");
         assert_eq!(vf.planes[2].data.len(), 88 * 72, "frame {i} cr size");
     }
 
     eprintln!(
-        "foreman: decoded {} frame(s) ({}x{} {:?})",
+        "foreman: decoded {} frame(s) (luma {}x{})",
         frames.len(),
-        frames[0].width,
-        frames[0].height,
-        frames[0].format
+        frames[0].planes[0].stride,
+        frames[0].planes[0].data.len() / frames[0].planes[0].stride,
     );
 }

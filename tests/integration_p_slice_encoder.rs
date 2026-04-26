@@ -18,7 +18,7 @@
 //! later rounds.
 
 use oxideav_core::Decoder as _;
-use oxideav_core::{CodecId, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::{EncodedFrameRef, Encoder, EncoderConfig, YuvFrame};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
@@ -124,10 +124,12 @@ fn round16_p_slice_self_roundtrip_matches_local_recon() {
     assert_eq!(frames.len(), 2, "expected 2 decoded frames (IDR + P)");
 
     // Frame 0: IDR.
+    // Slim VideoFrame: derive 64x64 Yuv420P geometry from plane stride
+    // + 3-plane layout. Format/resolution live on stream params now.
     let f0_dec = &frames[0];
-    assert_eq!(f0_dec.format, PixelFormat::Yuv420P);
-    assert_eq!(f0_dec.width, 64);
-    assert_eq!(f0_dec.height, 64);
+    assert_eq!(f0_dec.planes.len(), 3, "expected Yuv420P (3-plane) layout");
+    assert_eq!(f0_dec.planes[0].stride, 64);
+    assert_eq!(f0_dec.planes[0].data.len(), 64 * 64);
     for (k, (&a, &b)) in f0_dec.planes[0]
         .data
         .iter()
@@ -140,10 +142,11 @@ fn round16_p_slice_self_roundtrip_matches_local_recon() {
         );
     }
 
-    // Frame 1: P-slice.
+    // Frame 1: P-slice. Same geometry derivation as the IDR.
     let f1_dec = &frames[1];
-    assert_eq!(f1_dec.width, 64);
-    assert_eq!(f1_dec.height, 64);
+    assert_eq!(f1_dec.planes.len(), 3, "expected Yuv420P (3-plane) layout");
+    assert_eq!(f1_dec.planes[0].stride, 64);
+    assert_eq!(f1_dec.planes[0].data.len(), 64 * 64);
 
     let mut max_diff = 0i32;
     let mut nz = 0usize;

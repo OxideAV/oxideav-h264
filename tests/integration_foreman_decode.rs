@@ -12,7 +12,7 @@
 //! skips if the sample is missing.
 
 use oxideav_core::Decoder as _;
-use oxideav_core::{CodecId, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 use std::path::PathBuf;
 
@@ -63,11 +63,13 @@ fn decode_foreman_p16x16_first_idr_through_trait() {
         other => panic!("expected Frame::Video, got {:?}", other),
     };
 
-    // foreman_p16x16.264 is 176x144 (QCIF) YUV 4:2:0 8-bit.
-    assert_eq!(vf.format, PixelFormat::Yuv420P);
-    assert_eq!(vf.width, 176);
-    assert_eq!(vf.height, 144);
-    assert_eq!(vf.planes.len(), 3);
+    // foreman_p16x16.264 is 176x144 (QCIF) YUV 4:2:0 8-bit. The slim
+    // VideoFrame shape no longer carries width/height/format directly —
+    // those live on the stream's CodecParameters. Geometry is asserted
+    // through the plane layout instead (stride == width, data ==
+    // stride * height), and the 3-plane / chroma-half pattern stands in
+    // for the Yuv420P format check.
+    assert_eq!(vf.planes.len(), 3, "expected 3-plane (Yuv420P) layout");
 
     // Luma plane stride matches width, and data size matches stride*height.
     assert_eq!(vf.planes[0].stride, 176);
@@ -92,7 +94,10 @@ fn decode_foreman_p16x16_first_idr_through_trait() {
     // pts carried through from the packet.
     assert_eq!(vf.pts, Some(0));
     eprintln!(
-        "first IDR: {}x{} fmt={:?} top-left-luma={} pts={:?}",
-        vf.width, vf.height, vf.format, vf.planes[0].data[0], vf.pts
+        "first IDR: luma={}x{} top-left-luma={} pts={:?}",
+        vf.planes[0].stride,
+        vf.planes[0].data.len() / vf.planes[0].stride,
+        vf.planes[0].data[0],
+        vf.pts
     );
 }
