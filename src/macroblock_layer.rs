@@ -1735,18 +1735,24 @@ fn cbf_cond_for(
                             // equal to 0" branch).
                             return trans_block_unavail_cbf();
                         }
-                        // transform_size_8x8_flag gate: for ctxBlockCat ∈
-                        // {1, 2}, the 4x4 block is available only when
-                        // t8x8=0 for the neighbour. For ctxBlockCat == 5
-                        // (Luma8x8), the 8x8 block is available only when
-                        // t8x8 == 1. We don't hit cat=5 here (Luma8x8 is
-                        // MbLevel for CBF in our dispatcher). Same spec
-                        // rule: transBlockN not available → condTermFlagN = 0.
-                        if info.transform_size_8x8_flag
-                            && matches!(block_type, BlockType::Luma4x4 | BlockType::Luma16x16Ac)
-                        {
-                            return trans_block_unavail_cbf();
-                        }
+                        // §9.3.3.1.1.9 ctxBlockCat ∈ {1, 2, 7, 8, 11, 12}:
+                        // when neighbour has transform_size_8x8_flag == 1
+                        // and the cbp bit covering luma4x4BlkIdxN is set,
+                        // the spec assigns the **8x8 block** with index
+                        // (luma4x4BlkIdxN >> 2) of the neighbour to
+                        // transBlockN — it IS available, not "not
+                        // available". Its coded_block_flag is:
+                        //   * inferred from the CBP (=1) for
+                        //     ChromaArrayType < 3 (8x8 blocks don't decode
+                        //     coded_block_flag in 4:2:x — §7.3.5.3.3);
+                        //   * the decoded value for ChromaArrayType == 3.
+                        // In both cases the residual walker propagates
+                        // that value into `cbf_luma_4x4[bi]` for each of
+                        // the four 4x4 sub-blocks (line ~3829-3834), so
+                        // a normal `cbf_luma_for` lookup at the wrapped
+                        // 4x4 index returns the right transBlockN cbf.
+                        // Therefore we do NOT short-circuit to "not
+                        // available" here — fall through.
                     }
                     _ => {}
                 }

@@ -604,6 +604,121 @@ const TBL_9_21: &[(usize, InitCell)] = &[
     (275, InitCell::all((-14, 97), (-8, 85), (-4, 78), (-10, 87))),
 ];
 
+// Table 9-24 — ctxIdx 402..=459 (Luma8x8 frame/field sig/last/level
+// + Luma8x8 frame coeff_abs_level_minus1).
+//
+// Used by:
+// - significant_coeff_flag cat=5 (Luma8x8): frame ctxIdxOffset=402;
+//   field ctxIdxOffset=436.
+// - last_significant_coeff_flag cat=5 (Luma8x8): frame ctxIdxOffset=417;
+//   field ctxIdxOffset=451.
+// - coeff_abs_level_minus1 cat=5: ctxIdxOffset=426 (frame and field
+//   share — the spec table only lists 10 abs-level entries, applied to
+//   both).
+//
+// Without this table populated, cat-5 contexts fall back to the
+// neutral (0, 0) init which collapses to pStateIdx=62, valMPS=0
+// (highly-skewed MPS=0). Real-world H.264 streams that use
+// transform_size_8x8_flag=1 (most High-profile encoders) drift the
+// arithmetic decoder out of sync within a few hundred bins —
+// typical symptom: "attempted to read past end of bitstream" mid-MB.
+const TBL_9_24: &[(usize, InitCell)] = &[
+    (402, InitCell::all((-17, 120), (-4, 79), (-5, 85), (-3, 78))),
+    (403, InitCell::all((-20, 112), (-7, 71), (-6, 81), (-8, 74))),
+    (
+        404,
+        InitCell::all((-18, 114), (-5, 69), (-10, 77), (-9, 72)),
+    ),
+    (405, InitCell::all((-11, 85), (-9, 70), (-7, 81), (-10, 72))),
+    (
+        406,
+        InitCell::all((-15, 92), (-8, 66), (-17, 80), (-18, 75)),
+    ),
+    (
+        407,
+        InitCell::all((-14, 89), (-10, 68), (-18, 73), (-12, 71)),
+    ),
+    (
+        408,
+        InitCell::all((-26, 71), (-19, 73), (-4, 74), (-11, 63)),
+    ),
+    (
+        409,
+        InitCell::all((-15, 81), (-12, 69), (-10, 83), (-5, 70)),
+    ),
+    (
+        410,
+        InitCell::all((-14, 80), (-16, 70), (-9, 71), (-17, 75)),
+    ),
+    (411, InitCell::all((0, 68), (-15, 67), (-9, 67), (-14, 72))),
+    (
+        412,
+        InitCell::all((-14, 70), (-20, 62), (-1, 61), (-16, 67)),
+    ),
+    (413, InitCell::all((-24, 56), (-19, 70), (-8, 66), (-8, 53))),
+    (
+        414,
+        InitCell::all((-23, 68), (-16, 66), (-14, 66), (-14, 59)),
+    ),
+    (415, InitCell::all((-24, 50), (-22, 65), (0, 59), (-9, 52))),
+    (416, InitCell::all((-11, 74), (-20, 63), (2, 59), (-11, 68))),
+    (417, InitCell::all((23, -13), (9, -2), (17, -10), (9, -2))),
+    (
+        418,
+        InitCell::all((26, -13), (26, -9), (32, -13), (30, -10)),
+    ),
+    (419, InitCell::all((40, -15), (33, -9), (42, -9), (31, -4))),
+    (420, InitCell::all((49, -14), (39, -7), (49, -5), (33, -1))),
+    (421, InitCell::all((44, 3), (41, -2), (53, 0), (33, 7))),
+    (422, InitCell::all((45, 6), (45, 3), (64, 3), (31, 12))),
+    (423, InitCell::all((44, 34), (49, 9), (68, 10), (37, 23))),
+    (424, InitCell::all((33, 54), (45, 27), (66, 27), (31, 38))),
+    (425, InitCell::all((19, 82), (36, 59), (47, 57), (20, 64))),
+    (426, InitCell::all((-3, 75), (-6, 66), (-5, 71), (-9, 71))),
+    (427, InitCell::all((-1, 23), (-7, 35), (0, 24), (-7, 37))),
+    (428, InitCell::all((1, 34), (-7, 42), (-1, 36), (-8, 44))),
+    (429, InitCell::all((1, 43), (-8, 45), (-2, 42), (-11, 49))),
+    (430, InitCell::all((0, 54), (-5, 48), (-2, 52), (-10, 56))),
+    (431, InitCell::all((-2, 55), (-12, 56), (-9, 57), (-12, 59))),
+    (432, InitCell::all((0, 61), (-6, 60), (-6, 63), (-8, 63))),
+    (433, InitCell::all((1, 64), (-5, 62), (-4, 65), (-9, 67))),
+    (434, InitCell::all((0, 68), (-8, 66), (-4, 67), (-6, 68))),
+    (435, InitCell::all((-9, 92), (-8, 76), (-7, 82), (-10, 79))),
+    (436, InitCell::all((-14, 106), (-5, 85), (-3, 81), (-3, 78))),
+    (437, InitCell::all((-13, 97), (-6, 81), (-3, 76), (-8, 74))),
+    (438, InitCell::all((-15, 90), (-10, 77), (-7, 72), (-9, 72))),
+    (439, InitCell::all((-12, 90), (-7, 81), (-6, 78), (-10, 72))),
+    (
+        440,
+        InitCell::all((-18, 88), (-17, 80), (-12, 72), (-18, 75)),
+    ),
+    (
+        441,
+        InitCell::all((-10, 73), (-18, 73), (-14, 68), (-12, 71)),
+    ),
+    (442, InitCell::all((-9, 79), (-4, 74), (-3, 70), (-11, 63))),
+    (443, InitCell::all((-14, 86), (-10, 83), (-6, 76), (-5, 70))),
+    (444, InitCell::all((-10, 73), (-9, 71), (-5, 66), (-17, 75))),
+    (445, InitCell::all((-10, 70), (-9, 67), (-5, 62), (-14, 72))),
+    (446, InitCell::all((-10, 69), (-1, 61), (0, 57), (-16, 67))),
+    (447, InitCell::all((-5, 66), (-8, 66), (-4, 61), (-8, 53))),
+    (448, InitCell::all((-9, 64), (-14, 66), (-9, 60), (-14, 59))),
+    (449, InitCell::all((-5, 58), (0, 59), (1, 54), (-9, 52))),
+    (450, InitCell::all((2, 59), (2, 59), (2, 58), (-11, 68))),
+    (451, InitCell::all((21, -10), (21, -13), (17, -10), (9, -2))),
+    (
+        452,
+        InitCell::all((24, -11), (33, -14), (32, -13), (30, -10)),
+    ),
+    (453, InitCell::all((28, -8), (39, -7), (42, -9), (31, -4))),
+    (454, InitCell::all((28, -1), (46, -2), (49, -5), (33, -1))),
+    (455, InitCell::all((29, 3), (51, 2), (53, 0), (33, 7))),
+    (456, InitCell::all((29, 9), (60, 6), (64, 3), (31, 12))),
+    (457, InitCell::all((35, 20), (61, 17), (68, 10), (37, 23))),
+    (458, InitCell::all((29, 36), (55, 34), (66, 27), (31, 38))),
+    (459, InitCell::all((14, 67), (42, 62), (47, 57), (20, 64))),
+];
+
 /// Union of all per-ctxIdx init cells used by this module. Assembled
 /// once into `INIT_TABLE[ctxIdx]`.
 ///
@@ -631,7 +746,7 @@ fn init_table() -> &'static [InitCell; NUM_CTX_IDX] {
         let mut arr = [InitCell::none(); NUM_CTX_IDX];
         for table in &[
             TBL_9_12, TBL_9_13, TBL_9_14, TBL_9_15, TBL_9_16, TBL_9_17, TBL_9_18, TBL_9_19,
-            TBL_9_20, TBL_9_21,
+            TBL_9_20, TBL_9_21, TBL_9_24,
         ] {
             for (idx, cell) in *table {
                 arr[*idx] = *cell;
@@ -2325,6 +2440,107 @@ mod tests {
                 state_idx: 0,
                 val_mps: 0
             }
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Decoder round 4 — Table 9-24 (ctxIdx 402..=459) regression.
+    //
+    // Without TBL_9_24 wired into the init pipeline, every Luma8x8
+    // (cat=5) frame-coded `significant_coeff_flag` /
+    // `last_significant_coeff_flag` / `coeff_abs_level_minus1` decode
+    // pulled from a default `(m=0, n=0)` cell — which collapses to
+    // `pStateIdx=62, valMPS=0` (highly-skewed always-MPS-0). On
+    // High-profile streams using `transform_size_8x8_flag=1`, this
+    // drifts the arithmetic decoder out of sync within a few hundred
+    // macroblocks. A real-world failing fixture
+    // (`solana-ad.mp4`, 1280x720 yuv420p High@3.1, 3960 frames)
+    // emitted ~1900 slice-skip errors before this fix and zero after.
+    //
+    // These spot checks pin the (m, n) values from Table 9-24 against
+    // the §9.3.1.1 eq. 9-5 hand-derivation. If any value diverges the
+    // table was transcribed wrong; if the contexts come back as
+    // `(state_idx=62, val_mps=0)` the table didn't make it into
+    // `init_table()` (the dispatch loop missed adding `TBL_9_24`).
+    // -----------------------------------------------------------------
+
+    /// Hand-derive `(state_idx, val_mps)` from §9.3.1.1 eq. 9-5.
+    fn expect_ctx(m: i32, n: i32, qp: i32) -> CtxState {
+        let clipped_qp = qp.clamp(0, 51);
+        let pre = (((m * clipped_qp) >> 4) + n).clamp(1, 126);
+        if pre <= 63 {
+            CtxState {
+                state_idx: (63 - pre) as u8,
+                val_mps: 0,
+            }
+        } else {
+            CtxState {
+                state_idx: (pre - 64) as u8,
+                val_mps: 1,
+            }
+        }
+    }
+
+    #[test]
+    fn ctx_402_through_459_initialised_for_b_slice() {
+        // Table 9-24 spot checks for B / cabac_init_idc=0 / SliceQPY=26.
+        // ctxIdx 402: significant_coeff_flag cat=5 frame, first entry.
+        //   init_idc=0 column: m=-4, n=79.
+        // ctxIdx 417: last_significant_coeff_flag cat=5 frame, first entry.
+        //   init_idc=0: m=9, n=-2.
+        // ctxIdx 426: coeff_abs_level_minus1 cat=5, first entry.
+        //   init_idc=0: m=-6, n=66.
+        // ctxIdx 435: coeff_abs_level_minus1 cat=5, last entry.
+        //   init_idc=0: m=-8, n=76.
+        // ctxIdx 459: last_significant_coeff_flag cat=5 field, last entry.
+        //   init_idc=0: m=42, n=62.
+        let ctxs = CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
+        assert_eq!(ctxs.at(402), &expect_ctx(-4, 79, 26));
+        assert_eq!(ctxs.at(417), &expect_ctx(9, -2, 26));
+        assert_eq!(ctxs.at(426), &expect_ctx(-6, 66, 26));
+        assert_eq!(ctxs.at(435), &expect_ctx(-8, 76, 26));
+        assert_eq!(ctxs.at(459), &expect_ctx(42, 62, 26));
+    }
+
+    #[test]
+    fn ctx_402_through_459_initialised_for_p_slice() {
+        // P slice + cabac_init_idc=1 + SliceQPY=30.
+        // Table 9-24 ctxIdx 402: m=-5, n=85.
+        // ctxIdx 426: m=-5, n=71.
+        let ctxs = CabacContexts::init(SliceKind::P, Some(1), 30).unwrap();
+        assert_eq!(ctxs.at(402), &expect_ctx(-5, 85, 30));
+        assert_eq!(ctxs.at(426), &expect_ctx(-5, 71, 30));
+    }
+
+    #[test]
+    fn ctx_402_for_i_slice_uses_i_si_column() {
+        // I slice → use the I/SI column of Table 9-24.
+        // ctxIdx 402: m=-17, n=120.
+        let ctxs = CabacContexts::init(SliceKind::I, None, 21).unwrap();
+        assert_eq!(ctxs.at(402), &expect_ctx(-17, 120, 21));
+    }
+
+    #[test]
+    fn ctx_402_through_459_not_default_neutral() {
+        // Pre-fix regression: every cat-5 ctx came back as
+        // pStateIdx=62, valMPS=0 (the (m=0, n=0) → preState=1 →
+        // state_idx=62 collapse). Assert no entry in 402..=459 hits
+        // that state when the table is wired.
+        let ctxs = CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
+        let neutral = CtxState {
+            state_idx: 62,
+            val_mps: 0,
+        };
+        // At least one entry would normally hit (62, 0) by coincidence
+        // (e.g. when the spec-derived preCtxState happens to be 1) so
+        // we don't assert "none". Instead require diversity: the 58
+        // entries should not be uniformly the neutral default.
+        let count_neutral = (402..=459).filter(|&i| ctxs.at(i) == &neutral).count();
+        assert!(
+            count_neutral < 5,
+            "ctxIdx 402..=459 came back as the neutral (62, 0) default \
+             {count_neutral} times — TBL_9_24 likely missing from the \
+             init dispatcher (see init_table())",
         );
     }
 

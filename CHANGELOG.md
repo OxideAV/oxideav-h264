@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- decoder (round 4): CABAC parse failures on real-world High-profile
+  B-slice content with `transform_size_8x8_flag=1`. Two related bugs:
+  (1) Table 9-24 (ctxIdx 402..=459 — Luma8x8 frame/field
+  significant_coeff_flag, last_significant_coeff_flag, and
+  coeff_abs_level_minus1) was missing from the CABAC context init
+  pipeline, leaving every cat-5 context at the neutral
+  `(m=0, n=0)` → `pStateIdx=62, valMPS=0` collapse; the arithmetic
+  decoder drifted out of sync within a few hundred macroblocks. (2)
+  §9.3.3.1.1.9 cat=1/2 transBlockN derivation: when the neighbour MB
+  has `transform_size_8x8_flag=1` and the cbp bit covering
+  `luma4x4BlkIdxN` is set, the spec assigns the neighbour's 8x8 luma
+  block as transBlockN — its `coded_block_flag` is inferred to 1 from
+  the CBP for ChromaArrayType < 3. Our `cabac_cbf_cond_terms` was
+  short-circuiting to "transBlockN unavailable" instead. On
+  `solana-ad.mp4` (1280×720 yuv420p High@3.1, 3960 frames, all B/P),
+  slice-skip errors went from ~1900 to **0** end-to-end. Adds 4
+  regression tests pinning Table 9-24 init values via §9.3.1.1
+  eq. 9-5 hand-derivation.
+
 ### Added
 
 - encoder: B-slice support (round 20). Explicit B_L0_16x16 / B_L1_16x16
