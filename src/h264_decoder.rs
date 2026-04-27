@@ -1202,49 +1202,69 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
 /// Derive the `(max_num_reorder_frames, max_dec_frame_buffering)`
 /// pair for sizing [`DpbOutput`] from the active SPS.
 ///
-/// Preferred source is the VUI `bitstream_restriction` block
-/// (§E.2.1). When it's absent we infer the spec default per
-/// §A.3.1:
-///   1. `max_dec_frame_buffering` ← Annex A Table A-1 per-level
-///      cap, i.e. Min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)
-///      (§A.3.1 item h).
-///   2. `max_num_reorder_frames` ← inferred to `max_dec_frame_buffering`
-///      when the VUI `bitstream_restriction` flag is absent
-///      (§A.3.1 item j / §E.2.1 — unspecified defaults to maximum).
-///      A smaller upper bound breaks streams that issue an MMCO-5
-///      deep into a POC range because §C.4 bumps pictures by POC in
-///      a single CVS, and clipping the reorder window prematurely
-///      forces out-of-POC-order emission when a later CVS reuses
-///      the low POC range.
+/// Two sources of sizing information:
+///   * **VUI `bitstream_restriction`** (§E.2.1) — encoder's explicit
+///     claim about how many pictures the decoder must hold.
+///   * **Level-derived cap** (§A.3.1 item h, Table A-1) —
+///     `Min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)`,
+///     the upper bound the decoder is *capable* of holding for the
+///     declared profile/level + picture size.
 ///
-/// Both values floor at 1 so `DpbOutput::push` can always bump when
-/// the queue is full (cap of 0 would deadlock the queue).
+/// Selection policy
+/// ----------------
+/// Real-world encoders routinely emit `max_num_reorder_frames`
+/// values smaller than the actual reorder depth their stream uses
+/// — solana-ad's High@L3.1 720p run is a textbook case (claims
+/// reorder=2 in VUI, decodes a 4-frame B-pyramid that needs
+/// reorder=4 to bump in POC order). Honoring the encoder's
+/// undersized claim forces §C.4 to bump pictures before later POCs
+/// arrive, emitting frames in something close to *decode* order
+/// rather than display order.
+///
+/// Per §A.3.1 the level-derived cap is always a valid decoder
+/// commitment — the spec lets a decoder hold up to that many
+/// pictures regardless of what `bitstream_restriction` claims. We
+/// therefore use it as a *floor* on the reorder window: trust the
+/// VUI when it asks us to hold *more*, but raise to the level cap
+/// when it asks for *fewer*. This is exactly the JM / FFmpeg
+/// "max_num_reorder_frames is a lower bound on what we can buffer"
+/// real-world reading and what makes B-pyramid streams from
+/// permissive encoders decode in display order.
+///
+/// `max_dec_frame_buffering` follows the same logic: it must be at
+/// least as large as the reorder window we settle on, and never
+/// below the level-derived buffering cap.
+///
+/// Both values floor at 1 so [`DpbOutput::push`] can always bump
+/// when the queue is full (cap of 0 would deadlock the queue).
 fn output_dpb_sizing(sps: &Sps) -> (u32, u32) {
-    if let Some(br) = sps
-        .vui
-        .as_ref()
-        .and_then(|v| v.bitstream_restriction.as_ref())
-    {
-        // §E.2.1 — max_dec_frame_buffering must be ≥ max_num_reorder_frames.
-        // Clamp to at least 1 so the queue can ever bump.
-        let reorder = br.max_num_reorder_frames;
-        let buffering = br.max_dec_frame_buffering.max(reorder).max(1);
-        return (reorder, buffering);
-    }
-
-    // Fallback — level-derived Annex A Table A-1 / §A.3.1 item h cap.
+    // Level-derived cap (§A.3.1 item h, Annex A Table A-1).
     let max_dpb_mbs = max_dpb_mbs_for_level(sps.level_idc);
     let pic_size_mbs = sps
         .pic_width_in_mbs()
         .saturating_mul(sps.frame_height_in_mbs())
         .max(1);
-    let max_dpb_frames = (max_dpb_mbs / pic_size_mbs).clamp(1, 16);
+    let level_cap = (max_dpb_mbs / pic_size_mbs).clamp(1, 16);
 
-    // §A.3.1 item j — when bitstream_restriction is absent, the
-    // spec's default for `max_num_reorder_frames` is the full
-    // buffering cap. Under-sizing it would clamp POC reordering and
-    // bump pictures in decode order instead of POC order.
-    (max_dpb_frames, max_dpb_frames)
+    if let Some(br) = sps
+        .vui
+        .as_ref()
+        .and_then(|v| v.bitstream_restriction.as_ref())
+    {
+        // §E.2.1 — encoder claim, but raise to the level cap when
+        // it's smaller. See doc-comment for the rationale.
+        let reorder = br.max_num_reorder_frames.max(level_cap);
+        let buffering = br
+            .max_dec_frame_buffering
+            .max(reorder)
+            .max(level_cap)
+            .max(1);
+        return (reorder, buffering);
+    }
+
+    // §A.3.1 item j — bitstream_restriction absent → both default
+    // to the level-derived buffering cap.
+    (level_cap, level_cap)
 }
 
 /// Annex A Table A-1 — `MaxDpbMbs` per `level_idc`.
@@ -1775,16 +1795,21 @@ mod tests {
         assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
     }
 
-    /// Annex A Table A-1 / §A.3.1 item h — when the SPS carries a VUI
-    /// `bitstream_restriction` block, we honour it; otherwise we fall
-    /// back to the level-derived default.
+    /// VUI policy: when the encoder claims a `max_num_reorder_frames`
+    /// at-or-above the level-derived cap we honour it (the encoder
+    /// has correctly characterised its stream); when it's below
+    /// the level cap we raise to the cap. solana-ad's High@L3.1 720p
+    /// run is the textbook case for the floor — the VUI claims 2
+    /// but the stream uses a 4-frame B-pyramid that needs 4. See
+    /// `output_dpb_sizing` doc-comment.
     #[test]
-    fn dpb_sizing_prefers_vui() {
+    fn dpb_sizing_honours_vui_when_at_or_above_level_cap() {
         use crate::sps::Sps;
         use crate::vui::{BitstreamRestriction, VuiParameters};
 
-        // Construct a minimal SPS with a VUI bitstream_restriction
-        // block that says "max 3 reorder, max 5 buffering".
+        // 176x144 (PicSize=99 mb) at level 3.0 → MaxDpbMbs/PicSize =
+        // 8100/99 = 81 → clamp to 16. VUI claims reorder=16, buffer=16
+        // → both honoured exactly because they match the cap.
         let sps = Sps {
             profile_idc: 66,
             constraint_set_flags: 0,
@@ -1821,13 +1846,116 @@ mod tests {
                     max_bits_per_mb_denom: 0,
                     log2_max_mv_length_horizontal: 0,
                     log2_max_mv_length_vertical: 0,
-                    max_num_reorder_frames: 3,
+                    max_num_reorder_frames: 16,
+                    max_dec_frame_buffering: 16,
+                }),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(output_dpb_sizing(&sps), (16, 16));
+    }
+
+    /// Real-world encoder quirk: VUI claims reorder=2 but the level
+    /// cap is 5 (level 3.1, 720p, PicSize=3600 mb → MaxDpbMbs/PicSize
+    /// = 18000/3600 = 5). The fix raises the reorder window to the
+    /// level cap so a 4-deep B-pyramid (which `max_num_reorder_frames=2`
+    /// would prematurely bump out of order) decodes in display order.
+    #[test]
+    fn dpb_sizing_raises_undersized_vui_to_level_cap() {
+        use crate::sps::Sps;
+        use crate::vui::{BitstreamRestriction, VuiParameters};
+
+        let sps = Sps {
+            profile_idc: 100, // High
+            constraint_set_flags: 0,
+            level_idc: 31, // 3.1 → MaxDpbMbs 18000
+            seq_parameter_set_id: 0,
+            chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            qpprime_y_zero_transform_bypass_flag: false,
+            seq_scaling_matrix_present_flag: false,
+            seq_scaling_lists: None,
+            log2_max_frame_num_minus4: 0,
+            pic_order_cnt_type: 0,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            delta_pic_order_always_zero_flag: false,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_ref_frame: Vec::new(),
+            max_num_ref_frames: 5,
+            gaps_in_frame_num_value_allowed_flag: false,
+            // 1280x720 → 80x45 mbs → PicSize = 3600.
+            pic_width_in_mbs_minus1: 79,
+            pic_height_in_map_units_minus1: 44,
+            frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
+            direct_8x8_inference_flag: true,
+            frame_cropping: None,
+            vui_parameters_present_flag: true,
+            vui: Some(VuiParameters {
+                bitstream_restriction: Some(BitstreamRestriction {
+                    motion_vectors_over_pic_boundaries_flag: true,
+                    max_bytes_per_pic_denom: 0,
+                    max_bits_per_mb_denom: 0,
+                    log2_max_mv_length_horizontal: 0,
+                    log2_max_mv_length_vertical: 0,
+                    max_num_reorder_frames: 2, // encoder's undersized claim
                     max_dec_frame_buffering: 5,
                 }),
                 ..Default::default()
             }),
         };
-        assert_eq!(output_dpb_sizing(&sps), (3, 5));
+        // level_cap = 18000/3600 = 5; reorder raised from 2 → 5,
+        // buffering = max(5, 5, 5) = 5.
+        assert_eq!(output_dpb_sizing(&sps), (5, 5));
+    }
+
+    /// §C.4 regression — B-pyramid output ordering on a stream
+    /// matching solana-ad's High@L3.1 720p shape.
+    ///
+    /// Decode order for a 4-deep B-pyramid following an IDR is
+    /// `I0, P8, P4, B2, B6, P16, P12, B10, B14, ...` — POC values
+    /// in parentheses; the encoder feeds the decoder anchor
+    /// references first then fills the in-between B-frames. Before
+    /// the fix, `output_dpb_sizing` honoured the encoder's
+    /// `max_num_reorder_frames = 2` which forced §C.4 bumps before
+    /// the in-between Bs arrived, scrambling the output. With the
+    /// reorder window sized to the level-derived 5 (level 3.1 720p
+    /// MaxDpbMbs/PicSize = 5), the bumping process emits frames in
+    /// strict POC-ascending order.
+    ///
+    /// `tag` here is `display_index + 1` (1..=9) so `vf_tag` can
+    /// recover monotonic display indices; the POC scheme uses the
+    /// usual ×2 spacing.
+    #[test]
+    fn b_pyramid_emits_in_poc_order_at_level_31_720p() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        // Mirror what the production fix derives for level 3.1 720p.
+        dec.output_dpb = DpbOutput::<VideoFrame>::new(5, 5);
+
+        // Decode order, with (tag = display_index + 1, POC).
+        push_entry(&mut dec, 1, 0, 0); // I0   display 0
+        push_entry(&mut dec, 5, 8, 1); // P8   display 4
+        push_entry(&mut dec, 3, 4, 2); // P4   display 2 (ref-B / pyramid anchor)
+        push_entry(&mut dec, 2, 2, 3); // B2   display 1
+        push_entry(&mut dec, 4, 6, 3); // B6   display 3
+        push_entry(&mut dec, 9, 16, 4); // P16  display 8
+        push_entry(&mut dec, 7, 12, 5); // P12  display 6 (ref-B)
+        push_entry(&mut dec, 6, 10, 5); // B10  display 5
+        push_entry(&mut dec, 8, 14, 5); // B14  display 7
+
+        dec.flush().expect("flush");
+
+        let mut tags = Vec::new();
+        while let Ok(f) = dec.receive_frame() {
+            tags.push(vf_tag(&f));
+        }
+
+        // Must emerge in display order — i.e. tags monotonically 1..=9.
+        assert_eq!(tags, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     /// Annex A Table A-1 fallback — when VUI is absent, use the

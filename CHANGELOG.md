@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **DPB output ordering when a real-world encoder under-reports
+  `max_num_reorder_frames` in SPS VUI** (§E.2.1 / §A.3.1).
+  `output_dpb_sizing` now floors the reorder window at the
+  level-derived MaxDpbMbs/PicSize cap (§A.3.1 item h, Annex A
+  Table A-1) so a stream whose actual reorder depth exceeds the
+  encoder's claim is no longer bumped out of POC order. The
+  textbook reproducer is solana-ad.mp4 (High@L3.1 720p, 4-deep
+  B-pyramid): VUI claims `reorder=2` but the stream needs 5,
+  and the §C.4 bumping process emits frames in display order
+  only when the queue can hold all five. Pre-fix `oxideplay`
+  saw frames arrive in something close to decode order with one
+  trailing B-frame per 4 anchors; post-fix every frame on the
+  3960-frame clip arrives with strictly monotonically-increasing
+  pts. Two new tests (`dpb_sizing_raises_undersized_vui_to_level_cap`,
+  `b_pyramid_emits_in_poc_order_at_level_31_720p`) pin the new
+  behaviour.
+
 ### Performance
 
 - decoder (round 5 — speed pass): **2.01× end-to-end on solana-ad.mp4**
