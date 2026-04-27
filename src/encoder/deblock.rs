@@ -37,6 +37,13 @@ use crate::reconstruct::deblock_picture_full;
 /// * `mv_l0`/`mv_l1`/`ref_idx_*`/`ref_poc_*` are unused for intra-only
 ///   content — `different_ref_or_mv_luma` short-circuits on
 ///   `is_intra && q_is_intra`.
+///
+/// Round 20 adds the L1 mirror (`mv_l1`, `ref_idx_l1`, `ref_poc_l1`)
+/// so that B-slice MBs feed the deblock walker's bipred edge-strength
+/// derivation correctly. Intra/P MBs leave the L1 fields at their
+/// defaults (ref_idx = -1, mv = 0, poc = i32::MIN), which the walker
+/// reads as "no L1 contribution" via the `predFlagL1 = 0` branch in
+/// §8.7.2.1.
 #[derive(Debug, Clone, Copy)]
 pub struct MbDeblockInfo {
     pub is_intra: bool,
@@ -57,12 +64,23 @@ pub struct MbDeblockInfo {
     /// unused. For our P_L0_16x16 / P_Skip path the same MV is
     /// replicated to all 16 4x4 blocks.
     pub mv_l0: [(i16, i16); 16],
-    /// Round-16: §7.4.5.1 per-8x8-partition L0 ref_idx. `-1` for intra.
+    /// Round-16: §7.4.5.1 per-8x8-partition L0 ref_idx. `-1` for intra
+    /// or L0-unused (B_L1_16x16).
     pub ref_idx_l0: [i8; 4],
     /// Round-16: §8.7.2.1 NOTE 1 per-8x8-partition L0 referenced POC.
     /// `i32::MIN` for intra / L0 unused. For our single-IDR-ref encoder
     /// every P MB references POC 0.
     pub ref_poc_l0: [i32; 4],
+    /// Round-20: §8.4.1 per-4x4-block L1 MV (1/4-pel units). Same role
+    /// as `mv_l0` but for the second reference list (only meaningful
+    /// for B-slice MBs whose pred uses L1).
+    pub mv_l1: [(i16, i16); 16],
+    /// Round-20: §7.4.5.1 per-8x8-partition L1 ref_idx. `-1` for intra
+    /// or L1-unused (B_L0_16x16, every P_L0_* MB).
+    pub ref_idx_l1: [i8; 4],
+    /// Round-20: §8.7.2.1 NOTE 1 per-8x8-partition L1 referenced POC.
+    /// `i32::MIN` for intra / L1 unused.
+    pub ref_poc_l1: [i32; 4],
 }
 
 impl Default for MbDeblockInfo {
@@ -75,6 +93,9 @@ impl Default for MbDeblockInfo {
             mv_l0: [(0, 0); 16],
             ref_idx_l0: [-1; 4],
             ref_poc_l0: [i32::MIN; 4],
+            mv_l1: [(0, 0); 16],
+            ref_idx_l1: [-1; 4],
+            ref_poc_l1: [i32::MIN; 4],
         }
     }
 }
@@ -154,6 +175,10 @@ pub fn deblock_recon(
         mb.mv_l0 = info.mv_l0;
         mb.ref_idx_l0 = info.ref_idx_l0;
         mb.ref_poc_l0 = info.ref_poc_l0;
+        // Round-20: same for L1 (B-slice MBs).
+        mb.mv_l1 = info.mv_l1;
+        mb.ref_idx_l1 = info.ref_idx_l1;
+        mb.ref_poc_l1 = info.ref_poc_l1;
     }
     // For unset entries (fully zeroed regions of the grid in pictures
     // that don't fill a power-of-2 — shouldn't happen given the encoder

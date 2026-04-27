@@ -58,15 +58,17 @@ use crate::encoder::intra_pred::{
     predict_16x16, predict_chroma_8x8, sad_8x8, I16x16Mode, IntraChromaMode,
 };
 use crate::encoder::macroblock::{
-    write_i_nxn_mb, write_intra16x16_mb, write_p_8x8_all_pl08x8_mb, write_p_l0_16x16_mb,
-    I16x16McbConfig, INxNMcbConfig, P8x8AllPL08x8McbConfig, PL016x16McbConfig,
+    write_b_16x16_mb, write_i_nxn_mb, write_intra16x16_mb, write_p_8x8_all_pl08x8_mb,
+    write_p_l0_16x16_mb, B16x16McbConfig, BPred16x16, I16x16McbConfig, INxNMcbConfig,
+    P8x8AllPL08x8McbConfig, PL016x16McbConfig,
 };
 use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::rdo::{cost_combined, lambda_ssd, ssd_16x16, ssd_4x4};
 use crate::encoder::slice::{
-    write_idr_i_slice_header, write_p_slice_header, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
+    IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
@@ -125,6 +127,16 @@ pub struct EncoderConfig {
     /// Slice QP_Y. Range 0..=51. Default 26 (PPS pic_init_qp_minus26 = 0
     /// + slice_qp_delta = 0).
     pub qp: i32,
+    /// §7.4.2.1 — `profile_idc` for the emitted SPS. Default 66
+    /// (Baseline). Set to 77 (Main) when calling [`Encoder::encode_b`]
+    /// because §A.2.2 forbids B-slices in Baseline.
+    pub profile_idc: u8,
+    /// §7.4.2.1.1 — `max_num_ref_frames`. Default 1 (one reference,
+    /// sufficient for IDR + linear P chain). Round-20 B-slice support
+    /// needs 2 (the prior IDR is the L0 reference, the prior P-frame
+    /// is the L1 reference, both must remain in the DPB until the B
+    /// MB has been decoded).
+    pub max_num_ref_frames: u32,
 }
 
 impl EncoderConfig {
@@ -133,6 +145,8 @@ impl EncoderConfig {
             width,
             height,
             qp: 26,
+            profile_idc: 66,
+            max_num_ref_frames: 1,
         }
     }
 }
@@ -427,7 +441,8 @@ impl Encoder {
             height_in_mbs: height_mbs,
             log2_max_frame_num_minus4: 4,
             log2_max_poc_lsb_minus4: 4,
-            max_num_ref_frames: 1,
+            max_num_ref_frames: self.cfg.max_num_ref_frames,
+            profile_idc: self.cfg.profile_idc,
         };
         let pps_cfg = BaselinePpsConfig {
             pic_parameter_set_id: 0,
@@ -2563,6 +2578,7 @@ impl Encoder {
                 mv_l0: [mv_t; 16],
                 ref_idx_l0: [0; 4],
                 ref_poc_l0: [0; 4],
+                ..Default::default()
             };
         }
 
@@ -2705,6 +2721,7 @@ impl Encoder {
             mv_l0: [mv_t; 16],
             ref_idx_l0: [0; 4],
             ref_poc_l0: [0; 4],
+            ..Default::default()
         }
     }
 
@@ -2992,6 +3009,7 @@ impl Encoder {
             mv_l0,
             ref_idx_l0: [0; 4],
             ref_poc_l0: [0; 4],
+            ..Default::default()
         }
     }
 }
@@ -3098,5 +3116,738 @@ fn forward_inter_luma(
         quant_raster,
         blk_has_nz,
         recon_residual,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 20 — B-slice support (B_L0_16x16 / B_L1_16x16 / B_Bi_16x16).
+//
+// Scope: explicit-inter only; one 16x16 partition per MB; no B_Skip /
+// B_Direct; one reference per list (L0 = the IDR, L1 = the prior P-frame),
+// `weighted_bipred_idc = 0` so bipred uses default `(L0+L1+1)>>1`
+// per §8.4.2.3.1 eq. 8-273. Spatial direct flag is signalled but never
+// exercised because no Direct MB is emitted.
+//
+// Spec sections cited:
+//   §7.3.3                 — slice_header() (B-slice fields)
+//   §7.3.5.1               — mb_pred() with mvd_l0 / mvd_l1
+//   §7.4.5 Table 7-14      — B-slice mb_type ∈ {1, 2, 3} mapping
+//   §8.4.1.3               — derivation of mvpLX (separate for L0 / L1)
+//   §8.4.2.3.1 eq. 8-273   — default weighted bi-prediction average
+//   §8.4.2.2.1             — luma 6-tap fractional sample interpolation
+//   §8.4.1.4               — chroma MV derivation from luma (4:2:0)
+//   §8.7.2.1 NOTE 2        — bipred edge bS derivation (drives deblock)
+//   §A.2                   — profile_idc must be ≥ 77 for B-slices
+// ---------------------------------------------------------------------------
+
+/// Output of [`Encoder::encode_b`] — a single B-slice access unit and the
+/// matching reconstruction. Same layout as [`EncodedP`]; B-frames are
+/// non-reference (`nal_ref_idc = 0`) so they do not feed any further
+/// inter-coding pass — but we publish the recon anyway for measurement
+/// (PSNR vs source) and ffmpeg-interop testing.
+pub struct EncodedB {
+    pub annex_b: Vec<u8>,
+    pub recon_y: Vec<u8>,
+    pub recon_u: Vec<u8>,
+    pub recon_v: Vec<u8>,
+    pub recon_width: u32,
+    pub recon_height: u32,
+    /// `frame_num` of this B-frame. Per §7.4.3 this matches the B's
+    /// position in decode order (NOT display order).
+    pub frame_num: u32,
+    /// `pic_order_cnt_lsb` of this B-frame — used by the decoder's
+    /// §8.2.4 list construction to determine which ref is "before" and
+    /// which is "after" in display order.
+    pub pic_order_cnt_lsb: u32,
+}
+
+impl<'a> From<&'a EncodedB> for EncodedFrameRef<'a> {
+    fn from(e: &'a EncodedB) -> Self {
+        Self {
+            width: e.recon_width,
+            height: e.recon_height,
+            recon_y: &e.recon_y,
+            recon_u: &e.recon_u,
+            recon_v: &e.recon_v,
+        }
+    }
+}
+
+/// Per-MB chosen B-prediction descriptor — what `encode_b_mb` decides
+/// before emitting the macroblock syntax + recon. `mvd_lN` already
+/// accounts for the §8.4.1.3 `mvpLN` predictor of the chosen list.
+#[derive(Debug, Clone, Copy)]
+struct BMbDecision {
+    /// Which list(s) this MB references.
+    pred: BPred16x16,
+    /// Chosen L0 MV (1/4-pel). Always Mv::ZERO when `pred == L1`.
+    mv_l0: Mv,
+    /// Chosen L1 MV (1/4-pel). Always Mv::ZERO when `pred == L0`.
+    mv_l1: Mv,
+    /// L0 mvd against the §8.4.1.3 mvp. Zero when L0 unused.
+    mvd_l0_x: i32,
+    mvd_l0_y: i32,
+    /// L1 mvd against the §8.4.1.3 mvp.
+    mvd_l1_x: i32,
+    mvd_l1_y: i32,
+    /// Combined luma predictor (post-§8.4.2.3 weighted-pred merge for
+    /// bipred, or one list verbatim for L0-only / L1-only).
+    pred_y: [i32; 256],
+    /// Combined chroma Cb predictor.
+    pred_u: [i32; 64],
+    /// Combined chroma Cr predictor.
+    pred_v: [i32; 64],
+}
+
+/// Build the L0 + L1 luma + chroma predictors for a 16x16 MB given the
+/// chosen MVs and the two reference frames. Returns one composite buffer
+/// per plane that already incorporates the §8.4.2.3.1 default weighted
+/// merge for bipred (`(L0 + L1 + 1) >> 1`). For L0-only / L1-only the
+/// returned predictor is just that list's interpolated samples.
+fn build_b_predictors(
+    pred: BPred16x16,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+) -> ([i32; 256], [i32; 64], [i32; 64]) {
+    // Always interpolate from each list it uses; the §8.4.2.3.1 average
+    // is bit-equivalent to the sum-then-shift the decoder applies.
+    let chroma_w_l0 = ref_l0.width / 2;
+    let chroma_h_l0 = ref_l0.height / 2;
+    let chroma_w_l1 = ref_l1.width / 2;
+    let chroma_h_l1 = ref_l1.height / 2;
+
+    let p_y_l0 = if pred.uses_l0() {
+        Some(build_inter_pred_luma(
+            ref_l0.recon_y,
+            ref_l0.width,
+            ref_l0.height,
+            mb_x,
+            mb_y,
+            mv_l0,
+        ))
+    } else {
+        None
+    };
+    let p_y_l1 = if pred.uses_l1() {
+        Some(build_inter_pred_luma(
+            ref_l1.recon_y,
+            ref_l1.width,
+            ref_l1.height,
+            mb_x,
+            mb_y,
+            mv_l1,
+        ))
+    } else {
+        None
+    };
+    let p_u_l0 = if pred.uses_l0() {
+        Some(build_inter_pred_chroma(
+            ref_l0.recon_u,
+            chroma_w_l0,
+            chroma_h_l0,
+            mb_x,
+            mb_y,
+            mv_l0,
+        ))
+    } else {
+        None
+    };
+    let p_u_l1 = if pred.uses_l1() {
+        Some(build_inter_pred_chroma(
+            ref_l1.recon_u,
+            chroma_w_l1,
+            chroma_h_l1,
+            mb_x,
+            mb_y,
+            mv_l1,
+        ))
+    } else {
+        None
+    };
+    let p_v_l0 = if pred.uses_l0() {
+        Some(build_inter_pred_chroma(
+            ref_l0.recon_v,
+            chroma_w_l0,
+            chroma_h_l0,
+            mb_x,
+            mb_y,
+            mv_l0,
+        ))
+    } else {
+        None
+    };
+    let p_v_l1 = if pred.uses_l1() {
+        Some(build_inter_pred_chroma(
+            ref_l1.recon_v,
+            chroma_w_l1,
+            chroma_h_l1,
+            mb_x,
+            mb_y,
+            mv_l1,
+        ))
+    } else {
+        None
+    };
+
+    // Merge per pred mode.
+    let mut pred_y = [0i32; 256];
+    let mut pred_u = [0i32; 64];
+    let mut pred_v = [0i32; 64];
+    match pred {
+        BPred16x16::L0 => {
+            pred_y = p_y_l0.unwrap();
+            pred_u = p_u_l0.unwrap();
+            pred_v = p_v_l0.unwrap();
+        }
+        BPred16x16::L1 => {
+            pred_y = p_y_l1.unwrap();
+            pred_u = p_u_l1.unwrap();
+            pred_v = p_v_l1.unwrap();
+        }
+        BPred16x16::Bi => {
+            // §8.4.2.3.1 eq. 8-273 — `(predL0 + predL1 + 1) >> 1`. The
+            // decoder applies this elementwise on each plane.
+            let l0_y = p_y_l0.unwrap();
+            let l1_y = p_y_l1.unwrap();
+            for i in 0..256 {
+                pred_y[i] = (l0_y[i] + l1_y[i] + 1) >> 1;
+            }
+            let l0_u = p_u_l0.unwrap();
+            let l1_u = p_u_l1.unwrap();
+            for i in 0..64 {
+                pred_u[i] = (l0_u[i] + l1_u[i] + 1) >> 1;
+            }
+            let l0_v = p_v_l0.unwrap();
+            let l1_v = p_v_l1.unwrap();
+            for i in 0..64 {
+                pred_v[i] = (l0_v[i] + l1_v[i] + 1) >> 1;
+            }
+        }
+    }
+    (pred_y, pred_u, pred_v)
+}
+
+/// SAD between a 16x16 source block (at MB `(mb_x, mb_y)` of `src_y`) and
+/// a 16x16 luma predictor buffer in row-major i32 (clamped to 0..=255 to
+/// match what the decoder writes after weighted-pred clipping).
+fn sad_16x16_pred(
+    src_y: &[u8],
+    src_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    pred: &[i32; 256],
+) -> u32 {
+    let mut s = 0u32;
+    for j in 0..16usize {
+        for i in 0..16usize {
+            let src = src_y[(mb_y * 16 + j) * src_stride + mb_x * 16 + i] as i32;
+            let p = pred[j * 16 + i].clamp(0, 255);
+            s = s.saturating_add((src - p).unsigned_abs());
+        }
+    }
+    s
+}
+
+impl Encoder {
+    /// Round-20 — encode one B-frame using `ref_l0` (typically the IDR /
+    /// older anchor) and `ref_l1` (typically the next anchor — the prior
+    /// P-frame in our IPB GOP). Emits just the slice NAL; SPS/PPS were
+    /// shipped by the IDR. The B-frame is **non-reference**
+    /// (`nal_ref_idc = 0`) so the DPB does not retain it, and we never
+    /// chain another inter-coded frame off of it.
+    ///
+    /// Strategy per MB:
+    ///   1. Run quarter-pel ME against L0 and against L1 independently.
+    ///   2. Build the bipred predictor as `(L0_pred + L1_pred + 1) >> 1`
+    ///      and SAD that against source as well.
+    ///   3. Pick the minimum-SAD candidate among {L0, L1, Bi} as the
+    ///      `pred` for this MB. Tie-break order: Bi → L0 → L1 (Bi first
+    ///      because the bit cost of a bipred MB is offset by its lower
+    ///      residual rate when L0 and L1 are close).
+    ///   4. Emit `B_L0/L1/Bi_16x16` with the appropriate mvd(s),
+    ///      residual, recon.
+    ///
+    /// The encoder never emits B_Skip or B_Direct in round 20 (they
+    /// require derivation paths we don't yet exercise). The slice header
+    /// still signals `direct_spatial_mv_pred_flag = 1` for spec
+    /// completeness.
+    pub fn encode_b(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+    ) -> EncodedB {
+        assert_eq!(frame.width, self.cfg.width);
+        assert_eq!(frame.height, self.cfg.height);
+        assert_eq!(ref_l0.width, self.cfg.width);
+        assert_eq!(ref_l0.height, self.cfg.height);
+        assert_eq!(ref_l1.width, self.cfg.width);
+        assert_eq!(ref_l1.height, self.cfg.height);
+        assert!(
+            self.cfg.profile_idc >= 77,
+            "B-slices require Main profile or higher (§A.2.2 — Baseline forbids B)"
+        );
+
+        let width = self.cfg.width as usize;
+        let width_mbs = self.cfg.width / 16;
+        let height_mbs = self.cfg.height / 16;
+        let chroma_width = (self.cfg.width / 2) as usize;
+        let chroma_height = (self.cfg.height / 2) as usize;
+
+        // SPS/PPS are not re-emitted for non-IDR slices.
+        let mut stream: Vec<u8> = Vec::new();
+
+        let log2_max_frame_num_minus4: u32 = 4;
+        let log2_max_poc_lsb_minus4: u32 = 4;
+        let chroma_qp_index_offset: i32 = 0;
+
+        let mut sw = BitWriter::new();
+        write_b_slice_header(
+            &mut sw,
+            &BSliceHeaderConfig {
+                first_mb_in_slice: 0,
+                slice_type_raw: 6, // B, all-same-type
+                pic_parameter_set_id: 0,
+                frame_num,
+                frame_num_bits: log2_max_frame_num_minus4 + 4,
+                pic_order_cnt_lsb,
+                poc_lsb_bits: log2_max_poc_lsb_minus4 + 4,
+                direct_spatial_mv_pred_flag: true,
+                slice_qp_delta: 0,
+                disable_deblocking_filter_idc: 0,
+                slice_alpha_c0_offset_div2: 0,
+                slice_beta_offset_div2: 0,
+                nal_ref_idc: 0, // non-reference B
+            },
+        );
+
+        // Reconstruction state for THIS picture.
+        let mut recon_y = vec![0u8; (self.cfg.width * self.cfg.height) as usize];
+        let mut recon_u = vec![0u8; chroma_width * chroma_height];
+        let mut recon_v = vec![0u8; chroma_width * chroma_height];
+
+        let qp_y = self.cfg.qp;
+        let qp_c = qp_y_to_qp_c(qp_y, chroma_qp_index_offset);
+
+        let mut nc_grid = CavlcNcGrid::new(width_mbs, height_mbs);
+        let mut intra_grid = IntraGrid::new(width_mbs as usize, height_mbs as usize);
+        // Two MV-pred grids — one per reference list. §8.4.1.3 derives
+        // mvpLX from neighbours' refIdxLX / mvLX of the *same* list, so
+        // the L0 and L1 predictors are derived independently from each
+        // other.
+        let mut mv_grid_l0 = MvGrid::new(width_mbs as usize, height_mbs as usize);
+        let mut mv_grid_l1 = MvGrid::new(width_mbs as usize, height_mbs as usize);
+
+        let mut mb_deblock_infos: Vec<MbDeblockInfo> =
+            vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
+
+        // §7.3.4 CAVLC B-slice walker — emit `mb_skip_run` (ue(v)) before
+        // each coded MB. Round 20 never emits B_Skip, so the run is always
+        // 0 (one '1' bit per MB). A future round can fold a proper skip
+        // run in once B_Skip detection lands.
+        for mb_y in 0..height_mbs as usize {
+            for mb_x in 0..width_mbs as usize {
+                let mb_addr = mb_y * (width_mbs as usize) + mb_x;
+                // mb_skip_run = 0 (no skips precede this coded MB).
+                sw.ue(0);
+                let dbl = self.encode_b_mb(
+                    frame,
+                    ref_l0,
+                    ref_l1,
+                    mb_x,
+                    mb_y,
+                    qp_y,
+                    qp_c,
+                    chroma_width,
+                    chroma_height,
+                    width,
+                    &mut recon_y,
+                    &mut recon_u,
+                    &mut recon_v,
+                    &mut sw,
+                    &mut nc_grid,
+                    &mut intra_grid,
+                    &mut mv_grid_l0,
+                    &mut mv_grid_l1,
+                );
+                mb_deblock_infos[mb_addr] = dbl;
+            }
+        }
+
+        // §7.3.2.8 — slice_data trailing bits.
+        sw.rbsp_trailing_bits();
+        let slice_rbsp = sw.into_bytes();
+        // nal_ref_idc = 0 (non-reference B).
+        stream.extend_from_slice(&build_nal_unit(0, NalUnitType::SliceNonIdr, &slice_rbsp));
+
+        // §8.7 — picture-level in-loop deblocking. The B picture itself
+        // is not used as a reference but we run the filter so the
+        // exported recon matches what the decoder will output (and so
+        // any test comparing against ffmpeg's decoded YUV measures the
+        // post-filter samples).
+        deblock_recon(
+            self.cfg.width,
+            self.cfg.height,
+            chroma_width as u32,
+            chroma_height as u32,
+            &mut recon_y,
+            &mut recon_u,
+            &mut recon_v,
+            &mb_deblock_infos,
+            chroma_qp_index_offset,
+            width_mbs,
+            height_mbs,
+        );
+
+        EncodedB {
+            annex_b: stream,
+            recon_y,
+            recon_u,
+            recon_v,
+            recon_width: self.cfg.width,
+            recon_height: self.cfg.height,
+            frame_num,
+            pic_order_cnt_lsb,
+        }
+    }
+
+    /// Encode one B-slice macroblock. Mirrors [`Encoder::encode_p_mb`]
+    /// but with two-list ME and the §8.4.2.3 weighted-pred merge for
+    /// bipred. No B_Skip / B_Direct path in round 20.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_b_mb(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        _chroma_height: usize,
+        src_stride: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mv_grid_l0: &mut MvGrid,
+        mv_grid_l1: &mut MvGrid,
+    ) -> MbDeblockInfo {
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let mb_addr = mb_y * width_mbs + mb_x;
+
+        // 1. Per-list quarter-pel ME (integer + ½-pel + ¼-pel). Exact
+        //    same routine the P encoder uses; only the reference plane
+        //    differs.
+        let me_l0 = search_quarter_pel_16x16(
+            frame.y,
+            src_stride,
+            self.cfg.width,
+            self.cfg.height,
+            ref_l0.recon_y,
+            ref_l0.width as usize,
+            ref_l0.width,
+            ref_l0.height,
+            mb_x,
+            mb_y,
+            16,
+            16,
+        );
+        let me_l1 = search_quarter_pel_16x16(
+            frame.y,
+            src_stride,
+            self.cfg.width,
+            self.cfg.height,
+            ref_l1.recon_y,
+            ref_l1.width as usize,
+            ref_l1.width,
+            ref_l1.height,
+            mb_x,
+            mb_y,
+            16,
+            16,
+        );
+        let mv_l0 = Mv::new(me_l0.mv_x, me_l0.mv_y);
+        let mv_l1 = Mv::new(me_l1.mv_x, me_l1.mv_y);
+
+        // 2. Build the L0-only / L1-only / bipred predictors and SAD them
+        //    against the source. The predictors are built once and then
+        //    re-used for the chosen mode.
+        let (pred_y_l0, pred_u_l0, pred_v_l0) =
+            build_b_predictors(BPred16x16::L0, ref_l0, ref_l1, mb_x, mb_y, mv_l0, mv_l1);
+        let (pred_y_l1, pred_u_l1, pred_v_l1) =
+            build_b_predictors(BPred16x16::L1, ref_l0, ref_l1, mb_x, mb_y, mv_l0, mv_l1);
+        let (pred_y_bi, pred_u_bi, pred_v_bi) =
+            build_b_predictors(BPred16x16::Bi, ref_l0, ref_l1, mb_x, mb_y, mv_l0, mv_l1);
+
+        let sad_l0 = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &pred_y_l0);
+        let sad_l1 = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &pred_y_l1);
+        let sad_bi = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &pred_y_bi);
+
+        // 3. Pick the lowest-SAD candidate. Tie-break order: Bi (lowest
+        //    bit-cost when both lists agree) → L0 → L1.
+        let (pred, pred_y, pred_u, pred_v) = if sad_bi <= sad_l0 && sad_bi <= sad_l1 {
+            (BPred16x16::Bi, pred_y_bi, pred_u_bi, pred_v_bi)
+        } else if sad_l0 <= sad_l1 {
+            (BPred16x16::L0, pred_y_l0, pred_u_l0, pred_v_l0)
+        } else {
+            (BPred16x16::L1, pred_y_l1, pred_u_l1, pred_v_l1)
+        };
+
+        // 4. mvds against the §8.4.1.3 mvp for each used list.
+        let mvp_l0 = mvp_for_16x16(mv_grid_l0, mb_x, mb_y, 0);
+        let mvp_l1 = mvp_for_16x16(mv_grid_l1, mb_x, mb_y, 0);
+        let (mvd_l0_x, mvd_l0_y) = if pred.uses_l0() {
+            (mv_l0.x - mvp_l0.x, mv_l0.y - mvp_l0.y)
+        } else {
+            (0, 0)
+        };
+        let (mvd_l1_x, mvd_l1_y) = if pred.uses_l1() {
+            (mv_l1.x - mvp_l1.x, mv_l1.y - mvp_l1.y)
+        } else {
+            (0, 0)
+        };
+        let _ = BMbDecision {
+            pred,
+            mv_l0,
+            mv_l1,
+            mvd_l0_x,
+            mvd_l0_y,
+            mvd_l1_x,
+            mvd_l1_y,
+            pred_y,
+            pred_u,
+            pred_v,
+        }; // (struct kept for forward documentation; the values are read directly below)
+
+        // 5. Forward + quantize the luma residual against the chosen
+        //    predictor (re-using the inter forward path).
+        let inter_luma = forward_inter_luma(frame.y, src_stride, mb_x, mb_y, &pred_y, qp_y);
+        let luma_4x4_levels_scan = inter_luma.levels_scan;
+        let blk_has_nz = inter_luma.blk_has_nz;
+        let recon_block_residual = inter_luma.recon_residual;
+
+        let mut cbp_luma: u8 = 0;
+        for blk8 in 0..4usize {
+            let any_nz = (0..4).any(|sub| blk_has_nz[blk8 * 4 + sub]);
+            if any_nz {
+                cbp_luma |= 1u8 << blk8;
+            }
+        }
+
+        // 6. Forward + quantize chroma residual.
+        let (u_dc_levels, u_ac_levels, u_recon_residual) =
+            encode_chroma_residual_inter(frame.u, chroma_width, mb_x, mb_y, &pred_u, qp_c);
+        let (v_dc_levels, v_ac_levels, v_recon_residual) =
+            encode_chroma_residual_inter(frame.v, chroma_width, mb_x, mb_y, &pred_v, qp_c);
+        let any_dc_nz = u_dc_levels.iter().any(|&v| v != 0) || v_dc_levels.iter().any(|&v| v != 0);
+        let any_ac_nz = u_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0))
+            || v_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0));
+        let cbp_chroma: u8 = if any_ac_nz {
+            2
+        } else if any_dc_nz {
+            1
+        } else {
+            0
+        };
+
+        // 7. Apply luma reconstruction (pred + residual or pred-only on
+        //    cbp_luma=0 quadrants). Same pattern as encode_p_mb.
+        let width = self.cfg.width as usize;
+        for blk8 in 0..4usize {
+            let send = (cbp_luma >> blk8) & 1 == 1;
+            for sub in 0..4usize {
+                let blk = blk8 * 4 + sub;
+                let (bx, by) = LUMA_4X4_BLK[blk];
+                let bx_pix = bx * 4;
+                let by_pix = by * 4;
+                for j in 0..4usize {
+                    for i in 0..4usize {
+                        let p = pred_y[(by_pix + j) * 16 + bx_pix + i];
+                        let r = if send {
+                            recon_block_residual[blk][j * 4 + i]
+                        } else {
+                            0
+                        };
+                        let py = mb_y * 16 + by_pix + j;
+                        let px = mb_x * 16 + bx_pix + i;
+                        recon_y[py * width + px] = (p + r).clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        for j in 0..8usize {
+            for i in 0..8usize {
+                let cy = mb_y * 8 + j;
+                let cx = mb_x * 8 + i;
+                let pu = pred_u[j * 8 + i];
+                let pv = pred_v[j * 8 + i];
+                let res_u = if cbp_chroma == 0 {
+                    0
+                } else {
+                    u_recon_residual[j * 8 + i]
+                };
+                let res_v = if cbp_chroma == 0 {
+                    0
+                } else {
+                    v_recon_residual[j * 8 + i]
+                };
+                recon_u[cy * chroma_width + cx] = (pu + res_u).clamp(0, 255) as u8;
+                recon_v[cy * chroma_width + cx] = (pv + res_v).clamp(0, 255) as u8;
+            }
+        }
+
+        // 8. CAVLC neighbour-grid update + per-block nC.
+        {
+            let cur = &mut nc_grid.mbs[mb_addr];
+            cur.is_available = true;
+            cur.is_intra = false;
+            cur.is_skip = false;
+            cur.is_i_pcm = false;
+            cur.luma_total_coeff = [0u8; 16];
+        }
+
+        let mut luma_4x4_nc = [0i32; 16];
+        let mut own_totals = [0u8; 16];
+        for blk in 0..16usize {
+            let blk8 = blk / 4;
+            nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
+            let nc = derive_nc_luma(
+                nc_grid,
+                mb_addr as u32,
+                blk as u8,
+                LumaNcKind::Ac,
+                true,
+                false,
+            );
+            luma_4x4_nc[blk] = nc;
+            if (cbp_luma >> blk8) & 1 == 1 {
+                let tc = luma_4x4_levels_scan[blk]
+                    .iter()
+                    .filter(|&&v| v != 0)
+                    .count() as u8;
+                own_totals[blk] = tc;
+            } else {
+                own_totals[blk] = 0;
+            }
+        }
+        nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
+
+        // 9. Emit the MB syntax.
+        let mb_cfg = B16x16McbConfig {
+            pred,
+            mvd_l0_x,
+            mvd_l0_y,
+            mvd_l1_x,
+            mvd_l1_y,
+            cbp_luma,
+            cbp_chroma,
+            mb_qp_delta: 0,
+            luma_4x4_levels: luma_4x4_levels_scan,
+            luma_4x4_nc,
+            chroma_dc_cb: u_dc_levels,
+            chroma_dc_cr: v_dc_levels,
+            chroma_ac_cb: u_ac_levels,
+            chroma_ac_cr: v_ac_levels,
+        };
+        write_b_16x16_mb(sw, &mb_cfg, 0, 0).expect("write B_*_16x16 mb");
+
+        // 10. Update the L0 and L1 mv-pred grids — only the list(s) this
+        //     MB actually uses contribute. The other list's grid slot
+        //     stays at the default (ref_idx = -1, mv = ZERO), which is
+        //     exactly what §8.4.1.3.2 wants for "no contribution" (the
+        //     median collapses for that side).
+        if pred.uses_l0() {
+            *mv_grid_l0.slot_mut(mb_x, mb_y) = MvGridSlot {
+                available: true,
+                is_intra: false,
+                ref_idx_l0_8x8: [0; 4],
+                mv_l0_8x8: [mv_l0; 4],
+            };
+        } else {
+            // Mark as available-but-no-L0 (intra-from-L0's-perspective).
+            *mv_grid_l0.slot_mut(mb_x, mb_y) = MvGridSlot {
+                available: true,
+                is_intra: true,
+                ref_idx_l0_8x8: [-1; 4],
+                mv_l0_8x8: [Mv::ZERO; 4],
+            };
+        }
+        if pred.uses_l1() {
+            *mv_grid_l1.slot_mut(mb_x, mb_y) = MvGridSlot {
+                available: true,
+                is_intra: false,
+                ref_idx_l0_8x8: [0; 4],
+                mv_l0_8x8: [mv_l1; 4],
+            };
+        } else {
+            *mv_grid_l1.slot_mut(mb_x, mb_y) = MvGridSlot {
+                available: true,
+                is_intra: true,
+                ref_idx_l0_8x8: [-1; 4],
+                mv_l0_8x8: [Mv::ZERO; 4],
+            };
+        }
+        let s = intra_grid.slot_mut(mb_x, mb_y);
+        s.available = true;
+        s.is_i_nxn = false;
+
+        // 11. Per-4x4 nonzero mask + per-list MVs/refs/POCs for the §8.7
+        //     deblock walker. POCs follow the canonical anchor layout:
+        //     L0 ref = anchor before this B (POC 0 — IDR), L1 ref =
+        //     anchor after (POC of ref_l1).
+        let luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
+        let cb_nz: [bool; 4] =
+            std::array::from_fn(|i| cbp_chroma == 2 && u_ac_levels[i].iter().any(|&v| v != 0));
+        let cr_nz: [bool; 4] =
+            std::array::from_fn(|i| cbp_chroma == 2 && v_ac_levels[i].iter().any(|&v| v != 0));
+
+        let mv_l0_t = (
+            mv_l0.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            mv_l0.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        );
+        let mv_l1_t = (
+            mv_l1.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            mv_l1.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        );
+        let (mv_l0_arr, ref_idx_l0, ref_poc_l0) = if pred.uses_l0() {
+            ([mv_l0_t; 16], [0i8; 4], [0i32; 4])
+        } else {
+            ([(0i16, 0i16); 16], [-1i8; 4], [i32::MIN; 4])
+        };
+        // L1 ref POC: distinct anchor — for the IPB GOP we use, the L1
+        // anchor is the prior P-frame whose POC > this B's POC. We
+        // assign POC = 1000 (sentinel: just needs to differ from L0's
+        // POC=0 so the deblock walker treats them as distinct pictures
+        // per §8.7.2.1 NOTE 1). The actual POC value doesn't change the
+        // bitstream — the decoder reads its own POC values from the
+        // SH and resolves the picture identity itself.
+        let (mv_l1_arr, ref_idx_l1, ref_poc_l1) = if pred.uses_l1() {
+            ([mv_l1_t; 16], [0i8; 4], [1000i32; 4])
+        } else {
+            ([(0i16, 0i16); 16], [-1i8; 4], [i32::MIN; 4])
+        };
+
+        MbDeblockInfo {
+            is_intra: false,
+            qp_y,
+            luma_nonzero_4x4,
+            chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+            mv_l0: mv_l0_arr,
+            ref_idx_l0,
+            ref_poc_l0,
+            mv_l1: mv_l1_arr,
+            ref_idx_l1,
+            ref_poc_l1,
+        }
     }
 }

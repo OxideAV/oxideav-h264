@@ -614,6 +614,189 @@ pub fn write_p_8x8_all_pl08x8_mb(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// B-slice 16x16 explicit-inter macroblocks — round 20.
+// ---------------------------------------------------------------------------
+
+/// §7.4.5 Table 7-14 — which list(s) a B 16x16 MB references.
+///
+/// Maps to raw mb_type values 1..=3. Round-20 only emits these three
+/// "explicit, single 16x16 partition" types — B_Direct_16x16 (raw 0)
+/// and B_Skip / B_Direct_8x8 / mixed B_Lx_Lx are all out of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BPred16x16 {
+    /// `B_L0_16x16` — single 16x16 partition predicted from L0 only.
+    L0,
+    /// `B_L1_16x16` — single 16x16 partition predicted from L1 only.
+    L1,
+    /// `B_Bi_16x16` — single 16x16 partition predicted from both lists,
+    /// combined per §8.4.2.3 (default weighted = `(L0 + L1 + 1) >> 1`).
+    Bi,
+}
+
+impl BPred16x16 {
+    /// Table 7-14 raw mb_type value.
+    pub fn mb_type_raw(self) -> u32 {
+        match self {
+            BPred16x16::L0 => 1,
+            BPred16x16::L1 => 2,
+            BPred16x16::Bi => 3,
+        }
+    }
+
+    /// True iff this prediction reads from list 0 (L0 or Bi).
+    pub fn uses_l0(self) -> bool {
+        matches!(self, BPred16x16::L0 | BPred16x16::Bi)
+    }
+
+    /// True iff this prediction reads from list 1 (L1 or Bi).
+    pub fn uses_l1(self) -> bool {
+        matches!(self, BPred16x16::L1 | BPred16x16::Bi)
+    }
+}
+
+/// Configuration for one B-slice 16x16 explicit-inter macroblock
+/// (`B_L0_16x16` / `B_L1_16x16` / `B_Bi_16x16`).
+///
+/// Layout per §7.3.5 / §7.3.5.1 with `mb_type` ∈ {1, 2, 3} (raw values
+/// in B-slice Table 7-14):
+///
+/// ```text
+///   mb_type ue(v)                        (1 = B_L0, 2 = B_L1, 3 = B_Bi)
+///   if uses_l0:
+///     ref_idx_l0[0]                      (te(v); ABSENT when num_ref_idx_l0_active_minus1 == 0)
+///   if uses_l1:
+///     ref_idx_l1[0]                      (te(v); ABSENT when num_ref_idx_l1_active_minus1 == 0)
+///   if uses_l0:
+///     mvd_l0_x, mvd_l0_y                 (se(v), se(v))
+///   if uses_l1:
+///     mvd_l1_x, mvd_l1_y                 (se(v), se(v))
+///   coded_block_pattern                  (me(v); inter Table 9-4(a))
+///   if cbp_luma > 0 || cbp_chroma > 0:
+///     mb_qp_delta                        (se(v))
+///   for each 8x8 quadrant where bit cbp_luma>>blk8 set:
+///     for each of 4 child 4x4 blocks:    residual_block(0..15, 16)
+///   if cbp_chroma >= 1: chroma DC Cb, Cr
+///   if cbp_chroma == 2: chroma AC Cb (4), Cr (4)
+/// ```
+///
+/// `mvd_*` are in **quarter-pel units** per §7.4.5.1 / §8.4.1.4.
+pub struct B16x16McbConfig {
+    /// Which list(s) this MB uses (drives mb_type and which mvd fields
+    /// are emitted).
+    pub pred: BPred16x16,
+    /// L0 motion vector difference, x component, in quarter-pel units.
+    /// Ignored when `pred == L1`.
+    pub mvd_l0_x: i32,
+    /// L0 motion vector difference, y component. Ignored when `pred == L1`.
+    pub mvd_l0_y: i32,
+    /// L1 motion vector difference, x component. Ignored when `pred == L0`.
+    pub mvd_l1_x: i32,
+    /// L1 motion vector difference, y component. Ignored when `pred == L0`.
+    pub mvd_l1_y: i32,
+    /// `cbp_luma` ∈ 0..=15.
+    pub cbp_luma: u8,
+    /// `cbp_chroma` ∈ {0, 1, 2}.
+    pub cbp_chroma: u8,
+    /// `mb_qp_delta` per §7.4.5. Range -26..=25 for 8-bit. Only emitted
+    /// when (`cbp_luma > 0 || cbp_chroma > 0`).
+    pub mb_qp_delta: i32,
+    /// 16 4x4 luma residual blocks in §6.4.3 raster-Z order. Same
+    /// layout as `PL016x16McbConfig::luma_4x4_levels`.
+    pub luma_4x4_levels: [[i32; 16]; 16],
+    /// Per-luma-4x4-block `nC` (CAVLC neighbour context) in §6.4.3
+    /// raster-Z order.
+    pub luma_4x4_nc: [i32; 16],
+    /// 4 quantized chroma DC levels (Cb).
+    pub chroma_dc_cb: [i32; 4],
+    /// 4 quantized chroma DC levels (Cr).
+    pub chroma_dc_cr: [i32; 4],
+    /// Per-4x4-block chroma AC levels (Cb), AC-only scan layout.
+    pub chroma_ac_cb: [[i32; 16]; 4],
+    /// Per-4x4-block chroma AC levels (Cr).
+    pub chroma_ac_cr: [[i32; 16]; 4],
+}
+
+/// Emit one B-slice explicit 16x16 macroblock (CAVLC, B-slice).
+///
+/// `num_ref_idx_lN_active_minus1` controls whether `ref_idx_lN` is
+/// emitted: when 0 the field is **absent** per §7.3.5.1 (single ref
+/// in that list).
+pub fn write_b_16x16_mb(
+    w: &mut BitWriter,
+    cfg: &B16x16McbConfig,
+    num_ref_idx_l0_active_minus1: u32,
+    num_ref_idx_l1_active_minus1: u32,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+
+    // §7.4.5 — Table 7-14: raw mb_type 1/2/3 for B_L0_16x16 / B_L1_16x16 /
+    // B_Bi_16x16. All three are NumMbPart == 1 (single 16x16 partition).
+    w.ue(cfg.pred.mb_type_raw());
+
+    // §7.3.5.1 mb_pred(): ref_idx_l0 then ref_idx_l1 (te(v)). Each is
+    // absent iff num_ref_idx_lN_active_minus1 == 0.
+    if cfg.pred.uses_l0() && num_ref_idx_l0_active_minus1 > 0 {
+        w.te(num_ref_idx_l0_active_minus1, 0);
+    }
+    if cfg.pred.uses_l1() && num_ref_idx_l1_active_minus1 > 0 {
+        w.te(num_ref_idx_l1_active_minus1, 0);
+    }
+
+    // §7.3.5.1 — mvd_l0 then mvd_l1 (each as (mvd_x, mvd_y) se(v)
+    // pair). Bipred emits both pairs; L0/L1-only emits one.
+    if cfg.pred.uses_l0() {
+        w.se(cfg.mvd_l0_x);
+        w.se(cfg.mvd_l0_y);
+    }
+    if cfg.pred.uses_l1() {
+        w.se(cfg.mvd_l1_x);
+        w.se(cfg.mvd_l1_y);
+    }
+
+    // §7.3.5 — coded_block_pattern me(v) using the inter table.
+    let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
+    w.ue(codenum);
+
+    // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
+    let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
+    if needs_qp_delta {
+        w.se(cfg.mb_qp_delta);
+    }
+
+    // §7.3.5.3 — luma residual: 16 4x4 blocks grouped by 8x8 quadrant.
+    for blk8 in 0..4u8 {
+        if (cfg.cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                let nc = cfg.luma_4x4_nc[blk];
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(nc),
+                    16,
+                    &cfg.luma_4x4_levels[blk],
+                )?;
+            }
+        }
+    }
+
+    // §7.3.5.3 — chroma residual: same structure as P_L0_16x16.
+    if cfg.cbp_chroma > 0 {
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
+    }
+    if cfg.cbp_chroma == 2 {
+        for blk in &cfg.chroma_ac_cb {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+        for blk in &cfg.chroma_ac_cr {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,5 +871,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// §7.4.5 Table 7-14 — B-slice 16x16 explicit mb_types decode back
+    /// to the expected `MbType` variants. Round-20 only emits raw
+    /// values 1, 2, 3 (B_L0_16x16 / B_L1_16x16 / B_Bi_16x16).
+    #[test]
+    fn b16x16_mb_type_raw_matches_table_7_14_decode() {
+        use crate::macroblock_layer::MbType;
+        assert_eq!(BPred16x16::L0.mb_type_raw(), 1);
+        assert_eq!(BPred16x16::L1.mb_type_raw(), 2);
+        assert_eq!(BPred16x16::Bi.mb_type_raw(), 3);
+        assert_eq!(MbType::from_b_slice(1).unwrap(), MbType::BL016x16);
+        assert_eq!(MbType::from_b_slice(2).unwrap(), MbType::BL116x16);
+        assert_eq!(MbType::from_b_slice(3).unwrap(), MbType::BBi16x16);
+
+        assert!(BPred16x16::L0.uses_l0() && !BPred16x16::L0.uses_l1());
+        assert!(!BPred16x16::L1.uses_l0() && BPred16x16::L1.uses_l1());
+        assert!(BPred16x16::Bi.uses_l0() && BPred16x16::Bi.uses_l1());
     }
 }

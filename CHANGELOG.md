@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: B-slice support (round 20). Explicit B_L0_16x16 / B_L1_16x16
+  / B_Bi_16x16 macroblock types via the new `Encoder::encode_b` entry
+  point. SPS bumps to Main profile (profile_idc=77) since §A.2.2
+  forbids B-slices in Baseline; `EncoderConfig::profile_idc` and
+  `max_num_ref_frames` are now part of the public configuration.
+  Per-MB SAD-driven L0/L1/Bi mode decision; bipred uses §8.4.2.3.1
+  default weighted average `(L0+L1+1)>>1`. Two-list MV-pred grids
+  (independent §8.4.1.3 mvpLX derivation per list). `MbDeblockInfo`
+  extended with `mv_l1` / `ref_idx_l1` / `ref_poc_l1` so the §8.7.2.1
+  bipred edge-strength derivation sees the right per-list identity.
+  ffmpeg/libavcodec decodes the B-slice **bit-equivalently** (max diff
+  0) at 54.19 dB PSNR_Y on a synthetic IPB fixture; our own decoder
+  agrees bit-for-bit. Round-20 caveats: no B_Skip, no B_Direct, no
+  intra fallback in B, single ref per list, no sub-MB partitions.
+- encoder: 4MV / P_8x8 with all sub_mb_type = PL08x8 (round 19).
+  Per-8x8 quarter-pel ME, content-driven SAD heuristic gate (≥30%
+  SAD reduction over 1MV), §8.4.1.3 within-MB-aware mvp derivation.
+  ffmpeg interop bit-equivalent on a per-sub-block-shifted fixture;
+  40.95 dB PSNR_Y.
 - encoder: P-slice support (round 16). Single L0 reference, integer-pel
   motion estimation, P_Skip + P_L0_16x16 macroblock types. Self-roundtrip
   + ffmpeg interop bit-exact on a 2-frame I+P fixture; PSNR vs source

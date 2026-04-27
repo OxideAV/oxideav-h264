@@ -2,10 +2,14 @@
 //!
 //! Emits the minimum subset needed by the round-1 Baseline encoder:
 //!
-//! * `profile_idc = 66` (Baseline)
-//! * `constraint_set0_flag = 1` (Baseline subset)
+//! * `profile_idc = 66` (Baseline) by default; round 20 lets callers
+//!   bump to Main (77) via [`BaselineSpsConfig::profile_idc`] so that
+//!   B-slices are permitted (§A.2.2 — Baseline forbids B-slices).
+//! * `constraint_set0_flag = 1` for Baseline; cleared when the caller
+//!   bumps the profile (Main/High don't satisfy the Baseline subset).
 //! * `chroma_format_idc = 1` inferred (4:2:0 — not signalled because
-//!   profile 66 is not in the chroma-extended group, §7.3.2.1.1)
+//!   neither profile 66 nor 77 is in the chroma-extended group,
+//!   §7.3.2.1.1)
 //! * `pic_order_cnt_type = 0`, `log2_max_pic_order_cnt_lsb_minus4 = 4`
 //! * `frame_mbs_only_flag = 1`, no FMO, no VUI, no cropping
 //!
@@ -34,7 +38,16 @@ pub struct BaselineSpsConfig {
     /// 256 POC LSB values.
     pub log2_max_poc_lsb_minus4: u32,
     /// `max_num_ref_frames`. For an IDR-only encoder 1 is sufficient.
+    /// Round-20 B-slice tests need 2 (the IDR's L0 ref and the prior
+    /// P-frame's L1 ref).
     pub max_num_ref_frames: u32,
+    /// §7.4.2.1 — `profile_idc`. Defaults to 66 (Baseline). Round-20
+    /// allows 77 (Main) so that B-slices are permitted (§A.2.2).
+    /// Profiles in the chroma-extended group (100, 110, 122, …) are
+    /// **not** supported by this writer because they require additional
+    /// `chroma_format_idc`, `bit_depth_*`, `seq_scaling_matrix_present`
+    /// fields per §7.3.2.1.1.
+    pub profile_idc: u8,
 }
 
 impl Default for BaselineSpsConfig {
@@ -47,6 +60,7 @@ impl Default for BaselineSpsConfig {
             log2_max_frame_num_minus4: 4,
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: 1,
+            profile_idc: 66,
         }
     }
 }
@@ -57,11 +71,22 @@ impl Default for BaselineSpsConfig {
 pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
     let mut w = BitWriter::new();
 
-    // §7.3.2.1.1 — profile_idc = 66 (Baseline).
-    w.u(8, 66);
-    // constraint_set0_flag=1 (Baseline subset), constraint_set1..5_flag=0,
-    // reserved_zero_2bits=00.
-    let cs0 = 1;
+    // §7.3.2.1.1 — profile_idc.
+    debug_assert!(
+        matches!(cfg.profile_idc, 66 | 77 | 88),
+        "this writer only emits SPS bodies for profiles outside the chroma-extended group \
+         (66 = Baseline, 77 = Main, 88 = Extended). Profile {} would require additional \
+         chroma_format_idc / bit_depth_* / seq_scaling_matrix_present_flag fields per §7.3.2.1.1.",
+        cfg.profile_idc,
+    );
+    w.u(8, cfg.profile_idc as u32);
+    // §A.2 — constraint_set flags. constraint_set0_flag is the Baseline
+    // subset gate (only meaningful when the bitstream conforms to
+    // profile 66's constraints). Setting it on a Main / Extended SPS
+    // would force decoders to also verify the Baseline restrictions
+    // (no B-slices, no weighted pred, no CABAC) which is incompatible
+    // with what we want for B-slice support.
+    let cs0 = if cfg.profile_idc == 66 { 1 } else { 0 };
     w.u(1, cs0);
     for _ in 0..5 {
         w.u(1, 0);
@@ -118,6 +143,7 @@ mod tests {
             log2_max_frame_num_minus4: 4,
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: 1,
+            profile_idc: 66,
         };
         let rbsp = build_baseline_sps_rbsp(&cfg);
         let sps = Sps::parse(&rbsp).expect("decoder parses our SPS");

@@ -641,12 +641,106 @@ heuristic so smooth content stays on the round-16 1MV path.
 - 3 new unit tests in `me::tests` covering per-8x8 ME (zero motion +
   per-sub-block motion recovery + `p_8x8_pred_bits`).
 
-## Round 20+ (planned)
+## Round 20 — landed
 
-- 4MV further sub-partitions (PL08x4 / PL04x8 / PL04x4).
-- Per-8x8 MV trial within RDO (currently a SAD heuristic).
-- Intra fallback in P-slices via RDO.
-- B-slices.
+Wire **B-slice support** for the explicit-inter macroblock types:
+`B_L0_16x16`, `B_L1_16x16`, `B_Bi_16x16` (Table 7-14 raw mb_type 1, 2,
+3). Bumps the SPS profile to **Main (77)** because Baseline forbids
+B-slices per §A.2.2. New entry point `Encoder::encode_b(frame,
+ref_l0, ref_l1, frame_num, pic_order_cnt_lsb)` emits a single
+non-reference (`nal_ref_idc = 0`) B-slice using the IDR + a prior
+P-frame as L0 / L1 anchors.
+
+- **`EncoderConfig`** gains `profile_idc` and `max_num_ref_frames`.
+  Defaults preserve round-19 behaviour (Baseline, 1 ref). Tests for
+  B-slices set `profile_idc = 77`, `max_num_ref_frames = 2`.
+- **B-slice header** (`encoder::slice::write_b_slice_header`):
+  `slice_type = 6` (B, all-same-type), `direct_spatial_mv_pred_flag = 1`,
+  `num_ref_idx_active_override_flag = 0` (use PPS defaults — one ref
+  per list), both list-modification flags = 0, `pred_weight_table`
+  absent (`weighted_bipred_idc == 0` ⇒ §8.4.2.3.1 default), and
+  `dec_ref_pic_marking` absent (B is non-reference, `nal_ref_idc=0`).
+- **B-slice macroblock writer**
+  (`encoder::macroblock::write_b_16x16_mb` + `B16x16McbConfig` +
+  `BPred16x16` enum). Layout per §7.3.5.1:
+    1. `mb_type ue(v)` ∈ {1, 2, 3}
+    2. `ref_idx_l0` te(v) — absent at single-ref
+    3. `ref_idx_l1` te(v) — absent at single-ref
+    4. `mvd_l0_x, mvd_l0_y se(v)` — present when `pred.uses_l0()`
+    5. `mvd_l1_x, mvd_l1_y se(v)` — present when `pred.uses_l1()`
+    6. inter `coded_block_pattern me(v)` + optional `mb_qp_delta` +
+       the same residual layout as P_L0_16x16.
+- **Mode decision**: per MB the encoder runs quarter-pel ME against
+  L0 and L1 independently, then SAD-scores three candidates:
+  L0-only, L1-only, and bipred = `(L0_pred + L1_pred + 1) >> 1`
+  (§8.4.2.3.1 eq. 8-273). Lowest-SAD wins with tie-break
+  Bi → L0 → L1 (Bi first because matching predictors mean lowest
+  residual + minimal mvd cost when both lists agree).
+- **Two-list MV-pred grids** (`mv_grid_l0` / `mv_grid_l1`) — §8.4.1.3
+  derives `mvpLX` per list independently. L0-only MBs leave L1 grid
+  slot at default (`ref_idx = -1, mv = 0`), and vice versa, so a
+  later B MB reading either side gets the correct §8.4.1.3.2 step-2
+  collapse.
+- **CAVLC `mb_skip_run`** (§7.3.4): emitted as `ue(0) = '1'` before
+  every coded MB (round 20 never produces B_Skip), plus a final
+  trailing `mb_skip_run = 0` at end of slice. Without this the
+  decoder mis-aligns at MB 2 (saw "cbp 55 out of range"); landed the
+  fix once the symptom showed up under our own decoder.
+- **Picture-level `MbDeblockInfo`**: extended with `mv_l1`,
+  `ref_idx_l1`, `ref_poc_l1`. The §8.7.2.1 walker's bipred
+  `different_ref_or_mv_luma` reads picture identity by POC, so the
+  encoder feeds in `ref_poc_l0 = 0` (IDR anchor) and `ref_poc_l1 =
+  1000` (sentinel ≠ L0 POC) to make the two anchors distinct under
+  NOTE 1.
+- **Bipred predictor build** (`build_b_predictors`): wraps the
+  existing `build_inter_pred_luma` / `build_inter_pred_chroma` for
+  each list, then applies the §8.4.2.3.1 average elementwise. The
+  encoder never re-implements the 6-tap FIR or the bilinear chroma
+  interpolator — both come straight from the decoder's
+  `inter_pred::interpolate_luma` / `interpolate_chroma`, which keeps
+  encoder and decoder bit-equivalent on every MV / sub-pel position.
+
+### Validation
+
+- `cargo test -p oxideav-h264` — **915 passed** (was 911 in round 19;
+  +4: 2 new unit tests + 2 new integration tests).
+- Round 16/17/18/19 PSNR fixtures unchanged: 50.82 / 49.40 / 53.61 /
+  40.95 dB.
+- New round-20 fixture (`integration_b_slice.rs`):
+  - `round20_b_slice_self_roundtrip_matches_local_recon`: encode
+    IDR + P + B where B = midpoint(IDR, P) sample-by-sample. Every
+    MB picks `B_Bi_16x16` because the bipred predictor reconstructs
+    the source bit-for-bit. Decode through our own decoder →
+    bit-exact match (max diff 0). **Local + decoder PSNR_Y = 54.19
+    dB**.
+  - `round20_b_slice_ffmpeg_interop`: ffmpeg/libavcodec decodes the
+    same IDR + P + B Annex B stream **bit-equivalently** against the
+    encoder's local recon (max diff 0). 54.19 dB PSNR_Y vs source.
+
+### Status caveats (unchanged from round 19 unless noted)
+
+- **B-slice landed** (round 20). mb_type ∈ {`B_L0_16x16`,
+  `B_L1_16x16`, `B_Bi_16x16`} alongside the round-19 P / IDR types.
+- No `B_Skip` / `B_Direct_16x16` (the spec's mode-decision derivation
+  paths). `direct_spatial_mv_pred_flag` is signalled but never
+  exercised.
+- No intra fallback in P / B slices.
+- Single reference per list: L0 = the previous IDR, L1 = the
+  previous P-frame. `max_num_ref_frames = 2` in the SPS.
+- Profile bumped to Main (77) when the caller asks for B-slices via
+  `EncoderConfig::profile_idc`. The default still emits Baseline
+  (66) for IDR-only / P-only streams.
+- In-loop deblocking active across intra / P / B MBs, with proper
+  L0+L1 ref / POC identity feeding §8.7.2.1's bipred edge derivation.
+- CAVLC only.
+- No rate control — fixed QP.
+
+## Round 21+ (planned)
+
+- B_Skip / B_Direct_16x16 with §8.4.1.2.2 spatial direct MV
+  derivation.
+- Intra fallback in P / B slices via RDO.
+- B-slice 16x8 / 8x16 partitions and B_8x8 sub-MB types.
 - Multiple slices per picture.
 - 8x8 transform / High-profile features.
 - CABAC.
@@ -655,8 +749,15 @@ heuristic so smooth content stays on the round-16 1MV path.
 
 ## Entry points
 
-- [`Encoder::encode_idr`] — top-level: takes one `YuvFrame` and emits
-  an Annex B byte stream + the matching reconstruction.
+- [`Encoder::encode_idr`] — top-level IDR I-slice: takes one `YuvFrame`
+  and emits an SPS + PPS + Annex B IDR slice + the matching reconstruction.
+- [`Encoder::encode_p`] — non-IDR P-slice (round 16). Takes one
+  `YuvFrame` + a single L0 reference (`EncodedFrameRef`) and emits the
+  P slice NAL + recon. SPS/PPS were shipped by the IDR.
+- [`Encoder::encode_b`] — non-reference B-slice (round 20). Takes one
+  `YuvFrame` + L0 and L1 references (`EncodedFrameRef`) and emits the
+  B slice NAL + recon. Requires `EncoderConfig::profile_idc >= 77` and
+  `max_num_ref_frames >= 2`. SPS/PPS were shipped by the IDR.
 - Lower-level helpers under [`bitstream`], [`nal`], [`sps`], [`pps`],
   [`slice`], [`macroblock`], [`cavlc`], [`transform`] are usable
   independently — round 2's higher-mode encoder can compose them
