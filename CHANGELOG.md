@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- decoder (round 5 — speed pass): **2.01× end-to-end on solana-ad.mp4**
+  (1280×720 yuv420p High@3.1, 3960 frames, ~158s of content) —
+  wall-time **89.83s → 44.76s** via `oxideplay --vo hash --ao null`,
+  hash digest unchanged (`da9c18e4008cfd37`, regression-checked).
+  Three independent wins, smallest-to-biggest:
+  1. **`src/simd/` skeleton + `chunked` interpolate_luma /
+     interpolate_chroma** matching the `oxideav-mpeg4video` pattern
+     (scalar / chunked / nightly portable). The 6-tap luma FIR is
+     rewritten so the H-FIR row strip is computed exactly once and
+     fed to the V-FIR for the diagonal "j" position; the per-pixel
+     edge-clip is hoisted out of the FIR. Bench numbers (1000 ×
+     16×16 blocks): scalar 222 µs → chunked 36 µs (integer copy,
+     **6.16×**); 798 µs → 109 µs (H-half-pel, **7.32×**); 805 µs →
+     98 µs (V-half-pel, **8.21×**); **3645 µs → 161 µs (diagonal-j,
+     22.64×)**. End-to-end contribution on solana-ad: ~4 % (~3.6 s)
+     because the luma interpolator wasn't the actual hotspot at
+     720p — but the kernel is now SIMD-shaped for the round-6
+     widening to 1080p / 4K.
+  2. **Cached debug-env-var lookups in CABAC + macroblock-layer +
+     reconstruct hot paths.** Several `std::env::var(...)` calls
+     (`OXIDEAV_H264_BIN_TRACE`, `OXIDEAV_H264_CABAC_DEBUG`,
+     `OXIDEAV_H264_MB_TRACE`, `OXIDEAV_H264_RECON_DEBUG`,
+     `OXIDEAV_H264_NO_DEBLOCK`, etc.) were resolving via a `getenv()`
+     syscall on **every CABAC bin decode and every per-MB parse**.
+     With ~140 M bin decisions in this 3960-frame clip that
+     dominated decoder wall-time. Each var is now resolved once on
+     first access and cached behind a `OnceLock<bool>` /
+     `OnceLock<Option<u32>>`. End-to-end contribution: ~21 %
+     (85.89 s → 68.12 s).
+  3. **Eliminated per-MB clone of the CABAC neighbour grid in
+     `parse_residual_cabac_only`.** The function previously cloned
+     the entire `CabacNeighbourGrid` (~720 KiB on 720p) at the top
+     of every macroblock parse to dodge the borrow checker between
+     read-only neighbour CBF lookups and the end-of-MB writeback.
+     Replaced with `nb_grid.as_deref()` for a shared re-borrow that
+     NLL drops before the writeback. **Eliminates ~10 TB of
+     `_platform_memmove` traffic** across the full file.
+     End-to-end contribution: ~35 % (68.12 s → 44.76 s).
+- decoder: deblocking-filter fast paths in `filter_vertical_edge_luma`
+  / `filter_horizontal_edge_luma` / `filter_chroma_vertical_rows` /
+  `filter_chroma_horizontal_cols` — when the 8-sample window across an
+  edge is fully inside the picture (the common case for picture-
+  internal edges), bypass the clipped `Picture::luma_at` /
+  `set_luma` accessor pair and read/write the contiguous slice
+  directly. Slow-path clipping retained for edges that straddle the
+  picture boundary so semantics are unchanged.
+
 ### Fixed
 
 - decoder (round 4): CABAC parse failures on real-world High-profile

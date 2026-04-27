@@ -67,9 +67,16 @@ use crate::bitstream::{BitError, BitReader};
 /// line to stderr capturing the full pre/post engine state and the
 /// decoded bin. Intended for bisecting CABAC divergences against the
 /// JM `_trace.txt` oracle.
+///
+/// The env var is read **once** on first access and cached. CABAC bin
+/// decoding is on the hot path (millions of calls per frame), and a
+/// `getenv()` syscall per bin is the difference between sub-realtime
+/// and sub-second-per-frame decoding on a 720p clip.
 #[inline]
 fn bin_trace_enabled() -> bool {
-    std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some()
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some())
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

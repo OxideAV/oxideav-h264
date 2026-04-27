@@ -55,6 +55,41 @@ use crate::slice_header::{SliceHeader, SliceType};
 use crate::sps::Sps;
 
 // ---------------------------------------------------------------------------
+// Cached debug env-var lookups
+// ---------------------------------------------------------------------------
+//
+// CABAC + macroblock parsing runs millions of times per frame. A naive
+// `std::env::var(...)` on every hot-path call resolves to a `getenv()`
+// libc syscall that dominates the decoder wall-time on real content.
+// We resolve each env var **once** on first access via `OnceLock` and
+// thereafter return the cached boolean / parsed value.
+
+#[inline]
+fn dbg_general_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_DEBUG").is_ok())
+}
+
+#[inline]
+fn dbg_mbtype_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_MBTYPE_TRACE").is_some())
+}
+
+#[inline]
+fn dbg_mb_trace_target() -> Option<u32> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("OXIDEAV_H264_MB_TRACE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -2049,7 +2084,7 @@ pub fn parse_macroblock(
     _current_mb_addr: u32,
 ) -> McblResult<Macroblock> {
     let slice_type = slice_header.slice_type;
-    let dbg = std::env::var("OXIDEAV_H264_DEBUG").is_ok();
+    let dbg = dbg_general_enabled();
     let mb_addr_dbg = entropy.current_mb_addr;
     if dbg {
         let (b, bi) = r.position();
@@ -2069,16 +2104,14 @@ pub fn parse_macroblock(
     // §7.3.5 — mb_type.
     // CAVLC: ue(v). CABAC: per-slice-type decoder in cabac_ctx.
     // ---------------------------------------------------------------
-    let dbg_mb_enter = std::env::var("OXIDEAV_H264_MB_TRACE")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok());
+    let dbg_mb_enter = dbg_mb_trace_target();
     let dbg_mb_enter_on = dbg_mb_enter == Some(entropy.current_mb_addr);
     // OXIDEAV_H264_MBTYPE_TRACE=1 — dump every (mb_addr, mb_type_raw,
     // bins_consumed, slice_type) tuple for cross-referencing against
     // JM's JVT trace when chasing CABAC state divergences. Emits
     // regardless of OXIDEAV_H264_MB_TRACE so the caller sees all MBs
     // of every slice in one pass.
-    let dbg_mb_type_all = std::env::var_os("OXIDEAV_H264_MBTYPE_TRACE").is_some();
+    let dbg_mb_type_all = dbg_mbtype_trace_enabled();
     let mb_type_raw = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
         let bins_before = dec.bin_count();
         let v = match slice_type {
@@ -2478,9 +2511,7 @@ fn parse_mb_pred(
     transform_size_8x8_flag: bool,
 ) -> McblResult<MbPred> {
     let mut pred = MbPred::default();
-    let dbg_mb = std::env::var("OXIDEAV_H264_MB_TRACE")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok());
+    let dbg_mb = dbg_mb_trace_target();
     let dbg_on = dbg_mb == Some(entropy.current_mb_addr);
 
     if mb_type.is_i_nxn() {
@@ -2894,9 +2925,7 @@ fn parse_sub_mb_pred(
     // OXIDEAV_H264_MB_TRACE=N — per-element trace of the specified MB
     // address inside the current slice. Used for CABAC bisection against
     // the JM trace oracle; see the round-30 notes in the commit history.
-    let dbg_mb = std::env::var("OXIDEAV_H264_MB_TRACE")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok());
+    let dbg_mb = dbg_mb_trace_target();
     let dbg_on = dbg_mb == Some(entropy.current_mb_addr);
 
     // 4 sub_mb_type entries. §7.3.5.2.
@@ -3353,7 +3382,7 @@ fn parse_residual_cavlc_only(
 
     // Short immutable borrow for the nC lookups.
     let grid_ref: Option<&CavlcNcGrid> = entropy.cavlc_nc.as_deref();
-    let dbg = std::env::var("OXIDEAV_H264_DEBUG").is_ok();
+    let dbg = dbg_general_enabled();
 
     // --- Luma DC (Intra_16x16) ---
     if mb_type.is_intra_16x16() {
@@ -3748,9 +3777,17 @@ fn parse_residual_cabac_only(
         is_skip: mb_type.is_skip(),
         ..CabacMbNeighbourInfo::default()
     };
-    // Snapshot the neighbour grid (immutable) for CBF lookups.
-    let grid_snap: Option<CabacNeighbourGrid> = nb_grid.as_deref().cloned();
-    let grid_ref: Option<&CabacNeighbourGrid> = grid_snap.as_ref();
+    // Re-borrow the neighbour grid as a shared reference for the long
+    // sequence of CBF lookups that follow. `nb_grid` is itself a
+    // `&mut`, so this borrow ends once `grid_ref` is no longer used,
+    // freeing `nb_grid` for the write-back at the end of the function
+    // (NLL — non-lexical lifetimes).
+    //
+    // We previously CLONED the entire grid here (`nb_grid.as_deref().cloned()`),
+    // which copied ~720 KiB of `CabacMbNeighbourInfo` per MB on a 720p
+    // frame. With ~3600 MBs/frame × 3960 frames that is ~10 TB of
+    // memmove traffic and dominated decoder wall time on real content.
+    let grid_ref: Option<&CabacNeighbourGrid> = nb_grid.as_deref();
 
     // --- Luma DC (Intra_16x16) ---
     if mb_type.is_intra_16x16() {

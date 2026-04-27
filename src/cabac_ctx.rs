@@ -33,8 +33,20 @@ use crate::cabac::{CabacDecoder, CabacResult, CtxState};
 #[inline]
 fn dbg_enabled() -> bool {
     // Separate switch from OXIDEAV_H264_DEBUG to avoid drowning the
-    // macroblock-layer logs.
-    std::env::var("OXIDEAV_H264_CABAC_DEBUG").is_ok()
+    // macroblock-layer logs. Cached once — see `cabac::bin_trace_enabled`
+    // for the rationale: this is called on every per-syntax decode and
+    // a `getenv()` syscall per call dominates the decode wall-time on
+    // real 720p content.
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_CABAC_DEBUG").is_ok())
+}
+
+#[inline]
+fn ctx17_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some())
 }
 
 #[inline]
@@ -1144,7 +1156,7 @@ pub fn decode_mb_type_p(
     // OXIDEAV_H264_CTX17_TRACE=1 — dump ctxs 14..=17 before each
     // mb_type_p decode. Used when investigating P-slice intra-suffix
     // decoding vs JVT trace (e.g. CABA2_SVA_B Pic 3 MB 28).
-    if std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some() {
+    if ctx17_trace_enabled() {
         let c14 = ctxs.at(14);
         let c15 = ctxs.at(15);
         let c16 = ctxs.at(16);
@@ -1707,7 +1719,7 @@ pub fn decode_coded_block_flag(
     let inc = cond_a + 2 * cond_b;
     let ctx_idx = (base + cat_offset + inc) as usize;
     let bin = dec.decode_decision(ctxs.at_mut(ctx_idx))?;
-    if std::env::var_os("OXIDEAV_H264_CABAC_DEBUG").is_some() {
+    if dbg_enabled() {
         eprintln!(
             "[CABAC] cbf bt={:?} base={} cat={} inc={} ctx={} -> {}  cond_left={:?} cond_above={:?}",
             block_type, base, cat_offset, inc, ctx_idx, bin,
@@ -2183,7 +2195,7 @@ pub fn decode_end_of_slice_flag(dec: &mut CabacDecoder<'_>) -> CabacResult<bool>
     let before_bins = dec.bin_count();
     let (b, bi) = dec.position();
     let v = dec.decode_terminate()?;
-    if std::env::var_os("OXIDEAV_H264_CABAC_DEBUG").is_some() {
+    if dbg_enabled() {
         eprintln!(
             "[CABAC] end_of_slice_flag pre_bins={} pre_pos=({},{}) -> {}",
             before_bins, b, bi, v

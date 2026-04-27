@@ -12,6 +12,25 @@ readme = "README.md"
 keywords = ["multimedia", "video", "h264", "avc", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
+[features]
+default = []
+# Enables `#![feature(portable_simd)]` and the `std::simd` code paths
+# in `src/simd/portable.rs`. Requires a nightly toolchain. The default
+# build relies on chunked fixed-size arrays that LLVM auto-vectorises
+# reliably on stable.
+nightly = []
+
 [dependencies]
 oxideav-core = "0.1"
 thiserror = "2"
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "inter_pred_bench"
+harness = false
+
+[[bench]]
+name = "transform_bench"
+harness = false

@@ -143,6 +143,7 @@ impl Picture {
     /// clipped to the picture edge per §8.4.2.2.1 / Clip3 of §5.7. This
     /// matches the neighbour-sampling rule used by intra prediction when
     /// a neighbour is available but the sample index goes off-picture.
+    #[inline]
     pub fn luma_at(&self, x: i32, y: i32) -> i32 {
         if self.width_in_samples == 0 || self.height_in_samples == 0 {
             return 0;
@@ -153,6 +154,7 @@ impl Picture {
     }
 
     /// Clamped chroma Cb access (§6.2).
+    #[inline]
     pub fn cb_at(&self, x: i32, y: i32) -> i32 {
         let cw = self.chroma_width();
         let ch = self.chroma_height();
@@ -165,6 +167,7 @@ impl Picture {
     }
 
     /// Clamped chroma Cr access.
+    #[inline]
     pub fn cr_at(&self, x: i32, y: i32) -> i32 {
         let cw = self.chroma_width();
         let ch = self.chroma_height();
@@ -179,6 +182,7 @@ impl Picture {
     /// Write a luma sample. Out-of-bounds writes are silently ignored
     /// (callers should not produce such writes — this is a hard guard
     /// for robustness during reconstruction edge handling).
+    #[inline]
     pub fn set_luma(&mut self, x: i32, y: i32, v: i32) {
         if x < 0 || y < 0 {
             return;
@@ -193,6 +197,7 @@ impl Picture {
     }
 
     /// Write a Cb sample.
+    #[inline]
     pub fn set_cb(&mut self, x: i32, y: i32, v: i32) {
         if x < 0 || y < 0 {
             return;
@@ -209,6 +214,7 @@ impl Picture {
     }
 
     /// Write a Cr sample.
+    #[inline]
     pub fn set_cr(&mut self, x: i32, y: i32, v: i32) {
         if x < 0 || y < 0 {
             return;

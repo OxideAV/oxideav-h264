@@ -36,6 +36,7 @@ pub mod ref_list;
 pub mod ref_store;
 pub mod scaling_list;
 pub mod sei;
+pub mod simd;
 pub mod slice_data;
 pub mod slice_header;
 pub mod sps;

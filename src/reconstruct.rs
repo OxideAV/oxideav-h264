@@ -30,9 +30,7 @@ use crate::deblock::{
     alpha_from_index, beta_from_index, derive_boundary_strength, filter_edge, tc0_from, BsInputs,
     EdgeSamples, FilterParams, Plane,
 };
-use crate::inter_pred::{
-    interpolate_chroma, interpolate_luma, weighted_pred_explicit, BiPredMode, WeightedEntry,
-};
+use crate::inter_pred::{weighted_pred_explicit, BiPredMode, WeightedEntry};
 use crate::intra_pred::{
     filter_samples_8x8, predict_16x16, predict_4x4, predict_8x8, predict_chroma,
     ChromaArrayType as IpChromaArrayType, Intra16x16Mode, Intra4x4Mode, Intra8x8Mode,
@@ -47,6 +45,7 @@ use crate::mv_deriv::{
 use crate::picture::Picture;
 use crate::pps::Pps;
 use crate::ref_store::RefPicProvider;
+use crate::simd::{interpolate_chroma, interpolate_luma};
 use crate::slice_data::SliceData;
 use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sps::Sps;
@@ -444,7 +443,7 @@ pub fn reconstruct_slice<R: RefPicProvider>(
     let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
     let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
     let deblock_enabled = slice_header.disable_deblocking_filter_idc != 1;
-    let deblock_env_off = std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok();
+    let deblock_env_off = deblock_no_op_cached();
     if deblock_enabled && !deblock_env_off {
         let alpha_off = slice_header.slice_alpha_c0_offset_div2 * 2;
         let beta_off = slice_header.slice_beta_offset_div2 * 2;
@@ -656,6 +655,41 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
 /// pictures that vary these per slice are a known simplification; the
 /// conformance streams we target use uniform deblock offsets across the
 /// picture.
+///
+/// Cached `OXIDEAV_H264_NO_DEBLOCK` env var lookup. Reading the env var
+/// per slice would dominate the decode wall-time on real content, since
+/// the OS resolves env vars through a `getenv()` syscall.
+fn deblock_no_op_cached() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok())
+}
+
+/// Cached `OXIDEAV_H264_RECON_DEBUG` flag (per-MB reconstruct trace).
+fn recon_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_RECON_DEBUG").is_ok())
+}
+
+/// Cached `OXIDEAV_H264_RECON_DEBUG_MB` (specific MB-address trace).
+fn recon_debug_mb_target() -> Option<u32> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("OXIDEAV_H264_RECON_DEBUG_MB")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+    })
+}
+
+/// Cached `OXIDEAV_H264_DEBLOCK_TRACE` flag.
+fn deblock_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_DEBLOCK_TRACE").is_some())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn deblock_picture_full(
     pic: &mut Picture,
@@ -668,7 +702,7 @@ pub fn deblock_picture_full(
     mbaff_frame_flag: bool,
     mb_field_flags: &[bool],
 ) {
-    let deblock_env_off = std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok();
+    let deblock_env_off = deblock_no_op_cached();
     if deblock_env_off {
         return;
     }
@@ -1407,11 +1441,8 @@ fn reconstruct_intra_nxn(
     } else {
         // §8.3.1 — Intra_4x4 path.
         // OXIDEAV_H264_RECON_DEBUG — test-only per-block trace for MB 0.
-        let debug_mb = std::env::var("OXIDEAV_H264_RECON_DEBUG_MB")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok());
-        let debug = (mb_addr == 0 && std::env::var("OXIDEAV_H264_RECON_DEBUG").is_ok())
-            || debug_mb == Some(mb_addr);
+        let debug_mb = recon_debug_mb_target();
+        let debug = (mb_addr == 0 && recon_debug_enabled()) || debug_mb == Some(mb_addr);
         if debug {
             eprintln!(
                 "RECON MB{} I_NxN: cbp_luma={:#x} qp_y={} mb_type_raw={} cbp={:#x} entropy={}",
@@ -2298,11 +2329,8 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     // Test-only OXIDEAV_H264_RECON_DEBUG / OXIDEAV_H264_RECON_DEBUG_MB
     // instrumentation — prints per-MB + per-partition inter reconstruct
     // inputs so a human operator can compare against ffmpeg's trace.
-    let inter_debug_mb = std::env::var("OXIDEAV_H264_RECON_DEBUG_MB")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok());
-    let inter_debug = (mb_addr == 0 && std::env::var("OXIDEAV_H264_RECON_DEBUG").is_ok())
-        || inter_debug_mb == Some(mb_addr);
+    let inter_debug_mb = recon_debug_mb_target();
+    let inter_debug = (mb_addr == 0 && recon_debug_enabled()) || inter_debug_mb == Some(mb_addr);
     if inter_debug {
         eprintln!(
             "RECON_INTER MB#{} mb_type={:?} mb_type_raw={} slice_type={:?} \
@@ -5633,7 +5661,7 @@ fn deblock_plane_chroma(
                                 vertical_edge: true,
                                 mbaff_or_field: mbaff_frame_flag,
                             });
-                            if std::env::var_os("OXIDEAV_H264_DEBLOCK_TRACE").is_some() {
+                            if deblock_trace_enabled() {
                                 eprintln!(
                                     "DBL C{} Vx={edge_x} y0={y0} bs={bs} plane={plane} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={} p_nz={} q_nz={} diff_ref_mv={}",
                                     plane, p_info.is_intra, q_info.is_intra, p_has_nz, q_has_nz, diff_ref_mv,
@@ -5787,12 +5815,65 @@ fn filter_vertical_edge_luma(
     beta_off: i32,
     bit_depth: u32,
 ) {
+    let qp_avg = (p_qp + q_qp + 1) >> 1;
+    let params = FilterParams {
+        bs,
+        qp_avg,
+        filter_offset_a: alpha_off,
+        filter_offset_b: beta_off,
+        bit_depth,
+    };
+    let pic_w = pic.width_in_samples as i32;
+    let pic_h = pic.height_in_samples as i32;
+    // Fast in-bounds path: the 8 samples per row are at columns
+    // edge_x-4 .. edge_x+3, all 4 rows are y0 .. y0+3. When the edge
+    // is fully inside the picture (the common case for picture-internal
+    // edges), we can take a contiguous &mut [i32] slice and avoid the
+    // per-pixel bounds-checked accessors.
+    if edge_x >= 4 && edge_x + 4 <= pic_w && y0 >= 0 && y0 + 4 <= pic_h {
+        let stride = pic_w as usize;
+        let base_x = (edge_x - 4) as usize;
+        for dy in 0..4 {
+            let y = (y0 + dy) as usize;
+            let row = &mut pic.luma[y * stride + base_x..y * stride + base_x + 8];
+            let p3 = row[0];
+            let q3 = row[7];
+            let mut p2 = row[1];
+            let mut p1 = row[2];
+            let mut p0 = row[3];
+            let mut q0 = row[4];
+            let mut q1 = row[5];
+            let mut q2 = row[6];
+            filter_edge(
+                Plane::Luma,
+                EdgeSamples {
+                    p3,
+                    p2: &mut p2,
+                    p1: &mut p1,
+                    p0: &mut p0,
+                    q0: &mut q0,
+                    q1: &mut q1,
+                    q2: &mut q2,
+                    q3,
+                },
+                params,
+            );
+            row[1] = p2;
+            row[2] = p1;
+            row[3] = p0;
+            row[4] = q0;
+            row[5] = q1;
+            row[6] = q2;
+        }
+        return;
+    }
+    // Slow path: edge straddles picture bounds — keep the original
+    // clipped/guarded accessor logic.
     for dy in 0..4 {
         let y = y0 + dy;
-        if y < 0 || y >= pic.height_in_samples as i32 {
+        if y < 0 || y >= pic_h {
             continue;
         }
-        // Fetch p3..p0, q0..q3 along the row.
         let mut samples = [0i32; 8];
         for (i, x) in (edge_x - 4..edge_x + 4).enumerate() {
             samples[i] = pic.luma_at(x, y);
@@ -5805,9 +5886,9 @@ fn filter_vertical_edge_luma(
         let mut q1 = samples[5];
         let mut q2 = samples[6];
         let q3 = samples[7];
-        let qp_avg = (p_qp + q_qp + 1) >> 1;
-        {
-            let edge = EdgeSamples {
+        filter_edge(
+            Plane::Luma,
+            EdgeSamples {
                 p3,
                 p2: &mut p2,
                 p1: &mut p1,
@@ -5816,20 +5897,9 @@ fn filter_vertical_edge_luma(
                 q1: &mut q1,
                 q2: &mut q2,
                 q3,
-            };
-            filter_edge(
-                Plane::Luma,
-                edge,
-                FilterParams {
-                    bs,
-                    qp_avg,
-                    filter_offset_a: alpha_off,
-                    filter_offset_b: beta_off,
-                    bit_depth,
-                },
-            );
-        }
-        // p3/q3 are read-only in the filter API.
+            },
+            params,
+        );
         pic.set_luma(edge_x - 4, y, samples[0]);
         pic.set_luma(edge_x - 3, y, p2);
         pic.set_luma(edge_x - 2, y, p1);
@@ -5852,9 +5922,58 @@ fn filter_horizontal_edge_luma(
     beta_off: i32,
     bit_depth: u32,
 ) {
+    let qp_avg = (p_qp + q_qp + 1) >> 1;
+    let params = FilterParams {
+        bs,
+        qp_avg,
+        filter_offset_a: alpha_off,
+        filter_offset_b: beta_off,
+        bit_depth,
+    };
+    let pic_w = pic.width_in_samples as i32;
+    let pic_h = pic.height_in_samples as i32;
+    if x0 >= 0 && x0 + 4 <= pic_w && edge_y >= 4 && edge_y + 4 <= pic_h {
+        let stride = pic_w as usize;
+        // For horizontal edges, the 8 samples are in 8 different rows at
+        // the same column. We split-borrow row-by-row.
+        for dx in 0..4 {
+            let x = (x0 + dx) as usize;
+            let p3_idx = ((edge_y - 4) as usize) * stride + x;
+            let q3_idx = ((edge_y + 3) as usize) * stride + x;
+            let p3 = pic.luma[p3_idx];
+            let q3 = pic.luma[q3_idx];
+            let mut p2 = pic.luma[((edge_y - 3) as usize) * stride + x];
+            let mut p1 = pic.luma[((edge_y - 2) as usize) * stride + x];
+            let mut p0 = pic.luma[((edge_y - 1) as usize) * stride + x];
+            let mut q0 = pic.luma[((edge_y) as usize) * stride + x];
+            let mut q1 = pic.luma[((edge_y + 1) as usize) * stride + x];
+            let mut q2 = pic.luma[((edge_y + 2) as usize) * stride + x];
+            filter_edge(
+                Plane::Luma,
+                EdgeSamples {
+                    p3,
+                    p2: &mut p2,
+                    p1: &mut p1,
+                    p0: &mut p0,
+                    q0: &mut q0,
+                    q1: &mut q1,
+                    q2: &mut q2,
+                    q3,
+                },
+                params,
+            );
+            pic.luma[((edge_y - 3) as usize) * stride + x] = p2;
+            pic.luma[((edge_y - 2) as usize) * stride + x] = p1;
+            pic.luma[((edge_y - 1) as usize) * stride + x] = p0;
+            pic.luma[((edge_y) as usize) * stride + x] = q0;
+            pic.luma[((edge_y + 1) as usize) * stride + x] = q1;
+            pic.luma[((edge_y + 2) as usize) * stride + x] = q2;
+        }
+        return;
+    }
     for dx in 0..4 {
         let x = x0 + dx;
-        if x < 0 || x >= pic.width_in_samples as i32 {
+        if x < 0 || x >= pic_w {
             continue;
         }
         let mut samples = [0i32; 8];
@@ -5869,9 +5988,9 @@ fn filter_horizontal_edge_luma(
         let mut q1 = samples[5];
         let mut q2 = samples[6];
         let q3 = samples[7];
-        let qp_avg = (p_qp + q_qp + 1) >> 1;
-        {
-            let edge = EdgeSamples {
+        filter_edge(
+            Plane::Luma,
+            EdgeSamples {
                 p3,
                 p2: &mut p2,
                 p1: &mut p1,
@@ -5880,19 +5999,9 @@ fn filter_horizontal_edge_luma(
                 q1: &mut q1,
                 q2: &mut q2,
                 q3,
-            };
-            filter_edge(
-                Plane::Luma,
-                edge,
-                FilterParams {
-                    bs,
-                    qp_avg,
-                    filter_offset_a: alpha_off,
-                    filter_offset_b: beta_off,
-                    bit_depth,
-                },
-            );
-        }
+            },
+            params,
+        );
         pic.set_luma(x, edge_y - 3, p2);
         pic.set_luma(x, edge_y - 2, p1);
         pic.set_luma(x, edge_y - 1, p0);
@@ -5921,6 +6030,52 @@ fn filter_chroma_vertical_rows(
 ) {
     let cw = pic.chroma_width() as i32;
     let ch = pic.chroma_height() as i32;
+    let params = FilterParams {
+        bs,
+        qp_avg,
+        filter_offset_a: alpha_off,
+        filter_offset_b: beta_off,
+        bit_depth,
+    };
+    // Fast in-bounds path for the chroma edge.
+    if edge_x >= 4 && edge_x + 4 <= cw && y0 >= 0 && y0 + rows <= ch {
+        let stride = cw as usize;
+        let base_x = (edge_x - 4) as usize;
+        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+        for dy in 0..rows {
+            let y = (y0 + dy) as usize;
+            let row = &mut buf[y * stride + base_x..y * stride + base_x + 8];
+            let p3 = row[0];
+            let q3 = row[7];
+            let mut p2 = row[1];
+            let mut p1 = row[2];
+            let mut p0 = row[3];
+            let mut q0 = row[4];
+            let mut q1 = row[5];
+            let mut q2 = row[6];
+            filter_edge(
+                Plane::Chroma,
+                EdgeSamples {
+                    p3,
+                    p2: &mut p2,
+                    p1: &mut p1,
+                    p0: &mut p0,
+                    q0: &mut q0,
+                    q1: &mut q1,
+                    q2: &mut q2,
+                    q3,
+                },
+                params,
+            );
+            // Chroma-style filter only updates p1/p0/q0/q1.
+            row[2] = p1;
+            row[3] = p0;
+            row[4] = q0;
+            row[5] = q1;
+        }
+        return;
+    }
+    // Slow path: edge straddles picture bounds.
     for dy in 0..rows {
         let y = y0 + dy;
         if y < 0 || y >= ch {
@@ -5946,8 +6101,9 @@ fn filter_chroma_vertical_rows(
         let mut q1 = s[5];
         let mut q2 = s[6];
         let q3 = s[7];
-        {
-            let edge = EdgeSamples {
+        filter_edge(
+            Plane::Chroma,
+            EdgeSamples {
                 p3,
                 p2: &mut p2,
                 p1: &mut p1,
@@ -5956,19 +6112,9 @@ fn filter_chroma_vertical_rows(
                 q1: &mut q1,
                 q2: &mut q2,
                 q3,
-            };
-            filter_edge(
-                Plane::Chroma,
-                edge,
-                FilterParams {
-                    bs,
-                    qp_avg,
-                    filter_offset_a: alpha_off,
-                    filter_offset_b: beta_off,
-                    bit_depth,
-                },
-            );
-        }
+            },
+            params,
+        );
         if plane == 0 {
             pic.set_cb(edge_x - 2, y, p1);
             pic.set_cb(edge_x - 1, y, p0);
@@ -6001,6 +6147,48 @@ fn filter_chroma_horizontal_cols(
 ) {
     let cw = pic.chroma_width() as i32;
     let ch = pic.chroma_height() as i32;
+    let params = FilterParams {
+        bs,
+        qp_avg,
+        filter_offset_a: alpha_off,
+        filter_offset_b: beta_off,
+        bit_depth,
+    };
+    // Fast in-bounds path.
+    if x0 >= 0 && x0 + cols <= cw && edge_y >= 4 && edge_y + 4 <= ch {
+        let stride = cw as usize;
+        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+        for dx in 0..cols {
+            let x = (x0 + dx) as usize;
+            let p3 = buf[((edge_y - 4) as usize) * stride + x];
+            let q3 = buf[((edge_y + 3) as usize) * stride + x];
+            let mut p2 = buf[((edge_y - 3) as usize) * stride + x];
+            let mut p1 = buf[((edge_y - 2) as usize) * stride + x];
+            let mut p0 = buf[((edge_y - 1) as usize) * stride + x];
+            let mut q0 = buf[((edge_y) as usize) * stride + x];
+            let mut q1 = buf[((edge_y + 1) as usize) * stride + x];
+            let mut q2 = buf[((edge_y + 2) as usize) * stride + x];
+            filter_edge(
+                Plane::Chroma,
+                EdgeSamples {
+                    p3,
+                    p2: &mut p2,
+                    p1: &mut p1,
+                    p0: &mut p0,
+                    q0: &mut q0,
+                    q1: &mut q1,
+                    q2: &mut q2,
+                    q3,
+                },
+                params,
+            );
+            buf[((edge_y - 2) as usize) * stride + x] = p1;
+            buf[((edge_y - 1) as usize) * stride + x] = p0;
+            buf[((edge_y) as usize) * stride + x] = q0;
+            buf[((edge_y + 1) as usize) * stride + x] = q1;
+        }
+        return;
+    }
     for dx in 0..cols {
         let x = x0 + dx;
         if x < 0 || x >= cw {
@@ -6026,8 +6214,9 @@ fn filter_chroma_horizontal_cols(
         let mut q1 = s[5];
         let mut q2 = s[6];
         let q3 = s[7];
-        {
-            let edge = EdgeSamples {
+        filter_edge(
+            Plane::Chroma,
+            EdgeSamples {
                 p3,
                 p2: &mut p2,
                 p1: &mut p1,
@@ -6036,19 +6225,9 @@ fn filter_chroma_horizontal_cols(
                 q1: &mut q1,
                 q2: &mut q2,
                 q3,
-            };
-            filter_edge(
-                Plane::Chroma,
-                edge,
-                FilterParams {
-                    bs,
-                    qp_avg,
-                    filter_offset_a: alpha_off,
-                    filter_offset_b: beta_off,
-                    bit_depth,
-                },
-            );
-        }
+            },
+            params,
+        );
         if plane == 0 {
             pic.set_cb(x, edge_y - 2, p1);
             pic.set_cb(x, edge_y - 1, p0);
