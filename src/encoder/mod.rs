@@ -553,6 +553,19 @@ impl Encoder {
             height_mbs,
         );
 
+        // IDR is all-intra: every partition is `is_intra = true`, so
+        // colocated lookups return colZeroFlag = 0 (the §8.4.1.2.2 step 7
+        // "intra colocated" branch).
+        let n_parts = (width_mbs as usize) * (height_mbs as usize) * 4;
+        let partition_mvs = vec![
+            FrameRefPartitionMv {
+                mv_l0: (0, 0),
+                ref_idx_l0: -1,
+                is_intra: true,
+            };
+            n_parts
+        ];
+
         EncodedIdr {
             annex_b: stream,
             recon_y,
@@ -560,6 +573,7 @@ impl Encoder {
             recon_v,
             recon_width: self.cfg.width,
             recon_height: self.cfg.height,
+            partition_mvs,
         }
     }
 
@@ -1465,6 +1479,31 @@ pub struct EncodedIdr {
     pub recon_v: Vec<u8>,
     pub recon_width: u32,
     pub recon_height: u32,
+    /// Per-8x8-partition MV state. IDR is all-intra so every partition's
+    /// `is_intra = true`. Provided for API symmetry with `EncodedP` so
+    /// that an IDR can be passed as an L0/L1 anchor to a B-slice — the
+    /// §8.4.1.2.2 step 7 colZeroFlag check then short-circuits to 0
+    /// (the `if is_intra` branch in `is_colocated_zero_mv`).
+    pub partition_mvs: Vec<FrameRefPartitionMv>,
+}
+
+/// One 8x8 partition's per-list MV state, captured at picture-level so
+/// later B-slices can use this picture as the L1 anchor for §8.4.1.2.2
+/// spatial direct derivation (specifically the colZeroFlag step).
+///
+/// Indexing: `partition` is 0..=3 (top-left, top-right, bottom-left,
+/// bottom-right of the parent MB, mirroring `MvGridSlot::mv_l0_8x8` order).
+/// `(mb_y * width_mbs + mb_x) * 4 + partition`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameRefPartitionMv {
+    /// L0 motion vector in quarter-pel units. `(0, 0)` for intra MBs.
+    pub mv_l0: (i16, i16),
+    /// L0 reference index. `-1` for intra MBs or when L0 not used.
+    pub ref_idx_l0: i8,
+    /// True when the parent MB is intra-coded (mvCol = 0, refIdxCol = -1
+    /// per §8.4.1.2.1 NOTE). Drives §8.4.1.2.2 step 7's colZeroFlag = 0
+    /// fallback for intra colocated MBs.
+    pub is_intra: bool,
 }
 
 /// Output of [`Encoder::encode_p`] — a single P-slice access unit and
@@ -1482,6 +1521,12 @@ pub struct EncodedP {
     pub frame_num: u32,
     /// `pic_order_cnt_lsb` of this P-frame.
     pub pic_order_cnt_lsb: u32,
+    /// Per-8x8-partition MV state for each MB. Length =
+    /// `(width / 16) * (height / 16) * 4`. Used by [`Encoder::encode_b`]
+    /// when this P-frame is the L1 anchor — the spatial direct
+    /// derivation (§8.4.1.2.2 step 7) needs the colocated block's L0
+    /// MV / refIdx to evaluate `colZeroFlag`.
+    pub partition_mvs: Vec<FrameRefPartitionMv>,
 }
 
 /// Per-MB encoder-side MV / refIdx slot for the §8.4.1.3 mvp neighbour
@@ -2317,6 +2362,34 @@ impl Encoder {
             height_mbs,
         );
 
+        // §8.4.1.2.1 / §8.4.1.2.2 — capture per-8x8 MV state so a later
+        // B-slice can use this P-frame as the L1 anchor and probe the
+        // colocated block's L0 MV/refIdx for colZeroFlag (step 7).
+        let n_parts = (width_mbs as usize) * (height_mbs as usize) * 4;
+        let mut partition_mvs = Vec::with_capacity(n_parts);
+        for slot in &mv_grid.slots {
+            for part in 0..4usize {
+                // Both "not available" and "intra" map to (mv=0,
+                // ref=-1, is_intra=true) per §8.4.1.2.1: an intra
+                // colocated MB has refIdxCol=-1, and an unencoded slot
+                // is treated identically to "intra" by the colocated
+                // probe.
+                let (mv, ref_idx, is_intra) = if !slot.available || slot.is_intra {
+                    (Mv::ZERO, -1, true)
+                } else {
+                    (slot.mv_l0_8x8[part], slot.ref_idx_l0_8x8[part], false)
+                };
+                partition_mvs.push(FrameRefPartitionMv {
+                    mv_l0: (
+                        mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    ),
+                    ref_idx_l0: ref_idx.clamp(-1, 127) as i8,
+                    is_intra,
+                });
+            }
+        }
+
         EncodedP {
             annex_b: stream,
             recon_y,
@@ -2326,6 +2399,7 @@ impl Encoder {
             recon_height: self.cfg.height,
             frame_num,
             pic_order_cnt_lsb,
+            partition_mvs,
         }
     }
 
@@ -3015,13 +3089,22 @@ impl Encoder {
 }
 
 /// Borrowed view of a previously-encoded frame's reconstruction. Used as
-/// the reference for [`Encoder::encode_p`].
+/// the reference for [`Encoder::encode_p`] and [`Encoder::encode_b`].
+///
+/// `partition_mvs` carries per-8x8 colocated MV / refIdx data when this
+/// reference is being used as the **L1 anchor** of a B-slice (round-21
+/// spatial direct mode needs it for §8.4.1.2.2 step 7 colZeroFlag).
+/// For non-B-slice users (`encode_p`) the field is ignored. An empty
+/// slice is treated as "all intra colocated" (colZeroFlag = 0).
 pub struct EncodedFrameRef<'a> {
     pub width: u32,
     pub height: u32,
     pub recon_y: &'a [u8],
     pub recon_u: &'a [u8],
     pub recon_v: &'a [u8],
+    /// Per-8x8 partition MVs, length = `(width / 16) * (height / 16) * 4`,
+    /// or empty when no MV data is available (IDR / treat as all-intra).
+    pub partition_mvs: &'a [FrameRefPartitionMv],
 }
 
 impl<'a> From<&'a EncodedIdr> for EncodedFrameRef<'a> {
@@ -3032,6 +3115,7 @@ impl<'a> From<&'a EncodedIdr> for EncodedFrameRef<'a> {
             recon_y: &e.recon_y,
             recon_u: &e.recon_u,
             recon_v: &e.recon_v,
+            partition_mvs: &e.partition_mvs,
         }
     }
 }
@@ -3044,6 +3128,7 @@ impl<'a> From<&'a EncodedP> for EncodedFrameRef<'a> {
             recon_y: &e.recon_y,
             recon_u: &e.recon_u,
             recon_v: &e.recon_v,
+            partition_mvs: &e.partition_mvs,
         }
     }
 }
@@ -3121,24 +3206,233 @@ fn forward_inter_luma(
 
 // ---------------------------------------------------------------------------
 // Round 20 — B-slice support (B_L0_16x16 / B_L1_16x16 / B_Bi_16x16).
+// Round 21 — B_Skip / B_Direct_16x16 (spatial direct mode).
 //
-// Scope: explicit-inter only; one 16x16 partition per MB; no B_Skip /
-// B_Direct; one reference per list (L0 = the IDR, L1 = the prior P-frame),
-// `weighted_bipred_idc = 0` so bipred uses default `(L0+L1+1)>>1`
-// per §8.4.2.3.1 eq. 8-273. Spatial direct flag is signalled but never
-// exercised because no Direct MB is emitted.
+// Round-20 scope: explicit-inter only; one 16x16 partition per MB; no
+// B_Skip / B_Direct; one reference per list (L0 = the IDR, L1 = the prior
+// P-frame), `weighted_bipred_idc = 0` so bipred uses default
+// `(L0+L1+1)>>1` per §8.4.2.3.1 eq. 8-273.
+//
+// Round-21 adds **spatial direct mode**:
+//   * `B_Direct_16x16` (raw mb_type 0): no mvd_lN / ref_idx_lN in the
+//     bitstream; decoder derives MVs per §8.4.1.2.2 from the encoder's
+//     L0 / L1 MV grids + the colocated picture's L0 MV.
+//   * `B_Skip` (signalled by `mb_skip_run`): same MV derivation as
+//     B_Direct_16x16 but with cbp_luma = cbp_chroma = 0 and no MB syntax
+//     at all — pure run-length skip.
+//
+// The encoder mirrors the decoder's §8.4.1.2.2 derivation locally and
+// emits B_Direct / B_Skip when:
+//   1. The derived predictor's SAD beats the round-20 explicit-inter
+//      (B_L0 / B_L1 / B_Bi) candidates, AND
+//   2. (For B_Skip) the residual quantises to all-zero (cbp == 0).
+//
+// `colZeroFlag` (§8.4.1.2.2 step 7) requires the colocated picture's
+// per-block L0 MV. The L1 reference (a prior P-frame) supplies these
+// via `EncodedFrameRef::partition_mvs`. For an IDR L1 (all-intra), the
+// step-7 check returns colZeroFlag = 0 for every block.
 //
 // Spec sections cited:
 //   §7.3.3                 — slice_header() (B-slice fields)
+//   §7.3.4                 — slice_data() with mb_skip_run (B_Skip)
 //   §7.3.5.1               — mb_pred() with mvd_l0 / mvd_l1
-//   §7.4.5 Table 7-14      — B-slice mb_type ∈ {1, 2, 3} mapping
+//   §7.4.5 Table 7-14      — B-slice mb_type ∈ {0..=3} mapping
+//   §8.4.1.2               — direct-mode predicted MV derivation entry
+//   §8.4.1.2.1             — colocated block selection (L0 vs L1 MV)
+//   §8.4.1.2.2             — spatial direct MV derivation (5..7)
 //   §8.4.1.3               — derivation of mvpLX (separate for L0 / L1)
+//   §8.4.1.3.1             — median MV prediction
+//   §8.4.1.3.2             — C→D substitution
 //   §8.4.2.3.1 eq. 8-273   — default weighted bi-prediction average
 //   §8.4.2.2.1             — luma 6-tap fractional sample interpolation
 //   §8.4.1.4               — chroma MV derivation from luma (4:2:0)
 //   §8.7.2.1 NOTE 2        — bipred edge bS derivation (drives deblock)
 //   §A.2                   — profile_idc must be ≥ 77 for B-slices
 // ---------------------------------------------------------------------------
+
+/// §8.4.1.2.2 — encoder-side spatial direct derivation result.
+///
+/// Each MB's direct mode produces one (refIdxL0, refIdxL1, mvL0, mvL1)
+/// per 8x8 sub-partition (when `direct_8x8_inference_flag = 1`). When all
+/// four 8x8 partitions resolve to the same `(ref, ref, mv, mv)` we can
+/// build a single 16x16 predictor; otherwise we'd need per-partition
+/// motion compensation. Round-21 only emits B_Direct / B_Skip when all
+/// four partitions agree (the common case under directZeroPredictionFlag
+/// or when neighbours are zero-MV propagating).
+#[derive(Debug, Clone, Copy)]
+struct BDirectDerivation {
+    ref_idx_l0: i32,
+    ref_idx_l1: i32,
+    /// Per-8x8 MV (4 entries) for L0. `Mv::ZERO` when `ref_idx_l0 < 0`.
+    mv_l0_per_8x8: [Mv; 4],
+    /// Per-8x8 MV (4 entries) for L1. `Mv::ZERO` when `ref_idx_l1 < 0`.
+    mv_l1_per_8x8: [Mv; 4],
+    /// True when `directZeroPredictionFlag` fired (§8.4.1.2.2 step 5).
+    direct_zero: bool,
+}
+
+impl BDirectDerivation {
+    /// True iff every 8x8 partition shares the same MV (and thus the
+    /// 16x16 predictor is uniform across the MB). Round-21 only emits
+    /// `B_Direct_16x16` / `B_Skip` for this case.
+    fn is_uniform(&self) -> bool {
+        let l0_uniform = self
+            .mv_l0_per_8x8
+            .iter()
+            .all(|m| *m == self.mv_l0_per_8x8[0]);
+        let l1_uniform = self
+            .mv_l1_per_8x8
+            .iter()
+            .all(|m| *m == self.mv_l1_per_8x8[0]);
+        l0_uniform && l1_uniform
+    }
+
+    /// Read the uniform per-MB L0 MV (only meaningful when `is_uniform()`).
+    fn mv_l0(&self) -> Mv {
+        self.mv_l0_per_8x8[0]
+    }
+
+    /// Read the uniform per-MB L1 MV (only meaningful when `is_uniform()`).
+    fn mv_l1(&self) -> Mv {
+        self.mv_l1_per_8x8[0]
+    }
+}
+
+/// §8.4.1.2.2 step 7 — colZeroFlag check.
+///
+/// Returns true iff the colocated 8x8 partition (from L1's
+/// `partition_mvs`) is short-term-coded with `refIdxCol == 0` and
+/// `|mvCol| <= 1` in both components.
+///
+/// Per §8.4.1.2.1, when the colocated MB is intra mvCol=0 / refIdxCol=-1,
+/// and colZeroFlag is forced to 0 (the `is_intra` branch). When
+/// `partition_mvs` is empty (e.g. an IDR L1 anchor with no MV data
+/// recorded), we treat all colocated blocks as intra → colZeroFlag = 0.
+fn col_zero_flag(
+    l1_partition_mvs: &[FrameRefPartitionMv],
+    width_mbs: usize,
+    mb_x: usize,
+    mb_y: usize,
+    part_8x8: usize,
+) -> bool {
+    let idx = (mb_y * width_mbs + mb_x) * 4 + part_8x8;
+    let Some(slot) = l1_partition_mvs.get(idx) else {
+        // No MV data → treat as intra → colZeroFlag = 0.
+        return false;
+    };
+    if slot.is_intra {
+        return false;
+    }
+    // §8.4.1.2.1 step 1.2 — picks L0's MV by default when refIdxL0Col >= 0.
+    // Our encoder's L1 anchor is a P-slice with single L0 ref so this is
+    // always the available data.
+    if slot.ref_idx_l0 != 0 {
+        return false;
+    }
+    // §8.4.1.2.2 step 7 — colZeroFlag iff |mvCol| <= 1 in both components.
+    slot.mv_l0.0.abs() <= 1 && slot.mv_l0.1.abs() <= 1
+}
+
+/// §8.4.1.2.2 — encoder-side spatial direct MV / refIdx derivation for
+/// the current MB. Mirrors the decoder's `build_spatial_direct_partitions`
+/// using the encoder's (`mv_grid_l0`, `mv_grid_l1`) state and the L1
+/// anchor's `partition_mvs` for the step-7 colZeroFlag check.
+///
+/// Implements:
+///   * step 4 — MinPositive(refIdxL0A, refIdxL0B, refIdxL0C) for both
+///     lists, with §8.4.1.3.2 C→D substitution applied first.
+///   * step 5 — `directZeroPredictionFlag` when both lists' MinPositive
+///     output is < 0; both refs collapse to 0, both MVs to (0, 0).
+///   * step 6 — per-partition MV derivation: median MVpred from the
+///     A/B/C neighbours unless `direct_zero` or `refIdxLX < 0`.
+///   * step 7 — per-8x8 colZeroFlag short-circuit: when refIdxLX == 0
+///     AND colZeroFlag fires, that list's MV for that partition is 0.
+///
+/// `direct_8x8_inference_flag = 1` is hard-wired in our SPS so the
+/// granularity is 8x8 (4 partitions per MB).
+fn b_spatial_direct_derive(
+    mv_grid_l0: &MvGrid,
+    mv_grid_l1: &MvGrid,
+    l1_partition_mvs: &[FrameRefPartitionMv],
+    width_mbs: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> BDirectDerivation {
+    // §8.4.1.2.2 step 2-3 — MB-level (A, B, C, D) for both lists.
+    let (a_l0, b_l0, c_l0, d_l0) = neighbour_mvs_16x16(mv_grid_l0, mb_x, mb_y);
+    let (a_l1, b_l1, c_l1, d_l1) = neighbour_mvs_16x16(mv_grid_l1, mb_x, mb_y);
+
+    // Run the §8.4.1.2.2 step 4-5 derivation through the helper to get
+    // ref_idx_l0/l1 + the MB-level mvL0/mvL1 (subject to step 7
+    // override below). The helper returns refIdx >= 0 for both lists
+    // when directZero fires, but with `direct_zero = (mv == 0)` the
+    // caller can detect the fallback by re-checking the MinPositive
+    // result independently.
+    let (ref_idx_l0_helper, mv_l0_mb, ref_idx_l1_helper, mv_l1_mb) =
+        crate::mv_deriv::derive_b_spatial_direct_with_d(
+            a_l0, a_l1, b_l0, b_l1, c_l0, c_l1, d_l0, d_l1,
+        );
+
+    // Repeat the step-4 MinPositive chain locally to detect directZero
+    // (the helper folds it into the output).
+    let c_l0_eff = if !c_l0.partition_available && d_l0.partition_available {
+        d_l0
+    } else {
+        c_l0
+    };
+    let c_l1_eff = if !c_l1.partition_available && d_l1.partition_available {
+        d_l1
+    } else {
+        c_l1
+    };
+    let min_pos = |x: i32, y: i32| -> i32 {
+        if x >= 0 && y >= 0 {
+            x.min(y)
+        } else {
+            x.max(y)
+        }
+    };
+    let r0_minp = min_pos(a_l0.ref_idx, min_pos(b_l0.ref_idx, c_l0_eff.ref_idx));
+    let r1_minp = min_pos(a_l1.ref_idx, min_pos(b_l1.ref_idx, c_l1_eff.ref_idx));
+    let direct_zero = r0_minp < 0 && r1_minp < 0;
+
+    let ref_idx_l0_final: i32 = if direct_zero {
+        0
+    } else if r0_minp < 0 {
+        -1
+    } else {
+        ref_idx_l0_helper
+    };
+    let ref_idx_l1_final: i32 = if direct_zero {
+        0
+    } else if r1_minp < 0 {
+        -1
+    } else {
+        ref_idx_l1_helper
+    };
+
+    // §8.4.1.2.2 step 6/7 — per 8x8 partition MV derivation.
+    let mut mv_l0_per_8x8 = [Mv::ZERO; 4];
+    let mut mv_l1_per_8x8 = [Mv::ZERO; 4];
+    for part in 0..4usize {
+        let cz = col_zero_flag(l1_partition_mvs, width_mbs, mb_x, mb_y, part);
+        // §8.4.1.2.2 step 6/7 — three forced-zero conditions per list
+        // (directZero, refIdx<0, refIdx==0 AND colZeroFlag); otherwise
+        // the MB-level median MV applies.
+        let l0_force_zero = direct_zero || ref_idx_l0_final < 0 || (ref_idx_l0_final == 0 && cz);
+        let l1_force_zero = direct_zero || ref_idx_l1_final < 0 || (ref_idx_l1_final == 0 && cz);
+        mv_l0_per_8x8[part] = if l0_force_zero { Mv::ZERO } else { mv_l0_mb };
+        mv_l1_per_8x8[part] = if l1_force_zero { Mv::ZERO } else { mv_l1_mb };
+    }
+
+    BDirectDerivation {
+        ref_idx_l0: ref_idx_l0_final,
+        ref_idx_l1: ref_idx_l1_final,
+        mv_l0_per_8x8,
+        mv_l1_per_8x8,
+        direct_zero,
+    }
+}
 
 /// Output of [`Encoder::encode_b`] — a single B-slice access unit and the
 /// matching reconstruction. Same layout as [`EncodedP`]; B-frames are
@@ -3159,6 +3453,9 @@ pub struct EncodedB {
     /// §8.2.4 list construction to determine which ref is "before" and
     /// which is "after" in display order.
     pub pic_order_cnt_lsb: u32,
+    /// Per-8x8-partition MV state. B-frames are non-reference so this
+    /// is normally unused, but is provided for API symmetry.
+    pub partition_mvs: Vec<FrameRefPartitionMv>,
 }
 
 impl<'a> From<&'a EncodedB> for EncodedFrameRef<'a> {
@@ -3169,6 +3466,7 @@ impl<'a> From<&'a EncodedB> for EncodedFrameRef<'a> {
             recon_y: &e.recon_y,
             recon_u: &e.recon_u,
             recon_v: &e.recon_v,
+            partition_mvs: &e.partition_mvs,
         }
     }
 }
@@ -3447,15 +3745,15 @@ impl Encoder {
         let mut mb_deblock_infos: Vec<MbDeblockInfo> =
             vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
 
-        // §7.3.4 CAVLC B-slice walker — emit `mb_skip_run` (ue(v)) before
-        // each coded MB. Round 20 never emits B_Skip, so the run is always
-        // 0 (one '1' bit per MB). A future round can fold a proper skip
-        // run in once B_Skip detection lands.
+        // §7.3.4 CAVLC B-slice walker — `mb_skip_run` ue(v) accumulates
+        // consecutive B_Skip MBs and is flushed before every coded MB
+        // (and once at end-of-slice). Round-21 enables B_Skip when the
+        // §8.4.1.2.2 spatial-direct predictor agrees with the encoder's
+        // chosen MVs and the residual quantises to all-zero.
+        let mut pending_skip: u32 = 0;
         for mb_y in 0..height_mbs as usize {
             for mb_x in 0..width_mbs as usize {
                 let mb_addr = mb_y * (width_mbs as usize) + mb_x;
-                // mb_skip_run = 0 (no skips precede this coded MB).
-                sw.ue(0);
                 let dbl = self.encode_b_mb(
                     frame,
                     ref_l0,
@@ -3475,10 +3773,14 @@ impl Encoder {
                     &mut intra_grid,
                     &mut mv_grid_l0,
                     &mut mv_grid_l1,
+                    &mut pending_skip,
                 );
                 mb_deblock_infos[mb_addr] = dbl;
             }
         }
+        // §7.3.4 — flush any trailing skip run (mb_skip_run for the
+        // final group of skips at end-of-slice).
+        sw.ue(pending_skip);
 
         // §7.3.2.8 — slice_data trailing bits.
         sw.rbsp_trailing_bits();
@@ -3505,6 +3807,34 @@ impl Encoder {
             height_mbs,
         );
 
+        // Capture per-8x8 MV state from the L0 grid (B-frames are
+        // non-reference so this is normally unused; provided for API
+        // symmetry with EncodedP / EncodedIdr).
+        let n_parts = (width_mbs as usize) * (height_mbs as usize) * 4;
+        let mut partition_mvs = Vec::with_capacity(n_parts);
+        for slot in &mv_grid_l0.slots {
+            for part in 0..4usize {
+                // Both "not available" and "intra" map to (mv=0,
+                // ref=-1, is_intra=true) per §8.4.1.2.1: an intra
+                // colocated MB has refIdxCol=-1, and an unencoded slot
+                // is treated identically to "intra" by the colocated
+                // probe.
+                let (mv, ref_idx, is_intra) = if !slot.available || slot.is_intra {
+                    (Mv::ZERO, -1, true)
+                } else {
+                    (slot.mv_l0_8x8[part], slot.ref_idx_l0_8x8[part], false)
+                };
+                partition_mvs.push(FrameRefPartitionMv {
+                    mv_l0: (
+                        mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    ),
+                    ref_idx_l0: ref_idx.clamp(-1, 127) as i8,
+                    is_intra,
+                });
+            }
+        }
+
         EncodedB {
             annex_b: stream,
             recon_y,
@@ -3514,12 +3844,24 @@ impl Encoder {
             recon_height: self.cfg.height,
             frame_num,
             pic_order_cnt_lsb,
+            partition_mvs,
         }
     }
 
     /// Encode one B-slice macroblock. Mirrors [`Encoder::encode_p_mb`]
     /// but with two-list ME and the §8.4.2.3 weighted-pred merge for
-    /// bipred. No B_Skip / B_Direct path in round 20.
+    /// bipred.
+    ///
+    /// Round-21 adds the **spatial direct** path:
+    ///   * Compute the §8.4.1.2.2 derived MVs / refIdxs for this MB's
+    ///     neighbour configuration.
+    ///   * Build the corresponding predictor and trial-quantise its
+    ///     residual.
+    ///   * If the result has `cbp_luma == cbp_chroma == 0`, emit the MB
+    ///     as **B_Skip** (extends `pending_skip`). Otherwise compare its
+    ///     SAD against the explicit-inter candidates (L0/L1/Bi) and
+    ///     prefer **B_Direct_16x16** when its SAD is competitive (it
+    ///     saves the mvds + ref_idx in the bitstream).
     #[allow(clippy::too_many_arguments)]
     fn encode_b_mb(
         &self,
@@ -3541,6 +3883,7 @@ impl Encoder {
         intra_grid: &mut IntraGrid,
         mv_grid_l0: &mut MvGrid,
         mv_grid_l1: &mut MvGrid,
+        pending_skip: &mut u32,
     ) -> MbDeblockInfo {
         let width_mbs = (self.cfg.width / 16) as usize;
         let mb_addr = mb_y * width_mbs + mb_x;
@@ -3593,33 +3936,176 @@ impl Encoder {
         let sad_l1 = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &pred_y_l1);
         let sad_bi = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &pred_y_bi);
 
-        // 3. Pick the lowest-SAD candidate. Tie-break order: Bi (lowest
-        //    bit-cost when both lists agree) → L0 → L1.
-        let (pred, pred_y, pred_u, pred_v) = if sad_bi <= sad_l0 && sad_bi <= sad_l1 {
-            (BPred16x16::Bi, pred_y_bi, pred_u_bi, pred_v_bi)
-        } else if sad_l0 <= sad_l1 {
-            (BPred16x16::L0, pred_y_l0, pred_u_l0, pred_v_l0)
-        } else {
-            (BPred16x16::L1, pred_y_l1, pred_u_l1, pred_v_l1)
-        };
+        // 2.5 Round-21 — §8.4.1.2.2 spatial direct trial.
+        //
+        // Mirror the decoder's derivation locally to learn what MVs /
+        // refIdxs the decoder would compute if we emitted B_Direct here.
+        // Build that predictor, trial-quantise its residual, and compare
+        // against the explicit-inter candidates.
+        //
+        // Round-21 only emits B_Direct / B_Skip when the derivation
+        // produces a uniform MV across all 4 8x8 partitions (then we
+        // can build a single 16x16 predictor). Non-uniform direct MVs
+        // (per-partition motion compensation) are deferred to a later
+        // round. Empirically the directZeroPredictionFlag fallback +
+        // its self-propagation ensures uniformity for most "no-motion"
+        // and "first-MB-of-slice" content.
+        let direct = b_spatial_direct_derive(
+            mv_grid_l0,
+            mv_grid_l1,
+            ref_l1.partition_mvs,
+            width_mbs,
+            mb_x,
+            mb_y,
+        );
+        let direct_uniform = direct.is_uniform();
+        // Map (refIdxL0 >= 0, refIdxL1 >= 0) onto the same BPred16x16
+        // enum the explicit-inter writer uses, so the predictor builder
+        // is shared. Direct mode where neither list is used should not
+        // happen (directZeroPredictionFlag forces both refs to 0), but
+        // if it did we fall back to L0-only with mv=0.
+        let direct_pred_kind: Option<BPred16x16> =
+            match (direct.ref_idx_l0 >= 0, direct.ref_idx_l1 >= 0) {
+                (true, true) => Some(BPred16x16::Bi),
+                (true, false) => Some(BPred16x16::L0),
+                (false, true) => Some(BPred16x16::L1),
+                (false, false) => None,
+            };
 
-        // 4. mvds against the §8.4.1.3 mvp for each used list.
+        // Compute the direct predictor + SAD only when the configuration
+        // is exploitable (uniform across 8x8 partitions and at least one
+        // list is used).
+        let (direct_competitive, direct_pred_y, direct_pred_u, direct_pred_v, direct_sad) =
+            match (direct_uniform, direct_pred_kind) {
+                (true, Some(dpk)) => {
+                    let (dy, du, dv) = build_b_predictors(
+                        dpk,
+                        ref_l0,
+                        ref_l1,
+                        mb_x,
+                        mb_y,
+                        direct.mv_l0(),
+                        direct.mv_l1(),
+                    );
+                    let dsad = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &dy);
+                    (true, dy, du, dv, dsad)
+                }
+                _ => (false, [0i32; 256], [0i32; 64], [0i32; 64], u32::MAX),
+            };
+
+        // 3. Pick the candidate that minimises a Lagrangian cost
+        //    `J = SAD_luma + λ · R_syntax`. Direct mode emits the
+        //    smallest syntax block (just `mb_type=0 + cbp`, or nothing
+        //    at all when B_Skip), so it gets a SAD allowance that
+        //    reflects its rate savings.
+        //
+        // We approximate R_syntax with simple constants:
+        //   * Direct (cbp != 0): ~2 bits (`mb_type=0` ue + `cbp_codenum`
+        //     ue=0 if cbp small).
+        //   * Direct + cbp == 0 (would emit B_Skip): 0 bits (run-length).
+        //   * Explicit L0 / L1: ~3 + 2·avg_mvd_bits ≈ ~12 bits.
+        //   * Explicit Bi:      ~3 + 4·avg_mvd_bits ≈ ~20 bits.
+        //
+        // The "SAD-equivalent" of one bit at QP_Y is roughly
+        //   λ · 1 ≈ 0.85 · 2^((QP-12)/3) bits-to-SAD scaling.
+        // For QP=26 this gives λ ≈ 22, and the explicit-vs-direct
+        // syntax delta is ~10-20 bits → an equivalent SAD margin of
+        // ~200-440. Empirically a fixed margin of 16 bits' worth on
+        // top of the explicit candidate's SAD is sufficient for static
+        // / smooth content where ME is searching a flat SAD landscape.
+        enum BMode {
+            Direct,
+            Explicit(BPred16x16),
+        }
+        // Per-MB Lagrangian penalty applied to explicit candidates
+        // relative to Direct, in SAD units. Tuned conservatively so
+        // round-20 fixtures still see Bi pick when it materially beats
+        // Direct (the round-20 midpoint test has direct_sad far above
+        // bi_sad on every MB → Bi still wins there).
+        let direct_bias_sad: u32 = {
+            // λ · bit-savings, scaled coarsely. For QP 0..51 this
+            // ranges from ~1 (low QP) to ~64 (QP 51). The bit savings
+            // (Direct vs Explicit Bi) are ~20 bits, so a typical
+            // smooth-motion B-slice gets a few hundred SAD units of
+            // headroom in favour of Direct.
+            let lambda = (qp_y / 6).clamp(0, 8) as u32;
+            (lambda + 1) * 16
+        };
+        let chosen_mode: BMode = if direct_competitive
+            && direct_sad <= sad_bi.saturating_add(direct_bias_sad)
+            && direct_sad <= sad_l0.saturating_add(direct_bias_sad)
+            && direct_sad <= sad_l1.saturating_add(direct_bias_sad)
+        {
+            BMode::Direct
+        } else if sad_bi <= sad_l0 && sad_bi <= sad_l1 {
+            BMode::Explicit(BPred16x16::Bi)
+        } else if sad_l0 <= sad_l1 {
+            BMode::Explicit(BPred16x16::L0)
+        } else {
+            BMode::Explicit(BPred16x16::L1)
+        };
+        let (pred, pred_y, pred_u, pred_v, eff_mv_l0, eff_mv_l1) = match chosen_mode {
+            BMode::Direct => {
+                // Direct's effective MVs are the §8.4.1.2.2 derivation's
+                // outputs (used for downstream grid updates + deblocker
+                // mv-identity). The explicit `pred` enum carries which
+                // list(s) the predictor reads; for the writer we'll use
+                // the dedicated B_Direct_16x16 path (no mvd / ref_idx).
+                (
+                    direct_pred_kind.expect("Direct chosen → direct_pred_kind set"),
+                    direct_pred_y,
+                    direct_pred_u,
+                    direct_pred_v,
+                    direct.mv_l0(),
+                    direct.mv_l1(),
+                )
+            }
+            BMode::Explicit(BPred16x16::Bi) => (
+                BPred16x16::Bi,
+                pred_y_bi,
+                pred_u_bi,
+                pred_v_bi,
+                mv_l0,
+                mv_l1,
+            ),
+            BMode::Explicit(BPred16x16::L0) => (
+                BPred16x16::L0,
+                pred_y_l0,
+                pred_u_l0,
+                pred_v_l0,
+                mv_l0,
+                Mv::ZERO,
+            ),
+            BMode::Explicit(BPred16x16::L1) => (
+                BPred16x16::L1,
+                pred_y_l1,
+                pred_u_l1,
+                pred_v_l1,
+                Mv::ZERO,
+                mv_l1,
+            ),
+        };
+        let is_direct = matches!(chosen_mode, BMode::Direct);
+
+        // 4. mvds against the §8.4.1.3 mvp for each used list (only
+        //    relevant for explicit modes; Direct has no mvd in the
+        //    bitstream).
         let mvp_l0 = mvp_for_16x16(mv_grid_l0, mb_x, mb_y, 0);
         let mvp_l1 = mvp_for_16x16(mv_grid_l1, mb_x, mb_y, 0);
-        let (mvd_l0_x, mvd_l0_y) = if pred.uses_l0() {
-            (mv_l0.x - mvp_l0.x, mv_l0.y - mvp_l0.y)
+        let (mvd_l0_x, mvd_l0_y) = if !is_direct && pred.uses_l0() {
+            (eff_mv_l0.x - mvp_l0.x, eff_mv_l0.y - mvp_l0.y)
         } else {
             (0, 0)
         };
-        let (mvd_l1_x, mvd_l1_y) = if pred.uses_l1() {
-            (mv_l1.x - mvp_l1.x, mv_l1.y - mvp_l1.y)
+        let (mvd_l1_x, mvd_l1_y) = if !is_direct && pred.uses_l1() {
+            (eff_mv_l1.x - mvp_l1.x, eff_mv_l1.y - mvp_l1.y)
         } else {
             (0, 0)
         };
         let _ = BMbDecision {
             pred,
-            mv_l0,
-            mv_l1,
+            mv_l0: eff_mv_l0,
+            mv_l1: eff_mv_l1,
             mvd_l0_x,
             mvd_l0_y,
             mvd_l1_x,
@@ -3707,11 +4193,17 @@ impl Encoder {
         }
 
         // 8. CAVLC neighbour-grid update + per-block nC.
+        //
+        // §9.2.1.1 step 6 — a B_Skip neighbour contributes nN=0 (same as
+        // P_Skip). For B_Direct_16x16 with cbp_luma=0 the slots are also
+        // 0 but `is_skip` stays false (the MB is coded, just with no
+        // residual).
+        let mb_is_skip = is_direct && cbp_luma == 0 && cbp_chroma == 0;
         {
             let cur = &mut nc_grid.mbs[mb_addr];
             cur.is_available = true;
             cur.is_intra = false;
-            cur.is_skip = false;
+            cur.is_skip = mb_is_skip;
             cur.is_i_pcm = false;
             cur.luma_total_coeff = [0u8; 16];
         }
@@ -3743,35 +4235,72 @@ impl Encoder {
         nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
 
         // 9. Emit the MB syntax.
-        let mb_cfg = B16x16McbConfig {
-            pred,
-            mvd_l0_x,
-            mvd_l0_y,
-            mvd_l1_x,
-            mvd_l1_y,
-            cbp_luma,
-            cbp_chroma,
-            mb_qp_delta: 0,
-            luma_4x4_levels: luma_4x4_levels_scan,
-            luma_4x4_nc,
-            chroma_dc_cb: u_dc_levels,
-            chroma_dc_cr: v_dc_levels,
-            chroma_ac_cb: u_ac_levels,
-            chroma_ac_cr: v_ac_levels,
-        };
-        write_b_16x16_mb(sw, &mb_cfg, 0, 0).expect("write B_*_16x16 mb");
+        //
+        // §7.3.4 — three bitstream layouts depending on the chosen mode:
+        //   * B_Skip       : no MB syntax — pending_skip += 1.
+        //   * B_Direct_16x16: mb_type=0 + cbp + (mb_qp_delta) + residuals.
+        //   * Explicit     : mb_type∈{1,2,3} + ref_idxs + mvds + cbp +
+        //                    (mb_qp_delta) + residuals.
+        // Skips never flush their own ue(v); they are folded into the
+        // run that precedes the next coded MB (or the trailing flush).
+        if mb_is_skip {
+            // §7.3.4 — extend the run of skipped MBs.
+            *pending_skip += 1;
+        } else {
+            // §7.3.4 — flush any preceding skip-run before this coded MB.
+            sw.ue(*pending_skip);
+            *pending_skip = 0;
+
+            if is_direct {
+                let dcfg = crate::encoder::macroblock::BDirect16x16McbConfig {
+                    cbp_luma,
+                    cbp_chroma,
+                    mb_qp_delta: 0,
+                    luma_4x4_levels: luma_4x4_levels_scan,
+                    luma_4x4_nc,
+                    chroma_dc_cb: u_dc_levels,
+                    chroma_dc_cr: v_dc_levels,
+                    chroma_ac_cb: u_ac_levels,
+                    chroma_ac_cr: v_ac_levels,
+                };
+                crate::encoder::macroblock::write_b_direct_16x16_mb(sw, &dcfg)
+                    .expect("write B_Direct_16x16 mb");
+            } else {
+                let mb_cfg = B16x16McbConfig {
+                    pred,
+                    mvd_l0_x,
+                    mvd_l0_y,
+                    mvd_l1_x,
+                    mvd_l1_y,
+                    cbp_luma,
+                    cbp_chroma,
+                    mb_qp_delta: 0,
+                    luma_4x4_levels: luma_4x4_levels_scan,
+                    luma_4x4_nc,
+                    chroma_dc_cb: u_dc_levels,
+                    chroma_dc_cr: v_dc_levels,
+                    chroma_ac_cb: u_ac_levels,
+                    chroma_ac_cr: v_ac_levels,
+                };
+                write_b_16x16_mb(sw, &mb_cfg, 0, 0).expect("write B_*_16x16 mb");
+            }
+        }
 
         // 10. Update the L0 and L1 mv-pred grids — only the list(s) this
         //     MB actually uses contribute. The other list's grid slot
         //     stays at the default (ref_idx = -1, mv = ZERO), which is
         //     exactly what §8.4.1.3.2 wants for "no contribution" (the
         //     median collapses for that side).
+        //
+        // For Direct mode we record the §8.4.1.2.2-derived MVs (which
+        // is what the decoder will compute too) so subsequent MBs that
+        // use this one as a §8.4.1.3 neighbour see the same MVs.
         if pred.uses_l0() {
             *mv_grid_l0.slot_mut(mb_x, mb_y) = MvGridSlot {
                 available: true,
                 is_intra: false,
                 ref_idx_l0_8x8: [0; 4],
-                mv_l0_8x8: [mv_l0; 4],
+                mv_l0_8x8: [eff_mv_l0; 4],
             };
         } else {
             // Mark as available-but-no-L0 (intra-from-L0's-perspective).
@@ -3787,7 +4316,7 @@ impl Encoder {
                 available: true,
                 is_intra: false,
                 ref_idx_l0_8x8: [0; 4],
-                mv_l0_8x8: [mv_l1; 4],
+                mv_l0_8x8: [eff_mv_l1; 4],
             };
         } else {
             *mv_grid_l1.slot_mut(mb_x, mb_y) = MvGridSlot {
@@ -3812,12 +4341,12 @@ impl Encoder {
             std::array::from_fn(|i| cbp_chroma == 2 && v_ac_levels[i].iter().any(|&v| v != 0));
 
         let mv_l0_t = (
-            mv_l0.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-            mv_l0.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            eff_mv_l0.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            eff_mv_l0.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
         );
         let mv_l1_t = (
-            mv_l1.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-            mv_l1.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            eff_mv_l1.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            eff_mv_l1.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
         );
         let (mv_l0_arr, ref_idx_l0, ref_poc_l0) = if pred.uses_l0() {
             ([mv_l0_t; 16], [0i8; 4], [0i32; 4])

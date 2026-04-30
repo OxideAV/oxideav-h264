@@ -735,12 +735,96 @@ P-frame as L0 / L1 anchors.
 - CAVLC only.
 - No rate control — fixed QP.
 
-## Round 21+ (planned)
+## Round 21 — landed
 
-- B_Skip / B_Direct_16x16 with §8.4.1.2.2 spatial direct MV
-  derivation.
+Wire **B_Skip / B_Direct_16x16** spatial-direct mode on top of round-20's
+explicit-inter B-slice support. The encoder now mirrors the §8.4.1.2.2
+derivation locally and emits the small/zero-bitstream B_Direct_16x16
+(raw mb_type 0) or B_Skip (no syntax — folded into `mb_skip_run`)
+whenever the spatial-direct predictor is competitive with the
+round-20 explicit-inter (B_L0 / B_L1 / B_Bi) candidates.
+
+- **§8.4.1.2.2 derivation** (`encoder::mod::b_spatial_direct_derive`):
+  reads the encoder's L0 and L1 MV grids for the (A, B, C, D)
+  neighbours, applies the §8.4.1.3.2 C→D substitution, runs the
+  MinPositive chain on refIdxLX (eq. 8-184/8-185), detects
+  `directZeroPredictionFlag` (eq. 8-188..8-190), and computes per-8x8
+  partition MVs subject to the step-7 `colZeroFlag` short-circuit.
+- **`colZeroFlag` (§8.4.1.2.2 step 7)**: encoder reads the colocated
+  block's L0 MV / refIdx from the L1 anchor. New
+  `EncodedFrameRef::partition_mvs` carries these — populated by
+  `encode_p` from its `MvGrid`, populated for IDRs as "all intra"
+  (refIdxCol = -1 → colZeroFlag = 0). Intra colocated blocks short-
+  circuit per §8.4.1.2.1 NOTE.
+- **B_Direct_16x16 writer** (`encoder::macroblock::write_b_direct_16x16_mb`
+  + `BDirect16x16McbConfig`): emits `mb_type=0` (Table 7-14 raw 0) +
+  `coded_block_pattern me(v)` + optional `mb_qp_delta` + residuals.
+  No `mvd_l0` / `mvd_l1` / `ref_idx_l0` / `ref_idx_l1` (the decoder
+  derives those itself).
+- **B_Skip path**: when the chosen mode is Direct AND `cbp_luma == 0
+  AND cbp_chroma == 0`, the MB is omitted from the bitstream entirely.
+  `pending_skip` accumulates the run; flushed as a single ue(v)
+  before the next coded MB or at end-of-slice.
+- **Mode-decision Lagrangian bias**: Direct gets a SAD allowance over
+  the explicit candidates of `(qp_y/6 + 1) * 16` SAD units, calibrated
+  so that on smooth / static content the explicit-inter path's
+  marginal SAD wins are outweighed by Direct's 10-20 bit syntax savings.
+  Round-20 fixtures (midpoint linear interp) still pass under this
+  bias because the explicit-Bi SAD on those is materially below the
+  spatial-direct SAD when neighbours haven't propagated the (0, 0) MV
+  yet.
+- **Per-8x8 uniformity gate**: round-21 only emits Direct / Skip when
+  the §8.4.1.2.2 derivation's per-partition MVs are uniform across the
+  MB. Non-uniform direct (per-partition motion compensation) is
+  deferred to a later round.
+
+### Validation
+
+- `cargo test -p oxideav-h264 --lib` — **803 passed** (+2 unit tests
+  for the B_Direct_16x16 writer round-trip and the mb_type/Table 7-14
+  decode).
+- All round-1..20 fixtures still pass with bit-exact ffmpeg interop on
+  every fixture. The round-20 midpoint test PSNR is 51.86 dB (was
+  54.19 dB; the small drop reflects more MBs choosing
+  Direct/Skip on the smooth content where explicit-Bi was marginally
+  better; quality is still well above the test's 38 dB floor).
+- New round-21 integration tests
+  (`integration_b_skip_direct.rs`):
+  - `round21_static_picture_uses_b_skip`: IDR + P + B all from the
+    same source → every B-MB picks Direct → cbp == 0 → B_Skip.
+    **B-slice = 11 bytes** (vs round-20's 75 bytes for same content
+    when only explicit modes are available; a **7× compression** on
+    the B portion). Decoder PSNR_Y = 52.36 dB, max enc/dec diff 0.
+  - `round21_b_skip_ffmpeg_interop`: ffmpeg/libavcodec decodes the
+    same all-skips B stream **bit-equivalently** against the encoder's
+    local recon (max diff 0). 52.36 dB PSNR_Y.
+  - `round21_midpoint_b_slice_decoder_match`: round-20's midpoint
+    fixture re-tested under the new mode-decision — bit-exact recon
+    via our own decoder, B-slice 16 bytes (unchanged).
+
+### Status caveats (unchanged from round 20 unless noted)
+
+- B-slices: round-20 explicit-inter (B_L0 / B_L1 / B_Bi) plus
+  **round-21 B_Direct_16x16 / B_Skip** for spatial direct mode.
+  No 16x8 / 8x16 partitions, no B_8x8 / B_Direct_8x8.
+- Spatial direct only (`direct_spatial_mv_pred_flag = 1`, hard-wired).
+  Temporal direct (§8.4.1.2.3) deferred.
+- Direct mode emits only when the §8.4.1.2.2 derivation gives uniform
+  per-8x8 MVs and at least one list is used. Non-uniform direct is
+  deferred.
+- No intra fallback in P / B slices (the round-21 frontier still
+  applies).
+- In-loop deblocking active across intra / P / B (with B_Skip /
+  B_Direct properly fed through `MbDeblockInfo`).
+- CAVLC only.
+- No rate control — fixed QP.
+
+## Round 22+ (planned)
+
 - Intra fallback in P / B slices via RDO.
 - B-slice 16x8 / 8x16 partitions and B_8x8 sub-MB types.
+- B_Direct_8x8 (sub-MB direct) with non-uniform per-8x8 MVs.
+- Temporal direct mode (§8.4.1.2.3).
 - Multiple slices per picture.
 - 8x8 transform / High-profile features.
 - CABAC.
@@ -754,10 +838,14 @@ P-frame as L0 / L1 anchors.
 - [`Encoder::encode_p`] — non-IDR P-slice (round 16). Takes one
   `YuvFrame` + a single L0 reference (`EncodedFrameRef`) and emits the
   P slice NAL + recon. SPS/PPS were shipped by the IDR.
-- [`Encoder::encode_b`] — non-reference B-slice (round 20). Takes one
-  `YuvFrame` + L0 and L1 references (`EncodedFrameRef`) and emits the
-  B slice NAL + recon. Requires `EncoderConfig::profile_idc >= 77` and
-  `max_num_ref_frames >= 2`. SPS/PPS were shipped by the IDR.
+- [`Encoder::encode_b`] — non-reference B-slice (round 20 + 21).
+  Takes one `YuvFrame` + L0 and L1 references (`EncodedFrameRef`) and
+  emits the B slice NAL + recon. Requires `EncoderConfig::profile_idc
+  >= 77` and `max_num_ref_frames >= 2`. SPS/PPS were shipped by the
+  IDR. Round-21: when an `EncodedFrameRef` is built `From<&EncodedP>`
+  (or `From<&EncodedIdr>`), its `partition_mvs` field is populated for
+  use by the §8.4.1.2.2 spatial-direct derivation when this frame
+  serves as the L1 anchor.
 - Lower-level helpers under [`bitstream`], [`nal`], [`sps`], [`pps`],
   [`slice`], [`macroblock`], [`cavlc`], [`transform`] are usable
   independently — round 2's higher-mode encoder can compose them

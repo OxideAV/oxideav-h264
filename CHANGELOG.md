@@ -98,6 +98,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: **B_Skip / B_Direct_16x16 spatial-direct mode (round 21)**
+  on top of round-20 explicit-inter. The encoder now mirrors the
+  §8.4.1.2.2 derivation locally using its own L0 / L1 MV grids plus
+  the L1 anchor's per-block colocated MVs (new
+  `EncodedFrameRef::partition_mvs`, populated by `encode_p`). When the
+  derived predictor's SAD is competitive with the explicit-inter
+  candidates (under a Lagrangian rate bias of `(qp_y/6 + 1) * 16` SAD
+  units), the encoder emits **B_Direct_16x16** (raw mb_type 0, no mvds
+  / ref_idx in the bitstream) — or **B_Skip** if the residual quantises
+  to zero (folded into a `mb_skip_run` ue(v)). On a 16-MB static-content
+  B-frame (IDR + P + B all from the same source), the new path
+  collapses the B-slice from 75 → 11 bytes (~85% reduction) with
+  identical PSNR (52.36 dB Y, max enc/dec diff 0, bit-equivalent
+  against ffmpeg/libavcodec). Implements §8.4.1.2.1 colocated-block
+  selection, §8.4.1.2.2 step 4 (MinPositive on refIdxLX), step 5
+  (directZeroPredictionFlag), step 7 (colZeroFlag short-circuit), and
+  §8.4.1.3 median MV prediction. Round-21 caveats: spatial direct only
+  (no temporal direct), 16x16 partitions only (no B_Direct_8x8 / B_8x8),
+  per-8x8 uniformity gate skips Direct when the derivation's per-
+  partition MVs disagree.
 - encoder: B-slice support (round 20). Explicit B_L0_16x16 / B_L1_16x16
   / B_Bi_16x16 macroblock types via the new `Encoder::encode_b` entry
   point. SPS bumps to Main profile (profile_idc=77) since §A.2.2

@@ -797,6 +797,105 @@ pub fn write_b_16x16_mb(
     Ok(())
 }
 
+/// Configuration for one B-slice **B_Direct_16x16** macroblock
+/// (raw mb_type 0 in Table 7-14). Round-21 entry point.
+///
+/// B_Direct_16x16 has no `mvd_l0` / `mvd_l1` / `ref_idx_l0` / `ref_idx_l1`
+/// in the bitstream — the decoder derives those itself per §8.4.1.2 (via
+/// §8.4.1.2.2 spatial-direct or §8.4.1.2.3 temporal-direct depending on
+/// `direct_spatial_mv_pred_flag`). The encoder is expected to mirror the
+/// derivation locally and build a recon predictor from the same MVs.
+///
+/// Layout per §7.3.5 / §7.3.5.1 with `mb_type = 0`:
+///
+/// ```text
+///   mb_type ue(v)                      (codeNum 0 = B_Direct_16x16)
+///   coded_block_pattern me(v)          (inter Table 9-4(a))
+///   if cbp_luma > 0 || cbp_chroma > 0:
+///     mb_qp_delta se(v)
+///   if cbp_luma > 0:
+///     16 luma 4x4 residuals (raster-Z, by 8x8 quadrant)
+///   if cbp_chroma >= 1: chroma DC Cb, Cr
+///   if cbp_chroma == 2: chroma AC Cb (4), Cr (4)
+/// ```
+pub struct BDirect16x16McbConfig {
+    /// `cbp_luma` ∈ 0..=15.
+    pub cbp_luma: u8,
+    /// `cbp_chroma` ∈ {0, 1, 2}.
+    pub cbp_chroma: u8,
+    /// `mb_qp_delta` per §7.4.5. Only emitted when (cbp_luma>0 || cbp_chroma>0).
+    pub mb_qp_delta: i32,
+    /// 16 4x4 luma residual blocks in §6.4.3 raster-Z order.
+    pub luma_4x4_levels: [[i32; 16]; 16],
+    /// Per-luma-4x4-block `nC` (CAVLC neighbour context).
+    pub luma_4x4_nc: [i32; 16],
+    /// 4 quantized chroma DC levels (Cb).
+    pub chroma_dc_cb: [i32; 4],
+    /// 4 quantized chroma DC levels (Cr).
+    pub chroma_dc_cr: [i32; 4],
+    /// Per-4x4-block chroma AC levels (Cb), AC-only scan layout.
+    pub chroma_ac_cb: [[i32; 16]; 4],
+    /// Per-4x4-block chroma AC levels (Cr).
+    pub chroma_ac_cr: [[i32; 16]; 4],
+}
+
+/// Emit one B-slice `B_Direct_16x16` macroblock (CAVLC).
+///
+/// `mb_type = 0` (raw value in Table 7-14). No mvd / ref_idx in the
+/// bitstream — the decoder derives them per §8.4.1.2 (spatial direct
+/// when `direct_spatial_mv_pred_flag == 1`, temporal direct otherwise).
+pub fn write_b_direct_16x16_mb(
+    w: &mut BitWriter,
+    cfg: &BDirect16x16McbConfig,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+
+    // §7.4.5 Table 7-14 — raw mb_type 0 = B_Direct_16x16.
+    w.ue(0);
+
+    // §7.3.5 — coded_block_pattern me(v) using the inter table.
+    let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
+    w.ue(codenum);
+
+    // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
+    let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
+    if needs_qp_delta {
+        w.se(cfg.mb_qp_delta);
+    }
+
+    // §7.3.5.3 — luma residual blocks (when cbp_luma != 0).
+    for blk8 in 0..4u8 {
+        if (cfg.cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                let nc = cfg.luma_4x4_nc[blk];
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(nc),
+                    16,
+                    &cfg.luma_4x4_levels[blk],
+                )?;
+            }
+        }
+    }
+
+    // §7.3.5.3 — chroma residual: same structure as P_L0_16x16 / B_L0_16x16.
+    if cfg.cbp_chroma > 0 {
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
+    }
+    if cfg.cbp_chroma == 2 {
+        for blk in &cfg.chroma_ac_cb {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+        for blk in &cfg.chroma_ac_cr {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,5 +988,38 @@ mod tests {
         assert!(BPred16x16::L0.uses_l0() && !BPred16x16::L0.uses_l1());
         assert!(!BPred16x16::L1.uses_l0() && BPred16x16::L1.uses_l1());
         assert!(BPred16x16::Bi.uses_l0() && BPred16x16::Bi.uses_l1());
+    }
+
+    /// §7.4.5 Table 7-14 — raw mb_type 0 round-trips to
+    /// `MbType::BDirect16x16` (round-21).
+    #[test]
+    fn b_direct_16x16_mb_type_raw_matches_table_7_14_decode() {
+        use crate::macroblock_layer::MbType;
+        assert_eq!(MbType::from_b_slice(0).unwrap(), MbType::BDirect16x16);
+    }
+
+    /// Round-21 B_Direct_16x16 writer with `cbp_luma=0, cbp_chroma=0`
+    /// emits exactly two ue(v): mb_type=0 (single '1') + cbp codeNum=0
+    /// (single '1'). No mb_qp_delta (gated on cbp > 0). That is two
+    /// bits total in the bitstream window we control before
+    /// `rbsp_trailing_bits()`.
+    #[test]
+    fn b_direct_16x16_zero_residual_emits_two_bits() {
+        let mut bw = BitWriter::new();
+        let cfg = BDirect16x16McbConfig {
+            cbp_luma: 0,
+            cbp_chroma: 0,
+            mb_qp_delta: 0,
+            luma_4x4_levels: [[0; 16]; 16],
+            luma_4x4_nc: [0; 16],
+            chroma_dc_cb: [0; 4],
+            chroma_dc_cr: [0; 4],
+            chroma_ac_cb: [[0; 16]; 4],
+            chroma_ac_cr: [[0; 16]; 4],
+        };
+        write_b_direct_16x16_mb(&mut bw, &cfg).expect("write");
+        // mb_type=0 → ue(v) "1" (1 bit). cbp codeNum=0 → ue(v) "1" (1 bit).
+        // Total 2 bits.
+        assert_eq!(bw.bits_emitted(), 2);
     }
 }
