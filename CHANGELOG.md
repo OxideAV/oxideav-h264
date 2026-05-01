@@ -98,6 +98,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: **B-slice 16x8 / 8x16 partition modes (round 22)** — Table
+  7-14 raw mb_types 4..=21 (`B_L0_L0_16x8` through `B_Bi_Bi_8x16`). Per-
+  partition refIdx, MV, prediction mode (L0 / L1 / Bi), and §8.4.1.3
+  partition-shape MVP derivation (`Partition16x8Top/Bottom`,
+  `Partition8x16Left/Right`). Per-partition ME candidates pulled from the
+  3-way set `{16x16-best-MV, cell-A-best-MV, cell-B-best-MV}`; mode
+  decision enumerates the 9 `(mode_a, mode_b)` combos per shape and
+  picks the minimum-SAD pair. Partition mode wins over 16x16 only when
+  its joint SAD beats 16x16 by more than `(qp_y/6 + 1) * 8` SAD units —
+  the Lagrangian rate penalty for the larger mb_type ue(v) plus the
+  duplicated mvds. Bipred uses the same §8.4.2.3.1 default weighted
+  average `(L0+L1+1)>>1` as round-20. The encoder's per-MB
+  `MvGridSlot` now carries genuinely per-8x8 MVs (top half = #0/#1,
+  bottom = #2/#3 for 16x8; left = #0/#2, right = #1/#3 for 8x16); the
+  §8.4.1.3.2 C→D substitution and the per-partition `LUMA_4X4_BLK`
+  Z-scan indexing of the deblock-walker's MV array are honoured so the
+  decoder's bs derivation sees the same MVs as the encoder. Two new
+  integration fixtures (`integration_b_partitions.rs`) verify
+  bit-exact ffmpeg/libavcodec interop on a per-half-motion B-frame
+  (max diff 0, 46.87 dB PSNR_Y on 16x8 split, 48.54 dB on 8x16). The
+  encoder's `neighbour_mvs_16x16` now reads each neighbour's per-8x8
+  cell that spatially abuts the current MB's top-left 4x4 (`#1` for
+  left, `#2` for above and above-right, `#3` for above-left), matching
+  the decoder's per-partition MV grid for partition-mode neighbours.
+  Round-22 caveats: partition mode never overrides Direct (B_Skip
+  beats partition by 0 vs ~10+ bits of mb_type / mvd cost), CAVLC only,
+  single ref per list.
 - encoder: **B_Skip / B_Direct_16x16 spatial-direct mode (round 21)**
   on top of round-20 explicit-inter. The encoder now mirrors the
   §8.4.1.2.2 derivation locally using its own L0 / L1 MV grids plus

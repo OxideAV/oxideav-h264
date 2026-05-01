@@ -819,10 +819,86 @@ round-20 explicit-inter (B_L0 / B_L1 / B_Bi) candidates.
 - CAVLC only.
 - No rate control — fixed QP.
 
-## Round 22+ (planned)
+## Round 22 — landed
+
+B-slice 16x8 / 8x16 partition modes (§7.4.5 Table 7-14 raw mb_types
+4..=21). The encoder picks among:
+- Round-21 set: B_Skip, B_Direct_16x16, B_L0_16x16, B_L1_16x16,
+  B_Bi_16x16.
+- Round-22 set: 9 mb_types per shape × 2 shapes = 18 new variants
+  (`B_L0_L0_16x8` / `B_L0_L1_16x8` / `B_Bi_Bi_16x8` / etc.).
+
+Per-MB decision flow extends the round-21 logic with two extra steps:
+
+1. **Per-cell ME** for both L0 and L1 (4 cells × 2 lists = 8 calls to
+   `search_quarter_pel_8x8`). The 16x16-best MV from round-20 is also
+   kept as a candidate.
+
+2. **Per-partition mode enumeration** (`best_partition_mode_b`): for
+   each of the 4 partition shapes (16x8 top, 16x8 bottom, 8x16 left,
+   8x16 right), try all 9 (mode_l0, mode_l1) combinations and keep
+   the one with minimum partition-wide SAD. Joint SAD across both
+   halves is the partition-shape SAD; the better of `(16x8, 8x16)` is
+   the partition winner.
+
+3. **Lagrangian gate**: partition wins over 16x16 only when its SAD
+   beats 16x16's by more than `(qp_y/6 + 1) * 8` SAD units (the rate
+   penalty for the larger mb_type ue(v) plus the duplicated mvds).
+   Direct mode is never overridden by partition mode (B_Skip's 0 bits
+   of MB syntax dominates any partition mode's ~10+ bits).
+
+§8.4.1.3 partition-shape MVP derivation uses the
+`Partition16x8Top/Bottom` / `Partition8x16Left/Right` directional
+shortcuts and falls through to median(A, B, C) with the §8.4.1.3.2
+C→D substitution. The encoder's partition writer (`write_b_16x8_mb`,
+`write_b_8x16_mb`) emits per-§7.3.5.1: `mb_type` ue(v), then
+`ref_idx_l0[part]` for parts 0..1 (gated on partition mode), then
+`ref_idx_l1[part]`, then `mvd_l0[part]`, then `mvd_l1[part]`, then
+the standard cbp + mb_qp_delta + residuals tail.
+
+Per-MB grid update writes per-8x8 MVs (top half = #0/#1, bottom =
+#2/#3 for 16x8; left = #0/#2, right = #1/#3 for 8x16). The deblock
+walker's per-4x4 MV array (`MbDeblockInfo::mv_l0`) is filled in §6.4.3
+Z-scan order via `LUMA_4X4_BLK[blk]` — the spec-mandated layout that
+the decoder also uses, ensuring §8.7.2.1 boundary-strength derivation
+agrees encoder ↔ decoder.
+
+Side fix: `neighbour_mvs_16x16` now reads each neighbour's per-8x8
+cell that **spatially abuts** the current MB's top-left 4x4 (`#1` for
+left, `#2` for above and above-right, `#3` for above-left). Previously
+it always read 8x8 #0 — a bug that didn't bite earlier because all
+prior B/P MBs had uniform per-8x8 MVs (16x16 partition); with round-22
+partition mode introducing per-8x8 variation, the bug would have
+produced encoder ↔ decoder mvp mismatches for Direct mode of
+partition-mode-neighbour MBs.
+
+### Validation
+
+- 936 tests passing (was 929 in round 21; +4 unit + 3 integration).
+- New `integration_b_partitions.rs`:
+  - `round22_b_16x8_self_roundtrip_matches_local_recon` — encode IDR
+    + P + B with per-half-vertical motion (top half = IDR content,
+    bottom = P-shifted content). Encoder picks 16x8 mb_types per MB.
+    Decoder match: max enc/dec diff 0, PSNR_Y = 46.87 dB.
+  - `round22_b_8x16_self_roundtrip_matches_local_recon` — same with
+    per-half-horizontal motion. Encoder picks 8x16 mb_types. PSNR_Y
+    = 48.54 dB, max enc/dec diff 0.
+  - `round22_b_partitions_ffmpeg_interop` — ffmpeg/libavcodec decodes
+    the 16x8 stream **bit-equivalently** (max diff 0).
+
+### Caveats
+
+- B_8x8 sub-MB partitions still deferred to a later round.
+- B_Direct_8x8 (sub-MB direct) still deferred.
+- Partition mode never overrides Direct (intentional — B_Skip
+  dominates any partition mode rate-wise).
+- CAVLC only.
+- Single ref per list.
+
+## Round 23+ (planned)
 
 - Intra fallback in P / B slices via RDO.
-- B-slice 16x8 / 8x16 partitions and B_8x8 sub-MB types.
+- B_8x8 sub-MB types (Table 7-18 sub_mb_type for B-slice).
 - B_Direct_8x8 (sub-MB direct) with non-uniform per-8x8 MVs.
 - Temporal direct mode (§8.4.1.2.3).
 - Multiple slices per picture.
@@ -838,14 +914,17 @@ round-20 explicit-inter (B_L0 / B_L1 / B_Bi) candidates.
 - [`Encoder::encode_p`] — non-IDR P-slice (round 16). Takes one
   `YuvFrame` + a single L0 reference (`EncodedFrameRef`) and emits the
   P slice NAL + recon. SPS/PPS were shipped by the IDR.
-- [`Encoder::encode_b`] — non-reference B-slice (round 20 + 21).
+- [`Encoder::encode_b`] — non-reference B-slice (round 20 + 21 + 22).
   Takes one `YuvFrame` + L0 and L1 references (`EncodedFrameRef`) and
   emits the B slice NAL + recon. Requires `EncoderConfig::profile_idc
   >= 77` and `max_num_ref_frames >= 2`. SPS/PPS were shipped by the
   IDR. Round-21: when an `EncodedFrameRef` is built `From<&EncodedP>`
   (or `From<&EncodedIdr>`), its `partition_mvs` field is populated for
   use by the §8.4.1.2.2 spatial-direct derivation when this frame
-  serves as the L1 anchor.
+  serves as the L1 anchor. Round-22: per-MB the encoder picks among
+  16x16 modes (round-20: B_L0/L1/Bi_16x16; round-21: B_Skip,
+  B_Direct_16x16) and the 18 partition modes (B_*_*_16x8 with raw
+  values 4..=20 even; B_*_*_8x16 with raw values 5..=21 odd).
 - Lower-level helpers under [`bitstream`], [`nal`], [`sps`], [`pps`],
   [`slice`], [`macroblock`], [`cavlc`], [`transform`] are usable
   independently — round 2's higher-mode encoder can compose them

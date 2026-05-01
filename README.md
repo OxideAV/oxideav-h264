@@ -47,7 +47,7 @@ no packet is decoded.
 | FMO MB address derivation | §8.2.2, §8.2.3 | implemented (all 7 slice_group_map_types + NextMbAddress) |
 | Top-level decoder driver | §7.4.1.2.1 | implemented (events: SPS/PPS stored, AUD, Slice, SEI, end markers, Ignored) |
 | I-slice reconstruction (Picture + MB grid + intra + deblock) | §8 / §6.4 | implemented (I_PCM, Intra_4x4, Intra_8x8, Intra_16x16, chroma) |
-| P/B-slice reconstruction (MC + ref store + MV wiring) | §8.4 | implemented (P_Skip, P_L0_*, P_8x8; B_Skip, B_Direct, B_L0/L1/Bi_*; flat scaling) |
+| P/B-slice reconstruction (MC + ref store + MV wiring) | §8.4 | implemented (P_Skip, P_L0_*, P_8x8; B_Skip, B_Direct, B_L0/L1/Bi_16x16/16x8/8x16; flat scaling) |
 | DPB output ordering (POC-ordered delivery + bumping) | §C.4 | implemented |
 | Reference picture marking (sliding window + MMCO) | §7.3.3.3, §8.2.5 | implemented |
 | Reference picture list construction | §8.2.4 | implemented (frame-only; field-pair interleaving partial) |

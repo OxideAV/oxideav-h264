@@ -896,6 +896,331 @@ pub fn write_b_direct_16x16_mb(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Round 22 — B-slice 16x8 / 8x16 partitions (Table 7-14 raw 4..=21).
+// ---------------------------------------------------------------------------
+
+/// §7.4.5 Table 7-14 — per-partition prediction list selector.
+///
+/// Each MB partition (one of two 16x8 halves or two 8x16 halves) picks
+/// from {L0-only, L1-only, BiPred}. The pair (top, bottom) for 16x8 or
+/// (left, right) for 8x16 enumerates the 9 mb_type rows 4..=21 in the
+/// spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BPartPred {
+    /// `Pred_L0` — one MV from list 0.
+    L0,
+    /// `Pred_L1` — one MV from list 1.
+    L1,
+    /// `BiPred` — both lists, combined per §8.4.2.3 (default weighted
+    /// average `(L0 + L1 + 1) >> 1` when `weighted_bipred_idc == 0`).
+    Bi,
+}
+
+impl BPartPred {
+    /// True iff this partition reads from list 0 (L0 or Bi).
+    pub fn uses_l0(self) -> bool {
+        matches!(self, BPartPred::L0 | BPartPred::Bi)
+    }
+
+    /// True iff this partition reads from list 1 (L1 or Bi).
+    pub fn uses_l1(self) -> bool {
+        matches!(self, BPartPred::L1 | BPartPred::Bi)
+    }
+}
+
+/// §7.4.5 Table 7-14 — raw mb_type for B_*_*_16x8 (rows 4..=20 even).
+///
+/// `(top, bottom)` → raw value mapping per the table:
+/// ```text
+///   (L0, L0)  →  4   (B_L0_L0_16x8)
+///   (L1, L1)  →  6   (B_L1_L1_16x8)
+///   (L0, L1)  →  8   (B_L0_L1_16x8)
+///   (L1, L0)  → 10   (B_L1_L0_16x8)
+///   (L0, Bi)  → 12   (B_L0_Bi_16x8)
+///   (L1, Bi)  → 14   (B_L1_Bi_16x8)
+///   (Bi, L0)  → 16   (B_Bi_L0_16x8)
+///   (Bi, L1)  → 18   (B_Bi_L1_16x8)
+///   (Bi, Bi)  → 20   (B_Bi_Bi_16x8)
+/// ```
+pub fn b_16x8_mb_type_raw(top: BPartPred, bottom: BPartPred) -> u32 {
+    use BPartPred::*;
+    match (top, bottom) {
+        (L0, L0) => 4,
+        (L1, L1) => 6,
+        (L0, L1) => 8,
+        (L1, L0) => 10,
+        (L0, Bi) => 12,
+        (L1, Bi) => 14,
+        (Bi, L0) => 16,
+        (Bi, L1) => 18,
+        (Bi, Bi) => 20,
+    }
+}
+
+/// §7.4.5 Table 7-14 — raw mb_type for B_*_*_8x16 (rows 5..=21 odd).
+///
+/// `(left, right)` → raw value mapping per the table:
+/// ```text
+///   (L0, L0)  →  5   (B_L0_L0_8x16)
+///   (L1, L1)  →  7   (B_L1_L1_8x16)
+///   (L0, L1)  →  9   (B_L0_L1_8x16)
+///   (L1, L0)  → 11   (B_L1_L0_8x16)
+///   (L0, Bi)  → 13   (B_L0_Bi_8x16)
+///   (L1, Bi)  → 15   (B_L1_Bi_8x16)
+///   (Bi, L0)  → 17   (B_Bi_L0_8x16)
+///   (Bi, L1)  → 19   (B_Bi_L1_8x16)
+///   (Bi, Bi)  → 21   (B_Bi_Bi_8x16)
+/// ```
+pub fn b_8x16_mb_type_raw(left: BPartPred, right: BPartPred) -> u32 {
+    use BPartPred::*;
+    match (left, right) {
+        (L0, L0) => 5,
+        (L1, L1) => 7,
+        (L0, L1) => 9,
+        (L1, L0) => 11,
+        (L0, Bi) => 13,
+        (L1, Bi) => 15,
+        (Bi, L0) => 17,
+        (Bi, L1) => 19,
+        (Bi, Bi) => 21,
+    }
+}
+
+/// Configuration for one B-slice 16x8 macroblock (mb_type ∈ {4, 6, 8,
+/// 10, 12, 14, 16, 18, 20}). Two 16x8 partitions stacked vertically.
+///
+/// Layout per §7.3.5 / §7.3.5.1:
+///
+/// ```text
+///   mb_type ue(v)                            (per b_16x8_mb_type_raw)
+///   for part in 0..2:                       -- top, then bottom
+///     if part uses L0 and num_ref_l0 > 0: ref_idx_l0[part]   (te(v))
+///   for part in 0..2:
+///     if part uses L1 and num_ref_l1 > 0: ref_idx_l1[part]   (te(v))
+///   for part in 0..2:
+///     if part uses L0: mvd_l0[part].x, mvd_l0[part].y        (se(v) x2)
+///   for part in 0..2:
+///     if part uses L1: mvd_l1[part].x, mvd_l1[part].y        (se(v) x2)
+///   coded_block_pattern me(v)
+///   if cbp != 0: mb_qp_delta se(v)
+///   ... residuals (same layout as the 16x16 path) ...
+/// ```
+pub struct B16x8McbConfig {
+    /// Top partition prediction list selection.
+    pub top: BPartPred,
+    /// Bottom partition prediction list selection.
+    pub bottom: BPartPred,
+    /// Per-partition L0 mvd. Index 0 = top, 1 = bottom. Ignored on
+    /// partitions whose list selection doesn't use L0.
+    pub mvd_l0: [(i32, i32); 2],
+    /// Per-partition L1 mvd. Index 0 = top, 1 = bottom. Ignored on
+    /// partitions whose list selection doesn't use L1.
+    pub mvd_l1: [(i32, i32); 2],
+    pub cbp_luma: u8,
+    pub cbp_chroma: u8,
+    pub mb_qp_delta: i32,
+    /// 16 4x4 luma residual blocks in §6.4.3 raster-Z order.
+    pub luma_4x4_levels: [[i32; 16]; 16],
+    pub luma_4x4_nc: [i32; 16],
+    pub chroma_dc_cb: [i32; 4],
+    pub chroma_dc_cr: [i32; 4],
+    pub chroma_ac_cb: [[i32; 16]; 4],
+    pub chroma_ac_cr: [[i32; 16]; 4],
+}
+
+/// Emit one B-slice 16x8 macroblock (CAVLC, B-slice). Mirrors the field
+/// order in §7.3.5.1 with `NumMbPart == 2`.
+pub fn write_b_16x8_mb(
+    w: &mut BitWriter,
+    cfg: &B16x8McbConfig,
+    num_ref_idx_l0_active_minus1: u32,
+    num_ref_idx_l1_active_minus1: u32,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+
+    // §7.4.5 — Table 7-14 mb_type for the (top, bottom) pair.
+    w.ue(b_16x8_mb_type_raw(cfg.top, cfg.bottom));
+
+    write_b_two_part_pred(
+        w,
+        [cfg.top, cfg.bottom],
+        cfg.mvd_l0,
+        cfg.mvd_l1,
+        num_ref_idx_l0_active_minus1,
+        num_ref_idx_l1_active_minus1,
+    );
+    write_b_two_part_residuals(
+        w,
+        cfg.cbp_luma,
+        cfg.cbp_chroma,
+        cfg.mb_qp_delta,
+        &cfg.luma_4x4_levels,
+        &cfg.luma_4x4_nc,
+        &cfg.chroma_dc_cb,
+        &cfg.chroma_dc_cr,
+        &cfg.chroma_ac_cb,
+        &cfg.chroma_ac_cr,
+    )
+}
+
+/// Configuration for one B-slice 8x16 macroblock (mb_type ∈ {5, 7, 9,
+/// 11, 13, 15, 17, 19, 21}). Two 8x16 partitions side-by-side.
+pub struct B8x16McbConfig {
+    /// Left partition prediction list selection.
+    pub left: BPartPred,
+    /// Right partition prediction list selection.
+    pub right: BPartPred,
+    /// Per-partition L0 mvd. Index 0 = left, 1 = right.
+    pub mvd_l0: [(i32, i32); 2],
+    /// Per-partition L1 mvd. Index 0 = left, 1 = right.
+    pub mvd_l1: [(i32, i32); 2],
+    pub cbp_luma: u8,
+    pub cbp_chroma: u8,
+    pub mb_qp_delta: i32,
+    pub luma_4x4_levels: [[i32; 16]; 16],
+    pub luma_4x4_nc: [i32; 16],
+    pub chroma_dc_cb: [i32; 4],
+    pub chroma_dc_cr: [i32; 4],
+    pub chroma_ac_cb: [[i32; 16]; 4],
+    pub chroma_ac_cr: [[i32; 16]; 4],
+}
+
+/// Emit one B-slice 8x16 macroblock. Field order identical to 16x8 —
+/// only the mb_type and the partition geometry differ; §7.3.5.1 lists
+/// per-partition fields in mbPartIdx order.
+pub fn write_b_8x16_mb(
+    w: &mut BitWriter,
+    cfg: &B8x16McbConfig,
+    num_ref_idx_l0_active_minus1: u32,
+    num_ref_idx_l1_active_minus1: u32,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+
+    // §7.4.5 — Table 7-14 mb_type for the (left, right) pair.
+    w.ue(b_8x16_mb_type_raw(cfg.left, cfg.right));
+
+    write_b_two_part_pred(
+        w,
+        [cfg.left, cfg.right],
+        cfg.mvd_l0,
+        cfg.mvd_l1,
+        num_ref_idx_l0_active_minus1,
+        num_ref_idx_l1_active_minus1,
+    );
+    write_b_two_part_residuals(
+        w,
+        cfg.cbp_luma,
+        cfg.cbp_chroma,
+        cfg.mb_qp_delta,
+        &cfg.luma_4x4_levels,
+        &cfg.luma_4x4_nc,
+        &cfg.chroma_dc_cb,
+        &cfg.chroma_dc_cr,
+        &cfg.chroma_ac_cb,
+        &cfg.chroma_ac_cr,
+    )
+}
+
+/// §7.3.5.1 — emit ref_idx_l0[0..=1], ref_idx_l1[0..=1], mvd_l0[0..=1],
+/// mvd_l1[0..=1] for the two partitions of a B 16x8 or B 8x16 MB.
+///
+/// Order is per the spec: all ref_idx_l0 first (for both partitions),
+/// then all ref_idx_l1, then all mvd_l0, then all mvd_l1. Each per-
+/// partition field is gated on the partition's prediction list usage.
+fn write_b_two_part_pred(
+    w: &mut BitWriter,
+    parts: [BPartPred; 2],
+    mvd_l0: [(i32, i32); 2],
+    mvd_l1: [(i32, i32); 2],
+    num_ref_idx_l0_active_minus1: u32,
+    num_ref_idx_l1_active_minus1: u32,
+) {
+    // ref_idx_l0[part] for part = 0, 1.
+    for &p in &parts {
+        if p.uses_l0() && num_ref_idx_l0_active_minus1 > 0 {
+            w.te(num_ref_idx_l0_active_minus1, 0);
+        }
+    }
+    // ref_idx_l1[part] for part = 0, 1.
+    for &p in &parts {
+        if p.uses_l1() && num_ref_idx_l1_active_minus1 > 0 {
+            w.te(num_ref_idx_l1_active_minus1, 0);
+        }
+    }
+    // mvd_l0[part] (.x, .y) for part = 0, 1.
+    for (i, &p) in parts.iter().enumerate() {
+        if p.uses_l0() {
+            w.se(mvd_l0[i].0);
+            w.se(mvd_l0[i].1);
+        }
+    }
+    // mvd_l1[part] (.x, .y) for part = 0, 1.
+    for (i, &p) in parts.iter().enumerate() {
+        if p.uses_l1() {
+            w.se(mvd_l1[i].0);
+            w.se(mvd_l1[i].1);
+        }
+    }
+}
+
+/// §7.3.5 — emit coded_block_pattern + mb_qp_delta + luma + chroma
+/// residuals. Identical layout to the 16x16 and Direct paths since the
+/// residual encoding is partition-shape-agnostic (every 4x4 block is
+/// emitted independently).
+#[allow(clippy::too_many_arguments)]
+fn write_b_two_part_residuals(
+    w: &mut BitWriter,
+    cbp_luma: u8,
+    cbp_chroma: u8,
+    mb_qp_delta: i32,
+    luma_4x4_levels: &[[i32; 16]; 16],
+    luma_4x4_nc: &[i32; 16],
+    chroma_dc_cb: &[i32; 4],
+    chroma_dc_cr: &[i32; 4],
+    chroma_ac_cb: &[[i32; 16]; 4],
+    chroma_ac_cr: &[[i32; 16]; 4],
+) -> Result<(), CavlcEncodeError> {
+    let codenum = inter_cbp_to_codenum_420_422(cbp_luma, cbp_chroma);
+    w.ue(codenum);
+
+    let needs_qp_delta = cbp_luma > 0 || cbp_chroma > 0;
+    if needs_qp_delta {
+        w.se(mb_qp_delta);
+    }
+
+    for blk8 in 0..4u8 {
+        if (cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                let nc = luma_4x4_nc[blk];
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(nc),
+                    16,
+                    &luma_4x4_levels[blk],
+                )?;
+            }
+        }
+    }
+
+    if cbp_chroma > 0 {
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, chroma_dc_cb)?;
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, chroma_dc_cr)?;
+    }
+    if cbp_chroma == 2 {
+        for blk in chroma_ac_cb {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+        for blk in chroma_ac_cr {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,5 +1346,110 @@ mod tests {
         // mb_type=0 → ue(v) "1" (1 bit). cbp codeNum=0 → ue(v) "1" (1 bit).
         // Total 2 bits.
         assert_eq!(bw.bits_emitted(), 2);
+    }
+
+    /// §7.4.5 Table 7-14 — round-22 B 16x8 mb_type raw values 4..=20
+    /// even all decode back to the expected (mode_top, mode_bottom)
+    /// `MbType` variant. Includes round-trip for every `(top, bottom)`
+    /// pair in BPartPred^2.
+    #[test]
+    fn b_16x8_mb_type_raw_matches_table_7_14_decode() {
+        use crate::macroblock_layer::MbType;
+        use BPartPred::*;
+        let cases: &[(BPartPred, BPartPred, u32, MbType)] = &[
+            (L0, L0, 4, MbType::BL0L016x8),
+            (L1, L1, 6, MbType::BL1L116x8),
+            (L0, L1, 8, MbType::BL0L116x8),
+            (L1, L0, 10, MbType::BL1L016x8),
+            (L0, Bi, 12, MbType::BL0Bi16x8),
+            (L1, Bi, 14, MbType::BL1Bi16x8),
+            (Bi, L0, 16, MbType::BBiL016x8),
+            (Bi, L1, 18, MbType::BBiL116x8),
+            (Bi, Bi, 20, MbType::BBiBi16x8),
+        ];
+        for (top, bot, raw, expected) in cases.iter().cloned() {
+            assert_eq!(b_16x8_mb_type_raw(top, bot), raw);
+            assert_eq!(MbType::from_b_slice(raw).unwrap(), expected);
+        }
+    }
+
+    /// §7.4.5 Table 7-14 — round-22 B 8x16 mb_type raw values 5..=21
+    /// odd all decode back to the expected (mode_left, mode_right)
+    /// `MbType` variant.
+    #[test]
+    fn b_8x16_mb_type_raw_matches_table_7_14_decode() {
+        use crate::macroblock_layer::MbType;
+        use BPartPred::*;
+        let cases: &[(BPartPred, BPartPred, u32, MbType)] = &[
+            (L0, L0, 5, MbType::BL0L08x16),
+            (L1, L1, 7, MbType::BL1L18x16),
+            (L0, L1, 9, MbType::BL0L18x16),
+            (L1, L0, 11, MbType::BL1L08x16),
+            (L0, Bi, 13, MbType::BL0Bi8x16),
+            (L1, Bi, 15, MbType::BL1Bi8x16),
+            (Bi, L0, 17, MbType::BBiL08x16),
+            (Bi, L1, 19, MbType::BBiL18x16),
+            (Bi, Bi, 21, MbType::BBiBi8x16),
+        ];
+        for (left, right, raw, expected) in cases.iter().cloned() {
+            assert_eq!(b_8x16_mb_type_raw(left, right), raw);
+            assert_eq!(MbType::from_b_slice(raw).unwrap(), expected);
+        }
+    }
+
+    /// Round-22 B 16x8 zero-residual writer emits exactly the ue(v) for
+    /// mb_type, the four mvds (Bi/Bi has 4 mvds = 8 se(v) ints), and the
+    /// cbp codeNum. With both partitions Bi and all mvds=0 the bit count
+    /// is: mb_type ue(v) for raw 20 (codeNum 20 → 9 bits) + 8 se(v) of
+    /// "0" (1 bit each) + cbp codeNum=0 (1 bit) = 18 bits.
+    #[test]
+    fn b_16x8_writer_round_trip_smoke() {
+        let mut bw = BitWriter::new();
+        let cfg = B16x8McbConfig {
+            top: BPartPred::Bi,
+            bottom: BPartPred::Bi,
+            mvd_l0: [(0, 0); 2],
+            mvd_l1: [(0, 0); 2],
+            cbp_luma: 0,
+            cbp_chroma: 0,
+            mb_qp_delta: 0,
+            luma_4x4_levels: [[0; 16]; 16],
+            luma_4x4_nc: [0; 16],
+            chroma_dc_cb: [0; 4],
+            chroma_dc_cr: [0; 4],
+            chroma_ac_cb: [[0; 16]; 4],
+            chroma_ac_cr: [[0; 16]; 4],
+        };
+        write_b_16x8_mb(&mut bw, &cfg, 0, 0).expect("write");
+        // ue(20) is 9 bits; 8 se(0)=1 bit each; ue(0)=1 bit. Total 18.
+        assert_eq!(bw.bits_emitted(), 18);
+    }
+
+    /// Round-22 B 8x16 zero-residual writer for (L0, L1) pair: mb_type
+    /// raw 9 → ue(9) is 7 bits; mvd_l0[0] (.x, .y) = 2 bits; mvd_l1[1]
+    /// (.x, .y) = 2 bits; cbp ue(0) = 1 bit. Total 12 bits.
+    #[test]
+    fn b_8x16_writer_l0_l1_zero_residual_bit_count() {
+        let mut bw = BitWriter::new();
+        let cfg = B8x16McbConfig {
+            left: BPartPred::L0,
+            right: BPartPred::L1,
+            mvd_l0: [(0, 0); 2],
+            mvd_l1: [(0, 0); 2],
+            cbp_luma: 0,
+            cbp_chroma: 0,
+            mb_qp_delta: 0,
+            luma_4x4_levels: [[0; 16]; 16],
+            luma_4x4_nc: [0; 16],
+            chroma_dc_cb: [0; 4],
+            chroma_dc_cr: [0; 4],
+            chroma_ac_cb: [[0; 16]; 4],
+            chroma_ac_cr: [[0; 16]; 4],
+        };
+        write_b_8x16_mb(&mut bw, &cfg, 0, 0).expect("write");
+        // ue(9) is 7 bits. Left uses L0 only → mvd_l0 (.x, .y) = 2 bits.
+        // Right uses L1 only → mvd_l1 (.x, .y) = 2 bits. cbp ue(0) = 1 bit.
+        // Total 12 bits.
+        assert_eq!(bw.bits_emitted(), 12);
     }
 }

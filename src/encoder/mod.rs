@@ -59,7 +59,7 @@ use crate::encoder::intra_pred::{
 };
 use crate::encoder::macroblock::{
     write_b_16x16_mb, write_i_nxn_mb, write_intra16x16_mb, write_p_8x8_all_pl08x8_mb,
-    write_p_l0_16x16_mb, B16x16McbConfig, BPred16x16, I16x16McbConfig, INxNMcbConfig,
+    write_p_l0_16x16_mb, B16x16McbConfig, BPartPred, BPred16x16, I16x16McbConfig, INxNMcbConfig,
     P8x8AllPL08x8McbConfig, PL016x16McbConfig,
 };
 use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
@@ -1601,12 +1601,22 @@ impl MvGrid {
 
 /// Build the (A, B, C, D) NeighbourMv records for the current MB
 /// (mb_x, mb_y) — single 16x16 partition. Per §6.4.11.7 the four
-/// neighbours of a 16x16 partition are:
+/// neighbours of a 16x16 partition's top-left 4x4 (block 0) are:
 ///
-/// * A: the 16x16 partition immediately to the left (mb_x - 1, mb_y).
-/// * B: the 16x16 partition immediately above (mb_x, mb_y - 1).
-/// * C: the 16x16 partition above-right (mb_x + 1, mb_y - 1).
-/// * D: the 16x16 partition above-left (mb_x - 1, mb_y - 1).
+/// * A: the 4x4 at (-1, 0) of current MB → MB(mb_x-1, mb_y) 8x8 #1
+///   (top-right 4x4 column, row 0 → 8x8 partition that contains 4x4
+///   (3, 0) = top-right).
+/// * B: the 4x4 at (0, -1) → MB(mb_x, mb_y-1) 8x8 #2 (bottom-left 4x4
+///   column → contains 4x4 (0, 3) = bottom-left).
+/// * C: the 4x4 at (16, -1) → MB(mb_x+1, mb_y-1) 8x8 #2 (bottom-left
+///   of MB above-right, which contains 4x4 (0, 3)).
+/// * D: the 4x4 at (-1, -1) → MB(mb_x-1, mb_y-1) 8x8 #3 (bottom-right).
+///
+/// For 16x16-partitioned neighbours, all 4 8x8 cells share the same MV
+/// so the read is unambiguous. For 16x8 / 8x16 / 8x8 partitioned
+/// neighbours, we read the 8x8 cell that **spatially** contains the
+/// requested 4x4 corner — matching what the decoder does when it
+/// derives mvpLX for the current MB's partition.
 ///
 /// Each neighbour is "MVpred-usable" iff its MB is encoded AND not intra.
 /// Intra neighbours collapse to (mv=0, ref=-1) per §8.4.1.3.2 step 2a.
@@ -1615,19 +1625,20 @@ fn neighbour_mvs_16x16(
     mb_x: usize,
     mb_y: usize,
 ) -> (NeighbourMv, NeighbourMv, NeighbourMv, NeighbourMv) {
-    let make = |maybe: Option<&MvGridSlot>| -> NeighbourMv {
+    // (8x8 partition index in neighbour MB) — picks the 8x8 cell
+    // spatially adjacent to the current MB's top-left 4x4 (block 0).
+    let make = |maybe: Option<&MvGridSlot>, part_idx: usize| -> NeighbourMv {
         match maybe {
             Some(s) if s.available => {
                 if s.is_intra {
-                    // §8.4.1.3.2 step 2a: intra neighbour collapses.
                     NeighbourMv::intra_but_mb_available()
                 } else {
                     NeighbourMv {
-                        available: true,
+                        available: s.ref_idx_l0_8x8[part_idx] >= 0,
                         mb_available: true,
                         partition_available: true,
-                        ref_idx: s.ref_idx_l0(),
-                        mv: s.mv_l0(),
+                        ref_idx: s.ref_idx_l0_8x8[part_idx],
+                        mv: s.mv_l0_8x8[part_idx],
                     }
                 }
             }
@@ -1654,7 +1665,12 @@ fn neighbour_mvs_16x16(
     } else {
         None
     };
-    (make(a), make(b), make(c), make(d))
+    (
+        make(a, 1), // left  → top-right 8x8 (#1)
+        make(b, 2), // above → bottom-left 8x8 (#2)
+        make(c, 2), // above-right → bottom-left 8x8 (#2)
+        make(d, 3), // above-left → bottom-right 8x8 (#3)
+    )
 }
 
 /// Per §8.4.1.3 + the §8.4.1.3.2 C→D substitution — derive the MVpred
@@ -3650,6 +3666,1124 @@ fn sad_16x16_pred(
     s
 }
 
+// ---------------------------------------------------------------------------
+// Round 22 — B-slice 16x8 / 8x16 partition predictors and MVP helpers.
+// ---------------------------------------------------------------------------
+
+/// Round-22 — build a luma inter predictor for one 16x8 partition (top
+/// or bottom) of a B MB, optionally combining L0 and L1 per
+/// `BPartPred`. Output is `[i32; 128]` in row-major (8 rows of 16
+/// samples). `partition_y_off` ∈ {0, 8} selects the half within the MB.
+#[allow(clippy::too_many_arguments)]
+fn build_b_partition_pred_luma_16x8(
+    pred: BPartPred,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    partition_y_off: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+) -> [i32; 128] {
+    let mut out = [0i32; 128];
+    let l0 = if pred.uses_l0() {
+        Some(build_inter_pred_luma_partition(
+            ref_l0.recon_y,
+            ref_l0.width,
+            ref_l0.height,
+            mb_x,
+            mb_y,
+            0,
+            partition_y_off,
+            16,
+            8,
+            mv_l0,
+        ))
+    } else {
+        None
+    };
+    let l1 = if pred.uses_l1() {
+        Some(build_inter_pred_luma_partition(
+            ref_l1.recon_y,
+            ref_l1.width,
+            ref_l1.height,
+            mb_x,
+            mb_y,
+            0,
+            partition_y_off,
+            16,
+            8,
+            mv_l1,
+        ))
+    } else {
+        None
+    };
+    match pred {
+        BPartPred::L0 => out.copy_from_slice(&l0.unwrap()),
+        BPartPred::L1 => out.copy_from_slice(&l1.unwrap()),
+        BPartPred::Bi => {
+            // §8.4.2.3.1 eq. 8-273.
+            let a = l0.unwrap();
+            let b = l1.unwrap();
+            for i in 0..128 {
+                out[i] = (a[i] + b[i] + 1) >> 1;
+            }
+        }
+    }
+    out
+}
+
+/// Round-22 — build a luma inter predictor for one 8x16 partition (left
+/// or right) of a B MB. Output is `[i32; 128]` in row-major (16 rows of
+/// 8 samples). `partition_x_off` ∈ {0, 8} selects the half within the
+/// MB.
+#[allow(clippy::too_many_arguments)]
+fn build_b_partition_pred_luma_8x16(
+    pred: BPartPred,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    partition_x_off: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+) -> [i32; 128] {
+    let mut out = [0i32; 128];
+    let l0 = if pred.uses_l0() {
+        Some(build_inter_pred_luma_partition(
+            ref_l0.recon_y,
+            ref_l0.width,
+            ref_l0.height,
+            mb_x,
+            mb_y,
+            partition_x_off,
+            0,
+            8,
+            16,
+            mv_l0,
+        ))
+    } else {
+        None
+    };
+    let l1 = if pred.uses_l1() {
+        Some(build_inter_pred_luma_partition(
+            ref_l1.recon_y,
+            ref_l1.width,
+            ref_l1.height,
+            mb_x,
+            mb_y,
+            partition_x_off,
+            0,
+            8,
+            16,
+            mv_l1,
+        ))
+    } else {
+        None
+    };
+    match pred {
+        BPartPred::L0 => out.copy_from_slice(&l0.unwrap()),
+        BPartPred::L1 => out.copy_from_slice(&l1.unwrap()),
+        BPartPred::Bi => {
+            let a = l0.unwrap();
+            let b = l1.unwrap();
+            for i in 0..128 {
+                out[i] = (a[i] + b[i] + 1) >> 1;
+            }
+        }
+    }
+    out
+}
+
+/// Round-22 — generic luma inter-pred helper for an arbitrary
+/// rectangular partition of an MB. `(off_x, off_y)` is the partition's
+/// top-left within the MB in luma samples; `(w, h)` is the partition
+/// dimensions (one of (16, 8), (8, 16), (16, 16), (8, 8)). Output is
+/// `[i32; w*h]` packed row-major into a `Vec<i32>` (length 128 for the
+/// 16x8/8x16 cases used here).
+#[allow(clippy::too_many_arguments)]
+fn build_inter_pred_luma_partition(
+    ref_y: &[u8],
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    off_x: usize,
+    off_y: usize,
+    w: u32,
+    h: u32,
+    mv: Mv,
+) -> Vec<i32> {
+    let stride = ref_w as usize;
+    let h_us = ref_h as usize;
+    let ref_i32: Vec<i32> = ref_y
+        .iter()
+        .take(stride * h_us)
+        .map(|&v| v as i32)
+        .collect();
+
+    let mv_int_x = mv.x >> 2;
+    let mv_int_y = mv.y >> 2;
+    let x_frac = (mv.x & 3) as u8;
+    let y_frac = (mv.y & 3) as u8;
+    let int_x = (mb_x * 16 + off_x) as i32 + mv_int_x;
+    let int_y = (mb_y * 16 + off_y) as i32 + mv_int_y;
+
+    let mut dst = vec![0i32; (w * h) as usize];
+    interpolate_luma(
+        &ref_i32, stride, stride, h_us, int_x, int_y, x_frac, y_frac, w, h, 8, &mut dst, w as usize,
+    )
+    .expect("luma interpolation partition");
+    dst
+}
+
+/// Round-22 — generic chroma inter-pred for an arbitrary partition.
+/// `(off_x, off_y)` is the partition's top-left in luma samples; `(w,
+/// h)` is the partition's chroma dimensions (so a 16x8 luma partition
+/// gives an 8x4 chroma partition). 4:2:0 only.
+#[allow(clippy::too_many_arguments)]
+fn build_inter_pred_chroma_partition(
+    ref_c: &[u8],
+    ref_cw: u32,
+    ref_ch: u32,
+    mb_x: usize,
+    mb_y: usize,
+    off_x_luma: usize,
+    off_y_luma: usize,
+    w_chroma: u32,
+    h_chroma: u32,
+    mv: Mv,
+) -> Vec<i32> {
+    let stride = ref_cw as usize;
+    let h_us = ref_ch as usize;
+    let ref_i32: Vec<i32> = ref_c
+        .iter()
+        .take(stride * h_us)
+        .map(|&v| v as i32)
+        .collect();
+
+    // §8.4.1.4 — 4:2:0 chroma uses luma MV directly with 1/8-pel
+    // fractional positions.
+    let int_x = (mb_x * 8 + off_x_luma / 2) as i32 + (mv.x >> 3);
+    let int_y = (mb_y * 8 + off_y_luma / 2) as i32 + (mv.y >> 3);
+    let x_frac = (mv.x & 7) as u8;
+    let y_frac = (mv.y & 7) as u8;
+
+    let mut dst = vec![0i32; (w_chroma * h_chroma) as usize];
+    interpolate_chroma(
+        &ref_i32,
+        stride,
+        stride,
+        h_us,
+        int_x,
+        int_y,
+        x_frac,
+        y_frac,
+        w_chroma,
+        h_chroma,
+        8,
+        &mut dst,
+        w_chroma as usize,
+    )
+    .expect("chroma interpolation partition");
+    dst
+}
+
+/// Round-22 — build chroma predictors for one B-slice 16x8 partition
+/// (Cb + Cr). 4:2:0 → chroma partition is 8x4 (`[i32; 32]` row-major).
+#[allow(clippy::too_many_arguments)]
+fn build_b_partition_pred_chroma_16x8(
+    pred: BPartPred,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    partition_y_off_luma: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+) -> ([i32; 32], [i32; 32]) {
+    let cw_l0 = ref_l0.width / 2;
+    let ch_l0 = ref_l0.height / 2;
+    let cw_l1 = ref_l1.width / 2;
+    let ch_l1 = ref_l1.height / 2;
+    let make = |plane_l0: &[u8], plane_l1: &[u8]| -> [i32; 32] {
+        let mut out = [0i32; 32];
+        let a = if pred.uses_l0() {
+            Some(build_inter_pred_chroma_partition(
+                plane_l0,
+                cw_l0,
+                ch_l0,
+                mb_x,
+                mb_y,
+                0,
+                partition_y_off_luma,
+                8,
+                4,
+                mv_l0,
+            ))
+        } else {
+            None
+        };
+        let b = if pred.uses_l1() {
+            Some(build_inter_pred_chroma_partition(
+                plane_l1,
+                cw_l1,
+                ch_l1,
+                mb_x,
+                mb_y,
+                0,
+                partition_y_off_luma,
+                8,
+                4,
+                mv_l1,
+            ))
+        } else {
+            None
+        };
+        match pred {
+            BPartPred::L0 => out.copy_from_slice(&a.unwrap()),
+            BPartPred::L1 => out.copy_from_slice(&b.unwrap()),
+            BPartPred::Bi => {
+                let a = a.unwrap();
+                let b = b.unwrap();
+                for i in 0..32 {
+                    out[i] = (a[i] + b[i] + 1) >> 1;
+                }
+            }
+        }
+        out
+    };
+    (
+        make(ref_l0.recon_u, ref_l1.recon_u),
+        make(ref_l0.recon_v, ref_l1.recon_v),
+    )
+}
+
+/// Round-22 — build chroma predictors for one B-slice 8x16 partition
+/// (Cb + Cr). 4:2:0 → chroma partition is 4x8 (`[i32; 32]` row-major).
+#[allow(clippy::too_many_arguments)]
+fn build_b_partition_pred_chroma_8x16(
+    pred: BPartPred,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    partition_x_off_luma: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+) -> ([i32; 32], [i32; 32]) {
+    let cw_l0 = ref_l0.width / 2;
+    let ch_l0 = ref_l0.height / 2;
+    let cw_l1 = ref_l1.width / 2;
+    let ch_l1 = ref_l1.height / 2;
+    let make = |plane_l0: &[u8], plane_l1: &[u8]| -> [i32; 32] {
+        let mut out = [0i32; 32];
+        let a = if pred.uses_l0() {
+            Some(build_inter_pred_chroma_partition(
+                plane_l0,
+                cw_l0,
+                ch_l0,
+                mb_x,
+                mb_y,
+                partition_x_off_luma,
+                0,
+                4,
+                8,
+                mv_l0,
+            ))
+        } else {
+            None
+        };
+        let b = if pred.uses_l1() {
+            Some(build_inter_pred_chroma_partition(
+                plane_l1,
+                cw_l1,
+                ch_l1,
+                mb_x,
+                mb_y,
+                partition_x_off_luma,
+                0,
+                4,
+                8,
+                mv_l1,
+            ))
+        } else {
+            None
+        };
+        match pred {
+            BPartPred::L0 => out.copy_from_slice(&a.unwrap()),
+            BPartPred::L1 => out.copy_from_slice(&b.unwrap()),
+            BPartPred::Bi => {
+                let a = a.unwrap();
+                let b = b.unwrap();
+                for i in 0..32 {
+                    out[i] = (a[i] + b[i] + 1) >> 1;
+                }
+            }
+        }
+        out
+    };
+    (
+        make(ref_l0.recon_u, ref_l1.recon_u),
+        make(ref_l0.recon_v, ref_l1.recon_v),
+    )
+}
+
+/// SAD between an arbitrary-sized source block (at MB-relative offset
+/// `(off_x, off_y)` of the MB at `(mb_x, mb_y)`) and a `w*h` luma
+/// predictor buffer (row-major i32 with stride = w, clamped to
+/// 0..=255).
+#[allow(clippy::too_many_arguments)]
+fn sad_partition_pred(
+    src_y: &[u8],
+    src_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    off_x: usize,
+    off_y: usize,
+    w: usize,
+    h: usize,
+    pred: &[i32],
+) -> u32 {
+    let mut s = 0u32;
+    for j in 0..h {
+        for i in 0..w {
+            let src = src_y[(mb_y * 16 + off_y + j) * src_stride + mb_x * 16 + off_x + i] as i32;
+            let p = pred[j * w + i].clamp(0, 255);
+            s = s.saturating_add((src - p).unsigned_abs());
+        }
+    }
+    s
+}
+
+/// Round-22 — derive the §8.4.1.3 mvpLX for one 16x8 partition (top or
+/// bottom) of a B MB at `(mb_x, mb_y)` against list `list_idx` ∈
+/// {0, 1}. `is_top` selects which 16x8 half. Within-MB neighbour reads
+/// use `inflight_*` arrays that carry the already-decoded partitions
+/// of the **current** MB.
+///
+/// The shape directs the §8.4.1.3 directional shortcut:
+/// `Partition16x8Top` for top, `Partition16x8Bottom` for bottom. The
+/// `derive_mvpred_with_d` median fallback consults A/B/C neighbours of
+/// the partition's top-left 4x4 plus the optional D (above-left).
+#[allow(clippy::too_many_arguments)]
+fn mvp_for_b_16x8_partition(
+    grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    is_top: bool,
+    ref_idx: i32,
+    inflight_avail: [bool; 4],
+    mv_inflight: [Mv; 4],
+    ref_inflight: [i32; 4],
+) -> Mv {
+    // Partition top-left in 4x4 units. Top: (0, 0); bottom: (0, 2).
+    let by = if is_top { 0i32 } else { 2 };
+    // A at (-1, by); B at (0, by - 1); C at (4, by - 1); D at (-1, by - 1).
+    // Partition width = 16 px = 4 4x4 → C at column index 4 (above-right
+    // neighbour MB). Partition height irrelevant for 16x8 neighbours.
+    let a = neighbour_8x8_partition_mv(
+        grid,
+        mb_x,
+        mb_y,
+        -1,
+        by,
+        inflight_avail,
+        mv_inflight,
+        ref_inflight,
+    );
+    let b = neighbour_8x8_partition_mv(
+        grid,
+        mb_x,
+        mb_y,
+        0,
+        by - 1,
+        inflight_avail,
+        mv_inflight,
+        ref_inflight,
+    );
+    let c = neighbour_8x8_partition_mv(
+        grid,
+        mb_x,
+        mb_y,
+        4,
+        by - 1,
+        inflight_avail,
+        mv_inflight,
+        ref_inflight,
+    );
+    let d = neighbour_8x8_partition_mv(
+        grid,
+        mb_x,
+        mb_y,
+        -1,
+        by - 1,
+        inflight_avail,
+        mv_inflight,
+        ref_inflight,
+    );
+    let shape = if is_top {
+        crate::mv_deriv::MvpredShape::Partition16x8Top
+    } else {
+        crate::mv_deriv::MvpredShape::Partition16x8Bottom
+    };
+    let inputs = MvpredInputs::from_abc(a, b, c, ref_idx, shape);
+    crate::mv_deriv::derive_mvpred_with_d(&inputs, d)
+}
+
+/// Round-22 — derive the §8.4.1.3 mvpLX for one 8x16 partition (left
+/// or right). Mirrors [`mvp_for_b_16x8_partition`].
+#[allow(clippy::too_many_arguments)]
+fn mvp_for_b_8x16_partition(
+    grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    is_left: bool,
+    ref_idx: i32,
+    inflight_avail: [bool; 4],
+    mv_inflight: [Mv; 4],
+    ref_inflight: [i32; 4],
+) -> Mv {
+    // Partition top-left in 4x4 units. Left: (0, 0); right: (2, 0).
+    let bx = if is_left { 0i32 } else { 2 };
+    // A at (bx - 1, 0); B at (bx, -1); C at (bx + 2, -1); D at (bx - 1, -1).
+    // Partition width = 8 px = 2 4x4 → C at column (bx + 2) (above MB
+    // for left, above-right MB for right).
+    let a = neighbour_8x8_partition_mv(
+        grid,
+        mb_x,
+        mb_y,
+        bx - 1,
+        0,
+        inflight_avail,
+        mv_inflight,
+        ref_inflight,
+    );
+    let b = neighbour_8x8_partition_mv(
+        grid,
+        mb_x,
+        mb_y,
+        bx,
+        -1,
+        inflight_avail,
+        mv_inflight,
+        ref_inflight,
+    );
+    let c = neighbour_8x8_partition_mv(
+        grid,
+        mb_x,
+        mb_y,
+        bx + 2,
+        -1,
+        inflight_avail,
+        mv_inflight,
+        ref_inflight,
+    );
+    let d = neighbour_8x8_partition_mv(
+        grid,
+        mb_x,
+        mb_y,
+        bx - 1,
+        -1,
+        inflight_avail,
+        mv_inflight,
+        ref_inflight,
+    );
+    let shape = if is_left {
+        crate::mv_deriv::MvpredShape::Partition8x16Left
+    } else {
+        crate::mv_deriv::MvpredShape::Partition8x16Right
+    };
+    let inputs = MvpredInputs::from_abc(a, b, c, ref_idx, shape);
+    crate::mv_deriv::derive_mvpred_with_d(&inputs, d)
+}
+
+/// Round-22 — per-partition ME for one 16x8 or 8x16 partition (any
+/// list). Runs `search_quarter_pel_8x8` on each of the (up to 2) 8x8
+/// cells covered by the partition, and picks the candidate MV (one of
+/// `mv_16x16` or per-cell-best) that gives the lowest partition-wide
+/// SAD against `ref_y`. Returns the best partition MV.
+///
+/// The encoder tries three candidates per (partition, list):
+///   * The 16x16 ME result (`mv_16x16`).
+///   * The first 8x8 cell's qpel ME result.
+///   * The second 8x8 cell's qpel ME result.
+///
+/// SAD is measured over the full partition area against the qpel-
+/// interpolated predictor. This costs 3 partition-SADs per (partition,
+/// list) but reuses ME results we already need anyway.
+#[allow(clippy::too_many_arguments)]
+fn best_partition_mv(
+    src_y: &[u8],
+    src_stride: usize,
+    src_w: u32,
+    src_h: u32,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    off_x: usize,
+    off_y: usize,
+    part_w: u32,
+    part_h: u32,
+    candidates: &[Mv],
+) -> (Mv, u32) {
+    let mut best_mv = candidates[0];
+    let mut best_sad = u32::MAX;
+    for &mv in candidates {
+        let pred = build_inter_pred_luma_partition(
+            ref_y, ref_w, ref_h, mb_x, mb_y, off_x, off_y, part_w, part_h, mv,
+        );
+        let sad = sad_partition_pred(
+            src_y,
+            src_stride,
+            mb_x,
+            mb_y,
+            off_x,
+            off_y,
+            part_w as usize,
+            part_h as usize,
+            &pred,
+        );
+        let _ = (src_w, src_h, ref_stride);
+        if sad < best_sad {
+            best_sad = sad;
+            best_mv = mv;
+        }
+    }
+    (best_mv, best_sad)
+}
+
+/// Round-22 — per-partition SAD for a given (mode, mv_l0, mv_l1).
+/// Builds the partition's L0/L1/Bi predictor, returns its SAD against
+/// source.
+#[allow(clippy::too_many_arguments)]
+fn partition_sad_b_16x8(
+    pred: BPartPred,
+    src_y: &[u8],
+    src_stride: usize,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    off_y: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+) -> u32 {
+    let p = build_b_partition_pred_luma_16x8(pred, ref_l0, ref_l1, mb_x, mb_y, off_y, mv_l0, mv_l1);
+    sad_partition_pred(src_y, src_stride, mb_x, mb_y, 0, off_y, 16, 8, &p)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn partition_sad_b_8x16(
+    pred: BPartPred,
+    src_y: &[u8],
+    src_stride: usize,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    off_x: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+) -> u32 {
+    let p = build_b_partition_pred_luma_8x16(pred, ref_l0, ref_l1, mb_x, mb_y, off_x, mv_l0, mv_l1);
+    sad_partition_pred(src_y, src_stride, mb_x, mb_y, off_x, 0, 8, 16, &p)
+}
+
+/// Round-22 — choose the best per-partition (mode, mv_l0, mv_l1) for
+/// one 16x8 or 8x16 partition given pre-computed per-list candidate MVs.
+fn best_partition_mode_b(
+    candidates_l0: &[Mv],
+    candidates_l1: &[Mv],
+    eval_sad: impl Fn(BPartPred, Mv, Mv) -> u32,
+) -> (BPartPred, Mv, Mv, u32) {
+    let mut best = (BPartPred::L0, Mv::ZERO, Mv::ZERO, u32::MAX);
+    // L0-only — try each L0 candidate.
+    for &mv0 in candidates_l0 {
+        let s = eval_sad(BPartPred::L0, mv0, Mv::ZERO);
+        if s < best.3 {
+            best = (BPartPred::L0, mv0, Mv::ZERO, s);
+        }
+    }
+    // L1-only — try each L1 candidate.
+    for &mv1 in candidates_l1 {
+        let s = eval_sad(BPartPred::L1, Mv::ZERO, mv1);
+        if s < best.3 {
+            best = (BPartPred::L1, Mv::ZERO, mv1, s);
+        }
+    }
+    // Bi — try each L0 × L1 combination.
+    for &mv0 in candidates_l0 {
+        for &mv1 in candidates_l1 {
+            let s = eval_sad(BPartPred::Bi, mv0, mv1);
+            if s < best.3 {
+                best = (BPartPred::Bi, mv0, mv1, s);
+            }
+        }
+    }
+    best
+}
+
+/// Round-22 — which partition shape was picked for a B MB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartitionShape {
+    /// Two 16x8 halves stacked vertically (top, bottom).
+    P16x8,
+    /// Two 8x16 halves side-by-side (left, right).
+    P8x16,
+}
+
+/// Round-22 — captured per-partition decision for a B 16x8 / 8x16 MB.
+/// `mode_a` / `mv_*_a` is the first partition (top for 16x8, left for
+/// 8x16); `mode_b` / `mv_*_b` is the second (bottom / right).
+#[derive(Debug, Clone, Copy)]
+struct PartitionChoiceB {
+    shape: PartitionShape,
+    mode_a: BPartPred,
+    mode_b: BPartPred,
+    mv_l0_a: Mv,
+    mv_l1_a: Mv,
+    mv_l0_b: Mv,
+    mv_l1_b: Mv,
+}
+
+/// Round-22 — build a 16x16 composite predictor (luma + Cb + Cr) from a
+/// partition decision, by stitching the two per-partition predictors
+/// into the relevant halves of a 16x16 buffer.
+fn build_partition_composite_b(
+    pc: &PartitionChoiceB,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+) -> ([i32; 256], [i32; 64], [i32; 64]) {
+    let mut pred_y = [0i32; 256];
+    let mut pred_u = [0i32; 64];
+    let mut pred_v = [0i32; 64];
+    match pc.shape {
+        PartitionShape::P16x8 => {
+            let py0 = build_b_partition_pred_luma_16x8(
+                pc.mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, pc.mv_l0_a, pc.mv_l1_a,
+            );
+            let py1 = build_b_partition_pred_luma_16x8(
+                pc.mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, pc.mv_l0_b, pc.mv_l1_b,
+            );
+            for j in 0..8usize {
+                for i in 0..16usize {
+                    pred_y[j * 16 + i] = py0[j * 16 + i];
+                    pred_y[(8 + j) * 16 + i] = py1[j * 16 + i];
+                }
+            }
+            // Chroma 4:2:0 → 8x4 each half.
+            let (cb0, cr0) = build_b_partition_pred_chroma_16x8(
+                pc.mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, pc.mv_l0_a, pc.mv_l1_a,
+            );
+            let (cb1, cr1) = build_b_partition_pred_chroma_16x8(
+                pc.mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, pc.mv_l0_b, pc.mv_l1_b,
+            );
+            for j in 0..4usize {
+                for i in 0..8usize {
+                    pred_u[j * 8 + i] = cb0[j * 8 + i];
+                    pred_v[j * 8 + i] = cr0[j * 8 + i];
+                    pred_u[(4 + j) * 8 + i] = cb1[j * 8 + i];
+                    pred_v[(4 + j) * 8 + i] = cr1[j * 8 + i];
+                }
+            }
+        }
+        PartitionShape::P8x16 => {
+            let py0 = build_b_partition_pred_luma_8x16(
+                pc.mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, pc.mv_l0_a, pc.mv_l1_a,
+            );
+            let py1 = build_b_partition_pred_luma_8x16(
+                pc.mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, pc.mv_l0_b, pc.mv_l1_b,
+            );
+            for j in 0..16usize {
+                for i in 0..8usize {
+                    pred_y[j * 16 + i] = py0[j * 8 + i];
+                    pred_y[j * 16 + 8 + i] = py1[j * 8 + i];
+                }
+            }
+            // Chroma 4:2:0 → 4x8 each half.
+            let (cb0, cr0) = build_b_partition_pred_chroma_8x16(
+                pc.mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, pc.mv_l0_a, pc.mv_l1_a,
+            );
+            let (cb1, cr1) = build_b_partition_pred_chroma_8x16(
+                pc.mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, pc.mv_l0_b, pc.mv_l1_b,
+            );
+            for j in 0..8usize {
+                for i in 0..4usize {
+                    pred_u[j * 8 + i] = cb0[j * 4 + i];
+                    pred_v[j * 8 + i] = cr0[j * 4 + i];
+                    pred_u[j * 8 + 4 + i] = cb1[j * 4 + i];
+                    pred_v[j * 8 + 4 + i] = cr1[j * 4 + i];
+                }
+            }
+        }
+    }
+    (pred_y, pred_u, pred_v)
+}
+
+/// Round-22 — derive per-partition MVDs for a B 16x8 / 8x16 MB using
+/// the §8.4.1.3 partition-shape MVP derivation. Returns
+/// `(mvd_l0[2], mvd_l1[2])`.
+///
+/// For the second partition (bottom of 16x8 / right of 8x16) the §8.4.1.3
+/// MVP can read from the first partition's MVs (which are part of the
+/// SAME MB, already decoded in raster order). We surface those via
+/// `inflight_*` arrays so the within-MB neighbour lookup in
+/// `mvp_for_b_*_partition` finds them.
+/// Per-partition MVD tuple (one (x, y) per of the two partitions).
+type PartitionMvds = [(i32, i32); 2];
+
+fn partition_mvds_b(
+    pc: &PartitionChoiceB,
+    mv_grid_l0: &MvGrid,
+    mv_grid_l1: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+) -> (PartitionMvds, PartitionMvds) {
+    let mut mvd_l0 = [(0i32, 0i32); 2];
+    let mut mvd_l1 = [(0i32, 0i32); 2];
+    let inflight_avail = [false; 4];
+    let mv_inflight = [Mv::ZERO; 4];
+    let ref_inflight = [-1i32; 4];
+    match pc.shape {
+        PartitionShape::P16x8 => {
+            // Partition 0 (top).
+            if pc.mode_a.uses_l0() {
+                let mvp = mvp_for_b_16x8_partition(
+                    mv_grid_l0,
+                    mb_x,
+                    mb_y,
+                    true,
+                    0,
+                    inflight_avail,
+                    mv_inflight,
+                    ref_inflight,
+                );
+                mvd_l0[0] = (pc.mv_l0_a.x - mvp.x, pc.mv_l0_a.y - mvp.y);
+            }
+            if pc.mode_a.uses_l1() {
+                let mvp = mvp_for_b_16x8_partition(
+                    mv_grid_l1,
+                    mb_x,
+                    mb_y,
+                    true,
+                    0,
+                    inflight_avail,
+                    mv_inflight,
+                    ref_inflight,
+                );
+                mvd_l1[0] = (pc.mv_l1_a.x - mvp.x, pc.mv_l1_a.y - mvp.y);
+            }
+            // Partition 1 (bottom) — top covers 8x8 #0 and #1.
+            let inflight_avail_bot = [true, true, false, false];
+            let mv_inflight_bot_l0 = [pc.mv_l0_a, pc.mv_l0_a, Mv::ZERO, Mv::ZERO];
+            let mv_inflight_bot_l1 = [pc.mv_l1_a, pc.mv_l1_a, Mv::ZERO, Mv::ZERO];
+            let ref_inflight_bot_l0 = [
+                if pc.mode_a.uses_l0() { 0 } else { -1 },
+                if pc.mode_a.uses_l0() { 0 } else { -1 },
+                -1,
+                -1,
+            ];
+            let ref_inflight_bot_l1 = [
+                if pc.mode_a.uses_l1() { 0 } else { -1 },
+                if pc.mode_a.uses_l1() { 0 } else { -1 },
+                -1,
+                -1,
+            ];
+            if pc.mode_b.uses_l0() {
+                let mvp = mvp_for_b_16x8_partition(
+                    mv_grid_l0,
+                    mb_x,
+                    mb_y,
+                    false,
+                    0,
+                    inflight_avail_bot,
+                    mv_inflight_bot_l0,
+                    ref_inflight_bot_l0,
+                );
+                mvd_l0[1] = (pc.mv_l0_b.x - mvp.x, pc.mv_l0_b.y - mvp.y);
+            }
+            if pc.mode_b.uses_l1() {
+                let mvp = mvp_for_b_16x8_partition(
+                    mv_grid_l1,
+                    mb_x,
+                    mb_y,
+                    false,
+                    0,
+                    inflight_avail_bot,
+                    mv_inflight_bot_l1,
+                    ref_inflight_bot_l1,
+                );
+                mvd_l1[1] = (pc.mv_l1_b.x - mvp.x, pc.mv_l1_b.y - mvp.y);
+            }
+        }
+        PartitionShape::P8x16 => {
+            if pc.mode_a.uses_l0() {
+                let mvp = mvp_for_b_8x16_partition(
+                    mv_grid_l0,
+                    mb_x,
+                    mb_y,
+                    true,
+                    0,
+                    inflight_avail,
+                    mv_inflight,
+                    ref_inflight,
+                );
+                mvd_l0[0] = (pc.mv_l0_a.x - mvp.x, pc.mv_l0_a.y - mvp.y);
+            }
+            if pc.mode_a.uses_l1() {
+                let mvp = mvp_for_b_8x16_partition(
+                    mv_grid_l1,
+                    mb_x,
+                    mb_y,
+                    true,
+                    0,
+                    inflight_avail,
+                    mv_inflight,
+                    ref_inflight,
+                );
+                mvd_l1[0] = (pc.mv_l1_a.x - mvp.x, pc.mv_l1_a.y - mvp.y);
+            }
+            // Partition 1 (right) — left covers 8x8 #0 and #2.
+            let inflight_avail_right = [true, false, true, false];
+            let mv_inflight_right_l0 = [pc.mv_l0_a, Mv::ZERO, pc.mv_l0_a, Mv::ZERO];
+            let mv_inflight_right_l1 = [pc.mv_l1_a, Mv::ZERO, pc.mv_l1_a, Mv::ZERO];
+            let ref_inflight_right_l0 = [
+                if pc.mode_a.uses_l0() { 0 } else { -1 },
+                -1,
+                if pc.mode_a.uses_l0() { 0 } else { -1 },
+                -1,
+            ];
+            let ref_inflight_right_l1 = [
+                if pc.mode_a.uses_l1() { 0 } else { -1 },
+                -1,
+                if pc.mode_a.uses_l1() { 0 } else { -1 },
+                -1,
+            ];
+            if pc.mode_b.uses_l0() {
+                let mvp = mvp_for_b_8x16_partition(
+                    mv_grid_l0,
+                    mb_x,
+                    mb_y,
+                    false,
+                    0,
+                    inflight_avail_right,
+                    mv_inflight_right_l0,
+                    ref_inflight_right_l0,
+                );
+                mvd_l0[1] = (pc.mv_l0_b.x - mvp.x, pc.mv_l0_b.y - mvp.y);
+            }
+            if pc.mode_b.uses_l1() {
+                let mvp = mvp_for_b_8x16_partition(
+                    mv_grid_l1,
+                    mb_x,
+                    mb_y,
+                    false,
+                    0,
+                    inflight_avail_right,
+                    mv_inflight_right_l1,
+                    ref_inflight_right_l1,
+                );
+                mvd_l1[1] = (pc.mv_l1_b.x - mvp.x, pc.mv_l1_b.y - mvp.y);
+            }
+        }
+    }
+    (mvd_l0, mvd_l1)
+}
+
+/// Round-22 — derive (per-8x8 MV, per-8x8 ref_idx, list_used) for the
+/// MvGrid update of one list. For partition modes the per-8x8 slots
+/// carry per-partition data; for 16x16 / Direct, all slots share the
+/// single MV.
+fn grid_state_b(
+    pc: Option<&PartitionChoiceB>,
+    is_l0: bool,
+    pred: BPred16x16,
+    eff_mv: Mv,
+) -> ([Mv; 4], [i32; 4], bool) {
+    if let Some(pc) = pc {
+        let (mv_a, mv_b, used_a, used_b) = if is_l0 {
+            (
+                pc.mv_l0_a,
+                pc.mv_l0_b,
+                pc.mode_a.uses_l0(),
+                pc.mode_b.uses_l0(),
+            )
+        } else {
+            (
+                pc.mv_l1_a,
+                pc.mv_l1_b,
+                pc.mode_a.uses_l1(),
+                pc.mode_b.uses_l1(),
+            )
+        };
+        let any_used = used_a || used_b;
+        let mut mvs = [Mv::ZERO; 4];
+        let mut refs = [-1i32; 4];
+        match pc.shape {
+            PartitionShape::P16x8 => {
+                // Top covers 8x8 #0/#1; bottom #2/#3.
+                if used_a {
+                    mvs[0] = mv_a;
+                    mvs[1] = mv_a;
+                    refs[0] = 0;
+                    refs[1] = 0;
+                }
+                if used_b {
+                    mvs[2] = mv_b;
+                    mvs[3] = mv_b;
+                    refs[2] = 0;
+                    refs[3] = 0;
+                }
+            }
+            PartitionShape::P8x16 => {
+                // Left covers 8x8 #0/#2; right #1/#3.
+                if used_a {
+                    mvs[0] = mv_a;
+                    mvs[2] = mv_a;
+                    refs[0] = 0;
+                    refs[2] = 0;
+                }
+                if used_b {
+                    mvs[1] = mv_b;
+                    mvs[3] = mv_b;
+                    refs[1] = 0;
+                    refs[3] = 0;
+                }
+            }
+        }
+        (mvs, refs, any_used)
+    } else {
+        let used = if is_l0 {
+            pred.uses_l0()
+        } else {
+            pred.uses_l1()
+        };
+        if used {
+            ([eff_mv; 4], [0; 4], true)
+        } else {
+            ([Mv::ZERO; 4], [-1; 4], false)
+        }
+    }
+}
+
+/// Round-22 — build the per-4x4 MV / per-8x8 ref / per-8x8 POC arrays
+/// for the §8.7 deblocker. For partition modes the 4x4 blocks in each
+/// half carry that half's MV; for 16x16 / Direct the single MV applies
+/// everywhere.
+fn deblock_mv_arr_b(
+    pc: Option<&PartitionChoiceB>,
+    is_l0: bool,
+    pred: BPred16x16,
+    eff_mv: Mv,
+    poc_sentinel: i32,
+) -> ([(i16, i16); 16], [i8; 4], [i32; 4]) {
+    if let Some(pc) = pc {
+        let (mv_a, mv_b, used_a, used_b) = if is_l0 {
+            (
+                pc.mv_l0_a,
+                pc.mv_l0_b,
+                pc.mode_a.uses_l0(),
+                pc.mode_b.uses_l0(),
+            )
+        } else {
+            (
+                pc.mv_l1_a,
+                pc.mv_l1_b,
+                pc.mode_a.uses_l1(),
+                pc.mode_b.uses_l1(),
+            )
+        };
+        let mv_a_t = (
+            mv_a.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            mv_a.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        );
+        let mv_b_t = (
+            mv_b.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            mv_b.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        );
+        let mut mvs = [(0i16, 0i16); 16];
+        let mut refs = [-1i8; 4];
+        let mut pocs = [i32::MIN; 4];
+        // The `mvs` array is indexed by §6.4.3 Z-scan position 0..15
+        // (matches `MbDeblockInfo::mv_l0` / decoder MbInfo layout). Map
+        // each Z-scan index to its (4x4-bx, 4x4-by) coords via
+        // `LUMA_4X4_BLK` so we correctly assign top/bottom (16x8) or
+        // left/right (8x16) partition MVs.
+        match pc.shape {
+            PartitionShape::P16x8 => {
+                for (blk, slot) in mvs.iter_mut().enumerate() {
+                    let (_bx, by) = LUMA_4X4_BLK[blk];
+                    *slot = if by < 2 {
+                        if used_a {
+                            mv_a_t
+                        } else {
+                            (0, 0)
+                        }
+                    } else if used_b {
+                        mv_b_t
+                    } else {
+                        (0, 0)
+                    };
+                }
+                refs[0] = if used_a { 0 } else { -1 };
+                refs[1] = if used_a { 0 } else { -1 };
+                refs[2] = if used_b { 0 } else { -1 };
+                refs[3] = if used_b { 0 } else { -1 };
+                pocs[0] = if used_a { poc_sentinel } else { i32::MIN };
+                pocs[1] = if used_a { poc_sentinel } else { i32::MIN };
+                pocs[2] = if used_b { poc_sentinel } else { i32::MIN };
+                pocs[3] = if used_b { poc_sentinel } else { i32::MIN };
+            }
+            PartitionShape::P8x16 => {
+                for (blk, slot) in mvs.iter_mut().enumerate() {
+                    let (bx, _by) = LUMA_4X4_BLK[blk];
+                    *slot = if bx < 2 {
+                        if used_a {
+                            mv_a_t
+                        } else {
+                            (0, 0)
+                        }
+                    } else if used_b {
+                        mv_b_t
+                    } else {
+                        (0, 0)
+                    };
+                }
+                refs[0] = if used_a { 0 } else { -1 };
+                refs[2] = if used_a { 0 } else { -1 };
+                refs[1] = if used_b { 0 } else { -1 };
+                refs[3] = if used_b { 0 } else { -1 };
+                pocs[0] = if used_a { poc_sentinel } else { i32::MIN };
+                pocs[2] = if used_a { poc_sentinel } else { i32::MIN };
+                pocs[1] = if used_b { poc_sentinel } else { i32::MIN };
+                pocs[3] = if used_b { poc_sentinel } else { i32::MIN };
+            }
+        }
+        (mvs, refs, pocs)
+    } else {
+        let used = if is_l0 {
+            pred.uses_l0()
+        } else {
+            pred.uses_l1()
+        };
+        if used {
+            let mv_t = (
+                eff_mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                eff_mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            );
+            ([mv_t; 16], [0; 4], [poc_sentinel; 4])
+        } else {
+            ([(0, 0); 16], [-1; 4], [i32::MIN; 4])
+        }
+    }
+}
+
 impl Encoder {
     /// Round-20 — encode one B-frame using `ref_l0` (typically the IDR /
     /// older anchor) and `ref_l1` (typically the next anchor — the prior
@@ -4085,23 +5219,178 @@ impl Encoder {
                 mv_l1,
             ),
         };
-        let is_direct = matches!(chosen_mode, BMode::Direct);
+        let mut is_direct = matches!(chosen_mode, BMode::Direct);
 
-        // 4. mvds against the §8.4.1.3 mvp for each used list (only
-        //    relevant for explicit modes; Direct has no mvd in the
-        //    bitstream).
+        // ---- Round-22: try 16x8 / 8x16 partition modes ----
+        //
+        // For each of the 4 partition shapes, pick the best (per-list
+        // MV, mode) pair. Then compare the joint partition-shape SAD
+        // against the winning 16x16 / Direct candidate above. Use a
+        // Lagrangian rate cost: a partition MB pays ~10-30 extra bits
+        // over 16x16 (single-ref → no extra ref_idx fields, just the
+        // larger mb_type ue(v) and the duplicated mvds).
+        let mut me_l0_cells: [Mv; 4] = [Mv::ZERO; 4];
+        let mut me_l1_cells: [Mv; 4] = [Mv::ZERO; 4];
+        for cell in 0..4usize {
+            let sx = cell % 2;
+            let sy = cell / 2;
+            let r0 = search_quarter_pel_8x8(
+                frame.y,
+                src_stride,
+                self.cfg.width,
+                self.cfg.height,
+                ref_l0.recon_y,
+                ref_l0.width as usize,
+                ref_l0.width,
+                ref_l0.height,
+                mb_x,
+                mb_y,
+                sx,
+                sy,
+                4,
+                4,
+            );
+            let r1 = search_quarter_pel_8x8(
+                frame.y,
+                src_stride,
+                self.cfg.width,
+                self.cfg.height,
+                ref_l1.recon_y,
+                ref_l1.width as usize,
+                ref_l1.width,
+                ref_l1.height,
+                mb_x,
+                mb_y,
+                sx,
+                sy,
+                4,
+                4,
+            );
+            me_l0_cells[cell] = Mv::new(r0.mv_x, r0.mv_y);
+            me_l1_cells[cell] = Mv::new(r1.mv_x, r1.mv_y);
+        }
+
+        // Best 16x16 SAD = the SAD of the chosen 16x16-mode predictor.
+        let best_16x16_sad = match chosen_mode {
+            BMode::Direct => direct_sad,
+            BMode::Explicit(BPred16x16::Bi) => sad_bi,
+            BMode::Explicit(BPred16x16::L0) => sad_l0,
+            BMode::Explicit(BPred16x16::L1) => sad_l1,
+        };
+
+        // 16x8 candidates: top uses cells 0/1; bottom uses 2/3.
+        let cand_top_l0 = [mv_l0, me_l0_cells[0], me_l0_cells[1]];
+        let cand_top_l1 = [mv_l1, me_l1_cells[0], me_l1_cells[1]];
+        let cand_bot_l0 = [mv_l0, me_l0_cells[2], me_l0_cells[3]];
+        let cand_bot_l1 = [mv_l1, me_l1_cells[2], me_l1_cells[3]];
+        let (top_mode, top_mv_l0, top_mv_l1, sad_top) =
+            best_partition_mode_b(&cand_top_l0, &cand_top_l1, |pred, mv0, mv1| {
+                partition_sad_b_16x8(
+                    pred, frame.y, src_stride, ref_l0, ref_l1, mb_x, mb_y, 0, mv0, mv1,
+                )
+            });
+        let (bot_mode, bot_mv_l0, bot_mv_l1, sad_bot) =
+            best_partition_mode_b(&cand_bot_l0, &cand_bot_l1, |pred, mv0, mv1| {
+                partition_sad_b_16x8(
+                    pred, frame.y, src_stride, ref_l0, ref_l1, mb_x, mb_y, 8, mv0, mv1,
+                )
+            });
+        let sad_16x8_total = sad_top.saturating_add(sad_bot);
+
+        // 8x16 candidates: left = cells 0/2; right = cells 1/3.
+        let cand_left_l0 = [mv_l0, me_l0_cells[0], me_l0_cells[2]];
+        let cand_left_l1 = [mv_l1, me_l1_cells[0], me_l1_cells[2]];
+        let cand_right_l0 = [mv_l0, me_l0_cells[1], me_l0_cells[3]];
+        let cand_right_l1 = [mv_l1, me_l1_cells[1], me_l1_cells[3]];
+        let (left_mode, left_mv_l0, left_mv_l1, sad_left) =
+            best_partition_mode_b(&cand_left_l0, &cand_left_l1, |pred, mv0, mv1| {
+                partition_sad_b_8x16(
+                    pred, frame.y, src_stride, ref_l0, ref_l1, mb_x, mb_y, 0, mv0, mv1,
+                )
+            });
+        let (right_mode, right_mv_l0, right_mv_l1, sad_right) =
+            best_partition_mode_b(&cand_right_l0, &cand_right_l1, |pred, mv0, mv1| {
+                partition_sad_b_8x16(
+                    pred, frame.y, src_stride, ref_l0, ref_l1, mb_x, mb_y, 8, mv0, mv1,
+                )
+            });
+        let sad_8x16_total = sad_left.saturating_add(sad_right);
+
+        // Lagrangian rate penalty for partition modes vs 16x16. For QP=26
+        // this gives ~40 SAD units of headroom — partition wins only when
+        // its SAD beats 16x16 by more than that.
+        let part_bias_sad: u32 = {
+            let lambda = (qp_y / 6).clamp(0, 8) as u32;
+            (lambda + 1) * 8
+        };
+        let part_threshold = best_16x16_sad.saturating_sub(part_bias_sad);
+        let (part_winner, part_winner_sad) = if sad_16x8_total <= sad_8x16_total {
+            (PartitionShape::P16x8, sad_16x8_total)
+        } else {
+            (PartitionShape::P8x16, sad_8x16_total)
+        };
+        let mut partition_choice: Option<PartitionChoiceB> = None;
+        // Don't override Direct: it may collapse to B_Skip (0 bits of MB
+        // syntax) once the residual quantises to zero, beating any
+        // partition mode by a large margin. Partition mode override only
+        // applies to explicit-inter 16x16 candidates.
+        if !is_direct && part_winner_sad < part_threshold {
+            partition_choice = Some(match part_winner {
+                PartitionShape::P16x8 => PartitionChoiceB {
+                    shape: PartitionShape::P16x8,
+                    mode_a: top_mode,
+                    mode_b: bot_mode,
+                    mv_l0_a: top_mv_l0,
+                    mv_l1_a: top_mv_l1,
+                    mv_l0_b: bot_mv_l0,
+                    mv_l1_b: bot_mv_l1,
+                },
+                PartitionShape::P8x16 => PartitionChoiceB {
+                    shape: PartitionShape::P8x16,
+                    mode_a: left_mode,
+                    mode_b: right_mode,
+                    mv_l0_a: left_mv_l0,
+                    mv_l1_a: left_mv_l1,
+                    mv_l0_b: right_mv_l0,
+                    mv_l1_b: right_mv_l1,
+                },
+            });
+            // Direct mode is incompatible with partition shapes — clear it.
+            is_direct = false;
+        }
+
+        // Override the working predictor with the partition composite
+        // when a partition mode was chosen.
+        let (pred_y, pred_u, pred_v) = if let Some(pc) = partition_choice.as_ref() {
+            build_partition_composite_b(pc, ref_l0, ref_l1, mb_x, mb_y)
+        } else {
+            (pred_y, pred_u, pred_v)
+        };
+
+        // 4. mvds against the §8.4.1.3 mvp for each used list. For 16x16
+        //    explicit, this is a single pair; for partition modes we
+        //    derive per-partition MVDs further below.
         let mvp_l0 = mvp_for_16x16(mv_grid_l0, mb_x, mb_y, 0);
         let mvp_l1 = mvp_for_16x16(mv_grid_l1, mb_x, mb_y, 0);
-        let (mvd_l0_x, mvd_l0_y) = if !is_direct && pred.uses_l0() {
+        let (mvd_l0_x, mvd_l0_y) = if !is_direct && partition_choice.is_none() && pred.uses_l0() {
             (eff_mv_l0.x - mvp_l0.x, eff_mv_l0.y - mvp_l0.y)
         } else {
             (0, 0)
         };
-        let (mvd_l1_x, mvd_l1_y) = if !is_direct && pred.uses_l1() {
+        let (mvd_l1_x, mvd_l1_y) = if !is_direct && partition_choice.is_none() && pred.uses_l1() {
             (eff_mv_l1.x - mvp_l1.x, eff_mv_l1.y - mvp_l1.y)
         } else {
             (0, 0)
         };
+
+        // Per-partition MVDs against the §8.4.1.3 partition-shape mvp.
+        // Only populated when `partition_choice` is set.
+        let (mvd_l0_parts, mvd_l1_parts) = if let Some(pc) = partition_choice.as_ref() {
+            partition_mvds_b(pc, mv_grid_l0, mv_grid_l1, mb_x, mb_y)
+        } else {
+            ([(0, 0); 2], [(0, 0); 2])
+        };
+
         let _ = BMbDecision {
             pred,
             mv_l0: eff_mv_l0,
@@ -4236,18 +5525,17 @@ impl Encoder {
 
         // 9. Emit the MB syntax.
         //
-        // §7.3.4 — three bitstream layouts depending on the chosen mode:
-        //   * B_Skip       : no MB syntax — pending_skip += 1.
-        //   * B_Direct_16x16: mb_type=0 + cbp + (mb_qp_delta) + residuals.
-        //   * Explicit     : mb_type∈{1,2,3} + ref_idxs + mvds + cbp +
-        //                    (mb_qp_delta) + residuals.
+        // §7.3.4 — four bitstream layouts:
+        //   * B_Skip            : no MB syntax — pending_skip += 1.
+        //   * B_Direct_16x16    : mb_type=0 + cbp + (mb_qp_delta) + residuals.
+        //   * Explicit 16x16    : mb_type∈{1,2,3} + ref_idxs + mvds + cbp + …
+        //   * 16x8 / 8x16 (r22) : mb_type∈{4..21} + per-partition ref_idxs
+        //                        + per-partition mvds + cbp + …
         // Skips never flush their own ue(v); they are folded into the
         // run that precedes the next coded MB (or the trailing flush).
         if mb_is_skip {
-            // §7.3.4 — extend the run of skipped MBs.
             *pending_skip += 1;
         } else {
-            // §7.3.4 — flush any preceding skip-run before this coded MB.
             sw.ue(*pending_skip);
             *pending_skip = 0;
 
@@ -4265,6 +5553,48 @@ impl Encoder {
                 };
                 crate::encoder::macroblock::write_b_direct_16x16_mb(sw, &dcfg)
                     .expect("write B_Direct_16x16 mb");
+            } else if let Some(pc) = partition_choice.as_ref() {
+                use crate::encoder::macroblock::{
+                    write_b_16x8_mb, write_b_8x16_mb, B16x8McbConfig, B8x16McbConfig,
+                };
+                match pc.shape {
+                    PartitionShape::P16x8 => {
+                        let cfg = B16x8McbConfig {
+                            top: pc.mode_a,
+                            bottom: pc.mode_b,
+                            mvd_l0: mvd_l0_parts,
+                            mvd_l1: mvd_l1_parts,
+                            cbp_luma,
+                            cbp_chroma,
+                            mb_qp_delta: 0,
+                            luma_4x4_levels: luma_4x4_levels_scan,
+                            luma_4x4_nc,
+                            chroma_dc_cb: u_dc_levels,
+                            chroma_dc_cr: v_dc_levels,
+                            chroma_ac_cb: u_ac_levels,
+                            chroma_ac_cr: v_ac_levels,
+                        };
+                        write_b_16x8_mb(sw, &cfg, 0, 0).expect("write B_*_16x8 mb");
+                    }
+                    PartitionShape::P8x16 => {
+                        let cfg = B8x16McbConfig {
+                            left: pc.mode_a,
+                            right: pc.mode_b,
+                            mvd_l0: mvd_l0_parts,
+                            mvd_l1: mvd_l1_parts,
+                            cbp_luma,
+                            cbp_chroma,
+                            mb_qp_delta: 0,
+                            luma_4x4_levels: luma_4x4_levels_scan,
+                            luma_4x4_nc,
+                            chroma_dc_cb: u_dc_levels,
+                            chroma_dc_cr: v_dc_levels,
+                            chroma_ac_cb: u_ac_levels,
+                            chroma_ac_cr: v_ac_levels,
+                        };
+                        write_b_8x16_mb(sw, &cfg, 0, 0).expect("write B_*_8x16 mb");
+                    }
+                }
             } else {
                 let mb_cfg = B16x16McbConfig {
                     pred,
@@ -4286,85 +5616,71 @@ impl Encoder {
             }
         }
 
-        // 10. Update the L0 and L1 mv-pred grids — only the list(s) this
-        //     MB actually uses contribute. The other list's grid slot
-        //     stays at the default (ref_idx = -1, mv = ZERO), which is
-        //     exactly what §8.4.1.3.2 wants for "no contribution" (the
-        //     median collapses for that side).
-        //
-        // For Direct mode we record the §8.4.1.2.2-derived MVs (which
-        // is what the decoder will compute too) so subsequent MBs that
-        // use this one as a §8.4.1.3 neighbour see the same MVs.
-        if pred.uses_l0() {
-            *mv_grid_l0.slot_mut(mb_x, mb_y) = MvGridSlot {
+        // 10. Update the L0 and L1 mv-pred grids. For partition modes,
+        //     the per-8x8 slots carry per-partition MVs (top half =
+        //     slots 0/1, bottom = 2/3 for 16x8; left = 0/2, right = 1/3
+        //     for 8x16). For 16x16 / Direct, all four slots share the
+        //     single MV.
+        let (l0_mvs_8x8, l0_refs_8x8, l0_used) = grid_state_b(
+            partition_choice.as_ref(),
+            true, // L0
+            pred,
+            eff_mv_l0,
+        );
+        let (l1_mvs_8x8, l1_refs_8x8, l1_used) = grid_state_b(
+            partition_choice.as_ref(),
+            false, // L1
+            pred,
+            eff_mv_l1,
+        );
+        *mv_grid_l0.slot_mut(mb_x, mb_y) = if l0_used {
+            MvGridSlot {
                 available: true,
                 is_intra: false,
-                ref_idx_l0_8x8: [0; 4],
-                mv_l0_8x8: [eff_mv_l0; 4],
-            };
+                ref_idx_l0_8x8: l0_refs_8x8,
+                mv_l0_8x8: l0_mvs_8x8,
+            }
         } else {
-            // Mark as available-but-no-L0 (intra-from-L0's-perspective).
-            *mv_grid_l0.slot_mut(mb_x, mb_y) = MvGridSlot {
+            MvGridSlot {
                 available: true,
                 is_intra: true,
                 ref_idx_l0_8x8: [-1; 4],
                 mv_l0_8x8: [Mv::ZERO; 4],
-            };
-        }
-        if pred.uses_l1() {
-            *mv_grid_l1.slot_mut(mb_x, mb_y) = MvGridSlot {
+            }
+        };
+        *mv_grid_l1.slot_mut(mb_x, mb_y) = if l1_used {
+            MvGridSlot {
                 available: true,
                 is_intra: false,
-                ref_idx_l0_8x8: [0; 4],
-                mv_l0_8x8: [eff_mv_l1; 4],
-            };
+                ref_idx_l0_8x8: l1_refs_8x8,
+                mv_l0_8x8: l1_mvs_8x8,
+            }
         } else {
-            *mv_grid_l1.slot_mut(mb_x, mb_y) = MvGridSlot {
+            MvGridSlot {
                 available: true,
                 is_intra: true,
                 ref_idx_l0_8x8: [-1; 4],
                 mv_l0_8x8: [Mv::ZERO; 4],
-            };
-        }
+            }
+        };
         let s = intra_grid.slot_mut(mb_x, mb_y);
         s.available = true;
         s.is_i_nxn = false;
 
         // 11. Per-4x4 nonzero mask + per-list MVs/refs/POCs for the §8.7
-        //     deblock walker. POCs follow the canonical anchor layout:
-        //     L0 ref = anchor before this B (POC 0 — IDR), L1 ref =
-        //     anchor after (POC of ref_l1).
+        //     deblock walker. For partition modes the per-4x4 MVs follow
+        //     the §8.7.2.1 partition layout. POCs use the same anchor-
+        //     layout sentinel as the 16x16 path.
         let luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
         let cb_nz: [bool; 4] =
             std::array::from_fn(|i| cbp_chroma == 2 && u_ac_levels[i].iter().any(|&v| v != 0));
         let cr_nz: [bool; 4] =
             std::array::from_fn(|i| cbp_chroma == 2 && v_ac_levels[i].iter().any(|&v| v != 0));
 
-        let mv_l0_t = (
-            eff_mv_l0.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-            eff_mv_l0.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-        );
-        let mv_l1_t = (
-            eff_mv_l1.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-            eff_mv_l1.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-        );
-        let (mv_l0_arr, ref_idx_l0, ref_poc_l0) = if pred.uses_l0() {
-            ([mv_l0_t; 16], [0i8; 4], [0i32; 4])
-        } else {
-            ([(0i16, 0i16); 16], [-1i8; 4], [i32::MIN; 4])
-        };
-        // L1 ref POC: distinct anchor — for the IPB GOP we use, the L1
-        // anchor is the prior P-frame whose POC > this B's POC. We
-        // assign POC = 1000 (sentinel: just needs to differ from L0's
-        // POC=0 so the deblock walker treats them as distinct pictures
-        // per §8.7.2.1 NOTE 1). The actual POC value doesn't change the
-        // bitstream — the decoder reads its own POC values from the
-        // SH and resolves the picture identity itself.
-        let (mv_l1_arr, ref_idx_l1, ref_poc_l1) = if pred.uses_l1() {
-            ([mv_l1_t; 16], [0i8; 4], [1000i32; 4])
-        } else {
-            ([(0i16, 0i16); 16], [-1i8; 4], [i32::MIN; 4])
-        };
+        let (mv_l0_arr, ref_idx_l0, ref_poc_l0) =
+            deblock_mv_arr_b(partition_choice.as_ref(), true, pred, eff_mv_l0, 0i32);
+        let (mv_l1_arr, ref_idx_l1, ref_poc_l1) =
+            deblock_mv_arr_b(partition_choice.as_ref(), false, pred, eff_mv_l1, 1000i32);
 
         MbDeblockInfo {
             is_intra: false,
