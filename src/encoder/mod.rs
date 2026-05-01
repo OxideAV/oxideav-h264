@@ -137,6 +137,15 @@ pub struct EncoderConfig {
     /// is the L1 reference, both must remain in the DPB until the B
     /// MB has been decoded).
     pub max_num_ref_frames: u32,
+    /// §7.4.3 / §8.4.1.2 — when `false` (default) the encoder emits
+    /// `direct_spatial_mv_pred_flag = 1` in the B-slice header and
+    /// drives B_Skip / B_Direct via §8.4.1.2.2 spatial direct
+    /// derivation (round 21 / 23). When `true`, the encoder emits
+    /// `direct_spatial_mv_pred_flag = 0` and uses §8.4.1.2.3
+    /// **temporal direct** derivation: per-8x8 (mvL0, mvL1, refIdxL0,
+    /// refIdxL1) are computed by POC-scaling the colocated L1
+    /// anchor's L0 motion vectors. Round-24.
+    pub direct_temporal_mv_pred: bool,
 }
 
 impl EncoderConfig {
@@ -147,6 +156,7 @@ impl EncoderConfig {
             qp: 26,
             profile_idc: 66,
             max_num_ref_frames: 1,
+            direct_temporal_mv_pred: false,
         }
     }
 }
@@ -3112,6 +3122,16 @@ impl Encoder {
 /// spatial direct mode needs it for §8.4.1.2.2 step 7 colZeroFlag).
 /// For non-B-slice users (`encode_p`) the field is ignored. An empty
 /// slice is treated as "all intra colocated" (colZeroFlag = 0).
+///
+/// `pic_order_cnt` (round-24) is the picture order count this reference
+/// was assigned at encode time, needed by §8.4.1.2.3 temporal direct
+/// derivation (the POCs of pic0 = L0[refIdxL0] and pic1 = L1[0] feed
+/// the `tb` / `td` distance computation). For IDR derived from
+/// `EncodedIdr` it defaults to 0 (POC type 0, IDR's
+/// `pic_order_cnt_lsb` is forced to 0). For P derived from
+/// `EncodedP` it is `2 * pic_order_cnt_lsb` matching the encoder's
+/// frame-coding convention (`TopFieldOrderCnt = pic_order_cnt_lsb`,
+/// frame POC = min(top, bottom) = top in our setup).
 pub struct EncodedFrameRef<'a> {
     pub width: u32,
     pub height: u32,
@@ -3121,6 +3141,9 @@ pub struct EncodedFrameRef<'a> {
     /// Per-8x8 partition MVs, length = `(width / 16) * (height / 16) * 4`,
     /// or empty when no MV data is available (IDR / treat as all-intra).
     pub partition_mvs: &'a [FrameRefPartitionMv],
+    /// §8.2.1 picture order count of this reference. Used by §8.4.1.2.3
+    /// temporal direct (round 24); ignored by spatial direct.
+    pub pic_order_cnt: i32,
 }
 
 impl<'a> From<&'a EncodedIdr> for EncodedFrameRef<'a> {
@@ -3132,6 +3155,7 @@ impl<'a> From<&'a EncodedIdr> for EncodedFrameRef<'a> {
             recon_u: &e.recon_u,
             recon_v: &e.recon_v,
             partition_mvs: &e.partition_mvs,
+            pic_order_cnt: 0, // §8.2.1.1 / §7.4.3 — IDR's pic_order_cnt_lsb is 0.
         }
     }
 }
@@ -3145,6 +3169,7 @@ impl<'a> From<&'a EncodedP> for EncodedFrameRef<'a> {
             recon_u: &e.recon_u,
             recon_v: &e.recon_v,
             partition_mvs: &e.partition_mvs,
+            pic_order_cnt: e.pic_order_cnt_lsb as i32,
         }
     }
 }
@@ -3450,6 +3475,119 @@ fn b_spatial_direct_derive(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Round 24 — §8.4.1.2.3 B-slice **temporal direct** derivation (encoder side).
+//
+// Temporal direct mode (`direct_spatial_mv_pred_flag = 0`) replaces the
+// §8.4.1.2.2 spatial MV / refIdx derivation with a POC-distance-driven
+// scaling of the colocated picture's L0 motion vectors:
+//
+//   pic1 = colocated picture = RefPicList1[0]   (the L1 anchor)
+//   pic0 = RefPicList0[refIdxL0]                 (the L0 reference picked by
+//                                                 MapColToList0(refIdxCol))
+//   td = Clip3(-128, 127, DiffPicOrderCnt(pic1, pic0))
+//   tb = Clip3(-128, 127, DiffPicOrderCnt(currPicOrField, pic0))
+//   tx = (16384 + |td/2|) / td
+//   DistScaleFactor = Clip3(-1024, 1023, (tb*tx + 32) >> 6)
+//   mvL0 = (DistScaleFactor*mvCol + 128) >> 8
+//   mvL1 = mvL0 - mvCol
+//
+// `MapColToList0` (eq. 8-191) maps the colocated block's `refIdxCol` (an
+// index into the colocated picture's RefPicList0) into the current
+// slice's RefPicList0 by **picture identity (POC)**. Our encoder uses a
+// single L0 reference per B-slice (the IDR), so MapColToList0 collapses
+// to "the current slice's RefPicList0[0] = the IDR" whenever the
+// colocated MB's refIdxCol == 0, and to refIdxL0 = 0 when refIdxCol < 0
+// (the "directZero" fallback per eq. 8-191's first branch).
+//
+// `direct_8x8_inference_flag = 1` in our SPS, so the granularity is
+// 4 partitions per MB (one (mvL0, mvL1) per 8x8). The 4x4 sub-grid
+// within each 8x8 carries the same MV — same convention the spatial
+// path uses.
+//
+// Spec sections cited:
+//   §8.4.1.2.1     — colocated block / picture selection (Table 8-6)
+//   §8.4.1.2.3     — temporal direct MV derivation (eq. 8-191..8-202)
+//   §8.4.1.2 NOTE 3 — direct_8x8_inference_flag = 1 → per-8x8 granularity
+//   §8.2.1         — DiffPicOrderCnt (frame coding ⇒ POC subtract)
+// ---------------------------------------------------------------------------
+
+/// §8.4.1.2.3 — encoder-side temporal direct derivation for one MB.
+///
+/// Mirrors the decoder's `derive_temporal_direct_mvs_for_block` for our
+/// constrained encoder setup:
+///   * Single L0 reference per B-slice (the IDR / older anchor).
+///   * Single L1 reference per B-slice (the prior P-frame).
+///   * `direct_8x8_inference_flag = 1` → 4 partitions per MB.
+///   * `MapColToList0` collapses to identity when refIdxCol == 0 (the
+///     IDR is at index 0 of both the L1 anchor's RefPicList0 and the
+///     current B's RefPicList0); else falls back to refIdxL0 = 0.
+///   * Long-term refs not used (encoder emits only short-term) — the
+///     long-term shortcut never fires.
+///
+/// `curr_poc` / `pic0_poc` / `pic1_poc` are picture order counts.
+/// For our POC type 0 frame-coded encoder these equal the
+/// `pic_order_cnt_lsb` values shipped in the slice headers.
+fn b_temporal_direct_derive(
+    l1_partition_mvs: &[FrameRefPartitionMv],
+    width_mbs: usize,
+    mb_x: usize,
+    mb_y: usize,
+    curr_poc: i32,
+    pic0_poc: i32,
+    pic1_poc: i32,
+) -> BDirectDerivation {
+    // §8.4.1.2.3 / eq. 8-192 — refIdxL1 is always 0 for direct mode
+    // (the colocated picture itself is RefPicList1[0]).
+    //
+    // refIdxL0: see eq. 8-191. Our encoder has a single L0 reference,
+    // so MapColToList0(refIdxCol) collapses to 0 whenever the colocated
+    // L0 reference matches the IDR (which it always does in our IPB
+    // setup — the L1 P-frame's only L0 ref is the IDR). When the
+    // colocated block is intra (refIdxCol < 0), eq. 8-191 forces
+    // refIdxL0 = 0 as well. Either way refIdxL0 = 0 across the MB.
+    let mut mv_l0_per_8x8 = [Mv::ZERO; 4];
+    let mut mv_l1_per_8x8 = [Mv::ZERO; 4];
+
+    for part in 0..4usize {
+        let idx = (mb_y * width_mbs + mb_x) * 4 + part;
+        // Default colocated mv = (0, 0) when no L1 partition data is
+        // available (e.g. an IDR L1 anchor — recall §8.4.1.2.1 NOTE
+        // for intra colocated MBs: mvCol = 0 / refIdxCol = -1).
+        let (mv_col, is_intra) = match l1_partition_mvs.get(idx) {
+            Some(slot) if !slot.is_intra => {
+                (Mv::new(slot.mv_l0.0 as i32, slot.mv_l0.1 as i32), false)
+            }
+            _ => (Mv::ZERO, true),
+        };
+        // §8.4.1.2.3 eq. 8-195/8-196 short-circuit when the colocated
+        // block is intra (or when DiffPicOrderCnt(pic1, pic0) == 0,
+        // handled inside `derive_b_temporal_direct`): mvL0 = mvCol = 0,
+        // mvL1 = 0. Same numerical result either way.
+        if is_intra {
+            mv_l0_per_8x8[part] = Mv::ZERO;
+            mv_l1_per_8x8[part] = Mv::ZERO;
+            continue;
+        }
+        // Forward to the shared §8.4.1.2.3 scaling helper (eq. 8-197..8-200).
+        // The helper handles the td == 0 → mvL0 = mvCol / mvL1 = 0
+        // shortcut internally.
+        let (mv_l0, mv_l1) =
+            crate::mv_deriv::derive_b_temporal_direct(mv_col, pic1_poc, curr_poc, pic0_poc);
+        mv_l0_per_8x8[part] = mv_l0;
+        mv_l1_per_8x8[part] = mv_l1;
+    }
+
+    // Both refIdxL0 and refIdxL1 are 0 in our single-ref-per-list setup.
+    BDirectDerivation {
+        ref_idx_l0: 0,
+        ref_idx_l1: 0,
+        mv_l0_per_8x8,
+        mv_l1_per_8x8,
+        direct_zero: false,
+    }
+}
+
 /// Output of [`Encoder::encode_b`] — a single B-slice access unit and the
 /// matching reconstruction. Same layout as [`EncodedP`]; B-frames are
 /// non-reference (`nal_ref_idc = 0`) so they do not feed any further
@@ -3483,6 +3621,7 @@ impl<'a> From<&'a EncodedB> for EncodedFrameRef<'a> {
             recon_u: &e.recon_u,
             recon_v: &e.recon_v,
             partition_mvs: &e.partition_mvs,
+            pic_order_cnt: e.pic_order_cnt_lsb as i32,
         }
     }
 }
@@ -5124,6 +5263,13 @@ impl Encoder {
         let log2_max_poc_lsb_minus4: u32 = 4;
         let chroma_qp_index_offset: i32 = 0;
 
+        // Round-24 — direct_spatial_mv_pred_flag follows the encoder
+        // configuration: 1 = §8.4.1.2.2 spatial direct (rounds 21/23),
+        // 0 = §8.4.1.2.3 temporal direct (round 24). The slice header
+        // signals the choice; the encoder's per-MB direct path picks
+        // the matching derivation below.
+        let direct_spatial = !self.cfg.direct_temporal_mv_pred;
+
         let mut sw = BitWriter::new();
         write_b_slice_header(
             &mut sw,
@@ -5135,7 +5281,7 @@ impl Encoder {
                 frame_num_bits: log2_max_frame_num_minus4 + 4,
                 pic_order_cnt_lsb,
                 poc_lsb_bits: log2_max_poc_lsb_minus4 + 4,
-                direct_spatial_mv_pred_flag: true,
+                direct_spatial_mv_pred_flag: direct_spatial,
                 slice_qp_delta: 0,
                 disable_deblocking_filter_idc: 0,
                 slice_alpha_c0_offset_div2: 0,
@@ -5193,6 +5339,7 @@ impl Encoder {
                     &mut mv_grid_l0,
                     &mut mv_grid_l1,
                     &mut pending_skip,
+                    pic_order_cnt_lsb as i32,
                 );
                 mb_deblock_infos[mb_addr] = dbl;
             }
@@ -5303,6 +5450,11 @@ impl Encoder {
         mv_grid_l0: &mut MvGrid,
         mv_grid_l1: &mut MvGrid,
         pending_skip: &mut u32,
+        // Round-24 — picture order count of the current B-frame, used by
+        // §8.4.1.2.3 temporal direct (with `ref_l0.pic_order_cnt` =
+        // pic0 POC and `ref_l1.pic_order_cnt` = pic1 POC). Ignored
+        // when the encoder is configured for spatial direct.
+        curr_poc: i32,
     ) -> MbDeblockInfo {
         let width_mbs = (self.cfg.width / 16) as usize;
         let mb_addr = mb_y * width_mbs + mb_x;
@@ -5355,28 +5507,50 @@ impl Encoder {
         let sad_l1 = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &pred_y_l1);
         let sad_bi = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &pred_y_bi);
 
-        // 2.5 Round-21 — §8.4.1.2.2 spatial direct trial.
+        // 2.5 Round-21 / Round-24 — direct mode trial.
         //
         // Mirror the decoder's derivation locally to learn what MVs /
         // refIdxs the decoder would compute if we emitted B_Direct here.
         // Build that predictor, trial-quantise its residual, and compare
         // against the explicit-inter candidates.
         //
+        // The encoder's `cfg.direct_temporal_mv_pred` flag chooses
+        // between two spec-defined paths:
+        //   * `false` (default) — §8.4.1.2.2 SPATIAL direct (rounds 21
+        //     / 23). MVs/refIdxs derived from the (A, B, C) MB-level
+        //     neighbour mvs/refs of the current B-frame's grids, with
+        //     a per-8x8 step-7 colZeroFlag override probing the L1
+        //     anchor's colocated motion.
+        //   * `true` — §8.4.1.2.3 TEMPORAL direct (round 24). MVs are
+        //     POC-distance scalings of the L1 anchor's per-partition
+        //     L0 motion vectors; refIdxs collapse to (0, 0) for our
+        //     single-ref-per-list setup.
+        //
         // Round-21 only emits B_Direct / B_Skip when the derivation
-        // produces a uniform MV across all 4 8x8 partitions (then we
-        // can build a single 16x16 predictor). Non-uniform direct MVs
-        // (per-partition motion compensation) are deferred to a later
-        // round. Empirically the directZeroPredictionFlag fallback +
-        // its self-propagation ensures uniformity for most "no-motion"
-        // and "first-MB-of-slice" content.
-        let direct = b_spatial_direct_derive(
-            mv_grid_l0,
-            mv_grid_l1,
-            ref_l1.partition_mvs,
-            width_mbs,
-            mb_x,
-            mb_y,
-        );
+        // produces a uniform MV across all 4 8x8 partitions; round-23
+        // adds B_8x8+all-Direct for the per-partition case. Same set
+        // of writers serves both spatial and temporal — only the
+        // derivation differs.
+        let direct = if self.cfg.direct_temporal_mv_pred {
+            b_temporal_direct_derive(
+                ref_l1.partition_mvs,
+                width_mbs,
+                mb_x,
+                mb_y,
+                curr_poc,
+                ref_l0.pic_order_cnt,
+                ref_l1.pic_order_cnt,
+            )
+        } else {
+            b_spatial_direct_derive(
+                mv_grid_l0,
+                mv_grid_l1,
+                ref_l1.partition_mvs,
+                width_mbs,
+                mb_x,
+                mb_y,
+            )
+        };
         let direct_uniform = direct.is_uniform();
         // Map (refIdxL0 >= 0, refIdxL1 >= 0) onto the same BPred16x16
         // enum the explicit-inter writer uses, so the predictor builder

@@ -63,6 +63,20 @@ no packet is decoded.
 | CABAC entropy decode — per-element binarisations + ctxIdx | §9.3.2 / §9.3.3.1 | implemented (mb_skip/mb_type/mvd/ref_idx/mb_qp_delta/cbp/cbf/sig_coeff/coeff_abs/sign/end_of_slice + intra pred mode flags; sub_mb_type and a few high-index init rows deferred) |
 | SEI payloads (buffering_period, pic_timing, recovery_point, user_data_unreg, filler, mastering_display, content_light_level) | §D.2 | implemented (7 common types; rest deferred) |
 
+### Encoder coverage
+
+Round-by-round encoder progress:
+
+| Round | Scope | Notes |
+| ----- | ----- | ----- |
+| 16 | P-slice support | Single L0 reference, integer-pel ME, P_Skip + P_L0_16x16 |
+| 19 | 4MV / P_8x8 | All sub_mb_type=PL08x8, per-8x8 quarter-pel ME |
+| 20 | B-slice support | Explicit B_L0_16x16 / B_L1_16x16 / B_Bi_16x16, default weighted bipred |
+| 21 | B_Skip / B_Direct_16x16 | §8.4.1.2.2 spatial direct, uniform-MV gate |
+| 22 | B 16x8 / 8x16 partitions | Table 7-14 mb_types 4..=21 (all per-partition L0/L1/Bi combos) |
+| 23 | B_8x8 + 4× B_Direct_8x8 | Per-8x8 spatial direct (lifts uniform-MV gate via per-partition MVs) |
+| 24 | B_Direct §8.4.1.2.3 temporal | POC-distance-scaled colocated MVs, `direct_temporal_mv_pred` toggle |
+
 ## Goals
 
 * Spec-faithful: every clause of §7, §8, §9 implemented from the spec

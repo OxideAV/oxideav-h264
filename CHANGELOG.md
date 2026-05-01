@@ -98,6 +98,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: **B-slice §8.4.1.2.3 temporal direct mode (round 24)** —
+  alongside the round-21/23 spatial direct path, the encoder can now
+  emit B_Skip / B_Direct_16x16 / B_8x8+all-B_Direct_8x8 macroblocks
+  driven by **temporal direct** MV derivation: per-8x8 (mvL0, mvL1)
+  computed by POC-distance scaling of the L1 anchor's per-block
+  colocated L0 motion vectors (eq. 8-191..8-202), with refIdxL0 /
+  refIdxL1 collapsed to 0 for our single-ref-per-list setup
+  (MapColToList0 collapses to identity since the L1 anchor's only L0
+  reference is the IDR — same as the current B's L0 reference). Slice
+  header now signals `direct_spatial_mv_pred_flag = 0`. New
+  `EncoderConfig::direct_temporal_mv_pred` toggle (default `false` =
+  spatial); new `EncodedFrameRef::pic_order_cnt` field carrying each
+  reference's POC (auto-populated for `EncodedIdr` / `EncodedP` /
+  `EncodedB` via the existing `From` impls). The encoder mirrors the
+  decoder's §8.4.1.2.3 derivation locally (`b_temporal_direct_derive`)
+  and re-uses the existing BMode chooser + `B_Direct_16x16` / `B_8x8`
+  writers — only the MV/refIdx derivation differs from spatial. Five
+  new integration tests (`integration_b_temporal_direct.rs`) pin the
+  new behaviour: slice-header signalling check, 5-frame I-P-B-P-B
+  self-roundtrip (max enc/dec diff ≤ 1 LSB on both B-frames),
+  ffmpeg-interop on the same fixture (max diff ≤ 1, ≥ 38 dB PSNR_Y on
+  every B), plus three boundary checks pinning the
+  `derive_b_temporal_direct` helper at zero-mvCol / td-zero passthrough
+  / symmetric-midpoint inputs. Round-24 caveats: still single ref per
+  list (multi-ref temporal direct needs full §8.2.4 RefPicList
+  construction + the MapColToList0 POC search — deferred), CAVLC only,
+  no field/MBAFF, no long-term refs.
 - encoder: **B_8x8 with all four `sub_mb_type = B_Direct_8x8` (round
   23)** — Table 7-14 raw mb_type 22 (`B_8x8`) + Table 7-18 raw
   sub_mb_type 0 (`B_Direct_8x8`) ×4. Zero MV / refIdx fields in the
