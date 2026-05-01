@@ -443,6 +443,257 @@ fn predict_chroma_plane_8x8(
 }
 
 // ---------------------------------------------------------------------------
+// §8.3.4 — chroma intra prediction (4:2:2 — 8x16 plane). Round 27.
+// ---------------------------------------------------------------------------
+
+/// Predict a single 8x16 chroma block (4:2:2). Returns 128 predicted
+/// samples row-major (8 columns × 16 rows), or `None` when the mode is
+/// unavailable at this MB position.
+///
+/// `width`/`height` are the chroma plane dimensions in samples
+/// (`pic_width / 2`, `pic_height` per §6.2 Table 6-1).
+/// `mb_x`/`mb_y` are MB indices (each MB covers an 8x16 chroma tile
+/// in 4:2:2: x = `mb_x * 8`, y = `mb_y * 16`).
+pub fn predict_chroma_8x16(
+    mode: IntraChromaMode,
+    recon: &[u8],
+    width: usize,
+    height: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> Option<[i32; 128]> {
+    let (top, left, tl) = chroma_avail_422(mb_x, mb_y);
+    match mode {
+        IntraChromaMode::Vertical if !top => None,
+        IntraChromaMode::Horizontal if !left => None,
+        IntraChromaMode::Plane if !(top && left && tl) => None,
+        IntraChromaMode::Dc => Some(predict_chroma_dc_8x16(recon, width, height, mb_x, mb_y)),
+        IntraChromaMode::Horizontal => {
+            Some(predict_chroma_h_8x16(recon, width, height, mb_x, mb_y))
+        }
+        IntraChromaMode::Vertical => Some(predict_chroma_v_8x16(recon, width, height, mb_x, mb_y)),
+        IntraChromaMode::Plane => Some(predict_chroma_plane_8x16(recon, width, height, mb_x, mb_y)),
+    }
+}
+
+/// Availability for an 8x16 chroma MB. Same neighbour rules as the
+/// 8x8 (4:2:0) helper: `mb_x > 0` ⇒ left available, `mb_y > 0` ⇒
+/// top available, both ⇒ top-left available.
+fn chroma_avail_422(mb_x: usize, mb_y: usize) -> (bool, bool, bool) {
+    let top = mb_y > 0;
+    let left = mb_x > 0;
+    (top, left, top && left)
+}
+
+/// §8.3.4.1 — Intra_Chroma_DC for 4:2:2. Eight 4x4 sub-blocks at
+/// (xO, yO) ∈ {(0,0),(4,0),(0,4),(4,4),(0,8),(4,8),(0,12),(4,12)}.
+/// Per-sub-block decision tree mirrors the decoder's
+/// `chroma_dc_subblock` to stay bit-exact.
+fn predict_chroma_dc_8x16(
+    recon: &[u8],
+    width: usize,
+    _height: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> [i32; 128] {
+    let (top, left, _tl) = chroma_avail_422(mb_x, mb_y);
+    let default = 128i32;
+    let row_above = if top { (mb_y * 16 - 1) * width } else { 0 };
+    let sum_top = |x_o: usize| -> i32 {
+        let mut s = 0i32;
+        for i in 0..4 {
+            s += recon[row_above + mb_x * 8 + x_o + i] as i32;
+        }
+        s
+    };
+    let sum_left = |y_o: usize| -> i32 {
+        let mut s = 0i32;
+        for j in 0..4 {
+            s += recon[(mb_y * 16 + y_o + j) * width + mb_x * 8 - 1] as i32;
+        }
+        s
+    };
+    let dc_sub = |x_o: usize, y_o: usize| -> i32 {
+        if x_o == 0 && y_o == 0 {
+            if top && left {
+                (sum_top(0) + sum_left(0) + 4) >> 3
+            } else if top {
+                (sum_top(0) + 2) >> 2
+            } else if left {
+                (sum_left(0) + 2) >> 2
+            } else {
+                default
+            }
+        } else if x_o > 0 && y_o == 0 {
+            if top {
+                (sum_top(x_o) + 2) >> 2
+            } else if left {
+                (sum_left(0) + 2) >> 2
+            } else {
+                default
+            }
+        } else if x_o == 0 && y_o > 0 {
+            if left {
+                (sum_left(y_o) + 2) >> 2
+            } else if top {
+                (sum_top(0) + 2) >> 2
+            } else {
+                default
+            }
+        } else {
+            // Inner: both available → average; else fall back.
+            if top && left {
+                (sum_top(x_o) + sum_left(y_o) + 4) >> 3
+            } else if top {
+                (sum_top(x_o) + 2) >> 2
+            } else if left {
+                (sum_left(y_o) + 2) >> 2
+            } else {
+                default
+            }
+        }
+    };
+    let mut out = [0i32; 128];
+    for y_o in [0usize, 4, 8, 12] {
+        for x_o in [0usize, 4] {
+            let dc = dc_sub(x_o, y_o);
+            for yy in 0..4 {
+                for xx in 0..4 {
+                    out[(y_o + yy) * 8 + (x_o + xx)] = dc;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// §8.3.4.2 — Intra_Chroma_Horizontal for 4:2:2 (8-142): copy left column.
+fn predict_chroma_h_8x16(
+    recon: &[u8],
+    width: usize,
+    _height: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> [i32; 128] {
+    let (_top, left, _tl) = chroma_avail_422(mb_x, mb_y);
+    let mut out = [128i32; 128];
+    if !left {
+        return out;
+    }
+    for y in 0..16 {
+        let s = recon[(mb_y * 16 + y) * width + mb_x * 8 - 1] as i32;
+        for x in 0..8 {
+            out[y * 8 + x] = s;
+        }
+    }
+    out
+}
+
+/// §8.3.4.3 — Intra_Chroma_Vertical for 4:2:2 (8-143): copy top row.
+fn predict_chroma_v_8x16(
+    recon: &[u8],
+    width: usize,
+    _height: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> [i32; 128] {
+    let (top, _left, _tl) = chroma_avail_422(mb_x, mb_y);
+    let mut out = [128i32; 128];
+    if !top {
+        return out;
+    }
+    let row_above = (mb_y * 16 - 1) * width;
+    for x in 0..8 {
+        let s = recon[row_above + mb_x * 8 + x] as i32;
+        for y in 0..16 {
+            out[y * 8 + x] = s;
+        }
+    }
+    out
+}
+
+/// §8.3.4.4 — Intra_Chroma_Plane for 4:2:2. Equations (8-144)..(8-149)
+/// with `xCF = 0` (since ChromaArrayType != 3) and `yCF = 4` (since
+/// ChromaArrayType != 1). The `c` coefficient becomes 5 instead of 34
+/// (eq. 8-147 with ChromaArrayType != 1).
+fn predict_chroma_plane_8x16(
+    recon: &[u8],
+    width: usize,
+    height: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> [i32; 128] {
+    let (top, left, tl) = chroma_avail_422(mb_x, mb_y);
+    if !(top && left && tl) {
+        return predict_chroma_dc_8x16(recon, width, height, mb_x, mb_y);
+    }
+    let row_above = (mb_y * 16 - 1) * width;
+    let p_top = |x: i32| -> i32 {
+        if x == -1 {
+            recon[row_above + mb_x * 8 - 1] as i32
+        } else {
+            recon[row_above + mb_x * 8 + x as usize] as i32
+        }
+    };
+    let p_left = |y: i32| -> i32 {
+        if y == -1 {
+            recon[row_above + mb_x * 8 - 1] as i32
+        } else {
+            recon[(mb_y * 16 + y as usize) * width + mb_x * 8 - 1] as i32
+        }
+    };
+    // (8-148) H = sum over x'=0..=3 of (x'+1) * (p[4+x',-1] - p[2-x',-1])
+    let mut h = 0i32;
+    for xp in 0..4i32 {
+        h += (xp + 1) * (p_top(4 + xp) - p_top(2 - xp));
+    }
+    // (8-149) V = sum over y'=0..=7 (since yCF=4 → 3+yCF = 7) of
+    //         (y'+1) * (p[-1, 4+yCF+y'] - p[-1, 2+yCF-y'])
+    //   = sum y'=0..=7 of (y'+1) * (p[-1, 8+y'] - p[-1, 6-y'])
+    let y_cf: i32 = 4;
+    let mut v = 0i32;
+    for yp in 0..=(3 + y_cf) {
+        v += (yp + 1) * (p_left(4 + y_cf + yp) - p_left(2 + y_cf - yp));
+    }
+    // (8-145) a = 16 * (p[-1, MbHeightC - 1] + p[MbWidthC - 1, -1])
+    //         MbHeightC = 16, MbWidthC = 8.
+    let a = 16 * (p_left(15) + p_top(7));
+    // (8-146) b = (34 * H + 32) >> 6 (ChromaArrayType != 3)
+    let b = (34 * h + 32) >> 6;
+    // (8-147) c = (5 * V + 32) >> 6 (ChromaArrayType != 1 → 34 - 29 = 5)
+    let c = (5 * v + 32) >> 6;
+    // (8-144) pred[x,y] = Clip1((a + b*(x-3-xCF) + c*(y-3-yCF) + 16) >> 5)
+    //         xCF = 0, yCF = 4 → c arg is (y - 7).
+    let mut out = [0i32; 128];
+    for y in 0..16i32 {
+        for x in 0..8i32 {
+            let raw = (a + b * (x - 3) + c * (y - 3 - y_cf) + 16) >> 5;
+            out[(y * 8 + x) as usize] = raw.clamp(0, 255);
+        }
+    }
+    out
+}
+
+/// SAD for 8x16 chroma blocks (4:2:2). Same idea as `sad_8x8`.
+pub fn sad_8x16(
+    src: &[u8],
+    src_stride: usize,
+    src_x: usize,
+    src_y: usize,
+    pred: &[i32; 128],
+) -> u64 {
+    let mut s = 0u64;
+    for j in 0..16 {
+        for i in 0..8 {
+            let p = pred[j * 8 + i];
+            let q = src[(src_y + j) * src_stride + (src_x + i)] as i32;
+            s += (p - q).unsigned_abs() as u64;
+        }
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
 // Mode-decision metric.
 // ---------------------------------------------------------------------------
 

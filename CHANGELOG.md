@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 27 — encoder 4:2:2 chroma support (IDR-only path)**.
+  `EncoderConfig::chroma_format_idc` selects between 1 (4:2:0,
+  default) and 2 (4:2:2). When set to 2, the SPS writer emits a High
+  4:2:2 (`profile_idc=122`) sequence parameter set with the
+  §7.3.2.1.1 chroma-extended group fields (chroma_format_idc=2,
+  bit_depth_luma/chroma_minus8=0, no scaling matrix). The per-MB
+  chroma path now dispatches to either:
+  * 4:2:0 (`encode_chroma_residual`) — 4 4x4 sub-blocks per plane,
+    2x2 Hadamard DC, `ChromaDc420` CAVLC context, 8x8 chroma tile;
+    OR
+  * 4:2:2 (`encode_chroma_residual_422`) — 8 4x4 sub-blocks per
+    plane, 4x2 Hadamard DC (§8.5.11.2 / eq. 8-325), `ChromaDc422`
+    CAVLC context, 8x16 chroma tile.
+  Chroma intra prediction adds `predict_chroma_8x16` covering DC, H,
+  V, Plane modes for the 4:2:2 8x16 block (§8.3.4 with `yCF=4` /
+  `c=5*V` per eq. 8-147 / 8-149). The §8.7 deblock walker now uses
+  `Picture::chroma_array_type` derived from the encoder config so
+  chroma 4x4 edges land in the right pixel positions for both
+  subsampling modes. New tests:
+  * `transform::tests::chroma_dc_422_uniform_residual_round_trips_within_tolerance`
+  * `transform::tests::chroma_dc_422_scan_matches_decoder_inverse`
+  * `sps::tests::high_422_sps_emits_chroma_extended_group`
+  * Integration: `round27_422_encode_decode_self_roundtrip_matches_local_recon`
+    (self-roundtrip + bit-exact decoder match, luma PSNR ≥ 40 dB
+    on a 64x64 gradient).
+  * Integration: `round27_422_ffmpeg_decode_matches_encoder_recon`
+    (ffmpeg cross-decode bit-exact for both planes).
+  P-slice / B-slice paths still pin `chroma_format_idc=1` (4:2:0).
+
 ### Fixed
 
 - **DPB output ordering when a real-world encoder under-reports

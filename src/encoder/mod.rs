@@ -109,9 +109,14 @@ const LUMA_4X4_BLK: [(usize, usize); 16] = [
     (3, 3),
 ];
 
-/// One encoded YUV 4:2:0 frame's worth of input planes. All planes are
+/// One encoded YUV frame's worth of input planes. All planes are
 /// 8-bit, row-major. Width and height must be multiples of 16 (no
 /// cropping support yet).
+///
+/// Default chroma layout is 4:2:0 — `u` / `v` length is `(W/2) *
+/// (H/2)`. When the encoder is configured for 4:2:2
+/// (`EncoderConfig::chroma_format_idc = 2`, round 27), `u` / `v` length
+/// is `(W/2) * H` — half-width, full-height per §6.2 Table 6-1.
 pub struct YuvFrame<'a> {
     pub width: u32,
     pub height: u32,
@@ -163,6 +168,14 @@ pub struct EncoderConfig {
     /// average `(L0 + L1 + 1) >> 1` and the PPS / slice header carry no
     /// pred_weight_table.
     pub explicit_weighted_bipred: bool,
+    /// §7.4.2.1.1 / §6.2 — `chroma_format_idc`. Defaults to 1 (4:2:0).
+    /// Round-27 supports 2 (4:2:2) on the `encode_idr` path: the
+    /// emitted SPS is High 4:2:2 (profile_idc=122), the chroma plane
+    /// is 8x16 per MB (two stacked 8x8 tiles), the chroma DC Hadamard
+    /// is 2x4 per §8.5.11.2, and the deblock pass adapts via
+    /// `Picture::chroma_array_type`. Other values (0 monochrome, 3
+    /// 4:4:4) and the P/B-slice paths remain 4:2:0-only.
+    pub chroma_format_idc: u32,
 }
 
 impl EncoderConfig {
@@ -175,6 +188,7 @@ impl EncoderConfig {
             max_num_ref_frames: 1,
             direct_temporal_mv_pred: false,
             explicit_weighted_bipred: false,
+            chroma_format_idc: 1,
         }
     }
 }
@@ -446,6 +460,22 @@ impl Encoder {
             "encoder requires 16-pixel-aligned dimensions",
         );
         assert!((0..=51).contains(&cfg.qp));
+        assert!(
+            matches!(cfg.chroma_format_idc, 1 | 2),
+            "encoder only supports 4:2:0 (chroma_format_idc=1) and 4:2:2 \
+             (chroma_format_idc=2); got {}",
+            cfg.chroma_format_idc,
+        );
+        // Round-27: 4:2:2 currently requires the High 4:2:2 profile (122).
+        // The 4:2:0-only P/B paths still pin profile_idc to 66/77; the
+        // 4:2:2 IDR path needs profile 122 because that's the only
+        // chroma-extended-group profile our SPS writer emits.
+        if cfg.chroma_format_idc == 2 {
+            assert_eq!(
+                cfg.profile_idc, 122,
+                "4:2:2 (chroma_format_idc=2) requires profile_idc=122 (High 4:2:2)",
+            );
+        }
         Self { cfg }
     }
 
@@ -458,8 +488,28 @@ impl Encoder {
         assert_eq!(frame.height, self.cfg.height);
         let width_mbs = self.cfg.width / 16;
         let height_mbs = self.cfg.height / 16;
+        // §6.2 / Table 6-1 — chroma plane dimensions per chroma_format_idc.
+        // 4:2:0 → (W/2, H/2); 4:2:2 → (W/2, H).
         let chroma_width = (self.cfg.width / 2) as usize;
-        let chroma_height = (self.cfg.height / 2) as usize;
+        let chroma_height = if self.cfg.chroma_format_idc == 2 {
+            self.cfg.height as usize
+        } else {
+            (self.cfg.height / 2) as usize
+        };
+        // Sanity-check the input frame's chroma plane sizes match what
+        // we expect for the configured chroma_format_idc. Mis-sized
+        // planes would silently produce out-of-bounds reads in the
+        // encoder helpers.
+        debug_assert_eq!(
+            frame.u.len(),
+            chroma_width * chroma_height,
+            "Cb plane length {} does not match {}x{} for chroma_format_idc={}",
+            frame.u.len(),
+            chroma_width,
+            chroma_height,
+            self.cfg.chroma_format_idc,
+        );
+        debug_assert_eq!(frame.v.len(), chroma_width * chroma_height);
 
         // SPS / PPS bytes.
         let sps_cfg = BaselineSpsConfig {
@@ -471,6 +521,7 @@ impl Encoder {
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: self.cfg.max_num_ref_frames,
             profile_idc: self.cfg.profile_idc,
+            chroma_format_idc: self.cfg.chroma_format_idc,
         };
         let pps_cfg = BaselinePpsConfig {
             pic_parameter_set_id: 0,
@@ -576,7 +627,7 @@ impl Encoder {
         // filter per picture and because the encoder's intra-prediction
         // step (which reads `recon_y` for neighbours) must see the
         // pre-filter samples — same as the decoder.
-        deblock_recon(
+        crate::encoder::deblock::deblock_recon_with_chroma_array_type(
             self.cfg.width,
             self.cfg.height,
             chroma_width as u32,
@@ -588,6 +639,7 @@ impl Encoder {
             pps_cfg.chroma_qp_index_offset,
             width_mbs,
             height_mbs,
+            self.cfg.chroma_format_idc,
         );
 
         // IDR is all-intra: every partition is `is_intra = true`, so
@@ -918,81 +970,53 @@ impl Encoder {
             }
         }
 
-        // ------- Chroma: pick mode by SAD on both planes -------
-        // §8.3.4 — same idea as luma but jointly across Cb/Cr (one
-        // chroma_pred_mode covers both planes).
-        let mut best_chroma_mode = IntraChromaMode::Dc;
-        let mut best_chroma_pred_u = [0i32; 64];
-        let mut best_chroma_pred_v = [0i32; 64];
-        let mut best_chroma_sad = u64::MAX;
-        for &mode in &[
-            IntraChromaMode::Dc,
-            IntraChromaMode::Horizontal,
-            IntraChromaMode::Vertical,
-            IntraChromaMode::Plane,
-        ] {
-            let (Some(pu), Some(pv)) = (
-                predict_chroma_8x8(mode, recon_u, chroma_width, chroma_height, mb_x, mb_y),
-                predict_chroma_8x8(mode, recon_v, chroma_width, chroma_height, mb_x, mb_y),
-            ) else {
-                continue;
-            };
-            let s = sad_8x8(frame.u, chroma_width, mb_x * 8, mb_y * 8, &pu)
-                + sad_8x8(frame.v, chroma_width, mb_x * 8, mb_y * 8, &pv);
-            if s < best_chroma_sad {
-                best_chroma_sad = s;
-                best_chroma_mode = mode;
-                best_chroma_pred_u = pu;
-                best_chroma_pred_v = pv;
-            }
+        // ------- Chroma: dispatch to 4:2:0 / 4:2:2 helper -------
+        // Round 27: the helper picks the best §8.3.4 mode by SAD,
+        // encodes both planes' DC + AC residuals, reconstructs the
+        // sample residual, and returns a `ChromaBlock` carrying
+        // everything the MB writer + recon installer + deblock walker
+        // need.
+        let chroma_array_type = self.cfg.chroma_format_idc;
+        let chroma_block = encode_chroma_block(
+            chroma_array_type,
+            frame.u,
+            frame.v,
+            recon_u,
+            recon_v,
+            chroma_width,
+            chroma_height,
+            mb_x,
+            mb_y,
+            qp_c,
+        );
+        let best_chroma_mode = chroma_block.pred_mode;
+        let cbp_chroma = chroma_block.cbp_chroma;
+        let n_chroma_blk = ChromaBlock::cb_block_count(chroma_array_type);
+        // Re-export the per-block AC arrays into local arrays of the
+        // shape the legacy `I16x16McbConfig` expects (4 blocks). For
+        // 4:2:2 the writer below uses `write_intra16x16_mb_chroma` with
+        // `ChromaWriteKind::Yuv422` so these arrays are unused.
+        let mut u_dc_levels = [0i32; 4];
+        let mut v_dc_levels = [0i32; 4];
+        let mut u_ac_levels = [[0i32; 16]; 4];
+        let mut v_ac_levels = [[0i32; 16]; 4];
+        if chroma_array_type == 1 {
+            u_dc_levels.copy_from_slice(&chroma_block.dc_cb[..4]);
+            v_dc_levels.copy_from_slice(&chroma_block.dc_cr[..4]);
+            u_ac_levels.copy_from_slice(&chroma_block.ac_cb[..4]);
+            v_ac_levels.copy_from_slice(&chroma_block.ac_cr[..4]);
         }
 
-        // Encode chroma residual for both planes. The decoder consumes
-        // both planes' DC residual when cbp_chroma >= 1, and both
-        // planes' AC residual when cbp_chroma == 2. Our encoder always
-        // emits chroma DC, and emits AC when at least one AC level is
-        // non-zero.
-        let (u_dc_levels, u_ac_levels, u_recon_residual) =
-            encode_chroma_residual(frame.u, chroma_width, mb_x, mb_y, &best_chroma_pred_u, qp_c);
-        let (v_dc_levels, v_ac_levels, v_recon_residual) =
-            encode_chroma_residual(frame.v, chroma_width, mb_x, mb_y, &best_chroma_pred_v, qp_c);
-
-        // Decide cbp_chroma: 1 if either plane has any non-zero DC,
-        // 2 if either plane has any non-zero AC. (Round-2 emits both
-        // planes' DC unconditionally when cbp_chroma >= 1.)
-        let any_dc_nz = u_dc_levels.iter().any(|&v| v != 0) || v_dc_levels.iter().any(|&v| v != 0);
-        let any_ac_nz = u_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0))
-            || v_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0));
-        let cbp_chroma: u8 = if any_ac_nz {
-            2
-        } else if any_dc_nz {
-            1
-        } else {
-            0
-        };
-
-        // Apply chroma reconstruction. When cbp_chroma == 0 nothing was
-        // sent, so the decoder will fall back to the predictor — match.
-        for j in 0..8usize {
-            for i in 0..8usize {
-                let cx = mb_x * 8 + i;
-                let cy = mb_y * 8 + j;
-                let pred_u = best_chroma_pred_u[j * 8 + i];
-                let pred_v = best_chroma_pred_v[j * 8 + i];
-                let res_u = if cbp_chroma == 0 {
-                    0
-                } else {
-                    u_recon_residual[j * 8 + i]
-                };
-                let res_v = if cbp_chroma == 0 {
-                    0
-                } else {
-                    v_recon_residual[j * 8 + i]
-                };
-                recon_u[cy * chroma_width + cx] = (pred_u + res_u).clamp(0, 255) as u8;
-                recon_v[cy * chroma_width + cx] = (pred_v + res_v).clamp(0, 255) as u8;
-            }
-        }
+        // Apply chroma reconstruction (4:2:0 → 8x8 tile, 4:2:2 → 8x16).
+        install_chroma_recon(
+            chroma_array_type,
+            chroma_width,
+            mb_x,
+            mb_y,
+            &chroma_block,
+            recon_u,
+            recon_v,
+        );
         let _ = chroma_height;
 
         // ------- Build CAVLC neighbour-grid view + per-block nC ------
@@ -1057,22 +1081,46 @@ impl Encoder {
         nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
 
         // ------- Emit MB syntax -------
-        let mb_cfg = I16x16McbConfig {
-            pred_mode: best_luma_mode.as_u8(),
-            intra_chroma_pred_mode: best_chroma_mode.as_u8(),
-            cbp_luma,
-            cbp_chroma,
-            mb_qp_delta: 0,
-            luma_dc_levels_raster: dc_levels,
-            luma_ac_levels,
-            luma_ac_nc,
-            chroma_dc_cb: u_dc_levels,
-            chroma_dc_cr: v_dc_levels,
-            chroma_ac_cb: u_ac_levels,
-            chroma_ac_cr: v_ac_levels,
-        };
-        write_intra16x16_mb(sw, &mb_cfg, CoeffTokenContext::Numeric(nc_dc))
-            .expect("write Intra16x16 mb");
+        let nc_dc_ctx = CoeffTokenContext::Numeric(nc_dc);
+        if chroma_array_type == 1 {
+            let mb_cfg = I16x16McbConfig {
+                pred_mode: best_luma_mode.as_u8(),
+                intra_chroma_pred_mode: best_chroma_mode.as_u8(),
+                cbp_luma,
+                cbp_chroma,
+                mb_qp_delta: 0,
+                luma_dc_levels_raster: dc_levels,
+                luma_ac_levels,
+                luma_ac_nc,
+                chroma_dc_cb: u_dc_levels,
+                chroma_dc_cr: v_dc_levels,
+                chroma_ac_cb: u_ac_levels,
+                chroma_ac_cr: v_ac_levels,
+            };
+            write_intra16x16_mb(sw, &mb_cfg, nc_dc_ctx).expect("write Intra16x16 mb");
+        } else {
+            // Round-27: 4:2:2 path. Pass per-plane 8-entry DC + 8-block
+            // AC arrays via `ChromaWriteKind::Yuv422`.
+            crate::encoder::macroblock::write_intra16x16_mb_chroma(
+                sw,
+                best_luma_mode.as_u8(),
+                best_chroma_mode.as_u8(),
+                cbp_luma,
+                cbp_chroma,
+                0,
+                &dc_levels,
+                &luma_ac_levels,
+                &luma_ac_nc,
+                crate::encoder::macroblock::ChromaWriteKind::Yuv422 {
+                    chroma_dc_cb: &chroma_block.dc_cb,
+                    chroma_dc_cr: &chroma_block.dc_cr,
+                    chroma_ac_cb: &chroma_block.ac_cb,
+                    chroma_ac_cr: &chroma_block.ac_cr,
+                },
+                nc_dc_ctx,
+            )
+            .expect("write Intra16x16 mb (4:2:2)");
+        }
 
         // Mark this MB as available + not-i_nxn for subsequent MBs'
         // §8.3.1.1 step 3 lookup. Intra_16x16 neighbours fall into
@@ -1109,18 +1157,18 @@ impl Encoder {
         } else {
             0
         };
-        // Chroma per-block AC nonzero (4 blocks × 2 planes).
-        let cb_nz: [bool; 4] =
-            std::array::from_fn(|i| cbp_chroma == 2 && u_ac_levels[i].iter().any(|&v| v != 0));
-        let cr_nz: [bool; 4] =
-            std::array::from_fn(|i| cbp_chroma == 2 && v_ac_levels[i].iter().any(|&v| v != 0));
+        // Chroma per-block AC nonzero. For 4:2:0: 4 blocks per plane,
+        // packed as bits 0..=3 (Cb) and 8..=11 (Cr). For 4:2:2: 8 blocks
+        // per plane, packed bits 0..=7 (Cb) and 8..=15 (Cr) per
+        // `compute_chroma_nonzero_mask` in the decoder's reconstruct.rs.
+        let chroma_nz_mask = chroma_nz_mask_from_chroma_block(&chroma_block, n_chroma_blk);
         MbTrial {
             luma_cost: best_luma_cost,
             deblock: MbDeblockInfo {
                 is_intra: true,
                 qp_y,
                 luma_nonzero_4x4,
-                chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+                chroma_nonzero_4x4: chroma_nz_mask,
                 ..Default::default()
             },
         }
@@ -1368,66 +1416,42 @@ impl Encoder {
             }
         }
 
-        // ----- Chroma: same path as I_16x16. -----
-        let mut best_chroma_mode = IntraChromaMode::Dc;
-        let mut best_chroma_pred_u = [0i32; 64];
-        let mut best_chroma_pred_v = [0i32; 64];
-        let mut best_chroma_sad = u64::MAX;
-        for &mode in &[
-            IntraChromaMode::Dc,
-            IntraChromaMode::Horizontal,
-            IntraChromaMode::Vertical,
-            IntraChromaMode::Plane,
-        ] {
-            let (Some(pu), Some(pv)) = (
-                predict_chroma_8x8(mode, recon_u, chroma_width, chroma_height, mb_x, mb_y),
-                predict_chroma_8x8(mode, recon_v, chroma_width, chroma_height, mb_x, mb_y),
-            ) else {
-                continue;
-            };
-            let s = sad_8x8(frame.u, chroma_width, mb_x * 8, mb_y * 8, &pu)
-                + sad_8x8(frame.v, chroma_width, mb_x * 8, mb_y * 8, &pv);
-            if s < best_chroma_sad {
-                best_chroma_sad = s;
-                best_chroma_mode = mode;
-                best_chroma_pred_u = pu;
-                best_chroma_pred_v = pv;
-            }
+        // ----- Chroma: dispatch via 4:2:0 / 4:2:2 helper. -----
+        let chroma_array_type = self.cfg.chroma_format_idc;
+        let chroma_block = encode_chroma_block(
+            chroma_array_type,
+            frame.u,
+            frame.v,
+            recon_u,
+            recon_v,
+            chroma_width,
+            chroma_height,
+            mb_x,
+            mb_y,
+            qp_c,
+        );
+        let best_chroma_mode = chroma_block.pred_mode;
+        let cbp_chroma = chroma_block.cbp_chroma;
+        let n_chroma_blk = ChromaBlock::cb_block_count(chroma_array_type);
+        let mut u_dc_levels = [0i32; 4];
+        let mut v_dc_levels = [0i32; 4];
+        let mut u_ac_levels = [[0i32; 16]; 4];
+        let mut v_ac_levels = [[0i32; 16]; 4];
+        if chroma_array_type == 1 {
+            u_dc_levels.copy_from_slice(&chroma_block.dc_cb[..4]);
+            v_dc_levels.copy_from_slice(&chroma_block.dc_cr[..4]);
+            u_ac_levels.copy_from_slice(&chroma_block.ac_cb[..4]);
+            v_ac_levels.copy_from_slice(&chroma_block.ac_cr[..4]);
         }
-        let (u_dc_levels, u_ac_levels, u_recon_residual) =
-            encode_chroma_residual(frame.u, chroma_width, mb_x, mb_y, &best_chroma_pred_u, qp_c);
-        let (v_dc_levels, v_ac_levels, v_recon_residual) =
-            encode_chroma_residual(frame.v, chroma_width, mb_x, mb_y, &best_chroma_pred_v, qp_c);
-        let any_dc_nz = u_dc_levels.iter().any(|&v| v != 0) || v_dc_levels.iter().any(|&v| v != 0);
-        let any_ac_nz = u_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0))
-            || v_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0));
-        let cbp_chroma: u8 = if any_ac_nz {
-            2
-        } else if any_dc_nz {
-            1
-        } else {
-            0
-        };
-        for j in 0..8usize {
-            for i in 0..8usize {
-                let cx = mb_x * 8 + i;
-                let cy = mb_y * 8 + j;
-                let pred_u = best_chroma_pred_u[j * 8 + i];
-                let pred_v = best_chroma_pred_v[j * 8 + i];
-                let res_u = if cbp_chroma == 0 {
-                    0
-                } else {
-                    u_recon_residual[j * 8 + i]
-                };
-                let res_v = if cbp_chroma == 0 {
-                    0
-                } else {
-                    v_recon_residual[j * 8 + i]
-                };
-                recon_u[cy * chroma_width + cx] = (pred_u + res_u).clamp(0, 255) as u8;
-                recon_v[cy * chroma_width + cx] = (pred_v + res_v).clamp(0, 255) as u8;
-            }
-        }
+        install_chroma_recon(
+            chroma_array_type,
+            chroma_width,
+            mb_x,
+            mb_y,
+            &chroma_block,
+            recon_u,
+            recon_v,
+        );
         let _ = chroma_height;
 
         // ----- CAVLC neighbour grid update. -----
@@ -1467,21 +1491,43 @@ impl Encoder {
         nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
 
         // ----- Emit syntax. -----
-        let mb_cfg = INxNMcbConfig {
-            prev_intra4x4_pred_mode_flag: prev_flag,
-            rem_intra4x4_pred_mode: rem,
-            intra_chroma_pred_mode: best_chroma_mode.as_u8(),
-            cbp_luma,
-            cbp_chroma,
-            mb_qp_delta: 0,
-            luma_4x4_levels: luma_4x4_levels_scan,
-            luma_4x4_nc,
-            chroma_dc_cb: u_dc_levels,
-            chroma_dc_cr: v_dc_levels,
-            chroma_ac_cb: u_ac_levels,
-            chroma_ac_cr: v_ac_levels,
-        };
-        write_i_nxn_mb(sw, &mb_cfg).expect("write I_NxN mb");
+        if chroma_array_type == 1 {
+            let mb_cfg = INxNMcbConfig {
+                prev_intra4x4_pred_mode_flag: prev_flag,
+                rem_intra4x4_pred_mode: rem,
+                intra_chroma_pred_mode: best_chroma_mode.as_u8(),
+                cbp_luma,
+                cbp_chroma,
+                mb_qp_delta: 0,
+                luma_4x4_levels: luma_4x4_levels_scan,
+                luma_4x4_nc,
+                chroma_dc_cb: u_dc_levels,
+                chroma_dc_cr: v_dc_levels,
+                chroma_ac_cb: u_ac_levels,
+                chroma_ac_cr: v_ac_levels,
+            };
+            write_i_nxn_mb(sw, &mb_cfg).expect("write I_NxN mb");
+        } else {
+            // Round-27: 4:2:2 chroma layout.
+            crate::encoder::macroblock::write_i_nxn_mb_chroma(
+                sw,
+                &prev_flag,
+                &rem,
+                best_chroma_mode.as_u8(),
+                cbp_luma,
+                cbp_chroma,
+                0,
+                &luma_4x4_levels_scan,
+                &luma_4x4_nc,
+                crate::encoder::macroblock::ChromaWriteKind::Yuv422 {
+                    chroma_dc_cb: &chroma_block.dc_cb,
+                    chroma_dc_cr: &chroma_block.dc_cr,
+                    chroma_ac_cb: &chroma_block.ac_cb,
+                    chroma_ac_cr: &chroma_block.ac_cr,
+                },
+            )
+            .expect("write I_NxN mb (4:2:2)");
+        }
 
         // intra_grid was updated incrementally above; nothing else to
         // commit here.
@@ -1491,17 +1537,14 @@ impl Encoder {
         // earlier (`blk_has_nz`); blocks in zero-cbp 8x8 quadrants are
         // already false there.
         let luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
-        let cb_nz: [bool; 4] =
-            std::array::from_fn(|i| cbp_chroma == 2 && u_ac_levels[i].iter().any(|&v| v != 0));
-        let cr_nz: [bool; 4] =
-            std::array::from_fn(|i| cbp_chroma == 2 && v_ac_levels[i].iter().any(|&v| v != 0));
+        let chroma_nz_mask = chroma_nz_mask_from_chroma_block(&chroma_block, n_chroma_blk);
         MbTrial {
             luma_cost: mb_luma_cost,
             deblock: MbDeblockInfo {
                 is_intra: true,
                 qp_y,
                 luma_nonzero_4x4,
-                chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+                chroma_nonzero_4x4: chroma_nz_mask,
                 ..Default::default()
             },
         }
@@ -2041,6 +2084,356 @@ fn encode_chroma_residual_inter(
     // bitstream is correct either way; only the rate-distortion trade-
     // off shifts marginally).
     encode_chroma_residual(src_plane, chroma_stride, mb_x, mb_y, pred, qp_c)
+}
+
+/// Round-27 — Chroma block encode result. Holds residual coefficients
+/// (DC + AC, both planes, sized for 4:2:0 or 4:2:2), the chosen
+/// intra-chroma mode, derived `cbp_chroma`, and the reconstructed
+/// chroma residual to be added back to the predictor.
+///
+/// 4:2:0 path fills the first 4 entries of every array; 4:2:2 fills
+/// all 8.
+struct ChromaBlock {
+    pred_mode: IntraChromaMode,
+    cbp_chroma: u8,
+    /// Quantized chroma DC levels for Cb / Cr. Length 4 (4:2:0) or 8
+    /// (4:2:2 — already in spec scan order).
+    dc_cb: [i32; 8],
+    dc_cr: [i32; 8],
+    /// Per-4x4-block AC scan for Cb / Cr. Up to 8 blocks for 4:2:2;
+    /// 4:2:0 uses only the first 4.
+    ac_cb: [[i32; 16]; 8],
+    ac_cr: [[i32; 16]; 8],
+    /// Reconstructed residual (sample-domain) for both planes. Size
+    /// 64 (4:2:0 8x8) or 128 (4:2:2 8x16). Stored in the upper bound
+    /// length so the caller iterates over the right number of rows.
+    recon_cb: Vec<i32>,
+    recon_cr: Vec<i32>,
+    /// Predictor samples used (64 / 128 entries).
+    pred_cb: Vec<i32>,
+    pred_cr: Vec<i32>,
+}
+
+impl ChromaBlock {
+    /// Per-4x4-block AC nonzero flags for Cb / Cr (length 4 for 4:2:0,
+    /// 8 for 4:2:2). Used by the deblock walker's chroma-nonzero mask.
+    fn cb_block_count(chroma_array_type: u32) -> usize {
+        match chroma_array_type {
+            1 => 4,
+            2 => 8,
+            _ => 0,
+        }
+    }
+}
+
+/// Round-27 — pick the best chroma intra-prediction mode (DC / H / V /
+/// Plane) by SAD, encode the residual, reconstruct the samples, and
+/// return everything the caller needs to install the recon, emit the
+/// MB syntax, and update the deblock walker mask.
+///
+/// `chroma_array_type` selects 4:2:0 (1) vs 4:2:2 (2). 4:4:4 is out
+/// of scope and panics.
+#[allow(clippy::too_many_arguments)]
+fn encode_chroma_block(
+    chroma_array_type: u32,
+    frame_u: &[u8],
+    frame_v: &[u8],
+    recon_u: &[u8],
+    recon_v: &[u8],
+    chroma_width: usize,
+    chroma_height: usize,
+    mb_x: usize,
+    mb_y: usize,
+    qp_c: i32,
+) -> ChromaBlock {
+    use crate::encoder::intra_pred::{predict_chroma_8x16, sad_8x16};
+    let (h_chroma, n_blk) = match chroma_array_type {
+        1 => (8usize, 4usize),
+        2 => (16usize, 8usize),
+        _ => panic!("encode_chroma_block: unsupported chroma_array_type {chroma_array_type}"),
+    };
+
+    let mut best_mode = IntraChromaMode::Dc;
+    let mut best_pred_u_64 = [0i32; 64];
+    let mut best_pred_v_64 = [0i32; 64];
+    let mut best_pred_u_128 = [0i32; 128];
+    let mut best_pred_v_128 = [0i32; 128];
+    let mut best_sad = u64::MAX;
+    for &mode in &[
+        IntraChromaMode::Dc,
+        IntraChromaMode::Horizontal,
+        IntraChromaMode::Vertical,
+        IntraChromaMode::Plane,
+    ] {
+        if chroma_array_type == 1 {
+            let (Some(pu), Some(pv)) = (
+                predict_chroma_8x8(mode, recon_u, chroma_width, chroma_height, mb_x, mb_y),
+                predict_chroma_8x8(mode, recon_v, chroma_width, chroma_height, mb_x, mb_y),
+            ) else {
+                continue;
+            };
+            let s = sad_8x8(frame_u, chroma_width, mb_x * 8, mb_y * 8, &pu)
+                + sad_8x8(frame_v, chroma_width, mb_x * 8, mb_y * 8, &pv);
+            if s < best_sad {
+                best_sad = s;
+                best_mode = mode;
+                best_pred_u_64 = pu;
+                best_pred_v_64 = pv;
+            }
+        } else {
+            // 4:2:2
+            let (Some(pu), Some(pv)) = (
+                predict_chroma_8x16(mode, recon_u, chroma_width, chroma_height, mb_x, mb_y),
+                predict_chroma_8x16(mode, recon_v, chroma_width, chroma_height, mb_x, mb_y),
+            ) else {
+                continue;
+            };
+            let s = sad_8x16(frame_u, chroma_width, mb_x * 8, mb_y * 16, &pu)
+                + sad_8x16(frame_v, chroma_width, mb_x * 8, mb_y * 16, &pv);
+            if s < best_sad {
+                best_sad = s;
+                best_mode = mode;
+                best_pred_u_128 = pu;
+                best_pred_v_128 = pv;
+            }
+        }
+    }
+
+    let mut dc_cb = [0i32; 8];
+    let mut dc_cr = [0i32; 8];
+    let mut ac_cb = [[0i32; 16]; 8];
+    let mut ac_cr = [[0i32; 16]; 8];
+    let mut recon_cb = vec![0i32; 8 * h_chroma];
+    let mut recon_cr = vec![0i32; 8 * h_chroma];
+
+    if chroma_array_type == 1 {
+        let (u_dc, u_ac, u_recon) =
+            encode_chroma_residual(frame_u, chroma_width, mb_x, mb_y, &best_pred_u_64, qp_c);
+        let (v_dc, v_ac, v_recon) =
+            encode_chroma_residual(frame_v, chroma_width, mb_x, mb_y, &best_pred_v_64, qp_c);
+        dc_cb[..4].copy_from_slice(&u_dc);
+        dc_cr[..4].copy_from_slice(&v_dc);
+        ac_cb[..4].copy_from_slice(&u_ac);
+        ac_cr[..4].copy_from_slice(&v_ac);
+        recon_cb[..64].copy_from_slice(&u_recon);
+        recon_cr[..64].copy_from_slice(&v_recon);
+    } else {
+        let (u_dc, u_ac, u_recon) =
+            encode_chroma_residual_422(frame_u, chroma_width, mb_x, mb_y, &best_pred_u_128, qp_c);
+        let (v_dc, v_ac, v_recon) =
+            encode_chroma_residual_422(frame_v, chroma_width, mb_x, mb_y, &best_pred_v_128, qp_c);
+        dc_cb = u_dc;
+        dc_cr = v_dc;
+        ac_cb = u_ac;
+        ac_cr = v_ac;
+        recon_cb[..128].copy_from_slice(&u_recon);
+        recon_cr[..128].copy_from_slice(&v_recon);
+    }
+
+    let any_dc_nz =
+        dc_cb[..n_blk].iter().any(|&v| v != 0) || dc_cr[..n_blk].iter().any(|&v| v != 0);
+    let any_ac_nz = ac_cb[..n_blk].iter().any(|blk| blk.iter().any(|&v| v != 0))
+        || ac_cr[..n_blk].iter().any(|blk| blk.iter().any(|&v| v != 0));
+    let cbp_chroma: u8 = if any_ac_nz {
+        2
+    } else if any_dc_nz {
+        1
+    } else {
+        0
+    };
+
+    let pred_cb: Vec<i32> = if chroma_array_type == 1 {
+        best_pred_u_64.to_vec()
+    } else {
+        best_pred_u_128.to_vec()
+    };
+    let pred_cr: Vec<i32> = if chroma_array_type == 1 {
+        best_pred_v_64.to_vec()
+    } else {
+        best_pred_v_128.to_vec()
+    };
+
+    ChromaBlock {
+        pred_mode: best_mode,
+        cbp_chroma,
+        dc_cb,
+        dc_cr,
+        ac_cb,
+        ac_cr,
+        recon_cb,
+        recon_cr,
+        pred_cb,
+        pred_cr,
+    }
+}
+
+/// Round-27 — pack a `ChromaBlock`'s per-4x4 AC nonzero flags into the
+/// 16-bit mask the deblock walker reads. Same packing as the decoder's
+/// `compute_chroma_nonzero_mask`: bits 0..=(n-1) are Cb, bits
+/// 8..=(8+n-1) are Cr, where n = 4 for 4:2:0 and n = 8 for 4:2:2.
+fn chroma_nz_mask_from_chroma_block(block: &ChromaBlock, n_blk: usize) -> u16 {
+    let mut mask = 0u16;
+    if block.cbp_chroma != 2 {
+        return mask;
+    }
+    for k in 0..n_blk {
+        if block.ac_cb[k].iter().any(|&v| v != 0) {
+            mask |= 1u16 << k;
+        }
+        if block.ac_cr[k].iter().any(|&v| v != 0) {
+            mask |= 1u16 << (8 + k);
+        }
+    }
+    mask
+}
+
+/// Round-27 — install the chroma block reconstruction back into the
+/// per-plane recon buffers. 4:2:0 → 8x8 tile per MB. 4:2:2 → 8x16 tile.
+fn install_chroma_recon(
+    chroma_array_type: u32,
+    chroma_width: usize,
+    mb_x: usize,
+    mb_y: usize,
+    block: &ChromaBlock,
+    recon_u: &mut [u8],
+    recon_v: &mut [u8],
+) {
+    let (h_chroma, base_y) = match chroma_array_type {
+        1 => (8usize, mb_y * 8),
+        2 => (16usize, mb_y * 16),
+        _ => return,
+    };
+    for j in 0..h_chroma {
+        for i in 0..8usize {
+            let cx = mb_x * 8 + i;
+            let cy = base_y + j;
+            let pred_u = block.pred_cb[j * 8 + i];
+            let pred_v = block.pred_cr[j * 8 + i];
+            let res_u = if block.cbp_chroma == 0 {
+                0
+            } else {
+                block.recon_cb[j * 8 + i]
+            };
+            let res_v = if block.cbp_chroma == 0 {
+                0
+            } else {
+                block.recon_cr[j * 8 + i]
+            };
+            recon_u[cy * chroma_width + cx] = (pred_u + res_u).clamp(0, 255) as u8;
+            recon_v[cy * chroma_width + cx] = (pred_v + res_v).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// Round-27 — encode one chroma plane's residual (DC + AC) for an 8x16
+/// chroma MB (4:2:2). Returns:
+///   * 8 quantized scan-order DC levels (already in `ChromaDCLevel`
+///     scan order — the decoder consumes this verbatim).
+///   * 8 per-4x4-block AC levels in scan order (AC-only layout).
+///   * Reconstructed 8x16 residual (`[i32; 128]`, row-major).
+///
+/// 8 4x4 sub-blocks per plane laid out as:
+///   (0,0), (4,0), (0,4), (4,4), (0,8), (4,8), (0,12), (4,12)
+/// matching the decoder's `chroma_block_xy` ordering for 4:2:2.
+fn encode_chroma_residual_422(
+    src_plane: &[u8],
+    chroma_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    pred: &[i32; 128],
+    qp_c: i32,
+) -> ([i32; 8], [[i32; 16]; 8], [i32; 128]) {
+    use crate::encoder::transform::{
+        forward_hadamard_4x2, quantize_chroma_dc_422, scan_chroma_dc_422,
+    };
+    use crate::transform::inverse_hadamard_chroma_dc_422;
+
+    // Build sample residual against the predictor.
+    let mut residual = [0i32; 128];
+    for j in 0..16usize {
+        for i in 0..8usize {
+            let s = src_plane[(mb_y * 16 + j) * chroma_stride + mb_x * 8 + i] as i32;
+            residual[j * 8 + i] = s - pred[j * 8 + i];
+        }
+    }
+
+    // Forward 4x4 on each of the 8 sub-blocks. Order matches the
+    // decoder's `chroma_block_xy` for 4:2:2 (raster: 2x4 layout).
+    let blocks_xy: [(usize, usize); 8] = [
+        (0, 0),
+        (4, 0),
+        (0, 4),
+        (4, 4),
+        (0, 8),
+        (4, 8),
+        (0, 12),
+        (4, 12),
+    ];
+    let mut sub_coeffs = [[0i32; 16]; 8];
+    for (k, &(bx, by)) in blocks_xy.iter().enumerate() {
+        let mut block = [0i32; 16];
+        for j in 0..4 {
+            for i in 0..4 {
+                block[j * 4 + i] = residual[(by + j) * 8 + bx + i];
+            }
+        }
+        sub_coeffs[k] = forward_core_4x4(&block);
+    }
+
+    // Collect the 8 DCs into a row-major 4x2 layout. Block (xO, yO):
+    //   k=0 (0,0)  → c[0,0]
+    //   k=1 (4,0)  → c[0,1]
+    //   k=2 (0,4)  → c[1,0]
+    //   k=3 (4,4)  → c[1,1]
+    //   k=4 (0,8)  → c[2,0]
+    //   k=5 (4,8)  → c[2,1]
+    //   k=6 (0,12) → c[3,0]
+    //   k=7 (4,12) → c[3,1]
+    let dc_in: [i32; 8] = [
+        sub_coeffs[0][0], // c[0,0]
+        sub_coeffs[1][0], // c[0,1]
+        sub_coeffs[2][0], // c[1,0]
+        sub_coeffs[3][0], // c[1,1]
+        sub_coeffs[4][0], // c[2,0]
+        sub_coeffs[5][0], // c[2,1]
+        sub_coeffs[6][0], // c[3,0]
+        sub_coeffs[7][0], // c[3,1]
+    ];
+
+    // Forward 4x2 Hadamard + quantize.
+    let dc_t = forward_hadamard_4x2(&dc_in);
+    let dc_q = quantize_chroma_dc_422(&dc_t, qp_c, true);
+    // Pack into spec scan order so the bitstream can carry it directly.
+    let dc_levels = scan_chroma_dc_422(&dc_q);
+
+    // Quantize AC of each sub-block (positions 1..15 in scan order).
+    let mut ac_levels = [[0i32; 16]; 8];
+    for (k, coeffs) in sub_coeffs.iter().enumerate() {
+        let z = quantize_4x4_ac(coeffs, qp_c, true);
+        ac_levels[k] = zigzag_scan_4x4_ac(&z);
+    }
+
+    // ------- Reconstruct the chroma 8x16 residual -------
+    // §8.5.11.2: inverse Hadamard → per-block DC-preserved inverse.
+    let dc_back = inverse_hadamard_chroma_dc_422(&dc_levels, qp_c, &FLAT_4X4_16, 8)
+        .expect("chroma DC 422 inverse");
+    // dc_back is row-major 4x2 → maps to blocks 0..=7 by (k as above).
+    let dc_block_index_to_dc_back: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+    let mut recon_residual = [0i32; 128];
+    for (k, &(bx, by)) in blocks_xy.iter().enumerate() {
+        let mut coeffs = inverse_scan_4x4_zigzag_ac(&ac_levels[k]);
+        coeffs[0] = dc_back[dc_block_index_to_dc_back[k]];
+        let r = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, &FLAT_4X4_16, 8)
+            .expect("chroma 4x4 422 inverse");
+        for j in 0..4 {
+            for i in 0..4 {
+                recon_residual[(by + j) * 8 + bx + i] = r[j * 4 + i];
+            }
+        }
+    }
+
+    (dc_levels, ac_levels, recon_residual)
 }
 
 /// Encode one chroma plane's residual (DC + AC) for an 8x8 chroma MB,

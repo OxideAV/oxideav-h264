@@ -77,6 +77,7 @@ Round-by-round encoder progress:
 | 23 | B_8x8 + 4× B_Direct_8x8 | Per-8x8 spatial direct (lifts uniform-MV gate via per-partition MVs) |
 | 24 | B_Direct §8.4.1.2.3 temporal | POC-distance-scaled colocated MVs, `direct_temporal_mv_pred` toggle |
 | 26 | Explicit weighted bipred | §7.4.2.2 `weighted_bipred_idc=1`, per-slice `pred_weight_table()` (luma, log2_wd=5), least-squares (w0,w1,off) selector, `explicit_weighted_bipred` toggle. Fade-in fixture: B-slice 1148 → 21 bytes (98 % smaller); ffmpeg cross-decode bit-equivalent. |
+| 27 | 4:2:2 chroma (IDR-only) | §7.3.2.1.1 High 4:2:2 SPS (`profile_idc=122`, `chroma_format_idc=2`), §8.5.11.2 4x2 chroma DC Hadamard, §8.3.4 8x16 chroma intra (DC/H/V/Plane with `yCF=4` and `c=5*V`), `ChromaDc422` CAVLC context, 8 4x4 chroma blocks per plane. ffmpeg cross-decode bit-exact at QP 26; luma PSNR ≥ 40 dB on synthetic gradient. P / B-slice 4:2:2 deferred. |
 
 ## Goals
 

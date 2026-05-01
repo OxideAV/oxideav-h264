@@ -31,6 +31,130 @@ use crate::encoder::bitstream::BitWriter;
 use crate::encoder::cavlc::{encode_residual_block_cavlc, CavlcEncodeError};
 use crate::encoder::transform::zigzag_scan_4x4;
 
+/// §6.2 — Chroma layout selector for the macroblock writer's chroma
+/// residual emission (round 27).
+///
+/// Variants:
+/// * `Yuv420`: 4 chroma DC entries per plane, 4 chroma AC 4x4 blocks
+///   per plane, CAVLC ctx `ChromaDc420`. Existing 4:2:0 path.
+/// * `Yuv422`: 8 chroma DC entries per plane (already in spec scan
+///   order — caller applies [`crate::encoder::transform::scan_chroma_dc_422`]
+///   first), 8 chroma AC 4x4 blocks per plane, CAVLC ctx `ChromaDc422`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromaWriteKind<'a> {
+    /// 4:2:0 chroma layout. The DC arrays are 4-entry, AC are 4-block.
+    Yuv420 {
+        /// Cb DC levels in the order the inverse 2x2 Hadamard expects.
+        chroma_dc_cb: &'a [i32; 4],
+        /// Cr DC levels.
+        chroma_dc_cr: &'a [i32; 4],
+        /// Per-plane AC 4x4 blocks (Cb), AC-only scan layout.
+        chroma_ac_cb: &'a [[i32; 16]; 4],
+        chroma_ac_cr: &'a [[i32; 16]; 4],
+    },
+    /// 4:2:2 chroma layout. The DC arrays are 8-entry already in
+    /// `ChromaDCLevel` scan order (apply
+    /// [`crate::encoder::transform::scan_chroma_dc_422`] before passing
+    /// in). AC arrays are 8-block.
+    Yuv422 {
+        chroma_dc_cb: &'a [i32; 8],
+        chroma_dc_cr: &'a [i32; 8],
+        chroma_ac_cb: &'a [[i32; 16]; 8],
+        chroma_ac_cr: &'a [[i32; 16]; 8],
+    },
+}
+
+impl<'a> ChromaWriteKind<'a> {
+    /// Emit the chroma residual portion of a macroblock per §7.3.5.3.
+    /// Same gate logic for both 4:2:0 and 4:2:2:
+    /// * `cbp_chroma >= 1` → both planes' DC blocks.
+    /// * `cbp_chroma == 2` → both planes' per-4x4-block AC.
+    pub fn emit(self, w: &mut BitWriter, cbp_chroma: u8) -> Result<(), CavlcEncodeError> {
+        debug_assert!(cbp_chroma <= 2);
+        match self {
+            ChromaWriteKind::Yuv420 {
+                chroma_dc_cb,
+                chroma_dc_cr,
+                chroma_ac_cb,
+                chroma_ac_cr,
+            } => {
+                if cbp_chroma > 0 {
+                    encode_residual_block_cavlc(
+                        w,
+                        CoeffTokenContext::ChromaDc420,
+                        4,
+                        chroma_dc_cb,
+                    )?;
+                    encode_residual_block_cavlc(
+                        w,
+                        CoeffTokenContext::ChromaDc420,
+                        4,
+                        chroma_dc_cr,
+                    )?;
+                }
+                if cbp_chroma == 2 {
+                    for blk in chroma_ac_cb {
+                        encode_residual_block_cavlc(
+                            w,
+                            CoeffTokenContext::Numeric(0),
+                            15,
+                            &blk[..15],
+                        )?;
+                    }
+                    for blk in chroma_ac_cr {
+                        encode_residual_block_cavlc(
+                            w,
+                            CoeffTokenContext::Numeric(0),
+                            15,
+                            &blk[..15],
+                        )?;
+                    }
+                }
+            }
+            ChromaWriteKind::Yuv422 {
+                chroma_dc_cb,
+                chroma_dc_cr,
+                chroma_ac_cb,
+                chroma_ac_cr,
+            } => {
+                if cbp_chroma > 0 {
+                    encode_residual_block_cavlc(
+                        w,
+                        CoeffTokenContext::ChromaDc422,
+                        8,
+                        chroma_dc_cb,
+                    )?;
+                    encode_residual_block_cavlc(
+                        w,
+                        CoeffTokenContext::ChromaDc422,
+                        8,
+                        chroma_dc_cr,
+                    )?;
+                }
+                if cbp_chroma == 2 {
+                    for blk in chroma_ac_cb {
+                        encode_residual_block_cavlc(
+                            w,
+                            CoeffTokenContext::Numeric(0),
+                            15,
+                            &blk[..15],
+                        )?;
+                    }
+                    for blk in chroma_ac_cr {
+                        encode_residual_block_cavlc(
+                            w,
+                            CoeffTokenContext::Numeric(0),
+                            15,
+                            &blk[..15],
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// §9.1.2 + Table 9-4(a) Intra column — inverse mapping CBP → codeNum.
 /// `INTRA_CBP_TO_CODENUM_420_422[cbp]` returns the `me(v)` codeNum that
 /// the decoder will map back to `cbp` via `ME_INTRA_420_422`. Entries
@@ -126,7 +250,57 @@ pub fn intra16x16_mb_type_value(pred_mode: u8, cbp_luma: u8, cbp_chroma: u8) -> 
     1 + group * 4 + pred_mode as u32
 }
 
-/// Emit one Intra_16x16 macroblock (CAVLC, I-slice).
+/// Emit one Intra_16x16 macroblock with caller-supplied chroma residual
+/// kind (round 27 — 4:2:0 or 4:2:2).
+///
+/// `nc_ctx` is the `nC` context for the luma DC residual block. With
+/// `cbp_luma == 0` always, the AC TotalCoeff used for nC derivation is
+/// identically zero; the encoder mirrors the decoder by passing
+/// `Numeric(0)` for every MB.
+#[allow(clippy::too_many_arguments)]
+pub fn write_intra16x16_mb_chroma(
+    w: &mut BitWriter,
+    pred_mode: u8,
+    intra_chroma_pred_mode: u8,
+    cbp_luma: u8,
+    cbp_chroma: u8,
+    mb_qp_delta: i32,
+    luma_dc_levels_raster: &[i32; 16],
+    luma_ac_levels: &[[i32; 16]; 16],
+    luma_ac_nc: &[i32; 16],
+    chroma: ChromaWriteKind<'_>,
+    nc_ctx: CoeffTokenContext,
+) -> Result<(), CavlcEncodeError> {
+    let raw = intra16x16_mb_type_value(pred_mode, cbp_luma, cbp_chroma);
+    w.ue(raw);
+    w.ue(intra_chroma_pred_mode as u32);
+    // §7.3.5 — coded_block_pattern absent for Intra_16x16; mb_qp_delta
+    // always present (the luma DC block is always coded).
+    w.se(mb_qp_delta);
+
+    // §7.3.5.3 — Intra_16x16 luma DC.
+    let scan = zigzag_scan_4x4(luma_dc_levels_raster);
+    encode_residual_block_cavlc(w, nc_ctx, 16, &scan)?;
+
+    // §7.3.5.3 — Intra_16x16 luma AC blocks (only when cbp_luma == 15).
+    if cbp_luma == 15 {
+        for blk in 0..16usize {
+            let nc = luma_ac_nc[blk];
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(nc),
+                15,
+                &luma_ac_levels[blk][..15],
+            )?;
+        }
+    }
+
+    // §7.3.5.3 — Chroma residual (DC ± AC, gated by cbp_chroma).
+    chroma.emit(w, cbp_chroma)?;
+    Ok(())
+}
+
+/// Emit one Intra_16x16 macroblock (CAVLC, I-slice). 4:2:0 chroma layout.
 ///
 /// `nc_ctx` is the `nC` context for the luma DC residual block. With
 /// `cbp_luma == 0` always, the AC TotalCoeff used for nC derivation is
@@ -257,7 +431,61 @@ pub struct INxNMcbConfig {
     pub chroma_ac_cr: [[i32; 16]; 4],
 }
 
-/// Emit one I_NxN (Intra_4x4) macroblock (CAVLC, I-slice).
+/// Emit one I_NxN (Intra_4x4) macroblock with caller-supplied chroma
+/// residual kind (round 27 — 4:2:0 or 4:2:2).
+#[allow(clippy::too_many_arguments)]
+pub fn write_i_nxn_mb_chroma(
+    w: &mut BitWriter,
+    prev_intra4x4_pred_mode_flag: &[bool; 16],
+    rem_intra4x4_pred_mode: &[u8; 16],
+    intra_chroma_pred_mode: u8,
+    cbp_luma: u8,
+    cbp_chroma: u8,
+    mb_qp_delta: i32,
+    luma_4x4_levels: &[[i32; 16]; 16],
+    luma_4x4_nc: &[i32; 16],
+    chroma: ChromaWriteKind<'_>,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cbp_luma <= 15);
+    debug_assert!(cbp_chroma <= 2);
+    debug_assert!(intra_chroma_pred_mode <= 3);
+
+    // §7.4.5 — Table 7-11: I_NxN mb_type raw = 0 in I-slice.
+    w.ue(0);
+    for blk in 0..16usize {
+        let flag = prev_intra4x4_pred_mode_flag[blk];
+        w.u(1, if flag { 1 } else { 0 });
+        if !flag {
+            debug_assert!(rem_intra4x4_pred_mode[blk] <= 7);
+            w.u(3, rem_intra4x4_pred_mode[blk] as u32);
+        }
+    }
+    w.ue(intra_chroma_pred_mode as u32);
+    let codenum = intra_cbp_to_codenum_420_422(cbp_luma, cbp_chroma);
+    w.ue(codenum);
+    let needs_qp_delta = cbp_luma > 0 || cbp_chroma > 0;
+    if needs_qp_delta {
+        w.se(mb_qp_delta);
+    }
+    for blk8 in 0..4u8 {
+        if (cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                let nc = luma_4x4_nc[blk];
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(nc),
+                    16,
+                    &luma_4x4_levels[blk],
+                )?;
+            }
+        }
+    }
+    chroma.emit(w, cbp_chroma)?;
+    Ok(())
+}
+
+/// Emit one I_NxN (Intra_4x4) macroblock (CAVLC, I-slice). 4:2:0 chroma.
 pub fn write_i_nxn_mb(w: &mut BitWriter, cfg: &INxNMcbConfig) -> Result<(), CavlcEncodeError> {
     debug_assert!(cfg.cbp_luma <= 15);
     debug_assert!(cfg.cbp_chroma <= 2);

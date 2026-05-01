@@ -376,6 +376,111 @@ pub fn quantize_chroma_dc(coeff: &[i32; 4], qp_c: i32, is_intra: bool) -> [i32; 
 }
 
 // ---------------------------------------------------------------------------
+// §8.5.11.2 — chroma DC (4:2:2): forward 2x4 Hadamard + quantization.
+// Round 27.
+// ---------------------------------------------------------------------------
+
+/// Forward 4x2 Hadamard for chroma DC (4:2:2). `dc` is row-major in the
+/// 4x2 layout `[c[0,0], c[0,1], c[1,0], c[1,1], c[2,0], c[2,1],
+/// c[3,0], c[3,1]]` — i.e. 4 rows of 2 columns. Mirrors the inverse in
+/// [`crate::transform::inverse_hadamard_chroma_dc_422`] (eq. 8-325).
+///
+/// Returns the 8 frequency-domain coefficients in the same row-major
+/// layout. The Hadamard is self-inverse so this is the same matrix
+/// multiply as the decoder, just expressed forward.
+pub fn forward_hadamard_4x2(dc: &[i32; 8]) -> [i32; 8] {
+    // c is a 4x2 matrix laid out as 4 rows × 2 cols.
+    // f = Hv * c * Hh, where
+    //   Hv = [[1,  1,  1,  1],
+    //         [1,  1, -1, -1],
+    //         [1, -1, -1,  1],
+    //         [1, -1,  1, -1]]  (4x4 acts on the row dimension)
+    //   Hh = [[1,  1],
+    //         [1, -1]]            (2x2 acts on the column dimension)
+    let c00 = dc[0];
+    let c01 = dc[1];
+    let c10 = dc[2];
+    let c11 = dc[3];
+    let c20 = dc[4];
+    let c21 = dc[5];
+    let c30 = dc[6];
+    let c31 = dc[7];
+
+    // Apply Hv on the left (combines rows).
+    let t00 = c00 + c10 + c20 + c30;
+    let t01 = c01 + c11 + c21 + c31;
+    let t10 = c00 + c10 - c20 - c30;
+    let t11 = c01 + c11 - c21 - c31;
+    let t20 = c00 - c10 - c20 + c30;
+    let t21 = c01 - c11 - c21 + c31;
+    let t30 = c00 - c10 + c20 - c30;
+    let t31 = c01 - c11 + c21 - c31;
+    // Apply Hh on the right (combines columns).
+    [
+        t00 + t01,
+        t00 - t01,
+        t10 + t11,
+        t10 - t11,
+        t20 + t21,
+        t20 - t21,
+        t30 + t31,
+        t30 - t31,
+    ]
+}
+
+/// Quantize the eight 4:2:2 chroma DC coefficients.
+///
+/// Mirrors the decoder's §8.5.11.2 scaling path. The 4:2:2 DC chain
+/// adds an extra `qPDC = qP + 3` shift relative to the 4:2:0 path, so
+/// the encoder's matched right-shift is `qBits + 2` (one extra bit
+/// over the 4:2:0 chroma DC path's `qBits + 1`).
+///
+/// Output is in the same row-major 4x2 layout the forward Hadamard
+/// produced — convert to spec scan order via [`scan_chroma_dc_422`]
+/// before handing to CAVLC.
+pub fn quantize_chroma_dc_422(coeff: &[i32; 8], qp_c: i32, is_intra: bool) -> [i32; 8] {
+    debug_assert!((0..=51).contains(&qp_c));
+    let m = (qp_c.rem_euclid(6)) as usize;
+    let mf = forward_mf_for(m)[0];
+    let qb = q_bits(qp_c) + 2;
+    let f = if is_intra {
+        (1i64 << qb) / 3
+    } else {
+        (1i64 << qb) / 6
+    };
+    let mut z = [0i32; 8];
+    for k in 0..8 {
+        let abs_c = (coeff[k] as i64).unsigned_abs();
+        let prod = abs_c * mf as u64;
+        let level = ((prod as i64 + f) >> qb) as i32;
+        z[k] = if coeff[k] < 0 { -level } else { level };
+    }
+    z
+}
+
+/// Apply the §8.5.4 eq. 8-305 forward raster scan: row-major 4x2 → 8
+/// scan-order entries (`ChromaDCLevel[0..=7]`). Inverse of the
+/// permutation embedded in
+/// [`crate::transform::inverse_hadamard_chroma_dc_422`].
+///
+/// Decoder mapping (verbatim from §8.5.4):
+///   c[0,0]=L[0], c[0,1]=L[2], c[1,0]=L[1], c[1,1]=L[5],
+///   c[2,0]=L[3], c[2,1]=L[6], c[3,0]=L[4], c[3,1]=L[7]
+pub fn scan_chroma_dc_422(rowmajor_4x2: &[i32; 8]) -> [i32; 8] {
+    let c00 = rowmajor_4x2[0];
+    let c01 = rowmajor_4x2[1];
+    let c10 = rowmajor_4x2[2];
+    let c11 = rowmajor_4x2[3];
+    let c20 = rowmajor_4x2[4];
+    let c21 = rowmajor_4x2[5];
+    let c30 = rowmajor_4x2[6];
+    let c31 = rowmajor_4x2[7];
+    // L[0] = c[0,0], L[1] = c[1,0], L[2] = c[0,1], L[3] = c[2,0],
+    // L[4] = c[3,0], L[5] = c[1,1], L[6] = c[2,1], L[7] = c[3,1]
+    [c00, c10, c01, c20, c30, c11, c21, c31]
+}
+
+// ---------------------------------------------------------------------------
 // Zig-zag scan helpers (matched to decoder).
 // ---------------------------------------------------------------------------
 
@@ -542,5 +647,45 @@ mod tests {
                 assert!(err <= (d.abs() / 4 + 8), "d={d} k={k} r={r} err={err}");
             }
         }
+    }
+
+    /// Round-27: 4:2:2 chroma DC round-trip (forward 4x2 hadamard +
+    /// quant + scan + decoder's inverse hadamard).
+    #[test]
+    fn chroma_dc_422_uniform_residual_round_trips_within_tolerance() {
+        use crate::transform::inverse_hadamard_chroma_dc_422;
+        let qp_c = 26;
+        for d in [16i32, 32, -32, 64, -64, 128] {
+            // 8 4x4 sub-blocks per 4:2:2 chroma MB → 8 DC entries, each
+            // = 16 * d (forward 4x4 of uniform `d`).
+            let dc_coeffs = [16 * d; 8];
+            let f = forward_hadamard_4x2(&dc_coeffs);
+            let z = quantize_chroma_dc_422(&f, qp_c, true);
+            let scan = scan_chroma_dc_422(&z);
+            let dc_c = inverse_hadamard_chroma_dc_422(&scan, qp_c, &FLAT_4X4_16, 8).unwrap();
+            for (k, &dc) in dc_c.iter().enumerate() {
+                let r = (dc + 32) >> 6;
+                let err = (r - d).abs();
+                assert!(err <= (d.abs() / 4 + 16), "d={d} k={k} r={r} err={err}",);
+            }
+        }
+    }
+
+    /// Round-27 — sanity-check the forward scan permutation matches the
+    /// decoder's inverse scan order. For an all-distinct row-major input
+    /// the emitted scan list must equal exactly what the decoder reads
+    /// off the bitstream.
+    #[test]
+    fn chroma_dc_422_scan_matches_decoder_inverse() {
+        // Row-major 4x2: [c[0,0], c[0,1], c[1,0], c[1,1], c[2,0], c[2,1], c[3,0], c[3,1]]
+        let rm: [i32; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+        let scan = scan_chroma_dc_422(&rm);
+        // Decoder de-scans ChromaDCLevel[L[0..=7]] into c per:
+        //   c[0,0]=L[0], c[0,1]=L[2], c[1,0]=L[1], c[1,1]=L[5],
+        //   c[2,0]=L[3], c[2,1]=L[6], c[3,0]=L[4], c[3,1]=L[7].
+        // So scan must be [c[0,0], c[1,0], c[0,1], c[2,0], c[3,0], c[1,1], c[2,1], c[3,1]]
+        //               = [rm[0], rm[2], rm[1], rm[4], rm[6], rm[3], rm[5], rm[7]]
+        //               = [10, 30, 20, 50, 70, 40, 60, 80]
+        assert_eq!(scan, [10, 30, 20, 50, 70, 40, 60, 80]);
     }
 }

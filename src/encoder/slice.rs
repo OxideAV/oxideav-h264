@@ -380,6 +380,7 @@ mod tests {
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: 1,
             profile_idc: 66,
+            chroma_format_idc: 1,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig::default());
@@ -443,6 +444,7 @@ mod tests {
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: 1,
             profile_idc: 66,
+            chroma_format_idc: 1,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig::default());
@@ -509,6 +511,7 @@ mod tests {
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: 2,
             profile_idc: 77,
+            chroma_format_idc: 1,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig::default());
@@ -578,6 +581,7 @@ mod tests {
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: 2,
             profile_idc: 77,
+            chroma_format_idc: 1,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {

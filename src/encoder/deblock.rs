@@ -128,6 +128,42 @@ pub fn deblock_recon(
     width_mbs: u32,
     height_mbs: u32,
 ) {
+    deblock_recon_with_chroma_array_type(
+        width,
+        height,
+        chroma_width,
+        chroma_height,
+        recon_y,
+        recon_u,
+        recon_v,
+        mb_infos,
+        chroma_qp_index_offset,
+        width_mbs,
+        height_mbs,
+        /* chroma_array_type */ 1,
+    )
+}
+
+/// Round-27 — variant of [`deblock_recon`] that takes an explicit
+/// `chroma_array_type` (1 = 4:2:0, 2 = 4:2:2). The §8.7 walker reads
+/// the chroma layout from `Picture::chroma_array_type`, so picking the
+/// right value here is sufficient for the chroma deblock pass to use
+/// the 8x16 chroma MB geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn deblock_recon_with_chroma_array_type(
+    width: u32,
+    height: u32,
+    chroma_width: u32,
+    chroma_height: u32,
+    recon_y: &mut [u8],
+    recon_u: &mut [u8],
+    recon_v: &mut [u8],
+    mb_infos: &[MbDeblockInfo],
+    chroma_qp_index_offset: i32,
+    width_mbs: u32,
+    height_mbs: u32,
+    chroma_array_type: u32,
+) {
     debug_assert_eq!(recon_y.len(), (width as usize) * (height as usize));
     debug_assert_eq!(
         recon_u.len(),
@@ -140,8 +176,10 @@ pub fn deblock_recon(
     debug_assert_eq!(mb_infos.len(), (width_mbs as usize) * (height_mbs as usize));
 
     // ------- Build a Picture from the encoder's recon planes. -------
-    // Picture stores samples as i32; promote from u8.
-    let mut pic = Picture::new(width, height, /* chroma_array_type 4:2:0 */ 1, 8, 8);
+    // Picture stores samples as i32; promote from u8. The
+    // `chroma_array_type` argument selects 4:2:0 (1) or 4:2:2 (2)
+    // chroma layouts for the deblock walker.
+    let mut pic = Picture::new(width, height, chroma_array_type, 8, 8);
     for (dst, src) in pic.luma.iter_mut().zip(recon_y.iter()) {
         *dst = *src as i32;
     }

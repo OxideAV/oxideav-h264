@@ -21,6 +21,13 @@
 //! The returned bytes form the RBSP body that goes after the NAL header.
 //! Wrap with [`crate::encoder::nal::build_nal_unit`] using
 //! `NalUnitType::Sps` to obtain a complete Annex B NAL unit.
+//!
+//! Round-27: 4:2:2 (`chroma_format_idc = 2`, profile_idc = 122 — High
+//! 4:2:2). When the caller selects profile 122, the writer emits the
+//! §7.3.2.1.1 chroma-extended group (chroma_format_idc / bit_depth_*
+//! / qpprime / seq_scaling_matrix_present), pinning bit_depth_luma /
+//! bit_depth_chroma at 8 (10/12/14-bit are out of round-27 scope) and
+//! seq_scaling_matrix_present_flag to 0 (flat scaling).
 
 use crate::encoder::bitstream::BitWriter;
 
@@ -43,11 +50,17 @@ pub struct BaselineSpsConfig {
     pub max_num_ref_frames: u32,
     /// §7.4.2.1 — `profile_idc`. Defaults to 66 (Baseline). Round-20
     /// allows 77 (Main) so that B-slices are permitted (§A.2.2).
-    /// Profiles in the chroma-extended group (100, 110, 122, …) are
-    /// **not** supported by this writer because they require additional
-    /// `chroma_format_idc`, `bit_depth_*`, `seq_scaling_matrix_present`
-    /// fields per §7.3.2.1.1.
+    /// Round-27 allows 122 (High 4:2:2) which triggers the
+    /// §7.3.2.1.1 chroma-extended group emission. Other chroma-extended
+    /// profiles (100, 110, 244, …) and bit depths > 8 remain out of
+    /// scope.
     pub profile_idc: u8,
+    /// §7.4.2.1.1 — `chroma_format_idc`. Default 1 (4:2:0). Set to 2
+    /// (4:2:2) when emitting a High 4:2:2 (122) SPS. The writer asserts
+    /// that 4:2:2 is only paired with `profile_idc = 122` (the only
+    /// profile in the chroma-extended group this writer currently
+    /// understands).
+    pub chroma_format_idc: u32,
 }
 
 impl Default for BaselineSpsConfig {
@@ -61,6 +74,7 @@ impl Default for BaselineSpsConfig {
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: 1,
             profile_idc: 66,
+            chroma_format_idc: 1,
         }
     }
 }
@@ -73,10 +87,22 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
 
     // §7.3.2.1.1 — profile_idc.
     debug_assert!(
-        matches!(cfg.profile_idc, 66 | 77 | 88),
-        "this writer only emits SPS bodies for profiles outside the chroma-extended group \
-         (66 = Baseline, 77 = Main, 88 = Extended). Profile {} would require additional \
-         chroma_format_idc / bit_depth_* / seq_scaling_matrix_present_flag fields per §7.3.2.1.1.",
+        matches!(cfg.profile_idc, 66 | 77 | 88 | 122),
+        "this writer only emits SPS bodies for profile_idc ∈ {{66, 77, 88, 122}} \
+         (Baseline / Main / Extended / High 4:2:2). Profile {} would require \
+         additional bit_depth_* / scaling-matrix wiring per §7.3.2.1.1.",
+        cfg.profile_idc,
+    );
+    // Round-27: 4:2:2 is only paired with profile 122 (High 4:2:2). The
+    // other chroma-extended-group profiles aren't emitted by this writer.
+    debug_assert!(
+        matches!(cfg.chroma_format_idc, 1 | 2),
+        "chroma_format_idc {} not in writer scope (round 27: only 1=4:2:0 and 2=4:2:2)",
+        cfg.chroma_format_idc,
+    );
+    debug_assert!(
+        cfg.chroma_format_idc == 1 || cfg.profile_idc == 122,
+        "chroma_format_idc=2 requires profile_idc=122 (High 4:2:2); got profile {}",
         cfg.profile_idc,
     );
     w.u(8, cfg.profile_idc as u32);
@@ -95,8 +121,29 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
     w.u(8, cfg.level_idc as u32);
 
     w.ue(cfg.seq_parameter_set_id);
-    // No chroma-extended fields for profile 66 — chroma_format_idc=1
-    // (4:2:0) is inferred per §7.4.2.1.1.
+    // §7.3.2.1.1 — chroma-extended group. Profile 122 (High 4:2:2)
+    // triggers the chroma_format_idc / bit_depth_* / qpprime /
+    // seq_scaling_matrix_present_flag fields. Round 27 pins bit depth
+    // to 8 and clears scaling-matrix-present (flat scaling lists).
+    if matches!(
+        cfg.profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        w.ue(cfg.chroma_format_idc);
+        if cfg.chroma_format_idc == 3 {
+            // separate_colour_plane_flag — 4:4:4 only, out of scope.
+            w.u(1, 0);
+        }
+        // bit_depth_luma_minus8 = 0 (8-bit luma).
+        w.ue(0);
+        // bit_depth_chroma_minus8 = 0 (8-bit chroma).
+        w.ue(0);
+        // qpprime_y_zero_transform_bypass_flag = 0.
+        w.u(1, 0);
+        // seq_scaling_matrix_present_flag = 0 (use flat scaling lists,
+        // matching what the decoder's flat path expects).
+        w.u(1, 0);
+    }
 
     w.ue(cfg.log2_max_frame_num_minus4);
     // pic_order_cnt_type = 0.
@@ -144,6 +191,7 @@ mod tests {
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: 1,
             profile_idc: 66,
+            chroma_format_idc: 1,
         };
         let rbsp = build_baseline_sps_rbsp(&cfg);
         let sps = Sps::parse(&rbsp).expect("decoder parses our SPS");
@@ -162,5 +210,40 @@ mod tests {
         assert!(sps.frame_mbs_only_flag);
         assert!(sps.frame_cropping.is_none());
         assert!(!sps.vui_parameters_present_flag);
+    }
+
+    #[test]
+    fn high_422_sps_emits_chroma_extended_group() {
+        // §7.3.2.1.1 / §7.4.2.1.1 — profile_idc=122 triggers the
+        // chroma_format_idc / bit_depth_*_minus8 / qpprime /
+        // seq_scaling_matrix_present_flag tail. Round-27 emits
+        // chroma_format_idc=2 (4:2:2), 8-bit depth, no scaling matrix.
+        let cfg = BaselineSpsConfig {
+            seq_parameter_set_id: 0,
+            level_idc: 30,
+            width_in_mbs: 4,
+            height_in_mbs: 4,
+            log2_max_frame_num_minus4: 4,
+            log2_max_poc_lsb_minus4: 4,
+            max_num_ref_frames: 1,
+            profile_idc: 122,
+            chroma_format_idc: 2,
+        };
+        let rbsp = build_baseline_sps_rbsp(&cfg);
+        let sps = Sps::parse(&rbsp).expect("decoder parses our 4:2:2 SPS");
+        assert_eq!(sps.profile_idc, 122);
+        // Profile 122 → constraint_set0_flag is 0 (Baseline-only gate).
+        assert_eq!(sps.constraint_set_flags, 0);
+        assert_eq!(sps.chroma_format_idc, 2);
+        assert!(!sps.separate_colour_plane_flag);
+        assert_eq!(sps.bit_depth_luma_minus8, 0);
+        assert_eq!(sps.bit_depth_chroma_minus8, 0);
+        assert!(!sps.qpprime_y_zero_transform_bypass_flag);
+        assert!(!sps.seq_scaling_matrix_present_flag);
+        // §6.2 — ChromaArrayType == chroma_format_idc when
+        // separate_colour_plane_flag == 0.
+        assert_eq!(sps.chroma_array_type(), 2);
+        assert_eq!(sps.pic_width_in_mbs(), 4);
+        assert_eq!(sps.frame_height_in_mbs(), 4);
     }
 }
