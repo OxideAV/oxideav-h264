@@ -3645,6 +3645,257 @@ fn build_b_predictors(
     (pred_y, pred_u, pred_v)
 }
 
+/// Round-23 — per-8x8 prediction kind for a `B_8x8` MB whose four
+/// sub-MBs are all `B_Direct_8x8`. Each 8x8 partition gets its own
+/// (refIdxL0, refIdxL1, mvL0, mvL1) per §8.4.1.2.2 step 4-7, and the
+/// (refIdxL0 >= 0, refIdxL1 >= 0) pair maps to one of the same three
+/// merge modes the 16x16 path uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPart8x8 {
+    /// L0-only — `refIdxL0 >= 0`, `refIdxL1 == -1`.
+    L0,
+    /// L1-only — `refIdxL0 == -1`, `refIdxL1 >= 0`.
+    L1,
+    /// Both lists, default weighted average `(L0 + L1 + 1) >> 1` per
+    /// §8.4.2.3.1 eq. 8-273.
+    Bi,
+    /// Neither list (would only arise for an all-intra colocated source
+    /// without `directZeroPredictionFlag` correction). Not expected in
+    /// practice — the spatial-direct derivation forces both refs to 0
+    /// when neighbours are all unavailable. We treat this as L0-only with
+    /// mv=0 to keep a single defined predictor in scope.
+    None,
+}
+
+impl DirectPart8x8 {
+    fn uses_l0(self) -> bool {
+        matches!(self, Self::L0 | Self::Bi)
+    }
+    fn uses_l1(self) -> bool {
+        matches!(self, Self::L1 | Self::Bi)
+    }
+}
+
+/// Round-23 — derive the per-8x8 prediction kind for each of the four
+/// sub-MBs of a `B_8x8` macroblock from the §8.4.1.2.2 spatial-direct
+/// derivation result.
+///
+/// With `direct_8x8_inference_flag = 1` (hard-wired in our SPS), the
+/// derivation produces one (mvL0, mvL1, refIdxL0, refIdxL1) per 8x8
+/// partition. The current `BDirectDerivation` shape carries a single
+/// (refIdxL0, refIdxL1) for the whole MB (matching the spec — refIdxLX
+/// is MB-level, not per-partition), so the per-8x8 prediction kind only
+/// varies when the per-8x8 MV grid disagrees AND we want to honour
+/// per-list "off" status when refIdx == -1.
+fn direct_per_8x8_kinds(d: &BDirectDerivation) -> [DirectPart8x8; 4] {
+    let l0_used = d.ref_idx_l0 >= 0;
+    let l1_used = d.ref_idx_l1 >= 0;
+    // §8.4.1.2.2 step 7 colZeroFlag can drive a per-list MV to (0,0)
+    // even when refIdxLX >= 0; that does NOT change predFlagLX, so
+    // L0/L1 still apply at the merge stage. We honour predFlagLX
+    // exactly via refIdxLX sign.
+    let kind = match (l0_used, l1_used) {
+        (true, true) => DirectPart8x8::Bi,
+        (true, false) => DirectPart8x8::L0,
+        (false, true) => DirectPart8x8::L1,
+        (false, false) => DirectPart8x8::None,
+    };
+    [kind; 4]
+}
+
+/// Round-23 — build per-8x8 luma + chroma predictors for a `B_8x8`
+/// macroblock with all-`B_Direct_8x8` sub-MBs. Each 8x8 quadrant uses
+/// its own (mvL0, mvL1) pair from the §8.4.1.2.2 derivation; the
+/// composite is stitched into a 16x16 luma buffer + two 8x8 chroma
+/// buffers (matching the `build_b_predictors` shape so the existing
+/// residual / reconstruction code works unchanged).
+///
+/// For each 8x8 quadrant index `q ∈ 0..4` (raster Z-order: top-left,
+/// top-right, bottom-left, bottom-right), the per-list 8x8 luma + 4x4
+/// chroma predictors are computed via `build_inter_pred_luma_8x8` /
+/// `build_inter_pred_chroma_4x4`. Bi-pred uses the same §8.4.2.3.1
+/// default weighted average `(L0+L1+1)>>1` as 16x16 / 16x8 / 8x16.
+fn build_b_direct_8x8_predictors(
+    kinds: [DirectPart8x8; 4],
+    mv_l0_per_8x8: [Mv; 4],
+    mv_l1_per_8x8: [Mv; 4],
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+) -> ([i32; 256], [i32; 64], [i32; 64]) {
+    let mut pred_y = [0i32; 256];
+    let mut pred_u = [0i32; 64];
+    let mut pred_v = [0i32; 64];
+
+    let chroma_w_l0 = ref_l0.width / 2;
+    let chroma_h_l0 = ref_l0.height / 2;
+    let chroma_w_l1 = ref_l1.width / 2;
+    let chroma_h_l1 = ref_l1.height / 2;
+
+    // §6.4.3 raster-Z order across the four 8x8 quadrants of an MB:
+    //   q=0 → (sub_x=0, sub_y=0)  top-left
+    //   q=1 → (sub_x=1, sub_y=0)  top-right
+    //   q=2 → (sub_x=0, sub_y=1)  bottom-left
+    //   q=3 → (sub_x=1, sub_y=1)  bottom-right
+    for q in 0..4usize {
+        let sub_x = q % 2;
+        let sub_y = q / 2;
+        let kind = kinds[q];
+        let mv0 = mv_l0_per_8x8[q];
+        let mv1 = mv_l1_per_8x8[q];
+
+        // Luma 8x8 predictor for this quadrant.
+        let l0_y = if kind.uses_l0() {
+            Some(build_inter_pred_luma_8x8(
+                ref_l0.recon_y,
+                ref_l0.width,
+                ref_l0.height,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv0,
+            ))
+        } else {
+            None
+        };
+        let l1_y = if kind.uses_l1() {
+            Some(build_inter_pred_luma_8x8(
+                ref_l1.recon_y,
+                ref_l1.width,
+                ref_l1.height,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv1,
+            ))
+        } else {
+            None
+        };
+        let q_y: [i32; 64] = match kind {
+            DirectPart8x8::L0 => l0_y.unwrap(),
+            DirectPart8x8::L1 => l1_y.unwrap(),
+            DirectPart8x8::Bi => {
+                let l0 = l0_y.unwrap();
+                let l1 = l1_y.unwrap();
+                let mut out = [0i32; 64];
+                for i in 0..64 {
+                    out[i] = (l0[i] + l1[i] + 1) >> 1;
+                }
+                out
+            }
+            DirectPart8x8::None => {
+                // Defensive fallback — predict from L0 with mv=0.
+                build_inter_pred_luma_8x8(
+                    ref_l0.recon_y,
+                    ref_l0.width,
+                    ref_l0.height,
+                    mb_x,
+                    mb_y,
+                    sub_x,
+                    sub_y,
+                    Mv::ZERO,
+                )
+            }
+        };
+
+        // Chroma 4x4 predictor (4:2:0) for this quadrant.
+        let l0_u = if kind.uses_l0() {
+            Some(build_inter_pred_chroma_4x4(
+                ref_l0.recon_u,
+                chroma_w_l0,
+                chroma_h_l0,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv0,
+            ))
+        } else {
+            None
+        };
+        let l0_v = if kind.uses_l0() {
+            Some(build_inter_pred_chroma_4x4(
+                ref_l0.recon_v,
+                chroma_w_l0,
+                chroma_h_l0,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv0,
+            ))
+        } else {
+            None
+        };
+        let l1_u = if kind.uses_l1() {
+            Some(build_inter_pred_chroma_4x4(
+                ref_l1.recon_u,
+                chroma_w_l1,
+                chroma_h_l1,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv1,
+            ))
+        } else {
+            None
+        };
+        let l1_v = if kind.uses_l1() {
+            Some(build_inter_pred_chroma_4x4(
+                ref_l1.recon_v,
+                chroma_w_l1,
+                chroma_h_l1,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv1,
+            ))
+        } else {
+            None
+        };
+        let merge_chroma = |c0: Option<[i32; 16]>, c1: Option<[i32; 16]>| -> [i32; 16] {
+            match kind {
+                DirectPart8x8::L0 => c0.unwrap(),
+                DirectPart8x8::L1 => c1.unwrap(),
+                DirectPart8x8::Bi => {
+                    let a = c0.unwrap();
+                    let b = c1.unwrap();
+                    let mut out = [0i32; 16];
+                    for i in 0..16 {
+                        out[i] = (a[i] + b[i] + 1) >> 1;
+                    }
+                    out
+                }
+                DirectPart8x8::None => c0.unwrap_or([0; 16]),
+            }
+        };
+        let q_u = merge_chroma(l0_u, l1_u);
+        let q_v = merge_chroma(l0_v, l1_v);
+
+        // Stitch the 8x8 luma + 4x4 chroma quadrants into the 16x16 /
+        // 8x8 plane buffers.
+        for j in 0..8usize {
+            for i in 0..8usize {
+                let dst_y = (sub_y * 8 + j) * 16 + sub_x * 8 + i;
+                pred_y[dst_y] = q_y[j * 8 + i];
+            }
+        }
+        for j in 0..4usize {
+            for i in 0..4usize {
+                let dst_c = (sub_y * 4 + j) * 8 + sub_x * 4 + i;
+                pred_u[dst_c] = q_u[j * 4 + i];
+                pred_v[dst_c] = q_v[j * 4 + i];
+            }
+        }
+    }
+    (pred_y, pred_u, pred_v)
+}
+
 /// SAD between a 16x16 source block (at MB `(mb_x, mb_y)` of `src_y`) and
 /// a 16x16 luma predictor buffer in row-major i32 (clamped to 0..=255 to
 /// match what the decoder writes after weighted-pred clipping).
@@ -4784,6 +5035,40 @@ fn deblock_mv_arr_b(
     }
 }
 
+/// Round-23 — build the per-4x4 MV / per-8x8 ref / per-8x8 POC arrays
+/// for the §8.7 deblocker on a `B_8x8` + 4× `B_Direct_8x8` macroblock.
+/// Each 8x8 quadrant carries its own per-list MV (from the §8.4.1.2.2
+/// derivation); within a quadrant all four 4x4 blocks share the
+/// quadrant's MV (`direct_8x8_inference_flag = 1`). When `ref_idx` is
+/// negative the list is unused for this MB and all per-4x4 MVs / refs /
+/// pocs are zeroed-out / sentinel.
+fn deblock_arrays_per_8x8_direct(
+    mv_per_8x8: [Mv; 4],
+    ref_idx: i32,
+    poc_sentinel: i32,
+) -> ([(i16, i16); 16], [i8; 4], [i32; 4]) {
+    let used = ref_idx >= 0;
+    if !used {
+        return ([(0, 0); 16], [-1; 4], [i32::MIN; 4]);
+    }
+    let mut mvs = [(0i16, 0i16); 16];
+    // §6.4.3 raster-Z 4x4 indexing; LUMA_4X4_BLK[blk] returns (4x4-bx,
+    // 4x4-by) ∈ 0..4 × 0..4. The containing 8x8 quadrant is
+    // (bx/2, by/2) → quadrant index = (by/2)*2 + bx/2.
+    for (blk, slot) in mvs.iter_mut().enumerate() {
+        let (bx, by) = LUMA_4X4_BLK[blk];
+        let q = (by / 2) * 2 + (bx / 2);
+        let mv = mv_per_8x8[q];
+        *slot = (
+            mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        );
+    }
+    let refs = [ref_idx.clamp(i8::MIN as i32, i8::MAX as i32) as i8; 4];
+    let pocs = [poc_sentinel; 4];
+    (mvs, refs, pocs)
+}
+
 impl Encoder {
     /// Round-20 — encode one B-frame using `ref_l0` (typically the IDR /
     /// older anchor) and `ref_l1` (typically the next anchor — the prior
@@ -5127,6 +5412,39 @@ impl Encoder {
                 _ => (false, [0i32; 256], [0i32; 64], [0i32; 64], u32::MAX),
             };
 
+        // 2.6 Round-23 — `B_8x8` with all four sub_mb_type =
+        // `B_Direct_8x8`. This honours the per-8x8 MVs produced by the
+        // §8.4.1.2.2 step-7 colZeroFlag override (which can drive
+        // individual partitions' MVs to (0,0) while leaving others on
+        // the median MVpred), as well as any future per-8x8 refIdx
+        // disagreement. Compute the per-8x8 stitched predictor and its
+        // SAD whenever direct_pred_kind is well-defined; the BMode
+        // selector below picks among {direct uniform, direct per-8x8,
+        // explicit, partition} on Lagrangian cost.
+        let direct_8x8_kinds = direct_per_8x8_kinds(&direct);
+        let (
+            direct_8x8_competitive,
+            direct_8x8_pred_y,
+            direct_8x8_pred_u,
+            direct_8x8_pred_v,
+            direct_8x8_sad,
+        ) = match direct_pred_kind {
+            Some(_) => {
+                let (dy, du, dv) = build_b_direct_8x8_predictors(
+                    direct_8x8_kinds,
+                    direct.mv_l0_per_8x8,
+                    direct.mv_l1_per_8x8,
+                    ref_l0,
+                    ref_l1,
+                    mb_x,
+                    mb_y,
+                );
+                let dsad = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &dy);
+                (true, dy, du, dv, dsad)
+            }
+            None => (false, [0i32; 256], [0i32; 64], [0i32; 64], u32::MAX),
+        };
+
         // 3. Pick the candidate that minimises a Lagrangian cost
         //    `J = SAD_luma + λ · R_syntax`. Direct mode emits the
         //    smallest syntax block (just `mb_type=0 + cbp`, or nothing
@@ -5149,6 +5467,15 @@ impl Encoder {
         // / smooth content where ME is searching a flat SAD landscape.
         enum BMode {
             Direct,
+            /// Round-23: `B_8x8` with all four sub_mb_type=B_Direct_8x8.
+            /// Same MV / ref derivation as Direct (§8.4.1.2.2), but with
+            /// per-8x8 motion compensation honouring the colZeroFlag
+            /// step-7 per-partition overrides. Bigger MB syntax than
+            /// `B_Direct_16x16` (mb_type=22 ue(9 bits) + 4× sub_mb_type
+            /// ue(1 bit) = 13 bits before cbp), so only chosen when
+            /// direct_8x8_sad beats direct_uniform_sad by more than the
+            /// extra-syntax cost.
+            DirectPer8x8,
             Explicit(BPred16x16),
         }
         // Per-MB Lagrangian penalty applied to explicit candidates
@@ -5165,12 +5492,37 @@ impl Encoder {
             let lambda = (qp_y / 6).clamp(0, 8) as u32;
             (lambda + 1) * 16
         };
-        let chosen_mode: BMode = if direct_competitive
-            && direct_sad <= sad_bi.saturating_add(direct_bias_sad)
-            && direct_sad <= sad_l0.saturating_add(direct_bias_sad)
-            && direct_sad <= sad_l1.saturating_add(direct_bias_sad)
+        // Round-23 — extra cost for B_8x8+all-Direct relative to
+        // B_Direct_16x16: ~13 - 1 = ~12 bits of MB header (mb_type 22 +
+        // 4× sub_mb_type=0 = 13 bits, vs B_Direct_16x16's 1 bit
+        // mb_type=0). Bias the selector against per-8x8 direct so we
+        // only switch when the per-8x8 motion materially beats the
+        // single-MV uniform predictor.
+        let direct_8x8_bias_sad: u32 = {
+            let lambda = (qp_y / 6).clamp(0, 8) as u32;
+            (lambda + 1) * 12
+        };
+        // Best direct candidate (between uniform B_Direct_16x16 and
+        // per-8x8 B_8x8+all-Direct). Pick uniform when its SAD plus the
+        // per-8x8 syntax-cost bias still beats the per-8x8 SAD.
+        let prefer_per_8x8 = direct_8x8_competitive
+            && (!direct_competitive
+                || direct_8x8_sad.saturating_add(direct_8x8_bias_sad) < direct_sad);
+        let (best_direct_competitive, best_direct_sad, best_direct_is_per_8x8) = if prefer_per_8x8 {
+            (direct_8x8_competitive, direct_8x8_sad, true)
+        } else {
+            (direct_competitive, direct_sad, false)
+        };
+        let chosen_mode: BMode = if best_direct_competitive
+            && best_direct_sad <= sad_bi.saturating_add(direct_bias_sad)
+            && best_direct_sad <= sad_l0.saturating_add(direct_bias_sad)
+            && best_direct_sad <= sad_l1.saturating_add(direct_bias_sad)
         {
-            BMode::Direct
+            if best_direct_is_per_8x8 {
+                BMode::DirectPer8x8
+            } else {
+                BMode::Direct
+            }
         } else if sad_bi <= sad_l0 && sad_bi <= sad_l1 {
             BMode::Explicit(BPred16x16::Bi)
         } else if sad_l0 <= sad_l1 {
@@ -5192,6 +5544,23 @@ impl Encoder {
                     direct_pred_v,
                     direct.mv_l0(),
                     direct.mv_l1(),
+                )
+            }
+            BMode::DirectPer8x8 => {
+                // The MB-level (eff_mv_l0, eff_mv_l1) returned here is
+                // only used for downstream grid + deblock setup when
+                // partition_choice is None (the per-8x8 path patches its
+                // own per-8x8 MVs into the grid further below), so we
+                // hand back the top-left 8x8's MV as a representative —
+                // the real per-8x8 grid update happens in the explicit
+                // per-8x8 branch after `partition_choice` is settled.
+                (
+                    direct_pred_kind.expect("DirectPer8x8 chosen → direct_pred_kind set"),
+                    direct_8x8_pred_y,
+                    direct_8x8_pred_u,
+                    direct_8x8_pred_v,
+                    direct.mv_l0_per_8x8[0],
+                    direct.mv_l1_per_8x8[0],
                 )
             }
             BMode::Explicit(BPred16x16::Bi) => (
@@ -5220,6 +5589,10 @@ impl Encoder {
             ),
         };
         let mut is_direct = matches!(chosen_mode, BMode::Direct);
+        // Round-23 — when DirectPer8x8 is chosen, we still want the
+        // partition-mode override below to be DISABLED (Direct paths
+        // never pair with explicit 16x8 / 8x16 partition shapes).
+        let is_direct_per_8x8 = matches!(chosen_mode, BMode::DirectPer8x8);
 
         // ---- Round-22: try 16x8 / 8x16 partition modes ----
         //
@@ -5273,6 +5646,7 @@ impl Encoder {
         // Best 16x16 SAD = the SAD of the chosen 16x16-mode predictor.
         let best_16x16_sad = match chosen_mode {
             BMode::Direct => direct_sad,
+            BMode::DirectPer8x8 => direct_8x8_sad,
             BMode::Explicit(BPred16x16::Bi) => sad_bi,
             BMode::Explicit(BPred16x16::L0) => sad_l0,
             BMode::Explicit(BPred16x16::L1) => sad_l1,
@@ -5332,9 +5706,12 @@ impl Encoder {
         let mut partition_choice: Option<PartitionChoiceB> = None;
         // Don't override Direct: it may collapse to B_Skip (0 bits of MB
         // syntax) once the residual quantises to zero, beating any
-        // partition mode by a large margin. Partition mode override only
-        // applies to explicit-inter 16x16 candidates.
-        if !is_direct && part_winner_sad < part_threshold {
+        // partition mode by a large margin. Same for DirectPer8x8 — it
+        // emits the per-8x8 sub_mb_type=B_Direct_8x8 path which is
+        // mutually exclusive with the explicit 16x8 / 8x16 partition
+        // shapes. Partition mode override only applies to explicit-inter
+        // 16x16 candidates.
+        if !is_direct && !is_direct_per_8x8 && part_winner_sad < part_threshold {
             partition_choice = Some(match part_winner {
                 PartitionShape::P16x8 => PartitionChoiceB {
                     shape: PartitionShape::P16x8,
@@ -5553,6 +5930,26 @@ impl Encoder {
                 };
                 crate::encoder::macroblock::write_b_direct_16x16_mb(sw, &dcfg)
                     .expect("write B_Direct_16x16 mb");
+            } else if is_direct_per_8x8 {
+                // Round-23 — `B_8x8` with all four sub_mb_type =
+                // `B_Direct_8x8`. The decoder re-derives all four
+                // (mvL0, mvL1, refIdxL0, refIdxL1) per §8.4.1.2.2 (we
+                // already mirror that derivation in
+                // `b_spatial_direct_derive`), so no MV / refIdx fields
+                // appear in the bitstream — only cbp + residuals.
+                let dcfg = crate::encoder::macroblock::B8x8AllDirectMcbConfig {
+                    cbp_luma,
+                    cbp_chroma,
+                    mb_qp_delta: 0,
+                    luma_4x4_levels: luma_4x4_levels_scan,
+                    luma_4x4_nc,
+                    chroma_dc_cb: u_dc_levels,
+                    chroma_dc_cr: v_dc_levels,
+                    chroma_ac_cb: u_ac_levels,
+                    chroma_ac_cr: v_ac_levels,
+                };
+                crate::encoder::macroblock::write_b_8x8_all_direct_mb(sw, &dcfg)
+                    .expect("write B_8x8 + 4× B_Direct_8x8 mb");
             } else if let Some(pc) = partition_choice.as_ref() {
                 use crate::encoder::macroblock::{
                     write_b_16x8_mb, write_b_8x16_mb, B16x8McbConfig, B8x16McbConfig,
@@ -5620,19 +6017,47 @@ impl Encoder {
         //     the per-8x8 slots carry per-partition MVs (top half =
         //     slots 0/1, bottom = 2/3 for 16x8; left = 0/2, right = 1/3
         //     for 8x16). For 16x16 / Direct, all four slots share the
-        //     single MV.
-        let (l0_mvs_8x8, l0_refs_8x8, l0_used) = grid_state_b(
-            partition_choice.as_ref(),
-            true, // L0
-            pred,
-            eff_mv_l0,
-        );
-        let (l1_mvs_8x8, l1_refs_8x8, l1_used) = grid_state_b(
-            partition_choice.as_ref(),
-            false, // L1
-            pred,
-            eff_mv_l1,
-        );
+        //     single MV. For Round-23 DirectPer8x8, every slot carries
+        //     its own (mvL0, mvL1, refIdxL0, refIdxL1) per the
+        //     §8.4.1.2.2 derivation.
+        let (l0_mvs_8x8, l0_refs_8x8, l0_used) = if is_direct_per_8x8 {
+            let used = direct.ref_idx_l0 >= 0;
+            (
+                direct.mv_l0_per_8x8,
+                if used {
+                    [direct.ref_idx_l0; 4]
+                } else {
+                    [-1; 4]
+                },
+                used,
+            )
+        } else {
+            grid_state_b(
+                partition_choice.as_ref(),
+                true, // L0
+                pred,
+                eff_mv_l0,
+            )
+        };
+        let (l1_mvs_8x8, l1_refs_8x8, l1_used) = if is_direct_per_8x8 {
+            let used = direct.ref_idx_l1 >= 0;
+            (
+                direct.mv_l1_per_8x8,
+                if used {
+                    [direct.ref_idx_l1; 4]
+                } else {
+                    [-1; 4]
+                },
+                used,
+            )
+        } else {
+            grid_state_b(
+                partition_choice.as_ref(),
+                false, // L1
+                pred,
+                eff_mv_l1,
+            )
+        };
         *mv_grid_l0.slot_mut(mb_x, mb_y) = if l0_used {
             MvGridSlot {
                 available: true,
@@ -5670,17 +6095,24 @@ impl Encoder {
         // 11. Per-4x4 nonzero mask + per-list MVs/refs/POCs for the §8.7
         //     deblock walker. For partition modes the per-4x4 MVs follow
         //     the §8.7.2.1 partition layout. POCs use the same anchor-
-        //     layout sentinel as the 16x16 path.
+        //     layout sentinel as the 16x16 path. For Round-23
+        //     DirectPer8x8 each 4x4 carries its containing 8x8's MV.
         let luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
         let cb_nz: [bool; 4] =
             std::array::from_fn(|i| cbp_chroma == 2 && u_ac_levels[i].iter().any(|&v| v != 0));
         let cr_nz: [bool; 4] =
             std::array::from_fn(|i| cbp_chroma == 2 && v_ac_levels[i].iter().any(|&v| v != 0));
 
-        let (mv_l0_arr, ref_idx_l0, ref_poc_l0) =
-            deblock_mv_arr_b(partition_choice.as_ref(), true, pred, eff_mv_l0, 0i32);
-        let (mv_l1_arr, ref_idx_l1, ref_poc_l1) =
-            deblock_mv_arr_b(partition_choice.as_ref(), false, pred, eff_mv_l1, 1000i32);
+        let (mv_l0_arr, ref_idx_l0, ref_poc_l0) = if is_direct_per_8x8 {
+            deblock_arrays_per_8x8_direct(direct.mv_l0_per_8x8, direct.ref_idx_l0, 0i32)
+        } else {
+            deblock_mv_arr_b(partition_choice.as_ref(), true, pred, eff_mv_l0, 0i32)
+        };
+        let (mv_l1_arr, ref_idx_l1, ref_poc_l1) = if is_direct_per_8x8 {
+            deblock_arrays_per_8x8_direct(direct.mv_l1_per_8x8, direct.ref_idx_l1, 1000i32)
+        } else {
+            deblock_mv_arr_b(partition_choice.as_ref(), false, pred, eff_mv_l1, 1000i32)
+        };
 
         MbDeblockInfo {
             is_intra: false,

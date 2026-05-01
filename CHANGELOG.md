@@ -98,6 +98,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: **B_8x8 with all four `sub_mb_type = B_Direct_8x8` (round
+  23)** — Table 7-14 raw mb_type 22 (`B_8x8`) + Table 7-18 raw
+  sub_mb_type 0 (`B_Direct_8x8`) ×4. Zero MV / refIdx fields in the
+  bitstream — the decoder re-derives all four per-8x8 (mvL0, mvL1,
+  refIdxL0, refIdxL1) per §8.4.1.2.2 (spatial direct, since
+  `direct_spatial_mv_pred_flag = 1` in our slice header). With
+  `direct_8x8_inference_flag = 1` (hard-wired in our SPS), each 8x8
+  sub-MB carries one (mvL0, mvL1) pair shared across its four 4x4
+  sub-partitions. The encoder mirrors the §8.4.1.2.2 derivation locally
+  (already present from round 21), now exercises the per-8x8 MV grid
+  it produces by stitching four independent 8x8 luma + 4x4 chroma
+  predictors into a 16x16 / 8x8 buffer and trial-coding it as a third
+  Direct candidate (uniform `B_Direct_16x16` from round 21 + per-8x8
+  `B_8x8`+all-Direct from round 23 + explicit/partition modes from
+  round 22). Lifts the round-21 "uniform-only" gate that previously
+  rejected Direct when the §8.4.1.2.2 step-7 colZeroFlag drove
+  per-partition MVs to disagree. Lagrangian rate bias `(qp_y/6+1)*12`
+  SAD units favours the smaller-syntax `B_Direct_16x16` over per-8x8
+  Direct when the per-8x8 SAD doesn't materially beat the uniform one
+  (per-8x8 syntax cost: mb_type=22 ue(9) + 4× sub_mb_type=0 ue(1) = 13
+  bits vs B_Direct_16x16's 1-bit mb_type=0). New writer
+  `write_b_8x8_all_direct_mb` + config `B8x8AllDirectMcbConfig`. The
+  encoder's per-8x8 grid update + per-4x4 deblock-walker MV array
+  honour the §8.4.1.2.2 derivation's per-8x8 MVs so the decoder's bs
+  derivation sees the same MVs as the encoder. Three new integration
+  fixtures (`integration_b_8x8_direct.rs`) verify bit-exact ffmpeg /
+  libavcodec interop on a synthetic IPB midpoint fixture, plus two new
+  unit tests for the writer (Table 7-14 / 7-18 round-trip + 14-bit
+  zero-residual emit count). Round-23 caveats: spatial direct only
+  (no temporal direct §8.4.1.2.3), CAVLC only, no per-sub-MB-partition
+  granularity (B_8x8 paths with mixed sub_mb_type ∈ {B_Direct_8x8,
+  B_L0_8x8, B_L1_8x8, B_Bi_8x8, …} are out of scope).
 - encoder: **B-slice 16x8 / 8x16 partition modes (round 22)** — Table
   7-14 raw mb_types 4..=21 (`B_L0_L0_16x8` through `B_Bi_Bi_8x16`). Per-
   partition refIdx, MV, prediction mode (L0 / L1 / Bi), and §8.4.1.3

@@ -1221,6 +1221,157 @@ fn write_b_two_part_residuals(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Round 23 — B_8x8 with all four sub_mb_type = B_Direct_8x8
+// ---------------------------------------------------------------------------
+//
+// Spec layout (§7.3.5 + §7.3.5.2 + §7.4.5 Table 7-14 + Table 7-18):
+//
+//   mb_type ue(v)                     -- raw 22 = B_8x8 (Table 7-14)
+//   sub_mb_pred(B_8x8) {
+//     for i in 0..4: sub_mb_type[i]   -- raw 0 = B_Direct_8x8 (Table 7-18),
+//                                        ue(v) "1" each (4 bits total).
+//     -- ref_idx_l0/_l1 are gated on `sub_mb_type[i] != B_Direct_8x8` and
+//        `SubMbPredMode != Pred_L1/_L0`. With every sub_mb_type =
+//        B_Direct_8x8 the gate fails for all four → no ref_idx fields.
+//     -- mvd_l0/_l1 same gating → no mvd fields.
+//   }
+//   coded_block_pattern me(v)         -- inter table (Table 9-4 column 2)
+//   if (cbp_luma>0 || cbp_chroma>0): mb_qp_delta se(v)
+//   ... residuals (same layout as the 16x16 / 16x8 / 8x16 paths) ...
+//
+// The decoder fully re-derives the per-8x8 (refIdxL0, refIdxL1, mvL0,
+// mvL1) per §8.4.1.2.2 (spatial direct, since
+// `direct_spatial_mv_pred_flag = 1` in our slice header). With
+// `direct_8x8_inference_flag = 1` (hard-wired in our SPS), every 8x8
+// sub-MB carries one (mvL0, mvL1) pair shared across its four 4x4
+// sub-partitions, so the encoder mirrors that derivation locally and
+// builds the 16x16 luma + 8x8 chroma predictors as four independent
+// 8x8 / 4x4 quadrants stitched together.
+//
+// Spec sections cited:
+//   §7.3.5            — macroblock_layer (this file already covers
+//                       I_16x16 / inter paths)
+//   §7.3.5.2          — sub_mb_pred() syntax with sub_mb_type[mbPartIdx]
+//   §7.4.5 Table 7-14 — mb_type=22 → B_8x8
+//   §7.4.5 Table 7-18 — sub_mb_type=0 → B_Direct_8x8 (NumSubMbPart=4
+//                       conceptually but with direct_8x8_inference_flag=1
+//                       a single MV/refIdx pair drives the whole 8x8;
+//                       see §8.4.1.2 NOTE 3)
+//   §8.4.1.2          — direct mode entry; B_Direct_8x8 dispatch
+//   §8.4.1.2.2        — spatial direct derivation (steps 4-7)
+//   §9.1.2 / Table 9-4(a) — inter CBP me(v) (already inverse-tabled here)
+
+/// Configuration for one B-slice **B_8x8** macroblock with every
+/// `sub_mb_type` equal to `B_Direct_8x8`. Round-23 entry point.
+///
+/// No `mvd_*`, no `ref_idx_*` in the bitstream — the decoder derives all
+/// four (mvL0, mvL1, refIdxL0, refIdxL1) pairs per §8.4.1.2.2.
+///
+/// Layout per §7.3.5 / §7.3.5.2 with `mb_type = 22`:
+///
+/// ```text
+///   mb_type ue(v)                      (codeNum 22 → 0000 0010 111)
+///   for i in 0..4:
+///     sub_mb_type[i] ue(v)             (codeNum 0 = B_Direct_8x8 → "1")
+///   coded_block_pattern me(v)          (inter Table 9-4(a))
+///   if cbp_luma > 0 || cbp_chroma > 0:
+///     mb_qp_delta se(v)
+///   if cbp_luma > 0:
+///     16 luma 4x4 residuals (raster-Z, by 8x8 quadrant)
+///   if cbp_chroma >= 1: chroma DC Cb, Cr
+///   if cbp_chroma == 2: chroma AC Cb (4), Cr (4)
+/// ```
+pub struct B8x8AllDirectMcbConfig {
+    /// `cbp_luma` ∈ 0..=15.
+    pub cbp_luma: u8,
+    /// `cbp_chroma` ∈ {0, 1, 2}.
+    pub cbp_chroma: u8,
+    /// `mb_qp_delta` per §7.4.5. Only emitted when (cbp_luma>0 || cbp_chroma>0).
+    pub mb_qp_delta: i32,
+    /// 16 4x4 luma residual blocks in §6.4.3 raster-Z order.
+    pub luma_4x4_levels: [[i32; 16]; 16],
+    /// Per-luma-4x4-block `nC` (CAVLC neighbour context).
+    pub luma_4x4_nc: [i32; 16],
+    /// 4 quantized chroma DC levels (Cb).
+    pub chroma_dc_cb: [i32; 4],
+    /// 4 quantized chroma DC levels (Cr).
+    pub chroma_dc_cr: [i32; 4],
+    /// Per-4x4-block chroma AC levels (Cb), AC-only scan layout.
+    pub chroma_ac_cb: [[i32; 16]; 4],
+    /// Per-4x4-block chroma AC levels (Cr).
+    pub chroma_ac_cr: [[i32; 16]; 4],
+}
+
+/// Emit one B-slice `B_8x8` macroblock with all four sub-MBs as
+/// `B_Direct_8x8` (CAVLC, round 23).
+///
+/// `mb_type = 22` (raw value in Table 7-14). Each `sub_mb_type[i] = 0`
+/// (B_Direct_8x8 per Table 7-18). No mvd / ref_idx in the bitstream —
+/// the decoder derives all four per-8x8 (mvL0, mvL1, refIdxL0,
+/// refIdxL1) pairs per §8.4.1.2 (spatial direct here).
+pub fn write_b_8x8_all_direct_mb(
+    w: &mut BitWriter,
+    cfg: &B8x8AllDirectMcbConfig,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+
+    // §7.4.5 Table 7-14 — raw mb_type 22 = B_8x8.
+    w.ue(22);
+
+    // §7.3.5.2 — sub_mb_type[0..4]: each = 0 → B_Direct_8x8.
+    for _ in 0..4 {
+        w.ue(0);
+    }
+
+    // §7.3.5.2 — ref_idx_l0/_l1 gated on `sub_mb_type[i] != B_Direct_8x8
+    // && SubMbPredMode != Pred_L1/_L0`. All four sub_mb_types ARE
+    // B_Direct_8x8 → all four gates fail → no ref_idx_l0[i] / ref_idx_l1[i]
+    // emitted. Same story for mvd_l0/_l1.
+
+    // §7.3.5 — coded_block_pattern me(v) using the inter table.
+    let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
+    w.ue(codenum);
+
+    // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
+    let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
+    if needs_qp_delta {
+        w.se(cfg.mb_qp_delta);
+    }
+
+    // §7.3.5.3 — luma residual blocks (when cbp_luma != 0).
+    for blk8 in 0..4u8 {
+        if (cfg.cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                let nc = cfg.luma_4x4_nc[blk];
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(nc),
+                    16,
+                    &cfg.luma_4x4_levels[blk],
+                )?;
+            }
+        }
+    }
+
+    // §7.3.5.3 — chroma residual: same layout as B_Direct_16x16.
+    if cfg.cbp_chroma > 0 {
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
+    }
+    if cfg.cbp_chroma == 2 {
+        for blk in &cfg.chroma_ac_cb {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+        for blk in &cfg.chroma_ac_cr {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,6 +1472,45 @@ mod tests {
     fn b_direct_16x16_mb_type_raw_matches_table_7_14_decode() {
         use crate::macroblock_layer::MbType;
         assert_eq!(MbType::from_b_slice(0).unwrap(), MbType::BDirect16x16);
+    }
+
+    /// §7.4.5 Table 7-14 — raw mb_type 22 round-trips to `MbType::B8x8`
+    /// (round-23). Each sub_mb_type=0 in §7.4.5 Table 7-18 round-trips
+    /// to `SubMbType::BDirect8x8`.
+    #[test]
+    fn b_8x8_mb_type_raw_matches_table_7_14_decode() {
+        use crate::macroblock_layer::{MbType, SubMbType};
+        assert_eq!(MbType::from_b_slice(22).unwrap(), MbType::B8x8);
+        assert_eq!(SubMbType::from_b(0).unwrap(), SubMbType::BDirect8x8);
+    }
+
+    /// Round-23 `B_8x8` + 4× `B_Direct_8x8` writer with `cbp_luma=0,
+    /// cbp_chroma=0` emits exactly the expected ue(v) sequence:
+    ///
+    ///   * mb_type=22  → ue(v) "0000 0010 111" (9 bits — codeNum 22)
+    ///   * sub_mb_type=0 (×4) → ue(v) "1" each (4 bits)
+    ///   * cbp codeNum 0 → ue(v) "1" (1 bit)
+    ///
+    /// No mb_qp_delta (gated on cbp > 0). Total 14 bits.
+    #[test]
+    fn b_8x8_all_direct_zero_residual_emits_expected_bit_count() {
+        let mut bw = BitWriter::new();
+        let cfg = B8x8AllDirectMcbConfig {
+            cbp_luma: 0,
+            cbp_chroma: 0,
+            mb_qp_delta: 0,
+            luma_4x4_levels: [[0; 16]; 16],
+            luma_4x4_nc: [0; 16],
+            chroma_dc_cb: [0; 4],
+            chroma_dc_cr: [0; 4],
+            chroma_ac_cb: [[0; 16]; 4],
+            chroma_ac_cr: [[0; 16]; 4],
+        };
+        write_b_8x8_all_direct_mb(&mut bw, &cfg).expect("write");
+        // ue(22): binValue=23, leadingZeros=4 → 4 zeros + "1" + 4
+        // bit-suffix "0111" = 9 bits. Plus 4× ue(0)=1 bit + ue(0)=1 bit
+        // = 14 bits total before any trailing alignment.
+        assert_eq!(bw.bits_emitted(), 14);
     }
 
     /// Round-21 B_Direct_16x16 writer with `cbp_luma=0, cbp_chroma=0`
