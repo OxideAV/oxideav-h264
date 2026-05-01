@@ -28,6 +28,13 @@
 //! / qpprime / seq_scaling_matrix_present), pinning bit_depth_luma /
 //! bit_depth_chroma at 8 (10/12/14-bit are out of round-27 scope) and
 //! seq_scaling_matrix_present_flag to 0 (flat scaling).
+//!
+//! Round-28: 4:4:4 (`chroma_format_idc = 3`, profile_idc = 244 — High
+//! 4:4:4 Predictive). Same chroma-extended group emit, but
+//! `chroma_format_idc=3` adds a `separate_colour_plane_flag` bit (held
+//! at 0 — separate planes are out of round-28 scope). The decoder maps
+//! `chroma_format_idc=3 + separate_colour_plane_flag=0` back to
+//! `ChromaArrayType=3`, the "chroma coded like luma" path of §7.3.5.3.
 
 use crate::encoder::bitstream::BitWriter;
 
@@ -50,16 +57,15 @@ pub struct BaselineSpsConfig {
     pub max_num_ref_frames: u32,
     /// §7.4.2.1 — `profile_idc`. Defaults to 66 (Baseline). Round-20
     /// allows 77 (Main) so that B-slices are permitted (§A.2.2).
-    /// Round-27 allows 122 (High 4:2:2) which triggers the
-    /// §7.3.2.1.1 chroma-extended group emission. Other chroma-extended
-    /// profiles (100, 110, 244, …) and bit depths > 8 remain out of
-    /// scope.
+    /// Round-27 allows 122 (High 4:2:2). Round-28 adds 244 (High 4:4:4
+    /// Predictive). All three trigger the §7.3.2.1.1 chroma-extended
+    /// group emission. Other chroma-extended profiles (100, 110, …)
+    /// and bit depths > 8 remain out of scope.
     pub profile_idc: u8,
     /// §7.4.2.1.1 — `chroma_format_idc`. Default 1 (4:2:0). Set to 2
-    /// (4:2:2) when emitting a High 4:2:2 (122) SPS. The writer asserts
-    /// that 4:2:2 is only paired with `profile_idc = 122` (the only
-    /// profile in the chroma-extended group this writer currently
-    /// understands).
+    /// (4:2:2) when emitting a High 4:2:2 (122) SPS or 3 (4:4:4) when
+    /// emitting a High 4:4:4 Predictive (244) SPS. The writer asserts
+    /// the (profile_idc, chroma_format_idc) pairing is one it understands.
     pub chroma_format_idc: u32,
 }
 
@@ -87,22 +93,30 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
 
     // §7.3.2.1.1 — profile_idc.
     debug_assert!(
-        matches!(cfg.profile_idc, 66 | 77 | 88 | 122),
-        "this writer only emits SPS bodies for profile_idc ∈ {{66, 77, 88, 122}} \
-         (Baseline / Main / Extended / High 4:2:2). Profile {} would require \
-         additional bit_depth_* / scaling-matrix wiring per §7.3.2.1.1.",
+        matches!(cfg.profile_idc, 66 | 77 | 88 | 122 | 244),
+        "this writer only emits SPS bodies for profile_idc ∈ {{66, 77, 88, 122, 244}} \
+         (Baseline / Main / Extended / High 4:2:2 / High 4:4:4 Predictive). Profile {} \
+         would require additional bit_depth_* / scaling-matrix wiring per §7.3.2.1.1.",
         cfg.profile_idc,
     );
-    // Round-27: 4:2:2 is only paired with profile 122 (High 4:2:2). The
-    // other chroma-extended-group profiles aren't emitted by this writer.
+    // Round-27/28: chroma_format_idc accepted values.
     debug_assert!(
-        matches!(cfg.chroma_format_idc, 1 | 2),
-        "chroma_format_idc {} not in writer scope (round 27: only 1=4:2:0 and 2=4:2:2)",
+        matches!(cfg.chroma_format_idc, 1..=3),
+        "chroma_format_idc {} not in writer scope (1=4:2:0, 2=4:2:2, 3=4:4:4)",
         cfg.chroma_format_idc,
     );
+    // Round-27: 4:2:2 only with profile 122. Round-28: 4:4:4 only with
+    // profile 244. The other chroma-extended-group profiles aren't
+    // emitted by this writer.
     debug_assert!(
-        cfg.chroma_format_idc == 1 || cfg.profile_idc == 122,
-        "chroma_format_idc=2 requires profile_idc=122 (High 4:2:2); got profile {}",
+        match cfg.chroma_format_idc {
+            1 => true,
+            2 => cfg.profile_idc == 122,
+            3 => cfg.profile_idc == 244,
+            _ => false,
+        },
+        "chroma_format_idc={} not paired with the expected profile_idc; got profile {}",
+        cfg.chroma_format_idc,
         cfg.profile_idc,
     );
     w.u(8, cfg.profile_idc as u32);
@@ -210,6 +224,43 @@ mod tests {
         assert!(sps.frame_mbs_only_flag);
         assert!(sps.frame_cropping.is_none());
         assert!(!sps.vui_parameters_present_flag);
+    }
+
+    #[test]
+    fn high_444_sps_emits_chroma_extended_group_with_separate_colour_plane_flag() {
+        // §7.3.2.1.1 / §7.4.2.1.1 — profile_idc=244 (High 4:4:4
+        // Predictive) triggers the chroma-extended group, and
+        // chroma_format_idc=3 additionally requires the
+        // separate_colour_plane_flag bit (held at 0 in round-28 since
+        // separate planes are out of scope; the decoder maps the pair
+        // (chroma_format_idc=3, separate_colour_plane_flag=0) back to
+        // ChromaArrayType=3).
+        let cfg = BaselineSpsConfig {
+            seq_parameter_set_id: 0,
+            level_idc: 30,
+            width_in_mbs: 4,
+            height_in_mbs: 4,
+            log2_max_frame_num_minus4: 4,
+            log2_max_poc_lsb_minus4: 4,
+            max_num_ref_frames: 1,
+            profile_idc: 244,
+            chroma_format_idc: 3,
+        };
+        let rbsp = build_baseline_sps_rbsp(&cfg);
+        let sps = Sps::parse(&rbsp).expect("decoder parses our 4:4:4 SPS");
+        assert_eq!(sps.profile_idc, 244);
+        assert_eq!(sps.constraint_set_flags, 0);
+        assert_eq!(sps.chroma_format_idc, 3);
+        assert!(!sps.separate_colour_plane_flag);
+        assert_eq!(sps.bit_depth_luma_minus8, 0);
+        assert_eq!(sps.bit_depth_chroma_minus8, 0);
+        assert!(!sps.qpprime_y_zero_transform_bypass_flag);
+        assert!(!sps.seq_scaling_matrix_present_flag);
+        // §6.2 — ChromaArrayType == chroma_format_idc when
+        // separate_colour_plane_flag == 0 → 3 (4:4:4 unified-plane path).
+        assert_eq!(sps.chroma_array_type(), 3);
+        assert_eq!(sps.pic_width_in_mbs(), 4);
+        assert_eq!(sps.frame_height_in_mbs(), 4);
     }
 
     #[test]

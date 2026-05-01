@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 28 — encoder 4:4:4 chroma support (IDR Intra_16x16-only path)**.
+  `EncoderConfig::chroma_format_idc` now also accepts 3 (4:4:4); when
+  paired with `profile_idc=244` (High 4:4:4 Predictive) the SPS writer
+  emits the §7.3.2.1.1 chroma-extended group with `chroma_format_idc=3`
+  and `separate_colour_plane_flag=0` (the decoder maps that pair to
+  `ChromaArrayType=3`). Per-MB chroma planes are encoded "like luma"
+  per §7.3.5.3 / §8.3.4.1: each plane has its own 16x16 DC Hadamard
+  block + 16 4x4 AC blocks (§6.4.3 raster-Z), shares the luma
+  Intra_16x16 prediction mode, and the `intra_chroma_pred_mode` u(v)
+  field is omitted from the bitstream. New helper
+  `encode_intra16x16_chroma_plane_luma_like` runs the luma transform
+  pipeline on a chroma plane and writes its decoded-bit-exact recon
+  back to `recon_u`/`recon_v`. Per §7.3.5.3 the per-plane chroma AC
+  emit is gated by `cbp_luma == 15`, so the encoder promotes
+  `cbp_luma` to 15 whenever any chroma plane has nonzero AC. Round-28
+  scope:
+  * IDR Intra_16x16 only (I_NxN for 4:4:4 is rejected).
+  * `disable_deblocking_filter_idc=1` is forced in the slice header
+    (§8.7 chroma deblock for ChromaArrayType==3 uses the LUMA filter
+    ladder applied per-plane — separate plumbing exercise).
+  * `separate_colour_plane_flag=0` only (separate-plane coding is
+    out of scope).
+  * P/B-slice paths still pin `chroma_format_idc ∈ {1}`.
+  Decoder side: lifted the blanket `chroma_array_type==3` rejection in
+  `reconstruct_slice_no_deblock`; new helper
+  `reconstruct_chroma_intra_444` reconstructs each chroma plane via
+  the §8.3.3 16x16 luma predictor + §8.5.10 Hadamard-DC + 16 AC
+  blocks. New writer variant `ChromaWriteKind::Yuv444` carries the
+  per-plane DC/AC arrays + their CAVLC nC contexts. New tests:
+  * `sps::tests::high_444_sps_emits_chroma_extended_group_with_separate_colour_plane_flag`
+  * Integration: `round28_444_encode_decode_self_roundtrip_matches_local_recon`
+    (self-roundtrip + bit-exact decoder match, PSNR Y=42.25 / U=V=50.85
+    on a 64x64 gradient).
+  * Integration: `round28_444_ffmpeg_decode_matches_encoder_recon`
+    (ffmpeg cross-decode bit-exact for all three planes,
+    Y PSNR ≥ 40 dB acceptance threshold).
+
 - **Round 27 — encoder 4:2:2 chroma support (IDR-only path)**.
   `EncoderConfig::chroma_format_idc` selects between 1 (4:2:0,
   default) and 2 (4:2:2). When set to 2, the SPS writer emits a High

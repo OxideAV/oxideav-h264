@@ -10,7 +10,15 @@
 //!   (B_Skip / B_Direct_16x16 / B_Direct_8x8 / B_L0_* / B_L1_* /
 //!   B_Bi_*).
 //! * Frame pictures, non-MBAFF.
-//! * ChromaArrayType ∈ {0, 1, 2}. 4:4:4 (== 3) is explicitly rejected.
+//! * ChromaArrayType ∈ {0, 1, 2, 3}. 4:4:4 (== 3) is supported on the
+//!   IDR Intra_16x16 path: per §7.3.5.3 / §8.3.4.1 each chroma plane
+//!   is reconstructed "like luma" — its own 16x16 DC Hadamard block +
+//!   16 4x4 AC blocks, sharing the luma Intra_16x16 prediction mode.
+//!   I_NxN, P, and B paths still reject 4:4:4. The §8.7 chroma
+//!   deblocking pass for ChromaArrayType==3 (which uses the LUMA
+//!   filter ladder per-plane) is also out of scope; encoders targeting
+//!   the round-28 4:4:4 path should set
+//!   `disable_deblocking_filter_idc=1` in the slice header.
 //! * Deblocking is applied as a single picture-level pass after all MBs
 //!   have been reconstructed (§8.7 conceptually runs per-MB; the
 //!   picture-level equivalent is permitted since the filter is defined
@@ -478,11 +486,9 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
 ) -> Result<(), ReconstructError> {
     // -------- Preconditions -----------------------------------------
     let chroma_array_type = sps.chroma_array_type();
-    if chroma_array_type == 3 {
-        return Err(ReconstructError::UnsupportedChromaArrayType(
-            chroma_array_type,
-        ));
-    }
+    // ChromaArrayType ∈ {0, 1, 2, 3}; 3 (4:4:4) is round-28 IDR-only —
+    // I_NxN / P / B for 4:4:4 still reject in `reconstruct_chroma_intra`
+    // (and `reconstruct_inter_chroma_residual`, which never runs for 3).
     // §7.4.2.1.1 — MbaffFrameFlag = mb_adaptive_frame_field_flag &&
     // !field_pic_flag. Field-only pictures (`field_pic_flag == 1`) still
     // aren't handled by this reconstruction pass — MBAFF frames are, as
@@ -1591,10 +1597,30 @@ fn reconstruct_chroma_intra(
     if chroma_array_type == 0 {
         return Ok(());
     }
+    // Round-28: 4:4:4 Intra_16x16 — chroma is "coded like luma" per
+    // §7.3.5.3 / §8.3.4.1. Each plane has its own 16x16 DC Hadamard
+    // block + 16 4x4 AC blocks sharing the luma Intra_16x16 mode.
+    // I_NxN 4:4:4 is rejected here (the per-plane 4x4-block layout
+    // for I_NxN-on-chroma is a separate plumbing exercise).
     if chroma_array_type == 3 {
-        return Err(ReconstructError::UnsupportedChromaArrayType(
-            chroma_array_type,
-        ));
+        if !mb.mb_type.is_intra_16x16() {
+            return Err(ReconstructError::UnsupportedChromaArrayType(
+                chroma_array_type,
+            ));
+        }
+        return reconstruct_chroma_intra_444(
+            mb,
+            qp_y,
+            bit_depth_c,
+            mb_px,
+            mb_py,
+            writer,
+            sps,
+            pps,
+            pic,
+            grid,
+            current_slice_id,
+        );
     }
 
     let ct = if chroma_array_type == 1 {
@@ -1741,6 +1767,191 @@ fn reconstruct_chroma_intra(
     let _ = c_mb_py;
 
     Ok(())
+}
+
+// -------------------------------------------------------------------------
+// Round-28 — 4:4:4 (ChromaArrayType==3) chroma intra reconstruction.
+//
+// §7.3.5.3 / §8.3.4.1 / §8.5.10 — chroma is "coded like luma" for 4:4:4:
+// each plane has its own 16x16 DC Hadamard block + 16 4x4 AC blocks
+// (§6.4.3 raster-Z order), shares the luma Intra_16x16 prediction mode,
+// and has no `intra_chroma_pred_mode` field. The per-plane residual
+// arrays in `Macroblock` are:
+//   * Cb: `residual_cb_16x16_dc` + `residual_cb_luma_like` (16 entries)
+//   * Cr: `residual_cr_16x16_dc` + `residual_cr_luma_like`
+// -------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_chroma_intra_444(
+    mb: &Macroblock,
+    qp_y: i32,
+    bit_depth_c: u32,
+    mb_px: i32,
+    mb_py: i32,
+    writer: &MbWriter,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    grid: &MbGrid,
+    current_slice_id: i32,
+) -> Result<(), ReconstructError> {
+    // §8.5.8 — QPc derivation per plane (Cb/Cr).
+    let cb_offset = pps.chroma_qp_index_offset;
+    let cr_offset = pps
+        .extension
+        .as_ref()
+        .map(|e| e.second_chroma_qp_index_offset)
+        .unwrap_or(pps.chroma_qp_index_offset);
+    let qp_cb = qp_y_to_qp_c(qp_y, cb_offset);
+    let qp_cr = qp_y_to_qp_c(qp_y, cr_offset);
+
+    // §8.3.3 — luma Intra_16x16 prediction mode + cbp_luma (carried by
+    // mb_type). Caller has already gated on `is_intra_16x16()`.
+    let (pred_mode_idx, cbp_luma) = match &mb.mb_type {
+        MbType::Intra16x16(i) => (i.pred_mode, i.cbp_luma),
+        _ => unreachable!("reconstruct_chroma_intra_444 requires Intra_16x16"),
+    };
+    let mode = Intra16x16Mode::from_index(pred_mode_idx).ok_or_else(|| {
+        ReconstructError::UnsupportedMbType(format!("4:4:4 Intra_16x16 mode {}", pred_mode_idx))
+    })?;
+
+    // §7.4.2.1.1.1 Table 7-2 — chroma scaling lists.
+    let sl4_cb = select_scaling_list_4x4(1, sps, pps);
+    let sl4_cr = select_scaling_list_4x4(2, sps, pps);
+
+    for plane in 0..2u8 {
+        // (1) Build 16x16 chroma intra prediction by gathering neighbour
+        // samples from the chroma plane (same geometry as luma — chroma
+        // origin == luma origin for 4:4:4) and running the luma
+        // §8.3.3 helper.
+        let samples = gather_samples_16x16_chroma(
+            pic,
+            grid,
+            mb_px,
+            mb_py,
+            plane,
+            current_slice_id,
+            pps.constrained_intra_pred_flag,
+        );
+        let mut pred = [0i32; 256];
+        predict_16x16(mode, &samples, bit_depth_c, &mut pred);
+
+        let qp_c = if plane == 0 { qp_cb } else { qp_cr };
+        let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
+
+        // (2) Inverse Hadamard on the per-plane DC.
+        let dc_levels = if plane == 0 {
+            mb.residual_cb_16x16_dc.unwrap_or([0i32; 16])
+        } else {
+            mb.residual_cr_16x16_dc.unwrap_or([0i32; 16])
+        };
+        // DC coefficients are in zig-zag scan order (parser reads them
+        // via residual_block_cavlc / inverse-scan). Apply the inverse
+        // scan + Hadamard.
+        let dc_matrix = crate::transform::inverse_scan_4x4_zigzag(&dc_levels);
+        let dc_inv = inverse_hadamard_luma_dc_16x16(&dc_matrix, qp_c, sl4, bit_depth_c)?;
+
+        // (3) Per-AC-block inverse 4x4 transform with c[0,0] from DC,
+        // add to predictor, write to the picture.
+        let ac_blocks = if plane == 0 {
+            &mb.residual_cb_luma_like
+        } else {
+            &mb.residual_cr_luma_like
+        };
+        #[allow(clippy::needless_range_loop)] // §6.4.3 raster-Z 4x4 walk
+        for block_idx in 0..16usize {
+            let (bx, by) = LUMA_4X4_XY[block_idx];
+            let mut coeffs = if cbp_luma == 15 {
+                let ac = ac_blocks.get(block_idx).copied().unwrap_or([0i32; 16]);
+                crate::transform::inverse_scan_4x4_zigzag_ac(&ac)
+            } else {
+                [0i32; 16]
+            };
+            let dc_row = (by / 4) as usize;
+            let dc_col = (bx / 4) as usize;
+            coeffs[0] = dc_inv[dc_row * 4 + dc_col];
+
+            let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?;
+
+            for yy in 0..4i32 {
+                for xx in 0..4i32 {
+                    let p = pred[((by + yy) as usize) * 16 + (bx + xx) as usize];
+                    let v = clip_sample(p + residual[(yy * 4 + xx) as usize], bit_depth_c);
+                    if plane == 0 {
+                        writer.set_cb(pic, bx + xx, by + yy, v);
+                    } else {
+                        writer.set_cr(pic, bx + xx, by + yy, v);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Round-28 — gather chroma neighbour samples for §8.3.3 16x16 luma-
+/// style prediction on a chroma plane (ChromaArrayType==3 only). Same
+/// geometry as `gather_samples_16x16` but reads from `pic.cb`/`pic.cr`.
+fn gather_samples_16x16_chroma(
+    pic: &Picture,
+    grid: &MbGrid,
+    mb_px: i32,
+    mb_py: i32,
+    plane: u8,
+    current_slice_id: i32,
+    constrained_intra_pred: bool,
+) -> Samples16x16 {
+    let left_avail = mb_px > 0
+        && same_slice_at(grid, mb_px - 1, mb_py, current_slice_id)
+        && cip_ok_at(grid, mb_px - 1, mb_py, constrained_intra_pred);
+    let top_avail = mb_py > 0
+        && same_slice_at(grid, mb_px, mb_py - 1, current_slice_id)
+        && cip_ok_at(grid, mb_px, mb_py - 1, constrained_intra_pred);
+    let tl_avail = mb_px > 0
+        && mb_py > 0
+        && same_slice_at(grid, mb_px - 1, mb_py - 1, current_slice_id)
+        && cip_ok_at(grid, mb_px - 1, mb_py - 1, constrained_intra_pred);
+
+    let read = |px: i32, py: i32| -> i32 {
+        if plane == 0 {
+            pic.cb_at(px, py)
+        } else {
+            pic.cr_at(px, py)
+        }
+    };
+
+    let top_left = if tl_avail {
+        read(mb_px - 1, mb_py - 1)
+    } else {
+        0
+    };
+    let mut top = [0i32; 16];
+    for x in 0..16 {
+        top[x as usize] = if top_avail {
+            read(mb_px + x, mb_py - 1)
+        } else {
+            0
+        };
+    }
+    let mut left = [0i32; 16];
+    for y in 0..16 {
+        left[y as usize] = if left_avail {
+            read(mb_px - 1, mb_py + y)
+        } else {
+            0
+        };
+    }
+    Samples16x16 {
+        top_left,
+        top,
+        left,
+        availability: Neighbour4x4Availability {
+            top_left: tl_avail,
+            top: top_avail,
+            top_right: false,
+            left: left_avail,
+        },
+    }
 }
 
 /// Lookup table for chroma 4x4 block (x, y) inside the chroma MB.

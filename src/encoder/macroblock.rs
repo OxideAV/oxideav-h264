@@ -62,6 +62,43 @@ pub enum ChromaWriteKind<'a> {
         chroma_ac_cb: &'a [[i32; 16]; 8],
         chroma_ac_cr: &'a [[i32; 16]; 8],
     },
+    /// Round-28 — 4:4:4 chroma layout. Per §7.3.5.3 chroma is "coded
+    /// like luma" for ChromaArrayType==3: each plane has its own 16x16
+    /// DC Hadamard block (16 levels in raster order, ready for
+    /// `zigzag_scan_4x4`) plus 16 4x4 AC blocks in §6.4.3 raster-Z
+    /// order (AC-only scan layout, positions 0..=14, slot 15 unused).
+    /// CAVLC `nC` for each per-plane AC block is supplied via
+    /// `cb_ac_nc` / `cr_ac_nc`.
+    ///
+    /// The `chroma.emit` path for `Yuv444` does NOT honour `cbp_chroma`:
+    /// for 4:4:4 Intra_16x16 the spec gates per-plane DC unconditionally
+    /// and per-plane AC by `cbp_luma == 15` — the writer caller must
+    /// dispatch the per-plane DC/AC emission outside `emit` to keep the
+    /// `cbp_chroma`-driven flow simple for 4:2:0/4:2:2.
+    Yuv444 {
+        /// Cb plane Intra_16x16 DC (16 raster-order levels).
+        cb_dc_raster: &'a [i32; 16],
+        /// Cr plane Intra_16x16 DC.
+        cr_dc_raster: &'a [i32; 16],
+        /// Cb plane per-4x4 AC blocks (§6.4.3 raster-Z order).
+        cb_ac_levels: &'a [[i32; 16]; 16],
+        /// Cr plane per-4x4 AC blocks.
+        cr_ac_levels: &'a [[i32; 16]; 16],
+        /// Per-Cb-AC-block CAVLC `nC` context (Numeric).
+        cb_ac_nc: &'a [i32; 16],
+        /// Per-Cr-AC-block CAVLC `nC` context (Numeric).
+        cr_ac_nc: &'a [i32; 16],
+        /// nC for the Cb 16x16 DC block (§9.2.1.1 step 1: blkIdx=0).
+        cb_dc_nc: i32,
+        /// nC for the Cr 16x16 DC block.
+        cr_dc_nc: i32,
+        /// Per §7.3.5.3 the 4:4:4 per-plane AC blocks are gated by
+        /// `cbp_luma == 15` (not by `cbp_chroma`). Pass the luma cbp
+        /// here so the writer can decide whether to emit per-plane AC
+        /// independently of the (always-zero-for-4:4:4) `cbp_chroma`
+        /// argument.
+        cbp_luma_for_ac_gate: u8,
+    },
 }
 
 impl<'a> ChromaWriteKind<'a> {
@@ -69,6 +106,14 @@ impl<'a> ChromaWriteKind<'a> {
     /// Same gate logic for both 4:2:0 and 4:2:2:
     /// * `cbp_chroma >= 1` → both planes' DC blocks.
     /// * `cbp_chroma == 2` → both planes' per-4x4-block AC.
+    ///
+    /// 4:4:4 (`Yuv444`) takes a different path: chroma planes are
+    /// "coded like luma" so the gate isn't `cbp_chroma` — per-plane DC
+    /// is always coded for Intra_16x16, and per-plane AC is gated by
+    /// `cbp_luma == 15`. Callers must pass `cbp_chroma` carrying the
+    /// **luma** cbp's "all-AC-coded" status: `cbp_chroma == 2` ⇒ emit
+    /// per-plane AC; `cbp_chroma == 0` ⇒ DC only. This keeps the dispatch
+    /// uniform across the three chroma layouts.
     pub fn emit(self, w: &mut BitWriter, cbp_chroma: u8) -> Result<(), CavlcEncodeError> {
         debug_assert!(cbp_chroma <= 2);
         match self {
@@ -144,6 +189,60 @@ impl<'a> ChromaWriteKind<'a> {
                         encode_residual_block_cavlc(
                             w,
                             CoeffTokenContext::Numeric(0),
+                            15,
+                            &blk[..15],
+                        )?;
+                    }
+                }
+            }
+            ChromaWriteKind::Yuv444 {
+                cb_dc_raster,
+                cr_dc_raster,
+                cb_ac_levels,
+                cr_ac_levels,
+                cb_ac_nc,
+                cr_ac_nc,
+                cb_dc_nc,
+                cr_dc_nc,
+                cbp_luma_for_ac_gate,
+            } => {
+                // §7.3.5.3 — ChromaArrayType==3 Intra_16x16: per-plane
+                // 16x16 DC Hadamard block (always coded), then per-plane
+                // 16 AC blocks gated by `cbp_luma == 15` (NOT by
+                // cbp_chroma — for 4:4:4 cbp_chroma is held at 0 in
+                // mb_type and the chroma plane AC emit follows the
+                // luma cbp).
+                //
+                // Per §9.2.1.1 the DC's nC uses neighbour cb_*/cr_*
+                // luma_total_coeff[0]; the AC's nC uses the standard
+                // §6.4.11.4 4x4 neighbour map but reading from the
+                // per-plane luma_total_coeff arrays in the neighbour
+                // grid (the decoder's `nc_nn_plane_luma_like` path).
+                // The encoder stores those `nC` values in
+                // `cb_ac_nc[]` / `cr_ac_nc[]` for direct use here.
+                let _ = cbp_chroma;
+
+                // Cb plane: DC then (cbp_luma==15) ? 16 AC blocks.
+                let scan_cb = zigzag_scan_4x4(cb_dc_raster);
+                encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(cb_dc_nc), 16, &scan_cb)?;
+                if cbp_luma_for_ac_gate == 15 {
+                    for (blk_idx, blk) in cb_ac_levels.iter().enumerate() {
+                        encode_residual_block_cavlc(
+                            w,
+                            CoeffTokenContext::Numeric(cb_ac_nc[blk_idx]),
+                            15,
+                            &blk[..15],
+                        )?;
+                    }
+                }
+                // Cr plane: DC then (cbp_luma==15) ? 16 AC blocks.
+                let scan_cr = zigzag_scan_4x4(cr_dc_raster);
+                encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(cr_dc_nc), 16, &scan_cr)?;
+                if cbp_luma_for_ac_gate == 15 {
+                    for (blk_idx, blk) in cr_ac_levels.iter().enumerate() {
+                        encode_residual_block_cavlc(
+                            w,
+                            CoeffTokenContext::Numeric(cr_ac_nc[blk_idx]),
                             15,
                             &blk[..15],
                         )?;
@@ -251,12 +350,18 @@ pub fn intra16x16_mb_type_value(pred_mode: u8, cbp_luma: u8, cbp_chroma: u8) -> 
 }
 
 /// Emit one Intra_16x16 macroblock with caller-supplied chroma residual
-/// kind (round 27 — 4:2:0 or 4:2:2).
+/// kind (round 27 — 4:2:0 or 4:2:2; round 28 — 4:4:4).
 ///
 /// `nc_ctx` is the `nC` context for the luma DC residual block. With
 /// `cbp_luma == 0` always, the AC TotalCoeff used for nC derivation is
 /// identically zero; the encoder mirrors the decoder by passing
 /// `Numeric(0)` for every MB.
+///
+/// Round-28: when `chroma` is `ChromaWriteKind::Yuv444`, the
+/// `intra_chroma_pred_mode` u(v) field is **omitted** per §7.3.5.1
+/// (mb_pred for ChromaArrayType==3 doesn't read it — chroma uses the
+/// luma Intra_16x16 prediction mode). The `intra_chroma_pred_mode`
+/// argument is ignored on the 4:4:4 path; pass 0 by convention.
 #[allow(clippy::too_many_arguments)]
 pub fn write_intra16x16_mb_chroma(
     w: &mut BitWriter,
@@ -273,7 +378,11 @@ pub fn write_intra16x16_mb_chroma(
 ) -> Result<(), CavlcEncodeError> {
     let raw = intra16x16_mb_type_value(pred_mode, cbp_luma, cbp_chroma);
     w.ue(raw);
-    w.ue(intra_chroma_pred_mode as u32);
+    // §7.3.5.1 — intra_chroma_pred_mode is absent when ChromaArrayType
+    // is 0 (monochrome) or 3 (4:4:4).
+    if !matches!(chroma, ChromaWriteKind::Yuv444 { .. }) {
+        w.ue(intra_chroma_pred_mode as u32);
+    }
     // §7.3.5 — coded_block_pattern absent for Intra_16x16; mb_qp_delta
     // always present (the luma DC block is always coded).
     w.se(mb_qp_delta);
@@ -295,7 +404,8 @@ pub fn write_intra16x16_mb_chroma(
         }
     }
 
-    // §7.3.5.3 — Chroma residual (DC ± AC, gated by cbp_chroma).
+    // §7.3.5.3 — Chroma residual (DC ± AC, gated by cbp_chroma for
+    // 4:2:0 / 4:2:2; per-plane luma-like for 4:4:4).
     chroma.emit(w, cbp_chroma)?;
     Ok(())
 }
