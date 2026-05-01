@@ -58,9 +58,10 @@ use crate::encoder::intra_pred::{
     predict_16x16, predict_chroma_8x8, sad_8x8, I16x16Mode, IntraChromaMode,
 };
 use crate::encoder::macroblock::{
-    write_b_16x16_mb, write_i_nxn_mb, write_intra16x16_mb, write_p_8x8_all_pl08x8_mb,
-    write_p_l0_16x16_mb, B16x16McbConfig, BPartPred, BPred16x16, I16x16McbConfig, INxNMcbConfig,
-    P8x8AllPL08x8McbConfig, PL016x16McbConfig,
+    write_b_16x16_mb, write_b_8x8_mixed_mb, write_i_nxn_mb, write_intra16x16_mb,
+    write_p_8x8_all_pl08x8_mb, write_p_l0_16x16_mb, B16x16McbConfig, B8x8MixedMcbConfig, BPartPred,
+    BPred16x16, BSubMbCell, I16x16McbConfig, INxNMcbConfig, P8x8AllPL08x8McbConfig,
+    PL016x16McbConfig,
 };
 use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
 use crate::encoder::nal::build_nal_unit;
@@ -68,7 +69,7 @@ use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::rdo::{cost_combined, lambda_ssd, ssd_16x16, ssd_4x4};
 use crate::encoder::slice::{
     write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
-    IdrSliceHeaderConfig, PSliceHeaderConfig,
+    ExplicitBipredWeightTable, IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
@@ -146,6 +147,22 @@ pub struct EncoderConfig {
     /// refIdxL1) are computed by POC-scaling the colocated L1
     /// anchor's L0 motion vectors. Round-24.
     pub direct_temporal_mv_pred: bool,
+    /// Round-26 — §7.4.2.2 / §8.4.2.3.2 explicit weighted bipred for B
+    /// slices. When `true` the encoder:
+    ///   * Sets PPS `weighted_bipred_idc = 1` so the decoder pulls a
+    ///     `pred_weight_table()` from each B slice header.
+    ///   * Selects per-slice (luma_weight_l0, luma_weight_l1,
+    ///     luma_offset_l0, luma_offset_l1) at `luma_log2_weight_denom = 5`
+    ///     via the §8.4.2.3.2 forward least-squares fit
+    ///     ([`compute_explicit_bipred_weights`]).
+    ///   * Replaces the bipred merge in `build_b_predictors` with the
+    ///     §8.4.2.3.2 eq. 8-276 explicit formula so the local recon
+    ///     stays bit-equivalent to what the decoder produces.
+    ///
+    /// When `false` (default) bipred uses the §8.4.2.3.1 default
+    /// average `(L0 + L1 + 1) >> 1` and the PPS / slice header carry no
+    /// pred_weight_table.
+    pub explicit_weighted_bipred: bool,
 }
 
 impl EncoderConfig {
@@ -157,6 +174,7 @@ impl EncoderConfig {
             profile_idc: 66,
             max_num_ref_frames: 1,
             direct_temporal_mv_pred: false,
+            explicit_weighted_bipred: false,
         }
     }
 }
@@ -459,6 +477,15 @@ impl Encoder {
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: self.cfg.qp - 26,
             chroma_qp_index_offset: 0,
+            weighted_pred_flag: false,
+            // Round-26 — when the encoder is configured for explicit
+            // weighted bipred, the PPS must signal idc=1 so subsequent
+            // B-slice headers may carry pred_weight_table().
+            weighted_bipred_idc: if self.cfg.explicit_weighted_bipred {
+                1
+            } else {
+                0
+            },
         };
         let sps_rbsp = build_baseline_sps_rbsp(&sps_cfg);
         let pps_rbsp = build_baseline_pps_rbsp(&pps_cfg);
@@ -3652,11 +3679,173 @@ struct BMbDecision {
     pred_v: [i32; 64],
 }
 
+/// Round-26 — explicit weighted-bipred merge parameters (luma only).
+///
+/// When `Some`, `build_b_predictors` replaces the §8.4.2.3.1 default
+/// `(L0 + L1 + 1) >> 1` luma merge with the §8.4.2.3.2 explicit formula
+/// (eq. 8-276) using these `(weight, offset)` pairs and `log2_wd` denom.
+/// Chroma keeps the default merge — our `pred_weight_table()` writer
+/// signals `chroma_weight_lN_flag = 0` for every ref so the decoder
+/// matches.
+#[derive(Debug, Clone, Copy)]
+struct WeightedBipredLuma {
+    log2_wd: u32,
+    weight_l0: i32,
+    offset_l0: i32,
+    weight_l1: i32,
+    offset_l1: i32,
+}
+
+/// Round-26 — slice-wide weight selector for explicit weighted bipred.
+///
+/// Models the source luma plane as
+///   `src[k] ≈ ((w0 * L0[k] + w1 * L1[k] + 2^logWD) >> (logWD+1)) +
+///             ((o0 + o1 + 1) >> 1)`
+/// (the §8.4.2.3.2 eq. 8-276 prediction). For a slice-wide constant fit
+/// we collapse to a 2-parameter least-squares problem in (α, β):
+///   `src ≈ α * L0 + (1 - α) * L1 + β`
+/// then quantise α to a denom-32 fraction (`logWD = 5`):
+///   `w0 = round(α * 32)`, `w1 = 32 - w0`
+/// Offsets are split symmetrically: `o0 = o1 = round(β / 2)`. The fit
+/// uses the encoder's mb-aligned regions only — no MV-aware sample
+/// matching — which is sufficient for cross-fade content where the two
+/// references share spatial structure (no per-MB motion).
+///
+/// Picks the (w0, w1) pair on a coarse grid `{0, 4, 8, 12, ..., 32}`
+/// (9 candidates) by sum-of-squared-error against the source after the
+/// §8.4.2.3.2 round-and-clip is applied. Offsets are constrained to
+/// the integer least-squares optimum, clamped to ±127 per spec.
+///
+/// Falls back to the default (16, 16, 0, 0) when the chosen weights
+/// don't beat the default merge by at least 1% on SSD — that ensures
+/// the bit cost of pred_weight_table doesn't backfire on neutral
+/// content. Returns `None`-equivalent default in that case.
+#[allow(clippy::too_many_arguments)]
+fn compute_explicit_bipred_weights(
+    src_y: &[u8],
+    ref_l0_y: &[u8],
+    ref_l1_y: &[u8],
+    width: usize,
+    height: usize,
+    ref_l0_stride: usize,
+    ref_l1_stride: usize,
+) -> ExplicitBipredWeightTable {
+    const LOG2_WD: u32 = 5; // denom = 32; w0+w1 = 64 for the canonical "α + (1-α) = 1"
+    const DENOM: i32 = 1 << (LOG2_WD + 1); // 64
+
+    // Default weights: w0 = w1 = 32 (sum = 64 → α = 0.5 → eq. 8-273).
+    let default_table = ExplicitBipredWeightTable {
+        luma_log2_weight_denom: LOG2_WD,
+        luma_weight_l0: 32,
+        luma_offset_l0: 0,
+        luma_weight_l1: 32,
+        luma_offset_l1: 0,
+    };
+
+    // Round-and-clip the §8.4.2.3.2 prediction for a given (w0, w1, o)
+    // combo and return the SSE against `src`. `o` is the per-list offset
+    // (symmetric: o0 = o1 = o so `(o0+o1+1)>>1` is just o). Used both
+    // for the candidate search and for the default-vs-explicit decision.
+    let sse_for = |w0: i32, w1: i32, o: i32| -> u64 {
+        let mut sse: u64 = 0;
+        let logwd_plus1 = LOG2_WD + 1;
+        let round = 1i32 << LOG2_WD;
+        let off_avg = (o + o + 1) >> 1;
+        for j in 0..height {
+            for i in 0..width {
+                let p0 = ref_l0_y[j * ref_l0_stride + i] as i32;
+                let p1 = ref_l1_y[j * ref_l1_stride + i] as i32;
+                let v = ((p0 * w0 + p1 * w1 + round) >> logwd_plus1) + off_avg;
+                let pred = v.clamp(0, 255);
+                let s = src_y[j * width + i] as i32;
+                let d = s - pred;
+                sse = sse.saturating_add((d * d) as u64);
+            }
+        }
+        sse
+    };
+
+    // Coarse grid over α at 1/16 granularity (sum w0+w1 == DENOM = 64).
+    // For every candidate w0, also pick the integer offset o that
+    // minimises SSE (closed-form: o = round(mean(src - pred_no_offset))).
+    let total = (width * height) as f64;
+    let mut best_sse = u64::MAX;
+    let mut best_w0 = 32i32;
+    let mut best_off = 0i32;
+    for w0 in (0..=DENOM).step_by(4) {
+        let w1 = DENOM - w0;
+        // Compute optimal symmetric offset (o0 = o1 = o) by averaging
+        // the residual. This is the LS fit for the constant component.
+        let mut sum_resid: f64 = 0.0;
+        let logwd_plus1 = LOG2_WD + 1;
+        let round = 1i32 << LOG2_WD;
+        for j in 0..height {
+            for i in 0..width {
+                let p0 = ref_l0_y[j * ref_l0_stride + i] as i32;
+                let p1 = ref_l1_y[j * ref_l1_stride + i] as i32;
+                let v = (p0 * w0 + p1 * w1 + round) >> logwd_plus1;
+                let s = src_y[j * width + i] as i32;
+                sum_resid += (s - v) as f64;
+            }
+        }
+        let o_raw = (sum_resid / total).round() as i32;
+        let o = o_raw.clamp(-127, 127);
+        let sse = sse_for(w0, w1, o);
+        if sse < best_sse {
+            best_sse = sse;
+            best_w0 = w0;
+            best_off = o;
+        }
+    }
+
+    // Compute the default (16, 16, 0, 0)-equivalent SSE for the
+    // accept/reject decision. Note: with w0=w1=32, logWD=5, eq. 8-276
+    // simplifies to `(L0 + L1 + 32) >> 6 + 0` which differs from the
+    // §8.4.2.3.1 default by one rounding-bit position. To compare
+    // apples-to-apples we evaluate the *actual* default merge.
+    let mut default_sse: u64 = 0;
+    for j in 0..height {
+        for i in 0..width {
+            let p0 = ref_l0_y[j * ref_l0_stride + i] as i32;
+            let p1 = ref_l1_y[j * ref_l1_stride + i] as i32;
+            let pred = (p0 + p1 + 1) >> 1;
+            let s = src_y[j * width + i] as i32;
+            let d = s - pred;
+            default_sse = default_sse.saturating_add((d * d) as u64);
+        }
+    }
+
+    // Accept the chosen weights only if they beat the default by a
+    // healthy margin (≥ 1% SSE reduction). This avoids spending the
+    // ~30-bit pred_weight_table budget on slices where it doesn't help.
+    let margin = default_sse / 100;
+    if best_sse + margin >= default_sse {
+        return default_table;
+    }
+
+    let w1 = DENOM - best_w0;
+    ExplicitBipredWeightTable {
+        luma_log2_weight_denom: LOG2_WD,
+        luma_weight_l0: best_w0,
+        luma_offset_l0: best_off,
+        luma_weight_l1: w1,
+        luma_offset_l1: best_off,
+    }
+}
+
 /// Build the L0 + L1 luma + chroma predictors for a 16x16 MB given the
 /// chosen MVs and the two reference frames. Returns one composite buffer
 /// per plane that already incorporates the §8.4.2.3.1 default weighted
 /// merge for bipred (`(L0 + L1 + 1) >> 1`). For L0-only / L1-only the
 /// returned predictor is just that list's interpolated samples.
+///
+/// Round-26 — when `weighted` is `Some`, the bipred luma merge instead
+/// uses the §8.4.2.3.2 explicit formula (eq. 8-276):
+///   `Clip1(((L0*w0 + L1*w1 + 2^logWD) >> (logWD+1)) +
+///          ((o0 + o1 + 1) >> 1))`
+/// Chroma still uses the default §8.4.2.3.1 average; our slice header
+/// emit flags chroma weights as absent so the decoder agrees.
+#[allow(clippy::too_many_arguments)]
 fn build_b_predictors(
     pred: BPred16x16,
     ref_l0: &EncodedFrameRef<'_>,
@@ -3665,6 +3854,7 @@ fn build_b_predictors(
     mb_y: usize,
     mv_l0: Mv,
     mv_l1: Mv,
+    weighted: Option<WeightedBipredLuma>,
 ) -> ([i32; 256], [i32; 64], [i32; 64]) {
     // Always interpolate from each list it uses; the §8.4.2.3.1 average
     // is bit-equivalent to the sum-then-shift the decoder applies.
@@ -3762,12 +3952,25 @@ fn build_b_predictors(
             pred_v = p_v_l1.unwrap();
         }
         BPred16x16::Bi => {
-            // §8.4.2.3.1 eq. 8-273 — `(predL0 + predL1 + 1) >> 1`. The
-            // decoder applies this elementwise on each plane.
             let l0_y = p_y_l0.unwrap();
             let l1_y = p_y_l1.unwrap();
-            for i in 0..256 {
-                pred_y[i] = (l0_y[i] + l1_y[i] + 1) >> 1;
+            if let Some(wp) = weighted {
+                // §8.4.2.3.2 eq. 8-276 — explicit weighted bipred:
+                //   Clip1Y(((L0*w0 + L1*w1 + 2^logWD) >> (logWD+1)) +
+                //          ((o0 + o1 + 1) >> 1))
+                let logwd = wp.log2_wd;
+                let off_avg = (wp.offset_l0 + wp.offset_l1 + 1) >> 1;
+                let round = 1i32 << logwd;
+                for i in 0..256 {
+                    let v =
+                        (l0_y[i] * wp.weight_l0 + l1_y[i] * wp.weight_l1 + round) >> (logwd + 1);
+                    pred_y[i] = (v + off_avg).clamp(0, 255);
+                }
+            } else {
+                // §8.4.2.3.1 eq. 8-273 — default `(L0 + L1 + 1) >> 1`.
+                for i in 0..256 {
+                    pred_y[i] = (l0_y[i] + l1_y[i] + 1) >> 1;
+                }
             }
             let l0_u = p_u_l0.unwrap();
             let l1_u = p_u_l1.unwrap();
@@ -4033,6 +4236,317 @@ fn build_b_direct_8x8_predictors(
         }
     }
     (pred_y, pred_u, pred_v)
+}
+
+// ---------------------------------------------------------------------------
+// Round 25 — B_8x8 with mixed sub_mb_type per cell.
+//
+// Each of the four 8x8 quadrants of a B_8x8 MB picks independently from
+// {Direct (§8.4.1.2.2 / §8.4.1.2.3), L0-only, L1-only, Bi}. The cell's
+// MB-syntax cost varies — Direct is free (no MVs / refs), L0/L1 each
+// cost ~12 bits of mvd (one mvd_l0 or mvd_l1 pair plus the sub_mb_type
+// ue(v) overhead vs Direct), and Bi costs ~20 bits.
+//
+// Spec sections cited:
+//   §7.3.5.2          — sub_mb_pred() syntax with sub_mb_type[i]
+//   §7.4.5 Table 7-18 — sub_mb_type ∈ {0..3} for the four single-partition
+//                       cell types (B_Direct_8x8 / B_L0_8x8 / B_L1_8x8 /
+//                       B_Bi_8x8).
+//   §8.4.1.2.2        — spatial direct derivation (mvL0, mvL1 per 8x8)
+//   §8.4.2.3.1 eq. 8-273 — default weighted bipred (L0 + L1 + 1) >> 1
+// ---------------------------------------------------------------------------
+
+/// SAD between an 8x8 source block (at MB-relative offset `(off_x,
+/// off_y)` ∈ {0, 8}² of MB `(mb_x, mb_y)` in `src_y`) and an 8x8 luma
+/// predictor buffer (row-major i32, length 64). Predictor samples are
+/// clipped to 0..=255 to match the decoder.
+fn sad_8x8_pred(
+    src_y: &[u8],
+    src_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    off_x: usize,
+    off_y: usize,
+    pred: &[i32; 64],
+) -> u32 {
+    let mut s = 0u32;
+    for j in 0..8usize {
+        for i in 0..8usize {
+            let src = src_y[(mb_y * 16 + off_y + j) * src_stride + mb_x * 16 + off_x + i] as i32;
+            let p = pred[j * 8 + i].clamp(0, 255);
+            s = s.saturating_add((src - p).unsigned_abs());
+        }
+    }
+    s
+}
+
+/// Round-25 — build one 8x8 luma cell predictor for an explicit-inter
+/// `B_8x8` cell (`B_L0_8x8` / `B_L1_8x8` / `B_Bi_8x8`). Bi uses the
+/// §8.4.2.3.1 default weighted average `(L0 + L1 + 1) >> 1`.
+#[allow(clippy::too_many_arguments)]
+fn build_b_explicit_8x8_cell_luma(
+    cell: BSubMbCell,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+) -> [i32; 64] {
+    match cell {
+        BSubMbCell::L0 => build_inter_pred_luma_8x8(
+            ref_l0.recon_y,
+            ref_l0.width,
+            ref_l0.height,
+            mb_x,
+            mb_y,
+            sub_x,
+            sub_y,
+            mv_l0,
+        ),
+        BSubMbCell::L1 => build_inter_pred_luma_8x8(
+            ref_l1.recon_y,
+            ref_l1.width,
+            ref_l1.height,
+            mb_x,
+            mb_y,
+            sub_x,
+            sub_y,
+            mv_l1,
+        ),
+        BSubMbCell::Bi => {
+            let a = build_inter_pred_luma_8x8(
+                ref_l0.recon_y,
+                ref_l0.width,
+                ref_l0.height,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv_l0,
+            );
+            let b = build_inter_pred_luma_8x8(
+                ref_l1.recon_y,
+                ref_l1.width,
+                ref_l1.height,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv_l1,
+            );
+            let mut out = [0i32; 64];
+            for i in 0..64 {
+                out[i] = (a[i] + b[i] + 1) >> 1;
+            }
+            out
+        }
+        BSubMbCell::Direct => {
+            // Caller is responsible for using `build_inter_pred_luma_8x8`
+            // with the §8.4.1.2.2 derived per-8x8 MVs for Direct cells.
+            // Defensive fallback: L0 with mv=0.
+            build_inter_pred_luma_8x8(
+                ref_l0.recon_y,
+                ref_l0.width,
+                ref_l0.height,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                Mv::ZERO,
+            )
+        }
+    }
+}
+
+/// Round-25 — build one 4x4 chroma cell predictor (4:2:0) for an
+/// explicit-inter `B_8x8` cell. Symmetric with `build_b_explicit_8x8_cell_luma`.
+#[allow(clippy::too_many_arguments)]
+fn build_b_explicit_4x4_cell_chroma(
+    cell: BSubMbCell,
+    ref_plane_l0: &[u8],
+    ref_plane_l1: &[u8],
+    chroma_w_l0: u32,
+    chroma_h_l0: u32,
+    chroma_w_l1: u32,
+    chroma_h_l1: u32,
+    mb_x: usize,
+    mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+) -> [i32; 16] {
+    match cell {
+        BSubMbCell::L0 => build_inter_pred_chroma_4x4(
+            ref_plane_l0,
+            chroma_w_l0,
+            chroma_h_l0,
+            mb_x,
+            mb_y,
+            sub_x,
+            sub_y,
+            mv_l0,
+        ),
+        BSubMbCell::L1 => build_inter_pred_chroma_4x4(
+            ref_plane_l1,
+            chroma_w_l1,
+            chroma_h_l1,
+            mb_x,
+            mb_y,
+            sub_x,
+            sub_y,
+            mv_l1,
+        ),
+        BSubMbCell::Bi => {
+            let a = build_inter_pred_chroma_4x4(
+                ref_plane_l0,
+                chroma_w_l0,
+                chroma_h_l0,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv_l0,
+            );
+            let b = build_inter_pred_chroma_4x4(
+                ref_plane_l1,
+                chroma_w_l1,
+                chroma_h_l1,
+                mb_x,
+                mb_y,
+                sub_x,
+                sub_y,
+                mv_l1,
+            );
+            let mut out = [0i32; 16];
+            for i in 0..16 {
+                out[i] = (a[i] + b[i] + 1) >> 1;
+            }
+            out
+        }
+        BSubMbCell::Direct => build_inter_pred_chroma_4x4(
+            ref_plane_l0,
+            chroma_w_l0,
+            chroma_h_l0,
+            mb_x,
+            mb_y,
+            sub_x,
+            sub_y,
+            Mv::ZERO,
+        ),
+    }
+}
+
+/// Round-25 — pick the best per-cell `BSubMbCell` for one 8x8 quadrant
+/// of a `B_8x8` MB by minimising a Lagrangian SAD with rate cost
+/// approximations:
+///
+///   * Direct: 0-bit headroom (no MVs / refs / sub_mb_type overhead vs
+///     B_Direct_8x8 baseline).
+///   * L0: ~6 bits worth of SAD penalty (sub_mb_type overhead +
+///     mvd_l0 (.x, .y) at se(0) = 2 bits, plus typical small se).
+///   * L1: ~6 bits.
+///   * Bi:  ~12 bits (two mvds + larger sub_mb_type).
+///
+/// The penalty multiplier scales with QP via λ. We use the same
+/// `λ = (qp_y / 6).clamp(0, 8)` family as the round-21..24 selectors.
+#[allow(clippy::too_many_arguments)]
+fn pick_best_b8x8_cell(
+    src_y: &[u8],
+    src_stride: usize,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+    direct_pred: &[i32; 64],
+    me_l0: Mv,
+    me_l1: Mv,
+    qp_y: i32,
+) -> (BSubMbCell, Mv, Mv, [i32; 64], u32) {
+    let off_x = sub_x * 8;
+    let off_y = sub_y * 8;
+
+    // Direct candidate — caller-supplied predictor (already built from
+    // the §8.4.1.2.2 derivation's per-8x8 MVs).
+    let sad_direct = sad_8x8_pred(src_y, src_stride, mb_x, mb_y, off_x, off_y, direct_pred);
+
+    // L0/L1/Bi candidates.
+    let pred_l0 = build_b_explicit_8x8_cell_luma(
+        BSubMbCell::L0,
+        ref_l0,
+        ref_l1,
+        mb_x,
+        mb_y,
+        sub_x,
+        sub_y,
+        me_l0,
+        me_l1,
+    );
+    let sad_l0 = sad_8x8_pred(src_y, src_stride, mb_x, mb_y, off_x, off_y, &pred_l0);
+
+    let pred_l1 = build_b_explicit_8x8_cell_luma(
+        BSubMbCell::L1,
+        ref_l0,
+        ref_l1,
+        mb_x,
+        mb_y,
+        sub_x,
+        sub_y,
+        me_l0,
+        me_l1,
+    );
+    let sad_l1 = sad_8x8_pred(src_y, src_stride, mb_x, mb_y, off_x, off_y, &pred_l1);
+
+    let pred_bi = build_b_explicit_8x8_cell_luma(
+        BSubMbCell::Bi,
+        ref_l0,
+        ref_l1,
+        mb_x,
+        mb_y,
+        sub_x,
+        sub_y,
+        me_l0,
+        me_l1,
+    );
+    let sad_bi = sad_8x8_pred(src_y, src_stride, mb_x, mb_y, off_x, off_y, &pred_bi);
+
+    // Rate cost approximations (bits) per cell, vs the all-Direct baseline.
+    let lambda = (qp_y / 6).clamp(0, 8) as u32;
+    let cost_direct = 0u32;
+    let cost_l0 = (lambda + 1) * 6;
+    let cost_l1 = (lambda + 1) * 6;
+    let cost_bi = (lambda + 1) * 12;
+
+    let j_direct = sad_direct.saturating_add(cost_direct);
+    let j_l0 = sad_l0.saturating_add(cost_l0);
+    let j_l1 = sad_l1.saturating_add(cost_l1);
+    let j_bi = sad_bi.saturating_add(cost_bi);
+
+    // Tie-break order: Direct → L0 → L1 → Bi (mirrors round-21 / round-22
+    // selector preferences for cheaper syntax).
+    let mut best = (
+        BSubMbCell::Direct,
+        Mv::ZERO,
+        Mv::ZERO,
+        *direct_pred,
+        j_direct,
+        sad_direct,
+    );
+    if j_l0 < best.4 {
+        best = (BSubMbCell::L0, me_l0, Mv::ZERO, pred_l0, j_l0, sad_l0);
+    }
+    if j_l1 < best.4 {
+        best = (BSubMbCell::L1, Mv::ZERO, me_l1, pred_l1, j_l1, sad_l1);
+    }
+    if j_bi < best.4 {
+        best = (BSubMbCell::Bi, me_l0, me_l1, pred_bi, j_bi, sad_bi);
+    }
+    (best.0, best.1, best.2, best.3, best.5)
 }
 
 /// SAD between a 16x16 source block (at MB `(mb_x, mb_y)` of `src_y`) and
@@ -5208,6 +5722,45 @@ fn deblock_arrays_per_8x8_direct(
     (mvs, refs, pocs)
 }
 
+/// Round-25 — build the per-4x4 MV / per-8x8 ref / per-8x8 POC arrays
+/// for the §8.7 deblocker on a mixed `B_8x8` macroblock. Each 8x8
+/// quadrant carries its own per-list MV AND its own per-list ref_idx
+/// (an 8x8 cell may be Direct, L0-only, L1-only, or Bi independently
+/// from its neighbours). Within a quadrant all four 4x4 blocks share
+/// the quadrant's MV.
+///
+/// Slots whose ref_idx is negative encode "list unused for this 8x8
+/// cell" (mv = (0, 0), poc = `i32::MIN` sentinel).
+fn deblock_arrays_per_8x8_mixed(
+    mv_per_8x8: [Mv; 4],
+    ref_idx_per_8x8: [i32; 4],
+    poc_sentinel: i32,
+) -> ([(i16, i16); 16], [i8; 4], [i32; 4]) {
+    let mut mvs = [(0i16, 0i16); 16];
+    for (blk, slot) in mvs.iter_mut().enumerate() {
+        let (bx, by) = LUMA_4X4_BLK[blk];
+        let q = (by / 2) * 2 + (bx / 2);
+        if ref_idx_per_8x8[q] >= 0 {
+            let mv = mv_per_8x8[q];
+            *slot = (
+                mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            );
+        } else {
+            *slot = (0, 0);
+        }
+    }
+    let mut refs = [-1i8; 4];
+    let mut pocs = [i32::MIN; 4];
+    for q in 0..4usize {
+        if ref_idx_per_8x8[q] >= 0 {
+            refs[q] = ref_idx_per_8x8[q].clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+            pocs[q] = poc_sentinel;
+        }
+    }
+    (mvs, refs, pocs)
+}
+
 impl Encoder {
     /// Round-20 — encode one B-frame using `ref_l0` (typically the IDR /
     /// older anchor) and `ref_l1` (typically the next anchor — the prior
@@ -5270,6 +5823,42 @@ impl Encoder {
         // the matching derivation below.
         let direct_spatial = !self.cfg.direct_temporal_mv_pred;
 
+        // Round-26 — explicit weighted-bipred weight selection.
+        //
+        // When `cfg.explicit_weighted_bipred` is set, fit a single
+        // (w0, w1, o0, o1) at log2_wd = 5 against the two reference
+        // recon planes and the source. The fit is a slice-wide constant
+        // — a finer per-MB selection would need its own pred_weight
+        // table per ref index, which is out of scope. The chosen weights
+        // are then carried in the slice header's `pred_weight_table()`
+        // and applied by the decoder via §8.4.2.3.2 explicit bipred.
+        //
+        // We accept the chosen weights only if they materially diverge
+        // from the default (32, 32, 0, 0); otherwise the bit cost of
+        // the pred_weight_table outweighs any gain and we leave the
+        // table absent (decoder falls back to default merge).
+        let weighted_table = if self.cfg.explicit_weighted_bipred {
+            Some(compute_explicit_bipred_weights(
+                frame.y,
+                ref_l0.recon_y,
+                ref_l1.recon_y,
+                self.cfg.width as usize,
+                self.cfg.height as usize,
+                ref_l0.width as usize,
+                ref_l1.width as usize,
+            ))
+        } else {
+            None
+        };
+        let weighted_luma_for_mb: Option<WeightedBipredLuma> =
+            weighted_table.map(|t| WeightedBipredLuma {
+                log2_wd: t.luma_log2_weight_denom,
+                weight_l0: t.luma_weight_l0,
+                offset_l0: t.luma_offset_l0,
+                weight_l1: t.luma_weight_l1,
+                offset_l1: t.luma_offset_l1,
+            });
+
         let mut sw = BitWriter::new();
         write_b_slice_header(
             &mut sw,
@@ -5287,6 +5876,7 @@ impl Encoder {
                 slice_alpha_c0_offset_div2: 0,
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 0, // non-reference B
+                pred_weight_table: weighted_table,
             },
         );
 
@@ -5340,6 +5930,7 @@ impl Encoder {
                     &mut mv_grid_l1,
                     &mut pending_skip,
                     pic_order_cnt_lsb as i32,
+                    weighted_luma_for_mb,
                 );
                 mb_deblock_infos[mb_addr] = dbl;
             }
@@ -5455,6 +6046,11 @@ impl Encoder {
         // pic0 POC and `ref_l1.pic_order_cnt` = pic1 POC). Ignored
         // when the encoder is configured for spatial direct.
         curr_poc: i32,
+        // Round-26 — explicit weighted-bipred parameters (luma) for
+        // this B slice. `Some` when the slice header carries a
+        // `pred_weight_table()`; the bipred merge in `build_b_predictors`
+        // then uses §8.4.2.3.2 eq. 8-276 instead of the default average.
+        weighted: Option<WeightedBipredLuma>,
     ) -> MbDeblockInfo {
         let width_mbs = (self.cfg.width / 16) as usize;
         let mb_addr = mb_y * width_mbs + mb_x;
@@ -5496,12 +6092,36 @@ impl Encoder {
         // 2. Build the L0-only / L1-only / bipred predictors and SAD them
         //    against the source. The predictors are built once and then
         //    re-used for the chosen mode.
-        let (pred_y_l0, pred_u_l0, pred_v_l0) =
-            build_b_predictors(BPred16x16::L0, ref_l0, ref_l1, mb_x, mb_y, mv_l0, mv_l1);
-        let (pred_y_l1, pred_u_l1, pred_v_l1) =
-            build_b_predictors(BPred16x16::L1, ref_l0, ref_l1, mb_x, mb_y, mv_l0, mv_l1);
-        let (pred_y_bi, pred_u_bi, pred_v_bi) =
-            build_b_predictors(BPred16x16::Bi, ref_l0, ref_l1, mb_x, mb_y, mv_l0, mv_l1);
+        let (pred_y_l0, pred_u_l0, pred_v_l0) = build_b_predictors(
+            BPred16x16::L0,
+            ref_l0,
+            ref_l1,
+            mb_x,
+            mb_y,
+            mv_l0,
+            mv_l1,
+            weighted,
+        );
+        let (pred_y_l1, pred_u_l1, pred_v_l1) = build_b_predictors(
+            BPred16x16::L1,
+            ref_l0,
+            ref_l1,
+            mb_x,
+            mb_y,
+            mv_l0,
+            mv_l1,
+            weighted,
+        );
+        let (pred_y_bi, pred_u_bi, pred_v_bi) = build_b_predictors(
+            BPred16x16::Bi,
+            ref_l0,
+            ref_l1,
+            mb_x,
+            mb_y,
+            mv_l0,
+            mv_l1,
+            weighted,
+        );
 
         let sad_l0 = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &pred_y_l0);
         let sad_l1 = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &pred_y_l1);
@@ -5579,6 +6199,7 @@ impl Encoder {
                         mb_y,
                         direct.mv_l0(),
                         direct.mv_l1(),
+                        weighted,
                     );
                     let dsad = sad_16x16_pred(frame.y, src_stride, mb_x, mb_y, &dy);
                     (true, dy, du, dv, dsad)
@@ -5619,6 +6240,186 @@ impl Encoder {
             None => (false, [0i32; 256], [0i32; 64], [0i32; 64], u32::MAX),
         };
 
+        // 2.7 Round-25 — `B_8x8` with **mixed** per-cell sub_mb_type.
+        // Per-cell qpel ME on each list (re-using `search_quarter_pel_8x8`),
+        // then per-cell pick of {Direct, L0, L1, Bi} on Lagrangian SAD.
+        // The Direct cell predictor is sliced from the round-23
+        // `direct_8x8_pred_y` 16x16 buffer at the appropriate quadrant.
+        // The mixed predictor is stitched from the per-cell winners. If
+        // every cell ends up Direct we collapse to the round-23 path
+        // (the all-Direct writer is a tighter syntax than the round-25
+        // mixed writer when no MVs are emitted).
+        let mut mixed_me_l0_cells: [Mv; 4] = [Mv::ZERO; 4];
+        let mut mixed_me_l1_cells: [Mv; 4] = [Mv::ZERO; 4];
+        for cell in 0..4usize {
+            let sx = cell % 2;
+            let sy = cell / 2;
+            let r0 = search_quarter_pel_8x8(
+                frame.y,
+                src_stride,
+                self.cfg.width,
+                self.cfg.height,
+                ref_l0.recon_y,
+                ref_l0.width as usize,
+                ref_l0.width,
+                ref_l0.height,
+                mb_x,
+                mb_y,
+                sx,
+                sy,
+                4,
+                4,
+            );
+            let r1 = search_quarter_pel_8x8(
+                frame.y,
+                src_stride,
+                self.cfg.width,
+                self.cfg.height,
+                ref_l1.recon_y,
+                ref_l1.width as usize,
+                ref_l1.width,
+                ref_l1.height,
+                mb_x,
+                mb_y,
+                sx,
+                sy,
+                4,
+                4,
+            );
+            mixed_me_l0_cells[cell] = Mv::new(r0.mv_x, r0.mv_y);
+            mixed_me_l1_cells[cell] = Mv::new(r1.mv_x, r1.mv_y);
+        }
+
+        let mut mixed_cells = [BSubMbCell::Direct; 4];
+        let mut mixed_cell_mv_l0 = [Mv::ZERO; 4];
+        let mut mixed_cell_mv_l1 = [Mv::ZERO; 4];
+        let mut mixed_cell_pred_y_per_cell = [[0i32; 64]; 4];
+        let mut mixed_total_sad = 0u32;
+        let mixed_competitive = direct_pred_kind.is_some();
+        if mixed_competitive {
+            for cell in 0..4usize {
+                let sub_x = cell % 2;
+                let sub_y = cell / 2;
+                // Slice the Direct cell's 8x8 luma predictor out of the
+                // 16x16 buffer.
+                let mut direct_cell_pred = [0i32; 64];
+                for j in 0..8usize {
+                    for i in 0..8usize {
+                        direct_cell_pred[j * 8 + i] =
+                            direct_8x8_pred_y[(sub_y * 8 + j) * 16 + sub_x * 8 + i];
+                    }
+                }
+                let (cell_kind, cell_mv0, cell_mv1, cell_pred, cell_sad) = pick_best_b8x8_cell(
+                    frame.y,
+                    src_stride,
+                    ref_l0,
+                    ref_l1,
+                    mb_x,
+                    mb_y,
+                    sub_x,
+                    sub_y,
+                    &direct_cell_pred,
+                    mixed_me_l0_cells[cell],
+                    mixed_me_l1_cells[cell],
+                    qp_y,
+                );
+                mixed_cells[cell] = cell_kind;
+                mixed_cell_mv_l0[cell] = cell_mv0;
+                mixed_cell_mv_l1[cell] = cell_mv1;
+                mixed_cell_pred_y_per_cell[cell] = cell_pred;
+                mixed_total_sad = mixed_total_sad.saturating_add(cell_sad);
+            }
+        } else {
+            mixed_total_sad = u32::MAX;
+        }
+
+        // The mixed mode is only worth emitting when at least one cell
+        // picked a non-Direct kind (otherwise the round-23 all-Direct
+        // writer is tighter and produces the same predictor).
+        let mixed_has_non_direct = mixed_cells.iter().any(|&c| c != BSubMbCell::Direct);
+        let mixed_competitive_for_pick = mixed_competitive && mixed_has_non_direct;
+
+        // Stitch the per-cell mixed luma + chroma composite predictors.
+        let (mixed_pred_y, mixed_pred_u, mixed_pred_v) = if mixed_competitive_for_pick {
+            let mut py = [0i32; 256];
+            let mut pu = [0i32; 64];
+            let mut pv = [0i32; 64];
+            let chroma_w_l0 = ref_l0.width / 2;
+            let chroma_h_l0 = ref_l0.height / 2;
+            let chroma_w_l1 = ref_l1.width / 2;
+            let chroma_h_l1 = ref_l1.height / 2;
+            for cell in 0..4usize {
+                let sub_x = cell % 2;
+                let sub_y = cell / 2;
+                let cell_pred_y = mixed_cell_pred_y_per_cell[cell];
+                for j in 0..8usize {
+                    for i in 0..8usize {
+                        py[(sub_y * 8 + j) * 16 + sub_x * 8 + i] = cell_pred_y[j * 8 + i];
+                    }
+                }
+                // Chroma predictor for this cell. Direct cells use the
+                // §8.4.1.2.2-derived per-8x8 MVs; explicit cells use the
+                // per-cell ME MVs. The chroma kind for Direct cells
+                // honours the §8.4.1.2.2 derived (refIdxL0, refIdxL1)
+                // status (both >= 0 → Bi; only one >= 0 → L0/L1).
+                let (mv0, mv1) = if mixed_cells[cell] == BSubMbCell::Direct {
+                    (direct.mv_l0_per_8x8[cell], direct.mv_l1_per_8x8[cell])
+                } else {
+                    (mixed_cell_mv_l0[cell], mixed_cell_mv_l1[cell])
+                };
+                let chroma_kind = match mixed_cells[cell] {
+                    BSubMbCell::Direct => {
+                        match (direct.ref_idx_l0 >= 0, direct.ref_idx_l1 >= 0) {
+                            (true, true) => BSubMbCell::Bi,
+                            (true, false) => BSubMbCell::L0,
+                            (false, true) => BSubMbCell::L1,
+                            (false, false) => BSubMbCell::L0, // defensive
+                        }
+                    }
+                    other => other,
+                };
+                let cu = build_b_explicit_4x4_cell_chroma(
+                    chroma_kind,
+                    ref_l0.recon_u,
+                    ref_l1.recon_u,
+                    chroma_w_l0,
+                    chroma_h_l0,
+                    chroma_w_l1,
+                    chroma_h_l1,
+                    mb_x,
+                    mb_y,
+                    sub_x,
+                    sub_y,
+                    mv0,
+                    mv1,
+                );
+                let cv = build_b_explicit_4x4_cell_chroma(
+                    chroma_kind,
+                    ref_l0.recon_v,
+                    ref_l1.recon_v,
+                    chroma_w_l0,
+                    chroma_h_l0,
+                    chroma_w_l1,
+                    chroma_h_l1,
+                    mb_x,
+                    mb_y,
+                    sub_x,
+                    sub_y,
+                    mv0,
+                    mv1,
+                );
+                for j in 0..4usize {
+                    for i in 0..4usize {
+                        pu[(sub_y * 4 + j) * 8 + sub_x * 4 + i] = cu[j * 4 + i];
+                        pv[(sub_y * 4 + j) * 8 + sub_x * 4 + i] = cv[j * 4 + i];
+                    }
+                }
+            }
+            (py, pu, pv)
+        } else {
+            ([0i32; 256], [0i32; 64], [0i32; 64])
+        };
+
         // 3. Pick the candidate that minimises a Lagrangian cost
         //    `J = SAD_luma + λ · R_syntax`. Direct mode emits the
         //    smallest syntax block (just `mb_type=0 + cbp`, or nothing
@@ -5650,6 +6451,12 @@ impl Encoder {
             /// direct_8x8_sad beats direct_uniform_sad by more than the
             /// extra-syntax cost.
             DirectPer8x8,
+            /// Round-25: `B_8x8` with mixed per-cell sub_mb_type (some
+            /// cells Direct, others L0/L1/Bi). Each non-Direct cell adds
+            /// ~6-12 bits of MB syntax (sub_mb_type overhead + per-cell
+            /// mvds), so only chosen when the per-cell motion materially
+            /// beats the all-Direct (round-23) candidate.
+            Mixed8x8,
             Explicit(BPred16x16),
         }
         // Per-MB Lagrangian penalty applied to explicit candidates
@@ -5687,7 +6494,48 @@ impl Encoder {
         } else {
             (direct_competitive, direct_sad, false)
         };
-        let chosen_mode: BMode = if best_direct_competitive
+        // Round-25 — mixed `B_8x8` candidate. The per-cell pick already
+        // factored in a per-cell Lagrangian rate cost (in
+        // `pick_best_b8x8_cell`), so `mixed_total_sad` already includes
+        // the per-non-Direct-cell sub_mb_type+mvd bit penalty.
+        //
+        // Mixed8x8 vs B_Direct_16x16: Mixed costs +12 bits of MB header
+        // (mb_type 22 ue(9) + 4× sub_mb_type ue(≥1) ≥ 4 bits, vs
+        // B_Direct_16x16's 1-bit mb_type=0).
+        //
+        // Mixed8x8 vs DirectPer8x8: same MB header (both mb_type=22),
+        // but Mixed's sub_mb_type entries cost ≥3 extra bits each for
+        // non-Direct cells (ue(1)/ue(2)/ue(3) = 3/3/5 bits vs ue(0) = 1
+        // bit) — that overhead is the per-cell `(lambda+1)*6` term in
+        // `pick_best_b8x8_cell`'s rate cost.
+        //
+        // To gate Mixed vs DirectPer8x8 / B_Direct_16x16 fairly:
+        //   * If best_direct is the 16x16 form, add the +12-bit MB
+        //     header penalty to Mixed's J score.
+        //   * If best_direct is DirectPer8x8, no extra penalty (same MB
+        //     header).
+        //
+        // Plus a small extra "tie-break" margin so Mixed only fires when
+        // it materially beats the simpler all-Direct candidate.
+        let mixed_mb_header_bias_sad: u32 = if best_direct_is_per_8x8 {
+            0
+        } else {
+            let lambda = (qp_y / 6).clamp(0, 8) as u32;
+            (lambda + 1) * 12
+        };
+        let mixed_tiebreak_bias_sad: u32 = {
+            let lambda = (qp_y / 6).clamp(0, 8) as u32;
+            (lambda + 1) * 8
+        };
+        let prefer_mixed = mixed_competitive_for_pick
+            && best_direct_competitive
+            && mixed_total_sad
+                .saturating_add(mixed_mb_header_bias_sad)
+                .saturating_add(mixed_tiebreak_bias_sad)
+                < best_direct_sad;
+        let chosen_mode: BMode = if prefer_mixed {
+            BMode::Mixed8x8
+        } else if best_direct_competitive
             && best_direct_sad <= sad_bi.saturating_add(direct_bias_sad)
             && best_direct_sad <= sad_l0.saturating_add(direct_bias_sad)
             && best_direct_sad <= sad_l1.saturating_add(direct_bias_sad)
@@ -5737,6 +6585,30 @@ impl Encoder {
                     direct.mv_l1_per_8x8[0],
                 )
             }
+            BMode::Mixed8x8 => {
+                // Round-25 — `B_8x8` with mixed sub_mb_type cells. The
+                // composite predictor was stitched above. The MB-level
+                // `pred` enum is a coarse summary used by downstream
+                // grid / deblock helpers when no per-cell override
+                // overrides them; the per-cell branch below patches the
+                // grid with the per-cell MVs / refs directly.
+                let any_l0 = mixed_cells.iter().any(|&c| c.writes_l0()) || direct.ref_idx_l0 >= 0;
+                let any_l1 = mixed_cells.iter().any(|&c| c.writes_l1()) || direct.ref_idx_l1 >= 0;
+                let summary = match (any_l0, any_l1) {
+                    (true, true) => BPred16x16::Bi,
+                    (true, false) => BPred16x16::L0,
+                    (false, true) => BPred16x16::L1,
+                    (false, false) => BPred16x16::L0, // defensive
+                };
+                (
+                    summary,
+                    mixed_pred_y,
+                    mixed_pred_u,
+                    mixed_pred_v,
+                    mixed_cell_mv_l0[0],
+                    mixed_cell_mv_l1[0],
+                )
+            }
             BMode::Explicit(BPred16x16::Bi) => (
                 BPred16x16::Bi,
                 pred_y_bi,
@@ -5767,6 +6639,9 @@ impl Encoder {
         // partition-mode override below to be DISABLED (Direct paths
         // never pair with explicit 16x8 / 8x16 partition shapes).
         let is_direct_per_8x8 = matches!(chosen_mode, BMode::DirectPer8x8);
+        // Round-25 — Mixed8x8 also bypasses the 16x8 / 8x16 partition
+        // override (mb_type=22 is mutually exclusive with raws 4..=21).
+        let is_mixed_8x8 = matches!(chosen_mode, BMode::Mixed8x8);
 
         // ---- Round-22: try 16x8 / 8x16 partition modes ----
         //
@@ -5818,9 +6693,14 @@ impl Encoder {
         }
 
         // Best 16x16 SAD = the SAD of the chosen 16x16-mode predictor.
+        // (For Mixed8x8 / DirectPer8x8 we still pass the SAD of their
+        // composite into the partition-mode comparison even though the
+        // partition path will be skipped — `is_mixed_8x8` /
+        // `is_direct_per_8x8` are checked directly in the gate below.)
         let best_16x16_sad = match chosen_mode {
             BMode::Direct => direct_sad,
             BMode::DirectPer8x8 => direct_8x8_sad,
+            BMode::Mixed8x8 => mixed_total_sad,
             BMode::Explicit(BPred16x16::Bi) => sad_bi,
             BMode::Explicit(BPred16x16::L0) => sad_l0,
             BMode::Explicit(BPred16x16::L1) => sad_l1,
@@ -5880,12 +6760,12 @@ impl Encoder {
         let mut partition_choice: Option<PartitionChoiceB> = None;
         // Don't override Direct: it may collapse to B_Skip (0 bits of MB
         // syntax) once the residual quantises to zero, beating any
-        // partition mode by a large margin. Same for DirectPer8x8 — it
-        // emits the per-8x8 sub_mb_type=B_Direct_8x8 path which is
-        // mutually exclusive with the explicit 16x8 / 8x16 partition
-        // shapes. Partition mode override only applies to explicit-inter
-        // 16x16 candidates.
-        if !is_direct && !is_direct_per_8x8 && part_winner_sad < part_threshold {
+        // partition mode by a large margin. Same for DirectPer8x8 / Mixed8x8 —
+        // both emit `mb_type=22` (B_8x8) which is mutually exclusive
+        // with the explicit 16x8 / 8x16 partition shapes (mb_type 4..=21).
+        // Partition mode override only applies to explicit-inter 16x16
+        // candidates.
+        if !is_direct && !is_direct_per_8x8 && !is_mixed_8x8 && part_winner_sad < part_threshold {
             partition_choice = Some(match part_winner {
                 PartitionShape::P16x8 => PartitionChoiceB {
                     shape: PartitionShape::P16x8,
@@ -5923,12 +6803,22 @@ impl Encoder {
         //    derive per-partition MVDs further below.
         let mvp_l0 = mvp_for_16x16(mv_grid_l0, mb_x, mb_y, 0);
         let mvp_l1 = mvp_for_16x16(mv_grid_l1, mb_x, mb_y, 0);
-        let (mvd_l0_x, mvd_l0_y) = if !is_direct && partition_choice.is_none() && pred.uses_l0() {
+        let (mvd_l0_x, mvd_l0_y) = if !is_direct
+            && !is_direct_per_8x8
+            && !is_mixed_8x8
+            && partition_choice.is_none()
+            && pred.uses_l0()
+        {
             (eff_mv_l0.x - mvp_l0.x, eff_mv_l0.y - mvp_l0.y)
         } else {
             (0, 0)
         };
-        let (mvd_l1_x, mvd_l1_y) = if !is_direct && partition_choice.is_none() && pred.uses_l1() {
+        let (mvd_l1_x, mvd_l1_y) = if !is_direct
+            && !is_direct_per_8x8
+            && !is_mixed_8x8
+            && partition_choice.is_none()
+            && pred.uses_l1()
+        {
             (eff_mv_l1.x - mvp_l1.x, eff_mv_l1.y - mvp_l1.y)
         } else {
             (0, 0)
@@ -5940,6 +6830,77 @@ impl Encoder {
             partition_mvds_b(pc, mv_grid_l0, mv_grid_l1, mb_x, mb_y)
         } else {
             ([(0, 0); 2], [(0, 0); 2])
+        };
+
+        // Round-25 — per-cell MVDs for the Mixed8x8 mode. For each
+        // non-Direct cell, compute the mvd against the §8.4.1.3 mvpLX
+        // for that 8x8 partition (using the within-MB inflight neighbour
+        // states as cells decode in raster Z-order 0→1→2→3). Direct
+        // cells emit no MVDs.
+        let (mixed_mvd_l0_per_cell, mixed_mvd_l1_per_cell) = if is_mixed_8x8 {
+            let mut mvd0 = [(0i32, 0i32); 4];
+            let mut mvd1 = [(0i32, 0i32); 4];
+            // Inflight per-cell L0 / L1 state for §8.4.1.3 within-MB
+            // neighbour reads (mirrors the round-19 P_8x8 path). Each
+            // cell sees the previously-decoded cells of this same MB.
+            let mut inflight_avail = [false; 4];
+            let mut mv_inflight_l0 = [Mv::ZERO; 4];
+            let mut ref_inflight_l0 = [-1i32; 4];
+            let mut mv_inflight_l1 = [Mv::ZERO; 4];
+            let mut ref_inflight_l1 = [-1i32; 4];
+            for cell in 0..4usize {
+                let kind = mixed_cells[cell];
+                if kind.writes_l0() {
+                    let mvp = mvp_for_p_8x8_partition(
+                        mv_grid_l0,
+                        mb_x,
+                        mb_y,
+                        cell,
+                        0,
+                        inflight_avail,
+                        mv_inflight_l0,
+                        ref_inflight_l0,
+                    );
+                    let mv = mixed_cell_mv_l0[cell];
+                    mvd0[cell] = (mv.x - mvp.x, mv.y - mvp.y);
+                }
+                if kind.writes_l1() {
+                    let mvp = mvp_for_p_8x8_partition(
+                        mv_grid_l1,
+                        mb_x,
+                        mb_y,
+                        cell,
+                        0,
+                        inflight_avail,
+                        mv_inflight_l1,
+                        ref_inflight_l1,
+                    );
+                    let mv = mixed_cell_mv_l1[cell];
+                    mvd1[cell] = (mv.x - mvp.x, mv.y - mvp.y);
+                }
+                // Update inflight per-cell state for downstream cells.
+                inflight_avail[cell] = true;
+                // For Direct cells, the inflight state must reflect the
+                // §8.4.1.2.2 derivation result (so subsequent cells'
+                // §8.4.1.3 neighbour reads see the correct MV / ref).
+                let (cell_mv0_ifl, cell_ref0_ifl) = match kind {
+                    BSubMbCell::Direct => (direct.mv_l0_per_8x8[cell], direct.ref_idx_l0),
+                    BSubMbCell::L0 | BSubMbCell::Bi => (mixed_cell_mv_l0[cell], 0),
+                    BSubMbCell::L1 => (Mv::ZERO, -1),
+                };
+                let (cell_mv1_ifl, cell_ref1_ifl) = match kind {
+                    BSubMbCell::Direct => (direct.mv_l1_per_8x8[cell], direct.ref_idx_l1),
+                    BSubMbCell::L1 | BSubMbCell::Bi => (mixed_cell_mv_l1[cell], 0),
+                    BSubMbCell::L0 => (Mv::ZERO, -1),
+                };
+                mv_inflight_l0[cell] = cell_mv0_ifl;
+                ref_inflight_l0[cell] = cell_ref0_ifl;
+                mv_inflight_l1[cell] = cell_mv1_ifl;
+                ref_inflight_l1[cell] = cell_ref1_ifl;
+            }
+            (mvd0, mvd1)
+        } else {
+            ([(0, 0); 4], [(0, 0); 4])
         };
 
         let _ = BMbDecision {
@@ -6124,6 +7085,26 @@ impl Encoder {
                 };
                 crate::encoder::macroblock::write_b_8x8_all_direct_mb(sw, &dcfg)
                     .expect("write B_8x8 + 4× B_Direct_8x8 mb");
+            } else if is_mixed_8x8 {
+                // Round-25 — `B_8x8` with mixed per-cell sub_mb_type.
+                // Direct cells emit only their sub_mb_type; explicit
+                // cells emit their (mvd_l0, mvd_l1) pair as appropriate
+                // (§7.3.5.2 gating; ref_idx absent in single-ref setup).
+                let mcfg = B8x8MixedMcbConfig {
+                    cells: mixed_cells,
+                    mvd_l0: mixed_mvd_l0_per_cell,
+                    mvd_l1: mixed_mvd_l1_per_cell,
+                    cbp_luma,
+                    cbp_chroma,
+                    mb_qp_delta: 0,
+                    luma_4x4_levels: luma_4x4_levels_scan,
+                    luma_4x4_nc,
+                    chroma_dc_cb: u_dc_levels,
+                    chroma_dc_cr: v_dc_levels,
+                    chroma_ac_cb: u_ac_levels,
+                    chroma_ac_cr: v_ac_levels,
+                };
+                write_b_8x8_mixed_mb(sw, &mcfg, 0, 0).expect("write B_8x8 mixed mb");
             } else if let Some(pc) = partition_choice.as_ref() {
                 use crate::encoder::macroblock::{
                     write_b_16x8_mb, write_b_8x16_mb, B16x8McbConfig, B8x16McbConfig,
@@ -6205,6 +7186,32 @@ impl Encoder {
                 },
                 used,
             )
+        } else if is_mixed_8x8 {
+            // Round-25 — per-cell L0 (mv, ref). Direct cells take their
+            // §8.4.1.2.2 derivation result; explicit L0/Bi cells take
+            // their explicit MV with refIdxL0=0; L1 cells leave L0 unset.
+            let mut mvs = [Mv::ZERO; 4];
+            let mut refs = [-1i32; 4];
+            let mut any_used = false;
+            for cell in 0..4usize {
+                let kind = mixed_cells[cell];
+                match kind {
+                    BSubMbCell::Direct => {
+                        if direct.ref_idx_l0 >= 0 {
+                            mvs[cell] = direct.mv_l0_per_8x8[cell];
+                            refs[cell] = direct.ref_idx_l0;
+                            any_used = true;
+                        }
+                    }
+                    BSubMbCell::L0 | BSubMbCell::Bi => {
+                        mvs[cell] = mixed_cell_mv_l0[cell];
+                        refs[cell] = 0;
+                        any_used = true;
+                    }
+                    BSubMbCell::L1 => {}
+                }
+            }
+            (mvs, refs, any_used)
         } else {
             grid_state_b(
                 partition_choice.as_ref(),
@@ -6224,6 +7231,29 @@ impl Encoder {
                 },
                 used,
             )
+        } else if is_mixed_8x8 {
+            let mut mvs = [Mv::ZERO; 4];
+            let mut refs = [-1i32; 4];
+            let mut any_used = false;
+            for cell in 0..4usize {
+                let kind = mixed_cells[cell];
+                match kind {
+                    BSubMbCell::Direct => {
+                        if direct.ref_idx_l1 >= 0 {
+                            mvs[cell] = direct.mv_l1_per_8x8[cell];
+                            refs[cell] = direct.ref_idx_l1;
+                            any_used = true;
+                        }
+                    }
+                    BSubMbCell::L1 | BSubMbCell::Bi => {
+                        mvs[cell] = mixed_cell_mv_l1[cell];
+                        refs[cell] = 0;
+                        any_used = true;
+                    }
+                    BSubMbCell::L0 => {}
+                }
+            }
+            (mvs, refs, any_used)
         } else {
             grid_state_b(
                 partition_choice.as_ref(),
@@ -6279,11 +7309,15 @@ impl Encoder {
 
         let (mv_l0_arr, ref_idx_l0, ref_poc_l0) = if is_direct_per_8x8 {
             deblock_arrays_per_8x8_direct(direct.mv_l0_per_8x8, direct.ref_idx_l0, 0i32)
+        } else if is_mixed_8x8 {
+            deblock_arrays_per_8x8_mixed(l0_mvs_8x8, l0_refs_8x8, 0i32)
         } else {
             deblock_mv_arr_b(partition_choice.as_ref(), true, pred, eff_mv_l0, 0i32)
         };
         let (mv_l1_arr, ref_idx_l1, ref_poc_l1) = if is_direct_per_8x8 {
             deblock_arrays_per_8x8_direct(direct.mv_l1_per_8x8, direct.ref_idx_l1, 1000i32)
+        } else if is_mixed_8x8 {
+            deblock_arrays_per_8x8_mixed(l1_mvs_8x8, l1_refs_8x8, 1000i32)
         } else {
             deblock_mv_arr_b(partition_choice.as_ref(), false, pred, eff_mv_l1, 1000i32)
         };
@@ -6300,5 +7334,75 @@ impl Encoder {
             ref_idx_l1,
             ref_poc_l1,
         }
+    }
+}
+
+#[cfg(test)]
+mod weighted_bipred_tests {
+    use super::*;
+
+    /// Hand-built fade fixture: textured frames at two brightness
+    /// levels with a true linear cross-fade. Texture (not just brightness)
+    /// rules out the degenerate "all-on-L1, offset compensates" solution
+    /// — the weights have to honour the per-sample mixing to keep SSE
+    /// low. The selector should land on weights near (45, 19) at
+    /// log2_wd = 5, i.e. α ≈ 0.7 toward L0.
+    #[test]
+    fn weight_selector_finds_alpha_07_on_textured_fade() {
+        let w = 16usize;
+        let h = 16usize;
+        let mut l0 = vec![0u8; w * h];
+        let mut l1 = vec![0u8; w * h];
+        let mut src = vec![0u8; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                // L0 and L1 have *different* texture scales so an offset
+                // alone cannot disguise itself as a weight choice. With
+                // L0 amplitude 60 and L1 amplitude 20, only the right α
+                // can match the source's mixed texture amplitude
+                // 0.7 * 60 + 0.3 * 20 = 42.
+                let tex_a = (((i * 13 + j * 7) % 16) as i32) * 4; // 0..=60
+                let tex_b = ((i * 13 + j * 7) % 16) as i32; // 0..=15
+                let a = 30 + tex_a;
+                let b = 180 + tex_b;
+                let v = (0.7 * a as f64 + 0.3 * b as f64).round() as i32;
+                l0[j * w + i] = a.clamp(0, 255) as u8;
+                l1[j * w + i] = b.clamp(0, 255) as u8;
+                src[j * w + i] = v.clamp(0, 255) as u8;
+            }
+        }
+        let table = compute_explicit_bipred_weights(&src, &l0, &l1, w, h, w, w);
+        assert_eq!(table.luma_log2_weight_denom, 5);
+        // w0 + w1 must sum to 64 (denom for log2_wd = 5).
+        assert_eq!(
+            table.luma_weight_l0 + table.luma_weight_l1,
+            64,
+            "weights must sum to 2^(logwd+1)"
+        );
+        // Coarse grid step is 4 → α=0.7 lands on w0 ∈ {44, 48}; we expect
+        // the selector to pick the better neighbour.
+        assert!(
+            (40..=48).contains(&table.luma_weight_l0),
+            "expected w0 ≈ 45 (α=0.7), got {}",
+            table.luma_weight_l0,
+        );
+    }
+
+    /// On content where the source IS the linear midpoint of L0 and L1
+    /// the selector should fall back to the default (32, 32, 0, 0)
+    /// because the explicit table wouldn't beat the default merge.
+    #[test]
+    fn weight_selector_returns_default_on_midpoint_fade() {
+        let w = 16usize;
+        let h = 16usize;
+        let l0 = vec![60u8; w * h];
+        let l1 = vec![160u8; w * h];
+        // Midpoint: (60+160+1)>>1 = 110.
+        let src = vec![110u8; w * h];
+        let table = compute_explicit_bipred_weights(&src, &l0, &l1, w, h, w, w);
+        assert_eq!(table.luma_weight_l0, 32);
+        assert_eq!(table.luma_weight_l1, 32);
+        assert_eq!(table.luma_offset_l0, 0);
+        assert_eq!(table.luma_offset_l1, 0);
     }
 }

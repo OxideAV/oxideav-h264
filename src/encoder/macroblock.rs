@@ -1372,6 +1372,244 @@ pub fn write_b_8x8_all_direct_mb(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Round 25 — B_8x8 with mixed sub_mb_type (Direct/L0/L1/Bi per cell)
+// ---------------------------------------------------------------------------
+//
+// Spec layout (§7.3.5 + §7.3.5.2 + §7.4.5 Table 7-14 + Table 7-18):
+//
+//   mb_type ue(v)                     -- raw 22 = B_8x8 (Table 7-14)
+//   sub_mb_pred(B_8x8) {
+//     for i in 0..4: sub_mb_type[i]   -- raw ∈ {0, 1, 2, 3} per cell
+//                                        (B_Direct_8x8 / B_L0_8x8 /
+//                                        B_L1_8x8 / B_Bi_8x8). Round-25
+//                                        scope is one MV per cell — sub-
+//                                        8x8 partition shapes (raws
+//                                        4..=12) deferred to r26.
+//     for i in 0..4: ref_idx_l0[i]    -- te(v); gated on:
+//                                        sub_mb_type[i] != B_Direct_8x8
+//                                        AND SubMbPredMode != Pred_L1
+//                                        AND num_ref_idx_l0_active_minus1>0
+//                                        (round-25: single ref → absent).
+//     for i in 0..4: ref_idx_l1[i]    -- te(v); same gate with PredL0.
+//     for i in 0..4:
+//       if sub_mb_type[i] != B_Direct_8x8 AND
+//          SubMbPredMode != Pred_L1:
+//         mvd_l0[i] = (x, y)          -- se(v) × 2 (NumSubMbPart == 1)
+//     for i in 0..4:
+//       if sub_mb_type[i] != B_Direct_8x8 AND
+//          SubMbPredMode != Pred_L0:
+//         mvd_l1[i] = (x, y)          -- se(v) × 2
+//   }
+//   coded_block_pattern me(v)         -- inter Table 9-4(a)
+//   if (cbp_luma>0 || cbp_chroma>0): mb_qp_delta se(v)
+//   ... residuals (same layout as the 16x16 / 16x8 / 8x16 paths) ...
+//
+// Cells coded as B_Direct_8x8 are derived via §8.4.1.2.2 (spatial direct,
+// our current configuration) — no MVs in the bitstream for those cells.
+// Cells coded as B_L0_8x8 / B_L1_8x8 / B_Bi_8x8 carry one explicit
+// (mvd_l0, mvd_l1) pair as appropriate.
+//
+// Spec sections cited:
+//   §7.3.5            — macroblock_layer (this file already covers the
+//                       base inter / intra paths)
+//   §7.3.5.2          — sub_mb_pred() syntax with sub_mb_type[mbPartIdx]
+//   §7.4.5 Table 7-14 — mb_type=22 → B_8x8
+//   §7.4.5 Table 7-18 — sub_mb_type ∈ {0..3} → 1 8x8 partition each
+//   §8.4.1.2          — direct mode entry; B_Direct_8x8 dispatch
+//   §8.4.1.2.2        — spatial direct derivation (steps 4-7)
+//   §9.1.2 / Table 9-4(a) — inter CBP me(v) (already inverse-tabled here)
+
+/// Round-25 — per-8x8-cell prediction kind for a `B_8x8` macroblock with
+/// mixed sub_mb_types. `Direct` maps to raw sub_mb_type 0
+/// (B_Direct_8x8); `L0`/`L1`/`Bi` map to raw 1/2/3 (B_L0_8x8/B_L1_8x8/
+/// B_Bi_8x8 per Table 7-18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BSubMbCell {
+    /// `B_Direct_8x8` — derived (mvL0, mvL1, refIdxL0, refIdxL1) via
+    /// §8.4.1.2 dispatch (spatial or temporal direct per slice header).
+    Direct,
+    /// `B_L0_8x8` — explicit L0-only single 8x8 partition.
+    L0,
+    /// `B_L1_8x8` — explicit L1-only single 8x8 partition.
+    L1,
+    /// `B_Bi_8x8` — explicit bipred single 8x8 partition.
+    Bi,
+}
+
+impl BSubMbCell {
+    /// Table 7-18 raw sub_mb_type value for this cell.
+    pub fn sub_mb_type_raw(self) -> u32 {
+        match self {
+            BSubMbCell::Direct => 0,
+            BSubMbCell::L0 => 1,
+            BSubMbCell::L1 => 2,
+            BSubMbCell::Bi => 3,
+        }
+    }
+
+    /// True iff this cell reads from list 0 (L0 or Bi). Direct cells
+    /// derive their own (refIdxL0, refIdxL1) per §8.4.1.2 — the gate
+    /// here only governs whether the encoder writes mvd_l0/ref_idx_l0
+    /// fields in the bitstream.
+    pub fn writes_l0(self) -> bool {
+        matches!(self, BSubMbCell::L0 | BSubMbCell::Bi)
+    }
+
+    /// True iff this cell reads from list 1 (L1 or Bi). Same caveat as
+    /// `writes_l0` for direct cells.
+    pub fn writes_l1(self) -> bool {
+        matches!(self, BSubMbCell::L1 | BSubMbCell::Bi)
+    }
+}
+
+/// Configuration for one B-slice **B_8x8** macroblock with mixed
+/// `sub_mb_type` cells (Direct / L0 / L1 / Bi per 8x8 quadrant).
+/// Round-25 entry point.
+///
+/// Each non-Direct cell carries one (mvd_l0, mvd_l1) pair as appropriate
+/// (NumSubMbPart == 1 for sub_mb_type ∈ {0, 1, 2, 3}). Direct cells
+/// have no MVs / ref_idxs in the bitstream — the decoder re-derives
+/// them via §8.4.1.2.2 / §8.4.1.2.3.
+///
+/// Layout per §7.3.5 / §7.3.5.2 with `mb_type = 22`:
+///
+/// ```text
+///   mb_type ue(v)                      (codeNum 22 → "0000 0010 111")
+///   for i in 0..4:
+///     sub_mb_type[i] ue(v)             (codeNum ∈ {0,1,2,3})
+///   for i in 0..4: ref_idx_l0[i] te(v) (only if cell writes L0 + multi-ref)
+///   for i in 0..4: ref_idx_l1[i] te(v) (only if cell writes L1 + multi-ref)
+///   for i in 0..4:
+///     if cell writes L0: mvd_l0[i].x, mvd_l0[i].y  (se(v) × 2)
+///   for i in 0..4:
+///     if cell writes L1: mvd_l1[i].x, mvd_l1[i].y  (se(v) × 2)
+///   coded_block_pattern me(v)          (inter Table 9-4(a))
+///   if cbp_luma > 0 || cbp_chroma > 0:
+///     mb_qp_delta se(v)
+///   ... residuals (16 luma 4x4 by 8x8 quadrant + chroma DC/AC) ...
+/// ```
+pub struct B8x8MixedMcbConfig {
+    /// Per-cell sub_mb_type pick (raster Z-order: TL, TR, BL, BR).
+    pub cells: [BSubMbCell; 4],
+    /// Per-cell L0 mvd. Ignored on cells whose `writes_l0()` is false.
+    pub mvd_l0: [(i32, i32); 4],
+    /// Per-cell L1 mvd. Ignored on cells whose `writes_l1()` is false.
+    pub mvd_l1: [(i32, i32); 4],
+    pub cbp_luma: u8,
+    pub cbp_chroma: u8,
+    pub mb_qp_delta: i32,
+    pub luma_4x4_levels: [[i32; 16]; 16],
+    pub luma_4x4_nc: [i32; 16],
+    pub chroma_dc_cb: [i32; 4],
+    pub chroma_dc_cr: [i32; 4],
+    pub chroma_ac_cb: [[i32; 16]; 4],
+    pub chroma_ac_cr: [[i32; 16]; 4],
+}
+
+/// Emit one B-slice `B_8x8` macroblock with mixed sub-MB types per
+/// quadrant (round-25). Per-cell sub_mb_type ∈ {B_Direct_8x8, B_L0_8x8,
+/// B_L1_8x8, B_Bi_8x8}.
+///
+/// `mb_type = 22` (raw value in Table 7-14). Each `sub_mb_type[i]` per
+/// Table 7-18; non-Direct cells emit explicit ref_idx (gated on multi-
+/// ref) + mvd_lX as required.
+pub fn write_b_8x8_mixed_mb(
+    w: &mut BitWriter,
+    cfg: &B8x8MixedMcbConfig,
+    num_ref_idx_l0_active_minus1: u32,
+    num_ref_idx_l1_active_minus1: u32,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+
+    // §7.4.5 Table 7-14 — raw mb_type 22 = B_8x8.
+    w.ue(22);
+
+    // §7.3.5.2 — sub_mb_type[0..4]: per-cell raw ∈ {0, 1, 2, 3}.
+    for &c in &cfg.cells {
+        w.ue(c.sub_mb_type_raw());
+    }
+
+    // §7.3.5.2 ref_idx_l0[i] gate: sub_mb_type[i] != B_Direct_8x8 AND
+    // SubMbPredMode != Pred_L1 AND num_ref_idx_l0_active_minus1 > 0.
+    // Round-25 always uses single-ref (num_ref_idx_l0_active_minus1==0)
+    // so these te(v) are never emitted, but the gate is honoured.
+    if num_ref_idx_l0_active_minus1 > 0 {
+        for &c in &cfg.cells {
+            if c.writes_l0() {
+                w.te(num_ref_idx_l0_active_minus1, 0);
+            }
+        }
+    }
+    // ref_idx_l1[i] gate — symmetric for Pred_L0.
+    if num_ref_idx_l1_active_minus1 > 0 {
+        for &c in &cfg.cells {
+            if c.writes_l1() {
+                w.te(num_ref_idx_l1_active_minus1, 0);
+            }
+        }
+    }
+
+    // §7.3.5.2 mvd_l0[i] gate: sub_mb_type[i] != B_Direct_8x8 AND
+    // SubMbPredMode != Pred_L1. NumSubMbPart(B_L0_8x8/B_L1_8x8/
+    // B_Bi_8x8) == 1 → exactly one (x, y) pair per non-Direct L0 cell.
+    for (i, &c) in cfg.cells.iter().enumerate() {
+        if c.writes_l0() {
+            w.se(cfg.mvd_l0[i].0);
+            w.se(cfg.mvd_l0[i].1);
+        }
+    }
+    // mvd_l1[i] gate — symmetric for Pred_L0.
+    for (i, &c) in cfg.cells.iter().enumerate() {
+        if c.writes_l1() {
+            w.se(cfg.mvd_l1[i].0);
+            w.se(cfg.mvd_l1[i].1);
+        }
+    }
+
+    // §7.3.5 — coded_block_pattern me(v) using the inter table.
+    let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
+    w.ue(codenum);
+
+    // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
+    let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
+    if needs_qp_delta {
+        w.se(cfg.mb_qp_delta);
+    }
+
+    // §7.3.5.3 — luma residual: 16 4x4 blocks grouped by 8x8 quadrant.
+    for blk8 in 0..4u8 {
+        if (cfg.cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                let nc = cfg.luma_4x4_nc[blk];
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(nc),
+                    16,
+                    &cfg.luma_4x4_levels[blk],
+                )?;
+            }
+        }
+    }
+
+    // §7.3.5.3 — chroma residual.
+    if cfg.cbp_chroma > 0 {
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
+    }
+    if cfg.cbp_chroma == 2 {
+        for blk in &cfg.chroma_ac_cb {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+        for blk in &cfg.chroma_ac_cr {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1641,5 +1879,116 @@ mod tests {
         // Right uses L1 only → mvd_l1 (.x, .y) = 2 bits. cbp ue(0) = 1 bit.
         // Total 12 bits.
         assert_eq!(bw.bits_emitted(), 12);
+    }
+
+    /// Round-25 — `BSubMbCell` raw values match Table 7-18 codenums for
+    /// the four single-8x8-partition sub_mb_types {B_Direct_8x8,
+    /// B_L0_8x8, B_L1_8x8, B_Bi_8x8} → raw {0, 1, 2, 3}. The decoder's
+    /// `SubMbType::from_b` maps each raw back to the matching variant.
+    #[test]
+    fn b8x8_mixed_sub_mb_type_raws_match_table_7_18() {
+        use crate::macroblock_layer::SubMbType;
+        assert_eq!(BSubMbCell::Direct.sub_mb_type_raw(), 0);
+        assert_eq!(BSubMbCell::L0.sub_mb_type_raw(), 1);
+        assert_eq!(BSubMbCell::L1.sub_mb_type_raw(), 2);
+        assert_eq!(BSubMbCell::Bi.sub_mb_type_raw(), 3);
+        assert_eq!(SubMbType::from_b(0).unwrap(), SubMbType::BDirect8x8);
+        assert_eq!(SubMbType::from_b(1).unwrap(), SubMbType::BL08x8);
+        assert_eq!(SubMbType::from_b(2).unwrap(), SubMbType::BL18x8);
+        assert_eq!(SubMbType::from_b(3).unwrap(), SubMbType::BBi8x8);
+
+        // List-usage gate (writer side): Direct emits no MVs / refs;
+        // L0/L1/Bi follow the standard pattern.
+        assert!(!BSubMbCell::Direct.writes_l0() && !BSubMbCell::Direct.writes_l1());
+        assert!(BSubMbCell::L0.writes_l0() && !BSubMbCell::L0.writes_l1());
+        assert!(!BSubMbCell::L1.writes_l0() && BSubMbCell::L1.writes_l1());
+        assert!(BSubMbCell::Bi.writes_l0() && BSubMbCell::Bi.writes_l1());
+    }
+
+    /// Round-25 — `B8x8MixedMcbConfig` writer with `cbp_luma == 0,
+    /// cbp_chroma == 0` and a (Direct, L0, L1, Bi) cell layout (one of
+    /// each non-trivial pick).
+    ///
+    /// Bit-count tally (Exp-Golomb ue(v) widths per §9.1.1: codeNum=k
+    /// uses `2*floor(log2(k+1)) + 1` bits):
+    ///   * mb_type=22 → 9 bits  (k+1=23, floor(log2)=4)
+    ///   * sub_mb_type[0]=0 (Direct) → 1 bit
+    ///   * sub_mb_type[1]=1 (L0)     → 3 bits  (ue(1))
+    ///   * sub_mb_type[2]=2 (L1)     → 3 bits  (ue(2))
+    ///   * sub_mb_type[3]=3 (Bi)     → 5 bits  (ue(3): k+1=4, floor(log2)=2)
+    ///   * num_ref ∈ {0} → no ref_idx te(v).
+    ///   * mvd_l0: cells writing L0 = {1 (L0), 3 (Bi)} → 2 cells × 2 se(v)
+    ///     each at zero → 4 bits.
+    ///   * mvd_l1: cells writing L1 = {2 (L1), 3 (Bi)} → 2 cells × 2 se(v)
+    ///     each at zero → 4 bits.
+    ///   * cbp codeNum 0 ue(v) → 1 bit.
+    ///   * No mb_qp_delta (gated on cbp > 0).
+    ///
+    /// Total 9 + 1+3+3+5 + 4 + 4 + 1 = 30 bits.
+    #[test]
+    fn b_8x8_mixed_zero_residual_emits_expected_bit_count() {
+        let mut bw = BitWriter::new();
+        let cfg = B8x8MixedMcbConfig {
+            cells: [
+                BSubMbCell::Direct,
+                BSubMbCell::L0,
+                BSubMbCell::L1,
+                BSubMbCell::Bi,
+            ],
+            mvd_l0: [(0, 0); 4],
+            mvd_l1: [(0, 0); 4],
+            cbp_luma: 0,
+            cbp_chroma: 0,
+            mb_qp_delta: 0,
+            luma_4x4_levels: [[0; 16]; 16],
+            luma_4x4_nc: [0; 16],
+            chroma_dc_cb: [0; 4],
+            chroma_dc_cr: [0; 4],
+            chroma_ac_cb: [[0; 16]; 4],
+            chroma_ac_cr: [[0; 16]; 4],
+        };
+        write_b_8x8_mixed_mb(&mut bw, &cfg, 0, 0).expect("write");
+        assert_eq!(bw.bits_emitted(), 30);
+    }
+
+    /// Round-25 — `B8x8MixedMcbConfig` writer with all four cells set to
+    /// `B_Direct_8x8` emits exactly the same bit pattern as the round-23
+    /// `write_b_8x8_all_direct_mb` writer (with cbp == 0): 9 (mb_type 22)
+    /// + 4×1 (sub_mb_type 0) + 1 (cbp ue(0)) = 14 bits.
+    #[test]
+    fn b_8x8_mixed_all_direct_matches_dedicated_all_direct_writer_bit_count() {
+        let mut bw = BitWriter::new();
+        let cfg = B8x8MixedMcbConfig {
+            cells: [BSubMbCell::Direct; 4],
+            mvd_l0: [(0, 0); 4],
+            mvd_l1: [(0, 0); 4],
+            cbp_luma: 0,
+            cbp_chroma: 0,
+            mb_qp_delta: 0,
+            luma_4x4_levels: [[0; 16]; 16],
+            luma_4x4_nc: [0; 16],
+            chroma_dc_cb: [0; 4],
+            chroma_dc_cr: [0; 4],
+            chroma_ac_cb: [[0; 16]; 4],
+            chroma_ac_cr: [[0; 16]; 4],
+        };
+        write_b_8x8_mixed_mb(&mut bw, &cfg, 0, 0).expect("write");
+        assert_eq!(bw.bits_emitted(), 14);
+
+        // Sanity: matches the dedicated all-Direct writer byte-for-byte.
+        let mut bw_dedicated = BitWriter::new();
+        let cfg_dedicated = B8x8AllDirectMcbConfig {
+            cbp_luma: 0,
+            cbp_chroma: 0,
+            mb_qp_delta: 0,
+            luma_4x4_levels: [[0; 16]; 16],
+            luma_4x4_nc: [0; 16],
+            chroma_dc_cb: [0; 4],
+            chroma_dc_cr: [0; 4],
+            chroma_ac_cb: [[0; 16]; 4],
+            chroma_ac_cr: [[0; 16]; 4],
+        };
+        write_b_8x8_all_direct_mb(&mut bw_dedicated, &cfg_dedicated).expect("write");
+        assert_eq!(bw.bits_emitted(), bw_dedicated.bits_emitted());
     }
 }

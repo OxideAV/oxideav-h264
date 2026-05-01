@@ -9,6 +9,15 @@
 //! * `constrained_intra_pred_flag = 0`
 //! * `redundant_pic_cnt_present_flag = 0`
 //! * No optional tail (`transform_8x8_mode_flag` etc. inferred to 0).
+//!
+//! Round-26: `weighted_pred_flag` and `weighted_bipred_idc` are now
+//! caller-configurable. Setting `weighted_bipred_idc = 1` enables the
+//! per-slice `pred_weight_table()` syntax (§7.3.3.2) for B-slices and
+//! makes the decoder use §8.4.2.3.2 explicit weighted prediction. The
+//! encoder pairs this with a least-squares weight selector (see
+//! [`crate::encoder::compute_explicit_bipred_weights`]) and a matching
+//! merge in `build_b_predictors` to keep the local recon bit-equivalent
+//! to what the decoder will produce.
 
 use crate::encoder::bitstream::BitWriter;
 
@@ -23,6 +32,17 @@ pub struct BaselinePpsConfig {
     pub pic_init_qp_minus26: i32,
     /// `chroma_qp_index_offset` per §7.4.2.2. Range -12..=12.
     pub chroma_qp_index_offset: i32,
+    /// §7.4.2.2 — `weighted_pred_flag` (P / SP slices). When `true`,
+    /// the encoder ships a `pred_weight_table()` per P slice and the
+    /// decoder applies §8.4.2.3.2 explicit weighted prediction. Round-26
+    /// only wires explicit weighted bipred (B slices), so this flag is
+    /// usually `false`.
+    pub weighted_pred_flag: bool,
+    /// §7.4.2.2 — `weighted_bipred_idc` ∈ 0..=2. 0 = default weighted
+    /// bipred (`(L0 + L1 + 1) >> 1`), 1 = explicit (round-26),
+    /// 2 = implicit (POC-distance derivation, not yet wired). Range
+    /// validated by the decoder's PPS parser.
+    pub weighted_bipred_idc: u32,
 }
 
 /// Build a Baseline PPS RBSP body (§7.3.2.2).
@@ -43,9 +63,10 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
     w.ue(0);
     w.ue(0);
 
-    // weighted_pred_flag = 0, weighted_bipred_idc = 0 (2 bits).
-    w.u(1, 0);
-    w.u(2, 0);
+    // §7.4.2.2 — weighted_pred_flag (1 bit) + weighted_bipred_idc (2 bits).
+    debug_assert!(cfg.weighted_bipred_idc <= 2);
+    w.u(1, if cfg.weighted_pred_flag { 1 } else { 0 });
+    w.u(2, cfg.weighted_bipred_idc);
 
     w.se(cfg.pic_init_qp_minus26);
     w.se(0); // pic_init_qs_minus26
@@ -77,6 +98,8 @@ mod tests {
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: 0,
             chroma_qp_index_offset: 0,
+            weighted_pred_flag: false,
+            weighted_bipred_idc: 0,
         };
         let rbsp = build_baseline_pps_rbsp(&cfg);
         let pps = Pps::parse(&rbsp).expect("decoder parses our PPS");

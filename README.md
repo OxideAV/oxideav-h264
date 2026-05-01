@@ -76,6 +76,7 @@ Round-by-round encoder progress:
 | 22 | B 16x8 / 8x16 partitions | Table 7-14 mb_types 4..=21 (all per-partition L0/L1/Bi combos) |
 | 23 | B_8x8 + 4× B_Direct_8x8 | Per-8x8 spatial direct (lifts uniform-MV gate via per-partition MVs) |
 | 24 | B_Direct §8.4.1.2.3 temporal | POC-distance-scaled colocated MVs, `direct_temporal_mv_pred` toggle |
+| 26 | Explicit weighted bipred | §7.4.2.2 `weighted_bipred_idc=1`, per-slice `pred_weight_table()` (luma, log2_wd=5), least-squares (w0,w1,off) selector, `explicit_weighted_bipred` toggle. Fade-in fixture: B-slice 1148 → 21 bytes (98 % smaller); ffmpeg cross-decode bit-equivalent. |
 
 ## Goals
 

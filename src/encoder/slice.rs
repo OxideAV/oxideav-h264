@@ -202,6 +202,12 @@ pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig) {
 /// * No `pred_weight_table` (PPS `weighted_bipred_idc = 0` ⇒ default
 ///   weighted prediction per §8.4.2.3.1, i.e. `(L0 + L1 + 1) >> 1` for
 ///   bipred and identity for L0-only / L1-only)
+///
+/// Round-26 — when `pred_weight_table` is `Some`, the writer emits the
+/// §7.3.3.2 sub-structure between `ref_pic_list_modification` and
+/// `dec_ref_pic_marking`. The caller is responsible for setting the
+/// PPS's `weighted_bipred_idc = 1` (or `weighted_pred_flag = 1` for
+/// P-slices) so the decoder pulls the table.
 #[derive(Debug, Clone, Copy)]
 pub struct BSliceHeaderConfig {
     pub first_mb_in_slice: u32,
@@ -225,6 +231,37 @@ pub struct BSliceHeaderConfig {
     /// `dec_ref_pic_marking()` per §7.3.3 last branch. For non-reference
     /// B-frames pass 0; the writer omits dec_ref_pic_marking().
     pub nal_ref_idc: u32,
+    /// Round-26 — explicit weighted-prediction parameters. `Some` when
+    /// the PPS has `weighted_bipred_idc == 1` (and the encoder picked
+    /// non-trivial weights for this slice); `None` when the slice
+    /// should fall back to the §8.4.2.3.1 default merge.
+    ///
+    /// Carries one (weight, offset) entry per ref index in each list.
+    /// Round-26 always uses a single L0 + L1 ref (matches the round-20
+    /// PPS defaults), so each list has exactly one luma entry. Chroma
+    /// entries are absent (`luma_weight_lN_flag = 1`,
+    /// `chroma_weight_lN_flag = 0`) to keep the syntax minimal.
+    pub pred_weight_table: Option<ExplicitBipredWeightTable>,
+}
+
+/// Round-26 — minimal explicit weighted-prediction table for a
+/// single-L0-ref + single-L1-ref B slice.
+///
+/// Mirrors §7.3.3.2 syntax fields. We only emit luma weights and skip
+/// chroma (chroma_weight_lN_flag = 0 for every ref → decoder infers the
+/// default chroma weights per §7.4.3.2). Each list has a single entry.
+#[derive(Debug, Clone, Copy)]
+pub struct ExplicitBipredWeightTable {
+    /// §7.4.3.2 `luma_log2_weight_denom`, range 0..=7.
+    pub luma_log2_weight_denom: u32,
+    /// L0 luma weight (`luma_weight_l0[0]`), range -128..=127.
+    pub luma_weight_l0: i32,
+    /// L0 luma offset (`luma_offset_l0[0]`), range -128..=127.
+    pub luma_offset_l0: i32,
+    /// L1 luma weight (`luma_weight_l1[0]`), range -128..=127.
+    pub luma_weight_l1: i32,
+    /// L1 luma offset (`luma_offset_l1[0]`), range -128..=127.
+    pub luma_offset_l1: i32,
 }
 
 /// Emit the bits of a single B-slice header (non-IDR) into the supplied
@@ -265,9 +302,40 @@ pub fn write_b_slice_header(w: &mut BitWriter, cfg: &BSliceHeaderConfig) {
     w.u(1, 0);
     w.u(1, 0);
 
-    // §7.3.3.2 — pred_weight_table() absent (PPS weighted_pred_flag == 0
-    // for P/SP, weighted_bipred_idc == 0 for B → default weighted pred
-    // per §8.4.2.3.1).
+    // §7.3.3.2 — pred_weight_table(). Round-26: emitted when
+    // `pred_weight_table` is `Some` (PPS `weighted_bipred_idc == 1`).
+    // Layout for our single-L0-ref + single-L1-ref B slice:
+    //   luma_log2_weight_denom        ue(v)
+    //   chroma_log2_weight_denom      ue(v)   (ChromaArrayType=1 in our SPS)
+    //   for L0:
+    //     luma_weight_l0_flag         u(1) = 1
+    //     luma_weight_l0[0]           se(v)
+    //     luma_offset_l0[0]           se(v)
+    //     chroma_weight_l0_flag       u(1) = 0  (use defaults)
+    //   for L1: symmetric.
+    if let Some(pwt) = cfg.pred_weight_table {
+        debug_assert!(pwt.luma_log2_weight_denom <= 7);
+        debug_assert!((-128..=127).contains(&pwt.luma_weight_l0));
+        debug_assert!((-128..=127).contains(&pwt.luma_offset_l0));
+        debug_assert!((-128..=127).contains(&pwt.luma_weight_l1));
+        debug_assert!((-128..=127).contains(&pwt.luma_offset_l1));
+        w.ue(pwt.luma_log2_weight_denom);
+        // ChromaArrayType=1 (4:2:0) in our SPS; chroma_log2_weight_denom
+        // is required even though we don't ship per-ref chroma weights.
+        // The decoder uses it to infer the default chroma weights per
+        // §7.4.3.2. We mirror luma_log2_weight_denom for simplicity.
+        w.ue(pwt.luma_log2_weight_denom);
+        // L0 entry (single ref).
+        w.u(1, 1); // luma_weight_l0_flag = 1
+        w.se(pwt.luma_weight_l0);
+        w.se(pwt.luma_offset_l0);
+        w.u(1, 0); // chroma_weight_l0_flag = 0 (use default chroma weight)
+                   // L1 entry (single ref).
+        w.u(1, 1); // luma_weight_l1_flag = 1
+        w.se(pwt.luma_weight_l1);
+        w.se(pwt.luma_offset_l1);
+        w.u(1, 0); // chroma_weight_l1_flag = 0
+    }
 
     // §7.3.3.3 — dec_ref_pic_marking() when nal_ref_idc != 0. For non-
     // reference B-frames (nal_ref_idc == 0) the field is absent.
@@ -463,6 +531,7 @@ mod tests {
                 slice_alpha_c0_offset_div2: 0,
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 0, // non-reference B
+                pred_weight_table: None,
             },
         );
         // Dummy bit + trailing so the parser doesn't blow up on EOF.
@@ -493,5 +562,89 @@ mod tests {
         // nal_ref_idc == 0 → dec_ref_pic_marking absent.
         assert!(parsed.dec_ref_pic_marking.is_none());
         assert_eq!(parsed.disable_deblocking_filter_idc, 0);
+    }
+
+    #[test]
+    fn b_slice_header_with_pred_weight_table_round_trips() {
+        // Round-26 — explicit weighted bipred. PPS signals
+        // `weighted_bipred_idc = 1`, slice header carries one
+        // pred_weight_table entry per list at log2_wd = 5.
+        let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
+            seq_parameter_set_id: 0,
+            level_idc: 30,
+            width_in_mbs: 4,
+            height_in_mbs: 4,
+            log2_max_frame_num_minus4: 4,
+            log2_max_poc_lsb_minus4: 4,
+            max_num_ref_frames: 2,
+            profile_idc: 77,
+        });
+        let sps = Sps::parse(&sps_rbsp).unwrap();
+        let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
+            pic_parameter_set_id: 0,
+            seq_parameter_set_id: 0,
+            pic_init_qp_minus26: 0,
+            chroma_qp_index_offset: 0,
+            weighted_pred_flag: false,
+            weighted_bipred_idc: 1,
+        });
+        let pps = Pps::parse(&pps_rbsp).unwrap();
+        assert_eq!(pps.weighted_bipred_idc, 1);
+
+        let pwt = ExplicitBipredWeightTable {
+            luma_log2_weight_denom: 5,
+            luma_weight_l0: 45,
+            luma_offset_l0: 2,
+            luma_weight_l1: 19,
+            luma_offset_l1: -1,
+        };
+        let mut w = BitWriter::new();
+        write_b_slice_header(
+            &mut w,
+            &BSliceHeaderConfig {
+                first_mb_in_slice: 0,
+                slice_type_raw: 6,
+                pic_parameter_set_id: 0,
+                frame_num: 2,
+                frame_num_bits: sps.log2_max_frame_num_minus4 + 4,
+                pic_order_cnt_lsb: 1,
+                poc_lsb_bits: sps.log2_max_pic_order_cnt_lsb_minus4 + 4,
+                direct_spatial_mv_pred_flag: true,
+                slice_qp_delta: 0,
+                disable_deblocking_filter_idc: 0,
+                slice_alpha_c0_offset_div2: 0,
+                slice_beta_offset_div2: 0,
+                nal_ref_idc: 0,
+                pred_weight_table: Some(pwt),
+            },
+        );
+        // Dummy bit + trailing so the parser doesn't blow up on EOF.
+        w.u(1, 1);
+        w.rbsp_trailing_bits();
+        let rbsp = w.into_bytes();
+
+        let nal = build_nal_unit(0, NalUnitType::SliceNonIdr, &rbsp);
+        let mut split = AnnexBSplitter::new(&nal);
+        let nal_bytes = split.next().unwrap();
+        let nu = parse_nal_unit(nal_bytes).unwrap();
+        let header = NalHeader {
+            forbidden_zero_bit: 0,
+            nal_ref_idc: 0,
+            nal_unit_type: NalUnitType::SliceNonIdr,
+        };
+        let parsed =
+            SliceHeader::parse(&nu.rbsp, &sps, &pps, &header).expect("parse B slice header");
+
+        // The decoder must surface our pred_weight_table verbatim.
+        let parsed_pwt = parsed.pred_weight_table.as_ref().expect("pwt present");
+        assert_eq!(parsed_pwt.luma_log2_weight_denom, 5);
+        assert_eq!(parsed_pwt.chroma_log2_weight_denom, 5);
+        // Single L0 entry, present.
+        assert_eq!(parsed_pwt.luma_weights_l0, vec![Some((45, 2))]);
+        // Chroma L0 absent (chroma_weight_l0_flag = 0).
+        assert_eq!(parsed_pwt.chroma_weights_l0, vec![None]);
+        // Single L1 entry, present.
+        assert_eq!(parsed_pwt.luma_weights_l1, vec![Some((19, -1))]);
+        assert_eq!(parsed_pwt.chroma_weights_l1, vec![None]);
     }
 }

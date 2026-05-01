@@ -21,7 +21,7 @@ default = []
 nightly = []
 
 [dependencies]
-oxideav-core = "0.1"
+oxideav-core = "0.2"
 thiserror = "2"
 
 [dev-dependencies]
