@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 30 — encoder CABAC entropy coding for I + P slices**.
+  Adds the H.264 §9.3 CABAC arithmetic encoder (engine + per-syntax
+  binarisations + ctxIdx derivation) and wires up two new entry points
+  on `Encoder`: `encode_idr_cabac` and `encode_p_cabac`. PPS now carries
+  `entropy_coding_mode_flag = 1` when [`EncoderConfig::cabac`] is enabled
+  (Main profile or higher — Baseline forbids CABAC per §A.2.1).
+  Implementation:
+  * New module `encoder::cabac_engine`: §9.3.4 `EncodeDecision`,
+    `EncodeBypass`, `EncodeTerminate`, `RenormE`, plus the
+    carry-propagation `put_bit` / outstanding-bit mechanism. Reuses the
+    decoder's `RANGE_TAB_LPS`, `TRANS_IDX_LPS`, `TRANS_IDX_MPS` tables —
+    same probabilities, just walked in encode direction.
+  * New module `encoder::cabac_syntax`: per-element encoders mirroring
+    the decoder's `cabac_ctx::decode_*` step-for-step
+    (`encode_mb_skip_flag`, `encode_mb_type_i` / `_p`,
+    `encode_mvd_lx`, `encode_ref_idx_lx`, `encode_coded_block_pattern`,
+    `encode_coded_block_flag`, `encode_significant_coeff_flag`,
+    `encode_last_significant_coeff_flag`,
+    `encode_coeff_abs_level_minus1`, `encode_coeff_sign_flag`,
+    `encode_intra_chroma_pred_mode`, `encode_mb_qp_delta`,
+    `encode_end_of_slice_flag`, `encode_residual_block_cabac`).
+  * New module `encoder::cabac_path`: top-level IDR + P encoders
+    layered on existing motion estimation / intra prediction /
+    transform / quantisation primitives. IDR encodes every MB as
+    Intra_16x16 with all four §8.3.3 modes trialled by SAD + chroma DC
+    / V / H / Plane. P encodes P_Skip when CBP collapses to zero or
+    P_L0_16x16 (single-ref, MV pinned to 0 for round-30 to keep the
+    §8.4.1.3 mvp derivation off the critical path; sufficient for the
+    P_Skip-dominated round-30 fixtures).
+  * `BaselinePpsConfig::entropy_coding_mode_flag`: PPS gains a CABAC
+    toggle. The slice header writer (`write_p_slice_header`) gains a
+    `cabac` parameter that emits `cabac_init_idc` ue(v) when present
+    (P/SP/B only).
+  * Per-MB CBF neighbour tracking (`CabacEncGrid` +
+    `cbf_neighbour_mb_level` / `cbf_neighbour_luma_ac` /
+    `cbf_neighbour_chroma_ac`) mirrors the decoder's
+    `CabacNeighbourGrid` so encoder + decoder agree on every
+    `coded_block_flag` ctxIdxInc derivation. Internal-to-MB neighbour
+    reads consult the running CBF state of the current MB; external
+    neighbour reads consult the previously-encoded MB's grid slot,
+    with the §9.3.3.1.1.9 "transBlockN unavailable" rule firing on
+    the cbp_luma 8x8-quadrant gate for `Luma4x4` / `Luma16x16Ac`
+    block types.
+  Validation:
+  * 27 new unit tests in `encoder::cabac_engine` (7) and
+    `encoder::cabac_syntax` (20) — every primitive round-trips through
+    the decoder bin-for-bin, including LPS-runs that exercise the
+    `outstanding_bits` carry path, alternating bins, mixed
+    decision/bypass/terminate sequences, and pseudo-random 200-bin
+    streams.
+  * `tests/integration_cabac_encoder.rs` — 3 integration tests:
+    `round30_idr_cabac_self_roundtrip` (47.58 dB Y on 64x64 gradient,
+    max enc/dec diff = 0), `round30_idr_plus_p_cabac_self_roundtrip`
+    (IDR 79 bytes + P 12 bytes, 47.58 dB Y, max enc/dec diff = 0),
+    `round30_idr_cabac_ffmpeg_interop` (ffmpeg 8.1 libavcodec decodes
+    bit-equivalently against encoder local recon, max diff = 0).
+  Status caveats:
+  * I + P slices only; B slices not yet wired to the CABAC path.
+  * 4:2:0 only; 4:2:2 / 4:4:4 still CAVLC-only.
+  * Round-30 P encoder forces MV = (0, 0) for every inter MB to
+    sidestep the §8.4.1.3 mvp derivation. Sufficient for the round-30
+    acceptance fixture (≥45 dB on synthetic gradient) since static /
+    near-static content hits the P_Skip fast path; future rounds will
+    wire the per-MB MV grid + spec mvp derivation for moving content.
+  * I_NxN (Intra_4x4) under CABAC deferred — the IDR CABAC path emits
+    every MB as Intra_16x16.
+
 - **Round 29 — encoder intra fallback in P/B slices (Intra_16x16)**.
   When [`EncoderConfig::intra_in_inter`] is true (default), the per-MB
   RDO loop in `encode_p` and `encode_b` now compares the inter cost

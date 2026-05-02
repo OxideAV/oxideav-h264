@@ -32,6 +32,9 @@
 #![allow(dead_code)]
 
 pub mod bitstream;
+pub mod cabac_engine;
+pub mod cabac_path;
+pub mod cabac_syntax;
 pub mod cavlc;
 pub mod deblock;
 pub mod intra4x4;
@@ -206,6 +209,16 @@ pub struct EncoderConfig {
     /// out of scope). Other values (0 monochrome) and the P/B-slice
     /// paths remain 4:2:0-only.
     pub chroma_format_idc: u32,
+    /// Round-30 — when `true`, the encoder emits CABAC entropy coding
+    /// (`entropy_coding_mode_flag = 1` in the PPS). Use the
+    /// [`Encoder::encode_idr_cabac`] / [`Encoder::encode_p_cabac`]
+    /// entry points; the existing CAVLC paths
+    /// ([`Encoder::encode_idr`] / [`Encoder::encode_p`]) ignore this
+    /// flag and continue emitting CAVLC.
+    ///
+    /// CABAC is forbidden by Baseline profile (§A.2.1); enabling this
+    /// flag requires `profile_idc >= 77` (Main).
+    pub cabac: bool,
 }
 
 impl EncoderConfig {
@@ -220,6 +233,7 @@ impl EncoderConfig {
             explicit_weighted_bipred: false,
             intra_in_inter: true,
             chroma_format_idc: 1,
+            cabac: false,
         }
     }
 }
@@ -649,6 +663,14 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    /// Read-only access to the encoder config (used by the round-30
+    /// CABAC entry points in [`crate::encoder::cabac_path`]).
+    pub fn config(&self) -> &EncoderConfig {
+        &self.cfg
+    }
+}
+
+impl Encoder {
     pub fn new(cfg: EncoderConfig) -> Self {
         assert!(
             cfg.width % 16 == 0 && cfg.height % 16 == 0,
@@ -742,6 +764,7 @@ impl Encoder {
             } else {
                 0
             },
+            entropy_coding_mode_flag: false,
         };
         let sps_rbsp = build_baseline_sps_rbsp(&sps_cfg);
         let pps_rbsp = build_baseline_pps_rbsp(&pps_cfg);
@@ -3218,6 +3241,7 @@ impl Encoder {
                 slice_alpha_c0_offset_div2: 0,
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 2,
+                cabac: None,
             },
         );
 

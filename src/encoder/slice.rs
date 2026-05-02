@@ -47,6 +47,15 @@ pub struct IdrSliceHeaderConfig {
     pub slice_beta_offset_div2: i32,
 }
 
+/// Round-30 — extra parameters for the CABAC-enabled slice writers.
+#[derive(Debug, Clone, Copy)]
+pub struct CabacSliceParams {
+    /// §7.3.3 — `cabac_init_idc` ∈ 0..=2. Only emitted on non-I/SI
+    /// slices when CABAC is enabled. The decoder uses it to pick the
+    /// per-element initialisation column (Tables 9-12..9-33).
+    pub cabac_init_idc: u32,
+}
+
 /// Emit the bits of a single IDR I-slice header into the supplied
 /// `BitWriter`. The writer is left at the position where `slice_data()`
 /// should begin.
@@ -124,6 +133,11 @@ pub struct PSliceHeaderConfig {
     /// `nal_ref_idc` of the parent NAL — used to gate
     /// `dec_ref_pic_marking()` per §7.3.3 last branch.
     pub nal_ref_idc: u32,
+    /// Round-30 — when `Some`, the writer emits `cabac_init_idc` ue(v)
+    /// at the §7.3.3 position (between `dec_ref_pic_marking` and
+    /// `slice_qp_delta`). Required when the PPS has
+    /// `entropy_coding_mode_flag = 1` and the slice is non-I/SI.
+    pub cabac: Option<CabacSliceParams>,
 }
 
 /// Emit the bits of a single P-slice header (non-IDR) into the supplied
@@ -162,7 +176,11 @@ pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig) {
         w.u(1, 0); // adaptive_ref_pic_marking_mode_flag = 0
     }
 
-    // No cabac_init_idc — entropy_coding_mode_flag == 0 (CAVLC).
+    // §7.3.3 — cabac_init_idc when CABAC is enabled and slice is non-I/SI.
+    if let Some(c) = cfg.cabac {
+        debug_assert!(c.cabac_init_idc <= 2);
+        w.ue(c.cabac_init_idc);
+    }
     w.se(cfg.slice_qp_delta);
     // No SP/SI fields — slice_type is P.
 
@@ -466,6 +484,7 @@ mod tests {
                 slice_alpha_c0_offset_div2: 0,
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 2,
+                cabac: None,
             },
         );
         // Append a dummy bit + trailing so the parser doesn't blow up.
@@ -591,6 +610,7 @@ mod tests {
             chroma_qp_index_offset: 0,
             weighted_pred_flag: false,
             weighted_bipred_idc: 1,
+            entropy_coding_mode_flag: false,
         });
         let pps = Pps::parse(&pps_rbsp).unwrap();
         assert_eq!(pps.weighted_bipred_idc, 1);

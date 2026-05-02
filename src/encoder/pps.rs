@@ -43,6 +43,11 @@ pub struct BaselinePpsConfig {
     /// 2 = implicit (POC-distance derivation, not yet wired). Range
     /// validated by the decoder's PPS parser.
     pub weighted_bipred_idc: u32,
+    /// Round-30 — §7.4.2.2 `entropy_coding_mode_flag`. `false` (default)
+    /// signals CAVLC; `true` signals CABAC. Baseline profile (66) does
+    /// NOT permit CABAC per §A.2.1; the encoder must bump
+    /// `profile_idc` to Main (77) or higher before enabling this.
+    pub entropy_coding_mode_flag: bool,
 }
 
 /// Build a Baseline PPS RBSP body (§7.3.2.2).
@@ -52,8 +57,8 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
     w.ue(cfg.pic_parameter_set_id);
     w.ue(cfg.seq_parameter_set_id);
 
-    // entropy_coding_mode_flag = 0 (CAVLC).
-    w.u(1, 0);
+    // §7.4.2.2 — entropy_coding_mode_flag. 0 = CAVLC, 1 = CABAC.
+    w.u(1, if cfg.entropy_coding_mode_flag { 1 } else { 0 });
     // bottom_field_pic_order_in_frame_present_flag = 0.
     w.u(1, 0);
     // num_slice_groups_minus1 = 0 (no FMO).
@@ -100,6 +105,7 @@ mod tests {
             chroma_qp_index_offset: 0,
             weighted_pred_flag: false,
             weighted_bipred_idc: 0,
+            entropy_coding_mode_flag: false,
         };
         let rbsp = build_baseline_pps_rbsp(&cfg);
         let pps = Pps::parse(&rbsp).expect("decoder parses our PPS");

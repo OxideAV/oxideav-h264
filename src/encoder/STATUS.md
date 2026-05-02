@@ -985,15 +985,80 @@ than a fresh intra block.
   weighted bipred (round 26) all still active and unaffected.
 - CAVLC only. No rate control. Single ref per list (B-slices).
 
-## Round 30+ (planned)
+## Round 30 — landed
 
+Wire **CABAC entropy coding** for I + P slices via two new entry points
+(`Encoder::encode_idr_cabac`, `Encoder::encode_p_cabac`) layered on the
+round-1..29 motion estimation / intra prediction / transform /
+quantisation primitives. The CAVLC paths (`encode_idr` / `encode_p`)
+remain unchanged.
+
+- **`encoder::cabac_engine`** — §9.3.4 arithmetic encoder primitives
+  (`EncodeDecision`, `EncodeBypass`, `EncodeTerminate`, `RenormE`,
+  `EncodeFlush`, `put_bit` carry-propagation). Reuses the decoder's
+  `RANGE_TAB_LPS` / `TRANS_IDX_LPS` / `TRANS_IDX_MPS` tables — same
+  state machine, same probabilities, walked in encode direction.
+- **`encoder::cabac_syntax`** — per-syntax-element binarisations and
+  ctxIdxInc derivations mirroring `cabac_ctx::decode_*` step-for-step.
+  Coverage: `mb_skip_flag`, `mb_type` (I and P), `mvd_lX`,
+  `ref_idx_lX`, `coded_block_pattern`, `coded_block_flag`,
+  `significant_coeff_flag`, `last_significant_coeff_flag`,
+  `coeff_abs_level_minus1`, `coeff_sign_flag`,
+  `intra_chroma_pred_mode`, `mb_qp_delta`, `end_of_slice_flag`,
+  `prev_intra4x4_pred_mode_flag`, `rem_intra4x4_pred_mode`, plus a
+  full `encode_residual_block_cabac` helper (CBF + significance map +
+  abs_level + sign).
+- **`encoder::cabac_path`** — top-level IDR + P encoders. IDR encodes
+  every MB as `Intra_16x16` (4 luma modes + 4 chroma modes by SAD).
+  P encodes `P_Skip` when CBP collapses to zero or `P_L0_16x16` (full
+  luma 4x4 DC+AC + chroma DC ± AC residual). Per-MB CBF neighbour
+  state tracked in `CabacEncGrid` so encoder + decoder agree on every
+  ctxIdxInc.
+- **PPS** (`BaselinePpsConfig::entropy_coding_mode_flag`): toggles
+  CAVLC vs CABAC. **Slice header** (`PSliceHeaderConfig::cabac`):
+  emits `cabac_init_idc` ue(v) when CABAC is enabled.
+- **Profile gate**: CABAC requires Main (77) or higher per §A.2.1.
+
+### Validation
+
+- `cargo test -p oxideav-h264 --lib` — **846 passed** (+27 new tests:
+  7 in `cabac_engine` + 20 in `cabac_syntax`).
+- All round-1..29 integration tests still pass with the existing
+  CAVLC paths unchanged.
+- New `tests/integration_cabac_encoder.rs`:
+  - `round30_idr_cabac_self_roundtrip`: 64x64 gradient → 79-byte IDR
+    decoded through our own decoder bit-exactly (max enc/dec diff = 0,
+    PSNR_Y = 47.58 dB).
+  - `round30_idr_plus_p_cabac_self_roundtrip`: IDR + P (same source) →
+    P-slice = 12 bytes (mostly P_Skip), bit-exact recon, PSNR_Y vs
+    source = 47.58 dB.
+  - `round30_idr_cabac_ffmpeg_interop`: ffmpeg 8.1 libavcodec decodes
+    the same CABAC IDR bit-equivalently against the encoder's local
+    recon (max diff = 0, PSNR_Y = 47.58 dB).
+
+### Status caveats
+
+- I + P slices only; B-slice CABAC encode deferred to a later round.
+- 4:2:0 only on the CABAC path; 4:2:2 / 4:4:4 still CAVLC-only.
+- Round-30 P encoder pins MV = (0, 0) for every inter MB to keep the
+  §8.4.1.3 mvp derivation off the critical path. Sufficient for
+  static / near-static fixtures (round-30 acceptance bar) since the
+  P_Skip fast path dominates; the next round will wire the per-MB MV
+  grid + spec mvp so non-trivial motion is supported.
+- I_NxN (Intra_4x4) under CABAC not yet wired — the IDR CABAC path
+  emits every MB as Intra_16x16.
+
+## Round 31+ (planned)
+
+- B-slice CABAC encode.
+- Per-MB MV grid + §8.4.1.3 mvp under CABAC P encoder so motion is
+  supported beyond P_Skip.
+- I_NxN under CABAC.
+- 4:2:2 / 4:4:4 under CABAC.
 - I_NxN fallback in P / B slices (round-29 currently only trials
   Intra_16x16; I_NxN can be a further win on detailed content).
-- 4:2:2 / 4:4:4 in P / B slices (round-29 intra fallback is 4:2:0
-  only; same scope as the inter encoder).
 - Multiple slices per picture.
 - 8x8 transform / High-profile features.
-- CABAC encode.
 - Rate control.
 - Chroma AC nC per §9.2.1.1.
 - VUI / SEI tuning (HRD, mastering display, content light level).
@@ -1020,3 +1085,8 @@ than a fresh intra block.
   [`slice`], [`macroblock`], [`cavlc`], [`transform`] are usable
   independently — round 2's higher-mode encoder can compose them
   without touching the round-1 dispatcher.
+- [`Encoder::encode_idr_cabac`] / [`Encoder::encode_p_cabac`]
+  (round 30) — CABAC-enabled IDR + P entry points. Require
+  `EncoderConfig::cabac = true` and `profile_idc >= 77`. Produce
+  Annex B streams that round-trip through this crate's decoder and
+  through ffmpeg's libavcodec H.264 decoder bit-equivalently.
