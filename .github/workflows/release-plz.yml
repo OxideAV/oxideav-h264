@@ -10,6 +10,12 @@ on:
   push:
     branches: [master]
 
+# Permissions must be granted at the caller and match (or exceed) what
+# the reusable workflow declares — workflow_call doesn't elevate.
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   release:
     uses: OxideAV/.github/.github/workflows/crate-release.yml@master
