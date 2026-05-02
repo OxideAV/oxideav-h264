@@ -59,9 +59,9 @@ use crate::encoder::intra_pred::{
 };
 use crate::encoder::macroblock::{
     write_b_16x16_mb, write_b_8x8_mixed_mb, write_i_nxn_mb, write_intra16x16_mb,
-    write_p_8x8_all_pl08x8_mb, write_p_l0_16x16_mb, B16x16McbConfig, B8x8MixedMcbConfig, BPartPred,
-    BPred16x16, BSubMbCell, I16x16McbConfig, INxNMcbConfig, P8x8AllPL08x8McbConfig,
-    PL016x16McbConfig,
+    write_intra16x16_mb_in_inter_slice, write_p_8x8_all_pl08x8_mb, write_p_l0_16x16_mb,
+    B16x16McbConfig, B8x8MixedMcbConfig, BPartPred, BPred16x16, BSubMbCell, I16x16McbConfig,
+    INxNMcbConfig, P8x8AllPL08x8McbConfig, PL016x16McbConfig,
 };
 use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
 use crate::encoder::nal::build_nal_unit;
@@ -168,6 +168,25 @@ pub struct EncoderConfig {
     /// average `(L0 + L1 + 1) >> 1` and the PPS / slice header carry no
     /// pred_weight_table.
     pub explicit_weighted_bipred: bool,
+    /// Round-29 — when `true` (default) the P/B-slice encoder runs an
+    /// **intra fallback** RDO trial on every coded MB: the inter MB cost
+    /// `J_inter = D_inter + λ·R_inter` is compared against an Intra_16x16
+    /// trial cost `J_intra`, and the lower-J path wins. This covers
+    /// occlusion, scene-cut frames, and high-detail areas where motion-
+    /// compensated prediction's residual is more expensive to code than
+    /// a fresh intra block. Per H.264 §7.3.5 (Tables 7-13 / 7-14) the
+    /// chosen MB is emitted with the intra mb_type values shifted by +5
+    /// (P-slice) or +23 (B-slice) so the decoder picks up Intra_16x16
+    /// from the inter-slice mb_type tables.
+    ///
+    /// When `false`, P/B slices are inter-only (`P_Skip` / `P_L0_*` /
+    /// `B_Skip` / `B_*_*`) — the round-16..28 behaviour. Useful for
+    /// A/B tests against the new path.
+    ///
+    /// Round-29 scope: I_16x16 only (no I_NxN / I_PCM fallback). The
+    /// intra trial runs only on coded inter MBs (P_Skip / B_Skip retain
+    /// their zero-syntax fast path).
+    pub intra_in_inter: bool,
     /// §7.4.2.1.1 / §6.2 — `chroma_format_idc`. Defaults to 1 (4:2:0).
     /// Round-27 supports 2 (4:2:2) on the `encode_idr` path: the
     /// emitted SPS is High 4:2:2 (profile_idc=122), the chroma plane
@@ -199,6 +218,7 @@ impl EncoderConfig {
             max_num_ref_frames: 1,
             direct_temporal_mv_pred: false,
             explicit_weighted_bipred: false,
+            intra_in_inter: true,
             chroma_format_idc: 1,
         }
     }
@@ -455,6 +475,170 @@ impl MbStateSnapshot {
             intra_grid,
             mb_addr,
         );
+    }
+}
+
+/// Round-29 — extra snapshot fields needed to roll back a P/B-slice MB
+/// trial. Wraps [`MbStateSnapshot`] with the inter-slice-only MV grid
+/// slot and `pending_skip` counter so the intra-fallback RDO can
+/// trial-encode a candidate MB and discard the loser without leaking
+/// state into the next MB.
+struct InterMbStateSnapshot {
+    inner: MbStateSnapshot,
+    mv_l0: MvGridSlot,
+    /// `Some` only on the B-slice path — L1 grid slot.
+    mv_l1: Option<MvGridSlot>,
+    pending_skip: u32,
+}
+
+impl InterMbStateSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    fn capture_p(
+        recon_y: &[u8],
+        recon_u: &[u8],
+        recon_v: &[u8],
+        width: usize,
+        chroma_width: usize,
+        mb_x: usize,
+        mb_y: usize,
+        sw: &BitWriter,
+        nc_grid: &CavlcNcGrid,
+        intra_grid: &IntraGrid,
+        mv_grid: &MvGrid,
+        mb_addr: usize,
+        width_mbs: usize,
+        pending_skip: u32,
+    ) -> Self {
+        Self {
+            inner: MbStateSnapshot::capture(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr,
+                width_mbs,
+            ),
+            mv_l0: *mv_grid.slot(mb_x, mb_y),
+            mv_l1: None,
+            pending_skip,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_b(
+        recon_y: &[u8],
+        recon_u: &[u8],
+        recon_v: &[u8],
+        width: usize,
+        chroma_width: usize,
+        mb_x: usize,
+        mb_y: usize,
+        sw: &BitWriter,
+        nc_grid: &CavlcNcGrid,
+        intra_grid: &IntraGrid,
+        mv_grid_l0: &MvGrid,
+        mv_grid_l1: &MvGrid,
+        mb_addr: usize,
+        width_mbs: usize,
+        pending_skip: u32,
+    ) -> Self {
+        Self {
+            inner: MbStateSnapshot::capture(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr,
+                width_mbs,
+            ),
+            mv_l0: *mv_grid_l0.slot(mb_x, mb_y),
+            mv_l1: Some(*mv_grid_l1.slot(mb_x, mb_y)),
+            pending_skip,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_p(
+        &self,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        width: usize,
+        chroma_width: usize,
+        mb_x: usize,
+        mb_y: usize,
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mv_grid: &mut MvGrid,
+        mb_addr: usize,
+        pending_skip: &mut u32,
+    ) {
+        self.inner.restore(
+            recon_y,
+            recon_u,
+            recon_v,
+            width,
+            chroma_width,
+            mb_x,
+            mb_y,
+            sw,
+            nc_grid,
+            intra_grid,
+            mb_addr,
+        );
+        *mv_grid.slot_mut(mb_x, mb_y) = self.mv_l0;
+        *pending_skip = self.pending_skip;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_b(
+        &self,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        width: usize,
+        chroma_width: usize,
+        mb_x: usize,
+        mb_y: usize,
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mv_grid_l0: &mut MvGrid,
+        mv_grid_l1: &mut MvGrid,
+        mb_addr: usize,
+        pending_skip: &mut u32,
+    ) {
+        self.inner.restore(
+            recon_y,
+            recon_u,
+            recon_v,
+            width,
+            chroma_width,
+            mb_x,
+            mb_y,
+            sw,
+            nc_grid,
+            intra_grid,
+            mb_addr,
+        );
+        *mv_grid_l0.slot_mut(mb_x, mb_y) = self.mv_l0;
+        if let Some(slot) = self.mv_l1 {
+            *mv_grid_l1.slot_mut(mb_x, mb_y) = slot;
+        }
+        *pending_skip = self.pending_skip;
     }
 }
 
@@ -3064,8 +3248,9 @@ impl Encoder {
             for mb_x in 0..width_mbs as usize {
                 let mb_addr = mb_y * width_mbs as usize + mb_x;
 
-                // Decide P_Skip vs P_L0_16x16 for this MB.
-                let dbl = self.encode_p_mb(
+                // Round-29 — Decide P_Skip / P_L0_16x16 / P_8x8 for this
+                // MB, with optional Intra_16x16 fallback when configured.
+                let dbl = self.encode_p_mb_with_intra_fallback(
                     frame,
                     prev,
                     mb_x,
@@ -3837,6 +4022,543 @@ impl Encoder {
             ref_poc_l0: [0; 4],
             ..Default::default()
         }
+    }
+
+    /// Round-29 — encode one P-slice MB with optional **Intra_16x16
+    /// fallback** RDO (per §7.3.5 Table 7-13 mb_type values 6..=29).
+    ///
+    /// When [`EncoderConfig::intra_in_inter`] is true, snapshot the
+    /// pre-state, run the inter pipeline (`encode_p_mb`), measure
+    /// `J_inter = D_inter + λ·R_inter`, snapshot the post-state, restore
+    /// pre-state, run an Intra_16x16 trial, measure `J_intra` the same
+    /// way, and install the lower-J winner. When false, just call the
+    /// inter pipeline directly.
+    ///
+    /// The intra trial reuses the already-reconstructed prior MBs from
+    /// `recon_y` for §8.3.3 neighbour samples — same as the IDR path.
+    /// On winner-is-intra the encoder skips emitting `mvd_l0` and
+    /// updates `mv_grid` with `is_intra = true` so subsequent inter MBs'
+    /// §8.4.1.3.2 step-2 collapse fires.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_p_mb_with_intra_fallback(
+        &self,
+        frame: &YuvFrame<'_>,
+        prev: &EncodedFrameRef<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mv_grid: &mut MvGrid,
+        pending_skip: &mut u32,
+    ) -> MbDeblockInfo {
+        if !self.cfg.intra_in_inter {
+            return self.encode_p_mb(
+                frame,
+                prev,
+                mb_x,
+                mb_y,
+                qp_y,
+                qp_c,
+                chroma_width,
+                chroma_height,
+                recon_y,
+                recon_u,
+                recon_v,
+                sw,
+                nc_grid,
+                intra_grid,
+                mv_grid,
+                pending_skip,
+            );
+        }
+
+        let width = self.cfg.width as usize;
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let mb_addr = mb_y * width_mbs + mb_x;
+
+        // -- Snapshot pre-state. --
+        let snap_pre = InterMbStateSnapshot::capture_p(
+            recon_y,
+            recon_u,
+            recon_v,
+            width,
+            chroma_width,
+            mb_x,
+            mb_y,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid,
+            mb_addr,
+            width_mbs,
+            *pending_skip,
+        );
+        let pre_bits = sw.bits_emitted();
+
+        // -- Trial 1: inter (P_Skip / P_L0_16x16 / P_8x8). --
+        let inter_dbl = self.encode_p_mb(
+            frame,
+            prev,
+            mb_x,
+            mb_y,
+            qp_y,
+            qp_c,
+            chroma_width,
+            chroma_height,
+            recon_y,
+            recon_u,
+            recon_v,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid,
+            pending_skip,
+        );
+        let inter_bits = sw.bits_emitted() - pre_bits;
+        let inter_d = ssd_16x16(frame.y, width, mb_x * 16, mb_y * 16, &{
+            let mut buf = [0i32; 256];
+            for j in 0..16usize {
+                for i in 0..16usize {
+                    buf[j * 16 + i] = recon_y[(mb_y * 16 + j) * width + (mb_x * 16 + i)] as i32;
+                }
+            }
+            buf
+        });
+        let lambda = lambda_ssd(qp_y, false);
+        let j_inter = cost_combined(inter_d, inter_bits as u64, lambda);
+
+        // Capture post-inter state.
+        let snap_inter = InterMbStateSnapshot::capture_p(
+            recon_y,
+            recon_u,
+            recon_v,
+            width,
+            chroma_width,
+            mb_x,
+            mb_y,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid,
+            mb_addr,
+            width_mbs,
+            *pending_skip,
+        );
+
+        // -- Restore pre-state for the intra trial. --
+        snap_pre.restore_p(
+            recon_y,
+            recon_u,
+            recon_v,
+            width,
+            chroma_width,
+            mb_x,
+            mb_y,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid,
+            mb_addr,
+            pending_skip,
+        );
+
+        // -- Trial 2: Intra_16x16 in P-slice. --
+        let intra_dbl = self.encode_p_mb_intra16x16(
+            frame,
+            mb_x,
+            mb_y,
+            qp_y,
+            qp_c,
+            chroma_width,
+            chroma_height,
+            recon_y,
+            recon_u,
+            recon_v,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid,
+            pending_skip,
+        );
+        let intra_bits = sw.bits_emitted() - pre_bits;
+        let intra_d = ssd_16x16(frame.y, width, mb_x * 16, mb_y * 16, &{
+            let mut buf = [0i32; 256];
+            for j in 0..16usize {
+                for i in 0..16usize {
+                    buf[j * 16 + i] = recon_y[(mb_y * 16 + j) * width + (mb_x * 16 + i)] as i32;
+                }
+            }
+            buf
+        });
+        let j_intra = cost_combined(intra_d, intra_bits as u64, lambda);
+
+        // -- Pick winner. --
+        if j_inter <= j_intra {
+            // Roll back the intra trial; install the inter results.
+            snap_pre.restore_p(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mv_grid,
+                mb_addr,
+                pending_skip,
+            );
+            snap_inter.restore_p(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mv_grid,
+                mb_addr,
+                pending_skip,
+            );
+            inter_dbl
+        } else {
+            intra_dbl
+        }
+    }
+
+    /// Round-29 — Intra_16x16 fallback for a P-slice MB. Picks the best
+    /// §8.3.3 mode by SAD against the reconstructed neighbour samples
+    /// (top/left of the current frame's already-encoded MBs), forward
+    /// 4x4 + Hadamard + quantize, encodes chroma, and emits the MB syntax
+    /// via [`write_intra16x16_mb_in_inter_slice`] with `mb_type_offset =
+    /// 5` (Table 7-13). Updates `mv_grid` with `is_intra = true` so
+    /// subsequent inter MBs' §8.4.1.3.2 step-2 collapses.
+    ///
+    /// Round-29 scope: 4:2:0 only (encode_p / encode_b are 4:2:0-only).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_p_mb_intra16x16(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mv_grid: &mut MvGrid,
+        pending_skip: &mut u32,
+    ) -> MbDeblockInfo {
+        // Flush any pending P_Skip run before emitting a coded MB.
+        sw.ue(*pending_skip);
+        *pending_skip = 0;
+
+        // Delegate the heavy lifting to a writer that targets the
+        // P-slice mb_type table (offset = 5).
+        self.encode_intra16x16_in_inter_slice(
+            frame,
+            mb_x,
+            mb_y,
+            qp_y,
+            qp_c,
+            chroma_width,
+            chroma_height,
+            recon_y,
+            recon_u,
+            recon_v,
+            sw,
+            nc_grid,
+            intra_grid,
+            5,
+        );
+
+        // Update MV grid: intra MB contributes (mv=0, ref=-1) per
+        // §8.4.1.3.2 step 2.
+        *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
+            available: true,
+            is_intra: true,
+            ref_idx_l0_8x8: [-1; 4],
+            mv_l0_8x8: [Mv::ZERO; 4],
+        };
+
+        // §8.7.2.1 — per-4x4 deblock mask. For Intra_16x16, when
+        // cbp_luma == 15 every 4x4 block carries AC; when cbp_luma == 0
+        // only the DC plane is sent. We approximate by setting all 16
+        // bits when any AC coefficient exists post-quantize, mirroring
+        // the IDR Intra_16x16 path. Look up the actual bit from the
+        // nc_grid we just populated.
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let mb_addr = mb_y * width_mbs + mb_x;
+        let any_nz = nc_grid.mbs[mb_addr]
+            .luma_total_coeff
+            .iter()
+            .any(|&v| v != 0);
+        let luma_nonzero_4x4: u16 = if any_nz {
+            let mut nz = [false; 16];
+            for (blkz, slot) in nz.iter_mut().enumerate() {
+                *slot = nc_grid.mbs[mb_addr].luma_total_coeff[blkz] != 0;
+            }
+            luma_nz_mask_from_blocks(&nz)
+        } else {
+            0
+        };
+
+        MbDeblockInfo {
+            is_intra: true,
+            qp_y,
+            luma_nonzero_4x4,
+            chroma_nonzero_4x4: 0,
+            ..Default::default()
+        }
+    }
+
+    /// Round-29 — shared Intra_16x16 emitter used by both the P-slice
+    /// (`mb_type_offset = 5`) and B-slice (`mb_type_offset = 23`)
+    /// fallback paths. Picks the best §8.3.3 luma mode + best §8.3.4
+    /// chroma mode by Lagrangian RDO (luma) / SAD (chroma), runs the
+    /// forward + quantize + inverse pipeline, writes the MB syntax via
+    /// [`write_intra16x16_mb_in_inter_slice`], and updates `recon_*`,
+    /// `nc_grid`, `intra_grid`. Caller is responsible for `mv_grid`
+    /// updates, `pending_skip` flush, and the deblock-info return.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_intra16x16_in_inter_slice(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mb_type_offset: u32,
+    ) {
+        let width = self.cfg.width as usize;
+        let height = self.cfg.height as usize;
+        let lambda = lambda_ssd(qp_y, true);
+
+        // Pick best luma mode by RDO (mirrors encode_mb_intra16x16's
+        // luma-mode loop, with neighbour reads against `recon_y` which
+        // has already been populated by prior MBs).
+        let mut best_luma_mode = I16x16Mode::Dc;
+        let mut best_luma_pred = [0i32; 256];
+        let mut best_luma_cost = u64::MAX;
+        for &mode in &[
+            I16x16Mode::Vertical,
+            I16x16Mode::Horizontal,
+            I16x16Mode::Dc,
+            I16x16Mode::Plane,
+        ] {
+            let Some(pred) = predict_16x16(mode, recon_y, width, height, mb_x, mb_y) else {
+                continue;
+            };
+            let cost = trial_intra16x16_cost(frame, &pred, mb_x, mb_y, qp_y, width, lambda);
+            if cost < best_luma_cost {
+                best_luma_cost = cost;
+                best_luma_mode = mode;
+                best_luma_pred = pred;
+            }
+        }
+
+        // Build luma residual against chosen predictor.
+        let mut residual = [0i32; 256];
+        for j in 0..16usize {
+            for i in 0..16usize {
+                let s = frame.y[(mb_y * 16 + j) * width + (mb_x * 16 + i)] as i32;
+                residual[j * 16 + i] = s - best_luma_pred[j * 16 + i];
+            }
+        }
+        let mut coeffs_4x4 = [[0i32; 16]; 16];
+        for (blk, slot) in coeffs_4x4.iter_mut().enumerate() {
+            let bx = blk % 4;
+            let by = blk / 4;
+            let mut block = [0i32; 16];
+            for j in 0..4 {
+                for i in 0..4 {
+                    block[j * 4 + i] = residual[(by * 4 + j) * 16 + bx * 4 + i];
+                }
+            }
+            *slot = forward_core_4x4(&block);
+        }
+        let mut dc_coeffs = [0i32; 16];
+        for (blk, c) in coeffs_4x4.iter().enumerate() {
+            let bx = blk % 4;
+            let by = blk / 4;
+            dc_coeffs[by * 4 + bx] = c[0];
+        }
+        let dc_t = forward_hadamard_4x4(&dc_coeffs);
+        let dc_levels = quantize_luma_dc(&dc_t, qp_y, true);
+
+        // Per-block AC quantize.
+        let mut luma_ac_levels = [[0i32; 16]; 16];
+        let mut luma_ac_quant_raster = [[0i32; 16]; 16];
+        let mut any_luma_ac_nz = false;
+        for blkz in 0..16usize {
+            let (bx, by) = LUMA_4X4_BLK[blkz];
+            let raster = by * 4 + bx;
+            let z = quantize_4x4_ac(&coeffs_4x4[raster], qp_y, true);
+            luma_ac_quant_raster[raster] = z;
+            let scan_ac = zigzag_scan_4x4_ac(&z);
+            luma_ac_levels[blkz] = scan_ac;
+            if scan_ac.iter().any(|&v| v != 0) {
+                any_luma_ac_nz = true;
+            }
+        }
+        let cbp_luma: u8 = if any_luma_ac_nz { 15 } else { 0 };
+
+        // Inverse path → recon_y.
+        let inv_dc = inverse_hadamard_luma_dc_16x16(&dc_levels, qp_y, &FLAT_4X4_16, 8)
+            .expect("luma DC inverse");
+        #[allow(clippy::needless_range_loop)]
+        for blk in 0..16usize {
+            let bx = blk % 4;
+            let by = blk / 4;
+            let mut coeffs_in = if cbp_luma == 15 {
+                luma_ac_quant_raster[blk]
+            } else {
+                [0i32; 16]
+            };
+            coeffs_in[0] = inv_dc[by * 4 + bx];
+            let r = inverse_transform_4x4_dc_preserved(&coeffs_in, qp_y, &FLAT_4X4_16, 8)
+                .expect("inverse 4x4");
+            for j in 0..4 {
+                for i in 0..4 {
+                    let px = mb_x * 16 + bx * 4 + i;
+                    let py = mb_y * 16 + by * 4 + j;
+                    let p = best_luma_pred[(by * 4 + j) * 16 + bx * 4 + i];
+                    let raw = p + r[j * 4 + i];
+                    recon_y[py * width + px] = raw.clamp(0, 255) as u8;
+                }
+            }
+        }
+
+        // Chroma path (4:2:0 only on this round).
+        let chroma_block = encode_chroma_block(
+            self.cfg.chroma_format_idc,
+            frame.u,
+            frame.v,
+            recon_u,
+            recon_v,
+            chroma_width,
+            chroma_height,
+            mb_x,
+            mb_y,
+            qp_c,
+        );
+        let cbp_chroma = chroma_block.cbp_chroma;
+        let best_chroma_mode_u8 = chroma_block.pred_mode.as_u8();
+        install_chroma_recon(
+            self.cfg.chroma_format_idc,
+            chroma_width,
+            mb_x,
+            mb_y,
+            &chroma_block,
+            recon_u,
+            recon_v,
+        );
+        let _ = chroma_height;
+
+        let mut u_dc_levels = [0i32; 4];
+        let mut v_dc_levels = [0i32; 4];
+        let mut u_ac_levels = [[0i32; 16]; 4];
+        let mut v_ac_levels = [[0i32; 16]; 4];
+        u_dc_levels.copy_from_slice(&chroma_block.dc_cb[..4]);
+        v_dc_levels.copy_from_slice(&chroma_block.dc_cr[..4]);
+        u_ac_levels.copy_from_slice(&chroma_block.ac_cb[..4]);
+        v_ac_levels.copy_from_slice(&chroma_block.ac_cr[..4]);
+
+        // CAVLC neighbour-grid update for this MB (Intra16x16 → mark as
+        // intra so subsequent MBs' nC derivation reads the correct
+        // TotalCoeff). Done before per-block nC derivation so internal
+        // neighbours within the MB read the freshly-zeroed totals.
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let mb_addr = mb_y * width_mbs + mb_x;
+        {
+            let cur = &mut nc_grid.mbs[mb_addr];
+            cur.is_available = true;
+            cur.is_intra = true;
+            cur.is_skip = false;
+            cur.is_i_pcm = false;
+            cur.luma_total_coeff = [0u8; 16];
+        }
+        let nc_dc = derive_nc_luma(
+            nc_grid,
+            mb_addr as u32,
+            0,
+            LumaNcKind::Intra16x16Dc,
+            true,
+            false,
+        );
+        let mut luma_ac_nc = [0i32; 16];
+        let mut own_totals = [0u8; 16];
+        for blkz in 0..16u8 {
+            nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
+            let nc = derive_nc_luma(nc_grid, mb_addr as u32, blkz, LumaNcKind::Ac, true, false);
+            luma_ac_nc[blkz as usize] = nc;
+            if cbp_luma == 15 {
+                let tc = luma_ac_levels[blkz as usize]
+                    .iter()
+                    .filter(|&&v| v != 0)
+                    .count() as u8;
+                own_totals[blkz as usize] = tc;
+            }
+        }
+        nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
+
+        // Emit MB syntax.
+        let mb_cfg = I16x16McbConfig {
+            pred_mode: best_luma_mode.as_u8(),
+            intra_chroma_pred_mode: best_chroma_mode_u8,
+            cbp_luma,
+            cbp_chroma,
+            mb_qp_delta: 0,
+            luma_dc_levels_raster: dc_levels,
+            luma_ac_levels,
+            luma_ac_nc,
+            chroma_dc_cb: u_dc_levels,
+            chroma_dc_cr: v_dc_levels,
+            chroma_ac_cb: u_ac_levels,
+            chroma_ac_cr: v_ac_levels,
+        };
+        write_intra16x16_mb_in_inter_slice(
+            sw,
+            &mb_cfg,
+            mb_type_offset,
+            CoeffTokenContext::Numeric(nc_dc),
+        )
+        .expect("write Intra_16x16 in inter slice");
+
+        // Mark intra grid: available + not-i_nxn so subsequent I_NxN
+        // neighbour lookups fall to DC (mode = 2).
+        let s = intra_grid.slot_mut(mb_x, mb_y);
+        s.available = true;
+        s.is_i_nxn = false;
+
+        // Suppress unused.
+        let _ = best_luma_cost;
     }
 }
 
@@ -6608,7 +7330,8 @@ impl Encoder {
         for mb_y in 0..height_mbs as usize {
             for mb_x in 0..width_mbs as usize {
                 let mb_addr = mb_y * (width_mbs as usize) + mb_x;
-                let dbl = self.encode_b_mb(
+                // Round-29: Intra fallback in B-slice via RDO wrapper.
+                let dbl = self.encode_b_mb_with_intra_fallback(
                     frame,
                     ref_l0,
                     ref_l1,
@@ -8032,6 +8755,309 @@ impl Encoder {
             mv_l1: mv_l1_arr,
             ref_idx_l1,
             ref_poc_l1,
+        }
+    }
+
+    /// Round-29 — encode one B-slice MB with optional **Intra_16x16
+    /// fallback** RDO (per §7.3.5 Table 7-14 mb_type values 24..=47).
+    /// Mirrors [`Encoder::encode_p_mb_with_intra_fallback`] but on the
+    /// two-list B-slice context.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_b_mb_with_intra_fallback(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        src_stride: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mv_grid_l0: &mut MvGrid,
+        mv_grid_l1: &mut MvGrid,
+        pending_skip: &mut u32,
+        curr_poc: i32,
+        weighted: Option<WeightedBipredLuma>,
+    ) -> MbDeblockInfo {
+        if !self.cfg.intra_in_inter {
+            return self.encode_b_mb(
+                frame,
+                ref_l0,
+                ref_l1,
+                mb_x,
+                mb_y,
+                qp_y,
+                qp_c,
+                chroma_width,
+                chroma_height,
+                src_stride,
+                recon_y,
+                recon_u,
+                recon_v,
+                sw,
+                nc_grid,
+                intra_grid,
+                mv_grid_l0,
+                mv_grid_l1,
+                pending_skip,
+                curr_poc,
+                weighted,
+            );
+        }
+
+        let width = self.cfg.width as usize;
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let mb_addr = mb_y * width_mbs + mb_x;
+
+        // -- Snapshot pre-state. --
+        let snap_pre = InterMbStateSnapshot::capture_b(
+            recon_y,
+            recon_u,
+            recon_v,
+            width,
+            chroma_width,
+            mb_x,
+            mb_y,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid_l0,
+            mv_grid_l1,
+            mb_addr,
+            width_mbs,
+            *pending_skip,
+        );
+        let pre_bits = sw.bits_emitted();
+
+        // -- Trial 1: inter (B_Skip / B_Direct / B_L0/L1/Bi / partitions / 8x8). --
+        let inter_dbl = self.encode_b_mb(
+            frame,
+            ref_l0,
+            ref_l1,
+            mb_x,
+            mb_y,
+            qp_y,
+            qp_c,
+            chroma_width,
+            chroma_height,
+            src_stride,
+            recon_y,
+            recon_u,
+            recon_v,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid_l0,
+            mv_grid_l1,
+            pending_skip,
+            curr_poc,
+            weighted,
+        );
+        let inter_bits = sw.bits_emitted() - pre_bits;
+        let inter_d = ssd_16x16(frame.y, width, mb_x * 16, mb_y * 16, &{
+            let mut buf = [0i32; 256];
+            for j in 0..16usize {
+                for i in 0..16usize {
+                    buf[j * 16 + i] = recon_y[(mb_y * 16 + j) * width + (mb_x * 16 + i)] as i32;
+                }
+            }
+            buf
+        });
+        let lambda = lambda_ssd(qp_y, false);
+        let j_inter = cost_combined(inter_d, inter_bits as u64, lambda);
+
+        // Capture post-inter state.
+        let snap_inter = InterMbStateSnapshot::capture_b(
+            recon_y,
+            recon_u,
+            recon_v,
+            width,
+            chroma_width,
+            mb_x,
+            mb_y,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid_l0,
+            mv_grid_l1,
+            mb_addr,
+            width_mbs,
+            *pending_skip,
+        );
+
+        // -- Restore pre-state for the intra trial. --
+        snap_pre.restore_b(
+            recon_y,
+            recon_u,
+            recon_v,
+            width,
+            chroma_width,
+            mb_x,
+            mb_y,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid_l0,
+            mv_grid_l1,
+            mb_addr,
+            pending_skip,
+        );
+
+        // -- Trial 2: Intra_16x16 in B-slice. --
+        let intra_dbl = self.encode_b_mb_intra16x16(
+            frame,
+            mb_x,
+            mb_y,
+            qp_y,
+            qp_c,
+            chroma_width,
+            chroma_height,
+            recon_y,
+            recon_u,
+            recon_v,
+            sw,
+            nc_grid,
+            intra_grid,
+            mv_grid_l0,
+            mv_grid_l1,
+            pending_skip,
+        );
+        let intra_bits = sw.bits_emitted() - pre_bits;
+        let intra_d = ssd_16x16(frame.y, width, mb_x * 16, mb_y * 16, &{
+            let mut buf = [0i32; 256];
+            for j in 0..16usize {
+                for i in 0..16usize {
+                    buf[j * 16 + i] = recon_y[(mb_y * 16 + j) * width + (mb_x * 16 + i)] as i32;
+                }
+            }
+            buf
+        });
+        let j_intra = cost_combined(intra_d, intra_bits as u64, lambda);
+
+        // -- Pick winner. --
+        if j_inter <= j_intra {
+            snap_pre.restore_b(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mv_grid_l0,
+                mv_grid_l1,
+                mb_addr,
+                pending_skip,
+            );
+            snap_inter.restore_b(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mv_grid_l0,
+                mv_grid_l1,
+                mb_addr,
+                pending_skip,
+            );
+            inter_dbl
+        } else {
+            intra_dbl
+        }
+    }
+
+    /// Round-29 — Intra_16x16 fallback for a B-slice MB. Mirrors
+    /// [`Encoder::encode_p_mb_intra16x16`] but updates *both* L0 and L1
+    /// MV grids (intra contribution for either list).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_b_mb_intra16x16(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mv_grid_l0: &mut MvGrid,
+        mv_grid_l1: &mut MvGrid,
+        pending_skip: &mut u32,
+    ) -> MbDeblockInfo {
+        // Flush any pending B_Skip run.
+        sw.ue(*pending_skip);
+        *pending_skip = 0;
+
+        self.encode_intra16x16_in_inter_slice(
+            frame,
+            mb_x,
+            mb_y,
+            qp_y,
+            qp_c,
+            chroma_width,
+            chroma_height,
+            recon_y,
+            recon_u,
+            recon_v,
+            sw,
+            nc_grid,
+            intra_grid,
+            23,
+        );
+
+        // Update both MV grids for the intra MB.
+        let intra_slot = MvGridSlot {
+            available: true,
+            is_intra: true,
+            ref_idx_l0_8x8: [-1; 4],
+            mv_l0_8x8: [Mv::ZERO; 4],
+        };
+        *mv_grid_l0.slot_mut(mb_x, mb_y) = intra_slot;
+        *mv_grid_l1.slot_mut(mb_x, mb_y) = intra_slot;
+
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let mb_addr = mb_y * width_mbs + mb_x;
+        let any_nz = nc_grid.mbs[mb_addr]
+            .luma_total_coeff
+            .iter()
+            .any(|&v| v != 0);
+        let luma_nonzero_4x4: u16 = if any_nz {
+            let mut nz = [false; 16];
+            for (blkz, slot) in nz.iter_mut().enumerate() {
+                *slot = nc_grid.mbs[mb_addr].luma_total_coeff[blkz] != 0;
+            }
+            luma_nz_mask_from_blocks(&nz)
+        } else {
+            0
+        };
+
+        MbDeblockInfo {
+            is_intra: true,
+            qp_y,
+            luma_nonzero_4x4,
+            chroma_nonzero_4x4: 0,
+            ..Default::default()
         }
     }
 }

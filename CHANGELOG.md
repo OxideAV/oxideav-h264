@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 29 — encoder intra fallback in P/B slices (Intra_16x16)**.
+  When [`EncoderConfig::intra_in_inter`] is true (default), the per-MB
+  RDO loop in `encode_p` and `encode_b` now compares the inter cost
+  `J_inter = D_inter + λ·R_inter` against an `Intra_16x16` trial cost
+  `J_intra` and installs the lower-J winner. This covers occlusion,
+  scene-cut frames, and high-detail areas where motion-compensated
+  prediction's residual is more expensive to code than a fresh intra
+  block. Per H.264 §7.3.5 the chosen MB is emitted with the intra
+  mb_type values shifted by **+5** (P-slice Table 7-13 raw mb_type ∈
+  6..=29 for Intra_16x16) or **+23** (B-slice Table 7-14 raw mb_type ∈
+  24..=47); the existing decoder already handles intra MBs in P/B
+  slices so no decoder-side change is required.
+  Implementation:
+  * New writer `write_intra16x16_mb_in_inter_slice` in
+    `encoder::macroblock` — identical layout to `write_intra16x16_mb`
+    but with a configurable `mb_type_offset` (5 or 23).
+  * New `InterMbStateSnapshot` type wraps the existing `MbStateSnapshot`
+    with the inter-context-only `MvGridSlot` (and optional L1 grid for
+    B-slice) plus `pending_skip` counter so the trial RDO can roll
+    back the loser cleanly.
+  * New methods `Encoder::encode_p_mb_with_intra_fallback` /
+    `encode_b_mb_with_intra_fallback` snapshot pre-state, run the
+    inter trial (existing `encode_p_mb` / `encode_b_mb`), measure
+    `J_inter` from `D_inter = SSD(source, recon)` and `R_inter =
+    bits_emitted` delta, snapshot post-inter state, restore pre-state,
+    run the new `encode_*_mb_intra16x16` trial, measure `J_intra`,
+    and install the winner.
+  * Shared emit helper `Encoder::encode_intra16x16_in_inter_slice`
+    runs §8.3.3 luma mode RDO + §8.3.4 chroma mode SAD, builds the
+    forward + quantize + inverse pipeline, writes the MB syntax, and
+    updates `recon_*` / `nc_grid` / `intra_grid`. Caller updates
+    `mv_grid` (intra MB → `is_intra = true`) so subsequent inter MBs'
+    §8.4.1.3.2 step-2 collapse fires (mv=0, ref=-1).
+  Round-29 scope:
+  * `Intra_16x16` only (no `I_NxN` / `I_PCM` fallback). The §8.3.1.2
+    9-mode I_NxN path in P/B slices needs careful CAVLC nC-grid
+    plumbing for the in-MB neighbour reads — deferred.
+  * 4:2:0 chroma only (encode_p / encode_b are 4:2:0-only).
+  * `P_Skip` / `B_Skip` fast paths still trigger normally — when the
+    inter trial decides the MB is a skip, `J_inter` is essentially
+    zero (no syntax + zero residual SSD) and intra never wins.
+  Acceptance fixture: `integration_p_slice_intra_fallback.rs`
+  encodes a 64x64 textured-wall IDR + a P-frame with a 32x32
+  "occluding ball" of brand-new content. Result: P-slice **588 → 108
+  bytes (81.6% smaller)** under intra fallback, ffmpeg/libavcodec
+  cross-decode bit-equivalent (max diff 0), self-roundtrip bit-exact
+  through our own decoder. New `EncoderConfig::intra_in_inter`
+  toggle (default `true`) lets callers A/B test against the inter-
+  only path. P-only / B-only fixtures from rounds 16..28 are
+  unaffected (their inter cost is well below any intra trial cost).
+
 - **Round 28 — encoder 4:4:4 chroma support (IDR Intra_16x16-only path)**.
   `EncoderConfig::chroma_format_idc` now also accepts 3 (4:4:4); when
   paired with `profile_idc=244` (High 4:4:4 Predictive) the SPS writer

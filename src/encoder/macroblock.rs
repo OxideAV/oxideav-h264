@@ -482,6 +482,75 @@ pub fn write_intra16x16_mb(
     Ok(())
 }
 
+/// Round-29 — emit one Intra_16x16 macroblock embedded in a P or B slice.
+///
+/// Identical bitstream layout to [`write_intra16x16_mb`] for the I-slice
+/// case, but the `mb_type ue(v)` field is **offset** by `mb_type_offset`:
+///
+/// * P-slice (Table 7-13): `mb_type_offset = 5`. Inter mb_types occupy
+///   raw values 0..=4; intra mb_types start at raw 5 → I_NxN, 6..=29
+///   → Intra_16x16 (per the +5 shift), 30 → I_PCM.
+/// * B-slice (Table 7-14): `mb_type_offset = 23`. Inter mb_types
+///   occupy raw values 0..=22; intra mb_types start at raw 23 → I_NxN,
+///   24..=47 → Intra_16x16, 48 → I_PCM.
+///
+/// The 4:2:0 chroma layout is the only one supported on this round (P/B
+/// slices are 4:2:0-only in the encoder); 4:2:2 / 4:4:4 fallback paths
+/// are deferred. Use [`I16x16McbConfig`] from the I-slice path for the
+/// per-block residual fields — the structure is identical, only the
+/// mb_type ue(v) value differs.
+pub fn write_intra16x16_mb_in_inter_slice(
+    w: &mut BitWriter,
+    cfg: &I16x16McbConfig,
+    mb_type_offset: u32,
+    nc_ctx: CoeffTokenContext,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(
+        mb_type_offset == 5 || mb_type_offset == 23,
+        "mb_type_offset must be 5 (P-slice) or 23 (B-slice); got {mb_type_offset}",
+    );
+    let raw =
+        mb_type_offset + intra16x16_mb_type_value(cfg.pred_mode, cfg.cbp_luma, cfg.cbp_chroma);
+    w.ue(raw);
+    w.ue(cfg.intra_chroma_pred_mode as u32);
+    // §7.3.5 — coded_block_pattern is *absent* for Intra_16x16 (the
+    // CBP is carried by mb_type itself). mb_qp_delta is always present
+    // (the luma DC block is always coded for Intra_16x16).
+    w.se(cfg.mb_qp_delta);
+
+    // §7.3.5.3 — Intra_16x16 luma DC block.
+    let scan = zigzag_scan_4x4(&cfg.luma_dc_levels_raster);
+    encode_residual_block_cavlc(w, nc_ctx, 16, &scan)?;
+
+    // §7.3.5.3 — Intra_16x16 luma AC blocks (only when cbp_luma == 15).
+    if cfg.cbp_luma == 15 {
+        for blk in 0..16usize {
+            let nc = cfg.luma_ac_nc[blk];
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(nc),
+                15,
+                &cfg.luma_ac_levels[blk][..15],
+            )?;
+        }
+    }
+
+    // §7.3.5.3 — Chroma residual (4:2:0).
+    if cfg.cbp_chroma > 0 {
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
+        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
+    }
+    if cfg.cbp_chroma == 2 {
+        for blk in &cfg.chroma_ac_cb {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+        for blk in &cfg.chroma_ac_cr {
+            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // I_NxN (Intra_4x4) macroblock emit — round 4.
 // ---------------------------------------------------------------------------

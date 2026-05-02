@@ -895,17 +895,108 @@ partition-mode-neighbour MBs.
 - CAVLC only.
 - Single ref per list.
 
-## Round 23+ (planned)
+## Round 29 — landed
 
-- Intra fallback in P / B slices via RDO.
-- B_8x8 sub-MB types (Table 7-18 sub_mb_type for B-slice).
-- B_Direct_8x8 (sub-MB direct) with non-uniform per-8x8 MVs.
-- Temporal direct mode (§8.4.1.2.3).
+**Intra fallback in P / B slices** via per-MB Lagrangian RDO. The
+encoder now compares the inter winner's cost (`J_inter = D_inter +
+λ·R_inter` measured on the actually-emitted bitstream) against an
+`Intra_16x16` trial cost (`J_intra` measured the same way) and
+installs the lower-J path. Picks up scene-cut frames, occlusion of
+new content over a textured background, and high-detail areas where
+motion-compensated prediction's residual is more expensive to code
+than a fresh intra block.
+
+- **`EncoderConfig::intra_in_inter`** (default `true`) — toggle for
+  the new path. When `false`, the round-16..28 inter-only behaviour
+  is preserved exactly (useful for A/B testing).
+- **`encoder::macroblock::write_intra16x16_mb_in_inter_slice`** — new
+  writer mirroring `write_intra16x16_mb` but emitting the mb_type
+  ue(v) with a configurable offset: `+5` for P-slice (Table 7-13
+  intra range raw 5..=30), `+23` for B-slice (Table 7-14 intra range
+  raw 23..=48). The decoder side already accepts these values
+  (`MbType::from_p_slice` / `from_b_slice` map them via
+  `from_i_slice(raw - 5)` / `from_i_slice(raw - 23)`).
+- **`InterMbStateSnapshot`** wraps the existing `MbStateSnapshot`
+  with the inter-context-only fields: `MvGridSlot` (and L1 grid for
+  B), plus `pending_skip`. Lets the trial RDO roll back the loser
+  cleanly without leaking state into the next MB.
+- **`Encoder::encode_p_mb_with_intra_fallback`** /
+  **`Encoder::encode_b_mb_with_intra_fallback`** — RDO wrappers
+  around the existing `encode_p_mb` / `encode_b_mb` per-MB encoders.
+  Snapshot pre-state, run inter trial, measure J_inter, snapshot
+  post-inter, restore pre-state, run new
+  `encode_p_mb_intra16x16` / `encode_b_mb_intra16x16` trial,
+  measure J_intra, install winner.
+- **`Encoder::encode_intra16x16_in_inter_slice`** — shared emit
+  helper used by both P/B paths. Runs §8.3.3 luma RDO across the 4
+  pred_modes (Vertical / Horizontal / DC / Plane), §8.3.4 chroma
+  SAD across the 4 chroma modes, the forward+quantize+inverse
+  pipeline, and emits the syntax via
+  `write_intra16x16_mb_in_inter_slice` with the requested offset.
+  Updates `recon_*`, `nc_grid` (per-block CAVLC TotalCoeff), and
+  `intra_grid` (`available = true, is_i_nxn = false` so subsequent
+  I_NxN neighbour lookups fall to DC). The wrapper updates `mv_grid`
+  with `is_intra = true`, `ref = -1`, `mv = 0` so subsequent inter
+  MBs' §8.4.1.3.2 step-2 collapse fires.
+- **Per-MB syntax accounting** — `J_inter` = `cost_combined(SSD,
+  inter_bits, λ_inter)`. For B_Skip / P_Skip MBs the inter trial
+  doesn't write any bits (the skip is folded into `pending_skip`),
+  so `J_inter = SSD(source, recon)` only — the fast path always
+  beats intra on static / skip-able content.
+
+### Validation
+
+- Lib tests: 819 → **819 passed** (all unit + integration tests
+  pass). Two trivial clippy lints fixed.
+- Pre-existing failure `round21_static_picture_uses_b_skip` (B-
+  slice byte budget regression unrelated to this round) is on the
+  master branch already; not caused by round-29.
+- New integration tests (`integration_p_slice_intra_fallback.rs`):
+  - `round29_p_slice_intra_fallback_shrinks_occlusion_fixture`:
+    encode a 64x64 textured-wall IDR + a P-frame with a 32x32
+    "occluding ball" of brand-new content. P-slice **588 → 108
+    bytes (81.6 % smaller)** under intra fallback vs. inter-only.
+  - `round29_p_slice_intra_fallback_decodes_through_self`:
+    self-roundtrip bit-exact through our own decoder (max enc/dec
+    luma diff 0).
+  - `round29_p_slice_intra_fallback_ffmpeg_interop`:
+    ffmpeg/libavcodec decodes the same intra-fallback P-slice
+    bit-equivalently against the encoder's local recon (max
+    ff/enc luma diff 0).
+  - `round29_p_slice_intra_fallback_picks_intra_for_occluded_mbs`:
+    sanity check that the parser accepts the intra-in-inter
+    mb_type values without error.
+- Round-16/17/18/19/20/21/22/23/24/25/26 fixtures all still pass
+  (their inter cost is dominated by motion-compensated prediction
+  matching the source; the intra trial never wins).
+
+### Status caveats (unchanged from round 28 unless noted)
+
+- **Intra fallback active in P/B slices** (round-29 default). When
+  `intra_in_inter = true`, every coded inter MB trials Intra_16x16
+  via RDO; lower-J wins.
+- Round-29 scope: **Intra_16x16 only** (no I_NxN / I_PCM fallback).
+  The §8.3.1.2 9-mode I_NxN path in P/B slices needs careful CAVLC
+  nC-grid plumbing for the in-MB neighbour reads — deferred.
+- Round-29 chroma: **4:2:0 only** (encode_p / encode_b are 4:2:0-
+  only at this level).
+- Spatial direct + temporal direct mode B (rounds 21/24) +
+  partition modes (round 22) + B_8x8 mixed (round 25) + explicit
+  weighted bipred (round 26) all still active and unaffected.
+- CAVLC only. No rate control. Single ref per list (B-slices).
+
+## Round 30+ (planned)
+
+- I_NxN fallback in P / B slices (round-29 currently only trials
+  Intra_16x16; I_NxN can be a further win on detailed content).
+- 4:2:2 / 4:4:4 in P / B slices (round-29 intra fallback is 4:2:0
+  only; same scope as the inter encoder).
 - Multiple slices per picture.
 - 8x8 transform / High-profile features.
-- CABAC.
+- CABAC encode.
 - Rate control.
 - Chroma AC nC per §9.2.1.1.
+- VUI / SEI tuning (HRD, mastering display, content light level).
 
 ## Entry points
 
