@@ -178,12 +178,7 @@ fn round30_idr_plus_p_cabac_self_roundtrip() {
     // tc-clipped delta may differ by ±1 LSB on smooth content).
     let mut max_diff = 0i32;
     let mut nz = 0usize;
-    for (_k, (&a, &b)) in f1_dec.planes[0]
-        .data
-        .iter()
-        .zip(p.recon_y.iter())
-        .enumerate()
-    {
+    for (&a, &b) in f1_dec.planes[0].data.iter().zip(p.recon_y.iter()) {
         let d = (a as i32 - b as i32).abs();
         if d > 0 {
             nz += 1;

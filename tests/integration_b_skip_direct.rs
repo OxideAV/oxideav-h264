@@ -61,9 +61,28 @@ fn psnr(orig: &[u8], recon: &[u8]) -> f64 {
 #[test]
 fn round21_static_picture_uses_b_skip() {
     // Static IDR + P + B: every B MB should pick B_Skip (no syntax).
+    //
+    // This fixture isolates the round-21 B_Skip selection path. With the
+    // round-29 `intra_in_inter` RDO trial enabled (the encoder default),
+    // a few P-slice MBs pick Intra_16x16 over P_Skip on this 64x64
+    // gradient because the post-IDR §8.7 deblock smoothing leaves the
+    // P_Skip predictor (= IDR recon) a couple of LSBs off the source
+    // and the intra trial's RDO cost lands lower. The resulting P recon
+    // is then used as the L1 anchor of the B-slice; the spatial-direct
+    // bipred predictor (= avg of L0=IDR and L1=P) inherits that small
+    // offset, so a few B MBs end up with cbp != 0 and cannot collapse
+    // to B_Skip — pushing the slice from ~11 bytes to ~18 bytes and
+    // breaking the round-21 byte-budget assertion below.
+    //
+    // Round-21 was designed and verified before round-29 existed, so
+    // we explicitly opt out of the intra fallback here to keep the
+    // round-21 invariant ("static content collapses to all-B_Skip")
+    // testable in isolation. The round-29 fallback has its own
+    // dedicated coverage in `tests/integration_p_slice_intra_fallback.rs`.
     let mut cfg = EncoderConfig::new(W as u32, H as u32);
     cfg.profile_idc = 77; // Main — required for B-slices (§A.2.2)
     cfg.max_num_ref_frames = 2;
+    cfg.intra_in_inter = false;
     let enc = Encoder::new(cfg);
 
     let (y0, u0, v0) = make_static_picture();
