@@ -222,13 +222,31 @@ fn videoframe_to_packed(
         true
     }
     let mut out = Vec::with_capacity(bps * (w * h + 2 * cw * ch));
-    if !pack(&mut out, &vf.planes[0].data, vf.planes[0].stride, w * bps, h) {
+    if !pack(
+        &mut out,
+        &vf.planes[0].data,
+        vf.planes[0].stride,
+        w * bps,
+        h,
+    ) {
         return None;
     }
-    if !pack(&mut out, &vf.planes[1].data, vf.planes[1].stride, cw * bps, ch) {
+    if !pack(
+        &mut out,
+        &vf.planes[1].data,
+        vf.planes[1].stride,
+        cw * bps,
+        ch,
+    ) {
         return None;
     }
-    if !pack(&mut out, &vf.planes[2].data, vf.planes[2].stride, cw * bps, ch) {
+    if !pack(
+        &mut out,
+        &vf.planes[2].data,
+        vf.planes[2].stride,
+        cw * bps,
+        ch,
+    ) {
         return None;
     }
     Some(out)
