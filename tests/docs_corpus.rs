@@ -177,9 +177,13 @@ struct CorpusCase {
 /// emits when dumping `-f rawvideo`: Y plane (W*H) || U plane
 /// (Cw*Ch) || V plane (Cw*Ch). Strips any per-row padding so the
 /// resulting buffer matches `expected.yuv` byte-for-byte.
-fn videoframe_to_packed(vf: &oxideav_core::VideoFrame, w: usize, h: usize, cw: usize, ch: usize)
-    -> Option<Vec<u8>>
-{
+fn videoframe_to_packed(
+    vf: &oxideav_core::VideoFrame,
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+) -> Option<Vec<u8>> {
     if vf.planes.len() < 3 {
         // Monochrome (Y-only) or unexpected shape — fail soft.
         return None;
@@ -259,11 +263,7 @@ fn decode_annex_b_fixture(case: &CorpusCase) -> Option<Vec<FrameResult>> {
 /// Drive a fresh `H264CodecDecoder` through the closure (which feeds
 /// packets), then drain `receive_frame` until EOF / NeedMore and score
 /// each emitted frame.
-fn decode_with_decoder<F>(
-    case: &CorpusCase,
-    yuv_ref: &[u8],
-    feed: F,
-) -> Option<Vec<FrameResult>>
+fn decode_with_decoder<F>(case: &CorpusCase, yuv_ref: &[u8], feed: F) -> Option<Vec<FrameResult>>
 where
     F: FnOnce(&mut H264CodecDecoder) -> Result<(), String>,
 {
@@ -766,7 +766,8 @@ fn corpus_iso_mp4_vs_annexb_mp4() {
             .map_err(|e| format!("consume_extradata: {e}"))?;
         for (i, sample) in mp4_data.samples.iter().enumerate() {
             let pkt = Packet::new(0, TimeBase::new(1, 25), sample.clone()).with_pts(i as i64);
-            dec.send_packet(&pkt).map_err(|e| format!("send_packet[{i}]: {e}"))?;
+            dec.send_packet(&pkt)
+                .map_err(|e| format!("send_packet[{i}]: {e}"))?;
         }
         dec.flush().map_err(|e| format!("flush: {e}"))?;
         Ok(())
@@ -843,7 +844,6 @@ fn parse_minimal_mp4_avc(buf: &[u8]) -> Result<Mp4AvcData, String> {
             if stsd.len() < 8 {
                 return Err("stsd truncated".into());
             }
-            let so = 8usize; // skip stsd full-box version+flags + entry_count
             // VisualSampleEntry layout per ISO/IEC 14496-12 §8.5.2:
             //   8  bytes  Box header  (size + 4-byte type)
             //   6  bytes  reserved
@@ -860,10 +860,12 @@ fn parse_minimal_mp4_avc(buf: &[u8]) -> Result<Mp4AvcData, String> {
             //   86 bytes  total before child boxes (e.g. avcC, btrt).
             // After the size+type header (8 bytes) the remainder is 78
             // bytes; child boxes start at `entry_start + 8 + 78`.
+            let so = 8usize; // skip stsd full-box version+flags + entry_count
             if so + 8 > stsd.len() {
                 return Err("stsd entry truncated".into());
             }
-            let entry_size = u32::from_be_bytes([stsd[so], stsd[so + 1], stsd[so + 2], stsd[so + 3]]) as usize;
+            let entry_size =
+                u32::from_be_bytes([stsd[so], stsd[so + 1], stsd[so + 2], stsd[so + 3]]) as usize;
             let entry_ty = &stsd[so + 4..so + 8];
             if entry_ty != b"avc1" && entry_ty != b"avc3" {
                 return Err(format!("unsupported video sample entry: {:?}", entry_ty));
@@ -902,7 +904,12 @@ fn parse_minimal_mp4_avc(buf: &[u8]) -> Result<Mp4AvcData, String> {
                 }
                 for i in 0..sample_count {
                     let o = 12 + i * 4;
-                    stsz_sizes.push(u32::from_be_bytes([stsz[o], stsz[o + 1], stsz[o + 2], stsz[o + 3]]));
+                    stsz_sizes.push(u32::from_be_bytes([
+                        stsz[o],
+                        stsz[o + 1],
+                        stsz[o + 2],
+                        stsz[o + 3],
+                    ]));
                 }
             }
 
@@ -911,15 +918,31 @@ fn parse_minimal_mp4_avc(buf: &[u8]) -> Result<Mp4AvcData, String> {
             if stsc_box.len() < 8 {
                 return Err("stsc truncated".into());
             }
-            let stsc_count = u32::from_be_bytes([stsc_box[4], stsc_box[5], stsc_box[6], stsc_box[7]]) as usize;
+            let stsc_count =
+                u32::from_be_bytes([stsc_box[4], stsc_box[5], stsc_box[6], stsc_box[7]]) as usize;
             if stsc_box.len() < 8 + stsc_count * 12 {
                 return Err("stsc table truncated".into());
             }
             for i in 0..stsc_count {
                 let o = 8 + i * 12;
-                let fc = u32::from_be_bytes([stsc_box[o], stsc_box[o + 1], stsc_box[o + 2], stsc_box[o + 3]]);
-                let spc = u32::from_be_bytes([stsc_box[o + 4], stsc_box[o + 5], stsc_box[o + 6], stsc_box[o + 7]]);
-                let sdi = u32::from_be_bytes([stsc_box[o + 8], stsc_box[o + 9], stsc_box[o + 10], stsc_box[o + 11]]);
+                let fc = u32::from_be_bytes([
+                    stsc_box[o],
+                    stsc_box[o + 1],
+                    stsc_box[o + 2],
+                    stsc_box[o + 3],
+                ]);
+                let spc = u32::from_be_bytes([
+                    stsc_box[o + 4],
+                    stsc_box[o + 5],
+                    stsc_box[o + 6],
+                    stsc_box[o + 7],
+                ]);
+                let sdi = u32::from_be_bytes([
+                    stsc_box[o + 8],
+                    stsc_box[o + 9],
+                    stsc_box[o + 10],
+                    stsc_box[o + 11],
+                ]);
                 stsc.push((fc, spc, sdi));
             }
 
@@ -928,19 +951,26 @@ fn parse_minimal_mp4_avc(buf: &[u8]) -> Result<Mp4AvcData, String> {
                 if stco_box.len() < 8 {
                     return Err("stco truncated".into());
                 }
-                let n = u32::from_be_bytes([stco_box[4], stco_box[5], stco_box[6], stco_box[7]]) as usize;
+                let n = u32::from_be_bytes([stco_box[4], stco_box[5], stco_box[6], stco_box[7]])
+                    as usize;
                 if stco_box.len() < 8 + n * 4 {
                     return Err("stco table truncated".into());
                 }
                 for i in 0..n {
                     let o = 8 + i * 4;
-                    stco_offsets.push(u32::from_be_bytes([stco_box[o], stco_box[o + 1], stco_box[o + 2], stco_box[o + 3]]) as u64);
+                    stco_offsets.push(u32::from_be_bytes([
+                        stco_box[o],
+                        stco_box[o + 1],
+                        stco_box[o + 2],
+                        stco_box[o + 3],
+                    ]) as u64);
                 }
             } else if let Ok((co64_box, _)) = find_box(stbl, b"co64") {
                 if co64_box.len() < 8 {
                     return Err("co64 truncated".into());
                 }
-                let n = u32::from_be_bytes([co64_box[4], co64_box[5], co64_box[6], co64_box[7]]) as usize;
+                let n = u32::from_be_bytes([co64_box[4], co64_box[5], co64_box[6], co64_box[7]])
+                    as usize;
                 if co64_box.len() < 8 + n * 8 {
                     return Err("co64 table truncated".into());
                 }
@@ -1046,7 +1076,9 @@ fn read_box<'a>(buf: &'a [u8], off: usize) -> Result<(&'a [u8], [u8; 4], usize),
         (8, size32 as usize)
     };
     if off + total > buf.len() {
-        return Err(format!("box {ty:?} body overruns ({total} bytes from {off})"));
+        return Err(format!(
+            "box {ty:?} body overruns ({total} bytes from {off})"
+        ));
     }
     Ok((&buf[off + header_len..off + total], ty, header_len))
 }
