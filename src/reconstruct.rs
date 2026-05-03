@@ -60,8 +60,7 @@ use crate::sps::Sps;
 use crate::transform::{
     inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422, inverse_hadamard_luma_dc_16x16,
     inverse_transform_4x4, inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
-    qp_y_to_qp_c, qp_y_to_qp_c_with_bd_offset, select_scaling_list_4x4, select_scaling_list_8x8,
-    TransformError,
+    qp_y_to_qp_c_with_bd_offset, select_scaling_list_4x4, select_scaling_list_8x8, TransformError,
 };
 
 use thiserror::Error;
@@ -5784,6 +5783,11 @@ fn deblock_plane_chroma(
         .as_ref()
         .map(|e| e.second_chroma_qp_index_offset)
         .unwrap_or(pps.chroma_qp_index_offset);
+    // §7.4.2.1.1 eq. 7-6 / §8.5.8 eq. 8-311 — QpBdOffsetC = 6 *
+    // bit_depth_chroma_minus8. Threaded into chroma_qp_avg so the §8.7.2
+    // QPC derivation runs with the extended `−QpBdOffsetC..=51` qPI
+    // range instead of the 8-bit-only `0..=51` clamp.
+    let qp_bd_offset_c = qp_bd_offset(bit_depth.saturating_sub(8));
     // §8.7.2.1 NOTE 1 — see deblock_plane_luma; `different_ref_or_mv_luma`
     // reads per-MB POCs directly from `MbInfo::ref_poc_l0/l1`.
     let (sub_w, sub_h) = chroma_subsample(pic.chroma_array_type);
@@ -5908,6 +5912,7 @@ fn deblock_plane_chroma(
                                 p_info.qp_y,
                                 q_info.qp_y,
                                 if plane == 0 { cb_offset } else { cr_offset },
+                                qp_bd_offset_c,
                             );
                             filter_chroma_vertical_rows(
                                 pic,
@@ -6007,6 +6012,7 @@ fn deblock_plane_chroma(
                                 p_info.qp_y,
                                 q_info.qp_y,
                                 if plane == 0 { cb_offset } else { cr_offset },
+                                qp_bd_offset_c,
                             );
                             filter_chroma_horizontal_cols(
                                 pic,
@@ -6032,9 +6038,19 @@ fn deblock_plane_chroma(
 }
 
 /// §8.5.8 / §8.7.2.2 eq. 8-453 — (QPc(p) + QPc(q) + 1) >> 1 for chroma.
-fn chroma_qp_avg(p_qp_y: i32, q_qp_y: i32, offset: i32) -> i32 {
-    let p_c = qp_y_to_qp_c(p_qp_y, offset);
-    let q_c = qp_y_to_qp_c(q_qp_y, offset);
+///
+/// `qp_bd_offset_c` (= `6 * bit_depth_chroma_minus8`) extends the lower
+/// bound of the qPI clamp in §8.5.8 eq. 8-311 from 0 to `−QpBdOffsetC`.
+/// At >8-bit chroma the legacy `qp_y_to_qp_c(.., 0)` shim would silently
+/// clamp negative qPI values to 0, dropping QPC entries that Table 8-15
+/// passes through verbatim (qPI < 30 → QPC = qPI). The §8.7.2 chroma
+/// path passes QPC (not qP'C) into qPav per §8.7.2 "qPz is set equal to
+/// the value of QPC", so we don't add `qp_bd_offset_c` here — the
+/// downstream Clip3(0, 51, qPav + filterOffsetA) in eq. 8-454 handles
+/// the alpha/beta table indexing.
+fn chroma_qp_avg(p_qp_y: i32, q_qp_y: i32, offset: i32, qp_bd_offset_c: i32) -> i32 {
+    let p_c = qp_y_to_qp_c_with_bd_offset(p_qp_y, offset, qp_bd_offset_c);
+    let q_c = qp_y_to_qp_c_with_bd_offset(q_qp_y, offset, qp_bd_offset_c);
     (p_c + q_c + 1) >> 1
 }
 
