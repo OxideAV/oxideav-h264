@@ -26,11 +26,12 @@
 //!   logged but not asserted. Each carries an inline `TODO(h264-corpus)`
 //!   tag explaining why so the underlying decoder bug stays grep-able.
 //!
-//! A handful of fixtures use `#[ignore]` instead of a separate tier
-//! when the comparison itself is structurally invalid (e.g. 10-bit
-//! `expected.yuv` is 16-bit per sample but our decoder clamps to u8 in
-//! `picture_to_video_frame`, so a byte-by-byte score is meaningless
-//! until the decoder grows a >8-bit output path).
+//! Per-fixture `bytes_per_sample` selects how the comparison reads
+//! the reference: `1` for 8-bit yuv420p / yuv444p, `2` for 10/12-bit
+//! yuv420p10le / yuv422p10le / yuv444p10le (LE u16 per sample).
+//! `picture_to_video_frame` emits matching layouts based on the SPS
+//! `bit_depth_luma` (clamped to u8 when `bit_depth_luma == 8`,
+//! else packed as little-endian u16 clamped to `(1 << bit_depth) - 1`).
 //!
 //! The trace.txt files under each fixture directory are not consumed by
 //! this driver; they exist so anyone bisecting a divergence can `diff`
@@ -127,26 +128,25 @@ fn diff_planes(our: (&[u8], &[u8], &[u8]), refp: (&[u8], &[u8], &[u8])) -> Frame
 
 #[derive(Clone, Copy, Debug)]
 enum ChromaFmt {
-    /// 4:2:0 planar 8-bit (Y full-res, U/V half each axis).
+    /// 4:2:0 planar (Y full-res, U/V half each axis).
     Yuv420,
-    /// 4:4:4 planar 8-bit (Y/U/V all same size).
+    /// 4:4:4 planar (Y/U/V all same size).
     Yuv444,
 }
 
 impl ChromaFmt {
-    /// Frame size in bytes given luma dimensions.
-    fn frame_bytes(&self, w: usize, h: usize) -> usize {
-        match self {
-            ChromaFmt::Yuv420 => w * h + 2 * (w / 2) * (h / 2),
-            ChromaFmt::Yuv444 => 3 * w * h,
-        }
-    }
-    /// Chroma plane geometry (per axis).
+    /// Chroma plane geometry (per axis), in samples.
     fn chroma_dims(&self, w: usize, h: usize) -> (usize, usize) {
         match self {
             ChromaFmt::Yuv420 => (w / 2, h / 2),
             ChromaFmt::Yuv444 => (w, h),
         }
+    }
+    /// Frame size in bytes given luma dimensions and bytes-per-sample
+    /// (1 for 8-bit, 2 for 9..=14-bit P10Le / P12Le).
+    fn frame_bytes(&self, w: usize, h: usize, bps: usize) -> usize {
+        let (cw, ch) = self.chroma_dims(w, h);
+        bps * (w * h + 2 * cw * ch)
     }
 }
 
@@ -171,29 +171,40 @@ struct CorpusCase {
     chroma: ChromaFmt,
     n_frames: usize,
     tier: Tier,
+    /// Bytes per sample in the reference `expected.yuv` and in the
+    /// decoder's output planes. 1 for 8-bit (yuv420p / yuv444p),
+    /// 2 for 10/12-bit (yuv420p10le / yuv422p10le / yuv444p10le, etc.) —
+    /// matches the `Yuv*P10Le` / `Yuv*P12Le` PixelFormat layout (LE u16
+    /// per sample). Default is 1.
+    bytes_per_sample: usize,
 }
 
 /// Repack a `VideoFrame` into the row-major plane layout libavcodec
-/// emits when dumping `-f rawvideo`: Y plane (W*H) || U plane
-/// (Cw*Ch) || V plane (Cw*Ch). Strips any per-row padding so the
+/// emits when dumping `-f rawvideo`: Y plane (W*H*bps) || U plane
+/// (Cw*Ch*bps) || V plane (Cw*Ch*bps). Strips any per-row padding so the
 /// resulting buffer matches `expected.yuv` byte-for-byte.
+///
+/// `bps` is bytes-per-sample: 1 for 8-bit, 2 for 10/12-bit `Yuv*P10Le`
+/// / `Yuv*P12Le` (LE u16 per sample).
 fn videoframe_to_packed(
     vf: &oxideav_core::VideoFrame,
     w: usize,
     h: usize,
     cw: usize,
     ch: usize,
+    bps: usize,
 ) -> Option<Vec<u8>> {
     if vf.planes.len() < 3 {
         // Monochrome (Y-only) or unexpected shape — fail soft.
         return None;
     }
-    fn pack(dst: &mut Vec<u8>, src: &[u8], stride: usize, cols: usize, rows: usize) -> bool {
-        if stride < cols {
+    // `cols_bytes` is the actual byte width of the visible region per row.
+    fn pack(dst: &mut Vec<u8>, src: &[u8], stride: usize, cols_bytes: usize, rows: usize) -> bool {
+        if stride < cols_bytes {
             return false;
         }
-        if stride == cols {
-            let n = cols * rows;
+        if stride == cols_bytes {
+            let n = cols_bytes * rows;
             if src.len() < n {
                 return false;
             }
@@ -202,7 +213,7 @@ fn videoframe_to_packed(
         }
         for r in 0..rows {
             let start = r * stride;
-            let end = start + cols;
+            let end = start + cols_bytes;
             if end > src.len() {
                 return false;
             }
@@ -210,14 +221,14 @@ fn videoframe_to_packed(
         }
         true
     }
-    let mut out = Vec::with_capacity(w * h + 2 * cw * ch);
-    if !pack(&mut out, &vf.planes[0].data, vf.planes[0].stride, w, h) {
+    let mut out = Vec::with_capacity(bps * (w * h + 2 * cw * ch));
+    if !pack(&mut out, &vf.planes[0].data, vf.planes[0].stride, w * bps, h) {
         return None;
     }
-    if !pack(&mut out, &vf.planes[1].data, vf.planes[1].stride, cw, ch) {
+    if !pack(&mut out, &vf.planes[1].data, vf.planes[1].stride, cw * bps, ch) {
         return None;
     }
-    if !pack(&mut out, &vf.planes[2].data, vf.planes[2].stride, cw, ch) {
+    if !pack(&mut out, &vf.planes[2].data, vf.planes[2].stride, cw * bps, ch) {
         return None;
     }
     Some(out)
@@ -267,7 +278,8 @@ fn decode_with_decoder<F>(case: &CorpusCase, yuv_ref: &[u8], feed: F) -> Option<
 where
     F: FnOnce(&mut H264CodecDecoder) -> Result<(), String>,
 {
-    let frame_size = case.chroma.frame_bytes(case.width, case.height);
+    let bps = case.bytes_per_sample.max(1);
+    let frame_size = case.chroma.frame_bytes(case.width, case.height, bps);
     if yuv_ref.len() != case.n_frames * frame_size {
         eprintln!(
             "skip {}: expected.yuv size mismatch (have {} bytes, expected {} = {} frames * {})",
@@ -281,8 +293,8 @@ where
     }
 
     let (cw, ch) = case.chroma.chroma_dims(case.width, case.height);
-    let y_size = case.width * case.height;
-    let uv_size = cw * ch;
+    let y_size = case.width * case.height * bps;
+    let uv_size = cw * ch * bps;
 
     let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
     if let Err(e) = feed(&mut dec) {
@@ -298,7 +310,7 @@ where
                     visible_idx += 1;
                     continue;
                 }
-                let our = match videoframe_to_packed(&vf, case.width, case.height, cw, ch) {
+                let our = match videoframe_to_packed(&vf, case.width, case.height, cw, ch, bps) {
                     Some(b) => b,
                     None => {
                         results.push(Err(format!(
@@ -454,6 +466,7 @@ fn corpus_tiny_i_only_16x16_baseline() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -468,6 +481,7 @@ fn corpus_i_only_64x64_main() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -485,6 +499,7 @@ fn corpus_i_frame_then_p_frame_baseline() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -500,6 +515,7 @@ fn corpus_bipred_with_b_frames_main() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 2,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -515,6 +531,7 @@ fn corpus_multi_ref_frames() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 2,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -529,6 +546,7 @@ fn corpus_weighted_prediction_explicit() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -546,6 +564,7 @@ fn corpus_multi_slice_per_frame() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 2,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -559,6 +578,7 @@ fn corpus_cavlc_mode() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -572,6 +592,7 @@ fn corpus_cabac_mode() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -588,6 +609,7 @@ fn corpus_transform_8x8_on() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -601,6 +623,7 @@ fn corpus_qp_low_cqp() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -614,6 +637,7 @@ fn corpus_qp_high_cqp() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -630,6 +654,7 @@ fn corpus_4_4_4_high() {
         chroma: ChromaFmt::Yuv444,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -643,30 +668,29 @@ fn corpus_intra_only_high444() {
         chroma: ChromaFmt::Yuv444,
         n_frames: 2,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
-// 10-bit fixtures: expected.yuv is 16-bit per sample (little-endian),
-// our decoder clamps to 8-bit in `picture_to_video_frame`. A direct
-// byte-by-byte comparison is meaningless until the decoder grows a
-// >8-bit output path, so this stays #[ignore].
+// 10-bit High10 fixture (yuv420p10le): expected.yuv is 16-bit per
+// sample, little-endian (3072 B = 32×32 × 1.5 × 2). The decoder now
+// emits u16-LE planes for `bit_depth_luma > 8`; we score them
+// byte-by-byte against the reference. ReportOnly: the §8.5.10 inverse
+// transform / dequant path is documented for 8-bit only in our
+// current reconstruct module, so per-byte diffs are expected. The
+// test exists to keep the >8-bit output path wired and to surface
+// regressions in the bit-depth plumbing.
 #[test]
-#[ignore = "10-bit High10: expected.yuv is 16-bit per sample but H264CodecDecoder \
-            clamps reconstructed samples to u8 in picture_to_video_frame. \
-            Track in a follow-up: add a wider-than-8-bit pixel format / per-frame \
-            bit_depth metadata so this fixture becomes scoreable."]
 fn corpus_10_bit_high10() {
     evaluate_annex_b(&CorpusCase {
         name: "10-bit-high10",
         width: 32,
         height: 32,
-        // Geometry only; the chroma_fmt/frame_bytes() math wouldn't
-        // give meaningful diffs at u8 vs u16 anyway — kept here so the
-        // structure mirrors the other fixtures when the test eventually
-        // un-ignores.
         chroma: ChromaFmt::Yuv420,
         n_frames: 1,
         tier: Tier::ReportOnly,
+        // 10-bit samples — 2 bytes per sample, LE u16 storage.
+        bytes_per_sample: 2,
     });
 }
 
@@ -686,6 +710,7 @@ fn corpus_mbaff_interlaced() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 2,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -706,6 +731,7 @@ fn corpus_iso_mp4_vs_annexb_annexb() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 2,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     });
 }
 
@@ -718,6 +744,7 @@ fn corpus_iso_mp4_vs_annexb_mp4() {
         chroma: ChromaFmt::Yuv420,
         n_frames: 2,
         tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
     };
     eprintln!(
         "=== fixture {} ({}x{} {:?}, {} frames, tier {:?}) — MP4 (length-prefixed AVC)",

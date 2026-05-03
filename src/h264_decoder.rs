@@ -1519,9 +1519,20 @@ fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
     }
 }
 
-/// Convert a reconstructed [`Picture`] to a [`VideoFrame`]. Samples are
-/// clamped to 8-bit (0..=255) for now; higher bit depths will get
-/// dedicated pixel formats later.
+/// Convert a reconstructed [`Picture`] to a [`VideoFrame`].
+///
+/// Samples are emitted at the picture's native bit depth:
+/// * 8-bit luma/chroma → one byte per sample, clamped to `0..=255`.
+///   Stride is `width_in_samples` for luma and `chroma_width()` for
+///   each chroma plane (matches `PixelFormat::Yuv420P` / `Yuv422P` /
+///   `Yuv444P` layout).
+/// * 9..=14-bit luma/chroma (High10 / High 4:2:2 / High 4:4:4
+///   Predictive) → two bytes per sample, little-endian, clamped to
+///   `0..=(1 << bit_depth) - 1`. Stride is `width * 2` for luma and
+///   `chroma_width * 2` for chroma. This matches the `Yuv420P10Le` /
+///   `Yuv422P10Le` / `Yuv444P10Le` (and 12-bit) layouts documented on
+///   `oxideav_core::PixelFormat`: little-endian u16 packed two bytes
+///   per sample.
 ///
 /// The slim `VideoFrame` shape only carries `pts` + `planes`; the pixel
 /// format / resolution / time_base live on the stream's
@@ -1530,22 +1541,55 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>) -> VideoFrame {
     let w = pic.width_in_samples as usize;
     let cw = pic.chroma_width() as usize;
 
-    let clamp_u8 = |s: i32| s.clamp(0, 255) as u8;
+    // Samples wider than 8-bit are stored as little-endian u16 (two
+    // bytes per sample) — matches the `Yuv*P10Le` / `Yuv*P12Le` layouts
+    // documented on `PixelFormat`. Both High10 (bit_depth=10) and
+    // High444 / High422 12-bit use the same 16-bit container, so a
+    // single ">8 bit" branch covers every >8-bit case the H.264 spec
+    // exposes (§7.4.2.1.1 caps `bit_depth_luma_minus8` at 6).
+    let luma_wide = pic.bit_depth_luma > 8;
+    let chroma_wide = pic.bit_depth_chroma > 8;
 
-    let luma: Vec<u8> = pic.luma.iter().map(|&s| clamp_u8(s)).collect();
+    let luma_max: i32 = (1i32 << pic.bit_depth_luma) - 1;
+    let chroma_max: i32 = (1i32 << pic.bit_depth_chroma) - 1;
+
+    let luma_data: Vec<u8> = if luma_wide {
+        let mut out = Vec::with_capacity(pic.luma.len() * 2);
+        for &s in &pic.luma {
+            let v = s.clamp(0, luma_max) as u16;
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    } else {
+        pic.luma.iter().map(|&s| s.clamp(0, 255) as u8).collect()
+    };
+    let luma_stride = if luma_wide { w * 2 } else { w };
     let mut planes = vec![VideoPlane {
-        stride: w,
-        data: luma,
+        stride: luma_stride,
+        data: luma_data,
     }];
     if pic.chroma_array_type != 0 {
-        let cb: Vec<u8> = pic.cb.iter().map(|&s| clamp_u8(s)).collect();
-        let cr: Vec<u8> = pic.cr.iter().map(|&s| clamp_u8(s)).collect();
+        let chroma_stride = if chroma_wide { cw * 2 } else { cw };
+        let pack_chroma = |src: &[i32]| -> Vec<u8> {
+            if chroma_wide {
+                let mut out = Vec::with_capacity(src.len() * 2);
+                for &s in src {
+                    let v = s.clamp(0, chroma_max) as u16;
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out
+            } else {
+                src.iter().map(|&s| s.clamp(0, 255) as u8).collect()
+            }
+        };
+        let cb = pack_chroma(&pic.cb);
+        let cr = pack_chroma(&pic.cr);
         planes.push(VideoPlane {
-            stride: cw,
+            stride: chroma_stride,
             data: cb,
         });
         planes.push(VideoPlane {
-            stride: cw,
+            stride: chroma_stride,
             data: cr,
         });
     }

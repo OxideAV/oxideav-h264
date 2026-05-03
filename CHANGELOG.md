@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Decoder honours SPS `bit_depth_luma_minus8` / `bit_depth_chroma_minus8`
+  in `picture_to_video_frame`** (task #259). When a High10 / High 4:2:2
+  / High 4:4:4 Predictive stream declares 9..=14-bit samples, the
+  reconstructed planes are emitted as little-endian u16 (two bytes per
+  sample) clamped to `(1 << bit_depth) - 1`, matching the
+  `oxideav_core::PixelFormat::{Yuv420P10Le, Yuv422P10Le, Yuv444P10Le,
+  Yuv420P12Le, Yuv422P12Le, Yuv444P12Le}` plane layouts. 8-bit streams
+  are unchanged (one byte per sample, clamped to `0..=255`). The
+  previously-`#[ignore]`d `corpus_10_bit_high10` integration test now
+  runs and scores against the 16-bit-per-sample `expected.yuv`
+  reference; it stays `Tier::ReportOnly` until the §8.5.10 inverse
+  transform / dequant path widens to >8-bit arithmetic. Spec refs:
+  §7.4.2.1.1, §6.4.2.1.
+
 - **Round 30 — encoder CABAC entropy coding for I + P slices**.
   Adds the H.264 §9.3 CABAC arithmetic encoder (engine + per-syntax
   binarisations + ctxIdx derivation) and wires up two new entry points
