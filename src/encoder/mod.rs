@@ -85,7 +85,8 @@ use crate::mv_deriv::{Mv, MvpredInputs, NeighbourMv};
 use crate::nal::NalUnitType;
 use crate::transform::{
     inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16, inverse_scan_4x4_zigzag_ac,
-    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, qp_y_to_qp_c, FLAT_4X4_16,
+    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, qp_bd_offset,
+    qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
 };
 
 /// §6.4.3 / Figure 6-10 — luma 4x4 block scan: index 0..=15 → (x, y)
@@ -219,6 +220,16 @@ pub struct EncoderConfig {
     /// CABAC is forbidden by Baseline profile (§A.2.1); enabling this
     /// flag requires `profile_idc >= 77` (Main).
     pub cabac: bool,
+    /// §7.4.2.1.1 — `bit_depth_chroma_minus8`. Defaults to 0 (8-bit
+    /// chroma). The current SPS writer ([`crate::encoder::sps`]) pins
+    /// the emitted bit_depth fields at 0 — High10/422/444 with bit
+    /// depth >8 is out of round-30 scope. This field is plumbed through
+    /// the encoder state so that the §8.5.8 chroma-QP derivation calls
+    /// the BD-aware [`crate::transform::qp_y_to_qp_c_with_bd_offset`]
+    /// with the correct `qp_bd_offset_c = 6 * bit_depth_chroma_minus8`.
+    /// When a future round extends the SPS to emit non-zero bit_depth
+    /// fields, the encoder's QPC math is already wired to follow.
+    pub bit_depth_chroma_minus8: u32,
 }
 
 impl EncoderConfig {
@@ -234,6 +245,7 @@ impl EncoderConfig {
             intra_in_inter: true,
             chroma_format_idc: 1,
             cabac: false,
+            bit_depth_chroma_minus8: 0,
         }
     }
 }
@@ -814,7 +826,15 @@ impl Encoder {
         let mut recon_v = vec![0u8; chroma_width * chroma_height];
 
         let qp_y = self.cfg.qp;
-        let qp_c = qp_y_to_qp_c(qp_y, pps_cfg.chroma_qp_index_offset);
+        // §8.5.8 — chroma-QP derivation, BD-aware. `qp_bd_offset_c =
+        // 6 * bit_depth_chroma_minus8` extends the eq. 8-311 qPI clamp
+        // from `0..=51` to `−QpBdOffsetC..=51`. Today the SPS pins
+        // bit_depth_chroma_minus8=0 so this matches the legacy 8-bit
+        // path; the BD-aware call lets a future High10/422/444 round
+        // wire a non-zero BD without re-touching the encoder math.
+        let qp_bd_offset_c = qp_bd_offset(self.cfg.bit_depth_chroma_minus8);
+        let qp_c =
+            qp_y_to_qp_c_with_bd_offset(qp_y, pps_cfg.chroma_qp_index_offset, qp_bd_offset_c);
 
         // §9.2.1.1 — neighbour grid for CAVLC nC derivation. Encoder
         // mirrors what the decoder will reconstruct as it walks the MBs:
@@ -3251,7 +3271,9 @@ impl Encoder {
         let mut recon_v = vec![0u8; chroma_width * chroma_height];
 
         let qp_y = self.cfg.qp;
-        let qp_c = qp_y_to_qp_c(qp_y, chroma_qp_index_offset);
+        // §8.5.8 BD-aware chroma-QP — see encode_idr; identical reasoning.
+        let qp_bd_offset_c = qp_bd_offset(self.cfg.bit_depth_chroma_minus8);
+        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, chroma_qp_index_offset, qp_bd_offset_c);
 
         let mut nc_grid = CavlcNcGrid::new(width_mbs, height_mbs);
         let mut intra_grid = IntraGrid::new(width_mbs as usize, height_mbs as usize);
@@ -7331,7 +7353,9 @@ impl Encoder {
         let mut recon_v = vec![0u8; chroma_width * chroma_height];
 
         let qp_y = self.cfg.qp;
-        let qp_c = qp_y_to_qp_c(qp_y, chroma_qp_index_offset);
+        // §8.5.8 BD-aware chroma-QP — see encode_idr; identical reasoning.
+        let qp_bd_offset_c = qp_bd_offset(self.cfg.bit_depth_chroma_minus8);
+        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, chroma_qp_index_offset, qp_bd_offset_c);
 
         let mut nc_grid = CavlcNcGrid::new(width_mbs, height_mbs);
         let mut intra_grid = IntraGrid::new(width_mbs as usize, height_mbs as usize);

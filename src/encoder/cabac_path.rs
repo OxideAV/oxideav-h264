@@ -70,7 +70,7 @@ use crate::mv_deriv::Mv;
 use crate::nal::NalUnitType;
 use crate::transform::{
     inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
-    inverse_transform_4x4_dc_preserved, qp_y_to_qp_c, FLAT_4X4_16,
+    inverse_transform_4x4_dc_preserved, qp_bd_offset, qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
 };
 
 /// §6.4.3 / Figure 6-10 — luma 4x4 block scan (block index → (bx, by)).
@@ -672,7 +672,15 @@ impl Encoder {
         let chroma_h = height / 2;
 
         let qp_y = cfg.qp;
-        let qp_c = qp_y_to_qp_c(qp_y, 0);
+        // §8.5.8 BD-aware chroma-QP. `qp_bd_offset_c = 6 *
+        // bit_depth_chroma_minus8` extends the eq. 8-311 qPI clamp
+        // from 0..=51 to −QpBdOffsetC..=51. Today the SPS pins
+        // bit_depth_chroma_minus8=0 (round-30 scope), so this is
+        // equivalent to the legacy 8-bit shim; the BD-aware call lets
+        // a future High10/422/444 round wire a non-zero BD without
+        // re-touching the encoder math.
+        let qp_bd_offset_c = qp_bd_offset(cfg.bit_depth_chroma_minus8);
+        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
 
         let sps = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_parameter_set_id: 0,
@@ -1127,7 +1135,9 @@ impl Encoder {
         let chroma_w = width / 2;
         let chroma_h = height / 2;
         let qp_y = cfg.qp;
-        let qp_c = qp_y_to_qp_c(qp_y, 0);
+        // §8.5.8 BD-aware chroma-QP — see encode_idr_cabac; identical reasoning.
+        let qp_bd_offset_c = qp_bd_offset(cfg.bit_depth_chroma_minus8);
+        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
 
         // SPS / PPS not re-emitted (caller shipped them with IDR).
         let mut stream: Vec<u8> = Vec::new();
