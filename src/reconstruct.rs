@@ -59,7 +59,8 @@ use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sps::Sps;
 use crate::transform::{
     inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422, inverse_hadamard_luma_dc_16x16,
-    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_y_to_qp_c,
+    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, inverse_transform_8x8,
+    qp_bd_offset, qp_y_to_qp_c, qp_y_to_qp_c_with_bd_offset,
     select_scaling_list_4x4, select_scaling_list_8x8, TransformError,
 };
 
@@ -895,11 +896,16 @@ fn reconstruct_intra_16x16(
     // -------- §8.5.10 — luma DC block (always present for I_16x16) --
     // §7.4.2.1.1.1 Table 7-2 — Intra luma 4x4 list (index 0).
     let sl4 = select_scaling_list_4x4(0, sps, pps);
+    // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY is the
+    // value the §8.5.10 / §8.5.12 scaling formulas consume. For 8-bit
+    // luma QpBdOffsetY = 0 and qp_prime_y == qp_y.
+    let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
+    let qp_prime_y = qp_y + qp_bd_offset_y;
     let dc_levels = mb.residual_luma_dc.as_ref().copied().unwrap_or([0i32; 16]);
     // DC coefficients are in zig-zag scan order; inverse-scan to a
     // 4x4 matrix before the Hadamard.
     let dc_matrix = crate::transform::inverse_scan_4x4_zigzag(&dc_levels);
-    let dc_y = inverse_hadamard_luma_dc_16x16(&dc_matrix, qp_y, &sl4, bit_depth_y)?;
+    let dc_y = inverse_hadamard_luma_dc_16x16(&dc_matrix, qp_prime_y, &sl4, bit_depth_y)?;
 
     // -------- §8.5.12 — each of the 16 AC blocks --------------------
     // Residual layout from macroblock_layer:
@@ -934,7 +940,8 @@ fn reconstruct_intra_16x16(
         let dc_col = (bx / 4) as usize;
         coeffs[0] = dc_y[dc_row * 4 + dc_col];
 
-        let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_y, &sl4, bit_depth_y)?;
+        let residual =
+            inverse_transform_4x4_dc_preserved(&coeffs, qp_prime_y, &sl4, bit_depth_y)?;
 
         // Add prediction + residual, clip, write via MbWriter so
         // §6.4.1 eq. (6-10) field-MB y-stride is applied.
@@ -1329,6 +1336,9 @@ fn reconstruct_intra_nxn(
     let sl8 = select_scaling_list_8x8(0, sps, pps);
     let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
     let cip = pps.constrained_intra_pred_flag;
+    // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY.
+    let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
+    let qp_prime_y = qp_y + qp_bd_offset_y;
 
     // The Intra_4x4/Intra_8x8 pred-mode derivation consults the
     // already-set `intra_4x4_pred_modes` / `intra_8x8_pred_modes` of
@@ -1426,7 +1436,7 @@ fn reconstruct_intra_nxn(
                     [0i32; 64]
                 }
             };
-            let residual = inverse_transform_8x8(&coeffs_flat, qp_y, &sl8, bit_depth_y)?;
+            let residual = inverse_transform_8x8(&coeffs_flat, qp_prime_y, &sl8, bit_depth_y)?;
 
             // Add prediction + residual; write back via MbWriter so
             // §6.4.1 eq. (6-10) field-MB y-stride is applied.
@@ -1517,7 +1527,7 @@ fn reconstruct_intra_nxn(
                 [0i32; 16]
             };
             let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
-            let residual = inverse_transform_4x4(&coeffs, qp_y, &sl4, bit_depth_y)?;
+            let residual = inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?;
 
             if debug && (block_idx == 0 || block_idx == 3) {
                 eprintln!(
@@ -1645,15 +1655,19 @@ fn reconstruct_chroma_intra(
     let chroma_mode = IntraChromaMode::from_index(chroma_mode_idx).unwrap_or(IntraChromaMode::Dc);
 
     // §8.5.8 — QPc derivation per plane (Cb uses chroma_qp_index_offset,
-    // Cr uses second_chroma_qp_index_offset when present).
+    // Cr uses second_chroma_qp_index_offset when present). At >8-bit
+    // chroma we add QpBdOffsetC after the table lookup to obtain qP'C
+    // (= QPC + QpBdOffsetC) per §8.5.8 eq. 8-312, which is the value the
+    // §8.5.11/§8.5.12 scaling formulas consume.
     let cb_offset = pps.chroma_qp_index_offset;
     let cr_offset = pps
         .extension
         .as_ref()
         .map(|e| e.second_chroma_qp_index_offset)
         .unwrap_or(pps.chroma_qp_index_offset);
-    let qp_cb = qp_y_to_qp_c(qp_y, cb_offset);
-    let qp_cr = qp_y_to_qp_c(qp_y, cr_offset);
+    let qp_bd_offset_c = qp_bd_offset(sps.bit_depth_chroma_minus8);
+    let qp_cb = qp_y_to_qp_c_with_bd_offset(qp_y, cb_offset, qp_bd_offset_c) + qp_bd_offset_c;
+    let qp_cr = qp_y_to_qp_c_with_bd_offset(qp_y, cr_offset, qp_bd_offset_c) + qp_bd_offset_c;
 
     let cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
     // §7.4.2.1.1.1 Table 7-2 — intra chroma lists: i=1 (Cb) / i=2 (Cr).
@@ -1795,15 +1809,18 @@ fn reconstruct_chroma_intra_444(
     grid: &MbGrid,
     current_slice_id: i32,
 ) -> Result<(), ReconstructError> {
-    // §8.5.8 — QPc derivation per plane (Cb/Cr).
+    // §8.5.8 — QPc derivation per plane (Cb/Cr). For >8-bit chroma,
+    // qP'C = QPC + QpBdOffsetC (§8.5.8 eq. 8-312) is what the scaling
+    // formulas consume.
     let cb_offset = pps.chroma_qp_index_offset;
     let cr_offset = pps
         .extension
         .as_ref()
         .map(|e| e.second_chroma_qp_index_offset)
         .unwrap_or(pps.chroma_qp_index_offset);
-    let qp_cb = qp_y_to_qp_c(qp_y, cb_offset);
-    let qp_cr = qp_y_to_qp_c(qp_y, cr_offset);
+    let qp_bd_offset_c = qp_bd_offset(sps.bit_depth_chroma_minus8);
+    let qp_cb = qp_y_to_qp_c_with_bd_offset(qp_y, cb_offset, qp_bd_offset_c) + qp_bd_offset_c;
+    let qp_cr = qp_y_to_qp_c_with_bd_offset(qp_y, cr_offset, qp_bd_offset_c) + qp_bd_offset_c;
 
     // §8.3.3 — luma Intra_16x16 prediction mode + cbp_luma (carried by
     // mb_type). Caller has already gated on `is_intra_16x16()`.
@@ -2622,6 +2639,9 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     // §7.4.2.1.1.1 Table 7-2 — inter-luma lists: 4x4 i=3 / 8x8 i=7 (sub-idx 1).
     let sl4 = select_scaling_list_4x4(3, sps, pps);
     let sl8 = select_scaling_list_8x8(1, sps, pps);
+    // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY.
+    let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
+    let qp_prime_y = qp_y + qp_bd_offset_y;
 
     if mb.transform_size_8x8_flag {
         // §8.5.13 — 8x8 inter residual path (four 8x8 blocks).
@@ -2654,7 +2674,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             } else {
                 [0i32; 64]
             };
-            let residual = inverse_transform_8x8(&coeffs, qp_y, &sl8, bit_depth_y)?;
+            let residual = inverse_transform_8x8(&coeffs, qp_prime_y, &sl8, bit_depth_y)?;
             for y in 0..8 {
                 for x in 0..8 {
                     let v =
@@ -2690,7 +2710,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
                 [0i32; 16]
             };
             let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
-            let residual = inverse_transform_4x4(&coeffs, qp_y, &sl4, bit_depth_y)?;
+            let residual = inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?;
             for yy in 0..4 {
                 for xx in 0..4 {
                     let v = pred_luma[(by as usize + yy) * 16 + (bx as usize + xx)]
@@ -4959,15 +4979,19 @@ fn reconstruct_inter_chroma_residual(
     let _ = mb_px;
     let _ = mb_py;
 
-    // §8.5.8 — QPc per plane.
+    // §8.5.8 — QPc per plane. qP'C = QPC + QpBdOffsetC (§8.5.8 eq.
+    // 8-312) is the value that the §8.5.11 / §8.5.12 scaling helpers
+    // consume; for 8-bit chroma QpBdOffsetC = 0 and this collapses to
+    // the legacy 0..=51 path.
     let cb_offset = pps.chroma_qp_index_offset;
     let cr_offset = pps
         .extension
         .as_ref()
         .map(|e| e.second_chroma_qp_index_offset)
         .unwrap_or(pps.chroma_qp_index_offset);
-    let qp_cb = qp_y_to_qp_c(qp_y, cb_offset);
-    let qp_cr = qp_y_to_qp_c(qp_y, cr_offset);
+    let qp_bd_offset_c = qp_bd_offset(sps.bit_depth_chroma_minus8);
+    let qp_cb = qp_y_to_qp_c_with_bd_offset(qp_y, cb_offset, qp_bd_offset_c) + qp_bd_offset_c;
+    let qp_cr = qp_y_to_qp_c_with_bd_offset(qp_y, cr_offset, qp_bd_offset_c) + qp_bd_offset_c;
 
     // §7.4.2.1.1.1 Table 7-2 — inter chroma lists: i=4 (Cb) / i=5 (Cr).
     let sl4_cb = select_scaling_list_4x4(4, sps, pps);

@@ -78,8 +78,8 @@ pub enum SliceDataError {
     /// downstream layers may still reject MBAFF streams with this.
     #[error("MBAFF macroblock layer is not supported in this walker")]
     MbaffNotSupported,
-    /// §7.4.4 — `slice_qp_y` (from slice_header + pps) out of valid range
-    /// 0..=51.
+    /// §7.4.3 — `slice_qp_y` (from slice_header + pps) out of valid range
+    /// `-QpBdOffsetY..=+51` (= 0..=51 for 8-bit luma).
     #[error("derived SliceQPY {0} out of range")]
     SliceQpOutOfRange(i32),
 }
@@ -147,9 +147,13 @@ pub fn parse_slice_data(
     let chroma_array_type = sps.chroma_array_type();
 
     // §7.4.2.1 — QpBdOffsetY = 6 * bit_depth_luma_minus8, SliceQPY =
-    // 26 + pic_init_qp_minus26 + slice_qp_delta (§7.4.3).
+    // 26 + pic_init_qp_minus26 + slice_qp_delta (§7.4.3). Per §7.4.3
+    // SliceQPY is constrained to −QpBdOffsetY..=+51 (negative values are
+    // legal at >8-bit luma depth and decoded MBs add QpBdOffsetY back to
+    // get qP'Y for the §8.5.10 / §8.5.12 scaling formulas).
     let slice_qp_y = 26 + pps.pic_init_qp_minus26 + slice_header.slice_qp_delta;
-    if !(0..=51).contains(&slice_qp_y) {
+    let qp_bd_offset_y = (6 * sps.bit_depth_luma_minus8) as i32;
+    if !(-qp_bd_offset_y..=51).contains(&slice_qp_y) {
         return Err(SliceDataError::SliceQpOutOfRange(slice_qp_y));
     }
 

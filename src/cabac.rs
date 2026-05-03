@@ -85,7 +85,13 @@ pub enum CabacError {
     Bitstream(#[from] BitError),
     #[error("invalid cabac_init_idc {0} (must be 0..=2 or absent for I-slice)")]
     InvalidInitIdc(u32),
-    #[error("invalid SliceQPY {0} (must be 0..=51)")]
+    /// §9.3.1.1 eq. 9-5 — `SliceQPY` outside the spec range
+    /// `−QpBdOffsetY..=+51`. The CABAC engine accepts the full range
+    /// (the equation Clip3(0, 51, SliceQPY) handles the lower clip
+    /// internally) but values that cannot occur even at 14-bit
+    /// (QpBdOffsetY = 36, so SliceQPY ≥ -36) are rejected as bitstream
+    /// errors.
+    #[error("invalid SliceQPY {0} (must be -36..=+51)")]
     InvalidSliceQp(i32),
 }
 
@@ -219,7 +225,12 @@ impl CtxState {
     /// the syntax element, slice type, and `cabac_init_idc`. Callers
     /// resolve those tables and pass the pair here.
     pub fn init(m: i32, n: i32, slice_qp_y: i32) -> CabacResult<Self> {
-        if !(0..=51).contains(&slice_qp_y) {
+        // §7.4.3 / §9.3.1.1 — SliceQPY ∈ −QpBdOffsetY..=51, with
+        // QpBdOffsetY ≤ 36 (= 6 * bit_depth_luma_minus8 max). The
+        // §9.3.1.1 equation (9-5) clips SliceQPY to 0..=51 internally,
+        // so any value in -36..=+51 is acceptable; outside that range
+        // it's a malformed bitstream.
+        if !(-36..=51).contains(&slice_qp_y) {
             return Err(CabacError::InvalidSliceQp(slice_qp_y));
         }
         // §9.3.1.1 equation (9-5):
@@ -572,13 +583,32 @@ mod tests {
 
     #[test]
     fn ctx_init_rejects_out_of_range_qp() {
+        // §7.4.3 — SliceQPY ∈ −QpBdOffsetY..=+51 with max QpBdOffsetY = 36.
+        // -37 / 52 are outside any legal bitstream range.
         assert_eq!(
-            CtxState::init(20, -15, -1).unwrap_err(),
-            CabacError::InvalidSliceQp(-1),
+            CtxState::init(20, -15, -37).unwrap_err(),
+            CabacError::InvalidSliceQp(-37),
         );
         assert_eq!(
             CtxState::init(20, -15, 52).unwrap_err(),
             CabacError::InvalidSliceQp(52),
+        );
+    }
+
+    #[test]
+    fn ctx_init_accepts_negative_slice_qp_at_high_bitdepth() {
+        // §7.4.3 — SliceQPY can be negative when QpBdOffsetY > 0
+        // (e.g. -12 at 10-bit luma). The §9.3.1.1 eq. 9-5 internal
+        // Clip3(0, 51, …) handles the clip; the engine must not error.
+        let c = CtxState::init(20, -15, -12).expect("negative SliceQPY at high bit depth");
+        // Clip3(0, 51, -12) = 0; ((20*0)>>4) + (-15) = -15; clip to 1..126 = 1.
+        // pre = 1 → state_idx = 63-1 = 62, val_mps = 0.
+        assert_eq!(
+            c,
+            CtxState {
+                state_idx: 62,
+                val_mps: 0,
+            }
         );
     }
 

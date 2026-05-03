@@ -32,12 +32,25 @@ use crate::sps::{ScalingListEntry, Sps};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransformError {
-    /// qP outside the valid 0..=51 range for 8-bit coding.
-    #[error("QP out of range (got {0}, must be 0..=51)")]
+    /// qP outside the valid range for the given bit depth.
+    /// §8.5.9 — the qP fed to the scaling formulas is qP'Y / qP'C, which
+    /// equals (QPY + QpBdOffsetY) or (QPC + QpBdOffsetC), so its valid
+    /// range is `0..=51 + QpBdOffset`. For 8-bit coding QpBdOffset is 0
+    /// and the range is 0..=51; at 10-bit luma it is 0..=63; at 14-bit
+    /// luma 0..=87. The error carries the offending qP for diagnostics.
+    #[error("QP out of range (got {0}, must be 0..=51+QpBdOffset for the bit depth)")]
     QpOutOfRange(i32),
     /// bit_depth outside the supported 8..=14 range.
     #[error("bit_depth out of range (got {0}, must be 8..=14)")]
     BitDepthOutOfRange(u32),
+}
+
+/// §7.4.2.1.1 Eq. 7-4 / 7-6 — `QpBdOffsetY = 6 * bit_depth_luma_minus8`
+/// (the same shape applies to `QpBdOffsetC`). Caller passes
+/// `bit_depth_luma_minus8` (or `bit_depth_chroma_minus8`).
+#[inline]
+pub fn qp_bd_offset(bit_depth_minus8: u32) -> i32 {
+    6 * bit_depth_minus8 as i32
 }
 
 // ---------------------------------------------------------------------------
@@ -65,18 +78,36 @@ pub fn qp_c_table_lookup(qp_i: i32) -> i32 {
     }
 }
 
-/// §8.5.8 — full chroma QP derivation (eq. 8-311, 8-312 simplified for
-/// BitDepth=8 where QpBdOffsetC is 0). For bit depths > 8 the caller
-/// is expected to apply any QpBdOffset externally; this helper handles
-/// the typical 8-bit path.
+/// §8.5.8 — chroma QP derivation (eq. 8-311) for the 8-bit chroma path
+/// (QpBdOffsetC = 0). For bit depths > 8 use
+/// [`qp_y_to_qp_c_with_bd_offset`] instead, which clamps qPI to the
+/// extended `−QpBdOffsetC..=51` range and propagates negative qPI values
+/// through the table-lookup unchanged (eq. 8-312 selects QPC = qPI when
+/// qPI < 30, including negatives).
 ///
 /// `qp_y` is the luma QP (post-adjustment) and `chroma_qp_index_offset`
 /// comes from the PPS (`chroma_qp_index_offset` for Cb,
 /// `second_chroma_qp_index_offset` for Cr). Returns QPc ∈ 0..=51.
 pub fn qp_y_to_qp_c(qp_y: i32, chroma_qp_index_offset: i32) -> i32 {
+    qp_y_to_qp_c_with_bd_offset(qp_y, chroma_qp_index_offset, 0)
+}
+
+/// §8.5.8 — chroma QP derivation (eq. 8-311) for arbitrary bit depth.
+///
+/// Computes `QPC` from `QPY`, `chroma_qp_index_offset` and
+/// `qp_bd_offset_c` (= `6 * bit_depth_chroma_minus8`). The intermediate
+/// `qPI = Clip3(-QpBdOffsetC, 51, QPY + qPOffset)` ranges in
+/// `-QpBdOffsetC..=51`, and qPI < 30 returns QPC = qPI verbatim — so
+/// the caller should add `QpBdOffsetC` afterwards to get qP'C for the
+/// transform/scaling helpers.
+pub fn qp_y_to_qp_c_with_bd_offset(
+    qp_y: i32,
+    chroma_qp_index_offset: i32,
+    qp_bd_offset_c: i32,
+) -> i32 {
     // §8.5.8 eq. 8-311: qPI = Clip3(-QpBdOffsetC, 51, QPY + qPOffset).
-    // With QpBdOffsetC = 0 (8-bit chroma) the lower bound is 0.
-    let qp_i = (qp_y + chroma_qp_index_offset).clamp(0, 51);
+    let lo = -qp_bd_offset_c;
+    let qp_i = (qp_y + chroma_qp_index_offset).clamp(lo, 51);
     qp_c_table_lookup(qp_i)
 }
 
@@ -704,9 +735,20 @@ fn inverse_core_4x4(d: &[i32; 16]) -> [i32; 16] {
 // §8.5.12 — public entry points for 4x4 residual blocks.
 // ---------------------------------------------------------------------------
 
+/// §8.5.9 / §8.5.12.1 / §8.5.13.1 — verify that the qP entering the
+/// scaling formulas is in `0..=51 + QpBdOffset`. The qP fed in here is
+/// qP'Y / qP'C (= QPY + QpBdOffsetY or QPC + QpBdOffsetC, see eq. 7-40
+/// and eq. 8-312), so the lower bound is always 0 and the upper bound
+/// grows with bit depth (from 51 at 8-bit to 87 at 14-bit). For
+/// out-of-spec bit depths (which `check_bit_depth` would reject) the
+/// upper bound is computed conservatively by clamping `bit_depth - 8`
+/// at 0 so the call still produces a meaningful QP-range check; the
+/// caller is expected to invoke `check_bit_depth` separately.
 #[inline]
-fn check_qp(qp: i32) -> Result<(), TransformError> {
-    if !(0..=51).contains(&qp) {
+fn check_qp(qp: i32, bit_depth: u32) -> Result<(), TransformError> {
+    let bd_minus8 = bit_depth.saturating_sub(8) as i32;
+    let qp_bd_offset = 6 * bd_minus8;
+    if !(0..=51 + qp_bd_offset).contains(&qp) {
         Err(TransformError::QpOutOfRange(qp))
     } else {
         Ok(())
@@ -732,7 +774,7 @@ pub fn inverse_transform_4x4(
     scaling_list: &[i32; 16],
     bit_depth: u32,
 ) -> Result<[i32; 16], TransformError> {
-    check_qp(qp)?;
+    check_qp(qp, bit_depth)?;
     check_bit_depth(bit_depth)?;
     // Standard path: c[0,0] participates in scaling (not an Intra_16x16
     // luma DC block / not a chroma DC block).
@@ -749,7 +791,7 @@ pub fn inverse_transform_4x4_dc_preserved(
     scaling_list: &[i32; 16],
     bit_depth: u32,
 ) -> Result<[i32; 16], TransformError> {
-    check_qp(qp)?;
+    check_qp(qp, bit_depth)?;
     check_bit_depth(bit_depth)?;
     let d = scale_4x4(coeffs, qp, scaling_list, true);
     Ok(inverse_core_4x4(&d))
@@ -894,7 +936,7 @@ pub fn inverse_transform_8x8(
     scaling_list: &[i32; 64],
     bit_depth: u32,
 ) -> Result<[i32; 64], TransformError> {
-    check_qp(qp)?;
+    check_qp(qp, bit_depth)?;
     check_bit_depth(bit_depth)?;
     let d = scale_8x8(coeffs, qp, scaling_list);
     Ok(inverse_core_8x8(&d))
@@ -915,7 +957,7 @@ pub fn inverse_hadamard_luma_dc_16x16(
     scaling_list: &[i32; 16],
     bit_depth: u32,
 ) -> Result<[i32; 16], TransformError> {
-    check_qp(qp)?;
+    check_qp(qp, bit_depth)?;
     check_bit_depth(bit_depth)?;
 
     // §8.5.10 Eq. 8-320 — f = H * c * H, with
@@ -999,7 +1041,7 @@ pub fn inverse_hadamard_chroma_dc_420(
     scaling_list: &[i32; 16],
     bit_depth: u32,
 ) -> Result<[i32; 4], TransformError> {
-    check_qp(qp)?;
+    check_qp(qp, bit_depth)?;
     check_bit_depth(bit_depth)?;
 
     // §8.5.11.1 Eq. 8-324 — f = H2 * c * H2 with
@@ -1058,7 +1100,7 @@ pub fn inverse_hadamard_chroma_dc_422(
     scaling_list: &[i32; 16],
     bit_depth: u32,
 ) -> Result<[i32; 8], TransformError> {
-    check_qp(qp)?;
+    check_qp(qp, bit_depth)?;
     check_bit_depth(bit_depth)?;
 
     // §8.5.4 Eq. 8-305 — inverse raster scan of ChromaDCLevel into the
@@ -1214,6 +1256,60 @@ mod tests {
             inverse_transform_4x4(&coeffs, 26, &sl, 15).unwrap_err(),
             TransformError::BitDepthOutOfRange(15)
         );
+    }
+
+    #[test]
+    fn inverse_transform_4x4_qp_range_extends_with_bit_depth() {
+        // §7.4.2.1.1 eq. 7-4 + §8.5.12 — qP'Y range is 0..=51+QpBdOffsetY.
+        // At 10-bit luma QpBdOffsetY = 12, so qp=63 must be accepted.
+        let coeffs = [0i32; 16];
+        let sl = default_scaling_list_4x4_flat();
+        // 8-bit: 51 ok, 52 rejected.
+        inverse_transform_4x4(&coeffs, 51, &sl, 8).expect("qp=51 ok at 8-bit");
+        assert!(matches!(
+            inverse_transform_4x4(&coeffs, 52, &sl, 8),
+            Err(TransformError::QpOutOfRange(52))
+        ));
+        // 10-bit: 63 ok (= 51 + 12), 64 rejected.
+        inverse_transform_4x4(&coeffs, 63, &sl, 10).expect("qp=63 ok at 10-bit");
+        assert!(matches!(
+            inverse_transform_4x4(&coeffs, 64, &sl, 10),
+            Err(TransformError::QpOutOfRange(64))
+        ));
+        // 12-bit: 75 ok (= 51 + 24).
+        inverse_transform_4x4(&coeffs, 75, &sl, 12).expect("qp=75 ok at 12-bit");
+        assert!(matches!(
+            inverse_transform_4x4(&coeffs, 76, &sl, 12),
+            Err(TransformError::QpOutOfRange(76))
+        ));
+        // 14-bit: 87 ok (= 51 + 36).
+        inverse_transform_4x4(&coeffs, 87, &sl, 14).expect("qp=87 ok at 14-bit");
+        assert!(matches!(
+            inverse_transform_4x4(&coeffs, 88, &sl, 14),
+            Err(TransformError::QpOutOfRange(88))
+        ));
+    }
+
+    #[test]
+    fn qp_bd_offset_eq_7_4() {
+        assert_eq!(qp_bd_offset(0), 0);
+        assert_eq!(qp_bd_offset(2), 12);
+        assert_eq!(qp_bd_offset(4), 24);
+        assert_eq!(qp_bd_offset(6), 36);
+    }
+
+    #[test]
+    fn qp_y_to_qp_c_with_bd_offset_extends_negative_range() {
+        // §8.5.8 eq. 8-311 + 8-312 — at 10-bit chroma (QpBdOffsetC=12)
+        // qPI can be as low as -12 and QPC = qPI verbatim for qPI<30.
+        // qp_y=-10 + offset=-2 = qPI=-12, QPC=-12.
+        assert_eq!(qp_y_to_qp_c_with_bd_offset(-10, -2, 12), -12);
+        // Negative QPC + QpBdOffsetC = qP'C = 0, the smallest qP'C.
+        assert_eq!(qp_y_to_qp_c_with_bd_offset(-10, -2, 12) + 12, 0);
+        // 8-bit path (qp_bd_offset_c=0) clamps to 0.
+        assert_eq!(qp_y_to_qp_c_with_bd_offset(-10, -2, 0), 0);
+        // High positive still uses Table 8-15 lookup (capped at 51 → 39).
+        assert_eq!(qp_y_to_qp_c_with_bd_offset(60, 0, 12), 39);
     }
 
     #[test]
