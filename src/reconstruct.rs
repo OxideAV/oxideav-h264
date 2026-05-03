@@ -59,9 +59,9 @@ use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sps::Sps;
 use crate::transform::{
     inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422, inverse_hadamard_luma_dc_16x16,
-    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, inverse_transform_8x8,
-    qp_bd_offset, qp_y_to_qp_c, qp_y_to_qp_c_with_bd_offset,
-    select_scaling_list_4x4, select_scaling_list_8x8, TransformError,
+    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
+    qp_y_to_qp_c, qp_y_to_qp_c_with_bd_offset, select_scaling_list_4x4, select_scaling_list_8x8,
+    TransformError,
 };
 
 use thiserror::Error;
@@ -940,8 +940,7 @@ fn reconstruct_intra_16x16(
         let dc_col = (bx / 4) as usize;
         coeffs[0] = dc_y[dc_row * 4 + dc_col];
 
-        let residual =
-            inverse_transform_4x4_dc_preserved(&coeffs, qp_prime_y, &sl4, bit_depth_y)?;
+        let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_prime_y, &sl4, bit_depth_y)?;
 
         // Add prediction + residual, clip, write via MbWriter so
         // §6.4.1 eq. (6-10) field-MB y-stride is applied.
