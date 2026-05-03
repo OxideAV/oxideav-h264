@@ -804,11 +804,8 @@ fn parse_minimal_mp4_avc(buf: &[u8]) -> Result<Mp4AvcData, String> {
     let mut off = 0usize;
     while off + 8 <= buf.len() {
         let (body, ty, hdr_len) = read_box(buf, off)?;
-        match &ty {
-            b"moov" => {
-                moov = Some(body);
-            }
-            _ => {}
+        if &ty == b"moov" {
+            moov = Some(body);
         }
         off += hdr_len + body.len();
     }
@@ -1056,7 +1053,7 @@ fn parse_minimal_mp4_avc(buf: &[u8]) -> Result<Mp4AvcData, String> {
 /// `(body_slice, four_cc, header_len)` where `header_len` is 8 (32-bit
 /// size) or 16 (64-bit size). Does NOT support box-size==0
 /// (extends-to-EOF), since the fixture doesn't use it.
-fn read_box<'a>(buf: &'a [u8], off: usize) -> Result<(&'a [u8], [u8; 4], usize), String> {
+fn read_box(buf: &[u8], off: usize) -> Result<(&[u8], [u8; 4], usize), String> {
     if off + 8 > buf.len() {
         return Err(format!("box header truncated at {off}"));
     }
@@ -1084,6 +1081,9 @@ fn read_box<'a>(buf: &'a [u8], off: usize) -> Result<(&'a [u8], [u8; 4], usize),
 }
 
 /// Walk container's child boxes looking for one with the given fourcc.
+/// `'a` is named explicitly because two input references appear and the
+/// returned slice borrows from `container`, not `target`; clippy's
+/// `needless_lifetimes` does not fire here.
 fn find_box<'a>(container: &'a [u8], target: &[u8; 4]) -> Result<(&'a [u8], usize), String> {
     let mut off = 0usize;
     while off + 8 <= container.len() {
