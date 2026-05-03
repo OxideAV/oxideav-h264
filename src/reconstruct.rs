@@ -6065,6 +6065,21 @@ fn filter_vertical_edge_luma(
     beta_off: i32,
     bit_depth: u32,
 ) {
+    // §8.7.2.2 eq. 8-453 — qPav = (qPp + qPq + 1) >> 1, where qPp/qPq
+    // are the QPY values of the p- and q-side macroblocks (§8.7.2 step
+    // "If chromaEdgeFlag is equal to 0, qPz is set to QPY"). For luma
+    // the spec does NOT clamp qPav itself; the only clamp is on indexA
+    // / indexB downstream:
+    //   indexA = Clip3(0, 51, qPav + filterOffsetA)   (eq. 8-454)
+    //   indexB = Clip3(0, 51, qPav + filterOffsetB)   (eq. 8-455)
+    // The lower bound is 0 because Tables 8-16 / 8-17 are 0..=51 indexed.
+    // Even in High10/422/444 with QPY ∈ −QpBdOffsetY..=51, eq. 8-454's
+    // `Clip3(0, ...)` is spec-correct: a negative qPav+filterOffsetA
+    // simply selects the indexA=0 alpha'/beta'/t'C0 entries (all zero).
+    // This intentionally differs from the §8.5.8 chroma path, where qPI
+    // is clamped to `−QpBdOffsetC..=51` because Table 8-15 passes qPI<30
+    // through verbatim — but that clamp belongs to the chroma-QP
+    // derivation, not the deblock indexA.
     let qp_avg = (p_qp + q_qp + 1) >> 1;
     let params = FilterParams {
         bs,
@@ -6172,6 +6187,10 @@ fn filter_horizontal_edge_luma(
     beta_off: i32,
     bit_depth: u32,
 ) {
+    // §8.7.2.2 eq. 8-453 — qPav = (qPp + qPq + 1) >> 1, no qPav clamp.
+    // Indexing into Table 8-16/8-17 happens via Clip3(0, 51, ...) at
+    // eq. 8-454/8-455 — see filter_vertical_edge_luma's note for why
+    // the lower bound stays at 0 even in High10/422/444 (negative qPY).
     let qp_avg = (p_qp + q_qp + 1) >> 1;
     let params = FilterParams {
         bs,
