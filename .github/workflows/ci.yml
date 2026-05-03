@@ -14,10 +14,9 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
 
 jobs:
   ci:
     uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
-    with:
-      enable_miri: false
     secrets: inherit
