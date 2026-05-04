@@ -1877,14 +1877,14 @@ mod tests {
     #[test]
     fn film_grain_characteristics_basic() {
         let fields = [
-            (0, 1),   // cancel_flag
-            (1, 2),   // model_id
-            (0, 1),   // separate_colour_description_present_flag
-            (0, 2),   // blending_mode_id
-            (4, 4),   // log2_scale_factor
-            (1, 1),   // comp_model_present_flag[0]
-            (0, 1),   // comp_model_present_flag[1]
-            (0, 1),   // comp_model_present_flag[2]
+            (0, 1), // cancel_flag
+            (1, 2), // model_id
+            (0, 1), // separate_colour_description_present_flag
+            (0, 2), // blending_mode_id
+            (4, 4), // log2_scale_factor
+            (1, 1), // comp_model_present_flag[0]
+            (0, 1), // comp_model_present_flag[1]
+            (0, 1), // comp_model_present_flag[2]
             // c=0 body
             (0, 8),   // num_intensity_intervals_minus1
             (0, 3),   // num_model_values_minus1
@@ -1933,20 +1933,20 @@ mod tests {
     #[test]
     fn film_grain_characteristics_with_separate_colour() {
         let fields = [
-            (0, 1),   // cancel_flag
-            (2, 2),   // model_id
-            (1, 1),   // separate_colour_description_present_flag
-            (2, 3),   // bit_depth_luma_minus8 (= 10 bit luma)
-            (2, 3),   // bit_depth_chroma_minus8
-            (1, 1),   // full_range_flag
-            (1, 8),   // colour_primaries = 1 (BT.709)
-            (13, 8),  // transfer_characteristics = 13
-            (1, 8),   // matrix_coefficients = 1
-            (0, 2),   // blending_mode_id
-            (3, 4),   // log2_scale_factor
-            (1, 1),   // comp_model_present_flag[0]
-            (1, 1),   // comp_model_present_flag[1]
-            (0, 1),   // comp_model_present_flag[2]
+            (0, 1),  // cancel_flag
+            (2, 2),  // model_id
+            (1, 1),  // separate_colour_description_present_flag
+            (2, 3),  // bit_depth_luma_minus8 (= 10 bit luma)
+            (2, 3),  // bit_depth_chroma_minus8
+            (1, 1),  // full_range_flag
+            (1, 8),  // colour_primaries = 1 (BT.709)
+            (13, 8), // transfer_characteristics = 13
+            (1, 8),  // matrix_coefficients = 1
+            (0, 2),  // blending_mode_id
+            (3, 4),  // log2_scale_factor
+            (1, 1),  // comp_model_present_flag[0]
+            (1, 1),  // comp_model_present_flag[1]
+            (0, 1),  // comp_model_present_flag[2]
             // c=0 body
             (0, 8),   // num_intensity_intervals_minus1
             (0, 3),   // num_model_values_minus1
@@ -1994,33 +1994,33 @@ mod tests {
     #[test]
     fn film_grain_characteristics_multi_interval_multi_value() {
         let fields = [
-            (0, 1),         // cancel_flag
-            (1, 2),         // model_id (auto-regression)
-            (0, 1),         // separate_colour_description_present_flag
-            (0, 2),         // blending_mode_id
-            (5, 4),         // log2_scale_factor
-            (0, 1),         // comp_model_present_flag[0] = false
-            (1, 1),         // comp_model_present_flag[1] = true
-            (0, 1),         // comp_model_present_flag[2] = false
+            (0, 1), // cancel_flag
+            (1, 2), // model_id (auto-regression)
+            (0, 1), // separate_colour_description_present_flag
+            (0, 2), // blending_mode_id
+            (5, 4), // log2_scale_factor
+            (0, 1), // comp_model_present_flag[0] = false
+            (1, 1), // comp_model_present_flag[1] = true
+            (0, 1), // comp_model_present_flag[2] = false
             // c=1 body
-            (2, 8),         // num_intensity_intervals_minus1 = 2 → 3 intervals
-            (1, 3),         // num_model_values_minus1 = 1 → 2 model values per interval
+            (2, 8), // num_intensity_intervals_minus1 = 2 → 3 intervals
+            (1, 3), // num_model_values_minus1 = 1 → 2 model values per interval
             // interval 0
-            (0, 8),         // lower
-            (84, 8),        // upper
-            (0b010, 3),     // se(+1)
-            (0b011, 3),     // se(-1)
+            (0, 8),     // lower
+            (84, 8),    // upper
+            (0b010, 3), // se(+1)
+            (0b011, 3), // se(-1)
             // interval 1
             (85, 8),
             (170, 8),
-            (0b00100, 5),   // se(+2)
-            (1, 1),         // se(0)
+            (0b00100, 5), // se(+2)
+            (1, 1),       // se(0)
             // interval 2
             (171, 8),
             (255, 8),
-            (1, 1),         // se(0)
-            (0b00101, 5),   // se(-2)
-            (0b010, 3),     // repetition_period = ue(1) = 1
+            (1, 1),       // se(0)
+            (0b00101, 5), // se(-2)
+            (0b010, 3),   // repetition_period = ue(1) = 1
         ];
         let payload = pack_bits(&fields);
         let fg = parse_film_grain_characteristics(&payload).unwrap();
