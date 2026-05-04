@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-h264/compare/v0.1.1...v0.1.2) - 2026-05-04
+
+### Other
+
+- add full_frame_freeze/release/snapshot + deblocking_filter_display_preference (§D.2.15-17, §D.2.22)
+- add post_filter_hint payload type 22 (§D.1.24 / §D.2.24)
+- rustfmt the film_grain test fixtures (CI green-up after 716fa7b)
+- complete film_grain_characteristics per-component body (§D.2.21)
+- derive level_idc from picture size instead of hard-coding 30
+- rustfmt fixes from 4e0e6b4 CI red
+- distinguish Level 1b from Level 1.1 in MaxDpbMbs lookup
+- add user_data_registered_itu_t_t35 ([#4](https://github.com/OxideAV/oxideav-h264/pull/4)) + pan_scan_rect ([#2](https://github.com/OxideAV/oxideav-h264/pull/2))
+- document why luma indexA clamp stays at 0 (no -QpBdOffsetY)
+- thread bit_depth_chroma_minus8 through QPC derivation
+- switch chroma QPC derivation to extended-range qPI for High10+
+- rustfmt fixes from CI red on previous commit
+- extend dequant + QP range for High10 / 4:2:2 / 4:4:4
+- rustfmt docs_corpus.rs videoframe_to_packed pack() calls
+- emit High10/High422/High444-Predictive 10/12-bit planes (task #259)
+- clippy fixes for docs_corpus.rs
+- rustfmt docs_corpus.rs
+- wire docs/video/h264/ fixture corpus into integration test
+- replace never-match regex with semver_check = false
+- drop enable_miri input (miri now manual-only via workflow_dispatch)
+- fix red-CI items from round 30
+- grant release-plz shim contents+pull-requests write
+- migrate to OxideAV/.github reusable workflows
+- round 30 — encoder CABAC entropy coding for I + P slices
+- round 29 — encoder intra fallback in P / B slices (Intra_16x16)
+- round 28 — encoder 4:4:4 chroma (IDR Intra_16x16-only path)
+- round 27 — encoder 4:2:2 chroma (IDR-only path)
+- oxideav-core ^0.2 -> ^0.1 (0.2.0 was yanked)
+- round 26 — encoder explicit weighted bipred (§7.4.2.2 + §8.4.2.3.2)
+- round 24 — encoder B-slice §8.4.1.2.3 temporal direct mode
+- round 23 — encoder B_8x8 + 4× B_Direct_8x8 (§8.4.1.2.2 spatial direct, Table 7-14 raw 22 / Table 7-18 raw 0)
+- round 22 — encoder B-slice 16x8 / 8x16 partitions (Table 7-14 raw 4..=21)
+- round 21 — encoder B_Skip / B_Direct_16x16 (§8.4.1.2.2 spatial direct)
+- decoder round 6 — fix DPB output ordering on under-reported max_num_reorder_frames
+- decoder round 5 — speed pass (2.01x on solana-ad.mp4)
+- decoder round 4 — fix CABAC drift on High-profile B-slice content
+- round 20 — encoder B-slice (B_L0 / B_L1 / B_Bi 16x16)
+- round 19 — encoder 4MV (P_8x8 / sub_mb_type=PL08x8)
+- round 18 — encoder quarter-pel ME (§8.4.2.2.1)
+- half-pel ME + 6-tap interpolation (round 17)
+- adopt slim VideoFrame shape
+- P-slice support — single L0, integer-pel ME (round 16)
+- Lagrangian RDO mode decision + intra4x4 blk-5 fix (round 15)
+- in-loop §8.7 deblocking on local recon (round 14)
+- I_NxN (Intra_4x4) all 9 modes + per-MB mb_type decision (round 4)
+- I_16x16 luma AC residual transmit (round 3)
+- I_16x16 V/H/DC/Plane modes + chroma residual (round 2)
+- Baseline I_16x16 IDR scaffold (round 1)
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - **SEI: `full_frame_freeze` (type 13), `full_frame_freeze_release`
