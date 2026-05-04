@@ -663,3 +663,366 @@ fn round31_b_cabac_pyramid_ffmpeg_interop() {
         "Average PSNR_Y {avg:.2} dB below 50 dB floor (round-31 acceptance)",
     );
 }
+
+// ============================================================================
+// Round-32 — Real ME + B_Skip / B_Direct_16x16 in CABAC paths.
+// ============================================================================
+
+/// Build a 64x64 luma plane carrying a 16x16 brighter "object" centred
+/// at `(cx, cy)`. Useful for synthesising translation motion.
+fn make_object_frame(w: usize, h: usize, cx: i32, cy: i32) -> Vec<u8> {
+    let mut y = vec![80u8; w * h];
+    for j in 0..16i32 {
+        for i in 0..16i32 {
+            let py = (cy + j).clamp(0, h as i32 - 1) as usize;
+            let px = (cx + i).clamp(0, w as i32 - 1) as usize;
+            y[py * w + px] = 200;
+        }
+    }
+    y
+}
+
+/// Build a 64x64 luma plane with a textured (gradient + diagonal stripe)
+/// background and a 16x16 textured "object" translated to `(cx, cy)`.
+/// Real ME on this fixture has to find the object against a non-trivial
+/// background — much closer to natural content than the flat-object
+/// fixture above.
+fn make_textured_motion_frame(w: usize, h: usize, cx: i32, cy: i32) -> Vec<u8> {
+    let mut y = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            // Background: gradient + diagonal stripe.
+            let bg = ((i + j) as i32 * 2 + ((i ^ j) as i32 & 7) * 4) as u8;
+            y[j * w + i] = bg;
+        }
+    }
+    // Object: distinct texture on top of background.
+    for j in 0..16i32 {
+        for i in 0..16i32 {
+            let py = (cy + j).clamp(0, h as i32 - 1) as usize;
+            let px = (cx + i).clamp(0, w as i32 - 1) as usize;
+            // Object texture — checker pattern + bias.
+            let obj = (180i32 + ((i ^ j) & 1) * 20 + (i + j) * 2) as u8;
+            y[py * w + px] = obj;
+        }
+    }
+    y
+}
+
+/// IDR + P-frame with the object translated by (8, 0) — exercises real
+/// motion estimation in the CABAC P-encoder. Verifies ffmpeg decodes
+/// the stream to PSNR >> the round-30 zero-MV baseline (which on this
+/// fixture would devolve to a wholly-intra residual + ~50 dB at QP 26).
+#[test]
+fn round32_p_cabac_motion_ffmpeg_interop() {
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: ffmpeg not at /opt/homebrew/bin/ffmpeg");
+        return;
+    }
+
+    let w = 64usize;
+    let h = 64usize;
+    let y0 = make_object_frame(w, h, 16, 24);
+    let y1 = make_object_frame(w, h, 24, 24); // moved (8, 0)
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let f0 = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &y0,
+        u: &u,
+        v: &v,
+    };
+    let f1 = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &y1,
+        u: &u,
+        v: &v,
+    };
+
+    let mut cfg = EncoderConfig::new(w as u32, h as u32);
+    cfg.cabac = true;
+    cfg.profile_idc = 77;
+    cfg.qp = 22;
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&f0);
+    let p = enc.encode_p_cabac(&f1, &EncodedFrameRef::from(&idr), 1, 2);
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&idr.annex_b);
+    combined.extend_from_slice(&p.annex_b);
+
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!(
+        "oxideav_h264_round32_pmotion_{}.h264",
+        std::process::id()
+    ));
+    let yuv_path = tmpdir.join(format!(
+        "oxideav_h264_round32_pmotion_{}.yuv",
+        std::process::id()
+    ));
+    std::fs::write(&h264_path, &combined).expect("write h264");
+
+    let status = std::process::Command::new(ffmpeg)
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("h264")
+        .arg("-i")
+        .arg(&h264_path)
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode");
+    let raw = std::fs::read(&yuv_path).expect("read yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+
+    let frame_bytes = w * h + 2 * (w / 2) * (h / 2);
+    assert_eq!(raw.len(), 2 * frame_bytes, "expected 2 frames from ffmpeg");
+    let p_y_dec = &raw[frame_bytes..frame_bytes + w * h];
+    let psnr_p = psnr(&y1, p_y_dec);
+    eprintln!(
+        "round32_p_cabac_motion: IDR={} P={} bytes; PSNR_Y(P vs source)={psnr_p:.2} dB",
+        idr.annex_b.len(),
+        p.annex_b.len(),
+    );
+    assert!(
+        psnr_p >= 40.0,
+        "P motion PSNR {psnr_p:.2} dB below 40 dB floor — ME may not be wired"
+    );
+}
+
+/// IDR + P + B with the object translated linearly. The B-frame's
+/// midpoint sample equals the §8.4.1.2.2 spatial-direct predictor
+/// almost exactly when the L1 anchor (P) carries the same motion as
+/// the ME would discover for the B; the encoder should emit a high
+/// proportion of B_Skip / B_Direct on the moving region. Verifies
+/// ffmpeg cross-decode + PSNR floor on motion content.
+#[test]
+fn round32_b_cabac_motion_ffmpeg_interop() {
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: ffmpeg not at /opt/homebrew/bin/ffmpeg");
+        return;
+    }
+
+    let w = 64usize;
+    let h = 64usize;
+    // IDR @ x=16, P @ x=32, B (midpoint, x=24).
+    let y0 = make_object_frame(w, h, 16, 24);
+    let y1 = make_object_frame(w, h, 32, 24);
+    let yb = make_object_frame(w, h, 24, 24);
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let f0 = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &y0,
+        u: &u,
+        v: &v,
+    };
+    let f1 = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &y1,
+        u: &u,
+        v: &v,
+    };
+    let fb = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &yb,
+        u: &u,
+        v: &v,
+    };
+
+    let mut cfg = EncoderConfig::new(w as u32, h as u32);
+    cfg.cabac = true;
+    cfg.profile_idc = 77;
+    cfg.max_num_ref_frames = 2;
+    cfg.qp = 22;
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&f0);
+    let p = enc.encode_p_cabac(&f1, &EncodedFrameRef::from(&idr), 1, 4);
+    let b = enc.encode_b_cabac(
+        &fb,
+        &EncodedFrameRef::from(&idr),
+        &EncodedFrameRef::from(&p),
+        1, // frame_num — same as preceding P (B is non-reference)
+        2, // pic_order_cnt_lsb between IDR (0) and P (4)
+    );
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&idr.annex_b);
+    combined.extend_from_slice(&p.annex_b);
+    combined.extend_from_slice(&b.annex_b);
+
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!(
+        "oxideav_h264_round32_bmotion_{}.h264",
+        std::process::id()
+    ));
+    let yuv_path = tmpdir.join(format!(
+        "oxideav_h264_round32_bmotion_{}.yuv",
+        std::process::id()
+    ));
+    std::fs::write(&h264_path, &combined).expect("write h264");
+
+    let status = std::process::Command::new(ffmpeg)
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("h264")
+        .arg("-i")
+        .arg(&h264_path)
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode");
+    let raw = std::fs::read(&yuv_path).expect("read yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+
+    let frame_bytes = w * h + 2 * (w / 2) * (h / 2);
+    assert!(raw.len() >= 3 * frame_bytes, "expected >= 3 frames");
+    // Display order: IDR (POC 0), B (POC 2), P (POC 4).
+    let b_y_dec = &raw[frame_bytes..frame_bytes + w * h];
+    let psnr_b = psnr(&yb, b_y_dec);
+    eprintln!(
+        "round32_b_cabac_motion: IDR={} P={} B={} bytes; PSNR_Y(B vs source)={psnr_b:.2} dB",
+        idr.annex_b.len(),
+        p.annex_b.len(),
+        b.annex_b.len(),
+    );
+    assert!(
+        psnr_b >= 40.0,
+        "B motion PSNR {psnr_b:.2} dB below 40 dB floor"
+    );
+}
+
+/// IDR + P + B with a textured object on a textured background. Stresses
+/// real ME on non-trivial content where the round-30/31 zero-MV path
+/// would heavily quantise the residual. Acceptance bar at QP 22 is
+/// PSNR_Y >= 40 dB on the B-frame.
+#[test]
+fn round32_b_cabac_textured_motion_ffmpeg_interop() {
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: ffmpeg not at /opt/homebrew/bin/ffmpeg");
+        return;
+    }
+
+    let w = 64usize;
+    let h = 64usize;
+    let y0 = make_textured_motion_frame(w, h, 16, 24);
+    let y1 = make_textured_motion_frame(w, h, 32, 24);
+    let yb = make_textured_motion_frame(w, h, 24, 24);
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let f0 = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &y0,
+        u: &u,
+        v: &v,
+    };
+    let f1 = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &y1,
+        u: &u,
+        v: &v,
+    };
+    let fb = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &yb,
+        u: &u,
+        v: &v,
+    };
+
+    let mut cfg = EncoderConfig::new(w as u32, h as u32);
+    cfg.cabac = true;
+    cfg.profile_idc = 77;
+    cfg.max_num_ref_frames = 2;
+    cfg.qp = 22;
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&f0);
+    let p = enc.encode_p_cabac(&f1, &EncodedFrameRef::from(&idr), 1, 4);
+    let b = enc.encode_b_cabac(
+        &fb,
+        &EncodedFrameRef::from(&idr),
+        &EncodedFrameRef::from(&p),
+        1,
+        2,
+    );
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&idr.annex_b);
+    combined.extend_from_slice(&p.annex_b);
+    combined.extend_from_slice(&b.annex_b);
+
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!(
+        "oxideav_h264_round32_btxt_{}.h264",
+        std::process::id()
+    ));
+    let yuv_path = tmpdir.join(format!(
+        "oxideav_h264_round32_btxt_{}.yuv",
+        std::process::id()
+    ));
+    std::fs::write(&h264_path, &combined).expect("write h264");
+
+    let status = std::process::Command::new(ffmpeg)
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("h264")
+        .arg("-i")
+        .arg(&h264_path)
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode");
+    let raw = std::fs::read(&yuv_path).expect("read yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+
+    let frame_bytes = w * h + 2 * (w / 2) * (h / 2);
+    assert!(raw.len() >= 3 * frame_bytes, "expected >= 3 frames");
+    let p_y_dec = &raw[2 * frame_bytes..2 * frame_bytes + w * h];
+    let b_y_dec = &raw[frame_bytes..frame_bytes + w * h];
+    let psnr_p = psnr(&y1, p_y_dec);
+    let psnr_b = psnr(&yb, b_y_dec);
+    eprintln!(
+        "round32_b_cabac_textured_motion: IDR={} P={} B={} bytes; PSNR_P={psnr_p:.2} dB, PSNR_B={psnr_b:.2} dB",
+        idr.annex_b.len(),
+        p.annex_b.len(),
+        b.annex_b.len(),
+    );
+    assert!(
+        psnr_b >= 40.0,
+        "B textured-motion PSNR {psnr_b:.2} dB below 40 dB floor"
+    );
+}

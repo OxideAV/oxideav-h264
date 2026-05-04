@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Encoder: CABAC real ME + `B_Skip` / `B_Direct_16x16` (round 32).**
+  P/B CABAC paths replace the round-30/31 forced MV=(0, 0) with real
+  quarter-pel motion estimation (`search_quarter_pel_16x16`) and emit
+  proper §8.4.1.3 mvds against a median MV predictor. New
+  `cabac_mvp_for_16x16` / `cabac_p_skip_mv` /
+  `cabac_b_spatial_direct_derive` helpers track per-8x8 MVs / refIdxs
+  in `CabacEncMbInfo` (`mv_l0_8x8` + `ref_idx_l0_8x8` + L1 mirrors) and
+  read the §6.4.11.7 (A, B, C, D) neighbour cells through the existing
+  `derive_mvpred_with_d` / `derive_p_skip_mv_with_d` /
+  `derive_b_spatial_direct_with_d` infrastructure. P-CABAC now requires
+  `chosen_mv == skip_mv` for P_Skip eligibility (no longer trivially
+  always-skip). B-CABAC additionally implements `B_Skip` (mb_skip_flag
+  with no further MB syntax) and `B_Direct_16x16` (mb_type=0 with no
+  mvd / ref_idx); the §8.4.1.2.2 derivation is mirrored encoder-side
+  and the direct candidate is picked over the explicit-inter rows
+  (B_L0/L1/Bi_16x16) on a Lagrangian rate-bias-adjusted SAD. Per-8x8 /
+  mixed `B_8x8`+all-Direct CABAC variants + 4:2:2 / 4:4:4 P/B still
+  deferred. ffmpeg cross-decode bit-exact at QP 22 on translation-
+  motion fixtures (PSNR_Y ≈ 99 dB on flat-object content,
+  ≥ 46 dB on textured-background motion via
+  `round32_b_cabac_textured_motion_ffmpeg_interop`); the smooth-content
+  16-frame B-pyramid GOP shrinks from 555 → 487 bytes (~12 %) thanks
+  to B_Skip / B_Direct gradually replacing the explicit B_L0_16x16
+  emissions.
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-h264/compare/v0.1.1...v0.1.2) - 2026-05-04
 
 ### Other

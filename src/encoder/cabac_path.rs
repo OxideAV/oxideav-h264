@@ -63,7 +63,10 @@ use crate::encoder::{
     EncodedB, EncodedFrameRef, EncodedIdr, EncodedP, Encoder, FrameRefPartitionMv, YuvFrame,
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
-use crate::mv_deriv::Mv;
+use crate::mv_deriv::{
+    derive_b_spatial_direct_with_d, derive_mvpred_with_d, derive_p_skip_mv_with_d, Mv,
+    MvpredInputs, MvpredShape, NeighbourMv,
+};
 
 // `build_inter_pred_luma` and `build_inter_pred_chroma` are private to the
 // `crate::encoder` module's `mod.rs`; we replicate them locally here.
@@ -97,7 +100,7 @@ const LUMA_4X4_BLK: [(usize, usize); 16] = [
 // CABAC neighbour state for the encoder side.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct CabacEncMbInfo {
     available: bool,
     is_intra: bool,
@@ -124,6 +127,76 @@ struct CabacEncMbInfo {
     /// L1 mvd magnitudes — only populated on B-slice MBs.
     abs_mvd_l1_x: [u32; 16],
     abs_mvd_l1_y: [u32; 16],
+    /// Round-32 — per-8x8 MV / refIdx tracking for §8.4.1.3 mvp
+    /// derivation in P + B CABAC paths. Round-30/31 forced MVs to (0, 0)
+    /// so this was unused; the round-32 real-ME wiring populates one
+    /// 16x16 MV (replicated across all 4 8x8 partitions) per MB. The
+    /// per-8x8 layout matches `MvGridSlot::mv_l0_8x8` so future per-
+    /// partition encoding (16x8 / 8x16 / 8x8) can plug into the same
+    /// structure. `ref_idx_l0_8x8 < 0` means "this list unused"
+    /// (intra MB or B mb_type that doesn't use L0).
+    ref_idx_l0_8x8: [i32; 4],
+    mv_l0_8x8: [Mv; 4],
+    ref_idx_l1_8x8: [i32; 4],
+    mv_l1_8x8: [Mv; 4],
+}
+
+impl Default for CabacEncMbInfo {
+    fn default() -> Self {
+        Self {
+            available: false,
+            is_intra: false,
+            is_skip: false,
+            is_i_pcm: false,
+            is_i_nxn: false,
+            is_b_skip_or_direct: false,
+            cbp_luma: 0,
+            cbp_chroma: 0,
+            intra_chroma_pred_mode: 0,
+            cbf_luma_4x4: [false; 16],
+            cbf_luma_dc: false,
+            cbf_luma_ac: [false; 16],
+            cbf_cb_dc: false,
+            cbf_cr_dc: false,
+            cbf_cb_ac: [false; 4],
+            cbf_cr_ac: [false; 4],
+            abs_mvd_l0_x: [0; 16],
+            abs_mvd_l0_y: [0; 16],
+            abs_mvd_l1_x: [0; 16],
+            abs_mvd_l1_y: [0; 16],
+            ref_idx_l0_8x8: [-1; 4],
+            mv_l0_8x8: [Mv::ZERO; 4],
+            ref_idx_l1_8x8: [-1; 4],
+            mv_l1_8x8: [Mv::ZERO; 4],
+        }
+    }
+}
+
+impl CabacEncMbInfo {
+    /// Build a [`NeighbourMv`] for this MB, looking at its 8x8 partition
+    /// `part`. Returns [`NeighbourMv::UNAVAILABLE`] when the MB hasn't
+    /// been encoded yet, or [`NeighbourMv::intra_but_mb_available`] for
+    /// intra MBs (so the §8.4.1.3.2 step 2a folding fires).
+    fn neighbour_mv_for(&self, part: usize, list: u8) -> NeighbourMv {
+        if !self.available {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        if self.is_intra {
+            return NeighbourMv::intra_but_mb_available();
+        }
+        let (ref_idx, mv) = if list == 0 {
+            (self.ref_idx_l0_8x8[part], self.mv_l0_8x8[part])
+        } else {
+            (self.ref_idx_l1_8x8[part], self.mv_l1_8x8[part])
+        };
+        NeighbourMv {
+            available: ref_idx >= 0,
+            mb_available: true,
+            partition_available: true,
+            ref_idx,
+            mv,
+        }
+    }
 }
 
 struct CabacEncGrid {
@@ -157,6 +230,215 @@ impl CabacEncGrid {
         } else {
             Some(self.at(x, y - 1))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round-32 — §8.4.1.3 MV-predictor derivation reading from the CABAC
+// encoder grid.
+//
+// Mirrors the CAVLC path's `neighbour_mvs_16x16` + `mvp_for_16x16` /
+// `p_skip_mv` helpers but operates on `CabacEncGrid`, which carries
+// per-8x8 MVs / refIdxs in [`CabacEncMbInfo::mv_l0_8x8`] / `..._l1_8x8`.
+//
+// Per §6.4.11.7 the four neighbours of a 16x16 partition's top-left
+// 4x4 block are (A=left, B=above, C=above-right, D=above-left). Each
+// neighbour's representative 8x8 partition is the one spatially adjacent
+// to the current MB's top-left 4x4 (block 0):
+//   * A → left MB's 8x8 #1 (top-right)
+//   * B → above MB's 8x8 #2 (bottom-left)
+//   * C → above-right MB's 8x8 #2 (bottom-left)
+//   * D → above-left MB's 8x8 #3 (bottom-right)
+// ---------------------------------------------------------------------------
+
+fn cabac_neighbour_mvs_16x16(
+    grid: &CabacEncGrid,
+    mb_x: usize,
+    mb_y: usize,
+    list: u8,
+) -> (NeighbourMv, NeighbourMv, NeighbourMv, NeighbourMv) {
+    let make = |x: i32, y: i32, part: usize| -> NeighbourMv {
+        if x < 0 || y < 0 || (x as usize) >= grid.width_mbs {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        let h = grid.mbs.len() / grid.width_mbs;
+        if (y as usize) >= h {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        grid.at(x as usize, y as usize).neighbour_mv_for(part, list)
+    };
+    let mb_xi = mb_x as i32;
+    let mb_yi = mb_y as i32;
+    let a = make(mb_xi - 1, mb_yi, 1);
+    let b = make(mb_xi, mb_yi - 1, 2);
+    let c = make(mb_xi + 1, mb_yi - 1, 2);
+    let d = make(mb_xi - 1, mb_yi - 1, 3);
+    (a, b, c, d)
+}
+
+/// §8.4.1.3 — derive mvpLX for a 16x16 partition reading neighbours
+/// from the CABAC encoder grid. `list ∈ {0, 1}`. `ref_idx` is the
+/// current MB's refIdxLX (always 0 in our single-ref-per-list setup).
+fn cabac_mvp_for_16x16(
+    grid: &CabacEncGrid,
+    mb_x: usize,
+    mb_y: usize,
+    list: u8,
+    ref_idx: i32,
+) -> Mv {
+    let (a, b, c, d) = cabac_neighbour_mvs_16x16(grid, mb_x, mb_y, list);
+    let inputs = MvpredInputs::from_abc(a, b, c, ref_idx, MvpredShape::Default);
+    derive_mvpred_with_d(&inputs, d)
+}
+
+/// §8.4.1.2 — derive (refIdxL0, mvL0) for a P_Skip MB at (mb_x, mb_y)
+/// using the CABAC encoder grid. Single-ref P-slice → refIdxL0 = 0.
+fn cabac_p_skip_mv(grid: &CabacEncGrid, mb_x: usize, mb_y: usize) -> (i32, Mv) {
+    let (a, b, c, d) = cabac_neighbour_mvs_16x16(grid, mb_x, mb_y, 0);
+    derive_p_skip_mv_with_d(a, b, c, d)
+}
+
+/// §8.4.1.2.2 — encoder-side spatial-direct derivation reading from the
+/// CABAC encoder grid. Mirrors `b_spatial_direct_derive` in
+/// `encoder::mod` but on the CABAC grid layout. Returns a
+/// [`CabacBDirect`] with per-8x8 MVs + refIdxs for both lists. The
+/// caller checks `is_uniform()` to gate `B_Direct_16x16` / `B_Skip`
+/// emission.
+///
+/// `direct_8x8_inference_flag = 1` is hard-wired in our SPS so the
+/// granularity is per-8x8 (4 partitions per MB).
+fn cabac_b_spatial_direct_derive(
+    grid: &CabacEncGrid,
+    l1_partition_mvs: &[FrameRefPartitionMv],
+    width_mbs: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> CabacBDirect {
+    // §8.4.1.2.2 step 2-3 — MB-level (A, B, C, D) for both lists.
+    let (a_l0, b_l0, c_l0, d_l0) = cabac_neighbour_mvs_16x16(grid, mb_x, mb_y, 0);
+    let (a_l1, b_l1, c_l1, d_l1) = cabac_neighbour_mvs_16x16(grid, mb_x, mb_y, 1);
+
+    // §8.4.1.2.2 step 4-5 derivation via the shared helper.
+    let (ref_idx_l0_helper, mv_l0_mb, ref_idx_l1_helper, mv_l1_mb) =
+        derive_b_spatial_direct_with_d(a_l0, a_l1, b_l0, b_l1, c_l0, c_l1, d_l0, d_l1);
+
+    // Repeat step 4 locally to detect the `directZero` fallback (the
+    // helper folds it into the output). Same logic as the CAVLC path.
+    let c_l0_eff = if !c_l0.partition_available && d_l0.partition_available {
+        d_l0
+    } else {
+        c_l0
+    };
+    let c_l1_eff = if !c_l1.partition_available && d_l1.partition_available {
+        d_l1
+    } else {
+        c_l1
+    };
+    let min_pos = |x: i32, y: i32| -> i32 {
+        if x >= 0 && y >= 0 {
+            x.min(y)
+        } else {
+            x.max(y)
+        }
+    };
+    let r0_minp = min_pos(a_l0.ref_idx, min_pos(b_l0.ref_idx, c_l0_eff.ref_idx));
+    let r1_minp = min_pos(a_l1.ref_idx, min_pos(b_l1.ref_idx, c_l1_eff.ref_idx));
+    let direct_zero = r0_minp < 0 && r1_minp < 0;
+
+    let ref_idx_l0_final: i32 = if direct_zero {
+        0
+    } else if r0_minp < 0 {
+        -1
+    } else {
+        ref_idx_l0_helper
+    };
+    let ref_idx_l1_final: i32 = if direct_zero {
+        0
+    } else if r1_minp < 0 {
+        -1
+    } else {
+        ref_idx_l1_helper
+    };
+
+    // §8.4.1.2.2 step 6/7 — per 8x8 partition MV with colZeroFlag override.
+    let mut mv_l0_per_8x8 = [Mv::ZERO; 4];
+    let mut mv_l1_per_8x8 = [Mv::ZERO; 4];
+    for part in 0..4usize {
+        let cz = cabac_col_zero_flag(l1_partition_mvs, width_mbs, mb_x, mb_y, part);
+        let l0_force_zero = direct_zero || ref_idx_l0_final < 0 || (ref_idx_l0_final == 0 && cz);
+        let l1_force_zero = direct_zero || ref_idx_l1_final < 0 || (ref_idx_l1_final == 0 && cz);
+        mv_l0_per_8x8[part] = if l0_force_zero { Mv::ZERO } else { mv_l0_mb };
+        mv_l1_per_8x8[part] = if l1_force_zero { Mv::ZERO } else { mv_l1_mb };
+    }
+
+    CabacBDirect {
+        ref_idx_l0: ref_idx_l0_final,
+        ref_idx_l1: ref_idx_l1_final,
+        mv_l0_per_8x8,
+        mv_l1_per_8x8,
+        direct_zero,
+    }
+}
+
+/// §8.4.1.2.2 step 7 — colZeroFlag check on the L1 anchor's colocated
+/// 8x8 partition. Returns true iff the colocated block is short-term-
+/// coded with `refIdxCol == 0` and `|mvCol| <= 1` in both components.
+fn cabac_col_zero_flag(
+    l1_partition_mvs: &[FrameRefPartitionMv],
+    width_mbs: usize,
+    mb_x: usize,
+    mb_y: usize,
+    part_8x8: usize,
+) -> bool {
+    let idx = (mb_y * width_mbs + mb_x) * 4 + part_8x8;
+    let Some(slot) = l1_partition_mvs.get(idx) else {
+        return false;
+    };
+    if slot.is_intra {
+        return false;
+    }
+    if slot.ref_idx_l0 != 0 {
+        return false;
+    }
+    slot.mv_l0.0.abs() <= 1 && slot.mv_l0.1.abs() <= 1
+}
+
+/// Round-32 — §8.4.1.2.2 spatial direct derivation output (CABAC side).
+/// Same shape as the CAVLC `BDirectDerivation` but local to the CABAC
+/// path so we don't have to expose the CAVLC type publicly.
+#[derive(Debug, Clone, Copy)]
+struct CabacBDirect {
+    ref_idx_l0: i32,
+    ref_idx_l1: i32,
+    mv_l0_per_8x8: [Mv; 4],
+    mv_l1_per_8x8: [Mv; 4],
+    #[allow(dead_code)]
+    direct_zero: bool,
+}
+
+impl CabacBDirect {
+    /// True iff every 8x8 partition shares the same MV across both
+    /// lists. Round-32 only emits `B_Direct_16x16` / `B_Skip` when this
+    /// holds (the per-8x8 / mixed paths are deferred — they need the
+    /// `B_8x8` syntax + sub_mb_type encoder which doesn't exist for
+    /// CABAC yet).
+    fn is_uniform(&self) -> bool {
+        let l0_uniform = self
+            .mv_l0_per_8x8
+            .iter()
+            .all(|m| *m == self.mv_l0_per_8x8[0]);
+        let l1_uniform = self
+            .mv_l1_per_8x8
+            .iter()
+            .all(|m| *m == self.mv_l1_per_8x8[0]);
+        l0_uniform && l1_uniform
+    }
+
+    fn mv_l0(&self) -> Mv {
+        self.mv_l0_per_8x8[0]
+    }
+    fn mv_l1(&self) -> Mv {
+        self.mv_l1_per_8x8[0]
     }
 }
 
@@ -1192,16 +1474,12 @@ impl Encoder {
             for mb_x in 0..width_mbs {
                 let mb_addr = mb_y * width_mbs + mb_x;
 
-                // Round-30 simplification — force MV = (0, 0) for every
-                // inter MB. The encoder's §8.4.1.3 mvp derivation is not
-                // wired (we don't track per-MB MVs in the grid), and emitting
-                // a non-zero mvd against an unknown mvp would desync with
-                // the decoder. With every MV at (0, 0) the mvp is always 0
-                // and mvd = 0, so encoder + decoder agree on the predictor.
-                // Quality on static / near-static fixtures (round-30
-                // acceptance bar) is unaffected because the inter pred
-                // already matches the ref well.
-                let _me = search_quarter_pel_16x16(
+                // Round-32 — real motion estimation (integer + ½-pel +
+                // ¼-pel) via the existing `search_quarter_pel_16x16`
+                // helper, and §8.4.1.3 / §8.4.1.2 mvp / skip-MV using
+                // `cabac_mvp_for_16x16` / `cabac_p_skip_mv` reading the
+                // per-MB MV grid we now maintain in `CabacEncMbInfo`.
+                let me = search_quarter_pel_16x16(
                     frame.y,
                     width,
                     cfg.width,
@@ -1215,7 +1493,9 @@ impl Encoder {
                     16,
                     16,
                 );
-                let chosen_mv = Mv::new(0, 0);
+                let chosen_mv = Mv::new(me.mv_x, me.mv_y);
+                let mvp = cabac_mvp_for_16x16(&grid, mb_x, mb_y, 0, 0);
+                let (_skip_ref, skip_mv) = cabac_p_skip_mv(&grid, mb_x, mb_y);
 
                 // Build inter predictor (luma + chroma).
                 let pred_y = build_inter_pred_luma_local(
@@ -1308,10 +1588,12 @@ impl Encoder {
                 };
                 let _ = cb_ac_quant;
 
-                // P_Skip eligibility: chosen MV == zero AND CBP == 0.
-                // With MV forced to (0, 0) above, the MV-equality check
-                // reduces to a CBP check.
-                let is_skip = cbp_luma == 0 && cbp_chroma == 0;
+                // P_Skip eligibility: chosen MV == §8.4.1.2 skip MV AND
+                // CBP == 0. Round-32 — with real ME wired the MV check
+                // is no longer trivial; many MBs on static / near-static
+                // content will still satisfy chosen_mv == skip_mv == (0, 0)
+                // and skip out, but moving content forces a mvd emit.
+                let is_skip = chosen_mv == skip_mv && cbp_luma == 0 && cbp_chroma == 0;
 
                 let nb = build_neighbour_ctx(&grid, mb_x, mb_y);
 
@@ -1346,14 +1628,20 @@ impl Encoder {
                     info.is_skip = true;
                     info.cbp_luma = 0;
                     info.cbp_chroma = 0;
-                    // P_Skip — MV is the §8.4.1.2 skip MV, which for our
-                    // simplified path is (0, 0). ref_idx = 0.
+                    // P_Skip — record the §8.4.1.2 skip MV across all 4
+                    // 8x8 partitions for downstream neighbour reads.
+                    info.ref_idx_l0_8x8 = [0; 4];
+                    info.mv_l0_8x8 = [skip_mv; 4];
+                    let skip_mv_t = (
+                        skip_mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        skip_mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    );
                     mb_dbl[mb_addr] = MbDeblockInfo {
                         is_intra: false,
                         qp_y,
                         luma_nonzero_4x4: 0,
                         chroma_nonzero_4x4: 0,
-                        mv_l0: [(0, 0); 16],
+                        mv_l0: [skip_mv_t; 16],
                         ref_idx_l0: [0; 4],
                         ref_poc_l0: [0; 4],
                         ..Default::default()
@@ -1366,13 +1654,10 @@ impl Encoder {
                 // mb_type = P_L0_16x16 (raw 0 in P-slice Table 7-13).
                 encode_mb_type_p(&mut cabac, &mut ctxs, &nb, 0);
 
-                // mvd_l0 (single-ref → no ref_idx_l0 emit). MV predictor
-                // is 0 for round-30 (encoder forces P_Skip when MV is zero
-                // and the neighbours are also zero, so a non-zero MV always
-                // means the residual is non-trivial — consistent with the
-                // simplified §8.4.1.3 we wire here).
-                let mvd_x = chosen_mv.x;
-                let mvd_y = chosen_mv.y;
+                // mvd_l0 (single-ref → no ref_idx_l0 emit). Round-32 —
+                // mvp via §8.4.1.3 median (`cabac_mvp_for_16x16`).
+                let mvd_x = chosen_mv.x - mvp.x;
+                let mvd_y = chosen_mv.y - mvp.y;
                 // §9.3.3.1.1.7 — neighbour |mvd| sum for ctxIdxInc(bin 0)
                 // of mvd_l0_x / mvd_l0_y. For 4x4 block 0 the A neighbour
                 // is left MB block 1 (top-right of the left MB at MB-pixel
@@ -1578,6 +1863,8 @@ impl Encoder {
                 info.cbp_chroma = cbp_chroma;
                 info.abs_mvd_l0_x = [mvd_x.unsigned_abs(); 16];
                 info.abs_mvd_l0_y = [mvd_y.unsigned_abs(); 16];
+                info.ref_idx_l0_8x8 = [0; 4];
+                info.mv_l0_8x8 = [chosen_mv; 4];
 
                 let mv_t = (
                     chosen_mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
@@ -1624,15 +1911,29 @@ impl Encoder {
             cfg.height / 16,
         );
 
+        // Round-32 — capture per-8x8 MV state from the grid so a
+        // downstream B-slice's colZeroFlag check (§8.4.1.2.2 step 7)
+        // sees real MVs, not all-zero. Intra MBs and unencoded slots
+        // map to (mv=0, ref=-1, is_intra=true) per §8.4.1.2.1.
         let n_parts = width_mbs * height_mbs * 4;
-        let partition_mvs = vec![
-            FrameRefPartitionMv {
-                mv_l0: (0, 0),
-                ref_idx_l0: 0,
-                is_intra: false,
-            };
-            n_parts
-        ];
+        let mut partition_mvs = Vec::with_capacity(n_parts);
+        for slot in &grid.mbs {
+            for part in 0..4usize {
+                let (mv, ref_idx, is_intra) = if !slot.available || slot.is_intra {
+                    (Mv::ZERO, -1i32, true)
+                } else {
+                    (slot.mv_l0_8x8[part], slot.ref_idx_l0_8x8[part], false)
+                };
+                partition_mvs.push(FrameRefPartitionMv {
+                    mv_l0: (
+                        mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    ),
+                    ref_idx_l0: ref_idx.clamp(-1, 127) as i8,
+                    is_intra,
+                });
+            }
+        }
 
         EncodedP {
             annex_b: stream,
@@ -1756,21 +2057,52 @@ impl Encoder {
             for mb_x in 0..width_mbs {
                 let mb_addr = mb_y * width_mbs + mb_x;
 
-                // Round-31 simplification — force MV = (0, 0) on both lists.
-                // The encoder's §8.4.1.3 mvp derivation is not wired (we
-                // don't track per-MB MVs in the grid); with both lists at
-                // (0, 0) the mvd is also (0, 0) and decoder + encoder
-                // agree on the predictor without any neighbour bookkeeping.
-                let mv_zero = Mv::new(0, 0);
+                // Round-32 — per-list quarter-pel ME. Same routine as the
+                // CAVLC encode_b_mb path; only the reference plane differs.
+                let me_l0 = search_quarter_pel_16x16(
+                    frame.y,
+                    width,
+                    cfg.width,
+                    cfg.height,
+                    ref_l0.recon_y,
+                    ref_l0.width as usize,
+                    ref_l0.width,
+                    ref_l0.height,
+                    mb_x,
+                    mb_y,
+                    16,
+                    16,
+                );
+                let me_l1 = search_quarter_pel_16x16(
+                    frame.y,
+                    width,
+                    cfg.width,
+                    cfg.height,
+                    ref_l1.recon_y,
+                    ref_l1.width as usize,
+                    ref_l1.width,
+                    ref_l1.height,
+                    mb_x,
+                    mb_y,
+                    16,
+                    16,
+                );
+                let mv_l0 = Mv::new(me_l0.mv_x, me_l0.mv_y);
+                let mv_l1 = Mv::new(me_l1.mv_x, me_l1.mv_y);
+                // §8.4.1.3 mvp per list (single ref → ref_idx = 0). Used
+                // when we emit the explicit `B_L0/L1/Bi_16x16` rows.
+                let mvp_l0 = cabac_mvp_for_16x16(&grid, mb_x, mb_y, 0, 0);
+                let mvp_l1 = cabac_mvp_for_16x16(&grid, mb_x, mb_y, 1, 0);
 
-                // Build the three explicit-inter predictor candidates.
+                // Build the three explicit-inter predictor candidates at
+                // the per-list ME-chosen MVs.
                 let pred_y_l0 = build_inter_pred_luma_local(
                     ref_l0.recon_y,
                     ref_l0.width,
                     ref_l0.height,
                     mb_x,
                     mb_y,
-                    mv_zero,
+                    mv_l0,
                 );
                 let pred_u_l0 = build_inter_pred_chroma_local(
                     ref_l0.recon_u,
@@ -1778,7 +2110,7 @@ impl Encoder {
                     chroma_h as u32,
                     mb_x,
                     mb_y,
-                    mv_zero,
+                    mv_l0,
                 );
                 let pred_v_l0 = build_inter_pred_chroma_local(
                     ref_l0.recon_v,
@@ -1786,7 +2118,7 @@ impl Encoder {
                     chroma_h as u32,
                     mb_x,
                     mb_y,
-                    mv_zero,
+                    mv_l0,
                 );
                 let pred_y_l1 = build_inter_pred_luma_local(
                     ref_l1.recon_y,
@@ -1794,7 +2126,7 @@ impl Encoder {
                     ref_l1.height,
                     mb_x,
                     mb_y,
-                    mv_zero,
+                    mv_l1,
                 );
                 let pred_u_l1 = build_inter_pred_chroma_local(
                     ref_l1.recon_u,
@@ -1802,7 +2134,7 @@ impl Encoder {
                     chroma_h as u32,
                     mb_x,
                     mb_y,
-                    mv_zero,
+                    mv_l1,
                 );
                 let pred_v_l1 = build_inter_pred_chroma_local(
                     ref_l1.recon_v,
@@ -1810,7 +2142,7 @@ impl Encoder {
                     chroma_h as u32,
                     mb_x,
                     mb_y,
-                    mv_zero,
+                    mv_l1,
                 );
                 // §8.4.2.3.1 default-merge bipred = ((L0 + L1 + 1) >> 1)
                 // followed by Clip1Y. The two operands are already
@@ -1827,6 +2159,159 @@ impl Encoder {
                     pred_v_bi[i] = ((pred_v_l0[i] + pred_v_l1[i] + 1) >> 1).clamp(0, 255);
                 }
 
+                // Round-32 — §8.4.1.2.2 spatial-direct derivation.
+                // Build the direct predictor when the derivation produces
+                // a uniform per-MB MV across all 4 8x8 partitions
+                // (round-32 only emits B_Direct_16x16 / B_Skip in that
+                // case; per-8x8 / mixed B_8x8+all-Direct under CABAC is
+                // out of scope for this round). When at least one list
+                // is used, build the direct predictor and SAD it.
+                let direct = cabac_b_spatial_direct_derive(
+                    &grid,
+                    ref_l1.partition_mvs,
+                    width_mbs,
+                    mb_x,
+                    mb_y,
+                );
+                let direct_uniform = direct.is_uniform();
+                let direct_pred_kind: Option<u32> =
+                    match (direct.ref_idx_l0 >= 0, direct.ref_idx_l1 >= 0) {
+                        (true, true) => Some(3),  // Bi
+                        (true, false) => Some(1), // L0
+                        (false, true) => Some(2), // L1
+                        (false, false) => None,
+                    };
+                let (direct_competitive, direct_pred_y, direct_pred_u, direct_pred_v) =
+                    match (direct_uniform, direct_pred_kind) {
+                        (true, Some(dpk)) => {
+                            let dy = match dpk {
+                                1 => build_inter_pred_luma_local(
+                                    ref_l0.recon_y,
+                                    ref_l0.width,
+                                    ref_l0.height,
+                                    mb_x,
+                                    mb_y,
+                                    direct.mv_l0(),
+                                ),
+                                2 => build_inter_pred_luma_local(
+                                    ref_l1.recon_y,
+                                    ref_l1.width,
+                                    ref_l1.height,
+                                    mb_x,
+                                    mb_y,
+                                    direct.mv_l1(),
+                                ),
+                                _ => {
+                                    let l0 = build_inter_pred_luma_local(
+                                        ref_l0.recon_y,
+                                        ref_l0.width,
+                                        ref_l0.height,
+                                        mb_x,
+                                        mb_y,
+                                        direct.mv_l0(),
+                                    );
+                                    let l1 = build_inter_pred_luma_local(
+                                        ref_l1.recon_y,
+                                        ref_l1.width,
+                                        ref_l1.height,
+                                        mb_x,
+                                        mb_y,
+                                        direct.mv_l1(),
+                                    );
+                                    let mut bi = [0i32; 256];
+                                    for i in 0..256 {
+                                        bi[i] = ((l0[i] + l1[i] + 1) >> 1).clamp(0, 255);
+                                    }
+                                    bi
+                                }
+                            };
+                            let du = match dpk {
+                                1 => build_inter_pred_chroma_local(
+                                    ref_l0.recon_u,
+                                    chroma_w as u32,
+                                    chroma_h as u32,
+                                    mb_x,
+                                    mb_y,
+                                    direct.mv_l0(),
+                                ),
+                                2 => build_inter_pred_chroma_local(
+                                    ref_l1.recon_u,
+                                    chroma_w as u32,
+                                    chroma_h as u32,
+                                    mb_x,
+                                    mb_y,
+                                    direct.mv_l1(),
+                                ),
+                                _ => {
+                                    let l0 = build_inter_pred_chroma_local(
+                                        ref_l0.recon_u,
+                                        chroma_w as u32,
+                                        chroma_h as u32,
+                                        mb_x,
+                                        mb_y,
+                                        direct.mv_l0(),
+                                    );
+                                    let l1 = build_inter_pred_chroma_local(
+                                        ref_l1.recon_u,
+                                        chroma_w as u32,
+                                        chroma_h as u32,
+                                        mb_x,
+                                        mb_y,
+                                        direct.mv_l1(),
+                                    );
+                                    let mut bi = [0i32; 64];
+                                    for i in 0..64 {
+                                        bi[i] = ((l0[i] + l1[i] + 1) >> 1).clamp(0, 255);
+                                    }
+                                    bi
+                                }
+                            };
+                            let dv = match dpk {
+                                1 => build_inter_pred_chroma_local(
+                                    ref_l0.recon_v,
+                                    chroma_w as u32,
+                                    chroma_h as u32,
+                                    mb_x,
+                                    mb_y,
+                                    direct.mv_l0(),
+                                ),
+                                2 => build_inter_pred_chroma_local(
+                                    ref_l1.recon_v,
+                                    chroma_w as u32,
+                                    chroma_h as u32,
+                                    mb_x,
+                                    mb_y,
+                                    direct.mv_l1(),
+                                ),
+                                _ => {
+                                    let l0 = build_inter_pred_chroma_local(
+                                        ref_l0.recon_v,
+                                        chroma_w as u32,
+                                        chroma_h as u32,
+                                        mb_x,
+                                        mb_y,
+                                        direct.mv_l0(),
+                                    );
+                                    let l1 = build_inter_pred_chroma_local(
+                                        ref_l1.recon_v,
+                                        chroma_w as u32,
+                                        chroma_h as u32,
+                                        mb_x,
+                                        mb_y,
+                                        direct.mv_l1(),
+                                    );
+                                    let mut bi = [0i32; 64];
+                                    for i in 0..64 {
+                                        bi[i] = ((l0[i] + l1[i] + 1) >> 1).clamp(0, 255);
+                                    }
+                                    bi
+                                }
+                            };
+                            (true, dy, du, dv)
+                        }
+                        _ => (false, [0i32; 256], [0i32; 64], [0i32; 64]),
+                    };
+
                 // SAD against source (luma only — chroma trail-along).
                 let sad = |pred: &[i32; 256]| -> u64 {
                     let mut s: u64 = 0;
@@ -1841,16 +2326,38 @@ impl Encoder {
                 let sad_l0 = sad(&pred_y_l0);
                 let sad_l1 = sad(&pred_y_l1);
                 let sad_bi = sad(&pred_y_bi);
+                let sad_direct = if direct_competitive {
+                    sad(&direct_pred_y)
+                } else {
+                    u64::MAX
+                };
 
-                // Pick best.
-                let (chosen_mb_type, pred_y, pred_u, pred_v) =
-                    if sad_l0 <= sad_l1 && sad_l0 <= sad_bi {
-                        (1u32, pred_y_l0, pred_u_l0, pred_v_l0) // B_L0_16x16
-                    } else if sad_l1 <= sad_bi {
-                        (2u32, pred_y_l1, pred_u_l1, pred_v_l1) // B_L1_16x16
-                    } else {
-                        (3u32, pred_y_bi, pred_u_bi, pred_v_bi) // B_Bi_16x16
-                    };
+                // Lagrangian rate bias for direct mode. Direct emits
+                // ~1 bit (mb_type=0), explicit-inter rows emit ~12-20
+                // bits (mvds + mb_type). Bias the comparison so direct
+                // wins on near-tie SADs. λ scales coarsely with QP.
+                let lambda = (qp_y / 6).clamp(0, 8) as u64;
+                let direct_bias_sad: u64 = (lambda + 1) * 16;
+
+                // Pick best — prefer direct when its SAD plus bias still
+                // beats the explicit candidates' SAD; otherwise pick the
+                // best explicit row by raw SAD.
+                let prefer_direct = direct_competitive
+                    && sad_direct <= sad_l0.saturating_add(direct_bias_sad)
+                    && sad_direct <= sad_l1.saturating_add(direct_bias_sad)
+                    && sad_direct <= sad_bi.saturating_add(direct_bias_sad);
+                // chosen_mb_type: 0 = B_Direct_16x16, 1 = B_L0, 2 = B_L1,
+                // 3 = B_Bi.
+                let (chosen_mb_type, pred_y, pred_u, pred_v) = if prefer_direct {
+                    (0u32, direct_pred_y, direct_pred_u, direct_pred_v)
+                } else if sad_l0 <= sad_l1 && sad_l0 <= sad_bi {
+                    (1u32, pred_y_l0, pred_u_l0, pred_v_l0) // B_L0_16x16
+                } else if sad_l1 <= sad_bi {
+                    (2u32, pred_y_l1, pred_u_l1, pred_v_l1) // B_L1_16x16
+                } else {
+                    (3u32, pred_y_bi, pred_u_bi, pred_v_bi) // B_Bi_16x16
+                };
+                let is_direct = chosen_mb_type == 0;
 
                 // Luma residual + per-4x4 quantise.
                 let mut residual = [0i32; 256];
@@ -1910,24 +2417,97 @@ impl Encoder {
 
                 let nb = build_neighbour_ctx(&grid, mb_x, mb_y);
 
-                // mb_skip_flag — always 0 (we don't emit B_Skip in
-                // round 31; see method docs).
-                encode_mb_skip_flag(&mut cabac, &mut ctxs, SliceKind::B, &nb, false);
+                // Round-32 — B_Skip emission (§7.3.4 mb_skip_flag = 1).
+                // Eligible iff:
+                //   * direct mode is the chosen winner above, AND
+                //   * residual (luma + chroma) quantises to all-zero.
+                //
+                // B_Skip carries NO further MB syntax — the decoder
+                // re-derives MVs / refIdxs via §8.4.1.2.2 spatial
+                // direct, applies the predictor, and moves on. The
+                // encoder's cbp_luma / cbp_chroma must therefore be 0.
+                let is_b_skip = is_direct && cbp_luma == 0 && cbp_chroma == 0;
+
+                // mb_skip_flag.
+                encode_mb_skip_flag(&mut cabac, &mut ctxs, SliceKind::B, &nb, is_b_skip);
+
+                if is_b_skip {
+                    // §9.3.3.1.1.5 — skipped MBs reset
+                    // prev_mb_qp_delta_nonzero (no qpd is emitted).
+                    prev_mb_qp_delta_nonzero = false;
+
+                    // Apply the direct predictor to the recon (no residual).
+                    for j in 0..16usize {
+                        for i in 0..16usize {
+                            let py = mb_y * 16 + j;
+                            let px = mb_x * 16 + i;
+                            recon_y[py * width + px] = pred_y[j * 16 + i].clamp(0, 255) as u8;
+                        }
+                    }
+                    for j in 0..8usize {
+                        for i in 0..8usize {
+                            let cy = mb_y * 8 + j;
+                            let cx = mb_x * 8 + i;
+                            recon_u[cy * chroma_w + cx] = pred_u[j * 8 + i].clamp(0, 255) as u8;
+                            recon_v[cy * chroma_w + cx] = pred_v[j * 8 + i].clamp(0, 255) as u8;
+                        }
+                    }
+                    // Update grid — record the per-8x8 direct MVs so
+                    // downstream MBs reading our slot get the right
+                    // §8.4.1.3 neighbour data.
+                    let info = grid.at_mut(mb_x, mb_y);
+                    info.available = true;
+                    info.is_intra = false;
+                    info.is_skip = true;
+                    info.is_b_skip_or_direct = true;
+                    info.cbp_luma = 0;
+                    info.cbp_chroma = 0;
+                    info.ref_idx_l0_8x8 = [direct.ref_idx_l0; 4];
+                    info.mv_l0_8x8 = direct.mv_l0_per_8x8;
+                    info.ref_idx_l1_8x8 = [direct.ref_idx_l1; 4];
+                    info.mv_l1_8x8 = direct.mv_l1_per_8x8;
+                    // mvd magnitudes stay zero (B_Skip carries no mvd).
+                    info.abs_mvd_l0_x = [0; 16];
+                    info.abs_mvd_l0_y = [0; 16];
+                    info.abs_mvd_l1_x = [0; 16];
+                    info.abs_mvd_l1_y = [0; 16];
+
+                    let mv_l0_t = (
+                        direct.mv_l0().x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        direct.mv_l0().y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    );
+                    mb_dbl[mb_addr] = MbDeblockInfo {
+                        is_intra: false,
+                        qp_y,
+                        luma_nonzero_4x4: 0,
+                        chroma_nonzero_4x4: 0,
+                        mv_l0: [mv_l0_t; 16],
+                        ref_idx_l0: [direct.ref_idx_l0.max(0) as i8; 4],
+                        ref_poc_l0: [0; 4],
+                        ..Default::default()
+                    };
+
+                    let is_last = mb_x + 1 == width_mbs && mb_y + 1 == height_mbs;
+                    encode_end_of_slice_flag(&mut cabac, is_last);
+                    continue;
+                }
 
                 // mb_type.
                 encode_mb_type_b(&mut cabac, &mut ctxs, &nb, chosen_mb_type);
 
-                let pred_kind = chosen_mb_type; // 1 = L0, 2 = L1, 3 = Bi
-                let uses_l0 = pred_kind == 1 || pred_kind == 3;
-                let uses_l1 = pred_kind == 2 || pred_kind == 3;
+                let pred_kind = chosen_mb_type; // 0 = Direct, 1 = L0, 2 = L1, 3 = Bi
+                let uses_l0_explicit = pred_kind == 1 || pred_kind == 3;
+                let uses_l1_explicit = pred_kind == 2 || pred_kind == 3;
 
                 // num_ref_idx_lN_active_minus1 = 0 in our PPS, so ref_idx_lN
-                // is NOT emitted (single ref per list).
+                // is NOT emitted (single ref per list). B_Direct_16x16
+                // also emits no mvd / ref_idx — the decoder re-derives
+                // them via §8.4.1.2.2.
 
-                // mvd_l0.
-                if uses_l0 {
-                    let mvd_x = 0i32;
-                    let mvd_y = 0i32;
+                // mvd_l0 (only for explicit B_L0 / B_Bi).
+                let (mvd_l0_x, mvd_l0_y) = if uses_l0_explicit {
+                    let mvd_x = mv_l0.x - mvp_l0.x;
+                    let mvd_y = mv_l0.y - mvp_l0.y;
                     let abs_l = grid
                         .left(mb_x, mb_y)
                         .map(|m| m.abs_mvd_l0_x[0])
@@ -1946,11 +2526,14 @@ impl Encoder {
                         .map(|m| m.abs_mvd_l0_y[0])
                         .unwrap_or(0);
                     encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, abs_l + abs_a, mvd_y);
-                }
+                    (mvd_x, mvd_y)
+                } else {
+                    (0i32, 0i32)
+                };
                 // mvd_l1.
-                if uses_l1 {
-                    let mvd_x = 0i32;
-                    let mvd_y = 0i32;
+                let (mvd_l1_x, mvd_l1_y) = if uses_l1_explicit {
+                    let mvd_x = mv_l1.x - mvp_l1.x;
+                    let mvd_y = mv_l1.y - mvp_l1.y;
                     let abs_l = grid
                         .left(mb_x, mb_y)
                         .map(|m| m.abs_mvd_l1_x[0])
@@ -1969,7 +2552,10 @@ impl Encoder {
                         .map(|m| m.abs_mvd_l1_y[0])
                         .unwrap_or(0);
                     encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, abs_l + abs_a, mvd_y);
-                }
+                    (mvd_x, mvd_y)
+                } else {
+                    (0i32, 0i32)
+                };
 
                 // coded_block_pattern.
                 encode_coded_block_pattern(&mut cabac, &mut ctxs, &nb, 1, cbp_luma, cbp_chroma);
@@ -1988,7 +2574,7 @@ impl Encoder {
                     let cur = grid.at_mut(mb_x, mb_y);
                     cur.is_intra = false;
                     cur.is_skip = false;
-                    cur.is_b_skip_or_direct = false;
+                    cur.is_b_skip_or_direct = is_direct;
                     cur.cbp_luma = cbp_luma;
                     cur.cbp_chroma = cbp_chroma;
                 }
@@ -2137,22 +2723,70 @@ impl Encoder {
                     }
                 }
 
-                // Update grid.
+                // Update grid — record real per-8x8 MVs / refIdxs for
+                // both lists so downstream MBs reading our slot get the
+                // right §8.4.1.3 neighbour data + §8.4.1.2.2 step-7
+                // colZeroFlag input. For B_Direct we use the §8.4.1.2.2
+                // derivation's per-8x8 MVs; for explicit-inter we use
+                // the chosen ME MVs (replicated across all 4 partitions
+                // since round-32 only emits 16x16 partitions in CABAC B).
                 let info = grid.at_mut(mb_x, mb_y);
                 info.available = true;
                 info.is_intra = false;
                 info.is_skip = false;
-                info.is_b_skip_or_direct = false;
+                info.is_b_skip_or_direct = is_direct;
                 info.cbp_luma = cbp_luma;
                 info.cbp_chroma = cbp_chroma;
-                if uses_l0 {
+                if is_direct {
+                    info.ref_idx_l0_8x8 = [direct.ref_idx_l0; 4];
+                    info.mv_l0_8x8 = direct.mv_l0_per_8x8;
+                    info.ref_idx_l1_8x8 = [direct.ref_idx_l1; 4];
+                    info.mv_l1_8x8 = direct.mv_l1_per_8x8;
                     info.abs_mvd_l0_x = [0; 16];
                     info.abs_mvd_l0_y = [0; 16];
-                }
-                if uses_l1 {
                     info.abs_mvd_l1_x = [0; 16];
                     info.abs_mvd_l1_y = [0; 16];
+                } else {
+                    if uses_l0_explicit {
+                        info.ref_idx_l0_8x8 = [0; 4];
+                        info.mv_l0_8x8 = [mv_l0; 4];
+                        info.abs_mvd_l0_x = [mvd_l0_x.unsigned_abs(); 16];
+                        info.abs_mvd_l0_y = [mvd_l0_y.unsigned_abs(); 16];
+                    } else {
+                        info.ref_idx_l0_8x8 = [-1; 4];
+                        info.mv_l0_8x8 = [Mv::ZERO; 4];
+                        info.abs_mvd_l0_x = [0; 16];
+                        info.abs_mvd_l0_y = [0; 16];
+                    }
+                    if uses_l1_explicit {
+                        info.ref_idx_l1_8x8 = [0; 4];
+                        info.mv_l1_8x8 = [mv_l1; 4];
+                        info.abs_mvd_l1_x = [mvd_l1_x.unsigned_abs(); 16];
+                        info.abs_mvd_l1_y = [mvd_l1_y.unsigned_abs(); 16];
+                    } else {
+                        info.ref_idx_l1_8x8 = [-1; 4];
+                        info.mv_l1_8x8 = [Mv::ZERO; 4];
+                        info.abs_mvd_l1_x = [0; 16];
+                        info.abs_mvd_l1_y = [0; 16];
+                    }
                 }
+
+                // Pick a representative L0 MV for the deblocker (used only
+                // when bS derivation references mv-identity between
+                // neighbours; B-slice deblock with all-same-MV MBs is
+                // numerically identical to all-zero so this is more for
+                // future-proofing).
+                let dbl_mv_l0 = if is_direct {
+                    direct.mv_l0()
+                } else if uses_l0_explicit {
+                    mv_l0
+                } else {
+                    Mv::ZERO
+                };
+                let mv_l0_t = (
+                    dbl_mv_l0.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    dbl_mv_l0.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                );
 
                 let cb_ac_per4x4: [bool; 4] = std::array::from_fn(|i| {
                     cbp_chroma == 2 && cb_ac_scan[i].iter().any(|&v| v != 0)
@@ -2165,7 +2799,7 @@ impl Encoder {
                     qp_y,
                     luma_nonzero_4x4: luma_nz_mask_from_blocks(&blk_has_nz),
                     chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_ac_per4x4, &cr_ac_per4x4),
-                    mv_l0: [(0, 0); 16],
+                    mv_l0: [mv_l0_t; 16],
                     ref_idx_l0: [0; 4],
                     ref_poc_l0: [0; 4],
                     ..Default::default()

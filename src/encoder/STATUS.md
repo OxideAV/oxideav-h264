@@ -1090,3 +1090,11 @@ remain unchanged.
   `EncoderConfig::cabac = true` and `profile_idc >= 77`. Produce
   Annex B streams that round-trip through this crate's decoder and
   through ffmpeg's libavcodec H.264 decoder bit-equivalently.
+- [`Encoder::encode_b_cabac`] (round 31) — CABAC B-slice entry point
+  (B_L0_16x16 / B_L1_16x16 / B_Bi_16x16, default-merge bipred). Round
+  32 extends the CABAC P + B paths with real quarter-pel ME (replacing
+  the round-30/31 forced MV=(0,0)) plus `B_Skip` / `B_Direct_16x16`
+  emission via the §8.4.1.2.2 spatial-direct derivation mirrored in
+  `cabac_b_spatial_direct_derive`. Per-8x8 / mixed `B_8x8`+all-Direct
+  CABAC variants + 4:2:2 / 4:4:4 P/B paths still deferred (they need a
+  CABAC sub_mb_type writer + Yuv422/Yuv444 chroma writer plumbing).
