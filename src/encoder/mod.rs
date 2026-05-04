@@ -220,6 +220,22 @@ pub struct EncoderConfig {
     /// CABAC is forbidden by Baseline profile (§A.2.1); enabling this
     /// flag requires `profile_idc >= 77` (Main).
     pub cabac: bool,
+    /// §7.4.2.1.1 / Annex A Table A-1 — `level_idc` to emit in the
+    /// SPS. Default: derived from `(width, height)` so the smallest
+    /// level whose `MaxFS` covers the picture is selected. A 720p
+    /// stream rounds up to 31 (Level 3.1, MaxFS = 3600 mb), 1080p to
+    /// 40 (Level 4, MaxFS = 8192 mb), 4K UHD to 51 (Level 5.1, MaxFS
+    /// = 36864 mb). Override when you know the actual constraint set
+    /// for the deployment (e.g. fixing a Level 4.0 cap because a
+    /// downstream decoder doesn't support 4.1+).
+    ///
+    /// Pre-config-flag behaviour was a hard-coded `level_idc = 30`
+    /// (Level 3, MaxFS 1620 mb = 720x576 SD). Encoding 720p / 1080p
+    /// content with that signalling produced spec-non-conformant
+    /// streams (PicSize > MaxFS) — strict decoders are entitled to
+    /// reject them. The new derivation closes that gap without
+    /// changing any other encoder behaviour.
+    pub level_idc: u8,
     /// §7.4.2.1.1 — `bit_depth_chroma_minus8`. Defaults to 0 (8-bit
     /// chroma). The current SPS writer ([`crate::encoder::sps`]) pins
     /// the emitted bit_depth fields at 0 — High10/422/444 with bit
@@ -234,6 +250,8 @@ pub struct EncoderConfig {
 
 impl EncoderConfig {
     pub fn new(width: u32, height: u32) -> Self {
+        let width_in_mbs = width.div_ceil(16);
+        let height_in_mbs = height.div_ceil(16);
         Self {
             width,
             height,
@@ -245,9 +263,62 @@ impl EncoderConfig {
             intra_in_inter: true,
             chroma_format_idc: 1,
             cabac: false,
+            level_idc: min_level_idc_for_picture_size(width_in_mbs, height_in_mbs),
             bit_depth_chroma_minus8: 0,
         }
     }
+}
+
+/// Annex A Table A-1 — pick the smallest `level_idc` whose MaxFS
+/// (max frame size in macroblocks) is at least `width_in_mbs *
+/// height_in_mbs`. Used by [`EncoderConfig::new`] to default the
+/// emitted SPS `level_idc` so 720p / 1080p / 4K encodes don't
+/// silently signal a too-low Level 3 (the historical hard-coded
+/// default).
+///
+/// The table walks from low to high so the caller could later cap
+/// to a downstream decoder's max supported level if needed. We
+/// include Levels 6.0 / 6.1 / 6.2 (added in the 2017+ revisions,
+/// MaxFS = 139264 each) so 8K UHD (480x270 mb) + larger settle on
+/// a real level rather than the previous 5.2 ceiling. Pictures
+/// beyond Level 6.2 (the highest in the 2024-08 edition) fall off
+/// the end and return 62 (the encoder will still emit it; whether
+/// a decoder honours it is its problem).
+///
+/// MaxFS values are pulled directly from §A.3.1 Table A-1.
+pub(crate) fn min_level_idc_for_picture_size(width_in_mbs: u32, height_in_mbs: u32) -> u8 {
+    let pic_size = width_in_mbs.saturating_mul(height_in_mbs);
+    // (level_idc, MaxFS) walking low→high; first hit wins.
+    const LEVELS: &[(u8, u32)] = &[
+        (10, 99),      // Level 1
+        (11, 396),     // Level 1.1
+        (12, 396),     // Level 1.2
+        (13, 396),     // Level 1.3
+        (20, 396),     // Level 2
+        (21, 792),     // Level 2.1
+        (22, 1_620),   // Level 2.2
+        (30, 1_620),   // Level 3
+        (31, 3_600),   // Level 3.1 (~720p)
+        (32, 5_120),   // Level 3.2
+        (40, 8_192),   // Level 4 (~1080p)
+        (41, 8_192),   // Level 4.1
+        (42, 8_704),   // Level 4.2
+        (50, 22_080),  // Level 5 (~2.5K)
+        (51, 36_864),  // Level 5.1 (~4K UHD)
+        (52, 36_864),  // Level 5.2
+        (60, 139_264), // Level 6 (~8K UHD)
+        (61, 139_264), // Level 6.1
+        (62, 139_264), // Level 6.2
+    ];
+    for &(level, max_fs) in LEVELS {
+        if pic_size <= max_fs {
+            return level;
+        }
+    }
+    // Pictures beyond every standardised level — emit the highest
+    // anyway so the SPS is at least syntactically valid; a strict
+    // decoder is entitled to reject the level + size pairing.
+    62
 }
 
 /// Encoder-side per-MB grid for the §8.3.1.1 / §6.4.11.4 neighbour
@@ -753,7 +824,7 @@ impl Encoder {
         // SPS / PPS bytes.
         let sps_cfg = BaselineSpsConfig {
             seq_parameter_set_id: 0,
-            level_idc: 30,
+            level_idc: self.cfg.level_idc,
             width_in_mbs: width_mbs,
             height_in_mbs: height_mbs,
             log2_max_frame_num_minus4: 4,
@@ -9177,5 +9248,69 @@ mod weighted_bipred_tests {
         assert_eq!(table.luma_weight_l1, 32);
         assert_eq!(table.luma_offset_l0, 0);
         assert_eq!(table.luma_offset_l1, 0);
+    }
+}
+
+#[cfg(test)]
+mod level_derivation_tests {
+    use super::*;
+
+    /// Annex A Table A-1 — `min_level_idc_for_picture_size` walks the
+    /// MaxFS column low→high and picks the first entry whose `MaxFS`
+    /// is at least the picture's `width_in_mbs * height_in_mbs`.
+    #[test]
+    fn min_level_idc_picks_smallest_covering_level() {
+        // QCIF 176x144 → 99 mb → Level 1 (MaxFS = 99).
+        assert_eq!(min_level_idc_for_picture_size(11, 9), 10);
+        // CIF 352x288 → 396 mb → Level 1.1 (first 396-bucket entry).
+        assert_eq!(min_level_idc_for_picture_size(22, 18), 11);
+        // 4CIF 704x576 → 1584 mb → Level 2.2 (MaxFS = 1620, first 1620
+        // bucket since 2.1 has 792 and 2 has 396).
+        assert_eq!(min_level_idc_for_picture_size(44, 36), 22);
+        // SD 720x576 → 1620 mb → Level 2.2 (1620 = MaxFS exact).
+        assert_eq!(min_level_idc_for_picture_size(45, 36), 22);
+        // 720p 1280x720 → 3600 mb → Level 3.1 (MaxFS = 3600 exact).
+        assert_eq!(min_level_idc_for_picture_size(80, 45), 31);
+        // 1080p 1920x1080 → 8160 mb → Level 4 (MaxFS = 8192).
+        assert_eq!(min_level_idc_for_picture_size(120, 68), 40);
+        // 4K UHD 3840x2160 → 32400 mb → Level 5.1 (MaxFS = 36864).
+        assert_eq!(min_level_idc_for_picture_size(240, 135), 51);
+        // 8K UHD 7680x4320 → 129600 mb → Level 6 (MaxFS = 139264).
+        assert_eq!(min_level_idc_for_picture_size(480, 270), 60);
+        // Pathological huge picture beyond every standardised level
+        // (e.g. 16K-equivalent) → cap at Level 6.2.
+        assert_eq!(min_level_idc_for_picture_size(1024, 1024), 62);
+    }
+
+    /// Default-derived encoder config picks the level via
+    /// [`min_level_idc_for_picture_size`]. Pre-fix the constructor
+    /// always emitted `level_idc = 30` regardless of size.
+    #[test]
+    fn encoder_config_default_level_matches_picture_size() {
+        // 64x64 (the synthetic test fixture) → 16 mb → Level 1.
+        let cfg = EncoderConfig::new(64, 64);
+        assert_eq!(cfg.level_idc, 10);
+
+        // 720p
+        let cfg = EncoderConfig::new(1280, 720);
+        assert_eq!(cfg.level_idc, 31);
+
+        // 1080p
+        let cfg = EncoderConfig::new(1920, 1080);
+        assert_eq!(cfg.level_idc, 40);
+
+        // 4K UHD
+        let cfg = EncoderConfig::new(3840, 2160);
+        assert_eq!(cfg.level_idc, 51);
+    }
+
+    /// Non-multiple-of-16 dimensions round up to whole MBs (the SPS
+    /// field is `pic_width_in_mbs_minus1`, which is in MB units).
+    #[test]
+    fn non_aligned_dimensions_round_up_to_whole_mbs() {
+        // 1920x1088 should equal 1920x1080 (both round to 120x68 mb).
+        assert_eq!(EncoderConfig::new(1920, 1088).level_idc, 40);
+        // 1920x1081 still rounds to 120x68 → Level 4.
+        assert_eq!(EncoderConfig::new(1920, 1081).level_idc, 40);
     }
 }

@@ -233,6 +233,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Encoder no longer emits `level_idc = 30` for HD/4K streams**
+  (§7.4.2.1.1 / Annex A Table A-1). The pre-fix encoder hard-coded
+  `level_idc = 30` (Level 3, MaxFS = 1620 mb = 720x576 SD) for
+  every emitted SPS regardless of picture size, producing
+  spec-non-conformant streams when encoding at 720p (3600 mb,
+  needs 3.1) / 1080p (8160 mb, needs 4.0) / 4K UHD (32400 mb,
+  needs 5.1) / 8K (129600 mb, needs 6.0). Strict decoders are
+  entitled to reject those streams.
+  * New `EncoderConfig::level_idc` field (u8). Default for new
+    configs is derived from `(width, height)` via the new
+    `min_level_idc_for_picture_size` helper, which walks Annex A
+    Table A-1 low-to-high and picks the first level whose `MaxFS`
+    covers the picture size in macroblocks. Includes Levels 1
+    through 6.2 (the full 2024-08 set).
+  * Hard-coded `level_idc: 30` removed from the two production
+    SPS-emit sites: `Encoder::encode_idr` (CAVLC path,
+    `src/encoder/mod.rs`) and `Encoder::encode_idr_cabac` (CABAC
+    path, `src/encoder/cabac_path.rs`). Test fixtures using small
+    synthetic dimensions (64x64) now correctly signal `level_idc = 10`.
+  * 3 new unit tests
+    (`encoder::level_derivation_tests::min_level_idc_picks_smallest_covering_level`,
+    `encoder_config_default_level_matches_picture_size`,
+    `non_aligned_dimensions_round_up_to_whole_mbs`) covering the
+    full Table A-1 walk plus dimension-rounding edge cases.
+
 - **Annex A Table A-1 — Level 1b vs Level 1.1 disambiguation**
   (§A.3.4.1). `max_dpb_mbs_for_level` now takes
   `constraint_set3_flag` and returns 396 (Level 1b) instead of 900

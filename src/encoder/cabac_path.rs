@@ -684,7 +684,7 @@ impl Encoder {
 
         let sps = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_parameter_set_id: 0,
-            level_idc: 30,
+            level_idc: cfg.level_idc,
             width_in_mbs: width_mbs as u32,
             height_in_mbs: height_mbs as u32,
             log2_max_frame_num_minus4: 4,
