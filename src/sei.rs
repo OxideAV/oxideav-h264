@@ -16,6 +16,7 @@
 //! | 5            | §D.1.7      | §D.2.7      | user_data_unregistered             |
 //! | 6            | §D.1.8      | §D.2.8      | recovery_point                     |
 //! | 19           | §D.1.21     | §D.2.21     | film_grain_characteristics         |
+//! | 22           | §D.1.24     | §D.2.24     | post_filter_hint                   |
 //! | 23           | §D.1.25     | §D.2.25     | tone_mapping_info                  |
 //! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
 //! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
@@ -45,6 +46,16 @@ pub enum SeiError {
         "film_grain num_model_values_minus1 must be in 0..=5 per §D.2.21 (got {got} for component {component})"
     )]
     FilmGrainNumModelValuesOutOfRange { component: usize, got: u8 },
+    #[error(
+        "post_filter_hint filter_hint_size_x / filter_hint_size_y must be in 1..=15 per §D.2.24 (got x={x}, y={y})"
+    )]
+    PostFilterHintSizeOutOfRange { x: u32, y: u32 },
+    #[error("post_filter_hint filter_hint_type 3 is reserved per §D.2.24")]
+    PostFilterHintTypeReserved,
+    #[error(
+        "post_filter_hint filter_hint_type 1 (two 1D FIRs) requires filter_hint_size_y == 2 per §D.2.24 (got {0})"
+    )]
+    PostFilterHintType1WrongHeight(u32),
 }
 
 /// §D.2.2 — buffering_period.
@@ -220,6 +231,31 @@ pub struct DisplayOrientation {
     pub anticlockwise_rotation: u16,
     pub repetition_period: u32,
     pub extension_flag: bool,
+}
+
+/// §D.2.24 — post_filter_hint.
+///
+/// Carries either FIR filter coefficients (1-D pair or 2-D) or a
+/// cross-correlation matrix between the original and the decoded
+/// signal, intended as a post-processing step after the picture is
+/// decoded, cropped, and output. One coefficient set per colour
+/// component (Y / Cb / Cr).
+///
+/// Per §D.2.24 the constraints policed here are:
+/// * `filter_hint_size_x`, `filter_hint_size_y` shall be in 1..=15;
+/// * `filter_hint_type` shall be in 0..=2 (3 is reserved);
+/// * `filter_hint_type == 1` (two 1-D FIRs) implies
+///   `filter_hint_size_y == 2`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostFilterHint {
+    pub filter_hint_size_x: u32,
+    pub filter_hint_size_y: u32,
+    pub filter_hint_type: u8,
+    /// `filter_hint_value[cIdx][cy][cx]` flattened in spec order:
+    /// outer = component (0..3), middle = `cy` (0..size_y), inner =
+    /// `cx` (0..size_x). Length = `3 * size_y * size_x`.
+    pub filter_hint_value: Vec<i32>,
+    pub additional_extension_flag: bool,
 }
 
 /// §D.2.25 — tone_mapping_info. HDR→SDR mapping parameters.
@@ -917,6 +953,60 @@ pub fn parse_alternative_transfer_characteristics(payload: &[u8]) -> Result<u8, 
     Ok(r.u(8)? as u8)
 }
 
+/// §D.2.24 — post_filter_hint (payload type 22).
+///
+/// Syntax (§D.1.24):
+/// ```text
+/// post_filter_hint( payloadSize ) {
+///   filter_hint_size_y                                    ue(v)
+///   filter_hint_size_x                                    ue(v)
+///   filter_hint_type                                      u(2)
+///   for( cIdx = 0; cIdx < 3; cIdx++ )
+///     for( cy = 0; cy < filter_hint_size_y; cy++ )
+///       for( cx = 0; cx < filter_hint_size_x; cx++ )
+///         filter_hint_value[ cIdx ][ cx ][ cy ]           se(v)
+///   additional_extension_flag                             u(1)
+/// }
+/// ```
+///
+/// Returns [`SeiError::PostFilterHintSizeOutOfRange`] if either size
+/// falls outside the §D.2.24 1..=15 range,
+/// [`SeiError::PostFilterHintTypeReserved`] if `filter_hint_type == 3`
+/// (reserved by ITU-T | ISO/IEC), and
+/// [`SeiError::PostFilterHintType1WrongHeight`] if
+/// `filter_hint_type == 1` but `filter_hint_size_y != 2`.
+pub fn parse_post_filter_hint(payload: &[u8]) -> Result<PostFilterHint, SeiError> {
+    let mut r = BitReader::new(payload);
+    let filter_hint_size_y = r.ue()?;
+    let filter_hint_size_x = r.ue()?;
+    if !(1..=15).contains(&filter_hint_size_y) || !(1..=15).contains(&filter_hint_size_x) {
+        return Err(SeiError::PostFilterHintSizeOutOfRange {
+            x: filter_hint_size_x,
+            y: filter_hint_size_y,
+        });
+    }
+    let filter_hint_type = r.u(2)? as u8;
+    if filter_hint_type == 3 {
+        return Err(SeiError::PostFilterHintTypeReserved);
+    }
+    if filter_hint_type == 1 && filter_hint_size_y != 2 {
+        return Err(SeiError::PostFilterHintType1WrongHeight(filter_hint_size_y));
+    }
+    let total = 3usize * filter_hint_size_y as usize * filter_hint_size_x as usize;
+    let mut filter_hint_value = Vec::with_capacity(total);
+    for _ in 0..total {
+        filter_hint_value.push(r.se()?);
+    }
+    let additional_extension_flag = r.u(1)? == 1;
+    Ok(PostFilterHint {
+        filter_hint_size_x,
+        filter_hint_size_y,
+        filter_hint_type,
+        filter_hint_value,
+        additional_extension_flag,
+    })
+}
+
 /// §D.2.25 — tone_mapping_info (payload type 23).
 ///
 /// Syntax (§D.1.25):
@@ -1216,6 +1306,7 @@ pub enum SeiPayload {
     PanScanRect(PanScanRect),
     RecoveryPoint(RecoveryPoint),
     FilmGrainCharacteristics(FilmGrainCharacteristics),
+    PostFilterHint(PostFilterHint),
     ToneMappingInfo(ToneMappingInfo),
     FramePackingArrangement(FramePackingArrangement),
     DisplayOrientation(DisplayOrientation),
@@ -1258,6 +1349,7 @@ pub fn parse_payload(
         19 => Ok(SeiPayload::FilmGrainCharacteristics(
             parse_film_grain_characteristics(payload)?,
         )),
+        22 => Ok(SeiPayload::PostFilterHint(parse_post_filter_hint(payload)?)),
         23 => Ok(SeiPayload::ToneMappingInfo(parse_tone_mapping_info(
             payload,
         )?)),
@@ -2105,6 +2197,129 @@ mod tests {
         match got {
             SeiPayload::FramePackingArrangement(f) => assert!(f.cancel_flag),
             other => panic!("expected FramePackingArrangement, got {:?}", other),
+        }
+    }
+
+    // §D.2.24 — post_filter_hint round-trip. 1x1 cross-correlation,
+    // each component carrying a single coefficient.
+    //
+    // size_y = 1, size_x = 1   → ue codeword "010" each
+    // type   = 2 (cross-corr)  → u(2) "10"
+    // c=0 coef = +5  → ue(9) = "0001010"  → se = 5  (codeword "0001010")
+    // c=1 coef = -3  → ue(6) = "00111"    → se = -3
+    // c=2 coef = 0   → "1"
+    // additional_extension_flag = 0
+    #[test]
+    fn post_filter_hint_basic_cross_correlation_1x1() {
+        let fields = [
+            (0b010, 3),     // ue(1) = 1 (size_y)
+            (0b010, 3),     // ue(1) = 1 (size_x)
+            (0b10, 2),      // type = 2
+            (0b0001010, 7), // se(+5)
+            (0b00111, 5),   // se(-3)
+            (1, 1),         // se(0)
+            (0, 1),         // additional_extension_flag = 0
+        ];
+        let payload = pack_bits(&fields);
+        let pfh = parse_post_filter_hint(&payload).unwrap();
+        assert_eq!(pfh.filter_hint_size_x, 1);
+        assert_eq!(pfh.filter_hint_size_y, 1);
+        assert_eq!(pfh.filter_hint_type, 2);
+        assert_eq!(pfh.filter_hint_value, vec![5, -3, 0]);
+        assert!(!pfh.additional_extension_flag);
+    }
+
+    // §D.2.24 — type=0 2-D FIR with size_y = 2, size_x = 3.
+    // Each component carries 6 coefficients. Use se(0) = "1" (1 bit
+    // each) to keep the fixture short. additional_extension_flag = 1.
+    #[test]
+    fn post_filter_hint_2d_fir_2x3() {
+        let mut fields = vec![
+            (0b011, 3),   // ue(2) = 2 (size_y)
+            (0b00100, 5), // ue(3) = 3 (size_x)
+            (0b00, 2),    // type = 0
+        ];
+        // 3 components × 2 rows × 3 cols = 18 se(0) coefficients.
+        for _ in 0..18 {
+            fields.push((1, 1));
+        }
+        fields.push((1, 1)); // additional_extension_flag = 1
+        let payload = pack_bits(&fields);
+        let pfh = parse_post_filter_hint(&payload).unwrap();
+        assert_eq!(pfh.filter_hint_size_y, 2);
+        assert_eq!(pfh.filter_hint_size_x, 3);
+        assert_eq!(pfh.filter_hint_type, 0);
+        assert_eq!(pfh.filter_hint_value.len(), 18);
+        assert!(pfh.filter_hint_value.iter().all(|&v| v == 0));
+        assert!(pfh.additional_extension_flag);
+    }
+
+    // §D.2.24 — type 1 (two 1-D FIRs) requires size_y == 2.
+    #[test]
+    fn post_filter_hint_type1_requires_height_two() {
+        let mut fields = vec![
+            (0b00100, 5), // ue(3) = 3 (size_y) — wrong (should be 2)
+            (0b010, 3),   // ue(1) = 1 (size_x)
+            (0b01, 2),    // type = 1
+        ];
+        for _ in 0..9 {
+            fields.push((1, 1));
+        }
+        fields.push((0, 1));
+        let payload = pack_bits(&fields);
+        let err = parse_post_filter_hint(&payload).unwrap_err();
+        assert_eq!(err, SeiError::PostFilterHintType1WrongHeight(3));
+    }
+
+    // §D.2.24 — filter_hint_size_x must be in 1..=15. ue(15) = "0001111",
+    // ue(16) = "000010001" (codeNum 16). Use size_x=16 to trip the
+    // out-of-range guard.
+    #[test]
+    fn post_filter_hint_rejects_size_out_of_range() {
+        let fields = [
+            (0b010, 3),       // ue(1) = 1 (size_y)
+            (0b000010001, 9), // ue(16) = 16 (size_x — out of range)
+        ];
+        let payload = pack_bits(&fields);
+        let err = parse_post_filter_hint(&payload).unwrap_err();
+        assert_eq!(err, SeiError::PostFilterHintSizeOutOfRange { x: 16, y: 1 });
+    }
+
+    // §D.2.24 — filter_hint_type 3 is reserved.
+    #[test]
+    fn post_filter_hint_rejects_reserved_type() {
+        let fields = [
+            (0b010, 3), // ue(1) = 1 (size_y)
+            (0b010, 3), // ue(1) = 1 (size_x)
+            (0b11, 2),  // type = 3 (reserved)
+        ];
+        let payload = pack_bits(&fields);
+        let err = parse_post_filter_hint(&payload).unwrap_err();
+        assert_eq!(err, SeiError::PostFilterHintTypeReserved);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_post_filter_hint() {
+        let ctx = SeiContext::default();
+        let fields = [
+            (0b010, 3), // ue(1) = 1 (size_y)
+            (0b010, 3), // ue(1) = 1 (size_x)
+            (0b10, 2),  // type = 2
+            (1, 1),     // se(0)
+            (1, 1),     // se(0)
+            (1, 1),     // se(0)
+            (0, 1),     // additional_extension_flag
+        ];
+        let payload = pack_bits(&fields);
+        let got = parse_payload(22, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::PostFilterHint(p) => {
+                assert_eq!(p.filter_hint_size_x, 1);
+                assert_eq!(p.filter_hint_size_y, 1);
+                assert_eq!(p.filter_hint_type, 2);
+                assert_eq!(p.filter_hint_value, vec![0, 0, 0]);
+            }
+            other => panic!("expected PostFilterHint, got {:?}", other),
         }
     }
 }

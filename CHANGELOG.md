@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SEI: `post_filter_hint` (payload type 22, §D.1.24 / §D.2.24)**.
+  Decodes the `filter_hint_size_y` / `filter_hint_size_x` ue(v)
+  dimensions, the `filter_hint_type` u(2) (0 = 2-D FIR, 1 = pair of
+  1-D FIRs, 2 = cross-correlation matrix), the `filter_hint_value
+  [cIdx][cy][cx]` se(v) coefficients (`3 * size_y * size_x` entries
+  flattened in spec order), and the trailing
+  `additional_extension_flag` u(1). Spec constraints policed:
+  * `filter_hint_size_y`, `filter_hint_size_x` ∈ 1..=15 →
+    `SeiError::PostFilterHintSizeOutOfRange`;
+  * `filter_hint_type == 3` (reserved) →
+    `SeiError::PostFilterHintTypeReserved`;
+  * `filter_hint_type == 1` ⇒ `filter_hint_size_y == 2` →
+    `SeiError::PostFilterHintType1WrongHeight`.
+  Wired into `parse_payload` and into `SeiPayload::PostFilterHint`.
+  6 new unit tests (1x1 cross-correlation round-trip, 2x3 type-0 2-D
+  FIR with 18 coefficients, type=1 wrong-height rejection,
+  size-out-of-range rejection, reserved-type rejection, dispatcher
+  wiring).
+
 - **SEI: `film_grain_characteristics` per-component intensity-interval body
   (§D.1.21 / §D.2.21).** Previously `parse_film_grain_characteristics`
   stopped after the three `comp_model_present_flag` bits and dropped the
