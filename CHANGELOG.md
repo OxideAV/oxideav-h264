@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SEI: `full_frame_freeze` (type 13), `full_frame_freeze_release`
+  (type 14), `full_frame_snapshot` (type 15), and
+  `deblocking_filter_display_preference` (type 20)**, covering §D.1.15 /
+  §D.1.16 / §D.1.17 / §D.1.22 and the corresponding semantics clauses.
+  All four are short single-element-or-flag-gated payloads:
+  * `FullFrameFreeze { full_frame_freeze_repetition_period: u32 }` —
+    one ue(v) field.
+  * `FullFrameFreezeRelease` — empty payload, surfaced as a unit
+    `SeiPayload::FullFrameFreezeRelease` variant.
+  * `FullFrameSnapshot { snapshot_id: u32 }` — one ue(v) field.
+  * `DeblockingFilterDisplayPreference { cancel_flag,
+    display_prior_to_deblocking_preferred_flag,
+    dec_frame_buffering_constraint_flag, repetition_period }` —
+    cancel-flag-gated body. When `cancel_flag` is true the body is
+    absent and the other fields default to zero / false per §D.2.22.
+  Wired into `parse_payload` and into `SeiPayload`. 8 new unit tests
+  including dispatcher round-trips and the empty-payload release path.
+
 - **SEI: `post_filter_hint` (payload type 22, §D.1.24 / §D.2.24)**.
   Decodes the `filter_hint_size_y` / `filter_hint_size_x` ue(v)
   dimensions, the `filter_hint_type` u(2) (0 = 2-D FIR, 1 = pair of

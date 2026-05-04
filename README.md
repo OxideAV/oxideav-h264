@@ -61,7 +61,7 @@ no packet is decoded.
 | CAVLC entropy decode | §9.2 | tables + primitives (residual_block_cavlc loop in place; nC derivation deferred to slice layer) |
 | CABAC entropy decode — engine | §9.3.1 / §9.3.3.2 | implemented (init + DecodeDecision/Bypass/Terminate) |
 | CABAC entropy decode — per-element binarisations + ctxIdx | §9.3.2 / §9.3.3.1 | implemented (mb_skip/mb_type/mvd/ref_idx/mb_qp_delta/cbp/cbf/sig_coeff/coeff_abs/sign/end_of_slice + intra pred mode flags; sub_mb_type and a few high-index init rows deferred) |
-| SEI payloads (buffering_period, pic_timing, pan_scan_rect, filler, user_data_registered_itu_t_t35, user_data_unreg, recovery_point, film_grain_characteristics, post_filter_hint, tone_mapping_info, frame_packing_arrangement, display_orientation, mastering_display, content_light_level, alternative_transfer_characteristics) | §D.2 | implemented (15 common types; film_grain incl. per-component model body; rest deferred) |
+| SEI payloads (buffering_period, pic_timing, pan_scan_rect, filler, user_data_registered_itu_t_t35, user_data_unreg, recovery_point, full_frame_freeze, full_frame_freeze_release, full_frame_snapshot, film_grain_characteristics, deblocking_filter_display_preference, post_filter_hint, tone_mapping_info, frame_packing_arrangement, display_orientation, mastering_display, content_light_level, alternative_transfer_characteristics) | §D.2 | implemented (19 common types; film_grain incl. per-component model body; rest deferred) |
 
 ### Encoder coverage
 

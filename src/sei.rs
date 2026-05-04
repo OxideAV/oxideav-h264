@@ -15,7 +15,11 @@
 //! | 4            | §D.1.6      | §D.2.6      | user_data_registered_itu_t_t35     |
 //! | 5            | §D.1.7      | §D.2.7      | user_data_unregistered             |
 //! | 6            | §D.1.8      | §D.2.8      | recovery_point                     |
+//! | 13           | §D.1.15     | §D.2.15     | full_frame_freeze                  |
+//! | 14           | §D.1.16     | §D.2.16     | full_frame_freeze_release          |
+//! | 15           | §D.1.17     | §D.2.17     | full_frame_snapshot                |
 //! | 19           | §D.1.21     | §D.2.21     | film_grain_characteristics         |
+//! | 20           | §D.1.22     | §D.2.22     | deblocking_filter_display_preference |
 //! | 22           | §D.1.24     | §D.2.24     | post_filter_hint                   |
 //! | 23           | §D.1.25     | §D.2.25     | tone_mapping_info                  |
 //! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
@@ -167,6 +171,39 @@ pub struct RecoveryPoint {
     pub exact_match_flag: bool,
     pub broken_link_flag: bool,
     pub changing_slice_group_idc: u8,
+}
+
+/// §D.2.15 — full_frame_freeze.
+///
+/// Asks the display layer to freeze the most recent output picture
+/// for `full_frame_freeze_repetition_period` decoded pictures (in
+/// output order); see §D.2.15 for the persistence semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullFrameFreeze {
+    pub full_frame_freeze_repetition_period: u32,
+}
+
+/// §D.2.17 — full_frame_snapshot.
+///
+/// Tags the current decoded picture as a still snapshot identified
+/// by `snapshot_id` (typically used to mark a frame for
+/// thumbnail / KLV-style external indexing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullFrameSnapshot {
+    pub snapshot_id: u32,
+}
+
+/// §D.2.22 — deblocking_filter_display_preference.
+///
+/// Producer hint for the display layer about whether to display the
+/// pre-deblocking-filter or post-deblocking-filter samples. When
+/// `cancel_flag` is true the body is absent (see §D.2.22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeblockingFilterDisplayPreference {
+    pub cancel_flag: bool,
+    pub display_prior_to_deblocking_preferred_flag: bool,
+    pub dec_frame_buffering_constraint_flag: bool,
+    pub repetition_period: u32,
 }
 
 /// §D.2.29 — mastering_display_colour_volume (HDR10).
@@ -755,6 +792,73 @@ pub fn parse_recovery_point(payload: &[u8]) -> Result<RecoveryPoint, SeiError> {
     })
 }
 
+/// §D.2.15 — full_frame_freeze (payload type 13).
+///
+/// Syntax (§D.1.15):
+/// ```text
+/// full_frame_freeze( payloadSize ) {
+///   full_frame_freeze_repetition_period   ue(v)
+/// }
+/// ```
+pub fn parse_full_frame_freeze(payload: &[u8]) -> Result<FullFrameFreeze, SeiError> {
+    let mut r = BitReader::new(payload);
+    let full_frame_freeze_repetition_period = r.ue()?;
+    Ok(FullFrameFreeze {
+        full_frame_freeze_repetition_period,
+    })
+}
+
+/// §D.2.17 — full_frame_snapshot (payload type 15).
+///
+/// Syntax (§D.1.17):
+/// ```text
+/// full_frame_snapshot( payloadSize ) {
+///   snapshot_id   ue(v)
+/// }
+/// ```
+pub fn parse_full_frame_snapshot(payload: &[u8]) -> Result<FullFrameSnapshot, SeiError> {
+    let mut r = BitReader::new(payload);
+    let snapshot_id = r.ue()?;
+    Ok(FullFrameSnapshot { snapshot_id })
+}
+
+/// §D.2.22 — deblocking_filter_display_preference (payload type 20).
+///
+/// Syntax (§D.1.22):
+/// ```text
+/// deblocking_filter_display_preference( payloadSize ) {
+///   deblocking_display_preference_cancel_flag                 u(1)
+///   if( !deblocking_display_preference_cancel_flag ) {
+///     display_prior_to_deblocking_preferred_flag              u(1)
+///     dec_frame_buffering_constraint_flag                     u(1)
+///     deblocking_display_preference_repetition_period         ue(v)
+///   }
+/// }
+/// ```
+pub fn parse_deblocking_filter_display_preference(
+    payload: &[u8],
+) -> Result<DeblockingFilterDisplayPreference, SeiError> {
+    let mut r = BitReader::new(payload);
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(DeblockingFilterDisplayPreference {
+            cancel_flag,
+            display_prior_to_deblocking_preferred_flag: false,
+            dec_frame_buffering_constraint_flag: false,
+            repetition_period: 0,
+        });
+    }
+    let display_prior_to_deblocking_preferred_flag = r.u(1)? == 1;
+    let dec_frame_buffering_constraint_flag = r.u(1)? == 1;
+    let repetition_period = r.ue()?;
+    Ok(DeblockingFilterDisplayPreference {
+        cancel_flag,
+        display_prior_to_deblocking_preferred_flag,
+        dec_frame_buffering_constraint_flag,
+        repetition_period,
+    })
+}
+
 /// §D.2.29 — mastering_display_colour_volume (HDR10 metadata).
 ///
 /// Syntax (§D.1.29):
@@ -1305,7 +1409,12 @@ pub enum SeiPayload {
     UserDataUnregistered(UserDataUnregistered),
     PanScanRect(PanScanRect),
     RecoveryPoint(RecoveryPoint),
+    FullFrameFreeze(FullFrameFreeze),
+    /// §D.2.16 — full_frame_freeze_release. Empty payload.
+    FullFrameFreezeRelease,
+    FullFrameSnapshot(FullFrameSnapshot),
     FilmGrainCharacteristics(FilmGrainCharacteristics),
+    DeblockingFilterDisplayPreference(DeblockingFilterDisplayPreference),
     PostFilterHint(PostFilterHint),
     ToneMappingInfo(ToneMappingInfo),
     FramePackingArrangement(FramePackingArrangement),
@@ -1346,8 +1455,18 @@ pub fn parse_payload(
             parse_user_data_unregistered(payload)?,
         )),
         6 => Ok(SeiPayload::RecoveryPoint(parse_recovery_point(payload)?)),
+        13 => Ok(SeiPayload::FullFrameFreeze(parse_full_frame_freeze(
+            payload,
+        )?)),
+        14 => Ok(SeiPayload::FullFrameFreezeRelease),
+        15 => Ok(SeiPayload::FullFrameSnapshot(parse_full_frame_snapshot(
+            payload,
+        )?)),
         19 => Ok(SeiPayload::FilmGrainCharacteristics(
             parse_film_grain_characteristics(payload)?,
+        )),
+        20 => Ok(SeiPayload::DeblockingFilterDisplayPreference(
+            parse_deblocking_filter_display_preference(payload)?,
         )),
         22 => Ok(SeiPayload::PostFilterHint(parse_post_filter_hint(payload)?)),
         23 => Ok(SeiPayload::ToneMappingInfo(parse_tone_mapping_info(
@@ -2320,6 +2439,99 @@ mod tests {
                 assert_eq!(p.filter_hint_value, vec![0, 0, 0]);
             }
             other => panic!("expected PostFilterHint, got {:?}", other),
+        }
+    }
+
+    // §D.2.15 — full_frame_freeze: single ue(v) repetition_period.
+    #[test]
+    fn full_frame_freeze_basic() {
+        // ue(7) = "0001000" (7 bits).
+        let payload = pack_bits(&[(0b0001000, 7)]);
+        let fff = parse_full_frame_freeze(&payload).unwrap();
+        assert_eq!(fff.full_frame_freeze_repetition_period, 7);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_full_frame_freeze() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(0b010, 3)]); // ue(1) = 1
+        let got = parse_payload(13, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::FullFrameFreeze(f) => {
+                assert_eq!(f.full_frame_freeze_repetition_period, 1);
+            }
+            other => panic!("expected FullFrameFreeze, got {:?}", other),
+        }
+    }
+
+    // §D.2.16 — full_frame_freeze_release: empty payload, dispatch
+    // returns the unit variant.
+    #[test]
+    fn parse_payload_dispatches_full_frame_freeze_release() {
+        let ctx = SeiContext::default();
+        let got = parse_payload(14, &[], &ctx).unwrap();
+        assert_eq!(got, SeiPayload::FullFrameFreezeRelease);
+    }
+
+    // §D.2.17 — full_frame_snapshot: single ue(v) snapshot_id.
+    #[test]
+    fn full_frame_snapshot_basic() {
+        // ue(42) = codeNum 42, 42+1 = 43 = 0b101011 (6 bits), so k=5
+        // → "00000 1 01011" = "00000101011" (11 bits).
+        let payload = pack_bits(&[(0b00000101011, 11)]);
+        let snap = parse_full_frame_snapshot(&payload).unwrap();
+        assert_eq!(snap.snapshot_id, 42);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_full_frame_snapshot() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(0b010, 3)]); // ue(1) = 1
+        let got = parse_payload(15, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::FullFrameSnapshot(s) => assert_eq!(s.snapshot_id, 1),
+            other => panic!("expected FullFrameSnapshot, got {:?}", other),
+        }
+    }
+
+    // §D.2.22 — deblocking_filter_display_preference: cancel_flag path.
+    #[test]
+    fn deblocking_filter_display_preference_cancel() {
+        let payload = pack_bits(&[(1, 1)]); // cancel_flag=1
+        let p = parse_deblocking_filter_display_preference(&payload).unwrap();
+        assert!(p.cancel_flag);
+        assert!(!p.display_prior_to_deblocking_preferred_flag);
+        assert!(!p.dec_frame_buffering_constraint_flag);
+        assert_eq!(p.repetition_period, 0);
+    }
+
+    // §D.2.22 — deblocking_filter_display_preference: full body.
+    #[test]
+    fn deblocking_filter_display_preference_full_body() {
+        let payload = pack_bits(&[
+            (0, 1),     // cancel_flag = 0
+            (1, 1),     // display_prior_to_deblocking_preferred_flag = 1
+            (0, 1),     // dec_frame_buffering_constraint_flag = 0
+            (0b011, 3), // ue(2) = 2 (repetition_period)
+        ]);
+        let p = parse_deblocking_filter_display_preference(&payload).unwrap();
+        assert!(!p.cancel_flag);
+        assert!(p.display_prior_to_deblocking_preferred_flag);
+        assert!(!p.dec_frame_buffering_constraint_flag);
+        assert_eq!(p.repetition_period, 2);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_deblocking_filter_display_preference() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(1, 1)]); // cancel_flag=1
+        let got = parse_payload(20, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::DeblockingFilterDisplayPreference(p) => assert!(p.cancel_flag),
+            other => panic!(
+                "expected DeblockingFilterDisplayPreference, got {:?}",
+                other
+            ),
         }
     }
 }
