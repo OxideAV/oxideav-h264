@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SEI: `user_data_registered_itu_t_t35` (payload type 4) + `pan_scan_rect`
+  (payload type 2)** (§D.1.4 / §D.2.4, §D.1.6 / §D.2.6). Both are
+  upgraded from `SeiPayload::Unknown { payload, .. }` round-tripping
+  to fully-typed payloads in the `parse_payload` dispatch.
+  * `parse_user_data_registered_itu_t_t35` returns
+    `(country_code, country_code_extension, payload_bytes)`. Country
+    code 0xFF triggers the §D.1.6 / Recommendation ITU-T T.35 §3.1
+    extension-byte read; an empty payload — or a 0xFF country code
+    with no extension byte to follow — is rejected with
+    `SeiError::RegisteredUserDataMissingCountryCode`. Real-world
+    consumers (ATSC A/53 closed captions, AFD, ATSC bar data,
+    HDR10+ dynamic metadata, Dolby Vision RPU) all ride on this
+    payload, distinguished by the country / provider tuple plus the
+    leading bytes of `payload_bytes`.
+  * `parse_pan_scan_rect` returns `pan_scan_rect_id`, `cancel_flag`,
+    and (when not cancelled) a `Vec<PanScanRectOffsets>` plus a
+    `repetition_period`. The §D.2.4 `pan_scan_cnt_minus1 ∈ 0..=2`
+    constraint is policed lazily — counts up to 31 are accepted but
+    32+ rejected with `SeiError::PanScanCountTooLarge` to avoid
+    pathological allocations on malformed streams.
+  * 11 new unit tests (`registered_user_data_*` ×5, `pan_scan_rect_*`
+    ×3, `parse_payload_dispatches_*` ×3) including hand-derived
+    Exp-Golomb encodings of the offsets test vector.
+
 - **Decoder honours SPS `bit_depth_luma_minus8` / `bit_depth_chroma_minus8`
   in `picture_to_video_frame`** (task #259). When a High10 / High 4:2:2
   / High 4:4:4 Predictive stream declares 9..=14-bit samples, the

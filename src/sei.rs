@@ -10,7 +10,9 @@
 //! | ------------ | ----------- | ----------- | ---------------------------------- |
 //! | 0            | §D.1.2      | §D.2.2      | buffering_period                   |
 //! | 1            | §D.1.3      | §D.2.3      | pic_timing                         |
+//! | 2            | §D.1.4      | §D.2.4      | pan_scan_rect                      |
 //! | 3            | §D.1.5      | §D.2.5      | filler_payload                     |
+//! | 4            | §D.1.6      | §D.2.6      | user_data_registered_itu_t_t35     |
 //! | 5            | §D.1.7      | §D.2.7      | user_data_unregistered             |
 //! | 6            | §D.1.8      | §D.2.8      | recovery_point                     |
 //! | 19           | §D.1.21     | §D.2.21     | film_grain_characteristics         |
@@ -35,6 +37,10 @@ pub enum SeiError {
     UserDataTooShort(usize),
     #[error("filler_payload contains a byte that is not 0xFF at position {0}")]
     FillerNonFfAt(usize),
+    #[error("user_data_registered_itu_t_t35 payload must contain at least the country code byte")]
+    RegisteredUserDataMissingCountryCode,
+    #[error("pan_scan_rect_cnt_minus1 must be < 32 per §D.2.4 (got {0})")]
+    PanScanCountTooLarge(u32),
 }
 
 /// §D.2.2 — buffering_period.
@@ -85,6 +91,58 @@ pub struct ClockTimestamp {
 pub struct UserDataUnregistered {
     pub uuid: [u8; 16],
     pub user_data: Vec<u8>,
+}
+
+/// §D.2.6 — user_data_registered_itu_t_t35.
+///
+/// The single most common SEI in real-world H.264 streams: ATSC A/53
+/// closed captions, AFD, ATSC bar data, HDR10+ dynamic metadata, and
+/// Dolby Vision RPU all ride on this payload, distinguished by their
+/// `(country_code, country_code_extension)` pair plus the leading bytes
+/// of `payload_bytes`. We surface the raw triple — the per-vendor
+/// payload format is out of scope for this layer (callers can switch
+/// on `country_code` / `country_code_extension` and parse `payload_bytes`
+/// against the relevant T.35 terminal-provider spec).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDataRegisteredItuTT35 {
+    /// itu_t_t35_country_code (u(8)). 0xB5 = USA, 0x26 = China, etc.
+    pub country_code: u8,
+    /// itu_t_t35_country_code_extension_byte (u(8)). Only present when
+    /// `country_code == 0xFF` (per §D.1.6); `None` otherwise.
+    pub country_code_extension: Option<u8>,
+    /// Remaining `itu_t_t35_payload_byte`s after the country code(s).
+    pub payload_bytes: Vec<u8>,
+}
+
+/// §D.2.4 — pan_scan_rect.
+///
+/// Carries one or more rectangles signalling the producer's preferred
+/// display crop (commonly used to letterbox/pillarbox 4:3 content
+/// inside a 16:9 frame, or vice-versa). Each rectangle's offsets are
+/// expressed in units of 1/16 sample (per §D.2.4) relative to the
+/// coded picture rectangle, and a positive offset shrinks the rectangle
+/// from that edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanScanRect {
+    pub pan_scan_rect_id: u32,
+    pub cancel_flag: bool,
+    /// Present only when `cancel_flag == false`.
+    pub body: Option<PanScanRectBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanScanRectBody {
+    /// One entry per rectangle (length = pan_scan_cnt_minus1 + 1).
+    pub rects: Vec<PanScanRectOffsets>,
+    pub repetition_period: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanScanRectOffsets {
+    pub left_offset: i32,
+    pub right_offset: i32,
+    pub top_offset: i32,
+    pub bottom_offset: i32,
 }
 
 /// §D.2.8 — recovery_point.
@@ -476,6 +534,112 @@ pub fn parse_filler_payload(payload: &[u8]) -> Result<(), SeiError> {
         }
     }
     Ok(())
+}
+
+/// §D.2.6 — user_data_registered_itu_t_t35.
+///
+/// Syntax (§D.1.6):
+/// ```text
+/// user_data_registered_itu_t_t35( payloadSize ) {
+///   itu_t_t35_country_code                          b(8)
+///   if( itu_t_t35_country_code == 0xFF )
+///     itu_t_t35_country_code_extension_byte         b(8)
+///   for( i = ...; i < payloadSize; i++ )
+///     itu_t_t35_payload_byte                        b(8)
+/// }
+/// ```
+///
+/// All fields are byte-aligned per §D.1.6, so we read straight from
+/// the slice without going through the bit-reader. The extension byte
+/// is consumed only when `country_code == 0xFF` per Recommendation
+/// ITU-T T.35 §3.1.
+pub fn parse_user_data_registered_itu_t_t35(
+    payload: &[u8],
+) -> Result<UserDataRegisteredItuTT35, SeiError> {
+    let Some((&country_code, rest)) = payload.split_first() else {
+        return Err(SeiError::RegisteredUserDataMissingCountryCode);
+    };
+    let (country_code_extension, payload_bytes) = if country_code == 0xFF {
+        match rest.split_first() {
+            Some((&ext, body)) => (Some(ext), body.to_vec()),
+            // §D.1.6 / T.35 §3.1: when country_code is the escape value
+            // 0xFF, the extension byte is required. A truncated payload
+            // here is malformed.
+            None => return Err(SeiError::RegisteredUserDataMissingCountryCode),
+        }
+    } else {
+        (None, rest.to_vec())
+    };
+    Ok(UserDataRegisteredItuTT35 {
+        country_code,
+        country_code_extension,
+        payload_bytes,
+    })
+}
+
+/// §D.2.4 — pan_scan_rect.
+///
+/// Syntax (§D.1.4):
+/// ```text
+/// pan_scan_rect( payloadSize ) {
+///   pan_scan_rect_id                                ue(v)
+///   pan_scan_rect_cancel_flag                       u(1)
+///   if( !pan_scan_rect_cancel_flag ) {
+///     pan_scan_cnt_minus1                           ue(v)
+///     for( i = 0; i <= pan_scan_cnt_minus1; i++ ) {
+///       pan_scan_rect_left_offset[ i ]              se(v)
+///       pan_scan_rect_right_offset[ i ]             se(v)
+///       pan_scan_rect_top_offset[ i ]               se(v)
+///       pan_scan_rect_bottom_offset[ i ]            se(v)
+///     }
+///     pan_scan_rect_repetition_period               ue(v)
+///   }
+/// }
+/// ```
+///
+/// Per §D.2.4 `pan_scan_cnt_minus1` is constrained to `0..=2` (so the
+/// payload carries at most three rectangles); we accept up to 31 to
+/// stay forgiving of streams that exceed the constraint, but reject
+/// counts that are obviously out of range to avoid pathological
+/// allocations.
+pub fn parse_pan_scan_rect(payload: &[u8]) -> Result<PanScanRect, SeiError> {
+    let mut r = BitReader::new(payload);
+    let pan_scan_rect_id = r.ue()?;
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(PanScanRect {
+            pan_scan_rect_id,
+            cancel_flag,
+            body: None,
+        });
+    }
+    let cnt_minus1 = r.ue()?;
+    if cnt_minus1 >= 32 {
+        return Err(SeiError::PanScanCountTooLarge(cnt_minus1));
+    }
+    let count = (cnt_minus1 as usize).saturating_add(1);
+    let mut rects = Vec::with_capacity(count);
+    for _ in 0..count {
+        let left = r.se()?;
+        let right = r.se()?;
+        let top = r.se()?;
+        let bottom = r.se()?;
+        rects.push(PanScanRectOffsets {
+            left_offset: left,
+            right_offset: right,
+            top_offset: top,
+            bottom_offset: bottom,
+        });
+    }
+    let repetition_period = r.ue()?;
+    Ok(PanScanRect {
+        pan_scan_rect_id,
+        cancel_flag,
+        body: Some(PanScanRectBody {
+            rects,
+            repetition_period,
+        }),
+    })
 }
 
 /// §D.2.7 — user_data_unregistered.
@@ -958,7 +1122,9 @@ pub enum SeiPayload {
     BufferingPeriod(BufferingPeriod),
     PicTiming(PicTiming),
     FillerPayload,
+    UserDataRegisteredItuTT35(UserDataRegisteredItuTT35),
     UserDataUnregistered(UserDataUnregistered),
+    PanScanRect(PanScanRect),
     RecoveryPoint(RecoveryPoint),
     FilmGrainCharacteristics(FilmGrainCharacteristics),
     ToneMappingInfo(ToneMappingInfo),
@@ -988,10 +1154,14 @@ pub fn parse_payload(
             payload, ctx,
         )?)),
         1 => Ok(SeiPayload::PicTiming(parse_pic_timing(payload, ctx)?)),
+        2 => Ok(SeiPayload::PanScanRect(parse_pan_scan_rect(payload)?)),
         3 => {
             parse_filler_payload(payload)?;
             Ok(SeiPayload::FillerPayload)
         }
+        4 => Ok(SeiPayload::UserDataRegisteredItuTT35(
+            parse_user_data_registered_itu_t_t35(payload)?,
+        )),
         5 => Ok(SeiPayload::UserDataUnregistered(
             parse_user_data_unregistered(payload)?,
         )),
@@ -1241,6 +1411,142 @@ mod tests {
         let ctx = SeiContext::default();
         let got = parse_payload(3, &[0xFF; 4], &ctx).unwrap();
         assert_eq!(got, SeiPayload::FillerPayload);
+    }
+
+    // §D.2.6 — user_data_registered_itu_t_t35.
+    //
+    // Country code 0xB5 (USA) is the headline real-world case: A/53
+    // closed-caption SEI uses (country_code=0xB5, provider_code=0x0031,
+    // provider_user_id="GA94"); HDR10+ uses (0xB5, 0x003C); Dolby
+    // Vision uses (country_code=0x4D, no extension).
+    #[test]
+    fn registered_user_data_us_country_no_extension() {
+        // 0xB5 (USA) + payload {0x00, 0x31, b"GA94"}
+        let payload = [0xB5, 0x00, 0x31, b'G', b'A', b'9', b'4'];
+        let got = parse_user_data_registered_itu_t_t35(&payload).unwrap();
+        assert_eq!(got.country_code, 0xB5);
+        assert_eq!(got.country_code_extension, None);
+        assert_eq!(got.payload_bytes, &[0x00, 0x31, b'G', b'A', b'9', b'4']);
+    }
+
+    #[test]
+    fn registered_user_data_escape_country_takes_extension_byte() {
+        // 0xFF (escape) + extension 0x42 + payload {0x00, 0x01}
+        let payload = [0xFF, 0x42, 0x00, 0x01];
+        let got = parse_user_data_registered_itu_t_t35(&payload).unwrap();
+        assert_eq!(got.country_code, 0xFF);
+        assert_eq!(got.country_code_extension, Some(0x42));
+        assert_eq!(got.payload_bytes, &[0x00, 0x01]);
+    }
+
+    #[test]
+    fn registered_user_data_empty_payload_after_country_code_is_ok() {
+        let payload = [0xB5];
+        let got = parse_user_data_registered_itu_t_t35(&payload).unwrap();
+        assert_eq!(got.country_code, 0xB5);
+        assert_eq!(got.country_code_extension, None);
+        assert!(got.payload_bytes.is_empty());
+    }
+
+    #[test]
+    fn registered_user_data_empty_payload_rejected() {
+        let err = parse_user_data_registered_itu_t_t35(&[]).unwrap_err();
+        assert_eq!(err, SeiError::RegisteredUserDataMissingCountryCode);
+    }
+
+    #[test]
+    fn registered_user_data_escape_without_extension_rejected() {
+        // country_code=0xFF requires the extension byte to follow.
+        let err = parse_user_data_registered_itu_t_t35(&[0xFF]).unwrap_err();
+        assert_eq!(err, SeiError::RegisteredUserDataMissingCountryCode);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_registered_user_data() {
+        let ctx = SeiContext::default();
+        let payload = [0xB5, 0x00, 0x31, b'G', b'A', b'9', b'4'];
+        let got = parse_payload(4, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::UserDataRegisteredItuTT35(u) => {
+                assert_eq!(u.country_code, 0xB5);
+                assert_eq!(u.payload_bytes, &[0x00, 0x31, b'G', b'A', b'9', b'4']);
+            }
+            other => panic!("expected UserDataRegisteredItuTT35, got {:?}", other),
+        }
+    }
+
+    // §D.2.4 — pan_scan_rect.
+    #[test]
+    fn pan_scan_rect_cancel_flag_only() {
+        // id = 0 → ue "1"; cancel_flag = 1 → 1 bit. Total 2 bits.
+        let payload = pack_bits(&[(1, 1), (1, 1)]);
+        let got = parse_pan_scan_rect(&payload).unwrap();
+        assert_eq!(got.pan_scan_rect_id, 0);
+        assert!(got.cancel_flag);
+        assert!(got.body.is_none());
+    }
+
+    #[test]
+    fn pan_scan_rect_single_rectangle_with_offsets() {
+        // id = 0 (ue "1"), cancel_flag = 0, cnt_minus1 = 0 (ue "1"),
+        // four se() offsets (left=2, right=-2, top=4, bottom=-4),
+        // repetition_period = 1 (ue "010").
+        //
+        // se(2)  → ue(3) → 5 bits "00100"
+        // se(-2) → ue(4) → 5 bits "00101"
+        // se(4)  → ue(7) → 7 bits "0001000"
+        // se(-4) → ue(8) → 7 bits "0001001"
+        // ue(1)  → 3 bits "010"
+        let fields = [
+            (1, 1), // id = 0
+            (0, 1), // cancel = 0
+            (1, 1), // cnt_minus1 = 0
+            (0b00100, 5),
+            (0b00101, 5),
+            (0b0001000, 7),
+            (0b0001001, 7),
+            (0b010, 3),
+        ];
+        let payload = pack_bits(&fields);
+        let got = parse_pan_scan_rect(&payload).unwrap();
+        assert_eq!(got.pan_scan_rect_id, 0);
+        assert!(!got.cancel_flag);
+        let body = got.body.expect("body present when cancel_flag = 0");
+        assert_eq!(body.rects.len(), 1);
+        assert_eq!(body.rects[0].left_offset, 2);
+        assert_eq!(body.rects[0].right_offset, -2);
+        assert_eq!(body.rects[0].top_offset, 4);
+        assert_eq!(body.rects[0].bottom_offset, -4);
+        assert_eq!(body.repetition_period, 1);
+    }
+
+    #[test]
+    fn pan_scan_rect_pathological_count_rejected() {
+        // id = 0 (ue "1"), cancel = 0, cnt_minus1 = 32 (ue "0000010_0001",
+        // 11 bits) — beyond our 32-rectangle ceiling.
+        let fields = [
+            (1, 1),
+            (0, 1),
+            (0b00000_100001, 11), // ue(32) = 11 bits "00000100001"
+        ];
+        let payload = pack_bits(&fields);
+        let err = parse_pan_scan_rect(&payload).unwrap_err();
+        assert_eq!(err, SeiError::PanScanCountTooLarge(32));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_pan_scan_rect() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(1, 1), (1, 1)]); // cancel-flag only
+        let got = parse_payload(2, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::PanScanRect(p) => {
+                assert_eq!(p.pan_scan_rect_id, 0);
+                assert!(p.cancel_flag);
+                assert!(p.body.is_none());
+            }
+            other => panic!("expected PanScanRect, got {:?}", other),
+        }
     }
 
     #[test]
