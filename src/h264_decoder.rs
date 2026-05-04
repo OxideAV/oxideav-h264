@@ -1290,8 +1290,8 @@ fn output_dpb_sizing(sps: &Sps) -> (u32, u32) {
 /// permitting at least one reference picture.
 fn max_dpb_mbs_for_level(level_idc: u8, constraint_set3_flag: bool) -> u32 {
     match level_idc {
-        9 => 396,    // Level 1b (Baseline / Constrained Baseline shorthand)
-        10 => 396,   // level 1
+        9 => 396,  // Level 1b (Baseline / Constrained Baseline shorthand)
+        10 => 396, // level 1
         11 => {
             if constraint_set3_flag {
                 396 // Level 1b
@@ -2137,7 +2137,7 @@ mod tests {
             offset_for_ref_frame: Vec::new(),
             max_num_ref_frames: 1,
             gaps_in_frame_num_value_allowed_flag: false,
-            pic_width_in_mbs_minus1: 10, // 11 MBs wide → 176 px
+            pic_width_in_mbs_minus1: 10,       // 11 MBs wide → 176 px
             pic_height_in_map_units_minus1: 8, // 9 map units high
             frame_mbs_only_flag: true,
             mb_adaptive_frame_field_flag: false,
