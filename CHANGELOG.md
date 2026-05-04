@@ -233,6 +233,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Annex A Table A-1 — Level 1b vs Level 1.1 disambiguation**
+  (§A.3.4.1). `max_dpb_mbs_for_level` now takes
+  `constraint_set3_flag` and returns 396 (Level 1b) instead of 900
+  (Level 1.1) when `level_idc == 11 && constraint_set3_flag == 1`.
+  The shorthand `level_idc == 9` (Baseline / Constrained Baseline
+  Level 1b form) also returns 396. Fixes a real over-allocation in
+  the §A.3.1 / §C.4 DPB reorder-window floor: a 176x144 QCIF
+  Level 1b stream (real PicSize = 99 MBs) now floors at 4 reorder
+  frames, not 9, matching the spec cap. Two new regression tests
+  (`max_dpb_mbs_level_1b_versus_level_1_1`,
+  `level_1b_qcif_stream_sized_at_level_1b_cap_not_level_1_1`).
+
 - **DPB output ordering when a real-world encoder under-reports
   `max_num_reorder_frames` in SPS VUI** (§E.2.1 / §A.3.1).
   `output_dpb_sizing` now floors the reorder window at the

@@ -1239,7 +1239,13 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
 /// when the queue is full (cap of 0 would deadlock the queue).
 fn output_dpb_sizing(sps: &Sps) -> (u32, u32) {
     // Level-derived cap (§A.3.1 item h, Annex A Table A-1).
-    let max_dpb_mbs = max_dpb_mbs_for_level(sps.level_idc);
+    // §A.3.4.1 — bit 3 of `constraint_set_flags` is constraint_set3_flag,
+    // which in combination with `level_idc == 11` signals Level 1b
+    // (MaxDpbMbs = 396, same as Level 1) rather than Level 1.1
+    // (MaxDpbMbs = 900). For all other level_idc values the flag is
+    // ignored.
+    let constraint_set3_flag = (sps.constraint_set_flags & 0b0000_1000) != 0;
+    let max_dpb_mbs = max_dpb_mbs_for_level(sps.level_idc, constraint_set3_flag);
     let pic_size_mbs = sps
         .pic_width_in_mbs()
         .saturating_mul(sps.frame_height_in_mbs())
@@ -1270,18 +1276,29 @@ fn output_dpb_sizing(sps: &Sps) -> (u32, u32) {
 /// Annex A Table A-1 — `MaxDpbMbs` per `level_idc`.
 ///
 /// `level_idc` is the raw `u8` from §7.4.2.1.1; intermediate levels
-/// (e.g. 2.1) are encoded as `10 * <level>` so `21 → 2.1`. Level 1b
-/// is signalled via `constraint_set3_flag` alongside `level_idc == 11`
-/// which carries MaxDpbMbs = 396 (same as level 1.1), so we treat 11
-/// conservatively as 1.1.
+/// (e.g. 2.1) are encoded as `10 * <level>` so `21 → 2.1`.
+///
+/// **Level 1b disambiguation**: `level_idc == 11` is shared between
+/// Level 1.1 (MaxDpbMbs = 900) and Level 1b (MaxDpbMbs = 396, same as
+/// Level 1). The two are distinguished by `constraint_set3_flag`
+/// (§A.3.4.1) — when set, the stream signals Level 1b. For Baseline /
+/// Constrained Baseline the spec also allows `level_idc == 9` to mean
+/// Level 1b directly; we honour that path too.
 ///
 /// Unknown `level_idc` values fall through to the lowest bucket
 /// (MaxDpbMbs = 396) to minimise over-allocation while still
 /// permitting at least one reference picture.
-fn max_dpb_mbs_for_level(level_idc: u8) -> u32 {
+fn max_dpb_mbs_for_level(level_idc: u8, constraint_set3_flag: bool) -> u32 {
     match level_idc {
+        9 => 396,    // Level 1b (Baseline / Constrained Baseline shorthand)
         10 => 396,   // level 1
-        11 => 900,   // level 1.1 (also 1b, per the conservative note above)
+        11 => {
+            if constraint_set3_flag {
+                396 // Level 1b
+            } else {
+                900 // Level 1.1
+            }
+        }
         12 => 2_376, // level 1.2
         13 => 2_376, // level 1.3
         20 => 2_376, // level 2
@@ -2054,18 +2071,92 @@ mod tests {
     /// value.
     #[test]
     fn max_dpb_mbs_per_level_table() {
-        assert_eq!(max_dpb_mbs_for_level(10), 396);
-        assert_eq!(max_dpb_mbs_for_level(12), 2_376);
-        assert_eq!(max_dpb_mbs_for_level(21), 4_752);
-        assert_eq!(max_dpb_mbs_for_level(30), 8_100);
-        assert_eq!(max_dpb_mbs_for_level(31), 18_000);
-        assert_eq!(max_dpb_mbs_for_level(40), 32_768);
-        assert_eq!(max_dpb_mbs_for_level(42), 34_816);
-        assert_eq!(max_dpb_mbs_for_level(50), 110_400);
-        assert_eq!(max_dpb_mbs_for_level(51), 184_320);
-        assert_eq!(max_dpb_mbs_for_level(60), 696_320);
+        // For all level_idc values except 11, constraint_set3_flag is
+        // ignored — pass `false` for the typical case.
+        assert_eq!(max_dpb_mbs_for_level(10, false), 396);
+        assert_eq!(max_dpb_mbs_for_level(12, false), 2_376);
+        assert_eq!(max_dpb_mbs_for_level(21, false), 4_752);
+        assert_eq!(max_dpb_mbs_for_level(30, false), 8_100);
+        assert_eq!(max_dpb_mbs_for_level(31, false), 18_000);
+        assert_eq!(max_dpb_mbs_for_level(40, false), 32_768);
+        assert_eq!(max_dpb_mbs_for_level(42, false), 34_816);
+        assert_eq!(max_dpb_mbs_for_level(50, false), 110_400);
+        assert_eq!(max_dpb_mbs_for_level(51, false), 184_320);
+        assert_eq!(max_dpb_mbs_for_level(60, false), 696_320);
         // Unknown level → conservative fallback.
-        assert_eq!(max_dpb_mbs_for_level(200), 396);
+        assert_eq!(max_dpb_mbs_for_level(200, false), 396);
+    }
+
+    /// §A.3.4.1 + Annex A Table A-1 — Level 1b vs Level 1.1.
+    ///
+    /// Both share `level_idc == 11`; `constraint_set3_flag` is the
+    /// disambiguator. Level 1b's MaxDpbMbs (396) matches Level 1, NOT
+    /// Level 1.1 (900). The shorthand `level_idc == 9` (Baseline /
+    /// Constrained Baseline) also signals Level 1b directly.
+    #[test]
+    fn max_dpb_mbs_level_1b_versus_level_1_1() {
+        // level_idc == 11 alone → Level 1.1 (the historical default
+        // when constraint_set3_flag is unset).
+        assert_eq!(max_dpb_mbs_for_level(11, false), 900);
+        // level_idc == 11 with constraint_set3_flag → Level 1b.
+        assert_eq!(max_dpb_mbs_for_level(11, true), 396);
+        // level_idc == 9 → Level 1b shorthand (Baseline path).
+        assert_eq!(max_dpb_mbs_for_level(9, false), 396);
+        assert_eq!(max_dpb_mbs_for_level(9, true), 396);
+    }
+
+    /// §A.3.1 / §C.4 — sizing a Level 1b QCIF stream must use the
+    /// Level 1b MaxDpbMbs (396), not the Level 1.1 value (900). For a
+    /// 176x144 frame (PicSize = 11x9 = 99 MBs) that gives a
+    /// level-derived reorder cap of 4, not 9.
+    ///
+    /// This is the textbook bug-fix case: a real Level 1b encoder
+    /// signals `level_idc=11`, `constraint_set3_flag=1`, and our
+    /// previous code over-buffered by treating the stream as Level 1.1.
+    #[test]
+    fn level_1b_qcif_stream_sized_at_level_1b_cap_not_level_1_1() {
+        let mut sps = Sps {
+            profile_idc: 66,
+            constraint_set_flags: 0b0000_1000, // constraint_set3_flag = 1
+            level_idc: 11,
+            seq_parameter_set_id: 0,
+            chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            qpprime_y_zero_transform_bypass_flag: false,
+            seq_scaling_matrix_present_flag: false,
+            seq_scaling_lists: None,
+            log2_max_frame_num_minus4: 0,
+            pic_order_cnt_type: 0,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            delta_pic_order_always_zero_flag: false,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_ref_frame: Vec::new(),
+            max_num_ref_frames: 1,
+            gaps_in_frame_num_value_allowed_flag: false,
+            pic_width_in_mbs_minus1: 10, // 11 MBs wide → 176 px
+            pic_height_in_map_units_minus1: 8, // 9 map units high
+            frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
+            direct_8x8_inference_flag: true,
+            frame_cropping: None,
+            vui_parameters_present_flag: false,
+            vui: None,
+        };
+        // Level 1b → reorder cap = min(396 / 99, 16) = 4.
+        let (reorder, buffering) = output_dpb_sizing(&sps);
+        assert_eq!(reorder, 4);
+        assert_eq!(buffering, 4);
+
+        // Same SPS, but clear constraint_set3_flag → Level 1.1 →
+        // reorder cap = min(900 / 99, 16) = 9.
+        sps.constraint_set_flags = 0;
+        let (reorder, buffering) = output_dpb_sizing(&sps);
+        assert_eq!(reorder, 9);
+        assert_eq!(buffering, 9);
     }
 
     // -- §7.4.1.2.4 first-VCL-of-primary-coded-picture detection -------
