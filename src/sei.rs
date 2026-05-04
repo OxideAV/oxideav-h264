@@ -41,6 +41,10 @@ pub enum SeiError {
     RegisteredUserDataMissingCountryCode,
     #[error("pan_scan_rect_cnt_minus1 must be < 32 per §D.2.4 (got {0})")]
     PanScanCountTooLarge(u32),
+    #[error(
+        "film_grain num_model_values_minus1 must be in 0..=5 per §D.2.21 (got {got} for component {component})"
+    )]
+    FilmGrainNumModelValuesOutOfRange { component: usize, got: u8 },
 }
 
 /// §D.2.2 — buffering_period.
@@ -278,13 +282,15 @@ pub enum ToneMappingModel {
 
 /// §D.2.21 — film_grain_characteristics.
 ///
-/// This first pass captures the framing plus the flags that answer
-/// "does this stream signal film grain?". The per-intensity-interval
-/// data (num_intensity_intervals_minus1, num_model_values_minus1,
-/// and the intensity_interval_lower/upper_bound / comp_model_value
-/// arrays) is left as a TODO for a future pass — callers that only
-/// need to know whether grain is present can rely on the cancel
-/// flag plus the `comp_model_present_flag` array we do decode.
+/// Fully decodes the §D.1.21 / §D.2.21 syntax including the per-
+/// component intensity-interval body (model_id 0 — frequency filtering;
+/// model_id 1 — auto-regression). For each component flagged in
+/// `comp_model_present_flag`, the resulting `FilmGrainComponent` carries
+/// the `num_model_values_minus1`, the per-interval `(lower_bound,
+/// upper_bound)` plus the `comp_model_value[i][j]` matrix as signed
+/// integers, and the trailing
+/// `film_grain_characteristics_repetition_period` is exposed on the
+/// body for callers that need to know whether the message persists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilmGrainCharacteristics {
     pub cancel_flag: bool,
@@ -298,8 +304,40 @@ pub struct FilmGrainBody {
     pub separate_colour_description: Option<FilmGrainSeparateColourDescription>,
     pub blending_mode_id: u8,  // u(2)
     pub log2_scale_factor: u8, // u(4)
-    /// One flag per colour component (c = 0..=2).
+    /// One flag per colour component (c = 0..=2). When the flag is set
+    /// the corresponding entry in [`Self::components`] is `Some(_)`.
     pub comp_model_present_flag: [bool; 3],
+    /// Per-component model parameters, in the same order as
+    /// `comp_model_present_flag` (Y, Cb, Cr). An entry is `Some(_)`
+    /// iff the matching present-flag is `true`.
+    pub components: [Option<FilmGrainComponent>; 3],
+    /// `film_grain_characteristics_repetition_period`. 0 = applies
+    /// only to the current decoded picture; 1 = persists until the
+    /// end of the coded video sequence (or until cancelled / replaced);
+    /// values > 1 mean expect the next message within this many
+    /// output-order pictures (see §D.2.21).
+    pub repetition_period: u32,
+}
+
+/// §D.1.21 / §D.2.21 — per-component film-grain model parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilmGrainComponent {
+    /// `num_model_values_minus1[c]`. The number of `comp_model_value`
+    /// entries per intensity interval is this value plus one. Per
+    /// §D.2.21 must be in 0..=5.
+    pub num_model_values_minus1: u8,
+    /// One entry per intensity interval (length =
+    /// `num_intensity_intervals_minus1[c] + 1`).
+    pub intensity_intervals: Vec<FilmGrainIntensityInterval>,
+}
+
+/// §D.1.21 — one intensity interval's bounds plus its model values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilmGrainIntensityInterval {
+    pub lower_bound: u8,
+    pub upper_bound: u8,
+    /// `comp_model_value[c][i][j]` for j = 0..=num_model_values_minus1.
+    pub model_values: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1049,18 +1087,30 @@ pub fn parse_tone_mapping_info(payload: &[u8]) -> Result<ToneMappingInfo, SeiErr
 ///     for( c = 0; c < 3; c++ )
 ///       comp_model_present_flag[ c ]                        u(1)
 ///     for( c = 0; c < 3; c++ )
-///       if( comp_model_present_flag[ c ] ) { ... per-c data ... }
+///       if( comp_model_present_flag[ c ] ) {
+///         num_intensity_intervals_minus1[ c ]               u(8)
+///         num_model_values_minus1[ c ]                      u(3)
+///         for( i = 0; i <= num_intensity_intervals_minus1[ c ]; i++ ) {
+///           intensity_interval_lower_bound[ c ][ i ]        u(8)
+///           intensity_interval_upper_bound[ c ][ i ]        u(8)
+///           for( j = 0; j <= num_model_values_minus1[ c ]; j++ )
+///             comp_model_value[ c ][ i ][ j ]               se(v)
+///         }
+///       }
 ///     film_grain_characteristics_repetition_period          ue(v)
 ///   }
 /// }
 /// ```
 ///
-/// This pass stops after the three `comp_model_present_flag` bits
-/// — enough to answer "does this stream signal film grain?" and
-/// which components carry a model. The per-intensity-interval body
-/// plus the trailing repetition_period are left for a future pass;
-/// callers that need them should keep the raw payload alongside the
-/// parsed struct.
+/// Fully decodes the per-component intensity-interval body. Per
+/// §D.2.21 `num_model_values_minus1[c]` must be in 0..=5; values
+/// outside that range produce
+/// [`SeiError::FilmGrainNumModelValuesOutOfRange`]. The
+/// `num_intensity_intervals_minus1[c] + 1` interval count uses the
+/// full u(8) range (0..=256 entries per component); pathological
+/// streams therefore allocate at most ~1.5 KiB per component for the
+/// interval-bounds list and 6 × 4 B × 256 ≈ 6 KiB per component for
+/// `comp_model_value`, both bounded.
 pub fn parse_film_grain_characteristics(
     payload: &[u8],
 ) -> Result<FilmGrainCharacteristics, SeiError> {
@@ -1102,6 +1152,43 @@ pub fn parse_film_grain_characteristics(
         *flag = r.u(1)? == 1;
     }
 
+    let mut components: [Option<FilmGrainComponent>; 3] = [None, None, None];
+    for (c, present) in comp_model_present_flag.iter().enumerate() {
+        if !*present {
+            continue;
+        }
+        let num_intensity_intervals_minus1 = r.u(8)? as u8;
+        let num_model_values_minus1 = r.u(3)? as u8;
+        if num_model_values_minus1 > 5 {
+            return Err(SeiError::FilmGrainNumModelValuesOutOfRange {
+                component: c,
+                got: num_model_values_minus1,
+            });
+        }
+        let interval_count = num_intensity_intervals_minus1 as usize + 1;
+        let mvalue_count = num_model_values_minus1 as usize + 1;
+        let mut intensity_intervals = Vec::with_capacity(interval_count);
+        for _ in 0..interval_count {
+            let lower_bound = r.u(8)? as u8;
+            let upper_bound = r.u(8)? as u8;
+            let mut model_values = Vec::with_capacity(mvalue_count);
+            for _ in 0..mvalue_count {
+                model_values.push(r.se()?);
+            }
+            intensity_intervals.push(FilmGrainIntensityInterval {
+                lower_bound,
+                upper_bound,
+                model_values,
+            });
+        }
+        components[c] = Some(FilmGrainComponent {
+            num_model_values_minus1,
+            intensity_intervals,
+        });
+    }
+
+    let repetition_period = r.ue()?;
+
     Ok(FilmGrainCharacteristics {
         cancel_flag,
         body: Some(FilmGrainBody {
@@ -1111,6 +1198,8 @@ pub fn parse_film_grain_characteristics(
             blending_mode_id,
             log2_scale_factor,
             comp_model_present_flag,
+            components,
+            repetition_period,
         }),
     })
 }
@@ -1780,17 +1869,29 @@ mod tests {
     // blending_mode_id = 0
     // log2_scale_factor = 4
     // comp_model_present_flag = [true, false, false]
+    // luma component:
+    //   num_intensity_intervals_minus1 = 0  → 1 interval
+    //   num_model_values_minus1 = 0         → 1 model value per interval
+    //   interval[0]: lower=16, upper=235, comp_model_value[0]=0 (se "1")
+    // repetition_period = 0 (ue "1")
     #[test]
     fn film_grain_characteristics_basic() {
         let fields = [
-            (0, 1), // cancel_flag
-            (1, 2), // model_id
-            (0, 1), // separate_colour_description_present_flag
-            (0, 2), // blending_mode_id
-            (4, 4), // log2_scale_factor
-            (1, 1), // comp_model_present_flag[0]
-            (0, 1), // comp_model_present_flag[1]
-            (0, 1), // comp_model_present_flag[2]
+            (0, 1),   // cancel_flag
+            (1, 2),   // model_id
+            (0, 1),   // separate_colour_description_present_flag
+            (0, 2),   // blending_mode_id
+            (4, 4),   // log2_scale_factor
+            (1, 1),   // comp_model_present_flag[0]
+            (0, 1),   // comp_model_present_flag[1]
+            (0, 1),   // comp_model_present_flag[2]
+            // c=0 body
+            (0, 8),   // num_intensity_intervals_minus1
+            (0, 3),   // num_model_values_minus1
+            (16, 8),  // interval[0].lower_bound
+            (235, 8), // interval[0].upper_bound
+            (1, 1),   // comp_model_value[0][0] = se(0) = 0
+            (1, 1),   // repetition_period = ue(0) = 0
         ];
         let payload = pack_bits(&fields);
         let fg = parse_film_grain_characteristics(&payload).unwrap();
@@ -1802,6 +1903,17 @@ mod tests {
         assert_eq!(body.blending_mode_id, 0);
         assert_eq!(body.log2_scale_factor, 4);
         assert_eq!(body.comp_model_present_flag, [true, false, false]);
+        assert_eq!(body.repetition_period, 0);
+
+        let luma = body.components[0].as_ref().expect("luma component present");
+        assert_eq!(luma.num_model_values_minus1, 0);
+        assert_eq!(luma.intensity_intervals.len(), 1);
+        assert_eq!(luma.intensity_intervals[0].lower_bound, 16);
+        assert_eq!(luma.intensity_intervals[0].upper_bound, 235);
+        assert_eq!(luma.intensity_intervals[0].model_values, vec![0]);
+
+        assert!(body.components[1].is_none());
+        assert!(body.components[2].is_none());
     }
 
     // §D.2.21 — cancel flag leaves body absent.
@@ -1815,23 +1927,39 @@ mod tests {
 
     // §D.2.21 — with separate colour description the inner block is
     // populated.
+    //
+    // Both luma and chroma flagged. Each component carries 1 interval
+    // with 1 model value. repetition_period = 0.
     #[test]
     fn film_grain_characteristics_with_separate_colour() {
         let fields = [
-            (0, 1),  // cancel_flag
-            (2, 2),  // model_id
-            (1, 1),  // separate_colour_description_present_flag
-            (2, 3),  // bit_depth_luma_minus8 (= 10 bit luma)
-            (2, 3),  // bit_depth_chroma_minus8
-            (1, 1),  // full_range_flag
-            (1, 8),  // colour_primaries = 1 (BT.709)
-            (13, 8), // transfer_characteristics = 13
-            (1, 8),  // matrix_coefficients = 1
-            (0, 2),  // blending_mode_id
-            (3, 4),  // log2_scale_factor
-            (1, 1),  // comp_model_present_flag[0]
-            (1, 1),  // comp_model_present_flag[1]
-            (0, 1),  // comp_model_present_flag[2]
+            (0, 1),   // cancel_flag
+            (2, 2),   // model_id
+            (1, 1),   // separate_colour_description_present_flag
+            (2, 3),   // bit_depth_luma_minus8 (= 10 bit luma)
+            (2, 3),   // bit_depth_chroma_minus8
+            (1, 1),   // full_range_flag
+            (1, 8),   // colour_primaries = 1 (BT.709)
+            (13, 8),  // transfer_characteristics = 13
+            (1, 8),   // matrix_coefficients = 1
+            (0, 2),   // blending_mode_id
+            (3, 4),   // log2_scale_factor
+            (1, 1),   // comp_model_present_flag[0]
+            (1, 1),   // comp_model_present_flag[1]
+            (0, 1),   // comp_model_present_flag[2]
+            // c=0 body
+            (0, 8),   // num_intensity_intervals_minus1
+            (0, 3),   // num_model_values_minus1
+            (0, 8),   // interval[0].lower_bound
+            (255, 8), // interval[0].upper_bound
+            (1, 1),   // comp_model_value[0][0] = se(0) = 0
+            // c=1 body
+            (0, 8),   // num_intensity_intervals_minus1
+            (0, 3),   // num_model_values_minus1
+            (0, 8),   // interval[0].lower_bound
+            (255, 8), // interval[0].upper_bound
+            (1, 1),   // comp_model_value[0][0] = se(0) = 0
+            (1, 1),   // repetition_period = ue(0) = 0
         ];
         let payload = pack_bits(&fields);
         let fg = parse_film_grain_characteristics(&payload).unwrap();
@@ -1847,6 +1975,97 @@ mod tests {
         assert_eq!(body.blending_mode_id, 0);
         assert_eq!(body.log2_scale_factor, 3);
         assert_eq!(body.comp_model_present_flag, [true, true, false]);
+        assert!(body.components[0].is_some());
+        assert!(body.components[1].is_some());
+        assert!(body.components[2].is_none());
+        assert_eq!(body.repetition_period, 0);
+    }
+
+    // §D.2.21 — multi-interval / multi-model-value path with non-trivial
+    // se(v) values exercising the full per-c body. Three intervals, two
+    // model values per interval; values include +/- non-zero entries.
+    //
+    // se codewords:
+    //   se(0)  = ue(0) = "1"        (1 bit)
+    //   se(+1) = ue(1) = "010"      (3 bits)
+    //   se(-1) = ue(2) = "011"      (3 bits)
+    //   se(+2) = ue(3) = "00100"    (5 bits)
+    //   se(-2) = ue(4) = "00101"    (5 bits)
+    #[test]
+    fn film_grain_characteristics_multi_interval_multi_value() {
+        let fields = [
+            (0, 1),         // cancel_flag
+            (1, 2),         // model_id (auto-regression)
+            (0, 1),         // separate_colour_description_present_flag
+            (0, 2),         // blending_mode_id
+            (5, 4),         // log2_scale_factor
+            (0, 1),         // comp_model_present_flag[0] = false
+            (1, 1),         // comp_model_present_flag[1] = true
+            (0, 1),         // comp_model_present_flag[2] = false
+            // c=1 body
+            (2, 8),         // num_intensity_intervals_minus1 = 2 → 3 intervals
+            (1, 3),         // num_model_values_minus1 = 1 → 2 model values per interval
+            // interval 0
+            (0, 8),         // lower
+            (84, 8),        // upper
+            (0b010, 3),     // se(+1)
+            (0b011, 3),     // se(-1)
+            // interval 1
+            (85, 8),
+            (170, 8),
+            (0b00100, 5),   // se(+2)
+            (1, 1),         // se(0)
+            // interval 2
+            (171, 8),
+            (255, 8),
+            (1, 1),         // se(0)
+            (0b00101, 5),   // se(-2)
+            (0b010, 3),     // repetition_period = ue(1) = 1
+        ];
+        let payload = pack_bits(&fields);
+        let fg = parse_film_grain_characteristics(&payload).unwrap();
+        let body = fg.body.expect("body present");
+        assert_eq!(body.repetition_period, 1);
+        assert!(body.components[0].is_none());
+        assert!(body.components[2].is_none());
+        let chroma = body.components[1].as_ref().expect("Cb component present");
+        assert_eq!(chroma.num_model_values_minus1, 1);
+        assert_eq!(chroma.intensity_intervals.len(), 3);
+        assert_eq!(chroma.intensity_intervals[0].lower_bound, 0);
+        assert_eq!(chroma.intensity_intervals[0].upper_bound, 84);
+        assert_eq!(chroma.intensity_intervals[0].model_values, vec![1, -1]);
+        assert_eq!(chroma.intensity_intervals[1].lower_bound, 85);
+        assert_eq!(chroma.intensity_intervals[1].upper_bound, 170);
+        assert_eq!(chroma.intensity_intervals[1].model_values, vec![2, 0]);
+        assert_eq!(chroma.intensity_intervals[2].lower_bound, 171);
+        assert_eq!(chroma.intensity_intervals[2].upper_bound, 255);
+        assert_eq!(chroma.intensity_intervals[2].model_values, vec![0, -2]);
+    }
+
+    // §D.2.21 — num_model_values_minus1 > 5 must be rejected.
+    #[test]
+    fn film_grain_characteristics_rejects_num_model_values_out_of_range() {
+        let fields = [
+            (0, 1), // cancel_flag
+            (0, 2), // model_id
+            (0, 1), // separate_colour_description_present_flag
+            (0, 2), // blending_mode_id
+            (0, 4), // log2_scale_factor
+            (1, 1), // comp_model_present_flag[0] = true
+            (0, 1),
+            (0, 1),
+            (0, 8), // num_intensity_intervals_minus1 = 0
+            (6, 3), // num_model_values_minus1 = 6 — out of range
+        ];
+        let payload = pack_bits(&fields);
+        let err = parse_film_grain_characteristics(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::FilmGrainNumModelValuesOutOfRange {
+                component: 0,
+                got: 6
+            }
+        );
     }
 
     // Dispatcher wiring for the new payload types.

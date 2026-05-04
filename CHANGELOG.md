@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SEI: `film_grain_characteristics` per-component intensity-interval body
+  (§D.1.21 / §D.2.21).** Previously `parse_film_grain_characteristics`
+  stopped after the three `comp_model_present_flag` bits and dropped the
+  per-component (`num_intensity_intervals_minus1`,
+  `num_model_values_minus1`, `intensity_interval_lower_bound`,
+  `intensity_interval_upper_bound`, `comp_model_value`) data plus the
+  trailing `film_grain_characteristics_repetition_period`. The full body
+  is now decoded:
+  * New `FilmGrainBody::components: [Option<FilmGrainComponent>; 3]`
+    populated in lockstep with `comp_model_present_flag` (Y, Cb, Cr).
+  * New `FilmGrainComponent { num_model_values_minus1, intensity_intervals }`
+    + new `FilmGrainIntensityInterval { lower_bound, upper_bound,
+    model_values: Vec<i32> }`. `comp_model_value[c][i][j]` is read as
+    se(v) per the spec.
+  * New `FilmGrainBody::repetition_period: u32`
+    (`film_grain_characteristics_repetition_period`, ue(v)).
+  * Per §D.2.21 `num_model_values_minus1[c]` shall be in 0..=5; out-of-
+    range values produce
+    `SeiError::FilmGrainNumModelValuesOutOfRange { component, got }`.
+  * Two new round-trip tests (multi-interval / multi-model-value with
+    signed `comp_model_value` entries; out-of-range rejection); the two
+    pre-existing tests now extend through the new body.
+
 - **SEI: `user_data_registered_itu_t_t35` (payload type 4) + `pan_scan_rect`
   (payload type 2)** (§D.1.4 / §D.2.4, §D.1.6 / §D.2.6). Both are
   upgraded from `SeiPayload::Unknown { payload, .. }` round-tripping
