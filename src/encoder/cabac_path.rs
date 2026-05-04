@@ -38,8 +38,8 @@ use crate::encoder::bitstream::BitWriter;
 use crate::encoder::cabac_engine::CabacEncoder;
 use crate::encoder::cabac_syntax::{
     encode_coded_block_pattern, encode_end_of_slice_flag, encode_intra_chroma_pred_mode,
-    encode_mb_qp_delta, encode_mb_skip_flag, encode_mb_type_i, encode_mb_type_p, encode_mvd_lx,
-    encode_residual_block_cabac,
+    encode_mb_qp_delta, encode_mb_skip_flag, encode_mb_type_b, encode_mb_type_i, encode_mb_type_p,
+    encode_mvd_lx, encode_residual_block_cabac,
 };
 use crate::encoder::deblock::{
     chroma_nz_mask_from_blocks, deblock_recon, luma_nz_mask_from_blocks, MbDeblockInfo,
@@ -51,8 +51,8 @@ use crate::encoder::me::search_quarter_pel_16x16;
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::slice::{
-    write_idr_i_slice_header, write_p_slice_header, CabacSliceParams, IdrSliceHeaderConfig,
-    PSliceHeaderConfig,
+    write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
+    CabacSliceParams, IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
@@ -60,7 +60,7 @@ use crate::encoder::transform::{
     quantize_chroma_dc, quantize_luma_dc, zigzag_scan_4x4, zigzag_scan_4x4_ac,
 };
 use crate::encoder::{
-    EncodedFrameRef, EncodedIdr, EncodedP, Encoder, FrameRefPartitionMv, YuvFrame,
+    EncodedB, EncodedFrameRef, EncodedIdr, EncodedP, Encoder, FrameRefPartitionMv, YuvFrame,
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::mv_deriv::Mv;
@@ -104,6 +104,9 @@ struct CabacEncMbInfo {
     is_skip: bool,
     is_i_pcm: bool,
     is_i_nxn: bool,
+    /// §9.3.3.1.1.3 — true when this MB's mb_type ∈ {B_Skip, B_Direct_16x16}.
+    /// Used by the B-slice mb_type ctxIdxOffset=27 bin-0 condTerm.
+    is_b_skip_or_direct: bool,
     cbp_luma: u8,
     cbp_chroma: u8,
     intra_chroma_pred_mode: u8,
@@ -118,6 +121,9 @@ struct CabacEncMbInfo {
     /// Per-4x4 |mvd_x| / |mvd_y| (round-30 P MBs use one MV per MB).
     abs_mvd_l0_x: [u32; 16],
     abs_mvd_l0_y: [u32; 16],
+    /// L1 mvd magnitudes — only populated on B-slice MBs.
+    abs_mvd_l1_x: [u32; 16],
+    abs_mvd_l1_y: [u32; 16],
 }
 
 struct CabacEncGrid {
@@ -344,9 +350,9 @@ fn cbf_neighbour_chroma_ac(
 fn build_neighbour_ctx(grid: &CabacEncGrid, mb_x: usize, mb_y: usize) -> NeighbourCtx {
     let left = grid.left(mb_x, mb_y);
     let above = grid.above(mb_x, mb_y);
-    let mk = |o: Option<&CabacEncMbInfo>| -> (bool, bool, bool, bool, bool, u8, u8, u8) {
+    let mk = |o: Option<&CabacEncMbInfo>| -> (bool, bool, bool, bool, bool, u8, u8, u8, bool) {
         match o {
-            None => (false, false, false, false, false, 0, 0, 0),
+            None => (false, false, false, false, false, 0, 0, 0, false),
             Some(m) => (
                 m.available,
                 m.is_skip,
@@ -356,11 +362,12 @@ fn build_neighbour_ctx(grid: &CabacEncGrid, mb_x: usize, mb_y: usize) -> Neighbo
                 m.cbp_luma,
                 m.cbp_chroma,
                 m.intra_chroma_pred_mode,
+                m.is_b_skip_or_direct,
             ),
         }
     };
-    let (la, ls, li, lpcm, linxn, lcbpl, lcbpc, licpm) = mk(left);
-    let (aa, as_, ai, apcm, ainxn, acbpl, acbpc, aicpm) = mk(above);
+    let (la, ls, li, lpcm, linxn, lcbpl, lcbpc, licpm, lbsd) = mk(left);
+    let (aa, as_, ai, apcm, ainxn, acbpl, acbpc, aicpm, absd) = mk(above);
     NeighbourCtx {
         available_left: la,
         available_above: aa,
@@ -370,8 +377,8 @@ fn build_neighbour_ctx(grid: &CabacEncGrid, mb_x: usize, mb_y: usize) -> Neighbo
         above_is_si: false,
         left_is_i_nxn: linxn,
         above_is_i_nxn: ainxn,
-        left_is_b_skip_or_direct: false,
-        above_is_b_skip_or_direct: false,
+        left_is_b_skip_or_direct: lbsd,
+        above_is_b_skip_or_direct: absd,
         left_inter: li,
         above_inter: ai,
         left_is_i_pcm: lpcm,
@@ -1628,6 +1635,578 @@ impl Encoder {
         ];
 
         EncodedP {
+            annex_b: stream,
+            recon_y,
+            recon_u,
+            recon_v,
+            recon_width: cfg.width,
+            recon_height: cfg.height,
+            frame_num,
+            pic_order_cnt_lsb,
+            partition_mvs,
+        }
+    }
+
+    /// Round-31 — encode a non-reference B-slice using **CABAC** entropy
+    /// coding.
+    ///
+    /// Per-MB strategy (intentionally simple, matching the round-30 P
+    /// path): compute four candidate inter predictors at forced MV =
+    /// (0, 0):
+    ///
+    /// 1. `B_L0_16x16` — list-0 predictor only.
+    /// 2. `B_L1_16x16` — list-1 predictor only.
+    /// 3. `B_Bi_16x16` — §8.4.2.3.1 default merge `(L0 + L1 + 1) >> 1`.
+    ///
+    /// Pick the lowest-SAD candidate, transform/quantise the residual,
+    /// emit `mb_skip_flag = 0`, the chosen mb_type, the L0/L1 mvds (each
+    /// at zero), `coded_block_pattern`, optional `mb_qp_delta`, and the
+    /// residual blocks.
+    ///
+    /// `B_Skip` and `B_Direct_16x16` are intentionally **not** emitted by
+    /// this round. Both rely on the §8.4.1.2 direct-mode derivation which
+    /// is non-trivial to mirror in the CABAC encoder; with the encoder /
+    /// decoder mvp both fixed at zero, the explicit `B_L*_16x16` types
+    /// already deliver the correct samples.
+    ///
+    /// Caller is responsible for emitting the SPS / PPS / IDR before
+    /// calling this method (the same as for [`Encoder::encode_p_cabac`]).
+    /// The SPS must declare `max_num_ref_frames >= 2` and
+    /// `profile_idc >= 77` (Main); the PPS must have
+    /// `entropy_coding_mode_flag = 1`.
+    pub fn encode_b_cabac(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+    ) -> EncodedB {
+        let cfg = self.config();
+        assert!(
+            cfg.cabac,
+            "encode_b_cabac requires EncoderConfig::cabac = true",
+        );
+        assert!(
+            cfg.profile_idc >= 77,
+            "CABAC + B-slices require Main profile or higher (got profile_idc={})",
+            cfg.profile_idc,
+        );
+        assert_eq!(cfg.chroma_format_idc, 1, "round-31 CABAC B is 4:2:0 only");
+        assert_eq!(frame.width, cfg.width);
+        assert_eq!(frame.height, cfg.height);
+        assert_eq!(ref_l0.width, cfg.width);
+        assert_eq!(ref_l0.height, cfg.height);
+        assert_eq!(ref_l1.width, cfg.width);
+        assert_eq!(ref_l1.height, cfg.height);
+
+        let width = cfg.width as usize;
+        let height = cfg.height as usize;
+        let width_mbs = (cfg.width / 16) as usize;
+        let height_mbs = (cfg.height / 16) as usize;
+        let chroma_w = width / 2;
+        let chroma_h = height / 2;
+
+        let qp_y = cfg.qp;
+        let qp_bd_offset_c = qp_bd_offset(cfg.bit_depth_chroma_minus8);
+        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
+
+        let mut stream: Vec<u8> = Vec::new();
+
+        let mut sw = BitWriter::new();
+        write_b_slice_header(
+            &mut sw,
+            &BSliceHeaderConfig {
+                first_mb_in_slice: 0,
+                slice_type_raw: 6, // B, all-same-type
+                pic_parameter_set_id: 0,
+                frame_num,
+                frame_num_bits: 8,
+                pic_order_cnt_lsb,
+                poc_lsb_bits: 8,
+                // §8.4.1.2.2 spatial direct flag — set 1 (the value is
+                // irrelevant: this round never emits B_Direct_16x16 /
+                // B_Skip, but the syntax field is mandatory in §7.3.3).
+                direct_spatial_mv_pred_flag: true,
+                slice_qp_delta: 0,
+                disable_deblocking_filter_idc: 0,
+                slice_alpha_c0_offset_div2: 0,
+                slice_beta_offset_div2: 0,
+                nal_ref_idc: 0, // non-reference B
+                pred_weight_table: None,
+                cabac: Some(CabacSliceParams { cabac_init_idc: 0 }),
+            },
+        );
+        // §7.3.4 — cabac_alignment_one_bit until byte aligned.
+        while !sw.byte_aligned() {
+            sw.u(1, 1);
+        }
+
+        let mut cabac = CabacEncoder::new();
+        let mut ctxs = CabacContexts::init(SliceKind::B, Some(0), qp_y).expect("ctx init");
+
+        let mut recon_y = vec![0u8; width * height];
+        let mut recon_u = vec![0u8; chroma_w * chroma_h];
+        let mut recon_v = vec![0u8; chroma_w * chroma_h];
+        let mut grid = CabacEncGrid::new(width_mbs, height_mbs);
+        let mut mb_dbl: Vec<MbDeblockInfo> = vec![MbDeblockInfo::default(); width_mbs * height_mbs];
+        let mut prev_mb_qp_delta_nonzero = false;
+
+        for mb_y in 0..height_mbs {
+            for mb_x in 0..width_mbs {
+                let mb_addr = mb_y * width_mbs + mb_x;
+
+                // Round-31 simplification — force MV = (0, 0) on both lists.
+                // The encoder's §8.4.1.3 mvp derivation is not wired (we
+                // don't track per-MB MVs in the grid); with both lists at
+                // (0, 0) the mvd is also (0, 0) and decoder + encoder
+                // agree on the predictor without any neighbour bookkeeping.
+                let mv_zero = Mv::new(0, 0);
+
+                // Build the three explicit-inter predictor candidates.
+                let pred_y_l0 = build_inter_pred_luma_local(
+                    ref_l0.recon_y,
+                    ref_l0.width,
+                    ref_l0.height,
+                    mb_x,
+                    mb_y,
+                    mv_zero,
+                );
+                let pred_u_l0 = build_inter_pred_chroma_local(
+                    ref_l0.recon_u,
+                    chroma_w as u32,
+                    chroma_h as u32,
+                    mb_x,
+                    mb_y,
+                    mv_zero,
+                );
+                let pred_v_l0 = build_inter_pred_chroma_local(
+                    ref_l0.recon_v,
+                    chroma_w as u32,
+                    chroma_h as u32,
+                    mb_x,
+                    mb_y,
+                    mv_zero,
+                );
+                let pred_y_l1 = build_inter_pred_luma_local(
+                    ref_l1.recon_y,
+                    ref_l1.width,
+                    ref_l1.height,
+                    mb_x,
+                    mb_y,
+                    mv_zero,
+                );
+                let pred_u_l1 = build_inter_pred_chroma_local(
+                    ref_l1.recon_u,
+                    chroma_w as u32,
+                    chroma_h as u32,
+                    mb_x,
+                    mb_y,
+                    mv_zero,
+                );
+                let pred_v_l1 = build_inter_pred_chroma_local(
+                    ref_l1.recon_v,
+                    chroma_w as u32,
+                    chroma_h as u32,
+                    mb_x,
+                    mb_y,
+                    mv_zero,
+                );
+                // §8.4.2.3.1 default-merge bipred = ((L0 + L1 + 1) >> 1)
+                // followed by Clip1Y. The two operands are already
+                // Clip1Y-ed by the per-list interpolation, so we only
+                // need the average + clip.
+                let mut pred_y_bi = [0i32; 256];
+                for i in 0..256 {
+                    pred_y_bi[i] = ((pred_y_l0[i] + pred_y_l1[i] + 1) >> 1).clamp(0, 255);
+                }
+                let mut pred_u_bi = [0i32; 64];
+                let mut pred_v_bi = [0i32; 64];
+                for i in 0..64 {
+                    pred_u_bi[i] = ((pred_u_l0[i] + pred_u_l1[i] + 1) >> 1).clamp(0, 255);
+                    pred_v_bi[i] = ((pred_v_l0[i] + pred_v_l1[i] + 1) >> 1).clamp(0, 255);
+                }
+
+                // SAD against source (luma only — chroma trail-along).
+                let sad = |pred: &[i32; 256]| -> u64 {
+                    let mut s: u64 = 0;
+                    for j in 0..16usize {
+                        for i in 0..16usize {
+                            let v = frame.y[(mb_y * 16 + j) * width + (mb_x * 16 + i)] as i32;
+                            s += (v - pred[j * 16 + i]).unsigned_abs() as u64;
+                        }
+                    }
+                    s
+                };
+                let sad_l0 = sad(&pred_y_l0);
+                let sad_l1 = sad(&pred_y_l1);
+                let sad_bi = sad(&pred_y_bi);
+
+                // Pick best.
+                let (chosen_mb_type, pred_y, pred_u, pred_v) =
+                    if sad_l0 <= sad_l1 && sad_l0 <= sad_bi {
+                        (1u32, pred_y_l0, pred_u_l0, pred_v_l0) // B_L0_16x16
+                    } else if sad_l1 <= sad_bi {
+                        (2u32, pred_y_l1, pred_u_l1, pred_v_l1) // B_L1_16x16
+                    } else {
+                        (3u32, pred_y_bi, pred_u_bi, pred_v_bi) // B_Bi_16x16
+                    };
+
+                // Luma residual + per-4x4 quantise.
+                let mut residual = [0i32; 256];
+                for j in 0..16usize {
+                    for i in 0..16usize {
+                        let s = frame.y[(mb_y * 16 + j) * width + (mb_x * 16 + i)] as i32;
+                        residual[j * 16 + i] = s - pred_y[j * 16 + i];
+                    }
+                }
+                let mut luma_blocks = [[0i32; 16]; 16];
+                let mut blk_has_nz = [false; 16];
+                let mut recon_residual_y = [0i32; 256];
+                for blkz in 0..16usize {
+                    let (bx, by) = LUMA_4X4_BLK[blkz];
+                    let mut block = [0i32; 16];
+                    for j in 0..4 {
+                        for i in 0..4 {
+                            block[j * 4 + i] = residual[(by * 4 + j) * 16 + bx * 4 + i];
+                        }
+                    }
+                    let coeffs = forward_core_4x4(&block);
+                    let q = crate::encoder::transform::quantize_4x4(&coeffs, qp_y, false);
+                    let scan = zigzag_scan_4x4(&q);
+                    luma_blocks[blkz] = scan;
+                    if scan.iter().any(|&v| v != 0) {
+                        blk_has_nz[blkz] = true;
+                    }
+                    let r = crate::transform::inverse_transform_4x4(&q, qp_y, &FLAT_4X4_16, 8)
+                        .expect("inverse 4x4");
+                    for j in 0..4 {
+                        for i in 0..4 {
+                            recon_residual_y[(by * 4 + j) * 16 + bx * 4 + i] = r[j * 4 + i];
+                        }
+                    }
+                }
+                let mut cbp_luma: u8 = 0;
+                for blk8 in 0..4usize {
+                    if (0..4).any(|sub| blk_has_nz[blk8 * 4 + sub]) {
+                        cbp_luma |= 1 << blk8;
+                    }
+                }
+
+                // Chroma residual.
+                let (cb_dc, cb_ac_scan, _cb_ac_quant, _cb_dc_nz, cb_ac_nz, cb_recon_res) =
+                    encode_chroma_inter_420(frame.u, &pred_u, chroma_w, mb_x, mb_y, qp_c);
+                let (cr_dc, cr_ac_scan, _cr_ac_quant, _cr_dc_nz, cr_ac_nz, cr_recon_res) =
+                    encode_chroma_inter_420(frame.v, &pred_v, chroma_w, mb_x, mb_y, qp_c);
+                let any_dc_nz = cb_dc.iter().any(|&v| v != 0) || cr_dc.iter().any(|&v| v != 0);
+                let any_ac_nz = cb_ac_nz || cr_ac_nz;
+                let cbp_chroma: u8 = if any_ac_nz {
+                    2
+                } else if any_dc_nz {
+                    1
+                } else {
+                    0
+                };
+
+                let nb = build_neighbour_ctx(&grid, mb_x, mb_y);
+
+                // mb_skip_flag — always 0 (we don't emit B_Skip in
+                // round 31; see method docs).
+                encode_mb_skip_flag(&mut cabac, &mut ctxs, SliceKind::B, &nb, false);
+
+                // mb_type.
+                encode_mb_type_b(&mut cabac, &mut ctxs, &nb, chosen_mb_type);
+
+                let pred_kind = chosen_mb_type; // 1 = L0, 2 = L1, 3 = Bi
+                let uses_l0 = pred_kind == 1 || pred_kind == 3;
+                let uses_l1 = pred_kind == 2 || pred_kind == 3;
+
+                // num_ref_idx_lN_active_minus1 = 0 in our PPS, so ref_idx_lN
+                // is NOT emitted (single ref per list).
+
+                // mvd_l0.
+                if uses_l0 {
+                    let mvd_x = 0i32;
+                    let mvd_y = 0i32;
+                    let abs_l = grid
+                        .left(mb_x, mb_y)
+                        .map(|m| m.abs_mvd_l0_x[0])
+                        .unwrap_or(0);
+                    let abs_a = grid
+                        .above(mb_x, mb_y)
+                        .map(|m| m.abs_mvd_l0_x[0])
+                        .unwrap_or(0);
+                    encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, abs_l + abs_a, mvd_x);
+                    let abs_l = grid
+                        .left(mb_x, mb_y)
+                        .map(|m| m.abs_mvd_l0_y[0])
+                        .unwrap_or(0);
+                    let abs_a = grid
+                        .above(mb_x, mb_y)
+                        .map(|m| m.abs_mvd_l0_y[0])
+                        .unwrap_or(0);
+                    encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, abs_l + abs_a, mvd_y);
+                }
+                // mvd_l1.
+                if uses_l1 {
+                    let mvd_x = 0i32;
+                    let mvd_y = 0i32;
+                    let abs_l = grid
+                        .left(mb_x, mb_y)
+                        .map(|m| m.abs_mvd_l1_x[0])
+                        .unwrap_or(0);
+                    let abs_a = grid
+                        .above(mb_x, mb_y)
+                        .map(|m| m.abs_mvd_l1_x[0])
+                        .unwrap_or(0);
+                    encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, abs_l + abs_a, mvd_x);
+                    let abs_l = grid
+                        .left(mb_x, mb_y)
+                        .map(|m| m.abs_mvd_l1_y[0])
+                        .unwrap_or(0);
+                    let abs_a = grid
+                        .above(mb_x, mb_y)
+                        .map(|m| m.abs_mvd_l1_y[0])
+                        .unwrap_or(0);
+                    encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, abs_l + abs_a, mvd_y);
+                }
+
+                // coded_block_pattern.
+                encode_coded_block_pattern(&mut cabac, &mut ctxs, &nb, 1, cbp_luma, cbp_chroma);
+
+                // mb_qp_delta only when CBP > 0.
+                let needs_qpd = cbp_luma > 0 || cbp_chroma > 0;
+                if needs_qpd {
+                    let qpd = 0i32;
+                    encode_mb_qp_delta(&mut cabac, &mut ctxs, prev_mb_qp_delta_nonzero, qpd);
+                    prev_mb_qp_delta_nonzero = qpd != 0;
+                } else {
+                    prev_mb_qp_delta_nonzero = false;
+                }
+
+                {
+                    let cur = grid.at_mut(mb_x, mb_y);
+                    cur.is_intra = false;
+                    cur.is_skip = false;
+                    cur.is_b_skip_or_direct = false;
+                    cur.cbp_luma = cbp_luma;
+                    cur.cbp_chroma = cbp_chroma;
+                }
+
+                // Luma residual blocks (per-8x8 gated).
+                for blk8 in 0..4u8 {
+                    if (cbp_luma >> blk8) & 1 == 1 {
+                        for sub in 0..4u8 {
+                            let blkz = (blk8 * 4 + sub) as usize;
+                            let cur = grid.at(mb_x, mb_y).clone();
+                            let (ca, cb) = cbf_neighbour_luma_ac(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                &cur,
+                                false,
+                                BlockType::Luma4x4,
+                                blkz as u8,
+                            );
+                            let coded = encode_residual_block_cabac(
+                                &mut cabac,
+                                &mut ctxs,
+                                BlockType::Luma4x4,
+                                &luma_blocks[blkz],
+                                16,
+                                Some(ca),
+                                Some(cb),
+                                false,
+                            );
+                            grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blkz] = coded;
+                        }
+                    }
+                }
+
+                // Chroma DC + AC residual.
+                if cbp_chroma > 0 {
+                    let (cb_a, cb_b) =
+                        cbf_neighbour_mb_level(&grid, mb_x, mb_y, false, CbfPlane::CbDc);
+                    let cb_dc_coded = encode_residual_block_cabac(
+                        &mut cabac,
+                        &mut ctxs,
+                        BlockType::ChromaDc,
+                        &cb_dc,
+                        4,
+                        Some(cb_a),
+                        Some(cb_b),
+                        false,
+                    );
+                    grid.at_mut(mb_x, mb_y).cbf_cb_dc = cb_dc_coded;
+                    let (cr_a, cr_b) =
+                        cbf_neighbour_mb_level(&grid, mb_x, mb_y, false, CbfPlane::CrDc);
+                    let cr_dc_coded = encode_residual_block_cabac(
+                        &mut cabac,
+                        &mut ctxs,
+                        BlockType::ChromaDc,
+                        &cr_dc,
+                        4,
+                        Some(cr_a),
+                        Some(cr_b),
+                        false,
+                    );
+                    grid.at_mut(mb_x, mb_y).cbf_cr_dc = cr_dc_coded;
+                }
+                if cbp_chroma == 2 {
+                    for blk in 0..4usize {
+                        let cur = grid.at(mb_x, mb_y).clone();
+                        let (ca, cb) = cbf_neighbour_chroma_ac(
+                            &grid, mb_x, mb_y, &cur, false, blk as u8, false,
+                        );
+                        let coded = encode_residual_block_cabac(
+                            &mut cabac,
+                            &mut ctxs,
+                            BlockType::ChromaAc,
+                            &cb_ac_scan[blk][..15],
+                            15,
+                            Some(ca),
+                            Some(cb),
+                            false,
+                        );
+                        grid.at_mut(mb_x, mb_y).cbf_cb_ac[blk] = coded;
+                    }
+                    for blk in 0..4usize {
+                        let cur = grid.at(mb_x, mb_y).clone();
+                        let (ca, cb) = cbf_neighbour_chroma_ac(
+                            &grid, mb_x, mb_y, &cur, false, blk as u8, true,
+                        );
+                        let coded = encode_residual_block_cabac(
+                            &mut cabac,
+                            &mut ctxs,
+                            BlockType::ChromaAc,
+                            &cr_ac_scan[blk][..15],
+                            15,
+                            Some(ca),
+                            Some(cb),
+                            false,
+                        );
+                        grid.at_mut(mb_x, mb_y).cbf_cr_ac[blk] = coded;
+                    }
+                }
+
+                // Reconstruct luma.
+                for blk8 in 0..4usize {
+                    let send = (cbp_luma >> blk8) & 1 == 1;
+                    for sub in 0..4usize {
+                        let blkz = blk8 * 4 + sub;
+                        let (bx, by) = LUMA_4X4_BLK[blkz];
+                        for j in 0..4usize {
+                            for i in 0..4usize {
+                                let p = pred_y[(by * 4 + j) * 16 + bx * 4 + i];
+                                let r = if send {
+                                    recon_residual_y[(by * 4 + j) * 16 + bx * 4 + i]
+                                } else {
+                                    0
+                                };
+                                let py = mb_y * 16 + by * 4 + j;
+                                let px = mb_x * 16 + bx * 4 + i;
+                                recon_y[py * width + px] = (p + r).clamp(0, 255) as u8;
+                            }
+                        }
+                    }
+                }
+
+                // Reconstruct chroma.
+                let recon_cb_residual = if cbp_chroma == 2 {
+                    cb_recon_res
+                } else if cbp_chroma == 1 {
+                    chroma_residual_dc_only(&cb_dc, qp_c)
+                } else {
+                    [0i32; 64]
+                };
+                let recon_cr_residual = if cbp_chroma == 2 {
+                    cr_recon_res
+                } else if cbp_chroma == 1 {
+                    chroma_residual_dc_only(&cr_dc, qp_c)
+                } else {
+                    [0i32; 64]
+                };
+                for j in 0..8usize {
+                    for i in 0..8usize {
+                        let cy = mb_y * 8 + j;
+                        let cx = mb_x * 8 + i;
+                        recon_u[cy * chroma_w + cx] =
+                            (pred_u[j * 8 + i] + recon_cb_residual[j * 8 + i]).clamp(0, 255) as u8;
+                        recon_v[cy * chroma_w + cx] =
+                            (pred_v[j * 8 + i] + recon_cr_residual[j * 8 + i]).clamp(0, 255) as u8;
+                    }
+                }
+
+                // Update grid.
+                let info = grid.at_mut(mb_x, mb_y);
+                info.available = true;
+                info.is_intra = false;
+                info.is_skip = false;
+                info.is_b_skip_or_direct = false;
+                info.cbp_luma = cbp_luma;
+                info.cbp_chroma = cbp_chroma;
+                if uses_l0 {
+                    info.abs_mvd_l0_x = [0; 16];
+                    info.abs_mvd_l0_y = [0; 16];
+                }
+                if uses_l1 {
+                    info.abs_mvd_l1_x = [0; 16];
+                    info.abs_mvd_l1_y = [0; 16];
+                }
+
+                let cb_ac_per4x4: [bool; 4] = std::array::from_fn(|i| {
+                    cbp_chroma == 2 && cb_ac_scan[i].iter().any(|&v| v != 0)
+                });
+                let cr_ac_per4x4: [bool; 4] = std::array::from_fn(|i| {
+                    cbp_chroma == 2 && cr_ac_scan[i].iter().any(|&v| v != 0)
+                });
+                mb_dbl[mb_addr] = MbDeblockInfo {
+                    is_intra: false,
+                    qp_y,
+                    luma_nonzero_4x4: luma_nz_mask_from_blocks(&blk_has_nz),
+                    chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_ac_per4x4, &cr_ac_per4x4),
+                    mv_l0: [(0, 0); 16],
+                    ref_idx_l0: [0; 4],
+                    ref_poc_l0: [0; 4],
+                    ..Default::default()
+                };
+
+                let is_last = mb_x + 1 == width_mbs && mb_y + 1 == height_mbs;
+                encode_end_of_slice_flag(&mut cabac, is_last);
+            }
+        }
+
+        let cabac_payload = cabac.finish();
+        let mut slice_rbsp = sw.into_bytes();
+        slice_rbsp.extend_from_slice(&cabac_payload);
+        // nal_ref_idc = 0 (non-reference B).
+        stream.extend_from_slice(&build_nal_unit(0, NalUnitType::SliceNonIdr, &slice_rbsp));
+
+        deblock_recon(
+            cfg.width,
+            cfg.height,
+            chroma_w as u32,
+            chroma_h as u32,
+            &mut recon_y,
+            &mut recon_u,
+            &mut recon_v,
+            &mb_dbl,
+            0,
+            cfg.width / 16,
+            cfg.height / 16,
+        );
+
+        let n_parts = width_mbs * height_mbs * 4;
+        let partition_mvs = vec![
+            FrameRefPartitionMv {
+                mv_l0: (0, 0),
+                ref_idx_l0: 0,
+                is_intra: false,
+            };
+            n_parts
+        ];
+
+        EncodedB {
             annex_b: stream,
             recon_y,
             recon_u,

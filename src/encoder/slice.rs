@@ -260,6 +260,11 @@ pub struct BSliceHeaderConfig {
     /// entries are absent (`luma_weight_lN_flag = 1`,
     /// `chroma_weight_lN_flag = 0`) to keep the syntax minimal.
     pub pred_weight_table: Option<ExplicitBipredWeightTable>,
+    /// Round-31 — when `Some`, the writer emits `cabac_init_idc` ue(v)
+    /// at the §7.3.3 position (between `dec_ref_pic_marking` and
+    /// `slice_qp_delta`). Required when the PPS has
+    /// `entropy_coding_mode_flag = 1` and the slice is non-I/SI.
+    pub cabac: Option<CabacSliceParams>,
 }
 
 /// Round-26 — minimal explicit weighted-prediction table for a
@@ -361,7 +366,11 @@ pub fn write_b_slice_header(w: &mut BitWriter, cfg: &BSliceHeaderConfig) {
         w.u(1, 0); // adaptive_ref_pic_marking_mode_flag = 0 (sliding window)
     }
 
-    // No cabac_init_idc — entropy_coding_mode_flag == 0 (CAVLC).
+    // §7.3.3 — cabac_init_idc when CABAC is enabled and slice is non-I/SI.
+    if let Some(c) = cfg.cabac {
+        debug_assert!(c.cabac_init_idc <= 2);
+        w.ue(c.cabac_init_idc);
+    }
     w.se(cfg.slice_qp_delta);
     // No SP/SI fields — slice_type is B.
 
@@ -554,6 +563,7 @@ mod tests {
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 0, // non-reference B
                 pred_weight_table: None,
+                cabac: None,
             },
         );
         // Dummy bit + trailing so the parser doesn't blow up on EOF.
@@ -640,6 +650,7 @@ mod tests {
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 0,
                 pred_weight_table: Some(pwt),
+                cabac: None,
             },
         );
         // Dummy bit + trailing so the parser doesn't blow up on EOF.

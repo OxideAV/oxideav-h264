@@ -63,6 +63,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encoder: B-slice CABAC encode (round 31).** New
+  `Encoder::encode_b_cabac` entry point covering non-reference B-slices
+  with CABAC entropy coding (mirror of round-30's
+  `encode_idr_cabac` / `encode_p_cabac`). Per-MB pick of {`B_L0_16x16`,
+  `B_L1_16x16`, `B_Bi_16x16`} on minimum-luma-SAD against MV=(0, 0)
+  predictors; bipred uses the §8.4.2.3.1 default merge `(L0 + L1 + 1)
+  >> 1`. New `encode_mb_type_b` syntax helper (mirror of
+  `decode_mb_type_b`) covers Table 9-37 B-slice rows 0..=22 + intra
+  suffix (rows 23..=48). `BSliceHeaderConfig` gains `cabac:
+  Option<CabacSliceParams>` to drive `cabac_init_idc` emission per
+  §7.3.3, parallel to `PSliceHeaderConfig`. Validated by
+  `round31_b_cabac_self_roundtrip` (decoder ↔ encoder recon match,
+  PSNR_Y ≥ 45 dB) and `round31_b_cabac_pyramid_ffmpeg_interop`
+  (16-frame B-pyramid GOP — 1 IDR + 7 P + 7 B — decoded by ffmpeg with
+  PSNR_Y ≈ 51.5 dB on smooth content). `B_Skip` / `B_Direct_16x16` /
+  4:2:2 / 4:4:4 P/B paths still deferred. New
+  `CabacEncMbInfo::is_b_skip_or_direct` field threads the spec's
+  §9.3.3.1.1.3 mb_type ctxIdxOffset=27 bin-0 condTerm correctly through
+  the CABAC encoder grid.
+
 - **SEI: `full_frame_freeze` (type 13), `full_frame_freeze_release`
   (type 14), `full_frame_snapshot` (type 15), and
   `deblocking_filter_display_preference` (type 20)**, covering §D.1.15 /

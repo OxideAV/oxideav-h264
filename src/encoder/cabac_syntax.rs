@@ -272,6 +272,122 @@ pub fn encode_mb_type_p(
     enc.encode_decision(ctxs.at_mut((OFFSET + inc_b2) as usize), b2);
 }
 
+/// §9.3.2.5 / Table 9-37 — encode `mb_type` for B-slices.
+///
+/// `value` is the Table 7-14 raw mb_type:
+/// * 0  — B_Direct_16x16 (bin string "0")
+/// * 1  — B_L0_16x16     (bin string "1 0 0")
+/// * 2  — B_L1_16x16     (bin string "1 0 1")
+/// * 3  — B_Bi_16x16     (bin string "1 1 0 0 0 0")
+/// * 4..=11 — 16x8 / 8x16 partition modes (bin strings 1 1 0 ... 1 1 1 1 1 0)
+/// * 12..=21 — Bi mixed 16x8 / 8x16 (7-bin)
+/// * 22 — B_8x8          (bin string "1 1 1 1 1 1")
+/// * 23..=48 — intra (B intra prefix "1 1 1 1 0 1" + Table 9-36 suffix at offset=32)
+///
+/// Mirror of [`crate::cabac_ctx::decode_mb_type_b`].
+pub fn encode_mb_type_b(
+    enc: &mut CabacEncoder,
+    ctxs: &mut CabacContexts,
+    neighbours: &NeighbourCtx,
+    value: u32,
+) {
+    const OFFSET: u32 = 27;
+    debug_assert!(value <= 48, "invalid B mb_type {value}");
+    // §9.3.3.1.1.3 — bin 0 ctxIdxInc using offset=27 special condTerm
+    // ("mb_type for mbAddrN is B_Skip or B_Direct_16x16").
+    let inc0 = mb_type_ctx_inc_first3(OFFSET, 0, neighbours);
+    if value == 0 {
+        // B_Direct_16x16 — single bin "0".
+        enc.encode_decision(ctxs.at_mut((OFFSET + inc0) as usize), 0);
+        return;
+    }
+    enc.encode_decision(ctxs.at_mut((OFFSET + inc0) as usize), 1);
+    // bin 1 at ctxIdxInc=3.
+    // bin 2 at ctxIdxInc = (b1 != 0) ? 4 : 5.
+    if value == 1 {
+        // B_L0_16x16 — "1 0 0".
+        enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), 0);
+        // b1==0 → inc_b2 = 5.
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 0);
+        return;
+    }
+    if value == 2 {
+        // B_L1_16x16 — "1 0 1".
+        enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), 0);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 1);
+        return;
+    }
+    // value >= 3 — bin 1 = 1.
+    enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), 1);
+    // b1==1 → inc_b2 = 4. b2 then determines further branching.
+    if (3..=10).contains(&value) {
+        // 6-bin rows "1 1 0 b3 b4 b5":
+        //   3  B_Bi_16x16     1 1 0 0 0 0
+        //   4  B_L0_L0_16x8   1 1 0 0 0 1
+        //   5  B_L0_L0_8x16   1 1 0 0 1 0
+        //   6  B_L1_L1_16x8   1 1 0 0 1 1
+        //   7  B_L1_L1_8x16   1 1 0 1 0 0
+        //   8  B_L0_L1_16x8   1 1 0 1 0 1
+        //   9  B_L0_L1_8x16   1 1 0 1 1 0
+        //   10 B_L1_L0_16x8   1 1 0 1 1 1
+        enc.encode_decision(ctxs.at_mut((OFFSET + 4) as usize), 0);
+        let v = value - 3;
+        let b3 = ((v >> 2) & 1) as u8;
+        let b4 = ((v >> 1) & 1) as u8;
+        let b5 = (v & 1) as u8;
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), b3);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), b4);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), b5);
+        return;
+    }
+    // value >= 11 — b2 = 1.
+    enc.encode_decision(ctxs.at_mut((OFFSET + 4) as usize), 1);
+    if value == 22 {
+        // B_8x8 — "1 1 1 1 1 1".
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 1);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 1);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 1);
+        return;
+    }
+    if value == 11 {
+        // B_L1_L0_8x16 — "1 1 1 1 1 0".
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 1);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 1);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 0);
+        return;
+    }
+    if (23..=48).contains(&value) {
+        // Intra suffix prefix "1 1 1 1 0 1": b3=1,b4=0,b5=1.
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 1);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 0);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), 1);
+        // Table 9-36 suffix at offset=32. Bin 0 of the suffix has not
+        // been emitted; pass `bin0_already_emitted=false`.
+        encode_mb_type_intra_suffix(enc, ctxs, 32, value - 23, false);
+        return;
+    }
+    // 7-bin rows 12..=21 — "1 1 1 b3 b4 b5 b6":
+    //   12 B_L0_Bi_16x8   1 1 1 0 0 0 0
+    //   13 B_L0_Bi_8x16   1 1 1 0 0 0 1
+    //   14 B_L1_Bi_16x8   1 1 1 0 0 1 0
+    //   15 B_L1_Bi_8x16   1 1 1 0 0 1 1
+    //   16 B_Bi_L0_16x8   1 1 1 0 1 0 0
+    //   17 B_Bi_L0_8x16   1 1 1 0 1 0 1
+    //   18 B_Bi_L1_16x8   1 1 1 0 1 1 0
+    //   19 B_Bi_L1_8x16   1 1 1 0 1 1 1
+    //   20 B_Bi_Bi_16x8   1 1 1 1 0 0 0
+    //   21 B_Bi_Bi_8x16   1 1 1 1 0 0 1
+    let v = value - 12;
+    let b3 = ((v >> 3) & 1) as u8;
+    let b4 = ((v >> 2) & 1) as u8;
+    let b5 = ((v >> 1) & 1) as u8;
+    let b6 = (v & 1) as u8;
+    enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), b3);
+    enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), b4);
+    enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), b5);
+    enc.encode_decision(ctxs.at_mut((OFFSET + 5) as usize), b6);
+}
+
 // ---------------------------------------------------------------------------
 // §9.3.3.1.1.5 — mb_qp_delta (signed Exp-Golomb-ish via Table 9-3 + unary).
 // ---------------------------------------------------------------------------
@@ -1100,8 +1216,9 @@ mod tests {
         decode_coded_block_flag, decode_coded_block_pattern, decode_coeff_abs_level_minus1,
         decode_coeff_sign_flag, decode_end_of_slice_flag, decode_intra_chroma_pred_mode,
         decode_last_significant_coeff_flag, decode_mb_qp_delta, decode_mb_skip_flag,
-        decode_mb_type_i, decode_mb_type_p, decode_mvd_lx, decode_prev_intra_pred_mode_flag,
-        decode_ref_idx_lx, decode_rem_intra_pred_mode, decode_significant_coeff_flag,
+        decode_mb_type_b, decode_mb_type_i, decode_mb_type_p, decode_mvd_lx,
+        decode_prev_intra_pred_mode_flag, decode_ref_idx_lx, decode_rem_intra_pred_mode,
+        decode_significant_coeff_flag,
     };
 
     fn roundtrip<F1, F2>(encode_side: F1, decode_side: F2) -> Vec<u8>
@@ -1176,6 +1293,29 @@ mod tests {
             let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
             let got = decode_mb_type_p(&mut dec, &mut ctxs_dec, &nb).unwrap();
             assert_eq!(got, v, "P mb_type {v} round-trip");
+            assert_eq!(dec.decode_terminate().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn rt_mb_type_b_inter_values() {
+        // Cover every Table 9-37 inter row + a couple intra and the
+        // B_8x8 corner.
+        let test_values: &[u32] = &[
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            30, 48,
+        ];
+        for &v in test_values {
+            let mut ctxs_enc = CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
+            let mut enc = CabacEncoder::new();
+            let nb = NeighbourCtx::default();
+            encode_mb_type_b(&mut enc, &mut ctxs_enc, &nb, v);
+            enc.encode_terminate(1);
+            let bytes = enc.finish_no_trailing();
+            let mut ctxs_dec = CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
+            let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
+            let got = decode_mb_type_b(&mut dec, &mut ctxs_dec, &nb).unwrap();
+            assert_eq!(got, v, "B mb_type {v} round-trip");
             assert_eq!(dec.decode_terminate().unwrap(), 1);
         }
     }

@@ -7415,6 +7415,7 @@ impl Encoder {
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 0, // non-reference B
                 pred_weight_table: weighted_table,
+                cabac: None,
             },
         );
 
