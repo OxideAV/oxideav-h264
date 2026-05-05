@@ -48,7 +48,7 @@ pub mod h264_decoder;
 pub mod encoder;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
-use oxideav_core::{CodecInfo, CodecRegistry};
+use oxideav_core::{CodecInfo, CodecRegistry, RuntimeContext};
 
 /// Codec id constant — matches the historical `"h264"` id used by
 /// containers (MKV `V_MPEG4/ISO/AVC`, MP4 `avc1`, AVI `H264`/`X264`).
@@ -58,7 +58,7 @@ pub const CODEC_ID_STR: &str = "h264";
 ///
 /// Claims the historical FourCCs used by MKV (`V_MPEG4/ISO/AVC` maps
 /// to `AVC1`), MP4 (`avc1`, `avc3`), and AVI (`H264`, `X264`, `h264`).
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("h264_sw")
         .with_lossy(true)
         .with_intra_only(false)
@@ -77,4 +77,32 @@ pub fn register(reg: &mut CodecRegistry) {
                 CodecTag::fourcc(b"x264"),
             ]),
     );
+}
+
+/// Unified registration entry point: install the H.264 codec factories
+/// into the codec sub-registry of a [`RuntimeContext`].
+///
+/// This is the preferred entry point for new code — it matches the
+/// convention every sibling crate now follows. Direct callers that need
+/// only the codec sub-registry can keep using [`register_codecs`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxideav_core::{CodecId, CodecParameters, RuntimeContext};
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("h264 decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+    }
 }
