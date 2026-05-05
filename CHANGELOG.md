@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encoder: CABAC B 16x8 / 8x16 partition modes + B_8x8 all-Direct
+  (task #475).** `encode_b_cabac` now emits Table 7-14 mb_type ∈ 4..=21
+  (the nine 16x8 + nine 8x16 partition variants) by mirroring the CAVLC
+  partition-decision pipeline: per-cell `search_quarter_pel_8x8` ME on
+  each list × four 8x8 cells, per-partition `best_partition_mode_b`
+  pick across {L0, L1, Bi}, Lagrangian SAD compare against the 16x16
+  candidates, and stitched composite predictor via the existing
+  `build_b_partition_pred_luma_16x8` / `_8x16` (now `pub(crate)`).
+  Per-partition mvd emission follows §7.3.5.1 ordering with within-MB
+  inflight tracking for partition 1's MVP. New `cabac_enc_mvd_abs_sum`
+  helper mirrors the decoder's `cabac_mvd_abs_sum` byte-for-byte so
+  the §9.3.3.1.1.7 ctxIdxInc lands on the same context regardless of
+  partition shape; `cabac_mvp_for_b_16x8_partition` /
+  `cabac_mvp_for_b_8x16_partition` reuse the shared
+  `derive_mvpred_with_d` machinery with the directional shortcuts
+  (`Partition16x8Top` / `Bottom`, `Partition8x16Left` / `Right`). The
+  per-MB deblock state (`MbDeblockInfo.mv_l0` / `mv_l1` / `ref_idx_*` /
+  `ref_poc_*`) is now built per-4x4 from the partition layout so the
+  internal partition boundary's bS derivation matches what the decoder
+  computes (without this the decode/encode recon drifts ~2 LSB at the
+  partition seam).
+
+  Also adds **B_8x8 + 4× B_Direct_8x8** (mb_type=22) as a fallback
+  whenever the §8.4.1.2.2 spatial-direct derivation produces non-uniform
+  per-8x8 MVs: composite predictor stitched per 8x8 quadrant via
+  `build_inter_pred_luma_8x8` / `build_inter_pred_chroma_4x4` (now
+  `pub(crate)`); writer emits `mb_type=22` + 4× `sub_mb_type=0` (no
+  ref_idx / mvd, decoder re-derives all four (mvL0, mvL1, refIdxL0,
+  refIdxL1) per §8.4.1.2.2). New `encode_sub_mb_type_p` /
+  `encode_sub_mb_type_b` helpers in `cabac_syntax.rs` mirror Table 9-37
+  / 9-38 binarisations bin-for-bin against `decode_sub_mb_type_p` /
+  `_b`. Per-cell mixed B_8x8 (per-quadrant L0 / L1 / Bi) deferred —
+  the all-Direct path establishes the syntax scaffolding for the next
+  round.
+
+  ffmpeg cross-decode bit-exact (≤ 1 LSB) on per-half-motion fixtures
+  forcing B_L0_L1_16x8 / B_L0_L1_8x16 (PSNR_Y ≥ 38 dB) and on the
+  bipred-on-midpoint fixture exercising B_8x8 + all-Direct. Encoder
+  now exits at ~62 → ~70 % H.264 syntax coverage estimated by the
+  task's progress yardstick.
+
 - **Encoder: CABAC real ME + `B_Skip` / `B_Direct_16x16` (round 32).**
   P/B CABAC paths replace the round-30/31 forced MV=(0, 0) with real
   quarter-pel motion estimation (`search_quarter_pel_16x16`) and emit

@@ -389,6 +389,149 @@ pub fn encode_mb_type_b(
 }
 
 // ---------------------------------------------------------------------------
+// §9.3.3.1.1.3 + Table 9-37 — sub_mb_type for P / SP slices.
+//
+// Mirror of [`crate::cabac_ctx::decode_sub_mb_type_p`].
+//
+// ctxIdxOffset = 21 (Table 9-34). ctxIdxInc per Table 9-39 row for
+// ctxIdxOffset=21:
+//   binIdx 0 → 0 → ctxIdx 21
+//   binIdx 1 → 1 → ctxIdx 22
+//   binIdx 2 → 2 → ctxIdx 23
+//
+// Bin strings (Table 9-37 P/SP rows):
+//   value 0 (P_L0_8x8): "1"
+//   value 1 (P_L0_8x4): "0 0"
+//   value 2 (P_L0_4x8): "0 1 1"
+//   value 3 (P_L0_4x4): "0 1 0"
+// ---------------------------------------------------------------------------
+
+/// §9.3.2.5 / Table 9-37 — encode `sub_mb_type` for one 8x8 partition of
+/// a P or SP slice macroblock.
+pub fn encode_sub_mb_type_p(enc: &mut CabacEncoder, ctxs: &mut CabacContexts, value: u32) {
+    const OFFSET: u32 = 21;
+    debug_assert!(value <= 3, "invalid P sub_mb_type {value}");
+    if value == 0 {
+        // "1" → P_L0_8x8.
+        enc.encode_decision(ctxs.at_mut(OFFSET as usize), 1);
+        return;
+    }
+    enc.encode_decision(ctxs.at_mut(OFFSET as usize), 0);
+    if value == 1 {
+        // "0 0" → P_L0_8x4.
+        enc.encode_decision(ctxs.at_mut((OFFSET + 1) as usize), 0);
+        return;
+    }
+    enc.encode_decision(ctxs.at_mut((OFFSET + 1) as usize), 1);
+    if value == 2 {
+        // "0 1 1" → P_L0_4x8.
+        enc.encode_decision(ctxs.at_mut((OFFSET + 2) as usize), 1);
+    } else {
+        // "0 1 0" → P_L0_4x4 (value 3).
+        enc.encode_decision(ctxs.at_mut((OFFSET + 2) as usize), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §9.3.3.1.1.3 + Table 9-38 — sub_mb_type for B slices.
+//
+// Mirror of [`crate::cabac_ctx::decode_sub_mb_type_b`].
+//
+// ctxIdxOffset = 36 (Table 9-34). ctxIdxInc per Table 9-39 row for
+// ctxIdxOffset=36:
+//   binIdx 0 → 0 → ctxIdx 36
+//   binIdx 1 → 1 → ctxIdx 37
+//   binIdx 2 → Table 9-41: (b1 != 0) ? 2 : 3 → ctxIdx 38 or 39
+//   binIdx 3..=5 → 3 → ctxIdx 39
+//
+// Bin strings (Table 9-38 B rows):
+//   value 0  (B_Direct_8x8): "0"
+//   value 1  (B_L0_8x8):     "1 0 0"
+//   value 2  (B_L1_8x8):     "1 0 1"
+//   value 3  (B_Bi_8x8):     "1 1 0 0 0"
+//   value 4  (B_L0_8x4):     "1 1 0 0 1"
+//   value 5  (B_L0_4x8):     "1 1 0 1 0"
+//   value 6  (B_L1_8x4):     "1 1 0 1 1"
+//   value 7  (B_L1_4x8):     "1 1 1 0 0 0"
+//   value 8  (B_Bi_8x4):     "1 1 1 0 0 1"
+//   value 9  (B_Bi_4x8):     "1 1 1 0 1 0"
+//   value 10 (B_L0_4x4):     "1 1 1 0 1 1"
+//   value 11 (B_L1_4x4):     "1 1 1 1 0"
+//   value 12 (B_Bi_4x4):     "1 1 1 1 1"
+// ---------------------------------------------------------------------------
+
+/// §9.3.2.5 / Table 9-38 — encode `sub_mb_type` for one 8x8 partition of
+/// a B-slice macroblock.
+pub fn encode_sub_mb_type_b(enc: &mut CabacEncoder, ctxs: &mut CabacContexts, value: u32) {
+    const OFFSET: u32 = 36;
+    debug_assert!(value <= 12, "invalid B sub_mb_type {value}");
+    if value == 0 {
+        // "0" → B_Direct_8x8.
+        enc.encode_decision(ctxs.at_mut(OFFSET as usize), 0);
+        return;
+    }
+    enc.encode_decision(ctxs.at_mut(OFFSET as usize), 1);
+
+    // value ∈ 1..=12. Emit b1 ∈ {0, 1}; b2 ctxIdxInc depends on b1.
+    let b1: u8 = if (1..=2).contains(&value) { 0 } else { 1 };
+    enc.encode_decision(ctxs.at_mut((OFFSET + 1) as usize), b1);
+
+    let inc_b2 = if b1 != 0 { 2 } else { 3 };
+
+    if value == 1 {
+        // "1 0 0" → B_L0_8x8.
+        enc.encode_decision(ctxs.at_mut((OFFSET + inc_b2) as usize), 0);
+        return;
+    }
+    if value == 2 {
+        // "1 0 1" → B_L1_8x8.
+        enc.encode_decision(ctxs.at_mut((OFFSET + inc_b2) as usize), 1);
+        return;
+    }
+
+    // b1 == 1 — values 3..=12. b2 distinguishes 5-bin "1 1 0 …" (3..=6)
+    // from 5/6-bin "1 1 1 …" (7..=12).
+    let b2: u8 = if (3..=6).contains(&value) { 0 } else { 1 };
+    enc.encode_decision(ctxs.at_mut((OFFSET + inc_b2) as usize), b2);
+
+    if b2 == 0 {
+        // 5-bin "1 1 0 b3 b4" — value = 3 + (b3 << 1) + b4.
+        let v = value - 3;
+        let b3 = ((v >> 1) & 1) as u8;
+        let b4 = (v & 1) as u8;
+        enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), b3);
+        enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), b4);
+        return;
+    }
+
+    // b2 == 1 — 5/6-bin "1 1 1 …".
+    //
+    // From Table 9-38:
+    //   value 7  B_L1_4x8 "1 1 1 0 0 0"
+    //   value 8  B_Bi_8x4 "1 1 1 0 0 1"
+    //   value 9  B_Bi_4x8 "1 1 1 0 1 0"
+    //   value 10 B_L0_4x4 "1 1 1 0 1 1"
+    //   value 11 B_L1_4x4 "1 1 1 1 0"
+    //   value 12 B_Bi_4x4 "1 1 1 1 1"
+    let b3: u8 = if (11..=12).contains(&value) { 1 } else { 0 };
+    enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), b3);
+
+    if b3 == 1 {
+        // "1 1 1 1 b4" — b4=0 → 11; b4=1 → 12.
+        let b4: u8 = if value == 11 { 0 } else { 1 };
+        enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), b4);
+        return;
+    }
+
+    // b3 == 0 — 6-bin "1 1 1 0 b4 b5", value = 7 + (b4 << 1) + b5.
+    let v = value - 7;
+    let b4 = ((v >> 1) & 1) as u8;
+    let b5 = (v & 1) as u8;
+    enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), b4);
+    enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), b5);
+}
+
+// ---------------------------------------------------------------------------
 // §9.3.3.1.1.5 — mb_qp_delta (signed Exp-Golomb-ish via Table 9-3 + unary).
 // ---------------------------------------------------------------------------
 
@@ -1218,7 +1361,7 @@ mod tests {
         decode_last_significant_coeff_flag, decode_mb_qp_delta, decode_mb_skip_flag,
         decode_mb_type_b, decode_mb_type_i, decode_mb_type_p, decode_mvd_lx,
         decode_prev_intra_pred_mode_flag, decode_ref_idx_lx, decode_rem_intra_pred_mode,
-        decode_significant_coeff_flag,
+        decode_significant_coeff_flag, decode_sub_mb_type_b, decode_sub_mb_type_p,
     };
 
     fn roundtrip<F1, F2>(encode_side: F1, decode_side: F2) -> Vec<u8>
@@ -1333,6 +1476,40 @@ mod tests {
             let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
             let got = decode_mb_type_p(&mut dec, &mut ctxs_dec, &nb).unwrap();
             assert_eq!(got, v, "P intra mb_type {v} round-trip");
+            assert_eq!(dec.decode_terminate().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn rt_sub_mb_type_p_all_values() {
+        // Round-475 — Table 9-37 P/SP sub_mb_type values 0..=3.
+        for v in 0u32..=3 {
+            let mut ctxs_enc = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+            let mut enc = CabacEncoder::new();
+            encode_sub_mb_type_p(&mut enc, &mut ctxs_enc, v);
+            enc.encode_terminate(1);
+            let bytes = enc.finish_no_trailing();
+            let mut ctxs_dec = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+            let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
+            let got = decode_sub_mb_type_p(&mut dec, &mut ctxs_dec).unwrap();
+            assert_eq!(got, v, "P sub_mb_type {v} round-trip");
+            assert_eq!(dec.decode_terminate().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn rt_sub_mb_type_b_all_values() {
+        // Round-475 — Table 9-38 B sub_mb_type values 0..=12.
+        for v in 0u32..=12 {
+            let mut ctxs_enc = CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
+            let mut enc = CabacEncoder::new();
+            encode_sub_mb_type_b(&mut enc, &mut ctxs_enc, v);
+            enc.encode_terminate(1);
+            let bytes = enc.finish_no_trailing();
+            let mut ctxs_dec = CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
+            let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
+            let got = decode_sub_mb_type_b(&mut dec, &mut ctxs_dec).unwrap();
+            assert_eq!(got, v, "B sub_mb_type {v} round-trip");
             assert_eq!(dec.decode_terminate().unwrap(), 1);
         }
     }

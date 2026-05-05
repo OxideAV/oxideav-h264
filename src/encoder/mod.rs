@@ -2446,7 +2446,7 @@ fn build_inter_pred_luma(
 /// {0, 1}` selects which 8x8 inside the MB. Output is `[i32; 64]`
 /// row-major (8 rows of 8 samples).
 #[allow(clippy::too_many_arguments)]
-fn build_inter_pred_luma_8x8(
+pub(crate) fn build_inter_pred_luma_8x8(
     ref_y: &[u8],
     ref_w: u32,
     ref_h: u32,
@@ -2479,7 +2479,7 @@ fn build_inter_pred_luma_8x8(
 /// partition of a P_8x8 MB (4:2:0). `(sub_x, sub_y) ∈ {0, 1}` selects
 /// the sub-block. Output is `[i32; 16]` row-major.
 #[allow(clippy::too_many_arguments)]
-fn build_inter_pred_chroma_4x4(
+pub(crate) fn build_inter_pred_chroma_4x4(
     ref_c: &[u8],
     ref_cw: u32,
     ref_ch: u32,
@@ -6117,7 +6117,7 @@ fn sad_16x16_pred(
 /// `BPartPred`. Output is `[i32; 128]` in row-major (8 rows of 16
 /// samples). `partition_y_off` ∈ {0, 8} selects the half within the MB.
 #[allow(clippy::too_many_arguments)]
-fn build_b_partition_pred_luma_16x8(
+pub(crate) fn build_b_partition_pred_luma_16x8(
     pred: BPartPred,
     ref_l0: &EncodedFrameRef<'_>,
     ref_l1: &EncodedFrameRef<'_>,
@@ -6180,7 +6180,7 @@ fn build_b_partition_pred_luma_16x8(
 /// 8 samples). `partition_x_off` ∈ {0, 8} selects the half within the
 /// MB.
 #[allow(clippy::too_many_arguments)]
-fn build_b_partition_pred_luma_8x16(
+pub(crate) fn build_b_partition_pred_luma_8x16(
     pred: BPartPred,
     ref_l0: &EncodedFrameRef<'_>,
     ref_l1: &EncodedFrameRef<'_>,
@@ -6334,7 +6334,7 @@ fn build_inter_pred_chroma_partition(
 /// Round-22 — build chroma predictors for one B-slice 16x8 partition
 /// (Cb + Cr). 4:2:0 → chroma partition is 8x4 (`[i32; 32]` row-major).
 #[allow(clippy::too_many_arguments)]
-fn build_b_partition_pred_chroma_16x8(
+pub(crate) fn build_b_partition_pred_chroma_16x8(
     pred: BPartPred,
     ref_l0: &EncodedFrameRef<'_>,
     ref_l1: &EncodedFrameRef<'_>,
@@ -6404,7 +6404,7 @@ fn build_b_partition_pred_chroma_16x8(
 /// Round-22 — build chroma predictors for one B-slice 8x16 partition
 /// (Cb + Cr). 4:2:0 → chroma partition is 4x8 (`[i32; 32]` row-major).
 #[allow(clippy::too_many_arguments)]
-fn build_b_partition_pred_chroma_8x16(
+pub(crate) fn build_b_partition_pred_chroma_8x16(
     pred: BPartPred,
     ref_l0: &EncodedFrameRef<'_>,
     ref_l1: &EncodedFrameRef<'_>,
@@ -6476,7 +6476,7 @@ fn build_b_partition_pred_chroma_8x16(
 /// predictor buffer (row-major i32 with stride = w, clamped to
 /// 0..=255).
 #[allow(clippy::too_many_arguments)]
-fn sad_partition_pred(
+pub(crate) fn sad_partition_pred(
     src_y: &[u8],
     src_stride: usize,
     mb_x: usize,
@@ -6702,7 +6702,7 @@ fn best_partition_mv(
 /// Builds the partition's L0/L1/Bi predictor, returns its SAD against
 /// source.
 #[allow(clippy::too_many_arguments)]
-fn partition_sad_b_16x8(
+pub(crate) fn partition_sad_b_16x8(
     pred: BPartPred,
     src_y: &[u8],
     src_stride: usize,
@@ -6719,7 +6719,7 @@ fn partition_sad_b_16x8(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn partition_sad_b_8x16(
+pub(crate) fn partition_sad_b_8x16(
     pred: BPartPred,
     src_y: &[u8],
     src_stride: usize,
@@ -6737,7 +6737,7 @@ fn partition_sad_b_8x16(
 
 /// Round-22 — choose the best per-partition (mode, mv_l0, mv_l1) for
 /// one 16x8 or 8x16 partition given pre-computed per-list candidate MVs.
-fn best_partition_mode_b(
+pub(crate) fn best_partition_mode_b(
     candidates_l0: &[Mv],
     candidates_l1: &[Mv],
     eval_sad: impl Fn(BPartPred, Mv, Mv) -> u32,
@@ -6771,7 +6771,7 @@ fn best_partition_mode_b(
 
 /// Round-22 — which partition shape was picked for a B MB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PartitionShape {
+pub(crate) enum PartitionShape {
     /// Two 16x8 halves stacked vertically (top, bottom).
     P16x8,
     /// Two 8x16 halves side-by-side (left, right).
