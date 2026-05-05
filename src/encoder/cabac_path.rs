@@ -47,7 +47,7 @@ use crate::encoder::deblock::{
 use crate::encoder::intra_pred::{
     predict_16x16, predict_chroma_8x8, sad_8x8, I16x16Mode, IntraChromaMode,
 };
-use crate::encoder::macroblock::{b_16x8_mb_type_raw, b_8x16_mb_type_raw, BPartPred};
+use crate::encoder::macroblock::{b_16x8_mb_type_raw, b_8x16_mb_type_raw, BPartPred, BSubMbCell};
 use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
@@ -61,11 +61,12 @@ use crate::encoder::transform::{
     quantize_chroma_dc, quantize_luma_dc, zigzag_scan_4x4, zigzag_scan_4x4_ac,
 };
 use crate::encoder::{
-    best_partition_mode_b, build_b_partition_pred_chroma_16x8, build_b_partition_pred_chroma_8x16,
+    best_partition_mode_b, build_b_explicit_4x4_cell_chroma, build_b_explicit_8x8_cell_luma,
+    build_b_partition_pred_chroma_16x8, build_b_partition_pred_chroma_8x16,
     build_b_partition_pred_luma_16x8, build_b_partition_pred_luma_8x16,
     build_inter_pred_chroma_4x4, build_inter_pred_luma_8x8, partition_sad_b_16x8,
-    partition_sad_b_8x16, EncodedB, EncodedFrameRef, EncodedIdr, EncodedP, Encoder,
-    FrameRefPartitionMv, PartitionShape, YuvFrame,
+    partition_sad_b_8x16, pick_best_b8x8_cell, EncodedB, EncodedFrameRef, EncodedIdr, EncodedP,
+    Encoder, FrameRefPartitionMv, PartitionShape, YuvFrame,
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::mv_deriv::{
@@ -678,6 +679,178 @@ fn cabac_mvp_for_b_8x16_partition(
     };
     let inputs = MvpredInputs::from_abc(a, b, c, ref_idx, shape);
     derive_mvpred_with_d(&inputs, d)
+}
+
+/// §8.4.1.3 — derive mvpLX for one 8x8 sub-MB partition (cell idx ∈
+/// {0, 1, 2, 3} in raster Z-order TL/TR/BL/BR) of a B `B_8x8` MB at
+/// `(mb_x, mb_y)` using the CABAC encoder grid. Round-475 mixed-cell
+/// path. Mirrors the CAVLC-side `mvp_for_p_8x8_partition` (extended for
+/// per-list operation in B-slices).
+///
+/// `cell_decoded[c]` carries whether cell `c` has been processed
+/// (decoder analogue: whether `process_partition` has been called on it
+/// yet). `mv_inflight[c]` and `ref_inflight[c]` carry that cell's
+/// per-list MV and refIdx (`-1` if the list is not used by that cell —
+/// e.g. a Direct cell with refIdxL0 < 0, or an explicit L1-only cell on
+/// the L0 lookup). When `cell_decoded[c]` is false the MVP function
+/// returns the [`NeighbourMv::partition_not_yet_decoded_same_mb`]
+/// sentinel; when true but `ref_inflight[c] < 0` it returns
+/// `intra_but_mb_available` (matching the decoder's grid behaviour for a
+/// processed cell whose other-list-only entry leaves the queried list
+/// at the default `(0, 0), -1`).
+#[allow(clippy::too_many_arguments)]
+fn cabac_mvp_for_b_8x8_partition(
+    grid: &CabacEncGrid,
+    mb_x: usize,
+    mb_y: usize,
+    sub_idx: usize,
+    ref_idx: i32,
+    list: u8,
+    cell_decoded: [bool; 4],
+    mv_inflight: [Mv; 4],
+    ref_inflight: [i32; 4],
+) -> Mv {
+    // Top-left 4x4 of this 8x8 partition, in 4x4-block units.
+    let sub_x = (sub_idx % 2) as i32;
+    let sub_y = (sub_idx / 2) as i32;
+    let bx = sub_x * 2;
+    let by = sub_y * 2;
+    // Partition width = 8 = 2 4x4 blocks → C is at (bx + 2, by - 1).
+    let a = cabac_neighbour_partition_mv_b8x8(
+        grid,
+        mb_x,
+        mb_y,
+        bx - 1,
+        by,
+        list,
+        cell_decoded,
+        mv_inflight,
+        ref_inflight,
+    );
+    let b = cabac_neighbour_partition_mv_b8x8(
+        grid,
+        mb_x,
+        mb_y,
+        bx,
+        by - 1,
+        list,
+        cell_decoded,
+        mv_inflight,
+        ref_inflight,
+    );
+    let c = cabac_neighbour_partition_mv_b8x8(
+        grid,
+        mb_x,
+        mb_y,
+        bx + 2,
+        by - 1,
+        list,
+        cell_decoded,
+        mv_inflight,
+        ref_inflight,
+    );
+    let d = cabac_neighbour_partition_mv_b8x8(
+        grid,
+        mb_x,
+        mb_y,
+        bx - 1,
+        by - 1,
+        list,
+        cell_decoded,
+        mv_inflight,
+        ref_inflight,
+    );
+    let inputs = MvpredInputs::from_abc(a, b, c, ref_idx, MvpredShape::Default);
+    derive_mvpred_with_d(&inputs, d)
+}
+
+/// Variant of `cabac_neighbour_partition_mv` for the B_8x8 mixed path.
+/// The same-MB case distinguishes between "cell decoded" (returns
+/// `intra_but_mb_available` when the queried list is unused — partition
+/// IS available per §6.4.11.1) and "cell not yet decoded" (returns
+/// `partition_not_yet_decoded_same_mb` — partition IS NOT available).
+#[allow(clippy::too_many_arguments)]
+fn cabac_neighbour_partition_mv_b8x8(
+    grid: &CabacEncGrid,
+    mb_x: usize,
+    mb_y: usize,
+    bx_4x4: i32,
+    by_4x4: i32,
+    list: u8,
+    cell_decoded: [bool; 4],
+    mv_inflight: [Mv; 4],
+    ref_inflight: [i32; 4],
+) -> NeighbourMv {
+    let h = grid.mbs.len() / grid.width_mbs;
+    let (nmb_x, nmb_y, lx, ly) = if bx_4x4 < 0 && (0..4).contains(&by_4x4) {
+        if mb_x == 0 {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        (mb_x - 1, mb_y, 3, by_4x4)
+    } else if (0..4).contains(&bx_4x4) && by_4x4 < 0 {
+        if mb_y == 0 {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        (mb_x, mb_y - 1, bx_4x4, 3)
+    } else if bx_4x4 < 0 && by_4x4 < 0 {
+        if mb_x == 0 || mb_y == 0 {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        (mb_x - 1, mb_y - 1, 3, 3)
+    } else if (0..4).contains(&bx_4x4) && (0..4).contains(&by_4x4) {
+        // Same MB — use cell_decoded + inflight.
+        let part = 2 * (by_4x4 as usize / 2) + (bx_4x4 as usize / 2);
+        if !cell_decoded[part] {
+            return NeighbourMv::partition_not_yet_decoded_same_mb();
+        }
+        // Cell IS decoded. If the queried list isn't used by that cell
+        // (ref_inflight < 0), the decoder grid has the default (0,0)/-1
+        // pair → `intra_but_mb_available` (partition available, but list
+        // unused → mvLXN=0, refIdxLXN=-1 in §8.4.1.3.2 step 2a sense).
+        if ref_inflight[part] < 0 {
+            return NeighbourMv::intra_but_mb_available();
+        }
+        return NeighbourMv {
+            available: true,
+            mb_available: true,
+            partition_available: true,
+            ref_idx: ref_inflight[part],
+            mv: mv_inflight[part],
+        };
+    } else if (4..).contains(&bx_4x4) && by_4x4 < 0 {
+        if mb_y == 0 || mb_x + 1 >= grid.width_mbs {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        (mb_x + 1, mb_y - 1, bx_4x4 - 4, 3)
+    } else {
+        return NeighbourMv::UNAVAILABLE;
+    };
+    if nmb_y >= h {
+        return NeighbourMv::UNAVAILABLE;
+    }
+    let s = grid.at(nmb_x, nmb_y);
+    if !s.available {
+        return NeighbourMv::UNAVAILABLE;
+    }
+    if s.is_intra {
+        return NeighbourMv::intra_but_mb_available();
+    }
+    let part = 2 * (ly as usize / 2) + (lx as usize / 2);
+    let (ref_idx, mv) = if list == 0 {
+        (s.ref_idx_l0_8x8[part], s.mv_l0_8x8[part])
+    } else {
+        (s.ref_idx_l1_8x8[part], s.mv_l1_8x8[part])
+    };
+    if ref_idx < 0 {
+        return NeighbourMv::intra_but_mb_available();
+    }
+    NeighbourMv {
+        available: true,
+        mb_available: true,
+        partition_available: true,
+        ref_idx,
+        mv,
+    }
 }
 
 /// §9.3.3.1.1.9 — CBF neighbour conditions for a block at the MB level
@@ -2854,7 +3027,7 @@ impl Encoder {
                     (3u32, pred_y_bi, pred_u_bi, pred_v_bi) // B_Bi_16x16
                 };
                 let mut is_direct = chosen_mb_type == 0;
-                let is_direct_per_8x8 = chosen_mb_type == 22;
+                let mut is_direct_per_8x8 = chosen_mb_type == 22;
 
                 // -------------------------------------------------------
                 // Round-475 — B 16x8 / 8x16 partition decision.
@@ -3000,79 +3173,355 @@ impl Encoder {
                     is_direct = false;
                 }
 
+                // -------------------------------------------------------
+                // Round-475 — per-cell mixed `B_8x8` decision.
+                //
+                // Per-cell pick from {Direct, L0, L1, Bi}. Each non-
+                // Direct cell pays ~6-12 bits of MB syntax (sub_mb_type
+                // + per-cell mvd_l0/_l1) — `pick_best_b8x8_cell` already
+                // bakes that rate cost into its Lagrangian score. The
+                // mixed mode is only worth emitting when at least one
+                // cell picks non-Direct AND the total cell SAD beats the
+                // best alternative by enough to amortise the +12-bit MB
+                // header cost vs B_Direct_16x16 (or 0 vs B_8x8+all-
+                // Direct). Mirror of the CAVLC `Mixed8x8` selector.
+                // -------------------------------------------------------
+                let mut mixed_choice: Option<(
+                    [BSubMbCell; 4],
+                    [Mv; 4], // per-cell mv L0
+                    [Mv; 4], // per-cell mv L1
+                )> = None;
+                if direct_pred_kind.is_some() {
+                    let mut mixed_cells = [BSubMbCell::Direct; 4];
+                    let mut mixed_mv_l0 = [Mv::ZERO; 4];
+                    let mut mixed_mv_l1 = [Mv::ZERO; 4];
+                    let mut mixed_pred_per_cell = [[0i32; 64]; 4];
+                    let mut mixed_total_sad: u32 = 0;
+                    for cell in 0..4usize {
+                        let sub_x = cell % 2;
+                        let sub_y = cell / 2;
+                        // Build per-cell Direct predictor directly from
+                        // §8.4.1.2.2-derived MVs (don't slice from
+                        // `direct_8x8_pred_y` — that's only populated
+                        // when `!direct_uniform`).
+                        let l0_used = direct.ref_idx_l0 >= 0;
+                        let l1_used = direct.ref_idx_l1 >= 0;
+                        let mv0d = direct.mv_l0_per_8x8[cell];
+                        let mv1d = direct.mv_l1_per_8x8[cell];
+                        let direct_cell_pred = match (l0_used, l1_used) {
+                            (true, true) => {
+                                let a = build_inter_pred_luma_8x8(
+                                    ref_l0.recon_y,
+                                    ref_l0.width,
+                                    ref_l0.height,
+                                    mb_x,
+                                    mb_y,
+                                    sub_x,
+                                    sub_y,
+                                    mv0d,
+                                );
+                                let b = build_inter_pred_luma_8x8(
+                                    ref_l1.recon_y,
+                                    ref_l1.width,
+                                    ref_l1.height,
+                                    mb_x,
+                                    mb_y,
+                                    sub_x,
+                                    sub_y,
+                                    mv1d,
+                                );
+                                let mut out = [0i32; 64];
+                                for i in 0..64 {
+                                    out[i] = ((a[i] + b[i] + 1) >> 1).clamp(0, 255);
+                                }
+                                out
+                            }
+                            (true, false) => build_inter_pred_luma_8x8(
+                                ref_l0.recon_y,
+                                ref_l0.width,
+                                ref_l0.height,
+                                mb_x,
+                                mb_y,
+                                sub_x,
+                                sub_y,
+                                mv0d,
+                            ),
+                            (false, true) => build_inter_pred_luma_8x8(
+                                ref_l1.recon_y,
+                                ref_l1.width,
+                                ref_l1.height,
+                                mb_x,
+                                mb_y,
+                                sub_x,
+                                sub_y,
+                                mv1d,
+                            ),
+                            (false, false) => [0i32; 64],
+                        };
+                        let (k, m0, m1, p, s) = pick_best_b8x8_cell(
+                            frame.y,
+                            width,
+                            ref_l0,
+                            ref_l1,
+                            mb_x,
+                            mb_y,
+                            sub_x,
+                            sub_y,
+                            &direct_cell_pred,
+                            me_l0_cells[cell],
+                            me_l1_cells[cell],
+                            qp_y,
+                        );
+                        mixed_cells[cell] = k;
+                        mixed_mv_l0[cell] = m0;
+                        mixed_mv_l1[cell] = m1;
+                        mixed_pred_per_cell[cell] = p;
+                        mixed_total_sad = mixed_total_sad.saturating_add(s);
+                    }
+                    let mixed_has_non_direct = mixed_cells.iter().any(|&c| c != BSubMbCell::Direct);
+                    if mixed_has_non_direct {
+                        // Compare mixed-total-SAD vs the best current
+                        // candidate (after partition / direct decisions).
+                        // Mixed costs +12 bits MB header vs B_Direct_16x16
+                        // and 0 vs DirectPer8x8.
+                        let mixed_mb_header_bias_sad: u64 = if is_direct_per_8x8 {
+                            0
+                        } else {
+                            (lambda + 1) * 12
+                        };
+                        let mixed_tiebreak_bias: u64 = (lambda + 1) * 8;
+                        let mixed_score = (mixed_total_sad as u64)
+                            .saturating_add(mixed_mb_header_bias_sad)
+                            .saturating_add(mixed_tiebreak_bias);
+                        // Reference SAD from current best.
+                        let current_best_sad: u64 = if partition_choice.is_some() {
+                            part_winner_sad
+                        } else {
+                            best_16x16_sad
+                        };
+                        if mixed_score < current_best_sad {
+                            // Build per-cell predictors (luma + chroma)
+                            // and stitch them into the MB-level buffers.
+                            // Done after the gating to avoid wasted work.
+                            mixed_choice = Some((mixed_cells, mixed_mv_l0, mixed_mv_l1));
+                            // Mixed wins; clear partition / direct flags.
+                            partition_choice = None;
+                            is_direct = false;
+                            is_direct_per_8x8 = false;
+                        }
+                    }
+                }
+
                 // Build the working luma + chroma predictors. For
                 // partition modes, build the composite from the two
-                // per-partition predictors; otherwise use the 16x16
+                // per-partition predictors; for mixed B_8x8, stitch the
+                // four cell predictors; otherwise use the 16x16
                 // predictor selected above.
-                let (pred_y, pred_u, pred_v) =
-                    if let Some((shape, mode_a, mode_b, mv0_a, mv1_a, mv0_b, mv1_b)) =
-                        partition_choice
-                    {
-                        let mut py = [0i32; 256];
-                        let mut pu = [0i32; 64];
-                        let mut pv = [0i32; 64];
-                        match shape {
-                            PartitionShape::P16x8 => {
-                                let p0 = build_b_partition_pred_luma_16x8(
-                                    mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
-                                );
-                                let p1 = build_b_partition_pred_luma_16x8(
-                                    mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
-                                );
-                                for j in 0..8usize {
-                                    for i in 0..16usize {
-                                        py[j * 16 + i] = p0[j * 16 + i];
-                                        py[(8 + j) * 16 + i] = p1[j * 16 + i];
+                let (pred_y, pred_u, pred_v) = if let Some((cells, mv0s, mv1s)) = mixed_choice {
+                    let mut py = [0i32; 256];
+                    let mut pu = [0i32; 64];
+                    let mut pv = [0i32; 64];
+                    let chroma_w_l0 = ref_l0.width / 2;
+                    let chroma_h_l0 = ref_l0.height / 2;
+                    let chroma_w_l1 = ref_l1.width / 2;
+                    let chroma_h_l1 = ref_l1.height / 2;
+                    for cell in 0..4usize {
+                        let sub_x = cell % 2;
+                        let sub_y = cell / 2;
+                        // Luma 8x8.
+                        let cell_y = match cells[cell] {
+                            BSubMbCell::Direct => {
+                                // Direct cell uses §8.4.1.2.2-derived
+                                // per-8x8 MVs. Build per-cell predictor
+                                // directly (we can't slice from
+                                // `direct_8x8_pred_y` because that's
+                                // only populated when `!direct_uniform`,
+                                // and mixed mode is gated on
+                                // `direct_pred_kind.is_some()` only).
+                                let l0_used = direct.ref_idx_l0 >= 0;
+                                let l1_used = direct.ref_idx_l1 >= 0;
+                                let mv0 = direct.mv_l0_per_8x8[cell];
+                                let mv1 = direct.mv_l1_per_8x8[cell];
+                                match (l0_used, l1_used) {
+                                    (true, true) => {
+                                        let a = build_inter_pred_luma_8x8(
+                                            ref_l0.recon_y,
+                                            ref_l0.width,
+                                            ref_l0.height,
+                                            mb_x,
+                                            mb_y,
+                                            sub_x,
+                                            sub_y,
+                                            mv0,
+                                        );
+                                        let b = build_inter_pred_luma_8x8(
+                                            ref_l1.recon_y,
+                                            ref_l1.width,
+                                            ref_l1.height,
+                                            mb_x,
+                                            mb_y,
+                                            sub_x,
+                                            sub_y,
+                                            mv1,
+                                        );
+                                        let mut out = [0i32; 64];
+                                        for i in 0..64 {
+                                            out[i] = ((a[i] + b[i] + 1) >> 1).clamp(0, 255);
+                                        }
+                                        out
                                     }
-                                }
-                                let (cb0, cr0) = build_b_partition_pred_chroma_16x8(
-                                    mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
-                                );
-                                let (cb1, cr1) = build_b_partition_pred_chroma_16x8(
-                                    mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
-                                );
-                                for j in 0..4usize {
-                                    for i in 0..8usize {
-                                        pu[j * 8 + i] = cb0[j * 8 + i];
-                                        pv[j * 8 + i] = cr0[j * 8 + i];
-                                        pu[(4 + j) * 8 + i] = cb1[j * 8 + i];
-                                        pv[(4 + j) * 8 + i] = cr1[j * 8 + i];
-                                    }
+                                    (true, false) => build_inter_pred_luma_8x8(
+                                        ref_l0.recon_y,
+                                        ref_l0.width,
+                                        ref_l0.height,
+                                        mb_x,
+                                        mb_y,
+                                        sub_x,
+                                        sub_y,
+                                        mv0,
+                                    ),
+                                    (false, true) => build_inter_pred_luma_8x8(
+                                        ref_l1.recon_y,
+                                        ref_l1.width,
+                                        ref_l1.height,
+                                        mb_x,
+                                        mb_y,
+                                        sub_x,
+                                        sub_y,
+                                        mv1,
+                                    ),
+                                    (false, false) => [0i32; 64],
                                 }
                             }
-                            PartitionShape::P8x16 => {
-                                let p0 = build_b_partition_pred_luma_8x16(
-                                    mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
-                                );
-                                let p1 = build_b_partition_pred_luma_8x16(
-                                    mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
-                                );
-                                for j in 0..16usize {
-                                    for i in 0..8usize {
-                                        py[j * 16 + i] = p0[j * 8 + i];
-                                        py[j * 16 + 8 + i] = p1[j * 8 + i];
-                                    }
+                            other => build_b_explicit_8x8_cell_luma(
+                                other, ref_l0, ref_l1, mb_x, mb_y, sub_x, sub_y, mv0s[cell],
+                                mv1s[cell],
+                            ),
+                        };
+                        for j in 0..8usize {
+                            for i in 0..8usize {
+                                py[(sub_y * 8 + j) * 16 + sub_x * 8 + i] = cell_y[j * 8 + i];
+                            }
+                        }
+                        // Chroma 4x4 per cell.
+                        let (mv0_eff, mv1_eff, chroma_kind) = match cells[cell] {
+                            BSubMbCell::Direct => {
+                                let kind = match (direct.ref_idx_l0 >= 0, direct.ref_idx_l1 >= 0) {
+                                    (true, true) => BSubMbCell::Bi,
+                                    (true, false) => BSubMbCell::L0,
+                                    (false, true) => BSubMbCell::L1,
+                                    (false, false) => BSubMbCell::L0, // defensive
+                                };
+                                (direct.mv_l0_per_8x8[cell], direct.mv_l1_per_8x8[cell], kind)
+                            }
+                            other => (mv0s[cell], mv1s[cell], other),
+                        };
+                        let cu = build_b_explicit_4x4_cell_chroma(
+                            chroma_kind,
+                            ref_l0.recon_u,
+                            ref_l1.recon_u,
+                            chroma_w_l0,
+                            chroma_h_l0,
+                            chroma_w_l1,
+                            chroma_h_l1,
+                            mb_x,
+                            mb_y,
+                            sub_x,
+                            sub_y,
+                            mv0_eff,
+                            mv1_eff,
+                        );
+                        let cv = build_b_explicit_4x4_cell_chroma(
+                            chroma_kind,
+                            ref_l0.recon_v,
+                            ref_l1.recon_v,
+                            chroma_w_l0,
+                            chroma_h_l0,
+                            chroma_w_l1,
+                            chroma_h_l1,
+                            mb_x,
+                            mb_y,
+                            sub_x,
+                            sub_y,
+                            mv0_eff,
+                            mv1_eff,
+                        );
+                        for j in 0..4usize {
+                            for i in 0..4usize {
+                                pu[(sub_y * 4 + j) * 8 + sub_x * 4 + i] = cu[j * 4 + i];
+                                pv[(sub_y * 4 + j) * 8 + sub_x * 4 + i] = cv[j * 4 + i];
+                            }
+                        }
+                    }
+                    (py, pu, pv)
+                } else if let Some((shape, mode_a, mode_b, mv0_a, mv1_a, mv0_b, mv1_b)) =
+                    partition_choice
+                {
+                    let mut py = [0i32; 256];
+                    let mut pu = [0i32; 64];
+                    let mut pv = [0i32; 64];
+                    match shape {
+                        PartitionShape::P16x8 => {
+                            let p0 = build_b_partition_pred_luma_16x8(
+                                mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
+                            );
+                            let p1 = build_b_partition_pred_luma_16x8(
+                                mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
+                            );
+                            for j in 0..8usize {
+                                for i in 0..16usize {
+                                    py[j * 16 + i] = p0[j * 16 + i];
+                                    py[(8 + j) * 16 + i] = p1[j * 16 + i];
                                 }
-                                let (cb0, cr0) = build_b_partition_pred_chroma_8x16(
-                                    mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
-                                );
-                                let (cb1, cr1) = build_b_partition_pred_chroma_8x16(
-                                    mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
-                                );
-                                for j in 0..8usize {
-                                    for i in 0..4usize {
-                                        pu[j * 8 + i] = cb0[j * 4 + i];
-                                        pv[j * 8 + i] = cr0[j * 4 + i];
-                                        pu[j * 8 + 4 + i] = cb1[j * 4 + i];
-                                        pv[j * 8 + 4 + i] = cr1[j * 4 + i];
-                                    }
+                            }
+                            let (cb0, cr0) = build_b_partition_pred_chroma_16x8(
+                                mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
+                            );
+                            let (cb1, cr1) = build_b_partition_pred_chroma_16x8(
+                                mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
+                            );
+                            for j in 0..4usize {
+                                for i in 0..8usize {
+                                    pu[j * 8 + i] = cb0[j * 8 + i];
+                                    pv[j * 8 + i] = cr0[j * 8 + i];
+                                    pu[(4 + j) * 8 + i] = cb1[j * 8 + i];
+                                    pv[(4 + j) * 8 + i] = cr1[j * 8 + i];
                                 }
                             }
                         }
-                        (py, pu, pv)
-                    } else {
-                        (pred_y_16, pred_u_16, pred_v_16)
-                    };
+                        PartitionShape::P8x16 => {
+                            let p0 = build_b_partition_pred_luma_8x16(
+                                mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
+                            );
+                            let p1 = build_b_partition_pred_luma_8x16(
+                                mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
+                            );
+                            for j in 0..16usize {
+                                for i in 0..8usize {
+                                    py[j * 16 + i] = p0[j * 8 + i];
+                                    py[j * 16 + 8 + i] = p1[j * 8 + i];
+                                }
+                            }
+                            let (cb0, cr0) = build_b_partition_pred_chroma_8x16(
+                                mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
+                            );
+                            let (cb1, cr1) = build_b_partition_pred_chroma_8x16(
+                                mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
+                            );
+                            for j in 0..8usize {
+                                for i in 0..4usize {
+                                    pu[j * 8 + i] = cb0[j * 4 + i];
+                                    pv[j * 8 + i] = cr0[j * 4 + i];
+                                    pu[j * 8 + 4 + i] = cb1[j * 4 + i];
+                                    pv[j * 8 + 4 + i] = cr1[j * 4 + i];
+                                }
+                            }
+                        }
+                    }
+                    (py, pu, pv)
+                } else {
+                    (pred_y_16, pred_u_16, pred_v_16)
+                };
 
                 // Luma residual + per-4x4 quantise.
                 let mut residual = [0i32; 256];
@@ -3221,29 +3670,35 @@ impl Encoder {
                             PartitionShape::P16x8 => b_16x8_mb_type_raw(mode_a, mode_b),
                             PartitionShape::P8x16 => b_8x16_mb_type_raw(mode_a, mode_b),
                         }
-                    } else if is_direct_per_8x8 {
+                    } else if is_direct_per_8x8 || mixed_choice.is_some() {
                         22u32
                     } else {
                         chosen_mb_type
                     };
                 encode_mb_type_b(&mut cabac, &mut ctxs, &nb, chosen_mb_type_emitted);
                 // §7.3.5.2 — B_8x8 sub_mb_pred(): four sub_mb_type entries.
-                // For round-475 all four are forced to 0 (B_Direct_8x8),
-                // which gates off ref_idx_lN and mvd_lN entirely (the
-                // decoder re-derives them via §8.4.1.2.2).
+                // For all-Direct (round-475 round-32) all four are 0
+                // (B_Direct_8x8). For mixed (round-475 task #475), per-
+                // cell ∈ {0, 1, 2, 3} per Table 7-18.
                 if is_direct_per_8x8 {
                     for _ in 0..4 {
                         encode_sub_mb_type_b(&mut cabac, &mut ctxs, 0);
                     }
+                } else if let Some((cells, _, _)) = mixed_choice {
+                    for &c in &cells {
+                        encode_sub_mb_type_b(&mut cabac, &mut ctxs, c.sub_mb_type_raw());
+                    }
                 }
 
                 // 16x16 explicit branch flags (only meaningful when
-                // partition_choice is None).
+                // partition_choice is None and mixed_choice is None).
                 let pred_kind = chosen_mb_type; // 0 = Direct, 1 = L0, 2 = L1, 3 = Bi
-                let uses_l0_explicit_16x16 =
-                    partition_choice.is_none() && (pred_kind == 1 || pred_kind == 3);
-                let uses_l1_explicit_16x16 =
-                    partition_choice.is_none() && (pred_kind == 2 || pred_kind == 3);
+                let uses_l0_explicit_16x16 = partition_choice.is_none()
+                    && mixed_choice.is_none()
+                    && (pred_kind == 1 || pred_kind == 3);
+                let uses_l1_explicit_16x16 = partition_choice.is_none()
+                    && mixed_choice.is_none()
+                    && (pred_kind == 2 || pred_kind == 3);
 
                 // num_ref_idx_lN_active_minus1 = 0 in our PPS, so ref_idx_lN
                 // is NOT emitted (single ref per list). B_Direct_16x16
@@ -3637,6 +4092,221 @@ impl Encoder {
                     }
                 }
 
+                // Round-475 — per-cell mixed `B_8x8` mvd emission.
+                //
+                // §7.3.5.2 sub_mb_pred() field order (per Table 7-18,
+                // single-ref → no ref_idx_lN te(v) since
+                // num_ref_idx_l0_active_minus1 == 0):
+                //   for i in 0..4: if cell uses L0: mvd_l0[i].x, .y
+                //   for i in 0..4: if cell uses L1: mvd_l1[i].x, .y
+                //
+                // Per-cell MVPs come from `cabac_mvp_for_b_8x8_partition`
+                // with the inflight per-quadrant MV / ref state of cells
+                // emitted earlier in the MB.
+                //
+                // Per-4x4 |mvd| fan-out: each 8x8 cell covers a 2x2 block
+                // of 4x4 indices. Cell `c` (sub_x, sub_y) covers blk4 in
+                // {(2*sub_y+0)*4 + 2*sub_x + 0, +1, (2*sub_y+1)*4 + ...}
+                // — but we use the §6.4.3 raster-Z layout below for
+                // consistency with the rest of the encoder.
+                let mut mixed_per_cell_mvd_l0_x = [0i32; 4];
+                let mut mixed_per_cell_mvd_l0_y = [0i32; 4];
+                let mut mixed_per_cell_mvd_l1_x = [0i32; 4];
+                let mut mixed_per_cell_mvd_l1_y = [0i32; 4];
+                if let Some((cells, mv0s, mv1s)) = mixed_choice {
+                    // Per-cell decoded flag + per-cell L0/L1 inflight
+                    // state, updated in raster order to mirror the
+                    // decoder's `process_partition` loop. The decoder
+                    // iterates partitions in raster cell order (0, 1,
+                    // 2, 3); for each partition it derives mvp_l0 +
+                    // mvp_l1 from the current grid state, then stores
+                    // (mv_l0, mv_l1) into the grid. So cell c's MVPs
+                    // for both lists read inflight reflecting cells
+                    // 0..(c-1)'s MVs.
+                    //
+                    // `cell_decoded[c]` carries whether cell c has been
+                    // processed (regardless of which list); the
+                    // per-list inflight slot may have ref_idx = -1 when
+                    // the cell uses only the OTHER list. The MVP helper
+                    // uses this distinction for the §8.4.1.3.2 C→D
+                    // substitution (decoded-but-other-list-only cells
+                    // are partition-available + intra-like; not-yet-
+                    // decoded cells are partition-unavailable).
+                    let mut cell_decoded = [false; 4];
+                    let mut cell_mv_inflight_l0 = [Mv::ZERO; 4];
+                    let mut cell_mv_inflight_l1 = [Mv::ZERO; 4];
+                    let mut cell_ref_inflight_l0 = [-1i32; 4];
+                    let mut cell_ref_inflight_l1 = [-1i32; 4];
+
+                    // Per-cell top-left 4x4 block index (Table 6-10
+                    // raster-Z layout): cell 0 → blk 0, cell 1 → blk 4,
+                    // cell 2 → blk 8, cell 3 → blk 12. (cell index `c`
+                    // maps to block `4*c` because the §6.4.3 LUMA_4X4_BLK
+                    // groups all 4 4x4s of one 8x8 quadrant first.)
+                    let cell_top_left_blk: [u8; 4] = [0, 4, 8, 12];
+                    let cell_4x4_ranges: [[u8; 4]; 4] = [
+                        [0, 1, 2, 3],     // cell 0 → blocks 0..=3
+                        [4, 5, 6, 7],     // cell 1 → blocks 4..=7
+                        [8, 9, 10, 11],   // cell 2 → blocks 8..=11
+                        [12, 13, 14, 15], // cell 3 → blocks 12..=15
+                    ];
+
+                    // §7.3.5.2 — emit mvd_l0[0..4] in cell order. After
+                    // each cell's MVP derivation, mark cell as decoded
+                    // and populate L0 + L1 inflight (Direct cells use
+                    // §8.4.1.2.2 MVs / refs; explicit cells use ME MVs
+                    // with refIdx = 0). This mirrors the decoder's per-
+                    // cell `process_partition` grid update.
+                    for c in 0..4usize {
+                        if cells[c].writes_l0() {
+                            let mvp = cabac_mvp_for_b_8x8_partition(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                c,
+                                0,
+                                0,
+                                cell_decoded,
+                                cell_mv_inflight_l0,
+                                cell_ref_inflight_l0,
+                            );
+                            let mvd_x = mv0s[c].x - mvp.x;
+                            let mvd_y = mv0s[c].y - mvp.y;
+                            let blk4 = cell_top_left_blk[c];
+                            let sum_x = cabac_enc_mvd_abs_sum(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                0,
+                                MvdComponent::X,
+                                blk4,
+                                &inflight_abs_l0_x,
+                            );
+                            let sum_y = cabac_enc_mvd_abs_sum(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                0,
+                                MvdComponent::Y,
+                                blk4,
+                                &inflight_abs_l0_y,
+                            );
+                            encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, sum_x, mvd_x);
+                            encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, sum_y, mvd_y);
+                            mixed_per_cell_mvd_l0_x[c] = mvd_x;
+                            mixed_per_cell_mvd_l0_y[c] = mvd_y;
+                            let ax = mvd_x.unsigned_abs();
+                            let ay = mvd_y.unsigned_abs();
+                            for &b4 in &cell_4x4_ranges[c] {
+                                inflight_abs_l0_x[b4 as usize] = ax;
+                                inflight_abs_l0_y[b4 as usize] = ay;
+                            }
+                        }
+                        // Update both L0 and L1 inflight at end of cell's
+                        // iteration (mirrors decoder).
+                        cell_decoded[c] = true;
+                        match cells[c] {
+                            BSubMbCell::Direct => {
+                                if direct.ref_idx_l0 >= 0 {
+                                    cell_mv_inflight_l0[c] = direct.mv_l0_per_8x8[c];
+                                    cell_ref_inflight_l0[c] = direct.ref_idx_l0;
+                                }
+                                if direct.ref_idx_l1 >= 0 {
+                                    cell_mv_inflight_l1[c] = direct.mv_l1_per_8x8[c];
+                                    cell_ref_inflight_l1[c] = direct.ref_idx_l1;
+                                }
+                            }
+                            BSubMbCell::L0 => {
+                                cell_mv_inflight_l0[c] = mv0s[c];
+                                cell_ref_inflight_l0[c] = 0;
+                            }
+                            BSubMbCell::L1 => {
+                                cell_mv_inflight_l1[c] = mv1s[c];
+                                cell_ref_inflight_l1[c] = 0;
+                            }
+                            BSubMbCell::Bi => {
+                                cell_mv_inflight_l0[c] = mv0s[c];
+                                cell_ref_inflight_l0[c] = 0;
+                                cell_mv_inflight_l1[c] = mv1s[c];
+                                cell_ref_inflight_l1[c] = 0;
+                            }
+                        }
+                    }
+                    // §7.3.5.2 — emit mvd_l1[0..4] in cell order. The L1
+                    // mvp for cell c reads cells 0..(c-1)'s L1 grid
+                    // state (already populated by the L0 loop above for
+                    // ALL cells). To match the decoder we need fresh
+                    // per-cell state that reflects cells 0..(c-1) only.
+                    let mut cell_decoded_walk = [false; 4];
+                    let mut cell_mv_inflight_l1_walk = [Mv::ZERO; 4];
+                    let mut cell_ref_inflight_l1_walk = [-1i32; 4];
+                    for c in 0..4usize {
+                        if cells[c].writes_l1() {
+                            let mvp = cabac_mvp_for_b_8x8_partition(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                c,
+                                0,
+                                1,
+                                cell_decoded_walk,
+                                cell_mv_inflight_l1_walk,
+                                cell_ref_inflight_l1_walk,
+                            );
+                            let mvd_x = mv1s[c].x - mvp.x;
+                            let mvd_y = mv1s[c].y - mvp.y;
+                            let blk4 = cell_top_left_blk[c];
+                            let sum_x = cabac_enc_mvd_abs_sum(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                1,
+                                MvdComponent::X,
+                                blk4,
+                                &inflight_abs_l1_x,
+                            );
+                            let sum_y = cabac_enc_mvd_abs_sum(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                1,
+                                MvdComponent::Y,
+                                blk4,
+                                &inflight_abs_l1_y,
+                            );
+                            encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, sum_x, mvd_x);
+                            encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, sum_y, mvd_y);
+                            mixed_per_cell_mvd_l1_x[c] = mvd_x;
+                            mixed_per_cell_mvd_l1_y[c] = mvd_y;
+                            let ax = mvd_x.unsigned_abs();
+                            let ay = mvd_y.unsigned_abs();
+                            for &b4 in &cell_4x4_ranges[c] {
+                                inflight_abs_l1_x[b4 as usize] = ax;
+                                inflight_abs_l1_y[b4 as usize] = ay;
+                            }
+                        }
+                        cell_decoded_walk[c] = true;
+                        match cells[c] {
+                            BSubMbCell::Direct if direct.ref_idx_l1 >= 0 => {
+                                cell_mv_inflight_l1_walk[c] = direct.mv_l1_per_8x8[c];
+                                cell_ref_inflight_l1_walk[c] = direct.ref_idx_l1;
+                            }
+                            BSubMbCell::L1 | BSubMbCell::Bi => {
+                                cell_mv_inflight_l1_walk[c] = mv1s[c];
+                                cell_ref_inflight_l1_walk[c] = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let _ = (
+                        cell_decoded,
+                        cell_mv_inflight_l0,
+                        cell_ref_inflight_l0,
+                        cell_mv_inflight_l1,
+                        cell_ref_inflight_l1,
+                    );
+                }
+
                 // coded_block_pattern.
                 encode_coded_block_pattern(&mut cabac, &mut ctxs, &nb, 1, cbp_luma, cbp_chroma);
 
@@ -3826,6 +4496,63 @@ impl Encoder {
                     info.abs_mvd_l0_y = [0; 16];
                     info.abs_mvd_l1_x = [0; 16];
                     info.abs_mvd_l1_y = [0; 16];
+                } else if let Some((cells, mv0s, mv1s)) = mixed_choice {
+                    // Round-475 — mixed B_8x8 per-cell grid update.
+                    let mut ref_l0 = [-1i32; 4];
+                    let mut ref_l1 = [-1i32; 4];
+                    let mut mv_l0_arr = [Mv::ZERO; 4];
+                    let mut mv_l1_arr = [Mv::ZERO; 4];
+                    for c in 0..4usize {
+                        match cells[c] {
+                            BSubMbCell::Direct => {
+                                ref_l0[c] = direct.ref_idx_l0;
+                                ref_l1[c] = direct.ref_idx_l1;
+                                mv_l0_arr[c] = direct.mv_l0_per_8x8[c];
+                                mv_l1_arr[c] = direct.mv_l1_per_8x8[c];
+                            }
+                            BSubMbCell::L0 => {
+                                ref_l0[c] = 0;
+                                mv_l0_arr[c] = mv0s[c];
+                            }
+                            BSubMbCell::L1 => {
+                                ref_l1[c] = 0;
+                                mv_l1_arr[c] = mv1s[c];
+                            }
+                            BSubMbCell::Bi => {
+                                ref_l0[c] = 0;
+                                ref_l1[c] = 0;
+                                mv_l0_arr[c] = mv0s[c];
+                                mv_l1_arr[c] = mv1s[c];
+                            }
+                        }
+                    }
+                    info.ref_idx_l0_8x8 = ref_l0;
+                    info.mv_l0_8x8 = mv_l0_arr;
+                    info.ref_idx_l1_8x8 = ref_l1;
+                    info.mv_l1_8x8 = mv_l1_arr;
+                    // Per-4x4 |mvd| layout. Cell c covers blocks {4c..4c+3}
+                    // in §6.4.3 raster-Z order (cell groups by 8x8).
+                    let mut abs_mvd_l0_x = [0u32; 16];
+                    let mut abs_mvd_l0_y = [0u32; 16];
+                    let mut abs_mvd_l1_x = [0u32; 16];
+                    let mut abs_mvd_l1_y = [0u32; 16];
+                    for c in 0..4usize {
+                        let ax_l0 = mixed_per_cell_mvd_l0_x[c].unsigned_abs();
+                        let ay_l0 = mixed_per_cell_mvd_l0_y[c].unsigned_abs();
+                        let ax_l1 = mixed_per_cell_mvd_l1_x[c].unsigned_abs();
+                        let ay_l1 = mixed_per_cell_mvd_l1_y[c].unsigned_abs();
+                        for sub in 0..4usize {
+                            let blkz = c * 4 + sub;
+                            abs_mvd_l0_x[blkz] = ax_l0;
+                            abs_mvd_l0_y[blkz] = ay_l0;
+                            abs_mvd_l1_x[blkz] = ax_l1;
+                            abs_mvd_l1_y[blkz] = ay_l1;
+                        }
+                    }
+                    info.abs_mvd_l0_x = abs_mvd_l0_x;
+                    info.abs_mvd_l0_y = abs_mvd_l0_y;
+                    info.abs_mvd_l1_x = abs_mvd_l1_x;
+                    info.abs_mvd_l1_y = abs_mvd_l1_y;
                 } else if let Some((shape, mode_a, mode_b, mv0_a, mv1_a, mv0_b, mv1_b)) =
                     partition_choice
                 {
@@ -3935,6 +4662,13 @@ impl Encoder {
                     direct.mv_l0()
                 } else if is_direct_per_8x8 {
                     direct.mv_l0_per_8x8[0]
+                } else if let Some((cells, mv0s, _)) = mixed_choice {
+                    // Top-left cell (idx 0) is the representative.
+                    match cells[0] {
+                        BSubMbCell::Direct => direct.mv_l0_per_8x8[0],
+                        BSubMbCell::L0 | BSubMbCell::Bi => mv0s[0],
+                        BSubMbCell::L1 => Mv::ZERO,
+                    }
                 } else if let Some((_, mode_a, _, mv0_a, _, _, _)) = partition_choice {
                     if mode_a.uses_l0() {
                         mv0_a
@@ -3989,6 +4723,32 @@ impl Encoder {
                             refs[q] = direct.ref_idx_l0.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
                             pocs[q] = 0;
                         }
+                    }
+                    (mvs, refs, pocs)
+                } else if let Some((cells, mv0s, _)) = mixed_choice {
+                    // Round-475 mixed B_8x8 — per-cell L0 MV / ref / poc.
+                    let mut mvs = [(0i16, 0i16); 16];
+                    let mut refs = [-1i8; 4];
+                    let mut pocs = [i32::MIN; 4];
+                    for c in 0..4usize {
+                        let (mv, ref_idx, poc) = match cells[c] {
+                            BSubMbCell::Direct => (
+                                direct.mv_l0_per_8x8[c],
+                                direct.ref_idx_l0,
+                                if direct.ref_idx_l0 >= 0 { 0 } else { i32::MIN },
+                            ),
+                            BSubMbCell::L0 | BSubMbCell::Bi => (mv0s[c], 0, 0),
+                            BSubMbCell::L1 => (Mv::ZERO, -1, i32::MIN),
+                        };
+                        let mvt = (
+                            mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                            mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        );
+                        for sub in 0..4usize {
+                            mvs[c * 4 + sub] = mvt;
+                        }
+                        refs[c] = ref_idx.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+                        pocs[c] = poc;
                     }
                     (mvs, refs, pocs)
                 } else if let Some((shape, mode_a, mode_b, mv0_a, _, mv0_b, _)) = partition_choice {
@@ -4082,6 +4842,36 @@ impl Encoder {
                             refs[q] = direct.ref_idx_l1.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
                             pocs[q] = 1000;
                         }
+                    }
+                    (mvs, refs, pocs)
+                } else if let Some((cells, _, mv1s)) = mixed_choice {
+                    // Round-475 mixed B_8x8 — per-cell L1 MV / ref / poc.
+                    let mut mvs = [(0i16, 0i16); 16];
+                    let mut refs = [-1i8; 4];
+                    let mut pocs = [i32::MIN; 4];
+                    for c in 0..4usize {
+                        let (mv, ref_idx, poc) = match cells[c] {
+                            BSubMbCell::Direct => (
+                                direct.mv_l1_per_8x8[c],
+                                direct.ref_idx_l1,
+                                if direct.ref_idx_l1 >= 0 {
+                                    1000
+                                } else {
+                                    i32::MIN
+                                },
+                            ),
+                            BSubMbCell::L1 | BSubMbCell::Bi => (mv1s[c], 0, 1000),
+                            BSubMbCell::L0 => (Mv::ZERO, -1, i32::MIN),
+                        };
+                        let mvt = (
+                            mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                            mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        );
+                        for sub in 0..4usize {
+                            mvs[c * 4 + sub] = mvt;
+                        }
+                        refs[c] = ref_idx.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+                        pocs[c] = poc;
                     }
                     (mvs, refs, pocs)
                 } else if let Some((shape, mode_a, mode_b, _, mv1_a, _, mv1_b)) = partition_choice {

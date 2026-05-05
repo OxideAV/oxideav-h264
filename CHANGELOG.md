@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encoder: CABAC per-cell mixed B_8x8 (task #475).** `encode_b_cabac`
+  now picks per-quadrant `sub_mb_type ∈ {B_Direct_8x8, B_L0_8x8,
+  B_L1_8x8, B_Bi_8x8}` for `mb_type=22` MBs, mirroring the CAVLC
+  round-25 selector. Per-cell ME (`pick_best_b8x8_cell`) builds an
+  L0 / L1 / Bi candidate per 8x8 quadrant and picks the lowest-
+  Lagrangian-cost variant; mixed mode wins over `B_Direct_16x16` /
+  `B_8x8`-all-Direct / explicit-16x16 / partition modes when its
+  total cell SAD beats the current best by more than the
+  +12-bit MB-header bias. Writer emits `mb_type=22` + per-cell
+  `sub_mb_type` raw {0, 1, 2, 3} via `encode_sub_mb_type_b`, then
+  per-cell mvd_l0[i] (cell order 0..3) + mvd_l1[i] (cell order 0..3)
+  per §7.3.5.2 sub_mb_pred() field ordering.
+
+  New `cabac_mvp_for_b_8x8_partition` derives §8.4.1.3 mvp for one
+  8x8 sub-MB partition with `MvpredShape::Default` (no directional
+  shortcut for 8x8 cells) using a per-cell inflight tracker
+  `cabac_neighbour_partition_mv_b8x8` that distinguishes
+  "cell decoded but list X unused" (returns `intra_but_mb_available`,
+  partition_available=true) from "cell not yet decoded" (returns
+  `partition_not_yet_decoded_same_mb`, partition_available=false) —
+  the distinction matters for the §8.4.1.3.2 C→D substitution gate.
+  Per-cell inflight is updated in raster order, mirroring the
+  decoder's per-cell `process_partition` grid update; Direct cells
+  contribute their §8.4.1.2.2-derived MVs / refs to the inflight even
+  though they emit no mvd. The L1 mvd loop walks raster order with a
+  fresh per-cell inflight to re-mirror the decoder's
+  cells-0..(c-1)-only state at cell c's L1 mvp derivation point.
+
+  Predictor build stitches per-cell 8x8 luma + 4x4 chroma predictors
+  via `build_b_explicit_8x8_cell_luma` /
+  `build_b_explicit_4x4_cell_chroma` (now `pub(crate)`); Direct
+  cells build per-cell predictors from `direct.mv_l0_per_8x8[c]` /
+  `direct.mv_l1_per_8x8[c]` directly (independent of the
+  `direct_8x8_competitive` build, which only fires when
+  `!direct_uniform`). Per-MB grid update writes per-cell `ref_idx_l*`
+  + `mv_l*` + `abs_mvd_l*` so neighbour MBs reading our slot get the
+  right §8.4.1.3 / §9.3.3.1.1.7 inputs. Per-4x4 deblock state
+  (`MbDeblockInfo.mv_l*` / `ref_idx_l*` / `ref_poc_l*`) reflects the
+  per-cell layout so the §8.7.2.1 bS derivation matches the decoder.
+
+  ffmpeg cross-decode bit-exact (max diff 0) on the round-25 mixed-
+  motion fixture (32×16 px, IDR + P + B, per-quadrant content
+  offsets exercising all four cell kinds) at PSNR_Y = 44.20 dB.
+  B-slice shrinks 99 → 73 bytes (~26 %) on the 64×64 round-475
+  per-half-motion fixture vs the prior partition-only path. Encoder
+  exits at ~72 % H.264 syntax coverage estimated by the task
+  yardstick.
+
 - **Encoder: CABAC B 16x8 / 8x16 partition modes + B_8x8 all-Direct
   (task #475).** `encode_b_cabac` now emits Table 7-14 mb_type ∈ 4..=21
   (the nine 16x8 + nine 8x16 partition variants) by mirroring the CAVLC

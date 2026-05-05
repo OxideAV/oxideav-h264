@@ -5798,7 +5798,7 @@ fn build_b_direct_8x8_predictors(
 /// off_y)` ∈ {0, 8}² of MB `(mb_x, mb_y)` in `src_y`) and an 8x8 luma
 /// predictor buffer (row-major i32, length 64). Predictor samples are
 /// clipped to 0..=255 to match the decoder.
-fn sad_8x8_pred(
+pub(crate) fn sad_8x8_pred(
     src_y: &[u8],
     src_stride: usize,
     mb_x: usize,
@@ -5822,7 +5822,7 @@ fn sad_8x8_pred(
 /// `B_8x8` cell (`B_L0_8x8` / `B_L1_8x8` / `B_Bi_8x8`). Bi uses the
 /// §8.4.2.3.1 default weighted average `(L0 + L1 + 1) >> 1`.
 #[allow(clippy::too_many_arguments)]
-fn build_b_explicit_8x8_cell_luma(
+pub(crate) fn build_b_explicit_8x8_cell_luma(
     cell: BSubMbCell,
     ref_l0: &EncodedFrameRef<'_>,
     ref_l1: &EncodedFrameRef<'_>,
@@ -5902,7 +5902,7 @@ fn build_b_explicit_8x8_cell_luma(
 /// Round-25 — build one 4x4 chroma cell predictor (4:2:0) for an
 /// explicit-inter `B_8x8` cell. Symmetric with `build_b_explicit_8x8_cell_luma`.
 #[allow(clippy::too_many_arguments)]
-fn build_b_explicit_4x4_cell_chroma(
+pub(crate) fn build_b_explicit_4x4_cell_chroma(
     cell: BSubMbCell,
     ref_plane_l0: &[u8],
     ref_plane_l1: &[u8],
@@ -5992,7 +5992,7 @@ fn build_b_explicit_4x4_cell_chroma(
 /// The penalty multiplier scales with QP via λ. We use the same
 /// `λ = (qp_y / 6).clamp(0, 8)` family as the round-21..24 selectors.
 #[allow(clippy::too_many_arguments)]
-fn pick_best_b8x8_cell(
+pub(crate) fn pick_best_b8x8_cell(
     src_y: &[u8],
     src_stride: usize,
     ref_l0: &EncodedFrameRef<'_>,
