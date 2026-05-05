@@ -23,6 +23,10 @@ nightly = []
 [dependencies]
 oxideav-core = "0.1"
 thiserror = "2"
+# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
+# via the `oxideav_core::register!` macro. Tiny crate, no transitive
+# deps; works on every target including wasm.
+linkme = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
