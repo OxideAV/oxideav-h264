@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-h264/compare/v0.1.2...v0.1.3) - 2026-05-05
+
+### Other
+
+- CABAC per-cell mixed B_8x8 (task #475)
+- CABAC B 16x8 / 8x16 partition modes + B_8x8 all-Direct (task #475)
+- CABAC real ME + B_Skip / B_Direct_16x16 (round 32)
+- B-slice CABAC encode (round 31)
+
 ### Added
 
 - **Encoder: CABAC per-cell mixed B_8x8 (task #475).** `encode_b_cabac`
