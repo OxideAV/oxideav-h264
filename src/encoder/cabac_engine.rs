@@ -31,6 +31,15 @@
 
 use crate::cabac::{CtxState, RANGE_TAB_LPS, TRANS_IDX_LPS, TRANS_IDX_MPS};
 
+/// When `OXIDEAV_H264_BIN_TRACE` is set, emit one line per encoded bin
+/// in the same format as the decoder's trace so the two can be diff'd.
+#[inline]
+fn bin_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some())
+}
+
 /// CABAC arithmetic encoder state per §9.3.4.
 ///
 /// `cod_i_low` holds the current low end of the interval. Per the
@@ -108,6 +117,12 @@ impl CabacEncoder {
     /// the decoder would apply after reading the same bin.
     pub fn encode_decision(&mut self, ctx: &mut CtxState, bin: u8) {
         debug_assert!(bin <= 1);
+        let trace_on = bin_trace_enabled();
+        let pre_state = ctx.state_idx;
+        let pre_mps = ctx.val_mps;
+        let pre_range = self.cod_i_range;
+        let pre_low = self.cod_i_low;
+
         let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
         let cod_i_range_lps = RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
         self.cod_i_range -= cod_i_range_lps;
@@ -126,12 +141,25 @@ impl CabacEncoder {
         }
         self.renorm_e();
         self.bin_count = self.bin_count.wrapping_add(1);
+        if trace_on {
+            eprintln!(
+                "[ENC {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_low={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_low={:>4}",
+                self.bin_count,
+                pre_state, pre_mps, pre_range, pre_low,
+                bin,
+                ctx.state_idx, ctx.val_mps, self.cod_i_range, self.cod_i_low,
+            );
+        }
     }
 
     /// §9.3.4.3 — EncodeBypass. Encodes one equiprobable bin without
     /// touching any context.
     pub fn encode_bypass(&mut self, bin: u8) {
         debug_assert!(bin <= 1);
+        let trace_on = bin_trace_enabled();
+        let pre_range = self.cod_i_range;
+        let pre_low = self.cod_i_low;
+
         self.cod_i_low <<= 1;
         if bin == 1 {
             self.cod_i_low += self.cod_i_range;
@@ -144,10 +172,21 @@ impl CabacEncoder {
         } else if self.cod_i_low < 512 {
             self.put_bit(0);
         } else {
+            // codILow in [512, 1023]: carry-uncertain zone — defer the bit
+            // using the same outstanding-bits mechanism as renorm_e.
             self.cod_i_low -= 512;
             self.outstanding_bits += 1;
         }
         self.bin_count = self.bin_count.wrapping_add(1);
+        if trace_on {
+            eprintln!(
+                "[ENC {:>8}] BP pre_range={:>4} pre_low={:>4} bin={} post_range={:>4} post_low={:>4}",
+                self.bin_count,
+                pre_range, pre_low,
+                bin,
+                self.cod_i_range, self.cod_i_low,
+            );
+        }
     }
 
     /// §9.3.4.5 — EncodeTerminate. `bin == 1` finalises the encoding
@@ -155,6 +194,10 @@ impl CabacEncoder {
     /// `bin == 0` is the "not yet" path used after every non-final MB.
     pub fn encode_terminate(&mut self, bin: u8) {
         debug_assert!(bin <= 1);
+        let trace_on = bin_trace_enabled();
+        let pre_range = self.cod_i_range;
+        let pre_low = self.cod_i_low;
+
         self.cod_i_range -= 2;
         if bin != 0 {
             // Terminate: per §9.3.4.5, codILow += codIRange; then EncodeFlush
@@ -166,6 +209,15 @@ impl CabacEncoder {
             self.renorm_e();
         }
         self.bin_count = self.bin_count.wrapping_add(1);
+        if trace_on {
+            eprintln!(
+                "[ENC {:>8}] TT pre_range={:>4} pre_low={:>4} bin={} post_range={:>4} post_low={:>4}",
+                self.bin_count,
+                pre_range, pre_low,
+                bin,
+                self.cod_i_range, self.cod_i_low,
+            );
+        }
     }
 
     /// §9.3.4.5 — EncodeFlush. Called by [`Self::finish`] (or by a

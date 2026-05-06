@@ -1026,3 +1026,449 @@ fn round32_b_cabac_textured_motion_ffmpeg_interop() {
         "B textured-motion PSNR {psnr_b:.2} dB below 40 dB floor"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round-33 — 4:4:4 IDR CABAC self-roundtrip + ffmpeg interop.
+// ---------------------------------------------------------------------------
+
+/// Build a 64×64 4:4:4 test frame: luma diagonal gradient, horizontal Cb
+/// gradient, vertical Cr gradient. Chroma planes are full W×H.
+fn make_gradient_444_64x64() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let w = 64usize;
+    let h = 64usize;
+    let mut y = vec![0u8; w * h];
+    let mut u = vec![0u8; w * h];
+    let mut v = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            y[j * w + i] = (16 + (i + j) * (240 - 16) / (w + h - 2)).clamp(0, 255) as u8;
+            u[j * w + i] = (64 + i * 128 / (w - 1)) as u8;
+            v[j * w + i] = (64 + j * 128 / (h - 1)) as u8;
+        }
+    }
+    (y, u, v)
+}
+
+/// Round-33: 4:4:4 IDR CABAC self-roundtrip — decoder output matches encoder
+/// local recon, PSNR_Y ≥ 40 dB.
+#[test]
+fn round33_444_idr_cabac_self_roundtrip() {
+    let (y, u, v) = make_gradient_444_64x64();
+    let frame = YuvFrame {
+        width: 64,
+        height: 64,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let mut cfg = EncoderConfig::new(64, 64);
+    cfg.cabac = true;
+    cfg.profile_idc = 244; // High 4:4:4 Predictive — chroma_format_idc=3 requires profile ≥ 244.
+    cfg.chroma_format_idc = 3;
+    cfg.qp = 26;
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&frame);
+
+    // Chroma recon planes must be W×H for 4:4:4.
+    assert_eq!(idr.recon_u.len(), 64 * 64, "Cb plane wrong size");
+    assert_eq!(idr.recon_v.len(), 64 * 64, "Cr plane wrong size");
+    eprintln!(
+        "round33 enc_recon[0]={} stream_len={}",
+        idr.recon_y[0],
+        idr.annex_b.len()
+    );
+    // Hex dump to identify stream structure.
+    {
+        let bytes = &idr.annex_b;
+        let mut i = 0;
+        while i < bytes.len() {
+            // Find NAL start codes.
+            if i + 3 < bytes.len()
+                && bytes[i] == 0
+                && bytes[i + 1] == 0
+                && bytes[i + 2] == 0
+                && bytes[i + 3] == 1
+            {
+                let nal_type = if i + 4 < bytes.len() {
+                    bytes[i + 4] & 0x1f
+                } else {
+                    0
+                };
+                eprintln!("[offset={i}] NAL start code, type={nal_type}");
+            } else if i + 2 < bytes.len() && bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1
+            {
+                let nal_type = if i + 3 < bytes.len() {
+                    bytes[i + 3] & 0x1f
+                } else {
+                    0
+                };
+                eprintln!("[offset={i}] NAL start code (3B), type={nal_type}");
+            }
+            i += 1;
+        }
+        // Print last 30 bytes as hex (the CABAC payload region).
+        let tail_start = bytes.len().saturating_sub(30);
+        let tail: Vec<String> = bytes[tail_start..]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        eprintln!("tail (last 30 bytes): {}", tail.join(" "));
+        // Print first 20 bytes.
+        let head: Vec<String> = bytes[..bytes.len().min(20)]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        eprintln!("head (first 20 bytes): {}", head.join(" "));
+        // Total hex.
+        let all: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!("full hex ({} bytes): {}", bytes.len(), all.join(" "));
+    }
+
+    // Self-decode.
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), idr.annex_b.clone()).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+
+    let frame_out = dec.receive_frame().expect("receive_frame");
+    let vf = match frame_out {
+        Frame::Video(vf) => vf,
+        other => panic!("expected Frame::Video, got {other:?}"),
+    };
+    assert_eq!(vf.planes.len(), 3, "expected 3-plane 4:4:4 output");
+    // Luma stride must equal width.
+    assert_eq!(vf.planes[0].stride, 64);
+    // Chroma planes sized W×H for 4:4:4.
+    assert_eq!(vf.planes[1].stride, 64);
+    assert_eq!(
+        vf.planes[1].data.len(),
+        64 * 64,
+        "Cb decoded plane wrong size"
+    );
+    assert_eq!(
+        vf.planes[2].data.len(),
+        64 * 64,
+        "Cr decoded plane wrong size"
+    );
+
+    // Encoder recon must match decoder output within ±1 (rounding).
+    for (k, (&a, &b)) in vf.planes[0].data.iter().zip(idr.recon_y.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "luma sample {k}: decoded={a} enc_recon={b}"
+        );
+    }
+    for (k, (&a, &b)) in vf.planes[1].data.iter().zip(idr.recon_u.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "Cb sample {k}: decoded={a} enc_recon={b}"
+        );
+    }
+    for (k, (&a, &b)) in vf.planes[2].data.iter().zip(idr.recon_v.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "Cr sample {k}: decoded={a} enc_recon={b}"
+        );
+    }
+
+    let psnr_y = psnr(&y, &idr.recon_y);
+    let psnr_u = psnr(&u, &idr.recon_u);
+    let psnr_v = psnr(&v, &idr.recon_v);
+    eprintln!(
+        "round33 4:4:4 IDR CABAC self-roundtrip 64x64 QP=26: {} bytes, PSNR Y={psnr_y:.2} U={psnr_u:.2} V={psnr_v:.2}",
+        idr.annex_b.len(),
+    );
+    assert!(
+        psnr_y >= 40.0,
+        "round33 4:4:4 CABAC IDR luma PSNR {psnr_y:.2} dB below 40 dB floor"
+    );
+}
+
+/// Round-33: 4:4:4 IDR CABAC single-MB sanity — encode a single 16×16
+/// 4:4:4 frame and self-decode it. Isolates the single-MB path.
+#[test]
+fn round33_444_idr_cabac_single_mb() {
+    // A single 16×16 MB with gradient data.
+    let w = 16usize;
+    let h = 16usize;
+    let mut y = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            y[j * w + i] = ((i + j) * 8).min(255) as u8;
+        }
+    }
+    let u: Vec<u8> = (0..w * h).map(|i| ((i * 4) % 256) as u8).collect();
+    let v: Vec<u8> = (0..w * h).map(|i| (128 + i % 64) as u8).collect();
+    let frame = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let mut cfg = EncoderConfig::new(w as u32, h as u32);
+    cfg.cabac = true;
+    cfg.profile_idc = 244;
+    cfg.chroma_format_idc = 3;
+    cfg.qp = 26;
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&frame);
+
+    eprintln!("single-MB stream_len={}", idr.annex_b.len());
+    let all: Vec<String> = idr.annex_b.iter().map(|b| format!("{b:02x}")).collect();
+    eprintln!("hex: {}", all.join(" "));
+
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), idr.annex_b.clone()).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let frame_out = dec.receive_frame().expect("receive_frame");
+    let vf = match frame_out {
+        Frame::Video(vf) => vf,
+        other => panic!("expected Frame::Video, got {other:?}"),
+    };
+    for (k, (&a, &b)) in vf.planes[0].data.iter().zip(idr.recon_y.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "luma sample {k}: decoded={a} enc_recon={b}"
+        );
+    }
+    eprintln!("round33 single-MB 4:4:4 CABAC self-roundtrip PASSED");
+}
+
+/// Round-33: 4:4:4 IDR CABAC ffmpeg interop — ffmpeg libx264 decoder accepts
+/// the stream and produces samples matching encoder local recon.
+#[test]
+fn round33_444_idr_cabac_ffmpeg_interop() {
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: ffmpeg not at /opt/homebrew/bin/ffmpeg");
+        return;
+    }
+    let (y, u, v) = make_gradient_444_64x64();
+    let frame = YuvFrame {
+        width: 64,
+        height: 64,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let mut cfg = EncoderConfig::new(64, 64);
+    cfg.cabac = true;
+    cfg.profile_idc = 244;
+    cfg.chroma_format_idc = 3;
+    cfg.qp = 26;
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&frame);
+
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!("oxideav_r33_444_cabac_{}.h264", std::process::id()));
+    let yuv_path = tmpdir.join(format!("oxideav_r33_444_cabac_{}.yuv", std::process::id()));
+    std::fs::write(&h264_path, &idr.annex_b).expect("write h264");
+
+    let status = std::process::Command::new(ffmpeg)
+        .args([
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "h264",
+            "-i",
+            h264_path.to_str().unwrap(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv444p",
+            yuv_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg decode failed");
+
+    let raw = std::fs::read(&yuv_path).expect("read raw yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+
+    let plane_len = 64 * 64;
+    assert_eq!(
+        raw.len(),
+        3 * plane_len,
+        "ffmpeg output wrong size (expected yuv444p)"
+    );
+
+    let ff_y = &raw[0..plane_len];
+    let ff_u = &raw[plane_len..2 * plane_len];
+    let ff_v = &raw[2 * plane_len..];
+
+    for (k, (&a, &b)) in ff_y.iter().zip(idr.recon_y.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "ffmpeg luma {k}: ff={a} enc_recon={b}"
+        );
+    }
+    for (k, (&a, &b)) in ff_u.iter().zip(idr.recon_u.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "ffmpeg Cb {k}: ff={a} enc_recon={b}"
+        );
+    }
+    for (k, (&a, &b)) in ff_v.iter().zip(idr.recon_v.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "ffmpeg Cr {k}: ff={a} enc_recon={b}"
+        );
+    }
+    let psnr_y = psnr(&y, &idr.recon_y);
+    eprintln!(
+        "round33 4:4:4 IDR CABAC ffmpeg interop 64x64 QP=26: {} bytes, PSNR Y={psnr_y:.2} (bit-exact)",
+        idr.annex_b.len(),
+    );
+    assert!(
+        psnr_y >= 40.0,
+        "round33 4:4:4 CABAC IDR ffmpeg PSNR {psnr_y:.2} dB below 40 dB floor"
+    );
+}
+
+/// Round-33 debug: 32×16 4:4:4 IDR CABAC (2 MBs wide, 1 MB tall) ffmpeg interop.
+/// Isolates whether the 2-MB-wide case fails before the full 64×64.
+#[test]
+fn round33_444_idr_cabac_32x16_ffmpeg_interop() {
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: ffmpeg not at /opt/homebrew/bin/ffmpeg");
+        return;
+    }
+    let w = 32usize;
+    let h = 16usize;
+    let mut y = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            y[j * w + i] = (16 + (i + j) * 224 / (w + h - 2)).clamp(0, 255) as u8;
+        }
+    }
+    let u: Vec<u8> = (0..w * h)
+        .map(|i| (64 + (i % w) * 128 / (w - 1)) as u8)
+        .collect();
+    let v: Vec<u8> = (0..w * h)
+        .map(|i| (64 + (i / w) * 128 / (h - 1)) as u8)
+        .collect();
+    let frame = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let mut cfg = EncoderConfig::new(w as u32, h as u32);
+    cfg.cabac = true;
+    cfg.profile_idc = 244;
+    cfg.chroma_format_idc = 3;
+    cfg.qp = 26;
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&frame);
+
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!("oxideav_r33_32x16_444_{}.h264", std::process::id()));
+    let yuv_path = tmpdir.join(format!("oxideav_r33_32x16_444_{}.yuv", std::process::id()));
+    std::fs::write(&h264_path, &idr.annex_b).expect("write h264");
+
+    let hex: Vec<String> = idr.annex_b.iter().map(|b| format!("{b:02x}")).collect();
+    eprintln!(
+        "32x16 stream ({} bytes): {}",
+        idr.annex_b.len(),
+        hex.join(" ")
+    );
+
+    let out = std::process::Command::new(ffmpeg)
+        .args([
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "h264",
+            "-i",
+            h264_path.to_str().unwrap(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv444p",
+            yuv_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn ffmpeg");
+    eprintln!("ffmpeg stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "ffmpeg failed");
+
+    let raw = std::fs::read(&yuv_path).expect("read raw yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+
+    let plane_len = w * h;
+    assert_eq!(raw.len(), 3 * plane_len, "ffmpeg output wrong size");
+
+    let ff_y = &raw[0..plane_len];
+    for (k, (&a, &b)) in ff_y.iter().zip(idr.recon_y.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "ffmpeg luma {k}: ff={a} enc_recon={b}"
+        );
+    }
+    eprintln!("round33 32x16 4:4:4 IDR CABAC ffmpeg interop PASSED");
+}
+
+/// Round-33 debug: 32×16 4:4:4 IDR CABAC (2 MBs wide) self-roundtrip.
+#[test]
+fn round33_444_idr_cabac_32x16_self_roundtrip() {
+    let w = 32usize;
+    let h = 16usize;
+    let mut y = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            y[j * w + i] = (16 + (i + j) * 224 / (w + h - 2)).clamp(0, 255) as u8;
+        }
+    }
+    let u: Vec<u8> = (0..w * h)
+        .map(|i| (64 + (i % w) * 128 / (w - 1)) as u8)
+        .collect();
+    let v: Vec<u8> = (0..w * h)
+        .map(|i| (64 + (i / w) * 128 / (h - 1)) as u8)
+        .collect();
+    let frame = YuvFrame {
+        width: w as u32,
+        height: h as u32,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let mut cfg = EncoderConfig::new(w as u32, h as u32);
+    cfg.cabac = true;
+    cfg.profile_idc = 244;
+    cfg.chroma_format_idc = 3;
+    cfg.qp = 26;
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&frame);
+
+    let hex: Vec<String> = idr.annex_b.iter().map(|b| format!("{b:02x}")).collect();
+    eprintln!(
+        "32x16 stream ({} bytes): {}",
+        idr.annex_b.len(),
+        hex.join(" ")
+    );
+
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), idr.annex_b.clone()).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let frame_out = dec.receive_frame().expect("receive_frame");
+    let vf = match frame_out {
+        Frame::Video(vf) => vf,
+        other => panic!("expected Frame::Video, got {other:?}"),
+    };
+    for (k, (&a, &b)) in vf.planes[0].data.iter().zip(idr.recon_y.iter()).enumerate() {
+        assert!(
+            (a as i32 - b as i32).abs() <= 1,
+            "luma sample {k}: decoded={a} enc_recon={b}"
+        );
+    }
+    eprintln!("round33 32x16 4:4:4 IDR CABAC self-roundtrip PASSED");
+}

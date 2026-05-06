@@ -763,13 +763,26 @@ fn sig_block_cat_offset(bt: BlockType) -> u32 {
 }
 
 fn lvl_block_cat_offset(bt: BlockType) -> u32 {
+    // §9.3.3.1.3 Table 9-40 — ctxIdxBlockCatOffset for coeff_abs_level_minus1.
+    // Mirror of the decoder's `BlockType::lvl_block_cat_offset`.
     match bt {
         BlockType::Luma16x16Dc => 0,
         BlockType::Luma16x16Ac => 10,
         BlockType::Luma4x4 => 20,
         BlockType::ChromaDc => 30,
         BlockType::ChromaAc => 39,
-        _ => 0,
+        BlockType::Luma8x8 => 0,
+        // 4:4:4 per-plane types (Table 9-40 rows for ctxBlockCat 6..=13):
+        // Cb plane: cat 6 (DC=0), cat 7 (AC=10), cat 8 (4x4=20), cat 9 (8x8=0)
+        BlockType::CbIntra16x16Dc => 0,
+        BlockType::CbIntra16x16Ac => 10,
+        BlockType::CbLuma4x4 => 20,
+        BlockType::Cb8x8 => 0,
+        // Cr plane: cat 10 (DC=0), cat 11 (AC=10), cat 12 (4x4=20), cat 13 (8x8=0)
+        BlockType::CrIntra16x16Dc => 0,
+        BlockType::CrIntra16x16Ac => 10,
+        BlockType::CrLuma4x4 => 20,
+        BlockType::Cr8x8 => 0,
     }
 }
 
@@ -1270,6 +1283,7 @@ pub fn encode_residual_block_cabac(
     skip_cbf: bool,
 ) -> bool {
     debug_assert_eq!(coeffs.len(), max_num_coeff as usize);
+    let bin_before = enc.bin_count();
     let any_nz = coeffs.iter().any(|&c| c != 0);
     if !skip_cbf {
         encode_coded_block_flag(
@@ -1282,6 +1296,15 @@ pub fn encode_residual_block_cabac(
         );
     }
     if !any_nz {
+        if std::env::var_os("OXIDEAV_H264_CABAC_DEBUG").is_some() {
+            let bin_after = enc.bin_count();
+            eprintln!(
+                "[ENC-CABAC] block_type={:?} max={} bins={} cbf=false",
+                block_type,
+                max_num_coeff,
+                bin_after - bin_before,
+            );
+        }
         return false;
     }
     // Find the index of the last non-zero coefficient (in scan order).
@@ -1342,6 +1365,16 @@ pub fn encode_residual_block_cabac(
         } else {
             num_decoded_gt_1 += 1;
         }
+    }
+    let bin_after = enc.bin_count();
+    if std::env::var_os("OXIDEAV_H264_CABAC_DEBUG").is_some() {
+        eprintln!(
+            "[ENC-CABAC] block_type={:?} max={} bins={} cbf=true coeffs={:?}",
+            block_type,
+            max_num_coeff,
+            bin_after - bin_before,
+            coeffs,
+        );
     }
     true
 }

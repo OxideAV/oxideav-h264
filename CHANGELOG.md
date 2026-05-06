@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CABAC context init Tables 9-25..9-33 (ctxIdx 460..=1023) added.**
+  All nine missing tables — coded_block_flag, significant_coeff_flag,
+  last_significant_coeff_flag, and coeff_abs_level_minus1 for 4:4:4
+  chroma blockCat 6..=13 (Cb/Cr planes) plus 8x8 field/frame variants —
+  were absent from `init_table()`. Every context in the 460..=1023 range
+  fell back to the neutral (0,0) init (pStateIdx=62, valMPS=0), causing
+  ffmpeg to fail decoding multi-MB 4:4:4 IDR CABAC streams with "top
+  block unavailable for requested intra mode". All five round-33 4:4:4
+  CABAC tests now pass including ffmpeg interop for 32×16 and 64×64.
+
 ## [0.1.3](https://github.com/OxideAV/oxideav-h264/compare/v0.1.2...v0.1.3) - 2026-05-05
 
 ### Other
