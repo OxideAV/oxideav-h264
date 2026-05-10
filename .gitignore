@@ -5,3 +5,9 @@
 # not commit Cargo.lock. See https://doc.rust-lang.org/cargo/faq.html#why-do-binaries-have-cargolock-in-version-control-but-not-libraries
 Cargo.lock
 .claude/
+
+# Fuzz harness scratch (cargo-fuzz writes corpus + crashes here).
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
