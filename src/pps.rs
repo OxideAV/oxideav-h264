@@ -47,10 +47,26 @@ pub enum PpsError {
     /// §7.4.2.2 — `second_chroma_qp_index_offset` in range -12..=12.
     #[error("second_chroma_qp_index_offset out of range (got {0}, must be -12..=12)")]
     SecondChromaQpIndexOffsetOutOfRange(i32),
+    /// §7.4.2.2 — `pic_size_in_map_units_minus1` is bounded by the
+    /// active SPS picture geometry (PicWidthInMbs * PicHeightInMapUnits
+    /// minus one). The PPS parser doesn't know which SPS will be active
+    /// at decode time, so we apply a generous upper bound derived from
+    /// the same `MAX_PIC_DIM_IN_MBS_MINUS1` ceiling used for SPS — well
+    /// above any real Annex A level, but small enough that the caller
+    /// can't be coerced into a multi-gigabyte allocation.
+    #[error("pic_size_in_map_units_minus1 out of range (got {0}, max {1})")]
+    PicSizeInMapUnitsOutOfRange(u32, u32),
     /// §7.3.2.1.1.1 — scaling_list body parse error.
     #[error("scaling_list: {0}")]
     ScalingList(#[from] ScalingListError),
 }
+
+/// Defensive cap on `pic_size_in_map_units_minus1` (FMO type 6). Set to
+/// (2^15 − 1)² so a fully-malformed PPS can at most allocate ~4 GB; in
+/// practice Level 6.2 limits the real picture size to a few hundred K.
+/// We keep the cap permissive to allow oversized but well-formed test
+/// cases through — it exists purely to head off attacker-driven OOMs.
+const MAX_PIC_SIZE_IN_MAP_UNITS_MINUS1: u32 = (1u32 << 22) - 2;
 
 /// §7.3.2.2 — PPS scaling matrices.
 ///
@@ -222,6 +238,12 @@ impl Pps {
                     // §7.4.2.2: each slice_group_id[i] is a u(v) with
                     // v = Ceil(Log2(num_slice_groups_minus1 + 1)) bits.
                     let pic_size_in_map_units_minus1 = r.ue()?;
+                    if pic_size_in_map_units_minus1 > MAX_PIC_SIZE_IN_MAP_UNITS_MINUS1 {
+                        return Err(PpsError::PicSizeInMapUnitsOutOfRange(
+                            pic_size_in_map_units_minus1,
+                            MAX_PIC_SIZE_IN_MAP_UNITS_MINUS1,
+                        ));
+                    }
                     let v = ceil_log2(num_slice_groups_minus1 + 1);
                     let count = pic_size_in_map_units_minus1 as usize + 1;
                     let mut slice_group_id = Vec::with_capacity(count);

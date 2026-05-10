@@ -82,6 +82,20 @@ pub enum SliceDataError {
     /// `-QpBdOffsetY..=+51` (= 0..=51 for 8-bit luma).
     #[error("derived SliceQPY {0} out of range")]
     SliceQpOutOfRange(i32),
+    /// §7.4.4 — `mb_skip_run` shall be in the range
+    /// `0..=PicSizeInMbs - 1`. A malformed CAVLC stream that encodes a
+    /// huge `mb_skip_run` would otherwise drive the macroblock vector
+    /// to a multi-gigabyte allocation while the decoder dutifully
+    /// pushes inferred-skip MBs.
+    #[error("mb_skip_run {0} would overflow picture (PicSizeInMbs = {1})")]
+    MbSkipRunOverflow(u32, u32),
+    /// The macroblock walker advanced past the end of the picture.
+    /// Either an `mb_skip_run` (CAVLC) or a non-end-of-slice signal
+    /// (CABAC) tried to push more MBs than the SPS geometry allows.
+    /// This is malformed input — every legitimate stream terminates
+    /// the slice loop before exceeding `PicSizeInMbs`.
+    #[error("macroblock walker exceeded PicSizeInMbs ({0}); slice malformed")]
+    MbAddrOverflow(u32),
 }
 
 pub type SliceDataResult<T> = Result<T, SliceDataError>;
@@ -172,6 +186,11 @@ pub fn parse_slice_data(
     } else {
         pic_h_mus * 2
     };
+    // §7.4.2.1.1 eq. 7-25: PicSizeInMbs = PicWidthInMbs * FrameHeightInMbs.
+    // Both terms are u32 capped by SPS (`MAX_PIC_DIM_IN_MBS_MINUS1 + 1`),
+    // so the product fits in u32 by construction. Used downstream to
+    // bound `mb_skip_run` and to detect MB-address overflow.
+    let pic_size_in_mbs = pic_w_mbs.saturating_mul(pic_h_mbs);
     let mut cavlc_nc = CavlcNcGrid::new(pic_w_mbs, pic_h_mbs);
 
     if pps.entropy_coding_mode_flag {
@@ -648,6 +667,21 @@ pub fn parse_slice_data(
             if end {
                 break;
             }
+            // Defensive: end_of_slice_flag should have terminated us
+            // by `PicSizeInMbs` MBs at the latest. A malformed stream
+            // that decodes "not end" past the last MB would otherwise
+            // grow the macroblocks Vec until OOM.
+            // Anti-OOM guard: refuse to grow the macroblocks Vec past
+            // `MB_HARD_CAP` (256K entries — comfortably above Level
+            // 6.2's MaxFS = 139 264, but small enough that the Macroblock
+            // Vec stays under ~64 MB even with worst-case realloc
+            // doubling). Real streams hit `end_of_slice_flag` long
+            // before this; the cap exists purely to head off
+            // attacker-driven runaway loops.
+            const MB_HARD_CAP: u32 = 1 << 18;
+            if curr_mb_addr > MB_HARD_CAP {
+                return Err(SliceDataError::MbAddrOverflow(pic_size_in_mbs));
+            }
         }
     } else {
         // ---------------------------------------------------------
@@ -664,6 +698,20 @@ pub fn parse_slice_data(
             // macroblock (the "skip run" is exp-Golomb).
             if !slice_header.slice_type.is_intra() && pending_skip == 0 {
                 pending_skip = r.ue()?;
+                // §7.4.4: `mb_skip_run` is implicitly bounded by
+                // PicSizeInMbs. The strict spec bound is
+                // `0..=PicSizeInMbs - 1 - CurrMbAddr`, but real
+                // encoders sometimes write `PicSizeInMbs` itself
+                // (whole picture skipped). Apply only an absolute
+                // hard-cap that prevents the for-loop below from
+                // driving the `macroblocks` Vec to OOM.
+                const MB_SKIP_HARD_CAP: u32 = 1 << 18;
+                if pending_skip > MB_SKIP_HARD_CAP {
+                    return Err(SliceDataError::MbSkipRunOverflow(
+                        pending_skip,
+                        pic_size_in_mbs,
+                    ));
+                }
                 prev_mb_skipped = pending_skip > 0;
                 for _ in 0..pending_skip {
                     // §7.4.4 — inferred mb_field_decoding_flag for a
@@ -762,6 +810,20 @@ pub fn parse_slice_data(
             pending_skip = 0;
             if !r.more_rbsp_data() {
                 break;
+            }
+            // Defensive PicSizeInMbs ceiling — see CABAC counterpart.
+            // After `more_rbsp_data()` says we should keep going, refuse
+            // to push beyond the picture's MB count.
+            // Anti-OOM guard: refuse to grow the macroblocks Vec past
+            // `MB_HARD_CAP` (256K entries — comfortably above Level
+            // 6.2's MaxFS = 139 264, but small enough that the Macroblock
+            // Vec stays under ~64 MB even with worst-case realloc
+            // doubling). Real streams hit `end_of_slice_flag` long
+            // before this; the cap exists purely to head off
+            // attacker-driven runaway loops.
+            const MB_HARD_CAP: u32 = 1 << 18;
+            if curr_mb_addr > MB_HARD_CAP {
+                return Err(SliceDataError::MbAddrOverflow(pic_size_in_mbs));
             }
         }
     }

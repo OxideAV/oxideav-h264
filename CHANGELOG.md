@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **slice_data: bound `mb_skip_run` and the macroblock walker against
+  malformed streams.** §7.4.4 implicitly bounds `mb_skip_run` by
+  `PicSizeInMbs - CurrMbAddr`, but the parser used to accept any
+  ue(v) and grew the `macroblocks` Vec until the process OOM'd
+  (~2.7 GB realloc reachable in CAVLC). A hard cap of 2^18 MBs (well
+  above any Annex A level) on both `mb_skip_run` and `CurrMbAddr`
+  rejects pathological streams with `SliceDataError::MbSkipRunOverflow`
+  / `MbAddrOverflow` instead of panicking.
+- **slice_header: cap `num_ref_idx_lX_active_minus1` at 63.** §7.4.3
+  bounds the field at 31 (frame) / 63 (field); without enforcement an
+  oversized value funneled into `parse_pred_weight_table` /
+  `parse_ref_pic_list_modification` and drove a multi-gigabyte
+  allocation. Defensive re-check covers PPS-inherited defaults too.
+- **pps: cap `pic_size_in_map_units_minus1` (FMO type 6) at 2^22 − 2.**
+  Previously fed unbounded into `Vec::with_capacity`, exposing a
+  decoder-side OOM via a single PPS NAL (~3.2 GB realloc reachable).
+- **cabac: bound the bypass Exp-Golomb escape suffix at `k = 30`.**
+  Both `coeff_abs_level_minus1` (UEG0, §9.3.3.1.3) and `mvd_lX`
+  (UEG3, §9.3.3.1.1.7) accumulated `k` without limit before computing
+  `1u32 << k`, panicking with `attempt to shift left with overflow`
+  in CABAC residual decode for any stream that fed ≥ 32 leading-one
+  bins in a row. Now returns `CabacError::EgEscapeSuffixOverflow`.
 - **scaling_list: enforce §7.4.2.1.1.1 `delta_scale ∈ −128..=127`
   bound.** Previously the parser quietly accepted any se(v) value and
   evaluated `last_scale + delta_scale + 256` in i32, which panicked

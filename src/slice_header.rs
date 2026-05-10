@@ -83,6 +83,13 @@ pub enum SliceHeaderError {
     /// handled by this parser.
     #[error("slice layer extension (nal_unit_type {0}) not supported")]
     SliceExtensionNotSupported(u8),
+    /// §7.4.3 — `num_ref_idx_lX_active_minus1` shall be in 0..=31 for
+    /// frame slices and 0..=63 for field slices. We accept up to 63 to
+    /// cover both, anything past that is malformed and would let an
+    /// attacker drive a multi-gigabyte allocation in
+    /// `parse_pred_weight_table` / `parse_ref_pic_list_modification`.
+    #[error("num_ref_idx_lX_active_minus1 out of range (got {0}, max 63)")]
+    NumRefIdxActiveMinus1OutOfRange(u32),
 }
 
 /// §7.4.3 Table 7-6 — decoded slice type. `slice_type` values 5..=9
@@ -412,10 +419,37 @@ impl SliceHeader {
             num_ref_idx_active_override_flag = r.u(1)? == 1;
             if num_ref_idx_active_override_flag {
                 num_ref_idx_l0_active_minus1 = r.ue()?;
+                if num_ref_idx_l0_active_minus1 > 63 {
+                    return Err(SliceHeaderError::NumRefIdxActiveMinus1OutOfRange(
+                        num_ref_idx_l0_active_minus1,
+                    ));
+                }
                 if matches!(slice_type, SliceType::B) {
                     num_ref_idx_l1_active_minus1 = r.ue()?;
+                    if num_ref_idx_l1_active_minus1 > 63 {
+                        return Err(SliceHeaderError::NumRefIdxActiveMinus1OutOfRange(
+                            num_ref_idx_l1_active_minus1,
+                        ));
+                    }
                 }
             }
+        }
+        // Defensive: if the override flag wasn't set, the values come
+        // from the active PPS — but the PPS parser doesn't bound them
+        // either (§7.4.2.2 only requires 0..=31). A malformed PPS
+        // followed by a slice that inherits its defaults could feed
+        // huge values into the same allocation paths. Re-check here so
+        // every slice header that reaches the weight-table / ref-list
+        // code is provably bounded.
+        if num_ref_idx_l0_active_minus1 > 63 {
+            return Err(SliceHeaderError::NumRefIdxActiveMinus1OutOfRange(
+                num_ref_idx_l0_active_minus1,
+            ));
+        }
+        if num_ref_idx_l1_active_minus1 > 63 {
+            return Err(SliceHeaderError::NumRefIdxActiveMinus1OutOfRange(
+                num_ref_idx_l1_active_minus1,
+            ));
         }
 
         // §7.3.3 — ref_pic_list_modification() (or ref_pic_list_mvc_modification()

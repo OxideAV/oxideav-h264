@@ -93,6 +93,15 @@ pub enum CabacError {
     /// errors.
     #[error("invalid SliceQPY {0} (must be -36..=+51)")]
     InvalidSliceQp(i32),
+    /// §9.3.3.2.3 — the bypass-coded Exp-Golomb escape suffix used by
+    /// `coeff_abs_level_minus1` reads ones until a zero appears, then
+    /// uses that count as a left-shift exponent. A malicious / corrupt
+    /// stream that produces ≥ 32 ones in a row would shift past the
+    /// width of `u32` (UB; panics in debug builds with `attempt to
+    /// shift left with overflow`). Bound the suffix length and reject
+    /// streams that exceed it.
+    #[error("CABAC EG escape suffix exceeded 31 leading-one bits")]
+    EgEscapeSuffixOverflow,
 }
 
 pub type CabacResult<T> = Result<T, CabacError>;

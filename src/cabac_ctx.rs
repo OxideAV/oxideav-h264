@@ -28,7 +28,7 @@
 
 #![allow(dead_code)]
 
-use crate::cabac::{CabacDecoder, CabacResult, CtxState};
+use crate::cabac::{CabacDecoder, CabacError, CabacResult, CtxState};
 
 #[inline]
 fn dbg_enabled() -> bool {
@@ -2527,7 +2527,10 @@ pub fn decode_mvd_lx(
     let abs_val: u32 = if prefix_val < 9 {
         prefix_val
     } else {
-        // §9.3.2.3 — UEG3 suffix (bypass-coded).
+        // §9.3.2.3 — UEG3 suffix (bypass-coded). Cap `k` at 30 so the
+        // `1u32 << k` shift can never overflow (UB at k=32) and the
+        // final `suf_s + tail + 9` still fits in u32. A malformed
+        // stream that asks for more is rejected.
         let k0: u32 = 3;
         let mut k = k0;
         let mut suf_s: u32 = 0;
@@ -2535,6 +2538,9 @@ pub fn decode_mvd_lx(
         loop {
             let b = dec.decode_bypass()? as u32;
             if b == 1 {
+                if k >= 30 {
+                    return Err(CabacError::EgEscapeSuffixOverflow);
+                }
                 suf_s += 1u32 << k;
                 k += 1;
             } else {
@@ -3223,11 +3229,20 @@ pub fn decode_coeff_abs_level_minus1(
         prefix_val += 1;
     }
     // prefix_val == u_coff — decode Exp-Golomb (k=0) suffix by bypass.
+    // §9.3.3.2.3 spec: the suffix is `unary 0` then a `k`-bit value.
+    // `k` grows unbounded in the syntax loop but the encoded value is
+    // bounded by Annex A profile/level limits (well below 2^32). Cap
+    // `k` at 30 so `1u32 << k` cannot overflow (UB at 32) AND the
+    // final `u_coff + suf_s + tail` still fits in u32 — a malicious
+    // stream that asks for 31+ ones is malformed by definition.
     let mut k: u32 = 0;
     let mut suf_s: u32 = 0;
     loop {
         let b = dec.decode_bypass()? as u32;
         if b == 1 {
+            if k >= 30 {
+                return Err(CabacError::EgEscapeSuffixOverflow);
+            }
             suf_s += 1u32 << k;
             k += 1;
         } else {
