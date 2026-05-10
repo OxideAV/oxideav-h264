@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-h264/compare/v0.1.3...v0.1.4) - 2026-05-06
+
+### Other
+
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `linkme` dep
+- CABAC 4:4:4 IDR encode (round 33) + fix ctxIdx 460-1023 init
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-h264/pull/502))
+
 ### Fixed
 
 - **CABAC context init Tables 9-25..9-33 (ctxIdx 460..=1023) added.**
