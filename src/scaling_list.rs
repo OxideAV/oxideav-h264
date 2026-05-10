@@ -31,6 +31,10 @@ pub enum ScalingListError {
     Bitstream(#[from] BitError),
     #[error("scaling_list size must be 16 or 64 (got {0})")]
     InvalidSize(u32),
+    /// §7.4.2.1.1.1: "The value of `delta_scale` shall be in the range
+    /// of −128 to +127, inclusive."
+    #[error("delta_scale out of range (got {0}, must be in -128..=127)")]
+    DeltaScaleOutOfRange(i32),
 }
 
 /// Result of parsing a single `scaling_list()` syntax structure
@@ -69,11 +73,17 @@ pub fn parse_scaling_list(
 
     for j in 0..n {
         if next_scale != 0 {
-            // se(v) delta_scale. §7.4.2.1.1.1 restricts delta_scale to
-            // the range −128..=127 — we don't enforce that here since
-            // the derivation is bit-exact regardless (the modulo-256 in
-            // the spec masks the constraint violation away).
+            // §7.4.2.1.1.1: "The value of delta_scale shall be in the
+            // range of −128 to +127, inclusive." Enforce the range
+            // explicitly — out-of-range values from a malformed stream
+            // would overflow the `last_scale + delta_scale + 256`
+            // arithmetic below (both operands are i32 and an attacker-
+            // controlled `delta_scale` could be near i32::MAX after
+            // se(v) decode of an oversized codeNum).
             let delta_scale = r.se()?;
+            if !(-128..=127).contains(&delta_scale) {
+                return Err(ScalingListError::DeltaScaleOutOfRange(delta_scale));
+            }
             next_scale = (last_scale + delta_scale + 256).rem_euclid(256);
             if j == 0 && next_scale == 0 {
                 use_default = true;
@@ -272,6 +282,40 @@ mod tests {
         assert!(!res.use_default);
         assert_eq!(res.scaling_list[0], 2);
         assert_eq!(res.scaling_list[15], 2);
+    }
+
+    #[test]
+    fn delta_scale_out_of_range_rejected() {
+        // §7.4.2.1.1.1 restricts delta_scale to [-128, 127]. A malformed
+        // stream that encodes +200 (or any value outside that band) used
+        // to feed unbounded values into `last_scale + delta_scale + 256`,
+        // which panicked with `attempt to add with overflow` for very
+        // large positive `delta_scale` values produced from oversized
+        // se(v) codewords. Now we reject early.
+        let bits: Vec<(u32, u32)> = vec![se_bits(200)];
+        let bytes = pack_bits(&bits);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_scaling_list(&mut r, 16).unwrap_err(),
+            ScalingListError::DeltaScaleOutOfRange(200)
+        );
+
+        let bits: Vec<(u32, u32)> = vec![se_bits(-129)];
+        let bytes = pack_bits(&bits);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_scaling_list(&mut r, 16).unwrap_err(),
+            ScalingListError::DeltaScaleOutOfRange(-129)
+        );
+
+        // The 127 / -128 endpoints are accepted.
+        let mut bits: Vec<(u32, u32)> = vec![se_bits(127)];
+        for _ in 0..15 {
+            bits.push(se_bits(0));
+        }
+        let bytes = pack_bits(&bits);
+        let mut r = BitReader::new(&bytes);
+        assert!(parse_scaling_list(&mut r, 16).is_ok());
     }
 
     #[test]

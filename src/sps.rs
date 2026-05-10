@@ -44,6 +44,17 @@ pub enum SpsError {
     /// §7.3.2.1.1 — `seq_parameter_set_id` range 0..=31.
     #[error("seq_parameter_set_id out of range (got {0}, max 31)")]
     SpsIdOutOfRange(u32),
+    /// §A.3 — picture dimensions are bounded by Annex A level limits.
+    /// `pic_width_in_mbs_minus1` is capped at 2^15 − 2 here so that the
+    /// derived `PicWidthInMbs * 16` (sample width) and `PicWidthInMbs *
+    /// (2 * PicHeightInMapUnits)` (mb count for interlaced) cannot
+    /// overflow u32. Real streams sit well below this — Level 6.2's
+    /// MaxFS = 139264 implies a per-axis upper bound of ~1056 mbs.
+    #[error("pic_width_in_mbs_minus1 out of range (got {0}, max 32766)")]
+    PicWidthInMbsOutOfRange(u32),
+    /// §A.3 — see `PicWidthInMbsOutOfRange`. Same rationale.
+    #[error("pic_height_in_map_units_minus1 out of range (got {0}, max 32766)")]
+    PicHeightInMapUnitsOutOfRange(u32),
     /// §7.3.2.1.1.1 — scaling_list body parse error.
     #[error("scaling_list: {0}")]
     ScalingList(#[from] ScalingListError),
@@ -51,6 +62,13 @@ pub enum SpsError {
     #[error("vui_parameters: {0}")]
     Vui(#[from] VuiError),
 }
+
+/// §A.3 derived ceiling — the maximum representable
+/// `pic_width_in_mbs_minus1` / `pic_height_in_map_units_minus1` after
+/// safety bounding. Anything > this is treated as malformed input.
+/// Chosen so that `(width_mbs+1) * (2 * (height_map_units+1)) * 16`
+/// — the worst-case interlaced sample count — fits in u32.
+const MAX_PIC_DIM_IN_MBS_MINUS1: u32 = (1 << 15) - 2;
 
 /// §7.3.2.1.1 — per-index entry in the SPS scaling-matrix list.
 ///
@@ -304,7 +322,15 @@ impl Sps {
         let max_num_ref_frames = r.ue()?;
         let gaps_in_frame_num_value_allowed_flag = r.u(1)? == 1;
         let pic_width_in_mbs_minus1 = r.ue()?;
+        if pic_width_in_mbs_minus1 > MAX_PIC_DIM_IN_MBS_MINUS1 {
+            return Err(SpsError::PicWidthInMbsOutOfRange(pic_width_in_mbs_minus1));
+        }
         let pic_height_in_map_units_minus1 = r.ue()?;
+        if pic_height_in_map_units_minus1 > MAX_PIC_DIM_IN_MBS_MINUS1 {
+            return Err(SpsError::PicHeightInMapUnitsOutOfRange(
+                pic_height_in_map_units_minus1,
+            ));
+        }
         let frame_mbs_only_flag = r.u(1)? == 1;
         let mb_adaptive_frame_field_flag = if !frame_mbs_only_flag {
             r.u(1)? == 1
@@ -873,5 +899,51 @@ mod tests {
         assert_eq!(sps.chroma_format_idc, 3);
         assert!(sps.separate_colour_plane_flag);
         assert_eq!(sps.chroma_array_type(), 0);
+    }
+
+    #[test]
+    fn pic_width_in_mbs_oversize_rejected() {
+        // Build an SPS where pic_width_in_mbs_minus1 = 2^31 - 1 (a value
+        // an attacker can produce via oversized ue(v) but real streams
+        // never come close to). Without the bound check, downstream code
+        // multiplies width_in_mbs * 16 and panics with `attempt to
+        // multiply with overflow`.
+        let mut w = BitWriter::new();
+        w.u(8, 66); // profile_idc Baseline
+        w.u(8, 0); // constraint_setN + reserved
+        w.u(8, 30); // level_idc
+        w.ue(0); // sps_id
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(0); // pic_order_cnt_type
+        w.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        w.ue(1); // max_num_ref_frames
+        w.u(1, 0); // gaps_in_frame_num_value_allowed_flag
+        w.ue(MAX_PIC_DIM_IN_MBS_MINUS1 + 1); // pic_width_in_mbs_minus1 (just past cap)
+        let err = Sps::parse(&w.into_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            SpsError::PicWidthInMbsOutOfRange(MAX_PIC_DIM_IN_MBS_MINUS1 + 1)
+        );
+    }
+
+    #[test]
+    fn pic_height_in_map_units_oversize_rejected() {
+        let mut w = BitWriter::new();
+        w.u(8, 66);
+        w.u(8, 0);
+        w.u(8, 30);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(1);
+        w.u(1, 0);
+        w.ue(0); // pic_width_in_mbs_minus1 OK
+        w.ue(MAX_PIC_DIM_IN_MBS_MINUS1 + 17); // pic_height_in_map_units_minus1 oversize
+        let err = Sps::parse(&w.into_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            SpsError::PicHeightInMapUnitsOutOfRange(MAX_PIC_DIM_IN_MBS_MINUS1 + 17)
+        );
     }
 }

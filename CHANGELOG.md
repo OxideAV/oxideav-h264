@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **scaling_list: enforce §7.4.2.1.1.1 `delta_scale ∈ −128..=127`
+  bound.** Previously the parser quietly accepted any se(v) value and
+  evaluated `last_scale + delta_scale + 256` in i32, which panicked
+  with `attempt to add with overflow` for values fed via oversized
+  se(v) codewords. Out-of-range deltas now return
+  `ScalingListError::DeltaScaleOutOfRange`. Surfaced by fuzz CI run
+  25642717757 once the bitstream-overflow gate landed.
+- **sps: cap `pic_width_in_mbs_minus1` and
+  `pic_height_in_map_units_minus1` at 2^15 − 2.** §A.3 level limits
+  bound real streams well below this, but malformed inputs could
+  previously feed arbitrarily large dimensions into
+  `sps.pic_width_in_mbs() * 16` (panic: multiply with overflow) and
+  `pic_width_in_mbs() * frame_height_in_mbs()` (panic on mb_count).
+  The chosen ceiling guarantees every downstream `* 16`, `* (1|2)`,
+  and width×height multiplication in `h264_decoder` stays within u32.
 - **Exp-Golomb decoder no longer panics on 32+ leading zeros.**
   `BitReader::read_codenum` previously accepted up to 32 leading zero
   bits, then computed `1u32 << leading_zeros` — which is undefined
