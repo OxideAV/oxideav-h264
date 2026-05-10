@@ -39,7 +39,7 @@
 pub enum BitError {
     #[error("attempted to read past end of bitstream")]
     Eof,
-    #[error("Exp-Golomb leading-zero run exceeded 32 bits")]
+    #[error("Exp-Golomb leading-zero run exceeded 31 bits")]
     ExpGolombOverflow,
     #[error("u(n)/i(n) requested {0} bits, max supported is 32")]
     TooManyBits(u32),
@@ -198,6 +198,14 @@ impl<'a> BitReader<'a> {
 
     /// §9.1 — read the leading-zero count, then the `leadingZeroBits`
     /// suffix; return `codeNum = 2^leadingZeroBits − 1 + suffix`.
+    ///
+    /// `leadingZeroBits` is bounded at 31: the formula `2^k − 1 + suffix`
+    /// already saturates `u32::MAX` at `k = 32` (since `suffix` itself
+    /// can be `2^32 − 1`), and `1u32 << 32` is UB in Rust. Anything past
+    /// 31 zeros indicates malformed input — the spec syntax elements
+    /// (slice headers, MB types, ref indices, etc.) all top out well
+    /// below this, so a stream that asks for `k ≥ 32` is corrupt by
+    /// definition. Return `ExpGolombOverflow` rather than panic.
     fn read_codenum(&mut self) -> BitResult<u32> {
         let mut leading_zeros: u32 = 0;
         loop {
@@ -208,7 +216,7 @@ impl<'a> BitReader<'a> {
                 break;
             }
             leading_zeros += 1;
-            if leading_zeros > 32 {
+            if leading_zeros > 31 {
                 return Err(BitError::ExpGolombOverflow);
             }
         }
@@ -387,5 +395,48 @@ mod tests {
     fn ue_reports_eof() {
         let mut r = BitReader::new(&[0x00]);
         assert_eq!(r.ue().unwrap_err(), BitError::Eof);
+    }
+
+    #[test]
+    fn ue_rejects_oversize_leading_zero_run() {
+        // §9.1: 32 leading zeros followed by a `1` would require
+        // `1u32 << 32` to compute the codeNum, which is undefined and
+        // panics in debug builds. Reject with `ExpGolombOverflow`
+        // before the shift. Regression for fuzz crash
+        // panic_free_decode/crash-5c9d8c8642cdb8ffc371d3dbb45c3a1604477676
+        // (PPS parser propagated an unbounded `ue(v)` decode).
+        // 32 zero bits = 4 bytes of 0x00, then a `1` bit.
+        let bytes = [0x00, 0x00, 0x00, 0x00, 0b1000_0000];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.ue().unwrap_err(), BitError::ExpGolombOverflow);
+
+        // Even a much longer run of zeros (well past 32) must not panic
+        // — the reader bails as soon as it counts 32 zero bits.
+        let bytes = [0u8; 16];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.ue().unwrap_err(), BitError::ExpGolombOverflow);
+    }
+
+    #[test]
+    fn ue_accepts_31_leading_zeros_max_codenum() {
+        // 31 leading zeros + `1` + 31-bit suffix is the largest legal
+        // codeNum that fits in u32: `(1 << 31) - 1 + (2^31 - 1)`
+        // = `2^32 - 2`. Make sure the boundary case decodes without
+        // panicking.
+        // Layout: 31 zeros, then `1`, then 31 suffix bits all `1`.
+        // Total = 63 bits; pack into 8 bytes (last bit padding).
+        let mut bits: Vec<u8> = Vec::new();
+        bits.extend(std::iter::repeat_n(0, 31));
+        bits.push(1); // the terminating one
+        bits.extend(std::iter::repeat_n(1, 31)); // suffix = 2^31 - 1
+        bits.push(0); // pad to 64
+        let mut bytes = [0u8; 8];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                bytes[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.ue().unwrap(), u32::MAX - 1);
     }
 }

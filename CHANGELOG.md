@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Exp-Golomb decoder no longer panics on 32+ leading zeros.**
+  `BitReader::read_codenum` previously accepted up to 32 leading zero
+  bits, then computed `1u32 << leading_zeros` — which is undefined
+  behaviour in Rust at `leading_zeros == 32` and panicked with
+  `attempt to shift left with overflow` in debug builds. The bound is
+  now 31 (the largest `k` for which `2^k − 1 + suffix` still fits in
+  u32), returning `BitError::ExpGolombOverflow` for malformed streams
+  that ask for more. The crash was reachable via PPS parsing on
+  fuzzer input (panic_free_decode crash
+  `5c9d8c8642cdb8ffc371d3dbb45c3a1604477676`). Regression unit tests
+  added in `src/bitstream.rs` cover both the overflow rejection path
+  and the 31-zeros boundary that yields the largest legal codeNum.
+
 ## [0.1.4](https://github.com/OxideAV/oxideav-h264/compare/v0.1.3...v0.1.4) - 2026-05-06
 
 ### Other
