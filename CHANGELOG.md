@@ -39,13 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ScalingListError::DeltaScaleOutOfRange`. Surfaced by fuzz CI run
   25642717757 once the bitstream-overflow gate landed.
 - **sps: cap `pic_width_in_mbs_minus1` and
-  `pic_height_in_map_units_minus1` at 2^15 − 2.** §A.3 level limits
-  bound real streams well below this, but malformed inputs could
-  previously feed arbitrarily large dimensions into
-  `sps.pic_width_in_mbs() * 16` (panic: multiply with overflow) and
-  `pic_width_in_mbs() * frame_height_in_mbs()` (panic on mb_count).
-  The chosen ceiling guarantees every downstream `* 16`, `* (1|2)`,
-  and width×height multiplication in `h264_decoder` stays within u32.
+  `pic_height_in_map_units_minus1` at 510.** §A.3 level limits bound
+  real streams well below this — Level 6.2 needs ~1056 mbs / axis,
+  4K-class needs ~240 — but malformed inputs could previously feed
+  arbitrarily large dimensions into `sps.pic_width_in_mbs() * 16`
+  (panic: multiply with overflow), `pic_width_in_mbs() *
+  frame_height_in_mbs()` (panic on mb_count), and `Picture::new`
+  (multi-GB calloc → fuzz OOM at 7.5 GB). The chosen ceiling
+  guarantees every downstream multiplication stays in u32 *and* the
+  worst-case `Picture` allocation (3 × width × height at 4:4:4)
+  stays under ~200 MB.
 - **Exp-Golomb decoder no longer panics on 32+ leading zeros.**
   `BitReader::read_codenum` previously accepted up to 32 leading zero
   bits, then computed `1u32 << leading_zeros` — which is undefined

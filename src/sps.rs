@@ -45,15 +45,17 @@ pub enum SpsError {
     #[error("seq_parameter_set_id out of range (got {0}, max 31)")]
     SpsIdOutOfRange(u32),
     /// §A.3 — picture dimensions are bounded by Annex A level limits.
-    /// `pic_width_in_mbs_minus1` is capped at 2^15 − 2 here so that the
-    /// derived `PicWidthInMbs * 16` (sample width) and `PicWidthInMbs *
-    /// (2 * PicHeightInMapUnits)` (mb count for interlaced) cannot
-    /// overflow u32. Real streams sit well below this — Level 6.2's
-    /// MaxFS = 139264 implies a per-axis upper bound of ~1056 mbs.
-    #[error("pic_width_in_mbs_minus1 out of range (got {0}, max 32766)")]
+    /// `pic_width_in_mbs_minus1` is capped at 510 here so the derived
+    /// `Picture::new` allocation (luma + 2× chroma at 4:4:4 = 3 ×
+    /// width_samples × height_samples bytes) stays within ~200 MB
+    /// even at the worst-case bit depth + chroma subsampling. Real
+    /// streams sit far below this — Level 6.2's MaxFS = 139264 implies
+    /// a per-axis upper bound of ~1056 mbs (and 4K-class streams need
+    /// only ~240 mbs / axis).
+    #[error("pic_width_in_mbs_minus1 out of range (got {0}, max 510)")]
     PicWidthInMbsOutOfRange(u32),
     /// §A.3 — see `PicWidthInMbsOutOfRange`. Same rationale.
-    #[error("pic_height_in_map_units_minus1 out of range (got {0}, max 32766)")]
+    #[error("pic_height_in_map_units_minus1 out of range (got {0}, max 510)")]
     PicHeightInMapUnitsOutOfRange(u32),
     /// §7.3.2.1.1.1 — scaling_list body parse error.
     #[error("scaling_list: {0}")]
@@ -66,9 +68,15 @@ pub enum SpsError {
 /// §A.3 derived ceiling — the maximum representable
 /// `pic_width_in_mbs_minus1` / `pic_height_in_map_units_minus1` after
 /// safety bounding. Anything > this is treated as malformed input.
-/// Chosen so that `(width_mbs+1) * (2 * (height_map_units+1)) * 16`
-/// — the worst-case interlaced sample count — fits in u32.
-const MAX_PIC_DIM_IN_MBS_MINUS1: u32 = (1 << 15) - 2;
+///
+/// Chosen so that the worst-case `Picture::new` allocation (luma +
+/// 2× chroma at 4:4:4 = 3 × width_samples × height_samples bytes)
+/// stays under ~200 MB, well within typical fuzz / decoder memory
+/// budgets. Real Annex A Level 6.2 streams need ~1056 mbs per axis;
+/// the cap of 510 (8176 luma samples / axis) is comfortably above
+/// any realistic 4K-class stream while preventing pathological
+/// PicSizeInMbs from driving multi-GB allocations.
+const MAX_PIC_DIM_IN_MBS_MINUS1: u32 = (1 << 9) - 2;
 
 /// §7.3.2.1.1 — per-index entry in the SPS scaling-matrix list.
 ///
