@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **slice_header: bound `first_mb_in_slice` by PicSizeInMbs
+  (§7.4.3).** The spec constrains `first_mb_in_slice` to
+  `0..PicSizeInMbs - 1` (non-MBAFF) or `0..PicSizeInMbs/2 - 1` (MBAFF,
+  where the parsed value is in macroblock-pair units and the underlying
+  raw MB address is `first_mb_in_slice * 2`). With no upper bound
+  applied at parse time, a multi-million MB address propagated to
+  `reconstruct::mb_sample_origin`, where the `(mb_addr / PicWidthInMbs)
+  * 16` i32 multiply overflowed in debug / sanitizer builds. New
+  `SliceHeaderError::FirstMbInSliceOutOfRange` carries the parsed
+  value + max + PicSizeInMbs + mbaff flag for diagnostics. PicSizeInMbs
+  is derived per eq. (7-31) `= PicWidthInMbs * PicHeightInMbs` with
+  PicHeightInMbs = FrameHeightInMbs / (1 + field_pic_flag) per eq.
+  (7-28), so the check runs after `field_pic_flag` is parsed.
+  Regression for fuzz crash
+  `crash-80e231ea0edb920c618dc6ea3f9d04626a5b2b16` (175-byte input
+  triggering the i32 multiply overflow path through `reconstruct.rs:254`).
 - **h264_decoder: drop in-progress picture when every slice failed
   parse / reconstruction (§7.4.1.2.4).** `H264CodecDecoder` collects
   per-slice CABAC/CAVLC failures via an `eprintln!` log line and

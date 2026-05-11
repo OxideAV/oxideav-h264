@@ -90,6 +90,20 @@ pub enum SliceHeaderError {
     /// `parse_pred_weight_table` / `parse_ref_pic_list_modification`.
     #[error("num_ref_idx_lX_active_minus1 out of range (got {0}, max 63)")]
     NumRefIdxActiveMinus1OutOfRange(u32),
+    /// §7.4.3 — `first_mb_in_slice` shall be in the range
+    /// `0 .. PicSizeInMbs - 1` (non-MBAFF) or `0 .. PicSizeInMbs/2 - 1`
+    /// (MBAFF, where the value is in pair units and the underlying raw
+    /// MB address is `first_mb_in_slice * 2`). Values outside this
+    /// range turn the per-MB `(addr % width, addr / width) * 16`
+    /// origin maths into an i32 multiply overflow inside the
+    /// reconstructor (`reconstruct::mb_sample_origin`).
+    #[error("first_mb_in_slice out of range (got {got}, max {max} for PicSizeInMbs={pic_size_in_mbs}, mbaff={mbaff})")]
+    FirstMbInSliceOutOfRange {
+        got: u32,
+        max: u32,
+        pic_size_in_mbs: u32,
+        mbaff: bool,
+    },
 }
 
 /// §7.4.3 Table 7-6 — decoded slice type. `slice_type` values 5..=9
@@ -361,6 +375,35 @@ impl SliceHeader {
         } else {
             (false, false)
         };
+
+        // §7.4.3 — `first_mb_in_slice` shall be in:
+        //   * `0 .. PicSizeInMbs - 1`        when MbaffFrameFlag == 0
+        //   * `0 .. PicSizeInMbs/2 - 1`      when MbaffFrameFlag == 1
+        // (MBAFF: the parsed value is in macroblock-pair units; the
+        // underlying raw MB address is `first_mb_in_slice * 2`.)
+        // Without this check, downstream `mb_sample_origin` in §6.4.1
+        // computes `(mb_addr / PicWidthInMbs) * 16` as i32 and an
+        // attacker-supplied multi-million MB address overflows the
+        // multiply. PicSizeInMbs derived per eq. (7-31) = PicWidthInMbs
+        // * PicHeightInMbs, with PicHeightInMbs = FrameHeightInMbs /
+        // (1 + field_pic_flag) per eq. (7-28).
+        let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !field_pic_flag;
+        let pic_height_in_mbs = sps.frame_height_in_mbs() / (1 + u32::from(field_pic_flag));
+        let pic_size_in_mbs = sps.pic_width_in_mbs() * pic_height_in_mbs;
+        let max_first_mb = if mbaff_frame_flag {
+            pic_size_in_mbs / 2
+        } else {
+            pic_size_in_mbs
+        }
+        .saturating_sub(1);
+        if first_mb_in_slice > max_first_mb {
+            return Err(SliceHeaderError::FirstMbInSliceOutOfRange {
+                got: first_mb_in_slice,
+                max: max_first_mb,
+                pic_size_in_mbs,
+                mbaff: mbaff_frame_flag,
+            });
+        }
 
         // §7.3.3 — idr_pic_id ue(v) when IdrPicFlag.
         let idr_pic_id = if idr_pic_flag {
@@ -1087,6 +1130,61 @@ mod tests {
         assert_eq!(hdr.num_ref_idx_l0_active_minus1, 2);
         assert_eq!(hdr.num_ref_idx_l1_active_minus1, 0);
         assert_eq!(hdr.slice_qp_delta, 1);
+    }
+
+    /// §7.4.3 — `first_mb_in_slice` shall be in 0..PicSizeInMbs-1
+    /// (non-MBAFF) or 0..PicSizeInMbs/2-1 (MBAFF). Without this check
+    /// the downstream `mb_sample_origin` in §6.4.1 overflows the i32
+    /// `* 16` multiply when the value exceeds PicSizeInMbs by orders
+    /// of magnitude. Regression for fuzz crash
+    /// `crash-80e231ea0edb920c618dc6ea3f9d04626a5b2b16`.
+    #[test]
+    fn first_mb_in_slice_beyond_pic_size_is_rejected() {
+        // dummy_sps has 20*15 = 300 MBs → max first_mb_in_slice = 299.
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let nh = nal(NalUnitType::SliceNonIdr, 3);
+
+        let mut w = BitWriter::new();
+        w.ue(300); // first_mb_in_slice = 300 — exactly out of range.
+        w.ue(7); // slice_type = 7 (I)
+        w.ue(0); // pps_id
+        w.u(4, 0); // frame_num
+        let bytes = w.into_bytes();
+        let err = SliceHeader::parse(&bytes, &sps, &pps, &nh).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SliceHeaderError::FirstMbInSliceOutOfRange {
+                    got: 300,
+                    max: 299,
+                    pic_size_in_mbs: 300,
+                    mbaff: false,
+                }
+            ),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    /// §7.4.3 — `first_mb_in_slice` value equal to PicSizeInMbs - 1
+    /// is the last legal MB address; ensure we don't off-by-one.
+    #[test]
+    fn first_mb_in_slice_at_max_is_accepted() {
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let nh = nal(NalUnitType::SliceNonIdr, 3);
+
+        let mut w = BitWriter::new();
+        w.ue(299); // last legal MB in dummy_sps (300 MBs total).
+        w.ue(7); // slice_type = I
+        w.ue(0); // pps_id
+        w.u(4, 0); // frame_num
+        w.u(4, 0); // pic_order_cnt_lsb
+        w.u(1, 0); // adaptive_ref_pic_marking_mode_flag (non-IDR)
+        w.se(0); // slice_qp_delta
+        let bytes = w.into_bytes();
+        let hdr = SliceHeader::parse(&bytes, &sps, &pps, &nh).unwrap();
+        assert_eq!(hdr.first_mb_in_slice, 299);
     }
 
     #[test]
