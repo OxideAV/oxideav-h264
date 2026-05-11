@@ -20,6 +20,17 @@ pub enum SpsError {
     /// §7.3.2.1.1 — `reserved_zero_2bits` shall be equal to 0.
     #[error("reserved_zero_2bits is not 0 (got {0})")]
     ReservedNotZero(u32),
+    /// §A.1 / §A.2 — profile_idc must be one of the values enumerated
+    /// in clause A.2 (66 Baseline, 77 Main, 88 Extended, 100 High,
+    /// 110 High 10, 122 High 4:2:2, 244 High 4:4:4 Predictive, 44
+    /// CAVLC 4:4:4 Intra, 83 Scalable Baseline, 86 Scalable High,
+    /// 118 Multiview High, 128 Stereo High, 138 Multiview Depth High,
+    /// 139 Enhanced Multiview Depth High, 134 MFC High, 135 MFC Depth
+    /// High). All other values are "reserved for future use by ITU-T
+    /// | ISO/IEC" and the decoder cannot honour them — match
+    /// libavcodec's strictness instead of silently mis-decoding.
+    #[error("profile_idc {0} is reserved (not enumerated in §A.2)")]
+    ProfileIdcReserved(u8),
     /// §7.4.2.1.1 — `chroma_format_idc` in range 0..=3.
     #[error("chroma_format_idc out of range (got {0}, max 3)")]
     ChromaFormatIdcOutOfRange(u32),
@@ -77,6 +88,24 @@ pub enum SpsError {
 /// any realistic 4K-class stream while preventing pathological
 /// PicSizeInMbs from driving multi-GB allocations.
 const MAX_PIC_DIM_IN_MBS_MINUS1: u32 = (1 << 9) - 2;
+
+/// §A.2 — return true iff `profile_idc` is one of the 16 values
+/// enumerated in clause A.2 (Baseline / Constrained Baseline → 66,
+/// Main → 77, Extended → 88, High → 100, High 10 / High 10 Intra →
+/// 110, High 4:2:2 / High 4:2:2 Intra → 122, High 4:4:4 Predictive /
+/// High 4:4:4 Intra → 244, CAVLC 4:4:4 Intra → 44, Scalable Baseline
+/// (Annex G) → 83, Scalable High (Annex G) → 86, Multiview High
+/// (Annex H) → 118, Stereo High (Annex H) → 128, Multiview Depth High
+/// (Annex I) → 138, Enhanced Multiview Depth High (Annex I) → 139,
+/// MFC High (Annex H) → 134, MFC Depth High (Annex I) → 135). All
+/// other values are "reserved for future use" per §A.1 and the
+/// decoder cannot safely consume them.
+fn is_valid_profile_idc(profile_idc: u8) -> bool {
+    matches!(
+        profile_idc,
+        66 | 77 | 88 | 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    )
+}
 
 /// §7.3.2.1.1 — per-index entry in the SPS scaling-matrix list.
 ///
@@ -206,6 +235,14 @@ impl Sps {
 
         // §7.3.2.1.1 — profile_idc / constraint_setN_flag / reserved_zero_2bits / level_idc.
         let profile_idc = r.u(8)? as u8;
+        // §A.1 / §A.2 — only the 16 enumerated profiles are allowed;
+        // other values are "reserved for future use" and we cannot
+        // safely decode bitstreams using them. Reject up front to
+        // match libavcodec's strictness (closes a fuzz-oracle
+        // divergence on profile_idc=251 + 243 inputs).
+        if !is_valid_profile_idc(profile_idc) {
+            return Err(SpsError::ProfileIdcReserved(profile_idc));
+        }
         let cs0 = r.u(1)? as u8;
         let cs1 = r.u(1)? as u8;
         let cs2 = r.u(1)? as u8;
@@ -536,6 +573,84 @@ mod tests {
             w.trailing();
         }
         w.into_bytes()
+    }
+
+    #[test]
+    fn reserved_profile_idc_is_rejected() {
+        // §A.1 — profile_idc values not enumerated in §A.2 are
+        // reserved. Regression for two fuzz-oracle divergences:
+        //   crash-1b2aaf6f54f92df08bf67802c970555c02de3b4e (profile_idc=251)
+        //   crash-181e9dea7dfa8fcb2c9721a3f9f044214af6167b (profile_idc=243)
+        // libavcodec rejects these; we used to accept and emit a
+        // mis-decoded frame.
+        for bad in [243u8, 251u8, 1u8, 200u8, 0u8] {
+            // Build a Baseline-shaped SPS but with the bad profile_idc.
+            let mut w = BitWriter::new();
+            w.u(8, bad as u32);
+            w.u(8, 0); // cs flags + reserved
+            w.u(8, 30); // level_idc
+            w.ue(0); // seq_parameter_set_id
+            w.ue(0); // log2_max_frame_num_minus4
+            w.ue(0); // pic_order_cnt_type
+            w.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+            w.ue(1); // max_num_ref_frames
+            w.u(1, 0);
+            w.ue(0);
+            w.ue(0);
+            w.u(1, 1);
+            w.u(1, 1);
+            w.u(1, 0);
+            w.u(1, 0);
+            w.trailing();
+            let bytes = w.into_bytes();
+            let err = Sps::parse(&bytes).unwrap_err();
+            assert!(
+                matches!(err, SpsError::ProfileIdcReserved(p) if p == bad),
+                "profile_idc={bad} → expected ProfileIdcReserved, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_annex_a_profile_idcs_accepted() {
+        // Smoke-check that every Annex A.2 profile_idc still parses
+        // (Baseline-shaped body — the chroma-extended profiles read
+        // four extra ue(v)/u(1) fields that we add here for them).
+        for good in [
+            66u8, 77, 88, 100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
+        ] {
+            let mut w = BitWriter::new();
+            w.u(8, good as u32);
+            w.u(8, 0);
+            w.u(8, 30);
+            w.ue(0); // sps_id
+                     // Chroma-extended profile gate.
+            if matches!(
+                good,
+                100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+            ) {
+                w.ue(1); // chroma_format_idc=1
+                w.ue(0); // bit_depth_luma_minus8
+                w.ue(0); // bit_depth_chroma_minus8
+                w.u(1, 0); // qpprime_y_zero_transform_bypass_flag
+                w.u(1, 0); // seq_scaling_matrix_present_flag
+            }
+            w.ue(0); // log2_max_frame_num_minus4
+            w.ue(0); // pic_order_cnt_type
+            w.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+            w.ue(1); // max_num_ref_frames
+            w.u(1, 0);
+            w.ue(0);
+            w.ue(0);
+            w.u(1, 1);
+            w.u(1, 1);
+            w.u(1, 0);
+            w.u(1, 0);
+            w.trailing();
+            let bytes = w.into_bytes();
+            let sps = Sps::parse(&bytes).unwrap_or_else(|e| panic!("profile_idc={good}: {e:?}"));
+            assert_eq!(sps.profile_idc, good);
+        }
     }
 
     #[test]

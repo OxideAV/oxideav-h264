@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **sps: reject reserved profile_idc values (§A.1 / §A.2).** Only the
+  16 profile_idc values enumerated in clause A.2 (66, 77, 88, 100,
+  110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135) are
+  defined; §A.1 says "all other values of profile_idc and level_idc
+  are reserved for future use". `Sps::parse` now returns
+  `SpsError::ProfileIdcReserved` for any other value, matching
+  libavcodec's "sps_id 0 out of range" rejection of fuzz inputs
+  carrying profile_idc=243 / 251 (regression for fuzz crash
+  `crash-1b2aaf6f54f92df08bf67802c970555c02de3b4e`).
+- **transform: use wrapping arithmetic in §8.5.11.1 / §8.5.11.2
+  chroma DC Hadamard + scaling for both 4:2:0 and 4:2:2.** Same
+  class of bug as commit `dc09485` (4x4 / 8x8 transforms): a
+  malformed CAVLC/CABAC stream can carry residual coefficients near
+  i32::MAX, the Hadamard combine sums up to 4 of them, and `f * ls
+  << shift` then panicked on debug builds with "attempt to shift
+  left with overflow" (regression for fuzz crash
+  `crash-5e4c895f03eb99238772ecd84738327f07b4cf75`). Wrapping
+  arithmetic absorbs the overflow; the §8.5.13 Clip3 stage in
+  reconstruct clamps wrapped pixels back to bit-depth range.
 - **decoder: reject FMO PPS activation (§A.2).** A slice that
   activates a PPS with `num_slice_groups_minus1 > 0` (Flexible
   Macroblock Ordering) is now rejected with

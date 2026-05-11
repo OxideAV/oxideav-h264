@@ -1069,11 +1069,20 @@ pub fn inverse_hadamard_chroma_dc_420(
     let c01 = dc_coeffs[1];
     let c10 = dc_coeffs[2];
     let c11 = dc_coeffs[3];
-    let t00 = c00 + c10;
-    let t01 = c01 + c11;
-    let t10 = c00 - c10;
-    let t11 = c01 - c11;
-    let f = [t00 + t01, t00 - t01, t10 + t11, t10 - t11];
+    // Wrapping adds: malformed CAVLC/CABAC streams can produce
+    // residual coefficients near i32::MAX even after the §9.2.2
+    // level_prefix cap; the Hadamard combine sums up to four of
+    // those before scaling. Wrapping keeps the arithmetic in i32.
+    let t00 = c00.wrapping_add(c10);
+    let t01 = c01.wrapping_add(c11);
+    let t10 = c00.wrapping_sub(c10);
+    let t11 = c01.wrapping_sub(c11);
+    let f = [
+        t00.wrapping_add(t01),
+        t00.wrapping_sub(t01),
+        t10.wrapping_add(t11),
+        t10.wrapping_sub(t11),
+    ];
 
     // §8.5.11.2 Eq. 8-326 — scaling for 4:2:0:
     //   dcC_ij = ( (f_ij * LevelScale4x4(qP%6, 0, 0)) << (qP/6) ) >> 5
@@ -1082,12 +1091,20 @@ pub fn inverse_hadamard_chroma_dc_420(
     // includes the weight_scale factor (typically 16). The `>> 5`
     // absorbs the extra 2^4 factor plus one more to recover the
     // equivalent of the 2003 spec's `>> 1`.
+    //
+    // Wrapping arithmetic mirrors the §8.5.12 fix in commit dc09485:
+    // spec-conformant streams keep `f * ls` well within i32, but
+    // pathological residual coefficients in malformed input can drive
+    // `f` to ~±2^18 (4-Hadamard amplifies ±2^15 by 4× per axis) and
+    // then `f * ls` past i32::MAX. Wrap-around produces nonsense
+    // pixels that the §8.5.13 Clip3 stage clamps back into bit-depth
+    // range — a quiet wrong frame is preferable to a panic.
     let qp_mod = (qp % 6) as usize;
     let qp_div = qp / 6;
     let ls = level_scale_4x4(scaling_list, qp_mod, 0, 0);
     let mut out = [0i32; 4];
     for k in 0..4 {
-        out[k] = ((f[k] * ls) << qp_div) >> 5;
+        out[k] = (f[k].wrapping_mul(ls).wrapping_shl((qp_div as u32) & 31)) >> 5;
     }
     Ok(out)
 }
@@ -1138,28 +1155,42 @@ pub fn inverse_hadamard_chroma_dc_422(
     //   Hh = [[1,  1],
     //         [1, -1]]           (2x2 on the 2-column side)
     //
-    // Apply Hv to the left (combines rows).
-    let t00 = c00 + c10 + c20 + c30;
-    let t01 = c01 + c11 + c21 + c31;
-    let t10 = c00 + c10 - c20 - c30;
-    let t11 = c01 + c11 - c21 - c31;
-    let t20 = c00 - c10 - c20 + c30;
-    let t21 = c01 - c11 - c21 + c31;
-    let t30 = c00 - c10 + c20 - c30;
-    let t31 = c01 - c11 + c21 - c31;
+    // Apply Hv to the left (combines rows). Wrapping arithmetic per
+    // the same rationale as inverse_hadamard_chroma_dc_420 above:
+    // malformed bitstreams can carry residual coefficients near
+    // i32::MAX, and the 4-element Hadamard combine sums could
+    // otherwise overflow before reaching the wrapping multiply.
+    let t00 = c00.wrapping_add(c10).wrapping_add(c20).wrapping_add(c30);
+    let t01 = c01.wrapping_add(c11).wrapping_add(c21).wrapping_add(c31);
+    let t10 = c00.wrapping_add(c10).wrapping_sub(c20).wrapping_sub(c30);
+    let t11 = c01.wrapping_add(c11).wrapping_sub(c21).wrapping_sub(c31);
+    let t20 = c00.wrapping_sub(c10).wrapping_sub(c20).wrapping_add(c30);
+    let t21 = c01.wrapping_sub(c11).wrapping_sub(c21).wrapping_add(c31);
+    let t30 = c00.wrapping_sub(c10).wrapping_add(c20).wrapping_sub(c30);
+    let t31 = c01.wrapping_sub(c11).wrapping_add(c21).wrapping_sub(c31);
     // Apply Hh to the right (combines columns).
     let f = [
-        t00 + t01,
-        t00 - t01,
-        t10 + t11,
-        t10 - t11,
-        t20 + t21,
-        t20 - t21,
-        t30 + t31,
-        t30 - t31,
+        t00.wrapping_add(t01),
+        t00.wrapping_sub(t01),
+        t10.wrapping_add(t11),
+        t10.wrapping_sub(t11),
+        t20.wrapping_add(t21),
+        t20.wrapping_sub(t21),
+        t30.wrapping_add(t31),
+        t30.wrapping_sub(t31),
     ];
 
     // §8.5.11.2 — scaling path with qPDC = qP + 3 (Eq. 8-327).
+    //
+    // Wrapping arithmetic mirrors the §8.5.12 fix in commit dc09485:
+    // spec-conformant streams keep `f * ls` well within i32, but
+    // malformed input can drive `f` (8-element 4×2 Hadamard
+    // amplification of ±2^15 residuals) past 2^18 and the product
+    // past i32::MAX. Wrap-around lets §8.5.13's downstream Clip3
+    // clamp the bogus values back into bit-depth range instead of
+    // panicking. The shift amount is masked to fit in u32 (qp/6 - 6
+    // stays in 0..=8 for qp ≤ 87 — the 14-bit max — but the mask
+    // documents the bound and silences shl-overflow worries).
     let qp_dc = qp + 3;
     let mut out = [0i32; 8];
     if qp_dc >= 36 {
@@ -1167,9 +1198,9 @@ pub fn inverse_hadamard_chroma_dc_422(
         //   dcCij = ( ( fij * LevelScale4x4(qP % 6, 0, 0) ) << (qP/6 - 6) )
         let qp_mod = (qp % 6) as usize;
         let ls = level_scale_4x4(scaling_list, qp_mod, 0, 0);
-        let shift = (qp / 6) - 6;
+        let shift = ((qp / 6) - 6) as u32 & 31;
         for k in 0..8 {
-            out[k] = (f[k] * ls) << shift;
+            out[k] = f[k].wrapping_mul(ls).wrapping_shl(shift);
         }
     } else {
         // Eq. 8-329 — shift and mod both use qPDC.
@@ -1179,9 +1210,9 @@ pub fn inverse_hadamard_chroma_dc_422(
         let qp_dc_div = qp_dc / 6;
         let ls = level_scale_4x4(scaling_list, qp_dc_mod, 0, 0);
         let shift = 6 - qp_dc_div;
-        let round = 1 << (5 - qp_dc_div);
+        let round = 1i32.wrapping_shl((5 - qp_dc_div) as u32);
         for k in 0..8 {
-            out[k] = (f[k] * ls + round) >> shift;
+            out[k] = f[k].wrapping_mul(ls).wrapping_add(round) >> shift;
         }
     }
     Ok(out)
@@ -1849,6 +1880,50 @@ mod tests {
         // Confirm the output is not all-zeros — previous buggy mapping
         // would have placed L[5] at c[2,1] giving a different pattern.
         assert!(out.iter().any(|&v| v != 0), "L[5] should affect the output");
+    }
+
+    // Regression: §8.5.11.1 / §8.5.11.2 chroma DC overflow safety —
+    // malformed CAVLC/CABAC streams can produce residual coefficients
+    // near i32::MAX. The 4-element 4:2:0 Hadamard combine sums up to
+    // four such values, then multiplies by ls and shifts left, which
+    // used to panic on debug builds with "attempt to shift left with
+    // overflow" / "attempt to multiply with overflow". Wrapping
+    // arithmetic absorbs the overflow; the §8.5.13 Clip3 stage
+    // reduces the wrapped pixels back to bit-depth range.
+    #[test]
+    fn chroma_dc_420_extreme_input_does_not_panic() {
+        let dc = [i32::MAX, i32::MIN, i32::MAX, i32::MIN];
+        let sl = default_scaling_list_4x4_flat();
+        // Just verify it returns without panicking. The pixel values
+        // are nonsense — that's fine, the spec contract is "no
+        // bit-exact requirement on malformed input".
+        let _ = inverse_hadamard_chroma_dc_420(&dc, 51, &sl, 8).unwrap();
+        let _ = inverse_hadamard_chroma_dc_420(&dc, 0, &sl, 8).unwrap();
+    }
+
+    // Regression for fuzz crash
+    // crash-5e4c895f03eb99238772ecd84738327f07b4cf75 ("attempt to
+    // shift left with overflow" at transform.rs:1172). The 4:2:2
+    // chroma DC scaling path's `(f * ls) << shift` overflows on
+    // pathological residual + qp combinations; same wrapping fix as
+    // the 4:2:0 sibling above.
+    #[test]
+    fn chroma_dc_422_extreme_input_does_not_panic() {
+        let dc = [
+            i32::MAX,
+            i32::MIN,
+            i32::MAX,
+            i32::MIN,
+            i32::MAX,
+            i32::MIN,
+            i32::MAX,
+            i32::MIN,
+        ];
+        let sl = default_scaling_list_4x4_flat();
+        // qP=51 → qpDC=54, qpDC>=36 path (the old panicking branch).
+        let _ = inverse_hadamard_chroma_dc_422(&dc, 51, &sl, 8).unwrap();
+        // qP=0 → qpDC=3, qpDC<36 path (the rounded right-shift branch).
+        let _ = inverse_hadamard_chroma_dc_422(&dc, 0, &sl, 8).unwrap();
     }
 
     // ------------ Scaling list helpers ----------------------------------
