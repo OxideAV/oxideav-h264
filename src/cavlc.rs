@@ -1310,10 +1310,15 @@ pub fn decode_level(
 
 /// §9.2.2.1 — Decode `level_prefix` (Eq. 9-4): count leading zeros then
 /// consume the terminating `1`.
+///
+/// §9.2.2 spec note: "the value of level_prefix shall be less than or
+/// equal to 25". Past that the §9.2.2 step-6 levelCode arithmetic
+/// produces values whose downstream §8.5.12 `c * ls` inverse-quant
+/// multiplication overflows i32. Reject as malformed.
 fn read_level_prefix(r: &mut BitReader<'_>) -> CavlcResult<u32> {
     let mut leading: u32 = 0;
     loop {
-        if leading > 32 {
+        if leading > 25 {
             return Err(CavlcError::LevelPrefixOverflow);
         }
         if r.u(1)? == 1 {

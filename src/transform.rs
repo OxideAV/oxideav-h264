@@ -657,14 +657,24 @@ fn scale_4x4(
             }
             let ls = level_scale_4x4(scaling_list, qp_mod, i, j);
             let c = coeffs[idx];
+            // Use wrapping arithmetic for the §8.5.12 inverse-quant
+            // formulas. Spec-conformant streams keep `c` and `ls`
+            // small enough that the i32 product is well-defined; only
+            // malformed input (which the parsers above try to reject
+            // up front) can drive `c * ls` past i32::MAX, and even
+            // there the wrap-around just produces nonsense pixels —
+            // not a panic. The downstream `Clip3(-2^15, 2^15-1, ...)`
+            // in §8.5.13 stages clamps everything back into range
+            // before display.
             d[idx] = if qp >= 24 {
                 // Eq. 8-336 — no rounding, left shift by (qP/6 - 4).
-                (c * ls) << (qp_div - 4)
+                let shift = (qp_div - 4) as u32 & 31;
+                c.wrapping_mul(ls).wrapping_shl(shift)
             } else {
                 // Eq. 8-337 — right shift with rounding.
-                let shift = 4 - qp_div;
-                let round = 1 << (3 - qp_div);
-                (c * ls + round) >> shift
+                let shift = (4 - qp_div) as u32;
+                let round = 1i32.wrapping_shl(3 - qp_div as u32);
+                (c.wrapping_mul(ls).wrapping_add(round)) >> shift
             };
         }
     }
@@ -811,14 +821,16 @@ fn scale_8x8(coeffs: &[i32; 64], qp: i32, scaling_list: &[i32; 64]) -> [i32; 64]
             let idx = i * 8 + j;
             let ls = level_scale_8x8(scaling_list, qp_mod, i, j);
             let c = coeffs[idx];
+            // Wrapping arithmetic — see §8.5.12 4×4 path for rationale.
             d[idx] = if qp >= 36 {
                 // Eq. 8-356.
-                (c * ls) << (qp_div - 6)
+                let shift = (qp_div - 6) as u32 & 31;
+                c.wrapping_mul(ls).wrapping_shl(shift)
             } else {
                 // Eq. 8-357.
-                let shift = 6 - qp_div;
-                let round = 1 << (5 - qp_div);
-                (c * ls + round) >> shift
+                let shift = (6 - qp_div) as u32;
+                let round = 1i32.wrapping_shl(5 - qp_div as u32);
+                (c.wrapping_mul(ls).wrapping_add(round)) >> shift
             };
         }
     }

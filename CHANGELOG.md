@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **transform: use wrapping arithmetic in §8.5.12 / §8.5.13
+  inverse-quant multiplications.** Spec-conformant streams keep `c *
+  ls` in i32; only malformed input could drive the product past
+  i32::MAX (panic: multiply with overflow). The downstream §8.5.13
+  Clip3 stage clamps everything back into bit-depth range, so
+  silently wrapping bad input is preferable to panicking on it.
+- **cavlc: tighten `level_prefix` cap from 32 to 25 (§9.2.2 note).**
+  The spec mandates `level_prefix ≤ 25`. The previous cap of 32 let
+  malformed CAVLC streams synthesise `levelCode` values whose
+  downstream §8.5.12 multiplication overflowed.
+- **cabac: tighten UEG0 escape suffix cap from k=30 to k=14
+  (§7.4.5.3.2).** Real coefficients fit in 16 bits; the previous
+  k=30 cap let malformed streams produce `coeff_abs_level_minus1`
+  values up to ~2^31, which then panicked in the §8.5.12 inverse
+  quant multiplication. Cap aligns with the actual spec residual
+  range.
 - **slice_data: bound `mb_skip_run` and the macroblock walker against
   malformed streams.** §7.4.4 implicitly bounds `mb_skip_run` by
   `PicSizeInMbs - CurrMbAddr`, but the parser used to accept any

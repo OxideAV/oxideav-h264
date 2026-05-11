@@ -3230,17 +3230,19 @@ pub fn decode_coeff_abs_level_minus1(
     }
     // prefix_val == u_coff — decode Exp-Golomb (k=0) suffix by bypass.
     // §9.3.3.2.3 spec: the suffix is `unary 0` then a `k`-bit value.
-    // `k` grows unbounded in the syntax loop but the encoded value is
-    // bounded by Annex A profile/level limits (well below 2^32). Cap
-    // `k` at 30 so `1u32 << k` cannot overflow (UB at 32) AND the
-    // final `u_coff + suf_s + tail` still fits in u32 — a malicious
-    // stream that asks for 31+ ones is malformed by definition.
+    // §7.4.5.3.2 bounds the absolute coefficient at 32 768 for 8-bit
+    // streams (and proportionally higher at deeper bit depths). Cap
+    // `k` at 14 — that gives a worst-case `val` of 14 + (2^15 − 1) +
+    // (2^14 − 1) ≈ 49 K, comfortably above any spec-conformant
+    // residual yet small enough that the downstream `c * ls` in
+    // §8.5.12 inverse-quant arithmetic stays within i32. Streams that
+    // ask for 15+ leading-one bins are malformed.
     let mut k: u32 = 0;
     let mut suf_s: u32 = 0;
     loop {
         let b = dec.decode_bypass()? as u32;
         if b == 1 {
-            if k >= 30 {
+            if k >= 14 {
                 return Err(CabacError::EgEscapeSuffixOverflow);
             }
             suf_s += 1u32 << k;
