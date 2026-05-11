@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **sps: bound `max_num_ref_frames` at 16 (§7.4.2.1.1 / Annex A.3.1).**
+  The spec says `max_num_ref_frames` shall be in the range `0..MaxDpbFrames`
+  where MaxDpbFrames = `Min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)`.
+  The cap at 16 is absolute — independent of level — and any value above
+  it implies a malformed bitstream that libavcodec rejects with
+  "too many reference frames". Closes a fuzz-oracle strictness divergence
+  on `crash-f9387b9697e640efbd689a9909ff59deaaf32864`, where a stream
+  with `max_num_ref_frames=32` was accepted by oxideav-h264 (producing
+  partially-decoded pictures from the slices that survived MB-level
+  CABAC parse) while libavcodec rejected the SPS outright.
 - **reconstruct + inter_pred: reject inter MC against zero-dim
   reference (§8.4.2).** §8.4.2 motion compensation addresses reference
   samples via `Clip3(0, src_width-1, x)` / `Clip3(0, src_height-1, y)`.

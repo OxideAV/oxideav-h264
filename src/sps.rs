@@ -74,6 +74,13 @@ pub enum SpsError {
     /// §E.1 — VUI parameters body parse error.
     #[error("vui_parameters: {0}")]
     Vui(#[from] VuiError),
+    /// §7.4.2.1.1 — `max_num_ref_frames` shall be in the range of 0 to
+    /// MaxDpbFrames (clause A.3), which is itself capped at 16 by the
+    /// Min(...) expression in A.3.1 step a regardless of level. Any
+    /// value above 16 is malformed (libavcodec rejects with "too many
+    /// reference frames").
+    #[error("max_num_ref_frames out of range (got {0}, max 16)")]
+    MaxNumRefFramesOutOfRange(u32),
 }
 
 /// §A.3 derived ceiling — the maximum representable
@@ -364,7 +371,13 @@ impl Sps {
         // pic_order_cnt_type == 2: no extra fields.
 
         // §7.3.2.1.1 — common tail.
+        // §7.4.2.1.1 / Annex A.3.1 — `max_num_ref_frames` ≤ MaxDpbFrames
+        // which is capped at 16 regardless of level. Beyond 16, downstream
+        // ref-list construction is invalid and the bitstream is malformed.
         let max_num_ref_frames = r.ue()?;
+        if max_num_ref_frames > 16 {
+            return Err(SpsError::MaxNumRefFramesOutOfRange(max_num_ref_frames));
+        }
         let gaps_in_frame_num_value_allowed_flag = r.u(1)? == 1;
         let pic_width_in_mbs_minus1 = r.ue()?;
         if pic_width_in_mbs_minus1 > MAX_PIC_DIM_IN_MBS_MINUS1 {
@@ -1068,5 +1081,49 @@ mod tests {
             err,
             SpsError::PicHeightInMapUnitsOutOfRange(MAX_PIC_DIM_IN_MBS_MINUS1 + 17)
         );
+    }
+
+    /// §7.4.2.1.1 / Annex A.3.1 — `max_num_ref_frames` is bounded by
+    /// MaxDpbFrames which is `Min(MaxDpbMbs / PicSizeInMbs, 16)`, so
+    /// the absolute upper bound is 16 regardless of level. ffmpeg
+    /// rejects with "too many reference frames" for values above 16;
+    /// matching this strictness closes a fuzz-oracle divergence
+    /// (regression for `crash-f9387b9697e640efbd689a9909ff59deaaf32864`).
+    #[test]
+    fn max_num_ref_frames_above_16_rejected() {
+        let mut w = BitWriter::new();
+        w.u(8, 66); // profile_idc Baseline
+        w.u(8, 0);
+        w.u(8, 30); // level_idc
+        w.ue(0); // sps_id
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(0); // pic_order_cnt_type
+        w.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        w.ue(17); // max_num_ref_frames = 17 — above MaxDpbFrames cap.
+        let err = Sps::parse(&w.into_bytes()).unwrap_err();
+        assert_eq!(err, SpsError::MaxNumRefFramesOutOfRange(17));
+    }
+
+    #[test]
+    fn max_num_ref_frames_at_16_accepted() {
+        let mut w = BitWriter::new();
+        w.u(8, 66);
+        w.u(8, 0);
+        w.u(8, 30);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(16); // exactly 16 — last legal value
+        w.u(1, 0); // gaps_in_frame_num_value_allowed_flag
+        w.ue(19); // pic_width_in_mbs_minus1 → 20 MBs
+        w.ue(14); // pic_height_in_map_units_minus1 → 15 map units
+        w.u(1, 1); // frame_mbs_only_flag
+        w.u(1, 0); // direct_8x8_inference_flag
+        w.u(1, 0); // frame_cropping_flag
+        w.u(1, 0); // vui_parameters_present_flag
+        w.trailing();
+        let sps = Sps::parse(&w.into_bytes()).unwrap();
+        assert_eq!(sps.max_num_ref_frames, 16);
     }
 }
