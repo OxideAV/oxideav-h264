@@ -126,6 +126,17 @@ struct PictureInProgress {
     /// values (JVT CACQP3 exercises this path).
     sps: Sps,
     pps: crate::pps::Pps,
+    /// True iff at least one slice of this picture has been
+    /// successfully reconstructed. When `false` at finalize time the
+    /// picture is dropped instead of being pushed into the DPB +
+    /// output queue: emitting a never-painted picture (zeroed luma /
+    /// chroma plus garbage residue from neighbour MBs) is a
+    /// strictness divergence from libavcodec, which rejects the
+    /// access unit outright when every slice fails CABAC / CAVLC
+    /// parse. Caught by fuzz target `ffmpeg_oracle_decode` on
+    /// crash-2ad9589f… (3 slices, all fail "read past end of
+    /// bitstream") — see commit message for details.
+    any_slice_succeeded: bool,
 }
 
 /// Registry factory — called by the codec registry when a container
@@ -533,6 +544,7 @@ impl H264CodecDecoder {
                 mb_field_flags,
                 sps: sps.clone(),
                 pps: pps.clone(),
+                any_slice_succeeded: false,
             });
         }
 
@@ -739,6 +751,14 @@ impl H264CodecDecoder {
             curr_addr = curr_addr.saturating_add(1);
         }
 
+        // §7.4.1.2.4 — record that this slice fully reconstructed.
+        // `finalize_in_progress_picture` consults this flag and
+        // discards pictures whose every slice failed parse /
+        // reconstruction (rather than emitting a never-painted
+        // frame). Reaching this line means `parse_slice_data` and
+        // `reconstruct_slice_no_deblock` both returned Ok.
+        in_progress.any_slice_succeeded = true;
+
         Ok(())
     }
 
@@ -752,6 +772,17 @@ impl H264CodecDecoder {
         let Some(in_progress) = self.in_progress.take() else {
             return Ok(());
         };
+        // §7.4.1.2.4 — a primary coded picture whose every slice
+        // failed parse / reconstruction is dropped here, with no DPB
+        // update and no `VideoFrame` emitted. Pushing the
+        // never-painted picture (zeroed planes plus stale neighbour
+        // residue) would diverge from libavcodec, which rejects the
+        // access unit outright when every slice fails. Caught by
+        // fuzz oracle on `crash-2ad9589f…` (3 non-IDR slices, all
+        // fail "CABAC read past end of bitstream").
+        if !in_progress.any_slice_succeeded {
+            return Ok(());
+        }
         let PictureInProgress {
             mut pic,
             grid,
@@ -770,6 +801,7 @@ impl H264CodecDecoder {
             mb_field_flags,
             sps,
             pps,
+            any_slice_succeeded: _,
         } = in_progress;
 
         // §8.4.1.2.3 temporal direct needs the colocated block's MVs
@@ -2295,6 +2327,7 @@ mod tests {
             mb_field_flags: Vec::new(),
             sps: test_sps(),
             pps: test_pps(),
+            any_slice_succeeded: true,
         });
     }
 

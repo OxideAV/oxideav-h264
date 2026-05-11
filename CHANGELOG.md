@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **h264_decoder: drop in-progress picture when every slice failed
+  parse / reconstruction (§7.4.1.2.4).** `H264CodecDecoder` collects
+  per-slice CABAC/CAVLC failures via an `eprintln!` log line and
+  keeps assembling the in-progress picture; the previous behaviour
+  then ran §8.7 deblocking on the never-painted picture and pushed
+  it through the §C.4 output bumping process, so `receive_frame`
+  emitted a zeroed `Frame::Video` for an access unit whose every
+  slice was malformed. libavcodec rejects the access unit outright
+  in that case (no frame produced), which the fuzz oracle flagged
+  as a strictness divergence on a 175-byte input
+  (`crash-2ad9589faea57c09b55364bf7ac4af0373e66c18`: PPS + SPS +
+  three non-IDR slices, every slice's CABAC stream runs past EOF).
+  `PictureInProgress` now carries an `any_slice_succeeded` flag set
+  on the OK return of `reconstruct_slice_into_in_progress`; finalize
+  drops the picture (no DPB insert, no `VideoFrame` emit) when the
+  flag is still false. Multi-slice pictures where some slices
+  succeed and others fail are unchanged — the partially-painted
+  picture still finalizes, matching the existing best-effort
+  recovery for the JVT SVA_Base_B / SL1_SVA_B conformance streams.
 - **sps: reject reserved profile_idc values (§A.1 / §A.2).** Only the
   16 profile_idc values enumerated in clause A.2 (66, 77, 88, 100,
   110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135) are
