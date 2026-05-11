@@ -50,6 +50,22 @@ pub enum DecoderError {
     /// possible (no PPS stored at all).
     #[error("slice NAL received before any SPS/PPS activation")]
     NoActiveParameterSets,
+    /// §A.2 — Flexible Macroblock Ordering (FMO,
+    /// `num_slice_groups_minus1 > 0`) is constrained to the Baseline
+    /// (§A.2.1, profile_idc=66) and Extended (§A.2.3, profile_idc=88)
+    /// profiles. Every other profile (Main, High, High 10, High 4:2:2,
+    /// High 4:4:4, etc.) constrains `num_slice_groups_minus1` to 0
+    /// (e.g. §A.2.2: "Picture parameter sets shall have
+    /// num_slice_groups_minus1 equal to 0 only."). The §8.2.2
+    /// MbToSliceGroupMap derivation IS implemented in `mb_address.rs`,
+    /// but the §8.4 reconstruction path walks macroblock addresses in
+    /// raster order (slice-group 0 only) — so an FMO PPS with multiple
+    /// groups would silently mis-decode. Reject at slice activation
+    /// time so we match libavcodec's "FMO is not implemented"
+    /// rejection rather than emitting a wrong-pixels frame for streams
+    /// the reference decoder refuses.
+    #[error("FMO (num_slice_groups_minus1={0} > 0) is not supported in this decoder build")]
+    FmoNotSupported(u32),
 }
 
 pub type DecoderResult<T> = Result<T, DecoderError>;
@@ -268,6 +284,16 @@ impl Decoder {
             .and_then(|p| p.as_ref())
             .ok_or(DecoderError::UnknownPps(pps_id))?
             .clone();
+        // §A.2 — FMO is constrained to Baseline / Extended profiles, and
+        // even there our §8.4 reconstruction path doesn't honour the
+        // §8.2.2 MbToSliceGroupMap (it walks raster order). Reject
+        // FMO-enabled PPS activation so we don't silently mis-decode a
+        // stream that the spec restricts (and that libavcodec rejects
+        // outright with "FMO is not implemented"). See
+        // [`DecoderError::FmoNotSupported`] for the full citation.
+        if pps.num_slice_groups_minus1 > 0 {
+            return Err(DecoderError::FmoNotSupported(pps.num_slice_groups_minus1));
+        }
         let sps_id = pps.seq_parameter_set_id;
         let sps = self
             .sps_by_id
@@ -671,6 +697,57 @@ mod tests {
         let slice_nal = build_nal(1, 3, &build_minimal_i_slice_rbsp(0));
         let err = dec.process_nal(&slice_nal).unwrap_err();
         assert!(matches!(err, DecoderError::UnknownSps(4)));
+    }
+
+    #[test]
+    fn slice_activating_fmo_pps_is_rejected() {
+        // §A.2 — FMO (num_slice_groups_minus1 > 0) is not honoured by
+        // our §8.4 raster reconstruction. A slice that activates such a
+        // PPS must be rejected at activation time so we don't emit a
+        // mis-decoded picture for a stream the H.264 reference decoder
+        // (libavcodec) would reject as "FMO is not implemented".
+        // Regression for the 309-byte fuzz-oracle divergence
+        // (`crash-181e9dea7dfa8fcb2c9721a3f9f044214af6167b`): the
+        // crash input carried a PPS with num_slice_groups_minus1=2,
+        // and our decoder used to silently produce a frame.
+        let mut dec = Decoder::new();
+        let _ = dec
+            .process_nal(&build_nal(7, 3, &build_minimal_sps_rbsp(0)))
+            .unwrap();
+        // FMO PPS — interleaved (slice_group_map_type=0) with 2 groups.
+        let pps_rbsp = {
+            let mut w = BitWriter::new();
+            w.ue(0); // pic_parameter_set_id
+            w.ue(0); // seq_parameter_set_id
+            w.u(1, 0); // entropy_coding_mode_flag = CAVLC
+            w.u(1, 0); // bottom_field_pic_order_in_frame_present_flag
+            w.ue(1); // num_slice_groups_minus1 = 1 (2 groups → FMO active)
+            w.ue(0); // slice_group_map_type = 0 (interleaved)
+            w.ue(3); // run_length_minus1[0]
+            w.ue(3); // run_length_minus1[1]
+            w.ue(0); // num_ref_idx_l0_default_active_minus1
+            w.ue(0); // num_ref_idx_l1_default_active_minus1
+            w.u(1, 0); // weighted_pred_flag
+            w.u(2, 0); // weighted_bipred_idc
+            w.se(0); // pic_init_qp_minus26
+            w.se(0); // pic_init_qs_minus26
+            w.se(0); // chroma_qp_index_offset
+            w.u(1, 0); // deblocking_filter_control_present_flag
+            w.u(1, 0); // constrained_intra_pred_flag
+            w.u(1, 0); // redundant_pic_cnt_present_flag
+            w.trailing();
+            w.into_bytes()
+        };
+        let _ = dec.process_nal(&build_nal(8, 3, &pps_rbsp)).unwrap();
+        let slice_nal = build_nal(1, 3, &build_minimal_i_slice_rbsp(0));
+        let err = dec.process_nal(&slice_nal).unwrap_err();
+        assert!(
+            matches!(err, DecoderError::FmoNotSupported(1)),
+            "expected FmoNotSupported(1), got {err:?}"
+        );
+        // Activation must NOT have committed for a rejected slice.
+        assert!(dec.active_pps_id().is_none());
+        assert!(dec.active_sps_id().is_none());
     }
 
     #[test]

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **decoder: reject FMO PPS activation (§A.2).** A slice that
+  activates a PPS with `num_slice_groups_minus1 > 0` (Flexible
+  Macroblock Ordering) is now rejected with
+  `DecoderError::FmoNotSupported`. Per §A.2.1 / §A.2.3, FMO is
+  constrained to the Baseline (profile_idc=66) and Extended
+  (profile_idc=88) profiles, and our §8.4 reconstruction path walks
+  raster (slice-group-0) order — it does not honour the §8.2.2
+  MbToSliceGroupMap. Without this gate the decoder emitted a
+  silently-mis-decoded picture for FMO streams that the H.264
+  reference decoder (libavcodec) refuses outright with "FMO is not
+  implemented", which the fuzz oracle flagged as a strictness
+  divergence (`crash-181e9dea7dfa8fcb2c9721a3f9f044214af6167b`).
 - **transform: use wrapping arithmetic in §8.5.12 / §8.5.13
   inverse-quant multiplications.** Spec-conformant streams keep `c *
   ls` in i32; only malformed input could drive the product past
