@@ -82,6 +82,16 @@ pub enum ReconstructError {
     MissingRefPic { list: u8, idx: u32 },
     #[error("unsupported inter mb_type for this scope: {0}")]
     UnsupportedInterMbType(String),
+    /// §8.4.2 motion compensation is defined only for reference pictures
+    /// with strictly positive luma + chroma dimensions. A zero-dim ref
+    /// pic in the active list triggers a `clip3(0, -1, _)` underflow in
+    /// the slow-path interpolator (`clip3` of `lo > hi` is undefined and
+    /// returns `hi == -1`, which casts to `usize::MAX` and indexes a
+    /// zero-length source slice). Returning early at the MC entry keeps
+    /// the decoder panic-free on malformed bitstreams whose reference
+    /// list resolves to an uninitialised DPB slot.
+    #[error("inter MC against zero-dim reference picture (width={width}, height={height})")]
+    InvalidRefDims { width: u32, height: u32 },
 }
 
 // -------------------------------------------------------------------------
@@ -3529,6 +3539,17 @@ fn mc_luma_partition(
     bit_depth: u32,
     dst: &mut [i32],
 ) -> Result<(), ReconstructError> {
+    // §8.4.2 — reference picture must have positive luma dims. A
+    // zero-dim ref pic (e.g. uninitialised DPB slot) drives the slow-
+    // path `clip3(0, -1, _)` in `simd::interpolate_luma` to return
+    // `-1`, which casts to `usize::MAX` and panics on the empty src
+    // slice index. Reject early with a clear error.
+    if ref_pic.width_in_samples == 0 || ref_pic.height_in_samples == 0 {
+        return Err(ReconstructError::InvalidRefDims {
+            width: ref_pic.width_in_samples,
+            height: ref_pic.height_in_samples,
+        });
+    }
     // §8.4.1.4 — MV is in 1/4-pel luma units. Integer part = mv / 4
     // (with spec's "truncate toward zero" via i32 division); fractional
     // part in 0..=3.
@@ -3594,6 +3615,20 @@ fn mc_chroma_partition(
 
     let cw = ref_pic.chroma_width() as usize;
     let ch = ref_pic.chroma_height() as usize;
+
+    // §8.4.2 / §6.2 Table 6-1 — when the active slice has chroma
+    // (chroma_array_type ∈ {1, 2, 3}), the reference picture must
+    // also expose chroma planes with positive dimensions. A reference
+    // resolved against a monochrome / placeholder DPB slot has
+    // `chroma_width == 0` for the same chroma_array_type, which
+    // would otherwise drive `clip3(0, -1, _)` in `interpolate_chroma`
+    // to return `-1` → `usize::MAX` into the empty `ref_pic.cb` slice.
+    if cw == 0 || ch == 0 {
+        return Err(ReconstructError::InvalidRefDims {
+            width: cw as u32,
+            height: ch as u32,
+        });
+    }
 
     interpolate_chroma(
         &ref_pic.cb,

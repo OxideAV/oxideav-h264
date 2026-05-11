@@ -30,6 +30,15 @@ pub enum InterPredError {
     ChromaFracOutOfRange(u8),
     #[error("block dimensions must be multiples of 4, got {w}x{h}")]
     InvalidBlockSize { w: u32, h: u32 },
+    /// §8.4.2 — reference samples are addressed by `Clip3(0, src_w-1, x)`
+    /// / `Clip3(0, src_h-1, y)`. With `src_w` or `src_h` equal to zero
+    /// the clip range becomes `[0, -1]` (lo > hi) which is undefined per
+    /// §5.7 Clip3 and returns `hi == -1`. `-1 as usize == usize::MAX`
+    /// then indexes a zero-length source slice. Reject these inputs at
+    /// the function entry as a panic-free defence even though the call
+    /// sites should already have screened the reference picture.
+    #[error("zero-dim reference plane: src_width={src_width}, src_height={src_height}")]
+    ZeroDimRef { src_width: usize, src_height: usize },
 }
 
 pub type InterPredResult<T> = Result<T, InterPredError>;
@@ -296,6 +305,12 @@ pub fn interpolate_luma(
     if w == 0 || h == 0 || w % 4 != 0 || h % 4 != 0 {
         return Err(InterPredError::InvalidBlockSize { w, h });
     }
+    if src_width == 0 || src_height == 0 {
+        return Err(InterPredError::ZeroDimRef {
+            src_width,
+            src_height,
+        });
+    }
     for yl in 0..h as i32 {
         for xl in 0..w as i32 {
             let v = luma_pred_one(
@@ -357,6 +372,12 @@ pub fn interpolate_chroma(
     // corresponding chroma block is 2x2; for 4x8 luma we get 2x4; etc.
     if w == 0 || h == 0 {
         return Err(InterPredError::InvalidBlockSize { w, h });
+    }
+    if src_width == 0 || src_height == 0 {
+        return Err(InterPredError::ZeroDimRef {
+            src_width,
+            src_height,
+        });
     }
 
     let xf = x_frac as i32;
@@ -1130,5 +1151,44 @@ mod tests {
         let mut dst = vec![0i32; 16];
         interpolate_chroma(&src, 8, 8, 8, 2, 2, 7, 7, 4, 4, 8, &mut dst, 4).unwrap();
         assert_eq!(dst[0], 49);
+    }
+
+    /// §8.4.2 — a zero-dim reference plane underflows `clip3(0, -1, _)`
+    /// and indexes `usize::MAX` into the empty `src` slice. Confirm
+    /// both interpolators reject the malformed input cleanly.
+    /// Regression for fuzz crash
+    /// `crash-a6f950699905bc0f4d353474b94d4801044c8091`.
+    #[test]
+    fn luma_zero_dim_ref_is_rejected() {
+        let src: [i32; 0] = [];
+        let mut dst = vec![0i32; 4 * 4];
+        let err = interpolate_luma(&src, 0, 0, 0, 0, 0, 0, 0, 4, 4, 8, &mut dst, 4).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InterPredError::ZeroDimRef {
+                    src_width: 0,
+                    src_height: 0
+                }
+            ),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn chroma_zero_dim_ref_is_rejected() {
+        let src: [i32; 0] = [];
+        let mut dst = vec![0i32; 4 * 4];
+        let err = interpolate_chroma(&src, 0, 0, 0, 0, 0, 0, 0, 4, 4, 8, &mut dst, 4).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InterPredError::ZeroDimRef {
+                    src_width: 0,
+                    src_height: 0
+                }
+            ),
+            "wrong variant: {err:?}"
+        );
     }
 }

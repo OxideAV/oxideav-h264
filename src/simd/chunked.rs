@@ -294,6 +294,15 @@ pub fn interpolate_luma(
     if w == 0 || h == 0 || w % 4 != 0 || h % 4 != 0 {
         return Err(InterPredError::InvalidBlockSize { w, h });
     }
+    // §8.4.2.2.1 — `clip3(0, src_width-1, x)` requires `src_width >= 1`
+    // (and likewise for height). A zero-dim reference plane underflows
+    // the clip3 range and indexes `usize::MAX` into the empty src slice.
+    if src_width == 0 || src_height == 0 {
+        return Err(InterPredError::ZeroDimRef {
+            src_width,
+            src_height,
+        });
+    }
     // Clamp the workspace size; partitions are at most 16x16 in H.264.
     let wu = w as usize;
     let hu = h as usize;
@@ -641,6 +650,18 @@ pub fn interpolate_chroma(
     }
     if w == 0 || h == 0 {
         return Err(InterPredError::InvalidBlockSize { w, h });
+    }
+    // §8.4.2.2.2 — `clip3(0, src_width-1, x)` requires `src_width >= 1`.
+    // Regression for fuzz crash
+    // `crash-a6f950699905bc0f4d353474b94d4801044c8091` — a malformed
+    // bitstream resolved an inter ref to an uninitialised DPB slot
+    // whose `chroma_width()` returned 0, driving clip3(0, -1, _) to
+    // return -1 → `usize::MAX` into the empty `ref_pic.cb` slice.
+    if src_width == 0 || src_height == 0 {
+        return Err(InterPredError::ZeroDimRef {
+            src_width,
+            src_height,
+        });
     }
     let wu = w as usize;
     let hu = h as usize;

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **reconstruct + inter_pred: reject inter MC against zero-dim
+  reference (§8.4.2).** §8.4.2 motion compensation addresses reference
+  samples via `Clip3(0, src_width-1, x)` / `Clip3(0, src_height-1, y)`.
+  With `src_width` or `src_height == 0` the clip range becomes
+  `[0, -1]` (lo > hi), and our `clip3` implementation returns
+  `hi == -1`. `-1 as usize == usize::MAX` then indexes the empty
+  `ref_pic.cb` slice and panics. A malformed bitstream whose active
+  reference list resolves to an uninitialised DPB slot (chroma
+  monochrome / placeholder) triggers this in the slow edge-replicated
+  path of `interpolate_chroma`. New `ReconstructError::InvalidRefDims`
+  guards both `mc_luma_partition` (luma dims) and `mc_chroma_partition`
+  (chroma dims) at the MC entry. New `InterPredError::ZeroDimRef`
+  guards `interpolate_luma` / `interpolate_chroma` in `inter_pred`,
+  `simd::chunked` (and via delegation `simd::scalar`, `simd::portable`)
+  for defence-in-depth. Regression for fuzz crash
+  `crash-a6f950699905bc0f4d353474b94d4801044c8091`.
 - **slice_header: bound `first_mb_in_slice` by PicSizeInMbs
   (§7.4.3).** The spec constrains `first_mb_in_slice` to
   `0..PicSizeInMbs - 1` (non-MBAFF) or `0..PicSizeInMbs/2 - 1` (MBAFF,
