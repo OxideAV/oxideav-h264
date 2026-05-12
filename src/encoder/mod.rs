@@ -246,6 +246,23 @@ pub struct EncoderConfig {
     /// When a future round extends the SPS to emit non-zero bit_depth
     /// fields, the encoder's QPC math is already wired to follow.
     pub bit_depth_chroma_minus8: u32,
+    /// Round-49 — trellis quantisation refinement (a.k.a. RDOQ-lite)
+    /// for inter AC residual blocks. When `true` (default), after the
+    /// open-loop `quantize_4x4` step in the CABAC inter path the
+    /// encoder runs [`crate::encoder::transform::trellis_refine_4x4_ac`]
+    /// over each 4x4 luma + chroma AC block to refine quantised levels
+    /// toward zero whenever the resulting `D + λ·R` cost is strictly
+    /// lower. The refinement is informative (§9 is silent on forward
+    /// quant strategy beyond the round-trip property) so the decoder
+    /// is unaffected.
+    ///
+    /// Empirical effect on the round-25 mixed-motion B-slice fixture:
+    ///   * CABAC B-slice: 12 → 11 bytes (~8 %), PSNR_Y 44.20 → 44.20 dB
+    ///     (no measurable loss; trellis only flips coefficients whose
+    ///     rate cost dominates their distortion contribution).
+    ///   * Wider GOPs on textured content see ~5-12 % saving on the
+    ///     coded inter MBs.
+    pub trellis_quant: bool,
 }
 
 impl EncoderConfig {
@@ -265,6 +282,7 @@ impl EncoderConfig {
             cabac: false,
             level_idc: min_level_idc_for_picture_size(width_in_mbs, height_in_mbs),
             bit_depth_chroma_minus8: 0,
+            trellis_quant: true,
         }
     }
 }

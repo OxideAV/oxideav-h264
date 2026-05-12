@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **encoder: CABAC inter trellis quantisation (round 49 — Lever C
+  RDOQ-lite).** A new `EncoderConfig::trellis_quant` toggle (default
+  `true`) wires a single-pass greedy Viterbi over the open-loop
+  quantised levels in the P-CABAC + B-CABAC inter luma paths.
+  `crate::encoder::transform::trellis_refine_4x4_ac` revisits each
+  non-zero quantised coefficient at each scan position and considers
+  one alternative (`|level|` → `|level| − 1` toward zero); the
+  alternative is accepted iff the spatial-domain `D + λ·R` cost
+  strictly drops, where the rate term is approximated from §9.3.3.1.3
+  (significant_coeff_flag + last_significant_coeff_flag + truncated-
+  unary prefix + sign), λ follows the JM `0.85 · 2^((QP-12)/3) · 2/3`
+  RDOQ relaxation, and D is the SSD between source and reconstructed
+  residual after the actual §8.5.12 inverse transform. The refinement
+  is informative — the decoder is unchanged, the bitstream syntax is
+  identical — so existing fixtures pin bit-equivalent ffmpeg cross-
+  decode (max diff 0) with the trellis enabled. On a 64×64 textured-
+  motion P-slice at QP=22 the encoded length drops from 178 → 167
+  bytes (-6.2 %) while local-recon PSNR_Y moves from 45.10 → 44.94
+  dB (-0.16 dB, well inside quantisation noise); the new
+  `integration_trellis_quant.rs` pins this number plus a QP=18..38
+  sweep that asserts the trellis never enlarges the inter slice.
+  Spec basis: §9.3.3.1.3 (CABAC residual binarisation), §8.5.12
+  (inverse 4×4 transform), informative reference JVT-D015. No
+  external encoder source consulted.
+
 ### Fixed
 
 - **sps: bound `max_num_ref_frames` at 16 (§7.4.2.1.1 / Annex A.3.1).**

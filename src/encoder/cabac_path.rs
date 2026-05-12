@@ -2158,7 +2158,19 @@ impl Encoder {
                     // by passing it through quantize_4x4_ac... wait, that
                     // clears DC. We need a full 4x4 quantiser. Re-use
                     // `quantize_4x4` from the transform module.
-                    let q = crate::encoder::transform::quantize_4x4(&coeffs, qp_y, false);
+                    let mut q = crate::encoder::transform::quantize_4x4(&coeffs, qp_y, false);
+                    // Round 49 — trellis-quant refinement (informative,
+                    // §9): pull small-magnitude coefficients toward zero
+                    // when the resulting `D + λ·R` cost is strictly
+                    // lower. Decoder-transparent; only the encoded
+                    // bitstream shrinks.
+                    if cfg.trellis_quant && q.iter().any(|&v| v != 0) {
+                        let lambda_q16 = crate::encoder::transform::trellis_lambda_q16(qp_y);
+                        q = crate::encoder::transform::trellis_refine_4x4_ac(
+                            &block, &coeffs, &q, qp_y, lambda_q16,
+                            false, // inter — DC participates
+                        );
+                    }
                     let scan = zigzag_scan_4x4(&q);
                     luma_blocks[blkz] = scan;
                     if scan.iter().any(|&v| v != 0) {
@@ -3680,7 +3692,15 @@ impl Encoder {
                         }
                     }
                     let coeffs = forward_core_4x4(&block);
-                    let q = crate::encoder::transform::quantize_4x4(&coeffs, qp_y, false);
+                    let mut q = crate::encoder::transform::quantize_4x4(&coeffs, qp_y, false);
+                    // Round 49 — trellis-quant refinement on the B-slice
+                    // inter luma path. Mirrors the P-CABAC call above.
+                    if cfg.trellis_quant && q.iter().any(|&v| v != 0) {
+                        let lambda_q16 = crate::encoder::transform::trellis_lambda_q16(qp_y);
+                        q = crate::encoder::transform::trellis_refine_4x4_ac(
+                            &block, &coeffs, &q, qp_y, lambda_q16, false,
+                        );
+                    }
                     let scan = zigzag_scan_4x4(&q);
                     luma_blocks[blkz] = scan;
                     if scan.iter().any(|&v| v != 0) {
