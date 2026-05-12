@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-h264/compare/v0.1.4...v0.1.5) - 2026-05-12
+
+### Other
+
+- CABAC inter trellis quantisation (round 49 RDOQ-lite)
+- bound max_num_ref_frames at 16 (§7.4.2.1.1 / Annex A.3.1)
+- reconstruct + inter_pred: reject inter MC against zero-dim reference (§8.4.2)
+- bound first_mb_in_slice by PicSizeInMbs (§7.4.3)
+- drop unfinished picture when every slice failed
+- sps + transform: reject reserved profile_idc + wrap chroma DC math
+- reject FMO PPS activation per §A.2 (fuzz oracle parity)
+- transform + cavlc + cabac: keep §8.5.12 inverse-quant multiply within i32
+- tighten picture-dim cap to 510 mbs / axis (was 32766)
+- cabac + slice_data + slice_header + pps: bound parse-time growth & shifts
+- sps + scaling_list: bound parse-time fields to prevent arithmetic overflow
+- bound Exp-Golomb leading-zero count at 31 (fix shl overflow)
+- add cargo-fuzz harness + libavcodec oracle for H.264 decoder
+
 ### Added
 
 - **encoder: CABAC inter trellis quantisation (round 49 — Lever C
