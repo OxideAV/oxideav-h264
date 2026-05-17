@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sei: round-73 — five additional Annex D payload parsers.** The
+  decoder now recognises five SEI payload types it previously kept as
+  `SeiPayload::Unknown`:
+  - **9** `scene_info` (§D.1.11 / §D.2.11) — `scene_id` +
+    `scene_transition_type` with the §D.1.11 `> 3` branch reading
+    `second_scene_id`.
+  - **16** `progressive_refinement_segment_start` (§D.1.18 / §D.2.18)
+    — `progressive_refinement_id` + `num_refinement_steps_minus1`.
+  - **17** `progressive_refinement_segment_end` (§D.1.19 / §D.2.19)
+    — pairs with type 16 by `progressive_refinement_id`.
+  - **18** `motion_constrained_slice_group_set` (§D.1.20 / §D.2.20)
+    — variable-width `slice_group_id[i]` (`u(v)` with
+    `v = Ceil(Log2(num_slice_groups))`) drawn from the active PPS via
+    a new `SeiContext::num_slice_groups` field; collapses to 0 bits
+    when `num_slice_groups <= 1`, with optional `pan_scan_rect_id`.
+  - **21** `stereo_video_info` (§D.1.23 / §D.2.23) — both
+    `field_views_flag = 1` (top_field_is_left_view_flag) and the
+    frame-views branch (`current_frame_is_left_view_flag` +
+    `next_frame_is_second_view_flag`) plus the two
+    `*_self_contained_flag` bits.
+
+  Each new parser ships unit tests in `sei::tests` (12 new tests)
+  exercising both `parse_*` directly and the `parse_payload`
+  dispatcher for the corresponding `payload_type`. `SeiContext` loses
+  its derived `Default` for a manual impl so the new
+  `num_slice_groups` field defaults to `1`. Coverage bumps from
+  19 → 24 recognised SEI types; the SEI table header comment in
+  `src/sei.rs` is updated to list all 24.
+
 - **encoder: CABAC inter trellis quantisation (round 49 — Lever C
   RDOQ-lite).** A new `EncoderConfig::trellis_quant` toggle (default
   `true`) wires a single-pass greedy Viterbi over the open-loop

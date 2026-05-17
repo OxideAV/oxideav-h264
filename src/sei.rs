@@ -15,11 +15,16 @@
 //! | 4            | §D.1.6      | §D.2.6      | user_data_registered_itu_t_t35     |
 //! | 5            | §D.1.7      | §D.2.7      | user_data_unregistered             |
 //! | 6            | §D.1.8      | §D.2.8      | recovery_point                     |
+//! | 9            | §D.1.11     | §D.2.11     | scene_info                         |
 //! | 13           | §D.1.15     | §D.2.15     | full_frame_freeze                  |
 //! | 14           | §D.1.16     | §D.2.16     | full_frame_freeze_release          |
 //! | 15           | §D.1.17     | §D.2.17     | full_frame_snapshot                |
+//! | 16           | §D.1.18     | §D.2.18     | progressive_refinement_segment_start |
+//! | 17           | §D.1.19     | §D.2.19     | progressive_refinement_segment_end |
+//! | 18           | §D.1.20     | §D.2.20     | motion_constrained_slice_group_set |
 //! | 19           | §D.1.21     | §D.2.21     | film_grain_characteristics         |
 //! | 20           | §D.1.22     | §D.2.22     | deblocking_filter_display_preference |
+//! | 21           | §D.1.23     | §D.2.23     | stereo_video_info                  |
 //! | 22           | §D.1.24     | §D.2.24     | post_filter_hint                   |
 //! | 23           | §D.1.25     | §D.2.25     | tone_mapping_info                  |
 //! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
@@ -426,7 +431,7 @@ pub struct FilmGrainSeparateColourDescription {
 /// Inputs a SEI parser needs beyond the raw payload bytes. Many parsers
 /// depend on VUI fields (CpbDpbDelaysPresentFlag, pic_struct_present_flag,
 /// time_offset_length, etc.).
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone)]
 pub struct SeiContext {
     /// From VUI.nal_hrd: initial_cpb_removal_delay_length_minus1 and
     /// cpb_removal_delay_length_minus1, needed by buffering_period and
@@ -442,6 +447,28 @@ pub struct SeiContext {
     pub pic_struct_present_flag: bool,
     /// CpbDpbDelaysPresentFlag: derived from VUI (NAL or VCL HRD present).
     pub cpb_dpb_delays_present_flag: bool,
+    /// From the active PPS — `num_slice_groups_minus1 + 1`. Needed by
+    /// §D.1.20 motion_constrained_slice_group_set to compute the
+    /// `u(v)` width of each slice_group_id entry. Defaults to 1 (single
+    /// slice group), under which the §D.1.20 field becomes 0 bits wide.
+    pub num_slice_groups: u32,
+}
+
+impl Default for SeiContext {
+    fn default() -> Self {
+        Self {
+            initial_cpb_removal_delay_length_minus1: 0,
+            cpb_removal_delay_length_minus1: 0,
+            dpb_output_delay_length_minus1: 0,
+            time_offset_length: 0,
+            nal_hrd_cpb_cnt_minus1: None,
+            vcl_hrd_cpb_cnt_minus1: None,
+            pic_struct_present_flag: false,
+            cpb_dpb_delays_present_flag: false,
+            // §D.1.20 — 0 bits per slice_group_id field when num_slice_groups = 1.
+            num_slice_groups: 1,
+        }
+    }
 }
 
 /// §D.2.2 — buffering_period.
@@ -1057,6 +1084,262 @@ pub fn parse_alternative_transfer_characteristics(payload: &[u8]) -> Result<u8, 
     Ok(r.u(8)? as u8)
 }
 
+// ---------------------------------------------------------------------------
+// Round 73 — additional SEI payload types.
+//
+// All five additions are syntactically simple Exp-Golomb / fixed-width
+// flag payloads from Annex D and add transparent parse coverage without
+// touching the pixel pipeline. They each implement EXACTLY the §D.1.x
+// syntax tables, with semantic-range validation deferred to §D.2.x
+// callers (per the existing crate convention of letting the syntax
+// layer accept anything the bitstream encodes).
+// ---------------------------------------------------------------------------
+
+/// §D.2.11 — scene_info (payload type 9).
+///
+/// Communicates "the current picture is part of scene N" plus an
+/// optional transition descriptor. Used by editors / players that need
+/// to know where a scene cut occurred without re-analysing the pixels.
+///
+/// Syntax (§D.1.11):
+/// ```text
+/// scene_info( payloadSize ) {
+///   scene_info_present_flag                u(1)
+///   if( scene_info_present_flag ) {
+///     scene_id                             ue(v)
+///     scene_transition_type                ue(v)
+///     if( scene_transition_type > 3 )
+///       second_scene_id                    ue(v)
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneInfo {
+    pub scene_info_present_flag: bool,
+    /// Present only when `scene_info_present_flag` is true.
+    pub scene_id: Option<u32>,
+    /// Present only when `scene_info_present_flag` is true. Per §D.2.11:
+    /// 0 = no transition, 1 = fade-to-black, 2 = fade-from-black,
+    /// 3 = unspecified transition, 4 = dissolve, 5 = wipe, 6 = unspecified,
+    /// values > 6 are reserved.
+    pub scene_transition_type: Option<u32>,
+    /// Present only when `scene_transition_type > 3` — identifies the
+    /// "second" scene the current picture transitions to.
+    pub second_scene_id: Option<u32>,
+}
+
+pub fn parse_scene_info(payload: &[u8]) -> Result<SceneInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+    let scene_info_present_flag = r.u(1)? == 1;
+    if !scene_info_present_flag {
+        return Ok(SceneInfo {
+            scene_info_present_flag,
+            scene_id: None,
+            scene_transition_type: None,
+            second_scene_id: None,
+        });
+    }
+    let scene_id = r.ue()?;
+    let scene_transition_type = r.ue()?;
+    let second_scene_id = if scene_transition_type > 3 {
+        Some(r.ue()?)
+    } else {
+        None
+    };
+    Ok(SceneInfo {
+        scene_info_present_flag,
+        scene_id: Some(scene_id),
+        scene_transition_type: Some(scene_transition_type),
+        second_scene_id,
+    })
+}
+
+/// §D.2.18 — progressive_refinement_segment_start (payload type 16).
+///
+/// Marks the first picture of a sequence whose subsequent pictures
+/// refine the same scene (e.g. a still photo progressively encoded).
+///
+/// Syntax (§D.1.18):
+/// ```text
+/// progressive_refinement_segment_start( payloadSize ) {
+///   progressive_refinement_id              ue(v)
+///   num_refinement_steps_minus1            ue(v)
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressiveRefinementSegmentStart {
+    pub progressive_refinement_id: u32,
+    pub num_refinement_steps_minus1: u32,
+}
+
+pub fn parse_progressive_refinement_segment_start(
+    payload: &[u8],
+) -> Result<ProgressiveRefinementSegmentStart, SeiError> {
+    let mut r = BitReader::new(payload);
+    let progressive_refinement_id = r.ue()?;
+    let num_refinement_steps_minus1 = r.ue()?;
+    Ok(ProgressiveRefinementSegmentStart {
+        progressive_refinement_id,
+        num_refinement_steps_minus1,
+    })
+}
+
+/// §D.2.19 — progressive_refinement_segment_end (payload type 17).
+///
+/// Closes a refinement segment opened by payload type 16, identified
+/// by the matching `progressive_refinement_id`.
+///
+/// Syntax (§D.1.19):
+/// ```text
+/// progressive_refinement_segment_end( payloadSize ) {
+///   progressive_refinement_id              ue(v)
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressiveRefinementSegmentEnd {
+    pub progressive_refinement_id: u32,
+}
+
+pub fn parse_progressive_refinement_segment_end(
+    payload: &[u8],
+) -> Result<ProgressiveRefinementSegmentEnd, SeiError> {
+    let mut r = BitReader::new(payload);
+    let progressive_refinement_id = r.ue()?;
+    Ok(ProgressiveRefinementSegmentEnd {
+        progressive_refinement_id,
+    })
+}
+
+/// §D.2.23 — stereo_video_info (payload type 21).
+///
+/// Pre-dates the more capable frame_packing_arrangement (payload 45);
+/// still used by some legacy stereoscopic streams. Identifies which
+/// field / frame carries the left vs right view.
+///
+/// Syntax (§D.1.23):
+/// ```text
+/// stereo_video_info( payloadSize ) {
+///   field_views_flag                       u(1)
+///   if( field_views_flag )
+///     top_field_is_left_view_flag          u(1)
+///   else {
+///     current_frame_is_left_view_flag      u(1)
+///     next_frame_is_second_view_flag       u(1)
+///   }
+///   left_view_self_contained_flag          u(1)
+///   right_view_self_contained_flag         u(1)
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StereoVideoInfo {
+    pub field_views_flag: bool,
+    /// Present only when `field_views_flag` is true.
+    pub top_field_is_left_view_flag: Option<bool>,
+    /// Present only when `field_views_flag` is false.
+    pub current_frame_is_left_view_flag: Option<bool>,
+    /// Present only when `field_views_flag` is false.
+    pub next_frame_is_second_view_flag: Option<bool>,
+    pub left_view_self_contained_flag: bool,
+    pub right_view_self_contained_flag: bool,
+}
+
+pub fn parse_stereo_video_info(payload: &[u8]) -> Result<StereoVideoInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+    let field_views_flag = r.u(1)? == 1;
+    let (
+        top_field_is_left_view_flag,
+        current_frame_is_left_view_flag,
+        next_frame_is_second_view_flag,
+    ) = if field_views_flag {
+        (Some(r.u(1)? == 1), None, None)
+    } else {
+        let cur = r.u(1)? == 1;
+        let nxt = r.u(1)? == 1;
+        (None, Some(cur), Some(nxt))
+    };
+    let left_view_self_contained_flag = r.u(1)? == 1;
+    let right_view_self_contained_flag = r.u(1)? == 1;
+    Ok(StereoVideoInfo {
+        field_views_flag,
+        top_field_is_left_view_flag,
+        current_frame_is_left_view_flag,
+        next_frame_is_second_view_flag,
+        left_view_self_contained_flag,
+        right_view_self_contained_flag,
+    })
+}
+
+/// §D.2.20 — motion_constrained_slice_group_set (payload type 18).
+///
+/// Identifies a set of slice groups that the encoder promises to
+/// motion-compensate only from samples inside the same set. Used by
+/// ROI / sub-picture decoding workflows.
+///
+/// Syntax (§D.1.20):
+/// ```text
+/// motion_constrained_slice_group_set( payloadSize ) {
+///   num_slice_groups_in_set_minus1         ue(v)
+///   for( i = 0; i <= num_slice_groups_in_set_minus1; i++ )
+///     slice_group_id[ i ]                  u(v)   // v = Ceil(Log2(num_slice_groups))
+///   exact_sample_value_match_flag          u(1)
+///   pan_scan_rect_flag                     u(1)
+///   if( pan_scan_rect_flag )
+///     pan_scan_rect_id                     ue(v)
+/// }
+/// ```
+///
+/// Note on slice_group_id width: §D.1.20 specifies `u(v)` for
+/// slice_group_id[i] with `v = Ceil(Log2(num_slice_groups_minus1 + 1))`
+/// per the active PPS. We accept the width hint via [`SeiContext`]
+/// (`num_slice_groups`); when the field is missing or `<= 1` the §D.2.20
+/// width collapses to 0 bits and no slice_group_id is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MotionConstrainedSliceGroupSet {
+    pub slice_group_ids: Vec<u32>,
+    pub exact_sample_value_match_flag: bool,
+    pub pan_scan_rect_flag: bool,
+    /// Present only when `pan_scan_rect_flag` is true.
+    pub pan_scan_rect_id: Option<u32>,
+}
+
+pub fn parse_motion_constrained_slice_group_set(
+    payload: &[u8],
+    ctx: &SeiContext,
+) -> Result<MotionConstrainedSliceGroupSet, SeiError> {
+    let mut r = BitReader::new(payload);
+    let num_slice_groups_in_set_minus1 = r.ue()?;
+    // §D.1.20 — slice_group_id[ i ] u(v). The width is Ceil(Log2(num_slice_groups))
+    // taken from the active PPS via `SeiContext::num_slice_groups`. When the
+    // PPS only declares a single slice group, the encoded width is 0 bits
+    // and we read zero slice_group_id values.
+    let num_slice_groups = ctx.num_slice_groups.max(1);
+    let width = if num_slice_groups <= 1 {
+        0
+    } else {
+        // Ceil(Log2(num_slice_groups)).
+        32 - (num_slice_groups - 1).leading_zeros()
+    };
+    let count = (num_slice_groups_in_set_minus1 as usize).saturating_add(1);
+    let mut slice_group_ids = Vec::with_capacity(count.min(8));
+    for _ in 0..count {
+        let v = if width == 0 { 0 } else { r.u(width)? };
+        slice_group_ids.push(v);
+    }
+    let exact_sample_value_match_flag = r.u(1)? == 1;
+    let pan_scan_rect_flag = r.u(1)? == 1;
+    let pan_scan_rect_id = if pan_scan_rect_flag {
+        Some(r.ue()?)
+    } else {
+        None
+    };
+    Ok(MotionConstrainedSliceGroupSet {
+        slice_group_ids,
+        exact_sample_value_match_flag,
+        pan_scan_rect_flag,
+        pan_scan_rect_id,
+    })
+}
+
 /// §D.2.24 — post_filter_hint (payload type 22).
 ///
 /// Syntax (§D.1.24):
@@ -1423,6 +1706,16 @@ pub enum SeiPayload {
     ContentLightLevel(ContentLightLevelInfo),
     /// preferred_transfer_characteristics — single u(8) field.
     AlternativeTransferCharacteristics(u8),
+    /// §D.2.11 — scene_info (payload type 9). Round 73.
+    SceneInfo(SceneInfo),
+    /// §D.2.18 — progressive_refinement_segment_start (payload type 16). Round 73.
+    ProgressiveRefinementSegmentStart(ProgressiveRefinementSegmentStart),
+    /// §D.2.19 — progressive_refinement_segment_end (payload type 17). Round 73.
+    ProgressiveRefinementSegmentEnd(ProgressiveRefinementSegmentEnd),
+    /// §D.2.20 — motion_constrained_slice_group_set (payload type 18). Round 73.
+    MotionConstrainedSliceGroupSet(MotionConstrainedSliceGroupSet),
+    /// §D.2.23 — stereo_video_info (payload type 21). Round 73.
+    StereoVideoInfo(StereoVideoInfo),
     /// Not parsed — caller keeps the raw payload for later interpretation.
     Unknown {
         payload_type: u32,
@@ -1455,6 +1748,7 @@ pub fn parse_payload(
             parse_user_data_unregistered(payload)?,
         )),
         6 => Ok(SeiPayload::RecoveryPoint(parse_recovery_point(payload)?)),
+        9 => Ok(SeiPayload::SceneInfo(parse_scene_info(payload)?)),
         13 => Ok(SeiPayload::FullFrameFreeze(parse_full_frame_freeze(
             payload,
         )?)),
@@ -1462,12 +1756,24 @@ pub fn parse_payload(
         15 => Ok(SeiPayload::FullFrameSnapshot(parse_full_frame_snapshot(
             payload,
         )?)),
+        16 => Ok(SeiPayload::ProgressiveRefinementSegmentStart(
+            parse_progressive_refinement_segment_start(payload)?,
+        )),
+        17 => Ok(SeiPayload::ProgressiveRefinementSegmentEnd(
+            parse_progressive_refinement_segment_end(payload)?,
+        )),
+        18 => Ok(SeiPayload::MotionConstrainedSliceGroupSet(
+            parse_motion_constrained_slice_group_set(payload, ctx)?,
+        )),
         19 => Ok(SeiPayload::FilmGrainCharacteristics(
             parse_film_grain_characteristics(payload)?,
         )),
         20 => Ok(SeiPayload::DeblockingFilterDisplayPreference(
             parse_deblocking_filter_display_preference(payload)?,
         )),
+        21 => Ok(SeiPayload::StereoVideoInfo(parse_stereo_video_info(
+            payload,
+        )?)),
         22 => Ok(SeiPayload::PostFilterHint(parse_post_filter_hint(payload)?)),
         23 => Ok(SeiPayload::ToneMappingInfo(parse_tone_mapping_info(
             payload,
@@ -2532,6 +2838,203 @@ mod tests {
                 "expected DeblockingFilterDisplayPreference, got {:?}",
                 other
             ),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 73 — scene_info / progressive_refinement / stereo_video /
+    // motion_constrained_slice_group_set.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn scene_info_present_flag_zero_yields_empty_struct() {
+        // scene_info_present_flag = 0 → struct is otherwise all-None.
+        let payload = pack_bits(&[(0, 1)]);
+        let got = parse_scene_info(&payload).unwrap();
+        assert!(!got.scene_info_present_flag);
+        assert!(got.scene_id.is_none());
+        assert!(got.scene_transition_type.is_none());
+        assert!(got.second_scene_id.is_none());
+    }
+
+    #[test]
+    fn scene_info_transition_type_le_3_omits_second_scene_id() {
+        // present=1, scene_id=5 (ue=5 → "00110"), transition=2 (ue=2 → "011"),
+        // no second_scene_id because transition <= 3.
+        let payload = pack_bits(&[
+            (1, 1),       // present_flag
+            (0b00110, 5), // ue(5) → scene_id=5
+            (0b011, 3),   // ue(2) → transition=2
+        ]);
+        let got = parse_scene_info(&payload).unwrap();
+        assert!(got.scene_info_present_flag);
+        assert_eq!(got.scene_id, Some(5));
+        assert_eq!(got.scene_transition_type, Some(2));
+        assert!(got.second_scene_id.is_none());
+    }
+
+    #[test]
+    fn scene_info_transition_type_gt_3_reads_second_scene_id() {
+        // present=1, scene_id=1 (ue=1 → "010"), transition=4 (ue=4 → "00101"),
+        // second_scene_id=2 (ue=2 → "011").
+        let payload = pack_bits(&[
+            (1, 1),
+            (0b010, 3),   // scene_id=1
+            (0b00101, 5), // transition=4
+            (0b011, 3),   // second_scene_id=2
+        ]);
+        let got = parse_scene_info(&payload).unwrap();
+        assert_eq!(got.scene_id, Some(1));
+        assert_eq!(got.scene_transition_type, Some(4));
+        assert_eq!(got.second_scene_id, Some(2));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_scene_info() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(0, 1)]);
+        let got = parse_payload(9, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::SceneInfo(s) => assert!(!s.scene_info_present_flag),
+            other => panic!("expected SceneInfo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn progressive_refinement_segment_start_basic() {
+        // id=2 (ue=2 → "011"), steps_minus1=0 (ue=0 → "1").
+        let payload = pack_bits(&[(0b011, 3), (1, 1)]);
+        let got = parse_progressive_refinement_segment_start(&payload).unwrap();
+        assert_eq!(got.progressive_refinement_id, 2);
+        assert_eq!(got.num_refinement_steps_minus1, 0);
+    }
+
+    #[test]
+    fn progressive_refinement_segment_end_basic() {
+        // id=3 (ue=3 → "00100").
+        let payload = pack_bits(&[(0b00100, 5)]);
+        let got = parse_progressive_refinement_segment_end(&payload).unwrap();
+        assert_eq!(got.progressive_refinement_id, 3);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_progressive_refinement() {
+        let ctx = SeiContext::default();
+        let payload_start = pack_bits(&[(1, 1), (1, 1)]); // id=0, steps=0
+        match parse_payload(16, &payload_start, &ctx).unwrap() {
+            SeiPayload::ProgressiveRefinementSegmentStart(p) => {
+                assert_eq!(p.progressive_refinement_id, 0);
+                assert_eq!(p.num_refinement_steps_minus1, 0);
+            }
+            other => panic!("expected ProgressiveRefinementSegmentStart, got {other:?}"),
+        }
+        let payload_end = pack_bits(&[(1, 1)]); // id=0
+        match parse_payload(17, &payload_end, &ctx).unwrap() {
+            SeiPayload::ProgressiveRefinementSegmentEnd(p) => {
+                assert_eq!(p.progressive_refinement_id, 0)
+            }
+            other => panic!("expected ProgressiveRefinementSegmentEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stereo_video_info_field_views_path() {
+        // field_views=1 → reads top_field_is_left_view_flag (1) then the
+        // two self_contained flags (1, 0). 5 bits, padded to 1 byte.
+        let payload = pack_bits(&[(1, 1), (1, 1), (1, 1), (0, 1)]);
+        let got = parse_stereo_video_info(&payload).unwrap();
+        assert!(got.field_views_flag);
+        assert_eq!(got.top_field_is_left_view_flag, Some(true));
+        assert!(got.current_frame_is_left_view_flag.is_none());
+        assert!(got.next_frame_is_second_view_flag.is_none());
+        assert!(got.left_view_self_contained_flag);
+        assert!(!got.right_view_self_contained_flag);
+    }
+
+    #[test]
+    fn stereo_video_info_frame_views_path() {
+        // field_views=0 → reads current_frame_is_left=1, next_frame_is_second=0,
+        // then left_self=1, right_self=1.
+        let payload = pack_bits(&[(0, 1), (1, 1), (0, 1), (1, 1), (1, 1)]);
+        let got = parse_stereo_video_info(&payload).unwrap();
+        assert!(!got.field_views_flag);
+        assert!(got.top_field_is_left_view_flag.is_none());
+        assert_eq!(got.current_frame_is_left_view_flag, Some(true));
+        assert_eq!(got.next_frame_is_second_view_flag, Some(false));
+        assert!(got.left_view_self_contained_flag);
+        assert!(got.right_view_self_contained_flag);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_stereo_video_info() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(1, 1), (0, 1), (1, 1), (1, 1)]);
+        match parse_payload(21, &payload, &ctx).unwrap() {
+            SeiPayload::StereoVideoInfo(s) => {
+                assert!(s.field_views_flag);
+                assert_eq!(s.top_field_is_left_view_flag, Some(false));
+            }
+            other => panic!("expected StereoVideoInfo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn motion_constrained_slice_group_set_single_group_collapses_width() {
+        // num_slice_groups = 1 → slice_group_id is 0 bits wide, so we
+        // only consume:
+        //   num_slice_groups_in_set_minus1 = 0 (ue=0 → "1") = 1 bit
+        //   exact_sample_value_match_flag = 1
+        //   pan_scan_rect_flag = 0
+        // Total = 3 bits.
+        let payload = pack_bits(&[(1, 1), (1, 1), (0, 1)]);
+        let ctx = SeiContext {
+            num_slice_groups: 1,
+            ..SeiContext::default()
+        };
+        let got = parse_motion_constrained_slice_group_set(&payload, &ctx).unwrap();
+        assert_eq!(got.slice_group_ids, vec![0]);
+        assert!(got.exact_sample_value_match_flag);
+        assert!(!got.pan_scan_rect_flag);
+        assert!(got.pan_scan_rect_id.is_none());
+    }
+
+    #[test]
+    fn motion_constrained_slice_group_set_multi_group_reads_u_v() {
+        // num_slice_groups = 4 → width = Ceil(Log2(4)) = 2 bits per id.
+        //   num_slice_groups_in_set_minus1 = 1 (ue=1 → "010") = 3 bits.
+        //   slice_group_id[0] = 1 (2 bits), slice_group_id[1] = 3 (2 bits).
+        //   exact_sample_value_match_flag = 0.
+        //   pan_scan_rect_flag = 1.
+        //   pan_scan_rect_id = 5 (ue=5 → "00110") = 5 bits.
+        let payload = pack_bits(&[
+            (0b010, 3),   // count_minus1 = 1
+            (0b01, 2),    // id[0] = 1
+            (0b11, 2),    // id[1] = 3
+            (0, 1),       // exact_match = 0
+            (1, 1),       // pan_scan_flag = 1
+            (0b00110, 5), // pan_scan_id = 5
+        ]);
+        let ctx = SeiContext {
+            num_slice_groups: 4,
+            ..SeiContext::default()
+        };
+        let got = parse_motion_constrained_slice_group_set(&payload, &ctx).unwrap();
+        assert_eq!(got.slice_group_ids, vec![1, 3]);
+        assert!(!got.exact_sample_value_match_flag);
+        assert!(got.pan_scan_rect_flag);
+        assert_eq!(got.pan_scan_rect_id, Some(5));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_motion_constrained_slice_group_set() {
+        let payload = pack_bits(&[(1, 1), (0, 1), (0, 1)]);
+        let ctx = SeiContext::default();
+        match parse_payload(18, &payload, &ctx).unwrap() {
+            SeiPayload::MotionConstrainedSliceGroupSet(s) => {
+                assert_eq!(s.slice_group_ids, vec![0]);
+                assert!(!s.exact_sample_value_match_flag);
+            }
+            other => panic!("expected MotionConstrainedSliceGroupSet, got {other:?}"),
         }
     }
 }
