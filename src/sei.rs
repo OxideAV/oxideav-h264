@@ -32,6 +32,10 @@
 //! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume    |
 //! | 144          | §D.1.31     | §D.2.31     | content_light_level_info           |
 //! | 147          | §D.1.32     | §D.2.32     | alternative_transfer_characteristics |
+//! | 148          | §D.1.34     | §D.2.34     | ambient_viewing_environment        |
+//! | 150          | §D.1.35.1   | §D.2.35.1   | equirectangular_projection         |
+//! | 151          | §D.1.35.2   | §D.2.35.2   | cubemap_projection                 |
+//! | 154          | §D.1.35.3   | §D.2.35.3   | sphere_rotation                    |
 
 #![allow(dead_code)]
 
@@ -65,6 +69,24 @@ pub enum SeiError {
         "post_filter_hint filter_hint_type 1 (two 1D FIRs) requires filter_hint_size_y == 2 per §D.2.24 (got {0})"
     )]
     PostFilterHintType1WrongHeight(u32),
+    #[error("ambient_viewing_environment ambient_illuminance shall not be 0 per §D.2.34")]
+    AmbientIlluminanceZero,
+    #[error(
+        "ambient_viewing_environment ambient_light_x / ambient_light_y shall be in 0..=50000 per §D.2.34 (got x={x}, y={y})"
+    )]
+    AmbientLightOutOfRange { x: u32, y: u32 },
+    #[error(
+        "sphere_rotation yaw_rotation shall be in [-180*2^16, 180*2^16 - 1] per §D.2.35.3 (got {0})"
+    )]
+    SphereRotationYawOutOfRange(i32),
+    #[error(
+        "sphere_rotation pitch_rotation shall be in [-90*2^16, 90*2^16] per §D.2.35.3 (got {0})"
+    )]
+    SphereRotationPitchOutOfRange(i32),
+    #[error(
+        "sphere_rotation roll_rotation shall be in [-180*2^16, 180*2^16 - 1] per §D.2.35.3 (got {0})"
+    )]
+    SphereRotationRollOutOfRange(i32),
 }
 
 /// §D.2.2 — buffering_period.
@@ -1681,6 +1703,254 @@ pub fn parse_film_grain_characteristics(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Round 78 — four additional Annex D payload parsers (HDR + 360 family).
+//
+// All four are syntactically fixed-width u(n) / i(n) reads, parallel to the
+// existing mastering_display / content_light_level / display_orientation
+// shape. Range validation per §D.2.34 / §D.2.35.* is policed at parse time.
+// ---------------------------------------------------------------------------
+
+/// §D.2.34 — ambient_viewing_environment (payload type 148).
+///
+/// Describes the nominal ambient viewing environment (illuminance +
+/// background chromaticity) the receiving system should assume when
+/// adapting the decoded picture for display.
+///
+/// Syntax (§D.1.34):
+/// ```text
+/// ambient_viewing_environment( payloadSize ) {
+///   ambient_illuminance      u(32)   // units of 0.0001 lux, nonzero
+///   ambient_light_x          u(16)   // 0..=50000, CIE 1931 x * 50000
+///   ambient_light_y          u(16)   // 0..=50000, CIE 1931 y * 50000
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmbientViewingEnvironment {
+    pub ambient_illuminance: u32,
+    pub ambient_light_x: u16,
+    pub ambient_light_y: u16,
+}
+
+pub fn parse_ambient_viewing_environment(
+    payload: &[u8],
+) -> Result<AmbientViewingEnvironment, SeiError> {
+    let mut r = BitReader::new(payload);
+    let ambient_illuminance = r.u(32)?;
+    let ambient_light_x = r.u(16)?;
+    let ambient_light_y = r.u(16)?;
+    // §D.2.34: "ambient_illuminance shall not be equal to 0".
+    if ambient_illuminance == 0 {
+        return Err(SeiError::AmbientIlluminanceZero);
+    }
+    // §D.2.34: "The values of ambient_light_x and ambient_light_y shall
+    // be in the range of 0 to 50 000, inclusive."
+    if ambient_light_x > 50_000 || ambient_light_y > 50_000 {
+        return Err(SeiError::AmbientLightOutOfRange {
+            x: ambient_light_x,
+            y: ambient_light_y,
+        });
+    }
+    Ok(AmbientViewingEnvironment {
+        ambient_illuminance,
+        ambient_light_x: ambient_light_x as u16,
+        ambient_light_y: ambient_light_y as u16,
+    })
+}
+
+/// §D.2.35.1 — equirectangular_projection (payload type 150).
+///
+/// Signals that the decoded picture is the equirectangular projection
+/// of an omnidirectional video, plus optional guard-band geometry on
+/// the left / right edges.
+///
+/// Syntax (§D.1.35.1):
+/// ```text
+/// equirectangular_projection( payloadSize ) {
+///   erp_cancel_flag                              u(1)
+///   if( !erp_cancel_flag ) {
+///     erp_persistence_flag                       u(1)
+///     erp_padding_flag                           u(1)
+///     erp_reserved_zero_2bits                    u(2)
+///     if( erp_padding_flag == 1 ) {
+///       gb_erp_type                              u(3)
+///       left_gb_erp_width                        u(8)
+///       right_gb_erp_width                       u(8)
+///     }
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EquirectangularProjection {
+    pub cancel_flag: bool,
+    /// Present only when `cancel_flag` is false.
+    pub persistence_flag: Option<bool>,
+    /// Present only when `cancel_flag` is false.
+    pub padding_flag: Option<bool>,
+    /// Present only when `padding_flag` is true. §D.2.35.1 lists
+    /// values 0..=3 with meaningful interpretations; values > 3 are
+    /// reserved and should be ignored.
+    pub gb_erp_type: Option<u8>,
+    /// Present only when `padding_flag` is true. Width of the left
+    /// guard band, in luma samples.
+    pub left_gb_erp_width: Option<u8>,
+    /// Present only when `padding_flag` is true. Width of the right
+    /// guard band, in luma samples.
+    pub right_gb_erp_width: Option<u8>,
+}
+
+pub fn parse_equirectangular_projection(
+    payload: &[u8],
+) -> Result<EquirectangularProjection, SeiError> {
+    let mut r = BitReader::new(payload);
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(EquirectangularProjection {
+            cancel_flag,
+            persistence_flag: None,
+            padding_flag: None,
+            gb_erp_type: None,
+            left_gb_erp_width: None,
+            right_gb_erp_width: None,
+        });
+    }
+    let persistence_flag = r.u(1)? == 1;
+    let padding_flag = r.u(1)? == 1;
+    // §D.2.35.1: erp_reserved_zero_2bits — decoders ignore the value
+    // but the two bits are still consumed.
+    let _reserved = r.u(2)?;
+    let (gb_erp_type, left_gb_erp_width, right_gb_erp_width) = if padding_flag {
+        let ty = r.u(3)? as u8;
+        let left = r.u(8)? as u8;
+        let right = r.u(8)? as u8;
+        (Some(ty), Some(left), Some(right))
+    } else {
+        (None, None, None)
+    };
+    Ok(EquirectangularProjection {
+        cancel_flag,
+        persistence_flag: Some(persistence_flag),
+        padding_flag: Some(padding_flag),
+        gb_erp_type,
+        left_gb_erp_width,
+        right_gb_erp_width,
+    })
+}
+
+/// §D.2.35.2 — cubemap_projection (payload type 151).
+///
+/// Marks the decoded picture as the cubemap projection of an
+/// omnidirectional video. The spec body carries only a persistence
+/// flag — the cube faces' layout is signalled via the frame-packing
+/// arrangement SEI message.
+///
+/// Syntax (§D.1.35.2):
+/// ```text
+/// cubemap_projection( payloadSize ) {
+///   cmp_cancel_flag             u(1)
+///   if( !cmp_cancel_flag )
+///     cmp_persistence_flag      u(1)
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CubemapProjection {
+    pub cancel_flag: bool,
+    /// Present only when `cancel_flag` is false.
+    pub persistence_flag: Option<bool>,
+}
+
+pub fn parse_cubemap_projection(payload: &[u8]) -> Result<CubemapProjection, SeiError> {
+    let mut r = BitReader::new(payload);
+    let cancel_flag = r.u(1)? == 1;
+    let persistence_flag = if cancel_flag {
+        None
+    } else {
+        Some(r.u(1)? == 1)
+    };
+    Ok(CubemapProjection {
+        cancel_flag,
+        persistence_flag,
+    })
+}
+
+/// §D.2.35.3 — sphere_rotation (payload type 154).
+///
+/// Yaw / pitch / roll rotation between the global and local axes, in
+/// units of 2^-16 degrees. Applies after the omnidirectional
+/// projection (equirectangular or cubemap) is reconstructed.
+///
+/// Syntax (§D.1.35.3):
+/// ```text
+/// sphere_rotation( payloadSize ) {
+///   sphere_rotation_cancel_flag           u(1)
+///   if( !sphere_rotation_cancel_flag ) {
+///     sphere_rotation_persistence_flag    u(1)
+///     sphere_rotation_reserved_zero_6bits u(6)
+///     yaw_rotation                        i(32)
+///     pitch_rotation                      i(32)
+///     roll_rotation                       i(32)
+///   }
+/// }
+/// ```
+///
+/// Per §D.2.35.3 the angles are clamped to:
+/// * yaw, roll  ∈ [−180·2^16, 180·2^16 − 1]   (i.e. −11_796_480..=11_796_479)
+/// * pitch     ∈ [−90·2^16, 90·2^16]          (i.e. −5_898_240..=5_898_240)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SphereRotation {
+    pub cancel_flag: bool,
+    /// Present only when `cancel_flag` is false.
+    pub persistence_flag: Option<bool>,
+    /// Present only when `cancel_flag` is false. Yaw (α) in 2^-16 deg.
+    pub yaw_rotation: Option<i32>,
+    /// Present only when `cancel_flag` is false. Pitch (β) in 2^-16 deg.
+    pub pitch_rotation: Option<i32>,
+    /// Present only when `cancel_flag` is false. Roll (γ) in 2^-16 deg.
+    pub roll_rotation: Option<i32>,
+}
+
+pub fn parse_sphere_rotation(payload: &[u8]) -> Result<SphereRotation, SeiError> {
+    let mut r = BitReader::new(payload);
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(SphereRotation {
+            cancel_flag,
+            persistence_flag: None,
+            yaw_rotation: None,
+            pitch_rotation: None,
+            roll_rotation: None,
+        });
+    }
+    let persistence_flag = r.u(1)? == 1;
+    // §D.2.35.3: reserved_zero_6bits — decoders ignore the value, but
+    // the six bits are still consumed.
+    let _reserved = r.u(6)?;
+    let yaw = r.i(32)?;
+    let pitch = r.i(32)?;
+    let roll = r.i(32)?;
+    // §D.2.35.3 range checks.
+    const YAW_ROLL_LO: i32 = -180 * (1 << 16);
+    const YAW_ROLL_HI: i32 = 180 * (1 << 16) - 1;
+    const PITCH_LO: i32 = -90 * (1 << 16);
+    const PITCH_HI: i32 = 90 * (1 << 16);
+    if !(YAW_ROLL_LO..=YAW_ROLL_HI).contains(&yaw) {
+        return Err(SeiError::SphereRotationYawOutOfRange(yaw));
+    }
+    if !(PITCH_LO..=PITCH_HI).contains(&pitch) {
+        return Err(SeiError::SphereRotationPitchOutOfRange(pitch));
+    }
+    if !(YAW_ROLL_LO..=YAW_ROLL_HI).contains(&roll) {
+        return Err(SeiError::SphereRotationRollOutOfRange(roll));
+    }
+    Ok(SphereRotation {
+        cancel_flag,
+        persistence_flag: Some(persistence_flag),
+        yaw_rotation: Some(yaw),
+        pitch_rotation: Some(pitch),
+        roll_rotation: Some(roll),
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1716,6 +1986,14 @@ pub enum SeiPayload {
     MotionConstrainedSliceGroupSet(MotionConstrainedSliceGroupSet),
     /// §D.2.23 — stereo_video_info (payload type 21). Round 73.
     StereoVideoInfo(StereoVideoInfo),
+    /// §D.2.34 — ambient_viewing_environment (payload type 148). Round 78.
+    AmbientViewingEnvironment(AmbientViewingEnvironment),
+    /// §D.2.35.1 — equirectangular_projection (payload type 150). Round 78.
+    EquirectangularProjection(EquirectangularProjection),
+    /// §D.2.35.2 — cubemap_projection (payload type 151). Round 78.
+    CubemapProjection(CubemapProjection),
+    /// §D.2.35.3 — sphere_rotation (payload type 154). Round 78.
+    SphereRotation(SphereRotation),
     /// Not parsed — caller keeps the raw payload for later interpretation.
     Unknown {
         payload_type: u32,
@@ -1793,6 +2071,16 @@ pub fn parse_payload(
         147 => Ok(SeiPayload::AlternativeTransferCharacteristics(
             parse_alternative_transfer_characteristics(payload)?,
         )),
+        148 => Ok(SeiPayload::AmbientViewingEnvironment(
+            parse_ambient_viewing_environment(payload)?,
+        )),
+        150 => Ok(SeiPayload::EquirectangularProjection(
+            parse_equirectangular_projection(payload)?,
+        )),
+        151 => Ok(SeiPayload::CubemapProjection(parse_cubemap_projection(
+            payload,
+        )?)),
+        154 => Ok(SeiPayload::SphereRotation(parse_sphere_rotation(payload)?)),
         other => Ok(SeiPayload::Unknown {
             payload_type: other,
             payload: payload.to_vec(),
@@ -3035,6 +3323,246 @@ mod tests {
                 assert!(!s.exact_sample_value_match_flag);
             }
             other => panic!("expected MotionConstrainedSliceGroupSet, got {other:?}"),
+        }
+    }
+
+    // ----- Round 78 — ambient_viewing_environment / equirectangular_projection /
+    // cubemap_projection / sphere_rotation -----
+
+    // Helper: encode a u32 / u16 big-endian to a Vec<u8>.
+    fn u32_be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+    fn u16_be(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+    fn i32_be(v: i32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+
+    #[test]
+    fn ambient_viewing_environment_bt2035_d65() {
+        // §D.2.34 BT.2035 example: illuminance=100_000, D65 chromaticity
+        // (15_635, 16_450).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32_be(100_000));
+        payload.extend_from_slice(&u16_be(15_635));
+        payload.extend_from_slice(&u16_be(16_450));
+        let got = parse_ambient_viewing_environment(&payload).unwrap();
+        assert_eq!(got.ambient_illuminance, 100_000);
+        assert_eq!(got.ambient_light_x, 15_635);
+        assert_eq!(got.ambient_light_y, 16_450);
+    }
+
+    #[test]
+    fn ambient_viewing_environment_zero_illuminance_rejected() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32_be(0));
+        payload.extend_from_slice(&u16_be(0));
+        payload.extend_from_slice(&u16_be(0));
+        let err = parse_ambient_viewing_environment(&payload).unwrap_err();
+        assert_eq!(err, SeiError::AmbientIlluminanceZero);
+    }
+
+    #[test]
+    fn ambient_viewing_environment_chromaticity_out_of_range_rejected() {
+        // ambient_light_x = 50_001 (just outside 0..=50_000).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32_be(1));
+        payload.extend_from_slice(&u16_be(50_001));
+        payload.extend_from_slice(&u16_be(0));
+        let err = parse_ambient_viewing_environment(&payload).unwrap_err();
+        assert_eq!(err, SeiError::AmbientLightOutOfRange { x: 50_001, y: 0 });
+    }
+
+    #[test]
+    fn parse_payload_dispatches_ambient_viewing_environment() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32_be(50_000));
+        payload.extend_from_slice(&u16_be(14_155));
+        payload.extend_from_slice(&u16_be(14_855));
+        let ctx = SeiContext::default();
+        match parse_payload(148, &payload, &ctx).unwrap() {
+            SeiPayload::AmbientViewingEnvironment(a) => {
+                assert_eq!(a.ambient_illuminance, 50_000);
+                assert_eq!(a.ambient_light_x, 14_155);
+                assert_eq!(a.ambient_light_y, 14_855);
+            }
+            other => panic!("expected AmbientViewingEnvironment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn equirectangular_projection_cancel() {
+        // cancel_flag = 1 → body skipped.
+        let payload = pack_bits(&[(1, 1)]);
+        let got = parse_equirectangular_projection(&payload).unwrap();
+        assert!(got.cancel_flag);
+        assert!(got.persistence_flag.is_none());
+        assert!(got.padding_flag.is_none());
+        assert!(got.gb_erp_type.is_none());
+    }
+
+    #[test]
+    fn equirectangular_projection_no_padding() {
+        // cancel=0, persistence=1, padding=0, reserved_zero_2bits=0.
+        let payload = pack_bits(&[
+            (0, 1), // cancel
+            (1, 1), // persistence
+            (0, 1), // padding
+            (0, 2), // reserved
+        ]);
+        let got = parse_equirectangular_projection(&payload).unwrap();
+        assert!(!got.cancel_flag);
+        assert_eq!(got.persistence_flag, Some(true));
+        assert_eq!(got.padding_flag, Some(false));
+        assert!(got.gb_erp_type.is_none());
+        assert!(got.left_gb_erp_width.is_none());
+        assert!(got.right_gb_erp_width.is_none());
+    }
+
+    #[test]
+    fn equirectangular_projection_with_padding() {
+        // cancel=0, persistence=0, padding=1, reserved_zero_2bits=0,
+        // gb_erp_type=2, left=8, right=4.
+        let payload = pack_bits(&[
+            (0, 1), // cancel
+            (0, 1), // persistence
+            (1, 1), // padding
+            (0, 2), // reserved
+            (2, 3), // gb_erp_type
+            (8, 8), // left
+            (4, 8), // right
+        ]);
+        let got = parse_equirectangular_projection(&payload).unwrap();
+        assert!(!got.cancel_flag);
+        assert_eq!(got.persistence_flag, Some(false));
+        assert_eq!(got.padding_flag, Some(true));
+        assert_eq!(got.gb_erp_type, Some(2));
+        assert_eq!(got.left_gb_erp_width, Some(8));
+        assert_eq!(got.right_gb_erp_width, Some(4));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_equirectangular_projection() {
+        let payload = pack_bits(&[(1, 1)]);
+        let ctx = SeiContext::default();
+        match parse_payload(150, &payload, &ctx).unwrap() {
+            SeiPayload::EquirectangularProjection(e) => assert!(e.cancel_flag),
+            other => panic!("expected EquirectangularProjection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cubemap_projection_cancel() {
+        let payload = pack_bits(&[(1, 1)]);
+        let got = parse_cubemap_projection(&payload).unwrap();
+        assert!(got.cancel_flag);
+        assert!(got.persistence_flag.is_none());
+    }
+
+    #[test]
+    fn cubemap_projection_persist() {
+        let payload = pack_bits(&[(0, 1), (1, 1)]);
+        let got = parse_cubemap_projection(&payload).unwrap();
+        assert!(!got.cancel_flag);
+        assert_eq!(got.persistence_flag, Some(true));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_cubemap_projection() {
+        let payload = pack_bits(&[(0, 1), (0, 1)]);
+        let ctx = SeiContext::default();
+        match parse_payload(151, &payload, &ctx).unwrap() {
+            SeiPayload::CubemapProjection(c) => {
+                assert!(!c.cancel_flag);
+                assert_eq!(c.persistence_flag, Some(false));
+            }
+            other => panic!("expected CubemapProjection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sphere_rotation_cancel() {
+        let payload = pack_bits(&[(1, 1)]);
+        let got = parse_sphere_rotation(&payload).unwrap();
+        assert!(got.cancel_flag);
+        assert!(got.yaw_rotation.is_none());
+        assert!(got.pitch_rotation.is_none());
+        assert!(got.roll_rotation.is_none());
+    }
+
+    #[test]
+    fn sphere_rotation_zero_angles() {
+        // cancel=0, persistence=1, reserved=0, then three i32(0) big-endian.
+        // First byte: 0_1_000000 = 0x40. Then 12 zero bytes.
+        let mut payload = vec![0x40];
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        let got = parse_sphere_rotation(&payload).unwrap();
+        assert!(!got.cancel_flag);
+        assert_eq!(got.persistence_flag, Some(true));
+        assert_eq!(got.yaw_rotation, Some(0));
+        assert_eq!(got.pitch_rotation, Some(0));
+        assert_eq!(got.roll_rotation, Some(0));
+    }
+
+    #[test]
+    fn sphere_rotation_min_max_angles() {
+        // Test boundary values per §D.2.35.3:
+        //   yaw=-180*2^16 (-11_796_480), pitch=90*2^16 (5_898_240),
+        //   roll=180*2^16-1 (11_796_479).
+        // cancel=0, persistence=0, reserved=0.
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&i32_be(-11_796_480));
+        payload.extend_from_slice(&i32_be(5_898_240));
+        payload.extend_from_slice(&i32_be(11_796_479));
+        let got = parse_sphere_rotation(&payload).unwrap();
+        assert_eq!(got.yaw_rotation, Some(-11_796_480));
+        assert_eq!(got.pitch_rotation, Some(5_898_240));
+        assert_eq!(got.roll_rotation, Some(11_796_479));
+    }
+
+    #[test]
+    fn sphere_rotation_yaw_out_of_range_rejected() {
+        // yaw=180*2^16 (11_796_480) — one past the high limit.
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&i32_be(11_796_480));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        let err = parse_sphere_rotation(&payload).unwrap_err();
+        assert_eq!(err, SeiError::SphereRotationYawOutOfRange(11_796_480));
+    }
+
+    #[test]
+    fn sphere_rotation_pitch_out_of_range_rejected() {
+        // pitch=-90*2^16 - 1 (-5_898_241) — one past the low limit.
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(-5_898_241));
+        payload.extend_from_slice(&i32_be(0));
+        let err = parse_sphere_rotation(&payload).unwrap_err();
+        assert_eq!(err, SeiError::SphereRotationPitchOutOfRange(-5_898_241));
+    }
+
+    #[test]
+    fn sphere_rotation_roll_out_of_range_rejected() {
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(11_796_480));
+        let err = parse_sphere_rotation(&payload).unwrap_err();
+        assert_eq!(err, SeiError::SphereRotationRollOutOfRange(11_796_480));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_sphere_rotation() {
+        let payload = pack_bits(&[(1, 1)]);
+        let ctx = SeiContext::default();
+        match parse_payload(154, &payload, &ctx).unwrap() {
+            SeiPayload::SphereRotation(s) => assert!(s.cancel_flag),
+            other => panic!("expected SphereRotation, got {other:?}"),
         }
     }
 }

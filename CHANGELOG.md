@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sei: round-78 — four additional Annex D HDR + 360 payload parsers.**
+  The decoder now recognises four more SEI payload types it previously
+  kept as `SeiPayload::Unknown`:
+  - **148** `ambient_viewing_environment` (§D.1.34 / §D.2.34) —
+    `ambient_illuminance` (`u(32)`, nonzero per §D.2.34) +
+    `ambient_light_x` / `ambient_light_y` (`u(16)` each, 0..=50000 per
+    §D.2.34 CIE 1931 chromaticity scaled by 50000). Parse-time range
+    check rejects illuminance=0 and chromaticity > 50000.
+  - **150** `equirectangular_projection` (§D.1.35.1 / §D.2.35.1) —
+    `erp_cancel_flag` + (when not cancelled) `erp_persistence_flag` +
+    `erp_padding_flag` + `erp_reserved_zero_2bits` (consumed but
+    ignored per §D.2.35.1) + the §D.1.35.1 padding-conditional triple
+    (`gb_erp_type u(3)`, `left_gb_erp_width u(8)`,
+    `right_gb_erp_width u(8)`).
+  - **151** `cubemap_projection` (§D.1.35.2 / §D.2.35.2) — the
+    shortest body in the family: `cmp_cancel_flag u(1)` plus, when
+    not cancelled, `cmp_persistence_flag u(1)`.
+  - **154** `sphere_rotation` (§D.1.35.3 / §D.2.35.3) —
+    `sphere_rotation_cancel_flag` + (when not cancelled) the
+    `sphere_rotation_persistence_flag u(1)`, `reserved_zero_6bits
+    u(6)` (consumed but ignored), and three `i(32)` rotation
+    angles (yaw, pitch, roll). Parse-time §D.2.35.3 range checks
+    enforce yaw / roll ∈ [−180·2^16, 180·2^16 − 1] and pitch ∈
+    [−90·2^16, 90·2^16].
+
+  Each new parser ships unit tests (15 new) exercising both
+  `parse_*` directly and the `parse_payload` dispatcher for the
+  matching `payload_type`. Six new `SeiError` variants police the
+  §D.2.34 / §D.2.35.3 range checks. Coverage bumps from 24 → 28
+  recognised SEI types; the SEI table header comment in
+  `src/sei.rs` is updated.
+
 - **sei: round-73 — five additional Annex D payload parsers.** The
   decoder now recognises five SEI payload types it previously kept as
   `SeiPayload::Unknown`:
