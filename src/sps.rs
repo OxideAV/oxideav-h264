@@ -81,6 +81,34 @@ pub enum SpsError {
     /// reference frames").
     #[error("max_num_ref_frames out of range (got {0}, max 16)")]
     MaxNumRefFramesOutOfRange(u32),
+    /// §7.4.2.1.1 — frame-cropping rectangle leaves the coded picture
+    /// boundary. The spec says:
+    ///
+    ///   * `frame_crop_left_offset` ∈ `[0, (PicWidthInSamplesL /
+    ///     CropUnitX) − (frame_crop_right_offset + 1)]`,
+    ///   * `frame_crop_top_offset`  ∈ `[0, (16 * FrameHeightInMbs /
+    ///     CropUnitY) − (frame_crop_bottom_offset + 1)]`.
+    ///
+    /// Reformulated as a positivity check, the cropped rectangle's
+    /// width and height must each be at least 1 luma sample. Strings
+    /// with a `frame_cropping_flag = 1` SPS that violate these are
+    /// rejected by libavcodec at SPS-parse time with "crop values
+    /// invalid X Y W H"; the access unit's slices then dangle with
+    /// no activated SPS. Caught by the `ffmpeg_oracle_decode` fuzz
+    /// oracle on `crash-8e8b38ae…` (round 91).
+    #[error(
+        "frame_cropping invalid: CropUnitX={cux}*(left={left}+right={right}+1) > PicWidthInSamplesL={width}, or CropUnitY={cuy}*(top={top}+bottom={bottom}+1) > FrameHeightInSamplesL={height}"
+    )]
+    FrameCroppingOutOfRange {
+        cux: u32,
+        cuy: u32,
+        left: u32,
+        right: u32,
+        top: u32,
+        bottom: u32,
+        width: u32,
+        height: u32,
+    },
 }
 
 /// §A.3 derived ceiling — the maximum representable
@@ -404,6 +432,72 @@ impl Sps {
             let right = r.ue()?;
             let top = r.ue()?;
             let bottom = r.ue()?;
+
+            // §7.4.2.1.1 — validate the cropping rectangle stays
+            // within the coded picture. Required by:
+            //   `frame_crop_left_offset ∈ [0, (PicWidthInSamplesL /
+            //    CropUnitX) − (frame_crop_right_offset + 1)]`,
+            //   `frame_crop_top_offset  ∈ [0, (16 * FrameHeightInMbs
+            //    / CropUnitY) − (frame_crop_bottom_offset + 1)]`.
+            //
+            // CropUnitX / CropUnitY (eqs. 7-19..7-22) depend on
+            // ChromaArrayType:
+            //   * ChromaArrayType == 0 (monochrome OR
+            //     separate_colour_plane_flag == 1):
+            //       CropUnitX = 1, CropUnitY = 2 − frame_mbs_only_flag
+            //   * Otherwise (1=4:2:0, 2=4:2:2, 3=4:4:4):
+            //       CropUnitX = SubWidthC,
+            //       CropUnitY = SubHeightC * (2 − frame_mbs_only_flag)
+            // with SubWidthC / SubHeightC from §6.2 Table 6-1:
+            //       1 (4:2:0) → 2, 2
+            //       2 (4:2:2) → 2, 1
+            //       3 (4:4:4) → 1, 1
+            //
+            // The cast to u32 is safe: chroma_format_idc was already
+            // bounded to 0..=3 above, separate_colour_plane_flag is
+            // a single bit, frame_mbs_only_flag likewise.
+            let chroma_array_type = if separate_colour_plane_flag {
+                0
+            } else {
+                chroma_format_idc
+            };
+            let (sub_w_c, sub_h_c) = match chroma_array_type {
+                1 => (2u32, 2u32),
+                2 => (2u32, 1u32),
+                3 => (1u32, 1u32),
+                _ => (1u32, 1u32), // ChromaArrayType == 0
+            };
+            let mbs_only_factor = if frame_mbs_only_flag { 1u32 } else { 2u32 };
+            let (cux, cuy) = if chroma_array_type == 0 {
+                (1u32, mbs_only_factor)
+            } else {
+                (sub_w_c, sub_h_c * mbs_only_factor)
+            };
+            // PicWidthInSamplesL = (pic_width_in_mbs_minus1 + 1) * 16
+            // FrameHeightInSamplesL = (2 - frame_mbs_only_flag) *
+            //                          (pic_height_in_map_units_minus1 + 1) * 16
+            let width_samples = (pic_width_in_mbs_minus1 + 1) * 16;
+            let height_samples = mbs_only_factor * (pic_height_in_map_units_minus1 + 1) * 16;
+            // Use u64 to avoid an overflow on the multiplication when
+            // the input is pathological (cropping offsets are ue(v)
+            // and the picture-dim cap is 510 mbs/axis = 8160 samples,
+            // so cux * (left + right + 1) at worst is 2 * (u32::MAX +
+            // 1) — fits comfortably in u64).
+            let need_w = u64::from(cux) * (u64::from(left) + u64::from(right) + 1);
+            let need_h = u64::from(cuy) * (u64::from(top) + u64::from(bottom) + 1);
+            if need_w > u64::from(width_samples) || need_h > u64::from(height_samples) {
+                return Err(SpsError::FrameCroppingOutOfRange {
+                    cux,
+                    cuy,
+                    left,
+                    right,
+                    top,
+                    bottom,
+                    width: width_samples,
+                    height: height_samples,
+                });
+            }
+
             Some(FrameCropping {
                 left,
                 right,
@@ -1125,5 +1219,97 @@ mod tests {
         w.trailing();
         let sps = Sps::parse(&w.into_bytes()).unwrap();
         assert_eq!(sps.max_num_ref_frames, 16);
+    }
+
+    /// §7.4.2.1.1 — a `frame_cropping_flag = 1` SPS whose offsets
+    /// would crop more samples than the coded picture contains must
+    /// be rejected at SPS parse time. The libfuzzer crash
+    /// `8e8b38ae…` (round-91 fuzz oracle) was a 4:2:0 / `frame_mbs_only_flag = 1`
+    /// SPS with `pic_width_in_mbs_minus1 = 177` (PicWidthInSamplesL =
+    /// 2848), `pic_height_in_map_units_minus1 = 0` (FrameHeightInSamplesL =
+    /// 16), and `top_offset = 2148` — CropUnitY = 2 × 1 = 2, so
+    /// `2 × (2148 + 2 + 1) = 4302 > 16` overflows the frame height.
+    /// libavcodec rejects with "crop values invalid"; we mirror.
+    #[test]
+    fn frame_cropping_offsets_exceeding_picture_rejected() {
+        let mut w = BitWriter::new();
+        w.u(8, 66); // profile_idc Baseline (no chroma_format_idc parse)
+        w.u(8, 0);
+        w.u(8, 30); // level_idc
+        w.ue(0); // sps_id
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(0); // pic_order_cnt_type
+        w.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        w.ue(1); // max_num_ref_frames
+        w.u(1, 0); // gaps_in_frame_num_value_allowed_flag
+        w.ue(0); // pic_width_in_mbs_minus1 = 0 → PicWidthInSamplesL = 16
+        w.ue(0); // pic_height_in_map_units_minus1 = 0 → FrameHeightInSamplesL = 16
+        w.u(1, 1); // frame_mbs_only_flag
+        w.u(1, 0); // direct_8x8_inference_flag
+        w.u(1, 1); // frame_cropping_flag = 1
+                   // 4:2:0 (inferred), frame_mbs_only=1 → CropUnitX=2, CropUnitY=2.
+                   // top=0, bottom=10 → 2 × (0 + 10 + 1) = 22 > 16.
+        w.ue(0); // left
+        w.ue(0); // right
+        w.ue(0); // top
+        w.ue(10); // bottom — overshoots
+        let err = Sps::parse(&w.into_bytes()).unwrap_err();
+        match err {
+            SpsError::FrameCroppingOutOfRange {
+                cux,
+                cuy,
+                left,
+                right,
+                top,
+                bottom,
+                width,
+                height,
+            } => {
+                assert_eq!(cux, 2);
+                assert_eq!(cuy, 2);
+                assert_eq!(left, 0);
+                assert_eq!(right, 0);
+                assert_eq!(top, 0);
+                assert_eq!(bottom, 10);
+                assert_eq!(width, 16);
+                assert_eq!(height, 16);
+            }
+            other => panic!("expected FrameCroppingOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// Boundary case: cropping that exactly fills the picture (cropped
+    /// width / height = 1 sample each) must be accepted. The spec
+    /// requires `left + right + 1 ≤ PicWidthInSamplesL / CropUnitX`,
+    /// so the worst-permitted offsets satisfy the inequality at
+    /// equality.
+    #[test]
+    fn frame_cropping_at_maximal_allowed_offsets_accepted() {
+        let mut w = BitWriter::new();
+        w.u(8, 66);
+        w.u(8, 0);
+        w.u(8, 30);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(1);
+        w.u(1, 0);
+        w.ue(0); // pic_width_in_mbs_minus1 = 0 → 16 samples wide
+        w.ue(0); // pic_height_in_map_units_minus1 = 0 → 16 samples tall
+        w.u(1, 1); // frame_mbs_only_flag
+        w.u(1, 0); // direct_8x8_inference_flag
+        w.u(1, 1); // frame_cropping_flag = 1
+                   // 4:2:0 frame_mbs_only=1: CropUnitX=2, CropUnitY=2.
+                   // Max bottom = (16/2) - (0 + 1) = 7 → 2 × (0+7+1) = 16 ≤ 16.
+        w.ue(0); // left
+        w.ue(0); // right
+        w.ue(0); // top
+        w.ue(7); // bottom = 7 → CropUnitY * (top + bottom + 1) = 16
+        w.u(1, 0); // vui_parameters_present_flag
+        w.trailing();
+        let sps = Sps::parse(&w.into_bytes()).unwrap();
+        let c = sps.frame_cropping.unwrap();
+        assert_eq!((c.left, c.right, c.top, c.bottom), (0, 0, 0, 7));
     }
 }

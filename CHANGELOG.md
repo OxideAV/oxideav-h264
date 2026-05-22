@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **sps: reject `frame_cropping` offsets that overshoot the coded
+  picture (round 91 fuzz-oracle triage, follow-up).** Per §7.4.2.1.1
+  the cropping rectangle must satisfy
+  `frame_crop_left_offset ≤ (PicWidthInSamplesL / CropUnitX) − (frame_crop_right_offset + 1)`
+  and the mirror inequality on the vertical axis. Previously our
+  SPS parser accepted any `ue(v)`-decoded offsets without checking
+  against the picture extent; a 506 B input
+  (`crash-8e8b38ae…`) carried `frame_crop_top_offset = 2148` against
+  a `FrameHeightInSamplesL = 16` picture, so `CropUnitY * (top +
+  bottom + 1) = 2 * 2151 = 4302 > 16` — but the SPS still activated,
+  slices reconstructed against MB 0 OK, and we emitted two
+  `Frame::Video` while libavcodec rejected the SPS outright with
+  "crop values invalid 0 5 2148 2 / 2848 16". The fix derives
+  CropUnitX / CropUnitY per §7.4.2.1.1 eqs. 7-19..7-22 (4:2:0 / 4:2:2
+  / 4:4:4 SubWidthC × SubHeightC table, mbs_only_flag scaling) and
+  raises `SpsError::FrameCroppingOutOfRange` when either inequality
+  fails. Two new unit tests pin the boundary (max-allowed offsets
+  accepted) and the reject path (overshoot rejected); a third
+  integration test
+  `fuzz_crash_8e8b38ae_sps_crop_out_of_range_rejected` embeds the
+  506 B crash verbatim.
 - **slice_header: reject `first_mb_in_slice != 0` when opening a new
   coded picture (round 91 fuzz-oracle triage).** Per §7.4.3 + Annex A
   the first VCL slice of a coded picture must cover MB 0 when
