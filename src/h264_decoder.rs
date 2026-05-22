@@ -473,6 +473,34 @@ impl H264CodecDecoder {
             // picture with this slice.
             self.finalize_in_progress_picture()?;
 
+            // §7.4.3 + Annex A — `first_mb_in_slice` of the first
+            // coded slice of a coded picture must be 0 when arbitrary
+            // slice order (ASO) is not allowed. ASO is gated on
+            // Baseline / Extended profiles AND FMO usage, both of
+            // which we already reject at PPS-activation time
+            // (`DecoderError::FmoNotSupported`, see `decoder.rs`).
+            // So for every stream we accept, the first VCL NAL of a
+            // primary coded picture must cover macroblock 0.
+            //
+            // Without this check, a stream whose every "first" slice
+            // carries `first_mb_in_slice > 0` opens a fresh picture
+            // whose MBs `0..first_mb_in_slice` are never coded,
+            // leaving the picture's luma + chroma planes
+            // zero-initialised. We then emit a `Frame::Video` with
+            // all-zero luma — a strictness divergence from
+            // libavcodec, which rejects the access unit outright.
+            //
+            // Caught by the fuzz oracle on `crash-957ac808…` (440 B,
+            // four IDR slices, all with `first_mb_in_slice == 2`,
+            // 1×6-MB picture; libavcodec rejects, we previously
+            // emitted two zero-luma frames).
+            if header.first_mb_in_slice != 0 {
+                return Err(Error::invalid(format!(
+                    "h264 slice_header: first_mb_in_slice = {} for first slice of a coded picture (§7.4.3 / Annex A require 0 when ASO/FMO is disabled)",
+                    header.first_mb_in_slice
+                )));
+            }
+
             // §8.2.5.2 — gaps in frame_num. When the stream signals a
             // gap (`frame_num != (PrevRefFrameNum + 1) mod MaxFrameNum`)
             // and the SPS allows gaps, synthesize "non-existing" short-term

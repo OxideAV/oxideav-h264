@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **slice_header: reject `first_mb_in_slice != 0` when opening a new
+  coded picture (round 91 fuzz-oracle triage).** Per §7.4.3 + Annex A
+  the first VCL slice of a coded picture must cover MB 0 when
+  arbitrary slice order (ASO) is not allowed; ASO is gated on the
+  same Baseline/Extended-with-FMO carve-out we already reject at PPS
+  activation (`DecoderError::FmoNotSupported` — see `decoder.rs`).
+  Previously, an input whose every "first" slice carried
+  `first_mb_in_slice > 0` opened a fresh `PictureInProgress` whose
+  MBs `0..first_mb_in_slice` were never coded; the slice walk did
+  return Ok (it just covered the wrong MBs), so
+  `any_slice_succeeded` flipped to true and `finalize_in_progress_picture`
+  emitted a `Frame::Video` whose luma + chroma planes were the
+  zero-initialised allocation buffer. libavcodec rejects the access
+  unit outright; we now match. Caught by `ffmpeg_oracle_decode` on
+  `crash-957ac808…` (440 B, four IDR slices, all with
+  `first_mb_in_slice == 2`, 1×6-MB picture). New regression test
+  `fuzz_crash_957ac808_first_mb_nonzero_for_new_picture_rejected`
+  pins the libavcodec parity.
+
 ### Added
 
 - **sei: round-78 — four additional Annex D HDR + 360 payload parsers.**
