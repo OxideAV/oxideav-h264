@@ -36,6 +36,8 @@
 //! | 150          | §D.1.35.1   | §D.2.35.1   | equirectangular_projection         |
 //! | 151          | §D.1.35.2   | §D.2.35.2   | cubemap_projection                 |
 //! | 154          | §D.1.35.3   | §D.2.35.3   | sphere_rotation                    |
+//! | 156          | §D.1.35.5   | §D.2.35.5   | omni_viewport                      |
+//! | 205          | §D.1.38     | §D.2.38     | shutter_interval_info              |
 
 #![allow(dead_code)]
 
@@ -87,6 +89,24 @@ pub enum SeiError {
         "sphere_rotation roll_rotation shall be in [-180*2^16, 180*2^16 - 1] per §D.2.35.3 (got {0})"
     )]
     SphereRotationRollOutOfRange(i32),
+    #[error(
+        "omni_viewport azimuth_centre shall be in [-180*2^16, 180*2^16 - 1] per §D.2.35.5 (got {0})"
+    )]
+    OmniViewportAzimuthOutOfRange(i32),
+    #[error(
+        "omni_viewport elevation_centre shall be in [-90*2^16, 90*2^16] per §D.2.35.5 (got {0})"
+    )]
+    OmniViewportElevationOutOfRange(i32),
+    #[error(
+        "omni_viewport tilt_centre shall be in [-180*2^16, 180*2^16 - 1] per §D.2.35.5 (got {0})"
+    )]
+    OmniViewportTiltOutOfRange(i32),
+    #[error("omni_viewport hor_range shall be in 1..=360*2^16 per §D.2.35.5 (got {0})")]
+    OmniViewportHorRangeOutOfRange(u32),
+    #[error("omni_viewport ver_range shall be in 1..=180*2^16 per §D.2.35.5 (got {0})")]
+    OmniViewportVerRangeOutOfRange(u32),
+    #[error("shutter_interval_info sii_time_scale shall not be 0 per §D.2.38")]
+    ShutterIntervalTimeScaleZero,
 }
 
 /// §D.2.2 — buffering_period.
@@ -1951,6 +1971,257 @@ pub fn parse_sphere_rotation(payload: &[u8]) -> Result<SphereRotation, SeiError>
     })
 }
 
+/// §D.2.35.5 — omni_viewport (payload type 156).
+///
+/// Specifies the coordinates of one or more spherical-coordinate
+/// viewport regions (great-circle bounded) recommended for display
+/// when the user has no control of viewing orientation. Pairs with
+/// the equirectangular-projection / cubemap-projection SEIs already
+/// parsed at payload types 150 / 151.
+///
+/// Syntax (§D.1.35.5):
+/// ```text
+/// omni_viewport( payloadSize ) {
+///   omni_viewport_id                       u(10)
+///   omni_viewport_cancel_flag              u(1)
+///   if( !omni_viewport_cancel_flag ) {
+///     omni_viewport_persistence_flag       u(1)
+///     omni_viewport_cnt_minus1             u(4)
+///     for( i = 0; i <= omni_viewport_cnt_minus1; i++ ) {
+///       omni_viewport_azimuth_centre[ i ]    i(32)
+///       omni_viewport_elevation_centre[ i ]  i(32)
+///       omni_viewport_tilt_centre[ i ]       i(32)
+///       omni_viewport_hor_range[ i ]         u(32)
+///       omni_viewport_ver_range[ i ]         u(32)
+///     }
+///   }
+/// }
+/// ```
+///
+/// Per §D.2.35.5 each viewport carries five values in units of 2^-16
+/// degrees, with the clamps:
+/// * `azimuth_centre`, `tilt_centre` ∈ [−180·2^16, 180·2^16 − 1]
+/// * `elevation_centre` ∈ [−90·2^16, 90·2^16]
+/// * `hor_range` ∈ [1, 360·2^16]
+/// * `ver_range` ∈ [1, 180·2^16]
+///
+/// Per the same clause, `omni_viewport_id` values 512..=1023 are
+/// reserved; we surface them verbatim and leave handling to callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OmniViewport {
+    pub viewport_id: u16,
+    pub cancel_flag: bool,
+    /// Present only when `cancel_flag` is false.
+    pub persistence_flag: Option<bool>,
+    /// One entry per recommended viewport (length =
+    /// `omni_viewport_cnt_minus1 + 1`). Present only when
+    /// `cancel_flag` is false.
+    pub viewports: Vec<OmniViewportEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OmniViewportEntry {
+    pub azimuth_centre: i32,
+    pub elevation_centre: i32,
+    pub tilt_centre: i32,
+    pub hor_range: u32,
+    pub ver_range: u32,
+}
+
+pub fn parse_omni_viewport(payload: &[u8]) -> Result<OmniViewport, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §D.1.35.5 — u(10) viewport_id.
+    let viewport_id = r.u(10)? as u16;
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(OmniViewport {
+            viewport_id,
+            cancel_flag,
+            persistence_flag: None,
+            viewports: Vec::new(),
+        });
+    }
+    let persistence_flag = r.u(1)? == 1;
+    let cnt_minus1 = r.u(4)?;
+    // §D.2.35.5 range constants.
+    const AZ_TILT_LO: i32 = -180 * (1 << 16);
+    const AZ_TILT_HI: i32 = 180 * (1 << 16) - 1;
+    const EL_LO: i32 = -90 * (1 << 16);
+    const EL_HI: i32 = 90 * (1 << 16);
+    const HOR_HI: u32 = 360 * (1 << 16);
+    const VER_HI: u32 = 180 * (1 << 16);
+    let count = (cnt_minus1 as usize) + 1;
+    let mut viewports = Vec::with_capacity(count);
+    for _ in 0..count {
+        let azimuth_centre = r.i(32)?;
+        let elevation_centre = r.i(32)?;
+        let tilt_centre = r.i(32)?;
+        let hor_range = r.u(32)?;
+        let ver_range = r.u(32)?;
+        if !(AZ_TILT_LO..=AZ_TILT_HI).contains(&azimuth_centre) {
+            return Err(SeiError::OmniViewportAzimuthOutOfRange(azimuth_centre));
+        }
+        if !(EL_LO..=EL_HI).contains(&elevation_centre) {
+            return Err(SeiError::OmniViewportElevationOutOfRange(elevation_centre));
+        }
+        if !(AZ_TILT_LO..=AZ_TILT_HI).contains(&tilt_centre) {
+            return Err(SeiError::OmniViewportTiltOutOfRange(tilt_centre));
+        }
+        if hor_range == 0 || hor_range > HOR_HI {
+            return Err(SeiError::OmniViewportHorRangeOutOfRange(hor_range));
+        }
+        if ver_range == 0 || ver_range > VER_HI {
+            return Err(SeiError::OmniViewportVerRangeOutOfRange(ver_range));
+        }
+        viewports.push(OmniViewportEntry {
+            azimuth_centre,
+            elevation_centre,
+            tilt_centre,
+            hor_range,
+            ver_range,
+        });
+    }
+    Ok(OmniViewport {
+        viewport_id,
+        cancel_flag,
+        persistence_flag: Some(persistence_flag),
+        viewports,
+    })
+}
+
+/// §D.2.38 — shutter_interval_info (payload type 205).
+///
+/// Indicates the camera shutter interval (image-sensor exposure time)
+/// for the associated source pictures, either as a single CVS-wide
+/// constant or as a per-sub-layer schedule keyed on `sii_sub_layer_idx`.
+///
+/// Syntax (§D.1.38):
+/// ```text
+/// shutter_interval_info( payloadSize ) {
+///   sii_sub_layer_idx                                ue(v)
+///   if( sii_sub_layer_idx == 0 ) {
+///     shutter_interval_info_present_flag             u(1)
+///     if( shutter_interval_info_present_flag ) {
+///       sii_time_scale                               u(32)
+///       fixed_shutter_interval_within_cvs_flag       u(1)
+///       if( fixed_shutter_interval_within_cvs_flag )
+///         sii_num_units_in_shutter_interval          u(32)
+///       else {
+///         sii_max_sub_layers_minus1                  u(3)
+///         for( i = 0; i <= sii_max_sub_layers_minus1; i++ )
+///           sub_layer_num_units_in_shutter_interval[ i ]  u(32)
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Per §D.2.38: `sii_time_scale` shall be greater than 0; when
+/// `fixed_shutter_interval_within_cvs_flag` is 1 the picture's shutter
+/// interval, in seconds, is `sii_num_units_in_shutter_interval /
+/// sii_time_scale`; otherwise it is
+/// `sub_layer_num_units_in_shutter_interval[sii_sub_layer_idx] /
+/// sii_time_scale`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShutterIntervalInfo {
+    /// Shutter-interval temporal sub-layer index of the current picture.
+    pub sub_layer_idx: u32,
+    /// Body fields. Present only when `sub_layer_idx == 0`.
+    pub body: Option<ShutterIntervalInfoBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShutterIntervalInfoBody {
+    /// True when the syntax elements `sii_time_scale`,
+    /// `fixed_shutter_interval_within_cvs_flag`, and the trailing
+    /// schedule are all present.
+    pub info_present_flag: bool,
+    /// Present only when `info_present_flag` is true.
+    pub schedule: Option<ShutterIntervalSchedule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShutterIntervalSchedule {
+    /// Time-base for all `*_num_units_in_shutter_interval` values.
+    /// Per §D.2.38 this is the count of time units in one second; e.g.
+    /// 27_000_000 for the canonical 27 MHz reference clock. Strictly
+    /// positive.
+    pub time_scale: u32,
+    /// CVS-wide vs. per-sub-layer body.
+    pub kind: ShutterIntervalKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutterIntervalKind {
+    /// `fixed_shutter_interval_within_cvs_flag == 1` — one constant
+    /// shutter interval for every picture in the CVS. The picture's
+    /// shutter interval, in seconds, is `num_units / time_scale`.
+    Fixed { num_units: u32 },
+    /// `fixed_shutter_interval_within_cvs_flag == 0` — per-sub-layer
+    /// schedule. `max_sub_layers_minus1` plus 1 entries; element `i`
+    /// gives the shutter interval for pictures with
+    /// `sii_sub_layer_idx == i`.
+    PerSubLayer {
+        max_sub_layers_minus1: u8,
+        num_units_per_sub_layer: Vec<u32>,
+    },
+}
+
+pub fn parse_shutter_interval_info(payload: &[u8]) -> Result<ShutterIntervalInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §D.1.38: ue(v) `sii_sub_layer_idx`. The bitstream layer's
+    // BitReader::ue caps the leading-zero run at 31 so a hostile
+    // input can't blow the shifter (see r91 fuzz fix on bitstream.rs).
+    let sub_layer_idx = r.ue()?;
+    if sub_layer_idx != 0 {
+        // Per §D.2.38 the rest of the payload is absent when
+        // sub_layer_idx != 0. We preserve the value so callers can
+        // map this picture against an earlier IDR-borne schedule.
+        return Ok(ShutterIntervalInfo {
+            sub_layer_idx,
+            body: None,
+        });
+    }
+    let info_present_flag = r.u(1)? == 1;
+    if !info_present_flag {
+        return Ok(ShutterIntervalInfo {
+            sub_layer_idx,
+            body: Some(ShutterIntervalInfoBody {
+                info_present_flag,
+                schedule: None,
+            }),
+        });
+    }
+    let time_scale = r.u(32)?;
+    // §D.2.38: "The value of sii_time_scale shall be greater than 0."
+    if time_scale == 0 {
+        return Err(SeiError::ShutterIntervalTimeScaleZero);
+    }
+    let fixed = r.u(1)? == 1;
+    let kind = if fixed {
+        let num_units = r.u(32)?;
+        ShutterIntervalKind::Fixed { num_units }
+    } else {
+        let max_sub_layers_minus1 = r.u(3)? as u8;
+        let count = (max_sub_layers_minus1 as usize) + 1;
+        let mut num_units_per_sub_layer = Vec::with_capacity(count);
+        for _ in 0..count {
+            num_units_per_sub_layer.push(r.u(32)?);
+        }
+        ShutterIntervalKind::PerSubLayer {
+            max_sub_layers_minus1,
+            num_units_per_sub_layer,
+        }
+    };
+    Ok(ShutterIntervalInfo {
+        sub_layer_idx,
+        body: Some(ShutterIntervalInfoBody {
+            info_present_flag,
+            schedule: Some(ShutterIntervalSchedule { time_scale, kind }),
+        }),
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1994,6 +2265,10 @@ pub enum SeiPayload {
     CubemapProjection(CubemapProjection),
     /// §D.2.35.3 — sphere_rotation (payload type 154). Round 78.
     SphereRotation(SphereRotation),
+    /// §D.2.35.5 — omni_viewport (payload type 156). Round 95.
+    OmniViewport(OmniViewport),
+    /// §D.2.38 — shutter_interval_info (payload type 205). Round 95.
+    ShutterIntervalInfo(ShutterIntervalInfo),
     /// Not parsed — caller keeps the raw payload for later interpretation.
     Unknown {
         payload_type: u32,
@@ -2081,6 +2356,10 @@ pub fn parse_payload(
             payload,
         )?)),
         154 => Ok(SeiPayload::SphereRotation(parse_sphere_rotation(payload)?)),
+        156 => Ok(SeiPayload::OmniViewport(parse_omni_viewport(payload)?)),
+        205 => Ok(SeiPayload::ShutterIntervalInfo(
+            parse_shutter_interval_info(payload)?,
+        )),
         other => Ok(SeiPayload::Unknown {
             payload_type: other,
             payload: payload.to_vec(),
@@ -3563,6 +3842,278 @@ mod tests {
         match parse_payload(154, &payload, &ctx).unwrap() {
             SeiPayload::SphereRotation(s) => assert!(s.cancel_flag),
             other => panic!("expected SphereRotation, got {other:?}"),
+        }
+    }
+
+    // ----- Round 95 — omni_viewport / shutter_interval_info -----
+
+    #[test]
+    fn omni_viewport_cancel() {
+        // viewport_id=42, cancel=1 → 10+1 bits = (42<<1)|1 = 85
+        // bits MSB-first, padded.
+        let payload = pack_bits(&[(42, 10), (1, 1)]);
+        let got = parse_omni_viewport(&payload).unwrap();
+        assert_eq!(got.viewport_id, 42);
+        assert!(got.cancel_flag);
+        assert!(got.persistence_flag.is_none());
+        assert!(got.viewports.is_empty());
+    }
+
+    #[test]
+    fn omni_viewport_single_directors_cut() {
+        // viewport_id=0 (director's cut), cancel=0, persistence=1, cnt_minus1=0.
+        // Header bits: u(10)=0, u(1)=0, u(1)=1, u(4)=0 → 16 bits = 2 bytes.
+        // bytes 0..2: 0b00000000_00010000 → 0x00, 0x10.
+        let mut payload = vec![0x00, 0x10];
+        // One viewport entry: azimuth=0, elevation=0, tilt=0, hor=1, ver=1.
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&u32_be(1));
+        payload.extend_from_slice(&u32_be(1));
+        let got = parse_omni_viewport(&payload).unwrap();
+        assert_eq!(got.viewport_id, 0);
+        assert!(!got.cancel_flag);
+        assert_eq!(got.persistence_flag, Some(true));
+        assert_eq!(got.viewports.len(), 1);
+        let v = got.viewports[0];
+        assert_eq!(v.azimuth_centre, 0);
+        assert_eq!(v.elevation_centre, 0);
+        assert_eq!(v.tilt_centre, 0);
+        assert_eq!(v.hor_range, 1);
+        assert_eq!(v.ver_range, 1);
+    }
+
+    #[test]
+    fn omni_viewport_max_range_boundary_accepted() {
+        // viewport_id=1, cancel=0, persistence=0, cnt_minus1=0 — two entries
+        // requires cnt_minus1=1; here use one entry with max-allowed values.
+        // header: u(10)=1, u(1)=0, u(1)=0, u(4)=0 = 16 bits total =
+        //   0b00000000_01_0_0_0000 = 0x00 0x40
+        let mut payload = vec![0x00, 0x40];
+        payload.extend_from_slice(&i32_be(180 * (1 << 16) - 1));
+        payload.extend_from_slice(&i32_be(90 * (1 << 16)));
+        payload.extend_from_slice(&i32_be(-180 * (1 << 16)));
+        payload.extend_from_slice(&u32_be(360 * (1 << 16)));
+        payload.extend_from_slice(&u32_be(180 * (1 << 16)));
+        let got = parse_omni_viewport(&payload).unwrap();
+        assert_eq!(got.viewport_id, 1);
+        assert_eq!(got.viewports.len(), 1);
+        let v = got.viewports[0];
+        assert_eq!(v.azimuth_centre, 180 * (1 << 16) - 1);
+        assert_eq!(v.elevation_centre, 90 * (1 << 16));
+        assert_eq!(v.tilt_centre, -180 * (1 << 16));
+        assert_eq!(v.hor_range, 360 * (1 << 16));
+        assert_eq!(v.ver_range, 180 * (1 << 16));
+    }
+
+    #[test]
+    fn omni_viewport_two_entries() {
+        // viewport_id=2, cancel=0, persistence=1, cnt_minus1=1 (so 2 entries).
+        // 10 + 1 + 1 + 4 = 16 bits: u(10)=2, u(1)=0, u(1)=1, u(4)=1
+        //   = 0b00000000_10_0_1_0001 = 0x00, 0x91.
+        let mut payload = vec![0x00, 0x91];
+        // entry 0
+        payload.extend_from_slice(&i32_be(100));
+        payload.extend_from_slice(&i32_be(200));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&u32_be(1024));
+        payload.extend_from_slice(&u32_be(512));
+        // entry 1
+        payload.extend_from_slice(&i32_be(-300));
+        payload.extend_from_slice(&i32_be(-400));
+        payload.extend_from_slice(&i32_be(50));
+        payload.extend_from_slice(&u32_be(2048));
+        payload.extend_from_slice(&u32_be(1024));
+        let got = parse_omni_viewport(&payload).unwrap();
+        assert_eq!(got.viewport_id, 2);
+        assert_eq!(got.viewports.len(), 2);
+        assert_eq!(got.viewports[0].azimuth_centre, 100);
+        assert_eq!(got.viewports[1].azimuth_centre, -300);
+        assert_eq!(got.viewports[1].tilt_centre, 50);
+    }
+
+    #[test]
+    fn omni_viewport_hor_range_zero_rejected() {
+        // header for one entry, then hor_range=0 (forbidden by §D.2.35.5).
+        let mut payload = vec![0x00, 0x10];
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&u32_be(0));
+        payload.extend_from_slice(&u32_be(1));
+        let err = parse_omni_viewport(&payload).unwrap_err();
+        assert_eq!(err, SeiError::OmniViewportHorRangeOutOfRange(0));
+    }
+
+    #[test]
+    fn omni_viewport_ver_range_overflow_rejected() {
+        let mut payload = vec![0x00, 0x10];
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&u32_be(1));
+        payload.extend_from_slice(&u32_be(180 * (1 << 16) + 1));
+        let err = parse_omni_viewport(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::OmniViewportVerRangeOutOfRange(180 * (1 << 16) + 1)
+        );
+    }
+
+    #[test]
+    fn omni_viewport_azimuth_overflow_rejected() {
+        let mut payload = vec![0x00, 0x10];
+        payload.extend_from_slice(&i32_be(180 * (1 << 16))); // one past high
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&u32_be(1));
+        payload.extend_from_slice(&u32_be(1));
+        let err = parse_omni_viewport(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::OmniViewportAzimuthOutOfRange(180 * (1 << 16))
+        );
+    }
+
+    #[test]
+    fn omni_viewport_elevation_underflow_rejected() {
+        let mut payload = vec![0x00, 0x10];
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&i32_be(-90 * (1 << 16) - 1));
+        payload.extend_from_slice(&i32_be(0));
+        payload.extend_from_slice(&u32_be(1));
+        payload.extend_from_slice(&u32_be(1));
+        let err = parse_omni_viewport(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::OmniViewportElevationOutOfRange(-90 * (1 << 16) - 1)
+        );
+    }
+
+    #[test]
+    fn parse_payload_dispatches_omni_viewport() {
+        // viewport_id=0, cancel=1.
+        let payload = pack_bits(&[(0, 10), (1, 1)]);
+        let ctx = SeiContext::default();
+        match parse_payload(156, &payload, &ctx).unwrap() {
+            SeiPayload::OmniViewport(v) => {
+                assert!(v.cancel_flag);
+                assert_eq!(v.viewport_id, 0);
+            }
+            other => panic!("expected OmniViewport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shutter_interval_info_sub_layer_idx_nonzero_skips_body() {
+        // sii_sub_layer_idx = 1, no further bytes (per §D.2.38 the
+        // body fields are absent when sub_layer_idx != 0).
+        // ue(v) for 1 = "010" → 3 bits → padded byte 0b01000000 = 0x40.
+        let payload = vec![0x40];
+        let got = parse_shutter_interval_info(&payload).unwrap();
+        assert_eq!(got.sub_layer_idx, 1);
+        assert!(got.body.is_none());
+    }
+
+    #[test]
+    fn shutter_interval_info_present_false() {
+        // sii_sub_layer_idx = 0 → ue codeword "1" (1 bit).
+        // info_present_flag = 0 → 1 more bit.
+        // Two bits total → 0b10_000000 = 0x80.
+        let payload = vec![0x80];
+        let got = parse_shutter_interval_info(&payload).unwrap();
+        assert_eq!(got.sub_layer_idx, 0);
+        let body = got.body.expect("body present when sub_layer_idx==0");
+        assert!(!body.info_present_flag);
+        assert!(body.schedule.is_none());
+    }
+
+    #[test]
+    fn shutter_interval_info_fixed_27mhz_1_080_000() {
+        // Per §D.2.38 worked example: 27 MHz time-scale, 1_080_000 units
+        // → 0.04 s shutter interval.
+        // Header bits (MSB-first, packed):
+        //   ue(0)             = "1"                    (1 bit)
+        //   info_present_flag = 1                       (1 bit)
+        //   time_scale        = 27_000_000   u(32)
+        //   fixed_flag        = 1                       (1 bit)
+        //   num_units         = 1_080_000    u(32)
+        // Total bits before u(32) values: 3 → "11 1" → 0b11100000 first byte
+        // but with the two u(32) values interleaved bit-by-bit. Build via
+        // pack_bits to avoid hand-aligning.
+        let payload = pack_bits(&[
+            (1, 1),           // ue("1") = 0
+            (1, 1),           // info_present
+            (27_000_000, 32), // time_scale
+            (1, 1),           // fixed_flag
+            (1_080_000, 32),  // num_units
+        ]);
+        let got = parse_shutter_interval_info(&payload).unwrap();
+        assert_eq!(got.sub_layer_idx, 0);
+        let body = got.body.expect("body present");
+        assert!(body.info_present_flag);
+        let sched = body.schedule.expect("schedule present");
+        assert_eq!(sched.time_scale, 27_000_000);
+        match sched.kind {
+            ShutterIntervalKind::Fixed { num_units } => assert_eq!(num_units, 1_080_000),
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shutter_interval_info_per_sub_layer() {
+        // 3 sub-layers (max_sub_layers_minus1 = 2 → 3 entries).
+        let payload = pack_bits(&[
+            (1, 1),       // ue("1") = sii_sub_layer_idx = 0
+            (1, 1),       // info_present
+            (90_000, 32), // time_scale = 90 kHz
+            (0, 1),       // fixed_flag = 0
+            (2, 3),       // max_sub_layers_minus1 = 2 → 3 entries
+            (1_800, 32),  // sub_layer[0]
+            (900, 32),    // sub_layer[1]
+            (450, 32),    // sub_layer[2]
+        ]);
+        let got = parse_shutter_interval_info(&payload).unwrap();
+        let body = got.body.expect("body present");
+        let sched = body.schedule.expect("schedule present");
+        assert_eq!(sched.time_scale, 90_000);
+        match sched.kind {
+            ShutterIntervalKind::PerSubLayer {
+                max_sub_layers_minus1,
+                num_units_per_sub_layer,
+            } => {
+                assert_eq!(max_sub_layers_minus1, 2);
+                assert_eq!(num_units_per_sub_layer, vec![1_800, 900, 450]);
+            }
+            other => panic!("expected PerSubLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shutter_interval_info_time_scale_zero_rejected() {
+        let payload = pack_bits(&[
+            (1, 1),  // ue("1") = 0
+            (1, 1),  // info_present
+            (0, 32), // time_scale = 0 (forbidden)
+            (1, 1),  // fixed_flag
+            (1, 32), // num_units
+        ]);
+        let err = parse_shutter_interval_info(&payload).unwrap_err();
+        assert_eq!(err, SeiError::ShutterIntervalTimeScaleZero);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_shutter_interval_info() {
+        // info_present_flag = 0 → just two bits 0b10 = 0x80.
+        let payload = vec![0x80];
+        let ctx = SeiContext::default();
+        match parse_payload(205, &payload, &ctx).unwrap() {
+            SeiPayload::ShutterIntervalInfo(s) => {
+                assert_eq!(s.sub_layer_idx, 0);
+                assert!(s.body.is_some());
+            }
+            other => panic!("expected ShutterIntervalInfo, got {other:?}"),
         }
     }
 }

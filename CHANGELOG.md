@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **sei: round-95 — two additional Annex D SEI payload parsers.**
+  Two new payload types land, bringing the typed-SEI surface from
+  28 to 30 recognised payloads:
+  - **156** `omni_viewport` (§D.1.35.5 / §D.2.35.5) — completes
+    the 360-video SEI family started in round 78 (alongside
+    `equirectangular_projection` (150), `cubemap_projection`
+    (151), and `sphere_rotation` (154)). `omni_viewport_id u(10)`
+    + `omni_viewport_cancel_flag u(1)` + (when not cancelled)
+    `omni_viewport_persistence_flag u(1)` + `omni_viewport_cnt_minus1
+    u(4)` + the per-viewport quintuple `(azimuth_centre i(32),
+    elevation_centre i(32), tilt_centre i(32), hor_range u(32),
+    ver_range u(32))`. Parse-time §D.2.35.5 range checks enforce:
+    `azimuth_centre`, `tilt_centre` ∈ [−180·2^16, 180·2^16 − 1];
+    `elevation_centre` ∈ [−90·2^16, 90·2^16]; `hor_range` ∈
+    [1, 360·2^16]; `ver_range` ∈ [1, 180·2^16].
+  - **205** `shutter_interval_info` (§D.1.38 / §D.2.38) — indicates
+    the camera shutter interval (image-sensor exposure time) for
+    the associated source pictures, either as a single CVS-wide
+    constant or as a per-sub-layer schedule. `sii_sub_layer_idx
+    ue(v)` gates the body; when the index is 0 the body adds
+    `shutter_interval_info_present_flag u(1)` and (when the
+    present-flag is 1) `sii_time_scale u(32)` +
+    `fixed_shutter_interval_within_cvs_flag u(1)` + either
+    `sii_num_units_in_shutter_interval u(32)` (fixed-mode) or
+    `sii_max_sub_layers_minus1 u(3)` followed by
+    `sub_layer_num_units_in_shutter_interval[i] u(32)`
+    (per-sub-layer). Parse-time §D.2.38 range check enforces
+    `sii_time_scale > 0`. The shutter interval, in seconds, is
+    derivable as `num_units / time_scale` (e.g. the §D.2.38
+    worked example: 27 MHz time-scale + 1_080_000 units →
+    0.04 s).
+
+  Each new parser ships unit tests (16 new: 9 for omni_viewport
+  covering cancel / single director's-cut / two-entry / max-range
+  boundary plus four range-rejection paths and a parse_payload
+  dispatch; 7 for shutter_interval_info covering present-false /
+  non-zero sub-layer-idx / fixed 27 MHz worked example /
+  per-sub-layer schedule / time_scale=0 reject and a parse_payload
+  dispatch). Six new `SeiError` variants police the §D.2.35.5
+  / §D.2.38 range checks. The SEI table header comment in
+  `src/sei.rs` is updated; coverage bumps from 28 → 30 recognised
+  SEI types.
+
 ### Fixed
 
 - **h264_decoder: drop in-progress pictures whose MbGrid is
