@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **h264_decoder: drop in-progress pictures whose MbGrid is
+  incomplete at finalize time (round 91 fuzz-oracle triage,
+  third hardening).** Per §7.4.2.1 / Annex A, a coded picture's
+  slices shall collectively cover macroblock addresses
+  `0..PicSizeInMbs`. Previously we emitted any picture for which
+  at least one slice succeeded (`any_slice_succeeded` gate) even
+  when the slice walk stopped well short of the picture's last
+  MB — the un-walked tail came out zero. A 420 B fuzz crash
+  (`crash-b20f4127…`) hit this on a 48x2048 (PicSizeInMbs = 384)
+  picture whose two slices each walked ~4 MBs before
+  `end_of_slice_flag` or a CABAC failure; we emitted two
+  mostly-zero `Frame::Video`, libavcodec emitted none. The fix
+  scans `MbGrid::info[]` for any `available == false` entry at
+  finalize time and drops the in-progress picture when found
+  (the `MbInfo::available` flag was already set per-MB by
+  `reconstruct_slice_no_deblock`).
 - **sps: reject `frame_cropping` offsets that overshoot the coded
   picture (round 91 fuzz-oracle triage, follow-up).** Per §7.4.2.1.1
   the cropping rectangle must satisfy

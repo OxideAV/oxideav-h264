@@ -811,6 +811,27 @@ impl H264CodecDecoder {
         if !in_progress.any_slice_succeeded {
             return Ok(());
         }
+        // §7.4.2.1 / Annex A — a coded picture must cover every
+        // macroblock 0..PicSizeInMbs in decoding order. Each
+        // successful slice marks its walked MBs as
+        // `MbInfo::available = true`; an in-progress picture whose
+        // MbGrid still has unavailable entries at finalize time means
+        // the slice walk stopped short (CABAC end_of_slice_flag fired
+        // before reaching the picture's last MB, or no later slice
+        // resumed the walk) and the picture is incomplete. libavcodec
+        // refuses to emit such pictures (it either conceals or returns
+        // Invalid Data from `avcodec_send_packet`); we mirror that by
+        // dropping the in-progress picture here rather than emitting a
+        // `Frame::Video` with the missing-MB remainder still
+        // zero-initialised. Caught by the `ffmpeg_oracle_decode` fuzz
+        // target on `crash-b20f4127…` (round 91): a 48x2048
+        // (3×128 = 384-MB) picture whose two non-IDR slices each
+        // walked ~4 MBs before CABAC-end then handed off to the next
+        // slice — total coverage ≪ PicSizeInMbs, leaving most of the
+        // luma + chroma planes zero on output.
+        if in_progress.grid.info.iter().any(|m| !m.available) {
+            return Ok(());
+        }
         let PictureInProgress {
             mut pic,
             grid,
