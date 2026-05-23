@@ -15,6 +15,7 @@
 //! | 4            | §D.1.6      | §D.2.6      | user_data_registered_itu_t_t35     |
 //! | 5            | §D.1.7      | §D.2.7      | user_data_unregistered             |
 //! | 6            | §D.1.8      | §D.2.8      | recovery_point                     |
+//! | 8            | §D.1.10     | §D.2.10     | spare_pic                          |
 //! | 9            | §D.1.11     | §D.2.11     | scene_info                         |
 //! | 10           | §D.1.11†    | §D.2.11†    | sub_seq_info                       |
 //! | 11           | §D.1.12†    | §D.2.12†    | sub_seq_layer_characteristics      |
@@ -123,6 +124,16 @@ pub enum SeiError {
     SubSeqLayersTooLarge(u32),
     #[error("sub_seq_characteristics num_referenced_subseqs shall be less than 256 (got {0})")]
     SubSeqReferencedTooLarge(u32),
+    #[error("spare_pic num_spare_pics_minus1 shall be in 0..=15 per §D.2.10 (got {0})")]
+    SparePicCountTooLarge(u32),
+    #[error(
+        "spare_pic spare_area_idc shall be in 0..=2 per §D.2.10 (got {idc} for spare picture {i})"
+    )]
+    SparePicAreaIdcOutOfRange { i: usize, idc: u32 },
+    #[error(
+        "spare_pic spare_area_idc {idc} (spare picture {i}) needs PicSizeInMapUnits from the active SPS, but the SeiContext carried 0 — wire pic_size_in_map_units in"
+    )]
+    SparePicMapUnitsUnknown { i: usize, idc: u32 },
 }
 
 /// §D.2.2 — buffering_period.
@@ -510,6 +521,14 @@ pub struct SeiContext {
     /// `u(v)` width of each slice_group_id entry. Defaults to 1 (single
     /// slice group), under which the §D.1.20 field becomes 0 bits wide.
     pub num_slice_groups: u32,
+    /// From the active SPS — `PicSizeInMapUnits` =
+    /// `(pic_width_in_mbs_minus1 + 1) * (pic_height_in_map_units_minus1 + 1)`
+    /// (§7.4.2.1.1, Eq. 7-25). Needed by §D.1.10 spare_pic to bound the
+    /// per-map-unit `spare_unit_flag` / `zero_run_length` loops. Defaults
+    /// to 0; a spare_pic message that reaches a per-map-unit branch
+    /// (`spare_area_idc == 1` or `2`) with a 0 value is rejected with
+    /// [`SeiError::SparePicMapUnitsUnknown`].
+    pub pic_size_in_map_units: u32,
 }
 
 impl Default for SeiContext {
@@ -525,6 +544,8 @@ impl Default for SeiContext {
             cpb_dpb_delays_present_flag: false,
             // §D.1.20 — 0 bits per slice_group_id field when num_slice_groups = 1.
             num_slice_groups: 1,
+            // §D.1.10 — unknown until the active SPS dimensions are wired in.
+            pic_size_in_map_units: 0,
         }
     }
 }
@@ -1152,6 +1173,192 @@ pub fn parse_alternative_transfer_characteristics(payload: &[u8]) -> Result<u8, 
 // callers (per the existing crate convention of letting the syntax
 // layer accept anything the bitstream encodes).
 // ---------------------------------------------------------------------------
+
+/// §D.2.10 — spare_pic, the i-th spare picture entry (payload type 8).
+///
+/// One entry per spare picture referenced by the message. The spare area
+/// is encoded with one of three methods selected by `spare_area_idc`:
+///
+/// * `spare_area_idc == 0` — every slice-group map unit in the spare
+///   picture is a spare unit; no per-unit data follows. `spare_units`
+///   is `None`.
+/// * `spare_area_idc == 1` — one `spare_unit_flag` per map unit in
+///   raster scan order. `spare_units` carries those flags
+///   (`true` = spare, mapped from `spare_unit_flag == 0` per §D.2.10).
+/// * `spare_area_idc == 2` — run-length coded in counter-clockwise
+///   box-out order (§8.2.2.4). `zero_run_lengths` carries the raw
+///   `zero_run_length[ ]` values; deriving
+///   `spareUnitFlagInBoxOutOrder[ ]` (Eq. D-4 / D-5) needs the
+///   box-out scan and is left to a caller that has the §8.2.2.4 walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparePicEntry {
+    /// `delta_spare_frame_num[ i ]` — identifies the i-th spare picture
+    /// relative to the running candidate frame_num (Eq. D-3). In the
+    /// range `0..=MaxFrameNum − 2 + spare_field_flag` per §D.2.10.
+    pub delta_spare_frame_num: u32,
+    /// `spare_bottom_field_flag[ i ]` — present only when the message's
+    /// `spare_field_flag` is set. `true` ⇒ the i-th spare picture is a
+    /// bottom field.
+    pub spare_bottom_field_flag: Option<bool>,
+    /// `spare_area_idc[ i ]` — selects the spare-area coding method
+    /// (0, 1, or 2 per §D.2.10).
+    pub spare_area_idc: u32,
+    /// Present only when `spare_area_idc == 1`. One entry per slice-group
+    /// map unit in raster scan order; `true` marks a spare unit
+    /// (`spare_unit_flag == 0` per §D.2.10).
+    pub spare_units: Option<Vec<bool>>,
+    /// Present only when `spare_area_idc == 2`. The raw `zero_run_length[ ]`
+    /// runs read until the box-out map-unit count reaches
+    /// PicSizeInMapUnits.
+    pub zero_run_lengths: Option<Vec<u32>>,
+}
+
+/// §D.2.10 — spare_pic (payload type 8).
+///
+/// Marks slice-group map units of one or more decoded reference pictures
+/// (the spare pictures) as resembling the co-located map units of a
+/// specified target picture, so a decoder concealing a lost target-picture
+/// region can substitute the spare picture's co-located samples.
+///
+/// Syntax (§D.1.10):
+/// ```text
+/// spare_pic( payloadSize ) {
+///   target_frame_num                                  ue(v)
+///   spare_field_flag                                  u(1)
+///   if( spare_field_flag )
+///     target_bottom_field_flag                        u(1)
+///   num_spare_pics_minus1                             ue(v)
+///   for( i = 0; i < num_spare_pics_minus1 + 1; i++ ) {
+///     delta_spare_frame_num[ i ]                      ue(v)
+///     if( spare_field_flag )
+///       spare_bottom_field_flag[ i ]                  u(1)
+///     spare_area_idc[ i ]                             ue(v)
+///     if( spare_area_idc[ i ] == 1 )
+///       for( j = 0; j < PicSizeInMapUnits; j++ )
+///         spare_unit_flag[ i ][ j ]                   u(1)
+///     else if( spare_area_idc[ i ] == 2 ) {
+///       mapUnitCnt = 0
+///       for( j = 0; mapUnitCnt < PicSizeInMapUnits; j++ ) {
+///         zero_run_length[ i ][ j ]                   ue(v)
+///         mapUnitCnt += zero_run_length[ i ][ j ] + 1
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// The per-map-unit branches (`spare_area_idc` 1 and 2) iterate over
+/// `PicSizeInMapUnits` of the active SPS, which the bitstream does not
+/// repeat — the parser reads it from [`SeiContext::pic_size_in_map_units`]
+/// and rejects a message that reaches one of those branches with a 0 value
+/// ([`SeiError::SparePicMapUnitsUnknown`]). A message that only uses
+/// `spare_area_idc == 0` for every spare picture parses without needing
+/// PicSizeInMapUnits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparePic {
+    /// `target_frame_num` — the frame_num of the target picture (§D.2.10).
+    pub target_frame_num: u32,
+    /// `spare_field_flag` — `true` ⇒ target and spare pictures are decoded
+    /// fields; `false` ⇒ decoded frames.
+    pub spare_field_flag: bool,
+    /// `target_bottom_field_flag` — present only when `spare_field_flag`.
+    /// `true` ⇒ the target picture is a bottom field.
+    pub target_bottom_field_flag: Option<bool>,
+    /// One entry per spare picture; `entries.len() == num_spare_pics_minus1 + 1`
+    /// (1..=16 per §D.2.10).
+    pub entries: Vec<SparePicEntry>,
+}
+
+pub fn parse_spare_pic(payload: &[u8], ctx: &SeiContext) -> Result<SparePic, SeiError> {
+    let mut r = BitReader::new(payload);
+    let target_frame_num = r.ue()?;
+    let spare_field_flag = r.u(1)? == 1;
+    let target_bottom_field_flag = if spare_field_flag {
+        Some(r.u(1)? == 1)
+    } else {
+        None
+    };
+    let num_spare_pics_minus1 = r.ue()?;
+    // §D.2.10 — num_spare_pics_minus1 shall be in the range of 0 to 15.
+    if num_spare_pics_minus1 > 15 {
+        return Err(SeiError::SparePicCountTooLarge(num_spare_pics_minus1));
+    }
+    let count = (num_spare_pics_minus1 as usize) + 1;
+    let pic_size_in_map_units = ctx.pic_size_in_map_units;
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let delta_spare_frame_num = r.ue()?;
+        let spare_bottom_field_flag = if spare_field_flag {
+            Some(r.u(1)? == 1)
+        } else {
+            None
+        };
+        let spare_area_idc = r.ue()?;
+        // §D.2.10 — spare_area_idc shall be in the range of 0 to 2.
+        if spare_area_idc > 2 {
+            return Err(SeiError::SparePicAreaIdcOutOfRange {
+                i,
+                idc: spare_area_idc,
+            });
+        }
+        let (spare_units, zero_run_lengths) = match spare_area_idc {
+            0 => (None, None),
+            1 => {
+                // §D.1.10 — spare_unit_flag[ i ][ j ] for j in 0..PicSizeInMapUnits.
+                if pic_size_in_map_units == 0 {
+                    return Err(SeiError::SparePicMapUnitsUnknown {
+                        i,
+                        idc: spare_area_idc,
+                    });
+                }
+                let mut units = Vec::with_capacity(pic_size_in_map_units as usize);
+                for _ in 0..pic_size_in_map_units {
+                    // §D.2.10 — spare_unit_flag == 0 marks a spare unit.
+                    units.push(r.u(1)? == 0);
+                }
+                (Some(units), None)
+            }
+            // spare_area_idc == 2.
+            _ => {
+                // §D.1.10 — zero_run_length[ i ][ j ] read until the box-out
+                // map-unit count reaches PicSizeInMapUnits.
+                if pic_size_in_map_units == 0 {
+                    return Err(SeiError::SparePicMapUnitsUnknown {
+                        i,
+                        idc: spare_area_idc,
+                    });
+                }
+                let mut runs = Vec::new();
+                let mut map_unit_cnt: u64 = 0;
+                let target = pic_size_in_map_units as u64;
+                // §D.1.10 — the read loop continues while mapUnitCnt is below
+                // PicSizeInMapUnits; the final run may push mapUnitCnt past it
+                // (each run consumes zero_run_length + 1 box-out slots), so the
+                // post-loop count is allowed to exceed the target.
+                while map_unit_cnt < target {
+                    let zero_run_length = r.ue()?;
+                    runs.push(zero_run_length);
+                    // mapUnitCnt += zero_run_length[ i ][ j ] + 1.
+                    map_unit_cnt += zero_run_length as u64 + 1;
+                }
+                (None, Some(runs))
+            }
+        };
+        entries.push(SparePicEntry {
+            delta_spare_frame_num,
+            spare_bottom_field_flag,
+            spare_area_idc,
+            spare_units,
+            zero_run_lengths,
+        });
+    }
+    Ok(SparePic {
+        target_frame_num,
+        spare_field_flag,
+        target_bottom_field_flag,
+        entries,
+    })
+}
 
 /// §D.2.11 — scene_info (payload type 9).
 ///
@@ -2488,6 +2695,8 @@ pub enum SeiPayload {
     UserDataUnregistered(UserDataUnregistered),
     PanScanRect(PanScanRect),
     RecoveryPoint(RecoveryPoint),
+    /// §D.2.10 — spare_pic (payload type 8). Round 103.
+    SparePic(SparePic),
     FullFrameFreeze(FullFrameFreeze),
     /// §D.2.16 — full_frame_freeze_release. Empty payload.
     FullFrameFreezeRelease,
@@ -2562,6 +2771,7 @@ pub fn parse_payload(
             parse_user_data_unregistered(payload)?,
         )),
         6 => Ok(SeiPayload::RecoveryPoint(parse_recovery_point(payload)?)),
+        8 => Ok(SeiPayload::SparePic(parse_spare_pic(payload, ctx)?)),
         9 => Ok(SeiPayload::SceneInfo(parse_scene_info(payload)?)),
         10 => Ok(SeiPayload::SubSeqInfo(parse_sub_seq_info(payload)?)),
         11 => Ok(SeiPayload::SubSeqLayerCharacteristics(
@@ -3732,6 +3942,217 @@ mod tests {
         match got {
             SeiPayload::SceneInfo(s) => assert!(!s.scene_info_present_flag),
             other => panic!("expected SceneInfo, got {other:?}"),
+        }
+    }
+
+    // --- §D.1.10 spare_pic (payload type 8) ---------------------------
+
+    #[test]
+    fn spare_pic_area_idc_0_needs_no_map_units() {
+        // target_frame_num=3 (ue → "00100"), spare_field_flag=0,
+        // num_spare_pics_minus1=0 (ue → "1") → one spare picture,
+        // delta_spare_frame_num=2 (ue → "011"), spare_area_idc=0 (ue → "1").
+        // PicSizeInMapUnits is irrelevant for spare_area_idc == 0.
+        let payload = pack_bits(&[
+            (0b00100, 5), // target_frame_num=3
+            (0, 1),       // spare_field_flag=0
+            (1, 1),       // num_spare_pics_minus1=0
+            (0b011, 3),   // delta_spare_frame_num=2
+            (1, 1),       // spare_area_idc=0
+        ]);
+        let ctx = SeiContext::default(); // pic_size_in_map_units = 0
+        let got = parse_spare_pic(&payload, &ctx).unwrap();
+        assert_eq!(got.target_frame_num, 3);
+        assert!(!got.spare_field_flag);
+        assert!(got.target_bottom_field_flag.is_none());
+        assert_eq!(got.entries.len(), 1);
+        let e = &got.entries[0];
+        assert_eq!(e.delta_spare_frame_num, 2);
+        assert_eq!(e.spare_area_idc, 0);
+        assert!(e.spare_units.is_none());
+        assert!(e.zero_run_lengths.is_none());
+        assert!(e.spare_bottom_field_flag.is_none());
+    }
+
+    #[test]
+    fn spare_pic_area_idc_1_reads_one_flag_per_map_unit() {
+        // PicSizeInMapUnits=4. target_frame_num=0 (ue → "1"),
+        // spare_field_flag=0, num_spare_pics_minus1=0 (ue → "1"),
+        // delta_spare_frame_num=0 (ue → "1"), spare_area_idc=1 (ue → "010"),
+        // spare_unit_flag[0..4] = 0,1,0,1 → spare,not,spare,not.
+        let payload = pack_bits(&[
+            (1, 1),     // target_frame_num=0
+            (0, 1),     // spare_field_flag=0
+            (1, 1),     // num_spare_pics_minus1=0
+            (1, 1),     // delta_spare_frame_num=0
+            (0b010, 3), // spare_area_idc=1
+            (0, 1),     // spare_unit_flag[0]=0 → spare
+            (1, 1),     // spare_unit_flag[1]=1 → not spare
+            (0, 1),     // spare_unit_flag[2]=0 → spare
+            (1, 1),     // spare_unit_flag[3]=1 → not spare
+        ]);
+        let ctx = SeiContext {
+            pic_size_in_map_units: 4,
+            ..SeiContext::default()
+        };
+        let got = parse_spare_pic(&payload, &ctx).unwrap();
+        let e = &got.entries[0];
+        assert_eq!(e.spare_area_idc, 1);
+        assert_eq!(e.spare_units, Some(vec![true, false, true, false]));
+        assert!(e.zero_run_lengths.is_none());
+    }
+
+    #[test]
+    fn spare_pic_area_idc_2_reads_zero_runs_until_map_units() {
+        // PicSizeInMapUnits=6. target_frame_num=0 (ue → "1"),
+        // spare_field_flag=0, num_spare_pics_minus1=0 (ue → "1"),
+        // delta_spare_frame_num=0 (ue → "1"), spare_area_idc=2 (ue → "011").
+        // zero_run_length runs: 2 (ue → "011"), 1 (ue → "010").
+        //   run 0: mapUnitCnt = 0 + 2 + 1 = 3 (< 6, continue)
+        //   run 1: mapUnitCnt = 3 + 1 + 1 = 5 (< 6, continue)
+        //   run 2: mapUnitCnt = 5 + 0 + 1 = 6 (>= 6, stop) — zero_run_length=0 (ue → "1")
+        let payload = pack_bits(&[
+            (1, 1),     // target_frame_num=0
+            (0, 1),     // spare_field_flag=0
+            (1, 1),     // num_spare_pics_minus1=0
+            (1, 1),     // delta_spare_frame_num=0
+            (0b011, 3), // spare_area_idc=2
+            (0b011, 3), // zero_run_length[0]=2
+            (0b010, 3), // zero_run_length[1]=1
+            (1, 1),     // zero_run_length[2]=0
+        ]);
+        let ctx = SeiContext {
+            pic_size_in_map_units: 6,
+            ..SeiContext::default()
+        };
+        let got = parse_spare_pic(&payload, &ctx).unwrap();
+        let e = &got.entries[0];
+        assert_eq!(e.spare_area_idc, 2);
+        assert!(e.spare_units.is_none());
+        assert_eq!(e.zero_run_lengths, Some(vec![2, 1, 0]));
+    }
+
+    #[test]
+    fn spare_pic_field_message_reads_bottom_field_flags() {
+        // spare_field_flag=1 pulls in target_bottom_field_flag and a
+        // per-spare spare_bottom_field_flag. target_frame_num=1 (ue → "010"),
+        // spare_field_flag=1, target_bottom_field_flag=1,
+        // num_spare_pics_minus1=0 (ue → "1"), delta_spare_frame_num=0 (ue → "1"),
+        // spare_bottom_field_flag[0]=0, spare_area_idc=0 (ue → "1").
+        let payload = pack_bits(&[
+            (0b010, 3), // target_frame_num=1
+            (1, 1),     // spare_field_flag=1
+            (1, 1),     // target_bottom_field_flag=1
+            (1, 1),     // num_spare_pics_minus1=0
+            (1, 1),     // delta_spare_frame_num=0
+            (0, 1),     // spare_bottom_field_flag[0]=0
+            (1, 1),     // spare_area_idc=0
+        ]);
+        let ctx = SeiContext::default();
+        let got = parse_spare_pic(&payload, &ctx).unwrap();
+        assert_eq!(got.target_frame_num, 1);
+        assert!(got.spare_field_flag);
+        assert_eq!(got.target_bottom_field_flag, Some(true));
+        assert_eq!(got.entries[0].spare_bottom_field_flag, Some(false));
+        assert_eq!(got.entries[0].spare_area_idc, 0);
+    }
+
+    #[test]
+    fn spare_pic_rejects_num_spare_pics_minus1_over_15() {
+        // target_frame_num=0 (ue → "1"), spare_field_flag=0,
+        // num_spare_pics_minus1=16 (ue(16) → "000010001", 9 bits) > 15.
+        let payload = pack_bits(&[
+            (1, 1),           // target_frame_num=0
+            (0, 1),           // spare_field_flag=0
+            (0b000010001, 9), // num_spare_pics_minus1=16
+        ]);
+        let ctx = SeiContext::default();
+        assert_eq!(
+            parse_spare_pic(&payload, &ctx),
+            Err(SeiError::SparePicCountTooLarge(16))
+        );
+    }
+
+    #[test]
+    fn spare_pic_rejects_area_idc_over_2() {
+        // delta_spare_frame_num=0 then spare_area_idc=3 (ue(3) → "00100").
+        let payload = pack_bits(&[
+            (1, 1),       // target_frame_num=0
+            (0, 1),       // spare_field_flag=0
+            (1, 1),       // num_spare_pics_minus1=0
+            (1, 1),       // delta_spare_frame_num=0
+            (0b00100, 5), // spare_area_idc=3
+        ]);
+        let ctx = SeiContext::default();
+        assert_eq!(
+            parse_spare_pic(&payload, &ctx),
+            Err(SeiError::SparePicAreaIdcOutOfRange { i: 0, idc: 3 })
+        );
+    }
+
+    #[test]
+    fn spare_pic_area_idc_1_without_map_units_is_rejected() {
+        // spare_area_idc=1 but the SeiContext carried PicSizeInMapUnits=0.
+        let payload = pack_bits(&[
+            (1, 1),     // target_frame_num=0
+            (0, 1),     // spare_field_flag=0
+            (1, 1),     // num_spare_pics_minus1=0
+            (1, 1),     // delta_spare_frame_num=0
+            (0b010, 3), // spare_area_idc=1
+        ]);
+        let ctx = SeiContext::default(); // pic_size_in_map_units = 0
+        assert_eq!(
+            parse_spare_pic(&payload, &ctx),
+            Err(SeiError::SparePicMapUnitsUnknown { i: 0, idc: 1 })
+        );
+    }
+
+    #[test]
+    fn spare_pic_two_entries_mix_methods() {
+        // num_spare_pics_minus1=1 → two spare pictures.
+        // entry 0: delta=0, spare_area_idc=0 (no map data).
+        // entry 1: delta=1 (ue → "010"), spare_area_idc=1, 2 flags (1,0).
+        let payload = pack_bits(&[
+            (1, 1),     // target_frame_num=0
+            (0, 1),     // spare_field_flag=0
+            (0b010, 3), // num_spare_pics_minus1=1
+            (1, 1),     // delta_spare_frame_num[0]=0
+            (1, 1),     // spare_area_idc[0]=0
+            (0b010, 3), // delta_spare_frame_num[1]=1
+            (0b010, 3), // spare_area_idc[1]=1
+            (1, 1),     // spare_unit_flag[1][0]=1 → not spare
+            (0, 1),     // spare_unit_flag[1][1]=0 → spare
+        ]);
+        let ctx = SeiContext {
+            pic_size_in_map_units: 2,
+            ..SeiContext::default()
+        };
+        let got = parse_spare_pic(&payload, &ctx).unwrap();
+        assert_eq!(got.entries.len(), 2);
+        assert_eq!(got.entries[0].spare_area_idc, 0);
+        assert!(got.entries[0].spare_units.is_none());
+        assert_eq!(got.entries[1].delta_spare_frame_num, 1);
+        assert_eq!(got.entries[1].spare_units, Some(vec![false, true]));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_spare_pic() {
+        // Same as spare_pic_area_idc_0_needs_no_map_units, via parse_payload(8).
+        let payload = pack_bits(&[
+            (0b00100, 5), // target_frame_num=3
+            (0, 1),       // spare_field_flag=0
+            (1, 1),       // num_spare_pics_minus1=0
+            (0b011, 3),   // delta_spare_frame_num=2
+            (1, 1),       // spare_area_idc=0
+        ]);
+        let ctx = SeiContext::default();
+        match parse_payload(8, &payload, &ctx).unwrap() {
+            SeiPayload::SparePic(s) => {
+                assert_eq!(s.target_frame_num, 3);
+                assert_eq!(s.entries.len(), 1);
+                assert_eq!(s.entries[0].spare_area_idc, 0);
+            }
+            other => panic!("expected SparePic, got {other:?}"),
         }
     }
 

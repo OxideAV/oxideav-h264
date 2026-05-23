@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sei: round-103 — spare_pic Annex D SEI payload (type 8).**
+  Adds `spare_pic` (§D.1.10 / §D.2.10 of
+  `docs/video/h264/T-REC-H.264-202408-I.pdf`), bringing the typed-SEI
+  surface from 33 to 34 recognised payloads. The message flags
+  slice-group map units of one or more decoded reference pictures (the
+  spare pictures) as resembling the co-located map units of a target
+  picture, so an error-concealing decoder can substitute spare-picture
+  samples. New `parse_spare_pic` reads `target_frame_num ue(v)`,
+  `spare_field_flag u(1)` (+ optional `target_bottom_field_flag`),
+  `num_spare_pics_minus1 ue(v)` (validated to 0..=15 per §D.2.10), then
+  one `SparePicEntry` per spare picture: `delta_spare_frame_num ue(v)`,
+  optional `spare_bottom_field_flag` (field messages only), and
+  `spare_area_idc ue(v)` (validated to 0..=2) selecting the spare-area
+  coding — `0` = whole picture spare (no per-unit data), `1` = one
+  `spare_unit_flag u(1)` per map unit in raster order (stored as
+  `true` = spare per §D.2.10), `2` = `zero_run_length ue(v)` runs in
+  counter-clockwise box-out order read until the running map-unit count
+  reaches `PicSizeInMapUnits`. The `1`/`2` branches need
+  `PicSizeInMapUnits`, newly carried on `SeiContext::pic_size_in_map_units`
+  (default 0; a message reaching a per-unit branch with 0 is rejected
+  with `SeiError::SparePicMapUnitsUnknown` rather than guessed). Wired
+  into `parse_payload(8, …)` → `SeiPayload::SparePic`. Nine unit tests
+  cover all three `spare_area_idc` methods, a field message with bottom
+  -field flags, a two-entry mixed-method message, and the three range/
+  context error paths.
+
 - **sei: round-99 — sub-sequence Annex D SEI payload family (2003 draft).**
   Three new payload types land, bringing the typed-SEI surface from
   30 to 33 recognised payloads. All three are specified in the 2003
