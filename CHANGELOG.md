@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sei: round-99 — sub-sequence Annex D SEI payload family (2003 draft).**
+  Three new payload types land, bringing the typed-SEI surface from
+  30 to 33 recognised payloads. All three are specified in the 2003
+  draft (`docs/video/h264/ISO_IEC_14496-10-AVC-2003-draft.pdf`,
+  §D.1.11–§D.1.13 / §D.2.11–§D.2.13) and describe the sub-sequence
+  data-dependency hierarchy (layer 0 independently decodable, higher
+  layers predicted only from lower ones):
+  - **10** `sub_seq_info` (§D.1.11 / §D.2.11) — places the current
+    picture in the hierarchy: `sub_seq_layer_num ue(v)` (< 256) +
+    `sub_seq_id ue(v)` (< 65536) + `first_ref_pic_flag` +
+    `leading_non_ref_pic_flag` + `last_pic_flag` +
+    `sub_seq_frame_num_flag`, the optional `sub_seq_frame_num ue(v)`
+    counting pictures within the sub-sequence modulo `MaxFrameNum`.
+  - **11** `sub_seq_layer_characteristics` (§D.1.12 / §D.2.12) —
+    `num_sub_seq_layers_minus1 ue(v)` (≤ 255) followed by one
+    `(accurate_statistics_flag u(1), average_bit_rate u(16),
+    average_frame_rate u(16))` triple per layer; the layer-`N` entry
+    jointly characterises layers `0..=N`.
+  - **12** `sub_seq_characteristics` (§D.1.13 / §D.2.13) — target
+    `sub_seq_layer_num` / `sub_seq_id`, optional `sub_seq_duration
+    u(32)` (90-kHz ticks) gated on `duration_flag`, an optional
+    average-rate triple gated on `average_rate_flag`, and a list of
+    `num_referenced_subseqs ue(v)` (< 256) inter-prediction-reference
+    sub-sequences `(ref_sub_seq_layer_num, ref_sub_seq_id,
+    ref_sub_seq_direction)`.
+  Parse-time §D.2.11–§D.2.13 range checks reject out-of-range
+  `sub_seq_layer_num` / `sub_seq_id` / `num_sub_seq_layers_minus1` /
+  `num_referenced_subseqs`. Nine new unit tests cover both the
+  with/without optional-field branches and the dispatch wiring for
+  payload types 10/11/12.
+
 - **sei: round-95 — two additional Annex D SEI payload parsers.**
   Two new payload types land, bringing the typed-SEI surface from
   28 to 30 recognised payloads:

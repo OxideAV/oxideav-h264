@@ -16,6 +16,9 @@
 //! | 5            | §D.1.7      | §D.2.7      | user_data_unregistered             |
 //! | 6            | §D.1.8      | §D.2.8      | recovery_point                     |
 //! | 9            | §D.1.11     | §D.2.11     | scene_info                         |
+//! | 10           | §D.1.11†    | §D.2.11†    | sub_seq_info                       |
+//! | 11           | §D.1.12†    | §D.2.12†    | sub_seq_layer_characteristics      |
+//! | 12           | §D.1.13†    | §D.2.13†    | sub_seq_characteristics            |
 //! | 13           | §D.1.15     | §D.2.15     | full_frame_freeze                  |
 //! | 14           | §D.1.16     | §D.2.16     | full_frame_freeze_release          |
 //! | 15           | §D.1.17     | §D.2.17     | full_frame_snapshot                |
@@ -38,6 +41,11 @@
 //! | 154          | §D.1.35.3   | §D.2.35.3   | sphere_rotation                    |
 //! | 156          | §D.1.35.5   | §D.2.35.5   | omni_viewport                      |
 //! | 205          | §D.1.38     | §D.2.38     | shutter_interval_info              |
+//!
+//! † The sub-sequence SEI family (types 10/11/12) is specified in the
+//!   2003 draft (`docs/video/h264/ISO_IEC_14496-10-AVC-2003-draft.pdf`,
+//!   §D.1.11–§D.1.13 / §D.2.11–§D.2.13). It was removed from later
+//!   editions; the section numbers above are the 2003-draft numbering.
 
 #![allow(dead_code)]
 
@@ -107,6 +115,14 @@ pub enum SeiError {
     OmniViewportVerRangeOutOfRange(u32),
     #[error("shutter_interval_info sii_time_scale shall not be 0 per §D.2.38")]
     ShutterIntervalTimeScaleZero,
+    #[error("sub-sequence sub_seq_layer_num shall be less than 256 (got {0})")]
+    SubSeqLayerNumTooLarge(u32),
+    #[error("sub-sequence sub_seq_id shall be less than 65536 (got {0})")]
+    SubSeqIdTooLarge(u32),
+    #[error("sub_seq_layer_characteristics num_sub_seq_layers_minus1 shall be <= 255 (got {0})")]
+    SubSeqLayersTooLarge(u32),
+    #[error("sub_seq_characteristics num_referenced_subseqs shall be less than 256 (got {0})")]
+    SubSeqReferencedTooLarge(u32),
 }
 
 /// §D.2.2 — buffering_period.
@@ -1196,6 +1212,245 @@ pub fn parse_scene_info(payload: &[u8]) -> Result<SceneInfo, SeiError> {
     })
 }
 
+/// §D.2.11 — sub_seq_info (payload type 10).
+///
+/// Locates the current picture within the sub-sequence layer / sub-sequence
+/// data-dependency hierarchy. Layer 0 is independently decodable; a layer
+/// `N` may be predicted only from layers `0..N`. A sub-sequence is a set of
+/// coded pictures within one layer that does not depend on any other
+/// sub-sequence in the same or a higher layer.
+///
+/// Syntax (§D.1.11):
+/// ```text
+/// sub_seq_info( payloadSize ) {
+///   sub_seq_layer_num             ue(v)
+///   sub_seq_id                    ue(v)
+///   first_ref_pic_flag            u(1)
+///   leading_non_ref_pic_flag      u(1)
+///   last_pic_flag                 u(1)
+///   sub_seq_frame_num_flag        u(1)
+///   if( sub_seq_frame_num_flag )
+///     sub_seq_frame_num           ue(v)
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubSeqInfo {
+    /// Sub-sequence layer number of the current picture (< 256 per §D.2.11).
+    pub sub_seq_layer_num: u32,
+    /// Identifies the sub-sequence within its layer (< 65536 per §D.2.11).
+    pub sub_seq_id: u32,
+    /// `true` ⇒ the current picture is the first reference picture of the
+    /// sub-sequence in decoding order.
+    pub first_ref_pic_flag: bool,
+    /// `true` ⇒ the current picture is a non-reference picture preceding any
+    /// reference picture in decoding order within the sub-sequence (or the
+    /// sub-sequence contains no reference pictures).
+    pub leading_non_ref_pic_flag: bool,
+    /// `true` ⇒ the current picture is the last picture of the sub-sequence
+    /// in decoding order.
+    pub last_pic_flag: bool,
+    /// Present only when `sub_seq_frame_num_flag` is 1. Counts coded pictures
+    /// within the sub-sequence modulo `MaxFrameNum` (< `MaxFrameNum`).
+    pub sub_seq_frame_num: Option<u32>,
+}
+
+pub fn parse_sub_seq_info(payload: &[u8]) -> Result<SubSeqInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+    let sub_seq_layer_num = r.ue()?;
+    if sub_seq_layer_num >= 256 {
+        return Err(SeiError::SubSeqLayerNumTooLarge(sub_seq_layer_num));
+    }
+    let sub_seq_id = r.ue()?;
+    if sub_seq_id >= 65536 {
+        return Err(SeiError::SubSeqIdTooLarge(sub_seq_id));
+    }
+    let first_ref_pic_flag = r.u(1)? == 1;
+    let leading_non_ref_pic_flag = r.u(1)? == 1;
+    let last_pic_flag = r.u(1)? == 1;
+    let sub_seq_frame_num_flag = r.u(1)? == 1;
+    let sub_seq_frame_num = if sub_seq_frame_num_flag {
+        Some(r.ue()?)
+    } else {
+        None
+    };
+    Ok(SubSeqInfo {
+        sub_seq_layer_num,
+        sub_seq_id,
+        first_ref_pic_flag,
+        leading_non_ref_pic_flag,
+        last_pic_flag,
+        sub_seq_frame_num,
+    })
+}
+
+/// §D.2.12 — one `(accurate_statistics_flag, average_bit_rate,
+/// average_frame_rate)` triple, characterising the joint range of
+/// sub-sequence layers `0..=layer` (the loop counter index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubSeqLayerCharacteristic {
+    /// `true` ⇒ `average_bit_rate` / `average_frame_rate` are rounded from
+    /// statistically correct values; `false` ⇒ they are estimates.
+    pub accurate_statistics_flag: bool,
+    /// Average bit rate in units of 1000 bits/second (`u(16)`). 0 ⇒
+    /// unspecified.
+    pub average_bit_rate: u16,
+    /// Average frame rate in units of frames/(256 seconds) (`u(16)`). 0 ⇒
+    /// unspecified.
+    pub average_frame_rate: u16,
+}
+
+/// §D.2.12 — sub_seq_layer_characteristics (payload type 11).
+///
+/// Specifies bit-rate / frame-rate characteristics of sub-sequence layers.
+/// The `layer`-th entry characterises the joint range of layers `0..=layer`.
+///
+/// Syntax (§D.1.12):
+/// ```text
+/// sub_seq_layer_characteristics( payloadSize ) {
+///   num_sub_seq_layers_minus1                 ue(v)
+///   for( layer = 0; layer <= num_sub_seq_layers_minus1; layer++ ) {
+///     accurate_statistics_flag                u(1)
+///     average_bit_rate                        u(16)
+///     average_frame_rate                      u(16)
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubSeqLayerCharacteristics {
+    /// One entry per sub-sequence layer; length == `num_sub_seq_layers_minus1
+    /// + 1` (1..=256 entries).
+    pub layers: Vec<SubSeqLayerCharacteristic>,
+}
+
+pub fn parse_sub_seq_layer_characteristics(
+    payload: &[u8],
+) -> Result<SubSeqLayerCharacteristics, SeiError> {
+    let mut r = BitReader::new(payload);
+    let num_sub_seq_layers_minus1 = r.ue()?;
+    if num_sub_seq_layers_minus1 > 255 {
+        return Err(SeiError::SubSeqLayersTooLarge(num_sub_seq_layers_minus1));
+    }
+    let count = num_sub_seq_layers_minus1 as usize + 1;
+    let mut layers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let accurate_statistics_flag = r.u(1)? == 1;
+        let average_bit_rate = r.u(16)? as u16;
+        let average_frame_rate = r.u(16)? as u16;
+        layers.push(SubSeqLayerCharacteristic {
+            accurate_statistics_flag,
+            average_bit_rate,
+            average_frame_rate,
+        });
+    }
+    Ok(SubSeqLayerCharacteristics { layers })
+}
+
+/// §D.2.13 — one referenced sub-sequence identifier triple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubSeqReference {
+    /// Layer number of the referenced sub-sequence.
+    pub ref_sub_seq_layer_num: u32,
+    /// Identifier of the referenced sub-sequence within its layer.
+    pub ref_sub_seq_id: u32,
+    /// `false` ⇒ the referenced sub-sequence's first picture precedes the
+    /// target's first picture in decoding order; `true` ⇒ it succeeds it.
+    pub ref_sub_seq_direction: bool,
+}
+
+/// §D.2.13 — sub_seq_characteristics (payload type 12).
+///
+/// Describes the duration / rate of a target sub-sequence (the next
+/// sub-sequence in decoding order with the given layer + id) and which
+/// other sub-sequences it inter-predicts from.
+///
+/// Syntax (§D.1.13):
+/// ```text
+/// sub_seq_characteristics( payloadSize ) {
+///   sub_seq_layer_num                         ue(v)
+///   sub_seq_id                                ue(v)
+///   duration_flag                             u(1)
+///   if( duration_flag )
+///     sub_seq_duration                        u(32)
+///   average_rate_flag                         u(1)
+///   if( average_rate_flag ) {
+///     accurate_statistics_flag                u(1)
+///     average_bit_rate                        u(16)
+///     average_frame_rate                      u(16)
+///   }
+///   num_referenced_subseqs                    ue(v)
+///   for( n = 0; n < num_referenced_subseqs; n++ ) {
+///     ref_sub_seq_layer_num                   ue(v)
+///     ref_sub_seq_id                          ue(v)
+///     ref_sub_seq_direction                   u(1)
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubSeqCharacteristics {
+    /// Layer the message applies to (< 256 per §D.2.13).
+    pub sub_seq_layer_num: u32,
+    /// Sub-sequence within the layer the message applies to (< 65536).
+    pub sub_seq_id: u32,
+    /// Duration of the target sub-sequence in 90-kHz clock ticks. Present
+    /// only when `duration_flag` is 1.
+    pub sub_seq_duration: Option<u32>,
+    /// Average bit/frame-rate statistics. Present only when
+    /// `average_rate_flag` is 1.
+    pub average_rate: Option<SubSeqLayerCharacteristic>,
+    /// Sub-sequences whose pictures are used as references for inter
+    /// prediction by the target sub-sequence (length < 256).
+    pub referenced: Vec<SubSeqReference>,
+}
+
+pub fn parse_sub_seq_characteristics(payload: &[u8]) -> Result<SubSeqCharacteristics, SeiError> {
+    let mut r = BitReader::new(payload);
+    let sub_seq_layer_num = r.ue()?;
+    if sub_seq_layer_num >= 256 {
+        return Err(SeiError::SubSeqLayerNumTooLarge(sub_seq_layer_num));
+    }
+    let sub_seq_id = r.ue()?;
+    if sub_seq_id >= 65536 {
+        return Err(SeiError::SubSeqIdTooLarge(sub_seq_id));
+    }
+    let duration_flag = r.u(1)? == 1;
+    let sub_seq_duration = if duration_flag { Some(r.u(32)?) } else { None };
+    let average_rate_flag = r.u(1)? == 1;
+    let average_rate = if average_rate_flag {
+        let accurate_statistics_flag = r.u(1)? == 1;
+        let average_bit_rate = r.u(16)? as u16;
+        let average_frame_rate = r.u(16)? as u16;
+        Some(SubSeqLayerCharacteristic {
+            accurate_statistics_flag,
+            average_bit_rate,
+            average_frame_rate,
+        })
+    } else {
+        None
+    };
+    let num_referenced_subseqs = r.ue()?;
+    if num_referenced_subseqs >= 256 {
+        return Err(SeiError::SubSeqReferencedTooLarge(num_referenced_subseqs));
+    }
+    let mut referenced = Vec::with_capacity(num_referenced_subseqs as usize);
+    for _ in 0..num_referenced_subseqs {
+        let ref_sub_seq_layer_num = r.ue()?;
+        let ref_sub_seq_id = r.ue()?;
+        let ref_sub_seq_direction = r.u(1)? == 1;
+        referenced.push(SubSeqReference {
+            ref_sub_seq_layer_num,
+            ref_sub_seq_id,
+            ref_sub_seq_direction,
+        });
+    }
+    Ok(SubSeqCharacteristics {
+        sub_seq_layer_num,
+        sub_seq_id,
+        sub_seq_duration,
+        average_rate,
+        referenced,
+    })
+}
+
 /// §D.2.18 — progressive_refinement_segment_start (payload type 16).
 ///
 /// Marks the first picture of a sequence whose subsequent pictures
@@ -2249,6 +2504,12 @@ pub enum SeiPayload {
     AlternativeTransferCharacteristics(u8),
     /// §D.2.11 — scene_info (payload type 9). Round 73.
     SceneInfo(SceneInfo),
+    /// §D.2.11 (2003 draft) — sub_seq_info (payload type 10). Round 99.
+    SubSeqInfo(SubSeqInfo),
+    /// §D.2.12 (2003 draft) — sub_seq_layer_characteristics (payload type 11). Round 99.
+    SubSeqLayerCharacteristics(SubSeqLayerCharacteristics),
+    /// §D.2.13 (2003 draft) — sub_seq_characteristics (payload type 12). Round 99.
+    SubSeqCharacteristics(SubSeqCharacteristics),
     /// §D.2.18 — progressive_refinement_segment_start (payload type 16). Round 73.
     ProgressiveRefinementSegmentStart(ProgressiveRefinementSegmentStart),
     /// §D.2.19 — progressive_refinement_segment_end (payload type 17). Round 73.
@@ -2302,6 +2563,13 @@ pub fn parse_payload(
         )),
         6 => Ok(SeiPayload::RecoveryPoint(parse_recovery_point(payload)?)),
         9 => Ok(SeiPayload::SceneInfo(parse_scene_info(payload)?)),
+        10 => Ok(SeiPayload::SubSeqInfo(parse_sub_seq_info(payload)?)),
+        11 => Ok(SeiPayload::SubSeqLayerCharacteristics(
+            parse_sub_seq_layer_characteristics(payload)?,
+        )),
+        12 => Ok(SeiPayload::SubSeqCharacteristics(
+            parse_sub_seq_characteristics(payload)?,
+        )),
         13 => Ok(SeiPayload::FullFrameFreeze(parse_full_frame_freeze(
             payload,
         )?)),
@@ -3464,6 +3732,182 @@ mod tests {
         match got {
             SeiPayload::SceneInfo(s) => assert!(!s.scene_info_present_flag),
             other => panic!("expected SceneInfo, got {other:?}"),
+        }
+    }
+
+    // --- §D.1.11 sub_seq_info (payload type 10) -----------------------
+
+    #[test]
+    fn sub_seq_info_without_frame_num() {
+        // layer=2 (ue → "011"), id=5 (ue → "00110"), first=1, leading=0,
+        // last=1, frame_num_flag=0 → no sub_seq_frame_num.
+        let payload = pack_bits(&[
+            (0b011, 3),   // sub_seq_layer_num = 2
+            (0b00110, 5), // sub_seq_id = 5
+            (1, 1),       // first_ref_pic_flag
+            (0, 1),       // leading_non_ref_pic_flag
+            (1, 1),       // last_pic_flag
+            (0, 1),       // sub_seq_frame_num_flag
+        ]);
+        let got = parse_sub_seq_info(&payload).unwrap();
+        assert_eq!(got.sub_seq_layer_num, 2);
+        assert_eq!(got.sub_seq_id, 5);
+        assert!(got.first_ref_pic_flag);
+        assert!(!got.leading_non_ref_pic_flag);
+        assert!(got.last_pic_flag);
+        assert!(got.sub_seq_frame_num.is_none());
+    }
+
+    #[test]
+    fn sub_seq_info_with_frame_num() {
+        // layer=0 (ue → "1"), id=0 (ue → "1"), first=0, leading=1, last=0,
+        // frame_num_flag=1, frame_num=3 (ue → "00100").
+        let payload = pack_bits(&[
+            (1, 1),       // sub_seq_layer_num = 0
+            (1, 1),       // sub_seq_id = 0
+            (0, 1),       // first_ref_pic_flag
+            (1, 1),       // leading_non_ref_pic_flag
+            (0, 1),       // last_pic_flag
+            (1, 1),       // sub_seq_frame_num_flag
+            (0b00100, 5), // sub_seq_frame_num = 3
+        ]);
+        let got = parse_sub_seq_info(&payload).unwrap();
+        assert_eq!(got.sub_seq_layer_num, 0);
+        assert_eq!(got.sub_seq_id, 0);
+        assert!(!got.first_ref_pic_flag);
+        assert!(got.leading_non_ref_pic_flag);
+        assert!(!got.last_pic_flag);
+        assert_eq!(got.sub_seq_frame_num, Some(3));
+    }
+
+    #[test]
+    fn sub_seq_info_layer_num_out_of_range_rejected() {
+        // sub_seq_layer_num = 256 is out of range (must be < 256).
+        // ue(256) = 8 leading zeros + "1" + 8-bit (256-255=... actually
+        // 256+1 = 257 = 0b1_0000_0001 → 8 leading zeros, then 9-bit value).
+        let payload = pack_bits(&[(0b1_0000_0001, 17)]);
+        let err = parse_sub_seq_info(&payload).unwrap_err();
+        assert_eq!(err, SeiError::SubSeqLayerNumTooLarge(256));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_sub_seq_info() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(1, 1), (1, 1), (1, 1), (0, 1), (0, 1), (0, 1)]);
+        match parse_payload(10, &payload, &ctx).unwrap() {
+            SeiPayload::SubSeqInfo(s) => {
+                assert_eq!(s.sub_seq_layer_num, 0);
+                assert!(s.first_ref_pic_flag);
+            }
+            other => panic!("expected SubSeqInfo, got {other:?}"),
+        }
+    }
+
+    // --- §D.1.12 sub_seq_layer_characteristics (payload type 11) ------
+
+    #[test]
+    fn sub_seq_layer_characteristics_two_layers() {
+        // num_sub_seq_layers_minus1 = 1 (ue → "010") → 2 entries.
+        // layer 0: accurate=1, bit_rate=0x1234, frame_rate=0x0100
+        // layer 1: accurate=0, bit_rate=0x0000, frame_rate=0x00FF
+        let payload = pack_bits(&[
+            (0b010, 3),   // num_sub_seq_layers_minus1 = 1
+            (1, 1),       // accurate_statistics_flag[0]
+            (0x1234, 16), // average_bit_rate[0]
+            (0x0100, 16), // average_frame_rate[0]
+            (0, 1),       // accurate_statistics_flag[1]
+            (0x0000, 16), // average_bit_rate[1]
+            (0x00FF, 16), // average_frame_rate[1]
+        ]);
+        let got = parse_sub_seq_layer_characteristics(&payload).unwrap();
+        assert_eq!(got.layers.len(), 2);
+        assert!(got.layers[0].accurate_statistics_flag);
+        assert_eq!(got.layers[0].average_bit_rate, 0x1234);
+        assert_eq!(got.layers[0].average_frame_rate, 0x0100);
+        assert!(!got.layers[1].accurate_statistics_flag);
+        assert_eq!(got.layers[1].average_bit_rate, 0);
+        assert_eq!(got.layers[1].average_frame_rate, 0x00FF);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_sub_seq_layer_characteristics() {
+        let ctx = SeiContext::default();
+        // single layer: minus1=0 (ue → "1"), accurate=0, rates 0.
+        let payload = pack_bits(&[(1, 1), (0, 1), (0, 16), (0, 16)]);
+        match parse_payload(11, &payload, &ctx).unwrap() {
+            SeiPayload::SubSeqLayerCharacteristics(s) => {
+                assert_eq!(s.layers.len(), 1);
+            }
+            other => panic!("expected SubSeqLayerCharacteristics, got {other:?}"),
+        }
+    }
+
+    // --- §D.1.13 sub_seq_characteristics (payload type 12) ------------
+
+    #[test]
+    fn sub_seq_characteristics_full() {
+        // layer=1 (ue → "010"), id=2 (ue → "011"),
+        // duration_flag=1, duration=0xDEADBEEF,
+        // average_rate_flag=1, accurate=1, bit_rate=0xAAAA, frame_rate=0x5555,
+        // num_referenced_subseqs=1 (ue → "010"),
+        //   ref_layer=0 (ue → "1"), ref_id=3 (ue → "00100"), direction=1.
+        let payload = pack_bits(&[
+            (0b010, 3),       // sub_seq_layer_num = 1
+            (0b011, 3),       // sub_seq_id = 2
+            (1, 1),           // duration_flag
+            (0xDEADBEEF, 32), // sub_seq_duration
+            (1, 1),           // average_rate_flag
+            (1, 1),           // accurate_statistics_flag
+            (0xAAAA, 16),     // average_bit_rate
+            (0x5555, 16),     // average_frame_rate
+            (0b010, 3),       // num_referenced_subseqs = 1
+            (1, 1),           // ref_sub_seq_layer_num = 0
+            (0b00100, 5),     // ref_sub_seq_id = 3
+            (1, 1),           // ref_sub_seq_direction = 1
+        ]);
+        let got = parse_sub_seq_characteristics(&payload).unwrap();
+        assert_eq!(got.sub_seq_layer_num, 1);
+        assert_eq!(got.sub_seq_id, 2);
+        assert_eq!(got.sub_seq_duration, Some(0xDEADBEEF));
+        let rate = got.average_rate.expect("average_rate present");
+        assert!(rate.accurate_statistics_flag);
+        assert_eq!(rate.average_bit_rate, 0xAAAA);
+        assert_eq!(rate.average_frame_rate, 0x5555);
+        assert_eq!(got.referenced.len(), 1);
+        assert_eq!(got.referenced[0].ref_sub_seq_layer_num, 0);
+        assert_eq!(got.referenced[0].ref_sub_seq_id, 3);
+        assert!(got.referenced[0].ref_sub_seq_direction);
+    }
+
+    #[test]
+    fn sub_seq_characteristics_minimal() {
+        // layer=0, id=0, duration_flag=0, average_rate_flag=0,
+        // num_referenced_subseqs=0.
+        let payload = pack_bits(&[
+            (1, 1), // sub_seq_layer_num = 0
+            (1, 1), // sub_seq_id = 0
+            (0, 1), // duration_flag
+            (0, 1), // average_rate_flag
+            (1, 1), // num_referenced_subseqs = 0
+        ]);
+        let got = parse_sub_seq_characteristics(&payload).unwrap();
+        assert_eq!(got.sub_seq_layer_num, 0);
+        assert_eq!(got.sub_seq_id, 0);
+        assert!(got.sub_seq_duration.is_none());
+        assert!(got.average_rate.is_none());
+        assert!(got.referenced.is_empty());
+    }
+
+    #[test]
+    fn parse_payload_dispatches_sub_seq_characteristics() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(1, 1), (1, 1), (0, 1), (0, 1), (1, 1)]);
+        match parse_payload(12, &payload, &ctx).unwrap() {
+            SeiPayload::SubSeqCharacteristics(s) => {
+                assert_eq!(s.sub_seq_layer_num, 0);
+                assert!(s.referenced.is_empty());
+            }
+            other => panic!("expected SubSeqCharacteristics, got {other:?}"),
         }
     }
 
