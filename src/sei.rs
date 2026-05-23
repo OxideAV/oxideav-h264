@@ -134,6 +134,18 @@ pub enum SeiError {
         "spare_pic spare_area_idc {idc} (spare picture {i}) needs PicSizeInMapUnits from the active SPS, but the SeiContext carried 0 — wire pic_size_in_map_units in"
     )]
     SparePicMapUnitsUnknown { i: usize, idc: u32 },
+    #[error(
+        "content_colour_volume requires at least one of the four present flags (primaries / min / max / avg) to be set per §D.2.33"
+    )]
+    ContentColourVolumeNoComponents,
+    #[error(
+        "content_colour_volume ccv_primaries_x/y[{c}] shall be in [-5000000, 5000000] per §D.2.33 (got x={x}, y={y})"
+    )]
+    ContentColourVolumePrimaryOutOfRange { c: usize, x: i32, y: i32 },
+    #[error(
+        "content_colour_volume luminance ordering violated per §D.2.33: ccv_min_luminance_value ({min}) <= ccv_avg_luminance_value ({avg}) <= ccv_max_luminance_value ({max}) must hold for whichever values are present"
+    )]
+    ContentColourVolumeLuminanceOrder { min: u64, avg: u64, max: u64 },
 }
 
 /// §D.2.2 — buffering_period.
@@ -2186,6 +2198,178 @@ pub fn parse_film_grain_characteristics(
 }
 
 // ---------------------------------------------------------------------------
+// Round 107 — content_colour_volume (payload type 149).
+//
+// HDR colour-volume metadata, parallel in shape to mastering_display
+// (137) / content_light_level (144). cancel/persistence gate plus four
+// independent "present" flags select which sub-blocks (primaries, min /
+// max / avg luminance) follow. Range + ordering validation per §D.2.33.
+// ---------------------------------------------------------------------------
+
+/// One CIE-1931 chromaticity coordinate pair for a content colour
+/// primary, in normalized increments of 0.00002. Per §D.2.33 each
+/// component is signed `i(32)` constrained to [-5 000 000, 5 000 000].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentColourVolumePrimary {
+    /// ccv_primaries_x[ c ] — CIE 1931 x, units of 0.00002.
+    pub x: i32,
+    /// ccv_primaries_y[ c ] — CIE 1931 y, units of 0.00002.
+    pub y: i32,
+}
+
+/// §D.2.33 — content_colour_volume (payload type 149).
+///
+/// Describes the nominal colour volume (display gamut + luminance
+/// range) of the associated pictures. Complements mastering_display
+/// (137, the *mastering* display's volume) and content_light_level
+/// (144, MaxCLL / MaxFALL): this message records the volume actually
+/// *present in the content* rather than the mastering display's
+/// capability.
+///
+/// Syntax (§D.1.33):
+/// ```text
+/// content_colour_volume( payloadSize ) {
+///   ccv_cancel_flag                              u(1)
+///   if( !ccv_cancel_flag ) {
+///     ccv_persistence_flag                       u(1)
+///     ccv_primaries_present_flag                 u(1)
+///     ccv_min_luminance_value_present_flag       u(1)
+///     ccv_max_luminance_value_present_flag       u(1)
+///     ccv_avg_luminance_value_present_flag       u(1)
+///     ccv_reserved_zero_2bits                    u(2)
+///     if( ccv_primaries_present_flag )
+///       for( c = 0; c < 3; c++ ) {
+///         ccv_primaries_x[ c ]                   i(32)
+///         ccv_primaries_y[ c ]                   i(32)
+///       }
+///     if( ccv_min_luminance_value_present_flag )
+///       ccv_min_luminance_value                  u(32)
+///     if( ccv_max_luminance_value_present_flag )
+///       ccv_max_luminance_value                  u(32)
+///     if( ccv_avg_luminance_value_present_flag )
+///       ccv_avg_luminance_value                  u(32)
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentColourVolume {
+    /// ccv_cancel_flag. When `true`, cancels persistence of any prior
+    /// content colour volume SEI message and no further fields follow.
+    pub cancel_flag: bool,
+    /// Present only when `cancel_flag == false`.
+    pub body: Option<ContentColourVolumeBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentColourVolumeBody {
+    /// ccv_persistence_flag.
+    pub persistence_flag: bool,
+    /// ccv_primaries_x/y[ 0..3 ]. Present only when
+    /// `ccv_primaries_present_flag == 1`. Per §D.2.33 the suggested
+    /// ordering is green (0), blue (1), red (2).
+    pub primaries: Option<[ContentColourVolumePrimary; 3]>,
+    /// ccv_min_luminance_value, units of 0.0000001. Present only when
+    /// `ccv_min_luminance_value_present_flag == 1`.
+    pub min_luminance_value: Option<u32>,
+    /// ccv_max_luminance_value, units of 0.0000001. Present only when
+    /// `ccv_max_luminance_value_present_flag == 1`.
+    pub max_luminance_value: Option<u32>,
+    /// ccv_avg_luminance_value, units of 0.0000001. Present only when
+    /// `ccv_avg_luminance_value_present_flag == 1`.
+    pub avg_luminance_value: Option<u32>,
+}
+
+/// §D.2.33 — parse content_colour_volume (payload type 149).
+pub fn parse_content_colour_volume(payload: &[u8]) -> Result<ContentColourVolume, SeiError> {
+    let mut r = BitReader::new(payload);
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(ContentColourVolume {
+            cancel_flag,
+            body: None,
+        });
+    }
+    let persistence_flag = r.u(1)? == 1;
+    let primaries_present = r.u(1)? == 1;
+    let min_present = r.u(1)? == 1;
+    let max_present = r.u(1)? == 1;
+    let avg_present = r.u(1)? == 1;
+    // §D.2.33: ccv_reserved_zero_2bits — "Decoders shall ignore the
+    // value", but the two bits are still consumed.
+    let _reserved = r.u(2)?;
+
+    // §D.2.33 bitstream conformance: the four present flags shall not
+    // all be 0.
+    if !primaries_present && !min_present && !max_present && !avg_present {
+        return Err(SeiError::ContentColourVolumeNoComponents);
+    }
+
+    let primaries = if primaries_present {
+        let mut prims = [ContentColourVolumePrimary { x: 0, y: 0 }; 3];
+        for (c, prim) in prims.iter_mut().enumerate() {
+            let x = r.i(32)?;
+            let y = r.i(32)?;
+            // §D.2.33: values shall be in [-5 000 000, 5 000 000].
+            const PRIM_LO: i32 = -5_000_000;
+            const PRIM_HI: i32 = 5_000_000;
+            if !(PRIM_LO..=PRIM_HI).contains(&x) || !(PRIM_LO..=PRIM_HI).contains(&y) {
+                return Err(SeiError::ContentColourVolumePrimaryOutOfRange { c, x, y });
+            }
+            *prim = ContentColourVolumePrimary { x, y };
+        }
+        Some(prims)
+    } else {
+        None
+    };
+
+    let min_luminance_value = if min_present { Some(r.u(32)?) } else { None };
+    let max_luminance_value = if max_present { Some(r.u(32)?) } else { None };
+    let avg_luminance_value = if avg_present { Some(r.u(32)?) } else { None };
+
+    // §D.2.33 ordering: min <= avg <= max, min <= max, for whichever
+    // values are present. Each pairwise constraint applies only when
+    // both members of the pair are present.
+    if let (Some(min), Some(avg)) = (min_luminance_value, avg_luminance_value) {
+        if min > avg {
+            return Err(SeiError::ContentColourVolumeLuminanceOrder {
+                min: min as u64,
+                avg: avg as u64,
+                max: max_luminance_value.map_or(u64::MAX, |m| m as u64),
+            });
+        }
+    }
+    if let (Some(avg), Some(max)) = (avg_luminance_value, max_luminance_value) {
+        if avg > max {
+            return Err(SeiError::ContentColourVolumeLuminanceOrder {
+                min: min_luminance_value.map_or(0, |m| m as u64),
+                avg: avg as u64,
+                max: max as u64,
+            });
+        }
+    }
+    if let (Some(min), Some(max)) = (min_luminance_value, max_luminance_value) {
+        if min > max {
+            return Err(SeiError::ContentColourVolumeLuminanceOrder {
+                min: min as u64,
+                avg: avg_luminance_value.map_or(min as u64, |a| a as u64),
+                max: max as u64,
+            });
+        }
+    }
+
+    Ok(ContentColourVolume {
+        cancel_flag,
+        body: Some(ContentColourVolumeBody {
+            persistence_flag,
+            primaries,
+            min_luminance_value,
+            max_luminance_value,
+            avg_luminance_value,
+        }),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Round 78 — four additional Annex D payload parsers (HDR + 360 family).
 //
 // All four are syntactically fixed-width u(n) / i(n) reads, parallel to the
@@ -2727,6 +2911,8 @@ pub enum SeiPayload {
     MotionConstrainedSliceGroupSet(MotionConstrainedSliceGroupSet),
     /// §D.2.23 — stereo_video_info (payload type 21). Round 73.
     StereoVideoInfo(StereoVideoInfo),
+    /// §D.2.33 — content_colour_volume (payload type 149). Round 107.
+    ContentColourVolume(ContentColourVolume),
     /// §D.2.34 — ambient_viewing_environment (payload type 148). Round 78.
     AmbientViewingEnvironment(AmbientViewingEnvironment),
     /// §D.2.35.1 — equirectangular_projection (payload type 150). Round 78.
@@ -2826,6 +3012,9 @@ pub fn parse_payload(
         )),
         148 => Ok(SeiPayload::AmbientViewingEnvironment(
             parse_ambient_viewing_environment(payload)?,
+        )),
+        149 => Ok(SeiPayload::ContentColourVolume(
+            parse_content_colour_volume(payload)?,
         )),
         150 => Ok(SeiPayload::EquirectangularProjection(
             parse_equirectangular_projection(payload)?,
@@ -4533,6 +4722,220 @@ mod tests {
                 assert_eq!(a.ambient_light_y, 14_855);
             }
             other => panic!("expected AmbientViewingEnvironment, got {other:?}"),
+        }
+    }
+
+    // ----- Round 107 — content_colour_volume (payload type 149) -----
+
+    // Helper: build the one-byte content_colour_volume header given the
+    // cancel flag, persistence flag, and the four "present" flags. The
+    // reserved 2 bits are written as 0. The header is exactly 8 bits, so
+    // any subsequent i(32) / u(32) fields stay byte-aligned and can be
+    // appended big-endian.
+    fn ccv_header(cancel: u8, persistence: u8, prim: u8, min: u8, max: u8, avg: u8) -> Vec<u8> {
+        pack_bits(&[
+            (cancel as u64, 1),
+            (persistence as u64, 1),
+            (prim as u64, 1),
+            (min as u64, 1),
+            (max as u64, 1),
+            (avg as u64, 1),
+            (0, 2), // ccv_reserved_zero_2bits
+        ])
+    }
+
+    #[test]
+    fn content_colour_volume_cancel() {
+        // cancel_flag = 1 → no body; only the first bit is consumed but
+        // the header byte is fully padded.
+        let payload = pack_bits(&[(1, 1)]);
+        let got = parse_content_colour_volume(&payload).unwrap();
+        assert!(got.cancel_flag);
+        assert!(got.body.is_none());
+    }
+
+    #[test]
+    fn content_colour_volume_all_present_bt2020() {
+        // cancel=0, persistence=1, all four present. Primaries are the
+        // suggested green/blue/red ordering using BT.2020-style coords
+        // scaled to 0.00002 increments; luminance min<=avg<=max.
+        let mut payload = ccv_header(0, 1, 1, 1, 1, 1);
+        // green (0): x=8500, y=39850 ; blue (1): x=6550, y=2300 ;
+        // red (2): x=35400, y=14600  (illustrative, within range).
+        for &(x, y) in &[(8_500i32, 39_850i32), (6_550, 2_300), (35_400, 14_600)] {
+            payload.extend_from_slice(&i32_be(x));
+            payload.extend_from_slice(&i32_be(y));
+        }
+        payload.extend_from_slice(&u32_be(1)); // min
+        payload.extend_from_slice(&u32_be(100_000_000)); // max
+        payload.extend_from_slice(&u32_be(50_000_000)); // avg
+        let got = parse_content_colour_volume(&payload).unwrap();
+        assert!(!got.cancel_flag);
+        let body = got.body.expect("body present");
+        assert!(body.persistence_flag);
+        let prims = body.primaries.expect("primaries present");
+        assert_eq!(
+            prims[0],
+            ContentColourVolumePrimary {
+                x: 8_500,
+                y: 39_850
+            }
+        );
+        assert_eq!(prims[1], ContentColourVolumePrimary { x: 6_550, y: 2_300 });
+        assert_eq!(
+            prims[2],
+            ContentColourVolumePrimary {
+                x: 35_400,
+                y: 14_600
+            }
+        );
+        assert_eq!(body.min_luminance_value, Some(1));
+        assert_eq!(body.max_luminance_value, Some(100_000_000));
+        assert_eq!(body.avg_luminance_value, Some(50_000_000));
+    }
+
+    #[test]
+    fn content_colour_volume_luminance_only() {
+        // No primaries; only max luminance present. Exercises the
+        // "some present flags 0" branch and a single-field body.
+        let mut payload = ccv_header(0, 0, 0, 0, 1, 0);
+        payload.extend_from_slice(&u32_be(42_000_000));
+        let got = parse_content_colour_volume(&payload).unwrap();
+        let body = got.body.expect("body present");
+        assert!(!body.persistence_flag);
+        assert!(body.primaries.is_none());
+        assert!(body.min_luminance_value.is_none());
+        assert_eq!(body.max_luminance_value, Some(42_000_000));
+        assert!(body.avg_luminance_value.is_none());
+    }
+
+    #[test]
+    fn content_colour_volume_negative_primary_coord() {
+        // A negative primary coordinate inside [-5_000_000, 5_000_000]
+        // round-trips through i(32) two's-complement decoding.
+        let mut payload = ccv_header(0, 0, 1, 0, 0, 0);
+        for &(x, y) in &[
+            (-1_000_000i32, 2_000_000i32),
+            (0, 0),
+            (5_000_000, -5_000_000),
+        ] {
+            payload.extend_from_slice(&i32_be(x));
+            payload.extend_from_slice(&i32_be(y));
+        }
+        let got = parse_content_colour_volume(&payload).unwrap();
+        let prims = got.body.unwrap().primaries.unwrap();
+        assert_eq!(
+            prims[0],
+            ContentColourVolumePrimary {
+                x: -1_000_000,
+                y: 2_000_000
+            }
+        );
+        assert_eq!(
+            prims[2],
+            ContentColourVolumePrimary {
+                x: 5_000_000,
+                y: -5_000_000
+            }
+        );
+    }
+
+    #[test]
+    fn content_colour_volume_no_components_rejected() {
+        // §D.2.33: all four present flags equal 0 is a conformance
+        // violation.
+        let payload = ccv_header(0, 1, 0, 0, 0, 0);
+        let err = parse_content_colour_volume(&payload).unwrap_err();
+        assert_eq!(err, SeiError::ContentColourVolumeNoComponents);
+    }
+
+    #[test]
+    fn content_colour_volume_primary_out_of_range_rejected() {
+        // ccv_primaries_x[0] = 5_000_001, just past the upper bound.
+        let mut payload = ccv_header(0, 0, 1, 0, 0, 0);
+        payload.extend_from_slice(&i32_be(5_000_001));
+        payload.extend_from_slice(&i32_be(0));
+        // Remaining primary coords to keep the read in-bounds (the
+        // error fires on c == 0 before these matter, but provide them
+        // anyway).
+        for _ in 0..4 {
+            payload.extend_from_slice(&i32_be(0));
+        }
+        let err = parse_content_colour_volume(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::ContentColourVolumePrimaryOutOfRange {
+                c: 0,
+                x: 5_000_001,
+                y: 0
+            }
+        );
+    }
+
+    #[test]
+    fn content_colour_volume_luminance_order_min_gt_max_rejected() {
+        // min present (100), max present (50): min > max violates §D.2.33.
+        let mut payload = ccv_header(0, 0, 0, 1, 1, 0);
+        payload.extend_from_slice(&u32_be(100)); // min
+        payload.extend_from_slice(&u32_be(50)); // max
+        let err = parse_content_colour_volume(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::ContentColourVolumeLuminanceOrder {
+                min: 100,
+                avg: 100,
+                max: 50
+            }
+        );
+    }
+
+    #[test]
+    fn content_colour_volume_luminance_order_min_gt_avg_rejected() {
+        // min (10) > avg (5): violates §D.2.33 even with no max.
+        let mut payload = ccv_header(0, 0, 0, 1, 0, 1);
+        payload.extend_from_slice(&u32_be(10)); // min
+        payload.extend_from_slice(&u32_be(5)); // avg
+        let err = parse_content_colour_volume(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::ContentColourVolumeLuminanceOrder {
+                min: 10,
+                avg: 5,
+                max: u64::MAX
+            }
+        );
+    }
+
+    #[test]
+    fn content_colour_volume_luminance_order_avg_gt_max_rejected() {
+        // avg (80) > max (60): violates §D.2.33 with no min present.
+        let mut payload = ccv_header(0, 0, 0, 0, 1, 1);
+        payload.extend_from_slice(&u32_be(60)); // max
+        payload.extend_from_slice(&u32_be(80)); // avg
+        let err = parse_content_colour_volume(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::ContentColourVolumeLuminanceOrder {
+                min: 0,
+                avg: 80,
+                max: 60
+            }
+        );
+    }
+
+    #[test]
+    fn parse_payload_dispatches_content_colour_volume() {
+        let mut payload = ccv_header(0, 1, 0, 0, 1, 0);
+        payload.extend_from_slice(&u32_be(10_000_000));
+        let ctx = SeiContext::default();
+        match parse_payload(149, &payload, &ctx).unwrap() {
+            SeiPayload::ContentColourVolume(c) => {
+                assert!(!c.cancel_flag);
+                let body = c.body.unwrap();
+                assert!(body.persistence_flag);
+                assert_eq!(body.max_luminance_value, Some(10_000_000));
+            }
+            other => panic!("expected ContentColourVolume, got {other:?}"),
         }
     }
 

@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sei: round-107 — content_colour_volume Annex D SEI payload (type 149).**
+  Adds `content_colour_volume` (§D.1.33 / §D.2.33 of
+  `docs/video/h264/T-REC-H.264-202408-I.pdf`), bringing the typed-SEI
+  surface from 34 to 35 recognised payloads. The message records the
+  colour volume (display gamut + luminance range) actually present in
+  the content, complementing the mastering-display volume (type 137)
+  and MaxCLL/MaxFALL (type 144). New `parse_content_colour_volume`
+  reads `ccv_cancel_flag u(1)`; when not cancelled it reads
+  `ccv_persistence_flag u(1)` + the four present flags
+  (`ccv_primaries_present_flag`, `ccv_min_/max_/avg_luminance_value_
+  present_flag`, each `u(1)`) + `ccv_reserved_zero_2bits u(2)` (read
+  and ignored per §D.2.33), then the gated sub-blocks: three
+  `(ccv_primaries_x[c], ccv_primaries_y[c])` `i(32)` pairs (green /
+  blue / red ordering per §D.2.33), and `ccv_min_/max_/avg_luminance_
+  value u(32)`. Parse-time §D.2.33 conformance checks reject the
+  all-present-flags-zero case (`ContentColourVolumeNoComponents`),
+  primary coordinates outside [-5 000 000, 5 000 000]
+  (`ContentColourVolumePrimaryOutOfRange`), and any luminance-ordering
+  violation among the present values — `min <= avg`, `avg <= max`,
+  `min <= max` (`ContentColourVolumeLuminanceOrder`). Wired into
+  `parse_payload(149, …)` → `SeiPayload::ContentColourVolume`. Ten
+  unit tests cover the cancel path, an all-fields BT.2020-style
+  message, a single-luminance-only body, negative primary coordinates
+  round-tripping through `i(32)`, and the four §D.2.33 error paths.
+
 - **sei: round-103 — spare_pic Annex D SEI payload (type 8).**
   Adds `spare_pic` (§D.1.10 / §D.2.10 of
   `docs/video/h264/T-REC-H.264-202408-I.pdf`), bringing the typed-SEI
