@@ -184,27 +184,38 @@ impl Decoder {
                 self.sps_by_id[id as usize] = Some(sps);
                 Ok(Event::SpsStored(id))
             }
-            // §7.3.2.2 / §7.4.1.2.1 — store PPS. If the referenced SPS
-            // is already stored, use its `chroma_format_idc` so the PPS
-            // scaling-matrix tail (if any) is parsed with the correct
-            // loop length. Otherwise fall back to 4:2:0 (the common
-            // case); this matters only for 4:4:4 streams with a
-            // scaling matrix in the PPS.
+            // §7.3.2.2 / §7.4.1.2.1 — store PPS. The PPS scaling-matrix
+            // tail loop length depends on the referenced SPS's
+            // `chroma_format_idc` (4:4:4 carries 6 8x8 lists; everything
+            // else carries 2 when transform_8x8 is on), so the SPS that
+            // the PPS references MUST already be stored before we can
+            // parse the PPS correctly. libavcodec enforces this at PPS
+            // arrival time and rejects out-of-order
+            // PPS-before-SPS deliveries; before this check, our decoder
+            // silently accepted such PPSes, slices later activated them,
+            // and we emitted frames that libavcodec rejected outright.
+            // Caught by the `ffmpeg_oracle_decode` fuzz target on
+            // `crash-065436ed…` (round-120 Fuzz CI failure, task #1044):
+            // PPS-then-SPS-then-IDR-x5 with sps_id=0 / pps_id=0; ffmpeg
+            // refuses the PPS at storage time ("sps_id 0 out of range"
+            // referring to the unstored backing SPS), our decoder used
+            // to store the PPS using the default 4:2:0 chroma assumption
+            // and then decode the IDR slices into 16x16 frames.
             NalUnitType::Pps => {
-                // Peek the seq_parameter_set_id without committing: parse
-                // with the default, then if the referenced SPS is
-                // present and has a non-default chroma_format_idc,
-                // reparse with the right value.
-                let pps = Pps::parse(&rbsp)?;
-                let sps_id = pps.seq_parameter_set_id;
-                let pps = if let Some(Some(sps)) = self.sps_by_id.get(sps_id as usize) {
-                    if sps.chroma_format_idc != 1 {
-                        Pps::parse_with_chroma_format(&rbsp, sps.chroma_format_idc)?
-                    } else {
-                        pps
-                    }
+                // First peek the seq_parameter_set_id so we can verify
+                // the referenced SPS exists BEFORE doing the full parse
+                // (which would otherwise mis-parse the scaling-matrix
+                // tail under a guessed chroma_format_idc).
+                let probe = Pps::parse(&rbsp)?;
+                let sps_id = probe.seq_parameter_set_id;
+                let sps = match self.sps_by_id.get(sps_id as usize).and_then(|s| s.as_ref()) {
+                    Some(sps) => sps,
+                    None => return Err(DecoderError::UnknownSps(sps_id)),
+                };
+                let pps = if sps.chroma_format_idc != 1 {
+                    Pps::parse_with_chroma_format(&rbsp, sps.chroma_format_idc)?
                 } else {
-                    pps
+                    probe
                 };
                 let id = pps.pic_parameter_set_id;
                 self.pps_by_id[id as usize] = Some(pps);
@@ -688,15 +699,28 @@ mod tests {
     }
 
     #[test]
-    fn slice_referencing_pps_with_unknown_sps_is_rejected() {
-        // PPS 0 points to SPS id 4, which we never stored.
+    fn pps_referencing_unknown_sps_is_rejected_at_storage() {
+        // §7.4.1.2.1 strictness — a PPS whose `seq_parameter_set_id`
+        // refers to an SPS not yet stored is rejected at PPS arrival
+        // time. Previously this delayed the rejection to slice
+        // activation time (`UnknownSps` on the slice path), which let
+        // the PPS sit in `pps_by_id[]` parsed under a guessed
+        // `chroma_format_idc = 1`. libavcodec rejects out-of-order
+        // PPS-before-SPS deliveries the same way (regression for
+        // `crash-065436ed…`, round-120 fuzz-CI failure / task #1044).
         let mut dec = Decoder::new();
-        let _ = dec
+        // PPS 0 points to SPS id 4, which we never stored.
+        let err = dec
             .process_nal(&build_nal(8, 3, &build_minimal_pps_rbsp(0, 4)))
-            .unwrap();
-        let slice_nal = build_nal(1, 3, &build_minimal_i_slice_rbsp(0));
-        let err = dec.process_nal(&slice_nal).unwrap_err();
-        assert!(matches!(err, DecoderError::UnknownSps(4)));
+            .unwrap_err();
+        assert!(
+            matches!(err, DecoderError::UnknownSps(4)),
+            "expected UnknownSps(4) at PPS storage, got {err:?}"
+        );
+        // Nothing should have been committed — neither the bad PPS nor
+        // any active-pps state.
+        assert!(dec.pps(0).is_none());
+        assert!(dec.active_pps_id().is_none());
     }
 
     #[test]

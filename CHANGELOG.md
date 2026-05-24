@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **fuzz: round-125 / task #1044 — reject PPS that arrives BEFORE its
+  referenced SPS (§7.4.1.2.1 / §7.4.2.2).** Closes the
+  `ffmpeg_oracle_decode` divergence flagged on
+  `crash-065436ed80e17520598536327afceed7133b3122` (359 B) and the
+  resulting scheduled-Fuzz-job redness on master since round 120. The
+  crash input delivered a PPS NAL ahead of its backing SPS; our
+  `process_nal` PPS branch used to fall back to a guessed
+  `chroma_format_idc = 1` in that case, store the PPS anyway, and let
+  the IDR slices that arrived later activate it and emit two 16x16
+  frames. libavcodec rejects the PPS at NAL arrival time
+  ("sps_id 0 out of range", referring to the unstored backing SPS) and
+  produces zero frames.
+
+  Per §7.4.2.2 the PPS scaling-matrix tail loop length depends on
+  the referenced SPS's `chroma_format_idc` (4:4:4 carries 6 8x8 lists;
+  everything else carries 2 when `transform_8x8_mode_flag` is set),
+  so the PPS cannot be parsed unambiguously when the SPS hasn't been
+  seen yet — the previous "parse with default, replace if SPS turns
+  up later" code path was correct only for 4:2:0 streams without a
+  PPS scaling matrix.
+
+  Fix sits in `Decoder::process_nal` (PPS branch): peek the
+  `seq_parameter_set_id`, look up the SPS, and return
+  `DecoderError::UnknownSps(sps_id)` when it isn't stored. The
+  permissive 4:2:0 fallback is removed; only the SPS-driven
+  `chroma_format_idc` reaches `Pps::parse_with_chroma_format`.
+
+  Regression: `tests/integration_fuzz_oracle_regression.rs::
+  fuzz_crash_065436ed_pps_before_sps_rejected` pins the exact
+  359-byte payload and asserts the decoder reports `Error::Eof`
+  with zero frames. The pre-existing
+  `slice_referencing_pps_with_unknown_sps_is_rejected` test in
+  `src/decoder.rs` is renamed to
+  `pps_referencing_unknown_sps_is_rejected_at_storage` and now
+  asserts the rejection happens at PPS arrival (not at slice
+  activation), with neither PPS storage nor active-pps state
+  committed.
+
 ### Added
 
 - **sei: round-120 — sei_manifest + sei_prefix_indication Annex D SEI
