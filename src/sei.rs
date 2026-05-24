@@ -35,6 +35,7 @@
 //! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
 //! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
 //! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume    |
+//! | 142          | §D.1.30     | §D.2.30     | colour_remapping_info              |
 //! | 144          | §D.1.31     | §D.2.31     | content_light_level_info           |
 //! | 147          | §D.1.32     | §D.2.32     | alternative_transfer_characteristics |
 //! | 148          | §D.1.34     | §D.2.34     | ambient_viewing_environment        |
@@ -167,6 +168,26 @@ pub enum SeiError {
         "regionwise_packing packed region {0} sets guard_band_flag but all four guard-band dimensions are 0 — at least one shall be greater than 0 per §D.2.35.4"
     )]
     RegionWisePackingGuardBandAllZero(usize),
+    #[error(
+        "colour_remapping_info colour_remap_repetition_period shall be in 0..=16384 per §D.2.30 (got {0})"
+    )]
+    ColourRemapRepetitionPeriodOutOfRange(u32),
+    #[error(
+        "colour_remapping_info colour_remap_{which}_bit_depth shall be in 8..=16 per §D.2.30 (got {got})"
+    )]
+    ColourRemapBitDepthOutOfRange { which: &'static str, got: u8 },
+    #[error(
+        "colour_remapping_info {which}_lut_num_val_minus1[{c}] shall be in 0..=32 per §D.2.30 (got {got})"
+    )]
+    ColourRemapLutCountOutOfRange {
+        which: &'static str,
+        c: usize,
+        got: u8,
+    },
+    #[error(
+        "colour_remapping_info colour_remap_coeffs shall be in [-32768, 32767] per §D.2.30 (got {0})"
+    )]
+    ColourRemapCoeffOutOfRange(i32),
 }
 
 /// §D.2.2 — buffering_period.
@@ -2560,6 +2581,251 @@ pub fn parse_content_colour_volume(payload: &[u8]) -> Result<ContentColourVolume
 }
 
 // ---------------------------------------------------------------------------
+// Round 117 — colour_remapping_info (payload type 142, §D.1.30 / §D.2.30).
+// ---------------------------------------------------------------------------
+
+/// §D.2.30 — colour_remap_video_signal_info: the optional triple of
+/// colour-space descriptors (E.2.1 semantics) for the *remapped*
+/// reconstructed picture. Present only when
+/// `colour_remap_video_signal_info_present_flag == 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColourRemapVideoSignalInfo {
+    /// colour_remap_full_range_flag — E.2.1 `video_full_range_flag`
+    /// semantics, applied to the remapped picture.
+    pub full_range_flag: bool,
+    /// colour_remap_primaries — E.2.1 `colour_primaries`.
+    pub primaries: u8,
+    /// colour_remap_transfer_function — E.2.1 `transfer_characteristics`.
+    pub transfer_function: u8,
+    /// colour_remap_matrix_coefficients — E.2.1 `matrix_coefficients`.
+    pub matrix_coefficients: u8,
+}
+
+/// One (coded, target) pivot point of a piece-wise linear LUT, for one
+/// colour component. Used for both the pre-LUT and the post-LUT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColourRemapLutEntry {
+    /// `pre_lut_coded_value` / `post_lut_coded_value`.
+    pub coded_value: u32,
+    /// `pre_lut_target_value` / `post_lut_target_value`.
+    pub target_value: u32,
+}
+
+/// The 3×3 colour-remapping matrix (§D.2.30). Present only when
+/// `colour_remap_matrix_present_flag == 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColourRemapMatrix {
+    /// log2_matrix_denom — base-2 log of the shared denominator, 0..=15.
+    pub log2_matrix_denom: u8,
+    /// colour_remap_coeffs[ c ][ i ], row-major (c outer, i inner). Each
+    /// value is in [-2^15, 2^15 - 1].
+    pub coeffs: [[i32; 3]; 3],
+}
+
+/// §D.2.30 — colour_remapping_info (payload type 142).
+///
+/// Conveys a colour-remapping function — an optional 3-component
+/// pre-LUT, an optional 3×3 matrix, and an optional 3-component post-LUT
+/// — that maps the decoded samples (interpreted at
+/// `colour_remap_input_bit_depth`) to a remapped colour space at
+/// `colour_remap_output_bit_depth`. Display application of the function
+/// is outside the scope of this Specification; this layer parses and
+/// validates the descriptor.
+///
+/// Syntax (§D.1.30):
+/// ```text
+/// colour_remapping_info( payloadSize ) {
+///   colour_remap_id                              ue(v)
+///   colour_remap_cancel_flag                     u(1)
+///   if( !colour_remap_cancel_flag ) {
+///     colour_remap_repetition_period             ue(v)
+///     colour_remap_video_signal_info_present_flag u(1)
+///     if( ... ) { full_range u(1); primaries u(8);
+///                 transfer u(8); matrix u(8) }
+///     colour_remap_input_bit_depth               u(8)
+///     colour_remap_output_bit_depth              u(8)
+///     for( c = 0; c < 3; c++ ) {                 // pre-LUT
+///       pre_lut_num_val_minus1[c]                u(8)
+///       if( > 0 ) for(i..) { coded u(v); target u(v) }
+///     }
+///     colour_remap_matrix_present_flag           u(1)
+///     if( ... ) { log2_matrix_denom u(4);
+///                 colour_remap_coeffs[c][i] se(v) }
+///     for( c = 0; c < 3; c++ ) {                 // post-LUT
+///       post_lut_num_val_minus1[c]               u(8)
+///       if( > 0 ) for(i..) { coded u(v); target u(v) }
+///     }
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColourRemappingInfo {
+    /// colour_remap_id — identifying number, 0..=2^32 - 2.
+    pub colour_remap_id: u32,
+    /// colour_remap_cancel_flag. When `true`, the message cancels prior
+    /// persistence and no further fields follow.
+    pub cancel_flag: bool,
+    /// Present only when `cancel_flag == false`.
+    pub body: Option<ColourRemappingInfoBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColourRemappingInfoBody {
+    /// colour_remap_repetition_period — 0..=16384.
+    pub repetition_period: u32,
+    /// colour_remap_video_signal_info, present only when its
+    /// present_flag was set.
+    pub video_signal_info: Option<ColourRemapVideoSignalInfo>,
+    /// colour_remap_input_bit_depth — 8..=16.
+    pub input_bit_depth: u8,
+    /// colour_remap_output_bit_depth — 8..=16.
+    pub output_bit_depth: u8,
+    /// pre-LUT for the three components (0 = luma/G, 1 = Cb/B,
+    /// 2 = Cr/R). An empty inner Vec means `pre_lut_num_val_minus1 == 0`
+    /// (default end points, no coded pivots).
+    pub pre_lut: [Vec<ColourRemapLutEntry>; 3],
+    /// colour_remap_matrix, present only when its present_flag was set.
+    pub matrix: Option<ColourRemapMatrix>,
+    /// post-LUT for the three components, same convention as `pre_lut`.
+    pub post_lut: [Vec<ColourRemapLutEntry>; 3],
+}
+
+/// §D.2.30 — parse colour_remapping_info (payload type 142).
+pub fn parse_colour_remapping_info(payload: &[u8]) -> Result<ColourRemappingInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+    let colour_remap_id = r.ue()?;
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(ColourRemappingInfo {
+            colour_remap_id,
+            cancel_flag,
+            body: None,
+        });
+    }
+
+    let repetition_period = r.ue()?;
+    // §D.2.30: shall be in 0..=16384.
+    if repetition_period > 16_384 {
+        return Err(SeiError::ColourRemapRepetitionPeriodOutOfRange(
+            repetition_period,
+        ));
+    }
+
+    let video_signal_info = if r.u(1)? == 1 {
+        let full_range_flag = r.u(1)? == 1;
+        let primaries = r.u(8)? as u8;
+        let transfer_function = r.u(8)? as u8;
+        let matrix_coefficients = r.u(8)? as u8;
+        Some(ColourRemapVideoSignalInfo {
+            full_range_flag,
+            primaries,
+            transfer_function,
+            matrix_coefficients,
+        })
+    } else {
+        None
+    };
+
+    let input_bit_depth = r.u(8)? as u8;
+    let output_bit_depth = r.u(8)? as u8;
+    // §D.2.30: both shall be in 8..=16; decoders shall ignore messages
+    // outside the range. We surface that as an error so the caller can
+    // drop the message.
+    if !(8..=16).contains(&input_bit_depth) {
+        return Err(SeiError::ColourRemapBitDepthOutOfRange {
+            which: "input",
+            got: input_bit_depth,
+        });
+    }
+    if !(8..=16).contains(&output_bit_depth) {
+        return Err(SeiError::ColourRemapBitDepthOutOfRange {
+            which: "output",
+            got: output_bit_depth,
+        });
+    }
+
+    // §D.2.30: number of bits for a LUT value is
+    // ( ( bit_depth + 7 ) >> 3 ) << 3 — i.e. round the bit depth up to a
+    // whole number of bytes. With bit_depth in 8..=16 this is 8 or 16.
+    let coded_bits = |bd: u8| -> u32 { ((bd as u32 + 7) >> 3) << 3 };
+    let pre_coded_bits = coded_bits(input_bit_depth);
+    let pre_target_bits = coded_bits(output_bit_depth);
+    let post_coded_bits = coded_bits(output_bit_depth);
+    let post_target_bits = coded_bits(output_bit_depth);
+
+    let read_lut = |r: &mut BitReader,
+                    coded_bits: u32,
+                    target_bits: u32,
+                    which: &'static str|
+     -> Result<[Vec<ColourRemapLutEntry>; 3], SeiError> {
+        let mut lut: [Vec<ColourRemapLutEntry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (c, comp) in lut.iter_mut().enumerate() {
+            let num_val_minus1 = r.u(8)? as u8;
+            // §D.2.30: pre/post_lut_num_val_minus1[c] shall be in 0..=32.
+            if num_val_minus1 > 32 {
+                return Err(SeiError::ColourRemapLutCountOutOfRange {
+                    which,
+                    c,
+                    got: num_val_minus1,
+                });
+            }
+            // The syntax only emits pivots when num_val_minus1 > 0; a
+            // value of 0 means the default end points (no coded entries).
+            if num_val_minus1 > 0 {
+                for _ in 0..=num_val_minus1 {
+                    let coded_value = r.u(coded_bits)?;
+                    let target_value = r.u(target_bits)?;
+                    comp.push(ColourRemapLutEntry {
+                        coded_value,
+                        target_value,
+                    });
+                }
+            }
+        }
+        Ok(lut)
+    };
+
+    let pre_lut = read_lut(&mut r, pre_coded_bits, pre_target_bits, "pre")?;
+
+    let matrix = if r.u(1)? == 1 {
+        let log2_matrix_denom = r.u(4)? as u8; // u(4) ⇒ 0..=15, in-range by construction.
+        let mut coeffs = [[0i32; 3]; 3];
+        for row in coeffs.iter_mut() {
+            for coeff in row.iter_mut() {
+                let v = r.se()?;
+                // §D.2.30: colour_remap_coeffs shall be in [-2^15, 2^15 - 1].
+                if !(-(1 << 15)..=(1 << 15) - 1).contains(&v) {
+                    return Err(SeiError::ColourRemapCoeffOutOfRange(v));
+                }
+                *coeff = v;
+            }
+        }
+        Some(ColourRemapMatrix {
+            log2_matrix_denom,
+            coeffs,
+        })
+    } else {
+        None
+    };
+
+    let post_lut = read_lut(&mut r, post_coded_bits, post_target_bits, "post")?;
+
+    Ok(ColourRemappingInfo {
+        colour_remap_id,
+        cancel_flag,
+        body: Some(ColourRemappingInfoBody {
+            repetition_period,
+            video_signal_info,
+            input_bit_depth,
+            output_bit_depth,
+            pre_lut,
+            matrix,
+            post_lut,
+        }),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Round 78 — four additional Annex D payload parsers (HDR + 360 family).
 //
 // All four are syntactically fixed-width u(n) / i(n) reads, parallel to the
@@ -3319,6 +3585,8 @@ pub enum SeiPayload {
     MotionConstrainedSliceGroupSet(MotionConstrainedSliceGroupSet),
     /// §D.2.23 — stereo_video_info (payload type 21). Round 73.
     StereoVideoInfo(StereoVideoInfo),
+    /// §D.2.30 — colour_remapping_info (payload type 142). Round 117.
+    ColourRemappingInfo(ColourRemappingInfo),
     /// §D.2.33 — content_colour_volume (payload type 149). Round 107.
     ContentColourVolume(ContentColourVolume),
     /// §D.2.34 — ambient_viewing_environment (payload type 148). Round 78.
@@ -3417,6 +3685,9 @@ pub fn parse_payload(
         137 => Ok(SeiPayload::MasteringDisplay(parse_mastering_display(
             payload,
         )?)),
+        142 => Ok(SeiPayload::ColourRemappingInfo(
+            parse_colour_remapping_info(payload)?,
+        )),
         144 => Ok(SeiPayload::ContentLightLevel(parse_content_light_level(
             payload,
         )?)),
@@ -5547,6 +5818,271 @@ mod tests {
                 assert_eq!(body.max_luminance_value, Some(10_000_000));
             }
             other => panic!("expected ContentColourVolume, got {other:?}"),
+        }
+    }
+
+    // -- Round 117: colour_remapping_info (payload type 142, §D.2.30) --
+
+    #[test]
+    fn colour_remapping_info_cancel() {
+        // colour_remap_id = ue(2) → codeNum 2 = "011"; cancel_flag = 1.
+        let payload = pack_bits(&[(0b011, 3), (1, 1)]);
+        let got = parse_colour_remapping_info(&payload).unwrap();
+        assert_eq!(got.colour_remap_id, 2);
+        assert!(got.cancel_flag);
+        assert!(got.body.is_none());
+    }
+
+    #[test]
+    fn colour_remapping_info_minimal_no_optionals() {
+        // id = ue(0) = "1"; cancel = 0; repetition_period = ue(0) = "1";
+        // video_signal_info_present = 0; input_bd = 8; output_bd = 8;
+        // pre-LUT: three num_val_minus1 = 0; matrix_present = 0;
+        // post-LUT: three num_val_minus1 = 0.
+        let payload = pack_bits(&[
+            (1, 1), // id ue=0
+            (0, 1), // cancel
+            (1, 1), // repetition_period ue=0
+            (0, 1), // video_signal_info_present
+            (8, 8), // input_bit_depth
+            (8, 8), // output_bit_depth
+            (0, 8), // pre num_val_minus1[0]
+            (0, 8), // pre num_val_minus1[1]
+            (0, 8), // pre num_val_minus1[2]
+            (0, 1), // matrix_present
+            (0, 8), // post num_val_minus1[0]
+            (0, 8), // post num_val_minus1[1]
+            (0, 8), // post num_val_minus1[2]
+        ]);
+        let got = parse_colour_remapping_info(&payload).unwrap();
+        assert_eq!(got.colour_remap_id, 0);
+        assert!(!got.cancel_flag);
+        let body = got.body.unwrap();
+        assert_eq!(body.repetition_period, 0);
+        assert!(body.video_signal_info.is_none());
+        assert_eq!(body.input_bit_depth, 8);
+        assert_eq!(body.output_bit_depth, 8);
+        assert!(body.pre_lut.iter().all(|c| c.is_empty()));
+        assert!(body.matrix.is_none());
+        assert!(body.post_lut.iter().all(|c| c.is_empty()));
+    }
+
+    #[test]
+    fn colour_remapping_info_full_8bit() {
+        // Full message at 8-bit input/output (LUT values are 8 bits).
+        // video signal info present (BT.709-ish: prim=1, tf=1, mc=1),
+        // a 2-pivot pre-LUT on component 0 only, an identity-ish matrix
+        // with log2_matrix_denom = 5, and a 2-pivot post-LUT on comp 2.
+        let payload = pack_bits(&[
+            (0b010, 3), // id ue=1 ("010")
+            (0, 1),     // cancel
+            (1, 1),     // repetition_period ue=0
+            (1, 1),     // video_signal_info_present
+            (1, 1),     // full_range_flag
+            (1, 8),     // primaries
+            (1, 8),     // transfer_function
+            (1, 8),     // matrix_coefficients
+            (8, 8),     // input_bit_depth = 8 → 8-bit LUT codes
+            (8, 8),     // output_bit_depth = 8 → 8-bit LUT targets
+            // pre-LUT comp 0: num_val_minus1 = 1 → 2 entries
+            (1, 8),
+            (16, 8),  // coded[0]
+            (32, 8),  // target[0]
+            (200, 8), // coded[1]
+            (220, 8), // target[1]
+            (0, 8),   // pre comp 1: none
+            (0, 8),   // pre comp 2: none
+            // matrix present
+            (1, 1), // matrix_present
+            (5, 4), // log2_matrix_denom
+            // colour_remap_coeffs[c][i], se(v): 32,0,0 / 0,32,0 / 0,0,32
+            // se(32) ⇒ codeNum 63 ⇒ ue value n = 64 in 13 bits
+            // (6 leading zeros + 7-bit "1000000"); se(0) ⇒ "1".
+            (64, 13), // se(32)
+            (1, 1),   // se(0)
+            (1, 1),   // se(0)
+            (1, 1),   // se(0)
+            (64, 13), // se(32)
+            (1, 1),   // se(0)
+            (1, 1),   // se(0)
+            (1, 1),   // se(0)
+            (64, 13), // se(32)
+            // post-LUT comp 0: none
+            (0, 8),
+            (0, 8), // post comp 1: none
+            // post comp 2: num_val_minus1 = 1 → 2 entries
+            (1, 8),
+            (5, 8),   // coded[0]
+            (9, 8),   // target[0]
+            (250, 8), // coded[1]
+            (255, 8), // target[1]
+        ]);
+        let got = parse_colour_remapping_info(&payload).unwrap();
+        assert_eq!(got.colour_remap_id, 1);
+        let body = got.body.unwrap();
+        let vsi = body.video_signal_info.unwrap();
+        assert!(vsi.full_range_flag);
+        assert_eq!(vsi.primaries, 1);
+        assert_eq!(vsi.transfer_function, 1);
+        assert_eq!(vsi.matrix_coefficients, 1);
+        assert_eq!(body.pre_lut[0].len(), 2);
+        assert_eq!(body.pre_lut[0][0].coded_value, 16);
+        assert_eq!(body.pre_lut[0][0].target_value, 32);
+        assert_eq!(body.pre_lut[0][1].coded_value, 200);
+        assert_eq!(body.pre_lut[0][1].target_value, 220);
+        assert!(body.pre_lut[1].is_empty());
+        assert!(body.pre_lut[2].is_empty());
+        let m = body.matrix.unwrap();
+        assert_eq!(m.log2_matrix_denom, 5);
+        assert_eq!(m.coeffs, [[32, 0, 0], [0, 32, 0], [0, 0, 32]]);
+        assert!(body.post_lut[0].is_empty());
+        assert!(body.post_lut[1].is_empty());
+        assert_eq!(body.post_lut[2].len(), 2);
+        assert_eq!(body.post_lut[2][1].coded_value, 250);
+        assert_eq!(body.post_lut[2][1].target_value, 255);
+    }
+
+    #[test]
+    fn colour_remapping_info_10bit_uses_16bit_lut_values() {
+        // input_bit_depth = 10 → ((10+7)>>3)<<3 = 16-bit LUT codes;
+        // output_bit_depth = 12 → 16-bit targets. One pivot on comp 1.
+        let payload = pack_bits(&[
+            (1, 1),  // id ue=0
+            (0, 1),  // cancel
+            (1, 1),  // repetition_period ue=0
+            (0, 1),  // video_signal_info_present
+            (10, 8), // input_bit_depth = 10
+            (12, 8), // output_bit_depth = 12
+            (0, 8),  // pre comp 0: none
+            // pre comp 1: num_val_minus1 = 1 → 2 entries, 16-bit each
+            (1, 8),
+            (500, 16),  // coded[0]
+            (1000, 16), // target[0]
+            (1000, 16), // coded[1]
+            (3000, 16), // target[1]
+            (0, 8),     // pre comp 2: none
+            (0, 1),     // matrix_present = 0
+            (0, 8),     // post comp 0
+            (0, 8),     // post comp 1
+            (0, 8),     // post comp 2
+        ]);
+        let got = parse_colour_remapping_info(&payload).unwrap();
+        let body = got.body.unwrap();
+        assert_eq!(body.input_bit_depth, 10);
+        assert_eq!(body.output_bit_depth, 12);
+        assert_eq!(body.pre_lut[1].len(), 2);
+        assert_eq!(body.pre_lut[1][0].coded_value, 500);
+        assert_eq!(body.pre_lut[1][0].target_value, 1000);
+        assert_eq!(body.pre_lut[1][1].coded_value, 1000);
+        assert_eq!(body.pre_lut[1][1].target_value, 3000);
+    }
+
+    #[test]
+    fn colour_remapping_info_negative_matrix_coeff() {
+        // se(-1) = codeNum 2 = "011". Verify signed coeff round-trips.
+        let payload = pack_bits(&[
+            (1, 1), // id ue=0
+            (0, 1), // cancel
+            (1, 1), // repetition_period ue=0
+            (0, 1), // video_signal_info_present
+            (8, 8), // input
+            (8, 8), // output
+            (0, 8), // pre 0
+            (0, 8), // pre 1
+            (0, 8), // pre 2
+            (1, 1), // matrix_present
+            (0, 4), // log2_matrix_denom = 0
+            // coeffs: all se(-1) = "011"
+            (0b011, 3),
+            (0b011, 3),
+            (0b011, 3),
+            (0b011, 3),
+            (0b011, 3),
+            (0b011, 3),
+            (0b011, 3),
+            (0b011, 3),
+            (0b011, 3),
+            (0, 8), // post 0
+            (0, 8), // post 1
+            (0, 8), // post 2
+        ]);
+        let got = parse_colour_remapping_info(&payload).unwrap();
+        let m = got.body.unwrap().matrix.unwrap();
+        assert_eq!(m.log2_matrix_denom, 0);
+        assert_eq!(m.coeffs, [[-1, -1, -1], [-1, -1, -1], [-1, -1, -1]]);
+    }
+
+    #[test]
+    fn colour_remapping_info_input_bit_depth_too_low_rejected() {
+        // input_bit_depth = 7 (reserved) → rejected per §D.2.30.
+        let payload = pack_bits(&[
+            (1, 1), // id ue=0
+            (0, 1), // cancel
+            (1, 1), // repetition_period ue=0
+            (0, 1), // video_signal_info_present
+            (7, 8), // input_bit_depth = 7 (out of 8..=16)
+            (8, 8), // output_bit_depth
+        ]);
+        let err = parse_colour_remapping_info(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::ColourRemapBitDepthOutOfRange {
+                which: "input",
+                got: 7
+            }
+        );
+    }
+
+    #[test]
+    fn colour_remapping_info_repetition_period_out_of_range_rejected() {
+        // repetition_period = 16385 → ue codeNum 16385.
+        // ue(16385): 16385+1 = 16386 = 0b100000000000010, 15 bits ⇒
+        // 14 leading zeros, then the 15-bit value.
+        let payload = pack_bits(&[
+            (1, 1),                  // id ue=0
+            (0, 1),                  // cancel
+            (0, 14),                 // ue prefix: 14 leading zeros
+            (0b100000000000010, 15), // 15-bit suffix → codeNum 16385
+        ]);
+        let err = parse_colour_remapping_info(&payload).unwrap_err();
+        assert_eq!(err, SeiError::ColourRemapRepetitionPeriodOutOfRange(16385));
+    }
+
+    #[test]
+    fn colour_remapping_info_lut_count_out_of_range_rejected() {
+        // pre_lut_num_val_minus1[0] = 33 (> 32) → rejected.
+        let payload = pack_bits(&[
+            (1, 1),  // id ue=0
+            (0, 1),  // cancel
+            (1, 1),  // repetition_period ue=0
+            (0, 1),  // video_signal_info_present
+            (8, 8),  // input
+            (8, 8),  // output
+            (33, 8), // pre num_val_minus1[0] = 33
+        ]);
+        let err = parse_colour_remapping_info(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::ColourRemapLutCountOutOfRange {
+                which: "pre",
+                c: 0,
+                got: 33
+            }
+        );
+    }
+
+    #[test]
+    fn parse_payload_dispatches_colour_remapping_info() {
+        // Minimal cancel message routed through parse_payload(142, ..).
+        let payload = pack_bits(&[(1, 1), (1, 1)]); // id ue=0, cancel=1
+        let ctx = SeiContext::default();
+        match parse_payload(142, &payload, &ctx).unwrap() {
+            SeiPayload::ColourRemappingInfo(c) => {
+                assert_eq!(c.colour_remap_id, 0);
+                assert!(c.cancel_flag);
+                assert!(c.body.is_none());
+            }
+            other => panic!("expected ColourRemappingInfo, got {other:?}"),
         }
     }
 
