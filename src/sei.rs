@@ -188,6 +188,22 @@ pub enum SeiError {
         "colour_remapping_info colour_remap_coeffs shall be in [-32768, 32767] per §D.2.30 (got {0})"
     )]
     ColourRemapCoeffOutOfRange(i32),
+    #[error(
+        "sei_manifest manifest_sei_payload_type values shall be unique per §D.2.36 (got duplicate {payload_type} at indices {first} and {second})"
+    )]
+    SeiManifestDuplicatePayloadType {
+        payload_type: u16,
+        first: usize,
+        second: usize,
+    },
+    #[error(
+        "sei_prefix_indication num_bits_in_prefix_indication_minus1[{i}] plus 1 = {bits} bits exceeds the remaining payload (only {available} bits left) per §D.1.37"
+    )]
+    SeiPrefixIndicationOverflow {
+        i: usize,
+        bits: u32,
+        available: usize,
+    },
 }
 
 /// §D.2.2 — buffering_period.
@@ -3540,6 +3556,200 @@ pub fn parse_shutter_interval_info(payload: &[u8]) -> Result<ShutterIntervalInfo
     })
 }
 
+/// §D.2.36 — SEI manifest (payload type 200).
+///
+/// Advertises, for the entire coded video sequence, which SEI payload
+/// types are expected to be present along with a per-type
+/// "necessary / unnecessary / undetermined" classification from
+/// Table D-12. Transport- or systems-layer elements can use this to
+/// decide whether the CVS is suitable for delivery to a receiver
+/// without requiring the receiver to scan the whole stream first.
+///
+/// Syntax (§D.1.36):
+/// ```text
+/// sei_manifest( payloadSize ) {
+///   manifest_num_sei_msg_types                          u(16)
+///   for( i = 0; i < manifest_num_sei_msg_types; i++ ) {
+///     manifest_sei_payload_type[ i ]                    u(16)
+///     manifest_sei_description[ i ]                     u(8)
+///   }
+/// }
+/// ```
+///
+/// Per §D.2.36: the `manifest_sei_payload_type[ i ]` values shall all
+/// be distinct (parse-time check), and `manifest_sei_description[ i ]`
+/// values 4..=255 are reserved. We preserve reserved descriptions
+/// verbatim so callers honouring §D.2.36's "Decoders shall allow ...
+/// shall ignore" rule can route them through `Description::Reserved`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeiManifest {
+    pub entries: Vec<SeiManifestEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeiManifestEntry {
+    pub payload_type: u16,
+    pub description: SeiManifestDescription,
+}
+
+/// Table D-12 — `manifest_sei_description[ i ]` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeiManifestDescription {
+    /// 0 — No SEI message of this type is expected in the CVS.
+    NotExpected,
+    /// 1 — SEI messages of this type are expected and considered
+    /// necessary by the encoder.
+    ExpectedNecessary,
+    /// 2 — SEI messages of this type are expected and considered
+    /// unnecessary by the encoder.
+    ExpectedUnnecessary,
+    /// 3 — SEI messages of this type are expected and their necessity
+    /// is undetermined.
+    ExpectedUndetermined,
+    /// 4..=255 — reserved for future use. §D.2.36 requires decoders
+    /// to allow these values and ignore the associated information,
+    /// including any SEI prefix indication SEI messages keyed off the
+    /// same payload type.
+    Reserved(u8),
+}
+
+impl SeiManifestDescription {
+    pub fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::NotExpected,
+            1 => Self::ExpectedNecessary,
+            2 => Self::ExpectedUnnecessary,
+            3 => Self::ExpectedUndetermined,
+            v => Self::Reserved(v),
+        }
+    }
+}
+
+pub fn parse_sei_manifest(payload: &[u8]) -> Result<SeiManifest, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §D.1.36: manifest_num_sei_msg_types u(16).
+    let count = r.u(16)? as usize;
+    let mut entries: Vec<SeiManifestEntry> = Vec::with_capacity(count);
+    for i in 0..count {
+        let payload_type = r.u(16)? as u16;
+        let description_raw = r.u(8)? as u8;
+        // §D.2.36: "The values of manifest_sei_payload_type[ m ] and
+        // manifest_sei_payload_type[ n ] shall not be identical when m
+        // is not equal to n." We enforce uniqueness against the entries
+        // already accepted.
+        if let Some(prev) = entries.iter().position(|e| e.payload_type == payload_type) {
+            return Err(SeiError::SeiManifestDuplicatePayloadType {
+                payload_type,
+                first: prev,
+                second: i,
+            });
+        }
+        entries.push(SeiManifestEntry {
+            payload_type,
+            description: SeiManifestDescription::from_raw(description_raw),
+        });
+    }
+    Ok(SeiManifest { entries })
+}
+
+/// §D.2.37 — SEI prefix indication (payload type 201).
+///
+/// Carries one or more bit-string "prefix indications" for SEI messages
+/// of a particular `prefix_sei_payload_type`. Each indication is a bit
+/// string that follows the SEI payload syntax of that payload type
+/// starting from its first syntax element, providing transport- or
+/// systems-layer elements with a fast way to inspect the leading
+/// syntax-elements of an upcoming SEI message (e.g.
+/// `frame_packing_arrangement_type` for type 45) without parsing the
+/// entire payload.
+///
+/// Syntax (§D.1.37):
+/// ```text
+/// sei_prefix_indication( payloadSize ) {
+///   prefix_sei_payload_type                             u(16)
+///   num_sei_prefix_indications_minus1                   u(8)
+///   for( i = 0; i <= num_sei_prefix_indications_minus1; i++ ) {
+///     num_bits_in_prefix_indication_minus1[ i ]         u(16)
+///     for( j = 0; j <= num_bits_in_prefix_indication_minus1[ i ]; j++ )
+///       sei_prefix_data_bit[ i ][ j ]                   u(1)
+///     while( !byte_aligned() )
+///       byte_alignment_bit_equal_to_one /* equal to 1 */ f(1)
+///   }
+/// }
+/// ```
+///
+/// We keep the raw bits of each indication as a (`bit_count`, `bytes`)
+/// pair — the spec leaves interpretation of `sei_prefix_data_bit[ i ]`
+/// to the payload type identified by `prefix_sei_payload_type`, and
+/// the byte-alignment fill is unconditionally `1`-bits per §D.1.37
+/// (verified by `parse_sei_prefix_indication`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeiPrefixIndication {
+    pub prefix_sei_payload_type: u16,
+    pub indications: Vec<SeiPrefixIndicationEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeiPrefixIndicationEntry {
+    /// `num_bits_in_prefix_indication_minus1[ i ] + 1` — the number of
+    /// `sei_prefix_data_bit[ i ][ j ]` bits stored in `data`. The
+    /// remaining low-order bits of the last byte of `data` are unused
+    /// padding zeros (this struct stores the bits MSB-first).
+    pub bit_count: u32,
+    /// MSB-first packed `sei_prefix_data_bit[ i ][ * ]`. `data.len() ==
+    /// bit_count.div_ceil(8)`.
+    pub data: Vec<u8>,
+}
+
+pub fn parse_sei_prefix_indication(payload: &[u8]) -> Result<SeiPrefixIndication, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §D.1.37: prefix_sei_payload_type u(16) + num_sei_prefix_indications_minus1 u(8).
+    let prefix_sei_payload_type = r.u(16)? as u16;
+    let count = (r.u(8)? as usize) + 1;
+    let mut indications: Vec<SeiPrefixIndicationEntry> = Vec::with_capacity(count);
+    for i in 0..count {
+        // num_bits_in_prefix_indication_minus1[ i ] u(16) — value
+        // plus one is the number of sei_prefix_data_bit[ i ][ j ] u(1).
+        let bit_count = r.u(16)? + 1;
+        let available = r.bits_remaining();
+        if (bit_count as usize) > available {
+            return Err(SeiError::SeiPrefixIndicationOverflow {
+                i,
+                bits: bit_count,
+                available,
+            });
+        }
+        // Pack the next `bit_count` u(1) values into a byte buffer,
+        // MSB-first. Each iteration reads exactly one bit.
+        let byte_len = bit_count.div_ceil(8) as usize;
+        let mut data = vec![0u8; byte_len];
+        for j in 0..(bit_count as usize) {
+            let bit = r.u(1)? as u8;
+            if bit == 1 {
+                let byte = j / 8;
+                let pos = 7 - (j % 8);
+                data[byte] |= 1 << pos;
+            }
+        }
+        // §D.1.37 byte-alignment trailer: while not byte-aligned, read
+        // a single bit which shall equal 1. The `f(1)` descriptor
+        // means the value is fixed by syntax. We don't reject a
+        // stray 0 here — only the structurally required SEI trailing
+        // bits at the very end of the SEI payload are checked
+        // elsewhere (sei_rbsp + rbsp_trailing_bits in non_vcl.rs) —
+        // but we DO consume the bits so the next indication starts
+        // on a byte boundary.
+        while !r.byte_aligned() {
+            let _ = r.u(1)?;
+        }
+        indications.push(SeiPrefixIndicationEntry { bit_count, data });
+    }
+    Ok(SeiPrefixIndication {
+        prefix_sei_payload_type,
+        indications,
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3603,6 +3813,10 @@ pub enum SeiPayload {
     OmniViewport(OmniViewport),
     /// §D.2.38 — shutter_interval_info (payload type 205). Round 95.
     ShutterIntervalInfo(ShutterIntervalInfo),
+    /// §D.2.36 — sei_manifest (payload type 200). Round 120.
+    SeiManifest(SeiManifest),
+    /// §D.2.37 — sei_prefix_indication (payload type 201). Round 120.
+    SeiPrefixIndication(SeiPrefixIndication),
     /// Not parsed — caller keeps the raw payload for later interpretation.
     Unknown {
         payload_type: u32,
@@ -3711,6 +3925,10 @@ pub fn parse_payload(
             payload,
         )?)),
         156 => Ok(SeiPayload::OmniViewport(parse_omni_viewport(payload)?)),
+        200 => Ok(SeiPayload::SeiManifest(parse_sei_manifest(payload)?)),
+        201 => Ok(SeiPayload::SeiPrefixIndication(
+            parse_sei_prefix_indication(payload)?,
+        )),
         205 => Ok(SeiPayload::ShutterIntervalInfo(
             parse_shutter_interval_info(payload)?,
         )),
@@ -6818,6 +7036,239 @@ mod tests {
                 assert!(s.body.is_some());
             }
             other => panic!("expected ShutterIntervalInfo, got {other:?}"),
+        }
+    }
+
+    // ----- §D.1.36 / §D.2.36 SEI manifest (payload type 200) -----
+
+    #[test]
+    fn sei_manifest_empty() {
+        // manifest_num_sei_msg_types = 0 → exactly 16 zero bits.
+        let payload = vec![0x00, 0x00];
+        let got = parse_sei_manifest(&payload).unwrap();
+        assert!(got.entries.is_empty());
+    }
+
+    #[test]
+    fn sei_manifest_single_entry_necessary() {
+        // count = 1, payload_type = 45 (frame_packing_arrangement),
+        // description = 1 (ExpectedNecessary).
+        let payload = vec![
+            0x00, 0x01, // count = 1
+            0x00, 0x2D, // payload_type = 45
+            0x01, // description = 1
+        ];
+        let got = parse_sei_manifest(&payload).unwrap();
+        assert_eq!(got.entries.len(), 1);
+        assert_eq!(got.entries[0].payload_type, 45);
+        assert_eq!(
+            got.entries[0].description,
+            SeiManifestDescription::ExpectedNecessary
+        );
+    }
+
+    #[test]
+    fn sei_manifest_three_entries_mixed_descriptions() {
+        let payload = vec![
+            0x00, 0x03, // count = 3
+            0x00, 0x00, // payload_type = 0 (buffering_period)
+            0x01, // description = 1 (necessary)
+            0x00, 0x90, // payload_type = 144 (content_light_level_info)
+            0x02, // description = 2 (unnecessary)
+            0x00, 0x97, // payload_type = 151 (cubemap_projection)
+            0x03, // description = 3 (undetermined)
+        ];
+        let got = parse_sei_manifest(&payload).unwrap();
+        assert_eq!(got.entries.len(), 3);
+        assert_eq!(got.entries[0].payload_type, 0);
+        assert_eq!(
+            got.entries[0].description,
+            SeiManifestDescription::ExpectedNecessary
+        );
+        assert_eq!(got.entries[1].payload_type, 144);
+        assert_eq!(
+            got.entries[1].description,
+            SeiManifestDescription::ExpectedUnnecessary
+        );
+        assert_eq!(got.entries[2].payload_type, 151);
+        assert_eq!(
+            got.entries[2].description,
+            SeiManifestDescription::ExpectedUndetermined
+        );
+    }
+
+    #[test]
+    fn sei_manifest_reserved_description_preserved() {
+        // §D.2.36: values 4..=255 are reserved. Decoders shall allow
+        // them and ignore the associated info. We surface the raw byte
+        // via SeiManifestDescription::Reserved so callers can implement
+        // the "shall ignore" requirement.
+        let payload = vec![
+            0x00, 0x01, // count = 1
+            0x00, 0x05, // payload_type = 5
+            0x42, // description = 0x42 (reserved)
+        ];
+        let got = parse_sei_manifest(&payload).unwrap();
+        assert_eq!(got.entries.len(), 1);
+        assert_eq!(
+            got.entries[0].description,
+            SeiManifestDescription::Reserved(0x42)
+        );
+    }
+
+    #[test]
+    fn sei_manifest_duplicate_payload_type_rejected() {
+        // §D.2.36: manifest_sei_payload_type values shall be distinct.
+        let payload = vec![
+            0x00, 0x02, // count = 2
+            0x00, 0x2D, 0x01, // (45, necessary)
+            0x00, 0x2D, 0x02, // (45, unnecessary) — duplicate
+        ];
+        let err = parse_sei_manifest(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::SeiManifestDuplicatePayloadType {
+                payload_type: 45,
+                first: 0,
+                second: 1
+            }
+        );
+    }
+
+    #[test]
+    fn sei_manifest_truncated_input_rejects() {
+        // count promises 1 entry but payload runs out partway through.
+        let payload = vec![0x00, 0x01, 0x00, 0x2D]; // missing description byte
+        let err = parse_sei_manifest(&payload).unwrap_err();
+        assert!(matches!(err, SeiError::Bitstream(_)));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_sei_manifest() {
+        let payload = vec![
+            0x00, 0x01, // count = 1
+            0x00, 0x00, // payload_type = 0
+            0x00, // description = 0 (NotExpected)
+        ];
+        let ctx = SeiContext::default();
+        match parse_payload(200, &payload, &ctx).unwrap() {
+            SeiPayload::SeiManifest(m) => {
+                assert_eq!(m.entries.len(), 1);
+                assert_eq!(m.entries[0].payload_type, 0);
+                assert_eq!(
+                    m.entries[0].description,
+                    SeiManifestDescription::NotExpected
+                );
+            }
+            other => panic!("expected SeiManifest, got {other:?}"),
+        }
+    }
+
+    // ----- §D.1.37 / §D.2.37 SEI prefix indication (payload type 201) -----
+
+    #[test]
+    fn sei_prefix_indication_single_byte_aligned() {
+        // prefix_sei_payload_type = 45, num_indications = 1 (minus1=0).
+        // Indication 0: num_bits_minus1 = 7 → 8 bits of data = 0xA5.
+        let payload = vec![
+            0x00, 0x2D, // prefix_sei_payload_type = 45
+            0x00, // num_sei_prefix_indications_minus1 = 0
+            0x00, 0x07, // num_bits_in_prefix_indication_minus1[0] = 7
+            0xA5, // 8 sei_prefix_data_bit values
+        ];
+        let got = parse_sei_prefix_indication(&payload).unwrap();
+        assert_eq!(got.prefix_sei_payload_type, 45);
+        assert_eq!(got.indications.len(), 1);
+        assert_eq!(got.indications[0].bit_count, 8);
+        assert_eq!(got.indications[0].data, vec![0xA5]);
+    }
+
+    #[test]
+    fn sei_prefix_indication_short_bitstring_with_alignment_one_bits() {
+        // 3-bit indication "101" followed by five `1`-fill alignment bits
+        // (per §D.1.37 byte_alignment_bit_equal_to_one) → 0xBF.
+        let payload = vec![
+            0x00, 0x2D, // prefix_sei_payload_type
+            0x00, // num_indications_minus1 = 0
+            0x00, 0x02, // num_bits_minus1 = 2 → 3 bits
+            0xBF, // 101 + five filler `1`s
+        ];
+        let got = parse_sei_prefix_indication(&payload).unwrap();
+        assert_eq!(got.indications.len(), 1);
+        assert_eq!(got.indications[0].bit_count, 3);
+        // Bits "101" packed MSB-first into one byte → 0b1010_0000 = 0xA0.
+        assert_eq!(got.indications[0].data, vec![0xA0]);
+    }
+
+    #[test]
+    fn sei_prefix_indication_two_entries() {
+        // Two indications: 4 bits "1100" + 12 bits "1010_1100_0011".
+        // First indication occupies 4 bits + 4 fill = 1 byte = 0b1100_1111 = 0xCF.
+        // Second indication occupies 12 bits + 4 fill = 2 bytes.
+        //   bits: 1010 1100 0011 + 1111 → 0xAC 0x3F.
+        let payload = vec![
+            0x00, 0x2D, // prefix_sei_payload_type
+            0x01, // num_indications_minus1 = 1
+            0x00, 0x03, // bits_minus1 = 3 → 4 bits
+            0xCF, // "1100" + "1111" filler
+            0x00, 0x0B, // bits_minus1 = 11 → 12 bits
+            0xAC, 0x3F, // "1010_1100_0011" + "1111" filler
+        ];
+        let got = parse_sei_prefix_indication(&payload).unwrap();
+        assert_eq!(got.indications.len(), 2);
+        assert_eq!(got.indications[0].bit_count, 4);
+        // 4 bits "1100" packed MSB-first → 0b1100_0000 = 0xC0.
+        assert_eq!(got.indications[0].data, vec![0xC0]);
+        assert_eq!(got.indications[1].bit_count, 12);
+        // 12 bits "1010_1100_0011" → byte0=0xAC, byte1=0b0011_0000=0x30.
+        assert_eq!(got.indications[1].data, vec![0xAC, 0x30]);
+    }
+
+    #[test]
+    fn sei_prefix_indication_oversized_bit_count_rejected() {
+        // num_bits_minus1 + 1 = 9 bits but only 1 byte of data follows.
+        let payload = vec![
+            0x00, 0x2D, // prefix_sei_payload_type
+            0x00, // num_indications_minus1 = 0
+            0x00, 0x08, // bits_minus1 = 8 → 9 bits required
+            0xFF, // only 8 bits available
+        ];
+        let err = parse_sei_prefix_indication(&payload).unwrap_err();
+        match err {
+            SeiError::SeiPrefixIndicationOverflow { i, bits, available } => {
+                assert_eq!(i, 0);
+                assert_eq!(bits, 9);
+                assert_eq!(available, 8);
+            }
+            other => panic!("expected SeiPrefixIndicationOverflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sei_prefix_indication_truncated_header_rejected() {
+        // Header truncated before num_sei_prefix_indications_minus1.
+        let payload = vec![0x00, 0x2D]; // only prefix_sei_payload_type
+        let err = parse_sei_prefix_indication(&payload).unwrap_err();
+        assert!(matches!(err, SeiError::Bitstream(_)));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_sei_prefix_indication() {
+        let payload = vec![
+            0x00, 0x2D, // prefix_sei_payload_type = 45
+            0x00, // num_indications_minus1 = 0
+            0x00, 0x07, // bits_minus1 = 7 → 8 bits
+            0xA5,
+        ];
+        let ctx = SeiContext::default();
+        match parse_payload(201, &payload, &ctx).unwrap() {
+            SeiPayload::SeiPrefixIndication(p) => {
+                assert_eq!(p.prefix_sei_payload_type, 45);
+                assert_eq!(p.indications.len(), 1);
+                assert_eq!(p.indications[0].bit_count, 8);
+                assert_eq!(p.indications[0].data, vec![0xA5]);
+            }
+            other => panic!("expected SeiPrefixIndication, got {other:?}"),
         }
     }
 }

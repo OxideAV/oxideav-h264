@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sei: round-120 — sei_manifest + sei_prefix_indication Annex D SEI
+  payloads (types 200 and 201).** Adds `sei_manifest` (§D.1.36 / §D.2.36)
+  and `sei_prefix_indication` (§D.1.37 / §D.2.37) of
+  `docs/video/h264/T-REC-H.264-202408-I.pdf`, bringing the typed-SEI
+  surface from 38 to 40 recognised payloads. These are transport- and
+  systems-layer hint messages — `sei_manifest` advertises, for the
+  entire coded video sequence, which SEI payload types are expected to
+  be present along with a per-type "necessary / unnecessary /
+  undetermined / not-expected" classification from Table D-12, and
+  `sei_prefix_indication` carries one or more leading bit-strings from
+  the start of an upcoming SEI payload of a given
+  `prefix_sei_payload_type` so a transport element can inspect the
+  first few syntax elements (e.g. `frame_packing_arrangement_type` for
+  type 45) without parsing the full SEI message.
+
+  New `parse_sei_manifest` reads `manifest_num_sei_msg_types u(16)`
+  then per entry `manifest_sei_payload_type[ i ] u(16)` and
+  `manifest_sei_description[ i ] u(8)`. Descriptions 0..=3 are
+  surfaced as `SeiManifestDescription::{NotExpected,
+  ExpectedNecessary, ExpectedUnnecessary, ExpectedUndetermined}`; per
+  §D.2.36 values 4..=255 are reserved and must be passed through (so
+  callers can honour "Decoders shall allow ... shall ignore" for both
+  the manifest entry and any SEI prefix indication keyed off the same
+  payload type) — these land as `Reserved(raw)`. The §D.2.36
+  uniqueness constraint (`manifest_sei_payload_type[ m ] !=
+  manifest_sei_payload_type[ n ] for m != n`) is enforced at parse
+  time via `SeiManifestDuplicatePayloadType { payload_type, first,
+  second }`.
+
+  New `parse_sei_prefix_indication` reads
+  `prefix_sei_payload_type u(16)`, `num_sei_prefix_indications_minus1
+  u(8)`, then for each indication `num_bits_in_prefix_indication_minus1
+  u(16)` (the data field's bit count is value + 1), packs that many
+  `sei_prefix_data_bit u(1)` values MSB-first into a `Vec<u8>` (length
+  `bit_count.div_ceil(8)`), and consumes the §D.1.37
+  byte-alignment trailer (`while !byte_aligned() { f(1) }`). A
+  `SeiPrefixIndicationOverflow { i, bits, available }` rejects an
+  indication whose declared `bit_count` exceeds the remaining payload
+  bits — the existing fuzzed bitstream EOF check already guards the
+  individual `u(1)` reads but the upfront check shortens the failure
+  path on hostile inputs.
+
+  Wired into `parse_payload(200, …)` → `SeiPayload::SeiManifest` and
+  `parse_payload(201, …)` → `SeiPayload::SeiPrefixIndication`.
+  Thirteen new unit tests in `src/sei.rs`: SEI manifest empty / single
+  entry / three-entry mixed / reserved-description / duplicate
+  rejection / truncated input / `parse_payload` dispatch; SEI prefix
+  indication single byte-aligned / short bit-string with `1`-fill
+  byte-alignment trailer / two entries with mixed bit-widths /
+  oversized-bit-count rejection / truncated-header rejection /
+  `parse_payload` dispatch. Lib-test count 1003 → 1016 (+13).
+
 - **sei: round-113 — regionwise_packing Annex D SEI payload (type 155).**
   Adds `regionwise_packing` (§D.1.35.4 / §D.2.35.4 of
   `docs/video/h264/T-REC-H.264-202408-I.pdf`), bringing the typed-SEI
