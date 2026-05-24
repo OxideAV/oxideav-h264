@@ -41,6 +41,7 @@
 //! | 150          | §D.1.35.1   | §D.2.35.1   | equirectangular_projection         |
 //! | 151          | §D.1.35.2   | §D.2.35.2   | cubemap_projection                 |
 //! | 154          | §D.1.35.3   | §D.2.35.3   | sphere_rotation                    |
+//! | 155          | §D.1.35.4   | §D.2.35.4   | regionwise_packing                 |
 //! | 156          | §D.1.35.5   | §D.2.35.5   | omni_viewport                      |
 //! | 205          | §D.1.38     | §D.2.38     | shutter_interval_info              |
 //!
@@ -152,6 +153,20 @@ pub enum SeiError {
         "dec_ref_pic_marking_repetition memory_management_control_operation shall be in 0..=6 per §7.4.3.3 / Table 7-9 (got {0})"
     )]
     DecRefPicMarkingRepetitionMmcoOutOfRange(u32),
+    #[error("regionwise_packing num_packed_regions shall be greater than 0 per §D.2.35.4")]
+    RegionWisePackingNoRegions,
+    #[error(
+        "regionwise_packing proj_picture_width / proj_picture_height shall both be greater than 0 per §D.2.35.4 (got w={w}, h={h})"
+    )]
+    RegionWisePackingProjPictureZero { w: u32, h: u32 },
+    #[error(
+        "regionwise_packing packed_picture_width / packed_picture_height shall both be greater than 0 per §D.2.35.4 (got w={w}, h={h})"
+    )]
+    RegionWisePackingPackedPictureZero { w: u32, h: u32 },
+    #[error(
+        "regionwise_packing packed region {0} sets guard_band_flag but all four guard-band dimensions are 0 — at least one shall be greater than 0 per §D.2.35.4"
+    )]
+    RegionWisePackingGuardBandAllZero(usize),
 }
 
 /// §D.2.2 — buffering_period.
@@ -2792,6 +2807,222 @@ pub fn parse_sphere_rotation(payload: &[u8]) -> Result<SphereRotation, SeiError>
     })
 }
 
+/// §D.2.35.4 — regionwise_packing (payload type 155).
+///
+/// Describes the region-wise packing transformation that maps regions
+/// of the cropped decoded ("packed") picture onto a projected picture,
+/// together with optional guard-band information. Pairs with the
+/// equirectangular-projection (150) / cubemap-projection (151) SEIs:
+/// per §D.2.35.4 a region-wise packing message with `rwp_cancel_flag`
+/// equal to 0 may only follow one of those projection messages in
+/// decoding order. We parse and surface the structure; the actual
+/// sphere remapping is left to the application.
+///
+/// Syntax (§D.1.35.4):
+/// ```text
+/// regionwise_packing( payloadSize ) {
+///   rwp_cancel_flag                          u(1)
+///   if( !rwp_cancel_flag ) {
+///     rwp_persistence_flag                   u(1)
+///     constituent_picture_matching_flag      u(1)
+///     rwp_reserved_zero_5bits                u(5)
+///     num_packed_regions                     u(8)
+///     proj_picture_width                     u(32)
+///     proj_picture_height                    u(32)
+///     packed_picture_width                   u(16)
+///     packed_picture_height                  u(16)
+///     for( i = 0; i < num_packed_regions; i++ ) {
+///       rwp_reserved_zero_4bits[ i ]         u(4)
+///       transform_type[ i ]                  u(3)
+///       guard_band_flag[ i ]                 u(1)
+///       proj_region_width[ i ]               u(32)
+///       proj_region_height[ i ]              u(32)
+///       proj_region_top[ i ]                 u(32)
+///       proj_region_left[ i ]                u(32)
+///       packed_region_width[ i ]             u(16)
+///       packed_region_height[ i ]            u(16)
+///       packed_region_top[ i ]               u(16)
+///       packed_region_left[ i ]              u(16)
+///       if( guard_band_flag[ i ] ) {
+///         left_gb_width[ i ]                 u(8)
+///         right_gb_width[ i ]                u(8)
+///         top_gb_height[ i ]                 u(8)
+///         bottom_gb_height[ i ]              u(8)
+///         gb_not_used_for_pred_flag[ i ]     u(1)
+///         for( j = 0; j < 4; j++ )
+///           gb_type[ i ][ j ]                u(3)
+///         rwp_gb_reserved_zero_3bits[ i ]    u(3)
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Per §D.2.35.4 conformance: `num_packed_regions` shall be greater than
+/// 0; `proj_picture_width`/`proj_picture_height` and
+/// `packed_picture_width`/`packed_picture_height` shall all be greater
+/// than 0; and when `guard_band_flag[ i ]` is 1 at least one of the four
+/// guard-band dimensions shall be greater than 0. The `rwp_reserved_*`
+/// and `gb_type` reserved values are read and ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionWisePacking {
+    pub cancel_flag: bool,
+    /// Present only when `cancel_flag` is false.
+    pub persistence_flag: Option<bool>,
+    /// Present only when `cancel_flag` is false. When true, the loop's
+    /// per-region information applies individually to each constituent
+    /// picture of a frame-packed stereoscopic picture (§D.2.35.4).
+    pub constituent_picture_matching_flag: Option<bool>,
+    /// Width / height of the projected picture, in relative projected
+    /// picture sample units. Present only when `cancel_flag` is false.
+    pub proj_picture_width: Option<u32>,
+    pub proj_picture_height: Option<u32>,
+    /// Width / height of the packed picture, in relative packed picture
+    /// sample units. Present only when `cancel_flag` is false.
+    pub packed_picture_width: Option<u16>,
+    pub packed_picture_height: Option<u16>,
+    /// One entry per packed region (length = `num_packed_regions`).
+    /// Empty when `cancel_flag` is true.
+    pub regions: Vec<PackedRegion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedRegion {
+    /// Rotation/mirroring mapping packed → projected (Table D-11, 0..=7).
+    pub transform_type: u8,
+    /// Projected region geometry, in relative projected picture units.
+    pub proj_region_width: u32,
+    pub proj_region_height: u32,
+    pub proj_region_top: u32,
+    pub proj_region_left: u32,
+    /// Packed region geometry, in relative packed picture units.
+    pub packed_region_width: u16,
+    pub packed_region_height: u16,
+    pub packed_region_top: u16,
+    pub packed_region_left: u16,
+    /// Guard-band description, present iff `guard_band_flag[ i ]` was 1.
+    pub guard_band: Option<GuardBand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardBand {
+    pub left_gb_width: u8,
+    pub right_gb_width: u8,
+    pub top_gb_height: u8,
+    pub bottom_gb_height: u8,
+    /// `gb_not_used_for_pred_flag`: when true the guard-band samples are
+    /// not used in inter prediction (§D.2.35.4).
+    pub gb_not_used_for_pred_flag: bool,
+    /// `gb_type[ i ][ 0..4 ]` for the left / right / top / bottom edges.
+    /// Values greater than 3 are reserved and surfaced verbatim.
+    pub gb_type: [u8; 4],
+}
+
+pub fn parse_regionwise_packing(payload: &[u8]) -> Result<RegionWisePacking, SeiError> {
+    let mut r = BitReader::new(payload);
+    let cancel_flag = r.u(1)? == 1;
+    if cancel_flag {
+        return Ok(RegionWisePacking {
+            cancel_flag,
+            persistence_flag: None,
+            constituent_picture_matching_flag: None,
+            proj_picture_width: None,
+            proj_picture_height: None,
+            packed_picture_width: None,
+            packed_picture_height: None,
+            regions: Vec::new(),
+        });
+    }
+    let persistence_flag = r.u(1)? == 1;
+    let constituent_picture_matching_flag = r.u(1)? == 1;
+    let _rwp_reserved_zero_5bits = r.u(5)?; // read and ignored per §D.2.35.4
+    let num_packed_regions = r.u(8)?;
+    if num_packed_regions == 0 {
+        return Err(SeiError::RegionWisePackingNoRegions);
+    }
+    let proj_picture_width = r.u(32)?;
+    let proj_picture_height = r.u(32)?;
+    if proj_picture_width == 0 || proj_picture_height == 0 {
+        return Err(SeiError::RegionWisePackingProjPictureZero {
+            w: proj_picture_width,
+            h: proj_picture_height,
+        });
+    }
+    let packed_picture_width = r.u(16)? as u16;
+    let packed_picture_height = r.u(16)? as u16;
+    if packed_picture_width == 0 || packed_picture_height == 0 {
+        return Err(SeiError::RegionWisePackingPackedPictureZero {
+            w: packed_picture_width as u32,
+            h: packed_picture_height as u32,
+        });
+    }
+    let mut regions = Vec::with_capacity(num_packed_regions as usize);
+    for i in 0..num_packed_regions as usize {
+        let _rwp_reserved_zero_4bits = r.u(4)?; // read and ignored per §D.2.35.4
+        let transform_type = r.u(3)? as u8;
+        let guard_band_flag = r.u(1)? == 1;
+        let proj_region_width = r.u(32)?;
+        let proj_region_height = r.u(32)?;
+        let proj_region_top = r.u(32)?;
+        let proj_region_left = r.u(32)?;
+        let packed_region_width = r.u(16)? as u16;
+        let packed_region_height = r.u(16)? as u16;
+        let packed_region_top = r.u(16)? as u16;
+        let packed_region_left = r.u(16)? as u16;
+        let guard_band = if guard_band_flag {
+            let left_gb_width = r.u(8)? as u8;
+            let right_gb_width = r.u(8)? as u8;
+            let top_gb_height = r.u(8)? as u8;
+            let bottom_gb_height = r.u(8)? as u8;
+            if left_gb_width == 0
+                && right_gb_width == 0
+                && top_gb_height == 0
+                && bottom_gb_height == 0
+            {
+                return Err(SeiError::RegionWisePackingGuardBandAllZero(i));
+            }
+            let gb_not_used_for_pred_flag = r.u(1)? == 1;
+            let mut gb_type = [0u8; 4];
+            for entry in gb_type.iter_mut() {
+                *entry = r.u(3)? as u8;
+            }
+            let _rwp_gb_reserved_zero_3bits = r.u(3)?; // read and ignored
+            Some(GuardBand {
+                left_gb_width,
+                right_gb_width,
+                top_gb_height,
+                bottom_gb_height,
+                gb_not_used_for_pred_flag,
+                gb_type,
+            })
+        } else {
+            None
+        };
+        regions.push(PackedRegion {
+            transform_type,
+            proj_region_width,
+            proj_region_height,
+            proj_region_top,
+            proj_region_left,
+            packed_region_width,
+            packed_region_height,
+            packed_region_top,
+            packed_region_left,
+            guard_band,
+        });
+    }
+    Ok(RegionWisePacking {
+        cancel_flag,
+        persistence_flag: Some(persistence_flag),
+        constituent_picture_matching_flag: Some(constituent_picture_matching_flag),
+        proj_picture_width: Some(proj_picture_width),
+        proj_picture_height: Some(proj_picture_height),
+        packed_picture_width: Some(packed_picture_width),
+        packed_picture_height: Some(packed_picture_height),
+        regions,
+    })
+}
+
 /// §D.2.35.5 — omni_viewport (payload type 156).
 ///
 /// Specifies the coordinates of one or more spherical-coordinate
@@ -3098,6 +3329,8 @@ pub enum SeiPayload {
     CubemapProjection(CubemapProjection),
     /// §D.2.35.3 — sphere_rotation (payload type 154). Round 78.
     SphereRotation(SphereRotation),
+    /// §D.2.35.4 — regionwise_packing (payload type 155). Round 113.
+    RegionWisePacking(RegionWisePacking),
     /// §D.2.35.5 — omni_viewport (payload type 156). Round 95.
     OmniViewport(OmniViewport),
     /// §D.2.38 — shutter_interval_info (payload type 205). Round 95.
@@ -3203,6 +3436,9 @@ pub fn parse_payload(
             payload,
         )?)),
         154 => Ok(SeiPayload::SphereRotation(parse_sphere_rotation(payload)?)),
+        155 => Ok(SeiPayload::RegionWisePacking(parse_regionwise_packing(
+            payload,
+        )?)),
         156 => Ok(SeiPayload::OmniViewport(parse_omni_viewport(payload)?)),
         205 => Ok(SeiPayload::ShutterIntervalInfo(
             parse_shutter_interval_info(payload)?,
@@ -5645,6 +5881,295 @@ mod tests {
                 assert_eq!(v.viewport_id, 0);
             }
             other => panic!("expected OmniViewport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regionwise_packing_cancel_skips_body() {
+        // rwp_cancel_flag = 1 → body absent (§D.1.35.4).
+        let payload = pack_bits(&[(1, 1)]);
+        let got = parse_regionwise_packing(&payload).unwrap();
+        assert!(got.cancel_flag);
+        assert!(got.persistence_flag.is_none());
+        assert!(got.constituent_picture_matching_flag.is_none());
+        assert!(got.proj_picture_width.is_none());
+        assert!(got.regions.is_empty());
+    }
+
+    #[test]
+    fn regionwise_packing_single_region_no_guard_band() {
+        // One packed region, no guard band.
+        //   rwp_cancel_flag                   = 0   (1)
+        //   rwp_persistence_flag              = 1   (1)
+        //   constituent_picture_matching_flag = 0   (1)
+        //   rwp_reserved_zero_5bits           = 0   (5)
+        //   num_packed_regions               = 1   u(8)
+        //   proj_picture_width               = 3840 u(32)
+        //   proj_picture_height              = 1920 u(32)
+        //   packed_picture_width             = 2560 u(16)
+        //   packed_picture_height            = 1280 u(16)
+        //   region 0:
+        //     rwp_reserved_zero_4bits        = 0   (4)
+        //     transform_type                 = 5   (3)   (90° anticlockwise)
+        //     guard_band_flag                = 0   (1)
+        //     proj_region_width              = 1920 u(32)
+        //     proj_region_height             = 1920 u(32)
+        //     proj_region_top                = 0   u(32)
+        //     proj_region_left               = 0   u(32)
+        //     packed_region_width            = 1280 u(16)
+        //     packed_region_height           = 1280 u(16)
+        //     packed_region_top              = 0   u(16)
+        //     packed_region_left             = 0   u(16)
+        let fields = [
+            (0u64, 1),
+            (1, 1),
+            (0, 1),
+            (0, 5),
+            (1, 8),
+            (3840, 32),
+            (1920, 32),
+            (2560, 16),
+            (1280, 16),
+            (0, 4),
+            (5, 3),
+            (0, 1),
+            (1920, 32),
+            (1920, 32),
+            (0, 32),
+            (0, 32),
+            (1280, 16),
+            (1280, 16),
+            (0, 16),
+            (0, 16),
+        ];
+        let payload = pack_bits(&fields);
+        let got = parse_regionwise_packing(&payload).unwrap();
+        assert!(!got.cancel_flag);
+        assert_eq!(got.persistence_flag, Some(true));
+        assert_eq!(got.constituent_picture_matching_flag, Some(false));
+        assert_eq!(got.proj_picture_width, Some(3840));
+        assert_eq!(got.proj_picture_height, Some(1920));
+        assert_eq!(got.packed_picture_width, Some(2560));
+        assert_eq!(got.packed_picture_height, Some(1280));
+        assert_eq!(got.regions.len(), 1);
+        let reg = got.regions[0];
+        assert_eq!(reg.transform_type, 5);
+        assert_eq!(reg.proj_region_width, 1920);
+        assert_eq!(reg.proj_region_height, 1920);
+        assert_eq!(reg.packed_region_width, 1280);
+        assert_eq!(reg.packed_region_height, 1280);
+        assert!(reg.guard_band.is_none());
+    }
+
+    #[test]
+    fn regionwise_packing_region_with_guard_band() {
+        // One region carrying a guard band on all four edges.
+        let fields = [
+            (0u64, 1), // cancel
+            (0, 1),    // persistence
+            (1, 1),    // constituent_picture_matching_flag
+            (0, 5),    // reserved
+            (1, 8),    // num_packed_regions
+            (1000, 32),
+            (500, 32),
+            (1000, 16),
+            (500, 16),
+            // region 0
+            (0, 4), // reserved
+            (0, 3), // transform_type = 0 (no transform)
+            (1, 1), // guard_band_flag = 1
+            (100, 32),
+            (100, 32),
+            (0, 32),
+            (0, 32),
+            (100, 16),
+            (100, 16),
+            (0, 16),
+            (0, 16),
+            // guard band
+            (4, 8), // left_gb_width
+            (4, 8), // right_gb_width
+            (2, 8), // top_gb_height
+            (2, 8), // bottom_gb_height
+            (1, 1), // gb_not_used_for_pred_flag
+            (1, 3), // gb_type[0]
+            (2, 3), // gb_type[1]
+            (3, 3), // gb_type[2]
+            (1, 3), // gb_type[3]
+            (0, 3), // rwp_gb_reserved_zero_3bits
+        ];
+        let payload = pack_bits(&fields);
+        let got = parse_regionwise_packing(&payload).unwrap();
+        assert_eq!(got.constituent_picture_matching_flag, Some(true));
+        assert_eq!(got.regions.len(), 1);
+        let gb = got.regions[0].guard_band.expect("guard band present");
+        assert_eq!(gb.left_gb_width, 4);
+        assert_eq!(gb.right_gb_width, 4);
+        assert_eq!(gb.top_gb_height, 2);
+        assert_eq!(gb.bottom_gb_height, 2);
+        assert!(gb.gb_not_used_for_pred_flag);
+        assert_eq!(gb.gb_type, [1, 2, 3, 1]);
+    }
+
+    #[test]
+    fn regionwise_packing_two_regions_mixed_guard_band() {
+        // Two regions: region 0 with guard band, region 1 without.
+        let fields = [
+            (0u64, 1), // cancel
+            (1, 1),    // persistence
+            (0, 1),    // constituent_picture_matching_flag
+            (0, 5),    // reserved
+            (2, 8),    // num_packed_regions = 2
+            (2000, 32),
+            (1000, 32),
+            (2000, 16),
+            (1000, 16),
+            // region 0 (guard band)
+            (0, 4),
+            (2, 3), // transform_type
+            (1, 1), // guard_band_flag
+            (1000, 32),
+            (1000, 32),
+            (0, 32),
+            (0, 32),
+            (1000, 16),
+            (1000, 16),
+            (0, 16),
+            (0, 16),
+            (8, 8),
+            (0, 8),
+            (0, 8),
+            (0, 8),
+            (0, 1), // gb_not_used_for_pred_flag
+            (0, 3),
+            (1, 3),
+            (1, 3),
+            (1, 3),
+            (0, 3),
+            // region 1 (no guard band)
+            (0, 4),
+            (7, 3), // transform_type = 7
+            (0, 1), // guard_band_flag = 0
+            (1000, 32),
+            (1000, 32),
+            (0, 32),
+            (1000, 32),
+            (1000, 16),
+            (1000, 16),
+            (0, 16),
+            (1000, 16),
+        ];
+        let payload = pack_bits(&fields);
+        let got = parse_regionwise_packing(&payload).unwrap();
+        assert_eq!(got.regions.len(), 2);
+        assert_eq!(got.regions[0].transform_type, 2);
+        let gb = got.regions[0].guard_band.expect("region 0 guard band");
+        assert_eq!(gb.left_gb_width, 8);
+        assert!(!gb.gb_not_used_for_pred_flag);
+        assert_eq!(got.regions[1].transform_type, 7);
+        assert_eq!(got.regions[1].proj_region_left, 1000);
+        assert_eq!(got.regions[1].packed_region_left, 1000);
+        assert!(got.regions[1].guard_band.is_none());
+    }
+
+    #[test]
+    fn regionwise_packing_zero_regions_rejected() {
+        // num_packed_regions = 0 → §D.2.35.4 violation.
+        let fields = [(0u64, 1), (0, 1), (0, 1), (0, 5), (0, 8)];
+        let payload = pack_bits(&fields);
+        assert_eq!(
+            parse_regionwise_packing(&payload),
+            Err(SeiError::RegionWisePackingNoRegions)
+        );
+    }
+
+    #[test]
+    fn regionwise_packing_zero_proj_picture_rejected() {
+        // proj_picture_width = 0 → §D.2.35.4 violation.
+        let fields = [
+            (0u64, 1),
+            (0, 1),
+            (0, 1),
+            (0, 5),
+            (1, 8),
+            (0, 32),
+            (100, 32),
+        ];
+        let payload = pack_bits(&fields);
+        assert_eq!(
+            parse_regionwise_packing(&payload),
+            Err(SeiError::RegionWisePackingProjPictureZero { w: 0, h: 100 })
+        );
+    }
+
+    #[test]
+    fn regionwise_packing_zero_packed_picture_rejected() {
+        // packed_picture_height = 0 → §D.2.35.4 violation.
+        let fields = [
+            (0u64, 1),
+            (0, 1),
+            (0, 1),
+            (0, 5),
+            (1, 8),
+            (100, 32),
+            (100, 32),
+            (100, 16),
+            (0, 16),
+        ];
+        let payload = pack_bits(&fields);
+        assert_eq!(
+            parse_regionwise_packing(&payload),
+            Err(SeiError::RegionWisePackingPackedPictureZero { w: 100, h: 0 })
+        );
+    }
+
+    #[test]
+    fn regionwise_packing_guard_band_all_zero_rejected() {
+        // guard_band_flag = 1 but all four dimensions 0 → §D.2.35.4.
+        let fields = [
+            (0u64, 1),
+            (0, 1),
+            (0, 1),
+            (0, 5),
+            (1, 8),
+            (100, 32),
+            (100, 32),
+            (100, 16),
+            (100, 16),
+            (0, 4),
+            (0, 3),
+            (1, 1), // guard_band_flag = 1
+            (50, 32),
+            (50, 32),
+            (0, 32),
+            (0, 32),
+            (50, 16),
+            (50, 16),
+            (0, 16),
+            (0, 16),
+            (0, 8), // all guard-band dims 0
+            (0, 8),
+            (0, 8),
+            (0, 8),
+        ];
+        let payload = pack_bits(&fields);
+        assert_eq!(
+            parse_regionwise_packing(&payload),
+            Err(SeiError::RegionWisePackingGuardBandAllZero(0))
+        );
+    }
+
+    #[test]
+    fn parse_payload_dispatches_regionwise_packing() {
+        // Dispatch wiring for payload type 155: cancelled message.
+        let payload = pack_bits(&[(1, 1)]);
+        let ctx = SeiContext::default();
+        match parse_payload(155, &payload, &ctx).unwrap() {
+            SeiPayload::RegionWisePacking(r) => {
+                assert!(r.cancel_flag);
+                assert!(r.regions.is_empty());
+            }
+            other => panic!("expected RegionWisePacking, got {other:?}"),
         }
     }
 

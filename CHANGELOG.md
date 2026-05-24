@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sei: round-113 — regionwise_packing Annex D SEI payload (type 155).**
+  Adds `regionwise_packing` (§D.1.35.4 / §D.2.35.4 of
+  `docs/video/h264/T-REC-H.264-202408-I.pdf`), bringing the typed-SEI
+  surface from 36 to 37 recognised payloads and completing the
+  omnidirectional projection family alongside equirectangular (150),
+  cubemap (151), sphere_rotation (154), and omni_viewport (156). The
+  message describes the region-wise packing transformation that maps
+  regions of the cropped decoded ("packed") picture onto a projected
+  picture, plus optional per-region guard bands. New
+  `parse_regionwise_packing` reads `rwp_cancel_flag u(1)`; when not
+  cancelled it reads `rwp_persistence_flag u(1)`,
+  `constituent_picture_matching_flag u(1)`, `rwp_reserved_zero_5bits
+  u(5)` (read and ignored), `num_packed_regions u(8)`,
+  `proj_picture_width`/`proj_picture_height u(32)`, and
+  `packed_picture_width`/`packed_picture_height u(16)`, then one
+  `PackedRegion` per region: `rwp_reserved_zero_4bits u(4)` (ignored),
+  `transform_type u(3)` (Table D-11, 0..=7), `guard_band_flag u(1)`,
+  the four `proj_region_*` `u(32)` and four `packed_region_*` `u(16)`
+  geometry fields, and — when `guard_band_flag` is set — a `GuardBand`
+  carrying the four `*_gb_*` `u(8)` widths/heights,
+  `gb_not_used_for_pred_flag u(1)`, the four `gb_type[j] u(3)` edge
+  types, and `rwp_gb_reserved_zero_3bits u(3)` (ignored). Parse-time
+  §D.2.35.4 conformance checks reject `num_packed_regions == 0`
+  (`RegionWisePackingNoRegions`), a zero `proj_picture_*`
+  (`RegionWisePackingProjPictureZero`) or `packed_picture_*`
+  (`RegionWisePackingPackedPictureZero`) dimension, and a guard band
+  with all four dimensions zero (`RegionWisePackingGuardBandAllZero`).
+  Wired into `parse_payload(155, …)` →
+  `SeiPayload::RegionWisePacking`. Nine unit tests cover the cancel
+  path, a single region without a guard band, a region with a
+  four-edge guard band, a two-region mixed-guard-band message, the
+  four §D.2.35.4 error paths, and parse_payload dispatch.
+
 - **sei: round-110 — dec_ref_pic_marking_repetition Annex D SEI payload
   (type 7).** Adds `dec_ref_pic_marking_repetition` (§D.1.9 / §D.2.9 of
   `docs/video/h264/T-REC-H.264-202408-I.pdf`), bringing the typed-SEI
