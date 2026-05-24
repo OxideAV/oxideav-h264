@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sei: round-110 — dec_ref_pic_marking_repetition Annex D SEI payload
+  (type 7).** Adds `dec_ref_pic_marking_repetition` (§D.1.9 / §D.2.9 of
+  `docs/video/h264/T-REC-H.264-202408-I.pdf`), bringing the typed-SEI
+  surface from 35 to 36 recognised payloads. The message repeats the
+  `dec_ref_pic_marking()` syntax structure (§7.3.3.3) that originally
+  appeared in an earlier picture's slice header(s), so a decoder that
+  lost that picture can still apply its reference-marking operations.
+  New `parse_dec_ref_pic_marking_repetition` reads `original_idr_flag
+  u(1)`, `original_frame_num ue(v)`, and — only when the active SPS has
+  `frame_mbs_only_flag == 0` — `original_field_pic_flag u(1)` plus
+  (when set) `original_bottom_field_flag u(1)`, then the embedded
+  `dec_ref_pic_marking()`. Per §D.2.9 the `IdrPicFlag` selecting the
+  embedded structure's IDR vs. non-IDR branch is `original_idr_flag`,
+  not the SEI NAL's own flag: the IDR branch yields
+  `no_output_of_prior_pics_flag` + `long_term_reference_flag`, the
+  non-IDR branch the `adaptive_ref_pic_marking_mode_flag` sliding-window
+  / MMCO loop. The embedded reader reuses the shared
+  `slice_header::{DecRefPicMarking, MmcoOp}` data model and validates
+  `memory_management_control_operation` to 0..=6 per Table 7-9
+  (`SeiError::DecRefPicMarkingRepetitionMmcoOutOfRange`). The active
+  SPS `frame_mbs_only_flag` is newly carried on
+  `SeiContext::frame_mbs_only_flag` (default `true`). Wired into
+  `parse_payload(7, …)` → `SeiPayload::DecRefPicMarkingRepetition`.
+  Eight unit tests cover the IDR frame-only path, a two-op adaptive
+  MMCO loop, sliding-window, field coding with and without a bottom-
+  field flag, an all-six-MMCO-ops sweep, the out-of-range MMCO error,
+  and parse_payload dispatch.
+
 - **sei: round-107 — content_colour_volume Annex D SEI payload (type 149).**
   Adds `content_colour_volume` (§D.1.33 / §D.2.33 of
   `docs/video/h264/T-REC-H.264-202408-I.pdf`), bringing the typed-SEI

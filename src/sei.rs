@@ -15,6 +15,7 @@
 //! | 4            | §D.1.6      | §D.2.6      | user_data_registered_itu_t_t35     |
 //! | 5            | §D.1.7      | §D.2.7      | user_data_unregistered             |
 //! | 6            | §D.1.8      | §D.2.8      | recovery_point                     |
+//! | 7            | §D.1.9      | §D.2.9      | dec_ref_pic_marking_repetition     |
 //! | 8            | §D.1.10     | §D.2.10     | spare_pic                          |
 //! | 9            | §D.1.11     | §D.2.11     | scene_info                         |
 //! | 10           | §D.1.11†    | §D.2.11†    | sub_seq_info                       |
@@ -51,6 +52,7 @@
 #![allow(dead_code)]
 
 use crate::bitstream::{BitError, BitReader};
+use crate::slice_header::{DecRefPicMarking, MmcoOp};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SeiError {
@@ -146,6 +148,10 @@ pub enum SeiError {
         "content_colour_volume luminance ordering violated per §D.2.33: ccv_min_luminance_value ({min}) <= ccv_avg_luminance_value ({avg}) <= ccv_max_luminance_value ({max}) must hold for whichever values are present"
     )]
     ContentColourVolumeLuminanceOrder { min: u64, avg: u64, max: u64 },
+    #[error(
+        "dec_ref_pic_marking_repetition memory_management_control_operation shall be in 0..=6 per §7.4.3.3 / Table 7-9 (got {0})"
+    )]
+    DecRefPicMarkingRepetitionMmcoOutOfRange(u32),
 }
 
 /// §D.2.2 — buffering_period.
@@ -541,6 +547,12 @@ pub struct SeiContext {
     /// (`spare_area_idc == 1` or `2`) with a 0 value is rejected with
     /// [`SeiError::SparePicMapUnitsUnknown`].
     pub pic_size_in_map_units: u32,
+    /// From the active SPS — `frame_mbs_only_flag` (§7.3.2.1.1). Needed by
+    /// §D.1.9 dec_ref_pic_marking_repetition: the `original_field_pic_flag`
+    /// / `original_bottom_field_flag` fields are present only when
+    /// `frame_mbs_only_flag == 0`. Defaults to `true` (frame-only coding,
+    /// the common case), under which those two fields are absent.
+    pub frame_mbs_only_flag: bool,
 }
 
 impl Default for SeiContext {
@@ -558,6 +570,10 @@ impl Default for SeiContext {
             num_slice_groups: 1,
             // §D.1.10 — unknown until the active SPS dimensions are wired in.
             pic_size_in_map_units: 0,
+            // §D.1.9 — assume frame-only coding unless the active SPS says
+            // otherwise; under frame_mbs_only_flag the original_field_pic_flag
+            // / original_bottom_field_flag fields are absent.
+            frame_mbs_only_flag: true,
         }
     }
 }
@@ -1223,6 +1239,165 @@ pub struct SparePicEntry {
     /// runs read until the box-out map-unit count reaches
     /// PicSizeInMapUnits.
     pub zero_run_lengths: Option<Vec<u32>>,
+}
+
+/// §D.2.9 — dec_ref_pic_marking_repetition (payload type 7).
+///
+/// Repeats the `dec_ref_pic_marking()` syntax structure (§7.3.3.3) that
+/// originally appeared in the slice header(s) of an earlier picture in
+/// the same coded video sequence, so a decoder that lost that earlier
+/// picture can still apply its reference-picture-marking operations.
+///
+/// Syntax (§D.1.9):
+/// ```text
+/// dec_ref_pic_marking_repetition( payloadSize ) {
+///   original_idr_flag                                  u(1)
+///   original_frame_num                                 ue(v)
+///   if( !frame_mbs_only_flag ) {
+///     original_field_pic_flag                          u(1)
+///     if( original_field_pic_flag )
+///       original_bottom_field_flag                     u(1)
+///   }
+///   dec_ref_pic_marking( )
+/// }
+/// ```
+///
+/// Per §D.2.9, the `IdrPicFlag` used to interpret the embedded
+/// `dec_ref_pic_marking()` (clause 7.3.3.3) is `original_idr_flag` rather
+/// than the IdrPicFlag of the SEI NAL unit itself: when `original_idr_flag`
+/// is set, the embedded structure carries `no_output_of_prior_pics_flag`
+/// and `long_term_reference_flag`; otherwise it carries the adaptive /
+/// sliding-window MMCO loop.
+///
+/// `original_field_pic_flag` / `original_bottom_field_flag` are present only
+/// when the active SPS has `frame_mbs_only_flag == 0`; the parser reads
+/// that flag from [`SeiContext::frame_mbs_only_flag`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecRefPicMarkingRepetition {
+    /// `original_idr_flag` — `true` when the repeated structure originally
+    /// occurred in an IDR picture (§D.2.9). Also serves as the `IdrPicFlag`
+    /// used to interpret the embedded `dec_ref_pic_marking()`.
+    pub original_idr_flag: bool,
+    /// `original_frame_num` — the frame_num of the picture where the
+    /// repeated structure originally occurred (§D.2.9).
+    pub original_frame_num: u32,
+    /// `original_field_pic_flag` — present only when the active SPS has
+    /// `frame_mbs_only_flag == 0`; `None` under frame-only coding (§D.1.9).
+    pub original_field_pic_flag: Option<bool>,
+    /// `original_bottom_field_flag` — present only when
+    /// `original_field_pic_flag == Some(true)` (§D.1.9).
+    pub original_bottom_field_flag: Option<bool>,
+    /// The repeated `dec_ref_pic_marking()` structure (§7.3.3.3),
+    /// interpreted with `IdrPicFlag = original_idr_flag` per §D.2.9.
+    pub dec_ref_pic_marking: DecRefPicMarking,
+}
+
+/// §D.1.9 / §D.2.9 — parse dec_ref_pic_marking_repetition (payload type 7).
+///
+/// `frame_mbs_only_flag` of the active SPS comes from
+/// [`SeiContext::frame_mbs_only_flag`].
+pub fn parse_dec_ref_pic_marking_repetition(
+    payload: &[u8],
+    ctx: &SeiContext,
+) -> Result<DecRefPicMarkingRepetition, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §D.1.9 — original_idr_flag u(1).
+    let original_idr_flag = r.u(1)? == 1;
+    // §D.1.9 — original_frame_num ue(v).
+    let original_frame_num = r.ue()?;
+    // §D.1.9 — original_field_pic_flag / original_bottom_field_flag present
+    // only when !frame_mbs_only_flag.
+    let (original_field_pic_flag, original_bottom_field_flag) = if ctx.frame_mbs_only_flag {
+        (None, None)
+    } else {
+        let fpf = r.u(1)? == 1;
+        let bff = if fpf { Some(r.u(1)? == 1) } else { None };
+        (Some(fpf), bff)
+    };
+    // §D.1.9 / §7.3.3.3 — dec_ref_pic_marking(), interpreted with
+    // IdrPicFlag = original_idr_flag per §D.2.9.
+    let dec_ref_pic_marking = parse_repeated_dec_ref_pic_marking(&mut r, original_idr_flag)?;
+    Ok(DecRefPicMarkingRepetition {
+        original_idr_flag,
+        original_frame_num,
+        original_field_pic_flag,
+        original_bottom_field_flag,
+        dec_ref_pic_marking,
+    })
+}
+
+/// §7.3.3.3 — read a `dec_ref_pic_marking()` structure from `r`, using
+/// `idr_pic_flag` as the `IdrPicFlag` that selects the IDR branch.
+///
+/// This is a self-contained spec-direct reader for the SEI repetition
+/// payload; it mirrors the §7.3.3.3 syntax table (the same structure that
+/// also appears in the slice header) and yields the shared
+/// [`DecRefPicMarking`] / [`MmcoOp`] data model.
+fn parse_repeated_dec_ref_pic_marking(
+    r: &mut BitReader<'_>,
+    idr_pic_flag: bool,
+) -> Result<DecRefPicMarking, SeiError> {
+    if idr_pic_flag {
+        // §7.3.3.3 IDR branch.
+        let no_output_of_prior_pics_flag = r.u(1)? == 1;
+        let long_term_reference_flag = r.u(1)? == 1;
+        Ok(DecRefPicMarking {
+            no_output_of_prior_pics_flag,
+            long_term_reference_flag,
+            adaptive_marking: None,
+        })
+    } else {
+        // §7.3.3.3 non-IDR branch.
+        let adaptive_ref_pic_marking_mode_flag = r.u(1)? == 1;
+        let adaptive_marking = if adaptive_ref_pic_marking_mode_flag {
+            let mut ops = Vec::new();
+            // do { ... } while( memory_management_control_operation != 0 )
+            loop {
+                let mmco = r.ue()?;
+                match mmco {
+                    0 => break,
+                    1 => {
+                        // difference_of_pic_nums_minus1 ue(v)
+                        let diff = r.ue()?;
+                        ops.push(MmcoOp::MarkShortTermUnused(diff));
+                    }
+                    2 => {
+                        // long_term_pic_num ue(v)
+                        let ltpn = r.ue()?;
+                        ops.push(MmcoOp::MarkLongTermUnused(ltpn));
+                    }
+                    3 => {
+                        // difference_of_pic_nums_minus1 ue(v), long_term_frame_idx ue(v)
+                        let diff = r.ue()?;
+                        let ltfi = r.ue()?;
+                        ops.push(MmcoOp::AssignLongTerm(diff, ltfi));
+                    }
+                    4 => {
+                        // max_long_term_frame_idx_plus1 ue(v)
+                        let max = r.ue()?;
+                        ops.push(MmcoOp::SetMaxLongTermIdx(max));
+                    }
+                    5 => ops.push(MmcoOp::MarkAllUnused),
+                    6 => {
+                        // long_term_frame_idx ue(v)
+                        let ltfi = r.ue()?;
+                        ops.push(MmcoOp::AssignCurrentLongTerm(ltfi));
+                    }
+                    other => {
+                        return Err(SeiError::DecRefPicMarkingRepetitionMmcoOutOfRange(other));
+                    }
+                }
+            }
+            Some(ops)
+        } else {
+            None
+        };
+        Ok(DecRefPicMarking {
+            no_output_of_prior_pics_flag: false,
+            long_term_reference_flag: false,
+            adaptive_marking,
+        })
+    }
 }
 
 /// §D.2.10 — spare_pic (payload type 8).
@@ -2879,6 +3054,8 @@ pub enum SeiPayload {
     UserDataUnregistered(UserDataUnregistered),
     PanScanRect(PanScanRect),
     RecoveryPoint(RecoveryPoint),
+    /// §D.2.9 — dec_ref_pic_marking_repetition (payload type 7). Round 110.
+    DecRefPicMarkingRepetition(DecRefPicMarkingRepetition),
     /// §D.2.10 — spare_pic (payload type 8). Round 103.
     SparePic(SparePic),
     FullFrameFreeze(FullFrameFreeze),
@@ -2957,6 +3134,9 @@ pub fn parse_payload(
             parse_user_data_unregistered(payload)?,
         )),
         6 => Ok(SeiPayload::RecoveryPoint(parse_recovery_point(payload)?)),
+        7 => Ok(SeiPayload::DecRefPicMarkingRepetition(
+            parse_dec_ref_pic_marking_repetition(payload, ctx)?,
+        )),
         8 => Ok(SeiPayload::SparePic(parse_spare_pic(payload, ctx)?)),
         9 => Ok(SeiPayload::SceneInfo(parse_scene_info(payload)?)),
         10 => Ok(SeiPayload::SubSeqInfo(parse_sub_seq_info(payload)?)),
@@ -4342,6 +4522,201 @@ mod tests {
                 assert_eq!(s.entries[0].spare_area_idc, 0);
             }
             other => panic!("expected SparePic, got {other:?}"),
+        }
+    }
+
+    // --- §D.1.9 dec_ref_pic_marking_repetition (payload type 7) -------
+
+    #[test]
+    fn dec_ref_pic_marking_repetition_idr_frame_only() {
+        // frame_mbs_only_flag = true ⇒ no field flags.
+        // original_idr_flag = 1, original_frame_num = 0 (ue → "1"),
+        // IDR branch: no_output_of_prior_pics_flag = 1, long_term_reference_flag = 0.
+        let payload = pack_bits(&[
+            (1, 1), // original_idr_flag
+            (1, 1), // original_frame_num = 0 (ue)
+            (1, 1), // no_output_of_prior_pics_flag
+            (0, 1), // long_term_reference_flag
+        ]);
+        let ctx = SeiContext::default(); // frame_mbs_only_flag = true
+        let got = parse_dec_ref_pic_marking_repetition(&payload, &ctx).unwrap();
+        assert!(got.original_idr_flag);
+        assert_eq!(got.original_frame_num, 0);
+        assert_eq!(got.original_field_pic_flag, None);
+        assert_eq!(got.original_bottom_field_flag, None);
+        assert!(got.dec_ref_pic_marking.no_output_of_prior_pics_flag);
+        assert!(!got.dec_ref_pic_marking.long_term_reference_flag);
+        assert_eq!(got.dec_ref_pic_marking.adaptive_marking, None);
+    }
+
+    #[test]
+    fn dec_ref_pic_marking_repetition_non_idr_adaptive_mmco() {
+        // original_idr_flag = 0, original_frame_num = 5 (ue → "00110"),
+        // non-IDR branch: adaptive_ref_pic_marking_mode_flag = 1, then
+        //   mmco = 1 (ue → "010"), difference_of_pic_nums_minus1 = 3 (ue → "00100"),
+        //   mmco = 3 (ue → "00100"), difference = 0 (ue → "1"),
+        //                            long_term_frame_idx = 2 (ue → "011"),
+        //   mmco = 0 (ue → "1")  [terminator].
+        let payload = pack_bits(&[
+            (0, 1),       // original_idr_flag
+            (0b00110, 5), // original_frame_num = 5
+            (1, 1),       // adaptive_ref_pic_marking_mode_flag
+            (0b010, 3),   // mmco = 1
+            (0b00100, 5), // difference_of_pic_nums_minus1 = 3
+            (0b00100, 5), // mmco = 3
+            (1, 1),       // difference_of_pic_nums_minus1 = 0
+            (0b011, 3),   // long_term_frame_idx = 2
+            (1, 1),       // mmco = 0 (terminator)
+        ]);
+        let ctx = SeiContext::default();
+        let got = parse_dec_ref_pic_marking_repetition(&payload, &ctx).unwrap();
+        assert!(!got.original_idr_flag);
+        assert_eq!(got.original_frame_num, 5);
+        let ops = got.dec_ref_pic_marking.adaptive_marking.unwrap();
+        assert_eq!(
+            ops,
+            vec![MmcoOp::MarkShortTermUnused(3), MmcoOp::AssignLongTerm(0, 2)]
+        );
+    }
+
+    #[test]
+    fn dec_ref_pic_marking_repetition_non_idr_sliding_window() {
+        // original_idr_flag = 0, original_frame_num = 2 (ue → "011"),
+        // adaptive_ref_pic_marking_mode_flag = 0 ⇒ sliding window (no ops).
+        let payload = pack_bits(&[
+            (0, 1),     // original_idr_flag
+            (0b011, 3), // original_frame_num = 2
+            (0, 1),     // adaptive_ref_pic_marking_mode_flag
+        ]);
+        let ctx = SeiContext::default();
+        let got = parse_dec_ref_pic_marking_repetition(&payload, &ctx).unwrap();
+        assert!(!got.original_idr_flag);
+        assert_eq!(got.original_frame_num, 2);
+        assert_eq!(got.dec_ref_pic_marking.adaptive_marking, None);
+    }
+
+    #[test]
+    fn dec_ref_pic_marking_repetition_field_with_bottom_flag() {
+        // frame_mbs_only_flag = false ⇒ field flags present.
+        // original_idr_flag = 1, original_frame_num = 0 (ue → "1"),
+        // original_field_pic_flag = 1, original_bottom_field_flag = 1,
+        // IDR branch: no_output = 0, long_term_reference_flag = 1.
+        let payload = pack_bits(&[
+            (1, 1), // original_idr_flag
+            (1, 1), // original_frame_num = 0
+            (1, 1), // original_field_pic_flag
+            (1, 1), // original_bottom_field_flag
+            (0, 1), // no_output_of_prior_pics_flag
+            (1, 1), // long_term_reference_flag
+        ]);
+        let ctx = SeiContext {
+            frame_mbs_only_flag: false,
+            ..SeiContext::default()
+        };
+        let got = parse_dec_ref_pic_marking_repetition(&payload, &ctx).unwrap();
+        assert_eq!(got.original_field_pic_flag, Some(true));
+        assert_eq!(got.original_bottom_field_flag, Some(true));
+        assert!(!got.dec_ref_pic_marking.no_output_of_prior_pics_flag);
+        assert!(got.dec_ref_pic_marking.long_term_reference_flag);
+    }
+
+    #[test]
+    fn dec_ref_pic_marking_repetition_field_no_bottom_flag() {
+        // frame_mbs_only_flag = false, original_field_pic_flag = 0 ⇒
+        // original_bottom_field_flag absent.
+        // original_idr_flag = 0, original_frame_num = 1 (ue → "010"),
+        // original_field_pic_flag = 0, adaptive = 0.
+        let payload = pack_bits(&[
+            (0, 1),     // original_idr_flag
+            (0b010, 3), // original_frame_num = 1
+            (0, 1),     // original_field_pic_flag
+            (0, 1),     // adaptive_ref_pic_marking_mode_flag
+        ]);
+        let ctx = SeiContext {
+            frame_mbs_only_flag: false,
+            ..SeiContext::default()
+        };
+        let got = parse_dec_ref_pic_marking_repetition(&payload, &ctx).unwrap();
+        assert_eq!(got.original_field_pic_flag, Some(false));
+        assert_eq!(got.original_bottom_field_flag, None);
+        assert_eq!(got.dec_ref_pic_marking.adaptive_marking, None);
+    }
+
+    #[test]
+    fn dec_ref_pic_marking_repetition_all_mmco_ops() {
+        // Exercise every MMCO 1..=6 in one adaptive loop, frame-only.
+        // original_idr_flag = 0, original_frame_num = 0 (ue → "1"),
+        // adaptive = 1, then:
+        //   mmco 1 (ue "010") + diff 0 (ue "1")
+        //   mmco 2 (ue "011") + long_term_pic_num 1 (ue "010")
+        //   mmco 3 (ue "00100") + diff 1 (ue "010") + ltfi 0 (ue "1")
+        //   mmco 4 (ue "00101") + max_lt_idx_plus1 2 (ue "011")
+        //   mmco 5 (ue "00110")
+        //   mmco 6 (ue "00111") + ltfi 3 (ue "00100")
+        //   mmco 0 (ue "1")
+        let payload = pack_bits(&[
+            (0, 1),       // original_idr_flag
+            (1, 1),       // original_frame_num = 0
+            (1, 1),       // adaptive_ref_pic_marking_mode_flag
+            (0b010, 3),   // mmco 1
+            (1, 1),       // difference_of_pic_nums_minus1 = 0
+            (0b011, 3),   // mmco 2
+            (0b010, 3),   // long_term_pic_num = 1
+            (0b00100, 5), // mmco 3
+            (0b010, 3),   // difference_of_pic_nums_minus1 = 1
+            (1, 1),       // long_term_frame_idx = 0
+            (0b00101, 5), // mmco 4
+            (0b011, 3),   // max_long_term_frame_idx_plus1 = 2
+            (0b00110, 5), // mmco 5
+            (0b00111, 5), // mmco 6
+            (0b00100, 5), // long_term_frame_idx = 3
+            (1, 1),       // mmco 0 (terminator)
+        ]);
+        let ctx = SeiContext::default();
+        let got = parse_dec_ref_pic_marking_repetition(&payload, &ctx).unwrap();
+        let ops = got.dec_ref_pic_marking.adaptive_marking.unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                MmcoOp::MarkShortTermUnused(0),
+                MmcoOp::MarkLongTermUnused(1),
+                MmcoOp::AssignLongTerm(1, 0),
+                MmcoOp::SetMaxLongTermIdx(2),
+                MmcoOp::MarkAllUnused,
+                MmcoOp::AssignCurrentLongTerm(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn dec_ref_pic_marking_repetition_mmco_out_of_range_rejected() {
+        // mmco = 7 is out of range (Table 7-9 defines 0..=6).
+        // original_idr_flag = 0, original_frame_num = 0 (ue "1"),
+        // adaptive = 1, mmco = 7 (ue → "0001000").
+        let payload = pack_bits(&[
+            (0, 1),         // original_idr_flag
+            (1, 1),         // original_frame_num = 0
+            (1, 1),         // adaptive_ref_pic_marking_mode_flag
+            (0b0001000, 7), // mmco = 7
+        ]);
+        let ctx = SeiContext::default();
+        let err = parse_dec_ref_pic_marking_repetition(&payload, &ctx).unwrap_err();
+        assert_eq!(err, SeiError::DecRefPicMarkingRepetitionMmcoOutOfRange(7));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_dec_ref_pic_marking_repetition() {
+        // Same body as dec_ref_pic_marking_repetition_idr_frame_only,
+        // routed via parse_payload(7).
+        let payload = pack_bits(&[(1, 1), (1, 1), (1, 1), (0, 1)]);
+        let ctx = SeiContext::default();
+        match parse_payload(7, &payload, &ctx).unwrap() {
+            SeiPayload::DecRefPicMarkingRepetition(d) => {
+                assert!(d.original_idr_flag);
+                assert_eq!(d.original_frame_num, 0);
+                assert!(d.dec_ref_pic_marking.no_output_of_prior_pics_flag);
+            }
+            other => panic!("expected DecRefPicMarkingRepetition, got {other:?}"),
         }
     }
 
