@@ -99,6 +99,22 @@ Round-by-round encoder progress:
 * Pluggable into the existing oxideav `Decoder` / `Encoder` trait
   surface once functional.
 
+## Benchmarks
+
+Criterion benches live under `benches/`:
+
+* `inter_pred_bench` — §8.4.2 luma + chroma fractional interpolation
+  (scalar / chunked / default 6-tap kernels, 4x4 / 8x8 / 16x16 blocks).
+* `transform_bench` — §8.5 inverse 4x4 and 8x8 transforms at QP 26.
+* `decode` — end-to-end `H264CodecDecoder` over five in-process
+  corpora: 64x64 + 128x96 Baseline IDR, IDR+4×P Baseline chain,
+  IDR+P+B Main GOP, and a 64x64 High 4:2:2 IDR. All streams are
+  synthesised from `oxideav-h264`'s own encoder so the bench needs
+  no on-disk fixtures.
+
+Run with `cargo bench --bench decode -- --quick` for a fast smoke
+or `cargo bench --bench decode` for the full Criterion report.
+
 ## Profiles + features in scope
 
 The long-term target is a **complete** implementation of ITU-T Rec.
