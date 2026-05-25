@@ -465,6 +465,8 @@ pub fn parse_slice_data(
                     // §9.3.3.1.1.9.
                     cabac_nb: Some(&mut cabac_nb),
                     pic_width_in_mbs: pic_w_mbs,
+                    bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
+                    bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
                 };
                 let (byte, bit) = r.position();
                 let mb_result =
@@ -783,6 +785,8 @@ pub fn parse_slice_data(
                 // CABAC neighbour grid unused on the CAVLC path.
                 cabac_nb: None,
                 pic_width_in_mbs: 0,
+                bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
+                bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
             };
             let (byte, bit) = r.position();
             let mb = parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)
@@ -1421,5 +1425,79 @@ mod tests {
                 let _ = e;
             }
         }
+    }
+
+    /// §7.3.5 / §7.4.5 / §7.4.2.1.1 — CAVLC I_PCM macroblock in a
+    /// 10-bit High10 sequence.
+    ///
+    /// Before round 128 the CAVLC I_PCM path hard-coded
+    /// `bit_depth_y = bit_depth_c = 8`, so `pcm_sample_luma[i]` and
+    /// `pcm_sample_chroma[i]` were read as 8-bit values regardless of
+    /// the active SPS. With `bit_depth_luma_minus8 = 2` /
+    /// `bit_depth_chroma_minus8 = 2` (BitDepthY = BitDepthC = 10), the
+    /// next macroblock's syntax then desynchronised by
+    /// 2 * (256 + 64 + 64) = 768 bits, corrupting all subsequent
+    /// macroblocks in the slice.
+    ///
+    /// This regression exercises the fix by emitting a single 10-bit
+    /// I_PCM MB whose luma / chroma samples cover values that don't
+    /// fit in 8 bits (0x200 = 512, 0x3ff = 1023), and asserts that
+    /// `PcmSamples` round-trips them losslessly.
+    #[test]
+    fn cavlc_i_pcm_macroblock_10bit_high10_round_trips() {
+        let mut sps = dummy_sps();
+        sps.profile_idc = 110; // High 10
+        sps.bit_depth_luma_minus8 = 2; // BitDepthY = 10
+        sps.bit_depth_chroma_minus8 = 2; // BitDepthC = 10
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+
+        // Build a 10-bit pattern. Use values that explicitly require
+        // bits 8..=9 so an 8-bit reader would truncate them.
+        let luma_pattern: Vec<u32> = (0..256u32).map(|i| (i * 4) & 0x3ff).collect();
+        // For 4:2:0 each chroma plane is 8x8 = 64 samples.
+        let chroma_cb_pattern: Vec<u32> = (0..64u32).map(|i| 0x200 | i).collect();
+        let chroma_cr_pattern: Vec<u32> = (0..64u32).map(|i| 0x3ff - (i & 0x3ff)).collect();
+
+        let mut w = BitWriter::new();
+        w.ue(25); // mb_type = 25 → I_PCM in I slices (§Table 7-11).
+                  // §7.3.5: pcm_alignment_zero_bit consumed until byte-aligned.
+                  // We're already aligned after the ue(25), but for clarity:
+        while w.bit_pos != 0 {
+            w.u(1, 0);
+        }
+        // §7.4.5: pcm_sample_luma[i] is u(v) with v = BitDepthY = 10.
+        for &v in &luma_pattern {
+            w.u(10, v);
+        }
+        for &v in &chroma_cb_pattern {
+            w.u(10, v);
+        }
+        for &v in &chroma_cr_pattern {
+            w.u(10, v);
+        }
+        // After I_PCM the next macroblock starts byte-aligned (PCM
+        // samples are sized so the cumulative bit count is a multiple
+        // of 8 when bit_depth values are multiples of 2 — true here
+        // for 10-bit with 256+64+64 samples ⇒ 3840 bits = 480 bytes).
+        // No further macroblocks in this fixture; emit the RBSP
+        // trailing bit so `more_rbsp_data()` returns false on the
+        // post-MB check.
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        assert_eq!(sd.macroblocks.len(), 1, "exactly one I_PCM MB");
+        let mb = &sd.macroblocks[0];
+        assert_eq!(mb.mb_type, MbType::IPcm);
+        let pcm = mb.pcm_samples.as_ref().expect("I_PCM carries pcm_samples");
+        assert_eq!(pcm.luma, luma_pattern, "10-bit luma samples preserved");
+        assert_eq!(pcm.chroma_cb, chroma_cb_pattern, "10-bit Cb preserved");
+        assert_eq!(pcm.chroma_cr, chroma_cr_pattern, "10-bit Cr preserved");
+        // §7.4.5 / §6.2: 4:2:0 ⇒ 2 * 8 * 8 = 128 chroma samples
+        // split evenly between Cb and Cr.
+        assert_eq!(pcm.luma.len(), 256);
+        assert_eq!(pcm.chroma_cb.len(), 64);
+        assert_eq!(pcm.chroma_cr.len(), 64);
     }
 }

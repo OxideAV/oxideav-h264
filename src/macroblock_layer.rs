@@ -2061,6 +2061,16 @@ pub struct EntropyState<'ctx, 'data> {
     /// `0` disables the grid (treats everything as unavailable) even
     /// when `cabac_nb` is `Some`.
     pub pic_width_in_mbs: u32,
+    /// §7.3.5 / §7.4.5 — `BitDepthY = 8 + bit_depth_luma_minus8` for the
+    /// active SPS. Sizes the `pcm_sample_luma[i]` reads in the I_PCM
+    /// macroblock path. Defaults to 0 (BitDepthY = 8) when callers
+    /// (e.g. parser unit tests) only exercise non-PCM macroblocks.
+    pub bit_depth_luma_minus8: u32,
+    /// §7.3.5 / §7.4.5 — `BitDepthC = 8 + bit_depth_chroma_minus8` for
+    /// the active SPS. Sizes the `pcm_sample_chroma[i]` reads in the
+    /// I_PCM macroblock path. Defaults to 0 (BitDepthC = 8) for
+    /// non-PCM callers.
+    pub bit_depth_chroma_minus8: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -2172,10 +2182,14 @@ pub fn parse_macroblock(
             // than "shall be parsed as".
             let _ = r.u(1)?;
         }
-        let bit_depth_y: u32 = 8; // For baseline/main/hi420 profiles we're
-                                  // testing, bit_depth_luma_minus8 == 0 → 8.
-                                  // A future pass should consult the SPS.
-        let bit_depth_c: u32 = 8;
+        // §7.4.5 — pcm_sample_luma[i] is u(v) with v = BitDepthY, and
+        // pcm_sample_chroma[i] is u(v) with v = BitDepthC. Both are
+        // derived from the active SPS via BitDepthY = 8 +
+        // bit_depth_luma_minus8 and BitDepthC = 8 +
+        // bit_depth_chroma_minus8 (§7.4.2.1.1). Supports the full
+        // 8..=14 range; spec maximum is 14.
+        let bit_depth_y: u32 = 8 + entropy.bit_depth_luma_minus8;
+        let bit_depth_c: u32 = 8 + entropy.bit_depth_chroma_minus8;
         // ChromaArrayType determines the count of chroma samples per §7.4.5:
         //   0 → none; 1 → 2*MbWidthC*MbHeightC = 2*8*8 = 128 total (64 Cb + 64 Cr);
         //   2 → 2*16*8 = 256 (128 + 128); 3 → 2*16*16 = 512 (256 + 256).
@@ -4568,6 +4582,8 @@ mod tests {
             mbaff_frame_flag: false,
             cabac_nb: None,
             pic_width_in_mbs: 0,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
         }
     }
 
@@ -5796,6 +5812,8 @@ mod tests {
             mbaff_frame_flag: false,
             cabac_nb: None,
             pic_width_in_mbs: 0,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
         };
         let pred = parse_mb_pred(&mut r, &mut entropy, mb_type, false).unwrap();
         let bins_used = dec.bin_count() - bins_before;
@@ -6111,6 +6129,8 @@ mod tests {
             mbaff_frame_flag: false,
             cabac_nb: None,
             pic_width_in_mbs: 0,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
         };
         let pred = parse_sub_mb_pred(&mut r, &mut entropy, mb_type).unwrap();
         let bins_used = dec.bin_count() - bins_before;
@@ -6242,6 +6262,8 @@ mod tests {
             mbaff_frame_flag: false,
             cabac_nb: None,
             pic_width_in_mbs: 0,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
         }
     }
 

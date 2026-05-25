@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **round 128 — CAVLC I_PCM macroblock now honours `BitDepthY` /
+  `BitDepthC` from the active SPS (§7.4.5 / §7.4.2.1.1).** Before this
+  round, the CAVLC `I_PCM` path in `macroblock_layer.rs` hard-coded
+  `bit_depth_y = bit_depth_c = 8`, so `pcm_sample_luma[i]` and
+  `pcm_sample_chroma[i]` were always read as 8-bit values regardless
+  of `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` on the SPS.
+  For a High10 (BitDepthY = 10) sequence with an `I_PCM` MB this
+  would truncate every sample to its low 8 bits and leave the bit
+  reader off by `(256 + 2 * MbWidthC * MbHeightC) * (BitDepth - 8)`
+  bits — corrupting all subsequent macroblocks in the slice.
+
+  Fix threads `bit_depth_luma_minus8` / `bit_depth_chroma_minus8`
+  through `EntropyState` (new fields, defaulting to 0 for parser
+  unit-test call sites) and reads them in the CAVLC PCM loop. The
+  CABAC PCM path in `slice_data.rs` already consulted the SPS
+  directly, so no behavioural change there beyond forwarding the
+  same fields into its `EntropyState`. New regression
+  `slice_data::tests::cavlc_i_pcm_macroblock_10bit_high10_round_trips`
+  emits a single 10-bit `I_PCM` MB with samples that explicitly
+  require bits 8..=9 and asserts byte-for-byte round-trip through
+  `parse_slice_data`.
+
 - **fuzz: round-125 / task #1044 — reject PPS that arrives BEFORE its
   referenced SPS (§7.4.1.2.1 / §7.4.2.2).** Closes the
   `ffmpeg_oracle_decode` divergence flagged on

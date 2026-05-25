@@ -43,7 +43,7 @@ no packet is decoded.
 | VUI parameters (+ HRD) | §E.1 | integrated into SPS |
 | AUD + SEI framing + filler + end-of-seq/stream | §7.3.2.3..7 | parsed (SEI payloads per Annex D deferred) |
 | Slice header | §7.3.3 | parsed (incl. RPLM, pred_weight_table, dec_ref_pic_marking) |
-| Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2; MBAFF + 4:4:4 + CABAC I_PCM termination deferred) |
+| Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2 + 4:4:4; I_PCM honours `BitDepth{Y,C}` from the SPS on both CAVLC and CABAC paths, incl. §9.3.1.2 post-PCM arithmetic-engine re-init; MBAFF parse + 4:4:4 P/B inter still deferred) |
 | FMO MB address derivation | §8.2.2, §8.2.3 | implemented (all 7 slice_group_map_types + NextMbAddress) |
 | Top-level decoder driver | §7.4.1.2.1 | implemented (events: SPS/PPS stored, AUD, Slice, SEI, end markers, Ignored) |
 | I-slice reconstruction (Picture + MB grid + intra + deblock) | §8 / §6.4 | implemented (I_PCM, Intra_4x4, Intra_8x8, Intra_16x16, chroma) |
