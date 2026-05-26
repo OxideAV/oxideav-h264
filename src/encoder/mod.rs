@@ -263,6 +263,33 @@ pub struct EncoderConfig {
     ///   * Wider GOPs on textured content see ~5-12 % saving on the
     ///     coded inter MBs.
     pub trellis_quant: bool,
+    /// Round-148 — opt-in trellis quantisation refinement on the CABAC
+    /// **IDR Intra_16x16 luma AC** path. Default `false`.
+    ///
+    /// When enabled, the 16 per-block 4x4 AC arrays produced by
+    /// `quantize_intra16x16_luma` are passed through
+    /// [`crate::encoder::transform::trellis_refine_4x4_ac`] with
+    /// `skip_dc=true` so the §8.5.10 inverse-Hadamard DC chain stays
+    /// untouched. The bitstream syntax does not change; the decoder
+    /// is unaffected; `cbp_luma` keeps the §7.4.5.1 Table 7-11 value
+    /// (`15` whenever any AC remains non-zero across the MB).
+    ///
+    /// Default is `false` because the [`trellis_quant`] rate model is
+    /// calibrated for inter blockCats and tends to *enlarge* dense
+    /// intra IDR streams at low QP on textured content (the
+    /// open-loop deadzone is already near-optimal on Intra_16x16 AC at
+    /// QP >= 22). The flag is wired so that a future round can
+    /// re-calibrate the rate model for blockCat 1 (Intra16x16AC) and
+    /// then flip the default. Until then the lever stays useful for
+    /// callers who want maximum-compression IDRs on high-noise
+    /// content where the open-loop quantiser leaves obvious AC
+    /// residue.
+    ///
+    /// Decoder-transparency is verified by the round-148
+    /// `integration_trellis_quant_idr` regression: a flipped IDR
+    /// self-roundtrips bit-equivalently and ffmpeg cross-decodes
+    /// within 1 LSB of the encoder's local recon.
+    pub trellis_quant_intra: bool,
 }
 
 impl EncoderConfig {
@@ -283,6 +310,7 @@ impl EncoderConfig {
             level_idc: min_level_idc_for_picture_size(width_in_mbs, height_in_mbs),
             bit_depth_chroma_minus8: 0,
             trellis_quant: true,
+            trellis_quant_intra: false,
         }
     }
 }

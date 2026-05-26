@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **round 148 — opt-in CABAC IDR Intra_16x16 luma AC trellis
+  quantisation.** Extends the round-49 `D + λ·R` refinement
+  (`crate::encoder::transform::trellis_refine_4x4_ac`) to the 16 per-
+  block 4x4 AC arrays inside an Intra_16x16 luma MB on the
+  `encode_idr_cabac` path. Each block is passed through the trellis
+  with `skip_dc=true` so the §8.5.10 inverse-Hadamard DC chain stays
+  bit-exact while higher-frequency AC levels can shrink toward zero.
+  New `EncoderConfig::trellis_quant_intra` toggle (default `false`)
+  gates the refinement. Bitstream syntax is unchanged; the decoder
+  is unaffected; `cbp_luma` keeps the §7.4.5.1 Table 7-11 value
+  (`15` whenever any AC remains non-zero across the MB). The default
+  stays off because the round-49 rate model is calibrated for inter
+  blockCat 2 (Luma4x4) and is net-negative on dense intra
+  Intra_16x16 AC at low QP — re-calibrating for blockCat 1
+  (Intra16x16AC) so the lever can ship default-on is the obvious
+  follow-up. New `integration_trellis_quant_intra.rs` pins four
+  guarantees: default-off byte-for-byte determinism, decoder self-
+  roundtrip bit-exact at QP=22, PSNR drift inside a 3 dB envelope
+  across QP {22, 28, 34}, and QP {18..42} sweep stays decodable +
+  bit-exact (max enc/dec luma diff = 0). Spec basis: §8.5.10, §8.5.12,
+  §7.4.5.1, §9.3.3.1.3.
+
 - **round 145 — end-to-end Criterion `encode` benchmark.** Adds
   `benches/encode.rs`, sibling to `benches/decode.rs`, exercising
   the public encoder entry points across seven in-process variants

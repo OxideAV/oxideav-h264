@@ -1244,12 +1244,22 @@ fn pick_chroma_mode(
 
 /// Quantise a 16x16 luma residual: returns per-block (DC, AC quant raster,
 /// AC scan) plus a flag for any AC nonzero.
+///
+/// `trellis` enables the §9.3.3.1.3-aware AC refinement applied per
+/// 4x4 block with `skip_dc=true` so the §8.5.10 Hadamard DC chain is
+/// not disturbed. The refinement is bitstream-compatible — it only
+/// changes which non-zero AC levels are emitted; the decoder is
+/// unchanged.
 fn quantize_intra16x16_luma(
     residual: &[i32; 256],
     qp_y: i32,
+    trellis: bool,
 ) -> ([i32; 16], [[i32; 16]; 16], [[i32; 16]; 16], bool) {
-    // Per-block forward 4x4.
+    // Per-block forward 4x4. The source residual is kept aside per
+    // 4x4 block as well so the trellis refinement (which works in the
+    // spatial domain) can compute SSD without recomputing slices.
     let mut coeffs_4x4 = [[0i32; 16]; 16];
+    let mut residual_4x4 = [[0i32; 16]; 16];
     for blk in 0..16usize {
         let bx = blk % 4;
         let by = blk / 4;
@@ -1259,6 +1269,7 @@ fn quantize_intra16x16_luma(
                 block[j * 4 + i] = residual[(by * 4 + j) * 16 + bx * 4 + i];
             }
         }
+        residual_4x4[blk] = block;
         coeffs_4x4[blk] = forward_core_4x4(&block);
     }
     // DC matrix.
@@ -1272,13 +1283,31 @@ fn quantize_intra16x16_luma(
     let dc_levels = quantize_luma_dc(&dc_hadamard, qp_y, true);
 
     // Per-block AC quantise.
+    let lambda_q16 = if trellis {
+        crate::encoder::transform::trellis_lambda_q16(qp_y)
+    } else {
+        0
+    };
     let mut ac_quant_raster = [[0i32; 16]; 16];
     let mut ac_scan = [[0i32; 16]; 16];
     let mut any_ac_nz = false;
     for blkz in 0..16usize {
         let (bx, by) = LUMA_4X4_BLK[blkz];
         let raster = by * 4 + bx;
-        let z = quantize_4x4_ac(&coeffs_4x4[raster], qp_y, true);
+        let mut z = quantize_4x4_ac(&coeffs_4x4[raster], qp_y, true);
+        // Trellis refinement on AC only — DC is rewritten by the
+        // §8.5.10 inverse Hadamard at reconstruct time and must stay
+        // untouched here. `skip_dc=true` pins z[0] across the refine.
+        if trellis && z.iter().any(|&v| v != 0) {
+            z = crate::encoder::transform::trellis_refine_4x4_ac(
+                &residual_4x4[raster],
+                &coeffs_4x4[raster],
+                &z,
+                qp_y,
+                lambda_q16,
+                true,
+            );
+        }
         ac_quant_raster[raster] = z;
         let scan_ac = zigzag_scan_4x4_ac(&z);
         ac_scan[blkz] = scan_ac;
@@ -1553,7 +1582,7 @@ impl Encoder {
                     }
                 }
                 let (luma_dc, luma_ac_quant, luma_ac_scan, any_luma_ac_nz) =
-                    quantize_intra16x16_luma(&residual, qp_y);
+                    quantize_intra16x16_luma(&residual, qp_y, cfg.trellis_quant_intra);
                 let mut cbp_luma: u8 = if any_luma_ac_nz { 15 } else { 0 };
 
                 // --------------- chroma encode (4:2:0 vs 4:4:4) ---------------
