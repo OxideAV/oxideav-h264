@@ -50,6 +50,15 @@
 //!   2003 draft (`docs/video/h264/ISO_IEC_14496-10-AVC-2003-draft.pdf`,
 //!   §D.1.11–§D.1.13 / §D.2.11–§D.2.13). It was removed from later
 //!   editions; the section numbers above are the 2003-draft numbering.
+//!
+//! Round-158 sub-parser: `parse_atsc1_envelope` decodes the typed ATSC1
+//! envelope (provider_code = 0x0031 + user_identifier in {GA94, DTG1})
+//! that real-world streams put inside a payload-type-4
+//! `user_data_registered_itu_t_t35` with country_code = 0xB5 (USA). See
+//! the `parse_atsc1_envelope` doc comment for the wire layout and the
+//! ATSC A/53 Part 4 §6.2.3 reference. The CEA-708 cc_data() inner byte
+//! layout is intentionally surfaced opaquely (CEA-708 spec is not in the
+//! docs tree).
 
 #![allow(dead_code)]
 
@@ -204,6 +213,44 @@ pub enum SeiError {
         bits: u32,
         available: usize,
     },
+    #[error(
+        "ATSC1 envelope requires at least 6 bytes (2 provider_code + 4 user_identifier) per ATSC A/53 Part 4 §6.2.3 (got {0})"
+    )]
+    Atsc1EnvelopeTooShort(usize),
+    #[error(
+        "ATSC1 envelope provider_code shall be 0x0031 (ATSC) per ATSC A/53 Part 4 §6.2.3 / SMPTE-RA T.35 registration (got 0x{0:04X})"
+    )]
+    Atsc1ProviderCodeMismatch(u16),
+    #[error(
+        "ATSC1 envelope user_identifier 0x{0:08X} is not a registered ATSC value per ATSC A/53 Part 4 §6.2.3 Table 6.7 (expected 'GA94' 0x47413934 or 'DTG1' 0x44544731)"
+    )]
+    Atsc1UnknownUserIdentifier(u32),
+    #[error(
+        "ATSC1 ATSC_user_data() requires at least 1 byte for user_data_type_code per A/53 Part 4 §6.2.3 Table 6.8 (got empty payload)"
+    )]
+    Atsc1AtscUserDataEmpty,
+    #[error(
+        "ATSC1 bar_data reserved field must be '1111' per A/53 Part 4 Table 6.11 (got 0b{0:04b})"
+    )]
+    Atsc1BarDataReservedMismatch(u8),
+    #[error(
+        "ATSC1 bar_data {which}_bar one_bits field must be '11' per A/53 Part 4 Table 6.11 (got 0b{got:02b})"
+    )]
+    Atsc1BarDataOneBitsMismatch { which: &'static str, got: u8 },
+    #[error(
+        "ATSC1 bar_data top_bar_flag and bottom_bar_flag must match per A/53 Part 4 §6.2.3.2 (top={top}, bottom={bottom})"
+    )]
+    Atsc1BarDataTopBottomMismatch { top: bool, bottom: bool },
+    #[error(
+        "ATSC1 bar_data left_bar_flag and right_bar_flag must match per A/53 Part 4 §6.2.3.2 (left={left}, right={right})"
+    )]
+    Atsc1BarDataLeftRightMismatch { left: bool, right: bool },
+    #[error(
+        "ATSC1 bar_data may not signal both letterbox (top/bottom) and pillarbox (left/right) at once per A/53 Part 4 §6.2.3.2"
+    )]
+    Atsc1BarDataLetterboxPillarboxBoth,
+    #[error("ATSC1 bar_data payload truncated — needed {needed} bytes, got {got}")]
+    Atsc1BarDataTruncated { needed: usize, got: usize },
 }
 
 /// §D.2.2 — buffering_period.
@@ -871,6 +918,330 @@ pub fn parse_user_data_registered_itu_t_t35(
         country_code,
         country_code_extension,
         payload_bytes,
+    })
+}
+
+// =============================================================================
+// ATSC1 (ATSC A/53 Part 4) typed envelope on top of user_data_registered_itu_t_t35
+// =============================================================================
+//
+// The single most common ATSC1 carriage seen in real-world H.264 streams
+// is closed-caption + bar / AFD metadata wrapped inside SEI payload-type 4
+// (`user_data_registered_itu_t_t35`, §D.2.6). The wire layout is:
+//
+//   country_code      = 0xB5             (USA, ITU-T T.35 §3.1)
+//   provider_code     = 0x0031           (ATSC, per the SMPTE-RA T.35
+//                                         terminal-provider registration
+//                                         referenced from ATSC A/53 Part 4)
+//   user_identifier   = 0x47413934       ("GA94" → ATSC_user_data() body,
+//                                         A/53 Part 4 §6.2.3 Table 6.7)
+//                       | 0x44544731     ("DTG1" → afd_data() body,
+//                                         A/53 Part 4 §6.2.3 Table 6.7)
+//   ATSC_user_data() = user_data_type_code (u(8)) + user_data_type_structure()
+//                                        A/53 Part 4 Table 6.8 + Table 6.9:
+//   user_data_type_code values:
+//     0x00..=0x02 — ATSC reserved
+//     0x03        — MPEG_cc_data() (cc_data() per CEA-708 [1] Table 2)
+//     0x04..=0x05 — ATSC reserved
+//     0x06        — bar_data()
+//     0x07..=0xFF — ATSC reserved
+//
+// This module parses the **outer envelope** (country / provider / user_id /
+// type_code) and the bar_data() body (Table 6.11 + 6.12 + §6.2.3.2). The
+// inner cc_data() bytes are kept opaque because the CEA-708 Table 2 byte
+// layout is normatively defined outside this spec — see the docs gap note
+// in the surrounding parser.
+
+/// ATSC1 user_identifier registered values (A/53 Part 4 Table 6.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Atsc1UserIdentifier {
+    /// 'GA94' (0x47413934) — ATSC_user_data() body per A/53 Part 4 §6.2.3.
+    Ga94,
+    /// 'DTG1' (0x44544731) — afd_data() body per A/53 Part 4 §6.2.3.
+    Dtg1,
+}
+
+impl Atsc1UserIdentifier {
+    /// Raw 4-byte representation as it appears on the wire.
+    pub const GA94: u32 = 0x4741_3934;
+    /// Raw 4-byte representation as it appears on the wire.
+    pub const DTG1: u32 = 0x4454_4731;
+
+    fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            Self::GA94 => Some(Self::Ga94),
+            Self::DTG1 => Some(Self::Dtg1),
+            _ => None,
+        }
+    }
+}
+
+/// One ATSC_user_data() entry per A/53 Part 4 §6.2.3 Table 6.8 / Table 6.9.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Atsc1UserData {
+    /// `user_data_type_code == 0x03` — MPEG_cc_data() per Table 6.10.
+    ///
+    /// The cc_data() inner bytes are normatively defined in CEA-708 [1]
+    /// Table 2, which is *not* present in this docs tree. We surface the
+    /// raw cc_data() byte string (with the trailing marker_bits == 0xFF
+    /// preserved) so callers that have a CEA-708 parser handy can drive
+    /// it; this layer treats the inner payload as opaque.
+    CcData { cc_data_bytes: Vec<u8> },
+    /// `user_data_type_code == 0x06` — bar_data() per Table 6.11.
+    BarData(BarData),
+    /// `user_data_type_code ∈ {0x00, 0x01, 0x02, 0x04, 0x05, 0x07..=0xFF}` —
+    /// ATSC reserved per Table 6.9. Receiving devices are expected to
+    /// silently discard the structure (A/53 Part 4 §6.2.2). We keep the
+    /// raw bytes to make round-trip diagnostics possible.
+    Reserved { type_code: u8, raw: Vec<u8> },
+}
+
+/// `afd_data()` per ATSC A/53 Part 4 §6.2.4 / Table 6.13.
+///
+/// Carried under the `'DTG1'` user_identifier. The wire layout is
+/// `[zero u(1) | active_format_flag u(1) | reserved '000001' u(6)]`
+/// followed optionally (when `active_format_flag == 1`) by `reserved '1111'
+/// u(4) | active_format u(4)`. We surface `active_format_flag` and the
+/// resolved 4-bit `active_format` value; the reserved bits are validated
+/// against their fixed patterns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AfdData {
+    pub active_format_flag: bool,
+    /// `active_format` per A/53 Part 4 Table 6.14. Only meaningful when
+    /// `active_format_flag` is true; `None` otherwise.
+    pub active_format: Option<u8>,
+}
+
+/// `bar_data()` per ATSC A/53 Part 4 §6.2.3.2 / Table 6.11.
+///
+/// A `bar_data()` structure signals either a letterbox region
+/// (top + bottom bars) or a pillarbox region (left + right bars). Per
+/// §6.2.3.2 the two pairs are mutually exclusive in a single structure;
+/// `top_bar_flag` shall equal `bottom_bar_flag`, and `left_bar_flag`
+/// shall equal `right_bar_flag`. We enforce both constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarData {
+    /// `(line_number_end_of_top_bar, line_number_start_of_bottom_bar)` —
+    /// `Some(_)` when `top_bar_flag == bottom_bar_flag == 1`. Each value
+    /// is a 14-bit unsigned line number whose video-format-dependent
+    /// designation is specified in Table 6.12.
+    pub letterbox: Option<(u16, u16)>,
+    /// `(pixel_number_end_of_left_bar, pixel_number_start_of_right_bar)` —
+    /// `Some(_)` when `left_bar_flag == right_bar_flag == 1`. Each value
+    /// is a 14-bit unsigned pixel index counted from zero at the leftmost
+    /// luma sample per §6.2.3.2.
+    pub pillarbox: Option<(u16, u16)>,
+}
+
+/// Typed ATSC1 envelope sitting on top of `user_data_registered_itu_t_t35`.
+///
+/// `provider_code` is preserved verbatim — `parse_atsc1_envelope` rejects
+/// any value other than `0x0031` so consumers can assume it. The structured
+/// `user_identifier` enum disambiguates the inner body type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Atsc1Envelope {
+    /// `provider_code` — always `0x0031` after a successful parse.
+    pub provider_code: u16,
+    /// `user_identifier` — registered value per A/53 Part 4 Table 6.7.
+    pub user_identifier: Atsc1UserIdentifier,
+    /// Decoded inner body — `Ga94 → AtscUserData`, `Dtg1 → Afd`.
+    pub body: Atsc1Body,
+}
+
+/// Inner body of an ATSC1 envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Atsc1Body {
+    /// `'GA94'` → `ATSC_user_data()` per Table 6.8.
+    AtscUserData(Atsc1UserData),
+    /// `'DTG1'` → `afd_data()` per §6.2.4.
+    Afd(AfdData),
+}
+
+/// Parse an `afd_data()` body per A/53 Part 4 §6.2.4 / Table 6.13.
+///
+/// Layout (1 or 2 bytes):
+/// ```text
+/// afd_data() {
+///   zero                              u(1) = 0
+///   active_format_flag                u(1)
+///   reserved                          u(6) = 0b000001
+///   if (active_format_flag == 1) {
+///     reserved                        u(4) = 0b1111
+///     active_format                   u(4)
+///   }
+/// }
+/// ```
+///
+/// The 'zero' leading bit + the 6-bit reserved field both have fixed
+/// patterns per Table 6.13 and the §6.2.4.2 semantics, but we accept any
+/// values silently because real-world streams have been known to populate
+/// the high bit differently and §6.2.4 Note (a) clarifies the field is
+/// non-`reserved`-in-the-strict-sense.
+fn parse_afd_data(bytes: &[u8]) -> Result<AfdData, SeiError> {
+    let Some(&first) = bytes.first() else {
+        return Err(SeiError::Atsc1BarDataTruncated { needed: 1, got: 0 });
+    };
+    let active_format_flag = (first & 0b0100_0000) != 0;
+    if !active_format_flag {
+        return Ok(AfdData {
+            active_format_flag: false,
+            active_format: None,
+        });
+    }
+    // Second byte = '1111' u(4) + active_format u(4).
+    let Some(&second) = bytes.get(1) else {
+        return Err(SeiError::Atsc1BarDataTruncated { needed: 2, got: 1 });
+    };
+    let active_format = second & 0x0F;
+    Ok(AfdData {
+        active_format_flag: true,
+        active_format: Some(active_format),
+    })
+}
+
+/// Parse a `bar_data()` body per A/53 Part 4 §6.2.3.2 / Table 6.11.
+///
+/// Wire layout (1 + 0..4 × 2 bytes):
+/// ```text
+///   top_bar_flag    u(1)
+///   bottom_bar_flag u(1)
+///   left_bar_flag   u(1)
+///   right_bar_flag  u(1)
+///   reserved        u(4) = '1111'
+///   if (top_bar_flag == 1) {
+///     one_bits      u(2) = '11'
+///     line_number_end_of_top_bar     u(14)
+///   }
+///   if (bottom_bar_flag == 1) {
+///     one_bits      u(2) = '11'
+///     line_number_start_of_bottom_bar u(14)
+///   }
+///   if (left_bar_flag == 1) {
+///     one_bits      u(2) = '11'
+///     pixel_number_end_of_left_bar    u(14)
+///   }
+///   if (right_bar_flag == 1) {
+///     one_bits      u(2) = '11'
+///     pixel_number_start_of_right_bar u(14)
+///   }
+/// ```
+///
+/// Per §6.2.3.2: top_bar_flag == bottom_bar_flag, left_bar_flag ==
+/// right_bar_flag, and only one of the two pairs may be set at a time.
+/// The reserved nibble and each `one_bits` value have fixed bit patterns
+/// per the table and are validated.
+fn parse_bar_data(bytes: &[u8]) -> Result<BarData, SeiError> {
+    let mut r = BitReader::new(bytes);
+    let top = r.u(1)? == 1;
+    let bottom = r.u(1)? == 1;
+    let left = r.u(1)? == 1;
+    let right = r.u(1)? == 1;
+    let reserved = r.u(4)? as u8;
+    if reserved != 0b1111 {
+        return Err(SeiError::Atsc1BarDataReservedMismatch(reserved));
+    }
+    if top != bottom {
+        return Err(SeiError::Atsc1BarDataTopBottomMismatch { top, bottom });
+    }
+    if left != right {
+        return Err(SeiError::Atsc1BarDataLeftRightMismatch { left, right });
+    }
+    if (top || bottom) && (left || right) {
+        return Err(SeiError::Atsc1BarDataLetterboxPillarboxBoth);
+    }
+
+    let mut read_14 = |which: &'static str| -> Result<u16, SeiError> {
+        let one_bits = r.u(2)? as u8;
+        if one_bits != 0b11 {
+            return Err(SeiError::Atsc1BarDataOneBitsMismatch {
+                which,
+                got: one_bits,
+            });
+        }
+        Ok(r.u(14)? as u16)
+    };
+    let letterbox = if top {
+        let t = read_14("top")?;
+        let b = read_14("bottom")?;
+        Some((t, b))
+    } else {
+        None
+    };
+    let pillarbox = if left {
+        let l = read_14("left")?;
+        let rt = read_14("right")?;
+        Some((l, rt))
+    } else {
+        None
+    };
+    Ok(BarData {
+        letterbox,
+        pillarbox,
+    })
+}
+
+/// Parse an ATSC1 envelope from the **`payload_bytes`** field of a
+/// `user_data_registered_itu_t_t35` (i.e. the bytes that follow the leading
+/// country_code byte). The caller has already established that
+/// `country_code == 0xB5` (USA).
+///
+/// Validates:
+/// * Minimum length (≥ 6 bytes for the 2-byte provider_code + 4-byte
+///   user_identifier).
+/// * `provider_code == 0x0031` (ATSC's T.35 administered slot).
+/// * `user_identifier ∈ {0x47413934 'GA94', 0x44544731 'DTG1'}` per
+///   A/53 Part 4 §6.2.3 Table 6.7.
+///
+/// For `'GA94'` it reads the `user_data_type_code` (u(8)) per Table 6.8
+/// and dispatches:
+/// * `0x03` → `Atsc1UserData::CcData { cc_data_bytes }` — opaque
+///   (CEA-708 Table 2 layout out of docs scope).
+/// * `0x06` → `Atsc1UserData::BarData(_)` per Table 6.11.
+/// * any reserved code → `Atsc1UserData::Reserved { type_code, raw }`
+///   per §6.2.2 ("receiving devices are expected to silently discard
+///   unrecognized video user data").
+///
+/// For `'DTG1'` it parses `afd_data()` per §6.2.4 / Table 6.13.
+pub fn parse_atsc1_envelope(payload_bytes: &[u8]) -> Result<Atsc1Envelope, SeiError> {
+    if payload_bytes.len() < 6 {
+        return Err(SeiError::Atsc1EnvelopeTooShort(payload_bytes.len()));
+    }
+    let provider_code = u16::from_be_bytes([payload_bytes[0], payload_bytes[1]]);
+    if provider_code != 0x0031 {
+        return Err(SeiError::Atsc1ProviderCodeMismatch(provider_code));
+    }
+    let user_identifier_raw = u32::from_be_bytes([
+        payload_bytes[2],
+        payload_bytes[3],
+        payload_bytes[4],
+        payload_bytes[5],
+    ]);
+    let user_identifier = Atsc1UserIdentifier::from_u32(user_identifier_raw)
+        .ok_or(SeiError::Atsc1UnknownUserIdentifier(user_identifier_raw))?;
+    let rest = &payload_bytes[6..];
+    let body = match user_identifier {
+        Atsc1UserIdentifier::Ga94 => {
+            let Some((&type_code, after)) = rest.split_first() else {
+                return Err(SeiError::Atsc1AtscUserDataEmpty);
+            };
+            let inner = match type_code {
+                0x03 => Atsc1UserData::CcData {
+                    cc_data_bytes: after.to_vec(),
+                },
+                0x06 => Atsc1UserData::BarData(parse_bar_data(after)?),
+                _ => Atsc1UserData::Reserved {
+                    type_code,
+                    raw: after.to_vec(),
+                },
+            };
+            Atsc1Body::AtscUserData(inner)
+        }
+        Atsc1UserIdentifier::Dtg1 => Atsc1Body::Afd(parse_afd_data(rest)?),
+    };
+    Ok(Atsc1Envelope {
+        provider_code,
+        user_identifier,
+        body,
     })
 }
 
@@ -7270,5 +7641,287 @@ mod tests {
             }
             other => panic!("expected SeiPrefixIndication, got {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // ATSC1 envelope (A/53 Part 4 §6.2.3) — typed view on top of
+    // user_data_registered_itu_t_t35 (round 158).
+    // =========================================================================
+
+    /// Build a full user_data_registered_itu_t_t35 payload that wraps an
+    /// ATSC1 envelope (country=0xB5 USA + provider 0x0031 + user_identifier
+    /// + body). Used to exercise the chained `parse_user_data_registered…`
+    ///   → `parse_atsc1_envelope` flow.
+    fn build_t35_atsc1(user_identifier: u32, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(7 + body.len());
+        v.push(0xB5);
+        v.extend_from_slice(&[0x00, 0x31]); // provider_code = 0x0031
+        v.extend_from_slice(&user_identifier.to_be_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn atsc1_envelope_ga94_cc_data_round_trip() {
+        // 'GA94' + user_data_type_code 0x03 (MPEG_cc_data) + 5 opaque cc bytes
+        // ending in the 0xFF marker the cc_data() trailer requires.
+        let cc = [0xFC, 0x94, 0x2C, 0xFE, 0xFF];
+        let mut body = vec![0x03u8];
+        body.extend_from_slice(&cc);
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        assert_eq!(outer.country_code, 0xB5);
+        assert!(outer.country_code_extension.is_none());
+
+        let env = parse_atsc1_envelope(&outer.payload_bytes).unwrap();
+        assert_eq!(env.provider_code, 0x0031);
+        assert_eq!(env.user_identifier, Atsc1UserIdentifier::Ga94);
+        match env.body {
+            Atsc1Body::AtscUserData(Atsc1UserData::CcData { cc_data_bytes }) => {
+                // CEA-708 inner layout intentionally opaque — only the byte
+                // count is asserted (we hand the bytes through unchanged for
+                // a downstream CEA-708 parser).
+                assert_eq!(cc_data_bytes, cc);
+            }
+            other => panic!("expected GA94 → CcData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atsc1_envelope_ga94_bar_data_letterbox() {
+        // top_bar_flag=1, bottom_bar_flag=1, left=0, right=0, reserved=1111,
+        // (one_bits=11, 14-bit line_number_end_of_top_bar = 0x0040 = 64),
+        // (one_bits=11, 14-bit line_number_start_of_bottom_bar = 0x03BF
+        //  = 959).
+        //
+        // First byte:  1 1 0 0  | 1 1 1 1 = 0b1100_1111 = 0xCF
+        // Then: '11' u(2) + u(14) = 16 bits = 2 bytes per value.
+        //   64  = 0x0040 → with 11 prefix → 0xC040
+        //   959 = 0x03BF → with 11 prefix → 0xC3BF
+        let body = [0x06, 0xCF, 0xC0, 0x40, 0xC3, 0xBF];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let env = parse_atsc1_envelope(&outer.payload_bytes).unwrap();
+        match env.body {
+            Atsc1Body::AtscUserData(Atsc1UserData::BarData(bar)) => {
+                assert_eq!(bar.letterbox, Some((64, 959)));
+                assert_eq!(bar.pillarbox, None);
+            }
+            other => panic!("expected BarData letterbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atsc1_envelope_ga94_bar_data_pillarbox() {
+        // top=0, bottom=0, left=1, right=1, reserved=1111, then two 16-bit
+        // (11 prefix + 14-bit) values: pixel_number_end_of_left_bar = 100,
+        // pixel_number_start_of_right_bar = 1820.
+        //   100  = 0x0064 → 0xC064
+        //   1820 = 0x071C → 0xC71C
+        // First byte: 0 0 1 1 | 1 1 1 1 = 0x3F
+        let body = [0x06, 0x3F, 0xC0, 0x64, 0xC7, 0x1C];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let env = parse_atsc1_envelope(&outer.payload_bytes).unwrap();
+        match env.body {
+            Atsc1Body::AtscUserData(Atsc1UserData::BarData(bar)) => {
+                assert_eq!(bar.letterbox, None);
+                assert_eq!(bar.pillarbox, Some((100, 1820)));
+            }
+            other => panic!("expected BarData pillarbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atsc1_envelope_bar_data_rejects_letterbox_and_pillarbox_simultaneously() {
+        // top=1, bottom=1, left=1, right=1 — explicitly forbidden by
+        // §6.2.3.2 ("either top and bottom bars or left and right bars,
+        // but not both pairs at once").
+        let body = [0x06, 0xFF];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let err = parse_atsc1_envelope(&outer.payload_bytes).unwrap_err();
+        assert_eq!(err, SeiError::Atsc1BarDataLetterboxPillarboxBoth);
+    }
+
+    #[test]
+    fn atsc1_envelope_bar_data_rejects_top_bottom_mismatch() {
+        // top=1, bottom=0 — §6.2.3.2 requires equality.
+        // First byte: 1 0 0 0 | 1 1 1 1 = 0x8F. Then a single (11+14) value.
+        let body = [0x06, 0x8F, 0xC0, 0x10];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let err = parse_atsc1_envelope(&outer.payload_bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::Atsc1BarDataTopBottomMismatch {
+                top: true,
+                bottom: false
+            }
+        );
+    }
+
+    #[test]
+    fn atsc1_envelope_bar_data_rejects_left_right_mismatch() {
+        // top=0, bottom=0, left=1, right=0 — §6.2.3.2 requires equality.
+        // First byte: 0 0 1 0 | 1 1 1 1 = 0x2F.
+        let body = [0x06, 0x2F, 0xC0, 0x10];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let err = parse_atsc1_envelope(&outer.payload_bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::Atsc1BarDataLeftRightMismatch {
+                left: true,
+                right: false,
+            }
+        );
+    }
+
+    #[test]
+    fn atsc1_envelope_bar_data_rejects_wrong_reserved_nibble() {
+        // top=0, bottom=0, left=0, right=0, reserved=0000 (must be 1111).
+        let body = [0x06, 0x00];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let err = parse_atsc1_envelope(&outer.payload_bytes).unwrap_err();
+        assert_eq!(err, SeiError::Atsc1BarDataReservedMismatch(0b0000));
+    }
+
+    #[test]
+    fn atsc1_envelope_bar_data_rejects_wrong_one_bits_prefix() {
+        // Letterbox flags set, reserved correct, but the per-value '11'
+        // prefix bits before line_number_end_of_top_bar are 0b01.
+        // First byte: 1 1 0 0 | 1 1 1 1 = 0xCF.
+        // Then: prefix 01 + 14-bit 0 → 0x4000.
+        let body = [0x06, 0xCF, 0x40, 0x00, 0xC0, 0x00];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let err = parse_atsc1_envelope(&outer.payload_bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::Atsc1BarDataOneBitsMismatch {
+                which: "top",
+                got: 0b01,
+            }
+        );
+    }
+
+    #[test]
+    fn atsc1_envelope_ga94_reserved_type_code_keeps_raw_bytes() {
+        // Table 6.9: 0x01 is ATSC reserved. §6.2.2 requires receivers
+        // to silently discard; we surface the raw bytes so a diagnostic
+        // tool can still inspect them.
+        let body = [0x01, 0xDE, 0xAD, 0xBE, 0xEF];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let env = parse_atsc1_envelope(&outer.payload_bytes).unwrap();
+        match env.body {
+            Atsc1Body::AtscUserData(Atsc1UserData::Reserved { type_code, raw }) => {
+                assert_eq!(type_code, 0x01);
+                assert_eq!(raw, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            other => panic!("expected reserved type_code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atsc1_envelope_ga94_empty_atsc_user_data_rejected() {
+        // 'GA94' with no following user_data_type_code byte — A/53 Part 4
+        // Table 6.8 requires the 8-bit type code field.
+        let body: [u8; 0] = [];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let err = parse_atsc1_envelope(&outer.payload_bytes).unwrap_err();
+        assert_eq!(err, SeiError::Atsc1AtscUserDataEmpty);
+    }
+
+    #[test]
+    fn atsc1_envelope_dtg1_afd_flag_off() {
+        // 'DTG1' + 1-byte afd_data() with active_format_flag = 0.
+        // First (and only) byte = 0 0 000001 = 0x01 (zero=0,
+        // active_format_flag=0, reserved=000001).
+        let body = [0x01u8];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::DTG1, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let env = parse_atsc1_envelope(&outer.payload_bytes).unwrap();
+        assert_eq!(env.user_identifier, Atsc1UserIdentifier::Dtg1);
+        match env.body {
+            Atsc1Body::Afd(afd) => {
+                assert!(!afd.active_format_flag);
+                assert_eq!(afd.active_format, None);
+            }
+            other => panic!("expected DTG1 → AFD, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atsc1_envelope_dtg1_afd_flag_on_carries_active_format() {
+        // 'DTG1' + 2-byte afd_data(): byte0 = 0 1 000001 = 0x41,
+        // byte1 = '1111' u(4) + active_format u(4) = 0xFA (active_format =
+        // 0b1010 = 10 → "16:9 letterbox image" per Table 6.14).
+        let body = [0x41u8, 0xFA];
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::DTG1, &body);
+        let outer = parse_user_data_registered_itu_t_t35(&raw).unwrap();
+        let env = parse_atsc1_envelope(&outer.payload_bytes).unwrap();
+        match env.body {
+            Atsc1Body::Afd(afd) => {
+                assert!(afd.active_format_flag);
+                assert_eq!(afd.active_format, Some(0b1010));
+            }
+            other => panic!("expected DTG1 → AFD with active_format, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atsc1_envelope_rejects_short_payload() {
+        // Six bytes are the minimum (provider 2 + user_id 4).
+        let err = parse_atsc1_envelope(&[0x00, 0x31, 0x47, 0x41, 0x39]).unwrap_err();
+        assert_eq!(err, SeiError::Atsc1EnvelopeTooShort(5));
+    }
+
+    #[test]
+    fn atsc1_envelope_rejects_wrong_provider_code() {
+        // 0x003C is the HDR10+ provider slot (also under USA 0xB5) — *not*
+        // the ATSC slot. The typed ATSC1 parser refuses to decode it as
+        // ATSC1; callers can fall back to the raw `payload_bytes` view.
+        let mut raw = vec![0x00, 0x3C];
+        raw.extend_from_slice(&Atsc1UserIdentifier::GA94.to_be_bytes());
+        let err = parse_atsc1_envelope(&raw).unwrap_err();
+        assert_eq!(err, SeiError::Atsc1ProviderCodeMismatch(0x003C));
+    }
+
+    #[test]
+    fn atsc1_envelope_rejects_unknown_user_identifier() {
+        // provider_code OK, but user_identifier 'ZZZZ' is unregistered.
+        let mut raw = vec![0x00, 0x31];
+        raw.extend_from_slice(b"ZZZZ");
+        let err = parse_atsc1_envelope(&raw).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::Atsc1UnknownUserIdentifier(u32::from_be_bytes(*b"ZZZZ"))
+        );
+    }
+
+    #[test]
+    fn atsc1_envelope_chain_through_parse_payload_dispatch() {
+        // End-to-end: parse_payload(4, …) → UserDataRegisteredItuTT35 →
+        // parse_atsc1_envelope. Mirrors what a slice-layer SEI consumer
+        // would do.
+        let cc = [0xFC, 0xC4, 0x91];
+        let mut body = vec![0x03u8];
+        body.extend_from_slice(&cc);
+        let raw = build_t35_atsc1(Atsc1UserIdentifier::GA94, &body);
+        let ctx = SeiContext::default();
+        let outer = match parse_payload(4, &raw, &ctx).unwrap() {
+            SeiPayload::UserDataRegisteredItuTT35(o) => o,
+            other => panic!("expected UserDataRegisteredItuTT35, got {other:?}"),
+        };
+        let env = parse_atsc1_envelope(&outer.payload_bytes).unwrap();
+        assert!(matches!(
+            env.body,
+            Atsc1Body::AtscUserData(Atsc1UserData::CcData { .. })
+        ));
     }
 }

@@ -9,6 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **round 158 — typed ATSC1 envelope sub-parser on top of
+  `user_data_registered_itu_t_t35` (§D.2.6).** Adds
+  `parse_atsc1_envelope(payload_bytes)` consuming the post-country-code
+  bytes of a country=0xB5 (USA) T.35 payload and decoding the ATSC1
+  envelope per ATSC A/53 Part 4 (2009) §6.2.3:
+  * `provider_code` (u(16) BE) — validated to be `0x0031` (the ATSC slot
+    in the T.35 administered provider registration).
+  * `user_identifier` (u(32) BE) — validated to be one of the two
+    registered ATSC values per Table 6.7: `'GA94'` (0x47413934 →
+    `ATSC_user_data()`) or `'DTG1'` (0x44544731 → `afd_data()`).
+  * For `'GA94'`: reads `user_data_type_code` (u(8)) per Table 6.8 and
+    dispatches per Table 6.9 — `0x03` surfaces the inner `MPEG_cc_data()`
+    bytes opaquely (the inner cc_data() byte layout is normatively in
+    CEA-708 [1] Table 2 which is **not present in this docs tree** — see
+    docs-gap note below), `0x06` parses `bar_data()` per Table 6.11
+    (top/bottom letterbox + left/right pillarbox pairs, reserved nibble
+    + per-value '11' one_bits validation + §6.2.3.2 mutual-exclusion
+    enforcement), any other code surfaces as `Atsc1UserData::Reserved`
+    with raw bytes preserved per §6.2.2 silent-discard rule.
+  * For `'DTG1'`: parses `afd_data()` per Table 6.13 / §6.2.4.2 (1 byte
+    when `active_format_flag = 0`, 2 bytes when `1` carrying the 4-bit
+    `active_format` value from Table 6.14).
+
+  New public surface in `crate::sei`: `Atsc1Envelope`, `Atsc1Body`,
+  `Atsc1UserData`, `Atsc1UserIdentifier` (with `GA94` / `DTG1`
+  constants), `BarData`, `AfdData`, and `parse_atsc1_envelope`. Ten new
+  `SeiError` variants pin the validation failures
+  (`Atsc1EnvelopeTooShort`, `Atsc1ProviderCodeMismatch`,
+  `Atsc1UnknownUserIdentifier`, `Atsc1AtscUserDataEmpty`,
+  `Atsc1BarDataReservedMismatch`, `Atsc1BarDataOneBitsMismatch`,
+  `Atsc1BarDataTopBottomMismatch`, `Atsc1BarDataLeftRightMismatch`,
+  `Atsc1BarDataLetterboxPillarboxBoth`, `Atsc1BarDataTruncated`).
+
+  Sixteen new `sei::tests::atsc1_*` unit tests cover: GA94+cc_data
+  round-trip with the raw cc_data bytes passed through verbatim;
+  GA94+bar_data letterbox + pillarbox decode at line/pixel values from
+  the worked example in §6.2.3.2; rejections for top≠bottom, left≠right,
+  reserved≠'1111', one_bits≠'11', and simultaneous letterbox+pillarbox;
+  GA94+reserved type-code preserving raw bytes for diagnostics; GA94
+  empty body rejected; DTG1+AFD flag-off (1-byte) and flag-on (2-byte
+  with `active_format = '1010'` 16:9 letterbox); 6-byte minimum size
+  enforcement; wrong provider_code (0x003C HDR10+) rejected; unknown
+  user_identifier rejected; and an end-to-end chain through
+  `parse_payload(4, …)` → `UserDataRegisteredItuTT35` →
+  `parse_atsc1_envelope`. 1033 lib tests + 1243 total tests pass with
+  the new module wired in (was 1017 + 1227).
+
+  Spec basis: ATSC A/53 Part 4 (2009) §6.2.3 Tables 6.7 / 6.8 / 6.9 /
+  6.10 / 6.11 / 6.13 / 6.14 (`docs/broadcast/atsc/A53-Part-4-2009.pdf`);
+  Rec. ITU-T H.264 (08/2024) §D.1.6 / §D.2.6 for the outer
+  `user_data_registered_itu_t_t35` carriage; ITU-T T.35 §3.1 for the
+  country_code / extension semantics.
+
+  **Docs-gap** — CEA-708 (the spec carrying the cc_data() Table 2 byte
+  layout: `process_cc_data_flag` + `cc_count` + per-triple `cc_valid` /
+  `cc_type` / `cc_data_1` / `cc_data_2` + DTVCC packet framing) is not
+  present in `docs/`. Until it lands, ATSC1 `MPEG_cc_data` inner bytes
+  stay opaque (the round-158 parser hands them through unchanged for a
+  downstream CEA-708-aware consumer). Adding CEA-708-D to
+  `docs/broadcast/cea/` would unblock a typed `CcData` decoder returning
+  the per-triple (cc_type, cc_data_1, cc_data_2) array.
+
 - **round 151 — opt-in CABAC IDR Intra_16x16 chroma AC trellis
   quantisation.** Extends the round-148 luma-AC trellis to the chroma
   Intra_16x16 paths. For 4:2:0 the lever refines the 4 per-block 4×4
