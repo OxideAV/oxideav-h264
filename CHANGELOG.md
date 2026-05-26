@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **round 145 — end-to-end Criterion `encode` benchmark.** Adds
+  `benches/encode.rs`, sibling to `benches/decode.rs`, exercising
+  the public encoder entry points across seven in-process variants
+  with no on-disk fixtures: 64x64 + 128x96 Baseline CAVLC IDR;
+  Baseline IDR + 4×P CAVLC chain (real P-slice ME); Main IDR + P +
+  B (§8.4.1.2.2 spatial-direct + bipred); 64x64 CABAC IDR
+  (`encode_idr_cabac`); 64x64 CABAC IDR + P
+  (`encode_idr_cabac` + `encode_p_cabac`, exercises the round-49
+  trellis-quant refinement that's on by default); 64x64 High 4:2:2
+  IDR (§8.5.11.2 4×2 chroma DC Hadamard). Criterion reports both
+  per-frame (`Throughput::Elements`, "Kelem/s" ≈ frames-encoded
+  per second) and per-source-byte (`Throughput::Bytes`,
+  MiB/s of raw planar input absorbed) views per variant. Measured
+  headline numbers on an Apple M-series host (Criterion `--quick`,
+  release profile): CABAC IDR ~18.3 Kelem/s (107 MiB/s of source);
+  CAVLC Baseline IDR 64x64 ~2.7 Kelem/s (17 MiB/s); CAVLC IDR + 4×P
+  chain 207 elem/s (1.22 MiB/s — ME-dominated); Main IPB GOP
+  176 elem/s; CABAC IDR + P 685 elem/s. Complements the existing
+  `inter_pred_bench`, `transform_bench`, and `decode` benches —
+  the encode hot path was previously unmeasured.
+
 - **round 139 — end-to-end Criterion `decode` benchmark.** Adds
   `benches/decode.rs` driving the public `H264CodecDecoder`
   (`send_packet` + `flush` + `receive_frame`) across five

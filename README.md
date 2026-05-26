@@ -111,9 +111,21 @@ Criterion benches live under `benches/`:
   IDR+P+B Main GOP, and a 64x64 High 4:2:2 IDR. All streams are
   synthesised from `oxideav-h264`'s own encoder so the bench needs
   no on-disk fixtures.
+* `encode` — sibling to `decode`, driving the public encoder entry
+  points across seven in-process variants: Baseline CAVLC IDR
+  (64x64 + 128x96), Baseline IDR + 4×P chain (real per-MB integer ME),
+  Main IDR + P + B GOP (§8.4.1.2.2 spatial-direct + bipred),
+  CABAC IDR + IDR + P (`encode_idr_cabac` / `encode_p_cabac` with the
+  round-49 trellis-quant refinement on), and High 4:2:2 IDR. Reports
+  both per-frame (`Throughput::Elements`, ≈ frames-encoded per
+  second) and per-source-byte (`Throughput::Bytes`, MiB/s of raw
+  planar input absorbed). The encoded-stream byte count is a
+  compression-efficiency metric and stays in the integration tests
+  rather than the bench.
 
-Run with `cargo bench --bench decode -- --quick` for a fast smoke
-or `cargo bench --bench decode` for the full Criterion report.
+Run with `cargo bench --bench decode -- --quick`
+or `cargo bench --bench encode -- --quick` for fast smokes,
+or omit `--quick` for the full Criterion report.
 
 ## Profiles + features in scope
 
