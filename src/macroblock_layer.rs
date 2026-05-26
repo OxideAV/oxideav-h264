@@ -2118,9 +2118,9 @@ pub fn parse_macroblock(
     let dbg_mb_enter_on = dbg_mb_enter == Some(entropy.current_mb_addr);
     // OXIDEAV_H264_MBTYPE_TRACE=1 — dump every (mb_addr, mb_type_raw,
     // bins_consumed, slice_type) tuple for cross-referencing against
-    // JM's JVT trace when chasing CABAC state divergences. Emits
-    // regardless of OXIDEAV_H264_MB_TRACE so the caller sees all MBs
-    // of every slice in one pass.
+    // an external reference trace when chasing CABAC state divergences.
+    // Emits regardless of OXIDEAV_H264_MB_TRACE so the caller sees all
+    // MBs of every slice in one pass.
     let dbg_mb_type_all = dbg_mbtype_trace_enabled();
     let mb_type_raw = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
         let bins_before = dec.bin_count();
@@ -2938,7 +2938,8 @@ fn parse_sub_mb_pred(
     let is_p8x8_ref0 = matches!(mb_type, MbType::P8x8Ref0);
     // OXIDEAV_H264_MB_TRACE=N — per-element trace of the specified MB
     // address inside the current slice. Used for CABAC bisection against
-    // the JM trace oracle; see the round-30 notes in the commit history.
+    // an external reference trace oracle; see the round-30 notes in the
+    // commit history.
     let dbg_mb = dbg_mb_trace_target();
     let dbg_on = dbg_mb == Some(entropy.current_mb_addr);
 

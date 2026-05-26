@@ -131,7 +131,7 @@ struct PictureInProgress {
     /// picture is dropped instead of being pushed into the DPB +
     /// output queue: emitting a never-painted picture (zeroed luma /
     /// chroma plus garbage residue from neighbour MBs) is a
-    /// strictness divergence from libavcodec, which rejects the
+    /// strictness divergence from common H.264 decoders, which reject the
     /// access unit outright when every slice fails CABAC / CAVLC
     /// parse. Caught by fuzz target `ffmpeg_oracle_decode` on
     /// crash-2ad9589f… (3 slices, all fail "read past end of
@@ -488,11 +488,11 @@ impl H264CodecDecoder {
             // leaving the picture's luma + chroma planes
             // zero-initialised. We then emit a `Frame::Video` with
             // all-zero luma — a strictness divergence from
-            // libavcodec, which rejects the access unit outright.
+            // common H.264 decoders, which reject the access unit outright.
             //
             // Caught by the fuzz oracle on `crash-957ac808…` (440 B,
             // four IDR slices, all with `first_mb_in_slice == 2`,
-            // 1×6-MB picture; libavcodec rejects, we previously
+            // 1×6-MB picture; common H.264 decoders reject, we previously
             // emitted two zero-luma frames).
             if header.first_mb_in_slice != 0 {
                 return Err(Error::invalid(format!(
@@ -804,7 +804,7 @@ impl H264CodecDecoder {
         // failed parse / reconstruction is dropped here, with no DPB
         // update and no `VideoFrame` emitted. Pushing the
         // never-painted picture (zeroed planes plus stale neighbour
-        // residue) would diverge from libavcodec, which rejects the
+        // residue) would diverge from common H.264 decoders, which reject the
         // access unit outright when every slice fails. Caught by
         // fuzz oracle on `crash-2ad9589f…` (3 non-IDR slices, all
         // fail "CABAC read past end of bitstream").
@@ -818,7 +818,7 @@ impl H264CodecDecoder {
         // MbGrid still has unavailable entries at finalize time means
         // the slice walk stopped short (CABAC end_of_slice_flag fired
         // before reaching the picture's last MB, or no later slice
-        // resumed the walk) and the picture is incomplete. libavcodec
+        // resumed the walk) and the picture is incomplete. common H.264 decoders
         // refuses to emit such pictures (it either conceals or returns
         // Invalid Data from `avcodec_send_packet`); we mirror that by
         // dropping the in-progress picture here rather than emitting a
@@ -1307,7 +1307,7 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
 /// pictures regardless of what `bitstream_restriction` claims. We
 /// therefore use it as a *floor* on the reorder window: trust the
 /// VUI when it asks us to hold *more*, but raise to the level cap
-/// when it asks for *fewer*. This is exactly the JM / FFmpeg
+/// when it asks for *fewer*. This is exactly the common-decoder
 /// "max_num_reorder_frames is a lower bound on what we can buffer"
 /// real-world reading and what makes B-pyramid streams from
 /// permissive encoders decode in display order.

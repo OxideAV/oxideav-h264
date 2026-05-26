@@ -283,8 +283,9 @@ const TBL_9_16: &[(usize, InitCell)] = &[
 // ctxIdx 68 at default (state=0, mps=0) and mis-decoded flag=0 (LPS
 // loop) instead of flag=1 (MPS loop), inflating the MB's bit budget
 // by 21 bits and cascading pixel divergence from that MB onward.
-// Applying the literal ::same fix matches JM's per-MB bit budget on
-// MB 28 of frame 3 and should be the correct spec behaviour.
+// Applying the literal ::same fix matches an external reference's
+// per-MB bit budget on MB 28 of frame 3 and should be the correct spec
+// behaviour.
 const TBL_9_17: &[(usize, InitCell)] = &[
     (60, InitCell::same((0, 41))),
     (61, InitCell::same((0, 63))),

@@ -27,8 +27,9 @@ pub enum SpsError {
     /// 118 Multiview High, 128 Stereo High, 138 Multiview Depth High,
     /// 139 Enhanced Multiview Depth High, 134 MFC High, 135 MFC Depth
     /// High). All other values are "reserved for future use by ITU-T
-    /// | ISO/IEC" and the decoder cannot honour them — match
-    /// libavcodec's strictness instead of silently mis-decoding.
+    /// | ISO/IEC" and the decoder cannot honour them — reject early
+    /// (matching the strictness of common H.264 decoders) instead of
+    /// silently mis-decoding.
     #[error("profile_idc {0} is reserved (not enumerated in §A.2)")]
     ProfileIdcReserved(u8),
     /// §7.4.2.1.1 — `chroma_format_idc` in range 0..=3.
@@ -77,8 +78,8 @@ pub enum SpsError {
     /// §7.4.2.1.1 — `max_num_ref_frames` shall be in the range of 0 to
     /// MaxDpbFrames (clause A.3), which is itself capped at 16 by the
     /// Min(...) expression in A.3.1 step a regardless of level. Any
-    /// value above 16 is malformed (libavcodec rejects with "too many
-    /// reference frames").
+    /// value above 16 is malformed (common H.264 decoders reject with
+    /// a "too many reference frames" diagnostic).
     #[error("max_num_ref_frames out of range (got {0}, max 16)")]
     MaxNumRefFramesOutOfRange(u32),
     /// §7.4.2.1.1 — frame-cropping rectangle leaves the coded picture
@@ -92,10 +93,11 @@ pub enum SpsError {
     /// Reformulated as a positivity check, the cropped rectangle's
     /// width and height must each be at least 1 luma sample. Strings
     /// with a `frame_cropping_flag = 1` SPS that violate these are
-    /// rejected by libavcodec at SPS-parse time with "crop values
-    /// invalid X Y W H"; the access unit's slices then dangle with
-    /// no activated SPS. Caught by the `ffmpeg_oracle_decode` fuzz
-    /// oracle on `crash-8e8b38ae…` (round 91).
+    /// rejected by common H.264 decoders at SPS-parse time with a
+    /// "crop values invalid X Y W H" diagnostic; the access unit's
+    /// slices then dangle with no activated SPS. Caught by the
+    /// `ffmpeg_oracle_decode` fuzz oracle on `crash-8e8b38ae…`
+    /// (round 91).
     #[error(
         "frame_cropping invalid: CropUnitX={cux}*(left={left}+right={right}+1) > PicWidthInSamplesL={width}, or CropUnitY={cuy}*(top={top}+bottom={bottom}+1) > FrameHeightInSamplesL={height}"
     )]
@@ -273,7 +275,7 @@ impl Sps {
         // §A.1 / §A.2 — only the 16 enumerated profiles are allowed;
         // other values are "reserved for future use" and we cannot
         // safely decode bitstreams using them. Reject up front to
-        // match libavcodec's strictness (closes a fuzz-oracle
+        // match the strictness of common H.264 decoders (closes a fuzz-oracle
         // divergence on profile_idc=251 + 243 inputs).
         if !is_valid_profile_idc(profile_idc) {
             return Err(SpsError::ProfileIdcReserved(profile_idc));
@@ -688,7 +690,7 @@ mod tests {
         // reserved. Regression for two fuzz-oracle divergences:
         //   crash-1b2aaf6f54f92df08bf67802c970555c02de3b4e (profile_idc=251)
         //   crash-181e9dea7dfa8fcb2c9721a3f9f044214af6167b (profile_idc=243)
-        // libavcodec rejects these; we used to accept and emit a
+        // common H.264 decoders reject these; we used to accept and emit a
         // mis-decoded frame.
         for bad in [243u8, 251u8, 1u8, 200u8, 0u8] {
             // Build a Baseline-shaped SPS but with the bad profile_idc.
@@ -1229,7 +1231,7 @@ mod tests {
     /// 2848), `pic_height_in_map_units_minus1 = 0` (FrameHeightInSamplesL =
     /// 16), and `top_offset = 2148` — CropUnitY = 2 × 1 = 2, so
     /// `2 × (2148 + 2 + 1) = 4302 > 16` overflows the frame height.
-    /// libavcodec rejects with "crop values invalid"; we mirror.
+    /// common H.264 decoders reject with "crop values invalid"; we mirror.
     #[test]
     fn frame_cropping_offsets_exceeding_picture_rejected() {
         let mut w = BitWriter::new();

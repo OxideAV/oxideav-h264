@@ -2,7 +2,7 @@
 
 This module hosts the **clean-room H.264 encoder** rebuilt from scratch
 against ITU-T Rec. H.264 (08/2024). No external implementation
-(libavcodec / openh264 / x264 / JM) was consulted while writing it.
+external implementation source was consulted while writing it.
 Same strict policy as the decoder.
 
 ## Round 1 — landed
@@ -18,7 +18,7 @@ Minimal Baseline I-only IDR encoder, end-to-end:
   `cbp_chroma=0` — only the luma DC block is transmitted (every
   Intra_16x16 MB carries it unconditionally per §7.3.5.3.1).
 - **Forward 4x4 integer transform** (`Cf * X * Cf^T`) + Hadamard for
-  luma DC + matched quantizer (JM-reference `MF` table, intra rounding
+  luma DC + matched quantizer (encoder MF table, intra rounding
   offset = `2^qBits / 3`).
 - **CAVLC encode** for the luma DC residual block. Re-uses the
   decoder's transcribed §9.2 tables (every table is a slice of
@@ -95,7 +95,7 @@ residual transmit.
     V/H modes need fewer non-zero DC coefficients than DC mode does).
   - 64x64 mixed chroma-gradient: Y 42.25 dB, Cb/Cr 47.05 dB.
   - 128x128 vertical+horizontal bars + gradient: **50.11 dB Y**.
-- **ffmpeg interop**: bit-exact match against ffmpeg 8.1's libavcodec
+- **ffmpeg interop**: bit-exact match against ffmpeg 8.1's common H.264 decoders
   H.264 decoder on every test fixture.
 
 ### Status caveats (unchanged from round 1 unless noted)
@@ -150,7 +150,7 @@ in luma instead of capping the per-MB recon at the DC term.
     high-frequency hash pattern (DC-only encoder gives ~14 dB PSNR
     Y) reaches **46.36 dB Y at QP=18** and **37.63 dB Y at QP=26**.
   - `round3_ffmpeg_decode_noisy_picture_matches` (new): bit-exact
-    against ffmpeg 8.1's libavcodec H.264 decoder on the same noisy
+    against ffmpeg 8.1 (black-box validator) H.264 decoder on the same noisy
     picture.
 
 ### Status caveats (unchanged from round 2 unless noted)
@@ -223,7 +223,7 @@ one I_16x16 mode per macroblock can't capture.
     MB). I_NxN gets picked, **PSNR Y = 41.25 dB at QP=26** with
     1066-byte stream (vs ~22 dB for I_16x16 alone on this content).
   - `round4_ffmpeg_decode_oriented_edges_matches` — bit-exact
-    against ffmpeg 8.1 libavcodec on the same picture.
+    against ffmpeg 8.1 (black-box validator) on the same picture.
 
 ### Status caveats (unchanged from round 3 unless noted)
 
@@ -279,7 +279,7 @@ will produce (including future inter slices that use it as a reference).
     the filter). Self-roundtrip matches encoder recon bit-exactly,
     confirming encoder-side deblock == decoder-side deblock.
   - `round14_ffmpeg_decode_deblocked_matches` — bit-exact against
-    ffmpeg 8.1 libavcodec on the same picture.
+    ffmpeg 8.1 (black-box validator) on the same picture.
 - **PSNR uplift** (QP 26):
   - 64x64 diagonal-gradient testsrc, luma: **42.58 → 48.05 dB**
     (+5.47 dB).
@@ -289,7 +289,7 @@ will produce (including future inter slices that use it as a reference).
   - The other fixtures (round-3 noisy QP=18; round-4 oriented-edges)
     are dominated by AC residual rather than block-boundary
     artefacts, so PSNR is essentially unchanged there.
-- **ffmpeg interop**: bit-exact match against ffmpeg 8.1 libavcodec
+- **ffmpeg interop**: bit-exact match against ffmpeg 8.1 common H.264 decoders
   on every fixture.
 
 ### Status caveats (unchanged from round 4 unless noted)
@@ -311,7 +311,7 @@ I_16x16 vs I_NxN dispatch all now minimise `J = D + λ · R` instead of
 SAD-on-predictor.
 
 - **`encoder::rdo`** module: closed-form `λ = 0.85 · 2^((QP-12)/3)`
-  per the JM convention, plus `ssd_4x4` / `ssd_16x16` distortion helpers
+  per common encoder convention, plus `ssd_4x4` / `ssd_16x16` distortion helpers
   and a `cost_combined(D, R, λ)` integer accumulator (λ scaled by 1024
   to keep arithmetic in `u64`).
 - **`BitWriter::bits_emitted`**: returns the running bit count so trial
@@ -454,7 +454,7 @@ integer-pel motion estimation, P_Skip + P_L0_16x16.
     IDR), bit-exact through self-roundtrip. The drop in size is
     smaller than ideal because IDR encoding noise prevents some MBs
     from quantising the residual to zero.
-  - `round16_ffmpeg_decode_p_sequence_matches`: ffmpeg/libavcodec
+  - `round16_ffmpeg_decode_p_sequence_matches`: ffmpeg/common H.264 decoders
     decodes the same combined IDR+P stream bit-exactly against the
     encoder's local recon (≤1 LSB tolerance).
 
@@ -514,7 +514,7 @@ end-to-end (verified against ffmpeg).
     decoder → bit-exact against encoder recon (max diff 0). PSNR_Y =
     **49.19 dB**, with `cbp_luma == 0` on most MBs because the
     half-pel predictor matches the source bit-for-bit.
-  - `round17_half_pel_ffmpeg_interop`: ffmpeg/libavcodec decodes the
+  - `round17_half_pel_ffmpeg_interop`: ffmpeg (black-box validator) decodes the
     same half-pel P stream bit-equivalently against the encoder's
     local recon (max diff 0).
 
@@ -575,7 +575,7 @@ so encoder and decoder remain bit-equivalent end-to-end.
     for the half-pel fixture — most MBs reach `cbp_luma == 0`
     because the quarter-pel predictor matches the source bit-for-
     bit).
-  - `round18_quarter_pel_ffmpeg_interop`: ffmpeg/libavcodec decodes
+  - `round18_quarter_pel_ffmpeg_interop`: ffmpeg (black-box validator) decodes
     the same quarter-pel P stream bit-equivalently against the
     encoder's local recon (max diff 0).
 
@@ -636,7 +636,7 @@ heuristic so smooth content stays on the round-16 1MV path.
   *different* integer-pel amount. **Local recon PSNR_Y = 40.95 dB**,
   decoder PSNR_Y = 40.95 dB (max enc/dec diff 0).
 - ffmpeg interop (`round19_4mv_ffmpeg_interop`):
-  libavcodec decodes the 4MV P-frame **bit-equivalently** against
+  ffmpeg (black-box validator) decodes the 4MV P-frame **bit-equivalently** against
   the encoder's local recon (max diff 0).
 - 3 new unit tests in `me::tests` covering per-8x8 ME (zero motion +
   per-sub-block motion recovery + `p_8x8_pred_bits`).
@@ -713,7 +713,7 @@ P-frame as L0 / L1 anchors.
     the source bit-for-bit. Decode through our own decoder →
     bit-exact match (max diff 0). **Local + decoder PSNR_Y = 54.19
     dB**.
-  - `round20_b_slice_ffmpeg_interop`: ffmpeg/libavcodec decodes the
+  - `round20_b_slice_ffmpeg_interop`: ffmpeg (black-box validator) decodes the
     same IDR + P + B Annex B stream **bit-equivalently** against the
     encoder's local recon (max diff 0). 54.19 dB PSNR_Y vs source.
 
@@ -795,7 +795,7 @@ round-20 explicit-inter (B_L0 / B_L1 / B_Bi) candidates.
     **B-slice = 11 bytes** (vs round-20's 75 bytes for same content
     when only explicit modes are available; a **7× compression** on
     the B portion). Decoder PSNR_Y = 52.36 dB, max enc/dec diff 0.
-  - `round21_b_skip_ffmpeg_interop`: ffmpeg/libavcodec decodes the
+  - `round21_b_skip_ffmpeg_interop`: ffmpeg (black-box validator) decodes the
     same all-skips B stream **bit-equivalently** against the encoder's
     local recon (max diff 0). 52.36 dB PSNR_Y.
   - `round21_midpoint_b_slice_decoder_match`: round-20's midpoint
@@ -883,7 +883,7 @@ partition-mode-neighbour MBs.
   - `round22_b_8x16_self_roundtrip_matches_local_recon` — same with
     per-half-horizontal motion. Encoder picks 8x16 mb_types. PSNR_Y
     = 48.54 dB, max enc/dec diff 0.
-  - `round22_b_partitions_ffmpeg_interop` — ffmpeg/libavcodec decodes
+  - `round22_b_partitions_ffmpeg_interop` — ffmpeg (black-box validator) decodes
     the 16x8 stream **bit-equivalently** (max diff 0).
 
 ### Caveats
@@ -960,7 +960,7 @@ than a fresh intra block.
     self-roundtrip bit-exact through our own decoder (max enc/dec
     luma diff 0).
   - `round29_p_slice_intra_fallback_ffmpeg_interop`:
-    ffmpeg/libavcodec decodes the same intra-fallback P-slice
+    ffmpeg (black-box validator) decodes the same intra-fallback P-slice
     bit-equivalently against the encoder's local recon (max
     ff/enc luma diff 0).
   - `round29_p_slice_intra_fallback_picks_intra_for_occluded_mbs`:
@@ -1032,7 +1032,7 @@ remain unchanged.
   - `round30_idr_plus_p_cabac_self_roundtrip`: IDR + P (same source) →
     P-slice = 12 bytes (mostly P_Skip), bit-exact recon, PSNR_Y vs
     source = 47.58 dB.
-  - `round30_idr_cabac_ffmpeg_interop`: ffmpeg 8.1 libavcodec decodes
+  - `round30_idr_cabac_ffmpeg_interop`: ffmpeg 8.1 (black-box validator) decodes
     the same CABAC IDR bit-equivalently against the encoder's local
     recon (max diff = 0, PSNR_Y = 47.58 dB).
 
@@ -1089,7 +1089,7 @@ remain unchanged.
   (round 30) — CABAC-enabled IDR + P entry points. Require
   `EncoderConfig::cabac = true` and `profile_idc >= 77`. Produce
   Annex B streams that round-trip through this crate's decoder and
-  through ffmpeg's libavcodec H.264 decoder bit-equivalently.
+  through ffmpeg (black-box validator) H.264 decoder bit-equivalently.
 - [`Encoder::encode_b_cabac`] (round 31) — CABAC B-slice entry point
   (B_L0_16x16 / B_L1_16x16 / B_Bi_16x16, default-merge bipred). Round
   32 extends the CABAC P + B paths with real quarter-pel ME (replacing

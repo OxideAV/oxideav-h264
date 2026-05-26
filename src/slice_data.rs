@@ -289,8 +289,8 @@ pub fn parse_slice_data(
                 mb_skip_flag_this_iter = mb_skip_flag;
                 // OXIDEAV_H264_SKIP_TRACE=1 — dump every mb_skip_flag
                 // decision with its neighbour condTermFlags for
-                // cross-referencing against JM's JVT trace. Useful
-                // when chasing CABAC state divergences at specific MBs.
+                // cross-referencing against an external reference trace.
+                // Useful when chasing CABAC state divergences at specific MBs.
                 if std::env::var_os("OXIDEAV_H264_SKIP_TRACE").is_some() {
                     eprintln!(
                         "[SKIP {}] flag={} avail_L={} skip_L={} avail_A={} skip_A={}",

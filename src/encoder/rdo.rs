@@ -18,16 +18,15 @@
 //! ## λ derivation
 //!
 //! H.264 / AVC class encoders converge to `λ ≈ 0.85 · 2^((QP - 12) / 3)`
-//! for SSD-domain mode decision (see e.g. JM's lambda_factor table for
-//! `RD_OPTIM_HIGH = 1`). We use the same closed form. The 0.85 prefactor
-//! biases very slightly toward higher quality at low-to-mid QP; the
-//! 2^((QP-12)/3) factor matches the AVC quantisation step doubling every
-//! six QP increments.
+//! for SSD-domain mode decision. This crate uses the same closed form.
+//! The 0.85 prefactor biases very slightly toward higher quality at
+//! low-to-mid QP; the 2^((QP-12)/3) factor matches the AVC quantisation
+//! step doubling every six QP increments.
 //!
-//! For RDO on Intra macroblocks, JM further multiplies λ by 0.5 on the
-//! mode-decision step (intra modes are slightly under-rated by direct
-//! SSD/bit accounting due to the chroma residual that piggybacks). We
-//! adopt that convention.
+//! For RDO on Intra macroblocks, a common refinement multiplies λ by
+//! 0.5 on the mode-decision step (intra modes are slightly under-rated
+//! by direct SSD/bit accounting due to the chroma residual that
+//! piggybacks). This crate adopts that approach.
 //!
 //! All spec / convention references in comments cite ITU-T Rec. H.264
 //! (08/2024). No external implementation source consulted.

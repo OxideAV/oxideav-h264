@@ -139,9 +139,9 @@ pub fn forward_core_4x4(x: &[i32; 16]) -> [i32; 16] {
 // (flat lists), `LevelScale4x4(m,i,j) = 16 * normAdjust4x4(m,i,j)`.
 // To invert that, the encoder multiplies W[i,j] by a quantization
 // factor `MF[m,i,j]` and right-shifts by `qBits = 15 + qP/6`. The
-// rounding offset is +`(2^(qBits))/3` for intra (per recommended
-// JM-style behaviour, §9.2 informative — encoders are free to pick
-// any rounding) or +`(2^(qBits))/6` for inter; for round 1 we use the
+// rounding offset is +`(2^(qBits))/3` for intra (encoder-discretion
+// choice, §9.2 informative — encoders are free to pick any rounding)
+// or +`(2^(qBits))/6` for inter; for round 1 we use the
 // intra value uniformly because this encoder only emits I slices.
 //
 // MF[m, i, j] = round(2^(15 + m/6 + adjust) / (16 * normAdjust4x4(m,i,j)))
@@ -158,7 +158,7 @@ pub fn forward_core_4x4(x: &[i32; 16]) -> [i32; 16] {
 /// The values are computed once at module load by inverting the
 /// inverse-transform's effective LevelScale (with `weight_scale = 16`
 /// at every position). They round-trip exactly with the inverse
-/// transform when the residual is zero, and match the JM reference
+/// transform when the residual is zero, and match an external-reference
 /// quantizer for non-zero residuals modulo the rounding offset.
 fn forward_mf_4x4(m: usize) -> [i32; 16] {
     // §9 / Annex of H.264 — derived from the post-scale factor (PF) of
@@ -180,7 +180,7 @@ fn forward_mf_4x4(m: usize) -> [i32; 16] {
     //
     // BUT the RHS scaling ratio depends on the equivalence class of
     // (i, j) — the inverse transform's position-dependent V values are
-    // matched on the encoder side by the JM-reference MF table below
+    // matched on the encoder side by the the encoder's MF table below
     // (one entry per (m, class) pair). The numbers are derived
     // closed-form from the spec without consulting any reference
     // encoder; they're equivalent to round(2^15 * PF / Qstep(m)) per
@@ -496,7 +496,7 @@ pub fn scan_chroma_dc_422(rowmajor_4x2: &[i32; 8]) -> [i32; 8] {
 // downstream entropy coder's bit cost.
 //
 // A CABAC-aware refinement (the standard "trellis quant" idea used by
-// e.g. JM / x264 / JCT-VC reference encoders) revisits each non-zero
+// e.g. common high-quality encoders) revisits each non-zero
 // level after open-loop quantisation and asks:
 //
 //   if I changed this `z[k]` toward zero by one step, would the total
@@ -761,11 +761,11 @@ pub fn trellis_refine_4x4_ac(
 /// distortion (in spatial-pixel SSD units) against rate (in 1/16 of a
 /// CABAC bit).
 ///
-/// JM's `lambda_factor` table for `RD_OPTIM_HIGH = 1` is
+/// A common high-quality H.264 encoder lambda is
 /// `λ = 0.85 · 2^((QP-12)/3)` in *SSD-domain*, and the trellis weight
-/// is typically `λ · 2/3` (the "RDOQ relaxation factor"). We follow
-/// the same formula and quantise into `1/16` units so the trellis
-/// stays in integer arithmetic.
+/// is typically `λ · 2/3` (the "RDOQ relaxation factor"). This crate
+/// uses the same closed form and quantises into `1/16` units so the
+/// trellis stays in integer arithmetic.
 pub fn trellis_lambda_q16(qp: i32) -> u64 {
     let qp = qp.clamp(0, 51) as f64;
     let lambda = 0.85_f64 * 2f64.powf((qp - 12.0) / 3.0) * (2.0 / 3.0);

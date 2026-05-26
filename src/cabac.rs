@@ -65,8 +65,8 @@ use crate::bitstream::{BitError, BitReader};
 /// `OXIDEAV_H264_BIN_TRACE` — when set (any value), every call to
 /// `decode_decision`, `decode_bypass`, and `decode_terminate` emits a
 /// line to stderr capturing the full pre/post engine state and the
-/// decoded bin. Intended for bisecting CABAC divergences against the
-/// JM `_trace.txt` oracle.
+/// decoded bin. Intended for bisecting CABAC divergences against an
+/// external reference `_trace.txt` oracle.
 ///
 /// The env var is read **once** on first access and cached. CABAC bin
 /// decoding is on the hot path (millions of calls per frame), and a

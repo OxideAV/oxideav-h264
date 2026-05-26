@@ -4,8 +4,8 @@
 //! the [`old`](https://github.com/OxideAV/oxideav-h264/tree/old) branch
 //! but is being rewritten from scratch with the ITU-T Rec. H.264 |
 //! ISO/IEC 14496-10 specification (2024-08 edition) as the single
-//! authoritative source. No external decoder code (libavcodec / openh264
-//! / JM / etc.) is consulted while writing this implementation.
+//! authoritative source. No external decoder code is consulted while
+//! writing this implementation.
 //!
 //! The crate exposes a registration entry point so the workspace
 //! aggregator keeps building, but no decoder or encoder is registered

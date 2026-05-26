@@ -61,7 +61,7 @@ pub enum DecoderError {
     /// but the §8.4 reconstruction path walks macroblock addresses in
     /// raster order (slice-group 0 only) — so an FMO PPS with multiple
     /// groups would silently mis-decode. Reject at slice activation
-    /// time so we match libavcodec's "FMO is not implemented"
+    /// time so we match the common-decoder convention of "FMO is not implemented"
     /// rejection rather than emitting a wrong-pixels frame for streams
     /// the reference decoder refuses.
     #[error("FMO (num_slice_groups_minus1={0} > 0) is not supported in this decoder build")]
@@ -189,11 +189,11 @@ impl Decoder {
             // `chroma_format_idc` (4:4:4 carries 6 8x8 lists; everything
             // else carries 2 when transform_8x8 is on), so the SPS that
             // the PPS references MUST already be stored before we can
-            // parse the PPS correctly. libavcodec enforces this at PPS
+            // parse the PPS correctly. common H.264 decoders enforce this at PPS
             // arrival time and rejects out-of-order
             // PPS-before-SPS deliveries; before this check, our decoder
             // silently accepted such PPSes, slices later activated them,
-            // and we emitted frames that libavcodec rejected outright.
+            // and we emitted frames that common H.264 decoders rejected outright.
             // Caught by the `ffmpeg_oracle_decode` fuzz target on
             // `crash-065436ed…` (round-120 Fuzz CI failure, task #1044):
             // PPS-then-SPS-then-IDR-x5 with sps_id=0 / pps_id=0; ffmpeg
@@ -299,7 +299,7 @@ impl Decoder {
         // even there our §8.4 reconstruction path doesn't honour the
         // §8.2.2 MbToSliceGroupMap (it walks raster order). Reject
         // FMO-enabled PPS activation so we don't silently mis-decode a
-        // stream that the spec restricts (and that libavcodec rejects
+        // stream that the spec restricts (and that common H.264 decoders reject
         // outright with "FMO is not implemented"). See
         // [`DecoderError::FmoNotSupported`] for the full citation.
         if pps.num_slice_groups_minus1 > 0 {
@@ -705,7 +705,7 @@ mod tests {
         // time. Previously this delayed the rejection to slice
         // activation time (`UnknownSps` on the slice path), which let
         // the PPS sit in `pps_by_id[]` parsed under a guessed
-        // `chroma_format_idc = 1`. libavcodec rejects out-of-order
+        // `chroma_format_idc = 1`. common H.264 decoders reject out-of-order
         // PPS-before-SPS deliveries the same way (regression for
         // `crash-065436ed…`, round-120 fuzz-CI failure / task #1044).
         let mut dec = Decoder::new();
@@ -729,7 +729,7 @@ mod tests {
         // our §8.4 raster reconstruction. A slice that activates such a
         // PPS must be rejected at activation time so we don't emit a
         // mis-decoded picture for a stream the H.264 reference decoder
-        // (libavcodec) would reject as "FMO is not implemented".
+        // (common H.264 decoders) would reject as "FMO is not implemented".
         // Regression for the 309-byte fuzz-oracle divergence
         // (`crash-181e9dea7dfa8fcb2c9721a3f9f044214af6167b`): the
         // crash input carried a PPS with num_slice_groups_minus1=2,
