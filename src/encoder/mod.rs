@@ -290,6 +290,32 @@ pub struct EncoderConfig {
     /// self-roundtrips bit-equivalently and ffmpeg cross-decodes
     /// within 1 LSB of the encoder's local recon.
     pub trellis_quant_intra: bool,
+    /// Round-151 — opt-in trellis quantisation refinement on the CABAC
+    /// **IDR Intra_16x16 chroma AC** path. Default `false`.
+    ///
+    /// When enabled, the per-block 4x4 chroma AC arrays produced by
+    /// `encode_chroma_intra16x16_420` (4 blocks per plane) and
+    /// `encode_chroma_intra16x16_444` (16 blocks per plane) are passed
+    /// through [`crate::encoder::transform::trellis_refine_4x4_ac`] with
+    /// `skip_dc=true`. The §8.5.11 inverse-Hadamard chroma-DC chain
+    /// (4:2:0: 2×2 Hadamard over the 4 plane DCs; 4:4:4: 4×4 Hadamard
+    /// over the 16 plane DCs treated like luma) is left untouched, so
+    /// `cbp_chroma` keeps the §7.4.5.1 Table 7-15 value (the
+    /// AC-vs-DC-only distinction depends only on whether any AC remains
+    /// non-zero across the MB).
+    ///
+    /// Default is `false` for the same reason as [`trellis_quant_intra`]:
+    /// the [`trellis_quant`] rate model is calibrated for inter
+    /// blockCat 2 and can enlarge dense intra chroma AC at low QP. The
+    /// flag is wired so a future round can re-calibrate the rate model
+    /// for blockCats 4 (ChromaACLevel @ 4:2:0) / 1 (Intra16x16AC @ 4:4:4
+    /// treated like luma) and flip the default.
+    ///
+    /// Decoder-transparency is verified by the round-151
+    /// `integration_trellis_quant_intra_chroma` regression: a flipped
+    /// IDR with non-trivial chroma content self-roundtrips
+    /// bit-equivalently through the local decoder.
+    pub trellis_quant_intra_chroma: bool,
 }
 
 impl EncoderConfig {
@@ -311,6 +337,7 @@ impl EncoderConfig {
             bit_depth_chroma_minus8: 0,
             trellis_quant: true,
             trellis_quant_intra: false,
+            trellis_quant_intra_chroma: false,
         }
     }
 }

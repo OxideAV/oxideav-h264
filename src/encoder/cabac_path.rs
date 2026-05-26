@@ -1357,6 +1357,12 @@ fn reconstruct_intra16x16_luma(
 /// Encode a chroma plane (Cb or Cr) for an Intra_16x16 MB at 4:2:0.
 /// Returns (dc_levels[4], ac_scan[4][16], ac_quant_raster[4][16],
 /// any_dc_nz, any_ac_nz, recon_residual[64]).
+///
+/// `trellis` (round-151) gates the §9.3.3.1.3-aware AC refinement
+/// applied per 4x4 block with `skip_dc=true` so the §8.5.11.1
+/// 2×2 chroma-DC Hadamard chain is not disturbed. The refinement is
+/// bitstream-compatible — it only changes which non-zero AC levels
+/// are emitted; the decoder is unchanged.
 #[allow(clippy::type_complexity)]
 fn encode_chroma_intra16x16_420(
     frame_c: &[u8],
@@ -1367,6 +1373,7 @@ fn encode_chroma_intra16x16_420(
     mb_y: usize,
     mode: IntraChromaMode,
     qp_c: i32,
+    trellis: bool,
 ) -> (
     [i32; 4],
     [[i32; 16]; 4],
@@ -1385,7 +1392,10 @@ fn encode_chroma_intra16x16_420(
             residual[j * 8 + i] = s - pred[j * 8 + i];
         }
     }
-    // Per-block 4x4 forward.
+    // Per-block 4x4 forward. Keep the spatial-domain residual aside per
+    // block so the trellis refinement (operating in pixel SSD) can run
+    // without recomputing slices.
+    let mut residual_4x4 = [[0i32; 16]; 4];
     let mut blocks = [[0i32; 16]; 4];
     for blk in 0..4usize {
         let bx = blk % 2;
@@ -1395,18 +1405,35 @@ fn encode_chroma_intra16x16_420(
                 blocks[blk][j * 4 + i] = residual[(by * 4 + j) * 8 + bx * 4 + i];
             }
         }
+        residual_4x4[blk] = blocks[blk];
         blocks[blk] = forward_core_4x4(&blocks[blk]);
     }
     // DC matrix (4 entries).
     let dc_in = [blocks[0][0], blocks[1][0], blocks[2][0], blocks[3][0]];
     let dc_had = forward_hadamard_2x2(&dc_in);
     let dc_levels = quantize_chroma_dc(&dc_had, qp_c, true);
-    // Per-block AC.
+    // Per-block AC. Trellis (round-151) refines on `skip_dc=true` so the
+    // §8.5.11.1 chroma-DC inverse Hadamard chain stays bit-exact.
+    let lambda_q16 = if trellis {
+        crate::encoder::transform::trellis_lambda_q16(qp_c)
+    } else {
+        0
+    };
     let mut ac_quant = [[0i32; 16]; 4];
     let mut ac_scan = [[0i32; 16]; 4];
     let mut any_ac_nz = false;
     for blk in 0..4usize {
-        let z = quantize_4x4_ac(&blocks[blk], qp_c, true);
+        let mut z = quantize_4x4_ac(&blocks[blk], qp_c, true);
+        if trellis && z.iter().any(|&v| v != 0) {
+            z = crate::encoder::transform::trellis_refine_4x4_ac(
+                &residual_4x4[blk],
+                &blocks[blk],
+                &z,
+                qp_c,
+                lambda_q16,
+                true,
+            );
+        }
         ac_quant[blk] = z;
         let s = zigzag_scan_4x4_ac(&z);
         ac_scan[blk] = s;
@@ -1619,6 +1646,7 @@ impl Encoder {
                         mb_y,
                         luma_mode,
                         qp_c,
+                        cfg.trellis_quant_intra_chroma,
                     );
                     cb_dc_444 = cdc;
                     cb_ac_scan_444 = cac;
@@ -1631,6 +1659,7 @@ impl Encoder {
                         mb_y,
                         luma_mode,
                         qp_c,
+                        cfg.trellis_quant_intra_chroma,
                     );
                     cr_dc_444 = cdc2;
                     cr_ac_scan_444 = cac2;
@@ -1654,6 +1683,7 @@ impl Encoder {
                         mb_y,
                         chroma_mode,
                         qp_c,
+                        cfg.trellis_quant_intra_chroma,
                     );
                     let (cdc2, cac2, _, _, any_cr_ac_nz, cr_res) = encode_chroma_intra16x16_420(
                         frame.v,
@@ -1664,6 +1694,7 @@ impl Encoder {
                         mb_y,
                         chroma_mode,
                         qp_c,
+                        cfg.trellis_quant_intra_chroma,
                     );
                     cb_dc_420 = cdc;
                     cr_dc_420 = cdc2;
@@ -5357,6 +5388,7 @@ fn encode_chroma_intra16x16_444(
     mb_y: usize,
     mode: I16x16Mode,
     qp_c: i32,
+    trellis: bool,
 ) -> (
     [i32; 16],
     [[i32; 16]; 16],
@@ -5380,8 +5412,12 @@ fn encode_chroma_intra16x16_444(
         }
     }
 
-    // (3) Per-4x4 forward integer transform; pull DCs.
+    // (3) Per-4x4 forward integer transform; pull DCs. Keep the
+    // spatial-domain residual aside per block so the round-151 chroma
+    // trellis refinement (§9.3.3.1.3) can run without recomputing
+    // slices.
     let mut coeffs_4x4 = [[0i32; 16]; 16];
+    let mut residual_4x4 = [[0i32; 16]; 16];
     for blk in 0..16usize {
         let bx = blk % 4;
         let by = blk / 4;
@@ -5391,6 +5427,7 @@ fn encode_chroma_intra16x16_444(
                 block[j * 4 + i] = residual[(by * 4 + j) * 16 + bx * 4 + i];
             }
         }
+        residual_4x4[blk] = block;
         coeffs_4x4[blk] = forward_core_4x4(&block);
     }
     let mut dc_coeffs = [0i32; 16];
@@ -5402,14 +5439,32 @@ fn encode_chroma_intra16x16_444(
     let dc_t = forward_hadamard_4x4(&dc_coeffs);
     let dc_levels = quantize_luma_dc(&dc_t, qp_c, true);
 
-    // (4) Per-block AC quantize (raster and scan order).
+    // (4) Per-block AC quantize (raster and scan order). Trellis
+    // (round-151) refines each 4x4 with `skip_dc=true` so the §8.5.10
+    // luma-style DC inverse Hadamard chain on the 4:4:4 chroma plane
+    // stays bit-exact.
+    let lambda_q16 = if trellis {
+        crate::encoder::transform::trellis_lambda_q16(qp_c)
+    } else {
+        0
+    };
     let mut ac_quant_raster = [[0i32; 16]; 16];
     let mut ac_scan = [[0i32; 16]; 16];
     let mut any_ac_nz = false;
     for blkz in 0..16usize {
         let (bx, by) = LUMA_4X4_BLK[blkz];
         let raster = by * 4 + bx;
-        let z = quantize_4x4_ac(&coeffs_4x4[raster], qp_c, true);
+        let mut z = quantize_4x4_ac(&coeffs_4x4[raster], qp_c, true);
+        if trellis && z.iter().any(|&v| v != 0) {
+            z = crate::encoder::transform::trellis_refine_4x4_ac(
+                &residual_4x4[raster],
+                &coeffs_4x4[raster],
+                &z,
+                qp_c,
+                lambda_q16,
+                true,
+            );
+        }
         ac_quant_raster[raster] = z;
         ac_scan[blkz] = zigzag_scan_4x4_ac(&z);
         if ac_scan[blkz].iter().any(|&v| v != 0) {

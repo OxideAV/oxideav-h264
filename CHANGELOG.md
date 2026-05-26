@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **round 151 — opt-in CABAC IDR Intra_16x16 chroma AC trellis
+  quantisation.** Extends the round-148 luma-AC trellis to the chroma
+  Intra_16x16 paths. For 4:2:0 the lever refines the 4 per-block 4×4
+  AC arrays per chroma plane (Cb / Cr) inside
+  `encode_chroma_intra16x16_420`; for 4:4:4 the lever refines the 16
+  per-block 4×4 AC arrays per chroma plane inside
+  `encode_chroma_intra16x16_444` (§7.3.5.3 "chroma coded like luma").
+  Each block is passed through
+  `crate::encoder::transform::trellis_refine_4x4_ac` with
+  `skip_dc=true` so the §8.5.11.1 2×2 chroma-DC Hadamard chain (4:2:0)
+  or the §8.5.10 luma-style 4×4 DC Hadamard chain on the 4:4:4 chroma
+  plane stays bit-exact. New `EncoderConfig::trellis_quant_intra_chroma`
+  toggle (default `false`) gates the refinement. Bitstream syntax is
+  unchanged; the decoder is unaffected; `cbp_chroma` keeps the §7.4.5.1
+  Table 7-15 value (`0`/`1`/`2` based purely on whether DC and / or AC
+  remains non-zero across the MB). The default stays off for the same
+  reason as `trellis_quant_intra`: the round-49 rate model is
+  calibrated for inter blockCat 2 (Luma4x4) and is roughly net-zero on
+  dense intra chroma AC at typical QP — re-calibrating for chroma
+  blockCats 4 (ChromaACLevel @ 4:2:0) and 1 (Intra16x16AC @ 4:4:4,
+  treated like luma) so the lever can ship default-on is the obvious
+  follow-up. New `integration_trellis_quant_intra_chroma.rs` pins six
+  guarantees: 4:2:0 and 4:4:4 default-off byte-for-byte determinism;
+  4:2:0 decoder self-roundtrip bit-exact on all three planes at QP=22;
+  4:4:4 decoder self-roundtrip bit-exact on all three planes at QP=22;
+  QP {18..42} sweep stays decodable + plane-wise bit-exact; luma PSNR
+  invariant under the chroma lever; and a measurement-only byte-savings
+  print across QP {18..38}. Spec basis: §8.5.10, §8.5.11.1, §7.3.5.3,
+  §7.4.5.1, §9.3.3.1.3.
+
 - **round 148 — opt-in CABAC IDR Intra_16x16 luma AC trellis
   quantisation.** Extends the round-49 `D + λ·R` refinement
   (`crate::encoder::transform::trellis_refine_4x4_ac`) to the 16 per-
