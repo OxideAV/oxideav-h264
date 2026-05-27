@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **round 164 — SEI parser hardening (new cargo-fuzz target +
+  malformed-input property sweep).** Two complementary additions
+  exercise the Annex D SEI surface that the existing whole-decoder
+  fuzz targets reach only when libFuzzer happens to synthesise a
+  well-formed Annex-B NAL→RBSP→sei_payload framing — i.e. almost
+  never. Together they bring the 40-payload SEI dispatcher under the
+  same panic-free contract the rest of the public Decoder surface
+  has carried since round 120.
+
+  `fuzz/fuzz_targets/sei_payload.rs` — new cargo-fuzz binary that
+  feeds raw libFuzzer bytes through three SEI-parsing paths: (1) the
+  full envelope (`parse_sei_rbsp`) and then `parse_payload` on every
+  extracted message; (2) `parse_payload` directly with a payload type
+  chosen from a 63-entry fixed pool (every dispatcher arm + several
+  `Unknown`-fallback sentinels covering Annex F/G/H/I numeric
+  ranges); (3) `parse_payload` on the full input under a second
+  payload-type selector. A `context_from_byte` helper derives a
+  varied-but-bounded `SeiContext` from the input so the VUI-gated
+  branches (`buffering_period`, `pic_timing`,
+  `dec_ref_pic_marking_repetition`, `spare_pic`, the §D.1.20
+  `num_slice_groups`-dependent u(v) width) are reached without
+  requiring libFuzzer to discover them. The new binary sits adjacent
+  to the existing `panic_free_decode` / `ffmpeg_oracle_decode`
+  binaries.
+
+  `tests/integration_sei_malformed.rs` — deterministic property
+  sweep covering every (payload_type, shape, context) triple in the
+  matrix the fuzz target explores, so CI catches a regression even
+  without libFuzzer. The grid is 40 known + 23 fallback payload
+  types × 11 adversarial shapes (empty / one_zero / eight_zeros /
+  sixtyfour_zeros / one_ff / eight_ffs / sixtyfour_ffs /
+  max_ueg_prefix / alt_55_aa / alt_aa_55 / long_zeros_then_stop) ×
+  4 `SeiContext` cells (`default` / `nal_hrd_present_24bit` /
+  `vcl_hrd_present_4sched` / `max_lengths_8sg`) = 2772 invocations
+  of `parse_payload`, asserted to never panic. Three companion
+  tests cover the envelope-only path
+  (`sei_parse_rbsp_never_panics`), the envelope-then-dispatch
+  composition (`sei_envelope_then_dispatch_never_panics`), and the
+  `SeiPayload::Unknown` catch-all contract
+  (`sei_unknown_payload_type_is_ok`). The cardinality is explicitly
+  pinned (2772) so a future change that accidentally drops a
+  payload-type row or shape entry fails loudly instead of silently
+  shrinking coverage.
+
+  No behaviour change — `parse_payload` and `parse_sei_rbsp` are
+  unchanged. This round is hardening only: it locks in the
+  panic-free contract on the SEI surface and gives a defined surface
+  for future libFuzzer runs to target without re-deriving the
+  framing.
+
 - **round 158 — typed ATSC1 envelope sub-parser on top of
   `user_data_registered_itu_t_t35` (§D.2.6).** Adds
   `parse_atsc1_envelope(payload_bytes)` consuming the post-country-code

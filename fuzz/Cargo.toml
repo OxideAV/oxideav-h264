@@ -44,3 +44,9 @@ name = "ffmpeg_oracle_decode"
 path = "fuzz_targets/ffmpeg_oracle_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "sei_payload"
+path = "fuzz_targets/sei_payload.rs"
+test = false
+doc = false
