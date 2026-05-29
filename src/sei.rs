@@ -140,6 +140,18 @@ pub enum SeiError {
     #[error("spare_pic num_spare_pics_minus1 shall be in 0..=15 per §D.2.10 (got {0})")]
     SparePicCountTooLarge(u32),
     #[error(
+        "motion_constrained_slice_group_set num_slice_groups_in_set_minus1 shall be in 0..=num_slice_groups_minus1 per §D.2.20 (got count {count}, num_slice_groups {num_slice_groups})"
+    )]
+    MotionConstrainedSliceGroupCountTooLarge { count: u32, num_slice_groups: u32 },
+    #[error(
+        "motion_constrained_slice_group_set slice_group_id[{i}] shall be in 0..=num_slice_groups_minus1 per §D.2.20 (got {id}, num_slice_groups {num_slice_groups})"
+    )]
+    MotionConstrainedSliceGroupIdOutOfRange {
+        i: usize,
+        id: u32,
+        num_slice_groups: u32,
+    },
+    #[error(
         "spare_pic spare_area_idc shall be in 0..=2 per §D.2.10 (got {idc} for spare picture {i})"
     )]
     SparePicAreaIdcOutOfRange { i: usize, idc: u32 },
@@ -2433,10 +2445,36 @@ pub fn parse_motion_constrained_slice_group_set(
         // Ceil(Log2(num_slice_groups)).
         32 - (num_slice_groups - 1).leading_zeros()
     };
-    let count = (num_slice_groups_in_set_minus1 as usize).saturating_add(1);
-    let mut slice_group_ids = Vec::with_capacity(count.min(8));
-    for _ in 0..count {
+    // §D.2.20 — "The allowed range of num_slice_groups_in_set_minus1 is 0 to
+    // num_slice_groups_minus1, inclusive." Reject anything larger before
+    // allocating the per-id loop: the inner read is `u(width)` bits, and at
+    // `width == 0` (single-slice-group PPS) the loop reads zero bits per
+    // iteration, so an unbounded `ue(v)` count would drive an unbounded
+    // `Vec::push(0)` and OOM the decoder. Fuzz crash from
+    // OxideAV/oxideav-h264#1044 reached this path via path-2 of the
+    // `sei_payload` target.
+    if num_slice_groups_in_set_minus1 >= num_slice_groups {
+        return Err(SeiError::MotionConstrainedSliceGroupCountTooLarge {
+            count: num_slice_groups_in_set_minus1.saturating_add(1),
+            num_slice_groups,
+        });
+    }
+    let count = (num_slice_groups_in_set_minus1 as usize) + 1;
+    let mut slice_group_ids = Vec::with_capacity(count);
+    for i in 0..count {
         let v = if width == 0 { 0 } else { r.u(width)? };
+        // §D.2.20 — "slice_group_id[ i ] ... identifies the slice group(s)
+        // contained within the slice group set" with the same per-PPS range
+        // as §7.4.2.2's slice_group_id (0..=num_slice_groups_minus1). Reject
+        // out-of-range ids so the message can't point at a slice group that
+        // the active PPS never declared.
+        if v >= num_slice_groups {
+            return Err(SeiError::MotionConstrainedSliceGroupIdOutOfRange {
+                i,
+                id: v,
+                num_slice_groups,
+            });
+        }
         slice_group_ids.push(v);
     }
     let exact_sample_value_match_flag = r.u(1)? == 1;

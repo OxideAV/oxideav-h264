@@ -222,6 +222,55 @@ fn sei_envelope_then_dispatch_never_panics() {
     let _ = messages_seen;
 }
 
+/// Round 177 regression — `sei_payload` fuzz target OOM
+/// (artifact `oom-1bf45ba3a116aa21631ccf3b3cec29fed395ef0e`, 11 bytes,
+/// reported by OxideAV/oxideav-h264 fuzz CI run 26569743256).
+///
+/// Path 2 of `fuzz_targets/sei_payload.rs` selected payload_type 18
+/// (motion_constrained_slice_group_set) with the post-first-byte tail
+/// `00 00 00 0b 00 00 00 00 00 d0`. The first 4 bytes are 28 leading
+/// zeros followed by `1011`, so the `ue(v)` first read returns
+/// `(1 << 28) − 1 + tail = 268_435_466 == 0x10000_00A`. The fuzz
+/// context derives `num_slice_groups = 1 + (0x90 & 7) = 1` from the
+/// first byte, so the §D.1.20 `slice_group_id` field is `u(0)` (zero
+/// bits per element). With no payload-side cost per element, the
+/// inner loop allocated ~1 GB of zero ids and tripped libfuzzer's
+/// rss_limit.
+///
+/// §D.2.20 caps `num_slice_groups_in_set_minus1` at
+/// `num_slice_groups_minus1` (`= num_slice_groups − 1`). The parser
+/// now rejects out-of-range counts before allocating the loop, so
+/// the same input returns a deterministic `SeiError` instead of
+/// drifting toward OOM. Test mirrors the fuzz target's path-2 input
+/// recipe verbatim so a future code change that re-introduces the
+/// unbounded loop fails here even with libFuzzer disabled.
+#[test]
+fn motion_constrained_slice_group_set_unbounded_count_is_rejected() {
+    // Bytes after the path-2 first-byte (0x90) selector.
+    const PAYLOAD: &[u8] = &[0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd0];
+    // Path-2 context derivation from the fuzz target's first byte
+    // (data[0] = 0x90). Only `num_slice_groups` matters for §D.2.20
+    // (the other fields gate other payload types).
+    let b: u8 = 0x90;
+    let ctx = SeiContext {
+        num_slice_groups: 1 + ((b as u32) & 0x07),
+        ..SeiContext::default()
+    };
+    // Payload type 18 = motion_constrained_slice_group_set.
+    let res = parse_payload(18, PAYLOAD, &ctx);
+    // Must be a deterministic Err, NOT a hang or an Ok with a billion
+    // entries. We don't pin the precise variant — the contract is "no
+    // OOM, no panic" — but we do confirm a billion-element Vec did not
+    // come back.
+    match res {
+        Err(_) => {}
+        Ok(payload) => panic!(
+            "expected Err for payload-type 18 with unbounded ue(v) count under \
+             num_slice_groups = 1, got Ok({payload:?})"
+        ),
+    }
+}
+
 /// Lock in the catch-all `Unknown` path — `parse_payload` must return
 /// `Ok(SeiPayload::Unknown { ... })` for payload types outside the
 /// dispatch table regardless of the payload content. Without this

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **round 177 — `sei_payload` fuzz target OOM (artifact
+  `oom-1bf45ba3a116aa21631ccf3b3cec29fed395ef0e`, 11 bytes, reported
+  by oxideav-h264 fuzz CI run 26569743256).** §D.2.20
+  motion_constrained_slice_group_set's
+  `parse_motion_constrained_slice_group_set` read
+  `num_slice_groups_in_set_minus1` as a raw `ue(v)` and pushed
+  `count = num_slice_groups_in_set_minus1 + 1` entries into the
+  slice_group_id vector before checking the §D.2.20 range bound.
+  When the active PPS only declares a single slice group, the
+  encoded width of each slice_group_id field collapses to 0 bits
+  per §D.1.20 (`Ceil(Log2(num_slice_groups))`), so each iteration
+  consumed zero payload bits — letting an adversarial `ue(v)` value
+  near 2^28 drive a ~1 GiB allocation and trip libfuzzer's
+  rss_limit. The fix reads the same `ue(v)` and immediately
+  enforces the §D.2.20 normative bound
+  `num_slice_groups_in_set_minus1 ≤ num_slice_groups_minus1` (where
+  `num_slice_groups_minus1` arrives via `SeiContext::num_slice_groups`),
+  returning the new
+  `SeiError::MotionConstrainedSliceGroupCountTooLarge` before the
+  loop allocates. Each `slice_group_id[i]` then gets the §7.4.2.2 /
+  §D.2.20 per-id range check (`< num_slice_groups`), surfaced as
+  `SeiError::MotionConstrainedSliceGroupIdOutOfRange`.
+
+  New `tests/integration_sei_malformed.rs` test
+  `motion_constrained_slice_group_set_unbounded_count_is_rejected`
+  replays the exact 11-byte fuzz artifact's path-2 payload tail
+  (first byte 0x90 used for the §D.2.20 `SeiContext` derivation;
+  remaining 10 bytes as the raw payload) and asserts the parser
+  returns a deterministic `Err` rather than allocating its way to
+  OOM. The two existing motion_constrained_slice_group_set tests
+  (`single_group_collapses_width` /
+  `multi_group_reads_u_v`) continue to pass — the bound is
+  consistent with their `num_slice_groups_in_set_minus1` values
+  (0 < 1 and 1 < 4 respectively). All 1033 lib tests + 5
+  `integration_sei_malformed` tests pass.
+
 ### Added
 
 - **round 164 — SEI parser hardening (new cargo-fuzz target +
