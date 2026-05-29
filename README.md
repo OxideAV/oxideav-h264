@@ -52,7 +52,7 @@ no packet is decoded.
 | Reference picture marking (sliding window + MMCO) | §7.3.3.3, §8.2.5 | implemented |
 | Reference picture list construction | §8.2.4 | implemented (frame-only; field-pair interleaving partial) |
 | Reference picture list modification (RPLM) | §7.3.3.1, §8.2.4.3 | implemented |
-| Picture order count derivation (types 0/1/2) | §8.2.1 | implemented |
+| Picture order count derivation (types 0/1/2) | §8.2.1 | implemented (round 187 — eq. 8-3 / 8-4 / 8-5 / 8-12 staged in i64 + `PocError::Overflow` surfaced through `try_from`, closes the `panic_free_decode` libfuzzer crash `1743a9ce…` against adversarial `prev_msb` + `delta_pic_order_cnt_bottom`) |
 | Intra prediction (4x4 / 8x8 / 16x16 / chroma) | §8.3 | implemented (all modes) |
 | Inter prediction — fractional interpolation + weighted pred | §8.4.2 | implemented (luma 6-tap, chroma bilinear, default + explicit weighted) |
 | Inter prediction — MV derivation (MVpred, P/B skip, spatial + temporal direct) | §8.4.1 | implemented |

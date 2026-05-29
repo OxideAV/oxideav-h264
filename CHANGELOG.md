@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **round 187 — §8.2.1 POC derivation overflow now structured, not
+  a panic.** Nightly `panic_free_decode` libfuzzer run #26632302094
+  surfaced a debug-build `attempt to add with overflow` at
+  `src/poc.rs:225` inside `derive_type0`'s eq. 8-5 frame branch
+  (`TopFieldOrderCnt + delta_pic_order_cnt_bottom`, i32+i32). The
+  `Decoder` trait contract is that adversarial bytes surface as
+  `Err(...)` from `send_packet` — never a process-killing panic —
+  so the i32 arithmetic in §8.2.1.1 eq. 8-3 / 8-4 / 8-5 was lifted
+  into i64 staging, the §8.2.1.2 / §8.2.1.3 silent `as i32` tail
+  truncations were replaced with `i32::try_from`, and a new
+  `PocError::Overflow` variant carries the §C.4-mandated
+  i32-PicOrderCnt invariant violation back to the caller. The
+  decoder driver in `h264_decoder.rs` already maps `PocError` to
+  `Error::invalid(...)`, so the affected slice is now skipped (and
+  logged) instead of aborting the process.
+
+  Four new unit tests in `src/poc.rs` pin the structured-error
+  contract per algorithm (type 0 eq. 8-5 frame branch overflow,
+  type 0 eq. 8-3 negative msb-wrap overflow, type 1 eq. 8-10
+  frame-branch overflow against an i32::MAX × 10 cycle, type 2
+  eq. 8-12 doubling overflow against `prev_frame_num_offset` ≈
+  i32::MAX / 2). A new integration regression
+  (`fuzz_crash_1743a9ce_poc_eq_8_5_frame_branch_overflow_does_not_panic`)
+  embeds the 596-byte libfuzzer artefact verbatim so CI exercises
+  the previously panicking path on every run; surviving the
+  `send_packet` / `flush` / `receive_frame` round trip without a
+  panic IS the assertion. All 22 pre-existing POC unit tests plus
+  the round-187 additions keep passing.
+
 ### Added
 
 - **round 183 — Annex G §G.13.2.10 multiview_view_position SEI

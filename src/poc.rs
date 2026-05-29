@@ -26,6 +26,16 @@ pub enum PocError {
     LsbWidthOutOfRange(u32),
     #[error("log2_max_frame_num_minus4 {0} exceeds 12")]
     FrameNumWidthOutOfRange(u32),
+    /// One of the §8.2.1.* equations produced a `PicOrderCnt` value or
+    /// intermediate accumulator that does not fit in the i32 range
+    /// `Annex C` mandates for the output side. Encountered on
+    /// adversarial bitstreams where prev_msb wrap-arounds or
+    /// `delta_pic_order_cnt_bottom` push the i32 frame branch
+    /// (eq. 8-5) past its representable range, and on a §8.2.1.2 /
+    /// §8.2.1.3 `FrameNumOffset` accumulation that the i32 cast at
+    /// the tail would have silently truncated.
+    #[error("POC derivation overflowed i32 representable range (clause §8.2.1)")]
+    Overflow,
 }
 
 /// Subset of SPS syntax elements that feed into §8.2.1 POC derivation.
@@ -192,17 +202,24 @@ fn derive_type0(
         (state.prev_pic_order_cnt_msb, state.prev_pic_order_cnt_lsb)
     };
 
-    // eq. 8-3 — PicOrderCntMsb wrap-around logic.
-    let cur_lsb = slice.pic_order_cnt_lsb as i32;
-    let prev_lsb_i = prev_lsb as i32;
-    let half = max_pic_order_cnt_lsb / 2;
-    let pic_order_cnt_msb = if cur_lsb < prev_lsb_i && (prev_lsb_i - cur_lsb) >= half {
-        prev_msb + max_pic_order_cnt_lsb
-    } else if cur_lsb > prev_lsb_i && (cur_lsb - prev_lsb_i) > half {
-        prev_msb - max_pic_order_cnt_lsb
-    } else {
-        prev_msb
-    };
+    // eq. 8-3 — PicOrderCntMsb wrap-around logic. Done in i64 so that
+    // a long fuzz-driven sequence of wrap events can saturate the
+    // accumulator past i32 without panicking in debug builds; the
+    // i32::try_from on the way out structurally maps that to
+    // PocError::Overflow per Annex C's i32-PicOrderCnt invariant.
+    let max_pic_order_cnt_lsb_i64 = max_pic_order_cnt_lsb as i64;
+    let cur_lsb_i64 = slice.pic_order_cnt_lsb as i64;
+    let prev_lsb_i64 = prev_lsb as i64;
+    let prev_msb_i64 = prev_msb as i64;
+    let half = max_pic_order_cnt_lsb_i64 / 2;
+    let pic_order_cnt_msb_i64 =
+        if cur_lsb_i64 < prev_lsb_i64 && (prev_lsb_i64 - cur_lsb_i64) >= half {
+            prev_msb_i64 + max_pic_order_cnt_lsb_i64
+        } else if cur_lsb_i64 > prev_lsb_i64 && (cur_lsb_i64 - prev_lsb_i64) > half {
+            prev_msb_i64 - max_pic_order_cnt_lsb_i64
+        } else {
+            prev_msb_i64
+        };
 
     // eq. 8-4 — TopFieldOrderCnt (present unless current picture is a
     // bottom field).
@@ -214,21 +231,26 @@ fn derive_type0(
     // A frame has both fields.
     let is_bottom_field = slice.field_pic_flag && slice.bottom_field_flag;
     let is_top_field = slice.field_pic_flag && !slice.bottom_field_flag;
+    let delta_bot_i64 = slice.delta_pic_order_cnt_bottom as i64;
 
-    let top = if !is_bottom_field {
-        pic_order_cnt_msb + cur_lsb // eq. 8-4
+    let top_i64 = if !is_bottom_field {
+        pic_order_cnt_msb_i64 + cur_lsb_i64 // eq. 8-4
     } else {
         0
     };
-    let bottom = if !is_top_field {
+    let bottom_i64 = if !is_top_field {
         if !slice.field_pic_flag {
-            top + slice.delta_pic_order_cnt_bottom // eq. 8-5 (frame branch)
+            top_i64 + delta_bot_i64 // eq. 8-5 (frame branch)
         } else {
-            pic_order_cnt_msb + cur_lsb // eq. 8-5 (bottom field branch)
+            pic_order_cnt_msb_i64 + cur_lsb_i64 // eq. 8-5 (bottom field branch)
         }
     } else {
         0
     };
+
+    let top = i32::try_from(top_i64).map_err(|_| PocError::Overflow)?;
+    let bottom = i32::try_from(bottom_i64).map_err(|_| PocError::Overflow)?;
+    let pic_order_cnt_msb = i32::try_from(pic_order_cnt_msb_i64).map_err(|_| PocError::Overflow)?;
 
     // eq. 8-1 — PicOrderCnt() projection onto current picture.
     let pic = if !slice.field_pic_flag {
@@ -376,8 +398,12 @@ fn derive_type1(
         (0, bot)
     };
 
-    let top = top_i64 as i32;
-    let bottom = bot_i64 as i32;
+    // Annex C bounds TopFieldOrderCnt / BottomFieldOrderCnt to i32.
+    // A silent `as i32` truncation would let fuzz-driven offsets walk
+    // past 2^31 and surface as a wrong but plausible POC; mapping the
+    // overflow to a structured error keeps the contract typed.
+    let top = i32::try_from(top_i64).map_err(|_| PocError::Overflow)?;
+    let bottom = i32::try_from(bot_i64).map_err(|_| PocError::Overflow)?;
 
     let pic = if !slice.field_pic_flag {
         top.min(bottom)
@@ -444,8 +470,12 @@ fn derive_type2(
         2 * (frame_num_offset + slice.frame_num as i64)
     };
 
-    // eq. 8-13 — TopFieldOrderCnt / BottomFieldOrderCnt.
-    let temp = temp_pic_order_cnt as i32;
+    // eq. 8-13 — TopFieldOrderCnt / BottomFieldOrderCnt. Annex C bounds
+    // these to i32; a silent `as i32` truncation would let a long
+    // fuzz-driven frame_num-wrap chain push tempPicOrderCnt past
+    // 2^31 and produce a wrong-but-plausible POC instead of a typed
+    // error.
+    let temp = i32::try_from(temp_pic_order_cnt).map_err(|_| PocError::Overflow)?;
     let (top, bottom) = if !slice.field_pic_flag {
         (temp, temp)
     } else if slice.bottom_field_flag {
@@ -982,5 +1012,95 @@ mod tests {
         sl.is_idr = true;
         let r = derive_poc(&sps, &sl, &mut st);
         assert_eq!(r, Err(PocError::FrameNumWidthOutOfRange(13)));
+    }
+
+    // -------- overflow paths (regression: fuzz crash on poc.rs:225) -
+
+    #[test]
+    fn type0_frame_branch_delta_bottom_overflow_is_structured_error() {
+        // §8.2.1.1 eq. 8-5 frame branch: BottomFieldOrderCnt =
+        // TopFieldOrderCnt + delta_pic_order_cnt_bottom. Construct a
+        // state where the addition overflows i32 and confirm we hand
+        // back `PocError::Overflow` instead of panicking in debug
+        // builds (the libfuzzer-driven `panic_free_decode` target
+        // surfaced this on 2026-05-29).
+        let sps = sps_type0(12, 0); // MaxPicOrderCntLsb = 65536.
+        let mut st = PocState {
+            // Seed prev_msb near i32::MAX so a single +max_pic_order_cnt_lsb
+            // wrap walks the §8.2.1.1 type-0 accumulator past i32 in the
+            // i64 staging path.
+            prev_pic_order_cnt_msb: i32::MAX - 1000,
+            prev_pic_order_cnt_lsb: 0,
+            prev_frame_num: 0,
+            prev_frame_num_offset: 0,
+        };
+        let mut sl = base_slice();
+        sl.is_idr = false;
+        sl.is_reference = true;
+        sl.pic_order_cnt_lsb = 65535; // ≫ half (32768) → no wrap branch.
+        sl.delta_pic_order_cnt_bottom = i32::MAX;
+        let r = derive_poc(&sps, &sl, &mut st);
+        assert_eq!(r, Err(PocError::Overflow));
+    }
+
+    #[test]
+    fn type0_msb_wrap_overflow_is_structured_error() {
+        // §8.2.1.1 eq. 8-3 "cur > prev && diff > half" branch:
+        // pic_order_cnt_msb = prev_msb - max_pic_order_cnt_lsb. Seed
+        // prev_msb at i32::MIN + epsilon and walk the negative wrap
+        // far enough that the resulting top FOC busts i32.
+        let sps = sps_type0(12, 0);
+        let mut st = PocState {
+            prev_pic_order_cnt_msb: i32::MIN + 1000,
+            prev_pic_order_cnt_lsb: 0,
+            prev_frame_num: 0,
+            prev_frame_num_offset: 0,
+        };
+        let mut sl = base_slice();
+        sl.is_idr = false;
+        sl.is_reference = true;
+        sl.pic_order_cnt_lsb = 65535; // forces "cur > prev && diff > half" → msb -= 65536.
+        let r = derive_poc(&sps, &sl, &mut st);
+        assert_eq!(r, Err(PocError::Overflow));
+    }
+
+    #[test]
+    fn type1_frame_branch_overflow_is_structured_error() {
+        // §8.2.1.2 eq. 8-10 frame branch: bot = top + offset_t2b + d1.
+        // With a long cycle of i32::MAX entries, expectedPicOrderCnt
+        // saturates i64-then-i32-down; we confirm the cast surfaces
+        // PocError::Overflow rather than truncating silently.
+        let sps = sps_type1(vec![i32::MAX; 10], 0, i32::MAX, false);
+        let mut st = PocState::default();
+        let mut sl0 = base_slice();
+        sl0.is_idr = true;
+        let _ = derive_poc(&sps, &sl0, &mut st).unwrap();
+
+        let mut sl = base_slice();
+        sl.frame_num = 5;
+        sl.delta_pic_order_cnt = [i32::MAX, i32::MAX];
+        let r = derive_poc(&sps, &sl, &mut st);
+        assert_eq!(r, Err(PocError::Overflow));
+    }
+
+    #[test]
+    fn type2_temp_overflow_is_structured_error() {
+        // §8.2.1.3 eq. 8-12 tempPicOrderCnt = 2*(FrameNumOffset +
+        // frame_num) for a reference picture. Seed prev_frame_num_offset
+        // near i32::MAX so the doubling busts i32 and confirm the
+        // structural error path replaces the previous `as i32` truncation.
+        let sps = sps_type2();
+        let mut st = PocState {
+            prev_pic_order_cnt_msb: 0,
+            prev_pic_order_cnt_lsb: 0,
+            prev_frame_num: 0,
+            prev_frame_num_offset: (i32::MAX as i64) / 2 + 1,
+        };
+        let mut sl = base_slice();
+        sl.is_idr = false;
+        sl.is_reference = true;
+        sl.frame_num = 0;
+        let r = derive_poc(&sps, &sl, &mut st);
+        assert_eq!(r, Err(PocError::Overflow));
     }
 }
