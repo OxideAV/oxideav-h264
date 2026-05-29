@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **round 183 — Annex G §G.13.2.10 multiview_view_position SEI
+  (payload type 46).** Wires the per-CVS view-position SEI from the
+  MVC family into the SEI dispatch table at payload type 46. The
+  syntax (§G.13.1.10) is three fields: `num_views_minus1` ue(v),
+  `view_position[i]` ue(v) for `i = 0..=num_views_minus1`, and a
+  trailing `multiview_view_position_extension_flag` u(1). Each ue(v)
+  is bounded at 1023 inclusive per §G.13.2.10 before allocation, so
+  an adversarial input can never drive the per-view vector past 1024
+  entries — the `num_views_minus1` check fires before
+  `Vec::with_capacity` runs. The extension flag is preserved
+  verbatim so callers auditing a non-conforming stream (§G.13.2.10
+  requires the flag equal 0) can distinguish a clean stream from a
+  reserved-extension marker. Two new `SeiError` variants
+  (`MultiviewViewPositionNumViewsOutOfRange`,
+  `MultiviewViewPositionViewPositionOutOfRange`) surface the bound
+  failures with the offending value + index.
+
+  New unit tests cover: two-view left/right ordering, single-view
+  zero-position degenerate case, extension-flag-preserved-when-set,
+  rejection of `num_views_minus1 = 1024` before allocation,
+  rejection of `view_position[i] = 1024`, and the `parse_payload`
+  dispatcher routing payload type 46 to the new variant. The
+  malformed-input integration sweep (`integration_sei_malformed.rs`)
+  pulls payload type 46 into `KNOWN_PAYLOAD_TYPES` so the existing
+  panic-free contract automatically extends to the new parser
+  across all 11 adversarial shapes × 4 contexts.
+
+  SEI dispatch arm count goes 40 → 41. This is the first §G.13.2
+  (Annex G — MVC) SEI parser to land; the rest of Annex G/H/I
+  (24–44, 48–54, 181) remains deferred to Phase 4 alongside the
+  matching `nal_unit_type` 14/15/20/21 prefix/subset-SPS handling.
+
 ### Fixed
 
 - **round 177 — `sei_payload` fuzz target OOM (artifact

@@ -33,6 +33,7 @@
 //! | 22           | §D.1.24     | §D.2.24     | post_filter_hint                   |
 //! | 23           | §D.1.25     | §D.2.25     | tone_mapping_info                  |
 //! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
+//! | 46           | §G.13.1.10  | §G.13.2.10  | multiview_view_position (Annex G)  |
 //! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
 //! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume    |
 //! | 142          | §D.1.30     | §D.2.30     | colour_remapping_info              |
@@ -263,6 +264,14 @@ pub enum SeiError {
     Atsc1BarDataLetterboxPillarboxBoth,
     #[error("ATSC1 bar_data payload truncated — needed {needed} bytes, got {got}")]
     Atsc1BarDataTruncated { needed: usize, got: usize },
+    #[error(
+        "multiview_view_position num_views_minus1 shall be in 0..=1023 per Annex G §G.13.2.10 (got {0})"
+    )]
+    MultiviewViewPositionNumViewsOutOfRange(u32),
+    #[error(
+        "multiview_view_position view_position[{i}] shall be in 0..=1023 per Annex G §G.13.2.10 (got {got})"
+    )]
+    MultiviewViewPositionViewPositionOutOfRange { i: usize, got: u32 },
 }
 
 /// §D.2.2 — buffering_period.
@@ -4159,6 +4168,93 @@ pub fn parse_sei_prefix_indication(payload: &[u8]) -> Result<SeiPrefixIndication
     })
 }
 
+/// §G.13.2.10 — multiview_view_position (payload type 46).
+///
+/// Annex G MVC extension. Specifies the relative left-to-right view
+/// position of every view component in a coded video sequence; valid
+/// only when associated with an IDR access unit, and the per-CVS
+/// information applies to the whole sequence. The syntax lives outside
+/// the main Annex D table because Annex G specifies it.
+///
+/// Syntax (§G.13.1.10):
+/// ```text
+/// multiview_view_position( payloadSize ) {
+///   num_views_minus1                                ue(v)
+///   for( i = 0; i <= num_views_minus1; i++ )
+///     view_position[ i ]                            ue(v)
+///   multiview_view_position_extension_flag          u(1)
+/// }
+/// ```
+///
+/// §G.13.2.10 semantics constraints:
+///
+/// * `num_views_minus1` shall match the active MVC SPS and shall be in
+///   the range 0..=1023 inclusive (so the loop reads at most 1024
+///   `view_position[i]` entries).
+/// * Each `view_position[i]` shall be in the range 0..=1023 inclusive.
+/// * `multiview_view_position_extension_flag` shall be equal to 0; a
+///   value of 1 is reserved for future use, and decoders shall ignore
+///   any bits following it. We preserve the observed bit verbatim so
+///   round-trip callers can distinguish a conforming `0` from a
+///   reserved-`1` extension marker.
+///
+/// This decoder does not (yet) carry the §G.7.3.2 MVC SPS — Phase 4 on
+/// the README's "Profiles + features in scope" table. The parser is
+/// nonetheless harmless on a non-MVC bitstream: when this payload type
+/// appears outside an MVC access unit it can still be parsed for
+/// inspection and logging without affecting decode of the main
+/// (`view_id == 0`) sub-bitstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiviewViewPosition {
+    /// `view_position[i]`, one entry per view. The vector length is
+    /// `num_views_minus1 + 1`, bounded at 1024 by the §G.13.2.10 range
+    /// check that runs before allocation.
+    pub view_positions: Vec<u16>,
+    /// `multiview_view_position_extension_flag`. Per §G.13.2.10 the
+    /// value shall be 0; conforming streams will always have `false`
+    /// here.
+    pub extension_flag: bool,
+}
+
+pub fn parse_multiview_view_position(payload: &[u8]) -> Result<MultiviewViewPosition, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §G.13.1.10 — num_views_minus1 ue(v); §G.13.2.10 range check
+    // BEFORE allocating the per-view vector so an adversarial ue(v)
+    // can't drive an unbounded Vec::push. BitReader::ue caps the
+    // leading-zero run at 31 (per the r91 fuzz fix on bitstream.rs),
+    // so the raw value is already bounded to fit in a u32; the
+    // 0..=1023 range check below pins it to a 1024-element ceiling.
+    let num_views_minus1 = r.ue()?;
+    if num_views_minus1 > 1023 {
+        return Err(SeiError::MultiviewViewPositionNumViewsOutOfRange(
+            num_views_minus1,
+        ));
+    }
+    let count = (num_views_minus1 as usize) + 1;
+    let mut view_positions: Vec<u16> = Vec::with_capacity(count);
+    for i in 0..count {
+        // §G.13.1.10 — view_position[ i ] ue(v); §G.13.2.10 range
+        // 0..=1023 inclusive. ue() returns u32 so the cast to u16
+        // is safe only after the range check.
+        let vp = r.ue()?;
+        if vp > 1023 {
+            return Err(SeiError::MultiviewViewPositionViewPositionOutOfRange { i, got: vp });
+        }
+        view_positions.push(vp as u16);
+    }
+    // §G.13.1.10 — multiview_view_position_extension_flag u(1).
+    // §G.13.2.10: shall equal 0. We preserve the observed bit so
+    // callers can audit a non-conforming stream rather than silently
+    // collapsing it; we do NOT consume any trailing bits beyond
+    // this flag (per §G.13.2.10 a `1` value means decoders shall
+    // ignore everything after).
+    let extension_flag = r.u(1)? == 1;
+    Ok(MultiviewViewPosition {
+        view_positions,
+        extension_flag,
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4222,6 +4318,8 @@ pub enum SeiPayload {
     OmniViewport(OmniViewport),
     /// §D.2.38 — shutter_interval_info (payload type 205). Round 95.
     ShutterIntervalInfo(ShutterIntervalInfo),
+    /// §G.13.2.10 — multiview_view_position (payload type 46). Round 183.
+    MultiviewViewPosition(MultiviewViewPosition),
     /// §D.2.36 — sei_manifest (payload type 200). Round 120.
     SeiManifest(SeiManifest),
     /// §D.2.37 — sei_prefix_indication (payload type 201). Round 120.
@@ -4301,6 +4399,9 @@ pub fn parse_payload(
         )?)),
         45 => Ok(SeiPayload::FramePackingArrangement(
             parse_frame_packing_arrangement(payload)?,
+        )),
+        46 => Ok(SeiPayload::MultiviewViewPosition(
+            parse_multiview_view_position(payload)?,
         )),
         47 => Ok(SeiPayload::DisplayOrientation(parse_display_orientation(
             payload,
@@ -5170,6 +5271,114 @@ mod tests {
         match got {
             SeiPayload::FramePackingArrangement(f) => assert!(f.cancel_flag),
             other => panic!("expected FramePackingArrangement, got {:?}", other),
+        }
+    }
+
+    // §G.13.1.10 / §G.13.2.10 — multiview_view_position (payload 46).
+    //
+    // Two-view case (num_views_minus1 = 1):
+    //   num_views_minus1 = 1 → ue codeword "010" (3 bits)
+    //   view_position[0] = 0 → ue codeword "1" (1 bit)
+    //   view_position[1] = 1 → ue codeword "010" (3 bits)
+    //   multiview_view_position_extension_flag = 0 (1 bit)
+    // Total: 8 bits → one byte.
+    #[test]
+    fn multiview_view_position_two_views_left_then_right() {
+        let payload = pack_bits(&[
+            (0b010, 3), // num_views_minus1 = 1
+            (1, 1),     // view_position[0] = 0
+            (0b010, 3), // view_position[1] = 1
+            (0, 1),     // extension_flag = 0
+        ]);
+        let got = parse_multiview_view_position(&payload).unwrap();
+        assert_eq!(got.view_positions, vec![0u16, 1u16]);
+        assert!(!got.extension_flag);
+    }
+
+    #[test]
+    fn multiview_view_position_single_view_zero_position() {
+        // num_views_minus1 = 0 → ue codeword "1" (1 bit)
+        // view_position[0] = 0 → ue "1" (1 bit)
+        // extension_flag = 0 (1 bit)
+        let payload = pack_bits(&[(1, 1), (1, 1), (0, 1)]);
+        let got = parse_multiview_view_position(&payload).unwrap();
+        assert_eq!(got.view_positions, vec![0u16]);
+        assert!(!got.extension_flag);
+    }
+
+    #[test]
+    fn multiview_view_position_preserves_extension_flag_when_set() {
+        // Single-view case with extension_flag = 1. §G.13.2.10 says
+        // conforming encoders write 0; the parser still surfaces the
+        // bit so callers can audit a non-conforming stream.
+        let payload = pack_bits(&[(1, 1), (1, 1), (1, 1)]);
+        let got = parse_multiview_view_position(&payload).unwrap();
+        assert_eq!(got.view_positions, vec![0u16]);
+        assert!(got.extension_flag);
+    }
+
+    #[test]
+    fn multiview_view_position_rejects_num_views_above_1023() {
+        // num_views_minus1 = 1024 → ue codeword "00000000001 0000000001"
+        // (10 leading zeros, leading 1, then 10-bit suffix = 0b00000000001).
+        // §G.13.2.10 caps it at 1023. We don't bother walking the
+        // suffix bits — the parser must reject before allocating.
+        let mut bits = Vec::new();
+        // ue(1024) = 11 bits prefix (10 zeros + a 1) + 10 bits suffix
+        // = "00000000001 0000000001".
+        for _ in 0..10 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        for _ in 0..9 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        let payload = pack_bits(&bits);
+        let err = parse_multiview_view_position(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::MultiviewViewPositionNumViewsOutOfRange(1024)
+        ));
+    }
+
+    #[test]
+    fn multiview_view_position_rejects_view_position_above_1023() {
+        // num_views_minus1 = 0 → ue "1"
+        // view_position[0] = 1024 → ue 11+10 bits as above.
+        let mut bits = vec![(1u64, 1u32)];
+        for _ in 0..10 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        for _ in 0..9 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        let payload = pack_bits(&bits);
+        let err = parse_multiview_view_position(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::MultiviewViewPositionViewPositionOutOfRange { i: 0, got: 1024 }
+        ));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_multiview_view_position() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[
+            (0b010, 3), // num_views_minus1 = 1
+            (1, 1),     // view_position[0] = 0
+            (0b010, 3), // view_position[1] = 1
+            (0, 1),     // extension_flag = 0
+        ]);
+        let got = parse_payload(46, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::MultiviewViewPosition(m) => {
+                assert_eq!(m.view_positions, vec![0u16, 1u16]);
+                assert!(!m.extension_flag);
+            }
+            other => panic!("expected MultiviewViewPosition, got {:?}", other),
         }
     }
 
