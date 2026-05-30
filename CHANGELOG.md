@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- round 194 — `parse_residual_block_cavlc` rejects malformed §7.3.5.3.1
+  call-contract triples (`startIdx > endIdx`, `maxNumCoeff ∉ {4, 8, 15, 16}`,
+  span exceeding `maxNumCoeff`) before any bit is read; new `CavlcError`
+  variants `InvalidBlockSpan` / `InvalidMaxNumCoeff` / `BlockSpanExceedsMax`
+- round 194 — sweep `fuzz/artifacts/panic_free_decode/` (4 local oom-*
+  artifacts cleared by round-177 §D.2.20 + round-187 §8.2.1 i64 staging;
+  re-fed through `panic_free_decode -runs=1`, all exit 0 in 0 ms within
+  libFuzzer's default 2 GiB RSS budget — the artifacts directory is
+  git-ignored so the prune is a local-disk operation) + new
+  `fuzz/README.md` documenting the harness layout, the round-194 sweep,
+  and the local-rerun recipe
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-h264/compare/v0.1.4...v0.1.5) - 2026-05-30
 
 ### Other

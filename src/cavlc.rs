@@ -40,6 +40,23 @@ pub enum CavlcError {
     InvalidTotalCoeff { tc: u32, max: u32 },
     #[error("invalid trailing_ones={t1} for total_coeff={tc}")]
     InvalidTrailingOnes { t1: u32, tc: u32 },
+    /// §7.3.5.3.1 — the call-contract for `residual_block_cavlc()` requires
+    /// `startIdx <= endIdx`; an inverted span would underflow the
+    /// `endIdx - startIdx + 1` coeffLevel sizing and is rejected up-front.
+    #[error("invalid CAVLC block span start_idx={start_idx} > end_idx={end_idx}")]
+    InvalidBlockSpan { start_idx: u32, end_idx: u32 },
+    /// §7.3.5.3.1 — `maxNumCoeff` is invoked at exactly four legal values:
+    /// 4 (Chroma DC 4:2:0), 8 (Chroma DC 4:2:2), 15 (Intra16x16 AC / luma
+    /// AC starting at index 1), and 16 (luma 4x4 / chroma AC / ChromaDC at
+    /// 4:4:4). Any other value is a caller bug and the block aborts before
+    /// reading bits.
+    #[error("invalid CAVLC max_num_coeff={max} (legal: 4, 8, 15, 16)")]
+    InvalidMaxNumCoeff { max: u32 },
+    /// §7.3.5.3.1 — the index span `(endIdx - startIdx + 1)` cannot exceed
+    /// `maxNumCoeff`: every coefficient written to `coeffLevel[startIdx +
+    /// coeffNum]` is implicitly bounded by `maxNumCoeff`.
+    #[error("CAVLC block span {span} exceeds max_num_coeff={max}")]
+    BlockSpanExceedsMax { span: u32, max: u32 },
 }
 
 pub type CavlcResult<T> = Result<T, CavlcError>;
@@ -1387,8 +1404,26 @@ pub fn parse_residual_block_cavlc(
     end_idx: u32,
     max_num_coeff: u32,
 ) -> CavlcResult<Vec<i32>> {
+    // §7.3.5.3.1 — caller-contract guards. The arithmetic in this
+    // function assumes a well-formed (startIdx, endIdx, maxNumCoeff)
+    // triple; reject malformed combinations before reading bits rather
+    // than relying on later u32 underflow or a quiet out-of-range
+    // coeff_level write.
+    if start_idx > end_idx {
+        return Err(CavlcError::InvalidBlockSpan { start_idx, end_idx });
+    }
+    if !matches!(max_num_coeff, 4 | 8 | 15 | 16) {
+        return Err(CavlcError::InvalidMaxNumCoeff { max: max_num_coeff });
+    }
     // §7.3.5.3.1 — coeffLevel is sized (endIdx - startIdx + 1).
-    let span = (end_idx - start_idx + 1) as usize;
+    let span_u32 = end_idx - start_idx + 1;
+    if span_u32 > max_num_coeff {
+        return Err(CavlcError::BlockSpanExceedsMax {
+            span: span_u32,
+            max: max_num_coeff,
+        });
+    }
+    let span = span_u32 as usize;
     let mut coeff_level = vec![0i32; span];
 
     // §9.2.1
@@ -2560,5 +2595,118 @@ mod tests {
         let mut expected = vec![0i32; 16];
         expected[0] = -1;
         assert_eq!(coeff, expected);
+    }
+
+    // ---- §7.3.5.3.1 caller-contract guards ----
+
+    /// §7.3.5.3.1 — `startIdx > endIdx` is rejected before bits are
+    /// read. The naïve `endIdx - startIdx + 1` sizing would either
+    /// underflow as u32 (`0xfffff…`) and immediately attempt a multi-GB
+    /// `vec![0i32; …]`, or panic in debug. The guard turns it into a
+    /// typed error.
+    #[test]
+    fn rejects_inverted_span() {
+        let bytes = pack_bits(&["1"]);
+        let mut r = BitReader::new(&bytes);
+        let err = parse_residual_block_cavlc(&mut r, CoeffTokenContext::Numeric(0), 5, 3, 16)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CavlcError::InvalidBlockSpan {
+                start_idx: 5,
+                end_idx: 3
+            }
+        );
+        // No bits should have been consumed: the guard fires before any
+        // bitstream access.
+        let (b, bi) = r.position();
+        assert_eq!((b, bi), (0, 0));
+    }
+
+    /// §7.3.5.3.1 — `maxNumCoeff` is one of {4, 8, 15, 16}. Spot-check
+    /// the four boundary rejects (0, 5, 9, 17) and one mid-range
+    /// reject (12).
+    #[test]
+    fn rejects_invalid_max_num_coeff() {
+        for bad in [0u32, 1, 5, 9, 12, 17, 64, 0xffff_ffff] {
+            let bytes = pack_bits(&["1"]);
+            let mut r = BitReader::new(&bytes);
+            let err = parse_residual_block_cavlc(
+                &mut r,
+                CoeffTokenContext::Numeric(0),
+                0,
+                bad.saturating_sub(1).min(15),
+                bad,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                CavlcError::InvalidMaxNumCoeff { max: bad },
+                "max_num_coeff={bad} must be rejected"
+            );
+            // Guard fires before bit reads.
+            let (b, bi) = r.position();
+            assert_eq!(
+                (b, bi),
+                (0, 0),
+                "max_num_coeff={bad} should not consume bits"
+            );
+        }
+    }
+
+    /// §7.3.5.3.1 — each of {4, 8, 15, 16} is individually accepted
+    /// (we exercise this via the existing parse paths in `full_block_…`
+    /// tests, but the boundary case here pins the guard's positive
+    /// arm). We feed a TotalCoeff=0 ("1") so the function returns an
+    /// all-zero coeffLevel without exercising downstream tables.
+    #[test]
+    fn accepts_all_four_legal_max_num_coeff() {
+        // (max_num_coeff, end_idx, ctx) — end_idx chosen so the span
+        // matches max_num_coeff exactly.
+        let cases: &[(u32, u32, CoeffTokenContext)] = &[
+            (4, 3, CoeffTokenContext::ChromaDc420),
+            (8, 7, CoeffTokenContext::ChromaDc422),
+            (15, 14, CoeffTokenContext::Numeric(0)),
+            (16, 15, CoeffTokenContext::Numeric(0)),
+        ];
+        for (max, end, ctx) in cases {
+            // coeff_token = (0,0) bin string is "1" in column 0,
+            // "11" in column 1, "11" in column 2, "0000 11" in
+            // column 3, "0000 00" in the ChromaDC420 column, and
+            // "01" in the ChromaDC422 column. Use a leading "1"
+            // for ctx columns where it decodes to (0,0) and adjust
+            // for the chroma DC contexts below.
+            let bits = match ctx {
+                CoeffTokenContext::Numeric(_) => "1",
+                CoeffTokenContext::ChromaDc420 => "01",
+                CoeffTokenContext::ChromaDc422 => "1",
+            };
+            let bytes = pack_bits(&[bits]);
+            let mut r = BitReader::new(&bytes);
+            let out =
+                parse_residual_block_cavlc(&mut r, *ctx, 0, *end, *max).expect("legal call ok");
+            assert_eq!(out.len() as u32, end + 1);
+            assert!(
+                out.iter().all(|c| *c == 0),
+                "TotalCoeff=0 should leave coeff_level all-zero"
+            );
+        }
+    }
+
+    /// §7.3.5.3.1 — `(endIdx - startIdx + 1)` may not exceed
+    /// `maxNumCoeff`. A caller asking for a 16-entry span against
+    /// maxNumCoeff=4 (a chroma-DC block) is rejected before any
+    /// coeff_token bit is touched, since the §9.2.4 combine step
+    /// would otherwise write to coeff_level positions that exceed
+    /// maxNumCoeff.
+    #[test]
+    fn rejects_span_exceeding_max() {
+        let bytes = pack_bits(&["1"]);
+        let mut r = BitReader::new(&bytes);
+        let err = parse_residual_block_cavlc(&mut r, CoeffTokenContext::ChromaDc420, 0, 15, 4)
+            .unwrap_err();
+        assert_eq!(err, CavlcError::BlockSpanExceedsMax { span: 16, max: 4 });
+        let (b, bi) = r.position();
+        assert_eq!((b, bi), (0, 0));
     }
 }
