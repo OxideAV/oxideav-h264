@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-h264/compare/v0.1.4...v0.1.5) - 2026-05-30
+
+### Other
+
+- round 192 — strict avcC parser + ISO/IEC 14496-15 §5.2.4.1.1 High-family extension
+- round 187 — i64-stage §8.2.1 derivation + PocError::Overflow (fuzz crash 1743a9ce)
+- round 183 — Annex G §G.13.2.10 multiview_view_position (payload type 46)
+- round 177 — fix sei_payload OOM via §D.2.20 num_slice_groups_in_set_minus1 bound
+- round 164 — fuzz target + malformed-input property sweep
+- round 158 — typed ATSC1 envelope sub-parser (A/53 Part 4 §6.2.3 / §D.2.6)
+- round-151 — opt-in CABAC IDR Intra_16x16 chroma AC trellis (§8.5.11.1 + §7.3.5.3 + §9.3.3.1.3)
+- round-148 — opt-in CABAC IDR Intra_16x16 luma AC trellis (§8.5.10 + §9.3.3.1.3)
+- scrub pre-existing JM / libavcodec decorative-attribution prose
+- round 145: end-to-end Criterion encode benchmark
+- round 139 — Criterion decode bench over IDR / P-chain / IPB / 4:2:2
+- CAVLC I_PCM honours BitDepth{Y,C} from the active SPS (§7.4.5)
+- reject PPS that arrives before its backing SPS (task #1044 / round 120 fuzz failure)
+- round-120 — sei_manifest + sei_prefix_indication (payload types 200, 201)
+- parse colour_remapping_info (payload type 142, §D.1.30/§D.2.30)
+- regionwise_packing Annex D SEI payload (type 155)
+- dec_ref_pic_marking_repetition Annex D SEI payload (type 7)
+- round-107 — content_colour_volume Annex D SEI payload (type 149)
+- round 103 — spare_pic Annex D SEI payload (type 8)
+- round 99 — sub-sequence Annex D SEI family (types 10/11/12)
+- round-95 — omni_viewport + shutter_interval_info parsers
+- drop incomplete pictures whose MbGrid leaves MBs uncovered
+- validate frame_cropping offsets stay within the coded picture
+- reject first_mb_in_slice != 0 for new coded picture
+- round-78 — four additional Annex D HDR + 360 payload parsers
+- round-73 — five additional Annex D payload parsers
+- CABAC inter trellis quantisation (round 49 RDOQ-lite)
+- bound max_num_ref_frames at 16 (§7.4.2.1.1 / Annex A.3.1)
+- reconstruct + inter_pred: reject inter MC against zero-dim reference (§8.4.2)
+- bound first_mb_in_slice by PicSizeInMbs (§7.4.3)
+- drop unfinished picture when every slice failed
+- sps + transform: reject reserved profile_idc + wrap chroma DC math
+- reject FMO PPS activation per §A.2 (fuzz oracle parity)
+- transform + cavlc + cabac: keep §8.5.12 inverse-quant multiply within i32
+- tighten picture-dim cap to 510 mbs / axis (was 32766)
+- cabac + slice_data + slice_header + pps: bound parse-time growth & shifts
+- sps + scaling_list: bound parse-time fields to prevent arithmetic overflow
+- bound Exp-Golomb leading-zero count at 31 (fix shl overflow)
+- add cargo-fuzz harness + libavcodec oracle for H.264 decoder
+
 ### Added
 
 - **round 192 — ISO/IEC 14496-15 §5.2.4.1.1 strict avcC parser +
