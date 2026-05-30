@@ -222,6 +222,22 @@ pub struct H264CodecDecoder {
     /// slice of a primary coded picture and consumed by `finalize_picture`
     /// when the picture boundary is detected.
     in_progress: Option<PictureInProgress>,
+
+    // ---- ISO/IEC 14496-15 §5.2.4.1.1 avcC diagnostic snapshot --------
+    /// `AVCProfileIndication` from the last `consume_extradata` call.
+    /// Optional because Annex B streams have no avcC.
+    avcc_profile_idc: Option<u8>,
+    /// `AVCLevelIndication` from the last `consume_extradata` call.
+    avcc_level_idc: Option<u8>,
+    /// `chroma_format` from the §5.2.4.1.1 High-profile extension
+    /// (`0` = monochrome, `1` = 4:2:0, `2` = 4:2:2, `3` = 4:4:4).
+    avcc_chroma_format: Option<u8>,
+    /// `bit_depth_luma_minus8 + 8` — only populated when the avcC
+    /// record carries the §5.2.4.1.1 High-profile extension.
+    avcc_bit_depth_luma: Option<u8>,
+    /// `bit_depth_chroma_minus8 + 8` — only populated when the avcC
+    /// record carries the §5.2.4.1.1 High-profile extension.
+    avcc_bit_depth_chroma: Option<u8>,
 }
 
 impl H264CodecDecoder {
@@ -248,19 +264,30 @@ impl H264CodecDecoder {
             prev_reference_top_foc: 0,
             prev_ref_frame_num: None,
             in_progress: None,
+            avcc_profile_idc: None,
+            avcc_level_idc: None,
+            avcc_chroma_format: None,
+            avcc_bit_depth_luma: None,
+            avcc_bit_depth_chroma: None,
         }
     }
 
-    /// §4.1.3.1 ISO/IEC 14496-15 — `AVCDecoderConfigurationRecord`.
-    /// Minimal parse: pick up `lengthSizeMinusOne` and feed the stored
-    /// SPS + PPS NAL units through the driver.
+    /// §5.2.4.1.1 ISO/IEC 14496-15 — `AVCDecoderConfigurationRecord`.
+    /// Picks up `lengthSizeMinusOne` and feeds the stored SPS + PPS NAL
+    /// units through the driver. When `AVCProfileIndication` matches one
+    /// of the High-family profiles whose §5.2.4.1.1 grammar extends the
+    /// record (100 / 110 / 122 / 144), the trailing
+    /// `chroma_format`/`bit_depth_luma_minus8`/`bit_depth_chroma_minus8`
+    /// fields plus the `sequenceParameterSetExt` NAL list are also
+    /// consumed (driver currently ignores SPS-Ext, but the parse must
+    /// not silently leave bytes behind for downstream readers).
     ///
     /// Layout:
     /// ```text
     ///   u8  configurationVersion (= 1)
-    ///   u8  AVCProfileIndication
-    ///   u8  profile_compatibility
-    ///   u8  AVCLevelIndication
+    ///   u8  AVCProfileIndication                 // §A.2 profile_idc
+    ///   u8  profile_compatibility                // constraint set flags
+    ///   u8  AVCLevelIndication                   // §A.3 level_idc
     ///   u8  reserved (6 bits, 111111) + lengthSizeMinusOne (2 bits)
     ///   u8  reserved (3 bits, 111) + numOfSequenceParameterSets (5 bits)
     ///     repeated numOfSequenceParameterSets times:
@@ -270,7 +297,19 @@ impl H264CodecDecoder {
     ///     repeated:
     ///       u16 pictureParameterSetLength
     ///       <that many> pictureParameterSetNALUnit
+    ///   --- ISO/IEC 14496-15 §5.2.4.1.1 extension (profiles 100/110/122/144) ---
+    ///   u8  reserved (6 bits, 111111) + chroma_format (2 bits)
+    ///   u8  reserved (5 bits, 11111)  + bit_depth_luma_minus8 (3 bits)
+    ///   u8  reserved (5 bits, 11111)  + bit_depth_chroma_minus8 (3 bits)
+    ///   u8  numOfSequenceParameterSetExt
+    ///     repeated:
+    ///       u16 sequenceParameterSetExtLength
+    ///       <that many> sequenceParameterSetExtNALUnit
     /// ```
+    ///
+    /// Per §5.2.4.1.1 `lengthSizeMinusOne` shall take the values 0, 1,
+    /// or 3 (mapping to 1-, 2-, or 4-byte length prefixes). The value 2
+    /// (3-byte prefix) is forbidden — reject it before storing.
     pub fn consume_extradata(&mut self, extra: &[u8]) -> Result<()> {
         if extra.len() < 7 {
             return Err(Error::invalid("h264: extradata shorter than avcC header"));
@@ -278,7 +317,23 @@ impl H264CodecDecoder {
         if extra[0] != 1 {
             return Err(Error::invalid("h264: avcC configurationVersion must be 1"));
         }
-        self.length_size = Some((extra[4] & 0x03) + 1);
+        let profile_idc = extra[1];
+        // Capture, even though the driver picks them up again from the
+        // SPS NAL — useful for diagnostics on streams where the avcC
+        // header and in-band SPS disagree (the SPS wins).
+        self.avcc_profile_idc = Some(profile_idc);
+        self.avcc_level_idc = Some(extra[3]);
+        let length_size_minus_one = extra[4] & 0x03;
+        // §5.2.4.1.1 — lengthSizeMinusOne ∈ {0, 1, 3}. Value 2 (i.e. a
+        // 3-byte length prefix) is forbidden by the spec; reject up
+        // front so the AVCC framer never has to construct an illegal
+        // splitter.
+        if length_size_minus_one == 2 {
+            return Err(Error::invalid(
+                "h264: avcC lengthSizeMinusOne == 2 (3-byte prefix) forbidden by ISO/IEC 14496-15 §5.2.4.1.1",
+            ));
+        }
+        self.length_size = Some(length_size_minus_one + 1);
         let num_sps = (extra[5] & 0x1f) as usize;
         let mut pos = 6;
         for _ in 0..num_sps {
@@ -316,7 +371,106 @@ impl H264CodecDecoder {
                 .map_err(|e| Error::invalid(format!("h264 avcC PPS: {e}")))?;
             pos += len;
         }
+
+        // §5.2.4.1.1 extension: only present for the High family of
+        // profile_idc values listed in the spec text. Older muxers that
+        // ship a Baseline / Main / Extended record never append these
+        // bytes, so the parse cleanly ends with the PPS list above.
+        // For 244 (High 4:4:4 Predictive) the spec extends the list of
+        // profiles that carry the extension — keep it here even though
+        // the 14496-15:2013 edition only enumerated 100/110/122/144.
+        if matches!(profile_idc, 100 | 110 | 122 | 144 | 244) {
+            // Some real-world MP4 muxers truncate the extension entirely
+            // even for these profiles; if we're already past the end,
+            // accept the record as-is rather than hard-fail.
+            if pos >= extra.len() {
+                return Ok(());
+            }
+            if pos + 4 > extra.len() {
+                return Err(Error::invalid(
+                    "h264: avcC truncated at High-profile extension header",
+                ));
+            }
+            let chroma_format = extra[pos] & 0x03;
+            let bit_depth_luma_minus8 = extra[pos + 1] & 0x07;
+            let bit_depth_chroma_minus8 = extra[pos + 2] & 0x07;
+            let num_sps_ext = extra[pos + 3] as usize;
+            // §7.4.2.1.1 caps both bit_depth fields at 6 (i.e. 14-bit
+            // pixel samples). Treat values outside 0..=6 as malformed:
+            // an unbounded value here would mislead any downstream code
+            // that picks the bit-depth out of the avcC header before
+            // the SPS is parsed.
+            if bit_depth_luma_minus8 > 6 {
+                return Err(Error::invalid(format!(
+                    "h264: avcC bit_depth_luma_minus8 = {bit_depth_luma_minus8} exceeds §7.4.2.1.1 cap"
+                )));
+            }
+            if bit_depth_chroma_minus8 > 6 {
+                return Err(Error::invalid(format!(
+                    "h264: avcC bit_depth_chroma_minus8 = {bit_depth_chroma_minus8} exceeds §7.4.2.1.1 cap"
+                )));
+            }
+            // §7.4.2.1.1 — chroma_format_idc ∈ {0, 1, 2, 3}. The 2-bit
+            // field already saturates at 3 so any value is grammatically
+            // valid; record it for diagnostic exposure.
+            self.avcc_chroma_format = Some(chroma_format);
+            self.avcc_bit_depth_luma = Some(8 + bit_depth_luma_minus8);
+            self.avcc_bit_depth_chroma = Some(8 + bit_depth_chroma_minus8);
+            pos += 4;
+            for _ in 0..num_sps_ext {
+                if pos + 2 > extra.len() {
+                    return Err(Error::invalid("h264: avcC truncated at SPS-Ext length"));
+                }
+                let len = u16::from_be_bytes([extra[pos], extra[pos + 1]]) as usize;
+                pos += 2;
+                if pos + len > extra.len() {
+                    return Err(Error::invalid("h264: avcC truncated at SPS-Ext body"));
+                }
+                // Drive the SPS-Ext NAL through the same parse path; the
+                // driver may or may not have an SPS-Ext handler today,
+                // but it MUST NOT panic, and a parse failure here means
+                // the avcC is corrupt.
+                let _ = self
+                    .driver
+                    .process_nal(&extra[pos..pos + len])
+                    .map_err(|e| Error::invalid(format!("h264 avcC SPS-Ext: {e}")))?;
+                pos += len;
+            }
+        }
         Ok(())
+    }
+
+    /// `AVCProfileIndication` byte from the most recently consumed
+    /// `avcC` record (ISO/IEC 14496-15 §5.2.4.1.1), if any.
+    /// Returns `None` when this decoder was driven Annex B (no
+    /// `consume_extradata` call) or before extradata is supplied.
+    pub fn avcc_profile_idc(&self) -> Option<u8> {
+        self.avcc_profile_idc
+    }
+
+    /// `AVCLevelIndication` byte from the most recently consumed `avcC`
+    /// record, if any.
+    pub fn avcc_level_idc(&self) -> Option<u8> {
+        self.avcc_level_idc
+    }
+
+    /// `chroma_format` from the `avcC` High-profile extension
+    /// (§5.2.4.1.1), if the record carried one. `0` = monochrome,
+    /// `1` = 4:2:0, `2` = 4:2:2, `3` = 4:4:4.
+    pub fn avcc_chroma_format(&self) -> Option<u8> {
+        self.avcc_chroma_format
+    }
+
+    /// Luma bit depth from the `avcC` High-profile extension. The
+    /// returned value is `bit_depth_luma_minus8 + 8` (so 8 ≤ x ≤ 14).
+    pub fn avcc_bit_depth_luma(&self) -> Option<u8> {
+        self.avcc_bit_depth_luma
+    }
+
+    /// Chroma bit depth from the `avcC` High-profile extension. The
+    /// returned value is `bit_depth_chroma_minus8 + 8` (so 8 ≤ x ≤ 14).
+    pub fn avcc_bit_depth_chroma(&self) -> Option<u8> {
+        self.avcc_bit_depth_chroma
     }
 
     /// Handle a single emitted driver event.
@@ -2534,5 +2688,223 @@ mod tests {
         let mut h = prev;
         h.first_mb_in_slice = 384;
         assert!(!dec.is_first_vcl_of_new_picture(5, 3, &h));
+    }
+
+    // ====== ISO/IEC 14496-15 §5.2.4.1.1 — avcC parser tests =========
+
+    /// Minimal Baseline avcC: configurationVersion=1, profile_idc=66,
+    /// profile_compat=0, level_idc=30, lengthSizeMinusOne=3 (=> 4-byte
+    /// prefix), 0 SPS, 0 PPS. No High-profile extension. Smallest
+    /// legal record that `consume_extradata` should accept.
+    fn baseline_avcc_zero_sps_zero_pps(length_size_minus_one: u8) -> Vec<u8> {
+        vec![
+            0x01,                               // configurationVersion
+            66,                                 // AVCProfileIndication = Baseline
+            0x00,                               // profile_compatibility
+            30,                                 // AVCLevelIndication = 3.0
+            0xfc | (length_size_minus_one & 3), // reserved (6 bits = 111111) | lengthSizeMinusOne
+            0xe0, // reserved (3 bits = 111) | numOfSequenceParameterSets = 0
+            0x00, // numOfPictureParameterSets = 0
+        ]
+    }
+
+    /// §5.2.4.1.1 — `consume_extradata` accepts the minimal 7-byte
+    /// header and stores `length_size = 4` for `lengthSizeMinusOne = 3`.
+    #[test]
+    fn avcc_minimal_baseline_record_accepted() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let extra = baseline_avcc_zero_sps_zero_pps(3);
+        dec.consume_extradata(&extra).expect("minimal avcC ok");
+        assert_eq!(dec.length_size, Some(4));
+        assert_eq!(dec.avcc_profile_idc(), Some(66));
+        assert_eq!(dec.avcc_level_idc(), Some(30));
+        // Baseline doesn't have the High-profile extension.
+        assert_eq!(dec.avcc_chroma_format(), None);
+        assert_eq!(dec.avcc_bit_depth_luma(), None);
+        assert_eq!(dec.avcc_bit_depth_chroma(), None);
+    }
+
+    /// §5.2.4.1.1 — `lengthSizeMinusOne = 0` (1-byte prefix) is
+    /// legal and yields `length_size = 1`.
+    #[test]
+    fn avcc_length_size_minus_one_0_means_1_byte_prefix() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.consume_extradata(&baseline_avcc_zero_sps_zero_pps(0))
+            .expect("lengthSize = 1 ok");
+        assert_eq!(dec.length_size, Some(1));
+    }
+
+    /// §5.2.4.1.1 — `lengthSizeMinusOne = 1` (2-byte prefix) is
+    /// legal and yields `length_size = 2`.
+    #[test]
+    fn avcc_length_size_minus_one_1_means_2_byte_prefix() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.consume_extradata(&baseline_avcc_zero_sps_zero_pps(1))
+            .expect("lengthSize = 2 ok");
+        assert_eq!(dec.length_size, Some(2));
+    }
+
+    /// §5.2.4.1.1 — `lengthSizeMinusOne = 2` is forbidden by the spec
+    /// (3-byte length prefix is not a legal AVCC framing). Verify the
+    /// parser rejects up front rather than silently building an
+    /// illegal splitter.
+    #[test]
+    fn avcc_length_size_minus_one_2_is_rejected() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let err = dec
+            .consume_extradata(&baseline_avcc_zero_sps_zero_pps(2))
+            .expect_err("lengthSize == 3 must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lengthSizeMinusOne"),
+            "error message should name the forbidden field: {msg}"
+        );
+        // Even though we rejected, `length_size` must NOT be populated
+        // with the illegal value — the decoder stays in Annex B mode.
+        assert_eq!(dec.length_size, None);
+    }
+
+    /// §5.2.4.1.1 — configurationVersion ≠ 1 is rejected.
+    #[test]
+    fn avcc_wrong_version_is_rejected() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let mut extra = baseline_avcc_zero_sps_zero_pps(3);
+        extra[0] = 2;
+        let err = dec
+            .consume_extradata(&extra)
+            .expect_err("version 2 must be rejected");
+        assert!(format!("{err}").contains("configurationVersion"));
+    }
+
+    /// §5.2.4.1.1 — 6-byte header is short of the 7-byte minimum.
+    #[test]
+    fn avcc_short_header_is_rejected() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let err = dec
+            .consume_extradata(&[0x01, 0x42, 0x00, 0x1e, 0xff, 0xe0])
+            .expect_err("6-byte avcC must be rejected");
+        assert!(format!("{err}").contains("shorter than avcC header"));
+    }
+
+    /// §5.2.4.1.1 — High-profile (profile_idc=100) extension: the
+    /// chroma_format / bit_depth_*_minus8 / numOfSequenceParameterSetExt
+    /// trailer is parsed and surfaced through the accessor methods.
+    #[test]
+    fn avcc_high_profile_extension_parsed() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let extra = vec![
+            0x01, // configurationVersion
+            100,  // AVCProfileIndication = High
+            0x00, // profile_compatibility
+            30,   // AVCLevelIndication
+            0xff, // reserved | lengthSizeMinusOne = 3
+            0xe0, // reserved | numOfSequenceParameterSets = 0
+            0x00, // numOfPictureParameterSets = 0
+            // §5.2.4.1.1 extension begins here:
+            0xfc | 0x01, // reserved | chroma_format = 1 (4:2:0)
+            0xf8 | 0x02, // reserved | bit_depth_luma_minus8 = 2 (10-bit)
+            0xf8 | 0x02, // reserved | bit_depth_chroma_minus8 = 2 (10-bit)
+            0x00,        // numOfSequenceParameterSetExt = 0
+        ];
+        dec.consume_extradata(&extra).expect("High avcC ext ok");
+        assert_eq!(dec.avcc_profile_idc(), Some(100));
+        assert_eq!(dec.avcc_chroma_format(), Some(1));
+        assert_eq!(dec.avcc_bit_depth_luma(), Some(10));
+        assert_eq!(dec.avcc_bit_depth_chroma(), Some(10));
+    }
+
+    /// §5.2.4.1.1 — the High-profile extension trailer is sometimes
+    /// elided by real-world muxers even on profile_idc=100. Accept
+    /// the truncated record (length_size still picked up) rather
+    /// than hard-fail; the accessors remain `None`.
+    #[test]
+    fn avcc_high_profile_missing_extension_tolerated() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let mut extra = baseline_avcc_zero_sps_zero_pps(3);
+        extra[1] = 100; // promote to High
+        dec.consume_extradata(&extra)
+            .expect("missing High ext tolerated");
+        assert_eq!(dec.avcc_profile_idc(), Some(100));
+        assert_eq!(dec.length_size, Some(4));
+        // No High extension bytes → no surfaced extension fields.
+        assert_eq!(dec.avcc_chroma_format(), None);
+        assert_eq!(dec.avcc_bit_depth_luma(), None);
+        assert_eq!(dec.avcc_bit_depth_chroma(), None);
+    }
+
+    /// §5.2.4.1.1 — profile_idc=244 (High 4:4:4 Predictive) extends
+    /// the §5.2.4.1.1 enumeration. Accept the chroma_format / bit depth
+    /// trailer for it too.
+    #[test]
+    fn avcc_high_444_profile_extension_parsed() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let extra = vec![
+            0x01,
+            244,
+            0x00,
+            30,          // header
+            0xff,        // lengthSizeMinusOne = 3
+            0xe0,        // 0 SPS
+            0x00,        // 0 PPS
+            0xfc | 0x03, // chroma_format = 3 (4:4:4)
+            0xf8 | 0x04, // bit_depth_luma_minus8 = 4 (12-bit)
+            0xf8 | 0x04, // bit_depth_chroma_minus8 = 4
+            0x00,        // 0 SPS-Ext
+        ];
+        dec.consume_extradata(&extra).expect("4:4:4 avcC ok");
+        assert_eq!(dec.avcc_chroma_format(), Some(3));
+        assert_eq!(dec.avcc_bit_depth_luma(), Some(12));
+        assert_eq!(dec.avcc_bit_depth_chroma(), Some(12));
+    }
+
+    /// §5.2.4.1.1 + §7.4.2.1.1 — `bit_depth_*_minus8` is capped at 6
+    /// (i.e. 14-bit pixel samples) by the spec; reject values 7 even
+    /// though the 3-bit field can carry it.
+    #[test]
+    fn avcc_bit_depth_minus8_overflow_is_rejected() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let extra = vec![
+            0x01,
+            100,
+            0x00,
+            30,
+            0xff,
+            0xe0,
+            0x00,
+            0xfc | 0x01, // chroma_format = 1
+            0xf8 | 0x07, // bit_depth_luma_minus8 = 7  ← invalid
+            0xf8,        // bit_depth_chroma_minus8 = 0
+            0x00,        // 0 SPS-Ext
+        ];
+        let err = dec
+            .consume_extradata(&extra)
+            .expect_err("bit_depth = 7 must be rejected");
+        assert!(format!("{err}").contains("bit_depth_luma_minus8"));
+    }
+
+    /// §5.2.4.1.1 — SPS body length exceeding the record bound is
+    /// rejected (no panic, surfaced as `Error::Invalid`).
+    #[test]
+    fn avcc_truncated_sps_body_is_rejected() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let extra = vec![
+            0x01, 66, 0x00, 30, 0xff, 0xe1, // 1 SPS announced
+            0x00, 0x10, // SPS length = 16 …
+            0xde, // … but only 1 byte present.
+        ];
+        let err = dec.consume_extradata(&extra).expect_err("truncated SPS");
+        assert!(format!("{err}").contains("avcC truncated at SPS body"));
+    }
+
+    /// §5.2.4.1.1 — the PPS count byte is mandatory; a record that
+    /// runs out of bytes after the SPS list is rejected.
+    #[test]
+    fn avcc_truncated_at_pps_count_is_rejected() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let extra = vec![0x01, 66, 0x00, 30, 0xff, 0xe0];
+        let err = dec
+            .consume_extradata(&extra)
+            .expect_err("missing PPS count");
+        assert!(format!("{err}").contains("avcC"));
     }
 }

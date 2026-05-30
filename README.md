@@ -36,7 +36,7 @@ no packet is decoded.
 
 | Spec area | Clause | Status |
 | --------- | ------ | ------ |
-| NAL parsing (Annex B + AVCC) | §7.3.1, §7.4.1, §B.1 | parsed (no extension headers) |
+| NAL parsing (Annex B + AVCC) | §7.3.1, §7.4.1, §B.1 + ISO/IEC 14496-15 §5.2.4.1.1 | parsed (no SVC / MVC extension headers; **round 192** — strict avcC parser rejects `lengthSizeMinusOne == 2` (3-byte prefix) per §5.2.4.1.1 + parses the §5.2.4.1.1 High-family extension trailer (`chroma_format`, `bit_depth_luma_minus8`, `bit_depth_chroma_minus8`, `numOfSequenceParameterSetExt` + SPS-Ext NAL list) for `profile_idc ∈ {100, 110, 122, 144, 244}`, surfaced via `avcc_profile_idc()` / `avcc_level_idc()` / `avcc_chroma_format()` / `avcc_bit_depth_luma()` / `avcc_bit_depth_chroma()` accessors; §7.4.2.1.1 `bit_depth_*_minus8 ≤ 6` cap enforced before storage) |
 | Sequence Parameter Set | §7.3.2.1 | parsed (VUI + scaling_list fully integrated) |
 | Picture Parameter Set | §7.3.2.2 | parsed (FMO + scaling_list fully integrated; 4:4:4 via `parse_with_chroma_format`) |
 | scaling_list body | §7.3.2.1.1.1 | integrated into SPS + PPS |

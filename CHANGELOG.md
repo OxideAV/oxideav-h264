@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **round 192 — ISO/IEC 14496-15 §5.2.4.1.1 strict avcC parser +
+  High-profile extension trailer.** `H264CodecDecoder::consume_extradata`
+  now (a) rejects `lengthSizeMinusOne == 2` (3-byte length prefix) at
+  the avcC header, as required by §5.2.4.1.1 — previously the illegal
+  value silently flowed into `AvccSplitter`, which rejected it later
+  with a less specific error; (b) parses the §5.2.4.1.1 High-family
+  extension (`chroma_format`, `bit_depth_luma_minus8`,
+  `bit_depth_chroma_minus8`, `numOfSequenceParameterSetExt` + SPS-Ext
+  NAL list) when `AVCProfileIndication ∈ {100, 110, 122, 144, 244}`,
+  rather than leaving up to 4+ trailing bytes silently dropped; (c)
+  enforces the §7.4.2.1.1 `bit_depth_*_minus8 ≤ 6` cap before the
+  values reach any consumer. New diagnostic accessors
+  `avcc_profile_idc()` / `avcc_level_idc()` / `avcc_chroma_format()` /
+  `avcc_bit_depth_luma()` / `avcc_bit_depth_chroma()` surface what the
+  avcC header advertised — useful for cross-checking against the
+  in-band SPS on streams where the two disagree (the SPS still wins).
+  Records that elide the High-family extension trailer are still
+  accepted (some real-world muxers truncate it); the accessors stay
+  `None` in that case. 11 new tests in `src/h264_decoder.rs` pin: the
+  baseline + 1-byte + 2-byte prefix accept paths, the
+  `lengthSizeMinusOne == 2` reject, wrong configurationVersion reject,
+  short-header reject, profile_idc 100 + 244 extension parse, missing
+  extension toleration, and the §7.4.2.1.1 bit-depth overflow / SPS
+  truncation rejections.
+
 ### Fixed
 
 - **round 187 — §8.2.1 POC derivation overflow now structured, not
