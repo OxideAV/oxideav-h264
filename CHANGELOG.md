@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 200 — two new Annex G (MVC) SEI payload types implemented in
+  `sei.rs`: payload type 39 `multiview_scene_info` (§G.13.1.4 /
+  §G.13.2.4 — single `max_disparity` ue(v), 0..=1023 range bound
+  enforced before storage) and payload type 43
+  `operation_point_not_present` (§G.13.1.8 / §G.13.2.8 — list of
+  16-bit operation-point identifiers declared absent in the bitstream,
+  with the §G.13.2.8 65536-id pre-allocation cap closing the same
+  shape of OOM lever that the round-177 §D.2.20 fix removed for
+  motion_constrained_slice_group_set, plus the 0..=65535 per-id range
+  check). Both arms are wired into `parse_payload` dispatch; the
+  payload-type table at the top of `sei.rs` grows two rows. New
+  `SeiError` variants `MultiviewSceneInfoMaxDisparityOutOfRange`,
+  `OperationPointNotPresentCountOutOfRange`, and
+  `OperationPointNotPresentIdOutOfRange`. The
+  `tests/integration_sei_malformed.rs` `KNOWN_PAYLOAD_TYPES` table
+  moves 39 and 43 out of the `Unknown`-fallback set (which also lifts
+  the sweep-cardinality lock from 2816 → 2904 panic-free invocations).
+  10 new lib unit tests (5 per payload type) cover boundary 0,
+  typical value, boundary 1023 / boundary 65535, count-overflow
+  rejection, id-overflow rejection, and `parse_payload` dispatch
+  round-trip. Harmless on non-MVC streams (Phase 4 on the README
+  "Profiles + features in scope" table).
 - round 194 — `parse_residual_block_cavlc` rejects malformed §7.3.5.3.1
   call-contract triples (`startIdx > endIdx`, `maxNumCoeff ∉ {4, 8, 15, 16}`,
   span exceeding `maxNumCoeff`) before any bit is read; new `CavlcError`

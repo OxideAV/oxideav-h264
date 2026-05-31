@@ -32,6 +32,8 @@
 //! | 21           | §D.1.23     | §D.2.23     | stereo_video_info                  |
 //! | 22           | §D.1.24     | §D.2.24     | post_filter_hint                   |
 //! | 23           | §D.1.25     | §D.2.25     | tone_mapping_info                  |
+//! | 39           | §G.13.1.4   | §G.13.2.4   | multiview_scene_info (Annex G)     |
+//! | 43           | §G.13.1.8   | §G.13.2.8   | operation_point_not_present (Annex G) |
 //! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
 //! | 46           | §G.13.1.10  | §G.13.2.10  | multiview_view_position (Annex G)  |
 //! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
@@ -272,6 +274,18 @@ pub enum SeiError {
         "multiview_view_position view_position[{i}] shall be in 0..=1023 per Annex G §G.13.2.10 (got {got})"
     )]
     MultiviewViewPositionViewPositionOutOfRange { i: usize, got: u32 },
+    #[error(
+        "multiview_scene_info max_disparity shall be in 0..=1023 per Annex G §G.13.2.4 (got {0})"
+    )]
+    MultiviewSceneInfoMaxDisparityOutOfRange(u32),
+    #[error(
+        "operation_point_not_present num_operation_points shall be in 0..=65536 per Annex G §G.13.2.8 (got {0})"
+    )]
+    OperationPointNotPresentCountOutOfRange(u32),
+    #[error(
+        "operation_point_not_present operation_point_not_present_id[{i}] shall be in 0..=65535 per Annex G §G.13.2.8 (got {got})"
+    )]
+    OperationPointNotPresentIdOutOfRange { i: usize, got: u32 },
 }
 
 /// §D.2.2 — buffering_period.
@@ -4216,6 +4230,146 @@ pub struct MultiviewViewPosition {
     pub extension_flag: bool,
 }
 
+/// §G.13.2.4 — multiview_scene_info (payload type 39, Annex G / MVC).
+///
+/// Indicates the maximum disparity, in units of luma samples, between
+/// spatially adjacent view components in an MVC access unit. A 3D
+/// display compositor can use this hint when planning the per-view
+/// rendering pipeline; the value is informative and does not affect
+/// the decoding of any single view.
+///
+/// Per §G.13.2.4 the SEI message shall be associated with an IDR
+/// access unit and the signalled value applies to the entire coded
+/// video sequence. The actual maximum disparity may be smaller than
+/// the signalled bound after sub-bitstream extraction (§G.8.5.3) has
+/// removed views from the original stream.
+///
+/// Syntax — §G.13.1.4:
+///
+/// ```text
+/// multiview_scene_info( payloadSize ) {
+///   max_disparity                                     ue(v)
+/// }
+/// ```
+///
+/// Constraints — §G.13.2.4: `0 <= max_disparity <= 1023`. Values
+/// outside this range surface as `MultiviewSceneInfoMaxDisparityOutOfRange`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiviewSceneInfo {
+    /// `max_disparity` in units of luma samples, capped at 1023 by
+    /// the §G.13.2.4 range check that runs before the value is
+    /// surfaced.
+    pub max_disparity: u16,
+}
+
+/// Parse a §G.13.1.4 `multiview_scene_info()` payload.
+///
+/// Enforces the §G.13.2.4 `0..=1023` range bound on `max_disparity`
+/// before storage so a malformed Exp-Golomb codeword can't surface a
+/// value the spec forbids.
+pub fn parse_multiview_scene_info(payload: &[u8]) -> Result<MultiviewSceneInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §G.13.1.4 — max_disparity ue(v). §G.13.2.4 range check.
+    let max_disparity = r.ue()?;
+    if max_disparity > 1023 {
+        return Err(SeiError::MultiviewSceneInfoMaxDisparityOutOfRange(
+            max_disparity,
+        ));
+    }
+    Ok(MultiviewSceneInfo {
+        max_disparity: max_disparity as u16,
+    })
+}
+
+/// §G.13.2.8 — operation_point_not_present (payload type 43, Annex G /
+/// MVC).
+///
+/// Lists MVC operation-point identifiers that are NOT present in the
+/// bitstream starting with the current access unit, interpreted with
+/// respect to the previous view_scalability_info SEI message in
+/// decoding order. The message remains effective until the next
+/// operation_point_not_present of the same type or the end of the
+/// coded video sequence, whichever is earlier.
+///
+/// Per §G.13.2.8 NOTE 1, the message is non-cumulative — each new
+/// instance replaces (rather than augments) the previous list. The
+/// IDs are u(16)-sized identifiers drawn from the
+/// `operation_point_id[i]` set declared in the preceding
+/// view_scalability_info SEI message.
+///
+/// Syntax — §G.13.1.8:
+///
+/// ```text
+/// operation_point_not_present( payloadSize ) {
+///   num_operation_points                             ue(v)
+///   for( k = 0; k < num_operation_points; k++ )
+///     operation_point_not_present_id[ k ]            ue(v)
+/// }
+/// ```
+///
+/// Constraints — §G.13.2.8:
+/// * `0 <= num_operation_points <= num_operation_points_minus1` of
+///   the preceding view_scalability_info; the absolute upper bound
+///   is 65536 (since each ID is u(16)-bounded and IDs are unique).
+///   We enforce that 65536 ceiling before allocating the
+///   `Vec<u16>` so an adversarial `ue(v)` can't drive an unbounded
+///   `Vec::with_capacity` from a maliciously-crafted SEI.
+/// * Each `operation_point_not_present_id[k]` shall be in
+///   `0..=65535` (i.e., representable as u16).
+///
+/// The 65536 upper bound on `num_operation_points` follows from the
+/// spec's `num_operation_points_minus1` field elsewhere in Annex G
+/// being a u(15)+1 maximum and IDs being u(16); we deliberately
+/// pre-check before storage so a fuzzer cannot OOM the decoder via
+/// the count field alone (the §D.2.20 oom-1bf45ba3 fix in round 177
+/// was a structurally identical issue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationPointNotPresent {
+    /// `operation_point_not_present_id[k]` list. Each entry is the
+    /// 16-bit operation-point identifier that is being declared as
+    /// not present in the bitstream. Vector length =
+    /// `num_operation_points`, capped at 65536 by the §G.13.2.8
+    /// range check that runs before allocation.
+    pub operation_point_not_present_ids: Vec<u16>,
+}
+
+/// Parse a §G.13.1.8 `operation_point_not_present()` payload.
+///
+/// Enforces both the §G.13.2.8 `0..=65536` cap on
+/// `num_operation_points` (pre-allocation, anti-OOM) and the
+/// §G.13.2.8 `0..=65535` range check on each
+/// `operation_point_not_present_id[k]` before storage.
+pub fn parse_operation_point_not_present(
+    payload: &[u8],
+) -> Result<OperationPointNotPresent, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §G.13.1.8 — num_operation_points ue(v). Pre-allocation cap per
+    // §G.13.2.8: ids are u(16) and unique, so the maximum count is
+    // 65536. Larger values are bitstream-conformance errors AND a
+    // realistic OOM vector (a malformed `ue(v)` can encode up to
+    // 2^31 - 1 here pre-check); cf. round-177 fix for §D.2.20.
+    let num_operation_points = r.ue()?;
+    if num_operation_points > 65536 {
+        return Err(SeiError::OperationPointNotPresentCountOutOfRange(
+            num_operation_points,
+        ));
+    }
+    let count = num_operation_points as usize;
+    let mut operation_point_not_present_ids: Vec<u16> = Vec::with_capacity(count);
+    for i in 0..count {
+        // §G.13.1.8 — operation_point_not_present_id[k] ue(v).
+        // §G.13.2.8: shall be in 0..=65535 (u16 representable).
+        let id = r.ue()?;
+        if id > 65535 {
+            return Err(SeiError::OperationPointNotPresentIdOutOfRange { i, got: id });
+        }
+        operation_point_not_present_ids.push(id as u16);
+    }
+    Ok(OperationPointNotPresent {
+        operation_point_not_present_ids,
+    })
+}
+
 pub fn parse_multiview_view_position(payload: &[u8]) -> Result<MultiviewViewPosition, SeiError> {
     let mut r = BitReader::new(payload);
     // §G.13.1.10 — num_views_minus1 ue(v); §G.13.2.10 range check
@@ -4318,6 +4472,10 @@ pub enum SeiPayload {
     OmniViewport(OmniViewport),
     /// §D.2.38 — shutter_interval_info (payload type 205). Round 95.
     ShutterIntervalInfo(ShutterIntervalInfo),
+    /// §G.13.2.4 — multiview_scene_info (payload type 39, Annex G). Round 200.
+    MultiviewSceneInfo(MultiviewSceneInfo),
+    /// §G.13.2.8 — operation_point_not_present (payload type 43, Annex G). Round 200.
+    OperationPointNotPresent(OperationPointNotPresent),
     /// §G.13.2.10 — multiview_view_position (payload type 46). Round 183.
     MultiviewViewPosition(MultiviewViewPosition),
     /// §D.2.36 — sei_manifest (payload type 200). Round 120.
@@ -4397,6 +4555,12 @@ pub fn parse_payload(
         23 => Ok(SeiPayload::ToneMappingInfo(parse_tone_mapping_info(
             payload,
         )?)),
+        39 => Ok(SeiPayload::MultiviewSceneInfo(parse_multiview_scene_info(
+            payload,
+        )?)),
+        43 => Ok(SeiPayload::OperationPointNotPresent(
+            parse_operation_point_not_present(payload)?,
+        )),
         45 => Ok(SeiPayload::FramePackingArrangement(
             parse_frame_packing_arrangement(payload)?,
         )),
@@ -5379,6 +5543,191 @@ mod tests {
                 assert!(!m.extension_flag);
             }
             other => panic!("expected MultiviewViewPosition, got {:?}", other),
+        }
+    }
+
+    // §G.13.1.4 / §G.13.2.4 — multiview_scene_info (payload 39, Annex G).
+    // Single ue(v) `max_disparity`, range 0..=1023.
+    #[test]
+    fn multiview_scene_info_zero_disparity() {
+        // max_disparity = 0 → ue codeword "1" (1 bit).
+        let payload = pack_bits(&[(1, 1)]);
+        let got = parse_multiview_scene_info(&payload).unwrap();
+        assert_eq!(got.max_disparity, 0);
+    }
+
+    #[test]
+    fn multiview_scene_info_picks_up_typical_value() {
+        // max_disparity = 16 → ue codeword "000010001" (4 leading zeros
+        // + leading 1 + 4-bit suffix 0001).
+        let payload = pack_bits(&[(0b000010001, 9)]);
+        let got = parse_multiview_scene_info(&payload).unwrap();
+        assert_eq!(got.max_disparity, 16);
+    }
+
+    #[test]
+    fn multiview_scene_info_accepts_boundary_1023() {
+        // max_disparity = 1023 → codeNum+1 = 1024 = 2^10 → 10 leading
+        // zeros + 1 + 10-bit suffix 0b0000000000 = 21 bits. Per
+        // §9.1 the ue(v) codeword for value v has Floor(log2(v+1))
+        // leading zeros.
+        let mut bits: Vec<(u64, u32)> = Vec::new();
+        for _ in 0..10 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        for _ in 0..10 {
+            bits.push((0, 1));
+        }
+        let payload = pack_bits(&bits);
+        let got = parse_multiview_scene_info(&payload).unwrap();
+        assert_eq!(got.max_disparity, 1023);
+    }
+
+    #[test]
+    fn multiview_scene_info_rejects_max_disparity_above_1023() {
+        // max_disparity = 1024 → ue codeword "00000000001 0000000001"
+        // (10 leading zeros + 1 + 10-bit suffix 0b00000_00001).
+        let mut bits: Vec<(u64, u32)> = Vec::new();
+        for _ in 0..10 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        for _ in 0..9 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        let payload = pack_bits(&bits);
+        let err = parse_multiview_scene_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::MultiviewSceneInfoMaxDisparityOutOfRange(1024)
+        ));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_multiview_scene_info() {
+        let ctx = SeiContext::default();
+        // max_disparity = 7 → ue codeword "0001000" (3 leading zeros +
+        // 1 + 3-bit suffix 0b000).
+        let payload = pack_bits(&[(0b0001000, 7)]);
+        let got = parse_payload(39, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::MultiviewSceneInfo(m) => assert_eq!(m.max_disparity, 7),
+            other => panic!("expected MultiviewSceneInfo, got {:?}", other),
+        }
+    }
+
+    // §G.13.1.8 / §G.13.2.8 — operation_point_not_present (payload 43).
+    #[test]
+    fn operation_point_not_present_empty_list() {
+        // num_operation_points = 0 → ue codeword "1" (1 bit).
+        // Per §G.13.2.8 num_operation_points = 0 means "all
+        // operation points declared in the prior view_scalability_info
+        // SEI message are present" — a valid degenerate case we must
+        // accept rather than refuse.
+        let payload = pack_bits(&[(1, 1)]);
+        let got = parse_operation_point_not_present(&payload).unwrap();
+        assert!(got.operation_point_not_present_ids.is_empty());
+    }
+
+    #[test]
+    fn operation_point_not_present_three_ids() {
+        // num_operation_points = 3 → ue codeword "00100" (5 bits).
+        // ids = [0, 1, 65535]:
+        //   0 → ue "1" (1 bit)
+        //   1 → ue "010" (3 bits)
+        //   65535 → codeNum+1 = 65536 = 2^16 → 16 leading zeros + 1 +
+        //           16-bit suffix 0b0000_0000_0000_0000 = 33 bits.
+        let mut bits: Vec<(u64, u32)> = vec![(0b00100, 5), (1, 1), (0b010, 3)];
+        for _ in 0..16 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        for _ in 0..16 {
+            bits.push((0, 1));
+        }
+        let payload = pack_bits(&bits);
+        let got = parse_operation_point_not_present(&payload).unwrap();
+        assert_eq!(
+            got.operation_point_not_present_ids,
+            vec![0u16, 1u16, 65535u16]
+        );
+    }
+
+    #[test]
+    fn operation_point_not_present_rejects_id_above_65535() {
+        // num_operation_points = 1, id = 65536 → codeNum+1 = 65537 =
+        // 2^16 + 1 → 16 leading zeros + 1 + 16-bit suffix
+        // 0b0000_0000_0000_0001 = 33 bits.
+        let mut bits: Vec<(u64, u32)> = vec![(0b010, 3)];
+        for _ in 0..16 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        for _ in 0..15 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        let payload = pack_bits(&bits);
+        let err = parse_operation_point_not_present(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::OperationPointNotPresentIdOutOfRange { i: 0, got: 65536 }
+        ));
+    }
+
+    #[test]
+    fn operation_point_not_present_rejects_count_above_65536() {
+        // num_operation_points = 65537 → codeNum+1 = 65538 = 2^16 + 2
+        // → 16 leading zeros + 1 + 16-bit suffix
+        // 0b0000_0000_0000_0010 = 33 bits. The §G.13.2.8 65536 cap
+        // must reject BEFORE the per-id loop allocates.
+        let mut bits: Vec<(u64, u32)> = Vec::new();
+        for _ in 0..16 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        for _ in 0..14 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        bits.push((0, 1));
+        let payload = pack_bits(&bits);
+        let err = parse_operation_point_not_present(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::OperationPointNotPresentCountOutOfRange(65537)
+        ));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_operation_point_not_present() {
+        let ctx = SeiContext::default();
+        // num_operation_points = 2, ids = [10, 200]:
+        //   2 → ue "011" (3 bits)
+        //   10 → ue "0001011" (3 zeros + 1 + 3-bit suffix 0b011 = 7 bits)
+        //   200 → ue: 7 leading zeros + 1 + 7-bit suffix
+        //               0b1001001 = 15 bits.
+        let mut bits: Vec<(u64, u32)> = vec![(0b011, 3), (0b0001011, 7)];
+        for _ in 0..7 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        bits.push((1, 1));
+        bits.push((0, 1));
+        bits.push((0, 1));
+        bits.push((1, 1));
+        bits.push((0, 1));
+        bits.push((0, 1));
+        bits.push((1, 1));
+        let payload = pack_bits(&bits);
+        let got = parse_payload(43, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::OperationPointNotPresent(o) => {
+                assert_eq!(o.operation_point_not_present_ids, vec![10u16, 200u16]);
+            }
+            other => panic!("expected OperationPointNotPresent, got {:?}", other),
         }
     }
 
