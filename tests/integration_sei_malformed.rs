@@ -39,14 +39,15 @@
 use oxideav_h264::non_vcl::parse_sei_rbsp;
 use oxideav_h264::sei::{parse_payload, SeiContext};
 
-/// Mirror of `parse_payload`'s dispatch arms — 43 implemented types
-/// (round 200 adds Annex G §G.13.2.4 multiview_scene_info type 39 +
-/// §G.13.2.8 operation_point_not_present type 43) +
+/// Mirror of `parse_payload`'s dispatch arms — 44 implemented types
+/// (round 207 adds Annex G §G.13.2.6 non_required_view_component
+/// type 41 on top of the round-200 §G.13.2.4 multiview_scene_info
+/// type 39 + §G.13.2.8 operation_point_not_present type 43) +
 /// representative `Unknown`-fallback values (Annex F/G/H/I ranges +
 /// reserved numbers).
 const KNOWN_PAYLOAD_TYPES: &[u32] = &[
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 39, 43,
-    45, 46, 47, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155, 156, 200, 201, 205,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 39, 41,
+    43, 45, 46, 47, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155, 156, 200, 201, 205,
 ];
 
 const FALLBACK_PAYLOAD_TYPES: &[u32] = &[
@@ -175,11 +176,11 @@ fn sei_parse_payload_never_panics() {
         }
     }
 
-    // 43 known + 23 fallback = 66 payload types × 11 shapes × 4 ctxs
-    // = 2904 invocations. Lock the count so a future change that
+    // 44 known + 23 fallback = 67 payload types × 11 shapes × 4 ctxs
+    // = 2948 invocations. Lock the count so a future change that
     // accidentally drops a row from one of the tables makes the test
     // fail loudly instead of silently shrinking coverage.
-    assert_eq!(total, 2904, "sweep cardinality drifted");
+    assert_eq!(total, 2948, "sweep cardinality drifted");
 }
 
 /// Envelope-shape regression — every shape also goes through

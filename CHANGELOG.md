@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 207 — new Annex G (MVC) SEI payload type implemented in
+  `sei.rs`: payload type 41 `non_required_view_component` (§G.13.1.6 /
+  §G.13.2.6 — per-target-view list of `(view_order_index[i],
+  index_delta_minus1[i][])` pairs, each pair recording the
+  view-order-index of the target view plus the deltas locating the
+  view components that are not needed to decode it). All four §G.13.2.6
+  range bounds are enforced before storage:
+  `num_info_entries_minus1 ≤ 1022` (pre-allocation cap derived from
+  Annex G's absolute `num_views_minus1 ≤ 1023` per §G.13.2.10);
+  `view_order_index[i] ∈ 1..=1023` (incl. the spec's lower bound of 1
+  since view 0 is the base view, not a target);
+  `num_non_required_view_components_minus1[i] ≤ view_order_index − 1`
+  (pre-allocation, anti-OOM); and `index_delta_minus1[i][j] ≤
+  view_order_index − 1`. Wired into `parse_payload` dispatch; the
+  payload-type table at the top of `sei.rs` grows one row. New
+  `SeiError` variants `NonRequiredViewComponentNumInfoEntriesOutOfRange`,
+  `NonRequiredViewComponentViewOrderIndexOutOfRange`,
+  `NonRequiredViewComponentCountOutOfRange`, and
+  `NonRequiredViewComponentIndexDeltaOutOfRange`. The
+  `tests/integration_sei_malformed.rs` `KNOWN_PAYLOAD_TYPES` table
+  moves 41 out of the `Unknown`-fallback set, lifting the
+  sweep-cardinality lock from 2904 → 2948 panic-free invocations. 7
+  new lib unit tests cover the single-entry / two-entry happy path,
+  rejection of `view_order_index == 0`, rejection of
+  `num_info_entries_minus1 == 1023` (1 above the absolute cap),
+  rejection of the per-entry inner count exceeding `view_order_index
+  − 1`, rejection of an index delta exceeding `view_order_index − 1`,
+  and `parse_payload` dispatch round-trip. Harmless on non-MVC streams
+  (Phase 4 on the README "Profiles + features in scope" table).
 - round 200 — two new Annex G (MVC) SEI payload types implemented in
   `sei.rs`: payload type 39 `multiview_scene_info` (§G.13.1.4 /
   §G.13.2.4 — single `max_disparity` ue(v), 0..=1023 range bound

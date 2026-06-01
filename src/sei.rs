@@ -33,6 +33,7 @@
 //! | 22           | §D.1.24     | §D.2.24     | post_filter_hint                   |
 //! | 23           | §D.1.25     | §D.2.25     | tone_mapping_info                  |
 //! | 39           | §G.13.1.4   | §G.13.2.4   | multiview_scene_info (Annex G)     |
+//! | 41           | §G.13.1.6   | §G.13.2.6   | non_required_view_component (Annex G) |
 //! | 43           | §G.13.1.8   | §G.13.2.8   | operation_point_not_present (Annex G) |
 //! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
 //! | 46           | §G.13.1.10  | §G.13.2.10  | multiview_view_position (Annex G)  |
@@ -286,6 +287,31 @@ pub enum SeiError {
         "operation_point_not_present operation_point_not_present_id[{i}] shall be in 0..=65535 per Annex G §G.13.2.8 (got {got})"
     )]
     OperationPointNotPresentIdOutOfRange { i: usize, got: u32 },
+    #[error(
+        "non_required_view_component num_info_entries_minus1 shall be in 0..=1022 per Annex G §G.13.2.6 (num_views_minus1 - 1, with num_views_minus1 bounded at 1023) (got {0})"
+    )]
+    NonRequiredViewComponentNumInfoEntriesOutOfRange(u32),
+    #[error(
+        "non_required_view_component view_order_index[{i}] shall be in 1..=1023 per Annex G §G.13.2.6 (got {got})"
+    )]
+    NonRequiredViewComponentViewOrderIndexOutOfRange { i: usize, got: u32 },
+    #[error(
+        "non_required_view_component num_non_required_view_components_minus1[{i}] shall be in 0..=view_order_index[i]-1 per Annex G §G.13.2.6 (got {got}, view_order_index={view_order_index})"
+    )]
+    NonRequiredViewComponentCountOutOfRange {
+        i: usize,
+        got: u32,
+        view_order_index: u32,
+    },
+    #[error(
+        "non_required_view_component index_delta_minus1[{i}][{j}] shall be in 0..=view_order_index[i]-1 per Annex G §G.13.2.6 (got {got}, view_order_index={view_order_index})"
+    )]
+    NonRequiredViewComponentIndexDeltaOutOfRange {
+        i: usize,
+        j: usize,
+        got: u32,
+        view_order_index: u32,
+    },
 }
 
 /// §D.2.2 — buffering_period.
@@ -4370,6 +4396,161 @@ pub fn parse_operation_point_not_present(
     })
 }
 
+/// §G.13.2.6 — non_required_view_component (payload type 41, Annex G /
+/// MVC).
+///
+/// Indicates, per target view component in the access unit, the set of
+/// view components that are NOT needed to decode the target view
+/// component (or any subsequent view component with the same view_id in
+/// decoding order within the coded video sequence). The list lets a
+/// sub-bitstream extractor / display compositor drop view components
+/// that won't be consumed downstream without disturbing decodability.
+///
+/// Per §G.13.2.6 the listed view components may even be absent from the
+/// associated access unit; the message records the dependency graph
+/// hint, not a presence assertion.
+///
+/// Syntax — §G.13.1.6:
+///
+/// ```text
+/// non_required_view_component( payloadSize ) {
+///   num_info_entries_minus1                          ue(v)
+///   for( i = 0; i <= num_info_entries_minus1; i++ ) {
+///     view_order_index[ i ]                          ue(v)
+///     num_non_required_view_components_minus1[ i ]   ue(v)
+///     for( j = 0; j <= num_non_required_view_components_minus1[ i ]; j++ )
+///       index_delta_minus1[ i ][ j ]                 ue(v)
+///   }
+/// }
+/// ```
+///
+/// Constraints — §G.13.2.6:
+/// * `num_info_entries_minus1` shall be in `0..=num_views_minus1 − 1`.
+///   With `num_views_minus1` itself bounded at 1023 per Annex G (see
+///   §G.13.2.10 et al.), the absolute upper bound on
+///   `num_info_entries_minus1` is 1022 → `num_info_entries` ≤ 1023.
+///   We enforce the absolute 1022 ceiling before allocating the entry
+///   vector so an adversarial `ue(v)` count can't drive an unbounded
+///   `Vec::with_capacity` (cf. round-200 fix on
+///   `operation_point_not_present`).
+/// * `view_order_index[i]` shall be in `1..=num_views_minus1`. We use
+///   the absolute upper bound 1023 and additionally require ≥ 1; any
+///   zero `view_order_index` reads as a §G.13.2.6 conformance error
+///   (the "i-th target view component" is by definition view_id 1 or
+///   greater).
+/// * `num_non_required_view_components_minus1[i]` shall be in
+///   `0..=view_order_index[i] − 1` (so an entry's listed non-required
+///   view components are always strictly earlier in view-order than
+///   the target view). We use `view_order_index − 1` as the bound;
+///   with `view_order_index ≤ 1023`, the per-entry list length is
+///   bounded at 1023 before the inner loop allocates.
+/// * `index_delta_minus1[i][j]` shall be in `0..=view_order_index[i]
+///   − 1` (the delta is the difference between the target's
+///   view_order_index and the non-required component's
+///   view_order_index, both bounded above by 1023).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonRequiredViewComponent {
+    /// One entry per target view component. There are
+    /// `num_info_entries_minus1 + 1` entries total, capped at 1023 by
+    /// the §G.13.2.6 absolute bound; the ordering matches the
+    /// bitstream order.
+    pub entries: Vec<NonRequiredViewComponentEntry>,
+}
+
+/// One target-view entry inside a `NonRequiredViewComponent` payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonRequiredViewComponentEntry {
+    /// `view_order_index[i]` — view order index of the target view
+    /// component. Bounded at 1..=1023 by the §G.13.2.6 range check.
+    pub view_order_index: u16,
+    /// `index_delta_minus1[i][j]` list. Each entry encodes a
+    /// non-required view component as the delta in view-order index
+    /// from the target: `non_required_voi = view_order_index −
+    /// index_delta_minus1[j] − 1`. List length is bounded at 1023 by
+    /// the §G.13.2.6 `view_order_index − 1` cap (with
+    /// `view_order_index ≤ 1023`).
+    pub index_delta_minus1: Vec<u16>,
+}
+
+/// Parse a §G.13.1.6 `non_required_view_component()` payload.
+///
+/// Enforces all four §G.13.2.6 range bounds before storage:
+/// * `num_info_entries_minus1 ≤ 1022` (pre-allocation, anti-OOM)
+/// * `view_order_index[i] ∈ 1..=1023` (lower bound from §G.13.2.6,
+///   absolute upper bound from Annex G's `num_views_minus1 ≤ 1023`)
+/// * `num_non_required_view_components_minus1[i] ≤ view_order_index −
+///   1` (pre-allocation; this implicitly caps the inner list at 1022
+///   when `view_order_index = 1023`)
+/// * `index_delta_minus1[i][j] ≤ view_order_index − 1`
+pub fn parse_non_required_view_component(
+    payload: &[u8],
+) -> Result<NonRequiredViewComponent, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §G.13.1.6 — num_info_entries_minus1 ue(v). §G.13.2.6 caps the
+    // value at `num_views_minus1 − 1`. With Annex G's absolute
+    // `num_views_minus1 ≤ 1023`, the absolute upper bound is 1022 →
+    // `num_info_entries` ≤ 1023. Pre-allocation cap (cf. round-200
+    // anti-OOM pattern on `num_operation_points`).
+    let num_info_entries_minus1 = r.ue()?;
+    if num_info_entries_minus1 > 1022 {
+        return Err(SeiError::NonRequiredViewComponentNumInfoEntriesOutOfRange(
+            num_info_entries_minus1,
+        ));
+    }
+    let entry_count = (num_info_entries_minus1 as usize) + 1;
+    let mut entries: Vec<NonRequiredViewComponentEntry> = Vec::with_capacity(entry_count);
+    for i in 0..entry_count {
+        // §G.13.1.6 — view_order_index[i] ue(v). §G.13.2.6 range
+        // 1..=num_views_minus1; absolute upper bound 1023. The lower
+        // bound 1 follows from "the i-th target view component has
+        // view_id equal to view_id[view_order_index[i]]" with view 0
+        // being the base view (not a target).
+        let view_order_index = r.ue()?;
+        if !(1..=1023).contains(&view_order_index) {
+            return Err(SeiError::NonRequiredViewComponentViewOrderIndexOutOfRange {
+                i,
+                got: view_order_index,
+            });
+        }
+        // §G.13.1.6 — num_non_required_view_components_minus1[i]
+        // ue(v). §G.13.2.6 caps it at `view_order_index − 1` so each
+        // non-required view component is strictly earlier in
+        // view-order than the target. Pre-allocation cap before the
+        // inner loop allocates the per-entry delta vector.
+        let num_non_required_view_components_minus1 = r.ue()?;
+        let voi_minus_1 = view_order_index - 1; // safe — view_order_index >= 1 verified
+        if num_non_required_view_components_minus1 > voi_minus_1 {
+            return Err(SeiError::NonRequiredViewComponentCountOutOfRange {
+                i,
+                got: num_non_required_view_components_minus1,
+                view_order_index,
+            });
+        }
+        let inner_count = (num_non_required_view_components_minus1 as usize) + 1;
+        let mut index_delta_minus1: Vec<u16> = Vec::with_capacity(inner_count);
+        for j in 0..inner_count {
+            // §G.13.1.6 — index_delta_minus1[i][j] ue(v). §G.13.2.6
+            // range 0..=view_order_index[i] − 1. Both bounds map to
+            // u16 once range-checked.
+            let idm1 = r.ue()?;
+            if idm1 > voi_minus_1 {
+                return Err(SeiError::NonRequiredViewComponentIndexDeltaOutOfRange {
+                    i,
+                    j,
+                    got: idm1,
+                    view_order_index,
+                });
+            }
+            index_delta_minus1.push(idm1 as u16);
+        }
+        entries.push(NonRequiredViewComponentEntry {
+            view_order_index: view_order_index as u16,
+            index_delta_minus1,
+        });
+    }
+    Ok(NonRequiredViewComponent { entries })
+}
+
 pub fn parse_multiview_view_position(payload: &[u8]) -> Result<MultiviewViewPosition, SeiError> {
     let mut r = BitReader::new(payload);
     // §G.13.1.10 — num_views_minus1 ue(v); §G.13.2.10 range check
@@ -4474,6 +4655,8 @@ pub enum SeiPayload {
     ShutterIntervalInfo(ShutterIntervalInfo),
     /// §G.13.2.4 — multiview_scene_info (payload type 39, Annex G). Round 200.
     MultiviewSceneInfo(MultiviewSceneInfo),
+    /// §G.13.2.6 — non_required_view_component (payload type 41, Annex G). Round 207.
+    NonRequiredViewComponent(NonRequiredViewComponent),
     /// §G.13.2.8 — operation_point_not_present (payload type 43, Annex G). Round 200.
     OperationPointNotPresent(OperationPointNotPresent),
     /// §G.13.2.10 — multiview_view_position (payload type 46). Round 183.
@@ -4558,6 +4741,9 @@ pub fn parse_payload(
         39 => Ok(SeiPayload::MultiviewSceneInfo(parse_multiview_scene_info(
             payload,
         )?)),
+        41 => Ok(SeiPayload::NonRequiredViewComponent(
+            parse_non_required_view_component(payload)?,
+        )),
         43 => Ok(SeiPayload::OperationPointNotPresent(
             parse_operation_point_not_present(payload)?,
         )),
@@ -5728,6 +5914,159 @@ mod tests {
                 assert_eq!(o.operation_point_not_present_ids, vec![10u16, 200u16]);
             }
             other => panic!("expected OperationPointNotPresent, got {:?}", other),
+        }
+    }
+
+    // §G.13.1.6 / §G.13.2.6 — non_required_view_component (payload 41).
+    #[test]
+    fn non_required_view_component_single_entry_single_component() {
+        // num_info_entries_minus1 = 0 → ue "1"
+        // entry[0]:
+        //   view_order_index = 1   → ue "010" (codeNum=1)
+        //   num_non_required_view_components_minus1 = 0 → ue "1"
+        //   index_delta_minus1[0] = 0 → ue "1"
+        // Total: 1 + 3 + 1 + 1 = 6 bits.
+        let payload = pack_bits(&[(1, 1), (0b010, 3), (1, 1), (1, 1)]);
+        let got = parse_non_required_view_component(&payload).unwrap();
+        assert_eq!(got.entries.len(), 1);
+        assert_eq!(got.entries[0].view_order_index, 1);
+        assert_eq!(got.entries[0].index_delta_minus1, vec![0u16]);
+    }
+
+    #[test]
+    fn non_required_view_component_two_entries_with_multiple_deltas() {
+        // Two target views, with multiple non-required deltas each.
+        //
+        // num_info_entries_minus1 = 1 → ue "010"
+        // entry[0]:
+        //   view_order_index = 2 → ue "011" (codeNum=2)
+        //   num_non_required_view_components_minus1 = 1 → ue "010"
+        //   index_delta_minus1[0] = 0 → ue "1"
+        //   index_delta_minus1[1] = 1 → ue "010"
+        // entry[1]:
+        //   view_order_index = 3 → ue "00100" (codeNum=3)
+        //   num_non_required_view_components_minus1 = 0 → ue "1"
+        //   index_delta_minus1[0] = 2 → ue "011"
+        // Total: 3 + 3 + 3 + 1 + 3 + 5 + 1 + 3 = 22 bits.
+        let payload = pack_bits(&[
+            (0b010, 3),
+            (0b011, 3),
+            (0b010, 3),
+            (1, 1),
+            (0b010, 3),
+            (0b00100, 5),
+            (1, 1),
+            (0b011, 3),
+        ]);
+        let got = parse_non_required_view_component(&payload).unwrap();
+        assert_eq!(got.entries.len(), 2);
+        assert_eq!(got.entries[0].view_order_index, 2);
+        assert_eq!(got.entries[0].index_delta_minus1, vec![0u16, 1u16]);
+        assert_eq!(got.entries[1].view_order_index, 3);
+        assert_eq!(got.entries[1].index_delta_minus1, vec![2u16]);
+    }
+
+    #[test]
+    fn non_required_view_component_rejects_view_order_index_zero() {
+        // §G.13.2.6 — view_order_index shall be in 1..=num_views_minus1;
+        // a 0 value is below the lower bound (view 0 is the base view,
+        // not a target).
+        //
+        // num_info_entries_minus1 = 0 → ue "1"
+        // entry[0].view_order_index = 0 → ue "1"
+        let payload = pack_bits(&[(1, 1), (1, 1)]);
+        let err = parse_non_required_view_component(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::NonRequiredViewComponentViewOrderIndexOutOfRange { i: 0, got: 0 }
+        ));
+    }
+
+    #[test]
+    fn non_required_view_component_rejects_num_info_entries_above_bound() {
+        // §G.13.2.6 — num_info_entries_minus1 ≤ num_views_minus1 − 1.
+        // With Annex G's absolute num_views_minus1 ≤ 1023, the cap is
+        // 1022. We test the boundary: num_info_entries_minus1 = 1023.
+        //
+        // codeNum = 1023 → codeNum + 1 = 1024 = 2^10 → 10 leading
+        // zeros + 1 + 10-bit suffix 0b0000000000 = 21 bits.
+        let mut bits: Vec<(u64, u32)> = Vec::new();
+        for _ in 0..10 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        for _ in 0..10 {
+            bits.push((0, 1));
+        }
+        let payload = pack_bits(&bits);
+        let err = parse_non_required_view_component(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::NonRequiredViewComponentNumInfoEntriesOutOfRange(1023)
+        ));
+    }
+
+    #[test]
+    fn non_required_view_component_rejects_inner_count_above_voi_minus_one() {
+        // §G.13.2.6 — num_non_required_view_components_minus1[i] ≤
+        // view_order_index − 1. With view_order_index = 1, the cap is
+        // 0; setting the count to 1 must reject before allocation.
+        //
+        // num_info_entries_minus1 = 0 → ue "1"
+        // entry[0]:
+        //   view_order_index = 1 → ue "010"
+        //   num_non_required_view_components_minus1 = 1 → ue "010"
+        let payload = pack_bits(&[(1, 1), (0b010, 3), (0b010, 3)]);
+        let err = parse_non_required_view_component(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::NonRequiredViewComponentCountOutOfRange {
+                i: 0,
+                got: 1,
+                view_order_index: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn non_required_view_component_rejects_index_delta_above_voi_minus_one() {
+        // §G.13.2.6 — index_delta_minus1[i][j] ≤ view_order_index − 1.
+        // With view_order_index = 2, the cap is 1; setting the delta
+        // to 2 must reject. (One inner component so the per-entry
+        // allocation succeeds and we reach the inner range check.)
+        //
+        // num_info_entries_minus1 = 0 → ue "1"
+        // entry[0]:
+        //   view_order_index = 2 → ue "011"
+        //   num_non_required_view_components_minus1 = 0 → ue "1"
+        //   index_delta_minus1[0] = 2 → ue "011"
+        let payload = pack_bits(&[(1, 1), (0b011, 3), (1, 1), (0b011, 3)]);
+        let err = parse_non_required_view_component(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::NonRequiredViewComponentIndexDeltaOutOfRange {
+                i: 0,
+                j: 0,
+                got: 2,
+                view_order_index: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_non_required_view_component() {
+        // Same single-entry single-component shape as the smoke test
+        // above, but routed via `parse_payload`'s dispatch arm.
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(1, 1), (0b010, 3), (1, 1), (1, 1)]);
+        let got = parse_payload(41, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::NonRequiredViewComponent(n) => {
+                assert_eq!(n.entries.len(), 1);
+                assert_eq!(n.entries[0].view_order_index, 1);
+                assert_eq!(n.entries[0].index_delta_minus1, vec![0u16]);
+            }
+            other => panic!("expected NonRequiredViewComponent, got {:?}", other),
         }
     }
 
