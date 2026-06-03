@@ -312,6 +312,14 @@ pub enum SeiError {
         got: u32,
         view_order_index: u32,
     },
+    #[error(
+        "multiview_acquisition_info num_views_minus1 shall be in 0..=1023 per Annex G §G.13.2.5 (got {0})"
+    )]
+    MultiviewAcquisitionInfoNumViewsOutOfRange(u32),
+    #[error(
+        "multiview_acquisition_info {field} shall be in 0..=31 per Annex G §G.13.2.5 (got {got})"
+    )]
+    MultiviewAcquisitionInfoPrecOutOfRange { field: &'static str, got: u32 },
 }
 
 /// §D.2.2 — buffering_period.
@@ -4590,6 +4598,432 @@ pub fn parse_multiview_view_position(payload: &[u8]) -> Result<MultiviewViewPosi
     })
 }
 
+/// §G.13.2.5 — multiview_acquisition_info (payload type 40, Annex G /
+/// MVC).
+///
+/// Specifies the intrinsic and extrinsic camera parameters of every
+/// view in an MVC coded video sequence. A 3D display compositor or a
+/// post-render geometry pipeline can use these parameters to project
+/// the per-view content according to the camera model defined in
+/// §G.13.2.5 equation G-85
+/// (`s * cP[i] = A[i] * R^{-1}[i] * (wP − T[i])`), where `A[i]` is the
+/// intrinsic matrix (focal length / principal point / skew),
+/// `R[i]` the rotation matrix, and `T[i]` the translation vector.
+///
+/// Per §G.13.2.5, when present as a non-nested SEI message the
+/// payload shall be associated with an IDR access unit and the
+/// information applies to the entire coded video sequence; when
+/// nested inside an MVCD scalable nesting SEI message the loop
+/// index `i` refers to `sei_view_id[i]` of the nesting message and
+/// the application scope shrinks to the nesting message lifetime.
+///
+/// Each scalar component is signalled in a sign-exponent-mantissa
+/// floating-point form (see [`FloatComponent`]) — `s` is a single
+/// sign bit (`u(1)`); `e` is a 6-bit exponent (`u(6)`); the
+/// mantissa is variable-width and computed from the per-block
+/// precision exponent `prec_*`:
+///
+/// * If `e == 0`, the mantissa width is `max(0, prec − 30)`.
+/// * If `0 < e < 63`, the mantissa width is `max(0, e + prec − 31)`.
+/// * If `e == 63`, the spec reserves the value (decoders treat
+///   it as "unspecified") and does not specify a mantissa width;
+///   we treat the mantissa as zero-width in that case so the
+///   bitstream cursor advances consistently regardless of which
+///   reserved-future encoder produced the stream.
+///
+/// The decoded scalar value `x` reconstructs from a stored
+/// `FloatComponent { sign, exponent: e, mantissa: n, mantissa_width: v }`
+/// per §G.13.2.5 (Table G-3 below the syntax table) as:
+///
+/// * `e == 0`         → `x = (-1)^sign * 2^(−30) * (n / 2^v)`     (denormal)
+/// * `0 < e < 63`     → `x = (-1)^sign * 2^(e − 31) * (1 + n / 2^v)` (normal)
+/// * `e == 63`        → "unspecified" — callers should treat the
+///   component as informational only.
+///
+/// Syntax — §G.13.1.5:
+///
+/// ```text
+/// multiview_acquisition_info( payloadSize ) {
+///   num_views_minus1                                 ue(v)
+///   intrinsic_param_flag                             u(1)
+///   extrinsic_param_flag                             u(1)
+///   if( intrinsic_param_flag ) {
+///     intrinsic_params_equal_flag                    u(1)
+///     prec_focal_length                              ue(v)
+///     prec_principal_point                           ue(v)
+///     prec_skew_factor                               ue(v)
+///     for( i = 0; i <= ( intrinsic_params_equal_flag ? 0 : num_views_minus1 ); i++ ) {
+///       focal_length_x[ i ]                          /* sign u(1) + exponent u(6) + mantissa u(v) */
+///       focal_length_y[ i ]
+///       principal_point_x[ i ]
+///       principal_point_y[ i ]
+///       skew_factor[ i ]
+///     }
+///   }
+///   if( extrinsic_param_flag ) {
+///     prec_rotation_param                            ue(v)
+///     prec_translation_param                         ue(v)
+///     for( i = 0; i <= num_views_minus1; i++ ) {
+///       for( j = 1; j <= 3; j++ ) {        /* row */
+///         for( k = 1; k <= 3; k++ ) {      /* column */
+///           r[ i ][ j ][ k ]               /* sign + exponent + mantissa */
+///         }
+///         t[ i ][ j ]                       /* sign + exponent + mantissa */
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Constraints — §G.13.2.5:
+///
+/// * `0 ≤ num_views_minus1 ≤ 1023` (Annex G absolute). Enforced
+///   pre-allocation so an adversarial `ue(v)` cannot drive an
+///   unbounded `Vec` (same anti-OOM rationale as
+///   round-177 §D.2.20 and round-200 §G.13.2.8).
+/// * Each of `prec_focal_length`, `prec_principal_point`,
+///   `prec_skew_factor`, `prec_rotation_param`,
+///   `prec_translation_param` shall be in `0..=31` inclusive.
+/// * `exponent_*` is a `u(6)` so its raw range is `0..=63`. The
+///   spec's range `0..=62` is informative — value 63 is reserved
+///   for future use and decoders shall treat it as "unspecified";
+///   we preserve the observed value without rejecting it so a
+///   future-compatible bitstream remains parsable.
+///
+/// Note: this decoder does not (yet) carry the §G.7.3.2 MVC SPS —
+/// Phase 4 on the README's "Profiles + features in scope" table.
+/// The parser is nonetheless harmless on a non-MVC bitstream: when
+/// this payload type appears outside an MVC access unit it can
+/// still be parsed for inspection and logging without affecting
+/// decode of the main (`view_id == 0`) sub-bitstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiviewAcquisitionInfo {
+    /// `num_views_minus1` — number of views in the CVS (minus one).
+    /// Capped at 1023 (Annex G absolute) by the §G.13.2.5 range
+    /// check that runs before allocation.
+    pub num_views_minus1: u16,
+    /// `intrinsic_param_flag == 1` populates `intrinsic`.
+    pub intrinsic: Option<IntrinsicCameraParams>,
+    /// `extrinsic_param_flag == 1` populates `extrinsic`.
+    pub extrinsic: Option<ExtrinsicCameraParams>,
+}
+
+/// §G.13.2.5 — intrinsic camera parameters block (focal lengths,
+/// principal point, skew factor). When
+/// `intrinsic_params_equal_flag == 1` the block carries a single
+/// per-CVS camera entry; otherwise it carries one entry per view
+/// (`num_views_minus1 + 1` total).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntrinsicCameraParams {
+    /// `intrinsic_params_equal_flag` — `true` if a single intrinsic
+    /// set applies to every camera; `false` if a distinct set is
+    /// signalled per camera.
+    pub intrinsic_params_equal_flag: bool,
+    /// `prec_focal_length` (0..=31) — sets the truncation precision
+    /// for `focal_length_x[i]` and `focal_length_y[i]` via the
+    /// mantissa-width formula in §G.13.2.5.
+    pub prec_focal_length: u8,
+    /// `prec_principal_point` (0..=31) — sets the truncation
+    /// precision for `principal_point_x[i]` and `principal_point_y[i]`.
+    pub prec_principal_point: u8,
+    /// `prec_skew_factor` (0..=31) — sets the truncation precision
+    /// for `skew_factor[i]`.
+    pub prec_skew_factor: u8,
+    /// Per-camera intrinsic entries. Length is either 1 (when
+    /// `intrinsic_params_equal_flag == true`) or
+    /// `num_views_minus1 + 1`.
+    pub cameras: Vec<IntrinsicCamera>,
+}
+
+/// §G.13.2.5 — per-camera intrinsic parameters: focal lengths
+/// (x, y), principal point (x, y), and skew factor. Each component
+/// is a [`FloatComponent`] following the §G.13.2.5 floating-point
+/// encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntrinsicCamera {
+    pub focal_length_x: FloatComponent,
+    pub focal_length_y: FloatComponent,
+    pub principal_point_x: FloatComponent,
+    pub principal_point_y: FloatComponent,
+    pub skew_factor: FloatComponent,
+}
+
+/// §G.13.2.5 — extrinsic camera parameters block. Carries the 3×3
+/// rotation matrix and 3-vector translation per camera.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtrinsicCameraParams {
+    /// `prec_rotation_param` (0..=31) — sets the truncation
+    /// precision for `r[i][j][k]`.
+    pub prec_rotation_param: u8,
+    /// `prec_translation_param` (0..=31) — sets the truncation
+    /// precision for `t[i][j]`.
+    pub prec_translation_param: u8,
+    /// Per-camera extrinsic entries. Length is `num_views_minus1 + 1`.
+    pub cameras: Vec<ExtrinsicCamera>,
+}
+
+/// §G.13.2.5 — per-camera extrinsic parameters: 3×3 rotation matrix
+/// `r[j][k]` (rows and columns are 1-indexed in the spec; we store
+/// in 0-indexed form so `r[j_spec − 1][k_spec − 1]` is the
+/// (j_spec, k_spec) entry) and 3-vector translation `t[j]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtrinsicCamera {
+    /// Rotation matrix entries. Spec 1-indexes `j, k ∈ {1, 2, 3}`;
+    /// we store with `r[j_spec − 1][k_spec − 1]`.
+    pub r: [[FloatComponent; 3]; 3],
+    /// Translation vector entries. Spec 1-indexes `j ∈ {1, 2, 3}`;
+    /// we store with `t[j_spec − 1]`.
+    pub t: [FloatComponent; 3],
+}
+
+/// §G.13.2.5 — sign-exponent-mantissa floating-point component used
+/// for every scalar in the multiview acquisition info SEI. The
+/// stored value is the raw bitstream value; the
+/// [`FloatComponent::to_f64`] helper reconstructs the IEEE-style
+/// scalar per Table G-3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloatComponent {
+    /// `sign` — `false` for the positive sign-bit value (`u(1) == 0`),
+    /// `true` for the negative (`u(1) == 1`).
+    pub sign: bool,
+    /// `exponent` — `u(6)`, raw range `0..=63`. Value 63 is reserved
+    /// (decoders treat as "unspecified" per §G.13.2.5).
+    pub exponent: u8,
+    /// `mantissa` — variable-width `u(v)` raw bits; width is
+    /// recorded in `mantissa_width`. The width is at most 62 bits so
+    /// it fits in `u64` (62 = 62 + 31 − 31, the §G.13.2.5 maximum).
+    pub mantissa: u64,
+    /// `mantissa_width` — number of bits in `mantissa`, derived per
+    /// §G.13.2.5 from the per-block precision and the exponent.
+    /// Bounded by 62.
+    pub mantissa_width: u8,
+}
+
+impl FloatComponent {
+    /// Reconstruct the §G.13.2.5 floating-point scalar value:
+    ///
+    /// * `e == 0`     → `(-1)^s * 2^(−30) * (n / 2^v)`         (denormal)
+    /// * `0 < e < 63` → `(-1)^s * 2^(e − 31) * (1 + n / 2^v)`  (normal)
+    /// * `e == 63`    → `f64::NAN` ("unspecified" per the spec).
+    ///
+    /// `v == 0` is handled implicitly: `n / 2^0 = n = 0` (parser
+    /// guarantees the stored mantissa is 0 when width is 0).
+    #[must_use]
+    pub fn to_f64(&self) -> f64 {
+        if self.exponent == 63 {
+            return f64::NAN;
+        }
+        let sign: f64 = if self.sign { -1.0 } else { 1.0 };
+        let v = self.mantissa_width as i32;
+        let n_over_2v = if v == 0 {
+            0.0
+        } else {
+            (self.mantissa as f64) / (2f64.powi(v))
+        };
+        if self.exponent == 0 {
+            sign * 2f64.powi(-30) * n_over_2v
+        } else {
+            sign * 2f64.powi((self.exponent as i32) - 31) * (1.0 + n_over_2v)
+        }
+    }
+}
+
+/// §G.13.2.5 — derive the mantissa bit-width from a precision
+/// `prec` (0..=31) and an exponent `e` (0..=63).
+///
+/// * `e == 0`     → `max(0, prec − 30)`
+/// * `0 < e < 63` → `max(0, e + prec − 31)`
+/// * `e == 63`    → `0` (spec reserves the value; no mantissa)
+///
+/// The maximum is `62 + 31 − 31 = 62` bits, comfortably within
+/// `u64`.
+fn mantissa_width_g1325(prec: u8, e: u8) -> u8 {
+    debug_assert!(prec <= 31);
+    if e == 0 {
+        prec.saturating_sub(30)
+    } else if e == 63 {
+        0
+    } else {
+        // 0 < e < 63 → e + prec − 31, clamped at 0.
+        let sum = e as i32 + prec as i32 - 31;
+        if sum <= 0 {
+            0
+        } else {
+            sum as u8
+        }
+    }
+}
+
+/// Read a §G.13.2.5 sign-exponent-mantissa component from `r`,
+/// using `prec` to derive the mantissa width. Returns the raw
+/// bitstream value; see [`FloatComponent::to_f64`] for the
+/// reconstructed scalar.
+fn read_float_component(r: &mut BitReader<'_>, prec: u8) -> Result<FloatComponent, SeiError> {
+    // sign u(1).
+    let sign = r.u(1)? == 1;
+    // exponent u(6).
+    let exponent = r.u(6)? as u8;
+    // mantissa u(v) where v is derived per §G.13.2.5.
+    let v = mantissa_width_g1325(prec, exponent);
+    let mantissa: u64 = if v == 0 {
+        0
+    } else if v <= 32 {
+        r.u(v as u32)? as u64
+    } else {
+        // 32 < v <= 62 — split into hi (v − 32 bits) + lo (32 bits)
+        // so each individual r.u call stays within the
+        // u(<=32) primitive contract.
+        let hi_bits = (v - 32) as u32;
+        let hi = r.u(hi_bits)? as u64;
+        let lo = r.u(32)? as u64;
+        (hi << 32) | lo
+    };
+    Ok(FloatComponent {
+        sign,
+        exponent,
+        mantissa,
+        mantissa_width: v,
+    })
+}
+
+/// Parse a §G.13.1.5 `multiview_acquisition_info()` payload.
+///
+/// Enforces:
+///
+/// * `num_views_minus1 ≤ 1023` (Annex G absolute, anti-OOM
+///   pre-allocation cap — cf. round-200 §G.13.2.8).
+/// * Each of `prec_focal_length`, `prec_principal_point`,
+///   `prec_skew_factor`, `prec_rotation_param`,
+///   `prec_translation_param` shall be in `0..=31` inclusive.
+///
+/// Floating-point components are stored verbatim in
+/// [`FloatComponent`] (no IEEE conversion at parse time — callers
+/// can call [`FloatComponent::to_f64`] when they need a scalar).
+pub fn parse_multiview_acquisition_info(
+    payload: &[u8],
+) -> Result<MultiviewAcquisitionInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+
+    // §G.13.1.5 — num_views_minus1 ue(v).
+    // §G.13.2.5 / Annex G absolute: 0..=1023.
+    let num_views_minus1 = r.ue()?;
+    if num_views_minus1 > 1023 {
+        return Err(SeiError::MultiviewAcquisitionInfoNumViewsOutOfRange(
+            num_views_minus1,
+        ));
+    }
+    let num_views = (num_views_minus1 as usize) + 1;
+
+    // §G.13.1.5 — intrinsic_param_flag u(1), extrinsic_param_flag u(1).
+    let intrinsic_param_flag = r.u(1)? == 1;
+    let extrinsic_param_flag = r.u(1)? == 1;
+
+    let intrinsic = if intrinsic_param_flag {
+        // §G.13.1.5 — intrinsic_params_equal_flag u(1).
+        let intrinsic_params_equal_flag = r.u(1)? == 1;
+        // §G.13.1.5 — prec_focal_length, prec_principal_point,
+        // prec_skew_factor ue(v). §G.13.2.5: each shall be in
+        // 0..=31 inclusive.
+        let prec_focal_length = read_prec_ue(&mut r, "prec_focal_length")?;
+        let prec_principal_point = read_prec_ue(&mut r, "prec_principal_point")?;
+        let prec_skew_factor = read_prec_ue(&mut r, "prec_skew_factor")?;
+
+        // §G.13.1.5 — when intrinsic_params_equal_flag == 1, only
+        // the i = 0 entry is signalled; otherwise the loop covers
+        // i = 0..=num_views_minus1.
+        let cam_count = if intrinsic_params_equal_flag {
+            1
+        } else {
+            num_views
+        };
+        let mut cameras: Vec<IntrinsicCamera> = Vec::with_capacity(cam_count);
+        for _ in 0..cam_count {
+            let focal_length_x = read_float_component(&mut r, prec_focal_length)?;
+            let focal_length_y = read_float_component(&mut r, prec_focal_length)?;
+            let principal_point_x = read_float_component(&mut r, prec_principal_point)?;
+            let principal_point_y = read_float_component(&mut r, prec_principal_point)?;
+            let skew_factor = read_float_component(&mut r, prec_skew_factor)?;
+            cameras.push(IntrinsicCamera {
+                focal_length_x,
+                focal_length_y,
+                principal_point_x,
+                principal_point_y,
+                skew_factor,
+            });
+        }
+
+        Some(IntrinsicCameraParams {
+            intrinsic_params_equal_flag,
+            prec_focal_length,
+            prec_principal_point,
+            prec_skew_factor,
+            cameras,
+        })
+    } else {
+        None
+    };
+
+    let extrinsic = if extrinsic_param_flag {
+        // §G.13.1.5 — prec_rotation_param, prec_translation_param
+        // ue(v). §G.13.2.5: each shall be in 0..=31 inclusive.
+        let prec_rotation_param = read_prec_ue(&mut r, "prec_rotation_param")?;
+        let prec_translation_param = read_prec_ue(&mut r, "prec_translation_param")?;
+
+        let mut cameras: Vec<ExtrinsicCamera> = Vec::with_capacity(num_views);
+        // The spec's outer loop runs i = 0..=num_views_minus1
+        // (the §G.13.1.5 loop comment differs from the intrinsic
+        // block in that there is no intrinsic_params_equal_flag
+        // shortcut — extrinsics are always per-camera).
+        for _ in 0..num_views {
+            // Initialise with a zero placeholder we'll overwrite —
+            // `FloatComponent` is Copy so this is cheap.
+            let zero = FloatComponent {
+                sign: false,
+                exponent: 0,
+                mantissa: 0,
+                mantissa_width: 0,
+            };
+            let mut r_mat: [[FloatComponent; 3]; 3] = [[zero; 3]; 3];
+            let mut t_vec: [FloatComponent; 3] = [zero; 3];
+            // §G.13.1.5 — for( j = 1; j <= 3; j++ ) { for( k = 1; k <= 3; k++ ) r[i][j][k]; t[i][j]; }
+            // i.e., row j carries three r entries (k=1..3) followed
+            // by a single t entry. We store with 0-indexed j, k.
+            for (j, row) in r_mat.iter_mut().enumerate() {
+                for cell in row.iter_mut() {
+                    *cell = read_float_component(&mut r, prec_rotation_param)?;
+                }
+                t_vec[j] = read_float_component(&mut r, prec_translation_param)?;
+            }
+            cameras.push(ExtrinsicCamera { r: r_mat, t: t_vec });
+        }
+
+        Some(ExtrinsicCameraParams {
+            prec_rotation_param,
+            prec_translation_param,
+            cameras,
+        })
+    } else {
+        None
+    };
+
+    Ok(MultiviewAcquisitionInfo {
+        num_views_minus1: num_views_minus1 as u16,
+        intrinsic,
+        extrinsic,
+    })
+}
+
+/// Helper: read a `prec_*` ue(v) and enforce the §G.13.2.5
+/// `0..=31` range bound. The `field` argument is the spec name
+/// surfaced in the error.
+fn read_prec_ue(r: &mut BitReader<'_>, field: &'static str) -> Result<u8, SeiError> {
+    let v = r.ue()?;
+    if v > 31 {
+        return Err(SeiError::MultiviewAcquisitionInfoPrecOutOfRange { field, got: v });
+    }
+    Ok(v as u8)
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4655,6 +5089,8 @@ pub enum SeiPayload {
     ShutterIntervalInfo(ShutterIntervalInfo),
     /// §G.13.2.4 — multiview_scene_info (payload type 39, Annex G). Round 200.
     MultiviewSceneInfo(MultiviewSceneInfo),
+    /// §G.13.2.5 — multiview_acquisition_info (payload type 40, Annex G). Round 213.
+    MultiviewAcquisitionInfo(MultiviewAcquisitionInfo),
     /// §G.13.2.6 — non_required_view_component (payload type 41, Annex G). Round 207.
     NonRequiredViewComponent(NonRequiredViewComponent),
     /// §G.13.2.8 — operation_point_not_present (payload type 43, Annex G). Round 200.
@@ -4741,6 +5177,9 @@ pub fn parse_payload(
         39 => Ok(SeiPayload::MultiviewSceneInfo(parse_multiview_scene_info(
             payload,
         )?)),
+        40 => Ok(SeiPayload::MultiviewAcquisitionInfo(
+            parse_multiview_acquisition_info(payload)?,
+        )),
         41 => Ok(SeiPayload::NonRequiredViewComponent(
             parse_non_required_view_component(payload)?,
         )),
@@ -6067,6 +6506,298 @@ mod tests {
                 assert_eq!(n.entries[0].index_delta_minus1, vec![0u16]);
             }
             other => panic!("expected NonRequiredViewComponent, got {:?}", other),
+        }
+    }
+
+    // Round-213 — §G.13.2.5 multiview_acquisition_info (payload
+    // type 40). Tests cover the four parse paths:
+    //
+    //   1. Both flags off — only num_views + the two flag bits are
+    //      consumed.
+    //   2. Intrinsic only, intrinsic_params_equal_flag = 1 — single
+    //      shared camera entry.
+    //   3. Extrinsic only — full 3×3 R + 3-vector T per camera.
+    //   4. Range-check rejections on num_views_minus1 + each prec_*.
+    //
+    // A separate test exercises the §G.13.2.5 mantissa-width formula
+    // (denormal e == 0, normal 0 < e < 63, reserved e == 63) and
+    // the FloatComponent::to_f64 reconstruction.
+
+    #[test]
+    fn multiview_acquisition_info_no_flags_set() {
+        // num_views_minus1 = 0 → ue "1"
+        // intrinsic_param_flag = 0
+        // extrinsic_param_flag = 0
+        // Total: 1 + 1 + 1 = 3 bits.
+        let payload = pack_bits(&[(1, 1), (0, 1), (0, 1)]);
+        let info = parse_multiview_acquisition_info(&payload).unwrap();
+        assert_eq!(info.num_views_minus1, 0);
+        assert!(info.intrinsic.is_none());
+        assert!(info.extrinsic.is_none());
+    }
+
+    #[test]
+    fn multiview_acquisition_info_intrinsic_equal_flag_single_camera() {
+        // Two views (num_views_minus1 = 1) but
+        // intrinsic_params_equal_flag = 1 so only one intrinsic
+        // entry is signalled.
+        //
+        // num_views_minus1 = 1                          → ue "010"      (3 bits)
+        // intrinsic_param_flag = 1                       → u(1) "1"      (1 bit)
+        // extrinsic_param_flag = 0                       → u(1) "0"      (1 bit)
+        // intrinsic_params_equal_flag = 1                → u(1) "1"      (1 bit)
+        // prec_focal_length = 1                          → ue "010"      (3 bits)
+        // prec_principal_point = 1                       → ue "010"      (3 bits)
+        // prec_skew_factor = 1                           → ue "010"      (3 bits)
+        //
+        // Five FloatComponents, each (sign u(1) + exponent u(6) +
+        // mantissa u(v)) where v = max(0, e + prec − 31) for
+        // 0 < e < 63. With prec = 1 and e = 30 (well below 63):
+        // v = max(0, 30 + 1 − 31) = 0 → mantissa is zero-width.
+        // Pick sign = 0, exponent = 30, mantissa = (absent).
+        //
+        // Per FloatComponent: u(1)=0, u(6)=30 (= 0b011110) → 7 bits.
+        // Five components × 7 bits = 35 bits.
+        let mut fields: Vec<(u64, u32)> = vec![
+            (0b010, 3), // num_views_minus1 = 1
+            (1, 1),     // intrinsic_param_flag = 1
+            (0, 1),     // extrinsic_param_flag = 0
+            (1, 1),     // intrinsic_params_equal_flag = 1
+            (0b010, 3), // prec_focal_length = 1
+            (0b010, 3), // prec_principal_point = 1
+            (0b010, 3), // prec_skew_factor = 1
+        ];
+        // Five FloatComponents each with sign=0, exponent=30,
+        // mantissa absent (width 0 since 0 < e < 63 → v = e + prec − 31
+        // = 30 + 1 − 31 = 0).
+        for _ in 0..5 {
+            fields.push((0, 1)); // sign
+            fields.push((30, 6)); // exponent
+        }
+        let payload = pack_bits(&fields);
+
+        let info = parse_multiview_acquisition_info(&payload).unwrap();
+        assert_eq!(info.num_views_minus1, 1);
+        let intr = info.intrinsic.expect("intrinsic block populated");
+        assert!(intr.intrinsic_params_equal_flag);
+        assert_eq!(intr.prec_focal_length, 1);
+        assert_eq!(intr.prec_principal_point, 1);
+        assert_eq!(intr.prec_skew_factor, 1);
+        // Only one camera entry shared across both views.
+        assert_eq!(intr.cameras.len(), 1);
+        let cam = intr.cameras[0];
+        assert_eq!(cam.focal_length_x.exponent, 30);
+        assert_eq!(cam.focal_length_x.mantissa_width, 0);
+        assert_eq!(cam.focal_length_x.mantissa, 0);
+        assert!(!cam.focal_length_x.sign);
+        assert!(info.extrinsic.is_none());
+    }
+
+    #[test]
+    fn multiview_acquisition_info_extrinsic_only_single_view() {
+        // Single view (num_views_minus1 = 0), no intrinsic, full
+        // extrinsic block (3×3 R + 3 t entries = 12 FloatComponents).
+        // Pick prec_rotation_param = 0, prec_translation_param = 0
+        // and each exponent = 0 → mantissa width = max(0, 0 − 30) = 0,
+        // so each FloatComponent is 7 bits (sign + exponent).
+        //
+        // num_views_minus1 = 0                  → ue "1"  (1 bit)
+        // intrinsic_param_flag = 0              → u(1) "0"
+        // extrinsic_param_flag = 1              → u(1) "1"
+        // prec_rotation_param = 0               → ue "1"  (1 bit)
+        // prec_translation_param = 0            → ue "1"  (1 bit)
+        // 12 FloatComponents × 7 bits each      = 84 bits
+        // Total: 89 bits → 12 bytes (5 bits padding).
+        let mut fields: Vec<(u64, u32)> = vec![
+            (1, 1), // num_views_minus1 = 0
+            (0, 1), // intrinsic_param_flag = 0
+            (1, 1), // extrinsic_param_flag = 1
+            (1, 1), // prec_rotation_param = 0
+            (1, 1), // prec_translation_param = 0
+        ];
+        // Per row j ∈ {1..3}: 3 r entries + 1 t entry = 4 components.
+        // Pick exponents in 0..=31 so the §G.13.2.5 mantissa-width
+        // formula yields width 0 for both prec_rotation_param == 0
+        // and prec_translation_param == 0 (otherwise an exponent in
+        // 32..62 introduces a 1+ bit mantissa that re-frames every
+        // subsequent component in this fixed-bit fixture).
+        let pattern = [
+            // (sign, exponent) — 9 r entries
+            (0u64, 11u64),
+            (1, 12),
+            (0, 13),
+            (1, 21),
+            (0, 22),
+            (1, 23),
+            (0, 14),
+            (1, 24),
+            (0, 31),
+        ];
+        let t_pattern = [(1u64, 1u64), (0, 2), (1, 3)];
+        // §G.13.1.5 order: for j { for k r[j][k]; t[j] }
+        for j in 0..3 {
+            for k in 0..3 {
+                let (s, e) = pattern[j * 3 + k];
+                fields.push((s, 1));
+                fields.push((e, 6));
+            }
+            let (s, e) = t_pattern[j];
+            fields.push((s, 1));
+            fields.push((e, 6));
+        }
+        let payload = pack_bits(&fields);
+
+        let info = parse_multiview_acquisition_info(&payload).unwrap();
+        assert_eq!(info.num_views_minus1, 0);
+        assert!(info.intrinsic.is_none());
+        let extr = info.extrinsic.expect("extrinsic block populated");
+        assert_eq!(extr.prec_rotation_param, 0);
+        assert_eq!(extr.prec_translation_param, 0);
+        assert_eq!(extr.cameras.len(), 1);
+        let cam = extr.cameras[0];
+        // Spot-check a few R entries.
+        assert_eq!(cam.r[0][0].exponent, 11);
+        assert!(!cam.r[0][0].sign);
+        assert_eq!(cam.r[2][2].exponent, 31);
+        assert_eq!(cam.r[2][2].mantissa_width, 0);
+        // Spot-check the translation.
+        assert_eq!(cam.t[0].exponent, 1);
+        assert!(cam.t[0].sign);
+        assert_eq!(cam.t[2].exponent, 3);
+    }
+
+    #[test]
+    fn multiview_acquisition_info_rejects_num_views_above_1023() {
+        // Encode num_views_minus1 = 1024 as ue(1024):
+        // codeword length = 21 bits (10 leading zeros + 1 + 10
+        // info bits for the value 1024 = 0b10000000001 with the
+        // leading 1 acting as the marker), and Exp-Golomb decoder
+        // returns ue = 2^10 + bits − 1 = 1024.
+        //
+        // 10 zeros + 1 + "0000000001" → codeNum = 0b10000000001 −1 = 1024.
+        // Total bits: 21 → 3 bytes.
+        let payload = pack_bits(&[(0, 10), (1, 1), (0b0000000001, 10)]);
+        let err = parse_multiview_acquisition_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::MultiviewAcquisitionInfoNumViewsOutOfRange(1024)
+        ));
+    }
+
+    #[test]
+    fn multiview_acquisition_info_rejects_prec_focal_length_above_31() {
+        // num_views_minus1 = 0, intrinsic_param_flag = 1,
+        // extrinsic_param_flag = 0, intrinsic_params_equal_flag = 1,
+        // prec_focal_length = 32 → ue("0000010001") (10 bits encode
+        // codeNum 33 → ue value 32).
+        //
+        // Wait: codeNum k → ue value = k. The ue codeword for value
+        // 32 has codeword "000001000001" → 12 bits (5 leading zeros
+        // + 1 + 6 info bits = 0b100001 - 1 = 32). Let me just feed
+        // a value > 31 via the marker-only form:
+        // ue(32) = "0000001000001" (6 zeros + 1 + 0b000001 = ... hmm).
+        //
+        // Simpler: encode value via the 0 + marker form:
+        // For value v, codeword is the (k+1)-bit binary
+        // representation of (v+1) with the leading 1 implicit-marker:
+        //   v = 32  →  v+1 = 33 = 0b100001 (6 bits)
+        //   codeword = 5 leading zeros + 0b100001  (11 bits total).
+        let payload = pack_bits(&[
+            (1, 1), // num_views_minus1 = 0
+            (1, 1), // intrinsic_param_flag = 1
+            (0, 1), // extrinsic_param_flag = 0
+            (1, 1), // intrinsic_params_equal_flag = 1
+            // prec_focal_length = 32 → ue codeword "000001000001"
+            // (5 zeros + 0b100001 = 11 bits).
+            (0, 5),
+            (0b100001, 6),
+        ]);
+        let err = parse_multiview_acquisition_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::MultiviewAcquisitionInfoPrecOutOfRange {
+                field: "prec_focal_length",
+                got: 32
+            }
+        ));
+    }
+
+    #[test]
+    fn multiview_acquisition_info_mantissa_width_formula() {
+        // §G.13.2.5: cover the three branches of the
+        // mantissa-width formula.
+        //
+        // e == 0       → width = max(0, prec − 30)
+        // 0 < e < 63   → width = max(0, e + prec − 31)
+        // e == 63      → reserved; we store width = 0
+        assert_eq!(mantissa_width_g1325(0, 0), 0); // prec=0, e=0 → 0
+        assert_eq!(mantissa_width_g1325(31, 0), 1); // prec=31, e=0 → max(0, 1) = 1
+        assert_eq!(mantissa_width_g1325(30, 0), 0); // prec=30, e=0 → max(0, 0) = 0
+        assert_eq!(mantissa_width_g1325(0, 1), 0); // prec=0, e=1 → max(0, −30) = 0
+        assert_eq!(mantissa_width_g1325(31, 1), 1); // prec=31, e=1 → 1+31−31 = 1
+        assert_eq!(mantissa_width_g1325(31, 62), 62); // prec=31, e=62 → 62 (max)
+        assert_eq!(mantissa_width_g1325(31, 63), 0); // e=63 reserved → 0
+        assert_eq!(mantissa_width_g1325(0, 63), 0); // e=63 reserved → 0
+    }
+
+    #[test]
+    fn float_component_to_f64_branches() {
+        // Denormal: e == 0, n == 1, v == 1
+        //   x = (-1)^0 * 2^(-30) * (1 / 2) = 2^(-31)
+        let denormal = FloatComponent {
+            sign: false,
+            exponent: 0,
+            mantissa: 1,
+            mantissa_width: 1,
+        };
+        let expected_denormal = 2f64.powi(-31);
+        assert!((denormal.to_f64() - expected_denormal).abs() < 1e-300);
+
+        // Normal: e == 31, prec == 0 → v = 0, mantissa absent
+        //   x = (-1)^0 * 2^(31 − 31) * (1 + 0) = 1.0
+        let unity = FloatComponent {
+            sign: false,
+            exponent: 31,
+            mantissa: 0,
+            mantissa_width: 0,
+        };
+        assert_eq!(unity.to_f64(), 1.0);
+
+        // Normal negative with a mantissa:
+        //   e = 32, prec = 31 → v = 32 + 31 − 31 = 32
+        //   mantissa = 0x80000000 (top bit set) → n / 2^v = 0.5
+        //   x = (-1)^1 * 2^(32 − 31) * (1 + 0.5) = -3.0
+        let neg_three = FloatComponent {
+            sign: true,
+            exponent: 32,
+            mantissa: 0x8000_0000,
+            mantissa_width: 32,
+        };
+        assert_eq!(neg_three.to_f64(), -3.0);
+
+        // Reserved (e == 63) → NaN.
+        let unspec = FloatComponent {
+            sign: false,
+            exponent: 63,
+            mantissa: 0,
+            mantissa_width: 0,
+        };
+        assert!(unspec.to_f64().is_nan());
+    }
+
+    #[test]
+    fn parse_payload_dispatches_multiview_acquisition_info() {
+        // Both flags off — three-bit payload routed via dispatcher.
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[(1, 1), (0, 1), (0, 1)]);
+        let got = parse_payload(40, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::MultiviewAcquisitionInfo(m) => {
+                assert_eq!(m.num_views_minus1, 0);
+                assert!(m.intrinsic.is_none());
+                assert!(m.extrinsic.is_none());
+            }
+            other => panic!("expected MultiviewAcquisitionInfo, got {other:?}"),
         }
     }
 

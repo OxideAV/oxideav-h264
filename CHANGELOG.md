@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 213 — new Annex G (MVC) SEI payload type implemented in
+  `sei.rs`: payload type 40 `multiview_acquisition_info` (§G.13.1.5 /
+  §G.13.2.5 — intrinsic + extrinsic camera parameters per view).
+  Intrinsic block carries `prec_focal_length`, `prec_principal_point`,
+  and `prec_skew_factor` (each ue(v) in 0..=31) plus a per-camera
+  `(focal_length_x, focal_length_y, principal_point_x,
+  principal_point_y, skew_factor)` five-tuple; when
+  `intrinsic_params_equal_flag == 1` a single shared entry is signalled
+  for all views. Extrinsic block carries `prec_rotation_param`,
+  `prec_translation_param` (each ue(v) in 0..=31) plus a 3×3 rotation
+  matrix `r[j][k]` and 3-vector translation `t[j]` per view in the
+  §G.13.1.5 row-major spec order. Each scalar is decoded as the
+  sign-exponent-mantissa floating-point form of §G.13.2.5: 1-bit sign,
+  6-bit exponent, and a variable-width mantissa whose width follows
+  the spec formula `e == 0 → max(0, prec − 30)`,
+  `0 < e < 63 → max(0, e + prec − 31)`, `e == 63 → 0` (the spec
+  reserves value 63 as "unspecified" without defining a mantissa
+  width; we conservatively read no mantissa bits in that case so the
+  bitstream cursor stays aligned). New `FloatComponent` (sign / exponent
+  / mantissa raw bits / mantissa width) preserves the bitstream value
+  verbatim; `FloatComponent::to_f64` reconstructs the §G.13.2.5
+  IEEE-style scalar (denormal for `e == 0`, normal for `0 < e < 63`,
+  `NaN` for `e == 63`). Anti-OOM pre-allocation cap on
+  `num_views_minus1 ≤ 1023` (Annex G absolute, mirrors round-200's
+  §G.13.2.8 pattern); explicit rejection of any `prec_* > 31`. New
+  `SeiError` variants `MultiviewAcquisitionInfoNumViewsOutOfRange` and
+  `MultiviewAcquisitionInfoPrecOutOfRange`. Wired into `parse_payload`
+  dispatch; `tests/integration_sei_malformed.rs` `KNOWN_PAYLOAD_TYPES`
+  table moves 40 out of the `Unknown`-fallback set (sweep cardinality
+  preserved at 2948 panic-free invocations since 40 was already
+  exercised in the fallback group). 8 new lib unit tests cover the
+  no-flags happy path, intrinsic-only with shared camera entry,
+  extrinsic-only with full 3×3 R + 3-vector T per camera, the
+  §G.13.2.5 mantissa-width formula across all three branches
+  (denormal / normal / reserved), `FloatComponent::to_f64`
+  reconstruction (denormal + unity + −3.0 + reserved → NaN),
+  rejection of `num_views_minus1 == 1024`, rejection of
+  `prec_focal_length == 32`, and `parse_payload` dispatch round-trip.
+  Harmless on non-MVC streams (Phase 4 on the README "Profiles +
+  features in scope" table).
+
 - round 207 — new Annex G (MVC) SEI payload type implemented in
   `sei.rs`: payload type 41 `non_required_view_component` (§G.13.1.6 /
   §G.13.2.6 — per-target-view list of `(view_order_index[i],
