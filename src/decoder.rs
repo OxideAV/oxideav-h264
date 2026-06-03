@@ -845,8 +845,13 @@ mod tests {
 
     #[test]
     fn prefix_nal_14_is_ignored() {
-        // Prefix NAL unit (SVC/MVC) — type 14. We don't parse these.
-        let nal = build_nal(14, 0, &[0xAB, 0xCD]);
+        // Prefix NAL unit (SVC/MVC) — type 14. The §7.3.1 dispatch
+        // consumes 3 extension bytes (svc_extension_flag + the §F/G
+        // body), so a syntactically valid type-14 NAL needs at least
+        // 3 bytes of payload after the NAL header byte. The §7.4.1.2
+        // semantics are still "ignore at the top level" — the decoder
+        // forwards the raw bytes as Event::Ignored.
+        let nal = build_nal(14, 0, &[0x00, 0x00, 0x00]);
         let mut dec = Decoder::new();
         let ev = dec.process_nal(&nal).unwrap();
         match ev {

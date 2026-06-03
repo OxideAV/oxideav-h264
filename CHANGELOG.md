@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 219 — strict §7.3.1 dispatch on `nal_unit_type ∈ {14, 20, 21}`
+  in `nal.rs`. `parse_nal_unit` now reads the leading
+  `svc_extension_flag` (for types 14 / 20) or `avc_3d_extension_flag`
+  (for type 21) and parses the matching three-byte NAL extension
+  header per §F.7.3.1.1 (SVC), §G.7.3.1.1 (MVC, three bytes), or
+  §I.7.3.1.1 (3D-AVC, two bytes). The MVC variant surfaces
+  `non_idr_flag`, `priority_id` (u(6)), `view_id` (u(10), widened to
+  `u16`), `temporal_id` (u(3)), `anchor_pic_flag`, `inter_view_flag`,
+  and `reserved_one_bit`; the SVC variant surfaces `idr_flag`,
+  `priority_id`, `no_inter_layer_pred_flag`, `dependency_id` (u(3)),
+  `quality_id` (u(4)), `temporal_id`, `use_ref_base_pic_flag`,
+  `discardable_flag`, `output_flag`, and `reserved_three_2bits`
+  (u(2)); the 3D-AVC variant surfaces `view_idx` (u(8)), `depth_flag`,
+  `non_idr_flag`, `temporal_id`, `anchor_pic_flag`, and
+  `inter_view_flag`. Per §7.3.1 the emulation-prevention scan starts
+  at `i = nalUnitHeaderBytes`, so the extension bytes themselves are
+  read verbatim; only the post-extension RBSP body is fed through
+  `rbsp_from_nal_payload`. New struct fields on `NalUnit`:
+  `extension: Option<NalUnitHeaderExtension>` with the
+  `Mvc / Svc / Avc3d` variants. New `NalError::TruncatedExtensionHeader`
+  error variant fires when the NAL is too short for the dispatched
+  extension width (≥ 3 bytes for SVC / MVC, ≥ 2 bytes for 3D-AVC).
+  The §7.3.1 type-21 fall-through to the MVC three-byte body when
+  `avc_3d_extension_flag == 0` is honoured (depth NAL referencing an
+  MVC view component). `decoder.rs` still routes extension NAL types
+  through `Event::Ignored`, but now does so against a
+  spec-conformantly-parsed RBSP slice that no longer includes the
+  extension bytes — observable through the
+  `prefix_nal_14_is_ignored` regression test, which is widened from
+  a two-byte payload (formerly tolerated; the spec requires at
+  least three bytes) to a syntactically valid three-byte zero
+  extension. Twelve new `nal::tests` cover MVC / SVC / 3D-AVC happy
+  paths, max-field-value coverage of the bit-width boundaries, the
+  three truncation modes, the §7.3.1 type-21 → MVC fall-through,
+  and the emulation-prevention scoping rule (extension bytes
+  preserved verbatim, RBSP body bytes still stripped).
 - round 213 — new Annex G (MVC) SEI payload type implemented in
   `sei.rs`: payload type 40 `multiview_acquisition_info` (§G.13.1.5 /
   §G.13.2.5 — intrinsic + extrinsic camera parameters per view).
