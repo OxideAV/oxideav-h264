@@ -39,16 +39,17 @@
 use oxideav_h264::non_vcl::parse_sei_rbsp;
 use oxideav_h264::sei::{parse_payload, SeiContext};
 
-/// Mirror of `parse_payload`'s dispatch arms — 45 implemented types
-/// (round 213 adds Annex G §G.13.2.5 multiview_acquisition_info
-/// type 40 on top of the round-207 §G.13.2.6 non_required_view_component
-/// type 41 and the round-200 §G.13.2.4 multiview_scene_info
-/// type 39 + §G.13.2.8 operation_point_not_present type 43) +
-/// representative `Unknown`-fallback values (Annex F/G/H/I ranges +
-/// reserved numbers).
+/// Mirror of `parse_payload`'s dispatch arms — 46 implemented types
+/// (round 226 adds Annex H §H.13.2.4 three_dimensional_reference_displays_info
+/// type 51 on top of the round-213 Annex G §G.13.2.5
+/// multiview_acquisition_info type 40, the round-207 §G.13.2.6
+/// non_required_view_component type 41, and the round-200 §G.13.2.4
+/// multiview_scene_info type 39 + §G.13.2.8 operation_point_not_present
+/// type 43) + representative `Unknown`-fallback values (Annex F/G/H/I
+/// ranges + reserved numbers).
 const KNOWN_PAYLOAD_TYPES: &[u32] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 39, 40,
-    41, 43, 45, 46, 47, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155, 156, 200, 201, 205,
+    41, 43, 45, 46, 47, 51, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155, 156, 200, 201, 205,
 ];
 
 const FALLBACK_PAYLOAD_TYPES: &[u32] = &[
@@ -177,13 +178,14 @@ fn sei_parse_payload_never_panics() {
         }
     }
 
-    // 45 known + 22 fallback = 67 payload types × 11 shapes × 4 ctxs
-    // = 2948 invocations. Lock the count so a future change that
+    // 46 known + 22 fallback = 68 payload types × 11 shapes × 4 ctxs
+    // = 2992 invocations. Lock the count so a future change that
     // accidentally drops a row from one of the tables makes the test
-    // fail loudly instead of silently shrinking coverage. (Round 213
-    // moved type 40 multiview_acquisition_info from the fallback
-    // group into the implemented group, preserving the 67-type total.)
-    assert_eq!(total, 2948, "sweep cardinality drifted");
+    // fail loudly instead of silently shrinking coverage. (Round 226
+    // added type 51 three_dimensional_reference_displays_info to the
+    // implemented group; type 51 wasn't in the fallback list, so the
+    // 67-type total grows by one to 68.)
+    assert_eq!(total, 2992, "sweep cardinality drifted");
 }
 
 /// Envelope-shape regression — every shape also goes through

@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 226 — first Annex H (3D-AVC) SEI payload implemented in
+  `sei.rs`: payload type 51 `three_dimensional_reference_displays_info`
+  (§H.13.1.4 / §H.13.2.4). Per-CVS reference-display list with
+  reference baseline, reference display width, optional reference
+  viewing distance, and per-display additional horizontal shift.
+  Each scalar follows §H.13.2.4 Table H-3 (sign-less floating-point
+  with 6-bit exponent and a variable-width mantissa from the same
+  three-branch width formula used in §G.13.2.5 — `e == 0 → max(0,
+  prec − 30)`, `0 < e < 63 → max(0, e + prec − 31)`, `e == 63 → 0`
+  reserved). New `UnsignedFloatComponent` mirrors the round-213
+  `FloatComponent` minus the sign bit; `to_f64()` reconstructs the
+  Table H-3 scalar (`NaN` for the reserved `e == 63`). Surfaces
+  `prec_ref_baseline`, `prec_ref_display_width`,
+  `prec_ref_viewing_dist` (each ue(v) in 0..=31), `num_ref_displays_minus1`
+  (ue(v) in 0..=31, anti-OOM pre-allocation cap), per-display
+  `additional_shift_present_flag` + optional `num_sample_shift_plus512`
+  (u(10), 0..=1023 naturally), and the trailing
+  `three_dimensional_reference_displays_extension_flag` (u(1)). New
+  `SeiError` variants `ThreeDimensionalReferenceDisplaysInfoPrecOutOfRange`
+  and `ThreeDimensionalReferenceDisplaysInfoNumRefDisplaysOutOfRange`.
+  Wired into `parse_payload` dispatch; the payload-type table at the
+  top of `sei.rs` grows one row (§H.13.1.4). The
+  `tests/integration_sei_malformed.rs` `KNOWN_PAYLOAD_TYPES` table
+  moves type 51 into the implemented group (it wasn't in the
+  fallback list either, so the sweep cardinality moves from 2948 →
+  2992 panic-free invocations across 68 payload types × 11
+  adversarial shapes × 4 contexts). 8 new lib unit tests cover the
+  minimum-syntax single-display path, the two-display path with
+  reference viewing distance + per-display additional shift, the
+  trailing `extension_flag` propagation, `UnsignedFloatComponent::to_f64`
+  branches (normal / denormal / reserved), rejection of
+  `prec_ref_baseline == 32`, rejection of `prec_ref_viewing_dist
+  == 32`, rejection of `num_ref_displays_minus1 == 32`, and
+  `parse_payload` dispatch round-trip. Harmless on non-Annex-H
+  streams (Phase 4 on the profiles table).
 - round 219 — strict §7.3.1 dispatch on `nal_unit_type ∈ {14, 20, 21}`
   in `nal.rs`. `parse_nal_unit` now reads the leading
   `svc_extension_flag` (for types 14 / 20) or `avc_3d_extension_flag`

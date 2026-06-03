@@ -38,6 +38,7 @@
 //! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
 //! | 46           | §G.13.1.10  | §G.13.2.10  | multiview_view_position (Annex G)  |
 //! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
+//! | 51           | §H.13.1.4   | §H.13.2.4   | three_dimensional_reference_displays_info (Annex H) |
 //! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume    |
 //! | 142          | §D.1.30     | §D.2.30     | colour_remapping_info              |
 //! | 144          | §D.1.31     | §D.2.31     | content_light_level_info           |
@@ -320,6 +321,14 @@ pub enum SeiError {
         "multiview_acquisition_info {field} shall be in 0..=31 per Annex G §G.13.2.5 (got {got})"
     )]
     MultiviewAcquisitionInfoPrecOutOfRange { field: &'static str, got: u32 },
+    #[error(
+        "three_dimensional_reference_displays_info {field} shall be in 0..=31 per Annex H §H.13.2.4 (got {got})"
+    )]
+    ThreeDimensionalReferenceDisplaysInfoPrecOutOfRange { field: &'static str, got: u32 },
+    #[error(
+        "three_dimensional_reference_displays_info num_ref_displays_minus1 shall be in 0..=31 per Annex H §H.13.2.4 (got {0})"
+    )]
+    ThreeDimensionalReferenceDisplaysInfoNumRefDisplaysOutOfRange(u32),
 }
 
 /// §D.2.2 — buffering_period.
@@ -5024,6 +5033,257 @@ fn read_prec_ue(r: &mut BitReader<'_>, field: &'static str) -> Result<u8, SeiErr
     Ok(v as u8)
 }
 
+/// §H.13.2.4 — sign-less floating-point component used by the 3D
+/// reference displays info SEI. Same exponent / mantissa-width
+/// formula as [`FloatComponent`] (§G.13.2.5), but the spec's Table
+/// H-3 fixes the sign column at 0 for every variable, so no sign
+/// bit is read from the bitstream.
+///
+/// The stored value is the raw bitstream value; the
+/// [`UnsignedFloatComponent::to_f64`] helper reconstructs the
+/// IEEE-style scalar per Table H-3:
+///
+/// * `0 < e < 63` → `2^(e − 31) * (1 + n ÷ 2^v)`         (normal)
+/// * `e == 0`     → `2^−(30 + v) * n`                    (denormal)
+/// * `e == 63`    → unspecified; we return `f64::NAN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsignedFloatComponent {
+    /// `exponent` — `u(6)`, raw range `0..=63`. Value 63 is
+    /// reserved (treated as "unspecified" per §H.13.2.4).
+    pub exponent: u8,
+    /// `mantissa` — variable-width `u(v)` raw bits; width is
+    /// recorded in `mantissa_width` and is at most 62.
+    pub mantissa: u64,
+    /// `mantissa_width` — bit-width of `mantissa`, derived per
+    /// §H.13.2.4 (same formula as §G.13.2.5) from the per-block
+    /// precision and the exponent.
+    pub mantissa_width: u8,
+}
+
+impl UnsignedFloatComponent {
+    /// Reconstruct the §H.13.2.4 scalar value per Table H-3 with
+    /// `s = 0`. Mirrors [`FloatComponent::to_f64`] minus the sign.
+    #[must_use]
+    pub fn to_f64(&self) -> f64 {
+        if self.exponent == 63 {
+            return f64::NAN;
+        }
+        let v = self.mantissa_width as i32;
+        let n_over_2v = if v == 0 {
+            0.0
+        } else {
+            (self.mantissa as f64) / (2f64.powi(v))
+        };
+        if self.exponent == 0 {
+            2f64.powi(-30) * n_over_2v
+        } else {
+            2f64.powi((self.exponent as i32) - 31) * (1.0 + n_over_2v)
+        }
+    }
+}
+
+/// Read a §H.13.2.4 unsigned floating-point component from `r`,
+/// using `prec` to derive the mantissa width. The §H.13.2.4
+/// mantissa-width formula is identical to the §G.13.2.5 one used
+/// by [`mantissa_width_g1325`].
+fn read_unsigned_float_component(
+    r: &mut BitReader<'_>,
+    prec: u8,
+) -> Result<UnsignedFloatComponent, SeiError> {
+    // exponent u(6).
+    let exponent = r.u(6)? as u8;
+    let v = mantissa_width_g1325(prec, exponent);
+    let mantissa: u64 = if v == 0 {
+        0
+    } else if v <= 32 {
+        r.u(v as u32)? as u64
+    } else {
+        // 32 < v <= 62 — split into hi (v − 32 bits) + lo (32 bits)
+        // so each individual r.u call stays within the
+        // u(<=32) primitive contract.
+        let hi_bits = (v - 32) as u32;
+        let hi = r.u(hi_bits)? as u64;
+        let lo = r.u(32)? as u64;
+        (hi << 32) | lo
+    };
+    Ok(UnsignedFloatComponent {
+        exponent,
+        mantissa,
+        mantissa_width: v,
+    })
+}
+
+/// §H.13.2.4 — 3D reference displays information SEI message.
+///
+/// Carries the reference display widths, reference viewing
+/// distances (optional), and the corresponding baseline distances
+/// and additional horizontal shifts that form a stereo pair for
+/// each reference display. Used by view renderers to compute a
+/// proper stereo pair for the target screen width and viewing
+/// distance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreeDimensionalReferenceDisplaysInfo {
+    /// `prec_ref_baseline` (0..=31) — truncation exponent for
+    /// `ref_baseline[i]`.
+    pub prec_ref_baseline: u8,
+    /// `prec_ref_display_width` (0..=31) — truncation exponent for
+    /// `ref_display_width[i]`.
+    pub prec_ref_display_width: u8,
+    /// `prec_ref_viewing_dist` (0..=31) — truncation exponent for
+    /// `ref_viewing_distance[i]`. Present iff
+    /// `ref_viewing_distance_flag == 1`.
+    pub prec_ref_viewing_dist: Option<u8>,
+    /// One entry per reference display
+    /// (`num_ref_displays_minus1 + 1`, capped at 32).
+    pub displays: Vec<ReferenceDisplay>,
+    /// `three_dimensional_reference_displays_extension_flag` — the
+    /// spec mandates 0 in this edition; non-zero values are
+    /// reserved for future use and a decoder shall ignore any
+    /// trailing data.
+    pub extension_flag: bool,
+}
+
+/// §H.13.2.4 — per-reference-display entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceDisplay {
+    /// `ref_baseline[i]` — reference baseline distance, in the same
+    /// units as the x component of the translation vector in the
+    /// associated multiview_acquisition_info SEI.
+    pub ref_baseline: UnsignedFloatComponent,
+    /// `ref_display_width[i]` — reference display width in
+    /// centimetres.
+    pub ref_display_width: UnsignedFloatComponent,
+    /// `ref_viewing_distance[i]` — reference viewing distance in
+    /// centimetres. Present iff `ref_viewing_distance_flag == 1`.
+    pub ref_viewing_distance: Option<UnsignedFloatComponent>,
+    /// `additional_shift_present_flag[i]` — whether `num_sample_shift_plus512`
+    /// is signalled for this display.
+    pub additional_shift_present_flag: bool,
+    /// `num_sample_shift_plus512[i]` — recommended additional
+    /// horizontal shift in samples between the left and right views
+    /// (biased by 512). Present iff
+    /// `additional_shift_present_flag == 1`. Range `0..=1023`.
+    pub num_sample_shift_plus512: Option<u16>,
+}
+
+/// Parse a §H.13.1.4 `three_dimensional_reference_displays_info()`
+/// payload.
+///
+/// Enforces:
+///
+/// * `prec_ref_baseline`, `prec_ref_display_width`,
+///   `prec_ref_viewing_dist` shall be in `0..=31` (§H.13.2.4).
+/// * `num_ref_displays_minus1` shall be in `0..=31` (§H.13.2.4) —
+///   serves as the pre-allocation cap for the per-display loop.
+///
+/// `num_sample_shift_plus512` is read as `u(10)`, naturally
+/// constrained to `0..=1023` by the bit width.
+///
+/// `three_dimensional_reference_displays_extension_flag` is read
+/// but no further data is parsed when it is 1 — the spec reserves
+/// the trailing region for future extensions and decoders shall
+/// ignore everything after this flag.
+pub fn parse_three_dimensional_reference_displays_info(
+    payload: &[u8],
+) -> Result<ThreeDimensionalReferenceDisplaysInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+
+    // prec_ref_baseline ue(v), 0..=31.
+    let prec_ref_baseline = {
+        let v = r.ue()?;
+        if v > 31 {
+            return Err(
+                SeiError::ThreeDimensionalReferenceDisplaysInfoPrecOutOfRange {
+                    field: "prec_ref_baseline",
+                    got: v,
+                },
+            );
+        }
+        v as u8
+    };
+    // prec_ref_display_width ue(v), 0..=31.
+    let prec_ref_display_width = {
+        let v = r.ue()?;
+        if v > 31 {
+            return Err(
+                SeiError::ThreeDimensionalReferenceDisplaysInfoPrecOutOfRange {
+                    field: "prec_ref_display_width",
+                    got: v,
+                },
+            );
+        }
+        v as u8
+    };
+    // ref_viewing_distance_flag u(1).
+    let ref_viewing_distance_flag = r.u(1)? == 1;
+    // prec_ref_viewing_dist ue(v), 0..=31. Present iff
+    // ref_viewing_distance_flag == 1.
+    let prec_ref_viewing_dist = if ref_viewing_distance_flag {
+        let v = r.ue()?;
+        if v > 31 {
+            return Err(
+                SeiError::ThreeDimensionalReferenceDisplaysInfoPrecOutOfRange {
+                    field: "prec_ref_viewing_dist",
+                    got: v,
+                },
+            );
+        }
+        Some(v as u8)
+    } else {
+        None
+    };
+    // num_ref_displays_minus1 ue(v), 0..=31. Anti-OOM cap before
+    // the per-display loop allocation.
+    let num_ref_displays_minus1 = r.ue()?;
+    if num_ref_displays_minus1 > 31 {
+        return Err(
+            SeiError::ThreeDimensionalReferenceDisplaysInfoNumRefDisplaysOutOfRange(
+                num_ref_displays_minus1,
+            ),
+        );
+    }
+    let num_ref_displays = (num_ref_displays_minus1 as usize) + 1;
+    let mut displays = Vec::with_capacity(num_ref_displays);
+    for _ in 0..num_ref_displays {
+        // exponent_ref_baseline u(6) + mantissa_ref_baseline u(v).
+        let ref_baseline = read_unsigned_float_component(&mut r, prec_ref_baseline)?;
+        // exponent_ref_display_width u(6) + mantissa_ref_display_width u(v).
+        let ref_display_width = read_unsigned_float_component(&mut r, prec_ref_display_width)?;
+        // exponent_ref_viewing_distance u(6) + mantissa u(v), iff
+        // ref_viewing_distance_flag == 1.
+        let ref_viewing_distance = if let Some(prec) = prec_ref_viewing_dist {
+            Some(read_unsigned_float_component(&mut r, prec)?)
+        } else {
+            None
+        };
+        // additional_shift_present_flag u(1).
+        let additional_shift_present_flag = r.u(1)? == 1;
+        // num_sample_shift_plus512 u(10) iff additional_shift_present_flag == 1.
+        let num_sample_shift_plus512 = if additional_shift_present_flag {
+            Some(r.u(10)? as u16)
+        } else {
+            None
+        };
+        displays.push(ReferenceDisplay {
+            ref_baseline,
+            ref_display_width,
+            ref_viewing_distance,
+            additional_shift_present_flag,
+            num_sample_shift_plus512,
+        });
+    }
+    // three_dimensional_reference_displays_extension_flag u(1).
+    let extension_flag = r.u(1)? == 1;
+
+    Ok(ThreeDimensionalReferenceDisplaysInfo {
+        prec_ref_baseline,
+        prec_ref_display_width,
+        prec_ref_viewing_dist,
+        displays,
+        extension_flag,
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5097,6 +5357,9 @@ pub enum SeiPayload {
     OperationPointNotPresent(OperationPointNotPresent),
     /// §G.13.2.10 — multiview_view_position (payload type 46). Round 183.
     MultiviewViewPosition(MultiviewViewPosition),
+    /// §H.13.2.4 — three_dimensional_reference_displays_info
+    /// (payload type 51, Annex H). Round 226.
+    ThreeDimensionalReferenceDisplaysInfo(ThreeDimensionalReferenceDisplaysInfo),
     /// §D.2.36 — sei_manifest (payload type 200). Round 120.
     SeiManifest(SeiManifest),
     /// §D.2.37 — sei_prefix_indication (payload type 201). Round 120.
@@ -5195,6 +5458,9 @@ pub fn parse_payload(
         47 => Ok(SeiPayload::DisplayOrientation(parse_display_orientation(
             payload,
         )?)),
+        51 => Ok(SeiPayload::ThreeDimensionalReferenceDisplaysInfo(
+            parse_three_dimensional_reference_displays_info(payload)?,
+        )),
         137 => Ok(SeiPayload::MasteringDisplay(parse_mastering_display(
             payload,
         )?)),
@@ -6798,6 +7064,239 @@ mod tests {
                 assert!(m.extrinsic.is_none());
             }
             other => panic!("expected MultiviewAcquisitionInfo, got {other:?}"),
+        }
+    }
+
+    // Round-226 — §H.13.2.4 three_dimensional_reference_displays_info
+    // (payload type 51, Annex H). Tests cover:
+    //
+    //   1. Single reference display, ref_viewing_distance_flag = 0,
+    //      additional_shift_present_flag = 0 — minimum-syntax path.
+    //   2. Two displays, ref_viewing_distance_flag = 1,
+    //      additional_shift_present_flag = 1 — full per-display
+    //      block exercised.
+    //   3. UnsignedFloatComponent::to_f64 branches (normal /
+    //      denormal / reserved).
+    //   4. Range-check rejections on the three prec_* fields and
+    //      num_ref_displays_minus1.
+    //   5. parse_payload dispatcher round-trip.
+
+    #[test]
+    fn three_dimensional_reference_displays_info_minimum_single_display() {
+        // prec_ref_baseline = 0                  → ue "1"        (1 bit)
+        // prec_ref_display_width = 0             → ue "1"        (1 bit)
+        // ref_viewing_distance_flag = 0          → u(1)          (1 bit)
+        // num_ref_displays_minus1 = 0            → ue "1"        (1 bit)
+        // One reference display, ref_viewing_distance_flag = 0:
+        //   exponent_ref_baseline u(6) = 31      → (6 bits)
+        //   mantissa_ref_baseline u(0) = absent  (prec=0, 0<e<63
+        //                                          → v = 0+0-31 = 0)
+        //   exponent_ref_display_width u(6) = 31 → (6 bits)
+        //   mantissa_ref_display_width u(0)      = absent
+        //   additional_shift_present_flag = 0    → u(1)          (1 bit)
+        //   no num_sample_shift_plus512
+        // three_dimensional_reference_displays_extension_flag = 0
+        //                                        → u(1)          (1 bit)
+        let payload = pack_bits(&[
+            (1, 1),  // prec_ref_baseline = 0
+            (1, 1),  // prec_ref_display_width = 0
+            (0, 1),  // ref_viewing_distance_flag = 0
+            (1, 1),  // num_ref_displays_minus1 = 0
+            (31, 6), // exponent_ref_baseline
+            (31, 6), // exponent_ref_display_width
+            (0, 1),  // additional_shift_present_flag = 0
+            (0, 1),  // extension_flag = 0
+        ]);
+        let info = parse_three_dimensional_reference_displays_info(&payload).unwrap();
+        assert_eq!(info.prec_ref_baseline, 0);
+        assert_eq!(info.prec_ref_display_width, 0);
+        assert!(info.prec_ref_viewing_dist.is_none());
+        assert_eq!(info.displays.len(), 1);
+        let d = info.displays[0];
+        assert_eq!(d.ref_baseline.exponent, 31);
+        assert_eq!(d.ref_baseline.mantissa_width, 0);
+        assert_eq!(d.ref_display_width.exponent, 31);
+        assert!(d.ref_viewing_distance.is_none());
+        assert!(!d.additional_shift_present_flag);
+        assert!(d.num_sample_shift_plus512.is_none());
+        assert!(!info.extension_flag);
+    }
+
+    #[test]
+    fn three_dimensional_reference_displays_info_two_displays_with_viewing_distance() {
+        // num_ref_displays_minus1 = 1 (two displays),
+        // ref_viewing_distance_flag = 1, additional_shift_present_flag
+        // = 1 on the first display only — exercises every conditional
+        // branch in the per-display loop.
+        let mut fields: Vec<(u64, u32)> = vec![
+            (1, 1),     // prec_ref_baseline = 0
+            (1, 1),     // prec_ref_display_width = 0
+            (1, 1),     // ref_viewing_distance_flag = 1
+            (1, 1),     // prec_ref_viewing_dist = 0
+            (0b010, 3), // num_ref_displays_minus1 = 1
+        ];
+        // Display 0: every component uses exponent in 0..=31, prec=0
+        // → mantissa width = 0 for both formulas.
+        fields.push((20, 6)); // exponent_ref_baseline
+        fields.push((21, 6)); // exponent_ref_display_width
+        fields.push((22, 6)); // exponent_ref_viewing_distance
+        fields.push((1, 1)); // additional_shift_present_flag = 1
+                             // num_sample_shift_plus512 = 768 → centre + 256 samples.
+        fields.push((768, 10));
+        // Display 1: no additional shift signalled.
+        fields.push((10, 6)); // exponent_ref_baseline
+        fields.push((11, 6)); // exponent_ref_display_width
+        fields.push((12, 6)); // exponent_ref_viewing_distance
+        fields.push((0, 1)); // additional_shift_present_flag = 0
+                             // extension_flag = 0
+        fields.push((0, 1));
+        let payload = pack_bits(&fields);
+        let info = parse_three_dimensional_reference_displays_info(&payload).unwrap();
+        assert_eq!(info.prec_ref_viewing_dist, Some(0));
+        assert_eq!(info.displays.len(), 2);
+        // Display 0.
+        let d0 = info.displays[0];
+        assert_eq!(d0.ref_baseline.exponent, 20);
+        assert_eq!(d0.ref_display_width.exponent, 21);
+        assert_eq!(d0.ref_viewing_distance.expect("rvd present").exponent, 22);
+        assert!(d0.additional_shift_present_flag);
+        assert_eq!(d0.num_sample_shift_plus512, Some(768));
+        // Display 1.
+        let d1 = info.displays[1];
+        assert_eq!(d1.ref_baseline.exponent, 10);
+        assert_eq!(d1.ref_display_width.exponent, 11);
+        assert_eq!(d1.ref_viewing_distance.expect("rvd present").exponent, 12);
+        assert!(!d1.additional_shift_present_flag);
+        assert!(d1.num_sample_shift_plus512.is_none());
+        assert!(!info.extension_flag);
+    }
+
+    #[test]
+    fn three_dimensional_reference_displays_info_extension_flag_propagates() {
+        // Single display, extension_flag = 1 — verify the trailing
+        // bit is surfaced (per §H.13.2.4 the trailing region is
+        // reserved; we ignore any subsequent data).
+        let payload = pack_bits(&[
+            (1, 1),  // prec_ref_baseline = 0
+            (1, 1),  // prec_ref_display_width = 0
+            (0, 1),  // ref_viewing_distance_flag = 0
+            (1, 1),  // num_ref_displays_minus1 = 0
+            (31, 6), // exponent_ref_baseline
+            (31, 6), // exponent_ref_display_width
+            (0, 1),  // additional_shift_present_flag = 0
+            (1, 1),  // extension_flag = 1 (reserved, ignored)
+        ]);
+        let info = parse_three_dimensional_reference_displays_info(&payload).unwrap();
+        assert!(info.extension_flag);
+    }
+
+    #[test]
+    fn unsigned_float_component_to_f64_branches() {
+        // Normal: e = 31, prec = 0 → v = 0 → x = 2^0 * 1 = 1.0
+        let unity = UnsignedFloatComponent {
+            exponent: 31,
+            mantissa: 0,
+            mantissa_width: 0,
+        };
+        assert_eq!(unity.to_f64(), 1.0);
+        // Normal positive with a mantissa:
+        //   e = 32, prec = 31 → v = 32 + 31 − 31 = 32
+        //   mantissa = 0x8000_0000 (top bit) → n / 2^v = 0.5
+        //   x = 2^1 * (1 + 0.5) = 3.0  (sign-less per H.13.2.4)
+        let three = UnsignedFloatComponent {
+            exponent: 32,
+            mantissa: 0x8000_0000,
+            mantissa_width: 32,
+        };
+        assert_eq!(three.to_f64(), 3.0);
+        // Denormal: e = 0, n = 1, v = 1 → x = 2^(-30) * (1/2) = 2^-31
+        let denormal = UnsignedFloatComponent {
+            exponent: 0,
+            mantissa: 1,
+            mantissa_width: 1,
+        };
+        assert!((denormal.to_f64() - 2f64.powi(-31)).abs() < 1e-300);
+        // Reserved: e = 63 → NaN.
+        let unspec = UnsignedFloatComponent {
+            exponent: 63,
+            mantissa: 0,
+            mantissa_width: 0,
+        };
+        assert!(unspec.to_f64().is_nan());
+    }
+
+    #[test]
+    fn three_dimensional_reference_displays_info_rejects_prec_ref_baseline_above_31() {
+        // prec_ref_baseline = 32 → ue codeword "000001000001"
+        // (5 zeros + 0b100001, 11 bits total). The first field
+        // checked is prec_ref_baseline, so no earlier bits.
+        let payload = pack_bits(&[(0, 5), (0b100001, 6)]);
+        let err = parse_three_dimensional_reference_displays_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::ThreeDimensionalReferenceDisplaysInfoPrecOutOfRange {
+                field: "prec_ref_baseline",
+                got: 32
+            }
+        ));
+    }
+
+    #[test]
+    fn three_dimensional_reference_displays_info_rejects_prec_ref_viewing_dist_above_31() {
+        // prec_ref_baseline = 0 (1 bit), prec_ref_display_width = 0
+        // (1 bit), ref_viewing_distance_flag = 1 (1 bit), then
+        // prec_ref_viewing_dist = 32 (11 bits).
+        let payload = pack_bits(&[
+            (1, 1), // prec_ref_baseline = 0
+            (1, 1), // prec_ref_display_width = 0
+            (1, 1), // ref_viewing_distance_flag = 1
+            (0, 5), // prec_ref_viewing_dist = 32 — codeword start
+            (0b100001, 6),
+        ]);
+        let err = parse_three_dimensional_reference_displays_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::ThreeDimensionalReferenceDisplaysInfoPrecOutOfRange {
+                field: "prec_ref_viewing_dist",
+                got: 32
+            }
+        ));
+    }
+
+    #[test]
+    fn three_dimensional_reference_displays_info_rejects_num_ref_displays_above_31() {
+        // prec_ref_baseline = 0 (1), prec_ref_display_width = 0 (1),
+        // ref_viewing_distance_flag = 0 (1), num_ref_displays_minus1
+        // = 32 (11 bits codeword "000001000001").
+        let payload = pack_bits(&[(1, 1), (1, 1), (0, 1), (0, 5), (0b100001, 6)]);
+        let err = parse_three_dimensional_reference_displays_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::ThreeDimensionalReferenceDisplaysInfoNumRefDisplaysOutOfRange(32)
+        ));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_three_dimensional_reference_displays_info() {
+        // Minimum-syntax single-display payload routed via dispatcher.
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[
+            (1, 1),  // prec_ref_baseline = 0
+            (1, 1),  // prec_ref_display_width = 0
+            (0, 1),  // ref_viewing_distance_flag = 0
+            (1, 1),  // num_ref_displays_minus1 = 0
+            (31, 6), // exponent_ref_baseline
+            (31, 6), // exponent_ref_display_width
+            (0, 1),  // additional_shift_present_flag = 0
+            (0, 1),  // extension_flag = 0
+        ]);
+        let got = parse_payload(51, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::ThreeDimensionalReferenceDisplaysInfo(info) => {
+                assert_eq!(info.displays.len(), 1);
+                assert!(!info.extension_flag);
+            }
+            other => panic!("expected ThreeDimensionalReferenceDisplaysInfo, got {other:?}"),
         }
     }
 
