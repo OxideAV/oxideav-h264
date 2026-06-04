@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 231 — second Annex H (3D-AVC) SEI payload implemented in
+  `sei.rs`: payload type 50 `depth_representation_info`
+  (§H.13.1.3 / §H.13.2.3). Per-CVS depth / disparity range parameters
+  per target view used by a renderer prior to display (e.g. for view
+  synthesis on a 3D display). Surfaces `all_views_equal_flag` (u(1)),
+  which gates whether `num_views_minus1` is signalled (when 1, the
+  message describes one shared view; when 0, `num_views_minus1 + 1`
+  per-view entries follow); `z_near_flag` / `z_far_flag` /
+  `d_min_flag` / `d_max_flag` (each u(1)) gating the four
+  §H.13.1.3.1 floating-point quadruples; the optional
+  `z_axis_equal_flag` + `common_z_axis_reference_view` pair gated by
+  `z_near_flag || z_far_flag`; `depth_representation_type` (ue(v)) —
+  Table H-1 interpretation: 0 = inverse-Z, 1 = disparity, 2 = Z,
+  3 = nonlinear-disparity, 4..=15 reserved (and the §H.13.2.3
+  ignore-trailing-data rule is honoured by skipping the nonlinear
+  tail when the value is not exactly 3); per-view
+  `depth_info_view_id` / optional `z_axis_reference_view` (gated by
+  `(z_near || z_far) && !z_axis_equal`) / optional
+  `disparity_reference_view` (gated by `d_min || d_max`) (each ue(v)
+  in 0..=1023); and, when `depth_representation_type == 3`, the
+  §H.13.2.3 piecewise-linear `depth_nonlinear_representation_model[]`
+  (count `num_minus1 + 1`, each entry ue(v) in 0..=65535, with the
+  §H.13.2.3 DepthLUT construction's `i = 0` / `i = num_minus1 + 2`
+  sentinels left implicit per the spec). New `DepthFloatComponent`
+  carries the §H.13.1.3.1 element bitstream value verbatim
+  (1-bit sign, 7-bit exponent, 5-bit mantissa_len_minus1, variable
+  mantissa width = `da_mantissa_len_minus1 + 1` in 1..=32);
+  `DepthFloatComponent::to_f64` reconstructs the Table H-2 scalar:
+  denormal `(-1)^s * 2^(-(30 + v)) * n` for `e == 0`, normal
+  `(-1)^s * 2^(e - 31) * (1 + n / 2^v)` for `0 < e < 127`, and
+  `f64::NAN` for the reserved `e == 127` value. New `SeiError`
+  variants `DepthRepresentationInfoNumViewsOutOfRange` (anti-OOM
+  cap on the per-view loop allocation),
+  `DepthRepresentationInfoViewIdOutOfRange { field }` (catch-all for
+  the four 0..=1023 view-id range checks),
+  `DepthRepresentationInfoNonlinearNumOutOfRange` (per §H.13.2.3 the
+  spec range is 0..=62; pre-allocation cap on the nonlinear-model
+  loop), and `DepthRepresentationInfoNonlinearModelOutOfRange { i }`
+  (per §H.13.2.3 each model entry is 0..=65535). Wired into
+  `parse_payload` dispatch; the payload-type table at the top of
+  `sei.rs` grows one row (§H.13.1.3). The
+  `tests/integration_sei_malformed.rs` `KNOWN_PAYLOAD_TYPES` table
+  lifts type 50 out of the `FALLBACK_PAYLOAD_TYPES` set into the
+  implemented group (46 → 47 entries; the per-type total is
+  unchanged at 68, so the sweep cardinality stays at 2992 panic-free
+  invocations). 8 new lib unit tests cover the minimum-syntax
+  single-view path with all flags off, the two-view path with
+  per-view `z_axis_reference_view` + per-view `ZNear` / `DMin` float
+  quadruples, the type-3 nonlinear-tail path with one model entry,
+  the reserved-type 4 ignore-trailing path, rejection of
+  `num_views_minus1 > 1023`, rejection of
+  `common_z_axis_reference_view > 1023`, rejection of
+  `depth_nonlinear_representation_num_minus1 > 62`,
+  `DepthFloatComponent::to_f64` branches (normal / negative-sign /
+  denormal / reserved), and `parse_payload` dispatch round-trip.
+  Harmless on non-Annex-H streams (Phase 4 on the profiles table).
 - round 226 — first Annex H (3D-AVC) SEI payload implemented in
   `sei.rs`: payload type 51 `three_dimensional_reference_displays_info`
   (§H.13.1.4 / §H.13.2.4). Per-CVS reference-display list with

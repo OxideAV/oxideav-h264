@@ -38,6 +38,7 @@
 //! | 45           | §D.1.26     | §D.2.26     | frame_packing_arrangement          |
 //! | 46           | §G.13.1.10  | §G.13.2.10  | multiview_view_position (Annex G)  |
 //! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
+//! | 50           | §H.13.1.3   | §H.13.2.3   | depth_representation_info (Annex H) |
 //! | 51           | §H.13.1.4   | §H.13.2.4   | three_dimensional_reference_displays_info (Annex H) |
 //! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume    |
 //! | 142          | §D.1.30     | §D.2.30     | colour_remapping_info              |
@@ -329,6 +330,22 @@ pub enum SeiError {
         "three_dimensional_reference_displays_info num_ref_displays_minus1 shall be in 0..=31 per Annex H §H.13.2.4 (got {0})"
     )]
     ThreeDimensionalReferenceDisplaysInfoNumRefDisplaysOutOfRange(u32),
+    #[error(
+        "depth_representation_info num_views_minus1 shall be in 0..=1023 per Annex H §H.13.2.3 (got {0})"
+    )]
+    DepthRepresentationInfoNumViewsOutOfRange(u32),
+    #[error(
+        "depth_representation_info {field} shall be in 0..=1023 per Annex H §H.13.2.3 (got {got})"
+    )]
+    DepthRepresentationInfoViewIdOutOfRange { field: &'static str, got: u32 },
+    #[error(
+        "depth_representation_info depth_nonlinear_representation_num_minus1 shall be in 0..=62 per Annex H §H.13.2.3 (got {0})"
+    )]
+    DepthRepresentationInfoNonlinearNumOutOfRange(u32),
+    #[error(
+        "depth_representation_info depth_nonlinear_representation_model[{i}] shall be in 0..=65535 per Annex H §H.13.2.3 (got {got})"
+    )]
+    DepthRepresentationInfoNonlinearModelOutOfRange { i: usize, got: u32 },
 }
 
 /// §D.2.2 — buffering_period.
@@ -5284,6 +5301,379 @@ pub fn parse_three_dimensional_reference_displays_info(
     })
 }
 
+/// §H.13.2.3.1 — depth representation SEI element.
+///
+/// Carries the raw `(s, e, n, v)` quadruple for one floating-point
+/// scalar in the depth representation information message. The
+/// scalar uses a different syntax shape than the
+/// §G.13.2.5 / §H.13.2.4 floats handled by [`FloatComponent`] /
+/// [`UnsignedFloatComponent`]:
+///
+/// * sign — `u(1)` (`da_sign_flag`)
+/// * exponent — `u(7)` (`da_exponent`, 0..=126; 127 is reserved for
+///   future use and shall be treated as unspecified)
+/// * mantissa width — `u(5) + 1` (`da_mantissa_len_minus1 + 1`,
+///   1..=32)
+/// * mantissa — `u(v)` (`da_mantissa`)
+///
+/// The §H.13.2.3 reconstruction formula in Table H-2 is:
+///
+/// * `0 < e < 127` → `x = (−1)^s * 2^(e − 31) * (1 + n / 2^v)`
+/// * `e == 0`      → `x = (−1)^s * 2^(−(30 + v)) * n`
+///
+/// The stored value is the raw bitstream value; [`DepthFloatComponent::to_f64`]
+/// reconstructs the scalar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthFloatComponent {
+    /// `da_sign_flag` — `false` for positive (`u(1) == 0`), `true` for
+    /// negative (`u(1) == 1`).
+    pub sign: bool,
+    /// `da_exponent` — `u(7)`, raw range `0..=127`. Value 127 is
+    /// reserved (decoders shall treat as "unspecified" per
+    /// §H.13.2.3.1).
+    pub exponent: u8,
+    /// `da_mantissa` — variable-width `u(v)` raw bits.
+    /// `da_mantissa_len_minus1` is `u(5)` so the width is in
+    /// `1..=32`; the mantissa fits in `u32`, stored here as `u64` for
+    /// uniformity with the other float components.
+    pub mantissa: u64,
+    /// `da_mantissa_len_minus1 + 1` — bit-width of `mantissa`,
+    /// in `1..=32`.
+    pub mantissa_width: u8,
+}
+
+impl DepthFloatComponent {
+    /// Reconstruct the §H.13.2.3 floating-point scalar value per the
+    /// Table H-2 formula.
+    ///
+    /// * `e == 0`      → `(-1)^s * 2^(-(30 + v)) * n`        (denormal)
+    /// * `0 < e < 127` → `(-1)^s * 2^(e - 31) * (1 + n / 2^v)` (normal)
+    /// * `e == 127`    → `f64::NAN` ("unspecified" per the spec).
+    #[must_use]
+    pub fn to_f64(&self) -> f64 {
+        if self.exponent == 127 {
+            return f64::NAN;
+        }
+        let sign: f64 = if self.sign { -1.0 } else { 1.0 };
+        let v = self.mantissa_width as i32;
+        let n_over_2v = if v == 0 {
+            0.0
+        } else {
+            (self.mantissa as f64) / (2f64.powi(v))
+        };
+        if self.exponent == 0 {
+            // 2^(-(30 + v)) * n  =  2^(-30) * (n / 2^v).
+            sign * 2f64.powi(-30) * n_over_2v
+        } else {
+            sign * 2f64.powi((self.exponent as i32) - 31) * (1.0 + n_over_2v)
+        }
+    }
+}
+
+/// Read a §H.13.1.3.1 `depth_representation_sei_element` from `r`.
+fn read_depth_float_component(r: &mut BitReader<'_>) -> Result<DepthFloatComponent, SeiError> {
+    // da_sign_flag u(1).
+    let sign = r.u(1)? == 1;
+    // da_exponent u(7).
+    let exponent = r.u(7)? as u8;
+    // da_mantissa_len_minus1 u(5). Width is 1..=32.
+    let mantissa_len_minus1 = r.u(5)? as u8;
+    let mantissa_width = mantissa_len_minus1 + 1;
+    // da_mantissa u(v). v is in 1..=32 so a single u(<=32) read
+    // satisfies the BitReader primitive contract.
+    let mantissa = r.u(mantissa_width as u32)? as u64;
+    Ok(DepthFloatComponent {
+        sign,
+        exponent,
+        mantissa,
+        mantissa_width,
+    })
+}
+
+/// §H.13.2.3 — depth representation information SEI message.
+///
+/// Carries depth / disparity range parameters per view used by a
+/// renderer prior to display (e.g. for view synthesis on a 3D
+/// display). When `all_views_equal_flag == 1`, the message describes
+/// one shared view (so `views` has length 1); otherwise it describes
+/// `num_views_minus1 + 1` views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthRepresentationInfo {
+    /// `all_views_equal_flag` (u(1)) — `true` when the parameters
+    /// apply equally to every target view (`views` carries one shared
+    /// entry); `false` otherwise.
+    pub all_views_equal_flag: bool,
+    /// `z_near_flag` (u(1)) — whether `z_near` is signalled in each
+    /// view entry.
+    pub z_near_flag: bool,
+    /// `z_far_flag` (u(1)) — whether `z_far` is signalled in each
+    /// view entry.
+    pub z_far_flag: bool,
+    /// `z_axis_equal_flag` (u(1)) — present iff `z_near_flag ||
+    /// z_far_flag`; `None` otherwise. `true` means all per-view
+    /// `z_near` / `z_far` values share the same Z-axis (signalled
+    /// once in `common_z_axis_reference_view`); `false` means each
+    /// view carries its own `z_axis_reference_view[i]`.
+    pub z_axis_equal_flag: Option<bool>,
+    /// `common_z_axis_reference_view` (ue(v), 0..=1023) — present iff
+    /// `z_axis_equal_flag == 1`.
+    pub common_z_axis_reference_view: Option<u16>,
+    /// `d_min_flag` (u(1)) — whether `d_min` is signalled in each
+    /// view entry.
+    pub d_min_flag: bool,
+    /// `d_max_flag` (u(1)) — whether `d_max` is signalled in each
+    /// view entry.
+    pub d_max_flag: bool,
+    /// `depth_representation_type` (ue(v)) — Table H-1 interpretation
+    /// of the decoded depth-view luma samples. 0..=3 are defined by
+    /// the spec; 4..=15 are reserved (and the spec requires decoders
+    /// to ignore any data that follows a reserved value, so the
+    /// nonlinear-representation tail below is skipped in that case).
+    pub depth_representation_type: u32,
+    /// Per-view entries (length 1 if `all_views_equal_flag`,
+    /// otherwise `num_views_minus1 + 1`).
+    pub views: Vec<DepthRepresentationView>,
+    /// `depth_nonlinear_representation_num_minus1` (ue(v), 0..=62) —
+    /// present iff `depth_representation_type == 3`.
+    pub depth_nonlinear_representation_num_minus1: Option<u8>,
+    /// `depth_nonlinear_representation_model[i]` for `i` in
+    /// `1..=depth_nonlinear_representation_num_minus1 + 1`. Each
+    /// entry is `ue(v)` in `0..=65535`. Present iff
+    /// `depth_representation_type == 3`. The trailing-coverage `i=0`
+    /// / `i = num_minus1 + 2` slots are pre-defined to 0 by the spec
+    /// (§H.13.2.3 DepthLUT construction) and are not signalled.
+    pub depth_nonlinear_representation_model: Vec<u16>,
+}
+
+/// §H.13.2.3 — per-view depth representation parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthRepresentationView {
+    /// `depth_info_view_id[i]` (ue(v), 0..=1023) — the `view_id` to
+    /// which the rest of the entry applies. When the outer struct's
+    /// `all_views_equal_flag` is 1, this carries the spec's view_id
+    /// for the single shared entry.
+    pub depth_info_view_id: u16,
+    /// `z_axis_reference_view[i]` (ue(v), 0..=1023) — present iff
+    /// `(z_near_flag || z_far_flag) && !z_axis_equal_flag`.
+    pub z_axis_reference_view: Option<u16>,
+    /// `disparity_reference_view[i]` (ue(v), 0..=1023) — present iff
+    /// `d_min_flag || d_max_flag`.
+    pub disparity_reference_view: Option<u16>,
+    /// `ZNear[i]` quadruple — present iff `z_near_flag`.
+    pub z_near: Option<DepthFloatComponent>,
+    /// `ZFar[i]` quadruple — present iff `z_far_flag`.
+    pub z_far: Option<DepthFloatComponent>,
+    /// `DMin[i]` quadruple — present iff `d_min_flag`.
+    pub d_min: Option<DepthFloatComponent>,
+    /// `DMax[i]` quadruple — present iff `d_max_flag`.
+    pub d_max: Option<DepthFloatComponent>,
+}
+
+/// Parse a §H.13.1.3 `depth_representation_info()` payload.
+///
+/// Enforces the §H.13.2.3 range bounds before allocation:
+///
+/// * `num_views_minus1 ≤ 1023` (pre-allocation cap on the per-view
+///   loop).
+/// * `common_z_axis_reference_view` ∈ `0..=1023`.
+/// * `depth_info_view_id[i]`, `z_axis_reference_view[i]`,
+///   `disparity_reference_view[i]` ∈ `0..=1023`.
+/// * `depth_nonlinear_representation_num_minus1 ≤ 62`
+///   (pre-allocation cap on the model loop; spec range
+///   `0..=62`).
+/// * `depth_nonlinear_representation_model[i]` ∈ `0..=65535`.
+///
+/// `depth_representation_type` in the reserved range `4..=15` is
+/// accepted (per §H.13.2.3 the decoder shall ignore trailing data);
+/// the nonlinear-model tail is parsed only when the value is exactly
+/// 3.
+pub fn parse_depth_representation_info(
+    payload: &[u8],
+) -> Result<DepthRepresentationInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+
+    // all_views_equal_flag u(1).
+    let all_views_equal_flag = r.u(1)? == 1;
+
+    // num_views_minus1 ue(v), 0..=1023 (anti-OOM cap before the
+    // per-view loop allocation). Present iff all_views_equal_flag
+    // == 0; when 1 the loop runs once over a shared entry.
+    let num_views = if all_views_equal_flag {
+        1usize
+    } else {
+        let v = r.ue()?;
+        if v > 1023 {
+            return Err(SeiError::DepthRepresentationInfoNumViewsOutOfRange(v));
+        }
+        (v as usize) + 1
+    };
+
+    // z_near_flag u(1), z_far_flag u(1).
+    let z_near_flag = r.u(1)? == 1;
+    let z_far_flag = r.u(1)? == 1;
+
+    // z_axis_equal_flag u(1) + common_z_axis_reference_view ue(v)
+    // gated by (z_near_flag || z_far_flag).
+    let (z_axis_equal_flag, common_z_axis_reference_view) = if z_near_flag || z_far_flag {
+        let z_axis_equal_flag = r.u(1)? == 1;
+        let common = if z_axis_equal_flag {
+            let v = r.ue()?;
+            if v > 1023 {
+                return Err(SeiError::DepthRepresentationInfoViewIdOutOfRange {
+                    field: "common_z_axis_reference_view",
+                    got: v,
+                });
+            }
+            Some(v as u16)
+        } else {
+            None
+        };
+        (Some(z_axis_equal_flag), common)
+    } else {
+        (None, None)
+    };
+
+    // d_min_flag u(1), d_max_flag u(1).
+    let d_min_flag = r.u(1)? == 1;
+    let d_max_flag = r.u(1)? == 1;
+
+    // depth_representation_type ue(v). 0..=3 defined, 4..=15
+    // reserved (per §H.13.2.3 the decoder shall ignore the tail when
+    // the value is reserved). Values outside 0..=15 are not
+    // explicitly bounded by §H.13.2.3 (the prose says "0 to 3,
+    // inclusive, in bitstreams conforming to this version" + "4 to
+    // 15, inclusive" reserved), so we store the raw ue(v) value
+    // without an upper bound: §H.13.2.3 instructs the decoder to
+    // ignore the tail for any non-{0..=3} value, which we honour by
+    // only parsing the §H.13.2.3 nonlinear tail when the value is
+    // exactly 3.
+    let depth_representation_type = r.ue()?;
+
+    let mut views = Vec::with_capacity(num_views);
+    for _ in 0..num_views {
+        // depth_info_view_id[i] ue(v), 0..=1023.
+        let depth_info_view_id = {
+            let v = r.ue()?;
+            if v > 1023 {
+                return Err(SeiError::DepthRepresentationInfoViewIdOutOfRange {
+                    field: "depth_info_view_id",
+                    got: v,
+                });
+            }
+            v as u16
+        };
+        // z_axis_reference_view[i] ue(v), 0..=1023, iff
+        // (z_near_flag || z_far_flag) && !z_axis_equal_flag.
+        let z_axis_reference_view =
+            if (z_near_flag || z_far_flag) && z_axis_equal_flag == Some(false) {
+                let v = r.ue()?;
+                if v > 1023 {
+                    return Err(SeiError::DepthRepresentationInfoViewIdOutOfRange {
+                        field: "z_axis_reference_view",
+                        got: v,
+                    });
+                }
+                Some(v as u16)
+            } else {
+                None
+            };
+        // disparity_reference_view[i] ue(v), 0..=1023, iff
+        // d_min_flag || d_max_flag.
+        let disparity_reference_view = if d_min_flag || d_max_flag {
+            let v = r.ue()?;
+            if v > 1023 {
+                return Err(SeiError::DepthRepresentationInfoViewIdOutOfRange {
+                    field: "disparity_reference_view",
+                    got: v,
+                });
+            }
+            Some(v as u16)
+        } else {
+            None
+        };
+        // Optional ZNear[i] depth_representation_sei_element.
+        let z_near = if z_near_flag {
+            Some(read_depth_float_component(&mut r)?)
+        } else {
+            None
+        };
+        // Optional ZFar[i].
+        let z_far = if z_far_flag {
+            Some(read_depth_float_component(&mut r)?)
+        } else {
+            None
+        };
+        // Optional DMin[i].
+        let d_min = if d_min_flag {
+            Some(read_depth_float_component(&mut r)?)
+        } else {
+            None
+        };
+        // Optional DMax[i].
+        let d_max = if d_max_flag {
+            Some(read_depth_float_component(&mut r)?)
+        } else {
+            None
+        };
+
+        views.push(DepthRepresentationView {
+            depth_info_view_id,
+            z_axis_reference_view,
+            disparity_reference_view,
+            z_near,
+            z_far,
+            d_min,
+            d_max,
+        });
+    }
+
+    // depth_nonlinear_representation_num_minus1 + per-segment
+    // depth_nonlinear_representation_model[i], iff
+    // depth_representation_type == 3.
+    let (depth_nonlinear_representation_num_minus1, depth_nonlinear_representation_model) =
+        if depth_representation_type == 3 {
+            let num_minus1 = r.ue()?;
+            if num_minus1 > 62 {
+                return Err(SeiError::DepthRepresentationInfoNonlinearNumOutOfRange(
+                    num_minus1,
+                ));
+            }
+            // The spec loop runs i = 1..=depth_nonlinear_representation_num_minus1 + 1,
+            // so the signalled count is num_minus1 + 1 (the i=0 and
+            // i=num_minus1+2 sentinels are pre-defined to 0 by the
+            // spec — they're not in the bitstream).
+            let count = (num_minus1 as usize) + 1;
+            let mut model = Vec::with_capacity(count);
+            for i in 0..count {
+                let v = r.ue()?;
+                if v > 65535 {
+                    return Err(SeiError::DepthRepresentationInfoNonlinearModelOutOfRange {
+                        i,
+                        got: v,
+                    });
+                }
+                model.push(v as u16);
+            }
+            (Some(num_minus1 as u8), model)
+        } else {
+            (None, Vec::new())
+        };
+
+    Ok(DepthRepresentationInfo {
+        all_views_equal_flag,
+        z_near_flag,
+        z_far_flag,
+        z_axis_equal_flag,
+        common_z_axis_reference_view,
+        d_min_flag,
+        d_max_flag,
+        depth_representation_type,
+        views,
+        depth_nonlinear_representation_num_minus1,
+        depth_nonlinear_representation_model,
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5357,6 +5747,9 @@ pub enum SeiPayload {
     OperationPointNotPresent(OperationPointNotPresent),
     /// §G.13.2.10 — multiview_view_position (payload type 46). Round 183.
     MultiviewViewPosition(MultiviewViewPosition),
+    /// §H.13.2.3 — depth_representation_info (payload type 50,
+    /// Annex H). Round 231.
+    DepthRepresentationInfo(DepthRepresentationInfo),
     /// §H.13.2.4 — three_dimensional_reference_displays_info
     /// (payload type 51, Annex H). Round 226.
     ThreeDimensionalReferenceDisplaysInfo(ThreeDimensionalReferenceDisplaysInfo),
@@ -5458,6 +5851,9 @@ pub fn parse_payload(
         47 => Ok(SeiPayload::DisplayOrientation(parse_display_orientation(
             payload,
         )?)),
+        50 => Ok(SeiPayload::DepthRepresentationInfo(
+            parse_depth_representation_info(payload)?,
+        )),
         51 => Ok(SeiPayload::ThreeDimensionalReferenceDisplaysInfo(
             parse_three_dimensional_reference_displays_info(payload)?,
         )),
@@ -7297,6 +7693,313 @@ mod tests {
                 assert!(!info.extension_flag);
             }
             other => panic!("expected ThreeDimensionalReferenceDisplaysInfo, got {other:?}"),
+        }
+    }
+
+    // §H.13.2.3 — depth_representation_info, minimum-syntax
+    // single-view path with all flags off.
+    //
+    // all_views_equal_flag = 1  →  numViews = 1, num_views_minus1
+    //                              absent.
+    // z_near_flag = z_far_flag = 0  →  no z_axis_equal_flag.
+    // d_min_flag = d_max_flag = 0   →  no disparity_reference_view.
+    // depth_representation_type = 0 →  no nonlinear tail.
+    // depth_info_view_id[0] = 0     →  ue codeword "1".
+    #[test]
+    fn depth_representation_info_minimum_syntax_all_views_equal() {
+        let payload = pack_bits(&[
+            (1, 1), // all_views_equal_flag = 1
+            (0, 1), // z_near_flag = 0
+            (0, 1), // z_far_flag = 0
+            (0, 1), // d_min_flag = 0
+            (0, 1), // d_max_flag = 0
+            (1, 1), // depth_representation_type ue(0) = "1"
+            (1, 1), // depth_info_view_id[0] ue(0) = "1"
+        ]);
+        let info = parse_depth_representation_info(&payload).unwrap();
+        assert!(info.all_views_equal_flag);
+        assert!(!info.z_near_flag);
+        assert!(!info.z_far_flag);
+        assert!(!info.d_min_flag);
+        assert!(!info.d_max_flag);
+        assert_eq!(info.z_axis_equal_flag, None);
+        assert_eq!(info.common_z_axis_reference_view, None);
+        assert_eq!(info.depth_representation_type, 0);
+        assert_eq!(info.views.len(), 1);
+        let v0 = info.views[0];
+        assert_eq!(v0.depth_info_view_id, 0);
+        assert!(v0.z_near.is_none());
+        assert!(v0.z_far.is_none());
+        assert!(v0.d_min.is_none());
+        assert!(v0.d_max.is_none());
+        assert!(v0.z_axis_reference_view.is_none());
+        assert!(v0.disparity_reference_view.is_none());
+        assert!(info.depth_nonlinear_representation_num_minus1.is_none());
+        assert!(info.depth_nonlinear_representation_model.is_empty());
+    }
+
+    // §H.13.2.3 — two views with z_axis_equal_flag = 0 (so
+    // z_axis_reference_view[i] is signalled per view), z_near + d_min
+    // both signalled. Verifies the float-element wiring and the
+    // per-view branch selectors.
+    #[test]
+    fn depth_representation_info_two_views_per_view_z_axis() {
+        // num_views_minus1 = 1 → ue codeword "010" (3 bits).
+        // depth_representation_type = 2 → ue codeword "011" (3 bits).
+        // Each view: depth_info_view_id = 0 → "1";
+        //            z_axis_reference_view = 0 → "1";
+        //            disparity_reference_view = 0 → "1";
+        //            ZNear float: sign=0, exp=63, mlen_minus1=0, mantissa=0
+        //              (1 + 7 + 5 + 1 = 14 bits)
+        //            DMin float : sign=1, exp=31, mlen_minus1=0, mantissa=1
+        //              (1 + 7 + 5 + 1 = 14 bits)
+        let view = [
+            (1, 1),  // depth_info_view_id[i] = 0
+            (1, 1),  // z_axis_reference_view[i] = 0
+            (1, 1),  // disparity_reference_view[i] = 0
+            (0, 1),  // ZNear sign
+            (63, 7), // ZNear exponent
+            (0, 5),  // ZNear mantissa_len_minus1 → width 1
+            (0, 1),  // ZNear mantissa
+            (1, 1),  // DMin sign (negative)
+            (31, 7), // DMin exponent
+            (0, 5),  // DMin mantissa_len_minus1 → width 1
+            (1, 1),  // DMin mantissa
+        ];
+        let mut fields: Vec<(u64, u32)> = vec![
+            (0, 1),     // all_views_equal_flag = 0
+            (0b010, 3), // num_views_minus1 = 1
+            (1, 1),     // z_near_flag = 1
+            (0, 1),     // z_far_flag = 0
+            (0, 1),     // z_axis_equal_flag = 0
+            (1, 1),     // d_min_flag = 1
+            (0, 1),     // d_max_flag = 0
+            (0b011, 3), // depth_representation_type = 2
+        ];
+        for _ in 0..2 {
+            fields.extend_from_slice(&view);
+        }
+        let payload = pack_bits(&fields);
+        let info = parse_depth_representation_info(&payload).unwrap();
+        assert!(!info.all_views_equal_flag);
+        assert_eq!(info.views.len(), 2);
+        assert_eq!(info.z_axis_equal_flag, Some(false));
+        assert!(info.common_z_axis_reference_view.is_none());
+        assert_eq!(info.depth_representation_type, 2);
+        for v in &info.views {
+            assert_eq!(v.depth_info_view_id, 0);
+            assert_eq!(v.z_axis_reference_view, Some(0));
+            assert_eq!(v.disparity_reference_view, Some(0));
+            let zn = v.z_near.expect("ZNear present when z_near_flag = 1");
+            assert!(!zn.sign);
+            assert_eq!(zn.exponent, 63);
+            assert_eq!(zn.mantissa_width, 1);
+            assert!(v.z_far.is_none());
+            let dn = v.d_min.expect("DMin present when d_min_flag = 1");
+            assert!(dn.sign);
+            assert_eq!(dn.exponent, 31);
+            assert_eq!(dn.mantissa_width, 1);
+            assert_eq!(dn.mantissa, 1);
+            assert!(v.d_max.is_none());
+        }
+        // Type 2 ≠ 3 — no nonlinear tail.
+        assert!(info.depth_nonlinear_representation_num_minus1.is_none());
+    }
+
+    // §H.13.2.3 — depth_representation_type == 3 triggers the
+    // nonlinear-model tail. num_minus1 = 0 ⇒ one entry signalled.
+    #[test]
+    fn depth_representation_info_nonlinear_type_3_tail() {
+        let payload = pack_bits(&[
+            (1, 1),       // all_views_equal_flag = 1
+            (1, 1),       // z_near_flag = 1
+            (1, 1),       // z_far_flag = 1
+            (1, 1),       // z_axis_equal_flag = 1
+            (1, 1),       // common_z_axis_reference_view = 0 → "1"
+            (0, 1),       // d_min_flag = 0
+            (0, 1),       // d_max_flag = 0
+            (0b00100, 5), // depth_representation_type = 3
+            (1, 1),       // depth_info_view_id[0] = 0
+            // ZNear float: sign=0, exp=1, mlen_minus1=0, mantissa=0
+            (0, 1),
+            (1, 7),
+            (0, 5),
+            (0, 1),
+            // ZFar float: sign=0, exp=2, mlen_minus1=0, mantissa=0
+            (0, 1),
+            (2, 7),
+            (0, 5),
+            (0, 1),
+            // depth_nonlinear_representation_num_minus1 = 0 → "1"
+            (1, 1),
+            // depth_nonlinear_representation_model[0] = 4 → "00101"
+            (0b00101, 5),
+        ]);
+        let info = parse_depth_representation_info(&payload).unwrap();
+        assert!(info.all_views_equal_flag);
+        assert_eq!(info.depth_representation_type, 3);
+        assert_eq!(info.z_axis_equal_flag, Some(true));
+        assert_eq!(info.common_z_axis_reference_view, Some(0));
+        assert_eq!(info.views.len(), 1);
+        assert_eq!(info.depth_nonlinear_representation_num_minus1, Some(0));
+        assert_eq!(info.depth_nonlinear_representation_model, vec![4]);
+    }
+
+    // §H.13.2.3 — values 4..=15 of depth_representation_type are
+    // reserved; the parser shall accept them and emit no nonlinear
+    // tail.
+    #[test]
+    fn depth_representation_info_reserved_type_skips_nonlinear_tail() {
+        let payload = pack_bits(&[
+            (1, 1),       // all_views_equal_flag = 1
+            (0, 1),       // z_near_flag = 0
+            (0, 1),       // z_far_flag = 0
+            (0, 1),       // d_min_flag = 0
+            (0, 1),       // d_max_flag = 0
+            (0b00101, 5), // depth_representation_type = 4 (reserved)
+            (1, 1),       // depth_info_view_id[0] = 0
+        ]);
+        let info = parse_depth_representation_info(&payload).unwrap();
+        assert_eq!(info.depth_representation_type, 4);
+        assert!(info.depth_nonlinear_representation_num_minus1.is_none());
+    }
+
+    // §H.13.2.3 — num_views_minus1 > 1023 must be rejected before
+    // allocation.
+    #[test]
+    fn depth_representation_info_rejects_num_views_above_1023() {
+        // ue codeword for 1024 = "00000000001 0000000001" =
+        // 10 zero prefix + 11-bit binary 0b10000000001 = 21 bits.
+        // all_views_equal_flag = 0 + that ue codeword.
+        // codeNum 1024 = ue codeword: 10 leading zeros + binary
+        // representation of (1024 + 1) = 0b10000000001 (11 bits).
+        let payload = pack_bits(&[
+            (0, 1), // all_views_equal_flag = 0
+            (0, 10),
+            (0b10000000001, 11),
+        ]);
+        let err = parse_depth_representation_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::DepthRepresentationInfoNumViewsOutOfRange(1024)
+        ));
+    }
+
+    // §H.13.2.3 — common_z_axis_reference_view > 1023 rejected.
+    #[test]
+    fn depth_representation_info_rejects_common_z_axis_above_1023() {
+        let payload = pack_bits(&[
+            (1, 1), // all_views_equal_flag = 1
+            (1, 1), // z_near_flag = 1
+            (0, 1), // z_far_flag = 0
+            (1, 1), // z_axis_equal_flag = 1
+            // common_z_axis_reference_view = 1024 → ue codeword as above.
+            (0, 10),
+            (0b10000000001, 11),
+        ]);
+        let err = parse_depth_representation_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::DepthRepresentationInfoViewIdOutOfRange {
+                field: "common_z_axis_reference_view",
+                got: 1024
+            }
+        ));
+    }
+
+    // §H.13.2.3 — depth_nonlinear_representation_num_minus1 > 62
+    // rejected before allocation.
+    #[test]
+    fn depth_representation_info_rejects_nonlinear_num_above_62() {
+        // Build a minimal type-3 prelude, then a num_minus1 = 63
+        // codeword. ue codeword for 63 = "0000010000000" — 6 zeros +
+        // 7-bit binary 0b1000000 (= codeNum+1 = 64).
+        let payload = pack_bits(&[
+            (1, 1),       // all_views_equal_flag = 1
+            (0, 1),       // z_near_flag = 0
+            (0, 1),       // z_far_flag = 0
+            (0, 1),       // d_min_flag = 0
+            (0, 1),       // d_max_flag = 0
+            (0b00100, 5), // depth_representation_type = 3
+            (1, 1),       // depth_info_view_id[0] = 0
+            (0, 6),
+            (0b1000000, 7),
+        ]);
+        let err = parse_depth_representation_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::DepthRepresentationInfoNonlinearNumOutOfRange(63)
+        ));
+    }
+
+    // §H.13.1.3.1 / Table H-2 — verify the DepthFloatComponent::to_f64
+    // arithmetic.
+    #[test]
+    fn depth_float_component_to_f64_branches() {
+        // Normal with e = 31, v = 1, n = 0 → 2^0 * 1 = 1.0
+        let one = DepthFloatComponent {
+            sign: false,
+            exponent: 31,
+            mantissa: 0,
+            mantissa_width: 1,
+        };
+        assert_eq!(one.to_f64(), 1.0);
+        // Normal with e = 32, v = 1, n = 1 → 2^1 * (1 + 0.5) = 3.0
+        let three = DepthFloatComponent {
+            sign: false,
+            exponent: 32,
+            mantissa: 1,
+            mantissa_width: 1,
+        };
+        assert_eq!(three.to_f64(), 3.0);
+        // Negative-sign sentinel: same magnitude, opposite sign.
+        let minus_three = DepthFloatComponent {
+            sign: true,
+            exponent: 32,
+            mantissa: 1,
+            mantissa_width: 1,
+        };
+        assert_eq!(minus_three.to_f64(), -3.0);
+        // Denormal e = 0, n = 1, v = 1 → 2^-30 * (1/2) = 2^-31
+        let dn = DepthFloatComponent {
+            sign: false,
+            exponent: 0,
+            mantissa: 1,
+            mantissa_width: 1,
+        };
+        assert!((dn.to_f64() - 2f64.powi(-31)).abs() < 1e-300);
+        // Reserved e = 127 → NaN.
+        let res = DepthFloatComponent {
+            sign: false,
+            exponent: 127,
+            mantissa: 0,
+            mantissa_width: 1,
+        };
+        assert!(res.to_f64().is_nan());
+    }
+
+    // §H.13.2.3 — dispatch through the public parse_payload entry
+    // point. Same fixture as the minimum-syntax test above; we just
+    // verify the match arm selects the right variant.
+    #[test]
+    fn parse_payload_dispatches_depth_representation_info() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[
+            (1, 1), // all_views_equal_flag = 1
+            (0, 1), // z_near_flag = 0
+            (0, 1), // z_far_flag = 0
+            (0, 1), // d_min_flag = 0
+            (0, 1), // d_max_flag = 0
+            (1, 1), // depth_representation_type = 0
+            (1, 1), // depth_info_view_id[0] = 0
+        ]);
+        let got = parse_payload(50, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::DepthRepresentationInfo(info) => {
+                assert_eq!(info.views.len(), 1);
+                assert_eq!(info.depth_representation_type, 0);
+            }
+            other => panic!("expected DepthRepresentationInfo, got {other:?}"),
         }
     }
 
