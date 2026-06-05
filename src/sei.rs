@@ -40,6 +40,7 @@
 //! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
 //! | 50           | §H.13.1.3   | §H.13.2.3   | depth_representation_info (Annex H) |
 //! | 51           | §H.13.1.4   | §H.13.2.4   | three_dimensional_reference_displays_info (Annex H) |
+//! | 54           | §I.13.1.1   | §I.13.2.1   | constrained_depth_parameter_set_identifier (Annex I) |
 //! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume    |
 //! | 142          | §D.1.30     | §D.2.30     | colour_remapping_info              |
 //! | 144          | §D.1.31     | §D.2.31     | content_light_level_info           |
@@ -346,6 +347,17 @@ pub enum SeiError {
         "depth_representation_info depth_nonlinear_representation_model[{i}] shall be in 0..=65535 per Annex H §H.13.2.3 (got {got})"
     )]
     DepthRepresentationInfoNonlinearModelOutOfRange { i: usize, got: u32 },
+    #[error(
+        "constrained_depth_parameter_set_identifier max_dps_id shall be in 0..=62 per Annex I §I.13.2.1 (depth_parameter_set_id range 1..=63 caps max_dps_id + 1 ≤ 63) (got {0})"
+    )]
+    ConstrainedDepthParameterSetIdentifierMaxDpsIdOutOfRange(u32),
+    #[error(
+        "constrained_depth_parameter_set_identifier max_dps_id_diff * 2 shall be less than max_dps_id per Annex I §I.13.2.1 (got max_dps_id_diff = {max_dps_id_diff}, max_dps_id = {max_dps_id})"
+    )]
+    ConstrainedDepthParameterSetIdentifierDiffViolatesBound {
+        max_dps_id_diff: u32,
+        max_dps_id: u32,
+    },
 }
 
 /// §D.2.2 — buffering_period.
@@ -5674,6 +5686,93 @@ pub fn parse_depth_representation_info(
     })
 }
 
+/// Annex I §I.13.1.1 / §I.13.2.1 — `constrained_depth_parameter_set_identifier`
+/// (payload type 54, Annex I 3D-AVC depth coding).
+///
+/// When present, this SEI message is associated with an IDR access unit
+/// and indicates that the `depth_parameter_set_id` and `dps_id` values
+/// in the coded video sequence are constrained to the windowed range
+/// described by the (`max_dps_id`, `max_dps_id_diff`) pair. Decoders
+/// use this signal to conclude losses of depth parameter set NAL units
+/// (NOTE 1 in §I.13.2.1) and to maintain the running `MaxUsedDpsId` /
+/// `UsedDpsIdSet` state per slice.
+///
+/// Syntax — §I.13.1.1:
+///
+/// ```text
+/// constrained_depth_parameter_set_identifier( payloadSize ) {
+///     max_dps_id          ue(v)
+///     max_dps_id_diff     ue(v)
+/// }
+/// ```
+///
+/// Constraints — §I.13.2.1:
+///
+/// * `max_dps_id` plus 1 specifies the maximum allowed
+///   `depth_range_parameter_set_id` value. Per §7.4.2.16, the
+///   `depth_parameter_set_id` field itself is in the range
+///   `1..=63` (i.e. 0..=63 storage with 0 reserved for the
+///   active-SPS-bound default), so the maximum meaningful value of
+///   `max_dps_id` is 62 (encoding `max_dps_id + 1 ≤ 63`). Values
+///   greater than 62 are rejected before storage.
+/// * `max_dps_id_diff * 2` shall be less than `max_dps_id`. This is
+///   the normative window-width constraint for the §I.13.2.1 sliding
+///   used-DPS-id range computation; a value that violates it would
+///   make the `prevMinUsedDpsId` / `minUsedDpsId` distance walk
+///   around §I.13.2.1 eq. (I-86) ambiguous (the window would overlap
+///   itself), so the parser rejects it before storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstrainedDepthParameterSetIdentifier {
+    /// `max_dps_id` plus 1 specifies the maximum allowed
+    /// `depth_range_parameter_set_id` value. Raw ue(v) value, bounded
+    /// 0..=62 per the constraint above.
+    pub max_dps_id: u8,
+    /// `max_dps_id_diff` specifies the value range of
+    /// `depth_range_parameter_set_id` values marked as "used". Raw
+    /// ue(v) value, bounded 0..=30 (since `max_dps_id_diff * 2 <
+    /// max_dps_id` and `max_dps_id ≤ 62`).
+    pub max_dps_id_diff: u8,
+}
+
+/// Parse a §I.13.1.1 `constrained_depth_parameter_set_identifier()`
+/// payload.
+///
+/// Enforces both §I.13.2.1 normative constraints before storage:
+/// * `max_dps_id ≤ 62` — derived from the `depth_parameter_set_id`
+///   range `1..=63` (§7.4.2.16).
+/// * `max_dps_id_diff * 2 < max_dps_id` — the §I.13.2.1 sliding-window
+///   integrity constraint for the §I.13.2.1 eq. (I-86) used-DPS-id
+///   computation.
+pub fn parse_constrained_depth_parameter_set_identifier(
+    payload: &[u8],
+) -> Result<ConstrainedDepthParameterSetIdentifier, SeiError> {
+    let mut r = BitReader::new(payload);
+
+    // §I.13.1.1 — max_dps_id ue(v).
+    let max_dps_id = r.ue()?;
+    if max_dps_id > 62 {
+        return Err(SeiError::ConstrainedDepthParameterSetIdentifierMaxDpsIdOutOfRange(max_dps_id));
+    }
+
+    // §I.13.1.1 — max_dps_id_diff ue(v).
+    let max_dps_id_diff = r.ue()?;
+    // §I.13.2.1: `max_dps_id_diff * 2 < max_dps_id`. Use u64 widening
+    // so the multiplication never overflows even at the ue(v) ceiling.
+    if (max_dps_id_diff as u64) * 2 >= max_dps_id as u64 {
+        return Err(
+            SeiError::ConstrainedDepthParameterSetIdentifierDiffViolatesBound {
+                max_dps_id_diff,
+                max_dps_id,
+            },
+        );
+    }
+
+    Ok(ConstrainedDepthParameterSetIdentifier {
+        max_dps_id: max_dps_id as u8,
+        max_dps_id_diff: max_dps_id_diff as u8,
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5753,6 +5852,9 @@ pub enum SeiPayload {
     /// §H.13.2.4 — three_dimensional_reference_displays_info
     /// (payload type 51, Annex H). Round 226.
     ThreeDimensionalReferenceDisplaysInfo(ThreeDimensionalReferenceDisplaysInfo),
+    /// §I.13.2.1 — constrained_depth_parameter_set_identifier (payload
+    /// type 54, Annex I 3D-AVC depth coding). Round 237.
+    ConstrainedDepthParameterSetIdentifier(ConstrainedDepthParameterSetIdentifier),
     /// §D.2.36 — sei_manifest (payload type 200). Round 120.
     SeiManifest(SeiManifest),
     /// §D.2.37 — sei_prefix_indication (payload type 201). Round 120.
@@ -5856,6 +5958,9 @@ pub fn parse_payload(
         )),
         51 => Ok(SeiPayload::ThreeDimensionalReferenceDisplaysInfo(
             parse_three_dimensional_reference_displays_info(payload)?,
+        )),
+        54 => Ok(SeiPayload::ConstrainedDepthParameterSetIdentifier(
+            parse_constrained_depth_parameter_set_identifier(payload)?,
         )),
         137 => Ok(SeiPayload::MasteringDisplay(parse_mastering_display(
             payload,
@@ -8000,6 +8105,125 @@ mod tests {
                 assert_eq!(info.depth_representation_type, 0);
             }
             other => panic!("expected DepthRepresentationInfo, got {other:?}"),
+        }
+    }
+
+    // ==============================================================
+    // §I.13.2.1 — constrained_depth_parameter_set_identifier (payload
+    // type 54, Annex I 3D-AVC depth coding). Round 237.
+    // ==============================================================
+
+    // Smallest legal fixture: max_dps_id = 1 (ue codeword "010"),
+    // max_dps_id_diff = 0 (ue codeword "1"). 0 * 2 < 1 holds.
+    #[test]
+    fn constrained_depth_parameter_set_identifier_min_legal() {
+        let payload = pack_bits(&[
+            (0b010, 3), // ue(1) = 1 → max_dps_id
+            (1, 1),     // ue(0) = 0 → max_dps_id_diff
+        ]);
+        let got = parse_constrained_depth_parameter_set_identifier(&payload).unwrap();
+        assert_eq!(got.max_dps_id, 1);
+        assert_eq!(got.max_dps_id_diff, 0);
+    }
+
+    // Mid-range fixture: max_dps_id = 7 (ue codeword "0001000"),
+    // max_dps_id_diff = 3 (ue codeword "00100"). 3 * 2 = 6 < 7 holds.
+    #[test]
+    fn constrained_depth_parameter_set_identifier_mid_range() {
+        let payload = pack_bits(&[
+            (0b0001000, 7), // ue(7) = 7 → max_dps_id
+            (0b00100, 5),   // ue(3) = 3 → max_dps_id_diff
+        ]);
+        let got = parse_constrained_depth_parameter_set_identifier(&payload).unwrap();
+        assert_eq!(got.max_dps_id, 7);
+        assert_eq!(got.max_dps_id_diff, 3);
+    }
+
+    // Maximum legal fixture: max_dps_id = 62, max_dps_id_diff = 30.
+    // 30 * 2 = 60 < 62 holds. ue(62) = leadingZeros 5, suffix = 62 -
+    // (2^5 - 1) = 31 in 5 bits → "000001" + "11111" = "00000111111"
+    // (11 bits). ue(30) = leadingZeros 4, suffix = 30 - (2^4 - 1) =
+    // 15 in 4 bits → "00001" + "1111" = "000011111" (9 bits).
+    #[test]
+    fn constrained_depth_parameter_set_identifier_max_legal() {
+        let payload = pack_bits(&[
+            (0b00000111111, 11), // ue(62)
+            (0b000011111, 9),    // ue(30)
+        ]);
+        let got = parse_constrained_depth_parameter_set_identifier(&payload).unwrap();
+        assert_eq!(got.max_dps_id, 62);
+        assert_eq!(got.max_dps_id_diff, 30);
+    }
+
+    // max_dps_id = 63 (ue codeword "0000001000000") is out of range:
+    // the §I.13.2.1 derivation `max_dps_id + 1 ≤ 63` requires
+    // max_dps_id ≤ 62 (depth_parameter_set_id range 1..=63 per
+    // §7.4.2.16). ue(63): leadingZeros 6, suffix = 63 - (2^6 - 1) = 0
+    // in 6 bits → "0000001" + "000000" = "0000001000000" (13 bits).
+    #[test]
+    fn constrained_depth_parameter_set_identifier_rejects_max_dps_id_above_62() {
+        let payload = pack_bits(&[(0b0000001000000, 13)]);
+        let err = parse_constrained_depth_parameter_set_identifier(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::ConstrainedDepthParameterSetIdentifierMaxDpsIdOutOfRange(63)
+        );
+    }
+
+    // max_dps_id = 4, max_dps_id_diff = 2 → 2 * 2 = 4 NOT < 4.
+    // Violates the §I.13.2.1 sliding-window-integrity constraint.
+    #[test]
+    fn constrained_depth_parameter_set_identifier_rejects_diff_equals_half_max() {
+        let payload = pack_bits(&[
+            (0b00101, 5), // ue(4) = 4 → max_dps_id
+            (0b011, 3),   // ue(2) = 2 → max_dps_id_diff
+        ]);
+        let err = parse_constrained_depth_parameter_set_identifier(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::ConstrainedDepthParameterSetIdentifierDiffViolatesBound {
+                max_dps_id_diff: 2,
+                max_dps_id: 4,
+            }
+        );
+    }
+
+    // max_dps_id = 0, max_dps_id_diff = 0 → 0 * 2 = 0 NOT < 0.
+    // Edge case: the spec's strict-less-than relation rules out
+    // even a "no diff" pair when max_dps_id is also zero.
+    #[test]
+    fn constrained_depth_parameter_set_identifier_rejects_zero_pair() {
+        let payload = pack_bits(&[
+            (1, 1), // ue(0) = 0 → max_dps_id
+            (1, 1), // ue(0) = 0 → max_dps_id_diff
+        ]);
+        let err = parse_constrained_depth_parameter_set_identifier(&payload).unwrap_err();
+        assert_eq!(
+            err,
+            SeiError::ConstrainedDepthParameterSetIdentifierDiffViolatesBound {
+                max_dps_id_diff: 0,
+                max_dps_id: 0,
+            }
+        );
+    }
+
+    // §I.13.2.1 — dispatch through the public parse_payload entry
+    // point. Same fixture as the min-legal test above; the match arm
+    // selects the right variant.
+    #[test]
+    fn parse_payload_dispatches_constrained_depth_parameter_set_identifier() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[
+            (0b010, 3), // ue(1) = 1 → max_dps_id
+            (1, 1),     // ue(0) = 0 → max_dps_id_diff
+        ]);
+        let got = parse_payload(54, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::ConstrainedDepthParameterSetIdentifier(info) => {
+                assert_eq!(info.max_dps_id, 1);
+                assert_eq!(info.max_dps_id_diff, 0);
+            }
+            other => panic!("expected ConstrainedDepthParameterSetIdentifier, got {other:?}"),
         }
     }
 

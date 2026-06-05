@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 237 — first Annex I (3D-AVC depth coding) SEI payload
+  implemented in `sei.rs`: payload type 54
+  `constrained_depth_parameter_set_identifier`
+  (§I.13.1.1 / §I.13.2.1). Per-CVS pair `(max_dps_id, max_dps_id_diff)`
+  constraining the `depth_range_parameter_set_id` window so decoders
+  can conclude losses of depth parameter set NAL units (§I.13.2.1
+  NOTE 1) and maintain the running `MaxUsedDpsId` / `UsedDpsIdSet`
+  state per slice (§I.13.2.1 eq. (I-86) sliding-window walk). Both
+  fields are ue(v); the parser enforces both §I.13.2.1 normative
+  constraints before storage: `max_dps_id ≤ 62` (derived from the
+  `depth_parameter_set_id` range `1..=63` per §7.4.2.16, since
+  `max_dps_id + 1` is the maximum allowed
+  `depth_range_parameter_set_id` value) and
+  `max_dps_id_diff * 2 < max_dps_id` (the §I.13.2.1 sliding-window
+  integrity constraint; a violation would make the prev/min walk
+  around eq. (I-86) ambiguous because the window would overlap
+  itself). New `SeiError` variants
+  `ConstrainedDepthParameterSetIdentifierMaxDpsIdOutOfRange` and
+  `ConstrainedDepthParameterSetIdentifierDiffViolatesBound
+  { max_dps_id_diff, max_dps_id }`. Wired into `parse_payload`
+  dispatch; the payload-type doc-comment table at the top of `sei.rs`
+  grows one row (§I.13.1.1).
+  `tests/integration_sei_malformed.rs` lifts type 54 out of the
+  `Unknown`-fallback set into the implemented group; sweep
+  cardinality is preserved at 2992 panic-free invocations (one type
+  migrated, total per-type count unchanged at 68). 7 new lib unit
+  tests cover the min-legal pair (`max_dps_id = 1`,
+  `max_dps_id_diff = 0`), a mid-range pair (`7`, `3`), the max-legal
+  pair (`62`, `30`), rejection of `max_dps_id = 63`, rejection of
+  `max_dps_id_diff = 2` when `max_dps_id = 4` (boundary `2 * 2 = 4`
+  ⇒ NOT < 4), rejection of the all-zero pair (strict-less-than rules
+  it out even without a diff), and `parse_payload` dispatch
+  round-trip. Harmless on non-Annex-I streams (Phase 4 on the
+  profiles table).
+
 - round 231 — second Annex H (3D-AVC) SEI payload implemented in
   `sei.rs`: payload type 50 `depth_representation_info`
   (§H.13.1.3 / §H.13.2.3). Per-CVS depth / disparity range parameters
