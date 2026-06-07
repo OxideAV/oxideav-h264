@@ -39,10 +39,11 @@
 use oxideav_h264::non_vcl::parse_sei_rbsp;
 use oxideav_h264::sei::{parse_payload, SeiContext};
 
-/// Mirror of `parse_payload`'s dispatch arms — 48 implemented types
-/// (round 237 adds Annex I §I.13.2.1
-/// constrained_depth_parameter_set_identifier type 54 on top of the
-/// round-231 Annex H §H.13.2.3 depth_representation_info type 50 +
+/// Mirror of `parse_payload`'s dispatch arms — 49 implemented types
+/// (round 247 adds Annex H §H.13.2.7 depth_sampling_info type 53 on
+/// top of the round-237 Annex I §I.13.2.1
+/// constrained_depth_parameter_set_identifier type 54, the round-231
+/// Annex H §H.13.2.3 depth_representation_info type 50, the
 /// round-226 Annex H §H.13.2.4
 /// three_dimensional_reference_displays_info type 51, the round-213
 /// Annex G §G.13.2.5 multiview_acquisition_info type 40, the round-207
@@ -53,7 +54,7 @@ use oxideav_h264::sei::{parse_payload, SeiContext};
 /// numbers).
 const KNOWN_PAYLOAD_TYPES: &[u32] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 39, 40,
-    41, 43, 45, 46, 47, 50, 51, 54, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155, 156, 200,
+    41, 43, 45, 46, 47, 50, 51, 53, 54, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155, 156, 200,
     201, 205,
 ];
 
@@ -183,14 +184,14 @@ fn sei_parse_payload_never_panics() {
         }
     }
 
-    // 48 known + 20 fallback = 68 payload types × 11 shapes × 4 ctxs
-    // = 2992 invocations. Lock the count so a future change that
+    // 49 known + 20 fallback = 69 payload types × 11 shapes × 4 ctxs
+    // = 3036 invocations. Lock the count so a future change that
     // accidentally drops a row from one of the tables makes the test
-    // fail loudly instead of silently shrinking coverage. (Round 237
-    // lifts type 54 constrained_depth_parameter_set_identifier out of
-    // the fallback list into the implemented group; the per-type
-    // total is unchanged at 68 because exactly one type migrated.)
-    assert_eq!(total, 2992, "sweep cardinality drifted");
+    // fail loudly instead of silently shrinking coverage. (Round 247
+    // adds the Annex H §H.13.2.7 depth_sampling_info type 53 — not
+    // previously in either list — bumping the per-type total from
+    // 68 to 69.)
+    assert_eq!(total, 3036, "sweep cardinality drifted");
 }
 
 /// Envelope-shape regression — every shape also goes through

@@ -40,6 +40,7 @@
 //! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
 //! | 50           | §H.13.1.3   | §H.13.2.3   | depth_representation_info (Annex H) |
 //! | 51           | §H.13.1.4   | §H.13.2.4   | three_dimensional_reference_displays_info (Annex H) |
+//! | 53           | §H.13.1.7   | §H.13.2.7   | depth_sampling_info (Annex H) |
 //! | 54           | §I.13.1.1   | §I.13.2.1   | constrained_depth_parameter_set_identifier (Annex I) |
 //! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume    |
 //! | 142          | §D.1.30     | §D.2.30     | colour_remapping_info              |
@@ -358,6 +359,16 @@ pub enum SeiError {
         max_dps_id_diff: u32,
         max_dps_id: u32,
     },
+    #[error("depth_sampling_info dttsr_{axis}_mul = 0 is reserved per Annex H §H.13.2.7")]
+    DepthSamplingInfoDttsrMulReserved { axis: &'static str },
+    #[error(
+        "depth_sampling_info num_video_plus_depth_views_minus1 shall be in 0..=1023 per Annex H §H.13.2.7 (num_views_minus1 absolute upper bound from Annex G/H) (got {0})"
+    )]
+    DepthSamplingInfoNumViewsOutOfRange(u32),
+    #[error(
+        "depth_sampling_info depth_grid_view_id[{i}] shall be in 0..=1023 per Annex H §H.13.2.7 (view_id range) (got {got})"
+    )]
+    DepthSamplingInfoViewIdOutOfRange { i: usize, got: u32 },
 }
 
 /// §D.2.2 — buffering_period.
@@ -5773,6 +5784,283 @@ pub fn parse_constrained_depth_parameter_set_identifier(
     })
 }
 
+/// Annex H §H.13.1.7.1 — `depth_grid_position()` sub-structure used by
+/// the §H.13.1.7 `depth_sampling_info` SEI message.
+///
+/// Carries the raw bitstream values for the horizontal + vertical
+/// top-left-sample location of a depth view's sampling grid relative
+/// to the same-`view_id` texture view. The §H.13.2.7.1 reconstruction
+/// formulas are:
+///
+/// * horizontal location = `(1 − 2 * depth_grid_pos_x_sign_flag) *
+///   (depth_grid_pos_x_fp ÷ 2^depth_grid_pos_x_dp)`
+/// * vertical   location = `(1 − 2 * depth_grid_pos_y_sign_flag) *
+///   (depth_grid_pos_y_fp ÷ 2^depth_grid_pos_y_dp)`
+///
+/// All six fields are u(n) reads so their range follows directly from
+/// the bit width:
+///
+/// * `depth_grid_pos_{x,y}_fp` — u(20), 0..=1_048_575
+/// * `depth_grid_pos_{x,y}_dp` — u(4), 0..=15
+/// * `depth_grid_pos_{x,y}_sign_flag` — u(1), 0..=1
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthGridPosition {
+    /// `depth_grid_pos_x_fp` — u(20). Raw fixed-point magnitude of
+    /// the horizontal grid position.
+    pub pos_x_fp: u32,
+    /// `depth_grid_pos_x_dp` — u(4). Number of fractional bits in
+    /// `pos_x_fp` (the divisor is `2^pos_x_dp`).
+    pub pos_x_dp: u8,
+    /// `depth_grid_pos_x_sign_flag` — u(1). `false` for positive,
+    /// `true` for negative.
+    pub pos_x_sign: bool,
+    /// `depth_grid_pos_y_fp` — u(20). Raw fixed-point magnitude of
+    /// the vertical grid position.
+    pub pos_y_fp: u32,
+    /// `depth_grid_pos_y_dp` — u(4). Number of fractional bits in
+    /// `pos_y_fp` (the divisor is `2^pos_y_dp`).
+    pub pos_y_dp: u8,
+    /// `depth_grid_pos_y_sign_flag` — u(1). `false` for positive,
+    /// `true` for negative.
+    pub pos_y_sign: bool,
+}
+
+impl DepthGridPosition {
+    /// Reconstruct the §H.13.2.7.1 horizontal position scalar
+    /// `(1 − 2 * pos_x_sign_flag) * (pos_x_fp ÷ 2^pos_x_dp)`.
+    pub fn x_to_f64(&self) -> f64 {
+        let mag = (self.pos_x_fp as f64) / (1u64 << self.pos_x_dp) as f64;
+        if self.pos_x_sign {
+            -mag
+        } else {
+            mag
+        }
+    }
+    /// Reconstruct the §H.13.2.7.1 vertical position scalar
+    /// `(1 − 2 * pos_y_sign_flag) * (pos_y_fp ÷ 2^pos_y_dp)`.
+    pub fn y_to_f64(&self) -> f64 {
+        let mag = (self.pos_y_fp as f64) / (1u64 << self.pos_y_dp) as f64;
+        if self.pos_y_sign {
+            -mag
+        } else {
+            mag
+        }
+    }
+}
+
+fn read_depth_grid_position(r: &mut BitReader) -> Result<DepthGridPosition, SeiError> {
+    // §H.13.1.7.1 — depth_grid_pos_x_fp u(20); depth_grid_pos_x_dp u(4);
+    // depth_grid_pos_x_sign_flag u(1); same triple repeated for y.
+    let pos_x_fp = r.u(20)?;
+    let pos_x_dp = r.u(4)? as u8;
+    let pos_x_sign = r.u(1)? == 1;
+    let pos_y_fp = r.u(20)?;
+    let pos_y_dp = r.u(4)? as u8;
+    let pos_y_sign = r.u(1)? == 1;
+    Ok(DepthGridPosition {
+        pos_x_fp,
+        pos_x_dp,
+        pos_x_sign,
+        pos_y_fp,
+        pos_y_dp,
+        pos_y_sign,
+    })
+}
+
+/// Per-view depth grid position entry used by §H.13.1.7
+/// `depth_sampling_info` when `per_view_depth_grid_pos_flag == 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthSamplingViewEntry {
+    /// `depth_grid_view_id[i]` — ue(v). The `view_id` value for which
+    /// the following `depth_grid_position()` applies. Bounded 0..=1023
+    /// per the Annex G/H view_id range.
+    pub depth_grid_view_id: u16,
+    /// `depth_grid_position()` for this `view_id`.
+    pub position: DepthGridPosition,
+}
+
+/// Annex H §H.13.1.7 / §H.13.2.7 — `depth_sampling_info` (payload
+/// type 53).
+///
+/// Specifies the depth-sample size relative to the luma-texture-sample
+/// size and the depth-sampling grid position for one or more depth
+/// view components relative to the texture view component with the
+/// same `view_id` value. When present, this SEI message shall be
+/// associated with an IDR access unit; the semantics apply to the
+/// current coded video sequence.
+///
+/// Syntax — §H.13.1.7:
+///
+/// ```text
+/// depth_sampling_info( payloadSize ) {
+///     dttsr_x_mul                                u(16)
+///     dttsr_x_dp                                 u(4)
+///     dttsr_y_mul                                u(16)
+///     dttsr_y_dp                                 u(4)
+///     per_view_depth_grid_pos_flag               u(1)
+///     if( per_view_depth_grid_pos_flag ) {
+///         num_video_plus_depth_views_minus1      ue(v)
+///         for( i = 0; i <= num_video_plus_depth_views_minus1; i++ ) {
+///             depth_grid_view_id[i]              ue(v)
+///             depth_grid_position()
+///         }
+///     } else
+///         depth_grid_position()
+/// }
+/// ```
+///
+/// Sample-size semantics (§H.13.2.7):
+///
+/// * The width of a depth sample relative to the width of a luma
+///   texture sample is approximately
+///   `dttsr_x_mul ÷ 2^dttsr_x_dp`. The value 0 for `dttsr_x_mul` is
+///   reserved (rejected with
+///   [`SeiError::DepthSamplingInfoDttsrMulReserved`]).
+/// * The height of a depth sample relative to the height of a luma
+///   texture sample is approximately
+///   `dttsr_y_mul ÷ 2^dttsr_y_dp`. The value 0 for `dttsr_y_mul` is
+///   reserved (rejected with
+///   [`SeiError::DepthSamplingInfoDttsrMulReserved`]).
+///
+/// Grid-position semantics (§H.13.2.7):
+///
+/// * `per_view_depth_grid_pos_flag == 0` — a single
+///   `depth_grid_position()` describes the same grid for all depth
+///   views in the access unit (stored as a single-entry
+///   `views` vector with a sentinel `depth_grid_view_id = 0`).
+/// * `per_view_depth_grid_pos_flag == 1` — one
+///   `depth_grid_position()` per declared `view_id`. The Annex G/H
+///   absolute upper bound on `num_views_minus1` (1023, derived from
+///   `num_views_minus1 ≤ 1023` in the Annex G/H SPS extensions) is
+///   used as the anti-OOM cap before allocating the per-view vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthSamplingInfo {
+    /// `dttsr_x_mul` — u(16), the horizontal depth/texture sample
+    /// ratio numerator. The value 0 is reserved.
+    pub dttsr_x_mul: u16,
+    /// `dttsr_x_dp` — u(4), the horizontal ratio's fractional bit
+    /// width (divisor is `2^dttsr_x_dp`).
+    pub dttsr_x_dp: u8,
+    /// `dttsr_y_mul` — u(16), the vertical depth/texture sample ratio
+    /// numerator. The value 0 is reserved.
+    pub dttsr_y_mul: u16,
+    /// `dttsr_y_dp` — u(4), the vertical ratio's fractional bit width
+    /// (divisor is `2^dttsr_y_dp`).
+    pub dttsr_y_dp: u8,
+    /// `per_view_depth_grid_pos_flag` — u(1). When `true`, `views`
+    /// carries one entry per signalled `view_id`. When `false`,
+    /// `views` carries a single shared entry.
+    pub per_view_depth_grid_pos_flag: bool,
+    /// `num_video_plus_depth_views_minus1` — only present when
+    /// `per_view_depth_grid_pos_flag == 1`. Plus one gives the count
+    /// of per-view entries that follow. Bounded 0..=1023 per the
+    /// Annex G/H absolute `num_views_minus1 ≤ 1023`.
+    pub num_video_plus_depth_views_minus1: Option<u16>,
+    /// Either a single shared `depth_grid_position()` entry
+    /// (`per_view_depth_grid_pos_flag == 0`, length 1, sentinel
+    /// `depth_grid_view_id = 0`) or one entry per signalled `view_id`.
+    pub views: Vec<DepthSamplingViewEntry>,
+}
+
+impl DepthSamplingInfo {
+    /// Reconstruct the §H.13.2.7 horizontal depth/texture sample-size
+    /// ratio `dttsr_x_mul ÷ 2^dttsr_x_dp`. Always > 0 since the parser
+    /// rejects `dttsr_x_mul == 0` (Annex H §H.13.2.7 reserved value).
+    pub fn dttsr_x_to_f64(&self) -> f64 {
+        (self.dttsr_x_mul as f64) / (1u64 << self.dttsr_x_dp) as f64
+    }
+    /// Reconstruct the §H.13.2.7 vertical depth/texture sample-size
+    /// ratio `dttsr_y_mul ÷ 2^dttsr_y_dp`. Always > 0 since the parser
+    /// rejects `dttsr_y_mul == 0` (Annex H §H.13.2.7 reserved value).
+    pub fn dttsr_y_to_f64(&self) -> f64 {
+        (self.dttsr_y_mul as f64) / (1u64 << self.dttsr_y_dp) as f64
+    }
+}
+
+/// Parse a §H.13.1.7 `depth_sampling_info()` payload (payload type 53).
+///
+/// Enforces the §H.13.2.7 normative range bounds before any
+/// allocation:
+/// * `dttsr_x_mul != 0` and `dttsr_y_mul != 0` (the value 0 is
+///   reserved per §H.13.2.7).
+/// * `num_video_plus_depth_views_minus1 ≤ 1023` (Annex G/H absolute
+///   `num_views_minus1` cap). Pre-allocation gate against the
+///   ue(v)-driven OOM lever closed in round 177 for §D.1.20 and
+///   round 200 for §G.13.2.8.
+/// * `depth_grid_view_id[i] ≤ 1023` (Annex G/H view_id range).
+pub fn parse_depth_sampling_info(payload: &[u8]) -> Result<DepthSamplingInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+
+    // §H.13.1.7 — dttsr_x_mul u(16). §H.13.2.7: 0 is reserved.
+    let dttsr_x_mul = r.u(16)? as u16;
+    if dttsr_x_mul == 0 {
+        return Err(SeiError::DepthSamplingInfoDttsrMulReserved { axis: "x" });
+    }
+    // §H.13.1.7 — dttsr_x_dp u(4).
+    let dttsr_x_dp = r.u(4)? as u8;
+    // §H.13.1.7 — dttsr_y_mul u(16). §H.13.2.7: 0 is reserved.
+    let dttsr_y_mul = r.u(16)? as u16;
+    if dttsr_y_mul == 0 {
+        return Err(SeiError::DepthSamplingInfoDttsrMulReserved { axis: "y" });
+    }
+    // §H.13.1.7 — dttsr_y_dp u(4).
+    let dttsr_y_dp = r.u(4)? as u8;
+    // §H.13.1.7 — per_view_depth_grid_pos_flag u(1).
+    let per_view_depth_grid_pos_flag = r.u(1)? == 1;
+
+    let (num_video_plus_depth_views_minus1, views) = if per_view_depth_grid_pos_flag {
+        // §H.13.1.7 — num_video_plus_depth_views_minus1 ue(v).
+        // §H.13.2.7: views_minus1 + 1 is the number of declared
+        // view_ids. Anti-OOM cap derived from the Annex G/H absolute
+        // `num_views_minus1 ≤ 1023`.
+        let num_minus1 = r.ue()?;
+        if num_minus1 > 1023 {
+            return Err(SeiError::DepthSamplingInfoNumViewsOutOfRange(num_minus1));
+        }
+        let count = (num_minus1 as usize) + 1;
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            // §H.13.1.7 — depth_grid_view_id[i] ue(v). §H.13.2.7
+            // refers to the same view_id 0..=1023 range used across
+            // Annex G/H view-signalling messages; reject anything
+            // beyond.
+            let view_id = r.ue()?;
+            if view_id > 1023 {
+                return Err(SeiError::DepthSamplingInfoViewIdOutOfRange { i, got: view_id });
+            }
+            let position = read_depth_grid_position(&mut r)?;
+            entries.push(DepthSamplingViewEntry {
+                depth_grid_view_id: view_id as u16,
+                position,
+            });
+        }
+        (Some(num_minus1 as u16), entries)
+    } else {
+        // §H.13.1.7 else branch — single shared depth_grid_position().
+        // We surface it as a single-entry views vector with a
+        // sentinel depth_grid_view_id = 0 so downstream consumers
+        // have a uniform shape.
+        let position = read_depth_grid_position(&mut r)?;
+        (
+            None,
+            vec![DepthSamplingViewEntry {
+                depth_grid_view_id: 0,
+                position,
+            }],
+        )
+    };
+
+    Ok(DepthSamplingInfo {
+        dttsr_x_mul,
+        dttsr_x_dp,
+        dttsr_y_mul,
+        dttsr_y_dp,
+        per_view_depth_grid_pos_flag,
+        num_video_plus_depth_views_minus1,
+        views,
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5852,6 +6140,9 @@ pub enum SeiPayload {
     /// §H.13.2.4 — three_dimensional_reference_displays_info
     /// (payload type 51, Annex H). Round 226.
     ThreeDimensionalReferenceDisplaysInfo(ThreeDimensionalReferenceDisplaysInfo),
+    /// §H.13.2.7 — depth_sampling_info (payload type 53, Annex H 3D-AVC).
+    /// Round 247.
+    DepthSamplingInfo(DepthSamplingInfo),
     /// §I.13.2.1 — constrained_depth_parameter_set_identifier (payload
     /// type 54, Annex I 3D-AVC depth coding). Round 237.
     ConstrainedDepthParameterSetIdentifier(ConstrainedDepthParameterSetIdentifier),
@@ -5959,6 +6250,9 @@ pub fn parse_payload(
         51 => Ok(SeiPayload::ThreeDimensionalReferenceDisplaysInfo(
             parse_three_dimensional_reference_displays_info(payload)?,
         )),
+        53 => Ok(SeiPayload::DepthSamplingInfo(parse_depth_sampling_info(
+            payload,
+        )?)),
         54 => Ok(SeiPayload::ConstrainedDepthParameterSetIdentifier(
             parse_constrained_depth_parameter_set_identifier(payload)?,
         )),
@@ -8224,6 +8518,203 @@ mod tests {
                 assert_eq!(info.max_dps_id_diff, 0);
             }
             other => panic!("expected ConstrainedDepthParameterSetIdentifier, got {other:?}"),
+        }
+    }
+
+    // §H.13.2.7 — minimal depth_sampling_info: shared
+    // depth_grid_position() (per_view_depth_grid_pos_flag == 0).
+    // dttsr_{x,y}_mul = 1 / dp = 0 means a 1:1 sample-size ratio.
+    // The shared depth_grid_position() carries a zero position with
+    // both fractional widths set to 0.
+    #[test]
+    fn depth_sampling_info_min_shared_position() {
+        let payload = pack_bits(&[
+            (1, 16), // dttsr_x_mul = 1
+            (0, 4),  // dttsr_x_dp = 0
+            (1, 16), // dttsr_y_mul = 1
+            (0, 4),  // dttsr_y_dp = 0
+            (0, 1),  // per_view_depth_grid_pos_flag = 0
+            (0, 20), // depth_grid_pos_x_fp = 0
+            (0, 4),  // depth_grid_pos_x_dp = 0
+            (0, 1),  // depth_grid_pos_x_sign_flag = 0
+            (0, 20), // depth_grid_pos_y_fp = 0
+            (0, 4),  // depth_grid_pos_y_dp = 0
+            (0, 1),  // depth_grid_pos_y_sign_flag = 0
+        ]);
+        let info = parse_depth_sampling_info(&payload).unwrap();
+        assert_eq!(info.dttsr_x_mul, 1);
+        assert_eq!(info.dttsr_x_dp, 0);
+        assert_eq!(info.dttsr_y_mul, 1);
+        assert_eq!(info.dttsr_y_dp, 0);
+        assert!(!info.per_view_depth_grid_pos_flag);
+        assert!(info.num_video_plus_depth_views_minus1.is_none());
+        assert_eq!(info.views.len(), 1);
+        assert_eq!(info.views[0].depth_grid_view_id, 0);
+        assert_eq!(info.views[0].position.pos_x_fp, 0);
+        assert_eq!(info.views[0].position.pos_y_fp, 0);
+        assert!((info.dttsr_x_to_f64() - 1.0).abs() < 1e-9);
+        assert!((info.dttsr_y_to_f64() - 1.0).abs() < 1e-9);
+        assert!((info.views[0].position.x_to_f64() - 0.0).abs() < 1e-9);
+    }
+
+    // §H.13.2.7 — per-view depth_sampling_info with two views. Each
+    // view's depth_grid_position() carries a distinct fp / dp /
+    // sign-bit triple so we can confirm the per-view storage isn't
+    // accidentally shared.
+    #[test]
+    fn depth_sampling_info_per_view_two_views() {
+        let payload = pack_bits(&[
+            (3, 16),     // dttsr_x_mul = 3
+            (0b0001, 4), // dttsr_x_dp = 1
+            (3, 16),     // dttsr_y_mul = 3
+            (0b0001, 4), // dttsr_y_dp = 1
+            (1, 1),      // per_view_depth_grid_pos_flag = 1
+            (0b010, 3),  // ue(1) = 1 → num_video_plus_depth_views_minus1
+            // view 0: depth_grid_view_id = 0 (ue "1")
+            (1, 1),
+            (0b0000_0000_0000_0001_0000u32 as u64, 20), // pos_x_fp = 16
+            (0b0011, 4),                                // pos_x_dp = 3
+            (0, 1),                                     // pos_x_sign = 0
+            (0b0000_0000_0000_0000_1000u32 as u64, 20), // pos_y_fp = 8
+            (0b0010, 4),                                // pos_y_dp = 2
+            (1, 1),                                     // pos_y_sign = 1
+            // view 1: depth_grid_view_id = 5 (ue codenum 5 = "00110")
+            (0b00110, 5),
+            (0b0000_0000_0000_0010_0000u32 as u64, 20), // pos_x_fp = 32
+            (0b0100, 4),                                // pos_x_dp = 4
+            (1, 1),                                     // pos_x_sign = 1
+            (0b0000_0000_0000_0001_0000u32 as u64, 20), // pos_y_fp = 16
+            (0b0011, 4),                                // pos_y_dp = 3
+            (0, 1),                                     // pos_y_sign = 0
+        ]);
+        let info = parse_depth_sampling_info(&payload).unwrap();
+        assert!(info.per_view_depth_grid_pos_flag);
+        assert_eq!(info.num_video_plus_depth_views_minus1, Some(1));
+        assert_eq!(info.views.len(), 2);
+        assert_eq!(info.views[0].depth_grid_view_id, 0);
+        assert_eq!(info.views[0].position.pos_x_fp, 16);
+        assert_eq!(info.views[0].position.pos_x_dp, 3);
+        assert!(!info.views[0].position.pos_x_sign);
+        assert_eq!(info.views[0].position.pos_y_fp, 8);
+        assert!(info.views[0].position.pos_y_sign);
+        assert_eq!(info.views[1].depth_grid_view_id, 5);
+        assert_eq!(info.views[1].position.pos_x_fp, 32);
+        assert!(info.views[1].position.pos_x_sign);
+        assert_eq!(info.views[1].position.pos_y_dp, 3);
+        // Reconstructed scalar: view 0 y = -(8/4) = -2.0
+        assert!((info.views[0].position.y_to_f64() + 2.0).abs() < 1e-9);
+        // view 1 x = -(32/16) = -2.0
+        assert!((info.views[1].position.x_to_f64() + 2.0).abs() < 1e-9);
+        // dttsr_x = 3/2 = 1.5
+        assert!((info.dttsr_x_to_f64() - 1.5).abs() < 1e-9);
+    }
+
+    // §H.13.2.7 — dttsr_x_mul = 0 is reserved; reject.
+    #[test]
+    fn depth_sampling_info_rejects_dttsr_x_mul_zero() {
+        let payload = pack_bits(&[
+            (0, 16), // dttsr_x_mul = 0 (reserved)
+            (0, 4),
+            (1, 16),
+            (0, 4),
+            (0, 1),
+        ]);
+        let err = parse_depth_sampling_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::DepthSamplingInfoDttsrMulReserved { axis: "x" }
+        ));
+    }
+
+    // §H.13.2.7 — dttsr_y_mul = 0 is reserved; reject.
+    #[test]
+    fn depth_sampling_info_rejects_dttsr_y_mul_zero() {
+        let payload = pack_bits(&[
+            (1, 16), // dttsr_x_mul = 1
+            (0, 4),
+            (0, 16), // dttsr_y_mul = 0 (reserved)
+            (0, 4),
+            (0, 1),
+        ]);
+        let err = parse_depth_sampling_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::DepthSamplingInfoDttsrMulReserved { axis: "y" }
+        ));
+    }
+
+    // §H.13.2.7 — num_video_plus_depth_views_minus1 > 1023 rejected
+    // before allocation.
+    #[test]
+    fn depth_sampling_info_rejects_num_views_above_1023() {
+        // ue codeNum 1024 = 10 leading zeros + 11-bit binary
+        // (1024 + 1) = 0b10000000001.
+        let payload = pack_bits(&[
+            (1, 16), // dttsr_x_mul = 1
+            (0, 4),
+            (1, 16), // dttsr_y_mul = 1
+            (0, 4),
+            (1, 1), // per_view_depth_grid_pos_flag = 1
+            (0, 10),
+            (0b10000000001, 11),
+        ]);
+        let err = parse_depth_sampling_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::DepthSamplingInfoNumViewsOutOfRange(1024)
+        ));
+    }
+
+    // §H.13.2.7 — depth_grid_view_id[i] > 1023 rejected; the i index
+    // is preserved in the error so a regression points at the failed
+    // entry without re-running the parser.
+    #[test]
+    fn depth_sampling_info_rejects_view_id_above_1023() {
+        let payload = pack_bits(&[
+            (1, 16), // dttsr_x_mul = 1
+            (0, 4),
+            (1, 16), // dttsr_y_mul = 1
+            (0, 4),
+            (1, 1),     // per_view_depth_grid_pos_flag = 1
+            (0b010, 3), // ue(1) = 1 → num_views_minus1 = 1
+            // view 0: view_id = 1024 (out of range).
+            (0, 10),
+            (0b10000000001, 11),
+        ]);
+        let err = parse_depth_sampling_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::DepthSamplingInfoViewIdOutOfRange { i: 0, got: 1024 }
+        ));
+    }
+
+    // §H.13.1.7 dispatch — parse_payload(53, ..) must route to
+    // parse_depth_sampling_info.
+    #[test]
+    fn parse_payload_dispatches_depth_sampling_info() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[
+            (2, 16), // dttsr_x_mul = 2
+            (0, 4),
+            (2, 16), // dttsr_y_mul = 2
+            (0, 4),
+            (0, 1),  // per_view_depth_grid_pos_flag = 0
+            (0, 20), // depth_grid_pos_x_fp
+            (0, 4),
+            (0, 1),
+            (0, 20), // depth_grid_pos_y_fp
+            (0, 4),
+            (0, 1),
+        ]);
+        let got = parse_payload(53, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::DepthSamplingInfo(info) => {
+                assert_eq!(info.dttsr_x_mul, 2);
+                assert_eq!(info.dttsr_y_mul, 2);
+                assert!(!info.per_view_depth_grid_pos_flag);
+                assert_eq!(info.views.len(), 1);
+            }
+            other => panic!("expected DepthSamplingInfo, got {other:?}"),
         }
     }
 

@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 247 — third Annex H (3D-AVC) SEI payload implemented in
+  `sei.rs`: payload type 53 `depth_sampling_info`
+  (§H.13.1.7 / §H.13.2.7). Surfaces the depth/texture sample-size
+  ratio (`dttsr_x_mul` / `dttsr_x_dp` for horizontal,
+  `dttsr_y_mul` / `dttsr_y_dp` for vertical — each ratio is
+  `dttsr_*_mul ÷ 2^dttsr_*_dp` per §H.13.2.7; the value 0 for
+  `dttsr_*_mul` is reserved per §H.13.2.7 and is rejected before
+  storage with the new
+  `SeiError::DepthSamplingInfoDttsrMulReserved { axis }`) and the
+  depth sampling grid position(s) for the IDR access unit's depth
+  views relative to the same-`view_id` texture views. The
+  `per_view_depth_grid_pos_flag` (u(1)) gates either a single
+  shared `depth_grid_position()` (else-branch — surfaced as a
+  single-entry `views` vector with a sentinel `depth_grid_view_id
+  = 0`) or `num_video_plus_depth_views_minus1 + 1` per-view
+  `(depth_grid_view_id[i], depth_grid_position())` entries.
+  Anti-OOM pre-allocation cap on
+  `num_video_plus_depth_views_minus1 ≤ 1023` (Annex G/H absolute
+  `num_views_minus1` upper bound) + the same `view_id ≤ 1023`
+  range check applied per entry. New §H.13.1.7.1
+  `depth_grid_position()` sub-struct `DepthGridPosition` carries
+  the raw `(pos_x_fp u(20), pos_x_dp u(4), pos_x_sign_flag u(1))`
+  triple + the matching y triple;
+  `DepthGridPosition::{x,y}_to_f64` reconstruct the §H.13.2.7.1
+  signed fixed-point scalar
+  `(1 − 2 * sign_flag) * (fp ÷ 2^dp)`. New
+  `DepthSamplingInfo::{dttsr_x,dttsr_y}_to_f64` helpers
+  reconstruct the §H.13.2.7 sample-size ratios. New `SeiError`
+  variants `DepthSamplingInfoDttsrMulReserved { axis }` (axis is
+  `"x"` or `"y"`), `DepthSamplingInfoNumViewsOutOfRange` and
+  `DepthSamplingInfoViewIdOutOfRange { i }`. Wired into
+  `parse_payload` dispatch; the payload-type doc-comment table at
+  the top of `sei.rs` grows one row (§H.13.1.7).
+  `tests/integration_sei_malformed.rs` `KNOWN_PAYLOAD_TYPES`
+  table grows from 48 → 49 entries (type 53 wasn't in the
+  fallback list either, so the sweep cardinality moves from 2992
+  → 3036 panic-free invocations). 7 new lib unit tests cover the
+  shared-position min path (1:1 sample-size ratio + zero grid
+  position), a two-view per-view path with distinct fp/dp/sign-bit
+  triples per view (and per-axis), rejection of
+  `dttsr_x_mul = 0`, rejection of `dttsr_y_mul = 0`, rejection of
+  `num_video_plus_depth_views_minus1 > 1023`, rejection of
+  `depth_grid_view_id[0] > 1023`, and `parse_payload(53, …)`
+  dispatch round-trip. Harmless on non-Annex-H streams (Phase 4
+  on the profiles table).
+
 - round 237 — first Annex I (3D-AVC depth coding) SEI payload
   implemented in `sei.rs`: payload type 54
   `constrained_depth_parameter_set_identifier`
