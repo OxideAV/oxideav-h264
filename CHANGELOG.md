@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 250 — typed accessor on the already-parsed §H.13.2.4
+  `three_dimensional_reference_displays_info` body (SEI payload
+  type 51). New `ReferenceDisplay::num_sample_shift(&self) ->
+  Option<i16>` surfaces the §H.13.2.4 signed semantic
+  `NumSampleShift[i] = num_sample_shift_plus512[i] − 512` from the
+  biased u(10) storage field. Returns `None` when
+  `additional_shift_present_flag == 0` (§H.13.2.4 leaves the value
+  unsignalled and does not define an inferred value); returns
+  `Some(NumSampleShift[i])` otherwise. The §H.13.2.4 sign
+  convention is documented inline on the method: negative →
+  shift the left view left by `|NumSampleShift|` samples; zero →
+  no shift; positive → shift the left view right by
+  `NumSampleShift` samples. The return type is `i16` since the
+  value fits in `−512..=511`. 6 new lib unit tests pin the
+  None-when-absent branch, the centre value (biased 512 →
+  semantic 0), a positive case (biased 768 → +256), a negative
+  case (biased 256 → −256), the −512 / +511 endpoint pair
+  exercising the full bitstream range (biased 0 and 1023), and an
+  end-to-end round trip through
+  `parse_three_dimensional_reference_displays_info` using the
+  existing per-display fixture so the accessor's contract is
+  wired to a real parse path. Zero new SEI types added; the
+  typed-accessor delta closes the small §H.13.2.4 semantic gap
+  left by round 226 (the parsed value was the biased u(10)
+  directly, not the spec's signed `NumSampleShift[i]`).
+
 - round 247 — third Annex H (3D-AVC) SEI payload implemented in
   `sei.rs`: payload type 53 `depth_sampling_info`
   (§H.13.1.7 / §H.13.2.7). Surfaces the depth/texture sample-size

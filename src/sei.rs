@@ -5206,6 +5206,44 @@ pub struct ReferenceDisplay {
     pub num_sample_shift_plus512: Option<u16>,
 }
 
+impl ReferenceDisplay {
+    /// §H.13.2.4 — recommended additional horizontal shift between
+    /// the left and right views, decoded from the biased
+    /// `num_sample_shift_plus512[i]` field into a signed sample
+    /// count.
+    ///
+    /// The bitstream stores the shift as `num_sample_shift_plus512`
+    /// with the bias `+ 512`, giving a raw range of `0..=1023`. The
+    /// semantic shift `NumSampleShift[i]` defined by §H.13.2.4 is
+    ///
+    /// ```text
+    /// NumSampleShift[i] = num_sample_shift_plus512[i] − 512
+    /// ```
+    ///
+    /// which spans `−512..=511`. The sign convention from §H.13.2.4
+    /// is:
+    ///
+    /// * `< 0` — recommend shifting the **left** view to the left by
+    ///   `512 − num_sample_shift_plus512[i]` samples (i.e. by
+    ///   `|NumSampleShift|`) relative to the right view.
+    /// * `= 0` — recommend that no shift be applied.
+    /// * `> 0` — recommend shifting the **left** view to the right
+    ///   by `num_sample_shift_plus512[i] − 512` samples (i.e. by
+    ///   `NumSampleShift`) relative to the right view.
+    ///
+    /// Returns `None` when `additional_shift_present_flag == 0` (the
+    /// shift is unsignalled and §H.13.2.4 does not define an
+    /// inferred value); returns `Some(NumSampleShift[i])` otherwise.
+    ///
+    /// The return type is `i16` since the value fits in
+    /// `−512..=511`.
+    #[must_use]
+    pub fn num_sample_shift(&self) -> Option<i16> {
+        self.num_sample_shift_plus512
+            .map(|biased| (biased as i32 - 512) as i16)
+    }
+}
+
 /// Parse a §H.13.1.4 `three_dimensional_reference_displays_info()`
 /// payload.
 ///
@@ -7983,6 +8021,168 @@ mod tests {
         ]);
         let info = parse_three_dimensional_reference_displays_info(&payload).unwrap();
         assert!(info.extension_flag);
+    }
+
+    // Round-250 — §H.13.2.4 typed accessor on the already-parsed
+    // `three_dimensional_reference_displays_info` body: surface the
+    // signed `NumSampleShift[i] = num_sample_shift_plus512[i] − 512`
+    // from the biased u(10) field stored on each `ReferenceDisplay`.
+
+    #[test]
+    fn reference_display_num_sample_shift_returns_none_when_absent() {
+        // §H.13.2.4 — additional_shift_present_flag == 0 means the
+        // shift was not signalled. The spec does not define an
+        // inferred value, so the accessor returns None.
+        let d = ReferenceDisplay {
+            ref_baseline: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_display_width: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_viewing_distance: None,
+            additional_shift_present_flag: false,
+            num_sample_shift_plus512: None,
+        };
+        assert_eq!(d.num_sample_shift(), None);
+    }
+
+    #[test]
+    fn reference_display_num_sample_shift_zero_at_bias() {
+        // §H.13.2.4 — num_sample_shift_plus512[i] == 512 is the
+        // "recommend that shifting is not applied" centre point; the
+        // semantic shift is 0.
+        let d = ReferenceDisplay {
+            ref_baseline: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_display_width: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_viewing_distance: None,
+            additional_shift_present_flag: true,
+            num_sample_shift_plus512: Some(512),
+        };
+        assert_eq!(d.num_sample_shift(), Some(0));
+    }
+
+    #[test]
+    fn reference_display_num_sample_shift_positive_branch() {
+        // §H.13.2.4 — values above the 512 centre map to a positive
+        // shift of (num_sample_shift_plus512 − 512) samples to the
+        // right of the left view. Use the test fixture's value 768
+        // → semantic +256.
+        let d = ReferenceDisplay {
+            ref_baseline: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_display_width: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_viewing_distance: None,
+            additional_shift_present_flag: true,
+            num_sample_shift_plus512: Some(768),
+        };
+        assert_eq!(d.num_sample_shift(), Some(256));
+    }
+
+    #[test]
+    fn reference_display_num_sample_shift_negative_branch() {
+        // §H.13.2.4 — values below the 512 centre map to a negative
+        // shift; |NumSampleShift| samples to the left of the right
+        // view. 256 → semantic −256.
+        let d = ReferenceDisplay {
+            ref_baseline: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_display_width: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_viewing_distance: None,
+            additional_shift_present_flag: true,
+            num_sample_shift_plus512: Some(256),
+        };
+        assert_eq!(d.num_sample_shift(), Some(-256));
+    }
+
+    #[test]
+    fn reference_display_num_sample_shift_extreme_endpoints() {
+        // §H.13.2.4 — full bitstream range 0..=1023 (u(10)) maps to
+        // semantic −512..=511. Cover both endpoints to confirm no
+        // off-by-one in the bias subtraction.
+        let template = ReferenceDisplay {
+            ref_baseline: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_display_width: UnsignedFloatComponent {
+                exponent: 31,
+                mantissa: 0,
+                mantissa_width: 0,
+            },
+            ref_viewing_distance: None,
+            additional_shift_present_flag: true,
+            num_sample_shift_plus512: Some(0),
+        };
+        // Bias subtraction floor: 0 − 512 = −512.
+        assert_eq!(template.num_sample_shift(), Some(-512));
+        let max = ReferenceDisplay {
+            num_sample_shift_plus512: Some(1023),
+            ..template
+        };
+        // Bias subtraction ceiling: 1023 − 512 = 511.
+        assert_eq!(max.num_sample_shift(), Some(511));
+    }
+
+    #[test]
+    fn reference_display_num_sample_shift_round_trip_via_parser() {
+        // End-to-end: parse a §H.13.1.4 payload with two displays
+        // (one with shift signalled, one without) and confirm the
+        // typed accessor returns the §H.13.2.4 semantic value on
+        // both. The first display uses num_sample_shift_plus512 =
+        // 768, identical to the existing parser fixture, so the
+        // expected accessor reading is +256.
+        let mut fields: Vec<(u64, u32)> = vec![
+            (1, 1),     // prec_ref_baseline = 0
+            (1, 1),     // prec_ref_display_width = 0
+            (1, 1),     // ref_viewing_distance_flag = 1
+            (1, 1),     // prec_ref_viewing_dist = 0
+            (0b010, 3), // num_ref_displays_minus1 = 1
+        ];
+        // Display 0 — additional_shift_present_flag = 1, biased value 768.
+        fields.push((20, 6)); // exponent_ref_baseline
+        fields.push((21, 6)); // exponent_ref_display_width
+        fields.push((22, 6)); // exponent_ref_viewing_distance
+        fields.push((1, 1)); // additional_shift_present_flag = 1
+        fields.push((768, 10));
+        // Display 1 — additional_shift_present_flag = 0.
+        fields.push((10, 6));
+        fields.push((11, 6));
+        fields.push((12, 6));
+        fields.push((0, 1));
+        fields.push((0, 1)); // extension_flag = 0
+        let payload = pack_bits(&fields);
+        let info = parse_three_dimensional_reference_displays_info(&payload).unwrap();
+        assert_eq!(info.displays.len(), 2);
+        assert_eq!(info.displays[0].num_sample_shift(), Some(256));
+        assert_eq!(info.displays[1].num_sample_shift(), None);
     }
 
     #[test]
