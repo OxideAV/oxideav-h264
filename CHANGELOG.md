@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 255 — two typed accessors on the already-parsed §D.2.13 (2024
+  spec) / §D.2.12 (2003 draft) `sub_seq_layer_characteristics` body
+  (SEI payload type 11), also re-used by §D.2.14 (payload type 12)
+  under `SubSeqCharacteristics::average_rate`. New
+  `SubSeqLayerCharacteristic::average_bit_rate_bps(&self) -> Option<u32>`
+  multiplies the raw u(16) `average_bit_rate` field by 1000 to surface
+  the bits-per-second semantic — the on-wire field is in units of
+  1000 bits/second per §D.2.13 / equation D-6 ("*average_bit_rate
+  indicates the average bit rate in units of 1000 bits per second*"),
+  so the carrier is a pre-divided count. Sibling accessor
+  `average_frame_rate_fps(&self) -> Option<f64>` divides the raw
+  u(16) `average_frame_rate` field by 256 to surface the
+  frames-per-second semantic — the on-wire field is in units of
+  frames/(256 seconds) per §D.2.13 / equation D-8 ("*average_frame_rate
+  indicates the average frame rate in units of frames/(256 seconds)*").
+  Both accessors return `None` when the carrier is 0 — equations D-7 /
+  D-9 (and the D-11 / D-13 mirror pair in §D.2.14) reserve the value
+  0 for the degenerate `t1 == t2` case and the general "unspecified"
+  reading; the spec defines no scalar derivation from a 0 carrier so
+  no inferred value exists. The `u32` return on the bit-rate accessor
+  is large enough for the on-wire ceiling (`65535 * 1000 = 65_535_000`,
+  well under `u32::MAX`); the `f64` return on the frame-rate accessor
+  represents the `1/256` quantisation step exactly (256 is a power of
+  two so all on-wire values map to dyadic rationals with no rounding
+  error). 8 new lib unit tests pin the None-when-zero branch, the
+  minimum non-zero carrier (1 ⇒ 1000 bits/s and 1/256 fps), a typical
+  bitrate (5000 ⇒ 5 Mbit/s), the u(16) bit-rate ceiling
+  (65535 ⇒ 65.535 Mbit/s), the u(16) frame-rate ceiling
+  (65535 ⇒ 65535/256 fps), exact-integer common frame rates
+  (24/25/30 fps via 24*256 / 25*256 / 30*256 carriers), an end-to-end
+  parse round trip through `parse_sub_seq_layer_characteristics`
+  proving `bps()` / `fps()` survive the layer-vector wrapping, and a
+  cross-payload round trip through `parse_sub_seq_characteristics`
+  proving the same accessors fire on the `SubSeqCharacteristics::
+  average_rate` carrier (payload type 12). Zero new SEI types added;
+  the typed-accessor delta closes the small §D.2.13 semantic gap left
+  by the round-99 implementation (the parsed values were the biased
+  on-wire u(16) counts directly, not the spec's bits/s and fps
+  scalars).
+
 - round 253 — two typed accessors on the already-parsed §H.13.2.3
   `depth_representation_info` body (SEI payload type 50). New
   `DepthRepresentationInfo::depth_nonlinear_representation_num_segments(&self)

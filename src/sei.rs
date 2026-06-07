@@ -2234,6 +2234,49 @@ pub struct SubSeqLayerCharacteristic {
     pub average_frame_rate: u16,
 }
 
+impl SubSeqLayerCharacteristic {
+    /// Reconstruct the §D.2.13 (2024) / §D.2.12 (2003 draft) `average_bit_rate`
+    /// semantic in bits/second: the on-wire field is in units of
+    /// 1000 bits/second (equations D-6 / D-10), so this multiplies by 1000.
+    ///
+    /// Returns `None` when the on-wire field is 0 — equations D-7 / D-11
+    /// reserve that sentinel for the `t1 == t2` degenerate case and for the
+    /// general "unspecified" reading; the spec defines no scalar derivation
+    /// from a 0 carrier so no inferred value exists.
+    ///
+    /// The result fits in `u32` since the on-wire range is `0..=65535` and
+    /// `65535 * 1000 == 65_535_000`, well below `u32::MAX`.
+    #[must_use]
+    pub fn average_bit_rate_bps(&self) -> Option<u32> {
+        if self.average_bit_rate == 0 {
+            None
+        } else {
+            Some((self.average_bit_rate as u32) * 1000)
+        }
+    }
+
+    /// Reconstruct the §D.2.13 (2024) / §D.2.12 (2003 draft) `average_frame_rate`
+    /// semantic in frames/second: the on-wire field is in units of
+    /// frames/(256 seconds) (equations D-8 / D-12), so this divides by 256.
+    ///
+    /// Returns `None` when the on-wire field is 0 — equations D-9 / D-13
+    /// reserve that sentinel for the `t1 == t2` degenerate case and the
+    /// general "unspecified" reading; the spec defines no scalar derivation
+    /// from a 0 carrier so no inferred value exists.
+    ///
+    /// `f64` is used so the 1/256 quantisation step is exactly representable
+    /// (256 is a power of two, so all on-wire values map to dyadic rationals
+    /// with no rounding error).
+    #[must_use]
+    pub fn average_frame_rate_fps(&self) -> Option<f64> {
+        if self.average_frame_rate == 0 {
+            None
+        } else {
+            Some((self.average_frame_rate as f64) / 256.0)
+        }
+    }
+}
+
 /// §D.2.12 — sub_seq_layer_characteristics (payload type 11).
 ///
 /// Specifies bit-rate / frame-rate characteristics of sub-sequence layers.
@@ -9914,6 +9957,146 @@ mod tests {
             }
             other => panic!("expected SubSeqLayerCharacteristics, got {other:?}"),
         }
+    }
+
+    // --- typed accessors on SubSeqLayerCharacteristic -----------------
+    //
+    // §D.2.13 (2024) / §D.2.12 (2003 draft) carrier semantics:
+    // * average_bit_rate is in units of 1000 bits/second; 0 ⇒ unspecified.
+    // * average_frame_rate is in units of frames/(256 seconds);
+    //   0 ⇒ unspecified.
+
+    #[test]
+    fn sub_seq_layer_avg_bit_rate_bps_zero_is_none() {
+        let s = SubSeqLayerCharacteristic {
+            accurate_statistics_flag: false,
+            average_bit_rate: 0,
+            average_frame_rate: 0,
+        };
+        assert_eq!(s.average_bit_rate_bps(), None);
+        assert_eq!(s.average_frame_rate_fps(), None);
+    }
+
+    #[test]
+    fn sub_seq_layer_avg_bit_rate_bps_minimum_nonzero() {
+        // Smallest valid signalled value: on-wire 1 ⇒ 1000 bits/second.
+        let s = SubSeqLayerCharacteristic {
+            accurate_statistics_flag: true,
+            average_bit_rate: 1,
+            average_frame_rate: 0,
+        };
+        assert_eq!(s.average_bit_rate_bps(), Some(1_000));
+    }
+
+    #[test]
+    fn sub_seq_layer_avg_bit_rate_bps_typical() {
+        // 5_000 * 1000 = 5_000_000 bits/second (5 Mbit/s).
+        let s = SubSeqLayerCharacteristic {
+            accurate_statistics_flag: true,
+            average_bit_rate: 5_000,
+            average_frame_rate: 0,
+        };
+        assert_eq!(s.average_bit_rate_bps(), Some(5_000_000));
+    }
+
+    #[test]
+    fn sub_seq_layer_avg_bit_rate_bps_maximum() {
+        // On-wire u(16) ceiling: 65535 * 1000 = 65_535_000 bits/second.
+        let s = SubSeqLayerCharacteristic {
+            accurate_statistics_flag: true,
+            average_bit_rate: u16::MAX,
+            average_frame_rate: 0,
+        };
+        assert_eq!(s.average_bit_rate_bps(), Some(65_535_000));
+    }
+
+    #[test]
+    fn sub_seq_layer_avg_frame_rate_fps_quarter_step() {
+        // 1/256 ⇒ smallest representable step.
+        let s = SubSeqLayerCharacteristic {
+            accurate_statistics_flag: true,
+            average_bit_rate: 0,
+            average_frame_rate: 1,
+        };
+        let fps = s.average_frame_rate_fps().expect("non-zero ⇒ Some");
+        assert!((fps - (1.0 / 256.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sub_seq_layer_avg_frame_rate_fps_exact_integer_rates() {
+        // 24, 25, 30 fps map to 24*256, 25*256, 30*256 on-wire.
+        for &(carrier, expected_fps) in
+            &[(24u16 * 256, 24.0_f64), (25 * 256, 25.0), (30 * 256, 30.0)]
+        {
+            let s = SubSeqLayerCharacteristic {
+                accurate_statistics_flag: true,
+                average_bit_rate: 0,
+                average_frame_rate: carrier,
+            };
+            let fps = s.average_frame_rate_fps().expect("non-zero ⇒ Some");
+            assert!(
+                (fps - expected_fps).abs() < f64::EPSILON,
+                "carrier {carrier} ⇒ expected {expected_fps} got {fps}"
+            );
+        }
+    }
+
+    #[test]
+    fn sub_seq_layer_avg_frame_rate_fps_maximum() {
+        // On-wire u(16) ceiling: 65535 / 256 ≈ 255.996 fps.
+        let s = SubSeqLayerCharacteristic {
+            accurate_statistics_flag: true,
+            average_bit_rate: 0,
+            average_frame_rate: u16::MAX,
+        };
+        let fps = s.average_frame_rate_fps().expect("non-zero ⇒ Some");
+        assert!((fps - (65535.0_f64 / 256.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sub_seq_layer_accessors_via_parse_round_trip() {
+        // End-to-end: parse_sub_seq_layer_characteristics → accessors.
+        // num_sub_seq_layers_minus1 = 0 (ue → "1") → 1 entry.
+        // accurate=1, bit_rate=2500 (2.5 Mbit/s), frame_rate=24*256 (24 fps).
+        let payload = pack_bits(&[
+            (1, 1),            // num_sub_seq_layers_minus1 = 0
+            (1, 1),            // accurate_statistics_flag
+            (2_500, 16),       // average_bit_rate
+            (24u64 * 256, 16), // average_frame_rate
+        ]);
+        let got = parse_sub_seq_layer_characteristics(&payload).unwrap();
+        assert_eq!(got.layers.len(), 1);
+        assert_eq!(got.layers[0].average_bit_rate_bps(), Some(2_500_000));
+        let fps = got.layers[0]
+            .average_frame_rate_fps()
+            .expect("non-zero ⇒ Some");
+        assert!((fps - 24.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sub_seq_characteristics_avg_rate_accessors_round_trip() {
+        // End-to-end via parse_sub_seq_characteristics, exercising the
+        // §D.2.14 carrier (payload type 12) that re-uses
+        // SubSeqLayerCharacteristic under `average_rate`.
+        // layer=0 (ue → "1"), id=0 (ue → "1"),
+        // duration_flag=0, average_rate_flag=1,
+        // accurate=0, bit_rate=10000 (10 Mbit/s), frame_rate=60*256,
+        // num_referenced_subseqs=0 (ue → "1").
+        let payload = pack_bits(&[
+            (1, 1),            // sub_seq_layer_num = 0
+            (1, 1),            // sub_seq_id = 0
+            (0, 1),            // duration_flag = 0
+            (1, 1),            // average_rate_flag = 1
+            (0, 1),            // accurate_statistics_flag = 0
+            (10_000, 16),      // average_bit_rate
+            (60u64 * 256, 16), // average_frame_rate
+            (1, 1),            // num_referenced_subseqs = 0
+        ]);
+        let got = parse_sub_seq_characteristics(&payload).unwrap();
+        let rate = got.average_rate.expect("average_rate present");
+        assert_eq!(rate.average_bit_rate_bps(), Some(10_000_000));
+        let fps = rate.average_frame_rate_fps().expect("non-zero ⇒ Some");
+        assert!((fps - 60.0).abs() < f64::EPSILON);
     }
 
     // --- §D.1.13 sub_seq_characteristics (payload type 12) ------------
