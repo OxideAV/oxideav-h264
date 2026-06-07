@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 253 — two typed accessors on the already-parsed §H.13.2.3
+  `depth_representation_info` body (SEI payload type 50). New
+  `DepthRepresentationInfo::depth_nonlinear_representation_num_segments(&self)
+  -> Option<u8>` surfaces the spec semantic
+  `DepthNonlinearRepresentationNumSegments` — the number of
+  piecewise linear segments used to map decoded depth-view luma
+  samples to a disparity-uniform scale — by applying the `+ 2`
+  bias documented in §H.13.2.3 ("*depth_nonlinear_representation_num_minus1
+  plus 2 specifies the number of piecewise linear segments…*").
+  Sibling accessor
+  `depth_nonlinear_representation_model_len(&self) -> Option<u8>`
+  returns the `num_minus1 + 1` count of *signalled*
+  `depth_nonlinear_representation_model[i]` entries — that is, the
+  on-wire `i = 1..=num_minus1 + 1` loop bound from the §H.13.1.3
+  syntax table, excluding the two trailing-coverage sentinels
+  `model[0]` and `model[num_minus1 + 2]` that §H.13.2.3 pre-defines
+  to `0`. Both accessors return `None` when the carrier is
+  unsignalled (`depth_representation_type != 3`); the spec's
+  piecewise model is only defined for type 3, so no inferred value
+  exists for other types. The on-wire range
+  `num_minus1 ∈ 0..=62` gives semantic ranges `2..=64` (segments)
+  and `1..=63` (signalled model entries), both fitting in `u8`. 5
+  new lib unit tests pin the None-when-absent branch, the minimum
+  carrier (0 → 2 segments / 1 signalled entry), an interior
+  carrier (3 → 5 / 4), the maximum on-wire carrier (62 → 64 / 63),
+  and an end-to-end round trip through
+  `parse_depth_representation_info` using the existing type-3
+  fixture that proves the relations
+  `model_len() == depth_nonlinear_representation_model.len()` and
+  `num_segments() == model_len() + 1`. Zero new SEI types added;
+  the typed-accessor delta closes the small §H.13.2.3 semantic gap
+  left by round 231 (the parsed value was the biased ue(v)
+  directly, not the spec's
+  `DepthNonlinearRepresentationNumSegments`).
+
 - round 250 — typed accessor on the already-parsed §H.13.2.4
   `three_dimensional_reference_displays_info` body (SEI payload
   type 51). New `ReferenceDisplay::num_sample_shift(&self) ->

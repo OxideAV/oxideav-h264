@@ -5506,6 +5506,72 @@ pub struct DepthRepresentationInfo {
     pub depth_nonlinear_representation_model: Vec<u16>,
 }
 
+impl DepthRepresentationInfo {
+    /// §H.13.2.3 — the spec semantic value
+    /// `DepthNonlinearRepresentationNumSegments`: the number of
+    /// piecewise linear segments used to map decoded depth-view luma
+    /// samples to a scale uniformly quantised in disparity.
+    ///
+    /// The bitstream stores the count as the biased field
+    /// `depth_nonlinear_representation_num_minus1` with the bias
+    /// `+ 2` (per the spec sentence:
+    /// *"depth_nonlinear_representation_num_minus1 plus 2 specifies
+    /// the number of piecewise linear segments…"*). Combined with
+    /// the on-wire range `0..=62`, the semantic value lies in
+    /// `2..=64`, which always fits in `u8`.
+    ///
+    /// Returns `None` when the field is absent — i.e. when
+    /// `depth_representation_type != 3` and the nonlinear-model
+    /// tail is therefore not signalled. The §H.13.2.3 piecewise
+    /// model is only defined for `depth_representation_type == 3`,
+    /// so no inferred segment count exists for other types.
+    ///
+    /// Note that the signalled model carries
+    /// `num_minus1 + 1` entries (see
+    /// [`Self::depth_nonlinear_representation_model_len`]); the
+    /// segment count is `num_minus1 + 2` because the §H.13.2.3
+    /// DepthLUT construction loops the piecewise linear interpolant
+    /// over indices `k = 0..=num_minus1 + 1`, yielding
+    /// `num_minus1 + 2` segments delimited by the `num_minus1 + 3`
+    /// model points `model[0..=num_minus1 + 2]` (with
+    /// `model[0]` and `model[num_minus1 + 2]` pre-defined to `0`
+    /// and not signalled).
+    #[must_use]
+    pub fn depth_nonlinear_representation_num_segments(&self) -> Option<u8> {
+        self.depth_nonlinear_representation_num_minus1
+            .map(|num_minus1| num_minus1 + 2)
+    }
+
+    /// §H.13.2.3 — the number of *signalled*
+    /// `depth_nonlinear_representation_model[i]` entries in the
+    /// bitstream, equal to `depth_nonlinear_representation_num_minus1
+    /// + 1`.
+    ///
+    /// The spec's syntax loop in §H.13.1.3 runs
+    ///
+    /// ```text
+    /// for( i = 1; i <= depth_nonlinear_representation_num_minus1 + 1; i++ )
+    ///     depth_nonlinear_representation_model[ i ]
+    /// ```
+    ///
+    /// so the on-wire count is `num_minus1 + 1`. The two
+    /// trailing-coverage sentinels `model[0]` and
+    /// `model[num_minus1 + 2]` defined by the §H.13.2.3 DepthLUT
+    /// construction are pre-defined to `0` and are not part of the
+    /// bitstream — this accessor counts only the entries the
+    /// decoder actually parsed (and that are stored in
+    /// [`Self::depth_nonlinear_representation_model`]).
+    ///
+    /// Returns `None` when the field is absent. With the on-wire
+    /// range `num_minus1 ∈ 0..=62`, the signalled count lies in
+    /// `1..=63` and always fits in `u8`.
+    #[must_use]
+    pub fn depth_nonlinear_representation_model_len(&self) -> Option<u8> {
+        self.depth_nonlinear_representation_num_minus1
+            .map(|num_minus1| num_minus1 + 1)
+    }
+}
+
 /// §H.13.2.3 — per-view depth representation parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DepthRepresentationView {
@@ -8442,6 +8508,150 @@ mod tests {
         assert_eq!(info.views.len(), 1);
         assert_eq!(info.depth_nonlinear_representation_num_minus1, Some(0));
         assert_eq!(info.depth_nonlinear_representation_model, vec![4]);
+    }
+
+    // §H.13.2.3 — typed accessor for the
+    // DepthNonlinearRepresentationNumSegments semantic value: when
+    // the field is unsignalled (depth_representation_type != 3) the
+    // accessor returns None — the §H.13.2.3 piecewise model is not
+    // defined for non-3 types so there is no inferred value.
+    #[test]
+    fn depth_representation_info_num_segments_returns_none_when_absent() {
+        let info = DepthRepresentationInfo {
+            all_views_equal_flag: true,
+            z_near_flag: false,
+            z_far_flag: false,
+            z_axis_equal_flag: None,
+            common_z_axis_reference_view: None,
+            d_min_flag: false,
+            d_max_flag: false,
+            depth_representation_type: 2,
+            views: Vec::new(),
+            depth_nonlinear_representation_num_minus1: None,
+            depth_nonlinear_representation_model: Vec::new(),
+        };
+        assert_eq!(info.depth_nonlinear_representation_num_segments(), None);
+        assert_eq!(info.depth_nonlinear_representation_model_len(), None);
+    }
+
+    // §H.13.2.3 — segment-count accessor decodes the `+ 2` bias on
+    // a num_minus1 = 0 carrier (the minimum permitted value). The
+    // signalled-model-len accessor reports 1 entry for the same
+    // carrier.
+    #[test]
+    fn depth_representation_info_num_segments_minimum() {
+        let info = DepthRepresentationInfo {
+            all_views_equal_flag: true,
+            z_near_flag: false,
+            z_far_flag: false,
+            z_axis_equal_flag: None,
+            common_z_axis_reference_view: None,
+            d_min_flag: false,
+            d_max_flag: false,
+            depth_representation_type: 3,
+            views: Vec::new(),
+            depth_nonlinear_representation_num_minus1: Some(0),
+            depth_nonlinear_representation_model: vec![0],
+        };
+        assert_eq!(info.depth_nonlinear_representation_num_segments(), Some(2));
+        assert_eq!(info.depth_nonlinear_representation_model_len(), Some(1));
+    }
+
+    // §H.13.2.3 — segment-count accessor decodes the `+ 2` bias on
+    // an interior carrier (num_minus1 = 3 ⇒ 5 segments, 4 signalled
+    // model entries).
+    #[test]
+    fn depth_representation_info_num_segments_interior() {
+        let info = DepthRepresentationInfo {
+            all_views_equal_flag: true,
+            z_near_flag: false,
+            z_far_flag: false,
+            z_axis_equal_flag: None,
+            common_z_axis_reference_view: None,
+            d_min_flag: false,
+            d_max_flag: false,
+            depth_representation_type: 3,
+            views: Vec::new(),
+            depth_nonlinear_representation_num_minus1: Some(3),
+            depth_nonlinear_representation_model: vec![10, 20, 30, 40],
+        };
+        assert_eq!(info.depth_nonlinear_representation_num_segments(), Some(5));
+        assert_eq!(info.depth_nonlinear_representation_model_len(), Some(4));
+    }
+
+    // §H.13.2.3 — segment-count accessor decodes the `+ 2` bias at
+    // the maximum on-wire value (num_minus1 = 62 ⇒ 64 segments,
+    // 63 signalled model entries). Confirms the u8 return type
+    // accommodates the upper endpoint without overflow.
+    #[test]
+    fn depth_representation_info_num_segments_maximum() {
+        let info = DepthRepresentationInfo {
+            all_views_equal_flag: true,
+            z_near_flag: false,
+            z_far_flag: false,
+            z_axis_equal_flag: None,
+            common_z_axis_reference_view: None,
+            d_min_flag: false,
+            d_max_flag: false,
+            depth_representation_type: 3,
+            views: Vec::new(),
+            depth_nonlinear_representation_num_minus1: Some(62),
+            depth_nonlinear_representation_model: vec![0; 63],
+        };
+        assert_eq!(info.depth_nonlinear_representation_num_segments(), Some(64));
+        assert_eq!(info.depth_nonlinear_representation_model_len(), Some(63));
+    }
+
+    // §H.13.2.3 — segment count and signalled-model length must be
+    // consistent with the stored `depth_nonlinear_representation_model`
+    // length: the spec relation
+    //
+    //   model_len() == depth_nonlinear_representation_model.len()
+    //   num_segments() == model_len() + 1
+    //
+    // holds end-to-end through the parser on the existing
+    // type-3 fixture (num_minus1 = 0 ⇒ 1 model entry, 2 segments).
+    #[test]
+    fn depth_representation_info_num_segments_round_trip_via_parser() {
+        let payload = pack_bits(&[
+            (1, 1),       // all_views_equal_flag = 1
+            (1, 1),       // z_near_flag = 1
+            (1, 1),       // z_far_flag = 1
+            (1, 1),       // z_axis_equal_flag = 1
+            (1, 1),       // common_z_axis_reference_view = 0 → "1"
+            (0, 1),       // d_min_flag = 0
+            (0, 1),       // d_max_flag = 0
+            (0b00100, 5), // depth_representation_type = 3
+            (1, 1),       // depth_info_view_id[0] = 0
+            // ZNear float: sign=0, exp=1, mlen_minus1=0, mantissa=0
+            (0, 1),
+            (1, 7),
+            (0, 5),
+            (0, 1),
+            // ZFar float: sign=0, exp=2, mlen_minus1=0, mantissa=0
+            (0, 1),
+            (2, 7),
+            (0, 5),
+            (0, 1),
+            // depth_nonlinear_representation_num_minus1 = 0 → "1"
+            (1, 1),
+            // depth_nonlinear_representation_model[0] = 4 → "00101"
+            (0b00101, 5),
+        ]);
+        let info = parse_depth_representation_info(&payload).unwrap();
+        let model_len = info
+            .depth_nonlinear_representation_model_len()
+            .expect("type-3 payload signals model_len");
+        let num_segments = info
+            .depth_nonlinear_representation_num_segments()
+            .expect("type-3 payload signals num_segments");
+        assert_eq!(
+            usize::from(model_len),
+            info.depth_nonlinear_representation_model.len()
+        );
+        assert_eq!(num_segments, model_len + 1);
+        assert_eq!(model_len, 1);
+        assert_eq!(num_segments, 2);
     }
 
     // §H.13.2.3 — values 4..=15 of depth_representation_type are
