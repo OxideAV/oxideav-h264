@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 259 — typed `sub_seq_duration_seconds(&self) -> Option<f64>`
+  accessor on the already-parsed §D.2.13 (2024 spec) / §D.2.12 (2003
+  draft) `SubSeqCharacteristics` body (SEI payload type 12). The
+  on-wire `sub_seq_duration` field is a u(32) count of 90-kHz clock
+  ticks per the spec text "*sub_seq_duration specifies the duration of
+  the target sub-sequence in clock ticks of a 90-kHz clock*", so the
+  accessor divides the carrier by `90_000` to surface the seconds
+  scalar. Returns `None` when `duration_flag == 0` (the spec sentinel:
+  "*duration_flag equal to 0 indicates that the duration of the target
+  sub-sequence is not specified*") — `sub_seq_duration` is `None` in
+  that case and no scalar derivation is defined. The `f64` return
+  represents the full u(32) carrier range (0..=4_294_967_295 ticks ≈
+  13.25 hours, since 4_294_967_295 / 90_000 ≈ 47_721.86 s) with only a
+  lossless `u32 → f64` widening followed by a single divide. 7 new
+  lib unit tests pin the None-when-unspecified branch, the minimum
+  non-zero carrier (1 tick round-trips back to 1 within 1e-12 after
+  multiplying by 90_000), the exact one-second carrier (90_000 ticks
+  → 1.0), a common per-frame interval (3_000 ticks → 1/30 second), the
+  u(32) ceiling (`u32::MAX` ticks → exact `f64::from(u32::MAX) /
+  90_000.0`), and two end-to-end round trips through
+  `parse_sub_seq_characteristics` covering the duration_flag=1 path
+  (180_000 ticks → 2.0 s) and the duration_flag=0 path (mirrors the
+  on-wire `None`). Zero new SEI types added; the delta closes the
+  remaining §D.2.13 semantic gap from the round-99 implementation —
+  the parsed value was the raw u(32) tick count, not the spec's
+  seconds scalar.
+
 - round 255 — two typed accessors on the already-parsed §D.2.13 (2024
   spec) / §D.2.12 (2003 draft) `sub_seq_layer_characteristics` body
   (SEI payload type 11), also re-used by §D.2.14 (payload type 12)

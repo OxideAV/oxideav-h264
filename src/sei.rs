@@ -2380,6 +2380,29 @@ pub struct SubSeqCharacteristics {
     pub referenced: Vec<SubSeqReference>,
 }
 
+impl SubSeqCharacteristics {
+    /// Reconstruct §D.2.13 (2024) / §D.2.12 (2003 draft) `sub_seq_duration`
+    /// in seconds: the on-wire field is counted in 90-kHz clock ticks
+    /// ("sub_seq_duration specifies the duration of the target sub-sequence
+    /// in clock ticks of a 90-kHz clock"), so this divides by 90_000.
+    ///
+    /// Returns `None` when `duration_flag == 0` (the spec says: "duration_flag
+    /// equal to 0 indicates that the duration of the target sub-sequence is
+    /// not specified") — `sub_seq_duration` is `None` in that case and no
+    /// scalar interpretation is defined.
+    ///
+    /// `f64` is used so the 90-kHz quantisation step is representable with
+    /// only the lossless `u32`-to-`f64` widening followed by a single
+    /// floating-point division; the full u(32) carrier range
+    /// (0..=4_294_967_295 ticks ≈ 13.25 hours) round-trips through
+    /// `f64::from(u32)` without loss.
+    #[must_use]
+    pub fn sub_seq_duration_seconds(&self) -> Option<f64> {
+        self.sub_seq_duration
+            .map(|ticks| f64::from(ticks) / 90_000.0)
+    }
+}
+
 pub fn parse_sub_seq_characteristics(payload: &[u8]) -> Result<SubSeqCharacteristics, SeiError> {
     let mut r = BitReader::new(payload);
     let sub_seq_layer_num = r.ue()?;
@@ -10166,6 +10189,119 @@ mod tests {
             }
             other => panic!("expected SubSeqCharacteristics, got {other:?}"),
         }
+    }
+
+    // --- §D.2.13 sub_seq_duration_seconds typed accessor ---------------
+
+    #[test]
+    fn sub_seq_duration_seconds_none_when_unspecified() {
+        // duration_flag == 0 ⇒ sub_seq_duration is None per spec
+        // ("duration_flag equal to 0 indicates that the duration of the
+        // target sub-sequence is not specified") — no scalar derivation.
+        let c = SubSeqCharacteristics {
+            sub_seq_layer_num: 0,
+            sub_seq_id: 0,
+            sub_seq_duration: None,
+            average_rate: None,
+            referenced: Vec::new(),
+        };
+        assert!(c.sub_seq_duration_seconds().is_none());
+    }
+
+    #[test]
+    fn sub_seq_duration_seconds_minimum_nonzero() {
+        // Smallest non-zero carrier: 1 tick of a 90-kHz clock is exactly
+        // 1/90_000 second; with denominator a power-of-five times a power
+        // of two the value is non-dyadic, so check via the exact integer
+        // identity ticks * 90_000 == reconstructed * 90_000² (i.e. the
+        // accessor's f64 result times 90_000 returns to 1.0 exactly).
+        let c = SubSeqCharacteristics {
+            sub_seq_layer_num: 0,
+            sub_seq_id: 0,
+            sub_seq_duration: Some(1),
+            average_rate: None,
+            referenced: Vec::new(),
+        };
+        let s = c.sub_seq_duration_seconds().unwrap();
+        // 1 / 90_000 ≈ 1.111…e-5; verify the round-trip pins to 1 tick.
+        assert!((s * 90_000.0 - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sub_seq_duration_seconds_one_second() {
+        // 90_000 ticks == 1 second exactly (the 90-kHz tick rate is
+        // defined so an integer second is an integer tick count).
+        let c = SubSeqCharacteristics {
+            sub_seq_layer_num: 0,
+            sub_seq_id: 0,
+            sub_seq_duration: Some(90_000),
+            average_rate: None,
+            referenced: Vec::new(),
+        };
+        assert_eq!(c.sub_seq_duration_seconds(), Some(1.0));
+    }
+
+    #[test]
+    fn sub_seq_duration_seconds_one_frame_at_30fps() {
+        // 3_000 ticks == 1 frame at 30 fps (30 * 3_000 == 90_000); a
+        // common GOP-edge unit and exactly representable in f64.
+        let c = SubSeqCharacteristics {
+            sub_seq_layer_num: 0,
+            sub_seq_id: 0,
+            sub_seq_duration: Some(3_000),
+            average_rate: None,
+            referenced: Vec::new(),
+        };
+        let s = c.sub_seq_duration_seconds().unwrap();
+        assert!((s - 1.0 / 30.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sub_seq_duration_seconds_u32_ceiling() {
+        // Carrier ceiling u32::MAX == 4_294_967_295 ticks ≈ 47_721.86 s
+        // ≈ 13 h 15 min 21.86 s — pin the exact f64 quotient.
+        let c = SubSeqCharacteristics {
+            sub_seq_layer_num: 0,
+            sub_seq_id: 0,
+            sub_seq_duration: Some(u32::MAX),
+            average_rate: None,
+            referenced: Vec::new(),
+        };
+        let expected = f64::from(u32::MAX) / 90_000.0;
+        assert_eq!(c.sub_seq_duration_seconds(), Some(expected));
+    }
+
+    #[test]
+    fn sub_seq_duration_seconds_roundtrip_via_parse() {
+        // End-to-end via parse_sub_seq_characteristics: pack a payload
+        // with duration_flag=1 and sub_seq_duration=180_000 (== 2 s).
+        let payload = pack_bits(&[
+            (1, 1),        // sub_seq_layer_num = 0
+            (1, 1),        // sub_seq_id = 0
+            (1, 1),        // duration_flag = 1
+            (180_000, 32), // sub_seq_duration = 180_000 ticks == 2 s
+            (0, 1),        // average_rate_flag = 0
+            (1, 1),        // num_referenced_subseqs = 0
+        ]);
+        let got = parse_sub_seq_characteristics(&payload).unwrap();
+        assert_eq!(got.sub_seq_duration, Some(180_000));
+        assert_eq!(got.sub_seq_duration_seconds(), Some(2.0));
+    }
+
+    #[test]
+    fn sub_seq_duration_seconds_roundtrip_unspecified() {
+        // End-to-end via parse_sub_seq_characteristics with
+        // duration_flag=0: typed accessor must mirror the on-wire None.
+        let payload = pack_bits(&[
+            (1, 1), // sub_seq_layer_num = 0
+            (1, 1), // sub_seq_id = 0
+            (0, 1), // duration_flag = 0
+            (0, 1), // average_rate_flag = 0
+            (1, 1), // num_referenced_subseqs = 0
+        ]);
+        let got = parse_sub_seq_characteristics(&payload).unwrap();
+        assert!(got.sub_seq_duration.is_none());
+        assert!(got.sub_seq_duration_seconds().is_none());
     }
 
     #[test]
