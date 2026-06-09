@@ -2470,6 +2470,39 @@ pub struct ProgressiveRefinementSegmentStart {
     pub num_refinement_steps_minus1: u32,
 }
 
+impl ProgressiveRefinementSegmentStart {
+    /// §D.2.18 — total count of refinement steps the segment promises,
+    /// reconstructed from the on-wire `num_refinement_steps_minus1`
+    /// field.
+    ///
+    /// The spec text reads: "*num_refinement_steps_minus1 plus 1
+    /// indicates the maximum number of refinement steps that may be
+    /// used during the refinement of the picture quality from the
+    /// progressive_refinement_segment_start to the corresponding
+    /// progressive_refinement_segment_end*". This accessor surfaces
+    /// the semantic `NumRefinementSteps = num_refinement_steps_minus1
+    /// + 1` directly.
+    ///
+    /// The return type is `u64` so the full u(32) carrier range maps
+    /// without overflow: `num_refinement_steps_minus1 == u32::MAX`
+    /// (the `ue(v)` carrier is bit-bounded by the parser, but the
+    /// stored field is `u32`) yields `u32::MAX + 1 == 4_294_967_296`,
+    /// which would overflow a `u32` return. `u32` callers can safely
+    /// downcast when the segment's carrier is known to fit, but the
+    /// raw return makes no such assumption.
+    ///
+    /// Always returns a positive value: the on-wire `_minus1` bias
+    /// guarantees `NumRefinementSteps >= 1` for any well-formed
+    /// payload, so the return is unconditional `u64` rather than
+    /// `Option<u64>` — unlike the `Option`-returning accessors that
+    /// guard against an unsignalled-flag sentinel, this field has no
+    /// "absent" encoding.
+    #[must_use]
+    pub fn num_refinement_steps(&self) -> u64 {
+        u64::from(self.num_refinement_steps_minus1) + 1
+    }
+}
+
 pub fn parse_progressive_refinement_segment_start(
     payload: &[u8],
 ) -> Result<ProgressiveRefinementSegmentStart, SeiError> {
@@ -10311,6 +10344,50 @@ mod tests {
         let got = parse_progressive_refinement_segment_start(&payload).unwrap();
         assert_eq!(got.progressive_refinement_id, 2);
         assert_eq!(got.num_refinement_steps_minus1, 0);
+    }
+
+    #[test]
+    fn progressive_refinement_num_refinement_steps_minimum() {
+        // num_refinement_steps_minus1 == 0 ⇒ NumRefinementSteps == 1.
+        let r = ProgressiveRefinementSegmentStart {
+            progressive_refinement_id: 0,
+            num_refinement_steps_minus1: 0,
+        };
+        assert_eq!(r.num_refinement_steps(), 1);
+    }
+
+    #[test]
+    fn progressive_refinement_num_refinement_steps_typical() {
+        // A typical small refinement segment with three steps:
+        // num_refinement_steps_minus1 == 2 ⇒ NumRefinementSteps == 3.
+        let r = ProgressiveRefinementSegmentStart {
+            progressive_refinement_id: 7,
+            num_refinement_steps_minus1: 2,
+        };
+        assert_eq!(r.num_refinement_steps(), 3);
+    }
+
+    #[test]
+    fn progressive_refinement_num_refinement_steps_u32_ceiling() {
+        // num_refinement_steps_minus1 == u32::MAX must not overflow
+        // the u64 return: u32::MAX + 1 == 4_294_967_296.
+        let r = ProgressiveRefinementSegmentStart {
+            progressive_refinement_id: 0,
+            num_refinement_steps_minus1: u32::MAX,
+        };
+        assert_eq!(r.num_refinement_steps(), u64::from(u32::MAX) + 1);
+        assert_eq!(r.num_refinement_steps(), 4_294_967_296);
+    }
+
+    #[test]
+    fn progressive_refinement_num_refinement_steps_parse_round_trip() {
+        // id=5 (ue=5 → "00110"), steps_minus1=9 (ue=9 → "0001010").
+        // After parsing, NumRefinementSteps should be 9 + 1 = 10.
+        let payload = pack_bits(&[(0b00110, 5), (0b0001010, 7)]);
+        let got = parse_progressive_refinement_segment_start(&payload).unwrap();
+        assert_eq!(got.progressive_refinement_id, 5);
+        assert_eq!(got.num_refinement_steps_minus1, 9);
+        assert_eq!(got.num_refinement_steps(), 10);
     }
 
     #[test]

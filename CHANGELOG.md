@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 264 — typed `num_refinement_steps(&self) -> u64` accessor on
+  the already-parsed §D.2.18 `ProgressiveRefinementSegmentStart` body
+  (SEI payload type 16). The on-wire field is the classic `_minus1`
+  bias per the spec text "*num_refinement_steps_minus1 plus 1
+  indicates the maximum number of refinement steps that may be used
+  during the refinement of the picture quality from the
+  progressive_refinement_segment_start to the corresponding
+  progressive_refinement_segment_end*", so the accessor surfaces the
+  semantic `NumRefinementSteps = num_refinement_steps_minus1 + 1`
+  directly. The `u64` return is the smallest unsigned type that can
+  represent the full u(32) carrier range without overflow:
+  `num_refinement_steps_minus1 == u32::MAX` yields
+  `u32::MAX + 1 == 4_294_967_296`, one past `u32::MAX`. Return is
+  unconditional (not `Option`) because the `_minus1` bias guarantees
+  `NumRefinementSteps >= 1` for any well-formed payload — no
+  unsignalled-flag sentinel exists, unlike the `Option`-returning
+  accessors elsewhere in this module. 4 new lib unit tests pin: the
+  minimum (0 ⇒ 1), a typical small segment (2 ⇒ 3), the u(32) ceiling
+  (`u32::MAX` ⇒ `u32::MAX + 1 == 4_294_967_296` with no overflow), and
+  an end-to-end round trip through `parse_progressive_refinement_segment_start`
+  (id=5, steps_minus1=9 ⇒ NumRefinementSteps=10).
+
 - round 259 — typed `sub_seq_duration_seconds(&self) -> Option<f64>`
   accessor on the already-parsed §D.2.13 (2024 spec) / §D.2.12 (2003
   draft) `SubSeqCharacteristics` body (SEI payload type 12). The
