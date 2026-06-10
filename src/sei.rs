@@ -662,6 +662,78 @@ pub enum ToneMappingModel {
     },
 }
 
+impl ToneMappingBody {
+    /// §D.2.25 — the two normative *default end points* of the
+    /// piece-wise linear mapping function (`tone_map_model_id == 3`).
+    ///
+    /// The spec defines `num_pivots` as
+    ///
+    /// > *"the number of pivot points in the piece-wise linear
+    /// > mapping function without counting the two default end
+    /// > points, (0, 0) and
+    /// > (2^coded_data_bit_depth − 1, 2^target_bit_depth − 1)."*
+    ///
+    /// Only the interior `num_pivots` pivots carry signalled
+    /// `(coded_pivot_value[i], target_pivot_value[i])` pairs; the two
+    /// end points are implicit and never appear in the bitstream.
+    /// This accessor materialises them as `(coded, target)` pairs in
+    /// the same `(coded_pivot_value, target_pivot_value)` domain as
+    /// the stored interior pivots, so a caller assembling the full
+    /// mapping curve can prepend the start point, append the end
+    /// point, and interpolate across all `num_pivots + 2` points.
+    ///
+    /// Returns `None` unless `tone_map_model_id == 3` — the implicit
+    /// end points are defined only for the piece-wise linear model;
+    /// no inferred end points exist for the linear / sigmoid /
+    /// user-table / reserved models.
+    ///
+    /// The end value `(2^coded_data_bit_depth − 1,
+    /// 2^target_bit_depth − 1)` is computed from the body's
+    /// `coded_data_bit_depth` (range 8..=14 ⇒ coded end 255..=16383)
+    /// and `target_bit_depth` (range 1..=16 ⇒ target end 1..=65535);
+    /// both fit in `u32`, the same width the interior pivots are
+    /// stored in.
+    #[must_use]
+    pub fn piecewise_default_end_points(&self) -> Option<((u32, u32), (u32, u32))> {
+        if self.model_id != 3 {
+            return None;
+        }
+        // Saturating shifts keep this total even for out-of-spec
+        // bit depths (the parser already range-checks the legal
+        // 8..=14 / 1..=16 windows, but the accessor must not panic
+        // on a hand-constructed body).
+        let coded_end = 1u32
+            .checked_shl(u32::from(self.coded_data_bit_depth))
+            .map_or(u32::MAX, |v| v - 1);
+        let target_end = 1u32
+            .checked_shl(u32::from(self.target_bit_depth))
+            .map_or(u32::MAX, |v| v - 1);
+        Some(((0, 0), (coded_end, target_end)))
+    }
+
+    /// §D.2.25 — the total number of pivot points in the piece-wise
+    /// linear mapping curve, **including** the two implicit default
+    /// end points `(0, 0)` and
+    /// `(2^coded_data_bit_depth − 1, 2^target_bit_depth − 1)`.
+    ///
+    /// The bitstream signals only the interior `num_pivots` points
+    /// (§D.2.25: `num_pivots` is counted *without* the two end
+    /// points), so the assembled curve has `num_pivots + 2` points.
+    ///
+    /// Returns `None` unless `tone_map_model_id == 3`. With the
+    /// on-wire `num_pivots` being u(16) (0..=65535) the total lies in
+    /// `2..=65537`, which is why the return widens to `u32`.
+    #[must_use]
+    pub fn piecewise_total_pivot_count(&self) -> Option<u32> {
+        match &self.model {
+            ToneMappingModel::PiecewisePivots { num_pivots, .. } => {
+                Some(u32::from(*num_pivots) + 2)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// §D.2.21 — film_grain_characteristics.
 ///
 /// Fully decodes the §D.1.21 / §D.2.21 syntax including the per-
@@ -7127,6 +7199,105 @@ mod tests {
         assert_eq!(tmi.tone_map_id, 7);
         assert!(tmi.cancel_flag);
         assert!(tmi.body.is_none());
+    }
+
+    // §D.2.25 — the implicit-end-point accessors only fire for
+    // tone_map_model_id == 3. For the linear (model_id 0) body
+    // exercised by `tone_mapping_info_linear`, both
+    // `piecewise_default_end_points` and `piecewise_total_pivot_count`
+    // return None.
+    #[test]
+    fn tone_mapping_piecewise_accessors_none_for_linear() {
+        let fields: [(u64, u32); 8] = [
+            (1, 1),            // ue tone_map_id=0
+            (0, 1),            // cancel_flag=0
+            (1, 1),            // ue repetition_period=0
+            (10, 8),           // coded_data_bit_depth
+            (8, 8),            // target_bit_depth
+            (1, 1),            // ue model_id=0 (linear)
+            (0x0000_0100, 32), // min_value
+            (0x0000_03FF, 32), // max_value
+        ];
+        let packed = pack_bits(&fields);
+        let body = parse_tone_mapping_info(&packed).unwrap().body.unwrap();
+        assert_eq!(body.model_id, 0);
+        assert!(body.piecewise_default_end_points().is_none());
+        assert!(body.piecewise_total_pivot_count().is_none());
+    }
+
+    // §D.2.25 — piecewise-linear (model_id 3) implicit default end
+    // points. num_pivots = 2 interior pivots; coded_data_bit_depth =
+    // 10, target_bit_depth = 8. The two implicit end points are
+    // (0, 0) and (2^10 − 1, 2^8 − 1) = (1023, 255). The assembled
+    // curve therefore has num_pivots + 2 = 4 points.
+    //
+    // coded_pivot_value width = ((10 + 7) >> 3) << 3 = 16 bits.
+    // target_pivot_value width = ((8 + 7) >> 3) << 3 = 8 bits.
+    #[test]
+    fn tone_mapping_piecewise_default_end_points_and_count() {
+        let fields: [(u64, u32); 11] = [
+            (1, 1),       // ue tone_map_id=0
+            (0, 1),       // cancel_flag=0
+            (1, 1),       // ue repetition_period=0
+            (10, 8),      // coded_data_bit_depth = 10
+            (8, 8),       // target_bit_depth = 8
+            (0b00100, 5), // ue model_id=3 (5-bit Exp-Golomb codeword)
+            (2, 16),      // num_pivots = 2
+            (300, 16),    // coded_pivot_value[0] (16-bit)
+            (100, 8),     // target_pivot_value[0] (8-bit)
+            (700, 16),    // coded_pivot_value[1] (16-bit)
+            (200, 8),     // target_pivot_value[1] (8-bit)
+        ];
+        let packed = pack_bits(&fields);
+        let body = parse_tone_mapping_info(&packed).unwrap().body.unwrap();
+        assert_eq!(body.model_id, 3);
+        match &body.model {
+            ToneMappingModel::PiecewisePivots {
+                num_pivots,
+                coded_pivot_value,
+                target_pivot_value,
+            } => {
+                assert_eq!(*num_pivots, 2);
+                assert_eq!(coded_pivot_value, &vec![300, 700]);
+                assert_eq!(target_pivot_value, &vec![100, 200]);
+            }
+            other => panic!("expected PiecewisePivots, got {:?}", other),
+        }
+
+        // Implicit end points: start (0, 0) and end (1023, 255).
+        let (start, end) = body.piecewise_default_end_points().unwrap();
+        assert_eq!(start, (0, 0));
+        assert_eq!(end, (1023, 255));
+
+        // Total = interior num_pivots (2) + 2 default end points = 4.
+        assert_eq!(body.piecewise_total_pivot_count(), Some(4));
+    }
+
+    // §D.2.25 — the implicit end value tracks coded_data_bit_depth /
+    // target_bit_depth independently. Here coded = 14 (max legal),
+    // target = 16 (max legal): end = (2^14 − 1, 2^16 − 1) =
+    // (16383, 65535) with zero interior pivots → total count 2.
+    //
+    // coded_pivot_value width = ((14 + 7) >> 3) << 3 = 16.
+    // target_pivot_value width = ((16 + 7) >> 3) << 3 = 16.
+    #[test]
+    fn tone_mapping_piecewise_max_bit_depths_zero_pivots() {
+        let fields = vec![
+            (1u64, 1u32), // ue tone_map_id=0
+            (0, 1),       // cancel_flag=0
+            (1, 1),       // ue repetition_period=0
+            (14, 8),      // coded_data_bit_depth = 14
+            (16, 8),      // target_bit_depth = 16
+            (0b00100, 5), // ue model_id = 3
+            (0, 16),      // num_pivots = 0
+        ];
+        let packed = pack_bits(&fields);
+        let body = parse_tone_mapping_info(&packed).unwrap().body.unwrap();
+        assert_eq!(body.model_id, 3);
+        let (start, end) = body.piecewise_default_end_points().unwrap();
+        assert_eq!(start, (0, 0));
+        assert_eq!(end, (16_383, 65_535));
+        assert_eq!(body.piecewise_total_pivot_count(), Some(2));
     }
 
     // §D.2.21 — film_grain_characteristics.

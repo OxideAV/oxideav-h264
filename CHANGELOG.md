@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 274 — two typed accessors on the already-parsed §D.2.25
+  `ToneMappingBody` (SEI payload type 23, tone_mapping_info) surfacing
+  the normative implicit *default end points* of the piece-wise linear
+  mapping model (`tone_map_model_id == 3`). §D.2.25 defines `num_pivots`
+  as "*the number of pivot points in the piece-wise linear mapping
+  function without counting the two default end points, (0, 0) and
+  (2^coded_data_bit_depth − 1, 2^target_bit_depth − 1)*" — only the
+  interior `num_pivots` pivots carry signalled
+  `(coded_pivot_value[i], target_pivot_value[i])` pairs; the two end
+  points are implicit and never appear in the bitstream. New
+  `ToneMappingBody::piecewise_default_end_points(&self) ->
+  Option<((u32, u32), (u32, u32))>` materialises the start `(0, 0)` and
+  the end `(2^coded_data_bit_depth − 1, 2^target_bit_depth − 1)` pair in
+  the same `(coded_pivot_value, target_pivot_value)` domain as the
+  stored interior pivots, computing the end value from the body's
+  `coded_data_bit_depth` (8..=14 ⇒ coded end 255..=16383) and
+  `target_bit_depth` (1..=16 ⇒ target end 1..=65535); the shifts are
+  `checked_shl`-saturated so a hand-constructed out-of-spec body can't
+  panic. Sibling accessor `piecewise_total_pivot_count(&self) ->
+  Option<u32>` returns `num_pivots + 2`, the size of the assembled curve
+  including the two implicit end points (u(16) `num_pivots` ⇒ total
+  2..=65537, widened to `u32`). Both return `None` unless
+  `tone_map_model_id == 3` — the implicit end points are defined only
+  for the piece-wise linear model, so no inferred value exists for the
+  linear / sigmoid / user-table / reserved models. 3 new lib unit tests
+  pin the None-for-linear (model_id 0) branch, the typical case
+  (coded 10 / target 8 ⇒ end (1023, 255), 2 interior pivots ⇒ total 4),
+  and the max-legal-bit-depth case (coded 14 / target 16 ⇒ end
+  (16383, 65535), zero interior pivots ⇒ total 2). Zero new SEI types;
+  the typed-accessor delta closes the small §D.2.25 semantic gap left by
+  the round-73 tone_mapping_info implementation (the implicit default
+  end points were normatively defined but not materialised — only the
+  interior signalled pivots were stored).
+
 - round 271 — two typed bit-depth accessors on the already-parsed
   §D.2.21 `FilmGrainSeparateColourDescription` body (SEI payload type
   19, film_grain_characteristics). New
