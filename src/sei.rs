@@ -732,6 +732,55 @@ pub struct FilmGrainSeparateColourDescription {
     pub matrix_coefficients: u8,
 }
 
+impl FilmGrainSeparateColourDescription {
+    /// §D.2.21 — luma bit depth of the simulated film grain signal,
+    /// reconstructed from the on-wire `film_grain_bit_depth_luma_minus8`
+    /// field.
+    ///
+    /// The spec text reads: "*film_grain_bit_depth_luma_minus8 plus 8
+    /// specifies the bit depth used for the luma component of the film
+    /// grain characteristics specified in the SEI message*". The
+    /// derivation is `filmGrainBitDepth[0] =
+    /// film_grain_bit_depth_luma_minus8 + 8` (eq. D-14). This accessor
+    /// surfaces that `filmGrainBitDepth[0]` semantic directly rather
+    /// than the biased on-wire `_minus8` carrier.
+    ///
+    /// The on-wire field is u(3) (0..=7), so the result is in 8..=15 and
+    /// always fits in `u8`. The return is unconditional (not `Option`)
+    /// because the field is only present — and this struct only
+    /// constructed — when `separate_colour_description_present_flag ==
+    /// 1`; the §D.2.21 "not present ⇒ inferred to bit_depth_luma_minus8"
+    /// rule applies to the absent-struct case, which is represented by
+    /// [`FilmGrainBody::separate_colour_description`] being `None`.
+    #[must_use]
+    pub fn bit_depth_luma(&self) -> u8 {
+        self.bit_depth_luma_minus8 + 8
+    }
+
+    /// §D.2.21 — chroma (Cb / Cr) bit depth of the simulated film grain
+    /// signal, reconstructed from the on-wire
+    /// `film_grain_bit_depth_chroma_minus8` field.
+    ///
+    /// The spec text reads: "*film_grain_bit_depth_chroma_minus8 plus 8
+    /// specifies the bit depth used for the Cb and Cr components of the
+    /// film grain characteristics specified in the SEI message*". The
+    /// derivation is `filmGrainBitDepth[c] =
+    /// film_grain_bit_depth_chroma_minus8 + 8` for c = 1, 2 (eq. D-15).
+    /// This accessor surfaces that shared `filmGrainBitDepth[1] ==
+    /// filmGrainBitDepth[2]` semantic directly rather than the biased
+    /// on-wire `_minus8` carrier.
+    ///
+    /// The on-wire field is u(3) (0..=7), so the result is in 8..=15 and
+    /// always fits in `u8`. The return is unconditional (not `Option`)
+    /// for the same reason as [`Self::bit_depth_luma`]: the §D.2.21
+    /// "not present ⇒ inferred" rule is represented by the carrying
+    /// struct being `None`, not by an in-struct sentinel.
+    #[must_use]
+    pub fn bit_depth_chroma(&self) -> u8 {
+        self.bit_depth_chroma_minus8 + 8
+    }
+}
+
 /// Inputs a SEI parser needs beyond the raw payload bytes. Many parsers
 /// depend on VUI fields (CpbDpbDelaysPresentFlag, pic_struct_present_flag,
 /// time_offset_length, etc.).
@@ -7198,6 +7247,106 @@ mod tests {
         assert!(body.components[1].is_some());
         assert!(body.components[2].is_none());
         assert_eq!(body.repetition_period, 0);
+    }
+
+    // §D.2.21 eq. D-14 / D-15 — typed bit-depth accessors on the
+    // separate-colour-description body. The on-wire `_minus8` carriers in
+    // the round-trip fixture above are both 2 (10-bit luma + chroma), so
+    // the accessors must surface filmGrainBitDepth = 10.
+    #[test]
+    fn film_grain_bit_depth_typical_10bit() {
+        let scd = FilmGrainSeparateColourDescription {
+            bit_depth_luma_minus8: 2,
+            bit_depth_chroma_minus8: 2,
+            full_range_flag: false,
+            colour_primaries: 1,
+            transfer_characteristics: 13,
+            matrix_coefficients: 1,
+        };
+        // eq. D-14: filmGrainBitDepth[0] = 2 + 8 = 10.
+        assert_eq!(scd.bit_depth_luma(), 10);
+        // eq. D-15: filmGrainBitDepth[1] = filmGrainBitDepth[2] = 2 + 8 = 10.
+        assert_eq!(scd.bit_depth_chroma(), 10);
+    }
+
+    // §D.2.21 — minimum on-wire carrier (0 ⇒ 8-bit), the most common case.
+    #[test]
+    fn film_grain_bit_depth_minimum_8bit() {
+        let scd = FilmGrainSeparateColourDescription {
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            full_range_flag: false,
+            colour_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+        };
+        assert_eq!(scd.bit_depth_luma(), 8);
+        assert_eq!(scd.bit_depth_chroma(), 8);
+    }
+
+    // §D.2.21 — u(3) ceiling (7 ⇒ 15-bit), and an asymmetric luma/chroma
+    // pair to prove the two accessors read independent carriers.
+    #[test]
+    fn film_grain_bit_depth_u3_ceiling_and_asymmetric() {
+        let scd = FilmGrainSeparateColourDescription {
+            bit_depth_luma_minus8: 7,
+            bit_depth_chroma_minus8: 4,
+            full_range_flag: true,
+            colour_primaries: 1,
+            transfer_characteristics: 1,
+            matrix_coefficients: 1,
+        };
+        // u(3) max carrier 7 ⇒ 15.
+        assert_eq!(scd.bit_depth_luma(), 15);
+        // Distinct chroma carrier 4 ⇒ 12 (not coupled to luma).
+        assert_eq!(scd.bit_depth_chroma(), 12);
+    }
+
+    // §D.2.21 — end-to-end through the parser: the round-trip fixture's
+    // separate-colour body carries 2 / 2, and the accessors must fire on
+    // the parsed struct (not just a hand-built one).
+    #[test]
+    fn film_grain_bit_depth_parse_round_trip() {
+        let fields = [
+            (0, 1),  // cancel_flag
+            (2, 2),  // model_id
+            (1, 1),  // separate_colour_description_present_flag
+            (2, 3),  // bit_depth_luma_minus8 (= 10-bit luma)
+            (2, 3),  // bit_depth_chroma_minus8 (= 10-bit chroma)
+            (1, 1),  // full_range_flag
+            (1, 8),  // colour_primaries
+            (13, 8), // transfer_characteristics
+            (1, 8),  // matrix_coefficients
+            (0, 2),  // blending_mode_id
+            (3, 4),  // log2_scale_factor
+            (1, 1),  // comp_model_present_flag[0]
+            (1, 1),  // comp_model_present_flag[1]
+            (0, 1),  // comp_model_present_flag[2]
+            // c=0 body
+            (0, 8),   // num_intensity_intervals_minus1
+            (0, 3),   // num_model_values_minus1
+            (0, 8),   // interval[0].lower_bound
+            (255, 8), // interval[0].upper_bound
+            (1, 1),   // comp_model_value[0][0] = se(0)
+            // c=1 body
+            (0, 8),   // num_intensity_intervals_minus1
+            (0, 3),   // num_model_values_minus1
+            (0, 8),   // interval[0].lower_bound
+            (255, 8), // interval[0].upper_bound
+            (1, 1),   // comp_model_value[0][0] = se(0)
+            (1, 1),   // repetition_period = ue(0) = 0
+        ];
+        let payload = pack_bits(&fields);
+        let fg = parse_film_grain_characteristics(&payload).unwrap();
+        let scd = fg
+            .body
+            .expect("body present")
+            .separate_colour_description
+            .expect("scd present");
+        assert_eq!(scd.bit_depth_luma_minus8, 2);
+        assert_eq!(scd.bit_depth_chroma_minus8, 2);
+        assert_eq!(scd.bit_depth_luma(), 10);
+        assert_eq!(scd.bit_depth_chroma(), 10);
     }
 
     // §D.2.21 — multi-interval / multi-model-value path with non-trivial

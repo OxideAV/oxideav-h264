@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 271 — two typed bit-depth accessors on the already-parsed
+  §D.2.21 `FilmGrainSeparateColourDescription` body (SEI payload type
+  19, film_grain_characteristics). New
+  `FilmGrainSeparateColourDescription::bit_depth_luma(&self) -> u8`
+  surfaces the spec semantic `filmGrainBitDepth[0]` by applying the
+  eq. D-14 derivation `filmGrainBitDepth[0] =
+  film_grain_bit_depth_luma_minus8 + 8` ("*film_grain_bit_depth_luma_minus8
+  plus 8 specifies the bit depth used for the luma component of the
+  film grain characteristics specified in the SEI message*"). Sibling
+  accessor `bit_depth_chroma(&self) -> u8` surfaces the shared
+  `filmGrainBitDepth[1] == filmGrainBitDepth[2]` semantic via eq. D-15
+  `filmGrainBitDepth[c] = film_grain_bit_depth_chroma_minus8 + 8` for
+  c = 1, 2. Both on-wire `_minus8` carriers are u(3) (0..=7), so the
+  results land in 8..=15 and always fit in `u8`. The returns are
+  unconditional (not `Option`) because this struct is only constructed
+  when `separate_colour_description_present_flag == 1`; the §D.2.21
+  "not present ⇒ inferred to bit_depth_{luma,chroma}_minus8" rule is
+  represented by the carrying `FilmGrainBody::separate_colour_description`
+  being `None`, not by an in-struct sentinel. 4 new lib unit tests pin
+  the typical 10-bit case (2 ⇒ 10 on both axes), the minimum 8-bit
+  carrier (0 ⇒ 8), the u(3) ceiling plus an asymmetric luma/chroma
+  pair (luma 7 ⇒ 15, chroma 4 ⇒ 12, proving the two accessors read
+  independent carriers), and an end-to-end round trip through
+  `parse_film_grain_characteristics` that fires the accessors on the
+  parsed struct. Zero new SEI types added; the typed-accessor delta
+  closes the small §D.2.21 semantic gap left by the round-73
+  film_grain implementation (the parsed values were the biased on-wire
+  u(3) `_minus8` carriers directly, not the spec's `filmGrainBitDepth`
+  scalars).
+
 - round 264 — typed `num_refinement_steps(&self) -> u64` accessor on
   the already-parsed §D.2.18 `ProgressiveRefinementSegmentStart` body
   (SEI payload type 16). The on-wire field is the classic `_minus1`
