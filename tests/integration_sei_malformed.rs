@@ -8,7 +8,7 @@
 //! unit tests. This sweep mirrors the r161/r162/r163 malformed-input
 //! property-test pattern on the SEI surface:
 //!
-//! Path 1 — for every payloadType the dispatcher recognises (40
+//! Path 1 — for every payloadType the dispatcher recognises (50
 //! explicit types + the `Unknown` fallback for Annex F/G/H/I/reserved
 //! numbers), feed several adversarial payload shapes: empty payload
 //! (zero bytes); all-zeros payload at three sizes (1, 8, 64 bytes);
@@ -39,11 +39,12 @@
 use oxideav_h264::non_vcl::parse_sei_rbsp;
 use oxideav_h264::sei::{parse_payload, SeiContext};
 
-/// Mirror of `parse_payload`'s dispatch arms — 49 implemented types
-/// (round 247 adds Annex H §H.13.2.7 depth_sampling_info type 53 on
-/// top of the round-237 Annex I §I.13.2.1
-/// constrained_depth_parameter_set_identifier type 54, the round-231
-/// Annex H §H.13.2.3 depth_representation_info type 50, the
+/// Mirror of `parse_payload`'s dispatch arms — 50 implemented types
+/// (round 278 adds Annex H §H.13.2.5 depth_timing type 52, completing
+/// the contiguous Annex H/I block 50..=54 on top of the round-247
+/// §H.13.2.7 depth_sampling_info type 53, the round-237 Annex I
+/// §I.13.2.1 constrained_depth_parameter_set_identifier type 54, the
+/// round-231 Annex H §H.13.2.3 depth_representation_info type 50, the
 /// round-226 Annex H §H.13.2.4
 /// three_dimensional_reference_displays_info type 51, the round-213
 /// Annex G §G.13.2.5 multiview_acquisition_info type 40, the round-207
@@ -54,8 +55,8 @@ use oxideav_h264::sei::{parse_payload, SeiContext};
 /// numbers).
 const KNOWN_PAYLOAD_TYPES: &[u32] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 39, 40,
-    41, 43, 45, 46, 47, 50, 51, 53, 54, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155, 156, 200,
-    201, 205,
+    41, 43, 45, 46, 47, 50, 51, 52, 53, 54, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155, 156,
+    200, 201, 205,
 ];
 
 const FALLBACK_PAYLOAD_TYPES: &[u32] = &[
@@ -128,6 +129,7 @@ fn contexts() -> Vec<(&'static str, SeiContext)> {
                 num_slice_groups: 1,
                 pic_size_in_map_units: 0,
                 frame_mbs_only_flag: true,
+                num_depth_views: 0,
             },
         ),
         (
@@ -144,6 +146,7 @@ fn contexts() -> Vec<(&'static str, SeiContext)> {
                 num_slice_groups: 4,
                 pic_size_in_map_units: 64,
                 frame_mbs_only_flag: false,
+                num_depth_views: 2,
             },
         ),
         (
@@ -160,6 +163,7 @@ fn contexts() -> Vec<(&'static str, SeiContext)> {
                 num_slice_groups: 8,
                 pic_size_in_map_units: 256,
                 frame_mbs_only_flag: false,
+                num_depth_views: 1024,
             },
         ),
     ]
@@ -184,14 +188,14 @@ fn sei_parse_payload_never_panics() {
         }
     }
 
-    // 49 known + 20 fallback = 69 payload types × 11 shapes × 4 ctxs
-    // = 3036 invocations. Lock the count so a future change that
+    // 50 known + 20 fallback = 70 payload types × 11 shapes × 4 ctxs
+    // = 3080 invocations. Lock the count so a future change that
     // accidentally drops a row from one of the tables makes the test
-    // fail loudly instead of silently shrinking coverage. (Round 247
-    // adds the Annex H §H.13.2.7 depth_sampling_info type 53 — not
+    // fail loudly instead of silently shrinking coverage. (Round 278
+    // adds the Annex H §H.13.2.5 depth_timing type 52 — not
     // previously in either list — bumping the per-type total from
-    // 68 to 69.)
-    assert_eq!(total, 3036, "sweep cardinality drifted");
+    // 69 to 70.)
+    assert_eq!(total, 3080, "sweep cardinality drifted");
 }
 
 /// Envelope-shape regression — every shape also goes through

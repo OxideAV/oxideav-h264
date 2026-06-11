@@ -40,6 +40,7 @@
 //! | 47           | §D.1.27     | §D.2.27     | display_orientation                |
 //! | 50           | §H.13.1.3   | §H.13.2.3   | depth_representation_info (Annex H) |
 //! | 51           | §H.13.1.4   | §H.13.2.4   | three_dimensional_reference_displays_info (Annex H) |
+//! | 52           | §H.13.1.5   | §H.13.2.5   | depth_timing (Annex H)             |
 //! | 53           | §H.13.1.7   | §H.13.2.7   | depth_sampling_info (Annex H) |
 //! | 54           | §I.13.1.1   | §I.13.2.1   | constrained_depth_parameter_set_identifier (Annex I) |
 //! | 137          | §D.1.29     | §D.2.29     | mastering_display_colour_volume    |
@@ -369,6 +370,14 @@ pub enum SeiError {
         "depth_sampling_info depth_grid_view_id[{i}] shall be in 0..=1023 per Annex H §H.13.2.7 (view_id range) (got {got})"
     )]
     DepthSamplingInfoViewIdOutOfRange { i: usize, got: u32 },
+    #[error(
+        "depth_timing per_view_depth_timing_flag = 1 needs NumDepthViews from the active subset SPS MVCD extension (§H.7.3.2.1.5) to bound the per-view loop per Annex H §H.13.1.5, but SeiContext.num_depth_views is 0 (unknown)"
+    )]
+    DepthTimingNumDepthViewsUnknown,
+    #[error(
+        "depth_timing NumDepthViews shall be in 1..=1024 per Annex H (§H.7.3.2.1.5 num_views_minus1 ≤ 1023 caps the depth-view count) (got {0})"
+    )]
+    DepthTimingNumDepthViewsOutOfRange(u32),
 }
 
 /// §D.2.2 — buffering_period.
@@ -891,6 +900,18 @@ pub struct SeiContext {
     /// `frame_mbs_only_flag == 0`. Defaults to `true` (frame-only coding,
     /// the common case), under which those two fields are absent.
     pub frame_mbs_only_flag: bool,
+    /// From the active subset SPS — the `NumDepthViews` variable
+    /// accumulated from `depth_view_present_flag[i]` over the
+    /// §H.7.3.2.1.5 `seq_parameter_set_mvcd_extension()` view loop.
+    /// Needed by §H.13.1.5 depth_timing: when
+    /// `per_view_depth_timing_flag == 1` the message carries one
+    /// `depth_timing_offset()` per depth view, and the loop bound
+    /// comes from this SPS-derived variable rather than the payload.
+    /// Defaults to 0 (unknown / no Annex H subset SPS active); a
+    /// depth_timing message that reaches the per-view branch with a 0
+    /// value is rejected with
+    /// [`SeiError::DepthTimingNumDepthViewsUnknown`].
+    pub num_depth_views: u32,
 }
 
 impl Default for SeiContext {
@@ -912,6 +933,10 @@ impl Default for SeiContext {
             // otherwise; under frame_mbs_only_flag the original_field_pic_flag
             // / original_bottom_field_flag fields are absent.
             frame_mbs_only_flag: true,
+            // §H.13.1.5 — unknown until an Annex H subset SPS MVCD
+            // extension is wired in; the depth_timing per-view branch
+            // is rejected under this value.
+            num_depth_views: 0,
         }
     }
 }
@@ -6385,6 +6410,168 @@ pub fn parse_depth_sampling_info(payload: &[u8]) -> Result<DepthSamplingInfo, Se
     })
 }
 
+/// Annex H §H.13.1.5.1 / §H.13.2.5.1 — `depth_timing_offset()`
+/// sub-structure used by the §H.13.1.5 `depth_timing` SEI message.
+///
+/// Specifies the acquisition offset of the respective depth view
+/// component(s) relative to the DPB output time of the access unit
+/// containing them, equal to
+/// `depth_disp_delay_offset_fp ÷ 2^depth_disp_delay_offset_dp` in
+/// units of clock ticks as specified in Annex C (§H.13.2.5.1).
+///
+/// Field ranges follow directly from the bit widths:
+///
+/// * `offset_len_minus1` — u(5), 0..=31; plus 1 gives the bit width
+///   of `depth_disp_delay_offset_fp` (§H.13.2.5.1: "The length of
+///   depth_disp_delay_offset_fp syntax element is equal to
+///   offset_len_minus1 + 1"), so the fp field spans 1..=32 bits.
+/// * `depth_disp_delay_offset_fp` — u(offset_len_minus1 + 1),
+///   0..=`2^(offset_len_minus1 + 1) − 1` (up to the full u32 range).
+/// * `depth_disp_delay_offset_dp` — u(6), 0..=63.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthTimingOffset {
+    /// `offset_len_minus1` — u(5). Plus 1 gives the bit width of
+    /// `depth_disp_delay_offset_fp`.
+    pub offset_len_minus1: u8,
+    /// `depth_disp_delay_offset_fp` — u(offset_len_minus1 + 1). The
+    /// fixed-point numerator of the acquisition offset.
+    pub depth_disp_delay_offset_fp: u32,
+    /// `depth_disp_delay_offset_dp` — u(6). The number of fractional
+    /// bits in `depth_disp_delay_offset_fp` (the divisor is
+    /// `2^depth_disp_delay_offset_dp`).
+    pub depth_disp_delay_offset_dp: u8,
+}
+
+impl DepthTimingOffset {
+    /// Reconstruct the §H.13.2.5.1 acquisition-offset scalar
+    /// `depth_disp_delay_offset_fp ÷ 2^depth_disp_delay_offset_dp`,
+    /// in units of clock ticks as specified in Annex C. Always
+    /// non-negative — the §H.13.1.5.1 syntax has no sign field.
+    pub fn offset_clock_ticks(&self) -> f64 {
+        f64::from(self.depth_disp_delay_offset_fp)
+            / 2f64.powi(i32::from(self.depth_disp_delay_offset_dp))
+    }
+}
+
+fn read_depth_timing_offset(r: &mut BitReader) -> Result<DepthTimingOffset, SeiError> {
+    // §H.13.1.5.1 — offset_len_minus1 u(5);
+    // depth_disp_delay_offset_fp u(offset_len_minus1 + 1);
+    // depth_disp_delay_offset_dp u(6).
+    let offset_len_minus1 = r.u(5)? as u8;
+    let depth_disp_delay_offset_fp = r.u(u32::from(offset_len_minus1) + 1)?;
+    let depth_disp_delay_offset_dp = r.u(6)? as u8;
+    Ok(DepthTimingOffset {
+        offset_len_minus1,
+        depth_disp_delay_offset_fp,
+        depth_disp_delay_offset_dp,
+    })
+}
+
+/// Annex H §H.13.1.5 / §H.13.2.5 — `depth_timing` (payload type 52).
+///
+/// Indicates the acquisition time of the depth view components of one
+/// or more access units relative to the DPB output time of the same
+/// access units. The message may be present in any access unit and
+/// pertains until the end of the coded video sequence or until the
+/// next depth timing SEI message, whichever is earlier in decoding
+/// order (the access units it pertains to are the *target access unit
+/// set*).
+///
+/// Syntax — §H.13.1.5:
+///
+/// ```text
+/// depth_timing( payloadSize ) {
+///     per_view_depth_timing_flag                 u(1)
+///     if( per_view_depth_timing_flag )
+///         for( i = 0; i < NumDepthViews; i++ )
+///             depth_timing_offset( )
+///     else
+///         depth_timing_offset( )
+/// }
+/// ```
+///
+/// Semantics (§H.13.2.5):
+///
+/// * `per_view_depth_timing_flag == 0` — all the depth view
+///   components within the target access unit set have the same
+///   acquisition time offset; the single `depth_timing_offset()`
+///   occurrence specifies it (stored as a single-entry `offsets`
+///   vector).
+/// * `per_view_depth_timing_flag == 1` — one `depth_timing_offset()`
+///   per depth view, in ascending order of view order index values
+///   for the depth views. The loop bound is the SPS-derived
+///   `NumDepthViews` variable (§H.7.3.2.1.5), supplied through
+///   [`SeiContext::num_depth_views`]; a message reaching this branch
+///   under an unknown (0) value is rejected with
+///   [`SeiError::DepthTimingNumDepthViewsUnknown`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthTiming {
+    /// `per_view_depth_timing_flag` — u(1). When `true`, `offsets`
+    /// carries one entry per depth view in ascending view order index
+    /// order. When `false`, `offsets` carries a single shared entry.
+    pub per_view_depth_timing_flag: bool,
+    /// Either a single shared `depth_timing_offset()` entry
+    /// (`per_view_depth_timing_flag == 0`, length 1) or one entry per
+    /// depth view (`per_view_depth_timing_flag == 1`, length
+    /// `NumDepthViews`).
+    pub offsets: Vec<DepthTimingOffset>,
+}
+
+/// Parse a §H.13.1.5 `depth_timing()` payload (payload type 52).
+///
+/// The per-view loop bound is NOT in the payload — §H.13.1.5 loops
+/// over the `NumDepthViews` variable accumulated from
+/// `depth_view_present_flag[i]` in the active subset SPS MVCD
+/// extension (§H.7.3.2.1.5), supplied here through
+/// [`SeiContext::num_depth_views`]. Two gates run before the
+/// per-view allocation:
+///
+/// * `ctx.num_depth_views == 0` (unknown / no Annex H subset SPS
+///   active) — rejected with
+///   [`SeiError::DepthTimingNumDepthViewsUnknown`], mirroring the
+///   §D.1.10 spare_pic treatment of an unknown `PicSizeInMapUnits`.
+/// * `ctx.num_depth_views > 1024` — rejected with
+///   [`SeiError::DepthTimingNumDepthViewsOutOfRange`]; the
+///   §H.7.3.2.1.5 view loop runs `num_views_minus1 + 1 ≤ 1024` times
+///   and increments `NumDepthViews` at most once per iteration, so
+///   1024 is the absolute ceiling. Pre-allocation gate in the same
+///   anti-OOM spirit as the round-177 / round-200 ue(v) caps (here
+///   the count is caller-supplied rather than bitstream-driven, but
+///   the `Vec::with_capacity` cost is bounded the same way).
+pub fn parse_depth_timing(payload: &[u8], ctx: &SeiContext) -> Result<DepthTiming, SeiError> {
+    let mut r = BitReader::new(payload);
+
+    // §H.13.1.5 — per_view_depth_timing_flag u(1).
+    let per_view_depth_timing_flag = r.u(1)? == 1;
+
+    let offsets = if per_view_depth_timing_flag {
+        // §H.13.1.5 — for( i = 0; i < NumDepthViews; i++ )
+        //                 depth_timing_offset( )
+        if ctx.num_depth_views == 0 {
+            return Err(SeiError::DepthTimingNumDepthViewsUnknown);
+        }
+        if ctx.num_depth_views > 1024 {
+            return Err(SeiError::DepthTimingNumDepthViewsOutOfRange(
+                ctx.num_depth_views,
+            ));
+        }
+        let count = ctx.num_depth_views as usize;
+        let mut offsets = Vec::with_capacity(count);
+        for _ in 0..count {
+            offsets.push(read_depth_timing_offset(&mut r)?);
+        }
+        offsets
+    } else {
+        // §H.13.1.5 else branch — single shared depth_timing_offset().
+        vec![read_depth_timing_offset(&mut r)?]
+    };
+
+    Ok(DepthTiming {
+        per_view_depth_timing_flag,
+        offsets,
+    })
+}
+
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6464,6 +6651,9 @@ pub enum SeiPayload {
     /// §H.13.2.4 — three_dimensional_reference_displays_info
     /// (payload type 51, Annex H). Round 226.
     ThreeDimensionalReferenceDisplaysInfo(ThreeDimensionalReferenceDisplaysInfo),
+    /// §H.13.2.5 — depth_timing (payload type 52, Annex H 3D-AVC).
+    /// Round 278.
+    DepthTiming(DepthTiming),
     /// §H.13.2.7 — depth_sampling_info (payload type 53, Annex H 3D-AVC).
     /// Round 247.
     DepthSamplingInfo(DepthSamplingInfo),
@@ -6574,6 +6764,7 @@ pub fn parse_payload(
         51 => Ok(SeiPayload::ThreeDimensionalReferenceDisplaysInfo(
             parse_three_dimensional_reference_displays_info(payload)?,
         )),
+        52 => Ok(SeiPayload::DepthTiming(parse_depth_timing(payload, ctx)?)),
         53 => Ok(SeiPayload::DepthSamplingInfo(parse_depth_sampling_info(
             payload,
         )?)),
@@ -9544,6 +9735,169 @@ mod tests {
                 assert_eq!(info.views.len(), 1);
             }
             other => panic!("expected DepthSamplingInfo, got {other:?}"),
+        }
+    }
+
+    // §H.13.2.5 — minimal depth_timing: per_view_depth_timing_flag == 0
+    // so a single shared depth_timing_offset() follows. offset_len_minus1
+    // = 7 makes the fp field u(8); fp = 64 with dp = 6 reconstructs to
+    // 64 / 2^6 = 1.0 clock ticks.
+    #[test]
+    fn depth_timing_shared_single_offset() {
+        let payload = pack_bits(&[
+            (0, 1),  // per_view_depth_timing_flag = 0
+            (7, 5),  // offset_len_minus1 = 7 → fp is u(8)
+            (64, 8), // depth_disp_delay_offset_fp = 64
+            (6, 6),  // depth_disp_delay_offset_dp = 6
+        ]);
+        // The shared branch never reads ctx.num_depth_views, so the
+        // default (0 = unknown) context must succeed.
+        let got = parse_depth_timing(&payload, &SeiContext::default()).unwrap();
+        assert!(!got.per_view_depth_timing_flag);
+        assert_eq!(got.offsets.len(), 1);
+        let off = got.offsets[0];
+        assert_eq!(off.offset_len_minus1, 7);
+        assert_eq!(off.depth_disp_delay_offset_fp, 64);
+        assert_eq!(off.depth_disp_delay_offset_dp, 6);
+        assert!((off.offset_clock_ticks() - 1.0).abs() < 1e-12);
+    }
+
+    // §H.13.2.5 — per-view depth_timing with NumDepthViews = 2 supplied
+    // through the context. The two offsets use the extreme fp widths:
+    // view 0 the minimum (offset_len_minus1 = 0 → u(1)), view 1 the
+    // maximum (offset_len_minus1 = 31 → u(32), all bits set).
+    #[test]
+    fn depth_timing_per_view_two_views() {
+        let payload = pack_bits(&[
+            (1, 1), // per_view_depth_timing_flag = 1
+            // view 0: offset_len_minus1 = 0 → fp u(1) = 1, dp = 0
+            // → 1 / 2^0 = 1.0 clock ticks.
+            (0, 5),
+            (1, 1),
+            (0, 6),
+            // view 1: offset_len_minus1 = 31 → fp u(32) = u32::MAX,
+            // dp = 32 → (2^32 − 1) / 2^32 just under 1.0.
+            (31, 5),
+            (u32::MAX as u64, 32),
+            (32, 6),
+        ]);
+        let ctx = SeiContext {
+            num_depth_views: 2,
+            ..SeiContext::default()
+        };
+        let got = parse_depth_timing(&payload, &ctx).unwrap();
+        assert!(got.per_view_depth_timing_flag);
+        assert_eq!(got.offsets.len(), 2);
+        assert_eq!(got.offsets[0].offset_len_minus1, 0);
+        assert_eq!(got.offsets[0].depth_disp_delay_offset_fp, 1);
+        assert_eq!(got.offsets[0].depth_disp_delay_offset_dp, 0);
+        assert!((got.offsets[0].offset_clock_ticks() - 1.0).abs() < 1e-12);
+        assert_eq!(got.offsets[1].offset_len_minus1, 31);
+        assert_eq!(got.offsets[1].depth_disp_delay_offset_fp, u32::MAX);
+        assert_eq!(got.offsets[1].depth_disp_delay_offset_dp, 32);
+        let expected = f64::from(u32::MAX) / 2f64.powi(32);
+        assert!((got.offsets[1].offset_clock_ticks() - expected).abs() < 1e-12);
+    }
+
+    // §H.13.1.5 — the per-view loop bound is the SPS-derived
+    // NumDepthViews (§H.7.3.2.1.5), not a payload field. Reaching the
+    // per-view branch with the context still at the unknown default
+    // (0) must be rejected, mirroring the §D.1.10 spare_pic treatment
+    // of an unknown PicSizeInMapUnits.
+    #[test]
+    fn depth_timing_per_view_unknown_num_depth_views_rejected() {
+        let payload = pack_bits(&[
+            (1, 1), // per_view_depth_timing_flag = 1
+            (0, 5),
+            (1, 1),
+            (0, 6),
+        ]);
+        let err = parse_depth_timing(&payload, &SeiContext::default()).unwrap_err();
+        assert!(matches!(err, SeiError::DepthTimingNumDepthViewsUnknown));
+    }
+
+    // §H.7.3.2.1.5 — the MVCD-extension view loop runs at most
+    // num_views_minus1 + 1 ≤ 1024 times and increments NumDepthViews
+    // at most once per iteration, so 1024 is the absolute ceiling. A
+    // caller-supplied context above it is rejected before allocation.
+    #[test]
+    fn depth_timing_rejects_num_depth_views_above_1024() {
+        let payload = pack_bits(&[
+            (1, 1), // per_view_depth_timing_flag = 1
+            (0, 5),
+            (1, 1),
+            (0, 6),
+        ]);
+        let ctx = SeiContext {
+            num_depth_views: 1025,
+            ..SeiContext::default()
+        };
+        let err = parse_depth_timing(&payload, &ctx).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::DepthTimingNumDepthViewsOutOfRange(1025)
+        ));
+    }
+
+    // §H.13.2.5.1 — fractional reconstruction: fp = 3 with dp = 1 is
+    // 1.5 clock ticks; the dp ceiling (u(6) max = 63) divides by 2^63
+    // without overflowing the intermediate.
+    #[test]
+    fn depth_timing_offset_clock_ticks_fractional_and_dp_ceiling() {
+        let half_step = DepthTimingOffset {
+            offset_len_minus1: 1,
+            depth_disp_delay_offset_fp: 3,
+            depth_disp_delay_offset_dp: 1,
+        };
+        assert!((half_step.offset_clock_ticks() - 1.5).abs() < 1e-12);
+
+        let dp_ceiling = DepthTimingOffset {
+            offset_len_minus1: 0,
+            depth_disp_delay_offset_fp: 1,
+            depth_disp_delay_offset_dp: 63,
+        };
+        let expected = 1.0 / 2f64.powi(63);
+        assert!((dp_ceiling.offset_clock_ticks() - expected).abs() < 1e-300);
+        assert!(dp_ceiling.offset_clock_ticks() > 0.0);
+    }
+
+    // §H.13.1.5.1 — a payload that ends inside the offset triple is a
+    // bitstream error, not a panic. Five bits of offset_len_minus1 = 31
+    // promise a 32-bit fp that the 1-byte payload cannot deliver.
+    #[test]
+    fn depth_timing_truncated_offset_rejected() {
+        let payload = pack_bits(&[
+            (0, 1),  // per_view_depth_timing_flag = 0
+            (31, 5), // offset_len_minus1 = 31 → fp u(32) expected
+        ]);
+        let err = parse_depth_timing(&payload, &SeiContext::default()).unwrap_err();
+        assert!(matches!(err, SeiError::Bitstream(_)));
+    }
+
+    // §H.13.1.5 dispatch — parse_payload(52, ..) must route to
+    // parse_depth_timing and thread the context through.
+    #[test]
+    fn parse_payload_dispatches_depth_timing() {
+        let payload = pack_bits(&[
+            (1, 1), // per_view_depth_timing_flag = 1
+            // view 0: fp u(3) = 5, dp = 2 → 1.25 clock ticks.
+            (2, 5),
+            (5, 3),
+            (2, 6),
+        ]);
+        let ctx = SeiContext {
+            num_depth_views: 1,
+            ..SeiContext::default()
+        };
+        let got = parse_payload(52, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::DepthTiming(dt) => {
+                assert!(dt.per_view_depth_timing_flag);
+                assert_eq!(dt.offsets.len(), 1);
+                assert_eq!(dt.offsets[0].depth_disp_delay_offset_fp, 5);
+                assert!((dt.offsets[0].offset_clock_ticks() - 1.25).abs() < 1e-12);
+            }
+            other => panic!("expected DepthTiming, got {other:?}"),
         }
     }
 

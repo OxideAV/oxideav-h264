@@ -81,6 +81,10 @@ fn context_from_byte(b: u8) -> SeiContext {
         // can't allocate gigabytes if the dispatch lands there.
         pic_size_in_map_units: ((b as u32) & 0x0F) * 16,
         frame_mbs_only_flag: b & 0x08 == 0,
+        // num_depth_views in 0..=7 covers the §H.13.1.5 depth_timing
+        // unknown-rejection (0) and the per-view loop (1..). The Annex H
+        // ceiling is 1024; small values keep the per-view Vec bounded.
+        num_depth_views: ((b as u32) >> 5) & 0x07,
     }
 }
 

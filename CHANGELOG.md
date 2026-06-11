@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 278 — fourth Annex H (3D-AVC) SEI payload: payload type 52
+  `depth_timing` (§H.13.1.5 / §H.13.2.5), completing the contiguous
+  Annex H/I payload block 50..=54 (depth_representation_info /
+  three_dimensional_reference_displays_info / depth_timing /
+  depth_sampling_info / constrained_depth_parameter_set_identifier).
+  The message indicates the acquisition time of the depth view
+  components of one or more access units relative to the DPB output
+  time of the same access units; it pertains until the end of the
+  coded video sequence or until the next depth timing SEI message,
+  whichever is earlier in decoding order. `per_view_depth_timing_flag`
+  (u(1)) selects either a single shared §H.13.1.5.1
+  `depth_timing_offset()` (all depth view components in the target
+  access unit set share one acquisition offset) or one offset per
+  depth view in ascending view order index. The per-view loop bound is
+  NOT in the payload — §H.13.1.5 loops over the SPS-derived
+  `NumDepthViews` variable (accumulated from
+  `depth_view_present_flag[i]` in the §H.7.3.2.1.5
+  `seq_parameter_set_mvcd_extension()`), threaded through a new
+  `SeiContext::num_depth_views` field. Default 0 (unknown / no Annex H
+  subset SPS active) rejects the per-view branch with new
+  `SeiError::DepthTimingNumDepthViewsUnknown`, mirroring the §D.1.10
+  spare_pic treatment of an unknown `PicSizeInMapUnits`; values above
+  1024 are rejected with `DepthTimingNumDepthViewsOutOfRange` since
+  the §H.7.3.2.1.5 view loop runs `num_views_minus1 + 1 ≤ 1024` times
+  and increments `NumDepthViews` at most once per iteration
+  (pre-allocation gate in the round-177/200 anti-OOM spirit). New
+  `DepthTimingOffset` struct carries `offset_len_minus1` (u(5)) +
+  `depth_disp_delay_offset_fp` (u(offset_len_minus1 + 1), 1..=32
+  bits per §H.13.2.5.1 "the length ... is equal to
+  offset_len_minus1 + 1") + `depth_disp_delay_offset_dp` (u(6));
+  `offset_clock_ticks()` reconstructs the §H.13.2.5.1 scalar
+  `depth_disp_delay_offset_fp ÷ 2^depth_disp_delay_offset_dp` in
+  units of clock ticks as specified in Annex C. Wired into
+  `parse_payload`; the payload-type table at the top of `sei.rs`
+  grows one row (§H.13.1.5). `tests/integration_sei_malformed.rs`
+  `KNOWN_PAYLOAD_TYPES` grows from 49 → 50 entries (sweep cardinality
+  3036 → 3080 panic-free invocations); two of the sweep contexts now
+  carry non-zero `num_depth_views` (2 / 1024) so the per-view branch
+  is part of the adversarial sweep, and the `sei_payload` fuzz
+  context derives a bounded 0..=7 `num_depth_views` from its selector
+  byte. 7 new lib unit tests cover the shared-offset path (1.0-tick
+  round trip), the two-view path at the extreme fp widths (u(1) and
+  u(32) with all bits set), the unknown-context rejection, the
+  above-1024 rejection, fractional (3 ÷ 2^1 = 1.5) + dp-ceiling
+  (2^-63) reconstruction, the truncated-offset bitstream error, and
+  the `parse_payload` dispatch round trip. Harmless on non-Annex-H
+  streams (Phase 4 on the profiles table).
+
 - round 274 — two typed accessors on the already-parsed §D.2.25
   `ToneMappingBody` (SEI payload type 23, tone_mapping_info) surfacing
   the normative implicit *default end points* of the piece-wise linear
