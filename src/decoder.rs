@@ -26,6 +26,7 @@ use crate::non_vcl::{self, AccessUnitDelimiter, PrimaryPicType, SeiMessage};
 use crate::pps::{Pps, PpsError};
 use crate::slice_header::{SliceHeader, SliceHeaderError};
 use crate::sps::{Sps, SpsError};
+use crate::subset_sps::{SubsetSps, SubsetSpsError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecoderError {
@@ -33,6 +34,8 @@ pub enum DecoderError {
     Nal(#[from] nal::NalError),
     #[error("SPS parse: {0}")]
     Sps(#[from] SpsError),
+    #[error("subset SPS parse: {0}")]
+    SubsetSps(#[from] SubsetSpsError),
     #[error("PPS parse: {0}")]
     Pps(#[from] PpsError),
     #[error("slice header parse: {0}")]
@@ -83,6 +86,11 @@ pub type DecoderResult<T> = Result<T, DecoderError>;
 pub enum Event {
     /// SPS parsed and stored. Payload is `seq_parameter_set_id`.
     SpsStored(u32),
+    /// §7.3.2.1.3 — subset SPS (NAL unit type 15) parsed and stored.
+    /// Payload is the embedded `seq_parameter_set_id`. Per §7.4.1.2.1
+    /// subset SPSs live in their own id space, separate from ordinary
+    /// SPSs; retrieve via [`Decoder::subset_sps`].
+    SubsetSpsStored(u32),
     /// PPS parsed and stored. Payload is `pic_parameter_set_id`.
     PpsStored(u32),
     /// §7.3.2.4 — Access Unit Delimiter.
@@ -140,6 +148,11 @@ pub struct Decoder {
     /// §7.4.1.2.1 — SPS database indexed by `seq_parameter_set_id`
     /// (0..=31).
     sps_by_id: Vec<Option<Sps>>,
+    /// §7.4.1.2.1 — subset SPS database indexed by
+    /// `seq_parameter_set_id` (0..=31). A value space separate from
+    /// `sps_by_id`: only coded slice extension NAL units (types 20/21)
+    /// activate these.
+    subset_sps_by_id: Vec<Option<SubsetSps>>,
     /// §7.4.1.2.1 — PPS database indexed by `pic_parameter_set_id`
     /// (0..=255).
     pps_by_id: Vec<Option<Pps>>,
@@ -155,6 +168,7 @@ impl Decoder {
     pub fn new() -> Self {
         Self {
             sps_by_id: (0..32).map(|_| None).collect(),
+            subset_sps_by_id: (0..32).map(|_| None).collect(),
             pps_by_id: (0..256).map(|_| None).collect(),
             active_sps_id: None,
             active_pps_id: None,
@@ -183,6 +197,17 @@ impl Decoder {
                 // is therefore always in-bounds.
                 self.sps_by_id[id as usize] = Some(sps);
                 Ok(Event::SpsStored(id))
+            }
+            // §7.3.2.1.3 / §7.4.1.2.1 — store subset SPS (separate id
+            // space from ordinary SPSs).
+            NalUnitType::SubsetSps => {
+                let subset = SubsetSps::parse(&rbsp)?;
+                let id = subset.sps.seq_parameter_set_id;
+                // `id <= 31` is validated inside
+                // `Sps::parse_seq_parameter_set_data`; the table slot is
+                // therefore always in-bounds.
+                self.subset_sps_by_id[id as usize] = Some(subset);
+                Ok(Event::SubsetSpsStored(id))
             }
             // §7.3.2.2 / §7.4.1.2.1 — store PPS. The PPS scaling-matrix
             // tail loop length depends on the referenced SPS's
@@ -257,15 +282,14 @@ impl Decoder {
                 nal_unit_type: header.nal_unit_type.as_u8(),
                 nal_bytes: nal_bytes.to_vec(),
             }),
-            // SPS extension (13), prefix NAL (14), subset SPS (15),
-            // depth parameter set (16), reserved (17/18/22/23), slice
-            // extension (20/21), and all unspecified values. Pass
-            // through as Ignored so the caller can inspect/log.
+            // SPS extension (13), prefix NAL (14), depth parameter set
+            // (16), reserved (17/18/22/23), slice extension (20/21),
+            // and all unspecified values. Pass through as Ignored so
+            // the caller can inspect/log.
             NalUnitType::Unspecified(_)
             | NalUnitType::Reserved(_)
             | NalUnitType::SpsExtension
             | NalUnitType::PrefixNalUnit
-            | NalUnitType::SubsetSps
             | NalUnitType::DepthParameterSet
             | NalUnitType::SliceExtension
             | NalUnitType::SliceExtensionDepth
@@ -380,6 +404,15 @@ impl Decoder {
     /// Look up a stored SPS by `seq_parameter_set_id`.
     pub fn sps(&self, id: u32) -> Option<&Sps> {
         self.sps_by_id.get(id as usize).and_then(|p| p.as_ref())
+    }
+
+    /// Look up a stored subset SPS (§7.3.2.1.3) by its embedded
+    /// `seq_parameter_set_id`. Per §7.4.1.2.1 this id space is separate
+    /// from [`Decoder::sps`].
+    pub fn subset_sps(&self, id: u32) -> Option<&SubsetSps> {
+        self.subset_sps_by_id
+            .get(id as usize)
+            .and_then(|p| p.as_ref())
     }
 
     /// Look up a stored PPS by `pic_parameter_set_id`.

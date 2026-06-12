@@ -262,14 +262,27 @@ impl Sps {
     /// with emulation prevention bytes already stripped — normally
     /// obtained from [`crate::nal::parse_nal_unit`]).
     ///
-    /// On `vui_parameters_present_flag == 1` the parser stops after
-    /// recording the flag; VUI parsing is deferred. Similarly the
-    /// scaling_list body is not yet implemented: an SPS with
-    /// `seq_scaling_matrix_present_flag == 1` returns
-    /// [`SpsError::ScalingMatrixNotSupported`].
+    /// Both the VUI body (§E.1) and the scaling_list body
+    /// (§7.3.2.1.1.1) are fully parsed inline.
     pub fn parse(rbsp: &[u8]) -> Result<Self, SpsError> {
         let mut r = BitReader::new(rbsp);
+        let sps = Self::parse_seq_parameter_set_data(&mut r)?;
+        // §7.3.2.11 — trailing stop bit + zero alignment. Some producers
+        // pad with extra zeros; don't reject on mis-match.
+        let _ = r.rbsp_trailing_bits();
+        Ok(sps)
+    }
 
+    /// §7.3.2.1.1 — parse a `seq_parameter_set_data()` syntax structure
+    /// from the current cursor position, leaving the reader positioned
+    /// on the first bit after it (rbsp_trailing_bits are NOT consumed).
+    ///
+    /// This is the shared body between `seq_parameter_set_rbsp()`
+    /// (§7.3.2.1, see [`Sps::parse`]) and
+    /// `subset_seq_parameter_set_rbsp()` (§7.3.2.1.3, see
+    /// [`crate::subset_sps::SubsetSps::parse`]) — the latter continues
+    /// reading a per-profile extension structure after this one.
+    pub fn parse_seq_parameter_set_data(r: &mut BitReader<'_>) -> Result<Self, SpsError> {
         // §7.3.2.1.1 — profile_idc / constraint_setN_flag / reserved_zero_2bits / level_idc.
         let profile_idc = r.u(8)? as u8;
         // §A.1 / §A.2 — only the 16 enumerated profiles are allowed;
@@ -346,7 +359,7 @@ impl Sps {
                 } else {
                     // First 6 entries are 4x4 (size 16), rest are 8x8 (size 64).
                     let size = if i < 6 { 16 } else { 64 };
-                    let result = parse_scaling_list(&mut r, size)?;
+                    let result = parse_scaling_list(r, size)?;
                     entries.push(ScalingListEntry::from_result(result));
                 }
             }
@@ -513,13 +526,10 @@ impl Sps {
         // §7.3.2.1.1 / §E.1 — VUI parameters.
         let vui_parameters_present_flag = r.u(1)? == 1;
         let vui = if vui_parameters_present_flag {
-            Some(VuiParameters::parse(&mut r)?)
+            Some(VuiParameters::parse(r)?)
         } else {
             None
         };
-        // §7.3.2.11 — trailing stop bit + zero alignment. Some producers
-        // pad with extra zeros; don't reject on mis-match.
-        let _ = r.rbsp_trailing_bits();
 
         Ok(Sps {
             profile_idc,

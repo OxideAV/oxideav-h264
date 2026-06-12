@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 281 — first Annex G (MVC) parameter-set body step: §7.3.2.1.3
+  `subset_seq_parameter_set_rbsp()` (NAL unit type 15) parsing in a new
+  `subset_sps` module, wired into the decoder. The embedded
+  `seq_parameter_set_data()` body reuses the §7.3.2.1.1 SPS parser,
+  extracted as `Sps::parse_seq_parameter_set_data` (cursor-based, no
+  rbsp_trailing_bits) with `Sps::parse` now a thin wrapper. The
+  per-profile extension branch dispatches on `profile_idc`:
+  118 (Multiview High) / 128 (Stereo High) / 134 (MFC High) parse the
+  full §G.7.3.2.1.4 `seq_parameter_set_mvc_extension()` — per-VOIdx
+  `view_id[]` (0..=1023 each, `num_views_minus1 ≤ 1023` checked before
+  allocation), the anchor + non-anchor inter-view dependency lists for
+  both reference picture lists (per-list count capped at the
+  §G.7.4.2.1.4 `Min(15, num_views_minus1)` bound; VOIdx 0 always empty
+  per the `num_*_refs_lX[0] == 0` constraint, matching the syntax
+  loops starting at i = 1), the signalled level values
+  (`num_level_values_signalled_minus1 ≤ 63`) with their operation
+  points (temporal_id u(3) + target view list + required-view count,
+  all 0..=1023-bounded), and — for profile 134 only — the MFC tail:
+  `mfc_format_idc` u(6) (Table G-1; reserved values 2..=63 stored, not
+  rejected, per the §G.7.4.2.1.4 decoder-shall-ignore direction),
+  `default_grid_position_flag` + explicit grid positions validated
+  against the "shall be equal to 4, 8 or 12" constraint, a
+  `grid_positions()` accessor applying the
+  `default_grid_position_flag == 1` inference ((4, 8, 12, 8) for idc 0,
+  (8, 4, 8, 12) for idc 1), `rpu_filter_enabled_flag`, and
+  `rpu_field_processing_flag` (present only when
+  `frame_mbs_only_flag == 0`; `rpu_field_processing()` applies the
+  inferred-0 rule). The optional §G.14.1
+  `mvc_vui_parameters_extension()` is parsed too: per-operation-point
+  temporal_id, target output view list, timing info triple, NAL + VCL
+  `hrd_parameters()` (reusing the §E.1.2 parser from `vui`),
+  conditional `low_delay_hrd_flag`, and `pic_struct_present_flag`,
+  with the §G.14.2 0..=1023 bounds enforced before every allocation.
+  §7.4.2.1.3 semantics honoured: `bit_equal_to_one` must be 1
+  (`SubsetSpsError::BitEqualToOneViolated`), and an
+  `additional_extension2_flag == 1` reserved tail is consumed and
+  discarded ("decoders shall ignore all data that follow"). SVC
+  profiles 83/86 (Annex F), MVCD 138/135 (Annex H) and MVCD+3D-AVC 139
+  (Annex H + I) extension bodies are not parsed yet — they surface as
+  typed `SubsetSpsExtension::{Svc,Mvcd,Mvcd3d}NotParsed` variants with
+  the base `seq_parameter_set_data()` still fully parsed, and
+  `additional_extension2_flag` reported as `None` since the flag sits
+  after the unparsed structure. Decoder integration: subset SPSs are
+  stored in a `subset_sps_by_id` table separate from ordinary SPSs per
+  the §7.4.1.2.1 separate-value-space rule, emitting a new
+  `Event::SubsetSpsStored(id)` (NAL 15 no longer falls through to
+  `Event::Ignored`), retrievable via `Decoder::subset_sps(id)`; new
+  `DecoderError::SubsetSps` wraps the parse error. 16 new lib unit
+  tests: two-view MVC round trip (view deps + level/op fields),
+  minimal single-view Stereo High, MFC default-grid inference /
+  explicit grid + field flag / reserved idc skips grid / invalid grid
+  value rejection, bit_equal_to_one violation, `num_views_minus1 >
+  1023` + `view_id > 1023` + anchor-ref-count-over-cap rejections, MVC
+  VUI with timing + NAL HRD, SVC/MVCD/139 not-parsed variants, the
+  no-extension-branch profile path, the reserved
+  additional_extension2 tail, and an end-to-end `Decoder` check that
+  the subset SPS lands in the separate table. Groundwork for the
+  Annex G slice-extension path (NAL 20 activates subset SPSs) and the
+  §H.7.3.2.1.5 MVCD extension that feeds
+  `SeiContext::num_depth_views`.
+
 - round 278 — fourth Annex H (3D-AVC) SEI payload: payload type 52
   `depth_timing` (§H.13.1.5 / §H.13.2.5), completing the contiguous
   Annex H/I payload block 50..=54 (depth_representation_info /
