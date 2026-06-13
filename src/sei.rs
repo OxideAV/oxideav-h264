@@ -73,11 +73,14 @@
 
 use crate::bitstream::{BitError, BitReader};
 use crate::slice_header::{DecRefPicMarking, MmcoOp};
+use crate::vui::{HrdParameters, VuiError};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SeiError {
     #[error("bitstream read failed: {0}")]
     Bitstream(#[from] BitError),
+    #[error("hrd_parameters() parse failed: {0}")]
+    Hrd(#[from] VuiError),
     #[error("SEI payload type {0} is not implemented — caller should keep the raw bytes")]
     UnsupportedPayloadType(u32),
     #[error("user_data_unregistered payload must be at least 16 bytes for the UUID (got {0})")]
@@ -292,6 +295,10 @@ pub enum SeiError {
         "operation_point_not_present operation_point_not_present_id[{i}] shall be in 0..=65535 per Annex G §G.13.2.8 (got {got})"
     )]
     OperationPointNotPresentIdOutOfRange { i: usize, got: u32 },
+    #[error(
+        "base_view_temporal_hrd num_of_temporal_layers_in_base_view_minus1 shall be in 0..=7 per Annex G §G.13.2.9 (got {0})"
+    )]
+    BaseViewTemporalHrdLayerCountOutOfRange(u32),
     #[error(
         "non_required_view_component num_info_entries_minus1 shall be in 0..=1022 per Annex G §G.13.2.6 (num_views_minus1 - 1, with num_views_minus1 bounded at 1023) (got {0})"
     )]
@@ -4698,6 +4705,141 @@ pub fn parse_operation_point_not_present(
     })
 }
 
+/// One temporal sub-bitstream's HRD entry inside a §G.13.1.9
+/// `base_view_temporal_hrd()` SEI message (payload type 44, Annex G /
+/// MVC). One `BaseViewTemporalHrdLayer` is recorded per temporal
+/// sub-bitstream identified by `sei_mvc_temporal_id`.
+///
+/// Each field carries the value of the correspondingly-named §E.2.1
+/// VUI/HRD syntax element that applies to the i-th temporal
+/// sub-bitstream of the base view (`num_units_in_tick`, `time_scale`,
+/// `fixed_frame_rate_flag`, `nal_hrd_parameters`, `vcl_hrd_parameters`,
+/// `low_delay_hrd_flag`, `pic_struct_present_flag`), as restated by
+/// §G.13.2.9.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseViewTemporalHrdLayer {
+    /// `sei_mvc_temporal_id[i]` u(3) — the `temporal_id` value of the
+    /// i-th temporal sub-bitstream (§G.13.2.9).
+    pub temporal_id: u8,
+    /// Present iff `sei_mvc_timing_info_present_flag[i]` was 1. Holds
+    /// `(sei_mvc_num_units_in_tick, sei_mvc_time_scale,
+    /// sei_mvc_fixed_frame_rate_flag)` for the i-th sub-bitstream.
+    pub timing_info: Option<BaseViewTemporalHrdTiming>,
+    /// `hrd_parameters()` block present iff
+    /// `sei_mvc_nal_hrd_parameters_present_flag[i]` was 1.
+    pub nal_hrd_parameters: Option<HrdParameters>,
+    /// `hrd_parameters()` block present iff
+    /// `sei_mvc_vcl_hrd_parameters_present_flag[i]` was 1.
+    pub vcl_hrd_parameters: Option<HrdParameters>,
+    /// `sei_mvc_low_delay_hrd_flag[i]` u(1). `Some` iff either of the
+    /// NAL/VCL HRD parameter blocks is present (the syntax only codes
+    /// this flag under that condition, §G.13.1.9).
+    pub low_delay_hrd_flag: Option<bool>,
+    /// `sei_mvc_pic_struct_present_flag[i]` u(1).
+    pub pic_struct_present_flag: bool,
+}
+
+/// `(num_units_in_tick, time_scale, fixed_frame_rate_flag)` triple for a
+/// single temporal sub-bitstream, present when
+/// `sei_mvc_timing_info_present_flag[i]` is 1 (§G.13.1.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseViewTemporalHrdTiming {
+    /// `sei_mvc_num_units_in_tick[i]` u(32).
+    pub num_units_in_tick: u32,
+    /// `sei_mvc_time_scale[i]` u(32).
+    pub time_scale: u32,
+    /// `sei_mvc_fixed_frame_rate_flag[i]` u(1).
+    pub fixed_frame_rate_flag: bool,
+}
+
+/// §G.13.2.9 — base_view_temporal_hrd (payload type 44, Annex G / MVC).
+///
+/// Conveys the timing and HRD parameters that apply to each temporal
+/// sub-bitstream of the base view of an MVC coded video sequence. It
+/// lets an HRD verifier (or a temporal sub-bitstream extractor) recover
+/// the per-temporal-layer `num_units_in_tick` / `time_scale` and the
+/// NAL/VCL HRD parameter sets without re-deriving them from the base
+/// view's own VUI, which describes only the full operation point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseViewTemporalHrd {
+    /// One entry per temporal sub-bitstream. Length =
+    /// `num_of_temporal_layers_in_base_view_minus1 + 1`, which §G.13.2.9
+    /// constrains to 1..=8 (the minus1 form is bounded to 0..=7).
+    pub layers: Vec<BaseViewTemporalHrdLayer>,
+}
+
+/// Parse a §G.13.1.9 `base_view_temporal_hrd()` payload (type 44).
+///
+/// `num_of_temporal_layers_in_base_view_minus1` is range-checked to
+/// 0..=7 per §G.13.2.9 before the per-layer loop runs; an out-of-range
+/// value is a bitstream-conformance error (and would otherwise be a
+/// large `ue(v)` driving an unbounded loop). Each per-layer
+/// `hrd_parameters()` block is delegated to the shared §E.1.2
+/// [`HrdParameters::parse`]; its errors surface as [`SeiError::Hrd`].
+pub fn parse_base_view_temporal_hrd(payload: &[u8]) -> Result<BaseViewTemporalHrd, SeiError> {
+    let mut r = BitReader::new(payload);
+    // §G.13.1.9 — num_of_temporal_layers_in_base_view_minus1 ue(v).
+    // §G.13.2.9 constrains it to 0..=7.
+    let minus1 = r.ue()?;
+    if minus1 > 7 {
+        return Err(SeiError::BaseViewTemporalHrdLayerCountOutOfRange(minus1));
+    }
+    let count = (minus1 + 1) as usize;
+    let mut layers: Vec<BaseViewTemporalHrdLayer> = Vec::with_capacity(count);
+    for _ in 0..count {
+        // sei_mvc_temporal_id[i] u(3)
+        let temporal_id = r.u(3)? as u8;
+        // sei_mvc_timing_info_present_flag[i] u(1)
+        let timing_info = if r.u(1)? == 1 {
+            // sei_mvc_num_units_in_tick[i] u(32)
+            let num_units_in_tick = r.u(32)?;
+            // sei_mvc_time_scale[i] u(32)
+            let time_scale = r.u(32)?;
+            // sei_mvc_fixed_frame_rate_flag[i] u(1)
+            let fixed_frame_rate_flag = r.u(1)? == 1;
+            Some(BaseViewTemporalHrdTiming {
+                num_units_in_tick,
+                time_scale,
+                fixed_frame_rate_flag,
+            })
+        } else {
+            None
+        };
+        // sei_mvc_nal_hrd_parameters_present_flag[i] u(1)
+        let nal_present = r.u(1)? == 1;
+        let nal_hrd_parameters = if nal_present {
+            Some(HrdParameters::parse(&mut r)?)
+        } else {
+            None
+        };
+        // sei_mvc_vcl_hrd_parameters_present_flag[i] u(1)
+        let vcl_present = r.u(1)? == 1;
+        let vcl_hrd_parameters = if vcl_present {
+            Some(HrdParameters::parse(&mut r)?)
+        } else {
+            None
+        };
+        // sei_mvc_low_delay_hrd_flag[i] u(1) — coded only when either
+        // HRD parameter block is present (§G.13.1.9).
+        let low_delay_hrd_flag = if nal_present || vcl_present {
+            Some(r.u(1)? == 1)
+        } else {
+            None
+        };
+        // sei_mvc_pic_struct_present_flag[i] u(1)
+        let pic_struct_present_flag = r.u(1)? == 1;
+        layers.push(BaseViewTemporalHrdLayer {
+            temporal_id,
+            timing_info,
+            nal_hrd_parameters,
+            vcl_hrd_parameters,
+            low_delay_hrd_flag,
+            pic_struct_present_flag,
+        });
+    }
+    Ok(BaseViewTemporalHrd { layers })
+}
+
 /// §G.13.2.6 — non_required_view_component (payload type 41, Annex G /
 /// MVC).
 ///
@@ -6643,6 +6785,8 @@ pub enum SeiPayload {
     NonRequiredViewComponent(NonRequiredViewComponent),
     /// §G.13.2.8 — operation_point_not_present (payload type 43, Annex G). Round 200.
     OperationPointNotPresent(OperationPointNotPresent),
+    /// §G.13.2.9 — base_view_temporal_hrd (payload type 44, Annex G / MVC). Round 293.
+    BaseViewTemporalHrd(BaseViewTemporalHrd),
     /// §G.13.2.10 — multiview_view_position (payload type 46). Round 183.
     MultiviewViewPosition(MultiviewViewPosition),
     /// §H.13.2.3 — depth_representation_info (payload type 50,
@@ -6748,6 +6892,9 @@ pub fn parse_payload(
         )),
         43 => Ok(SeiPayload::OperationPointNotPresent(
             parse_operation_point_not_present(payload)?,
+        )),
+        44 => Ok(SeiPayload::BaseViewTemporalHrd(
+            parse_base_view_temporal_hrd(payload)?,
         )),
         45 => Ok(SeiPayload::FramePackingArrangement(
             parse_frame_packing_arrangement(payload)?,
@@ -8129,6 +8276,133 @@ mod tests {
             }
             other => panic!("expected OperationPointNotPresent, got {:?}", other),
         }
+    }
+
+    // §G.13.1.9 / §G.13.2.9 — base_view_temporal_hrd (payload 44).
+
+    /// Build the bits of one §E.1.2 `hrd_parameters()` block with a
+    /// single SchedSelIdx (cpb_cnt_minus1 = 0) and all-zero values, so
+    /// tests can append/prepend other fields around it.
+    fn minimal_hrd_bits() -> Vec<(u64, u32)> {
+        vec![
+            (1, 1), // cpb_cnt_minus1 = 0 → ue "1"
+            (0, 4), // bit_rate_scale
+            (0, 4), // cpb_size_scale
+            (1, 1), // bit_rate_value_minus1[0] = 0 → ue "1"
+            (1, 1), // cpb_size_value_minus1[0] = 0 → ue "1"
+            (0, 1), // cbr_flag[0]
+            (0, 5), // initial_cpb_removal_delay_length_minus1
+            (0, 5), // cpb_removal_delay_length_minus1
+            (0, 5), // dpb_output_delay_length_minus1
+            (0, 5), // time_offset_length
+        ]
+    }
+
+    #[test]
+    fn base_view_temporal_hrd_single_layer_no_timing_no_hrd() {
+        // num_of_temporal_layers_in_base_view_minus1 = 0 → ue "1"
+        // layer[0]: temporal_id u(3) = 5
+        //           sei_mvc_timing_info_present_flag u(1) = 0
+        //           sei_mvc_nal_hrd_parameters_present_flag u(1) = 0
+        //           sei_mvc_vcl_hrd_parameters_present_flag u(1) = 0
+        //           (low_delay flag NOT coded — neither HRD present)
+        //           sei_mvc_pic_struct_present_flag u(1) = 1
+        let payload = pack_bits(&[(1, 1), (5, 3), (0, 1), (0, 1), (0, 1), (1, 1)]);
+        let got = parse_base_view_temporal_hrd(&payload).unwrap();
+        assert_eq!(got.layers.len(), 1);
+        let l = &got.layers[0];
+        assert_eq!(l.temporal_id, 5);
+        assert!(l.timing_info.is_none());
+        assert!(l.nal_hrd_parameters.is_none());
+        assert!(l.vcl_hrd_parameters.is_none());
+        assert_eq!(l.low_delay_hrd_flag, None);
+        assert!(l.pic_struct_present_flag);
+    }
+
+    #[test]
+    fn base_view_temporal_hrd_layer_with_timing_and_nal_hrd() {
+        // num_of_temporal_layers_in_base_view_minus1 = 0 → ue "1"
+        // layer[0]: temporal_id u(3) = 2
+        //           timing_info_present u(1) = 1
+        //             num_units_in_tick u(32) = 1001
+        //             time_scale u(32) = 60000
+        //             fixed_frame_rate_flag u(1) = 1
+        //           nal_hrd_present u(1) = 1 → minimal hrd_parameters()
+        //           vcl_hrd_present u(1) = 0
+        //           low_delay_hrd_flag u(1) = 1 (coded: nal present)
+        //           pic_struct_present_flag u(1) = 0
+        let mut bits: Vec<(u64, u32)> = vec![
+            (1, 1),
+            (2, 3),
+            (1, 1),
+            (1001, 32),
+            (60000, 32),
+            (1, 1),
+            (1, 1), // nal_hrd_parameters_present_flag
+        ];
+        bits.extend(minimal_hrd_bits());
+        bits.push((0, 1)); // vcl_hrd_parameters_present_flag
+        bits.push((1, 1)); // low_delay_hrd_flag
+        bits.push((0, 1)); // pic_struct_present_flag
+        let payload = pack_bits(&bits);
+        let got = parse_base_view_temporal_hrd(&payload).unwrap();
+        assert_eq!(got.layers.len(), 1);
+        let l = &got.layers[0];
+        assert_eq!(l.temporal_id, 2);
+        let t = l.timing_info.as_ref().expect("timing present");
+        assert_eq!(t.num_units_in_tick, 1001);
+        assert_eq!(t.time_scale, 60000);
+        assert!(t.fixed_frame_rate_flag);
+        let nal = l.nal_hrd_parameters.as_ref().expect("nal hrd present");
+        assert_eq!(nal.cpb_cnt_minus1, 0);
+        assert!(l.vcl_hrd_parameters.is_none());
+        assert_eq!(l.low_delay_hrd_flag, Some(true));
+        assert!(!l.pic_struct_present_flag);
+    }
+
+    #[test]
+    fn base_view_temporal_hrd_two_layers_via_dispatch() {
+        // num_of_temporal_layers_in_base_view_minus1 = 1 → ue "010"
+        // layer[0]: tid=0, no timing, no hrd, pic_struct=0
+        // layer[1]: tid=1, no timing, no hrd, pic_struct=1
+        let payload = pack_bits(&[
+            (0b010, 3),
+            (0, 3),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1), // layer 0
+            (1, 3),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (1, 1), // layer 1
+        ]);
+        let ctx = SeiContext::default();
+        let got = parse_payload(44, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::BaseViewTemporalHrd(b) => {
+                assert_eq!(b.layers.len(), 2);
+                assert_eq!(b.layers[0].temporal_id, 0);
+                assert!(!b.layers[0].pic_struct_present_flag);
+                assert_eq!(b.layers[1].temporal_id, 1);
+                assert!(b.layers[1].pic_struct_present_flag);
+            }
+            other => panic!("expected BaseViewTemporalHrd, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn base_view_temporal_hrd_rejects_layer_count_above_8() {
+        // num_of_temporal_layers_in_base_view_minus1 = 8 → out of range
+        // (§G.13.2.9 caps the minus1 form at 7). ue(8) = codeNum 8
+        // → 3 leading zeros + 1 + 3-bit suffix 0b001 = "0001001".
+        let payload = pack_bits(&[(0b0001001, 7)]);
+        let err = parse_base_view_temporal_hrd(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::BaseViewTemporalHrdLayerCountOutOfRange(8)
+        ));
     }
 
     // §G.13.1.6 / §G.13.2.6 — non_required_view_component (payload 41).
