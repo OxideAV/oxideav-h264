@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-h264/compare/v0.1.5...v0.2.0) - 2026-06-13
+
+### Other
+
+- round 288 — Annex G (MVC) coded slice extension (NAL 20) slice-header path
+- round 281 — §7.3.2.1.3 subset SPS + §G.7.3.2.1.4 MVC extension + §G.14.1 MVC VUI
+- round 278 — Annex H §H.13.1.5 depth_timing (payload type 52)
+- §D.2.25 tone_mapping_info typed piece-wise default-endpoint accessors
+- round 271 typed filmGrainBitDepth accessors (§D.2.21 eq. D-14/D-15)
+- round 264 — typed num_refinement_steps accessor on ProgressiveRefinementSegmentStart
+- round 259 — typed sub_seq_duration_seconds accessor on SubSeqCharacteristics
+- round 255 — typed average_bit_rate_bps / average_frame_rate_fps accessors on SubSeqLayerCharacteristic
+- round 253 — typed DepthNonlinearRepresentationNumSegments + signalled-model-len accessors on depth_representation_info
+- round 250 — typed NumSampleShift accessor on three_dimensional_reference_displays_info
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round 247 — Annex H (3D-AVC) SEI type 53 depth_sampling_info
+- round 237 — Annex I (3D-AVC depth) SEI type 54 constrained_depth_parameter_set_identifier
+- round 231 — Annex H (3D-AVC) SEI type 50 depth_representation_info
+- round 226 — Annex H (3D-AVC) SEI type 51 three_dimensional_reference_displays_info
+- round 219 — strict §7.3.1 NAL extension header parsing (§F/G/I.7.3.1.1)
+- round 213 — Annex G (MVC) SEI type 40 multiview_acquisition_info
+- round 207 — Annex G (MVC) SEI type 41 non_required_view_component
+- round 200 — two more Annex G (MVC) SEI types: type 39 multiview_scene_info + type 43 operation_point_not_present
+- round 194 — CAVLC §7.3.5.3.1 call-contract guards + fuzz artifact sweep
+
 ### Other
 
 - round 288 — Annex G (MVC) coded-slice-extension path: NAL unit type 20
