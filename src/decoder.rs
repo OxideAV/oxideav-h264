@@ -69,6 +69,19 @@ pub enum DecoderError {
     /// the reference decoder refuses.
     #[error("FMO (num_slice_groups_minus1={0} > 0) is not supported in this decoder build")]
     FmoNotSupported(u32),
+    /// §G.7.4.1.2.1 — a coded slice MVC extension NAL (type 20)
+    /// activated a PPS whose referenced `seq_parameter_set_id` has no
+    /// subset SPS (NAL 15) stored. Per the activation rule a type-20
+    /// slice's PPS must reference a *subset* SPS, not an ordinary one.
+    #[error("MVC slice extension PPS references unknown subset SPS id {0}")]
+    UnknownSubsetSps(u32),
+    /// §G.7.3.2.13 — the coded slice extension NAL (type 20/21) carries
+    /// an SVC (`svc_extension_flag == 1`) or 3D-AVC
+    /// (`avc_3d_extension_flag == 1`) body. Only the MVC branch
+    /// (`slice_header()` + `slice_data()`) is parsed; the Annex F SVC
+    /// and Annex J 3D-AVC slice bodies are not modelled yet.
+    #[error("coded slice extension body is not MVC (svc_extension_flag/avc_3d_extension_flag set); not supported")]
+    SliceExtensionBodyNotMvc,
 }
 
 pub type DecoderResult<T> = Result<T, DecoderError>;
@@ -122,6 +135,38 @@ pub enum Event {
         /// at slice-header parse time. Mirrors the snapshot rationale for
         /// `pps` above (though SPS re-transmission is rarer in practice).
         sps: Sps,
+    },
+    /// §G.7.3.2.13 — coded slice MVC extension (`nal_unit_type == 20`,
+    /// `svc_extension_flag == 0`). The `slice_layer_extension_rbsp()`
+    /// MVC branch carries the same §7.3.3 `slice_header()` as a
+    /// base-view slice, parsed here against the base SPS embedded in the
+    /// subset SPS (§7.3.2.1.3) that the activated PPS references (per the
+    /// §G.7.4.1.2.1 activation rule). The §G.7.3.1.1 NAL-unit-header MVC
+    /// extension fields are surfaced so the caller can route the slice
+    /// to the correct view component.
+    SliceExtension {
+        /// Raw 5-bit `nal_unit_type` value (always 20 here).
+        nal_unit_type: u8,
+        /// 2-bit `nal_ref_idc` value.
+        nal_ref_idc: u8,
+        /// §G.7.3.1.1 NAL-unit-header MVC extension (view_id,
+        /// temporal_id, anchor_pic_flag, inter_view_flag, …).
+        mvc: nal::NalUnitHeaderMvcExtension,
+        /// IdrPicFlag derived from `!mvc.non_idr_flag` (§G.7.4.1.1).
+        idr_pic_flag: bool,
+        header: SliceHeader,
+        /// RBSP body after the NAL header byte + 3 MVC extension bytes
+        /// are stripped and emulation-prevention bytes removed.
+        rbsp: Vec<u8>,
+        /// `(byte_index, bit_index)` into `rbsp` marking the first bit
+        /// of slice_data().
+        slice_data_cursor: (usize, u8),
+        /// §7.4.1.2.1 — the PPS activated by this MVC slice.
+        pps: Pps,
+        /// §G.7.4.1.2.1 — the subset SPS (NAL 15) the activated PPS
+        /// references. The view-coding parameters used to parse the
+        /// slice header come from its embedded base `sps`.
+        subset_sps: SubsetSps,
     },
     /// §7.3.2.3 — parsed SEI messages. May be empty when the SEI RBSP
     /// carries only rbsp_trailing_bits.
@@ -233,12 +278,29 @@ impl Decoder {
                 // tail under a guessed chroma_format_idc).
                 let probe = Pps::parse(&rbsp)?;
                 let sps_id = probe.seq_parameter_set_id;
-                let sps = match self.sps_by_id.get(sps_id as usize).and_then(|s| s.as_ref()) {
-                    Some(sps) => sps,
-                    None => return Err(DecoderError::UnknownSps(sps_id)),
-                };
-                let pps = if sps.chroma_format_idc != 1 {
-                    Pps::parse_with_chroma_format(&rbsp, sps.chroma_format_idc)?
+                // §G.7.4.2.2 — for an MVC PPS the referenced sequence
+                // parameter set is the *MVC* sequence parameter set,
+                // i.e. a subset SPS (NAL 15). The two id spaces are
+                // separate (§7.4.1.2.1), so resolve the chroma format
+                // from the ordinary SPS table first and fall back to the
+                // subset SPS table (its embedded base SPS body) when no
+                // ordinary SPS carries this id. The scaling-matrix tail
+                // length depends only on that chroma_format_idc, which
+                // both flavours carry.
+                let chroma_format_idc = self
+                    .sps_by_id
+                    .get(sps_id as usize)
+                    .and_then(|s| s.as_ref())
+                    .map(|s| s.chroma_format_idc)
+                    .or_else(|| {
+                        self.subset_sps_by_id
+                            .get(sps_id as usize)
+                            .and_then(|s| s.as_ref())
+                            .map(|s| s.sps.chroma_format_idc)
+                    })
+                    .ok_or(DecoderError::UnknownSps(sps_id))?;
+                let pps = if chroma_format_idc != 1 {
+                    Pps::parse_with_chroma_format(&rbsp, chroma_format_idc)?
                 } else {
                     probe
                 };
@@ -282,8 +344,26 @@ impl Decoder {
                 nal_unit_type: header.nal_unit_type.as_u8(),
                 nal_bytes: nal_bytes.to_vec(),
             }),
+            // §7.3.2.13 / §G.7.3.2.13 — coded slice MVC extension
+            // (nal_unit_type 20). When the §7.3.1 dispatch parsed an MVC
+            // NAL-unit-header extension (`svc_extension_flag == 0`), the
+            // `slice_layer_extension_rbsp()` else-branch carries a plain
+            // §7.3.3 `slice_header()`, which we parse against the subset
+            // SPS the activated PPS references. An SVC
+            // (`svc_extension_flag == 1`) body or a missing extension
+            // header falls through to `Ignored` — those Annex F slice
+            // bodies aren't modelled.
+            NalUnitType::SliceExtension => match nu.extension {
+                Some(nal::NalUnitHeaderExtension::Mvc(mvc)) => {
+                    self.process_mvc_slice_extension_nal(&header, &rbsp, mvc)
+                }
+                _ => Ok(Event::Ignored {
+                    nal_unit_type: header.nal_unit_type.as_u8(),
+                    nal_bytes: nal_bytes.to_vec(),
+                }),
+            },
             // SPS extension (13), prefix NAL (14), depth parameter set
-            // (16), reserved (17/18/22/23), slice extension (20/21),
+            // (16), reserved (17/18/22/23), slice extension depth (21),
             // and all unspecified values. Pass through as Ignored so
             // the caller can inspect/log.
             NalUnitType::Unspecified(_)
@@ -291,13 +371,79 @@ impl Decoder {
             | NalUnitType::SpsExtension
             | NalUnitType::PrefixNalUnit
             | NalUnitType::DepthParameterSet
-            | NalUnitType::SliceExtension
             | NalUnitType::SliceExtensionDepth
             | NalUnitType::UnspecifiedRange(_) => Ok(Event::Ignored {
                 nal_unit_type: header.nal_unit_type.as_u8(),
                 nal_bytes: nal_bytes.to_vec(),
             }),
         }
+    }
+
+    /// §G.7.3.2.13 / §G.7.4.1.2.1 — process a coded slice MVC extension
+    /// NAL unit (`nal_unit_type == 20`, `svc_extension_flag == 0`).
+    ///
+    /// Resolves the activated PPS, then resolves that PPS's
+    /// `seq_parameter_set_id` against the **subset SPS** id space (per
+    /// §G.7.4.1.2.1: "a subset sequence parameter set RBSP … referred
+    /// to by activation of a picture parameter set RBSP … activated by
+    /// a coded slice MVC extension NAL unit"). The §7.3.3
+    /// `slice_header()` is then parsed against the subset SPS's embedded
+    /// base SPS, with `IdrPicFlag = !mvc.non_idr_flag` (§G.7.4.1.1).
+    fn process_mvc_slice_extension_nal(
+        &mut self,
+        header: &NalHeader,
+        rbsp: &[u8],
+        mvc: nal::NalUnitHeaderMvcExtension,
+    ) -> DecoderResult<Event> {
+        if self.pps_by_id.iter().all(|p| p.is_none()) {
+            return Err(DecoderError::NoActiveParameterSets);
+        }
+        // Peek pic_parameter_set_id (third ue(v) of the slice header).
+        let pps_id = peek_slice_pps_id(rbsp)?;
+        let pps = self
+            .pps_by_id
+            .get(pps_id as usize)
+            .and_then(|p| p.as_ref())
+            .ok_or(DecoderError::UnknownPps(pps_id))?
+            .clone();
+        // §A.2 — FMO is not modelled; reject as for base-view slices.
+        if pps.num_slice_groups_minus1 > 0 {
+            return Err(DecoderError::FmoNotSupported(pps.num_slice_groups_minus1));
+        }
+        // §G.7.4.1.2.1 — a type-20 slice activates a *subset* SPS
+        // (NAL 15), looked up in the separate subset-SPS id space.
+        let sps_id = pps.seq_parameter_set_id;
+        let subset_sps = self
+            .subset_sps_by_id
+            .get(sps_id as usize)
+            .and_then(|p| p.as_ref())
+            .ok_or(DecoderError::UnknownSubsetSps(sps_id))?
+            .clone();
+
+        // §G.7.4.1.1 — IdrPicFlag = !non_idr_flag.
+        let idr_pic_flag = mvc.non_idr_flag == 0;
+
+        // §7.3.3 — parse the slice header against the subset SPS's base
+        // SPS body.
+        let (parsed, slice_data_cursor) = SliceHeader::parse_mvc_extension_and_tell(
+            rbsp,
+            &subset_sps.sps,
+            &pps,
+            header,
+            idr_pic_flag,
+        )?;
+
+        Ok(Event::SliceExtension {
+            nal_unit_type: header.nal_unit_type.as_u8(),
+            nal_ref_idc: header.nal_ref_idc,
+            mvc,
+            idr_pic_flag,
+            header: parsed,
+            rbsp: rbsp.to_vec(),
+            slice_data_cursor,
+            pps,
+            subset_sps,
+        })
     }
 
     /// §7.4.1.2.1 — slice NAL: resolve PPS, activate PPS+SPS, then
@@ -928,5 +1074,239 @@ mod tests {
         w.u(8, 0); // pad
         let rbsp = w.into_bytes();
         assert_eq!(peek_slice_pps_id(&rbsp).unwrap(), 7);
+    }
+
+    // ---- §G.7.3.2.13 coded slice MVC extension (NAL 20) ----
+
+    /// §7.3.2.1.3 + §G.7.3.2.1.4 — minimal Stereo High (profile_idc=128)
+    /// subset SPS RBSP. The embedded base `seq_parameter_set_data()` is
+    /// 4:2:0, POC type 0 with 4-bit frame_num / pic_order_cnt_lsb, and
+    /// 320x240 dims so the §7.3.3 slice header built below parses
+    /// identically to the base-view path. `seq_parameter_set_id` lives
+    /// in the subset-SPS id space.
+    fn build_minimal_subset_sps_rbsp(sps_id: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        // seq_parameter_set_data() — profile 128 takes the chroma-
+        // extended gate (§7.3.2.1.1).
+        w.u(8, 128); // profile_idc = Stereo High
+        w.u(8, 0); // constraint_sets + reserved_zero_2bits
+        w.u(8, 30); // level_idc
+        w.ue(sps_id); // seq_parameter_set_id
+        w.ue(1); // chroma_format_idc = 4:2:0
+        w.ue(0); // bit_depth_luma_minus8
+        w.ue(0); // bit_depth_chroma_minus8
+        w.u(1, 0); // qpprime_y_zero_transform_bypass_flag
+        w.u(1, 0); // seq_scaling_matrix_present_flag
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(0); // pic_order_cnt_type
+        w.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        w.ue(1); // max_num_ref_frames
+        w.u(1, 0); // gaps_in_frame_num_value_allowed_flag
+        w.ue(19); // pic_width_in_mbs_minus1 — 320px / 16
+        w.ue(14); // pic_height_in_map_units_minus1 — 240px / 16
+        w.u(1, 1); // frame_mbs_only_flag
+        w.u(1, 1); // direct_8x8_inference_flag
+        w.u(1, 0); // frame_cropping_flag
+        w.u(1, 0); // vui_parameters_present_flag
+                   // §7.3.2.1.3 subset_seq_parameter_set_rbsp tail (profile 128 →
+                   // MVC extension branch).
+        w.u(1, 1); // bit_equal_to_one
+                   // §G.7.3.2.1.4 seq_parameter_set_mvc_extension() — two views.
+        w.ue(1); // num_views_minus1 = 1
+        w.ue(0); // view_id[0]
+        w.ue(2); // view_id[1]
+        w.ue(1); // num_anchor_refs_l0[1]
+        w.ue(0); // anchor_ref_l0[1][0]
+        w.ue(0); // num_anchor_refs_l1[1]
+        w.ue(1); // num_non_anchor_refs_l0[1]
+        w.ue(0); // non_anchor_ref_l0[1][0]
+        w.ue(0); // num_non_anchor_refs_l1[1]
+        w.ue(0); // num_level_values_signalled_minus1
+        w.u(8, 40); // level_idc[0]
+        w.ue(0); // num_applicable_ops_minus1[0]
+        w.u(3, 1); // applicable_op_temporal_id[0][0]
+        w.ue(1); // applicable_op_num_target_views_minus1[0][0]
+        w.ue(0); // applicable_op_target_view_id[0][0][0]
+        w.ue(2); // applicable_op_target_view_id[0][0][1]
+        w.ue(1); // applicable_op_num_views_minus1[0][0]
+        w.u(1, 0); // mvc_vui_parameters_present_flag
+        w.u(1, 0); // additional_extension2_flag
+        w.trailing();
+        w.into_bytes()
+    }
+
+    /// §G.7.3.1.1 — pack the three MVC NAL-unit-header extension bytes
+    /// (`svc_extension_flag = 0` in the MSB, left out of the OR).
+    fn pack_mvc_ext_bytes(
+        non_idr: u8,
+        priority: u8,
+        view: u16,
+        temporal: u8,
+        anchor: u8,
+        inter_view: u8,
+    ) -> [u8; 3] {
+        let bits24: u32 = ((non_idr as u32 & 0x1) << 22)
+            | ((priority as u32 & 0x3F) << 16)
+            | ((view as u32 & 0x3FF) << 6)
+            | ((temporal as u32 & 0x7) << 3)
+            | ((anchor as u32 & 0x1) << 2)
+            | ((inter_view as u32 & 0x1) << 1)
+            | 1; // reserved_one_bit = 1 (§G.7.4.1.1)
+        [
+            ((bits24 >> 16) & 0xFF) as u8,
+            ((bits24 >> 8) & 0xFF) as u8,
+            (bits24 & 0xFF) as u8,
+        ]
+    }
+
+    /// Build a NAL-20 coded slice MVC extension: header byte + 3 MVC
+    /// extension bytes + slice RBSP.
+    fn build_mvc_slice_ext_nal(
+        nal_ref_idc: u8,
+        non_idr: u8,
+        view_id: u16,
+        slice_rbsp: &[u8],
+    ) -> Vec<u8> {
+        let mut nal = build_nal(20, nal_ref_idc, &[]);
+        nal.extend_from_slice(&pack_mvc_ext_bytes(non_idr, 0, view_id, 0, 1, 1));
+        nal.extend_from_slice(slice_rbsp);
+        nal
+    }
+
+    /// Store the SPS / subset SPS / PPS a NAL-20 test needs. The PPS
+    /// references `sps_id` which is resolved against the subset-SPS id
+    /// space per §G.7.4.1.2.1.
+    fn setup_mvc_decoder(sps_id: u32, pps_id: u32) -> Decoder {
+        let mut dec = Decoder::new();
+        // Ordinary base-view SPS (NAL 7) at the same id, as a real MVC
+        // stream carries for view 0.
+        dec.process_nal(&build_nal(7, 3, &build_minimal_sps_rbsp(sps_id)))
+            .unwrap();
+        // Subset SPS (NAL 15) — separate id space.
+        let ev = dec
+            .process_nal(&build_nal(15, 3, &build_minimal_subset_sps_rbsp(sps_id)))
+            .unwrap();
+        assert!(matches!(ev, Event::SubsetSpsStored(_)));
+        // PPS (NAL 8) referencing that sps_id.
+        dec.process_nal(&build_nal(8, 3, &build_minimal_pps_rbsp(pps_id, sps_id)))
+            .unwrap();
+        dec
+    }
+
+    #[test]
+    fn mvc_slice_extension_parses_against_subset_sps() {
+        // §G.7.3.2.13 — NAL 20, svc_extension_flag=0 → slice_header().
+        let mut dec = setup_mvc_decoder(0, 0);
+        // non_idr_flag = 1 (non-IDR dependent-view slice), view_id = 2.
+        let slice = build_minimal_i_slice_rbsp(0);
+        let nal = build_mvc_slice_ext_nal(3, 1, 2, &slice);
+        let ev = dec.process_nal(&nal).unwrap();
+        match ev {
+            Event::SliceExtension {
+                nal_unit_type,
+                nal_ref_idc,
+                mvc,
+                idr_pic_flag,
+                header,
+                subset_sps,
+                ..
+            } => {
+                assert_eq!(nal_unit_type, 20);
+                assert_eq!(nal_ref_idc, 3);
+                assert_eq!(mvc.view_id, 2);
+                assert_eq!(mvc.non_idr_flag, 1);
+                // §G.7.4.1.1 — IdrPicFlag = !non_idr_flag.
+                assert!(!idr_pic_flag);
+                assert_eq!(header.first_mb_in_slice, 0);
+                assert_eq!(header.pic_parameter_set_id, 0);
+                // The slice was parsed against the subset SPS's base SPS.
+                assert_eq!(subset_sps.sps.profile_idc, 128);
+            }
+            other => panic!("expected SliceExtension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mvc_slice_extension_idr_flag_from_non_idr_flag() {
+        // non_idr_flag = 0 → IdrPicFlag = 1 (§G.7.4.1.1). An IDR slice
+        // header carries idr_pic_id (§7.3.3), absent from the non-IDR
+        // body, so build it explicitly here.
+        let mut dec = setup_mvc_decoder(0, 0);
+        let mut w = BitWriter::new();
+        w.ue(0); // first_mb_in_slice
+        w.ue(7); // slice_type = 7 (I)
+        w.ue(0); // pic_parameter_set_id
+        w.u(4, 0); // frame_num (4 bits)
+        w.ue(0); // idr_pic_id — present because IdrPicFlag = 1
+        w.u(4, 0); // pic_order_cnt_lsb (4 bits)
+        w.u(1, 0); // dec_ref_pic_marking: no_output_of_prior_pics_flag
+        w.u(1, 0); // dec_ref_pic_marking: long_term_reference_flag
+        w.se(0); // slice_qp_delta
+        w.u(8, 0x80); // padding
+        let slice = w.into_bytes();
+        let nal = build_mvc_slice_ext_nal(3, 0, 2, &slice);
+        let ev = dec.process_nal(&nal).unwrap();
+        match ev {
+            Event::SliceExtension { idr_pic_flag, .. } => {
+                assert!(idr_pic_flag, "non_idr_flag=0 must yield IdrPicFlag=1");
+            }
+            other => panic!("expected SliceExtension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mvc_slice_extension_missing_subset_sps_is_error() {
+        // PPS references sps_id 0 but only an ordinary SPS is stored —
+        // no subset SPS at id 0. §G.7.4.1.2.1 requires a subset SPS for
+        // a type-20 activation.
+        let mut dec = Decoder::new();
+        dec.process_nal(&build_nal(7, 3, &build_minimal_sps_rbsp(0)))
+            .unwrap();
+        dec.process_nal(&build_nal(8, 3, &build_minimal_pps_rbsp(0, 0)))
+            .unwrap();
+        let slice = build_minimal_i_slice_rbsp(0);
+        let nal = build_mvc_slice_ext_nal(3, 1, 2, &slice);
+        let err = dec.process_nal(&nal).unwrap_err();
+        assert!(
+            matches!(err, DecoderError::UnknownSubsetSps(0)),
+            "expected UnknownSubsetSps(0), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mvc_slice_extension_unknown_pps_is_error() {
+        let mut dec = setup_mvc_decoder(0, 0);
+        // Slice references pps_id 5 which was never stored.
+        let slice = build_minimal_i_slice_rbsp(5);
+        let nal = build_mvc_slice_ext_nal(3, 1, 2, &slice);
+        let err = dec.process_nal(&nal).unwrap_err();
+        assert!(
+            matches!(err, DecoderError::UnknownPps(5)),
+            "expected UnknownPps(5), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn svc_slice_extension_falls_through_to_ignored() {
+        // svc_extension_flag = 1 → Annex F SVC body, which we don't
+        // parse. The NAL must surface as Ignored, not SliceExtension.
+        let mut dec = setup_mvc_decoder(0, 0);
+        // Build a NAL 20 with svc_extension_flag = 1 (MSB set).
+        let mut svc_ext = pack_mvc_ext_bytes(1, 0, 0, 0, 0, 0);
+        svc_ext[0] |= 0x80; // set svc_extension_flag
+        let mut nal = build_nal(20, 3, &[]);
+        nal.extend_from_slice(&svc_ext);
+        nal.extend_from_slice(&build_minimal_i_slice_rbsp(0));
+        let ev = dec.process_nal(&nal).unwrap();
+        assert!(
+            matches!(
+                ev,
+                Event::Ignored {
+                    nal_unit_type: 20,
+                    ..
+                }
+            ),
+            "expected Ignored for SVC body, got {ev:?}"
+        );
     }
 }

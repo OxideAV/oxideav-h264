@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 288 — Annex G (MVC) coded-slice-extension path: NAL unit type 20
+  (`SliceExtension`) with `svc_extension_flag == 0` is now decoded as a
+  §G.7.3.2.13 `slice_layer_extension_rbsp()` MVC body instead of falling
+  through to `Event::Ignored`. Per §G.7.3.2.13 the MVC else-branch
+  (neither `svc_extension_flag` nor `avc_3d_extension_flag` set) carries
+  the *same* §7.3.3 `slice_header()` as a base-view slice, so the
+  existing slice-header parser is reused with two MVC-specific
+  adaptations: (a) `IdrPicFlag` is derived from the §G.7.3.1.1
+  NAL-unit-header MVC extension's `non_idr_flag` (`IdrPicFlag =
+  !non_idr_flag`, §G.7.4.1.1) rather than from the NAL unit type (fixed
+  at 20); (b) the activated PPS's `seq_parameter_set_id` resolves against
+  the **subset SPS** id space (NAL 15) rather than the ordinary SPS
+  table, per the §G.7.4.1.2.1 activation rule ("a subset sequence
+  parameter set RBSP … referred to by activation of a picture parameter
+  set RBSP … activated by a coded slice MVC extension NAL unit"). The
+  slice header is then parsed against the subset SPS's embedded base SPS.
+  New `SliceHeader::parse_mvc_extension_and_tell` shares the parse body
+  with `parse_and_tell` via a private `parse_and_tell_inner` taking the
+  caller-resolved `idr_pic_flag`; the public `parse_and_tell` still
+  rejects NAL 20/21 with `SliceExtensionNotSupported` so a base-view
+  caller can't mis-parse an extension body. New `Event::SliceExtension`
+  surfaces the parsed header alongside the §G.7.3.1.1 MVC fields
+  (`view_id`, `temporal_id`, `anchor_pic_flag`, `inter_view_flag`), the
+  derived `idr_pic_flag`, the activated PPS, the referencing subset SPS,
+  and the slice_data() cursor. The §7.3.2.2 PPS-storage handler now
+  resolves `chroma_format_idc` (needed for the scaling-matrix tail) from
+  the subset SPS table when no ordinary SPS carries the referenced id,
+  per §G.7.4.2.2 ("substituting MVC sequence parameter set for sequence
+  parameter set"), so an MVC PPS that references a subset-SPS-only id is
+  accepted. SVC bodies (`svc_extension_flag == 1`, Annex F) and 3D-AVC
+  bodies (NAL 21, Annex J) still surface as `Event::Ignored` — their
+  `slice_header_in_scalable_extension()` / `slice_header_in_3davc_extension()`
+  prefixes are not modelled. New `DecoderError` variants:
+  `UnknownSubsetSps(id)` (type-20 PPS references an unstored subset SPS)
+  and `SliceExtensionBodyNotMvc`. 5 new decoder unit tests: two-view
+  Stereo High (profile 128) MVC slice parsed against the subset SPS,
+  IdrPicFlag derivation from `non_idr_flag` (non-IDR vs IDR-with-
+  idr_pic_id bodies), missing-subset-SPS rejection, unknown-PPS
+  rejection, and SVC-body fall-through to Ignored. Reconstruction of
+  inter-view-predicted MVC slices remains out of scope (no §G.8
+  inter-view reference assembly yet); this lands the parse + activation
+  groundwork the r281 subset-SPS work flagged.
+
 - round 281 — first Annex G (MVC) parameter-set body step: §7.3.2.1.3
   `subset_seq_parameter_set_rbsp()` (NAL unit type 15) parsing in a new
   `subset_sps` module, wired into the decoder. The embedded

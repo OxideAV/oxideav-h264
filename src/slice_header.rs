@@ -320,7 +320,12 @@ impl SliceHeader {
         nal_header: &NalHeader,
     ) -> Result<(Self, (usize, u8)), SliceHeaderError> {
         // Annex F/G/J — MVC/SVC/3D-AVC slice extensions use a
-        // different sub-header prefix. We don't parse those.
+        // different sub-header prefix and derive IdrPicFlag from the
+        // NAL-unit-header extension's `idr_flag` / `non_idr_flag`
+        // rather than from the NAL unit type. Those are routed through
+        // [`Self::parse_mvc_extension_and_tell`]; the base entry point
+        // rejects them so a caller can't accidentally parse a NAL 20/21
+        // body as a §7.3.3 `slice_header()`.
         let nut = nal_header.nal_unit_type;
         if matches!(
             nut,
@@ -328,8 +333,46 @@ impl SliceHeader {
         ) {
             return Err(SliceHeaderError::SliceExtensionNotSupported(nut.as_u8()));
         }
-        let idr_pic_flag = nut.is_idr();
+        // §7.4.3 — for NAL unit types 1..=5, IdrPicFlag = (type == 5).
+        Self::parse_and_tell_inner(rbsp, sps, pps, nal_header, nut.is_idr())
+    }
 
+    /// §G.7.3.2.13 / §7.3.3 — parse the `slice_header()` of a coded
+    /// slice MVC extension NAL unit (`nal_unit_type == 20`,
+    /// `svc_extension_flag == 0`).
+    ///
+    /// Per §G.7.3.2.13 `slice_layer_extension_rbsp()`, when neither
+    /// `svc_extension_flag` nor `avc_3d_extension_flag` is set the body
+    /// is the *same* §7.3.3 `slice_header()` followed by §7.3.4
+    /// `slice_data()` used for base-view (`nal_unit_type ∈ {1, 5}`)
+    /// slices. The one semantic difference is that `IdrPicFlag` is not
+    /// derived from the NAL unit type (which is fixed at 20) but from
+    /// the §G.7.3.1.1 NAL-unit-header MVC extension's `non_idr_flag`:
+    /// `IdrPicFlag = !non_idr_flag` (§G.7.4.1.1). The caller supplies
+    /// that derived flag; `sps` must be the base SPS embedded in the
+    /// subset SPS (§7.3.2.1.3) that the activated PPS references, per
+    /// the §G.7.4.1.2.1 activation rule.
+    pub fn parse_mvc_extension_and_tell(
+        rbsp: &[u8],
+        sps: &Sps,
+        pps: &Pps,
+        nal_header: &NalHeader,
+        idr_pic_flag: bool,
+    ) -> Result<(Self, (usize, u8)), SliceHeaderError> {
+        Self::parse_and_tell_inner(rbsp, sps, pps, nal_header, idr_pic_flag)
+    }
+
+    /// Shared body of [`Self::parse_and_tell`] and
+    /// [`Self::parse_mvc_extension_and_tell`]. `idr_pic_flag` is the
+    /// caller-resolved IdrPicFlag (NAL-type-derived for base slices,
+    /// `non_idr_flag`-derived for MVC extension slices).
+    fn parse_and_tell_inner(
+        rbsp: &[u8],
+        sps: &Sps,
+        pps: &Pps,
+        nal_header: &NalHeader,
+        idr_pic_flag: bool,
+    ) -> Result<(Self, (usize, u8)), SliceHeaderError> {
         let mut r = BitReader::new(rbsp);
 
         // §7.3.3 — first_mb_in_slice ue(v), slice_type ue(v), pic_parameter_set_id ue(v).
