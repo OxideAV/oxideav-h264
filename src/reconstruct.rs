@@ -837,20 +837,39 @@ fn reconstruct_mb_intra(
                 grid,
                 current_slice_id,
             )?;
-            reconstruct_chroma_intra(
-                mb,
-                qp_y,
-                chroma_array_type,
-                bit_depth_c,
-                mb_px,
-                mb_py,
-                &writer,
-                sps,
-                pps,
-                pic,
-                grid,
-                current_slice_id,
-            )?;
+            if chroma_array_type == 3 {
+                // §8.3.4.5 — 4:4:4 I_NxN: Cb/Cr coded like luma, reusing
+                // the per-block luma Intra_NxN modes derived above.
+                reconstruct_chroma_intra_nxn_444(
+                    mb,
+                    qp_y,
+                    bit_depth_c,
+                    mb_px,
+                    mb_py,
+                    mb_addr,
+                    &writer,
+                    sps,
+                    pps,
+                    pic,
+                    grid,
+                    current_slice_id,
+                )?;
+            } else {
+                reconstruct_chroma_intra(
+                    mb,
+                    qp_y,
+                    chroma_array_type,
+                    bit_depth_c,
+                    mb_px,
+                    mb_py,
+                    &writer,
+                    sps,
+                    pps,
+                    pic,
+                    grid,
+                    current_slice_id,
+                )?;
+            }
         }
         _ => {
             // Not reachable for valid I-slice data — caller checks
@@ -1616,10 +1635,13 @@ fn reconstruct_chroma_intra(
         return Ok(());
     }
     // Round-28: 4:4:4 Intra_16x16 — chroma is "coded like luma" per
-    // §7.3.5.3 / §8.3.4.1. Each plane has its own 16x16 DC Hadamard
+    // §7.3.5.3 / §8.3.4.5. Each plane has its own 16x16 DC Hadamard
     // block + 16 4x4 AC blocks sharing the luma Intra_16x16 mode.
-    // I_NxN 4:4:4 is rejected here (the per-plane 4x4-block layout
-    // for I_NxN-on-chroma is a separate plumbing exercise).
+    // 4:4:4 I_NxN chroma is handled at the dispatch site by
+    // `reconstruct_chroma_intra_nxn_444` (it needs `mb_addr` to read
+    // the per-block luma pred modes), so the only 4:4:4 caller that
+    // reaches here is the Intra_16x16 path. The non-16x16 arm is kept
+    // as a defensive guard.
     if chroma_array_type == 3 {
         if !mb.mb_type.is_intra_16x16() {
             return Err(ReconstructError::UnsupportedChromaArrayType(
@@ -1906,6 +1928,177 @@ fn reconstruct_chroma_intra_444(
                         writer.set_cb(pic, bx + xx, by + yy, v);
                     } else {
                         writer.set_cr(pic, bx + xx, by + yy, v);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// §8.3.4.5 / §7.3.5.3 — reconstruct the Cb + Cr planes of a 4:4:4
+/// I_NxN macroblock (Intra_4x4 or Intra_8x8). At ChromaArrayType == 3
+/// each chroma block is "coded like luma": the §8.3.1 / §8.3.2 sample
+/// prediction is applied to Cb/Cr with BitDepthC, **reusing the same
+/// `Intra4x4PredMode` / `Intra8x8PredMode` as the luma block with the
+/// matching block index** (the spec's substitution rule — see
+/// §8.3.4.5: "the output variable Intra4x4PredMode[luma4x4BlkIdx] …
+/// is also used for the 4x4 Cb or 4x4 Cr blocks"). The per-block modes
+/// were already derived by the luma pass and are read back from the
+/// grid; there is no chroma DC Hadamard block for I_NxN (only
+/// Intra_16x16 carries one — §8.5.10/§8.5.13 vs the plain §8.5.12 4x4
+/// / §8.5.13 8x8 inverse transforms used here).
+///
+/// The chroma residual is stored in `residual_cb_luma_like` /
+/// `residual_cr_luma_like`, compacted by `cbp_luma` per 8x8 quadrant in
+/// exactly the same way as the luma `residual_luma` array, so the
+/// set-bit-counting index mapping mirrors `reconstruct_intra_nxn`.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_chroma_intra_nxn_444(
+    mb: &Macroblock,
+    qp_y: i32,
+    bit_depth_c: u32,
+    mb_px: i32,
+    mb_py: i32,
+    mb_addr: u32,
+    writer: &MbWriter,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    grid: &MbGrid,
+    current_slice_id: i32,
+) -> Result<(), ReconstructError> {
+    let cip = pps.constrained_intra_pred_flag;
+    let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
+
+    // §8.5.8 — per-plane chroma QP (qP'C = QPC + QpBdOffsetC).
+    let cb_offset = pps.chroma_qp_index_offset;
+    let cr_offset = pps
+        .extension
+        .as_ref()
+        .map(|e| e.second_chroma_qp_index_offset)
+        .unwrap_or(pps.chroma_qp_index_offset);
+    let qp_bd_offset_c = qp_bd_offset(sps.bit_depth_chroma_minus8);
+    let qp_cb = qp_y_to_qp_c_with_bd_offset(qp_y, cb_offset, qp_bd_offset_c) + qp_bd_offset_c;
+    let qp_cr = qp_y_to_qp_c_with_bd_offset(qp_y, cr_offset, qp_bd_offset_c) + qp_bd_offset_c;
+
+    // §7.4.2.1.1.1 Table 7-2 — chroma scaling lists. 4x4 lists: i=1
+    // (Cb) / i=2 (Cr). 8x8 lists: i=2 (Intra_Cb) / i=4 (Intra_Cr).
+    let sl4_cb = select_scaling_list_4x4(1, sps, pps);
+    let sl4_cr = select_scaling_list_4x4(2, sps, pps);
+    let sl8_cb = select_scaling_list_8x8(2, sps, pps);
+    let sl8_cr = select_scaling_list_8x8(4, sps, pps);
+
+    // Per-block luma prediction modes already derived by the luma pass
+    // (stamped into the grid by `reconstruct_intra_nxn` before chroma).
+    let (pred_modes_4x4, pred_modes_8x8) = match grid.get(mb_addr) {
+        Some(info) => (info.intra_4x4_pred_modes, info.intra_8x8_pred_modes),
+        None => ([0u8; 16], [0u8; 4]),
+    };
+
+    for plane in 0..2u8 {
+        let qp_c = if plane == 0 { qp_cb } else { qp_cr };
+        let ac_blocks = if plane == 0 {
+            &mb.residual_cb_luma_like
+        } else {
+            &mb.residual_cr_luma_like
+        };
+
+        if mb.transform_size_8x8_flag {
+            // §8.3.2 / §8.5.13 — Intra_8x8 on the chroma plane.
+            let sl8 = if plane == 0 { &sl8_cb } else { &sl8_cr };
+            #[allow(clippy::needless_range_loop)]
+            for blk8 in 0..4usize {
+                let (bx, by) = LUMA_8X8_XY[blk8];
+                let mode =
+                    Intra8x8Mode::from_index(pred_modes_8x8[blk8]).unwrap_or(Intra8x8Mode::Dc);
+                let raw = gather_samples_8x8_chroma(
+                    pic,
+                    grid,
+                    mb_px + bx,
+                    mb_py + by,
+                    blk8,
+                    plane,
+                    current_slice_id,
+                    cip,
+                );
+                let filtered = filter_samples_8x8(&raw, bit_depth_c);
+                let mut pred_samples = [0i32; 64];
+                predict_8x8(mode, &filtered, bit_depth_c, &mut pred_samples);
+
+                // §8.5.13 — 64-coeff 8x8 zig-zag (CABAC packs them as one
+                // block; the CAVLC path emits four 4x4 zig-zag scans per
+                // 8x8 quadrant, matching the luma-like compaction below).
+                let coeffs_flat: [i32; 64] = if (cbp_luma >> blk8) & 1 == 1 {
+                    let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                    let base_slot = set_before * 4;
+                    let mut scan = [0i32; 64];
+                    for sub in 0..4usize {
+                        if let Some(coefs) = ac_blocks.get(base_slot + sub) {
+                            for (i, c) in coefs.iter().enumerate().take(16) {
+                                scan[sub * 16 + i] = *c;
+                            }
+                        }
+                    }
+                    inverse_scan_8x8_zigzag(&scan)
+                } else {
+                    [0i32; 64]
+                };
+                let residual = inverse_transform_8x8(&coeffs_flat, qp_c, sl8, bit_depth_c)?;
+
+                for y in 0..8i32 {
+                    for x in 0..8i32 {
+                        let idx = (y * 8 + x) as usize;
+                        let v = clip_sample(pred_samples[idx] + residual[idx], bit_depth_c);
+                        if plane == 0 {
+                            writer.set_cb(pic, bx + x, by + y, v);
+                        } else {
+                            writer.set_cr(pic, bx + x, by + y, v);
+                        }
+                    }
+                }
+            }
+        } else {
+            // §8.3.1 / §8.5.12 — Intra_4x4 on the chroma plane.
+            let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
+            #[allow(clippy::needless_range_loop)]
+            for block_idx in 0..16usize {
+                let (bx, by) = LUMA_4X4_XY[block_idx];
+                let mode =
+                    Intra4x4Mode::from_index(pred_modes_4x4[block_idx]).unwrap_or(Intra4x4Mode::Dc);
+                let samples = gather_samples_4x4_chroma(
+                    pic,
+                    grid,
+                    mb_px + bx,
+                    mb_py + by,
+                    block_idx,
+                    plane,
+                    current_slice_id,
+                    cip,
+                );
+                let mut pred_samples = [0i32; 16];
+                predict_4x4(mode, &samples, bit_depth_c, &mut pred_samples);
+
+                let blk8 = block_idx / 4;
+                let coeffs_scan = if (cbp_luma >> blk8) & 1 == 1 {
+                    let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                    let compact_idx = set_before * 4 + (block_idx % 4);
+                    ac_blocks.get(compact_idx).copied().unwrap_or([0i32; 16])
+                } else {
+                    [0i32; 16]
+                };
+                let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
+                let residual = inverse_transform_4x4(&coeffs, qp_c, sl4, bit_depth_c)?;
+
+                for yy in 0..4i32 {
+                    for xx in 0..4i32 {
+                        let p = pred_samples[(yy * 4 + xx) as usize];
+                        let v = clip_sample(p + residual[(yy * 4 + xx) as usize], bit_depth_c);
+                        if plane == 0 {
+                            writer.set_cb(pic, bx + xx, by + yy, v);
+                        } else {
+                            writer.set_cr(pic, bx + xx, by + yy, v);
+                        }
                     }
                 }
             }
@@ -2282,6 +2475,152 @@ fn gather_samples_8x8(
         } else {
             0
         };
+    }
+    Samples8x8 {
+        top_left,
+        top,
+        top_right,
+        left,
+        availability: Neighbour4x4Availability {
+            top_left: tl_avail,
+            top: top_avail,
+            top_right: tr_avail,
+            left: left_avail,
+        },
+    }
+}
+
+/// §8.3.4.5 — neighbour reference samples for a 4x4 Cb/Cr block at
+/// picture-absolute coordinate (bx, by) when ChromaArrayType == 3.
+///
+/// At 4:4:4 the chroma plane has the same geometry as luma
+/// (SubWidthC == SubHeightC == 1), so the availability + scan rules are
+/// byte-for-byte the luma rules of [`gather_samples_4x4`]; only the
+/// sample reads target `pic.cb_at` / `pic.cr_at` instead of
+/// `pic.luma_at`. `plane` selects 0 = Cb, 1 = Cr.
+#[allow(clippy::too_many_arguments)]
+fn gather_samples_4x4_chroma(
+    pic: &Picture,
+    grid: &MbGrid,
+    bx: i32,
+    by: i32,
+    block_idx: usize,
+    plane: u8,
+    current_slice_id: i32,
+    constrained_intra_pred: bool,
+) -> Samples4x4 {
+    let left_avail = bx > 0
+        && same_slice_at(grid, bx - 1, by, current_slice_id)
+        && cip_ok_at(grid, bx - 1, by, constrained_intra_pred);
+    let top_avail = by > 0
+        && same_slice_at(grid, bx, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx, by - 1, constrained_intra_pred);
+    let tl_avail = bx > 0
+        && by > 0
+        && same_slice_at(grid, bx - 1, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx - 1, by - 1, constrained_intra_pred);
+    // §6.4.3 scan: the same {3, 7, 11, 13, 15} top-right exclusion as
+    // luma — chroma blocks share the luma4x4BlkIdx scan order at 4:4:4.
+    let tr_scan_ok = !matches!(block_idx, 3 | 7 | 11 | 13 | 15);
+    let tr_avail = by > 0
+        && tr_scan_ok
+        && (bx + 4 < pic.width_in_samples as i32)
+        && same_slice_at(grid, bx + 4, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx + 4, by - 1, constrained_intra_pred);
+
+    let read = |px: i32, py: i32| -> i32 {
+        if plane == 0 {
+            pic.cb_at(px, py)
+        } else {
+            pic.cr_at(px, py)
+        }
+    };
+
+    let top_left = if tl_avail { read(bx - 1, by - 1) } else { 0 };
+    let mut top = [0i32; 4];
+    let mut top_right = [0i32; 4];
+    for x in 0..4 {
+        top[x as usize] = if top_avail { read(bx + x, by - 1) } else { 0 };
+        top_right[x as usize] = if tr_avail {
+            read(bx + 4 + x, by - 1)
+        } else {
+            0
+        };
+    }
+    let mut left = [0i32; 4];
+    for y in 0..4 {
+        left[y as usize] = if left_avail { read(bx - 1, by + y) } else { 0 };
+    }
+    Samples4x4 {
+        top_left,
+        top,
+        top_right,
+        left,
+        availability: Neighbour4x4Availability {
+            top_left: tl_avail,
+            top: top_avail,
+            top_right: tr_avail,
+            left: left_avail,
+        },
+    }
+}
+
+/// §8.3.4.5 — neighbour reference samples for an 8x8 Cb/Cr block at
+/// picture-absolute coordinate (bx, by) when ChromaArrayType == 3.
+///
+/// As with [`gather_samples_4x4_chroma`], 4:4:4 chroma reuses the luma
+/// 8x8 availability + scan logic of [`gather_samples_8x8`]; only the
+/// sample plane differs. `plane` selects 0 = Cb, 1 = Cr.
+#[allow(clippy::too_many_arguments)]
+fn gather_samples_8x8_chroma(
+    pic: &Picture,
+    grid: &MbGrid,
+    bx: i32,
+    by: i32,
+    blk8: usize,
+    plane: u8,
+    current_slice_id: i32,
+    constrained_intra_pred: bool,
+) -> Samples8x8 {
+    let left_avail = bx > 0
+        && same_slice_at(grid, bx - 1, by, current_slice_id)
+        && cip_ok_at(grid, bx - 1, by, constrained_intra_pred);
+    let top_avail = by > 0
+        && same_slice_at(grid, bx, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx, by - 1, constrained_intra_pred);
+    let tl_avail = bx > 0
+        && by > 0
+        && same_slice_at(grid, bx - 1, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx - 1, by - 1, constrained_intra_pred);
+    let tr_scan_ok = blk8 != 3;
+    let tr_avail = by > 0
+        && tr_scan_ok
+        && (bx + 8 < pic.width_in_samples as i32)
+        && same_slice_at(grid, bx + 8, by - 1, current_slice_id)
+        && cip_ok_at(grid, bx + 8, by - 1, constrained_intra_pred);
+
+    let read = |px: i32, py: i32| -> i32 {
+        if plane == 0 {
+            pic.cb_at(px, py)
+        } else {
+            pic.cr_at(px, py)
+        }
+    };
+
+    let top_left = if tl_avail { read(bx - 1, by - 1) } else { 0 };
+    let mut top = [0i32; 8];
+    let mut top_right = [0i32; 8];
+    for x in 0..8 {
+        top[x as usize] = if top_avail { read(bx + x, by - 1) } else { 0 };
+        top_right[x as usize] = if tr_avail {
+            read(bx + 8 + x, by - 1)
+        } else {
+            0
+        };
+    }
+    let mut left = [0i32; 8];
+    for y in 0..8 {
+        left[y as usize] = if left_avail { read(bx - 1, by + y) } else { 0 };
     }
     Samples8x8 {
         top_left,
@@ -9122,6 +9461,133 @@ mod tests {
                     "cbp=0x{:x} block 0 should be flat DC=128 (cbp bit 0 clear)",
                     cbp,
                 );
+            }
+        }
+    }
+
+    /// §8.3.4.5 / §7.3.5.3 — a 4:4:4 (ChromaArrayType == 3) I_NxN
+    /// (Intra_4x4) macroblock at the top-left of a single-MB picture.
+    /// `cbp_luma == 0` (no residual). With no neighbours every 4x4
+    /// block of every plane derives DC mode (eq. 8-41 → 2) and the
+    /// §8.3.1.2.3 "neighbours unavailable" branch fills the DC value
+    /// `1 << (BitDepth − 1) = 128` for 8-bit. Before this round the
+    /// chroma pass rejected 4:4:4 I_NxN with `UnsupportedChromaArrayType`
+    /// and the whole reconstruct failed; now Cb + Cr each fill with the
+    /// chroma DC just like luma.
+    #[test]
+    fn intra_4x4_zero_residual_dc_reconstructs_444_chroma() {
+        let mut sps = make_sps(1, 1);
+        sps.chroma_format_idc = 3; // 4:4:4
+        assert_eq!(sps.chroma_array_type(), 3);
+        let pps = make_pps();
+        let sh = make_slice_header();
+
+        // Intra_4x4: prev_flag = true → Intra4x4PredMode = predicted DC
+        // (2) for the top-left MB with no neighbours, on every block.
+        let mut pred = MbPred::default();
+        for i in 0..16 {
+            pred.prev_intra4x4_pred_mode_flag[i] = true;
+            pred.rem_intra4x4_pred_mode[i] = 0;
+        }
+        // intra_chroma_pred_mode is not coded for 4:4:4 (chroma is
+        // "coded like luma"); the chroma pass ignores it.
+        pred.intra_chroma_pred_mode = 0;
+        let mb = Macroblock {
+            mb_type: MbType::INxN,
+            mb_type_raw: 0,
+            mb_pred: Some(pred),
+            sub_mb_pred: None,
+            pcm_samples: None,
+            coded_block_pattern: 0, // cbp_luma = 0 → no luma/chroma residual.
+            transform_size_8x8_flag: false,
+            mb_qp_delta: 0,
+            residual_luma: Vec::new(),
+            residual_luma_dc: None,
+            residual_chroma_dc_cb: Vec::new(),
+            residual_chroma_dc_cr: Vec::new(),
+            residual_chroma_ac_cb: Vec::new(),
+            residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
+            is_skip: false,
+        };
+
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
+            last_mb_addr: 0,
+        };
+        // 4:4:4 → chroma plane is full size (16x16 for a 1-MB picture).
+        let mut pic = Picture::new(16, 16, 3, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid)
+            .expect("4:4:4 I_NxN must reconstruct (no longer rejected)");
+
+        // Every luma + chroma sample is the 8-bit DC fill (128).
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pic.luma_at(x, y), 128, "luma DC at ({x},{y})");
+                assert_eq!(pic.cb_at(x, y), 128, "Cb DC at ({x},{y})");
+                assert_eq!(pic.cr_at(x, y), 128, "Cr DC at ({x},{y})");
+            }
+        }
+    }
+
+    /// §8.3.4.5 — same as above but with `transform_size_8x8_flag = 1`
+    /// (Intra_8x8). The four 8x8 chroma blocks each derive DC (eq. 8-73)
+    /// and fill 128 with zero residual, exercising the 8x8 chroma
+    /// branch of `reconstruct_chroma_intra_nxn_444`.
+    #[test]
+    fn intra_8x8_zero_residual_dc_reconstructs_444_chroma() {
+        let mut sps = make_sps(1, 1);
+        sps.chroma_format_idc = 3;
+        let pps = make_pps();
+        let sh = make_slice_header();
+
+        let mut pred = MbPred::default();
+        for i in 0..4 {
+            pred.prev_intra8x8_pred_mode_flag[i] = true;
+            pred.rem_intra8x8_pred_mode[i] = 0;
+        }
+        pred.intra_chroma_pred_mode = 0;
+        let mb = Macroblock {
+            mb_type: MbType::INxN,
+            mb_type_raw: 0,
+            mb_pred: Some(pred),
+            sub_mb_pred: None,
+            pcm_samples: None,
+            coded_block_pattern: 0,
+            transform_size_8x8_flag: true,
+            mb_qp_delta: 0,
+            residual_luma: Vec::new(),
+            residual_luma_dc: None,
+            residual_chroma_dc_cb: Vec::new(),
+            residual_chroma_dc_cr: Vec::new(),
+            residual_chroma_ac_cb: Vec::new(),
+            residual_chroma_ac_cr: Vec::new(),
+            residual_cb_luma_like: Vec::new(),
+            residual_cr_luma_like: Vec::new(),
+            residual_cb_16x16_dc: None,
+            residual_cr_16x16_dc: None,
+            is_skip: false,
+        };
+
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 3, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &NoRefs, &mut pic, &mut grid)
+            .expect("4:4:4 Intra_8x8 must reconstruct");
+
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pic.cb_at(x, y), 128, "Cb DC at ({x},{y})");
+                assert_eq!(pic.cr_at(x, y), 128, "Cr DC at ({x},{y})");
             }
         }
     }
