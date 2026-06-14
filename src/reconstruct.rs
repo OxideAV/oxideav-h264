@@ -5613,8 +5613,11 @@ fn deblock_picture(
 ) {
     // For simplicity, walk the luma plane and filter each 4x4 block
     // boundary (vertical edges first, then horizontal) per §8.7.1.
-    // Chroma filtering is a per-plane replay at the chroma grid; we
-    // handle 4:2:0 and 4:2:2 only (4:4:4 was already rejected upstream).
+    // Chroma filtering is a per-plane replay at the chroma grid; 4:2:0
+    // and 4:2:2 use the chroma filtering process (chromaStyleFilteringFlag
+    // == 1), while 4:4:4 (ChromaArrayType == 3) per §8.7.2 eq. (8-450)
+    // applies the *luma* filtering process to each full-resolution chroma
+    // plane (chromaStyleFilteringFlag == 0).
     //
     // MBAFF scope: the walker consults [`pixel_to_mb_addr`] for MB
     // addressing so field-coded pairs hit the right per-MB MbInfo.
@@ -5635,6 +5638,27 @@ fn deblock_picture(
     );
     if pic.chroma_array_type == 1 || pic.chroma_array_type == 2 {
         deblock_plane_chroma(
+            pic,
+            grid,
+            alpha_off,
+            beta_off,
+            bit_depth_c,
+            pps,
+            mbaff_frame_flag,
+            mb_field_flags,
+        );
+    } else if pic.chroma_array_type == 3 {
+        // §8.7.2 eq. (8-450) — for ChromaArrayType == 3 (4:4:4) the
+        // chroma edges use chromaStyleFilteringFlag == 0, i.e. the
+        // *luma* filtering process is applied to each chroma plane
+        // independently. SubWidthC == SubHeightC == 1, so the chroma
+        // grid is full-resolution and shares the luma 16x16 MB edge
+        // geometry; the §8.7.2.1 last-paragraph bS inheritance maps the
+        // chroma sample at (x, y) onto the luma edge at the identical
+        // (x, y). Only the quantization parameter differs: §8.7.2 sets
+        // qPz to QPC (per §8.5.8, with the cb / cr offset) rather than
+        // QPY for a chroma edge.
+        deblock_plane_chroma_444(
             pic,
             grid,
             alpha_off,
@@ -6426,6 +6450,393 @@ fn chroma_qp_avg(p_qp_y: i32, q_qp_y: i32, offset: i32, qp_bd_offset_c: i32) -> 
     let p_c = qp_y_to_qp_c_with_bd_offset(p_qp_y, offset, qp_bd_offset_c);
     let q_c = qp_y_to_qp_c_with_bd_offset(q_qp_y, offset, qp_bd_offset_c);
     (p_c + q_c + 1) >> 1
+}
+
+// -------------------------------------------------------------------------
+// §8.7.2 eq. (8-450) — 4:4:4 (ChromaArrayType == 3) chroma deblocking
+// -------------------------------------------------------------------------
+
+/// §8.7 deblocking of the Cb / Cr planes when ChromaArrayType == 3.
+///
+/// At 4:4:4 the chroma planes are full-resolution (SubWidthC ==
+/// SubHeightC == 1), so the chroma grid shares the luma 16x16 MB edge
+/// geometry exactly. Per §8.7.2 eq. (8-450) the variable
+/// `chromaStyleFilteringFlag` evaluates to 0 for ChromaArrayType == 3,
+/// meaning the *luma* filtering process (§8.7.2.3 / §8.7.2.4 with
+/// `chromaStyleFilteringFlag == 0`, the four-sample p0..p2 / q0..q2
+/// update) is applied to each chroma plane independently — not the
+/// two-sample chroma-style filter used at 4:2:0 / 4:2:2.
+///
+/// The §8.7.2.1 last paragraph maps the chroma sample at `(x, y)` onto
+/// the luma edge at `(SubWidthC * x, SubHeightC * y) == (x, y)`, so the
+/// boundary strength `bS` is derived from exactly the same per-4x4-block
+/// inputs (intra / nonzero-coeff / ref-or-MV) as the luma walker, with
+/// the same `transform_size_8x8_flag` internal-edge skips.
+///
+/// The single difference from the luma plane is the quantization
+/// parameter: §8.7.2 sets `qPz` to `QPC` (§8.5.8, applying the cb / cr
+/// `chroma_qp_index_offset`) for a chroma edge — and to the `QPC` that
+/// corresponds to `QPY == 0` for an I_PCM macroblock.
+#[allow(clippy::too_many_arguments)]
+fn deblock_plane_chroma_444(
+    pic: &mut Picture,
+    grid: &MbGrid,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+    pps: &Pps,
+    mbaff_frame_flag: bool,
+    mb_field_flags: &[bool],
+) {
+    let w = pic.width_in_samples as i32;
+    let h = pic.height_in_samples as i32;
+    let mb_w = grid.width_in_mbs as i32;
+    let mb_h = grid.height_in_mbs as i32;
+    let cb_offset = pps.chroma_qp_index_offset;
+    let cr_offset = pps
+        .extension
+        .as_ref()
+        .map(|e| e.second_chroma_qp_index_offset)
+        .unwrap_or(pps.chroma_qp_index_offset);
+    let qp_bd_offset_c = qp_bd_offset(bit_depth.saturating_sub(8));
+
+    // §8.7.2 — for an I_PCM macroblock the chroma edge qPz is the QPC
+    // that corresponds to QPY == 0 (not the stored prev-QPY). Honour
+    // this per side when deriving QPC.
+    let side_qp = |info: &MbInfo| -> i32 {
+        if info.is_i_pcm {
+            0
+        } else {
+            info.qp_y
+        }
+    };
+
+    for plane in 0..2u8 {
+        let offset = if plane == 0 { cb_offset } else { cr_offset };
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                // --- 4 vertical edges, left-to-right (mirrors luma) ---
+                for edge_off in 0..4 {
+                    let edge_x = mb_x * 16 + edge_off * 4;
+                    if edge_x == 0 || edge_x >= w {
+                        continue;
+                    }
+                    for seg in 0..4 {
+                        let y0 = mb_y * 16 + seg * 4;
+                        if y0 >= h {
+                            break;
+                        }
+                        let p_addr = match pixel_to_mb_addr(
+                            grid,
+                            edge_x - 1,
+                            y0,
+                            mbaff_frame_flag,
+                            mb_field_flags,
+                        ) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let q_addr = match pixel_to_mb_addr(
+                            grid,
+                            edge_x,
+                            y0,
+                            mbaff_frame_flag,
+                            mb_field_flags,
+                        ) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
+                            (Some(p), Some(q)) if p.available && q.available => (p, q),
+                            _ => continue,
+                        };
+                        let is_mb_edge = p_addr != q_addr;
+                        // §8.7 — same internal 4x4-edge skip as luma when
+                        // the q-side MB uses the 8x8 transform.
+                        if !is_mb_edge
+                            && (edge_off == 1 || edge_off == 3)
+                            && q_info.transform_size_8x8_flag
+                        {
+                            continue;
+                        }
+                        let p_in_mb_x = (edge_x - 1).rem_euclid(16) as u32;
+                        let p_in_mb_y = y0.rem_euclid(16) as u32;
+                        let q_in_mb_x = edge_x.rem_euclid(16) as u32;
+                        let q_in_mb_y = y0.rem_euclid(16) as u32;
+                        let bs = derive_chroma_444_bs(
+                            p_info,
+                            q_info,
+                            is_mb_edge,
+                            p_in_mb_x,
+                            p_in_mb_y,
+                            q_in_mb_x,
+                            q_in_mb_y,
+                            true,
+                            mbaff_frame_flag,
+                        );
+                        if bs == 0 {
+                            continue;
+                        }
+                        let qp_avg =
+                            chroma_qp_avg(side_qp(p_info), side_qp(q_info), offset, qp_bd_offset_c);
+                        filter_vertical_edge_plane_luma_style(
+                            pic, plane, edge_x, y0, bs, qp_avg, alpha_off, beta_off, bit_depth,
+                        );
+                    }
+                }
+
+                // --- 4 horizontal edges, top-to-bottom (mirrors luma) ---
+                for edge_off in 0..4 {
+                    let edge_y = mb_y * 16 + edge_off * 4;
+                    if edge_y == 0 || edge_y >= h {
+                        continue;
+                    }
+                    for seg in 0..4 {
+                        let x0 = mb_x * 16 + seg * 4;
+                        if x0 >= w {
+                            break;
+                        }
+                        let p_addr = match pixel_to_mb_addr(
+                            grid,
+                            x0,
+                            edge_y - 1,
+                            mbaff_frame_flag,
+                            mb_field_flags,
+                        ) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let q_addr = match pixel_to_mb_addr(
+                            grid,
+                            x0,
+                            edge_y,
+                            mbaff_frame_flag,
+                            mb_field_flags,
+                        ) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let (p_info, q_info) = match (grid.get(p_addr), grid.get(q_addr)) {
+                            (Some(p), Some(q)) if p.available && q.available => (p, q),
+                            _ => continue,
+                        };
+                        let is_mb_edge = p_addr != q_addr;
+                        if !is_mb_edge
+                            && (edge_off == 1 || edge_off == 3)
+                            && q_info.transform_size_8x8_flag
+                        {
+                            continue;
+                        }
+                        let p_in_mb_x = x0.rem_euclid(16) as u32;
+                        let p_in_mb_y = (edge_y - 1).rem_euclid(16) as u32;
+                        let q_in_mb_x = x0.rem_euclid(16) as u32;
+                        let q_in_mb_y = edge_y.rem_euclid(16) as u32;
+                        let bs = derive_chroma_444_bs(
+                            p_info,
+                            q_info,
+                            is_mb_edge,
+                            p_in_mb_x,
+                            p_in_mb_y,
+                            q_in_mb_x,
+                            q_in_mb_y,
+                            false,
+                            mbaff_frame_flag,
+                        );
+                        if bs == 0 {
+                            continue;
+                        }
+                        let qp_avg =
+                            chroma_qp_avg(side_qp(p_info), side_qp(q_info), offset, qp_bd_offset_c);
+                        filter_horizontal_edge_plane_luma_style(
+                            pic, plane, x0, edge_y, bs, qp_avg, alpha_off, beta_off, bit_depth,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// §8.7.2.1 boundary-strength derivation for a 4:4:4 chroma edge,
+/// identical to the luma derivation (the chroma bS *is* the luma bS at
+/// the same full-resolution location per §8.7.2.1 last paragraph).
+#[allow(clippy::too_many_arguments)]
+fn derive_chroma_444_bs(
+    p_info: &MbInfo,
+    q_info: &MbInfo,
+    is_mb_edge: bool,
+    p_in_mb_x: u32,
+    p_in_mb_y: u32,
+    q_in_mb_x: u32,
+    q_in_mb_y: u32,
+    vertical_edge: bool,
+    mbaff_frame_flag: bool,
+) -> u8 {
+    let diff_ref_mv = !p_info.is_intra
+        && !q_info.is_intra
+        && different_ref_or_mv_luma(p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y);
+    let p_blk4_z = blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+    let q_blk4_z = blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+    derive_boundary_strength(BsInputs {
+        p_is_intra: p_info.is_intra,
+        q_is_intra: q_info.is_intra,
+        is_mb_edge,
+        is_sp_or_si: false,
+        either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+        different_ref_or_mv: diff_ref_mv,
+        mixed_mode_edge: false,
+        vertical_edge,
+        mbaff_or_field: mbaff_frame_flag,
+    })
+}
+
+/// §8.7.2 — apply the *luma* filtering process to a vertical edge of one
+/// 4:4:4 chroma plane (`plane`: 0 = Cb, 1 = Cr) for the four rows
+/// `y0..y0+4`. `Plane::Luma` is passed to [`filter_edge`] so
+/// `chromaStyleFilteringFlag == 0` (the four-sample filter) is used,
+/// matching eq. (8-450) for ChromaArrayType == 3.
+#[allow(clippy::too_many_arguments)]
+fn filter_vertical_edge_plane_luma_style(
+    pic: &mut Picture,
+    plane: u8,
+    edge_x: i32,
+    y0: i32,
+    bs: u8,
+    qp_avg: i32,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+) {
+    let params = FilterParams {
+        bs,
+        qp_avg,
+        filter_offset_a: alpha_off,
+        filter_offset_b: beta_off,
+        bit_depth,
+    };
+    let pic_h = pic.height_in_samples as i32;
+    for dy in 0..4 {
+        let y = y0 + dy;
+        if y < 0 || y >= pic_h {
+            continue;
+        }
+        let mut samples = [0i32; 8];
+        for (i, x) in (edge_x - 4..edge_x + 4).enumerate() {
+            samples[i] = plane_at(pic, plane, x, y);
+        }
+        let p3 = samples[0];
+        let mut p2 = samples[1];
+        let mut p1 = samples[2];
+        let mut p0 = samples[3];
+        let mut q0 = samples[4];
+        let mut q1 = samples[5];
+        let mut q2 = samples[6];
+        let q3 = samples[7];
+        filter_edge(
+            Plane::Luma,
+            EdgeSamples {
+                p3,
+                p2: &mut p2,
+                p1: &mut p1,
+                p0: &mut p0,
+                q0: &mut q0,
+                q1: &mut q1,
+                q2: &mut q2,
+                q3,
+            },
+            params,
+        );
+        plane_set(pic, plane, edge_x - 3, y, p2);
+        plane_set(pic, plane, edge_x - 2, y, p1);
+        plane_set(pic, plane, edge_x - 1, y, p0);
+        plane_set(pic, plane, edge_x, y, q0);
+        plane_set(pic, plane, edge_x + 1, y, q1);
+        plane_set(pic, plane, edge_x + 2, y, q2);
+    }
+}
+
+/// §8.7.2 — luma-style filtering of a horizontal edge of one 4:4:4
+/// chroma plane. See [`filter_vertical_edge_plane_luma_style`].
+#[allow(clippy::too_many_arguments)]
+fn filter_horizontal_edge_plane_luma_style(
+    pic: &mut Picture,
+    plane: u8,
+    x0: i32,
+    edge_y: i32,
+    bs: u8,
+    qp_avg: i32,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+) {
+    let params = FilterParams {
+        bs,
+        qp_avg,
+        filter_offset_a: alpha_off,
+        filter_offset_b: beta_off,
+        bit_depth,
+    };
+    let pic_w = pic.width_in_samples as i32;
+    for dx in 0..4 {
+        let x = x0 + dx;
+        if x < 0 || x >= pic_w {
+            continue;
+        }
+        let mut samples = [0i32; 8];
+        for (i, y) in (edge_y - 4..edge_y + 4).enumerate() {
+            samples[i] = plane_at(pic, plane, x, y);
+        }
+        let p3 = samples[0];
+        let mut p2 = samples[1];
+        let mut p1 = samples[2];
+        let mut p0 = samples[3];
+        let mut q0 = samples[4];
+        let mut q1 = samples[5];
+        let mut q2 = samples[6];
+        let q3 = samples[7];
+        filter_edge(
+            Plane::Luma,
+            EdgeSamples {
+                p3,
+                p2: &mut p2,
+                p1: &mut p1,
+                p0: &mut p0,
+                q0: &mut q0,
+                q1: &mut q1,
+                q2: &mut q2,
+                q3,
+            },
+            params,
+        );
+        plane_set(pic, plane, x, edge_y - 3, p2);
+        plane_set(pic, plane, x, edge_y - 2, p1);
+        plane_set(pic, plane, x, edge_y - 1, p0);
+        plane_set(pic, plane, x, edge_y, q0);
+        plane_set(pic, plane, x, edge_y + 1, q1);
+        plane_set(pic, plane, x, edge_y + 2, q2);
+    }
+}
+
+/// Clamped read of chroma plane `plane` (0 = Cb, 1 = Cr).
+#[inline]
+fn plane_at(pic: &Picture, plane: u8, x: i32, y: i32) -> i32 {
+    if plane == 0 {
+        pic.cb_at(x, y)
+    } else {
+        pic.cr_at(x, y)
+    }
+}
+
+/// Bounds-checked write to chroma plane `plane` (0 = Cb, 1 = Cr).
+#[inline]
+fn plane_set(pic: &mut Picture, plane: u8, x: i32, y: i32, v: i32) {
+    if plane == 0 {
+        pic.set_cb(x, y, v);
+    } else {
+        pic.set_cr(x, y, v);
+    }
 }
 
 fn filter_vertical_edge_luma(
@@ -7809,6 +8220,102 @@ mod tests {
             changed,
             "deblocking filter did not modify any samples, \
              expected at least the edge column to change"
+        );
+    }
+
+    #[test]
+    fn deblock_444_chroma_uses_luma_style_filter_at_mb_edge() {
+        // §8.7.2 eq. (8-450) — for ChromaArrayType == 3 the chroma planes
+        // are deblocked with the *luma* filtering process. Build a 2x1-MB
+        // 4:4:4 picture (32x16, full-resolution chroma) with two intra
+        // MBs and a hard chroma step at the vertical MB edge at x=16, then
+        // confirm `deblock_plane_chroma_444` modifies the chroma samples
+        // straddling that edge (the four-sample p2..q2 luma-style filter
+        // fires at bS=4 for an intra MB edge).
+        let pps = make_pps();
+        let mut pic = Picture::new(32, 16, 3, 8, 8);
+        assert_eq!(pic.chroma_width(), 32, "4:4:4 chroma is full-res");
+        assert_eq!(pic.chroma_height(), 16);
+        // Flat luma; chroma flat 100 in the left MB, 116 in the right MB
+        // (|Δ| = 16, below alpha at QP_Y=46 so filterSamplesFlag fires).
+        for y in 0..16 {
+            for x in 0..32 {
+                pic.set_luma(x, y, 110);
+                let v = if x < 16 { 100 } else { 116 };
+                pic.set_cb(x, y, v);
+                pic.set_cr(x, y, v);
+            }
+        }
+        // Two available intra MBs at QP_Y = 46 (deblock tables active).
+        let mut grid = MbGrid::new(2, 1);
+        for addr in 0..2u32 {
+            if let Some(info) = grid.get_mut(addr) {
+                *info = mk_intra4x4_info(2);
+                info.qp_y = 46;
+            }
+        }
+        let before_cb: Vec<i32> = pic.cb.clone();
+        let before_cr: Vec<i32> = pic.cr.clone();
+        deblock_plane_chroma_444(&mut pic, &grid, 0, 0, 8, &pps, false, &[false, false]);
+        // The Cb/Cr columns adjacent to the x=16 edge must have changed.
+        let cw = pic.chroma_width() as usize;
+        let edge_changed_cb = (0..16).any(|y| {
+            let row = y * cw;
+            pic.cb[row + 15] != before_cb[row + 15] || pic.cb[row + 16] != before_cb[row + 16]
+        });
+        let edge_changed_cr = (0..16).any(|y| {
+            let row = y * cw;
+            pic.cr[row + 15] != before_cr[row + 15] || pic.cr[row + 16] != before_cr[row + 16]
+        });
+        assert!(edge_changed_cb, "Cb chroma edge not filtered at 4:4:4");
+        assert!(edge_changed_cr, "Cr chroma edge not filtered at 4:4:4");
+        // No interior 8x8/4x4 block edge exists between two flat-equal
+        // columns far from x=16 (e.g. x=4 inside the left MB had no step),
+        // so those columns must be untouched — confirms the walker filters
+        // edges, not the whole plane.
+        let interior_unchanged = (0..16).all(|y| {
+            let row = y * cw;
+            pic.cb[row + 1] == before_cb[row + 1]
+        });
+        assert!(
+            interior_unchanged,
+            "deblock altered a non-edge interior chroma column"
+        );
+    }
+
+    #[test]
+    fn deblock_444_chroma_skips_zero_bs_edge() {
+        // Two inter MBs with identical refs/MVs/no-coeffs ⇒ bS=0 at the
+        // internal edge ⇒ chroma is left untouched even at 4:4:4.
+        let pps = make_pps();
+        let mut pic = Picture::new(32, 16, 3, 8, 8);
+        for y in 0..16 {
+            for x in 0..32 {
+                pic.set_luma(x, y, 110);
+                let v = if x < 16 { 100 } else { 116 };
+                pic.set_cb(x, y, v);
+                pic.set_cr(x, y, v);
+            }
+        }
+        // Inter MBs (not intra), no nonzero coeffs, matching ref/MV ⇒
+        // §8.7.2.1 yields bS=0 at the MB edge (not an MB-edge-intra case).
+        let mut grid = MbGrid::new(2, 1);
+        for addr in 0..2u32 {
+            if let Some(info) = grid.get_mut(addr) {
+                info.available = true;
+                info.is_intra = false;
+                info.qp_y = 46;
+                info.luma_nonzero_4x4 = 0;
+                info.ref_idx_l0 = [0; 4];
+                info.ref_idx_l1 = [-1; 4];
+                info.ref_poc_l0 = [0; 4];
+            }
+        }
+        let before_cb = pic.cb.clone();
+        deblock_plane_chroma_444(&mut pic, &grid, 0, 0, 8, &pps, false, &[false, false]);
+        assert_eq!(
+            pic.cb, before_cb,
+            "bS=0 chroma edge must not be filtered at 4:4:4"
         );
     }
 

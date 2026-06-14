@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 306 — §8.7.2 eq. (8-450) 4:4:4 (ChromaArrayType == 3) chroma
+  deblocking. Previously only the luma plane was deblocked at 4:4:4 and
+  the Cb/Cr planes were left unfiltered (the `deblock_picture` chroma
+  branch handled only ChromaArrayType ∈ {1, 2}). Per eq. (8-450)
+  `chromaStyleFilteringFlag` evaluates to 0 for ChromaArrayType == 3, so
+  the chroma planes are filtered with the *luma* filtering process (the
+  four-sample p0..p2 / q0..q2 update), not the two-sample chroma-style
+  filter. At 4:4:4 SubWidthC == SubHeightC == 1, so the chroma grid is
+  full-resolution and shares the luma 16x16 MB edge geometry exactly: the
+  new `deblock_plane_chroma_444` mirrors the luma walker (4 vertical + 4
+  horizontal edges, identical `transform_size_8x8_flag` internal-edge
+  skips) and derives `bS` from the same §8.7.2.1 per-4x4-block inputs (the
+  §8.7.2.1 last paragraph maps the chroma sample at (x, y) onto the luma
+  edge at (SubWidthC·x, SubHeightC·y) == (x, y)). The only per-edge
+  difference is the quantization parameter: §8.7.2 uses QPC (§8.5.8, with
+  the cb/cr `chroma_qp_index_offset`), and the QPC corresponding to
+  QPY == 0 for an I_PCM macroblock. New helpers
+  `filter_vertical_edge_plane_luma_style` /
+  `filter_horizontal_edge_plane_luma_style` apply `filter_edge` with
+  `Plane::Luma` to a selected chroma plane via `plane_at` / `plane_set`.
+  Measured on the docs corpus: `intra-only-high444` frame 1 goes from
+  76.14 % byte-exact (UV 1315/2048, max diff 20) to **100.00 %** (UV
+  2048/2048, max diff 0), lifting the fixture aggregate from 60.97 % to
+  72.90 %; the luma planes are unaffected. 2 new lib unit tests cover the
+  luma-style filter firing at an intra MB edge and the bS == 0 skip.
 - round 288 — Annex G (MVC) coded-slice-extension path: NAL unit type 20
   (`SliceExtension`) with `svc_extension_flag == 0` is now decoded as a
   §G.7.3.2.13 `slice_layer_extension_rbsp()` MVC body instead of falling
