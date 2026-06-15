@@ -385,6 +385,12 @@ pub enum SeiError {
         "depth_timing NumDepthViews shall be in 1..=1024 per Annex H (§H.7.3.2.1.5 num_views_minus1 ≤ 1023 caps the depth-view count) (got {0})"
     )]
     DepthTimingNumDepthViewsOutOfRange(u32),
+    #[error(
+        "alternative_depth_info num_constituent_views_gvd_minus1 shall be in 0..=3 per Annex H §H.13.2.6 (got {0})"
+    )]
+    AlternativeDepthInfoNumConstituentViewsOutOfRange(u32),
+    #[error("alternative_depth_info {field} shall be in 0..=31 per Annex H §H.13.2.6 (got {got})")]
+    AlternativeDepthInfoPrecOutOfRange { field: &'static str, got: u32 },
 }
 
 /// §D.2.2 — buffering_period.
@@ -6275,6 +6281,284 @@ pub fn parse_constrained_depth_parameter_set_identifier(
     })
 }
 
+// -------------------------------------------------------------------------
+// Annex H §H.13.1.6 / §H.13.2.6 — alternative_depth_info (SEI payload 181)
+// -------------------------------------------------------------------------
+
+/// §H.13.2.6 — global view and depth (GVD) per-camera parameter block,
+/// present in an [`AlternativeDepthInfo`] when `depth_type == 0`.
+///
+/// The `i`-index of every per-camera vector runs `0..=num_constituent_
+/// views_gvd_minus1 + 1` (that is, `num_constituent_views_gvd_minus1 + 2`
+/// cameras: i == 0 is the base texture view, i > 0 the constituent
+/// views packed per Table H-4). Each optional sub-block is gated by its
+/// corresponding presence flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlternativeDepthGvd {
+    /// `num_constituent_views_gvd_minus1` (ue(v), 0..=3) — the number
+    /// of constituent texture pictures packed into each non-base view
+    /// texture component, minus one.
+    pub num_constituent_views_gvd_minus1: u8,
+    /// `depth_present_gvd_flag` (u(1)).
+    pub depth_present_gvd_flag: bool,
+    /// `z_gvd_flag` (u(1)) — gates the per-camera near/far depth block.
+    pub z_gvd_flag: bool,
+    /// `intrinsic_param_gvd_flag` (u(1)) — gates the focal-length +
+    /// principal-point block.
+    pub intrinsic_param_gvd_flag: bool,
+    /// `rotation_gvd_flag` (u(1)) — gates the 3×3 rotation block. When
+    /// `false` a unit rotation matrix is inferred per §H.13.2.6.
+    pub rotation_gvd_flag: bool,
+    /// `translation_gvd_flag` (u(1)) — gates the horizontal translation
+    /// block.
+    pub translation_gvd_flag: bool,
+    /// Per-camera near/far depth values. Present (length =
+    /// `num_constituent_views_gvd_minus1 + 2`) iff `z_gvd_flag`; empty
+    /// otherwise.
+    pub z_values: Vec<AlternativeDepthZ>,
+    /// `prec_gvd_focal_length` (ue(v), 0..=31). `None` iff
+    /// `!intrinsic_param_gvd_flag`.
+    pub prec_gvd_focal_length: Option<u8>,
+    /// `prec_gvd_principal_point` (ue(v), 0..=31). `None` iff
+    /// `!intrinsic_param_gvd_flag`.
+    pub prec_gvd_principal_point: Option<u8>,
+    /// `prec_gvd_rotation_param` (ue(v), 0..=31). `None` iff
+    /// `!rotation_gvd_flag`.
+    pub prec_gvd_rotation_param: Option<u8>,
+    /// `prec_gvd_translation_param` (ue(v), 0..=31). `None` iff
+    /// `!translation_gvd_flag`.
+    pub prec_gvd_translation_param: Option<u8>,
+    /// Per-camera intrinsic + extrinsic float entries, one per camera
+    /// (`num_constituent_views_gvd_minus1 + 2`). Each entry's optional
+    /// members mirror the per-block presence flags above.
+    pub cameras: Vec<AlternativeDepthCamera>,
+}
+
+/// §H.13.2.6 — per-camera nearest/farthest depth pair. Each value uses
+/// the §H.13.2.3 depth float encoding (sign u(1), exponent u(7) with
+/// reserved value 127, explicit mantissa length `man_len_minus1 + 1`),
+/// so [`DepthFloatComponent`] is reused verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlternativeDepthZ {
+    /// `zNear[i]` per eq. H-1 (`man_gvd_z_near` mantissa width is
+    /// `man_len_gvd_z_near_minus1 + 1`).
+    pub z_near: DepthFloatComponent,
+    /// `zFar[i]` per eq. H-1.
+    pub z_far: DepthFloatComponent,
+}
+
+/// §H.13.2.6 — per-camera intrinsic + extrinsic float parameters. Each
+/// scalar uses the §G.13.2.5-style float encoding (sign u(1), exponent
+/// u(6) with reserved value 63, prec-derived mantissa width per eq.
+/// in §H.13.2.6), so [`FloatComponent`] is reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlternativeDepthCamera {
+    /// `(focalLengthX, focalLengthY, principalPointX, principalPointY)`
+    /// — `Some` iff `intrinsic_param_gvd_flag`.
+    pub intrinsic: Option<AlternativeDepthIntrinsic>,
+    /// 3×3 rotation matrix `r[j][k]` (0-indexed) — `Some` iff
+    /// `rotation_gvd_flag`.
+    pub rotation: Option<[[FloatComponent; 3]; 3]>,
+    /// Horizontal translation `tX` — `Some` iff `translation_gvd_flag`.
+    pub translation_x: Option<FloatComponent>,
+}
+
+/// §H.13.2.6 — per-camera intrinsic float quadruple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlternativeDepthIntrinsic {
+    pub focal_length_x: FloatComponent,
+    pub focal_length_y: FloatComponent,
+    pub principal_point_x: FloatComponent,
+    pub principal_point_y: FloatComponent,
+}
+
+/// §H.13.2.6 — alternative depth information SEI message (payload type
+/// 181, Annex H). Indicates that one output view's view components are
+/// a spatial packing of multiple distinct constituent pictures (global
+/// view + depth, GVD), so the view is not suitable for direct display.
+///
+/// `depth_type` selects the body: only `depth_type == 0` carries the
+/// GVD parameter block (`gvd`). Other values are reserved; per
+/// §H.13.2.6 "Decoders shall ignore alternative depth information SEI
+/// messages in which such other values are present", so for a non-zero
+/// type we record the type and leave `gvd` as `None` (graceful ignore,
+/// not an error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlternativeDepthInfo {
+    /// `depth_type` (ue(v)). Conforming bitstreams use 0.
+    pub depth_type: u32,
+    /// GVD parameter block, present iff `depth_type == 0`.
+    pub gvd: Option<AlternativeDepthGvd>,
+}
+
+/// Helper: read a `prec_gvd_*` ue(v) and enforce the §H.13.2.6 `0..=31`
+/// range bound, surfacing an alternative-depth-specific error.
+fn read_alt_depth_prec(r: &mut BitReader<'_>, field: &'static str) -> Result<u8, SeiError> {
+    let v = r.ue()?;
+    if v > 31 {
+        return Err(SeiError::AlternativeDepthInfoPrecOutOfRange { field, got: v });
+    }
+    Ok(v as u8)
+}
+
+/// Parse an Annex H §H.13.1.6 `alternative_depth_info()` payload.
+///
+/// Enforces:
+///
+/// * `num_constituent_views_gvd_minus1 ≤ 3` (§H.13.2.6).
+/// * each `prec_gvd_*` ∈ `0..=31` (§H.13.2.6).
+///
+/// Float components are stored verbatim:
+///
+/// * near/far depth pairs use [`DepthFloatComponent`] (exponent u(7),
+///   reserved 127, explicit mantissa length).
+/// * intrinsic / extrinsic scalars use [`FloatComponent`] (exponent
+///   u(6), reserved 63, prec-derived mantissa width via
+///   [`mantissa_width_g1325`], shared with §G.13.2.5).
+///
+/// Non-zero `depth_type` values are reserved; the body is not parsed
+/// (graceful ignore per §H.13.2.6).
+pub fn parse_alternative_depth_info(payload: &[u8]) -> Result<AlternativeDepthInfo, SeiError> {
+    let mut r = BitReader::new(payload);
+
+    // §H.13.1.6 — depth_type ue(v).
+    let depth_type = r.ue()?;
+    if depth_type != 0 {
+        // Reserved value — decoders shall ignore the message body.
+        return Ok(AlternativeDepthInfo {
+            depth_type,
+            gvd: None,
+        });
+    }
+
+    // §H.13.1.6 — num_constituent_views_gvd_minus1 ue(v), 0..=3.
+    let num_constituent_views_gvd_minus1 = r.ue()?;
+    if num_constituent_views_gvd_minus1 > 3 {
+        return Err(SeiError::AlternativeDepthInfoNumConstituentViewsOutOfRange(
+            num_constituent_views_gvd_minus1,
+        ));
+    }
+    // i runs 0..=num_constituent_views_gvd_minus1 + 1 → that many + 2.
+    let cam_count = (num_constituent_views_gvd_minus1 as usize) + 2;
+
+    // §H.13.1.6 — five u(1) presence flags.
+    let depth_present_gvd_flag = r.u(1)? == 1;
+    let z_gvd_flag = r.u(1)? == 1;
+    let intrinsic_param_gvd_flag = r.u(1)? == 1;
+    let rotation_gvd_flag = r.u(1)? == 1;
+    let translation_gvd_flag = r.u(1)? == 1;
+
+    // §H.13.1.6 — when z_gvd_flag, a per-camera near/far depth pair.
+    let z_values = if z_gvd_flag {
+        let mut v = Vec::with_capacity(cam_count);
+        for _ in 0..cam_count {
+            // §H.13.1.6: sign u(1), exp u(7), man_len_minus1 u(5),
+            // man u(man_len_minus1 + 1) — exactly the §H.13.2.3
+            // depth-float layout, so reuse read_depth_float_component.
+            let z_near = read_depth_float_component(&mut r)?;
+            let z_far = read_depth_float_component(&mut r)?;
+            v.push(AlternativeDepthZ { z_near, z_far });
+        }
+        v
+    } else {
+        Vec::new()
+    };
+
+    // §H.13.1.6 — precision ue(v) words, each gated by its block flag.
+    let prec_gvd_focal_length = if intrinsic_param_gvd_flag {
+        Some(read_alt_depth_prec(&mut r, "prec_gvd_focal_length")?)
+    } else {
+        None
+    };
+    let prec_gvd_principal_point = if intrinsic_param_gvd_flag {
+        Some(read_alt_depth_prec(&mut r, "prec_gvd_principal_point")?)
+    } else {
+        None
+    };
+    let prec_gvd_rotation_param = if rotation_gvd_flag {
+        Some(read_alt_depth_prec(&mut r, "prec_gvd_rotation_param")?)
+    } else {
+        None
+    };
+    let prec_gvd_translation_param = if translation_gvd_flag {
+        Some(read_alt_depth_prec(&mut r, "prec_gvd_translation_param")?)
+    } else {
+        None
+    };
+
+    // §H.13.1.6 — per-camera intrinsic / rotation / translation floats.
+    let mut cameras: Vec<AlternativeDepthCamera> = Vec::with_capacity(cam_count);
+    for _ in 0..cam_count {
+        let intrinsic = if intrinsic_param_gvd_flag {
+            let prec_fl = prec_gvd_focal_length.unwrap();
+            let prec_pp = prec_gvd_principal_point.unwrap();
+            let focal_length_x = read_float_component(&mut r, prec_fl)?;
+            let focal_length_y = read_float_component(&mut r, prec_fl)?;
+            let principal_point_x = read_float_component(&mut r, prec_pp)?;
+            let principal_point_y = read_float_component(&mut r, prec_pp)?;
+            Some(AlternativeDepthIntrinsic {
+                focal_length_x,
+                focal_length_y,
+                principal_point_x,
+                principal_point_y,
+            })
+        } else {
+            None
+        };
+
+        let rotation = if rotation_gvd_flag {
+            let prec_rot = prec_gvd_rotation_param.unwrap();
+            let zero = FloatComponent {
+                sign: false,
+                exponent: 0,
+                mantissa: 0,
+                mantissa_width: 0,
+            };
+            // §H.13.1.6: for( j = 0; j < 3; j++ ) for( k = 0; k < 3; k++ ).
+            let mut mat: [[FloatComponent; 3]; 3] = [[zero; 3]; 3];
+            for row in mat.iter_mut() {
+                for cell in row.iter_mut() {
+                    *cell = read_float_component(&mut r, prec_rot)?;
+                }
+            }
+            Some(mat)
+        } else {
+            None
+        };
+
+        let translation_x = if translation_gvd_flag {
+            let prec_tr = prec_gvd_translation_param.unwrap();
+            Some(read_float_component(&mut r, prec_tr)?)
+        } else {
+            None
+        };
+
+        cameras.push(AlternativeDepthCamera {
+            intrinsic,
+            rotation,
+            translation_x,
+        });
+    }
+
+    Ok(AlternativeDepthInfo {
+        depth_type,
+        gvd: Some(AlternativeDepthGvd {
+            num_constituent_views_gvd_minus1: num_constituent_views_gvd_minus1 as u8,
+            depth_present_gvd_flag,
+            z_gvd_flag,
+            intrinsic_param_gvd_flag,
+            rotation_gvd_flag,
+            translation_gvd_flag,
+            z_values,
+            prec_gvd_focal_length,
+            prec_gvd_principal_point,
+            prec_gvd_rotation_param,
+            prec_gvd_translation_param,
+            cameras,
+        }),
+    })
+}
+
 /// Annex H §H.13.1.7.1 — `depth_grid_position()` sub-structure used by
 /// the §H.13.1.7 `depth_sampling_info` SEI message.
 ///
@@ -6804,6 +7088,9 @@ pub enum SeiPayload {
     /// §I.13.2.1 — constrained_depth_parameter_set_identifier (payload
     /// type 54, Annex I 3D-AVC depth coding). Round 237.
     ConstrainedDepthParameterSetIdentifier(ConstrainedDepthParameterSetIdentifier),
+    /// §H.13.2.6 — alternative_depth_info (payload type 181, Annex H
+    /// 3D-AVC). Round 318.
+    AlternativeDepthInfo(AlternativeDepthInfo),
     /// §D.2.36 — sei_manifest (payload type 200). Round 120.
     SeiManifest(SeiManifest),
     /// §D.2.37 — sei_prefix_indication (payload type 201). Round 120.
@@ -6917,6 +7204,9 @@ pub fn parse_payload(
         )?)),
         54 => Ok(SeiPayload::ConstrainedDepthParameterSetIdentifier(
             parse_constrained_depth_parameter_set_identifier(payload)?,
+        )),
+        181 => Ok(SeiPayload::AlternativeDepthInfo(
+            parse_alternative_depth_info(payload)?,
         )),
         137 => Ok(SeiPayload::MasteringDisplay(parse_mastering_display(
             payload,
@@ -10009,6 +10299,206 @@ mod tests {
                 assert_eq!(info.views.len(), 1);
             }
             other => panic!("expected DepthSamplingInfo, got {other:?}"),
+        }
+    }
+
+    // §H.13.1.6 — alternative_depth_info with depth_type == 0 and all
+    // four GVD presence flags clear: the message reduces to depth_type +
+    // num_constituent_views_gvd_minus1 + the five flags, then one empty
+    // per-camera entry per camera (no intrinsic / rotation / translation
+    // sub-blocks, no z block). num_constituent_views_gvd_minus1 = 1 →
+    // 1 + 2 = 3 cameras.
+    #[test]
+    fn alternative_depth_info_minimal_flags_clear() {
+        let payload = pack_bits(&[
+            (0b1, 1),   // depth_type ue(0) = 0
+            (0b010, 3), // num_constituent_views_gvd_minus1 ue(1) = 1
+            (0, 1),     // depth_present_gvd_flag = 0
+            (0, 1),     // z_gvd_flag = 0
+            (0, 1),     // intrinsic_param_gvd_flag = 0
+            (0, 1),     // rotation_gvd_flag = 0
+            (0, 1),     // translation_gvd_flag = 0
+        ]);
+        let info = parse_alternative_depth_info(&payload).unwrap();
+        assert_eq!(info.depth_type, 0);
+        let gvd = info.gvd.expect("depth_type 0 carries a gvd block");
+        assert_eq!(gvd.num_constituent_views_gvd_minus1, 1);
+        assert!(!gvd.depth_present_gvd_flag);
+        assert!(!gvd.z_gvd_flag);
+        assert!(gvd.z_values.is_empty());
+        assert_eq!(gvd.prec_gvd_focal_length, None);
+        assert_eq!(gvd.prec_gvd_rotation_param, None);
+        // 1 + 2 = 3 cameras, each with no sub-blocks.
+        assert_eq!(gvd.cameras.len(), 3);
+        for cam in &gvd.cameras {
+            assert!(cam.intrinsic.is_none());
+            assert!(cam.rotation.is_none());
+            assert!(cam.translation_x.is_none());
+        }
+    }
+
+    // §H.13.2.6 — a non-zero depth_type is reserved; the decoder records
+    // the type and ignores the body (no error, gvd == None).
+    #[test]
+    fn alternative_depth_info_nonzero_type_ignored() {
+        // depth_type = 2 → ue(2) = 0b011 (3 bits). Trailing garbage is
+        // not read because the body is skipped.
+        let payload = pack_bits(&[(0b011, 3), (0xFF, 8)]);
+        let info = parse_alternative_depth_info(&payload).unwrap();
+        assert_eq!(info.depth_type, 2);
+        assert!(info.gvd.is_none());
+    }
+
+    // §H.13.2.6 — num_constituent_views_gvd_minus1 must be in 0..=3.
+    #[test]
+    fn alternative_depth_info_num_views_out_of_range() {
+        // depth_type = 0, num_constituent_views_gvd_minus1 = 4 →
+        // ue(4) = 0b00101 (5 bits). 4 > 3 must error.
+        let payload = pack_bits(&[(0b1, 1), (0b00101, 5)]);
+        let err = parse_alternative_depth_info(&payload).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::AlternativeDepthInfoNumConstituentViewsOutOfRange(4)
+        ));
+    }
+
+    // §H.13.2.6 — z_gvd_flag set: a near/far DepthFloatComponent pair per
+    // camera (sign u(1), exp u(7), man_len_minus1 u(5), man u(v)). One
+    // constituent view (minus1 = 0 → 2 cameras). exp == 0 with a small
+    // mantissa exercises the denormal eq. H-1 path; the second camera
+    // uses exp == 127 (reserved → NaN).
+    #[test]
+    fn alternative_depth_info_z_block_two_cameras() {
+        let payload = pack_bits(&[
+            (0b1, 1), // depth_type = 0
+            (0b1, 1), // num_constituent_views_gvd_minus1 ue(0) = 0 → 2 cams
+            (0, 1),   // depth_present_gvd_flag = 0
+            (1, 1),   // z_gvd_flag = 1
+            (0, 1),   // intrinsic_param_gvd_flag = 0
+            (0, 1),   // rotation_gvd_flag = 0
+            (0, 1),   // translation_gvd_flag = 0
+            // camera 0 z_near: sign 0, exp 0 (denormal), man_len_minus1 3
+            // (→ width 4), mantissa 0b1000 = 8.
+            (0, 1),
+            (0, 7),
+            (3, 5),
+            (0b1000, 4),
+            // camera 0 z_far: sign 1, exp 64 (normal), man_len_minus1 0
+            // (→ width 1), mantissa 1.
+            (1, 1),
+            (64, 7),
+            (0, 5),
+            (1, 1),
+            // camera 1 z_near: sign 0, exp 127 (reserved), man_len_minus1
+            // 0 (→ width 1), mantissa 0.
+            (0, 1),
+            (127, 7),
+            (0, 5),
+            (0, 1),
+            // camera 1 z_far: sign 0, exp 1, man_len_minus1 1 (width 2),
+            // mantissa 0b10 = 2.
+            (0, 1),
+            (1, 7),
+            (1, 5),
+            (0b10, 2),
+        ]);
+        let info = parse_alternative_depth_info(&payload).unwrap();
+        let gvd = info.gvd.unwrap();
+        assert!(gvd.z_gvd_flag);
+        assert_eq!(gvd.z_values.len(), 2);
+
+        let z0 = gvd.z_values[0];
+        // z_near denormal: (-1)^0 * 2^-30 * (8 / 2^4) = 2^-30 * 0.5.
+        assert!((z0.z_near.to_f64() - 2f64.powi(-30) * 0.5).abs() < 1e-18);
+        // z_far normal: (-1)^1 * 2^(64-31) * (1 + 1/2^1) = -2^33 * 1.5.
+        assert!((z0.z_far.to_f64() - (-(2f64.powi(33)) * 1.5)).abs() < 1.0);
+
+        let z1 = gvd.z_values[1];
+        // z_near exp == 127 → unspecified (NaN).
+        assert!(z1.z_near.to_f64().is_nan());
+        // z_far normal: 2^(1-31) * (1 + 2/2^2) = 2^-30 * 1.5.
+        assert!((z1.z_far.to_f64() - 2f64.powi(-30) * 1.5).abs() < 1e-18);
+    }
+
+    // §H.13.2.6 — intrinsic + rotation + translation blocks for a single
+    // camera (num_constituent_views_gvd_minus1 = 0 → 2 cameras). Uses
+    // the §G.13.2.5 FloatComponent layout (exp u(6), reserved 63,
+    // prec-derived mantissa width). prec = 31 with exp = 31 gives a
+    // mantissa width of 31 + 31 - 31 = 31 bits.
+    #[test]
+    fn alternative_depth_info_intrinsic_rotation_translation() {
+        // Build the per-camera float as sign u(1) + exp u(6) +
+        // man u(width). With prec = 0 and exp in 1..=31, width =
+        // max(0, exp + 0 - 31) = 0 for exp <= 31, so no mantissa bits.
+        // That keeps the test compact: every float is just sign + exp.
+        let mut fields: Vec<(u64, u32)> = vec![
+            (0b1, 1), // depth_type = 0
+            (0b1, 1), // num_constituent_views_gvd_minus1 ue(0) = 0 → 2 cams
+            (0, 1),   // depth_present_gvd_flag = 0
+            (0, 1),   // z_gvd_flag = 0
+            (1, 1),   // intrinsic_param_gvd_flag = 1
+            (1, 1),   // rotation_gvd_flag = 1
+            (1, 1),   // translation_gvd_flag = 1
+            // prec_gvd_focal_length ue(0) = 0
+            (0b1, 1),
+            // prec_gvd_principal_point ue(0) = 0
+            (0b1, 1),
+            // prec_gvd_rotation_param ue(0) = 0
+            (0b1, 1),
+            // prec_gvd_translation_param ue(0) = 0
+            (0b1, 1),
+        ];
+        // For each of the 2 cameras: 4 intrinsic floats + 9 rotation
+        // floats + 1 translation float = 14 floats, each sign u(1) +
+        // exp u(6), no mantissa (width 0 because prec = 0, exp <= 62
+        // small).
+        for cam in 0..2u64 {
+            for f in 0..14u64 {
+                let exp = (cam * 14 + f) % 30 + 1; // 1..=30
+                fields.push((0, 1)); // sign
+                fields.push((exp, 6)); // exp u(6)
+            }
+        }
+        let payload = pack_bits(&fields);
+        let info = parse_alternative_depth_info(&payload).unwrap();
+        let gvd = info.gvd.unwrap();
+        assert_eq!(gvd.prec_gvd_focal_length, Some(0));
+        assert_eq!(gvd.prec_gvd_rotation_param, Some(0));
+        assert_eq!(gvd.prec_gvd_translation_param, Some(0));
+        assert_eq!(gvd.cameras.len(), 2);
+        for cam in &gvd.cameras {
+            let intr = cam.intrinsic.expect("intrinsic present");
+            // exp values were 1..=30, width 0 → mantissa 0, normal float.
+            assert_eq!(intr.focal_length_x.mantissa_width, 0);
+            let rot = cam.rotation.expect("rotation present");
+            assert_eq!(rot.len(), 3);
+            assert_eq!(rot[0].len(), 3);
+            assert!(cam.translation_x.is_some());
+        }
+    }
+
+    // §H.13.1.6 dispatch — parse_payload(181, ..) routes to
+    // parse_alternative_depth_info.
+    #[test]
+    fn parse_payload_dispatches_alternative_depth_info() {
+        let ctx = SeiContext::default();
+        let payload = pack_bits(&[
+            (0b1, 1), // depth_type = 0
+            (0b1, 1), // num_constituent_views_gvd_minus1 = 0
+            (0, 1),   // depth_present_gvd_flag
+            (0, 1),   // z_gvd_flag
+            (0, 1),   // intrinsic_param_gvd_flag
+            (0, 1),   // rotation_gvd_flag
+            (0, 1),   // translation_gvd_flag
+        ]);
+        let got = parse_payload(181, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::AlternativeDepthInfo(info) => {
+                assert_eq!(info.depth_type, 0);
+                let gvd = info.gvd.unwrap();
+                assert_eq!(gvd.cameras.len(), 2);
+            }
+            other => panic!("expected AlternativeDepthInfo, got {other:?}"),
         }
     }
 

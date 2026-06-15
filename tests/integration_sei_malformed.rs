@@ -56,7 +56,7 @@ use oxideav_h264::sei::{parse_payload, SeiContext};
 const KNOWN_PAYLOAD_TYPES: &[u32] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 39, 40,
     41, 43, 44, 45, 46, 47, 50, 51, 52, 53, 54, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155,
-    156, 200, 201, 205,
+    156, 181, 200, 201, 205,
 ];
 
 const FALLBACK_PAYLOAD_TYPES: &[u32] = &[
@@ -188,14 +188,15 @@ fn sei_parse_payload_never_panics() {
         }
     }
 
-    // 51 known + 20 fallback = 71 payload types × 11 shapes × 4 ctxs
-    // = 3124 invocations. Lock the count so a future change that
+    // 52 known + 20 fallback = 72 payload types × 11 shapes × 4 ctxs
+    // = 3168 invocations. Lock the count so a future change that
     // accidentally drops a row from one of the tables makes the test
     // fail loudly instead of silently shrinking coverage. (Round 293
     // adds the Annex G §G.13.2.9 base_view_temporal_hrd type 44 — not
     // previously in either list — bumping the per-type total from
-    // 70 to 71.)
-    assert_eq!(total, 3124, "sweep cardinality drifted");
+    // 70 to 71. Round 318 adds the Annex H §H.13.2.6
+    // alternative_depth_info type 181, bumping 71 to 72.)
+    assert_eq!(total, 3168, "sweep cardinality drifted");
 }
 
 /// Envelope-shape regression — every shape also goes through

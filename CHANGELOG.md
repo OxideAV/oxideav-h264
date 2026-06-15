@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 318 — Annex H §H.13.1.6 / §H.13.2.6 alternative_depth_info SEI
+  payload (type 181). The dispatch previously routed type 181 to
+  `SeiPayload::Unknown`; it now parses the global-view-and-depth (GVD)
+  camera-parameter body. `parse_alternative_depth_info` reads
+  `depth_type` (ue(v)); a non-zero (reserved) type is recorded and the
+  body ignored per the spec's "decoders shall ignore" rule. For
+  `depth_type == 0` it parses `num_constituent_views_gvd_minus1`
+  (0..=3 → `+2` cameras, base + constituent per Table H-4), the five
+  GVD presence flags, the optional per-camera near/far depth pair
+  (reusing the §H.13.2.3 `DepthFloatComponent`: sign u(1), exponent
+  u(7) reserved-127, explicit `man_len_minus1+1` mantissa), and the
+  optional per-camera intrinsic (focal lengths + principal point),
+  3×3 rotation, and horizontal-translation float blocks (reusing the
+  §G.13.2.5 `FloatComponent`: sign u(1), exponent u(6) reserved-63,
+  prec-derived mantissa width via `mantissa_width_g1325`). Range
+  checks enforce `num_constituent_views_gvd_minus1 ≤ 3` and each
+  `prec_gvd_* ∈ 0..=31`. Six unit tests cover the all-flags-clear
+  body, reserved-`depth_type` graceful ignore, the out-of-range
+  guard, the z near/far block (denormal + normal + reserved-exponent
+  `binToFp` eq. H-1 reconstruction), the intrinsic/rotation/
+  translation block, and `parse_payload` dispatch; the type is added
+  to the malformed-input never-panic sweep (cardinality 3124 → 3168)
+  and the `sei_payload` fuzz target.
 - round 314 — §8.4.2.2 ChromaArrayType==3 (4:4:4) inter chroma
   reconstruction. Previously the P/B inter path motion-compensated only
   luma at 4:4:4 and left the Cb/Cr planes zero (the chroma MC + residual
