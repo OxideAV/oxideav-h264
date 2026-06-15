@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- round 314 — §8.4.2.2 ChromaArrayType==3 (4:4:4) inter chroma
+  reconstruction. Previously the P/B inter path motion-compensated only
+  luma at 4:4:4 and left the Cb/Cr planes zero (the chroma MC + residual
+  branches handled only ChromaArrayType ∈ {1, 2}). Per §8.4.1.4 eq.
+  8-221/8-222 the chroma motion vector equals the luma MV at 4:4:4
+  (SubWidthC == SubHeightC == 1), and per §8.4.2.2 eq. 8-235..8-238 the
+  chroma sample is taken at full-resolution integer position with
+  quarter-sample fractions and the §8.4.2.2.1 *luma* 6-tap interpolation
+  process (not the §8.4.2.2.2 chroma bilinear filter). New
+  `mc_chroma_partition_444` runs the luma kernel on each chroma plane;
+  the §8.4.2.3 default / explicit / implicit weighted-sample combine
+  reuses the chroma weight tables / `chroma_log2_weight_denom`. The
+  §8.5.5 "coded like luma" inter chroma residual is reconstructed by
+  `reconstruct_inter_chroma_residual_444` (cbp_luma-gated 4x4 / 8x8
+  blocks, inter chroma scaling lists Table 7-2 i=4/5 + i=9/11, no chroma
+  DC Hadamard). Verified by a bit-identical MC equality test against the
+  luma kernel plus two end-to-end P_L0_16x16 reconstructions (zero-MV
+  plane copy + half-pel luma-6tap on chroma).
+
 ## [0.1.6](https://github.com/OxideAV/oxideav-h264/compare/v0.1.5...v0.1.6) - 2026-06-14
 
 ### Other

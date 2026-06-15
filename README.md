@@ -42,18 +42,18 @@ https://www.itu.int/rec/T-REC-H.264 (pick the 2024-08 edition).
 | VUI parameters (+ HRD) | §E.1 | integrated into SPS |
 | AUD + SEI framing + filler + end-of-seq/stream | §7.3.2.3..7 | parsed |
 | Slice header | §7.3.3 | parsed (incl. RPLM, pred_weight_table, dec_ref_pic_marking) |
-| Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2 + 4:4:4; I_PCM honours `BitDepth{Y,C}` from the SPS on both CAVLC and CABAC paths, incl. §9.3.1.2 post-PCM arithmetic-engine re-init; MBAFF parse + 4:4:4 P/B inter still deferred) |
+| Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2 + 4:4:4; I_PCM honours `BitDepth{Y,C}` from the SPS on both CAVLC and CABAC paths, incl. §9.3.1.2 post-PCM arithmetic-engine re-init; 4:4:4 P/B inter reconstruction now wired — MBAFF parse still deferred) |
 | FMO MB address derivation | §8.2.2, §8.2.3 | implemented (all 7 slice_group_map_types + NextMbAddress) |
 | Top-level decoder driver | §7.4.1.2.1 | implemented (events: SPS/PPS stored, AUD, Slice, SEI, end markers, Ignored) |
 | I-slice reconstruction (Picture + MB grid + intra + deblock) | §8 / §6.4 | implemented (I_PCM, Intra_4x4, Intra_8x8, Intra_16x16, chroma; §8.3.4.5 4:4:4 I_NxN chroma reconstruction at ChromaArrayType==3 — Cb/Cr "coded like luma" per §7.3.5.3, reusing the per-block luma pred modes with neighbour samples at BitDepthC) |
-| P/B-slice reconstruction (MC + ref store + MV wiring) | §8.4 | implemented (P_Skip, P_L0_*, P_8x8; B_Skip, B_Direct, B_L0/L1/Bi_16x16/16x8/8x16; flat scaling) |
+| P/B-slice reconstruction (MC + ref store + MV wiring) | §8.4 | implemented (P_Skip, P_L0_*, P_8x8; B_Skip, B_Direct, B_L0/L1/Bi_16x16/16x8/8x16; flat scaling; §8.4.2.2 ChromaArrayType==3 4:4:4 inter — the Cb/Cr planes are motion-compensated identically to luma per eq. 8-221/8-222 (`mvCLX == mvLX`) + eq. 8-235..8-238 (full-resolution integer position, quarter-sample fracs, §8.4.2.2.1 luma 6-tap kernel on each chroma plane via `mc_chroma_partition_444`), with the §8.4.2.3 default / explicit / implicit weighted-sample combine reusing the chroma weight tables; the §8.5.5 "coded like luma" inter chroma residual is added by `reconstruct_inter_chroma_residual_444` (cbp_luma-gated 4x4 / 8x8 blocks, inter chroma scaling lists Table 7-2 i=4/5 + i=9/11, no chroma DC Hadamard)) |
 | DPB output ordering (POC-ordered delivery + bumping) | §C.4 | implemented |
 | Reference picture marking (sliding window + MMCO) | §7.3.3.3, §8.2.5 | implemented |
 | Reference picture list construction | §8.2.4 | implemented (frame-only; field-pair interleaving partial) |
 | Reference picture list modification (RPLM) | §7.3.3.1, §8.2.4.3 | implemented |
 | Picture order count derivation (types 0/1/2) | §8.2.1 | implemented (eq. 8-3 / 8-4 / 8-5 / 8-12 in i64 with `PocError::Overflow` surfaced through `try_from`) |
 | Intra prediction (4x4 / 8x8 / 16x16 / chroma) | §8.3 | implemented (all modes) |
-| Inter prediction — fractional interpolation + weighted pred | §8.4.2 | implemented (luma 6-tap, chroma bilinear, default + explicit weighted) |
+| Inter prediction — fractional interpolation + weighted pred | §8.4.2 | implemented (luma 6-tap, chroma bilinear for 4:2:0 / 4:2:2; at ChromaArrayType==3 the chroma planes use the luma 6-tap kernel per §8.4.2.2 eq. 8-235..8-238; default + explicit + implicit weighted) |
 | Inter prediction — MV derivation (MVpred, P/B skip, spatial + temporal direct) | §8.4.1 | implemented |
 | Transform decode + reconstruction | §8.5 | implemented (4x4 / 8x8 / Hadamard DC / chroma DC) |
 | Deblocking filter | §8.7 | implemented (edge-level filter + bS derivation; §8.7.2 eq. (8-450) 4:4:4 chroma deblock at ChromaArrayType==3 filters the Cb/Cr planes with the *luma* filtering process, full-resolution, sharing the luma MB edge geometry + bS with the chroma QPC per side) |

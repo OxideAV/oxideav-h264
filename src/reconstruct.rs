@@ -3074,7 +3074,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     }
 
     // -------- Chroma residual + write --------------------------------
-    if chroma_array_type != 0 && chroma_array_type != 3 {
+    if chroma_array_type == 1 || chroma_array_type == 2 {
         reconstruct_inter_chroma_residual(
             mb,
             qp_y,
@@ -3086,6 +3086,22 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             sps,
             pps,
             cbp_chroma,
+            &pred_cb,
+            &pred_cr,
+            pic,
+        )?;
+    } else if chroma_array_type == 3 {
+        // §8.5.5 — 4:4:4 chroma "coded like luma": the residual is gated
+        // by cbp_luma and dequantised with the inter chroma scaling
+        // lists, added to the motion-compensated pred_cb / pred_cr.
+        reconstruct_inter_chroma_residual_444(
+            mb,
+            qp_y,
+            bit_depth_c,
+            &writer,
+            sps,
+            pps,
+            cbp_luma,
             &pred_cb,
             &pred_cr,
             pic,
@@ -3861,6 +3877,224 @@ fn process_partition<R: RefPicProvider>(
                 }
             }
         }
+    } else if chroma_array_type == 3 {
+        // §8.4.2.2 (ChromaArrayType == 3) — 4:4:4 chroma is
+        // motion-compensated identically to luma: full-resolution
+        // partition geometry, the luma MV (eq. 8-221/8-222), and the
+        // §8.4.2.2.1 luma interpolation process on each chroma plane
+        // (eq. 8-235..8-238). The §8.4.2.3 weighted-sample combine is
+        // the same dispatch as for 4:2:0 / 4:2:2 chroma, but uses the
+        // chroma weight tables / `chroma_log2_weight_denom`.
+        let mbw_c_use = 16u32; // ChromaArrayType==3 chroma MB is 16x16.
+        let c_w = part.w as u32;
+        let c_h = part.h as u32;
+        let c_part_x = part.x as i32;
+        let c_part_y = part.y as i32;
+
+        let mut l0_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l0_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l1_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l1_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+        if has_l0 {
+            let rp = ref_pics.ref_pic(0, part.ref_idx_l0 as u32).unwrap();
+            mc_chroma_partition_444(
+                rp,
+                part_abs_x,
+                part_abs_y,
+                mv_l0,
+                c_w,
+                c_h,
+                bit_depth_c,
+                &mut l0_cb,
+                &mut l0_cr,
+            )?;
+        }
+        if has_l1 {
+            let rp = ref_pics.ref_pic(1, part.ref_idx_l1 as u32).unwrap();
+            mc_chroma_partition_444(
+                rp,
+                part_abs_x,
+                part_abs_y,
+                mv_l1,
+                c_w,
+                c_h,
+                bit_depth_c,
+                &mut l1_cb,
+                &mut l1_cr,
+            )?;
+        }
+
+        if let Some((w0, w1, log2_wd)) = implicit_weights {
+            // §8.4.2.3.3 — implicit bipred reuses the luma (w0, w1,
+            // log2WD=5) triple for chroma with zero offsets.
+            let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
+            let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+            let w_entry_l0 = WeightedEntry {
+                weight: w0,
+                offset: 0,
+            };
+            let w_entry_l1 = WeightedEntry {
+                weight: w1,
+                offset: 0,
+            };
+            weighted_pred_explicit(
+                Some(l0_cb.as_slice()),
+                Some(l1_cb.as_slice()),
+                c_w as usize,
+                c_w,
+                c_h,
+                BiPredMode::Bipred,
+                w_entry_l0,
+                w_entry_l1,
+                log2_wd,
+                bit_depth_c,
+                &mut scratch_cb,
+                c_w as usize,
+            );
+            weighted_pred_explicit(
+                Some(l0_cr.as_slice()),
+                Some(l1_cr.as_slice()),
+                c_w as usize,
+                c_w,
+                c_h,
+                BiPredMode::Bipred,
+                w_entry_l0,
+                w_entry_l1,
+                log2_wd,
+                bit_depth_c,
+                &mut scratch_cr,
+                c_w as usize,
+            );
+            for py in 0..c_h as usize {
+                for px in 0..c_w as usize {
+                    let dst_idx =
+                        (c_part_y as usize + py) * (mbw_c_use as usize) + (c_part_x as usize + px);
+                    let idx = py * c_w as usize + px;
+                    pred_cb[dst_idx] = scratch_cb[idx];
+                    pred_cr[dst_idx] = scratch_cr[idx];
+                }
+            }
+        } else if use_explicit {
+            if let (Some(mode), Some(pwt)) = (bi_mode, slice_header.pred_weight_table.as_ref()) {
+                // §8.4.2.3.2 — explicit weighted chroma prediction, with
+                // separate weights per (list, iCbCr) and the chroma
+                // log2 denominator.
+                let log2_wd_c = pwt.chroma_log2_weight_denom;
+                let (w_cb_l0, w_cb_l1) = (
+                    chroma_weight_entry(pwt, 0, 0, part.ref_idx_l0, log2_wd_c),
+                    chroma_weight_entry(pwt, 1, 0, part.ref_idx_l1, log2_wd_c),
+                );
+                let (w_cr_l0, w_cr_l1) = (
+                    chroma_weight_entry(pwt, 0, 1, part.ref_idx_l0, log2_wd_c),
+                    chroma_weight_entry(pwt, 1, 1, part.ref_idx_l1, log2_wd_c),
+                );
+
+                let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
+                let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+                let cb_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
+                    Some(l0_cb.as_slice())
+                } else {
+                    None
+                };
+                let cb_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
+                    Some(l1_cb.as_slice())
+                } else {
+                    None
+                };
+                let cr_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
+                    Some(l0_cr.as_slice())
+                } else {
+                    None
+                };
+                let cr_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
+                    Some(l1_cr.as_slice())
+                } else {
+                    None
+                };
+                weighted_pred_explicit(
+                    cb_l0,
+                    cb_l1,
+                    c_w as usize,
+                    c_w,
+                    c_h,
+                    mode,
+                    w_cb_l0,
+                    w_cb_l1,
+                    log2_wd_c,
+                    bit_depth_c,
+                    &mut scratch_cb,
+                    c_w as usize,
+                );
+                weighted_pred_explicit(
+                    cr_l0,
+                    cr_l1,
+                    c_w as usize,
+                    c_w,
+                    c_h,
+                    mode,
+                    w_cr_l0,
+                    w_cr_l1,
+                    log2_wd_c,
+                    bit_depth_c,
+                    &mut scratch_cr,
+                    c_w as usize,
+                );
+                for py in 0..c_h as usize {
+                    for px in 0..c_w as usize {
+                        let dst_idx = (c_part_y as usize + py) * (mbw_c_use as usize)
+                            + (c_part_x as usize + px);
+                        let idx = py * c_w as usize + px;
+                        pred_cb[dst_idx] = scratch_cb[idx];
+                        pred_cr[dst_idx] = scratch_cr[idx];
+                    }
+                }
+            } else {
+                for py in 0..c_h as usize {
+                    for px in 0..c_w as usize {
+                        let dst_idx = (c_part_y as usize + py) * (mbw_c_use as usize)
+                            + (c_part_x as usize + px);
+                        let idx = py * c_w as usize + px;
+                        let (vb, vr) = if has_l0 && has_l1 {
+                            (
+                                (l0_cb[idx] + l1_cb[idx] + 1) >> 1,
+                                (l0_cr[idx] + l1_cr[idx] + 1) >> 1,
+                            )
+                        } else if has_l0 {
+                            (l0_cb[idx], l0_cr[idx])
+                        } else if has_l1 {
+                            (l1_cb[idx], l1_cr[idx])
+                        } else {
+                            (0, 0)
+                        };
+                        pred_cb[dst_idx] = vb;
+                        pred_cr[dst_idx] = vr;
+                    }
+                }
+            }
+        } else {
+            // §8.4.2.3.1 — default: copy single list / average bipred.
+            for py in 0..c_h as usize {
+                for px in 0..c_w as usize {
+                    let dst_idx =
+                        (c_part_y as usize + py) * (mbw_c_use as usize) + (c_part_x as usize + px);
+                    let idx = py * c_w as usize + px;
+                    let (vb, vr) = if has_l0 && has_l1 {
+                        (
+                            (l0_cb[idx] + l1_cb[idx] + 1) >> 1,
+                            (l0_cr[idx] + l1_cr[idx] + 1) >> 1,
+                        )
+                    } else if has_l0 {
+                        (l0_cb[idx], l0_cr[idx])
+                    } else if has_l1 {
+                        (l1_cb[idx], l1_cr[idx])
+                    } else {
+                        (0, 0)
+                    };
+                    pred_cb[dst_idx] = vb;
+                    pred_cr[dst_idx] = vr;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -3986,6 +4220,84 @@ fn mc_chroma_partition(
     )
     .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
     interpolate_chroma(
+        &ref_pic.cr,
+        cw,
+        cw,
+        ch,
+        int_x,
+        int_y,
+        x_frac,
+        y_frac,
+        w,
+        h,
+        bit_depth,
+        dst_cr,
+        w as usize,
+    )
+    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+    Ok(())
+}
+
+/// §8.4.2.2 — motion-compensate one partition's chroma planes (Cb + Cr)
+/// for ChromaArrayType == 3 (4:4:4). Per §8.4.1.4 eq. 8-221/8-222 the
+/// chroma motion vector equals the luma motion vector (SubWidthC ==
+/// SubHeightC == 1), and per §8.4.2.2 eq. 8-235..8-238 the integer
+/// position is taken at full luma resolution with quarter-sample
+/// fractions, and the chroma sample value is derived by the **luma**
+/// interpolation process (§8.4.2.2.1) — not the §8.4.2.2.2 chroma
+/// bilinear filter. The chroma planes are therefore motion-compensated
+/// identically to luma (same MV, same 6-tap kernel, full resolution).
+#[allow(clippy::too_many_arguments)]
+fn mc_chroma_partition_444(
+    ref_pic: &Picture,
+    part_abs_x: i32,
+    part_abs_y: i32,
+    mv: Mv,
+    w: u32,
+    h: u32,
+    bit_depth: u32,
+    dst_cb: &mut [i32],
+    dst_cr: &mut [i32],
+) -> Result<(), ReconstructError> {
+    // §8.4.2.2 eq. 8-235..8-238 — full-resolution integer position +
+    // quarter-sample fractions, identical to the luma derivation.
+    let int_x = part_abs_x + (mv.x >> 2);
+    let int_y = part_abs_y + (mv.y >> 2);
+    let x_frac = (mv.x & 3) as u8;
+    let y_frac = (mv.y & 3) as u8;
+
+    let cw = ref_pic.chroma_width() as usize;
+    let ch = ref_pic.chroma_height() as usize;
+    // §8.4.2 / §6.2 Table 6-1 — a reference resolved against a
+    // monochrome / placeholder DPB slot would expose zero-dim chroma
+    // planes; reject early to avoid the `clip3(0, -1, _)` underflow in
+    // `interpolate_luma`.
+    if cw == 0 || ch == 0 {
+        return Err(ReconstructError::InvalidRefDims {
+            width: cw as u32,
+            height: ch as u32,
+        });
+    }
+
+    // §8.4.2.2.1 — luma interpolation process applied to each chroma
+    // plane (the same 6-tap kernel `mc_luma_partition` drives).
+    interpolate_luma(
+        &ref_pic.cb,
+        cw,
+        cw,
+        ch,
+        int_x,
+        int_y,
+        x_frac,
+        y_frac,
+        w,
+        h,
+        bit_depth,
+        dst_cb,
+        w as usize,
+    )
+    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+    interpolate_luma(
         &ref_pic.cr,
         cw,
         cw,
@@ -5439,6 +5751,135 @@ fn reconstruct_inter_chroma_residual(
     }
     let _ = c_mb_px;
     let _ = c_mb_py;
+    Ok(())
+}
+
+/// §8.5.5 / §8.5.12 / §8.5.13 — inter chroma residual path for
+/// ChromaArrayType == 3 (4:4:4). At 4:4:4 the chroma residual is
+/// "coded like luma" (§7.3.5.3): each plane carries 16 4x4 (or four
+/// 8x8) luma-style residual blocks gated by `cbp_luma`, with **no**
+/// chroma DC Hadamard. The blocks are dequantised with the inter
+/// chroma scaling lists (Table 7-2: 4x4 i=4/5, 8x8 i=9/11) and the
+/// per-plane chroma QP (§8.5.8), then added to the motion-compensated
+/// `pred_cb` / `pred_cr` (full 16x16 resolution) and written out.
+///
+/// The residual-array layout / compaction mirrors the intra-NxN 4:4:4
+/// path exactly (`reconstruct_chroma_intra_nxn_444`): the parser stores
+/// the coded planes' coefficients in `residual_cb_luma_like` /
+/// `residual_cr_luma_like`, compacted by the set bits of `cbp_luma`.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_inter_chroma_residual_444(
+    mb: &Macroblock,
+    qp_y: i32,
+    bit_depth_c: u32,
+    writer: &MbWriter,
+    sps: &Sps,
+    pps: &Pps,
+    cbp_luma: u8,
+    pred_cb: &[i32],
+    pred_cr: &[i32],
+    pic: &mut Picture,
+) -> Result<(), ReconstructError> {
+    // §8.5.8 — per-plane chroma QP (qP'C = QPC + QpBdOffsetC).
+    let cb_offset = pps.chroma_qp_index_offset;
+    let cr_offset = pps
+        .extension
+        .as_ref()
+        .map(|e| e.second_chroma_qp_index_offset)
+        .unwrap_or(pps.chroma_qp_index_offset);
+    let qp_bd_offset_c = qp_bd_offset(sps.bit_depth_chroma_minus8);
+    let qp_cb = qp_y_to_qp_c_with_bd_offset(qp_y, cb_offset, qp_bd_offset_c) + qp_bd_offset_c;
+    let qp_cr = qp_y_to_qp_c_with_bd_offset(qp_y, cr_offset, qp_bd_offset_c) + qp_bd_offset_c;
+
+    // §7.4.2.1.1.1 Table 7-2 — inter chroma lists. 4x4: i=4 (Cb) / i=5
+    // (Cr). 8x8: i=9 (Inter_Cb) / i=11 (Inter_Cr).
+    let sl4_cb = select_scaling_list_4x4(4, sps, pps);
+    let sl4_cr = select_scaling_list_4x4(5, sps, pps);
+    let sl8_cb = select_scaling_list_8x8(9, sps, pps);
+    let sl8_cr = select_scaling_list_8x8(11, sps, pps);
+
+    for plane in 0..2u8 {
+        let qp_c = if plane == 0 { qp_cb } else { qp_cr };
+        let ac_blocks = if plane == 0 {
+            &mb.residual_cb_luma_like
+        } else {
+            &mb.residual_cr_luma_like
+        };
+
+        if mb.transform_size_8x8_flag {
+            // §8.5.13 — 8x8 inter residual on the chroma plane.
+            let sl8 = if plane == 0 { &sl8_cb } else { &sl8_cr };
+            #[allow(clippy::needless_range_loop)] // §8.5.13 4×8x8 walk
+            for blk8 in 0..4usize {
+                let (bx, by) = LUMA_8X8_XY[blk8];
+                let coeffs_flat: [i32; 64] = if (cbp_luma >> blk8) & 1 == 1 {
+                    let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                    let base_slot = set_before * 4;
+                    let mut scan = [0i32; 64];
+                    for sub in 0..4usize {
+                        if let Some(coefs) = ac_blocks.get(base_slot + sub) {
+                            for (i, c) in coefs.iter().enumerate().take(16) {
+                                scan[sub * 16 + i] = *c;
+                            }
+                        }
+                    }
+                    inverse_scan_8x8_zigzag(&scan)
+                } else {
+                    [0i32; 64]
+                };
+                let residual = inverse_transform_8x8(&coeffs_flat, qp_c, sl8, bit_depth_c)?;
+                for y in 0..8i32 {
+                    for x in 0..8i32 {
+                        let pidx = ((by + y) as usize) * 16 + (bx + x) as usize;
+                        let pred_v = if plane == 0 {
+                            pred_cb[pidx]
+                        } else {
+                            pred_cr[pidx]
+                        };
+                        let v = clip_sample(pred_v + residual[(y * 8 + x) as usize], bit_depth_c);
+                        if plane == 0 {
+                            writer.set_cb(pic, bx + x, by + y, v);
+                        } else {
+                            writer.set_cr(pic, bx + x, by + y, v);
+                        }
+                    }
+                }
+            }
+        } else {
+            // §8.5.12 — 4x4 inter residual on the chroma plane.
+            let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
+            #[allow(clippy::needless_range_loop)] // §8.5.12 raster-Z 4x4 walk
+            for block_idx in 0..16usize {
+                let (bx, by) = LUMA_4X4_XY[block_idx];
+                let blk8 = block_idx / 4;
+                let coeffs_scan = if (cbp_luma >> blk8) & 1 == 1 {
+                    let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                    let compact_idx = set_before * 4 + (block_idx % 4);
+                    ac_blocks.get(compact_idx).copied().unwrap_or([0i32; 16])
+                } else {
+                    [0i32; 16]
+                };
+                let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
+                let residual = inverse_transform_4x4(&coeffs, qp_c, sl4, bit_depth_c)?;
+                for yy in 0..4i32 {
+                    for xx in 0..4i32 {
+                        let pidx = ((by + yy) as usize) * 16 + (bx + xx) as usize;
+                        let pred_v = if plane == 0 {
+                            pred_cb[pidx]
+                        } else {
+                            pred_cr[pidx]
+                        };
+                        let v = clip_sample(pred_v + residual[(yy * 4 + xx) as usize], bit_depth_c);
+                        if plane == 0 {
+                            writer.set_cb(pic, bx + xx, by + yy, v);
+                        } else {
+                            writer.set_cr(pic, bx + xx, by + yy, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -10097,5 +10538,134 @@ mod tests {
                 assert_eq!(pic.cr_at(x, y), 128, "Cr DC at ({x},{y})");
             }
         }
+    }
+
+    /// §8.4.1.4 eq. 8-221/8-222 + §8.4.2.2 eq. 8-235..8-238 — at
+    /// ChromaArrayType == 3 the chroma motion-compensation is **bit-
+    /// identical** to luma: same MV, full-resolution integer position,
+    /// quarter-sample fractions, and the §8.4.2.2.1 luma 6-tap kernel.
+    /// We verify `mc_chroma_partition_444` against `mc_luma_partition`
+    /// on the same plane data with the same half-pel MV.
+    #[test]
+    fn mc_chroma_444_is_bit_identical_to_luma_mc() {
+        // 4:4:4 ref picture: every plane carries the SAME ramp so a
+        // correct chroma MC must equal the luma MC.
+        let mut ref_pic = Picture::new(32, 32, 3, 8, 8);
+        for y in 0..32i32 {
+            for x in 0..32i32 {
+                let v = (y * 13 + x * 7) & 0xFF;
+                ref_pic.set_luma(x, y, v);
+                ref_pic.set_cb(x, y, v);
+                ref_pic.set_cr(x, y, v);
+            }
+        }
+
+        // A non-trivial quarter/half-pel MV so the 6-tap kernel runs.
+        let mv = Mv { x: 6, y: 10 };
+        let (w, h) = (16u32, 16u32);
+        let (px, py) = (0i32, 0i32);
+
+        let mut luma = vec![0i32; (w * h) as usize];
+        mc_luma_partition(&ref_pic, px, py, mv, w, h, 8, &mut luma).unwrap();
+
+        let mut cb = vec![0i32; (w * h) as usize];
+        let mut cr = vec![0i32; (w * h) as usize];
+        mc_chroma_partition_444(&ref_pic, px, py, mv, w, h, 8, &mut cb, &mut cr).unwrap();
+
+        assert_eq!(cb, luma, "4:4:4 Cb MC must match luma MC bit-for-bit");
+        assert_eq!(cr, luma, "4:4:4 Cr MC must match luma MC bit-for-bit");
+    }
+
+    /// §8.4.2.2 (ChromaArrayType == 3) end-to-end — a 4:4:4 P_L0_16x16
+    /// MB with zero MV and zero residual must copy the reference Cb/Cr
+    /// planes through motion compensation (previously the inter chroma
+    /// planes were left unfiltered / zero at 4:4:4).
+    #[test]
+    fn p_l0_16x16_444_zero_mv_copies_chroma_planes() {
+        let mut sps = make_sps(1, 1);
+        sps.profile_idc = 244;
+        sps.chroma_format_idc = 3;
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+
+        // Distinct per-plane ramps so a wrong plane source would fail.
+        let mut ref_pic = Picture::new(16, 16, 3, 8, 8);
+        for y in 0..16i32 {
+            for x in 0..16i32 {
+                ref_pic.set_luma(x, y, (y * 16 + x) & 0xFF);
+                ref_pic.set_cb(x, y, (y * 3 + x * 5 + 17) & 0xFF);
+                ref_pic.set_cr(x, y, (y * 7 + x * 2 + 40) & 0xFF);
+            }
+        }
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        let mb = make_p_l0_16x16(0, [0, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 3, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid)
+            .expect("4:4:4 P_L0_16x16 must reconstruct");
+
+        for y in 0..16i32 {
+            for x in 0..16i32 {
+                assert_eq!(pic.luma_at(x, y), (y * 16 + x) & 0xFF, "Y at ({x},{y})");
+                assert_eq!(
+                    pic.cb_at(x, y),
+                    (y * 3 + x * 5 + 17) & 0xFF,
+                    "Cb at ({x},{y})"
+                );
+                assert_eq!(
+                    pic.cr_at(x, y),
+                    (y * 7 + x * 2 + 40) & 0xFF,
+                    "Cr at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// §8.4.2.2.1 — half-pel chroma MV at 4:4:4 drives the luma 6-tap
+    /// kernel on the chroma planes. With Cb/Cr identical to luma, the
+    /// reconstructed chroma sample equals the reconstructed luma sample.
+    #[test]
+    fn p_l0_16x16_444_half_pel_chroma_uses_luma_6tap() {
+        let mut sps = make_sps(2, 2);
+        sps.profile_idc = 244;
+        sps.chroma_format_idc = 3;
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+
+        // Plant the same {10,20,30,40,50,60} row on all three planes at
+        // (8..=13, 8) so the half-pel result is the known 35 on each.
+        let mut ref_pic = Picture::new(32, 32, 3, 8, 8);
+        for (i, v) in [10, 20, 30, 40, 50, 60].iter().enumerate() {
+            ref_pic.set_luma(8 + i as i32, 8, *v);
+            ref_pic.set_cb(8 + i as i32, 8, *v);
+            ref_pic.set_cr(8 + i as i32, 8, *v);
+        }
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        let mb = make_p_l0_16x16(0, [2, 0]); // xFrac = 2 (half-pel).
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 3, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid)
+            .expect("4:4:4 half-pel P_L0_16x16 must reconstruct");
+
+        // §8.4.2.2.1 half-pel b at (10, 8) == 35 on every plane.
+        assert_eq!(pic.luma_at(10, 8), 35, "Y half-pel");
+        assert_eq!(pic.cb_at(10, 8), 35, "Cb half-pel (luma 6-tap)");
+        assert_eq!(pic.cr_at(10, 8), 35, "Cr half-pel (luma 6-tap)");
     }
 }
