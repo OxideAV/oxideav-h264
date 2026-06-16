@@ -40,6 +40,7 @@ pub mod simd;
 pub mod slice_data;
 pub mod slice_header;
 pub mod sps;
+pub mod sps_extension;
 pub mod subset_sps;
 pub mod transform;
 pub mod vui;

@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 325 — §7.3.2.1.2 `seq_parameter_set_extension_rbsp()` (NAL unit
+  type 13). The decoder previously routed type-13 NAL units to
+  `Event::Ignored` with the body unread; it now parses the sequence
+  parameter set extension into a new `SeqParameterSetExtension`
+  (`src/sps_extension.rs`). The parser reads `seq_parameter_set_id`
+  (range-checked 0..=31), `aux_format_idc` (range-checked 0..=3 per
+  §7.4.2.1.2; reserved values >3 rejected), and — when
+  `aux_format_idc != 0` — the auxiliary-coded-picture / alpha-blending
+  block: `bit_depth_aux_minus8` (range-checked 0..=4), `alpha_incr_flag`,
+  and the `bit_depth_aux_minus8 + 9`-bit `u(v)` `alpha_opaque_value` /
+  `alpha_transparent_value` (the §7.4.2.1.2 width rule), exposed as
+  `AuxFormat` with `bit_depth_aux()` / `alpha_value_bits()` helpers;
+  finally `additional_extension_flag`. The body is stored keyed by the
+  supplemented `seq_parameter_set_id` (the ordinary SPS id space, since an
+  SPS extension supplements the SPS of the same id) and surfaced through a
+  new `Event::SpsExtensionStored(id)` event plus a `Decoder::sps_extension`
+  accessor. Auxiliary-picture reconstruction is not wired — §7.4.2.1.2
+  states "the decoding of the sequence parameter set extension and the
+  decoding of auxiliary coded pictures is not required for conformance" —
+  but the parameters are now surfaced rather than discarded. Eight unit
+  tests cover `aux_format_idc == 0` (no aux block), the full aux block,
+  the `bit_depth_aux_minus8 == 0` 9-bit alpha-value width, the reserved
+  `additional_extension_flag == 1`, the three range-check rejections, and a
+  truncated-input EOF; one decoder test exercises NAL-13 dispatch +
+  storage + the `sps_extension` accessor end-to-end.
 - round 321 — Annex F (SVC) §F.7.3.2.1.4
   `seq_parameter_set_svc_extension()` + §F.14.1
   `svc_vui_parameters_extension()`. Subset SPSs with `profile_idc ∈

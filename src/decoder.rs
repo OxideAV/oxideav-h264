@@ -26,6 +26,7 @@ use crate::non_vcl::{self, AccessUnitDelimiter, PrimaryPicType, SeiMessage};
 use crate::pps::{Pps, PpsError};
 use crate::slice_header::{SliceHeader, SliceHeaderError};
 use crate::sps::{Sps, SpsError};
+use crate::sps_extension::{SeqParameterSetExtension, SpsExtensionError};
 use crate::subset_sps::{SubsetSps, SubsetSpsError};
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +37,8 @@ pub enum DecoderError {
     Sps(#[from] SpsError),
     #[error("subset SPS parse: {0}")]
     SubsetSps(#[from] SubsetSpsError),
+    #[error("SPS extension parse: {0}")]
+    SpsExtension(#[from] SpsExtensionError),
     #[error("PPS parse: {0}")]
     Pps(#[from] PpsError),
     #[error("slice header parse: {0}")]
@@ -104,6 +107,12 @@ pub enum Event {
     /// subset SPSs live in their own id space, separate from ordinary
     /// SPSs; retrieve via [`Decoder::subset_sps`].
     SubsetSpsStored(u32),
+    /// §7.3.2.1.2 — sequence parameter set extension (NAL unit type 13)
+    /// parsed and stored. Payload is the `seq_parameter_set_id` of the
+    /// ordinary SPS this extension supplements. Carries the auxiliary
+    /// coded picture / alpha-blending parameters; retrieve the parsed
+    /// body via [`Decoder::sps_extension`].
+    SpsExtensionStored(u32),
     /// PPS parsed and stored. Payload is `pic_parameter_set_id`.
     PpsStored(u32),
     /// §7.3.2.4 — Access Unit Delimiter.
@@ -198,6 +207,11 @@ pub struct Decoder {
     /// `sps_by_id`: only coded slice extension NAL units (types 20/21)
     /// activate these.
     subset_sps_by_id: Vec<Option<SubsetSps>>,
+    /// §7.3.2.1.2 — sequence parameter set extension database indexed by
+    /// `seq_parameter_set_id` (0..=31). An SPS extension (NAL 13) shares
+    /// the ordinary SPS id space — it supplements the SPS of the same id
+    /// with the auxiliary-coded-picture parameters.
+    sps_extension_by_id: Vec<Option<SeqParameterSetExtension>>,
     /// §7.4.1.2.1 — PPS database indexed by `pic_parameter_set_id`
     /// (0..=255).
     pps_by_id: Vec<Option<Pps>>,
@@ -214,6 +228,7 @@ impl Decoder {
         Self {
             sps_by_id: (0..32).map(|_| None).collect(),
             subset_sps_by_id: (0..32).map(|_| None).collect(),
+            sps_extension_by_id: (0..32).map(|_| None).collect(),
             pps_by_id: (0..256).map(|_| None).collect(),
             active_sps_id: None,
             active_pps_id: None,
@@ -362,13 +377,25 @@ impl Decoder {
                     nal_bytes: nal_bytes.to_vec(),
                 }),
             },
-            // SPS extension (13), prefix NAL (14), depth parameter set
-            // (16), reserved (17/18/22/23), slice extension depth (21),
-            // and all unspecified values. Pass through as Ignored so
-            // the caller can inspect/log.
+            // §7.3.2.1.2 / §7.4.1.2.1 — sequence parameter set extension
+            // (NAL 13). Parses the auxiliary-coded-picture / alpha-blending
+            // parameters and stores them keyed by the supplemented SPS id
+            // (the ordinary SPS id space). Auxiliary reconstruction is not
+            // wired — per §7.4.2.1.2 it is not required for conformance —
+            // but the parameters are now surfaced rather than discarded.
+            NalUnitType::SpsExtension => {
+                let ext = SeqParameterSetExtension::parse(&rbsp)?;
+                let id = ext.seq_parameter_set_id;
+                // `id <= 31` validated inside `SeqParameterSetExtension::parse`.
+                self.sps_extension_by_id[id as usize] = Some(ext);
+                Ok(Event::SpsExtensionStored(id))
+            }
+            // Prefix NAL (14), depth parameter set (16), reserved
+            // (17/18/22/23), slice extension depth (21), and all
+            // unspecified values. Pass through as Ignored so the caller
+            // can inspect/log.
             NalUnitType::Unspecified(_)
             | NalUnitType::Reserved(_)
-            | NalUnitType::SpsExtension
             | NalUnitType::PrefixNalUnit
             | NalUnitType::DepthParameterSet
             | NalUnitType::SliceExtensionDepth
@@ -557,6 +584,14 @@ impl Decoder {
     /// from [`Decoder::sps`].
     pub fn subset_sps(&self, id: u32) -> Option<&SubsetSps> {
         self.subset_sps_by_id
+            .get(id as usize)
+            .and_then(|p| p.as_ref())
+    }
+
+    /// Look up a stored sequence parameter set extension (§7.3.2.1.2) by
+    /// the `seq_parameter_set_id` of the ordinary SPS it supplements.
+    pub fn sps_extension(&self, id: u32) -> Option<&SeqParameterSetExtension> {
+        self.sps_extension_by_id
             .get(id as usize)
             .and_then(|p| p.as_ref())
     }
@@ -1043,6 +1078,55 @@ mod tests {
             }
             other => panic!("expected Ignored, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn sps_extension_13_is_parsed_and_stored() {
+        // §7.3.2.1.2 seq_parameter_set_extension_rbsp() body, hand-packed:
+        //   seq_parameter_set_id = 2  → ue(v) "011"
+        //   aux_format_idc       = 1  → ue(v) "010"
+        //   bit_depth_aux_minus8 = 0  → ue(v) "1"
+        //   alpha_incr_flag      = 1  → u(1)  "1"
+        //   alpha_opaque_value   = 0x1FF (9 bits) "111111111"
+        //   alpha_transparent_value = 0x000 (9 bits) "000000000"
+        //   additional_extension_flag = 0 → u(1) "0"
+        //   rbsp_trailing_bits(): "1" then zero-pad.
+        // Bit string:
+        //   011 010 1 1 111111111 000000000 0 1
+        let bits = "011".to_string() + "010" + "1" + "1" + "111111111" + "000000000" + "0" + "1";
+        let mut rbsp = Vec::new();
+        let mut acc = 0u8;
+        let mut n = 0u8;
+        for ch in bits.chars() {
+            acc = (acc << 1) | (ch == '1') as u8;
+            n += 1;
+            if n == 8 {
+                rbsp.push(acc);
+                acc = 0;
+                n = 0;
+            }
+        }
+        if n > 0 {
+            rbsp.push(acc << (8 - n));
+        }
+
+        let nal = build_nal(13, 0, &rbsp);
+        let mut dec = Decoder::new();
+        let ev = dec.process_nal(&nal).unwrap();
+        assert!(matches!(ev, Event::SpsExtensionStored(2)));
+
+        let ext = dec.sps_extension(2).expect("SPS extension stored");
+        assert_eq!(ext.seq_parameter_set_id, 2);
+        assert_eq!(ext.aux_format_idc, 1);
+        let aux = ext.aux_format.expect("aux block present");
+        assert_eq!(aux.bit_depth_aux(), 8);
+        assert!(aux.alpha_incr_flag);
+        assert_eq!(aux.alpha_opaque_value, 0x1FF);
+        assert_eq!(aux.alpha_transparent_value, 0x000);
+        assert!(!ext.additional_extension_flag);
+
+        // No extension was stored for any other SPS id.
+        assert!(dec.sps_extension(0).is_none());
     }
 
     #[test]
