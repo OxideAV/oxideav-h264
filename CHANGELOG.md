@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 321 — Annex F (SVC) §F.7.3.2.1.4
+  `seq_parameter_set_svc_extension()` + §F.14.1
+  `svc_vui_parameters_extension()`. Subset SPSs with `profile_idc ∈
+  {83, 86}` previously surfaced as `SubsetSpsExtension::SvcNotParsed`
+  with the extension body unread; they now parse fully into a new
+  `SubsetSpsExtension::Svc { extension, vui }` variant carrying
+  `SpsSvcExtension` + optional `SvcVuiParametersExtension`. The SVC
+  extension reads `inter_layer_deblocking_filter_control_present_flag`,
+  `extended_spatial_scalability_idc` (range-checked 0..=2 per
+  §F.7.4.2.1.4), the ChromaArrayType-gated `chroma_phase_x_plus1_flag`
+  / `chroma_phase_y_plus1` (with the §F.7.4.2.1.4 absent-field
+  inference to 1), the `extended_spatial_scalability_idc == 1`
+  geometrical-resampling block (`seq_ref_layer_chroma_phase_*` gated on
+  ChromaArrayType nonzero, four `se(v)` scaled-ref-layer offsets), and
+  the `seq_tcoeff_level_prediction_flag` /
+  `adaptive_tcoeff_level_prediction_flag` /
+  `slice_header_restriction_flag` tail. The SVC VUI extension parses
+  per-entry `vui_ext_dependency_id` / `vui_ext_quality_id` /
+  `vui_ext_temporal_id`, reusing the §E.2.1 timing triple and §E.1.2
+  NAL/VCL HRD parsers (mirroring the existing MVC VUI path).
+  `vui_ext_num_entries_minus1` is range-checked (0..=1023) before
+  allocation. Five new unit tests cover the basic round-trip (both SVC
+  profiles), the ESS==1 geometrical block, the monochrome chroma-phase
+  inference path, the two-entry SVC VUI with HRD, and the illegal
+  `extended_spatial_scalability_idc == 3` rejection.
 - round 318 — Annex H §H.13.1.6 / §H.13.2.6 alternative_depth_info SEI
   payload (type 181). The dispatch previously routed type 181 to
   `SeiPayload::Unknown`; it now parses the global-view-and-depth (GVD)

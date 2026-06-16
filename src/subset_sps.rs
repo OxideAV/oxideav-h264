@@ -5,8 +5,9 @@
 //! [`crate::sps::Sps`]) followed by a per-profile extension structure:
 //!
 //! * `profile_idc ∈ {83, 86}` — `seq_parameter_set_svc_extension()`
-//!   (Annex F). Not parsed yet; surfaced as
-//!   [`SubsetSpsExtension::SvcNotParsed`].
+//!   (§F.7.3.2.1.4) and the optional `svc_vui_parameters_extension()`
+//!   (§F.14.1). Fully parsed here, surfaced as
+//!   [`SubsetSpsExtension::Svc`].
 //! * `profile_idc ∈ {118, 128, 134}` —
 //!   `seq_parameter_set_mvc_extension()` (§G.7.3.2.1.4) and the
 //!   optional `mvc_vui_parameters_extension()` (§G.14.1). Fully
@@ -122,6 +123,24 @@ pub enum SubsetSpsError {
     /// §G.14.2 — `vui_mvc_view_id[i][j]` in 0..=1023.
     #[error("vui_mvc_view_id[{i}][{j}] out of range (got {value}, max 1023)")]
     VuiViewIdOutOfRange { i: usize, j: usize, value: u32 },
+    /// §F.7.4.2.1.4 — `extended_spatial_scalability_idc` "shall be in the
+    /// range of 0 to 2, inclusive". The u(2) read can yield 3.
+    #[error("extended_spatial_scalability_idc out of range (got {0}, max 2)")]
+    ExtendedSpatialScalabilityIdcOutOfRange(u32),
+    /// §F.7.4.2.1.4 — `chroma_phase_y_plus1` /
+    /// `seq_ref_layer_chroma_phase_y_plus1` "shall be in the range of 0
+    /// to 2, inclusive". The u(2) read can yield 3.
+    #[error("{field} out of range (got {value}, max 2)")]
+    ChromaPhaseYOutOfRange {
+        /// `"chroma_phase_y_plus1"` or
+        /// `"seq_ref_layer_chroma_phase_y_plus1"`.
+        field: &'static str,
+        value: u32,
+    },
+    /// §F.14.2 — `vui_ext_num_entries_minus1` in 0..=1023. Checked
+    /// before allocating any per-entry storage (anti-OOM gate).
+    #[error("vui_ext_num_entries_minus1 out of range (got {0}, max 1023)")]
+    VuiExtNumEntriesOutOfRange(u32),
 }
 
 /// §G.7.3.2.1.4 — the per-view inter-view dependency lists, indexed by
@@ -558,6 +577,240 @@ impl MvcVuiParametersExtension {
     }
 }
 
+/// §F.7.3.2.1.4 — geometrical resampling parameters, present only when
+/// `extended_spatial_scalability_idc == 1`. Each offset is `se(v)` in
+/// the range `−2^15 .. 2^15 − 1`; absent fields infer to 0 per
+/// §F.7.4.2.1.4.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SvcSeqRefLayerOffsets {
+    /// `seq_ref_layer_chroma_phase_x_plus1_flag` — present only when
+    /// `ChromaArrayType > 0`; otherwise inferred equal to
+    /// `chroma_phase_x_plus1_flag` per §F.7.4.2.1.4.
+    pub ref_layer_chroma_phase_x_plus1_flag: bool,
+    /// `seq_ref_layer_chroma_phase_y_plus1` (0..=2) — present only when
+    /// `ChromaArrayType > 0`; otherwise inferred equal to
+    /// `chroma_phase_y_plus1`.
+    pub ref_layer_chroma_phase_y_plus1: u8,
+    /// `seq_scaled_ref_layer_left_offset` (units of two luma samples).
+    pub scaled_ref_layer_left_offset: i32,
+    /// `seq_scaled_ref_layer_top_offset` (units of two/four luma samples
+    /// per `frame_mbs_only_flag`).
+    pub scaled_ref_layer_top_offset: i32,
+    /// `seq_scaled_ref_layer_right_offset` (units of two luma samples).
+    pub scaled_ref_layer_right_offset: i32,
+    /// `seq_scaled_ref_layer_bottom_offset` (units of two/four luma
+    /// samples per `frame_mbs_only_flag`).
+    pub scaled_ref_layer_bottom_offset: i32,
+}
+
+/// §F.7.3.2.1.4 — `seq_parameter_set_svc_extension()`, the Annex F
+/// (scalable extension) tail of a subset SPS for SVC profiles
+/// (`profile_idc ∈ {83, 86}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpsSvcExtension {
+    /// `inter_layer_deblocking_filter_control_present_flag` — u(1).
+    pub inter_layer_deblocking_filter_control_present_flag: bool,
+    /// `extended_spatial_scalability_idc` (0..=2) — u(2).
+    pub extended_spatial_scalability_idc: u8,
+    /// `chroma_phase_x_plus1_flag`; present only when
+    /// `ChromaArrayType ∈ {1, 2}`, else inferred to `true` (value 1) per
+    /// §F.7.4.2.1.4.
+    pub chroma_phase_x_plus1_flag: bool,
+    /// `chroma_phase_y_plus1` (0..=2); present only when
+    /// `ChromaArrayType == 1`, else inferred to 1.
+    pub chroma_phase_y_plus1: u8,
+    /// Geometrical parameters — `Some` only when
+    /// `extended_spatial_scalability_idc == 1`.
+    pub seq_ref_layer_offsets: Option<SvcSeqRefLayerOffsets>,
+    /// `seq_tcoeff_level_prediction_flag` — u(1).
+    pub seq_tcoeff_level_prediction_flag: bool,
+    /// `adaptive_tcoeff_level_prediction_flag`; present only when
+    /// `seq_tcoeff_level_prediction_flag == 1`, else inferred to `false`
+    /// (0) per §F.7.4.2.1.4.
+    pub adaptive_tcoeff_level_prediction_flag: bool,
+    /// `slice_header_restriction_flag` — u(1).
+    pub slice_header_restriction_flag: bool,
+}
+
+impl SpsSvcExtension {
+    /// §F.7.3.2.1.4 — parse from the current cursor. `chroma_array_type`
+    /// is `ChromaArrayType` (§6.2) derived from the embedded
+    /// `seq_parameter_set_data()`; it gates the chroma-phase and
+    /// reference-layer-chroma-phase reads. `frame_mbs_only_flag` is
+    /// carried in the returned offsets' implicit units but is not needed
+    /// for parsing (the `se(v)` reads are unit-agnostic).
+    pub fn parse(r: &mut BitReader<'_>, chroma_array_type: u32) -> Result<Self, SubsetSpsError> {
+        let inter_layer_deblocking_filter_control_present_flag = r.u(1)? == 1;
+        let extended_spatial_scalability_idc = r.u(2)?;
+        if extended_spatial_scalability_idc > 2 {
+            return Err(SubsetSpsError::ExtendedSpatialScalabilityIdcOutOfRange(
+                extended_spatial_scalability_idc,
+            ));
+        }
+        let extended_spatial_scalability_idc = extended_spatial_scalability_idc as u8;
+
+        // §F.7.4.2.1.4 — chroma_phase_x_plus1_flag inferred to 1 when
+        // absent; chroma_phase_y_plus1 inferred to 1 when absent.
+        let chroma_phase_x_plus1_flag = if chroma_array_type == 1 || chroma_array_type == 2 {
+            r.u(1)? == 1
+        } else {
+            true
+        };
+        let chroma_phase_y_plus1 = if chroma_array_type == 1 {
+            let v = r.u(2)?;
+            if v > 2 {
+                return Err(SubsetSpsError::ChromaPhaseYOutOfRange {
+                    field: "chroma_phase_y_plus1",
+                    value: v,
+                });
+            }
+            v as u8
+        } else {
+            1
+        };
+
+        let seq_ref_layer_offsets = if extended_spatial_scalability_idc == 1 {
+            // §F.7.4.2.1.4 — when ChromaArrayType == 0 these chroma-phase
+            // fields are absent and inferred from the layer's own
+            // chroma_phase_* values.
+            let (ref_layer_chroma_phase_x_plus1_flag, ref_layer_chroma_phase_y_plus1) =
+                if chroma_array_type > 0 {
+                    let x = r.u(1)? == 1;
+                    let y = r.u(2)?;
+                    if y > 2 {
+                        return Err(SubsetSpsError::ChromaPhaseYOutOfRange {
+                            field: "seq_ref_layer_chroma_phase_y_plus1",
+                            value: y,
+                        });
+                    }
+                    (x, y as u8)
+                } else {
+                    (chroma_phase_x_plus1_flag, chroma_phase_y_plus1)
+                };
+            Some(SvcSeqRefLayerOffsets {
+                ref_layer_chroma_phase_x_plus1_flag,
+                ref_layer_chroma_phase_y_plus1,
+                scaled_ref_layer_left_offset: r.se()?,
+                scaled_ref_layer_top_offset: r.se()?,
+                scaled_ref_layer_right_offset: r.se()?,
+                scaled_ref_layer_bottom_offset: r.se()?,
+            })
+        } else {
+            None
+        };
+
+        let seq_tcoeff_level_prediction_flag = r.u(1)? == 1;
+        // §F.7.4.2.1.4 — adaptive_tcoeff_level_prediction_flag inferred
+        // to 0 when seq_tcoeff_level_prediction_flag == 0.
+        let adaptive_tcoeff_level_prediction_flag = if seq_tcoeff_level_prediction_flag {
+            r.u(1)? == 1
+        } else {
+            false
+        };
+        let slice_header_restriction_flag = r.u(1)? == 1;
+
+        Ok(SpsSvcExtension {
+            inter_layer_deblocking_filter_control_present_flag,
+            extended_spatial_scalability_idc,
+            chroma_phase_x_plus1_flag,
+            chroma_phase_y_plus1,
+            seq_ref_layer_offsets,
+            seq_tcoeff_level_prediction_flag,
+            adaptive_tcoeff_level_prediction_flag,
+            slice_header_restriction_flag,
+        })
+    }
+}
+
+/// §F.14.1 — one information entry inside
+/// `svc_vui_parameters_extension()`. Mirrors the §E.2.1 timing /
+/// §E.1.2 HRD reuse pattern (cf. [`MvcVuiOp`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SvcVuiEntry {
+    /// `vui_ext_dependency_id[i]` — u(3).
+    pub dependency_id: u8,
+    /// `vui_ext_quality_id[i]` — u(4).
+    pub quality_id: u8,
+    /// `vui_ext_temporal_id[i]` — u(3).
+    pub temporal_id: u8,
+    /// Present when `vui_ext_timing_info_present_flag[i] == 1`. Reuses
+    /// the §E.2.1 timing triple ([`MvcVuiTimingInfo`]).
+    pub timing_info: Option<MvcVuiTimingInfo>,
+    /// Present when `vui_ext_nal_hrd_parameters_present_flag[i] == 1`.
+    pub nal_hrd_parameters: Option<HrdParameters>,
+    /// Present when `vui_ext_vcl_hrd_parameters_present_flag[i] == 1`.
+    pub vcl_hrd_parameters: Option<HrdParameters>,
+    /// `vui_ext_low_delay_hrd_flag[i]` — present only when one of the
+    /// two HRD blocks is.
+    pub low_delay_hrd_flag: Option<bool>,
+    /// `vui_ext_pic_struct_present_flag[i]` — u(1).
+    pub pic_struct_present_flag: bool,
+}
+
+/// §F.14.1 — `svc_vui_parameters_extension()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SvcVuiParametersExtension {
+    /// One entry per `i ∈ 0..=vui_ext_num_entries_minus1`.
+    pub entries: Vec<SvcVuiEntry>,
+}
+
+impl SvcVuiParametersExtension {
+    /// §F.14.1 — parse from the current cursor position.
+    pub fn parse(r: &mut BitReader<'_>) -> Result<Self, SubsetSpsError> {
+        // §F.14.2 — vui_ext_num_entries_minus1 in 0..=1023; checked
+        // before allocation.
+        let num_entries_minus1 = r.ue()?;
+        if num_entries_minus1 > 1023 {
+            return Err(SubsetSpsError::VuiExtNumEntriesOutOfRange(
+                num_entries_minus1,
+            ));
+        }
+        let mut entries = Vec::with_capacity(num_entries_minus1 as usize + 1);
+        for _ in 0..=num_entries_minus1 {
+            let dependency_id = r.u(3)? as u8;
+            let quality_id = r.u(4)? as u8;
+            let temporal_id = r.u(3)? as u8;
+            let timing_info = if r.u(1)? == 1 {
+                Some(MvcVuiTimingInfo {
+                    num_units_in_tick: r.u(32)?,
+                    time_scale: r.u(32)?,
+                    fixed_frame_rate_flag: r.u(1)? == 1,
+                })
+            } else {
+                None
+            };
+            let nal_hrd_parameters = if r.u(1)? == 1 {
+                Some(HrdParameters::parse(r)?)
+            } else {
+                None
+            };
+            let vcl_hrd_parameters = if r.u(1)? == 1 {
+                Some(HrdParameters::parse(r)?)
+            } else {
+                None
+            };
+            let low_delay_hrd_flag = if nal_hrd_parameters.is_some() || vcl_hrd_parameters.is_some()
+            {
+                Some(r.u(1)? == 1)
+            } else {
+                None
+            };
+            let pic_struct_present_flag = r.u(1)? == 1;
+            entries.push(SvcVuiEntry {
+                dependency_id,
+                quality_id,
+                temporal_id,
+                timing_info,
+                nal_hrd_parameters,
+                vcl_hrd_parameters,
+                low_delay_hrd_flag,
+                pic_struct_present_flag,
+            });
+        }
+        Ok(SvcVuiParametersExtension { entries })
+    }
+}
+
 /// §7.3.2.1.3 — the per-profile extension branch of a subset SPS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubsetSpsExtension {
@@ -568,10 +821,13 @@ pub enum SubsetSpsExtension {
         /// `Some(..)` when `mvc_vui_parameters_present_flag == 1`.
         vui: Option<MvcVuiParametersExtension>,
     },
-    /// `profile_idc ∈ {83, 86}` — Annex F
-    /// `seq_parameter_set_svc_extension()` is not parsed yet; the base
-    /// `seq_parameter_set_data()` is still surfaced.
-    SvcNotParsed,
+    /// `profile_idc ∈ {83, 86}` — the Annex F SVC extension and its
+    /// optional SVC VUI.
+    Svc {
+        extension: SpsSvcExtension,
+        /// `Some(..)` when `svc_vui_parameters_present_flag == 1`.
+        vui: Option<SvcVuiParametersExtension>,
+    },
     /// `profile_idc ∈ {138, 135}` — Annex H
     /// `seq_parameter_set_mvcd_extension()` is not parsed yet.
     MvcdNotParsed,
@@ -599,8 +855,7 @@ pub struct SubsetSps {
     /// ignore all data that follow it (this parser consumes and
     /// discards the `additional_extension2_data_flag` run). `None`
     /// when the extension branch was not parsed
-    /// ([`SubsetSpsExtension::SvcNotParsed`] /
-    /// [`SubsetSpsExtension::MvcdNotParsed`] /
+    /// ([`SubsetSpsExtension::MvcdNotParsed`] /
     /// [`SubsetSpsExtension::Mvcd3dNotParsed`]) — the flag sits after
     /// the unparsed structure and cannot be located.
     pub additional_extension2_flag: Option<bool>,
@@ -616,12 +871,24 @@ impl SubsetSps {
         let sps = Sps::parse_seq_parameter_set_data(&mut r)?;
 
         match sps.profile_idc {
-            // Annex F SVC profiles — extension body not parsed yet.
-            83 | 86 => Ok(SubsetSps {
-                sps,
-                extension: SubsetSpsExtension::SvcNotParsed,
-                additional_extension2_flag: None,
-            }),
+            // Annex F SVC profiles (83 Scalable Baseline, 86 Scalable
+            // High). §7.3.2.1.3 — no bit_equal_to_one precedes the SVC
+            // extension (unlike the MVC/MVCD branches).
+            83 | 86 => {
+                let chroma_array_type = sps.chroma_array_type();
+                let extension = SpsSvcExtension::parse(&mut r, chroma_array_type)?;
+                let vui = if r.u(1)? == 1 {
+                    Some(SvcVuiParametersExtension::parse(&mut r)?)
+                } else {
+                    None
+                };
+                let additional_extension2_flag = Self::finish_rbsp(&mut r)?;
+                Ok(SubsetSps {
+                    sps,
+                    extension: SubsetSpsExtension::Svc { extension, vui },
+                    additional_extension2_flag: Some(additional_extension2_flag),
+                })
+            }
             // Annex G MVC profiles (118 Multiview High, 128 Stereo
             // High, 134 MFC High).
             118 | 128 | 134 => {
@@ -725,6 +992,16 @@ mod tests {
                 self.u(1, 0);
             }
             self.u(leading + 1, v);
+        }
+
+        /// §9.1.1 inverse mapping — `v > 0 ⇒ 2v − 1`, `v ≤ 0 ⇒ −2v`.
+        fn se(&mut self, value: i32) {
+            let code_num = if value > 0 {
+                (value as u32) * 2 - 1
+            } else {
+                (value.unsigned_abs()) * 2
+            };
+            self.ue(code_num);
         }
 
         fn trailing(&mut self) {
@@ -1117,23 +1394,241 @@ mod tests {
         assert!(op.pic_struct_present_flag);
     }
 
-    /// Annex F SVC profiles (83/86): the extension body is not parsed
-    /// yet but the embedded `seq_parameter_set_data()` is surfaced.
+    /// §F.7.3.2.1.4 — a minimal SVC extension body for both SVC
+    /// profiles (83 Scalable Baseline, 86 Scalable High) with
+    /// `extended_spatial_scalability_idc == 0` (no geometrical params),
+    /// ChromaArrayType == 1 (so both chroma-phase fields are present),
+    /// `seq_tcoeff_level_prediction_flag == 0`, no SVC VUI.
     #[test]
-    fn svc_profile_not_parsed() {
+    fn svc_profile_basic_round_trip() {
         for profile in [83u8, 86] {
             let mut w = BitWriter::new();
             write_sps_data(&mut w, profile, true);
-            // Arbitrary unread extension bytes follow.
-            w.u(8, 0xAA);
+            // seq_parameter_set_svc_extension():
+            w.u(1, 1); // inter_layer_deblocking_filter_control_present_flag
+            w.u(2, 0); // extended_spatial_scalability_idc
+            w.u(1, 1); // chroma_phase_x_plus1_flag (ChromaArrayType==1)
+            w.u(2, 2); // chroma_phase_y_plus1 (ChromaArrayType==1)
+            w.u(1, 0); // seq_tcoeff_level_prediction_flag
+            w.u(1, 1); // slice_header_restriction_flag
+            w.u(1, 0); // svc_vui_parameters_present_flag
+            w.u(1, 0); // additional_extension2_flag
             w.trailing();
 
             let subset = SubsetSps::parse(&w.into_bytes()).expect("SVC subset SPS");
             assert_eq!(subset.sps.profile_idc, profile);
             assert_eq!(subset.sps.pic_width_in_mbs(), 4);
-            assert_eq!(subset.extension, SubsetSpsExtension::SvcNotParsed);
-            assert_eq!(subset.additional_extension2_flag, None);
+            assert_eq!(subset.additional_extension2_flag, Some(false));
+            let SubsetSpsExtension::Svc { extension, vui } = &subset.extension else {
+                panic!(
+                    "expected the Svc extension variant, got {:?}",
+                    subset.extension
+                );
+            };
+            assert!(vui.is_none());
+            assert!(extension.inter_layer_deblocking_filter_control_present_flag);
+            assert_eq!(extension.extended_spatial_scalability_idc, 0);
+            assert!(extension.chroma_phase_x_plus1_flag);
+            assert_eq!(extension.chroma_phase_y_plus1, 2);
+            assert!(extension.seq_ref_layer_offsets.is_none());
+            assert!(!extension.seq_tcoeff_level_prediction_flag);
+            assert!(!extension.adaptive_tcoeff_level_prediction_flag);
+            assert!(extension.slice_header_restriction_flag);
         }
+    }
+
+    /// §F.7.3.2.1.4 — `extended_spatial_scalability_idc == 1` makes the
+    /// `seq_ref_layer_*` geometrical parameters present (ChromaArrayType
+    /// nonzero ⇒ the reference-layer chroma-phase fields are also
+    /// coded), and `seq_tcoeff_level_prediction_flag == 1` makes
+    /// `adaptive_tcoeff_level_prediction_flag` present.
+    #[test]
+    fn svc_extended_spatial_scalability_round_trip() {
+        let mut w = BitWriter::new();
+        write_sps_data(&mut w, 86, true);
+        w.u(1, 0); // inter_layer_deblocking_filter_control_present_flag
+        w.u(2, 1); // extended_spatial_scalability_idc == 1
+        w.u(1, 0); // chroma_phase_x_plus1_flag (ChromaArrayType==1)
+        w.u(2, 1); // chroma_phase_y_plus1 (ChromaArrayType==1)
+                   // ChromaArrayType > 0 ⇒ ref-layer chroma-phase fields present:
+        w.u(1, 1); // seq_ref_layer_chroma_phase_x_plus1_flag
+        w.u(2, 2); // seq_ref_layer_chroma_phase_y_plus1
+        w.se(-3); // seq_scaled_ref_layer_left_offset
+        w.se(5); // seq_scaled_ref_layer_top_offset
+        w.se(0); // seq_scaled_ref_layer_right_offset
+        w.se(-1); // seq_scaled_ref_layer_bottom_offset
+        w.u(1, 1); // seq_tcoeff_level_prediction_flag
+        w.u(1, 1); // adaptive_tcoeff_level_prediction_flag
+        w.u(1, 0); // slice_header_restriction_flag
+        w.u(1, 0); // svc_vui_parameters_present_flag
+        w.u(1, 0); // additional_extension2_flag
+        w.trailing();
+
+        let subset = SubsetSps::parse(&w.into_bytes()).expect("SVC ESS=1 subset SPS");
+        let SubsetSpsExtension::Svc { extension, vui } = &subset.extension else {
+            panic!("expected Svc, got {:?}", subset.extension);
+        };
+        assert!(vui.is_none());
+        assert_eq!(extension.extended_spatial_scalability_idc, 1);
+        let offs = extension
+            .seq_ref_layer_offsets
+            .as_ref()
+            .expect("ESS=1 ⇒ geometrical params present");
+        assert!(offs.ref_layer_chroma_phase_x_plus1_flag);
+        assert_eq!(offs.ref_layer_chroma_phase_y_plus1, 2);
+        assert_eq!(offs.scaled_ref_layer_left_offset, -3);
+        assert_eq!(offs.scaled_ref_layer_top_offset, 5);
+        assert_eq!(offs.scaled_ref_layer_right_offset, 0);
+        assert_eq!(offs.scaled_ref_layer_bottom_offset, -1);
+        assert!(extension.seq_tcoeff_level_prediction_flag);
+        assert!(extension.adaptive_tcoeff_level_prediction_flag);
+    }
+
+    /// §F.7.4.2.1.4 — when `ChromaArrayType == 0` (monochrome) neither
+    /// `chroma_phase_x_plus1_flag` nor `chroma_phase_y_plus1` is coded;
+    /// they infer to 1. With `extended_spatial_scalability_idc == 1` the
+    /// reference-layer chroma-phase fields are likewise absent and infer
+    /// from the layer's own chroma_phase_* values.
+    #[test]
+    fn svc_monochrome_chroma_phase_inferred() {
+        let mut w = BitWriter::new();
+        // write_sps_data writes chroma_format_idc=1 for the SVC gate; we
+        // instead build a monochrome (chroma_format_idc=0) SPS by hand.
+        w.u(8, 86); // profile_idc
+        w.u(8, 0); // constraint flags + reserved
+        w.u(8, 30); // level_idc
+        w.ue(0); // seq_parameter_set_id
+        w.ue(0); // chroma_format_idc == 0 (monochrome)
+        w.ue(0); // bit_depth_luma_minus8
+        w.ue(0); // bit_depth_chroma_minus8
+        w.u(1, 0); // qpprime_y_zero_transform_bypass_flag
+        w.u(1, 0); // seq_scaling_matrix_present_flag
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(0); // pic_order_cnt_type
+        w.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        w.ue(1); // max_num_ref_frames
+        w.u(1, 0); // gaps_in_frame_num_value_allowed_flag
+        w.ue(3); // pic_width_in_mbs_minus1
+        w.ue(3); // pic_height_in_map_units_minus1
+        w.u(1, 1); // frame_mbs_only_flag
+        w.u(1, 1); // direct_8x8_inference_flag
+        w.u(1, 0); // frame_cropping_flag
+        w.u(1, 0); // vui_parameters_present_flag
+                   // seq_parameter_set_svc_extension() — ChromaArrayType == 0:
+        w.u(1, 0); // inter_layer_deblocking_filter_control_present_flag
+        w.u(2, 1); // extended_spatial_scalability_idc == 1
+                   // no chroma_phase_x_plus1_flag / chroma_phase_y_plus1 coded.
+                   // ChromaArrayType == 0 ⇒ no ref-layer chroma-phase fields:
+        w.se(2); // seq_scaled_ref_layer_left_offset
+        w.se(0); // seq_scaled_ref_layer_top_offset
+        w.se(0); // seq_scaled_ref_layer_right_offset
+        w.se(0); // seq_scaled_ref_layer_bottom_offset
+        w.u(1, 0); // seq_tcoeff_level_prediction_flag
+        w.u(1, 0); // slice_header_restriction_flag
+        w.u(1, 0); // svc_vui_parameters_present_flag
+        w.u(1, 0); // additional_extension2_flag
+        w.trailing();
+
+        let subset = SubsetSps::parse(&w.into_bytes()).expect("monochrome SVC subset SPS");
+        assert_eq!(subset.sps.chroma_array_type(), 0);
+        let SubsetSpsExtension::Svc { extension, .. } = &subset.extension else {
+            panic!("expected Svc, got {:?}", subset.extension);
+        };
+        // §F.7.4.2.1.4 inference defaults.
+        assert!(extension.chroma_phase_x_plus1_flag);
+        assert_eq!(extension.chroma_phase_y_plus1, 1);
+        let offs = extension.seq_ref_layer_offsets.as_ref().unwrap();
+        // Inferred from the (default) layer chroma_phase_* values.
+        assert!(offs.ref_layer_chroma_phase_x_plus1_flag);
+        assert_eq!(offs.ref_layer_chroma_phase_y_plus1, 1);
+        assert_eq!(offs.scaled_ref_layer_left_offset, 2);
+    }
+
+    /// §F.14.1 — an SVC subset SPS carrying a two-entry
+    /// `svc_vui_parameters_extension()`, the second entry with NAL HRD
+    /// parameters present.
+    #[test]
+    fn svc_vui_parameters_round_trip() {
+        let mut w = BitWriter::new();
+        write_sps_data(&mut w, 83, true);
+        // seq_parameter_set_svc_extension() (minimal, ESS=0):
+        w.u(1, 0); // inter_layer_deblocking_filter_control_present_flag
+        w.u(2, 0); // extended_spatial_scalability_idc
+        w.u(1, 1); // chroma_phase_x_plus1_flag
+        w.u(2, 1); // chroma_phase_y_plus1
+        w.u(1, 0); // seq_tcoeff_level_prediction_flag
+        w.u(1, 0); // slice_header_restriction_flag
+        w.u(1, 1); // svc_vui_parameters_present_flag
+                   // svc_vui_parameters_extension():
+        w.ue(1); // vui_ext_num_entries_minus1 == 1 (two entries)
+                 // entry 0:
+        w.u(3, 0); // vui_ext_dependency_id
+        w.u(4, 0); // vui_ext_quality_id
+        w.u(3, 0); // vui_ext_temporal_id
+        w.u(1, 0); // vui_ext_timing_info_present_flag
+        w.u(1, 0); // vui_ext_nal_hrd_parameters_present_flag
+        w.u(1, 0); // vui_ext_vcl_hrd_parameters_present_flag
+        w.u(1, 1); // vui_ext_pic_struct_present_flag
+                   // entry 1 (with NAL HRD parameters):
+        w.u(3, 1); // vui_ext_dependency_id
+        w.u(4, 2); // vui_ext_quality_id
+        w.u(3, 3); // vui_ext_temporal_id
+        w.u(1, 0); // vui_ext_timing_info_present_flag
+        w.u(1, 1); // vui_ext_nal_hrd_parameters_present_flag
+                   // hrd_parameters() — single CPB, simplest legal body:
+        w.ue(0); // cpb_cnt_minus1
+        w.u(4, 1); // bit_rate_scale
+        w.u(4, 1); // cpb_size_scale
+        w.ue(999); // bit_rate_value_minus1[0]
+        w.ue(499); // cpb_size_value_minus1[0]
+        w.u(1, 1); // cbr_flag[0]
+        w.u(5, 23); // initial_cpb_removal_delay_length_minus1
+        w.u(5, 23); // cpb_removal_delay_length_minus1
+        w.u(5, 23); // dpb_output_delay_length_minus1
+        w.u(5, 23); // time_offset_length
+        w.u(1, 0); // vui_ext_vcl_hrd_parameters_present_flag
+        w.u(1, 0); // vui_ext_low_delay_hrd_flag
+        w.u(1, 0); // vui_ext_pic_struct_present_flag
+        w.u(1, 0); // additional_extension2_flag
+        w.trailing();
+
+        let subset = SubsetSps::parse(&w.into_bytes()).expect("SVC subset SPS with VUI");
+        let SubsetSpsExtension::Svc { vui, .. } = &subset.extension else {
+            panic!("expected Svc, got {:?}", subset.extension);
+        };
+        let vui = vui.as_ref().expect("svc_vui_parameters_present_flag == 1");
+        assert_eq!(vui.entries.len(), 2);
+        assert_eq!(vui.entries[0].dependency_id, 0);
+        assert!(vui.entries[0].pic_struct_present_flag);
+        assert!(vui.entries[0].nal_hrd_parameters.is_none());
+        let e1 = &vui.entries[1];
+        assert_eq!(e1.dependency_id, 1);
+        assert_eq!(e1.quality_id, 2);
+        assert_eq!(e1.temporal_id, 3);
+        let hrd = e1
+            .nal_hrd_parameters
+            .as_ref()
+            .expect("NAL HRD present on entry 1");
+        assert_eq!(hrd.bit_rate_value_minus1, vec![999]);
+        assert_eq!(e1.low_delay_hrd_flag, Some(false));
+        assert!(!e1.pic_struct_present_flag);
+    }
+
+    /// §F.7.4.2.1.4 — `extended_spatial_scalability_idc` "shall be in
+    /// the range of 0 to 2"; a u(2) value of 3 is rejected.
+    #[test]
+    fn svc_ess_idc_3_rejected() {
+        let mut w = BitWriter::new();
+        write_sps_data(&mut w, 86, true);
+        w.u(1, 0); // inter_layer_deblocking_filter_control_present_flag
+        w.u(2, 3); // extended_spatial_scalability_idc == 3 (illegal)
+        w.trailing();
+
+        let err = SubsetSps::parse(&w.into_bytes()).expect_err("ESS idc 3 must be rejected");
+        assert_eq!(
+            err,
+            SubsetSpsError::ExtendedSpatialScalabilityIdcOutOfRange(3)
+        );
     }
 
     /// Annex H MVCD profiles (138/135) and the Annex H + I profile
