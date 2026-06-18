@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 330 — §H.7.3.2.1.4 `seq_parameter_set_mvcd_extension()` for the
+  Annex H MVCD profiles 138 (Multiview Depth High) / 135 (Multiview Depth
+  Stereo). The subset-SPS dispatch previously surfaced these as a typed
+  `MvcdNotParsed` placeholder with the base SPS still read; it now parses
+  the full MVCD extension into `SpsMvcdExtension`: the per-VOIdx view-info
+  loop (`view_id[i]` + `depth_view_present_flag[i]` /
+  `texture_view_present_flag[i]`, with a `num_depth_views()` accessor for
+  the §H.7.4.2.1.4 `NumDepthViews` count), the `depth_view_present_flag`-
+  gated anchor + non-anchor inter-view reference loops (reusing the §G MVC
+  `Min(15, num_views_minus1)` count cap + 0..=1023 view-id bounds by
+  reference from §H.7.4.2.1.4), and the per-level operation points
+  (`MvcdApplicableOp` / `MvcdLevelValue`) extended with per-target-view
+  `applicable_op_depth_flag` / `applicable_op_texture_flag` and the
+  `applicable_op_num_texture_views_minus1` / `applicable_op_num_depth_views`
+  counts. The §H.7.3.2.1.4 tail flags `mvcd_vui_parameters_present_flag`
+  (parsing the new §H.14.1 `mvcd_vui_parameters_extension()` into
+  `MvcdVuiParametersExtension`, with per-op depth/texture target-view flags
+  and §E timing/HRD reuse) and `texture_vui_parameters_present_flag`
+  (reusing the §G.14.1 `mvc_vui_parameters_extension()` parser) are now
+  read, so profiles 138/135 reach `additional_extension2_flag` and finish
+  the RBSP. The `SubsetSpsExtension::MvcdNotParsed` variant is replaced by
+  a fully-parsed `Mvcd { extension, vui, texture_vui }` variant; profile
+  139 (MVCD + Annex I 3D-AVC) stays `Mvcd3dNotParsed` because the trailing
+  `seq_parameter_set_3davc_extension()` is unimplemented. Five new range-
+  bound error variants (`OpNumTextureViewsOutOfRange`,
+  `OpNumDepthViewsOutOfRange`, `VuiMvcdNumOpsOutOfRange`,
+  `VuiMvcdNumTargetOutputViewsOutOfRange`, `VuiMvcdViewIdOutOfRange`) plus
+  five round-trip / gating / VUI / texture-VUI / rejection tests. Source:
+  ITU-T Rec. H.264 (2024-08) §7.3.2.1.3, §H.7.3.2.1.4, §H.7.4.2.1.4,
+  §H.14.1, §H.14.2.
 - round 325 — §7.3.2.1.2 `seq_parameter_set_extension_rbsp()` (NAL unit
   type 13). The decoder previously routed type-13 NAL units to
   `Event::Ignored` with the body unread; it now parses the sequence

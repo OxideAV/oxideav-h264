@@ -13,11 +13,13 @@
 //!   optional `mvc_vui_parameters_extension()` (§G.14.1). Fully
 //!   parsed here.
 //! * `profile_idc ∈ {138, 135}` — `seq_parameter_set_mvcd_extension()`
-//!   (Annex H). Not parsed yet; surfaced as
-//!   [`SubsetSpsExtension::MvcdNotParsed`].
+//!   (§H.7.3.2.1.4) and the optional `mvcd_vui_parameters_extension()`
+//!   (§H.14.1) + texture `mvc_vui_parameters_extension()` (§G.14.1).
+//!   Fully parsed here, surfaced as [`SubsetSpsExtension::Mvcd`].
 //! * `profile_idc == 139` — MVCD + `seq_parameter_set_3davc_extension()`
-//!   (Annex I). Not parsed yet; surfaced as
-//!   [`SubsetSpsExtension::Mvcd3dNotParsed`].
+//!   (Annex I). The trailing 3D-AVC body is not parsed yet, so the
+//!   leading MVCD half is left unparsed too (the RBSP tail can't be
+//!   located); surfaced as [`SubsetSpsExtension::Mvcd3dNotParsed`].
 //!
 //! Per §7.4.1.2.1, subset sequence parameter sets use a
 //! `seq_parameter_set_id` value space *separate* from that of ordinary
@@ -141,6 +143,27 @@ pub enum SubsetSpsError {
     /// before allocating any per-entry storage (anti-OOM gate).
     #[error("vui_ext_num_entries_minus1 out of range (got {0}, max 1023)")]
     VuiExtNumEntriesOutOfRange(u32),
+    /// §H.7.4.2.1.4 — `applicable_op_num_texture_views_minus1[i][j]` in
+    /// 0..=1023.
+    #[error(
+        "applicable_op_num_texture_views_minus1[{i}][{j}] out of range (got {value}, max 1023)"
+    )]
+    OpNumTextureViewsOutOfRange { i: usize, j: usize, value: u32 },
+    /// §H.7.4.2.1.4 — `applicable_op_num_depth_views[i][j]` in 0..=1023
+    /// (the semantics name it `applicable_op_num_depth_views_minus1`, but
+    /// the §H.7.3.2.1.4 syntax reads `applicable_op_num_depth_views`
+    /// directly as `ue(v)`).
+    #[error("applicable_op_num_depth_views[{i}][{j}] out of range (got {value}, max 1023)")]
+    OpNumDepthViewsOutOfRange { i: usize, j: usize, value: u32 },
+    /// §H.14.2 — `vui_mvcd_num_ops_minus1` in 0..=1023.
+    #[error("vui_mvcd_num_ops_minus1 out of range (got {0}, max 1023)")]
+    VuiMvcdNumOpsOutOfRange(u32),
+    /// §H.14.2 — `vui_mvcd_num_target_output_views_minus1[i]` in 0..=1023.
+    #[error("vui_mvcd_num_target_output_views_minus1[{i}] out of range (got {value}, max 1023)")]
+    VuiMvcdNumTargetOutputViewsOutOfRange { i: usize, value: u32 },
+    /// §H.14.2 — `vui_mvcd_view_id[i][j]` in 0..=1023.
+    #[error("vui_mvcd_view_id[{i}][{j}] out of range (got {value}, max 1023)")]
+    VuiMvcdViewIdOutOfRange { i: usize, j: usize, value: u32 },
 }
 
 /// §G.7.3.2.1.4 — the per-view inter-view dependency lists, indexed by
@@ -577,6 +600,365 @@ impl MvcVuiParametersExtension {
     }
 }
 
+/// §H.7.3.2.1.4 — one entry of the per-view information loop of
+/// `seq_parameter_set_mvcd_extension()`. Each VOIdx `i ∈ 0..=num_views_minus1`
+/// carries a `view_id` plus two presence flags distinguishing whether a
+/// texture view and/or a depth view exists for that VOIdx.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MvcdViewInfo {
+    /// `view_id[i]` (0..=1023).
+    pub view_id: u16,
+    /// `depth_view_present_flag[i]` — when set, a depth view exists for
+    /// this VOIdx and contributes one entry to `DepthViewId[]`
+    /// (§H.7.4.2.1.4).
+    pub depth_view_present_flag: bool,
+    /// `texture_view_present_flag[i]`. §H.7.4.2.1.4 — when
+    /// `depth_view_present_flag[i] == 0`, this shall be 1.
+    pub texture_view_present_flag: bool,
+}
+
+/// §H.7.3.2.1.4 — one `applicable_op_target_view_id[i][j][k]` plus its
+/// per-view depth / texture inclusion flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MvcdOpTargetView {
+    /// `applicable_op_target_view_id[i][j][k]` (0..=1023).
+    pub target_view_id: u16,
+    /// `applicable_op_depth_flag[i][j][k]` — whether the depth view with
+    /// this view_id is included in the j-th operation point.
+    pub depth_flag: bool,
+    /// `applicable_op_texture_flag[i][j][k]`. §H.7.4.2.1.4 — when
+    /// `applicable_op_depth_flag` is 0, this shall be 1.
+    pub texture_flag: bool,
+}
+
+/// §H.7.3.2.1.4 — one operation point to which a signalled
+/// `level_idc[i]` applies (the MVCD counterpart of [`MvcApplicableOp`],
+/// extended with depth/texture view counts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvcdApplicableOp {
+    /// `applicable_op_temporal_id[i][j]` — u(3).
+    pub temporal_id: u8,
+    /// `applicable_op_target_view_id[i][j][..]` + per-view depth/texture
+    /// flags (length `applicable_op_num_target_views_minus1[i][j] + 1`).
+    pub target_views: Vec<MvcdOpTargetView>,
+    /// `applicable_op_num_texture_views_minus1[i][j]` — plus 1 is the
+    /// number of texture views required to decode the target output
+    /// views of this operation point.
+    pub num_texture_views_minus1: u16,
+    /// `applicable_op_num_depth_views[i][j]` — the number of depth views
+    /// required to decode the target output views.
+    pub num_depth_views: u16,
+}
+
+/// §H.7.3.2.1.4 — one signalled level value and the MVCD operation
+/// points it applies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvcdLevelValue {
+    /// `level_idc[i]` — u(8).
+    pub level_idc: u8,
+    /// One entry per `j ∈ 0..=num_applicable_ops_minus1[i]`.
+    pub applicable_ops: Vec<MvcdApplicableOp>,
+}
+
+/// §H.7.3.2.1.4 — `seq_parameter_set_mvcd_extension()`, the Annex H
+/// (MVC + depth) tail of a subset SPS for MVCD profiles
+/// (`profile_idc ∈ {138, 135}`; also the leading half of the
+/// `profile_idc == 139` 3D-AVC body).
+///
+/// §H.7.4.2.1.4 inherits the §G.7.4.2.1.4 semantics by reference, so the
+/// view-id / count range bounds and the `Min(15, num_views_minus1)`
+/// reference-count cap match the MVC extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpsMvcdExtension {
+    /// `view_id[i]` + presence flags, one entry per VOIdx
+    /// `i ∈ 0..=num_views_minus1`.
+    pub views: Vec<MvcdViewInfo>,
+    /// Inter-view dependency lists, one entry per VOIdx (same length as
+    /// `views`). Entries are signalled only for `i ∈ 1..=num_views_minus1`
+    /// with `depth_view_present_flag[i] == 1`; every other VOIdx keeps
+    /// four empty lists (§H.7.3.2.1.4 — the loops are gated on
+    /// `depth_view_present_flag[i]`).
+    pub view_dependencies: Vec<MvcViewDependency>,
+    /// `level_idc[i]` + operation points, one entry per
+    /// `i ∈ 0..=num_level_values_signalled_minus1`.
+    pub level_values: Vec<MvcdLevelValue>,
+}
+
+impl SpsMvcdExtension {
+    /// `num_views_minus1 + 1` — the maximum number of coded views (texture
+    /// + depth) in the coded video sequence.
+    pub fn num_views(&self) -> usize {
+        self.views.len()
+    }
+
+    /// §H.7.4.2.1.4 — `NumDepthViews`, the count of VOIdx values carrying
+    /// a depth view (the number of entries pushed into `DepthViewId[]`).
+    pub fn num_depth_views(&self) -> usize {
+        self.views
+            .iter()
+            .filter(|v| v.depth_view_present_flag)
+            .count()
+    }
+
+    /// §H.7.3.2.1.4 — parse from the current cursor position.
+    pub fn parse(r: &mut BitReader<'_>) -> Result<Self, SubsetSpsError> {
+        // §G.7.4.2.1.4 (by reference from §H.7.4.2.1.4) —
+        // num_views_minus1 in 0..=1023; checked before any allocation.
+        let num_views_minus1 = r.ue()?;
+        if num_views_minus1 > 1023 {
+            return Err(SubsetSpsError::NumViewsOutOfRange(num_views_minus1));
+        }
+        let num_views = num_views_minus1 as usize + 1;
+
+        // First loop: view_id + depth/texture presence flags per VOIdx.
+        let mut views = Vec::with_capacity(num_views);
+        for i in 0..num_views {
+            let view_id = r.ue()?;
+            if view_id > 1023 {
+                return Err(SubsetSpsError::ViewIdOutOfRange { i, value: view_id });
+            }
+            let depth_view_present_flag = r.u(1)? == 1;
+            let texture_view_present_flag = r.u(1)? == 1;
+            views.push(MvcdViewInfo {
+                view_id: view_id as u16,
+                depth_view_present_flag,
+                texture_view_present_flag,
+            });
+        }
+
+        // §G.7.4.2.1.4 — the per-list reference count cap
+        // Min( 15, num_views_minus1 ).
+        let max_refs = num_views_minus1.min(15);
+        let mut view_dependencies = vec![MvcViewDependency::default(); num_views];
+        // §H.7.3.2.1.4 — the anchor + non-anchor reference loops run for
+        // i ∈ 1..=num_views_minus1 but only when depth_view_present_flag[i]
+        // is set (unlike §G's MVC body, which signals them for every i).
+        for (i, dep) in view_dependencies.iter_mut().enumerate().skip(1) {
+            if views[i].depth_view_present_flag {
+                dep.anchor_refs_l0 = parse_inter_view_ref_list(r, "anchor", 0, i, max_refs)?;
+                dep.anchor_refs_l1 = parse_inter_view_ref_list(r, "anchor", 1, i, max_refs)?;
+            }
+        }
+        for (i, dep) in view_dependencies.iter_mut().enumerate().skip(1) {
+            if views[i].depth_view_present_flag {
+                dep.non_anchor_refs_l0 =
+                    parse_inter_view_ref_list(r, "non_anchor", 0, i, max_refs)?;
+                dep.non_anchor_refs_l1 =
+                    parse_inter_view_ref_list(r, "non_anchor", 1, i, max_refs)?;
+            }
+        }
+
+        // §G.7.4.2.1.4 — num_level_values_signalled_minus1 in 0..=63.
+        let num_level_values_minus1 = r.ue()?;
+        if num_level_values_minus1 > 63 {
+            return Err(SubsetSpsError::NumLevelValuesOutOfRange(
+                num_level_values_minus1,
+            ));
+        }
+        let mut level_values = Vec::with_capacity(num_level_values_minus1 as usize + 1);
+        for i in 0..=num_level_values_minus1 as usize {
+            let level_idc = r.u(8)? as u8;
+            // §G.7.4.2.1.4 — num_applicable_ops_minus1[i] in 0..=1023.
+            let num_ops_minus1 = r.ue()?;
+            if num_ops_minus1 > 1023 {
+                return Err(SubsetSpsError::NumApplicableOpsOutOfRange {
+                    i,
+                    value: num_ops_minus1,
+                });
+            }
+            let mut applicable_ops = Vec::with_capacity(num_ops_minus1 as usize + 1);
+            for j in 0..=num_ops_minus1 as usize {
+                let temporal_id = r.u(3)? as u8;
+                // §G.7.4.2.1.4 —
+                // applicable_op_num_target_views_minus1[i][j] in 0..=1023.
+                let num_target_views_minus1 = r.ue()?;
+                if num_target_views_minus1 > 1023 {
+                    return Err(SubsetSpsError::NumTargetViewsOutOfRange {
+                        i,
+                        j,
+                        value: num_target_views_minus1,
+                    });
+                }
+                let mut target_views = Vec::with_capacity(num_target_views_minus1 as usize + 1);
+                for k in 0..=num_target_views_minus1 as usize {
+                    let target_view_id = r.ue()?;
+                    if target_view_id > 1023 {
+                        return Err(SubsetSpsError::TargetViewIdOutOfRange {
+                            i,
+                            j,
+                            k,
+                            value: target_view_id,
+                        });
+                    }
+                    let depth_flag = r.u(1)? == 1;
+                    let texture_flag = r.u(1)? == 1;
+                    target_views.push(MvcdOpTargetView {
+                        target_view_id: target_view_id as u16,
+                        depth_flag,
+                        texture_flag,
+                    });
+                }
+                // §H.7.4.2.1.4 —
+                // applicable_op_num_texture_views_minus1[i][j] in 0..=1023.
+                let num_texture_views_minus1 = r.ue()?;
+                if num_texture_views_minus1 > 1023 {
+                    return Err(SubsetSpsError::OpNumTextureViewsOutOfRange {
+                        i,
+                        j,
+                        value: num_texture_views_minus1,
+                    });
+                }
+                // §H.7.4.2.1.4 — applicable_op_num_depth_views[i][j] in
+                // 0..=1023.
+                let num_depth_views = r.ue()?;
+                if num_depth_views > 1023 {
+                    return Err(SubsetSpsError::OpNumDepthViewsOutOfRange {
+                        i,
+                        j,
+                        value: num_depth_views,
+                    });
+                }
+                applicable_ops.push(MvcdApplicableOp {
+                    temporal_id,
+                    target_views,
+                    num_texture_views_minus1: num_texture_views_minus1 as u16,
+                    num_depth_views: num_depth_views as u16,
+                });
+            }
+            level_values.push(MvcdLevelValue {
+                level_idc,
+                applicable_ops,
+            });
+        }
+
+        Ok(SpsMvcdExtension {
+            views,
+            view_dependencies,
+            level_values,
+        })
+    }
+}
+
+/// §H.14.1 — one operation point inside `mvcd_vui_parameters_extension()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvcdVuiOp {
+    /// `vui_mvcd_temporal_id[i]` — u(3).
+    pub temporal_id: u8,
+    /// `vui_mvcd_view_id[i][..]` + per-view depth/texture flags
+    /// (length `vui_mvcd_num_target_output_views_minus1[i] + 1`).
+    pub target_output_views: Vec<MvcdVuiTargetView>,
+    /// Present when `vui_mvcd_timing_info_present_flag[i] == 1`.
+    pub timing_info: Option<MvcVuiTimingInfo>,
+    /// Present when `vui_mvcd_nal_hrd_parameters_present_flag[i] == 1`.
+    pub nal_hrd_parameters: Option<HrdParameters>,
+    /// Present when `vui_mvcd_vcl_hrd_parameters_present_flag[i] == 1`.
+    pub vcl_hrd_parameters: Option<HrdParameters>,
+    /// `vui_mvcd_low_delay_hrd_flag[i]` — present only when one of the
+    /// two HRD blocks is.
+    pub low_delay_hrd_flag: Option<bool>,
+    /// `vui_mvcd_pic_struct_present_flag[i]` — u(1).
+    pub pic_struct_present_flag: bool,
+}
+
+/// §H.14.1 — one `vui_mvcd_view_id[i][j]` plus its depth / texture
+/// inclusion flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MvcdVuiTargetView {
+    /// `vui_mvcd_view_id[i][j]` (0..=1023).
+    pub view_id: u16,
+    /// `vui_mvcd_depth_flag[i][j]`.
+    pub depth_flag: bool,
+    /// `vui_mvcd_texture_flag[i][j]`. §H.14.2 — when
+    /// `vui_mvcd_depth_flag[i][j]` is 0, this shall be 1.
+    pub texture_flag: bool,
+}
+
+/// §H.14.1 — `mvcd_vui_parameters_extension()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvcdVuiParametersExtension {
+    /// One entry per `i ∈ 0..=vui_mvcd_num_ops_minus1`.
+    pub ops: Vec<MvcdVuiOp>,
+}
+
+impl MvcdVuiParametersExtension {
+    /// §H.14.1 — parse from the current cursor position.
+    pub fn parse(r: &mut BitReader<'_>) -> Result<Self, SubsetSpsError> {
+        // §H.14.2 — vui_mvcd_num_ops_minus1 in 0..=1023; checked before
+        // allocation.
+        let num_ops_minus1 = r.ue()?;
+        if num_ops_minus1 > 1023 {
+            return Err(SubsetSpsError::VuiMvcdNumOpsOutOfRange(num_ops_minus1));
+        }
+        let mut ops = Vec::with_capacity(num_ops_minus1 as usize + 1);
+        for i in 0..=num_ops_minus1 as usize {
+            let temporal_id = r.u(3)? as u8;
+            // §H.14.2 — vui_mvcd_num_target_output_views_minus1[i] in
+            // 0..=1023.
+            let num_target_views_minus1 = r.ue()?;
+            if num_target_views_minus1 > 1023 {
+                return Err(SubsetSpsError::VuiMvcdNumTargetOutputViewsOutOfRange {
+                    i,
+                    value: num_target_views_minus1,
+                });
+            }
+            let mut target_output_views = Vec::with_capacity(num_target_views_minus1 as usize + 1);
+            for j in 0..=num_target_views_minus1 as usize {
+                let view_id = r.ue()?;
+                if view_id > 1023 {
+                    return Err(SubsetSpsError::VuiMvcdViewIdOutOfRange {
+                        i,
+                        j,
+                        value: view_id,
+                    });
+                }
+                let depth_flag = r.u(1)? == 1;
+                let texture_flag = r.u(1)? == 1;
+                target_output_views.push(MvcdVuiTargetView {
+                    view_id: view_id as u16,
+                    depth_flag,
+                    texture_flag,
+                });
+            }
+            let timing_info = if r.u(1)? == 1 {
+                Some(MvcVuiTimingInfo {
+                    num_units_in_tick: r.u(32)?,
+                    time_scale: r.u(32)?,
+                    fixed_frame_rate_flag: r.u(1)? == 1,
+                })
+            } else {
+                None
+            };
+            let nal_hrd_parameters = if r.u(1)? == 1 {
+                Some(HrdParameters::parse(r)?)
+            } else {
+                None
+            };
+            let vcl_hrd_parameters = if r.u(1)? == 1 {
+                Some(HrdParameters::parse(r)?)
+            } else {
+                None
+            };
+            let low_delay_hrd_flag = if nal_hrd_parameters.is_some() || vcl_hrd_parameters.is_some()
+            {
+                Some(r.u(1)? == 1)
+            } else {
+                None
+            };
+            let pic_struct_present_flag = r.u(1)? == 1;
+            ops.push(MvcdVuiOp {
+                temporal_id,
+                target_output_views,
+                timing_info,
+                nal_hrd_parameters,
+                vcl_hrd_parameters,
+                low_delay_hrd_flag,
+                pic_struct_present_flag,
+            });
+        }
+        Ok(MvcdVuiParametersExtension { ops })
+    }
+}
+
 /// §F.7.3.2.1.4 — geometrical resampling parameters, present only when
 /// `extended_spatial_scalability_idc == 1`. Each offset is `se(v)` in
 /// the range `−2^15 .. 2^15 − 1`; absent fields infer to 0 per
@@ -828,11 +1210,22 @@ pub enum SubsetSpsExtension {
         /// `Some(..)` when `svc_vui_parameters_present_flag == 1`.
         vui: Option<SvcVuiParametersExtension>,
     },
-    /// `profile_idc ∈ {138, 135}` — Annex H
-    /// `seq_parameter_set_mvcd_extension()` is not parsed yet.
-    MvcdNotParsed,
-    /// `profile_idc == 139` — Annex H MVCD + Annex I 3D-AVC extensions
-    /// are not parsed yet.
+    /// `profile_idc ∈ {138, 135}` — the Annex H
+    /// `seq_parameter_set_mvcd_extension()` and its optional MVCD VUI.
+    Mvcd {
+        extension: SpsMvcdExtension,
+        /// `Some(..)` when `mvcd_vui_parameters_present_flag == 1`.
+        vui: Option<MvcdVuiParametersExtension>,
+        /// `Some(..)` when `texture_vui_parameters_present_flag == 1` —
+        /// §H.7.3.2.1.4 reuses the §G.14.1 `mvc_vui_parameters_extension()`
+        /// for the texture-view VUI tail.
+        texture_vui: Option<MvcVuiParametersExtension>,
+    },
+    /// `profile_idc == 139` — Annex H MVCD + Annex I 3D-AVC. The leading
+    /// `seq_parameter_set_mvcd_extension()` half is not parsed because the
+    /// trailing `seq_parameter_set_3davc_extension()` body (Annex I) is
+    /// not yet implemented, so `additional_extension2_flag` cannot be
+    /// located.
     Mvcd3dNotParsed,
     /// Any other (legal §A.2) `profile_idc` — the §7.3.2.1.3 syntax
     /// table has no extension branch for it; only
@@ -855,8 +1248,7 @@ pub struct SubsetSps {
     /// ignore all data that follow it (this parser consumes and
     /// discards the `additional_extension2_data_flag` run). `None`
     /// when the extension branch was not parsed
-    /// ([`SubsetSpsExtension::MvcdNotParsed`] /
-    /// [`SubsetSpsExtension::Mvcd3dNotParsed`]) — the flag sits after
+    /// ([`SubsetSpsExtension::Mvcd3dNotParsed`]) — the flag sits after
     /// the unparsed structure and cannot be located.
     pub additional_extension2_flag: Option<bool>,
 }
@@ -910,12 +1302,38 @@ impl SubsetSps {
                     additional_extension2_flag: Some(additional_extension2_flag),
                 })
             }
-            // Annex H MVCD profiles — extension body not parsed yet.
-            138 | 135 => Ok(SubsetSps {
-                sps,
-                extension: SubsetSpsExtension::MvcdNotParsed,
-                additional_extension2_flag: None,
-            }),
+            // Annex H MVCD profiles (138 Multiview Depth High, 135 MVCD
+            // Multiview Depth Stereo).
+            138 | 135 => {
+                // §7.4.2.1.3 — bit_equal_to_one shall be equal to 1.
+                if r.f(1)? != 1 {
+                    return Err(SubsetSpsError::BitEqualToOneViolated);
+                }
+                let extension = SpsMvcdExtension::parse(&mut r)?;
+                // §H.7.3.2.1.4 tail — mvcd_vui_parameters_present_flag then
+                // texture_vui_parameters_present_flag sit inside the MVCD
+                // extension structure.
+                let vui = if r.u(1)? == 1 {
+                    Some(MvcdVuiParametersExtension::parse(&mut r)?)
+                } else {
+                    None
+                };
+                let texture_vui = if r.u(1)? == 1 {
+                    Some(MvcVuiParametersExtension::parse(&mut r)?)
+                } else {
+                    None
+                };
+                let additional_extension2_flag = Self::finish_rbsp(&mut r)?;
+                Ok(SubsetSps {
+                    sps,
+                    extension: SubsetSpsExtension::Mvcd {
+                        extension,
+                        vui,
+                        texture_vui,
+                    },
+                    additional_extension2_flag: Some(additional_extension2_flag),
+                })
+            }
             // Annex H MVCD + Annex I 3D-AVC — not parsed yet.
             139 => Ok(SubsetSps {
                 sps,
@@ -1141,6 +1559,272 @@ mod tests {
         assert_eq!(extension.view_ids, vec![5]);
         assert_eq!(extension.view_dependencies.len(), 1);
         assert_eq!(extension.view_dependencies[0], MvcViewDependency::default());
+    }
+
+    /// §H.7.3.2.1.4 — write a minimal two-view MVCD extension body: VOIdx
+    /// 0 carries texture only (`depth_view_present_flag[0] == 0`), VOIdx 1
+    /// carries both texture and depth (`depth_view_present_flag[1] == 1`)
+    /// so its anchor / non-anchor reference loops are signalled. One level
+    /// value with one operation point targeting both views.
+    fn write_two_view_mvcd_extension(w: &mut BitWriter) {
+        w.ue(1); // num_views_minus1
+                 // view info loop
+        w.ue(0); // view_id[0]
+        w.u(1, 0); // depth_view_present_flag[0] = 0
+        w.u(1, 1); // texture_view_present_flag[0] = 1
+        w.ue(2); // view_id[1]
+        w.u(1, 1); // depth_view_present_flag[1] = 1
+        w.u(1, 1); // texture_view_present_flag[1] = 1
+                   // anchor refs: only i==1 (depth_view_present_flag[1]==1)
+        w.ue(1); // num_anchor_refs_l0[1]
+        w.ue(0); // anchor_ref_l0[1][0]
+        w.ue(0); // num_anchor_refs_l1[1]
+                 // non-anchor refs: only i==1
+        w.ue(0); // num_non_anchor_refs_l0[1]
+        w.ue(1); // num_non_anchor_refs_l1[1]
+        w.ue(0); // non_anchor_ref_l1[1][0]
+                 // level values
+        w.ue(0); // num_level_values_signalled_minus1
+        w.u(8, 40); // level_idc[0]
+        w.ue(0); // num_applicable_ops_minus1[0]
+        w.u(3, 1); // applicable_op_temporal_id[0][0]
+        w.ue(1); // applicable_op_num_target_views_minus1[0][0]
+        w.ue(0); // applicable_op_target_view_id[0][0][0]
+        w.u(1, 0); // applicable_op_depth_flag[0][0][0] = 0
+        w.u(1, 1); // applicable_op_texture_flag[0][0][0] = 1
+        w.ue(2); // applicable_op_target_view_id[0][0][1]
+        w.u(1, 1); // applicable_op_depth_flag[0][0][1] = 1
+        w.u(1, 1); // applicable_op_texture_flag[0][0][1] = 1
+        w.ue(1); // applicable_op_num_texture_views_minus1[0][0]
+        w.ue(1); // applicable_op_num_depth_views[0][0]
+    }
+
+    /// §H.7.3.2.1.4 — a two-view Multiview Depth High (profile 138) subset
+    /// SPS round-trips through every MVCD field.
+    #[test]
+    fn mvcd_two_views_full_round_trip() {
+        let mut w = BitWriter::new();
+        write_sps_data(&mut w, 138, true);
+        w.u(1, 1); // bit_equal_to_one
+        write_two_view_mvcd_extension(&mut w);
+        w.u(1, 0); // mvcd_vui_parameters_present_flag
+        w.u(1, 0); // texture_vui_parameters_present_flag
+        w.u(1, 0); // additional_extension2_flag
+        w.trailing();
+
+        let subset = SubsetSps::parse(&w.into_bytes()).expect("two-view MVCD subset SPS");
+        assert_eq!(subset.sps.profile_idc, 138);
+        assert_eq!(subset.additional_extension2_flag, Some(false));
+        let SubsetSpsExtension::Mvcd {
+            extension,
+            vui,
+            texture_vui,
+        } = &subset.extension
+        else {
+            panic!(
+                "expected the Mvcd extension variant, got {:?}",
+                subset.extension
+            );
+        };
+        assert!(vui.is_none());
+        assert!(texture_vui.is_none());
+        assert_eq!(extension.num_views(), 2);
+        // §H.7.4.2.1.4 — NumDepthViews counts VOIdx with a depth view.
+        assert_eq!(extension.num_depth_views(), 1);
+        assert_eq!(
+            extension.views[0],
+            MvcdViewInfo {
+                view_id: 0,
+                depth_view_present_flag: false,
+                texture_view_present_flag: true,
+            }
+        );
+        assert_eq!(
+            extension.views[1],
+            MvcdViewInfo {
+                view_id: 2,
+                depth_view_present_flag: true,
+                texture_view_present_flag: true,
+            }
+        );
+        // VOIdx 0 has no inter-view references; VOIdx 1's depth loops fired.
+        assert_eq!(extension.view_dependencies[0], MvcViewDependency::default());
+        assert_eq!(extension.view_dependencies[1].anchor_refs_l0, vec![0]);
+        assert!(extension.view_dependencies[1].anchor_refs_l1.is_empty());
+        assert!(extension.view_dependencies[1].non_anchor_refs_l0.is_empty());
+        assert_eq!(extension.view_dependencies[1].non_anchor_refs_l1, vec![0]);
+        assert_eq!(extension.level_values.len(), 1);
+        let lv = &extension.level_values[0];
+        assert_eq!(lv.level_idc, 40);
+        assert_eq!(lv.applicable_ops.len(), 1);
+        let op = &lv.applicable_ops[0];
+        assert_eq!(op.temporal_id, 1);
+        assert_eq!(op.target_views.len(), 2);
+        assert_eq!(
+            op.target_views[0],
+            MvcdOpTargetView {
+                target_view_id: 0,
+                depth_flag: false,
+                texture_flag: true,
+            }
+        );
+        assert_eq!(
+            op.target_views[1],
+            MvcdOpTargetView {
+                target_view_id: 2,
+                depth_flag: true,
+                texture_flag: true,
+            }
+        );
+        assert_eq!(op.num_texture_views_minus1, 1);
+        assert_eq!(op.num_depth_views, 1);
+    }
+
+    /// §H.7.3.2.1.4 — a VOIdx 1 with `depth_view_present_flag == 0` skips
+    /// its anchor / non-anchor reference loops entirely (the gating differs
+    /// from the §G MVC body, which signals them unconditionally).
+    #[test]
+    fn mvcd_no_depth_view_skips_ref_loops() {
+        let mut w = BitWriter::new();
+        write_sps_data(&mut w, 135, true);
+        w.u(1, 1); // bit_equal_to_one
+        w.ue(1); // num_views_minus1
+        w.ue(0); // view_id[0]
+        w.u(1, 0); // depth_view_present_flag[0] = 0
+        w.u(1, 1); // texture_view_present_flag[0] = 1
+        w.ue(7); // view_id[1]
+        w.u(1, 0); // depth_view_present_flag[1] = 0 ⇒ ref loops skipped
+        w.u(1, 1); // texture_view_present_flag[1] = 1
+                   // (no anchor / non-anchor reference syntax)
+        w.ue(0); // num_level_values_signalled_minus1
+        w.u(8, 30); // level_idc[0]
+        w.ue(0); // num_applicable_ops_minus1[0]
+        w.u(3, 0); // applicable_op_temporal_id[0][0]
+        w.ue(0); // applicable_op_num_target_views_minus1[0][0]
+        w.ue(7); // applicable_op_target_view_id[0][0][0]
+        w.u(1, 0); // applicable_op_depth_flag[0][0][0] = 0
+        w.u(1, 1); // applicable_op_texture_flag[0][0][0] = 1
+        w.ue(0); // applicable_op_num_texture_views_minus1[0][0]
+        w.ue(0); // applicable_op_num_depth_views[0][0]
+        w.u(1, 0); // mvcd_vui_parameters_present_flag
+        w.u(1, 0); // texture_vui_parameters_present_flag
+        w.u(1, 0); // additional_extension2_flag
+        w.trailing();
+
+        let subset = SubsetSps::parse(&w.into_bytes()).expect("depthless MVCD subset SPS");
+        assert_eq!(subset.sps.profile_idc, 135);
+        let SubsetSpsExtension::Mvcd { extension, .. } = &subset.extension else {
+            panic!("expected Mvcd variant");
+        };
+        assert_eq!(extension.num_views(), 2);
+        assert_eq!(extension.num_depth_views(), 0);
+        // No depth view anywhere ⇒ every dependency entry stays empty.
+        assert_eq!(extension.view_dependencies[0], MvcViewDependency::default());
+        assert_eq!(extension.view_dependencies[1], MvcViewDependency::default());
+    }
+
+    /// §H.14.1 — the `mvcd_vui_parameters_extension()` tail parses, with a
+    /// timing-info-present operation point and no HRD blocks.
+    #[test]
+    fn mvcd_vui_parameters_extension_round_trip() {
+        let mut w = BitWriter::new();
+        write_sps_data(&mut w, 138, true);
+        w.u(1, 1); // bit_equal_to_one
+        write_two_view_mvcd_extension(&mut w);
+        w.u(1, 1); // mvcd_vui_parameters_present_flag
+                   // mvcd_vui_parameters_extension()
+        w.ue(0); // vui_mvcd_num_ops_minus1
+        w.u(3, 2); // vui_mvcd_temporal_id[0]
+        w.ue(0); // vui_mvcd_num_target_output_views_minus1[0]
+        w.ue(2); // vui_mvcd_view_id[0][0]
+        w.u(1, 1); // vui_mvcd_depth_flag[0][0]
+        w.u(1, 1); // vui_mvcd_texture_flag[0][0]
+        w.u(1, 1); // vui_mvcd_timing_info_present_flag[0]
+        w.u(32, 1001); // vui_mvcd_num_units_in_tick[0]
+        w.u(32, 60000); // vui_mvcd_time_scale[0]
+        w.u(1, 1); // vui_mvcd_fixed_frame_rate_flag[0]
+        w.u(1, 0); // vui_mvcd_nal_hrd_parameters_present_flag[0]
+        w.u(1, 0); // vui_mvcd_vcl_hrd_parameters_present_flag[0]
+                   // no low_delay_hrd_flag (both HRD flags 0)
+        w.u(1, 1); // vui_mvcd_pic_struct_present_flag[0]
+        w.u(1, 0); // texture_vui_parameters_present_flag
+        w.u(1, 0); // additional_extension2_flag
+        w.trailing();
+
+        let subset = SubsetSps::parse(&w.into_bytes()).expect("MVCD subset SPS with VUI");
+        let SubsetSpsExtension::Mvcd { vui, .. } = &subset.extension else {
+            panic!("expected Mvcd variant");
+        };
+        let vui = vui.as_ref().expect("mvcd_vui_parameters present");
+        assert_eq!(vui.ops.len(), 1);
+        let op = &vui.ops[0];
+        assert_eq!(op.temporal_id, 2);
+        assert_eq!(op.target_output_views.len(), 1);
+        assert_eq!(
+            op.target_output_views[0],
+            MvcdVuiTargetView {
+                view_id: 2,
+                depth_flag: true,
+                texture_flag: true,
+            }
+        );
+        let timing = op.timing_info.as_ref().expect("timing info present");
+        assert_eq!(timing.num_units_in_tick, 1001);
+        assert_eq!(timing.time_scale, 60000);
+        assert!(timing.fixed_frame_rate_flag);
+        assert!(op.nal_hrd_parameters.is_none());
+        assert!(op.vcl_hrd_parameters.is_none());
+        assert!(op.low_delay_hrd_flag.is_none());
+        assert!(op.pic_struct_present_flag);
+    }
+
+    /// §H.7.3.2.1.4 — a `texture_vui_parameters_present_flag == 1` tail
+    /// reuses the §G.14.1 `mvc_vui_parameters_extension()` parser.
+    #[test]
+    fn mvcd_texture_vui_uses_mvc_parser() {
+        let mut w = BitWriter::new();
+        write_sps_data(&mut w, 138, true);
+        w.u(1, 1); // bit_equal_to_one
+        write_two_view_mvcd_extension(&mut w);
+        w.u(1, 0); // mvcd_vui_parameters_present_flag
+        w.u(1, 1); // texture_vui_parameters_present_flag
+                   // mvc_vui_parameters_extension() — one op, no timing/HRD
+        w.ue(0); // vui_mvc_num_ops_minus1
+        w.u(3, 0); // vui_mvc_temporal_id[0]
+        w.ue(0); // vui_mvc_num_target_output_views_minus1[0]
+        w.ue(0); // vui_mvc_view_id[0][0]
+        w.u(1, 0); // vui_mvc_timing_info_present_flag[0]
+        w.u(1, 0); // vui_mvc_nal_hrd_parameters_present_flag[0]
+        w.u(1, 0); // vui_mvc_vcl_hrd_parameters_present_flag[0]
+        w.u(1, 0); // vui_mvc_pic_struct_present_flag[0]
+        w.u(1, 0); // additional_extension2_flag
+        w.trailing();
+
+        let subset = SubsetSps::parse(&w.into_bytes()).expect("MVCD subset SPS with texture VUI");
+        let SubsetSpsExtension::Mvcd {
+            vui, texture_vui, ..
+        } = &subset.extension
+        else {
+            panic!("expected Mvcd variant");
+        };
+        assert!(vui.is_none());
+        let texture_vui = texture_vui.as_ref().expect("texture VUI present");
+        assert_eq!(texture_vui.ops.len(), 1);
+        assert_eq!(texture_vui.ops[0].target_output_view_ids, vec![0]);
+    }
+
+    /// §H.7.4.2.1.4 (by reference to §G.7.4.2.1.4) — an out-of-range
+    /// `num_views_minus1` is rejected before any allocation.
+    #[test]
+    fn mvcd_num_views_out_of_range_rejected() {
+        let mut w = BitWriter::new();
+        write_sps_data(&mut w, 138, true);
+        w.u(1, 1); // bit_equal_to_one
+        w.ue(1024); // num_views_minus1 — VIOLATION (max 1023)
+        w.trailing();
+
+        let err = SubsetSps::parse(&w.into_bytes()).unwrap_err();
+        assert_eq!(err, SubsetSpsError::NumViewsOutOfRange(1024));
     }
 
     /// §G.7.3.2.1.4 / §G.7.4.2.1.4 — profile 134 MFC tail with
@@ -1631,25 +2315,22 @@ mod tests {
         );
     }
 
-    /// Annex H MVCD profiles (138/135) and the Annex H + I profile
-    /// (139): extension bodies not parsed yet.
+    /// §7.3.2.1.3 — the Annex H MVCD + Annex I 3D-AVC profile (139): the
+    /// trailing `seq_parameter_set_3davc_extension()` body is not parsed,
+    /// so the leading MVCD half is left unparsed too (the RBSP tail can't
+    /// be located). Profiles 138/135 are now fully parsed and covered by
+    /// `mvcd_two_views_full_round_trip` et al.
     #[test]
-    fn mvcd_profiles_not_parsed() {
-        for (profile, expected) in [
-            (138u8, SubsetSpsExtension::MvcdNotParsed),
-            (135, SubsetSpsExtension::MvcdNotParsed),
-            (139, SubsetSpsExtension::Mvcd3dNotParsed),
-        ] {
-            let mut w = BitWriter::new();
-            write_sps_data(&mut w, profile, true);
-            w.u(8, 0xAA);
-            w.trailing();
+    fn mvcd_3davc_profile_not_parsed() {
+        let mut w = BitWriter::new();
+        write_sps_data(&mut w, 139, true);
+        w.u(8, 0xAA);
+        w.trailing();
 
-            let subset = SubsetSps::parse(&w.into_bytes()).expect("MVCD subset SPS");
-            assert_eq!(subset.sps.profile_idc, profile);
-            assert_eq!(subset.extension, expected);
-            assert_eq!(subset.additional_extension2_flag, None);
-        }
+        let subset = SubsetSps::parse(&w.into_bytes()).expect("3D-AVC subset SPS");
+        assert_eq!(subset.sps.profile_idc, 139);
+        assert_eq!(subset.extension, SubsetSpsExtension::Mvcd3dNotParsed);
+        assert_eq!(subset.additional_extension2_flag, None);
     }
 
     /// §7.3.2.1.3 — a profile outside every extension branch reads
