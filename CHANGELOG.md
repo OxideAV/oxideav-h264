@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 339 — MBAFF (macroblock-adaptive frame/field) decode. Added the
+  exact §6.4.12.2 Table 6-4 neighbouring-location derivation
+  (`mb_address::mbaff_neigh_location`) covering all six spatial cells and
+  the full (currMbFrameFlag, mbIsTopMbFlag, mbAddrXFrameFlag, yN-parity)
+  dispatch, returning `(mbAddrN, xW, yW)` per eqs. 6-36/6-37. Wired the
+  §6.4.11.1 MB-level neighbour addresses (Table 6-2 (xN,yN) = (-1,0)/(0,-1))
+  into the CABAC `mb_skip_flag` + per-MB `NeighbourCtx` context modeling
+  and the §9.3.3.1.1.9 `coded_block_flag` external-MB lookup
+  (`CabacNeighbourGrid::neighbour_mb_addrs_mbaff` / `new_mbaff`).
+  Corrected the §7.3.5.1/.2 ref_idx-presence override to
+  `mbaff_frame_flag && mb_field_decoding_flag` (field_pic_flag == 0 in an
+  MBAFF frame) instead of unconditionally-true. Result: the libx264 Main
+  MBAFF `mbaff-interlaced` fixture now parses both slices without CABAC
+  desync (was: read-past-end at MB #21 of slice 0) and reconstructs both
+  frames through the §6.4.1 field/frame y-stride path. New
+  `corpus_mbaff_interlaced_parses` regression guard. 10 Table-6-4 unit
+  tests. Deferred: field/frame-mixed-pair §6.4.11.4 block-index
+  remapping, §8.7.2 MBAFF deblock cascade, PAFF (`field_pic_flag == 1`).
 - round 334 — §G.13.1.7 `view_dependency_change()` SEI message (payload
   type 42, Annex G / MVC). Parses `seq_parameter_set_id` (range-checked
   0..=31 per §G.13.2.7), `anchor_update_flag` / `non_anchor_update_flag`,

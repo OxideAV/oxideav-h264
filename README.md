@@ -12,8 +12,10 @@ H.264 | ISO/IEC 14496-10 specification (2024-08 edition) as the
 slices (4:2:0, 4:2:2 and 4:4:4 chroma) through full intra / inter
 prediction, transform, deblocking and DPB output ordering on both the
 CAVLC and CABAC entropy paths; the encoder emits CAVLC and CABAC
-streams across Baseline / Main / High profiles. Field / MBAFF coding,
-higher bit depths, and the Annex F/G/H/I scalable / multiview / 3D
+streams across Baseline / Main / High profiles. MBAFF
+(macroblock-adaptive frame/field) streams now parse without CABAC
+desync and reconstruct all-frame pairs; PAFF field pictures, higher
+bit depths, and the Annex F/G/H/I scalable / multiview / 3D
 extensions are in progress (see the coverage matrix below).
 
 No external decoder source is consulted while writing this
@@ -43,7 +45,7 @@ https://www.itu.int/rec/T-REC-H.264 (pick the 2024-08 edition).
 | VUI parameters (+ HRD) | §E.1 | integrated into SPS |
 | AUD + SEI framing + filler + end-of-seq/stream | §7.3.2.3..7 | parsed |
 | Slice header | §7.3.3 | parsed (incl. RPLM, pred_weight_table, dec_ref_pic_marking) |
-| Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2 + 4:4:4; I_PCM honours `BitDepth{Y,C}` from the SPS on both CAVLC and CABAC paths, incl. §9.3.1.2 post-PCM arithmetic-engine re-init; 4:4:4 P/B inter reconstruction now wired — MBAFF parse still deferred) |
+| Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2 + 4:4:4; I_PCM honours `BitDepth{Y,C}` from the SPS on both CAVLC and CABAC paths, incl. §9.3.1.2 post-PCM arithmetic-engine re-init; 4:4:4 P/B inter reconstruction now wired. MBAFF (`mb_adaptive_frame_field_flag == 1`, `field_pic_flag == 0`): the §7.3.4 MB-pair walker reads `mb_field_decoding_flag` per pair and decodes both MBs without CABAC desync — neighbour-MB addressing for §9.3.3.1.1.* context modeling routes through the exact §6.4.12.2 Table 6-4 process (`mb_address::mbaff_neigh_location`); all-frame MBAFF pairs reconstruct through the §6.4.1 field/frame y-stride path. The libx264 Main MBAFF `mbaff-interlaced` fixture decodes both frames end-to-end. Field/frame-mixed-pair block-index remapping + §8.7.2 MBAFF deblock cascade + PAFF (`field_pic_flag == 1`) still deferred) |
 | FMO MB address derivation | §8.2.2, §8.2.3 | implemented (all 7 slice_group_map_types + NextMbAddress) |
 | Top-level decoder driver | §7.4.1.2.1 | implemented (events: SPS/PPS stored, AUD, Slice, SEI, end markers, Ignored) |
 | I-slice reconstruction (Picture + MB grid + intra + deblock) | §8 / §6.4 | implemented (I_PCM, Intra_4x4, Intra_8x8, Intra_16x16, chroma; §8.3.4.5 4:4:4 I_NxN chroma reconstruction at ChromaArrayType==3 — Cb/Cr "coded like luma" per §7.3.5.3, reusing the per-block luma pred modes with neighbour samples at BitDepthC) |
