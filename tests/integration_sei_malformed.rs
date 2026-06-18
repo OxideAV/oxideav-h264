@@ -37,7 +37,7 @@
 //! contract.
 
 use oxideav_h264::non_vcl::parse_sei_rbsp;
-use oxideav_h264::sei::{parse_payload, SeiContext};
+use oxideav_h264::sei::{parse_payload, MvcViewRefCounts, SeiContext};
 
 /// Mirror of `parse_payload`'s dispatch arms — 50 implemented types
 /// (round 278 adds Annex H §H.13.2.5 depth_timing type 52, completing
@@ -55,8 +55,8 @@ use oxideav_h264::sei::{parse_payload, SeiContext};
 /// numbers).
 const KNOWN_PAYLOAD_TYPES: &[u32] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 39, 40,
-    41, 43, 44, 45, 46, 47, 50, 51, 52, 53, 54, 137, 142, 144, 147, 148, 149, 150, 151, 154, 155,
-    156, 181, 200, 201, 205,
+    41, 42, 43, 44, 45, 46, 47, 50, 51, 52, 53, 54, 137, 142, 144, 147, 148, 149, 150, 151, 154,
+    155, 156, 181, 200, 201, 205,
 ];
 
 const FALLBACK_PAYLOAD_TYPES: &[u32] = &[
@@ -130,6 +130,7 @@ fn contexts() -> Vec<(&'static str, SeiContext)> {
                 pic_size_in_map_units: 0,
                 frame_mbs_only_flag: true,
                 num_depth_views: 0,
+                mvc_view_ref_counts: Vec::new(),
             },
         ),
         (
@@ -147,6 +148,23 @@ fn contexts() -> Vec<(&'static str, SeiContext)> {
                 pic_size_in_map_units: 64,
                 frame_mbs_only_flag: false,
                 num_depth_views: 2,
+                // §G.13.1.7 — two views (num_views_minus1 = 2) so the
+                // view_dependency_change anchor / non-anchor update
+                // branches read flags instead of bailing out.
+                mvc_view_ref_counts: vec![
+                    MvcViewRefCounts {
+                        num_anchor_refs_l0: 1,
+                        num_anchor_refs_l1: 0,
+                        num_non_anchor_refs_l0: 1,
+                        num_non_anchor_refs_l1: 1,
+                    },
+                    MvcViewRefCounts {
+                        num_anchor_refs_l0: 2,
+                        num_anchor_refs_l1: 1,
+                        num_non_anchor_refs_l0: 0,
+                        num_non_anchor_refs_l1: 2,
+                    },
+                ],
             },
         ),
         (
@@ -164,6 +182,14 @@ fn contexts() -> Vec<(&'static str, SeiContext)> {
                 pic_size_in_map_units: 256,
                 frame_mbs_only_flag: false,
                 num_depth_views: 1024,
+                // §G.13.1.7 — one view at the §G.7.4.2.1.4 per-list
+                // maximum (Min(15, num_views_minus1)) ref count.
+                mvc_view_ref_counts: vec![MvcViewRefCounts {
+                    num_anchor_refs_l0: 15,
+                    num_anchor_refs_l1: 15,
+                    num_non_anchor_refs_l0: 15,
+                    num_non_anchor_refs_l1: 15,
+                }],
             },
         ),
     ]
@@ -188,15 +214,17 @@ fn sei_parse_payload_never_panics() {
         }
     }
 
-    // 52 known + 20 fallback = 72 payload types × 11 shapes × 4 ctxs
-    // = 3168 invocations. Lock the count so a future change that
+    // 53 known + 20 fallback = 73 payload types × 11 shapes × 4 ctxs
+    // = 3212 invocations. Lock the count so a future change that
     // accidentally drops a row from one of the tables makes the test
     // fail loudly instead of silently shrinking coverage. (Round 293
     // adds the Annex G §G.13.2.9 base_view_temporal_hrd type 44 — not
     // previously in either list — bumping the per-type total from
     // 70 to 71. Round 318 adds the Annex H §H.13.2.6
-    // alternative_depth_info type 181, bumping 71 to 72.)
-    assert_eq!(total, 3168, "sweep cardinality drifted");
+    // alternative_depth_info type 181, bumping 71 to 72. Round 334
+    // adds the Annex G §G.13.2.7 view_dependency_change type 42,
+    // bumping 72 to 73.)
+    assert_eq!(total, 3212, "sweep cardinality drifted");
 }
 
 /// Envelope-shape regression — every shape also goes through

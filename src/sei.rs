@@ -391,6 +391,14 @@ pub enum SeiError {
     AlternativeDepthInfoNumConstituentViewsOutOfRange(u32),
     #[error("alternative_depth_info {field} shall be in 0..=31 per Annex H §H.13.2.6 (got {got})")]
     AlternativeDepthInfoPrecOutOfRange { field: &'static str, got: u32 },
+    #[error(
+        "view_dependency_change with anchor_update_flag / non_anchor_update_flag set needs the per-view inter-view reference counts from the active MVC subset SPS (§G.7.3.2.1.4) to bound the anchor_ref / non_anchor_ref flag loops per Annex G §G.13.1.7, but SeiContext.mvc_view_ref_counts is empty (unknown)"
+    )]
+    ViewDependencyChangeRefCountsUnknown,
+    #[error(
+        "view_dependency_change seq_parameter_set_id shall be in 0..=31 per Annex G §G.13.2.7 (got {0})"
+    )]
+    ViewDependencyChangeSpsIdOutOfRange(u32),
 }
 
 /// §D.2.2 — buffering_period.
@@ -877,8 +885,36 @@ impl FilmGrainSeparateColourDescription {
 
 /// Inputs a SEI parser needs beyond the raw payload bytes. Many parsers
 /// depend on VUI fields (CpbDpbDelaysPresentFlag, pic_struct_present_flag,
+/// Per-view inter-view-reference counts taken from the active MVC
+/// subset SPS (§G.7.3.2.1.4 `seq_parameter_set_mvc_extension()`),
+/// needed by §G.13.1.7 `view_dependency_change()` to bound its
+/// per-view `anchor_ref_lX_flag[i][j]` / `non_anchor_ref_lX_flag[i][j]`
+/// loops.
+///
+/// One [`MvcViewRefCounts`] is recorded per view index `i` in the
+/// MVC dependency range `1..=num_views_minus1`; the base view (VOIdx
+/// 0) is excluded because §G.7.3.2.1.4 starts that loop at `i = 1`
+/// and the §G.13.1.7 loops do likewise. Therefore the populated
+/// vector length equals `num_views_minus1` (Eq.: index 0 of the
+/// vector = view `i = 1`).
+///
+/// Each count is the value of `num_anchor_refs_lX[i]` /
+/// `num_non_anchor_refs_lX[i]`, which §G.7.4.2.1.4 bounds to
+/// `Min( 15, num_views_minus1 )`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MvcViewRefCounts {
+    /// `num_anchor_refs_l0[i]` — bounded by `Min(15, num_views_minus1)`.
+    pub num_anchor_refs_l0: u8,
+    /// `num_anchor_refs_l1[i]` — bounded by `Min(15, num_views_minus1)`.
+    pub num_anchor_refs_l1: u8,
+    /// `num_non_anchor_refs_l0[i]` — bounded by `Min(15, num_views_minus1)`.
+    pub num_non_anchor_refs_l0: u8,
+    /// `num_non_anchor_refs_l1[i]` — bounded by `Min(15, num_views_minus1)`.
+    pub num_non_anchor_refs_l1: u8,
+}
+
 /// time_offset_length, etc.).
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct SeiContext {
     /// From VUI.nal_hrd: initial_cpb_removal_delay_length_minus1 and
     /// cpb_removal_delay_length_minus1, needed by buffering_period and
@@ -925,6 +961,19 @@ pub struct SeiContext {
     /// value is rejected with
     /// [`SeiError::DepthTimingNumDepthViewsUnknown`].
     pub num_depth_views: u32,
+    /// From the active MVC subset SPS — the per-view inter-view
+    /// reference counts (`num_anchor_refs_lX[i]` /
+    /// `num_non_anchor_refs_lX[i]`, §G.7.3.2.1.4) for view indices
+    /// `i ∈ 1..=num_views_minus1`. Needed by §G.13.1.7
+    /// `view_dependency_change` (payload type 42): the message carries
+    /// one `anchor_ref_lX_flag` / `non_anchor_ref_lX_flag` per
+    /// inter-view reference, and the loop bounds come from this
+    /// SPS-derived structure rather than the payload. Empty by default
+    /// (no MVC subset SPS active); a `view_dependency_change` message
+    /// that sets `anchor_update_flag` / `non_anchor_update_flag` with
+    /// an empty vector is rejected with
+    /// [`SeiError::ViewDependencyChangeRefCountsUnknown`].
+    pub mvc_view_ref_counts: Vec<MvcViewRefCounts>,
 }
 
 impl Default for SeiContext {
@@ -950,6 +999,10 @@ impl Default for SeiContext {
             // extension is wired in; the depth_timing per-view branch
             // is rejected under this value.
             num_depth_views: 0,
+            // §G.13.1.7 — empty until an Annex G MVC subset SPS is
+            // wired in; the view_dependency_change update branches are
+            // rejected when an update flag is set with no counts.
+            mvc_view_ref_counts: Vec::new(),
         }
     }
 }
@@ -4711,6 +4764,165 @@ pub fn parse_operation_point_not_present(
     })
 }
 
+/// One view's inter-view-reference update inside a §G.13.1.7
+/// `view_dependency_change()` SEI message (payload type 42, Annex G /
+/// MVC). One `ViewDependencyChangeView` is recorded per view index
+/// `i ∈ 1..=num_views_minus1` of the active MVC subset SPS, present
+/// only inside the block(s) gated by `anchor_update_flag` /
+/// `non_anchor_update_flag`.
+///
+/// Each flag, per §G.13.2.7, signals whether the corresponding
+/// `anchor_ref_lX[i][j]` / `non_anchor_ref_lX[i][j]` inter-view
+/// reference (declared in the MVC subset SPS) shall NOT be used for
+/// inter-view reference by the coded view component with `VOIdx == i`
+/// from the access unit this SEI message is associated with onward.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ViewDependencyChangeView {
+    /// `anchor_ref_l0_flag[i][j]` — one bit per `num_anchor_refs_l0[i]`
+    /// inter-view reference. Empty when `anchor_update_flag == 0`.
+    pub anchor_ref_l0_flags: Vec<bool>,
+    /// `anchor_ref_l1_flag[i][j]` — one bit per `num_anchor_refs_l1[i]`.
+    pub anchor_ref_l1_flags: Vec<bool>,
+    /// `non_anchor_ref_l0_flag[i][j]` — one bit per
+    /// `num_non_anchor_refs_l0[i]`. Empty when `non_anchor_update_flag == 0`.
+    pub non_anchor_ref_l0_flags: Vec<bool>,
+    /// `non_anchor_ref_l1_flag[i][j]` — one bit per
+    /// `num_non_anchor_refs_l1[i]`.
+    pub non_anchor_ref_l1_flags: Vec<bool>,
+}
+
+/// §G.13.2.7 — `view_dependency_change()` (payload type 42, Annex G /
+/// MVC) parsed payload.
+///
+/// The message updates the inter-view dependency declared in the MVC
+/// subset SPS referenced by `seq_parameter_set_id`: the per-view
+/// `*_ref_lX_flag` arrays mark which of the SPS-declared inter-view
+/// references shall not be used from this access unit onward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewDependencyChange {
+    /// `seq_parameter_set_id` — identifies the MVC subset SPS whose
+    /// inter-view dependency lists this message updates. Range
+    /// `0..=31` per §G.13.2.7.
+    pub seq_parameter_set_id: u32,
+    /// `anchor_update_flag` — when set, the per-view
+    /// `anchor_ref_lX_flag` arrays are present.
+    pub anchor_update_flag: bool,
+    /// `non_anchor_update_flag` — when set, the per-view
+    /// `non_anchor_ref_lX_flag` arrays are present.
+    pub non_anchor_update_flag: bool,
+    /// One [`ViewDependencyChangeView`] per view index
+    /// `i ∈ 1..=num_views_minus1` (vector index 0 ↔ view `i = 1`),
+    /// mirroring the §G.7.3.2.1.4 dependency loop ordering. Empty when
+    /// both update flags are 0.
+    pub views: Vec<ViewDependencyChangeView>,
+}
+
+/// Parse a §G.13.1.7 `view_dependency_change()` payload (payload type
+/// 42, Annex G / MVC).
+///
+/// Syntax (§G.13.1.7):
+/// ```text
+/// view_dependency_change( payloadSize ) {
+///   seq_parameter_set_id                              ue(v)
+///   anchor_update_flag                                u(1)
+///   non_anchor_update_flag                            u(1)
+///   if( anchor_update_flag )
+///     for( i = 1; i <= num_views_minus1; i++ ) {
+///       for( j = 0; j < num_anchor_refs_l0[ i ]; j++ )
+///         anchor_ref_l0_flag[ i ][ j ]                u(1)
+///       for( j = 0; j < num_anchor_refs_l1[ i ]; j++ )
+///         anchor_ref_l1_flag[ i ][ j ]                u(1)
+///     }
+///   if( non_anchor_update_flag )
+///     for( i = 1; i <= num_views_minus1; i++ ) {
+///       for( j = 0; j < num_non_anchor_refs_l0[ i ]; j++ )
+///         non_anchor_ref_l0_flag[ i ][ j ]            u(1)
+///       for( j = 0; j < num_non_anchor_refs_l1[ i ]; j++ )
+///         non_anchor_ref_l1_flag[ i ][ j ]            u(1)
+///     }
+/// }
+/// ```
+///
+/// The inner loop bounds (`num_views_minus1`,
+/// `num_anchor_refs_lX[i]`, `num_non_anchor_refs_lX[i]`) are NOT in
+/// the payload — §G.13.2.7 takes them from the MVC subset SPS
+/// referenced by `seq_parameter_set_id`. Those counts are supplied by
+/// the caller through [`SeiContext::mvc_view_ref_counts`]; when an
+/// update flag is set but the context vector is empty (no MVC subset
+/// SPS wired in) the message is rejected with
+/// [`SeiError::ViewDependencyChangeRefCountsUnknown`], mirroring the
+/// §H.13.1.5 depth_timing / §D.1.10 spare_pic context-gating
+/// precedent. `seq_parameter_set_id` is range-checked to `0..=31`
+/// per §G.13.2.7.
+pub fn parse_view_dependency_change(
+    payload: &[u8],
+    ctx: &SeiContext,
+) -> Result<ViewDependencyChange, SeiError> {
+    let mut r = BitReader::new(payload);
+
+    // §G.13.1.7 — seq_parameter_set_id ue(v); §G.13.2.7 bounds 0..=31.
+    let seq_parameter_set_id = r.ue()?;
+    if seq_parameter_set_id > 31 {
+        return Err(SeiError::ViewDependencyChangeSpsIdOutOfRange(
+            seq_parameter_set_id,
+        ));
+    }
+
+    // §G.13.1.7 — anchor_update_flag / non_anchor_update_flag u(1).
+    let anchor_update_flag = r.u(1)? == 1;
+    let non_anchor_update_flag = r.u(1)? == 1;
+
+    // The per-view loops run only if at least one update flag is set;
+    // their bounds come from the active MVC subset SPS. If neither
+    // flag is set there is nothing to read and the context counts are
+    // not required.
+    let views = if anchor_update_flag || non_anchor_update_flag {
+        if ctx.mvc_view_ref_counts.is_empty() {
+            return Err(SeiError::ViewDependencyChangeRefCountsUnknown);
+        }
+        let mut views = Vec::with_capacity(ctx.mvc_view_ref_counts.len());
+        // §G.13.1.7 — for( i = 1; i <= num_views_minus1; i++ ). The
+        // context vector is already indexed view-1-first (length =
+        // num_views_minus1), so a plain walk reproduces the loop.
+        for counts in &ctx.mvc_view_ref_counts {
+            let mut view = ViewDependencyChangeView::default();
+            if anchor_update_flag {
+                for _ in 0..counts.num_anchor_refs_l0 {
+                    view.anchor_ref_l0_flags.push(r.u(1)? == 1);
+                }
+                for _ in 0..counts.num_anchor_refs_l1 {
+                    view.anchor_ref_l1_flags.push(r.u(1)? == 1);
+                }
+            }
+            views.push(view);
+        }
+        // §G.13.1.7 — the non_anchor block is a SEPARATE per-view loop
+        // that follows the entire anchor block, not interleaved with
+        // it. Walk the views again to append the non-anchor flags.
+        if non_anchor_update_flag {
+            for (idx, counts) in ctx.mvc_view_ref_counts.iter().enumerate() {
+                let view = &mut views[idx];
+                for _ in 0..counts.num_non_anchor_refs_l0 {
+                    view.non_anchor_ref_l0_flags.push(r.u(1)? == 1);
+                }
+                for _ in 0..counts.num_non_anchor_refs_l1 {
+                    view.non_anchor_ref_l1_flags.push(r.u(1)? == 1);
+                }
+            }
+        }
+        views
+    } else {
+        Vec::new()
+    };
+
+    Ok(ViewDependencyChange {
+        seq_parameter_set_id,
+        anchor_update_flag,
+        non_anchor_update_flag,
+        views,
+    })
+}
+
 /// One temporal sub-bitstream's HRD entry inside a §G.13.1.9
 /// `base_view_temporal_hrd()` SEI message (payload type 44, Annex G /
 /// MVC). One `BaseViewTemporalHrdLayer` is recorded per temporal
@@ -7067,6 +7279,8 @@ pub enum SeiPayload {
     MultiviewAcquisitionInfo(MultiviewAcquisitionInfo),
     /// §G.13.2.6 — non_required_view_component (payload type 41, Annex G). Round 207.
     NonRequiredViewComponent(NonRequiredViewComponent),
+    /// §G.13.2.7 — view_dependency_change (payload type 42, Annex G / MVC). Round 334.
+    ViewDependencyChange(ViewDependencyChange),
     /// §G.13.2.8 — operation_point_not_present (payload type 43, Annex G). Round 200.
     OperationPointNotPresent(OperationPointNotPresent),
     /// §G.13.2.9 — base_view_temporal_hrd (payload type 44, Annex G / MVC). Round 293.
@@ -7176,6 +7390,9 @@ pub fn parse_payload(
         )),
         41 => Ok(SeiPayload::NonRequiredViewComponent(
             parse_non_required_view_component(payload)?,
+        )),
+        42 => Ok(SeiPayload::ViewDependencyChange(
+            parse_view_dependency_change(payload, ctx)?,
         )),
         43 => Ok(SeiPayload::OperationPointNotPresent(
             parse_operation_point_not_present(payload)?,
@@ -8565,6 +8782,172 @@ mod tests {
                 assert_eq!(o.operation_point_not_present_ids, vec![10u16, 200u16]);
             }
             other => panic!("expected OperationPointNotPresent, got {:?}", other),
+        }
+    }
+
+    // §G.13.1.7 / §G.13.2.7 — view_dependency_change (payload 42).
+
+    /// A SeiContext carrying a small MVC inter-view dependency: two
+    /// views (num_views_minus1 = 2), so the §G.13.1.7 update branches
+    /// have something to walk.
+    fn vdc_ctx_two_views() -> SeiContext {
+        SeiContext {
+            mvc_view_ref_counts: vec![
+                MvcViewRefCounts {
+                    num_anchor_refs_l0: 1,
+                    num_anchor_refs_l1: 0,
+                    num_non_anchor_refs_l0: 2,
+                    num_non_anchor_refs_l1: 1,
+                },
+                MvcViewRefCounts {
+                    num_anchor_refs_l0: 2,
+                    num_anchor_refs_l1: 1,
+                    num_non_anchor_refs_l0: 0,
+                    num_non_anchor_refs_l1: 1,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn view_dependency_change_no_updates_reads_no_flags() {
+        // seq_parameter_set_id = 0 → ue "1".
+        // anchor_update_flag = 0, non_anchor_update_flag = 0.
+        // The per-view loops are skipped entirely, so an empty context
+        // is fine (the rejection only triggers when an update flag is
+        // set).
+        let payload = pack_bits(&[(1, 1), (0, 1), (0, 1)]);
+        let got = parse_view_dependency_change(&payload, &SeiContext::default()).unwrap();
+        assert_eq!(got.seq_parameter_set_id, 0);
+        assert!(!got.anchor_update_flag);
+        assert!(!got.non_anchor_update_flag);
+        assert!(got.views.is_empty());
+    }
+
+    #[test]
+    fn view_dependency_change_anchor_only() {
+        // seq_parameter_set_id = 1 → ue "010" (3 bits).
+        // anchor_update_flag = 1, non_anchor_update_flag = 0.
+        // Anchor block over two views:
+        //   view i=1: num_anchor_refs_l0=1 → 1 flag; l1=0 → none.
+        //   view i=2: num_anchor_refs_l0=2 → 2 flags; l1=1 → 1 flag.
+        // Flags in order: [1] [0,1] [1] → 4 bits.
+        let payload = pack_bits(&[
+            (0b010, 3), // sps id = 1
+            (1, 1),     // anchor_update_flag
+            (0, 1),     // non_anchor_update_flag
+            (1, 1),     // view1 anchor_l0[0]
+            (0, 1),     // view2 anchor_l0[0]
+            (1, 1),     // view2 anchor_l0[1]
+            (1, 1),     // view2 anchor_l1[0]
+        ]);
+        let got = parse_view_dependency_change(&payload, &vdc_ctx_two_views()).unwrap();
+        assert_eq!(got.seq_parameter_set_id, 1);
+        assert!(got.anchor_update_flag);
+        assert!(!got.non_anchor_update_flag);
+        assert_eq!(got.views.len(), 2);
+        assert_eq!(got.views[0].anchor_ref_l0_flags, vec![true]);
+        assert!(got.views[0].anchor_ref_l1_flags.is_empty());
+        assert_eq!(got.views[1].anchor_ref_l0_flags, vec![false, true]);
+        assert_eq!(got.views[1].anchor_ref_l1_flags, vec![true]);
+        // Non-anchor flags absent because non_anchor_update_flag == 0.
+        assert!(got.views[0].non_anchor_ref_l0_flags.is_empty());
+        assert!(got.views[1].non_anchor_ref_l1_flags.is_empty());
+    }
+
+    #[test]
+    fn view_dependency_change_both_updates_separate_loops() {
+        // anchor_update_flag = 1, non_anchor_update_flag = 1.
+        // Per §G.13.1.7 the non-anchor block is a SECOND full per-view
+        // loop that follows the entire anchor block — NOT interleaved.
+        // Anchor flags (4): view1 l0[0]; view2 l0[0],l0[1],l1[0].
+        // Non-anchor flags: view1 l0=2 (2), l1=1 (1); view2 l0=0,
+        //   l1=1 (1) → 4 flags.
+        let payload = pack_bits(&[
+            (1, 1), // sps id = 0
+            (1, 1), // anchor_update_flag
+            (1, 1), // non_anchor_update_flag
+            // anchor block
+            (1, 1), // v1 anchor_l0[0]
+            (0, 1), // v2 anchor_l0[0]
+            (1, 1), // v2 anchor_l0[1]
+            (0, 1), // v2 anchor_l1[0]
+            // non-anchor block (separate loop)
+            (1, 1), // v1 non_anchor_l0[0]
+            (0, 1), // v1 non_anchor_l0[1]
+            (1, 1), // v1 non_anchor_l1[0]
+            (0, 1), // v2 non_anchor_l1[0]
+        ]);
+        let got = parse_view_dependency_change(&payload, &vdc_ctx_two_views()).unwrap();
+        assert!(got.anchor_update_flag);
+        assert!(got.non_anchor_update_flag);
+        // Anchor side.
+        assert_eq!(got.views[0].anchor_ref_l0_flags, vec![true]);
+        assert_eq!(got.views[1].anchor_ref_l0_flags, vec![false, true]);
+        assert_eq!(got.views[1].anchor_ref_l1_flags, vec![false]);
+        // Non-anchor side.
+        assert_eq!(got.views[0].non_anchor_ref_l0_flags, vec![true, false]);
+        assert_eq!(got.views[0].non_anchor_ref_l1_flags, vec![true]);
+        assert!(got.views[1].non_anchor_ref_l0_flags.is_empty());
+        assert_eq!(got.views[1].non_anchor_ref_l1_flags, vec![false]);
+    }
+
+    #[test]
+    fn view_dependency_change_update_without_context_rejected() {
+        // anchor_update_flag = 1 but no MVC counts available → the
+        // loop bounds are unknown, so the message is rejected rather
+        // than silently reading zero flags.
+        let payload = pack_bits(&[(1, 1), (1, 1), (0, 1)]);
+        let err = parse_view_dependency_change(&payload, &SeiContext::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::ViewDependencyChangeRefCountsUnknown
+        ));
+    }
+
+    #[test]
+    fn view_dependency_change_rejects_sps_id_above_31() {
+        // seq_parameter_set_id = 32 → ue codeNum+1 = 33 = 2^5 + 1 →
+        // 5 leading zeros + 1 + 5-bit suffix 0b00001 = 11 bits.
+        let mut bits: Vec<(u64, u32)> = Vec::new();
+        for _ in 0..5 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        for _ in 0..4 {
+            bits.push((0, 1));
+        }
+        bits.push((1, 1));
+        let payload = pack_bits(&bits);
+        let err = parse_view_dependency_change(&payload, &SeiContext::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            SeiError::ViewDependencyChangeSpsIdOutOfRange(32)
+        ));
+    }
+
+    #[test]
+    fn parse_payload_dispatches_view_dependency_change() {
+        let ctx = vdc_ctx_two_views();
+        // Reuse the anchor-only shape from above through the dispatcher.
+        let payload = pack_bits(&[
+            (0b010, 3), // sps id = 1
+            (1, 1),     // anchor_update_flag
+            (0, 1),     // non_anchor_update_flag
+            (1, 1),     // view1 anchor_l0[0]
+            (0, 1),     // view2 anchor_l0[0]
+            (1, 1),     // view2 anchor_l0[1]
+            (1, 1),     // view2 anchor_l1[0]
+        ]);
+        let got = parse_payload(42, &payload, &ctx).unwrap();
+        match got {
+            SeiPayload::ViewDependencyChange(v) => {
+                assert_eq!(v.seq_parameter_set_id, 1);
+                assert_eq!(v.views.len(), 2);
+                assert_eq!(v.views[1].anchor_ref_l0_flags, vec![false, true]);
+            }
+            other => panic!("expected ViewDependencyChange, got {:?}", other),
         }
     }
 

@@ -31,7 +31,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_h264::non_vcl::parse_sei_rbsp;
-use oxideav_h264::sei::{parse_payload, SeiContext};
+use oxideav_h264::sei::{parse_payload, MvcViewRefCounts, SeiContext};
 
 /// Fixed dispatch pool. Mirrors the `match` arms in
 /// `oxideav_h264::sei::parse_payload`. The trailing entries fall through
@@ -87,6 +87,23 @@ fn context_from_byte(b: u8) -> SeiContext {
         // unknown-rejection (0) and the per-view loop (1..). The Annex H
         // ceiling is 1024; small values keep the per-view Vec bounded.
         num_depth_views: ((b as u32) >> 5) & 0x07,
+        // mvc_view_ref_counts: 0..=3 views, each with per-list ref
+        // counts in 0..=3 derived from the input byte. Empty (b low
+        // bits 0) reaches the §G.13.1.7 view_dependency_change
+        // unknown-rejection; non-empty exercises the per-view flag
+        // loops. Counts stay small so the per-view flag Vecs stay
+        // bounded under fuzzing.
+        mvc_view_ref_counts: (0..((b as usize) & 0x03))
+            .map(|i| {
+                let n = ((b >> (i % 6)) & 0x03) as u8;
+                MvcViewRefCounts {
+                    num_anchor_refs_l0: n,
+                    num_anchor_refs_l1: (b >> 1) & 0x03,
+                    num_non_anchor_refs_l0: (b >> 2) & 0x03,
+                    num_non_anchor_refs_l1: (b >> 3) & 0x03,
+                }
+            })
+            .collect(),
     }
 }
 

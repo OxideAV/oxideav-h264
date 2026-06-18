@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 334 — §G.13.1.7 `view_dependency_change()` SEI message (payload
+  type 42, Annex G / MVC). Parses `seq_parameter_set_id` (range-checked
+  0..=31 per §G.13.2.7), `anchor_update_flag` / `non_anchor_update_flag`,
+  and — when an update flag is set — the per-view
+  `anchor_ref_lX_flag[i][j]` / `non_anchor_ref_lX_flag[i][j]` arrays for
+  view indices `i ∈ 1..=num_views_minus1`. The §G.13.1.7 inner-loop
+  bounds (`num_views_minus1`, `num_anchor_refs_lX[i]`,
+  `num_non_anchor_refs_lX[i]`) are not in the payload — §G.13.2.7 takes
+  them from the active MVC subset SPS (§G.7.3.2.1.4), so they are supplied
+  through the new `SeiContext::mvc_view_ref_counts` field (a
+  `Vec<MvcViewRefCounts>` indexed view-1-first). The anchor and
+  non-anchor blocks are decoded as two SEPARATE per-view loops per the
+  spec (not interleaved). When an update flag is set but the context
+  carries no MVC counts the message is rejected with
+  `SeiError::ViewDependencyChangeRefCountsUnknown`, mirroring the
+  §H.13.1.5 depth_timing / §D.1.10 spare_pic context-gating precedent.
+  Six unit tests (no-update, anchor-only, both-updates separate-loop
+  ordering, unknown-context rejection, sps-id range rejection, dispatch)
+  plus the malformed-input sweep (type 42 added; cardinality 3168 →
+  3212) and the `sei_payload` cargo-fuzz context generator. `SeiContext`
+  drops its `Copy` derive (now `Clone` only) to carry the new
+  variable-length field. Brings the SEI dispatch to 53 explicit payload
+  types.
 - round 330 — §H.7.3.2.1.4 `seq_parameter_set_mvcd_extension()` for the
   Annex H MVCD profiles 138 (Multiview Depth High) / 135 (Multiview Depth
   Stereo). The subset-SPS dispatch previously surfaced these as a typed
