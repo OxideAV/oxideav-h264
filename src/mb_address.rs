@@ -554,6 +554,278 @@ pub fn mbaff_pair_neighbour_addrs(curr_mb_addr: u32, pic_width_in_mbs: u32) -> [
     [a, b, c, d]
 }
 
+/// §6.4.12.2 Table 6-4 — exact neighbouring-location derivation for
+/// MBAFF frames.
+///
+/// Given a luma location `(xN, yN)` relative to the upper-left corner of
+/// the **current** macroblock (`xN`/`yN` may be negative or ≥ `max_w` /
+/// `max_h`), this returns the address `mbAddrN` of the macroblock that
+/// contains the neighbouring location together with the location
+/// `(xW, yW)` relative to that macroblock's upper-left corner (eqs.
+/// 6-36 / 6-37), or `None` when the neighbour is unavailable.
+///
+/// Inputs:
+/// * `xn`, `yn`: the neighbour offset (signed).
+/// * `max_w`, `max_h`: macroblock dimensions in the queried plane
+///   (16/16 for luma, `MbWidthC`/`MbHeightC` for chroma).
+/// * `curr_mb_frame_flag`: §6.4.12.2 `currMbFrameFlag` — `true` when the
+///   current MB is frame-coded.
+/// * `mb_is_top`: §6.4.12.2 `mbIsTopMbFlag` — `true` when
+///   `CurrMbAddr % 2 == 0`.
+/// * `curr_mb_addr`: the current MB address (used directly for the
+///   "current macroblock" rows of Table 6-4).
+/// * `pair`: `[mbAddrA, mbAddrB, mbAddrC, mbAddrD]` from
+///   [`mbaff_pair_neighbour_addrs`] — the **top** MB of each neighbouring
+///   pair, or `None` when that pair is outside the picture.
+/// * `frame_flag_of`: a closure returning the `mbAddrXFrameFlag` of a
+///   given (available) macroblock address — `true` for frame-coded.
+///
+/// The function implements Table 6-4 verbatim. It is the shared backbone
+/// for §6.4.11.1 (neighbouring macroblocks), §6.4.11.4 (4x4 luma blocks),
+/// §6.4.11.5 (4x4 chroma blocks) etc., each of which supplies its own
+/// `(xN, yN)` per Table 6-2 and the inverse block-scan.
+#[allow(clippy::too_many_arguments)]
+pub fn mbaff_neigh_location(
+    xn: i32,
+    yn: i32,
+    max_w: i32,
+    max_h: i32,
+    curr_mb_frame_flag: bool,
+    mb_is_top: bool,
+    curr_mb_addr: u32,
+    pair: [Option<u32>; 4],
+    frame_flag_of: impl Fn(u32) -> bool,
+) -> Option<(u32, i32, i32)> {
+    let [mb_a, mb_b, mb_c, mb_d] = pair;
+
+    // Step 1: pick mbAddrX (the pair-level neighbour) from the 3x3
+    // spatial region of (xN, yN). Table 6-4 column 3.
+    //   xN < 0          → left column (A or D)
+    //   0..maxW-1       → centre column (Curr or B)
+    //   > maxW-1        → right column (C)
+    //   yN < 0          → top row (B/C/D)
+    //   0..maxH-1       → centre row (A/Curr)
+    //   > maxH-1        → bottom row (always unavailable)
+    if yn > max_h - 1 {
+        return None;
+    }
+    // Determine the spatial cell.
+    // We branch exactly as the rows of Table 6-4 are grouped.
+    // `mb_x` is the chosen mbAddrX (top MB of the relevant pair, or the
+    // current MB address for the centre-centre cell).
+    enum Cell {
+        // (xN<0, yN<0): A/D region — uses mbAddrA, mbAddrD.
+        TopLeft,
+        // (xN in 0..maxW-1, yN<0): B region.
+        TopCentre,
+        // (xN>maxW-1, yN<0): C region.
+        TopRight,
+        // (xN<0, yN in 0..maxH-1): A region.
+        MidLeft,
+        // (xN in 0..maxW-1, yN in 0..maxH-1): current MB.
+        MidCentre,
+        // (xN>maxW-1, yN in 0..maxH-1): unavailable.
+        MidRight,
+    }
+    let cell = if yn < 0 {
+        if xn < 0 {
+            Cell::TopLeft
+        } else if xn > max_w - 1 {
+            Cell::TopRight
+        } else {
+            Cell::TopCentre
+        }
+    } else if xn < 0 {
+        Cell::MidLeft
+    } else if xn > max_w - 1 {
+        Cell::MidRight
+    } else {
+        Cell::MidCentre
+    };
+
+    // Resolve (mbAddrN, yM) per Table 6-4. The table is grouped by
+    // (cell, currMbFrameFlag, mbIsTopMbFlag, mbAddrXFrameFlag,
+    // additional yN condition). `mb_addr_n`/`y_m` are computed; `None`
+    // means unavailable.
+    let frame = curr_mb_frame_flag;
+    let top = mb_is_top;
+
+    let (mb_addr_n, y_m): (Option<u32>, i32) = match cell {
+        Cell::MidCentre => {
+            // (xN,yN) inside current MB → mbAddrN = CurrMbAddr, yM = yN.
+            (Some(curr_mb_addr), yn)
+        }
+        Cell::MidRight => (None, 0),
+        Cell::TopLeft => {
+            // xN<0, yN<0 — neighbour is the above-left pair (D) for the
+            // top-row part, but Table 6-4 selects A or D depending on
+            // currMbFrameFlag/mbIsTopMbFlag.
+            if frame {
+                if top {
+                    // mbAddrX = mbAddrD; mbAddrN = mbAddrD + 1; yM = yN.
+                    match mb_d {
+                        Some(d) => (Some(d + 1), yn),
+                        None => (None, 0),
+                    }
+                } else {
+                    // mbAddrX = mbAddrA.
+                    match mb_a {
+                        Some(a) => {
+                            if frame_flag_of(a) {
+                                (Some(a), yn)
+                            } else {
+                                (Some(a + 1), (yn + max_h) >> 1)
+                            }
+                        }
+                        None => (None, 0),
+                    }
+                }
+            } else {
+                // currMbFrameFlag == 0.
+                if top {
+                    // mbAddrX = mbAddrD.
+                    match mb_d {
+                        Some(d) => {
+                            if frame_flag_of(d) {
+                                (Some(d + 1), 2 * yn)
+                            } else {
+                                (Some(d), yn)
+                            }
+                        }
+                        None => (None, 0),
+                    }
+                } else {
+                    // mbAddrX = mbAddrD; mbAddrN = mbAddrD + 1; yM = yN.
+                    match mb_d {
+                        Some(d) => (Some(d + 1), yn),
+                        None => (None, 0),
+                    }
+                }
+            }
+        }
+        Cell::MidLeft => {
+            // xN<0, yN in 0..maxH-1 — neighbour is the left pair (A).
+            match mb_a {
+                None => (None, 0),
+                Some(a) => {
+                    let a_frame = frame_flag_of(a);
+                    if frame {
+                        if top {
+                            if a_frame {
+                                (Some(a), yn)
+                            } else if yn % 2 == 0 {
+                                (Some(a), yn >> 1)
+                            } else {
+                                (Some(a + 1), yn >> 1)
+                            }
+                        } else {
+                            // current bottom MB of frame pair.
+                            if a_frame {
+                                (Some(a + 1), yn)
+                            } else if yn % 2 == 0 {
+                                (Some(a), (yn + max_h) >> 1)
+                            } else {
+                                (Some(a + 1), (yn + max_h) >> 1)
+                            }
+                        }
+                    } else {
+                        // currMbFrameFlag == 0.
+                        if top {
+                            if a_frame {
+                                if yn < max_h / 2 {
+                                    (Some(a), yn << 1)
+                                } else {
+                                    (Some(a + 1), (yn << 1) - max_h)
+                                }
+                            } else {
+                                (Some(a), yn)
+                            }
+                        } else {
+                            // current bottom field MB.
+                            if a_frame {
+                                if yn < max_h / 2 {
+                                    (Some(a), (yn << 1) + 1)
+                                } else {
+                                    (Some(a + 1), (yn << 1) + 1 - max_h)
+                                }
+                            } else {
+                                (Some(a + 1), yn)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Cell::TopCentre => {
+            // xN in 0..maxW-1, yN<0 — neighbour is the above pair (B) or,
+            // for the frame/bottom case, the current pair's top MB.
+            if frame {
+                if top {
+                    // mbAddrX = mbAddrB; mbAddrN = mbAddrB + 1; yM = yN.
+                    match mb_b {
+                        Some(b) => (Some(b + 1), yn),
+                        None => (None, 0),
+                    }
+                } else {
+                    // mbAddrX = CurrMbAddr; mbAddrN = CurrMbAddr - 1; yM = yN.
+                    (Some(curr_mb_addr - 1), yn)
+                }
+            } else {
+                // currMbFrameFlag == 0; mbAddrX = mbAddrB.
+                match mb_b {
+                    Some(b) => {
+                        if frame_flag_of(b) {
+                            (Some(b + 1), 2 * yn)
+                        } else {
+                            (Some(b), yn)
+                        }
+                    }
+                    None => (None, 0),
+                }
+            }
+        }
+        Cell::TopRight => {
+            // xN>maxW-1, yN<0 — neighbour is the above-right pair (C).
+            if frame {
+                if top {
+                    match mb_c {
+                        Some(c) => (Some(c + 1), yn),
+                        None => (None, 0),
+                    }
+                } else {
+                    // currMbFrameFlag==1, bottom → not available.
+                    (None, 0)
+                }
+            } else {
+                match mb_c {
+                    Some(c) => {
+                        if frame_flag_of(c) {
+                            (Some(c + 1), 2 * yn)
+                        } else {
+                            (Some(c), yn)
+                        }
+                    }
+                    None => (None, 0),
+                }
+            }
+        }
+    };
+
+    let mb_addr_n = mb_addr_n?;
+    // §6.4.8 — a macroblock with address > CurrMbAddr is not yet decoded
+    // and so is not available. (mbAddrN + 1 forms can transiently exceed
+    // CurrMbAddr for the current pair's own bottom MB; those are handled
+    // by the explicit CurrMbAddr rows above and never reach here as a
+    // forward reference.)
+    if mb_addr_n > curr_mb_addr {
+        return None;
+    }
+    // eqs. (6-36)/(6-37): xW = (xN + maxW) % maxW, yW = (yM + maxH) % maxH.
+    let xw = (xn + max_w).rem_euclid(max_w);
+    let yw = (y_m + max_h).rem_euclid(max_h);
+    Some((mb_addr_n, xw, yw))
+}
+
 /// §6.4.11.1 (MBAFF case) — best-effort neighbour MB address derivation
 /// for the current MB in an MBAFF frame picture. Consumers use this
 /// for intra-pred neighbour lookup (§8.3.1.1 / §8.3.2.1).
@@ -1247,5 +1519,91 @@ mod tests {
         let flags = vec![false; 16];
         let n = mbaff_neighbour_addrs(8, 4, &flags);
         assert_eq!(n, [None, Some(1), Some(3), None]);
+    }
+
+    // --- §6.4.12.2 Table 6-4 `mbaff_neigh_location` ---
+
+    // Helper: all-frame picture, 4 MBs wide. frame_flag_of returns true.
+    fn loc_all_frame(xn: i32, yn: i32, curr_mb_addr: u32) -> Option<(u32, i32, i32)> {
+        let pair = mbaff_pair_neighbour_addrs(curr_mb_addr, 4);
+        let mb_is_top = curr_mb_addr % 2 == 0;
+        mbaff_neigh_location(xn, yn, 16, 16, true, mb_is_top, curr_mb_addr, pair, |_| {
+            true
+        })
+    }
+
+    #[test]
+    fn loc_frame_top_left_neighbour_is_left_pair_top() {
+        // Interior top MB, addr 10 (pair 5, col 1). Left neighbour A at
+        // (xN=-1, yN=0): mbAddrA top = 8, frame-coded → mbAddrN = 8,
+        // (xW=15, yW=0).
+        assert_eq!(loc_all_frame(-1, 0, 10), Some((8, 15, 0)));
+    }
+
+    #[test]
+    fn loc_frame_top_above_neighbour_is_above_pair_bottom() {
+        // addr 10 top MB. Above neighbour B at (xN=0, yN=-1): frame+top
+        // → mbAddrB + 1. mbAddrB top = 2 (pair above col 1), so +1 = 3
+        // (the bottom MB of the above pair). yW = (−1 + 16)%16 = 15.
+        assert_eq!(loc_all_frame(0, -1, 10), Some((3, 0, 15)));
+    }
+
+    #[test]
+    fn loc_frame_bottom_left_neighbour_is_left_pair_bottom() {
+        // addr 11 bottom MB. Left A at (xN=-1, yN=0): bottom + a_frame →
+        // mbAddrA + 1 = 9. yW = 0, xW = 15.
+        assert_eq!(loc_all_frame(-1, 0, 11), Some((9, 15, 0)));
+    }
+
+    #[test]
+    fn loc_frame_bottom_above_neighbour_is_own_pair_top() {
+        // addr 11 bottom MB. Above B at (xN=0, yN=-1): frame, not top →
+        // CurrMbAddr - 1 = 10 (own pair top). yW = 15.
+        assert_eq!(loc_all_frame(0, -1, 11), Some((10, 0, 15)));
+    }
+
+    #[test]
+    fn loc_frame_inside_is_curr() {
+        // (xN,yN) inside the MB → CurrMbAddr, unchanged coords.
+        assert_eq!(loc_all_frame(5, 7, 10), Some((10, 5, 7)));
+    }
+
+    #[test]
+    fn loc_frame_left_edge_unavailable() {
+        // addr 8 top MB, pair col 0. Left A unavailable → None.
+        assert_eq!(loc_all_frame(-1, 0, 8), None);
+    }
+
+    #[test]
+    fn loc_top_row_above_unavailable() {
+        // addr 0 top MB, pair row 0. Above B unavailable → None.
+        assert_eq!(loc_all_frame(0, -1, 0), None);
+    }
+
+    #[test]
+    fn loc_below_mb_always_unavailable() {
+        // yN > maxH-1 → unavailable per Table 6-4 last row.
+        assert_eq!(loc_all_frame(0, 16, 10), None);
+    }
+
+    #[test]
+    fn loc_field_current_top_left_frame_neighbour_splits_rows() {
+        // Current field top MB (frame=false, top), left pair is frame-
+        // coded. (xN=-1, yN=3 < maxH/2=8) → mbAddrA, yM = yN<<1 = 6.
+        // addr 10, mbAddrA top = 8.
+        let pair = mbaff_pair_neighbour_addrs(10, 4);
+        let r = mbaff_neigh_location(-1, 3, 16, 16, false, true, 10, pair, |_| true);
+        assert_eq!(r, Some((8, 15, 6)));
+        // yN=10 >= 8 → mbAddrA+1 = 9, yM = (10<<1)-16 = 4.
+        let r2 = mbaff_neigh_location(-1, 10, 16, 16, false, true, 10, pair, |_| true);
+        assert_eq!(r2, Some((9, 15, 4)));
+    }
+
+    #[test]
+    fn loc_field_current_top_left_field_neighbour_same_row() {
+        // Current field top MB, left pair is field-coded → mbAddrA, yM=yN.
+        let pair = mbaff_pair_neighbour_addrs(10, 4);
+        let r = mbaff_neigh_location(-1, 5, 16, 16, false, true, 10, pair, |_| false);
+        assert_eq!(r, Some((8, 15, 5)));
     }
 }
