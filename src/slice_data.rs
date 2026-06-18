@@ -240,7 +240,7 @@ pub fn parse_slice_data(
         // §9.3.3.1.1.9 — CABAC residual neighbour grid; populated per MB
         // as the walker steps, and consulted when deriving `ctxIdxInc`
         // for coded_block_flag / ref_idx / mvd on subsequent MBs.
-        let mut cabac_nb = CabacNeighbourGrid::new(pic_w_mbs, pic_h_mbs);
+        let mut cabac_nb = CabacNeighbourGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag);
         loop {
             // Debug marker for bin-level trace: emit a MB-boundary line
             // (gated on OXIDEAV_H264_BIN_TRACE) so downstream tooling can

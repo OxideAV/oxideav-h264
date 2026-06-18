@@ -1366,6 +1366,10 @@ pub struct CabacNeighbourGrid {
     pub width_in_mbs: u32,
     pub height_in_mbs: u32,
     pub mbs: Vec<CabacMbNeighbourInfo>,
+    /// §7.3.4 — `MbaffFrameFlag`. When set, external-MB neighbour
+    /// addresses for context derivation are resolved through the exact
+    /// §6.4.12.2 Table 6-4 process rather than the §6.4.9 raster scan.
+    pub mbaff_frame_flag: bool,
 }
 
 impl CabacNeighbourGrid {
@@ -1376,7 +1380,16 @@ impl CabacNeighbourGrid {
             width_in_mbs,
             height_in_mbs,
             mbs: vec![CabacMbNeighbourInfo::default(); len],
+            mbaff_frame_flag: false,
         }
+    }
+
+    /// Allocate a grid flagged as an MBAFF frame (§7.3.4). Used by the
+    /// slice_data walker when `MbaffFrameFlag == 1`.
+    pub fn new_mbaff(width_in_mbs: u32, height_in_mbs: u32, mbaff_frame_flag: bool) -> Self {
+        let mut g = Self::new(width_in_mbs, height_in_mbs);
+        g.mbaff_frame_flag = mbaff_frame_flag;
+        g
     }
 
     /// §6.4.9 — raster-scan `(mbAddrA, mbAddrB)` pair. Non-MBAFF only.
@@ -1707,15 +1720,26 @@ fn cabac_cbf_cond_terms(
         _ => (CbfLoc::MbLevel, CbfLoc::MbLevel),
     };
 
-    let left_addr = if x > 0 {
-        Some(current_mb_addr - 1)
+    let (left_addr, above_addr) = if grid.mbaff_frame_flag {
+        // §9.3.3.1.1.9 → §6.4.11.4 → §6.4.12.2: the external MB for the
+        // left/above block edge is the MB containing block location
+        // (bx-1, by) / (bx, by-1). For all-frame MBAFF pairs this equals
+        // the MB-level (mbAddrA, mbAddrB); field/frame-mixed pairs remap
+        // per Table 6-4 (a Phase-4 refinement — block-internal index
+        // remapping isn't applied here yet).
+        grid.neighbour_mb_addrs_mbaff(current_mb_addr, true)
     } else {
-        None
-    };
-    let above_addr = if y > 0 {
-        Some(current_mb_addr - w)
-    } else {
-        None
+        let la = if x > 0 {
+            Some(current_mb_addr - 1)
+        } else {
+            None
+        };
+        let ab = if y > 0 {
+            Some(current_mb_addr - w)
+        } else {
+            None
+        };
+        (la, ab)
     };
     let cond_a = cbf_cond_for(
         grid,

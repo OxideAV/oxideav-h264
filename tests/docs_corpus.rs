@@ -714,11 +714,16 @@ fn corpus_10_bit_high10() {
 
 // --- Interlaced / MBAFF ---------------------------------------------------
 
-// MBAFF: H264CodecDecoder rejects field-coded slices in `reconstruct`
-// (`field_pic_flag == 1` or `mb_adaptive_frame_field_flag == 1` are
-// known simplifications per the module docstring). The decoder won't
-// produce visible frames here — kept as ReportOnly so the eprintln
-// output documents the failure mode but doesn't gate CI.
+// MBAFF: as of round 339 the §7.3.4/§7.4.4 MB-pair walker + §6.4.12.2
+// Table 6-4 neighbour derivation parse this libx264 MBAFF clip through
+// to completion without CABAC desync, and the MBAFF-frame reconstruct
+// path (§6.4.1 field/frame y-stride) produces both visible frames.
+// Pixel-exactness against this particular `expected.yuv` is NOT a goal
+// (per the fixture's own notes.md: it was produced by an FFmpeg HEAD
+// that conceals MBs; the bitstream is documentary). Scoring stays
+// ReportOnly, but `corpus_mbaff_interlaced_parses` below asserts the
+// real milestone: both frames decode end-to-end (no MbaffNotSupported,
+// no FieldOrMbaffNotSupported, no CABAC read-past-end).
 #[test]
 fn corpus_mbaff_interlaced() {
     evaluate_annex_b(&CorpusCase {
@@ -730,6 +735,39 @@ fn corpus_mbaff_interlaced() {
         tier: Tier::ReportOnly,
         bytes_per_sample: 1,
     });
+}
+
+/// Round-339 milestone guard: the MBAFF clip must parse + reconstruct
+/// both frames without erroring. This is the regression boundary for
+/// the MBAFF slice_data walker + Table 6-4 neighbour derivation.
+#[test]
+fn corpus_mbaff_interlaced_parses() {
+    let case = CorpusCase {
+        name: "mbaff-interlaced",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 2,
+        tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
+    };
+    let Some(results) = decode_annex_b_fixture(&case) else {
+        eprintln!("skip corpus_mbaff_interlaced_parses: fixture missing");
+        return;
+    };
+    assert_eq!(
+        results.len(),
+        2,
+        "MBAFF clip must yield 2 decoded frames, got {}",
+        results.len()
+    );
+    for (i, r) in results.iter().enumerate() {
+        assert!(
+            r.is_ok(),
+            "MBAFF frame {i} must decode without error, got: {:?}",
+            r.as_ref().err()
+        );
+    }
 }
 
 // --- Container framing dispatch -------------------------------------------
