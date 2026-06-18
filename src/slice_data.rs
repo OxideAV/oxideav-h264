@@ -266,7 +266,8 @@ pub fn parse_slice_data(
             // the skip-flag path; the full snapshot (inter/intra/CBP)
             // rebuilds below once we know the MB is not skipped.
             let mut skip_nctx = NeighbourCtx::default();
-            let (skip_a_addr, skip_b_addr) = cabac_nb.neighbour_mb_addrs(curr_mb_addr);
+            let (skip_a_addr, skip_b_addr) =
+                cabac_nb.neighbour_mb_addrs_mbaff(curr_mb_addr, mbaff_frame_flag);
             if let Some(a) = skip_a_addr {
                 if let Some(info) = cabac_nb.mbs.get(a as usize) {
                     if info.available {
@@ -413,7 +414,8 @@ pub fn parse_slice_data(
                 // addresses come from §6.4.9 raster-scan: A = left
                 // (same row, x-1), B = above (row above, same x).
                 let mut nctx = NeighbourCtx::default();
-                let (a_addr, b_addr) = cabac_nb.neighbour_mb_addrs(curr_mb_addr);
+                let (a_addr, b_addr) =
+                    cabac_nb.neighbour_mb_addrs_mbaff(curr_mb_addr, mbaff_frame_flag);
                 if let Some(a) = a_addr {
                     if let Some(info) = cabac_nb.mbs.get(a as usize) {
                         if info.available {
@@ -460,7 +462,8 @@ pub fn parse_slice_data(
                     constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
                     num_ref_idx_l0_active_minus1: slice_header.num_ref_idx_l0_active_minus1,
                     num_ref_idx_l1_active_minus1: slice_header.num_ref_idx_l1_active_minus1,
-                    mbaff_frame_flag: false,
+                    mbaff_frame_flag,
+                    mb_field_decoding_flag: flag,
                     // CABAC per-MB neighbour grid — spec-correct per
                     // §9.3.3.1.1.9.
                     cabac_nb: Some(&mut cabac_nb),
@@ -782,6 +785,7 @@ pub fn parse_slice_data(
                 num_ref_idx_l0_active_minus1: slice_header.num_ref_idx_l0_active_minus1,
                 num_ref_idx_l1_active_minus1: slice_header.num_ref_idx_l1_active_minus1,
                 mbaff_frame_flag: false,
+                mb_field_decoding_flag: false,
                 // CABAC neighbour grid unused on the CAVLC path.
                 cabac_nb: None,
                 pic_width_in_mbs: 0,

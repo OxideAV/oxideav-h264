@@ -1379,8 +1379,7 @@ impl CabacNeighbourGrid {
         }
     }
 
-    /// §6.4.9 — raster-scan `(mbAddrA, mbAddrB)` pair. Non-MBAFF only —
-    /// our Phase-1 MBAFF falls back to this derivation per the task spec.
+    /// §6.4.9 — raster-scan `(mbAddrA, mbAddrB)` pair. Non-MBAFF only.
     #[inline]
     pub fn neighbour_mb_addrs(&self, mb_addr: u32) -> (Option<u32>, Option<u32>) {
         let w = self.width_in_mbs;
@@ -1391,6 +1390,65 @@ impl CabacNeighbourGrid {
         let y = mb_addr / w;
         let a = if x > 0 { Some(mb_addr - 1) } else { None };
         let b = if y > 0 { Some(mb_addr - w) } else { None };
+        (a, b)
+    }
+
+    /// §6.4.11.1 (MBAFF) — MB-level `(mbAddrA, mbAddrB)` for context
+    /// derivation, derived via the exact §6.4.12.2 Table 6-4 process
+    /// (Table 6-2 supplies `(xN,yN) = (-1,0)` for A, `(0,-1)` for B).
+    ///
+    /// `mb_field` returns the `mb_field_decoding_flag` of the current MB;
+    /// the per-neighbour frame flag is read from the grid slots. This
+    /// returns the **address** of the neighbouring MB (top or bottom of
+    /// the neighbour pair, fully disambiguated). When `mbaff_frame_flag`
+    /// is false it falls back to the §6.4.9 raster scan.
+    #[inline]
+    pub fn neighbour_mb_addrs_mbaff(
+        &self,
+        mb_addr: u32,
+        mbaff_frame_flag: bool,
+    ) -> (Option<u32>, Option<u32>) {
+        if !mbaff_frame_flag {
+            return self.neighbour_mb_addrs(mb_addr);
+        }
+        let curr_field = self
+            .mbs
+            .get(mb_addr as usize)
+            .map(|m| m.mb_field_decoding_flag)
+            .unwrap_or(false);
+        let curr_frame = !curr_field;
+        let mb_is_top = mb_addr % 2 == 0;
+        let pair = crate::mb_address::mbaff_pair_neighbour_addrs(mb_addr, self.width_in_mbs);
+        let frame_flag_of = |addr: u32| -> bool {
+            self.mbs
+                .get(addr as usize)
+                .map(|m| !m.mb_field_decoding_flag)
+                .unwrap_or(true)
+        };
+        let a = crate::mb_address::mbaff_neigh_location(
+            -1,
+            0,
+            16,
+            16,
+            curr_frame,
+            mb_is_top,
+            mb_addr,
+            pair,
+            frame_flag_of,
+        )
+        .map(|(addr, _, _)| addr);
+        let b = crate::mb_address::mbaff_neigh_location(
+            0,
+            -1,
+            16,
+            16,
+            curr_frame,
+            mb_is_top,
+            mb_addr,
+            pair,
+            frame_flag_of,
+        )
+        .map(|(addr, _, _)| addr);
         (a, b)
     }
 }
@@ -2046,9 +2104,15 @@ pub struct EntropyState<'ctx, 'data> {
     pub num_ref_idx_l1_active_minus1: u32,
     /// §7.3.4 / §7.4.4 — `MbaffFrameFlag`. When 0, `mb_field_decoding_flag`
     /// equals `field_pic_flag`, i.e. the "mb_field != field_pic" gate in
-    /// §7.3.5.1 / §7.3.5.2 never fires. We don't currently support MBAFF
-    /// decoding, so parsers should assume this is false.
+    /// §7.3.5.1 / §7.3.5.2 never fires.
     pub mbaff_frame_flag: bool,
+    /// §7.4.4 — `mb_field_decoding_flag` for the current MB (shared within
+    /// a pair). Used together with `mbaff_frame_flag` to evaluate the
+    /// §7.3.5.1/.2 "`mb_field_decoding_flag != field_pic_flag`" ref_idx
+    /// presence condition (in an MBAFF frame `field_pic_flag == 0`, so
+    /// the condition reduces to `mb_field_decoding_flag == 1`). `false`
+    /// for non-MBAFF and frame-coded MBs.
+    pub mb_field_decoding_flag: bool,
     /// §9.3.3.1.1.6 / .7 / .9 — CABAC per-MB neighbour grid. Populated
     /// by the MB parser with each macroblock's decoded inter / residual
     /// state, consulted on subsequent MBs for neighbour-derived
@@ -2608,7 +2672,7 @@ fn parse_mb_pred(
         // (`mbaff_frame_flag == false`), so the "mb_field !=
         // field_pic" condition simplifies away.
         let num_parts = mb_type.num_mb_part() as usize;
-        let mbaff_override = entropy.mbaff_frame_flag;
+        let mbaff_override = entropy.mbaff_frame_flag && entropy.mb_field_decoding_flag;
         let ref_l0_present = entropy.num_ref_idx_l0_active_minus1 > 0 || mbaff_override;
         let ref_l1_present = entropy.num_ref_idx_l1_active_minus1 > 0 || mbaff_override;
         let x_l0 = entropy.num_ref_idx_l0_active_minus1;
@@ -2988,7 +3052,7 @@ fn parse_sub_mb_pred(
     //   mb_type != P_8x8ref0 &&
     //   sub_mb_type[i] != B_Direct_8x8 &&
     //   SubMbPredMode(sub_mb_type[i]) != Pred_L1
-    let mbaff_override = entropy.mbaff_frame_flag;
+    let mbaff_override = entropy.mbaff_frame_flag && entropy.mb_field_decoding_flag;
     let ref_l0_present = entropy.num_ref_idx_l0_active_minus1 > 0 || mbaff_override;
     let ref_l1_present = entropy.num_ref_idx_l1_active_minus1 > 0 || mbaff_override;
     let x_l0 = entropy.num_ref_idx_l0_active_minus1;
@@ -4581,6 +4645,7 @@ mod tests {
             num_ref_idx_l0_active_minus1: 0,
             num_ref_idx_l1_active_minus1: 0,
             mbaff_frame_flag: false,
+            mb_field_decoding_flag: false,
             cabac_nb: None,
             pic_width_in_mbs: 0,
             bit_depth_luma_minus8: 0,
@@ -5811,6 +5876,7 @@ mod tests {
             num_ref_idx_l0_active_minus1,
             num_ref_idx_l1_active_minus1,
             mbaff_frame_flag: false,
+            mb_field_decoding_flag: false,
             cabac_nb: None,
             pic_width_in_mbs: 0,
             bit_depth_luma_minus8: 0,
@@ -6128,6 +6194,7 @@ mod tests {
             num_ref_idx_l0_active_minus1,
             num_ref_idx_l1_active_minus1,
             mbaff_frame_flag: false,
+            mb_field_decoding_flag: false,
             cabac_nb: None,
             pic_width_in_mbs: 0,
             bit_depth_luma_minus8: 0,
@@ -6261,6 +6328,7 @@ mod tests {
             num_ref_idx_l0_active_minus1: 0,
             num_ref_idx_l1_active_minus1: 0,
             mbaff_frame_flag: false,
+            mb_field_decoding_flag: false,
             cabac_nb: None,
             pic_width_in_mbs: 0,
             bit_depth_luma_minus8: 0,
