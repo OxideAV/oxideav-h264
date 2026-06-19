@@ -538,7 +538,7 @@ fn corpus_i_frame_then_p_frame_baseline() {
 fn corpus_bipred_with_b_frames_main() {
     // Main / 1.1, refs=2. expected.yuv is 2 packed 32×32 frames in
     // DISPLAY order (CTS-sorted), so RPL + DPB ordering must match
-    // libavcodec to score. trace: 32 lines. (The fixture name says
+    // the staged expected.yuv to score. trace: 32 lines. (The fixture name says
     // "b-frames" but `trace.txt` shows only slice_type 1 (I) + 2 (P) —
     // no B-slice is present; frame 1 is the P picture.)
     //
