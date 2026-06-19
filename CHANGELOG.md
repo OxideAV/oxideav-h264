@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 343 — fixture-validation hardening. Ran the full staged
+  `docs/video/h264/fixtures/` corpus byte-for-byte against each
+  `expected.yuv` and promoted the ten fixtures that decode bit-exactly
+  from `ReportOnly` to the enforced `BitExact` tier (test fails on any
+  divergence): `tiny-i-only-16x16-baseline`,
+  `i-frame-then-p-frame-baseline`, `cavlc-mode`, `cabac-mode`,
+  `transform-8x8-on`, `qp-low-cqp`, `qp-high-cqp`,
+  `weighted-prediction-explicit`, and `iso-mp4-vs-annexb` on both the
+  Annex-B and length-prefixed-AVC (avcC) framing paths. These now guard
+  against regression in the all-intra, CAVLC/CABAC entropy, §8.5
+  transform + QP-extreme, §8.4.2.3.2 explicit-weighted, and container
+  framing decode paths. Diagnosed and documented (in each fixture's test
+  comment) the remaining gaps: two fixtures carry bogus reference YUV
+  (`i-only-64x64-main` — `expected.yuv` is a uniform 128 that cannot
+  correspond to its non-zero-CBP 16-MB CABAC I-frame; `multi-slice-per-frame`
+  — a single-coded-picture bitstream split into two reference frames),
+  and a genuine narrow §8.4.2 inter edge-case affecting only the bottom
+  MB row of P_L0 pictures (`bipred-with-b-frames-main` 90.4 %,
+  `multi-ref-frames` 94.3 %; Y max diff ≤16, chroma ≤10, survives with
+  deblocking disabled). No `src/` behaviour change; the corpus harness is
+  the deliverable.
 - round 339 — MBAFF (macroblock-adaptive frame/field) decode. Added the
   exact §6.4.12.2 Table 6-4 neighbouring-location derivation
   (`mb_address::mbaff_neigh_location`) covering all six spatial cells and

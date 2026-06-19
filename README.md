@@ -22,7 +22,14 @@ No external decoder source is consulted while writing this
 implementation — only the spec PDF. Conformance is verified by
 behavioural diff: our decoder is run against synthetic and
 public-domain real-world streams and the YUV output is compared
-against an independent reference decoder run separately.
+against an independent reference decoder run separately. The staged
+fixture corpus (`tests/docs_corpus.rs`) decodes each fixture
+byte-for-byte against its `expected.yuv`; ten fixtures are pinned to
+the enforced `BitExact` tier — the all-intra (tiny 16×16, baseline
+I→P), CAVLC + CABAC entropy, §8.5 8×8-transform + QP-low/high extremes,
+§8.4.2.3.2 explicit-weighted-prediction, and dual Annex-B / avcC
+container-framing paths — so any regression in those decode paths fails
+CI.
 
 The spec PDF itself can't be redistributed (ITU-T copyright) so it
 lives in the private OxideAV/docs repo at
