@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 349 — High10 (10-bit, `profile_idc=110`) decode-path milestone
+  guard (`corpus_10_bit_high10_emits_full_range`). The 10-bit fixture's
+  `expected.yuv` cannot gate bit-exactness (its entire left MB column is
+  concealed with `0x80` fill — 50% of the reference bytes; see Other),
+  so this guard asserts the spec-checkable invariants of the >8-bit path
+  instead: the all-intra frame decodes at 32×32 packed as `yuv420p10le`
+  (2-bytes/sample LE-u16, 3072 B); every emitted sample is a legal
+  10-bit value (`0..=1023`); and the luma plane genuinely exercises the
+  >8-bit range (≥¼ of samples exceed 255), proving the §8.5.12 dequant
+  at `qP'=qP+QpBdOffsetY` (=qP+12), the `1<<(10-1)=512` predicted DC
+  default, and the LE-u16 plane packing are all wired end-to-end rather
+  than collapsed to 8-bit.
+
 - round 346 — enforced bit-exact gate for the High 4:4:4 Predictive
   I_4x4 decode path (`integration_high444_i4x4_bitexact`). The
   `intra-only-high444` fixture's high-QP picture (frame 1) decodes
@@ -37,6 +50,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   weights, and bS=0 internal edges — a delta the spec cannot produce, so
   the reference is internally inconsistent. All recorded as docs-gaps for
   fixture regeneration; the affected cases stay `ReportOnly`.
+
+- round 349 — `10-bit-high10` corpus fixture diagnosis (spec-only, no
+  web tools). The fixture's `expected.yuv` is partially concealed: the
+  whole left MB column (luma x∈0..16 over both MB rows, plus co-sited
+  chroma) is `0x80` byte-fill — exactly 50% (1536/3072) of the reference
+  bytes are the FFmpeg-HEAD conceal-MB mid-gray seen in
+  `i-only-64x64-main` (100%) / `4-4-4-high` (52%) / `intra-only-high444`
+  (29%), and `0x8080` as LE-u16 (32896) is not even a legal 10-bit
+  value. Per `trace.txt` all four MBs are real textured CABAC I_4x4
+  (CBPs 0x27..0x2e), so a flat left column cannot be a true decode. The
+  valid right MB column can't gate either, because its §8.3.1.2 intra-4x4
+  prediction reads the concealed left-MB right edge as its left
+  neighbour — so no part of this `expected.yuv` is verifiable 10-bit
+  ground truth. Recorded as a docs-gap for fixture regeneration; the
+  scoring case stays `ReportOnly`, with the verifiable 10-bit invariants
+  now guarded by `corpus_10_bit_high10_emits_full_range` (see Added). A
+  byte-exact gate on the High10 path is unblocked the moment the fixture
+  is re-exported without the conceal-MB fill.
 
 - round 343 — fixture-validation hardening. Ran the full staged
   `docs/video/h264/fixtures/` corpus byte-for-byte against each

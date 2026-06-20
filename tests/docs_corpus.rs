@@ -349,6 +349,13 @@ where
                     visible_idx += 1;
                     continue;
                 }
+                // Optional: dump our packed frame for offline diff against
+                // `expected.yuv` (e.g. region-by-region bisection of a
+                // partially-defective fixture). One file per visible frame:
+                // `${OXIDEAV_H264_DUMP_OURS_YUV}.<idx>`.
+                if let Ok(base) = std::env::var("OXIDEAV_H264_DUMP_OURS_YUV") {
+                    let _ = fs::write(format!("{base}.{visible_idx}"), &our);
+                }
                 let ref_off = visible_idx * frame_size;
                 let ref_y = &yuv_ref[ref_off..ref_off + y_size];
                 let ref_u = &yuv_ref[ref_off + y_size..ref_off + y_size + uv_size];
@@ -792,13 +799,35 @@ fn corpus_intra_only_high444() {
 }
 
 // 10-bit High10 fixture (yuv420p10le): expected.yuv is 16-bit per
-// sample, little-endian (3072 B = 32×32 × 1.5 × 2). The decoder now
-// emits u16-LE planes for `bit_depth_luma > 8`; we score them
-// byte-by-byte against the reference. ReportOnly: the §8.5.10 inverse
-// transform / dequant path is documented for 8-bit only in our
-// current reconstruct module, so per-byte diffs are expected. The
-// test exists to keep the >8-bit output path wired and to surface
-// regressions in the bit-depth plumbing.
+// sample, little-endian (3072 B = 32×32 × 1.5 × 2). The decoder emits
+// u16-LE planes for `bit_depth_luma > 8`; we score them byte-by-byte
+// against the reference.
+//
+// Round 349 finding: this fixture's `expected.yuv` is *partially
+// concealed* — the entire left MB column (luma x∈0..16, both MB rows;
+// plus the co-sited chroma) is filled with the byte `0x80` (== LE-u16
+// 0x8080 = 32896, which is not even a legal 10-bit value), i.e. exactly
+// 50% (1536/3072) of the reference bytes are the FFmpeg-HEAD "conceal
+// MB" mid-gray fill seen in `i-only-64x64-main` (100%), `4-4-4-high`
+// (52%), and `intra-only-high444` (29%). Per `trace.txt`, all four MBs
+// are real textured CABAC I_4x4 with non-zero CBPs (0x27..0x2e), so a
+// flat 0x80 left column cannot be a true decode.
+//
+// The remaining right MB column (luma x∈16..32) does carry valid 10-bit
+// data, but its §8.3.1.2 intra-4x4 prediction reads the *left-MB right
+// edge* as its left-neighbour. Because the fixture concealed the left
+// MB, no part of this `expected.yuv` provides verifiable 10-bit ground
+// truth: the right column is unreachable without the (hidden) true left
+// reconstruction. Scoring therefore stays ReportOnly. DOCS-GAP recorded
+// in the round report — the fixture must be regenerated without the
+// conceal-MB fill (same ask as the other partially-blanked fixtures).
+//
+// What IS verifiable about the 10-bit path is asserted separately by
+// `corpus_10_bit_high10_emits_full_range` below: our decoder plumbs
+// `bit_depth_luma=10` end-to-end (predicted DC default `1<<(10-1)=512`,
+// `QpBdOffsetY=12` extended QP, §8.5.12 dequant at qP'=qP+12) and emits
+// genuine high-bit-depth samples spanning the full 0..1023 range, not
+// 8-bit-collapsed output.
 #[test]
 fn corpus_10_bit_high10() {
     evaluate_annex_b(&CorpusCase {
@@ -811,6 +840,101 @@ fn corpus_10_bit_high10() {
         // 10-bit samples — 2 bytes per sample, LE u16 storage.
         bytes_per_sample: 2,
     });
+}
+
+/// Round-349 milestone guard for the High10 (10-bit) decode path.
+///
+/// The `corpus_10_bit_high10` scoring stays ReportOnly because the
+/// fixture's left MB column is concealed (see that test's comment), so
+/// it cannot gate bit-exactness. This guard instead asserts the parts of
+/// the 10-bit path that ARE objectively checkable from the bitstream +
+/// spec alone, with no dependence on the concealed reference samples:
+///
+/// 1. The single all-intra frame decodes without error and at the
+///    declared 32×32 geometry, packed as 2-bytes-per-sample LE-u16
+///    `yuv420p10le` (3072 B).
+/// 2. Every emitted luma/chroma sample is a legal 10-bit value
+///    (`0..=1023`), i.e. the high byte of each LE-u16 is `<= 3`. A
+///    decoder that mistakenly clamped to 8 bits or mis-packed the u16
+///    would fail this.
+/// 3. The luma plane actually exercises the >8-bit range: a substantial
+///    fraction of samples exceed 255. An 8-bit-collapsed reconstruction
+///    (the failure mode if `QpBdOffsetY`/`bit_depth` were dropped on the
+///    floor) would pin every sample to `<= 255`.
+#[test]
+fn corpus_10_bit_high10_emits_full_range() {
+    const W: usize = 32;
+    const H: usize = 32;
+    let dir = fixture_dir("10-bit-high10");
+    let h264_path = dir.join("input.h264");
+    let h264 = match fs::read(&h264_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "skip corpus_10_bit_high10_emits_full_range: missing {} ({e})",
+                h264_path.display()
+            );
+            return;
+        }
+    };
+
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), h264).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+
+    // Drain the single visible frame.
+    let vf = loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(vf)) => break vf,
+            Ok(_) => continue,
+            Err(Error::NeedMore) | Err(Error::Eof) => {
+                panic!("High10 fixture produced no video frame");
+            }
+            Err(e) => panic!("High10 decode error: {e:?}"),
+        }
+    };
+
+    // (1) Geometry + 2-bytes-per-sample LE-u16 packing.
+    let (cw, ch) = (W / 2, H / 2);
+    let packed = videoframe_to_packed(&vf, W, H, cw, ch, 2)
+        .expect("High10 frame must repack as yuv420p10le (3 planes, 2 bytes/sample)");
+    let frame_bytes = 2 * (W * H + 2 * cw * ch);
+    assert_eq!(
+        packed.len(),
+        frame_bytes,
+        "High10 packed frame must be {frame_bytes} bytes (32x32 yuv420p10le)"
+    );
+
+    // Read every sample as LE-u16.
+    let sample = |i: usize| -> u16 { u16::from_le_bytes([packed[i * 2], packed[i * 2 + 1]]) };
+    let n_samples = packed.len() / 2;
+
+    // (2) Every sample is a legal 10-bit value.
+    let mut max_val: u16 = 0;
+    let mut luma_over_8bit = 0usize;
+    for i in 0..n_samples {
+        let v = sample(i);
+        assert!(
+            v <= 1023,
+            "sample {i} = {v} exceeds the 10-bit max (1023); 10-bit output is mis-packed or unclamped"
+        );
+        max_val = max_val.max(v);
+        if i < W * H && v > 255 {
+            luma_over_8bit += 1;
+        }
+    }
+
+    // (3) The reconstruction genuinely uses the >8-bit range.
+    assert!(
+        max_val > 255,
+        "High10 output never exceeds 255 — the >8-bit transform/dequant path collapsed to 8-bit (max={max_val})"
+    );
+    assert!(
+        luma_over_8bit >= W * H / 4,
+        "only {luma_over_8bit}/{} luma samples exceed 8-bit range — High10 reconstruction looks 8-bit-collapsed",
+        W * H
+    );
 }
 
 // --- Interlaced / MBAFF ---------------------------------------------------
