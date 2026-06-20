@@ -17,11 +17,18 @@
 //!    marking (MMCO 1..=6).
 //!
 //! Field-specific initialisation (§8.2.4.2.2 / §8.2.4.2.4 / §8.2.4.2.5)
-//! is partially supported: the API takes a `PicStructure` and `current_bottom`
-//! so that `PicNum` derivations for fields are correct, but list
-//! interleaving by parity is not yet modelled — fields are treated as
-//! single-parity reference frames. This keeps the state machine correct
-//! for frame-only coded streams, which is the common case.
+//! is implemented by [`init_ref_pic_list_p_field`] /
+//! [`init_ref_pic_lists_b_field`], which build per-field
+//! [`RefFieldEntry`] lists via the §8.2.4.2.5 parity-alternation
+//! interleave, and [`modify_ref_pic_list_field`] (§8.2.4.3) applies RPLM
+//! ops to them using the field forms of PicNum / LongTermPicNum. The
+//! frame-only entry points ([`init_ref_pic_list_p`] /
+//! [`init_ref_pic_lists_b`] / [`modify_ref_pic_list`]) return `dpb_key`
+//! lists and remain the path used for frame-coded streams. Wiring the
+//! field lists into pixel reconstruction is gated on the field-coded
+//! reconstruction path (`field_pic_flag == 1`), which is a separate
+//! phase; these functions are complete and unit-tested against the spec
+//! equations independently of that wiring.
 
 #![allow(dead_code)]
 // Spec-driven §8.2.4 / §8.2.5 ops legitimately take many parameters
