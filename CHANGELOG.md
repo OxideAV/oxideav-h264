@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 355 — **§8.2.4.3 field reference-list modification (RPLM).**
+  `modify_ref_pic_list_field` applies `modification_of_pic_nums_idc`
+  ops to the `RefFieldEntry` lists from the field init step. Short-term
+  ops (idc 0/1) derive `picNumLX` via eq. 8-34..8-36 with the field
+  forms of CurrPicNum (`2*frame_num+1`) and MaxPicNum (`2*MaxFrameNum`),
+  then splice the *field* of the DPB whose field-level PicNum
+  (eq. 8-30/8-31, parity-relative to the current field) matches; the
+  long-term op (idc 2) matches a field by field-level LongTermPicNum
+  (eq. 8-32/8-33). The eq. 8-37/8-38 shift-and-compact splice is
+  reduced to "drop the duplicate of the just-inserted field" since a
+  field is uniquely keyed by `(dpb_key, parity)`. New
+  `DpbEntry::field_pic_num` / `field_long_term_pic_num` give the
+  per-parity numbers (the existing `pic_num` infers parity from the
+  entry's own structure, which is wrong when a stored *frame* can
+  supply either of its two fields). 5 spec-derived unit tests
+  (parity-relative PicNum, subtract reorder, long-term splice,
+  picNumLXPred chaining across ops, pad/truncate).
+
 - round 355 — **§8.2.4.2.2 / §8.2.4.2.4 / §8.2.4.2.5 field reference
   picture list initialisation.** When the current picture is a coded
   field, each *field* of a stored reference frame is a separate

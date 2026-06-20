@@ -165,6 +165,47 @@ impl DpbEntry {
         }
     }
 
+    /// §8.2.4.1 eq. 8-30 / 8-31 — `PicNum` of a *specific parity field*
+    /// of this stored reference frame, as seen by a current field of
+    /// parity `current_bottom`.
+    ///
+    /// Unlike [`Self::pic_num`] (which infers the field parity from
+    /// `self.structure`), this names the parity explicitly via
+    /// `field_parity` — needed by §8.2.4.3.1 field modification, where a
+    /// stored *frame* can supply either of its two parity fields and the
+    /// PicNum hinges on whether that chosen field matches the current
+    /// field's parity.
+    fn field_pic_num(
+        &self,
+        field_parity: FieldParity,
+        current_frame_num: u32,
+        max_frame_num: u32,
+        current_bottom: bool,
+    ) -> i32 {
+        let frame_num_wrap = if self.frame_num > current_frame_num {
+            self.frame_num as i64 - max_frame_num as i64
+        } else {
+            self.frame_num as i64
+        };
+        let same_parity = (field_parity == FieldParity::Bottom) == current_bottom;
+        if same_parity {
+            (2 * frame_num_wrap + 1) as i32
+        } else {
+            (2 * frame_num_wrap) as i32
+        }
+    }
+
+    /// §8.2.4.1 eq. 8-32 / 8-33 — `LongTermPicNum` of a *specific parity
+    /// field* of this stored long-term reference frame.
+    fn field_long_term_pic_num(&self, field_parity: FieldParity, current_bottom: bool) -> i32 {
+        let same_parity = (field_parity == FieldParity::Bottom) == current_bottom;
+        if same_parity {
+            (2 * self.long_term_frame_idx + 1) as i32
+        } else {
+            (2 * self.long_term_frame_idx) as i32
+        }
+    }
+
     /// §8.2.4.1 eq. 8-29 / 8-32 / 8-33 — `LongTermPicNum` for a
     /// long-term reference.
     pub fn long_term_pic_num(&self, current_is_field: bool, current_bottom: bool) -> i32 {
@@ -831,6 +872,185 @@ fn splice_into_list<F>(
     // Re-pad / truncate to num_active.
     while tmp.len() < num_active {
         tmp.push(u32::MAX);
+    }
+    tmp.truncate(num_active);
+    *list = tmp;
+}
+
+/// Sentinel "no reference picture" entry for a field list.
+fn no_ref_field() -> RefFieldEntry {
+    RefFieldEntry {
+        dpb_key: u32::MAX,
+        parity: FieldParity::Top,
+    }
+}
+
+/// §8.2.4.3 — apply RPLM ops to a *field-coded* reference picture list
+/// (`field_pic_flag == 1`).
+///
+/// Operates on the `RefFieldEntry` lists produced by
+/// [`init_ref_pic_list_p_field`] / [`init_ref_pic_lists_b_field`]. The
+/// short-term ops (idc 0/1) resolve `picNumLX` to a *field* of the DPB —
+/// the entry whose field-level PicNum (eq. 8-30/8-31, parity-relative to
+/// the current field) equals `picNumLX`; the long-term op (idc 2)
+/// resolves a field whose field-level LongTermPicNum (eq. 8-32/8-33)
+/// equals `long_term_pic_num`. CurrPicNum / MaxPicNum use the field forms
+/// (`2*frame_num+1` / `2*MaxFrameNum`, §7.4.3 / clause 8.2.4.1).
+///
+/// `current_bottom` is the current field's parity. The candidate field's
+/// parity is the one stored in each DPB entry (single fields) or chosen
+/// by matching `picNumLX` against both parities of a stored frame/pair.
+pub fn modify_ref_pic_list_field(
+    list: &mut Vec<RefFieldEntry>,
+    ops: &[RplmOp],
+    dpb: &[DpbEntry],
+    num_active: u32,
+    current_frame_num: u32,
+    max_frame_num: u32,
+    current_bottom: bool,
+) {
+    // Normalise to exactly `num_active` entries (§8.2.4.2 fall-through).
+    let target = num_active as usize;
+    if list.len() > target {
+        list.truncate(target);
+    }
+    while list.len() < target {
+        list.push(no_ref_field());
+    }
+
+    if ops.is_empty() {
+        return;
+    }
+
+    // §7.4.3 — field forms of CurrPicNum / MaxPicNum.
+    let curr_pic_num: i32 = (2 * current_frame_num + 1) as i32;
+    let max_pic_num: i32 = (2 * max_frame_num) as i32;
+
+    let mut ref_idx_lx: usize = 0;
+    let mut pic_num_lx_pred: i32 = curr_pic_num;
+
+    for op in ops {
+        match *op {
+            RplmOp::Subtract(abs_diff) | RplmOp::Add(abs_diff) => {
+                let delta = (abs_diff + 1) as i32;
+
+                // eq. 8-34 / 8-35 — picNumLXNoWrap.
+                let pic_num_lx_no_wrap: i32 = if matches!(op, RplmOp::Subtract(_)) {
+                    if pic_num_lx_pred - delta < 0 {
+                        pic_num_lx_pred - delta + max_pic_num
+                    } else {
+                        pic_num_lx_pred - delta
+                    }
+                } else if pic_num_lx_pred + delta >= max_pic_num {
+                    pic_num_lx_pred + delta - max_pic_num
+                } else {
+                    pic_num_lx_pred + delta
+                };
+
+                pic_num_lx_pred = pic_num_lx_no_wrap;
+
+                // eq. 8-36 — picNumLX.
+                let pic_num_lx: i32 = if pic_num_lx_no_wrap > curr_pic_num {
+                    pic_num_lx_no_wrap - max_pic_num
+                } else {
+                    pic_num_lx_no_wrap
+                };
+
+                // Find the (frame, parity) field whose field-PicNum
+                // matches. A stored frame/pair can match on either parity;
+                // a single field matches only its own.
+                let target = find_field_short_term(
+                    dpb,
+                    pic_num_lx,
+                    current_frame_num,
+                    max_frame_num,
+                    current_bottom,
+                );
+                splice_field_into_list(list, ref_idx_lx, num_active as usize, target);
+                ref_idx_lx += 1;
+            }
+            RplmOp::LongTerm(long_term_pic_num) => {
+                let target = find_field_long_term(dpb, long_term_pic_num as i32, current_bottom);
+                splice_field_into_list(list, ref_idx_lx, num_active as usize, target);
+                ref_idx_lx += 1;
+            }
+        }
+    }
+}
+
+/// Locate the short-term reference *field* whose field-level PicNum
+/// equals `pic_num_lx`. Returns the sentinel "no reference picture" when
+/// nothing matches (a non-conforming stream).
+fn find_field_short_term(
+    dpb: &[DpbEntry],
+    pic_num_lx: i32,
+    current_frame_num: u32,
+    max_frame_num: u32,
+    current_bottom: bool,
+) -> RefFieldEntry {
+    for e in dpb.iter().filter(|e| e.is_short_term()) {
+        for parity in [FieldParity::Top, FieldParity::Bottom] {
+            if e.has_field(parity)
+                && e.field_pic_num(parity, current_frame_num, max_frame_num, current_bottom)
+                    == pic_num_lx
+            {
+                return RefFieldEntry {
+                    dpb_key: e.dpb_key,
+                    parity,
+                };
+            }
+        }
+    }
+    no_ref_field()
+}
+
+/// Locate the long-term reference *field* whose field-level
+/// LongTermPicNum equals `long_term_pic_num`.
+fn find_field_long_term(
+    dpb: &[DpbEntry],
+    long_term_pic_num: i32,
+    current_bottom: bool,
+) -> RefFieldEntry {
+    for e in dpb.iter().filter(|e| e.is_long_term()) {
+        for parity in [FieldParity::Top, FieldParity::Bottom] {
+            if e.has_field(parity)
+                && e.field_long_term_pic_num(parity, current_bottom) == long_term_pic_num
+            {
+                return RefFieldEntry {
+                    dpb_key: e.dpb_key,
+                    parity,
+                };
+            }
+        }
+    }
+    no_ref_field()
+}
+
+/// §8.2.4.3.1 eq. 8-37 / §8.2.4.3.2 eq. 8-38 for field lists — shift
+/// entries right from `ref_idx_lx`, insert the `target` field, then drop
+/// any later occurrence of the identical `(dpb_key, parity)` field. A
+/// field is uniquely identified by `(dpb_key, parity)`, so the
+/// `PicNumF`/`LongTermPicNumF` "!= picNumLX" compaction reduces to "drop
+/// the duplicate of the just-inserted field".
+fn splice_field_into_list(
+    list: &mut Vec<RefFieldEntry>,
+    ref_idx_lx: usize,
+    num_active: usize,
+    target: RefFieldEntry,
+) {
+    if ref_idx_lx >= num_active {
+        return;
+    }
+    let mut tmp: Vec<RefFieldEntry> = Vec::with_capacity(num_active + 1);
+    tmp.extend_from_slice(&list[..ref_idx_lx]);
+    tmp.push(target);
+    for &e in &list[ref_idx_lx..] {
+        if e != target {
+            tmp.push(e);
+        }
+    }
+    while tmp.len() < num_active {
+        tmp.push(no_ref_field());
     }
     tmp.truncate(num_active);
     *list = tmp;
@@ -1805,5 +2025,96 @@ mod tests {
         let dpb = vec![st_single_field(0, FieldParity::Bottom, 5, 7)];
         let (l0, _l1) = init_ref_pic_lists_b_field(&dpb, 10, false);
         assert_eq!(l0, vec![bot(7)]);
+    }
+
+    // -----------------------------------------------------------------
+    // §8.2.4.3 (field) — RPLM on field-coded lists.
+    // -----------------------------------------------------------------
+
+    // field_pic_num sanity (eq. 8-30/8-31): frame_num 3, current frame_num
+    // 5, max 16 ⇒ FrameNumWrap 3. Current = top field.
+    //   same-parity (top): 2*3+1 = 7; opposite (bottom): 2*3 = 6.
+    #[test]
+    fn field_pic_num_eqs() {
+        let e = st_pair(3, 0, 1, 3);
+        assert_eq!(e.field_pic_num(FieldParity::Top, 5, 16, false), 7);
+        assert_eq!(e.field_pic_num(FieldParity::Bottom, 5, 16, false), 6);
+        // Current = bottom field: parities swap which is "same".
+        assert_eq!(e.field_pic_num(FieldParity::Top, 5, 16, true), 6);
+        assert_eq!(e.field_pic_num(FieldParity::Bottom, 5, 16, true), 7);
+    }
+
+    // Subtract op moves a specific field to the front. DPB frames 3,4
+    // (full pairs), current frame_num 5 (top field). Initial P-field list
+    // = [top4,bot4,top3,bot3] (FrameNumWrap desc 4,3). num_active 4.
+    // CurrPicNum = 2*5+1 = 11. Op Subtract(0) → delta 1 → noWrap 10 →
+    // picNumLX 10. field_pic_num for frame4 top (FNW 4, same parity) =
+    // 2*4+1 = 9; bottom = 8. Frame3 top = 7, bottom = 6. None == 10?
+    // Choose a delta that lands on frame4's bottom field (8): picNumLX 8
+    // ⇒ Subtract(2) (delta 3, 11-3=8).
+    #[test]
+    fn field_modify_subtract_reorders() {
+        let dpb = vec![st_pair(3, 0, 1, 3), st_pair(4, 2, 3, 4)];
+        let mut list = init_ref_pic_list_p_field(&dpb, 5, 16, false);
+        assert_eq!(list, vec![top(4), bot(4), top(3), bot(3)]);
+        // picNumLX = 11 - 3 = 8 → frame4 bottom field.
+        modify_ref_pic_list_field(&mut list, &[RplmOp::Subtract(2)], &dpb, 4, 5, 16, false);
+        // bot(4) hoisted to front; its earlier occurrence removed.
+        assert_eq!(list, vec![bot(4), top(4), top(3), bot(3)]);
+    }
+
+    // Long-term op (idc 2) splices a long-term field. DPB: one ST pair
+    // (frame 4) + one LT pair (ltfi 1). Current = top field.
+    // field_long_term_pic_num for LT top (same parity) = 2*1+1 = 3,
+    // bottom = 2. Op LongTerm(2) → LT bottom field to front.
+    #[test]
+    fn field_modify_long_term_splices() {
+        let dpb = vec![st_pair(4, 2, 3, 4), lt_pair(1, 9, 100)];
+        let mut list = init_ref_pic_list_p_field(&dpb, 5, 16, false);
+        // ST then LT: [top4,bot4, top100,bot100].
+        assert_eq!(list, vec![top(4), bot(4), top(100), bot(100)]);
+        modify_ref_pic_list_field(&mut list, &[RplmOp::LongTerm(2)], &dpb, 4, 5, 16, false);
+        // LT bottom (LongTermPicNum 2) hoisted to index 0.
+        assert_eq!(list, vec![bot(100), top(4), bot(4), top(100)]);
+    }
+
+    // No-op list pads / truncates to num_active with the sentinel field.
+    #[test]
+    fn field_modify_pads_and_truncates() {
+        let dpb = vec![st_pair(1, 0, 1, 1)];
+        let mut list = vec![top(1)];
+        modify_ref_pic_list_field(&mut list, &[], &dpb, 3, 2, 16, false);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], top(1));
+        assert_eq!(list[1], no_ref_field());
+        assert_eq!(list[2], no_ref_field());
+    }
+
+    // Two sequential ops: picNumLXPred chains across ops (§8.2.4.3.1).
+    // DPB frames 2,3,4 full pairs, current frame_num 5 top field.
+    // Initial list = [top4,bot4,top3,bot3,top2,bot2] (FNW desc 4,3,2).
+    // CurrPicNum = 11. Op1 Subtract(2): pred 11→noWrap 8 → frame4 bottom
+    // (field_pic_num 8) to idx0. Op2 Subtract(0): pred 8→noWrap 7 →
+    // frame3 top (field_pic_num 7) to idx1.
+    #[test]
+    fn field_modify_pred_chains_across_ops() {
+        let dpb = vec![
+            st_pair(2, 4, 5, 2),
+            st_pair(3, 6, 7, 3),
+            st_pair(4, 8, 9, 4),
+        ];
+        let mut list = init_ref_pic_list_p_field(&dpb, 5, 16, false);
+        assert_eq!(list, vec![top(4), bot(4), top(3), bot(3), top(2), bot(2)]);
+        modify_ref_pic_list_field(
+            &mut list,
+            &[RplmOp::Subtract(2), RplmOp::Subtract(0)],
+            &dpb,
+            6,
+            5,
+            16,
+            false,
+        );
+        assert_eq!(list[0], bot(4));
+        assert_eq!(list[1], top(3));
     }
 }
