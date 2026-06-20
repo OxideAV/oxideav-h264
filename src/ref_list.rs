@@ -66,6 +66,38 @@ impl PicStructure {
     }
 }
 
+/// Parity of a single reference field. Used by the §8.2.4.2.5
+/// parity-alternation interleave to designate *which* field of a stored
+/// reference frame occupies a given `RefPicListX` index when the current
+/// picture is a coded field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldParity {
+    Top,
+    Bottom,
+}
+
+impl FieldParity {
+    /// The opposite parity.
+    fn flip(self) -> FieldParity {
+        match self {
+            FieldParity::Top => FieldParity::Bottom,
+            FieldParity::Bottom => FieldParity::Top,
+        }
+    }
+}
+
+/// One entry of a field-coded `RefPicListX` (§8.2.4.2.2 / §8.2.4.2.4).
+///
+/// When decoding a coded field, each *field* of a stored reference frame
+/// is a separate reference picture with its own list index (§8.2.4.2.4),
+/// so a list entry must name both the DPB frame (`dpb_key`) and the
+/// `parity` of the field within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefFieldEntry {
+    pub dpb_key: u32,
+    pub parity: FieldParity,
+}
+
 /// A decoded picture as held in the DPB.
 #[derive(Debug, Clone)]
 pub struct DpbEntry {
@@ -168,6 +200,33 @@ impl DpbEntry {
     /// True if this entry is used for reference at all.
     fn is_ref(&self) -> bool {
         !matches!(self.marking, RefMarking::Unused)
+    }
+
+    /// §8.2.4.2.5 — does this stored frame carry a *decoded* field of the
+    /// given `parity`?
+    ///
+    /// A `Frame` or complementary `FieldPair` carries both parities; a
+    /// single coded field (`TopField` / `BottomField`) carries only its
+    /// own parity. The §8.2.4.2.5 interleave skips ("the missing field is
+    /// ignored") any frame whose field of the requested parity was not
+    /// decoded or is not marked with the matching reference type.
+    fn has_field(&self, parity: FieldParity) -> bool {
+        match self.structure {
+            PicStructure::Frame | PicStructure::FieldPair => true,
+            PicStructure::TopField => parity == FieldParity::Top,
+            PicStructure::BottomField => parity == FieldParity::Bottom,
+        }
+    }
+
+    /// `PicOrderCnt` of the individual field of the given `parity`, per
+    /// §8.2.4.1 (`top_field_order_cnt` / `bottom_field_order_cnt`). For a
+    /// frame/pair the two may differ; for a single field both members hold
+    /// that field's POC.
+    fn field_poc(&self, parity: FieldParity) -> i32 {
+        match parity {
+            FieldParity::Top => self.top_field_order_cnt,
+            FieldParity::Bottom => self.bottom_field_order_cnt,
+        }
     }
 }
 
@@ -344,6 +403,249 @@ pub fn init_ref_pic_lists_b(
 
     // §8.2.4.2.3 final rule — when RefPicList1 has more than one entry
     // and is identical to RefPicList0, swap [0] and [1] of List1.
+    if list1.len() > 1 && list1 == list0 {
+        list1.swap(0, 1);
+    }
+
+    (list0, list1)
+}
+
+// ---------------------------------------------------------------------
+// §8.2.4.2.2 / §8.2.4.2.4 / §8.2.4.2.5 — Field reference-list init.
+//
+// When the current picture is a coded field (`field_pic_flag == 1`) the
+// initialisation runs in two stages:
+//
+//   1. An ordered list of reference *frames* is built (§8.2.4.2.2 for
+//      P/SP, §8.2.4.2.4 for B) using the same frame-level FrameNumWrap /
+//      PicOrderCnt ordering as the frame cases, but treating any frame
+//      with at least one referenced field as a list member.
+//   2. §8.2.4.2.5 walks that ordered frame list and emits one
+//      `RefFieldEntry` per field, alternating parity (starting with the
+//      current field's own parity) and skipping frames whose field of the
+//      wanted parity is absent. When a parity runs out, the remaining
+//      fields of the other parity are appended in frame order.
+//
+// Each emitted entry names a specific (`dpb_key`, `parity`) field, since
+// §8.2.4.2.4 makes every field of a stored frame a separate reference
+// picture with its own list index.
+// ---------------------------------------------------------------------
+
+/// §8.2.4.2.5 — Initialisation process for reference picture lists in
+/// fields. Given an ordered list of reference-frame `dpb_key`s and the
+/// `current_parity` of the field being decoded, interleave the per-frame
+/// fields by alternating parity.
+///
+/// `frame_order` is the §8.2.4.2.2 / §8.2.4.2.4 ordered frame list (each
+/// a `dpb_key`); `dpb` is consulted via `has_field` to know which
+/// parities each frame actually carries. The same helper serves both the
+/// short-term and long-term stages (the spec text for the two stages is
+/// identical except for the marking type, which the caller already
+/// filtered into `frame_order`).
+fn interleave_fields(
+    frame_order: &[u32],
+    dpb: &[DpbEntry],
+    current_parity: FieldParity,
+) -> Vec<RefFieldEntry> {
+    // Index from dpb_key → entry for the `has_field` lookups.
+    let lookup = |key: u32| -> Option<&DpbEntry> { dpb.iter().find(|e| e.dpb_key == key) };
+
+    let mut out: Vec<RefFieldEntry> = Vec::with_capacity(frame_order.len() * 2);
+    // A per-frame "already consumed" flag per parity so the leftover pass
+    // doesn't re-emit a field that the alternating pass already placed.
+    let mut used_top = vec![false; frame_order.len()];
+    let mut used_bot = vec![false; frame_order.len()];
+
+    // Alternating pass — start with the current field's own parity.
+    let mut want = current_parity;
+    // Per-parity scan cursors into `frame_order`: the spec advances to
+    // "the next available stored reference field of the chosen parity".
+    let mut cursor_top = 0usize;
+    let mut cursor_bot = 0usize;
+
+    loop {
+        let (cursor, used) = match want {
+            FieldParity::Top => (&mut cursor_top, &mut used_top),
+            FieldParity::Bottom => (&mut cursor_bot, &mut used_bot),
+        };
+        // Advance the cursor to the next frame carrying a `want`-parity
+        // field that has not been consumed yet.
+        let mut found: Option<usize> = None;
+        while *cursor < frame_order.len() {
+            let i = *cursor;
+            *cursor += 1;
+            if used[i] {
+                continue;
+            }
+            if lookup(frame_order[i])
+                .map(|e| e.has_field(want))
+                .unwrap_or(false)
+            {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => {
+                used[i] = true;
+                out.push(RefFieldEntry {
+                    dpb_key: frame_order[i],
+                    parity: want,
+                });
+                want = want.flip();
+            }
+            None => {
+                // No more fields of the wanted parity. If the *other*
+                // parity still has any unconsumed field, the spec switches
+                // to appending those in frame order; otherwise we are done.
+                let other = want.flip();
+                let other_has_more = frame_order.iter().enumerate().any(|(i, &k)| {
+                    let used_other = match other {
+                        FieldParity::Top => used_top[i],
+                        FieldParity::Bottom => used_bot[i],
+                    };
+                    !used_other && lookup(k).map(|e| e.has_field(other)).unwrap_or(false)
+                });
+                if other_has_more {
+                    want = other;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// §8.2.4.2.2 — Initialisation process for the reference picture list for
+/// P and SP slices in fields.
+///
+/// Builds `refFrameList0ShortTerm` (short-term frames, descending
+/// `FrameNumWrap`) and `refFrameList0LongTerm` (long-term frames,
+/// ascending `LongTermFrameIdx`), then invokes §8.2.4.2.5 on each and
+/// concatenates short-term fields ahead of long-term fields.
+///
+/// `current_bottom` selects the starting parity for the §8.2.4.2.5
+/// alternation (the current field's own parity).
+pub fn init_ref_pic_list_p_field(
+    dpb: &[DpbEntry],
+    current_frame_num: u32,
+    max_frame_num: u32,
+    current_bottom: bool,
+) -> Vec<RefFieldEntry> {
+    let current_parity = if current_bottom {
+        FieldParity::Bottom
+    } else {
+        FieldParity::Top
+    };
+
+    // refFrameList0ShortTerm — every frame with ≥1 short-term field,
+    // ordered by descending FrameNumWrap (eq. 8-27). `pic_num` with
+    // `current_is_field = false` yields FrameNumWrap directly (eq. 8-28),
+    // which is the frame-level ordering key the spec asks for here.
+    let mut short: Vec<(i32, u32)> = dpb
+        .iter()
+        .filter(|e| e.is_short_term())
+        .map(|e| {
+            (
+                e.pic_num(current_frame_num, max_frame_num, false, false),
+                e.dpb_key,
+            )
+        })
+        .collect();
+    short.sort_by_key(|e| std::cmp::Reverse(e.0));
+    let short_frames: Vec<u32> = short.into_iter().map(|(_, k)| k).collect();
+
+    // refFrameList0LongTerm — ascending LongTermFrameIdx.
+    let mut long: Vec<(u32, u32)> = dpb
+        .iter()
+        .filter(|e| e.is_long_term())
+        .map(|e| (e.long_term_frame_idx, e.dpb_key))
+        .collect();
+    long.sort_by_key(|a| a.0);
+    let long_frames: Vec<u32> = long.into_iter().map(|(_, k)| k).collect();
+
+    let mut out = interleave_fields(&short_frames, dpb, current_parity);
+    out.extend(interleave_fields(&long_frames, dpb, current_parity));
+    out
+}
+
+/// §8.2.4.2.4 — Initialisation process for reference picture lists for B
+/// slices in fields.
+///
+/// Builds three ordered frame lists keyed on `PicOrderCnt`:
+///
+/// * `refFrameList0ShortTerm` — frames with POC ≤ current first
+///   (descending POC), then the rest (ascending POC);
+/// * `refFrameList1ShortTerm` — frames with POC > current first
+///   (ascending POC), then the rest (descending POC);
+/// * `refFrameListLongTerm` — ascending `LongTermFrameIdx`.
+///
+/// Each is fed through §8.2.4.2.5; short-term fields precede long-term
+/// fields. Finally, if `RefPicList1` has >1 entry and equals
+/// `RefPicList0`, the first two entries of List1 are swapped.
+///
+/// The per-frame ordering POC is the frame's `pic_order_cnt`
+/// (`min(top,bottom)` per eq. 8-1, already stored on the entry), matching
+/// the spec's use of `PicOrderCnt(entryShortTerm)` over a frame.
+pub fn init_ref_pic_lists_b_field(
+    dpb: &[DpbEntry],
+    current_poc: i32,
+    current_bottom: bool,
+) -> (Vec<RefFieldEntry>, Vec<RefFieldEntry>) {
+    let current_parity = if current_bottom {
+        FieldParity::Bottom
+    } else {
+        FieldParity::Top
+    };
+
+    // List0 frame order: POC ≤ current desc, then POC > current asc.
+    let mut l0_le: Vec<(i32, u32)> = Vec::new();
+    let mut l0_gt: Vec<(i32, u32)> = Vec::new();
+    // List1 frame order: POC > current asc, then POC ≤ current desc.
+    let mut l1_gt: Vec<(i32, u32)> = Vec::new();
+    let mut l1_le: Vec<(i32, u32)> = Vec::new();
+
+    for e in dpb.iter().filter(|e| e.is_short_term()) {
+        let poc = e.pic_order_cnt;
+        if poc <= current_poc {
+            l0_le.push((poc, e.dpb_key));
+            l1_le.push((poc, e.dpb_key));
+        } else {
+            l0_gt.push((poc, e.dpb_key));
+            l1_gt.push((poc, e.dpb_key));
+        }
+    }
+    l0_le.sort_by_key(|e| std::cmp::Reverse(e.0));
+    l0_gt.sort_by_key(|a| a.0);
+    l1_gt.sort_by_key(|a| a.0);
+    l1_le.sort_by_key(|e| std::cmp::Reverse(e.0));
+
+    let mut l0_frames: Vec<u32> = Vec::new();
+    l0_frames.extend(l0_le.iter().map(|(_, k)| *k));
+    l0_frames.extend(l0_gt.iter().map(|(_, k)| *k));
+    let mut l1_frames: Vec<u32> = Vec::new();
+    l1_frames.extend(l1_gt.iter().map(|(_, k)| *k));
+    l1_frames.extend(l1_le.iter().map(|(_, k)| *k));
+
+    // refFrameListLongTerm — ascending LongTermFrameIdx (shared).
+    let mut long: Vec<(u32, u32)> = dpb
+        .iter()
+        .filter(|e| e.is_long_term())
+        .map(|e| (e.long_term_frame_idx, e.dpb_key))
+        .collect();
+    long.sort_by_key(|a| a.0);
+    let long_frames: Vec<u32> = long.into_iter().map(|(_, k)| k).collect();
+
+    let mut list0 = interleave_fields(&l0_frames, dpb, current_parity);
+    list0.extend(interleave_fields(&long_frames, dpb, current_parity));
+
+    let mut list1 = interleave_fields(&l1_frames, dpb, current_parity);
+    list1.extend(interleave_fields(&long_frames, dpb, current_parity));
+
+    // §8.2.4.2.4 final rule — when RefPicList1 has more than one entry and
+    // is identical to RefPicList0, swap [0] and [1] of List1.
     if list1.len() > 1 && list1 == list0 {
         list1.swap(0, 1);
     }
@@ -820,6 +1122,67 @@ mod tests {
         }
     }
 
+    /// A short-term reference *frame* whose two fields carry distinct
+    /// POCs (`top_poc` / `bot_poc`); `pic_order_cnt` is `min` per eq. 8-1.
+    fn st_pair(frame_num: u32, top_poc: i32, bot_poc: i32, key: u32) -> DpbEntry {
+        DpbEntry {
+            frame_num,
+            top_field_order_cnt: top_poc,
+            bottom_field_order_cnt: bot_poc,
+            pic_order_cnt: top_poc.min(bot_poc),
+            structure: PicStructure::FieldPair,
+            marking: RefMarking::ShortTerm,
+            long_term_frame_idx: 0,
+            dpb_key: key,
+        }
+    }
+
+    /// A single short-term reference field of the given parity.
+    fn st_single_field(frame_num: u32, parity: FieldParity, poc: i32, key: u32) -> DpbEntry {
+        let structure = match parity {
+            FieldParity::Top => PicStructure::TopField,
+            FieldParity::Bottom => PicStructure::BottomField,
+        };
+        DpbEntry {
+            frame_num,
+            top_field_order_cnt: poc,
+            bottom_field_order_cnt: poc,
+            pic_order_cnt: poc,
+            structure,
+            marking: RefMarking::ShortTerm,
+            long_term_frame_idx: 0,
+            dpb_key: key,
+        }
+    }
+
+    /// A long-term reference frame whose two fields are both available.
+    fn lt_pair(ltfi: u32, poc: i32, key: u32) -> DpbEntry {
+        DpbEntry {
+            frame_num: 0,
+            top_field_order_cnt: poc,
+            bottom_field_order_cnt: poc,
+            pic_order_cnt: poc,
+            structure: PicStructure::FieldPair,
+            marking: RefMarking::LongTerm,
+            long_term_frame_idx: ltfi,
+            dpb_key: key,
+        }
+    }
+
+    fn top(key: u32) -> RefFieldEntry {
+        RefFieldEntry {
+            dpb_key: key,
+            parity: FieldParity::Top,
+        }
+    }
+
+    fn bot(key: u32) -> RefFieldEntry {
+        RefFieldEntry {
+            dpb_key: key,
+            parity: FieldParity::Bottom,
+        }
+    }
+
     // §8.2.4.1 eq. 8-27 / 8-28 — PicNum derivation with frame_num wrap.
     #[test]
     fn pic_num_no_wrap() {
@@ -1211,5 +1574,236 @@ mod tests {
         assert_eq!(list[0], 1);
         assert_eq!(list[1], u32::MAX);
         assert_eq!(list[2], u32::MAX);
+    }
+
+    // -----------------------------------------------------------------
+    // §8.2.4.2.5 — parity-alternation interleave (the shared core).
+    // -----------------------------------------------------------------
+
+    // Two complete reference frames; current field is a TOP field. The
+    // alternation starts with the current parity (top) and zig-zags:
+    //   frame-order = [A(key=1), B(key=2)]
+    //   top: A.top, then bottom: A.bot, then top: B.top, then bottom: B.bot
+    // i.e. each frame contributes both fields, same-parity-first.
+    #[test]
+    fn interleave_two_full_frames_top_first() {
+        let dpb = vec![st_pair(1, 0, 1, 1), st_pair(2, 2, 3, 2)];
+        let order = vec![1u32, 2];
+        let out = interleave_fields(&order, &dpb, FieldParity::Top);
+        assert_eq!(out, vec![top(1), bot(1), top(2), bot(2)]);
+    }
+
+    // Same DPB, current field is a BOTTOM field — alternation starts with
+    // bottom parity: B.bot first? No — the cursor for each parity walks
+    // `frame_order` independently, so bottom starts at frame A:
+    //   bot: A.bot, top: A.top, bot: B.bot, top: B.top
+    #[test]
+    fn interleave_two_full_frames_bottom_first() {
+        let dpb = vec![st_pair(1, 0, 1, 1), st_pair(2, 2, 3, 2)];
+        let order = vec![1u32, 2];
+        let out = interleave_fields(&order, &dpb, FieldParity::Bottom);
+        assert_eq!(out, vec![bot(1), top(1), bot(2), top(2)]);
+    }
+
+    // A non-paired field in the middle: frame B carries only its TOP
+    // field. Current parity = top.
+    //   want=top  → A.top  (A has top)
+    //   want=bot  → A.bot  (A has bot; B has no bot, skipped later)
+    //   want=top  → B.top  (cursor_top resumes after A)
+    //   want=bot  → none left of bottom parity → switch to leftover top →
+    //               but all tops consumed → done.
+    #[test]
+    fn interleave_skips_missing_parity() {
+        let dpb = vec![
+            st_pair(1, 0, 1, 1),
+            st_single_field(2, FieldParity::Top, 2, 2),
+        ];
+        let order = vec![1u32, 2];
+        let out = interleave_fields(&order, &dpb, FieldParity::Top);
+        assert_eq!(out, vec![top(1), bot(1), top(2)]);
+    }
+
+    // Parity runs out mid-list: only top fields exist. Current = top.
+    //   top: F1.top, (want bot → none) → leftover top: F2.top, F3.top
+    #[test]
+    fn interleave_one_parity_only_appends_leftovers() {
+        let dpb = vec![
+            st_single_field(1, FieldParity::Top, 0, 1),
+            st_single_field(2, FieldParity::Top, 2, 2),
+            st_single_field(3, FieldParity::Top, 4, 3),
+        ];
+        let order = vec![1u32, 2, 3];
+        let out = interleave_fields(&order, &dpb, FieldParity::Top);
+        assert_eq!(out, vec![top(1), top(2), top(3)]);
+    }
+
+    // Current parity = top but only BOTTOM fields exist: the first wanted
+    // (top) parity is empty, so the leftover bottom pass takes over from
+    // the start, in frame order.
+    #[test]
+    fn interleave_opposite_parity_only() {
+        let dpb = vec![
+            st_single_field(1, FieldParity::Bottom, 0, 1),
+            st_single_field(2, FieldParity::Bottom, 2, 2),
+        ];
+        let order = vec![1u32, 2];
+        let out = interleave_fields(&order, &dpb, FieldParity::Top);
+        assert_eq!(out, vec![bot(1), bot(2)]);
+    }
+
+    #[test]
+    fn interleave_empty() {
+        let dpb: Vec<DpbEntry> = vec![];
+        let out = interleave_fields(&[], &dpb, FieldParity::Top);
+        assert!(out.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // §8.2.4.2.2 — P/SP field RefPicList0 init.
+    // -----------------------------------------------------------------
+
+    // Two short-term reference frames, frame_num {1,2}, current frame_num
+    // 5 (no wrap). refFrameList0ShortTerm descending FrameNumWrap = [2,1].
+    // Current field = top ⇒ §8.2.4.2.5 alternates:
+    //   top: F2.top, bot: F2.bot, top: F1.top, bot: F1.bot
+    #[test]
+    fn p_field_two_full_frames() {
+        let dpb = vec![st_pair(1, 0, 1, 1), st_pair(2, 2, 3, 2)];
+        let out = init_ref_pic_list_p_field(&dpb, 5, 16, false);
+        assert_eq!(out, vec![top(2), bot(2), top(1), bot(1)]);
+    }
+
+    // Mixed short + long term. ST frame_nums {3,4} (desc FrameNumWrap →
+    // [4,3]); LT ltfi {0,2} (asc → [k=100(ltfi0), k=102(ltfi2)]). Current
+    // field = bottom. Short-term fields precede long-term fields.
+    #[test]
+    fn p_field_short_then_long() {
+        let dpb = vec![
+            st_pair(3, 0, 1, 3),
+            st_pair(4, 2, 3, 4),
+            lt_pair(2, 10, 102),
+            lt_pair(0, 8, 100),
+        ];
+        let out = init_ref_pic_list_p_field(&dpb, 6, 16, true);
+        // ST refFrameList0 = [4,3], current=bottom →
+        //   bot:F4.bot, top:F4.top, bot:F3.bot, top:F3.top
+        // LT refFrameList0 = [100(ltfi0), 102(ltfi2)], current=bottom →
+        //   bot:100.bot, top:100.top, bot:102.bot, top:102.top
+        assert_eq!(
+            out,
+            vec![
+                bot(4),
+                top(4),
+                bot(3),
+                top(3),
+                bot(100),
+                top(100),
+                bot(102),
+                top(102),
+            ]
+        );
+    }
+
+    // FrameNumWrap ordering with wrap: current frame_num 1, ref
+    // frame_nums {1, 15} with max_frame_num 16. FrameNumWrap(15) = -1,
+    // FrameNumWrap(1) = 1, so descending = [F1(key=1), F15(key=15)].
+    #[test]
+    fn p_field_framenumwrap_order() {
+        let dpb = vec![st_pair(1, 0, 1, 1), st_pair(15, 4, 5, 15)];
+        let out = init_ref_pic_list_p_field(&dpb, 1, 16, false);
+        assert_eq!(out, vec![top(1), bot(1), top(15), bot(15)]);
+    }
+
+    // -----------------------------------------------------------------
+    // §8.2.4.2.4 — B field RefPicList0 / RefPicList1 init.
+    // -----------------------------------------------------------------
+
+    // Current field POC = 10 (top field). DPB frames with pic_order_cnt
+    // {5, 6, 15, 20}. Per §8.2.4.2.4:
+    //   refFrameList0ShortTerm: POC≤10 desc [6,5], then POC>10 asc [15,20]
+    //                           ⇒ frames [6,5,15,20]
+    //   refFrameList1ShortTerm: POC>10 asc [15,20], then POC≤10 desc [6,5]
+    //                           ⇒ frames [15,20,6,5]
+    // Then §8.2.4.2.5 interleave (current=top, every frame full pair):
+    //   list0 = top6,bot6,top5,bot5,top15,bot15,top20,bot20
+    //   list1 = top15,bot15,top20,bot20,top6,bot6,top5,bot5
+    #[test]
+    fn b_field_lists_spec_rules() {
+        let dpb = vec![
+            st_pair(0, 5, 5, 5),
+            st_pair(1, 6, 6, 6),
+            st_pair(2, 15, 15, 15),
+            st_pair(3, 20, 20, 20),
+        ];
+        let (l0, l1) = init_ref_pic_lists_b_field(&dpb, 10, false);
+        assert_eq!(
+            l0,
+            vec![
+                top(6),
+                bot(6),
+                top(5),
+                bot(5),
+                top(15),
+                bot(15),
+                top(20),
+                bot(20),
+            ]
+        );
+        assert_eq!(
+            l1,
+            vec![
+                top(15),
+                bot(15),
+                top(20),
+                bot(20),
+                top(6),
+                bot(6),
+                top(5),
+                bot(5),
+            ]
+        );
+    }
+
+    // §8.2.4.2.4 final rule: when List1 == List0 (>1 entry), swap the
+    // first two entries of List1. Force identity by giving a single
+    // reference frame split into two fields, all on the same side of the
+    // current POC so the two frame orders coincide.
+    #[test]
+    fn b_field_identical_list_swap() {
+        // Two full ref frames, both POC < current(10). List0 short order =
+        // [POC8, POC6] desc; List1 short order: POC>10 empty, then leftover
+        // POC≤10 desc = [POC8, POC6] — identical frame orders ⇒ identical
+        // field lists, so List1[0] and List1[1] swap.
+        let dpb = vec![st_pair(0, 6, 6, 6), st_pair(1, 8, 8, 8)];
+        let (l0, l1) = init_ref_pic_lists_b_field(&dpb, 10, false);
+        assert_eq!(l0, vec![top(8), bot(8), top(6), bot(6)]);
+        // List1 identical pre-swap → swap [0],[1].
+        assert_eq!(l1, vec![bot(8), top(8), top(6), bot(6)]);
+    }
+
+    // Long-term fields trail short-term fields in both lists. ST POC 5
+    // (<10), LT ltfi 0. Current top field. Here List1's pre-swap content
+    // is identical to List0 (the single ST frame's POC 5 ≤ 10 lands in the
+    // same leftover slot for both lists), so the §8.2.4.2.4 final rule
+    // swaps List1[0] and List1[1].
+    #[test]
+    fn b_field_short_then_long() {
+        let dpb = vec![st_pair(0, 5, 5, 5), lt_pair(0, 99, 100)];
+        let (l0, l1) = init_ref_pic_lists_b_field(&dpb, 10, false);
+        assert_eq!(l0, vec![top(5), bot(5), top(100), bot(100)]);
+        // List1 == List0 pre-swap ⇒ first two entries swapped.
+        assert_eq!(l1, vec![bot(5), top(5), top(100), bot(100)]);
+    }
+
+    // Non-paired field handling under B: ref frame carries only a bottom
+    // field. Current = top field, ref POC 5 < 10.
+    //   List0 ST frames = [F(key=7)]; interleave current=top:
+    //     want top → F7 has no top → skip; switch to leftover bottom →
+    //     F7.bot. Result = [bot7].
+    #[test]
+    fn b_field_nonpaired_ref() {
+        let dpb = vec![st_single_field(0, FieldParity::Bottom, 5, 7)];
+        let (l0, _l1) = init_ref_pic_lists_b_field(&dpb, 10, false);
+        assert_eq!(l0, vec![bot(7)]);
     }
 }

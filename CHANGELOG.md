@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- round 355 — **§8.2.4.2.2 / §8.2.4.2.4 / §8.2.4.2.5 field reference
+  picture list initialisation.** When the current picture is a coded
+  field, each *field* of a stored reference frame is a separate
+  reference picture with its own list index (§8.2.4.2.4), so the field
+  RefPicLists are built in two stages: an ordered list of reference
+  *frames* (§8.2.4.2.2 for P/SP — descending `FrameNumWrap` short-term,
+  ascending `LongTermFrameIdx` long-term; §8.2.4.2.4 for B — the
+  `PicOrderCnt`-partitioned List0/List1 frame orders), then the
+  §8.2.4.2.5 parity-alternation interleave that emits one entry per
+  field, starting with the current field's own parity, skipping any
+  frame whose field of the wanted parity was not decoded ("the missing
+  field is ignored"), and appending the leftover fields of the available
+  parity in frame order once the alternate parity is exhausted. New
+  `FieldParity` / `RefFieldEntry` types name the `(dpb_key, parity)` of
+  each list entry; `init_ref_pic_list_p_field`,
+  `init_ref_pic_lists_b_field`, and the shared `interleave_fields` helper
+  implement the three clauses, plus `DpbEntry::has_field` / `field_poc`
+  accessors for per-parity availability + POC. Covered by 18
+  spec-derived unit tests. This replaces the previous "fields treated as
+  single-parity reference frames" placeholder for the list-interleaving
+  step; the frame-only paths (`init_ref_pic_list_p` /
+  `init_ref_pic_lists_b`) are unchanged.
+
 ### Fixed
 
 - round 349 — **§8.5.8 eq. 8-309 QP_Y derivation for >8-bit luma.** The
