@@ -542,15 +542,30 @@ fn corpus_bipred_with_b_frames_main() {
     // "b-frames" but `trace.txt` shows only slice_type 1 (I) + 2 (P) —
     // no B-slice is present; frame 1 is the P picture.)
     //
-    // Round 343 finding (90.4% exact): frame 0 (IDR) is bit-exact; in
-    // frame 1 (P) the *top* MB row (P_Skip) is bit-exact and only the
-    // *bottom* MB row of P_L0 inter MBs diverges by a small amount
-    // (Y max diff 13, chroma up to ~10). The same signature appears in
-    // `multi-ref-frames`. The error is confined to bottom-edge P_L0 MBs
-    // and survives with deblocking disabled, so it is a §8.4.2 inter
-    // reconstruction edge case (sub-pel interpolation / residual at the
-    // picture's bottom boundary), not a deblock artifact. Tracked as a
-    // followup in the round report; stays ReportOnly until fixed.
+    // Round 346 finding (90.4% exact, frames are CONSECUTIVE here so
+    // our[1] vs expected[1] is a valid comparison — unlike
+    // `multi-ref-frames`): frame 0 (IDR) is bit-exact; in frame 1 (P)
+    // the top MB row (P_Skip) is bit-exact and only the bottom MB row
+    // diverges in a tight 4-row band (rows 24-27, cols 0-7 of each
+    // bottom MB), Y max diff 16.
+    //
+    // Per `trace.txt`, frame-1's bottom MBs are P_L0_16x16
+    // (`mb_type=0x3040`) with `mv=(0,0) ref_idx=0` and `cbp=0x10`
+    // (CodedBlockPatternChroma=1, *luma cbp=0* → no luma residual).
+    // With a zero MV, no luma residual, identity weights
+    // (`luma_log2_weight_denom=0`, w=1 o=0, confirmed by dumping the
+    // parsed pred_weight_table), and bS=0 on the internal edges (both
+    // 4x4 blocks share mv/ref and carry no coeffs), frame-1's bottom-MB
+    // luma is REQUIRED by §8.4.2 / §8.7.2.1 to equal the deblocked IDR
+    // sample-for-sample. Our decoder produces exactly that: our[1]'s
+    // bottom band ≈ our[0] (the bit-exact IDR). But `expected.yuv`'s
+    // frame-1 bottom band differs from its own frame-0 by up to +16
+    // (IDR [87,102,132,147] → expected-f1 [91,118,139,163]) — a delta
+    // that mv=0 + no-luma-residual + identity-weight + bS=0 cannot
+    // produce. The fixture's expected.yuv is therefore internally
+    // inconsistent with its trace at the bottom MB row. DOCS-GAP
+    // recorded in the round report (same class as #1728). ReportOnly
+    // until the fixture is regenerated with a matching expected.yuv.
     evaluate_annex_b(&CorpusCase {
         name: "bipred-with-b-frames-main",
         width: 32,
@@ -568,11 +583,22 @@ fn corpus_multi_ref_frames() {
     // sliding-window when more than one short-term ref is live. trace:
     // 31 lines.
     //
-    // Round 343 finding (94.3% exact): identical signature to
-    // `bipred-with-b-frames-main` — IDR + P top row bit-exact, only the
-    // bottom MB row of frame-1 P_L0 inter MBs diverges by a small amount
-    // (Y max diff 16, chroma ~10). Same §8.4.2 bottom-edge inter
-    // reconstruction edge case; see that fixture's note. ReportOnly.
+    // Round 346 finding (94.3% "exact" — but the comparison is FRAME-
+    // MISALIGNED): the staged `expected.yuv` holds only 2 frames, while
+    // `input.h264` codes 5 (bf=0, so decode order == display order).
+    // `trace.txt`'s frame=1 carries `frame_num=4, prev_frame_num=3` —
+    // i.e. it is the *5th* coded picture, not the 2nd. So expected[1]
+    // is frame_num=4, but the corpus harness scores it against our 2nd
+    // decoded frame (frame_num=1). The 94.3% is an artefact of expected
+    // frame_num=4 being nearly a copy of the IDR (only 32/1024 Y
+    // samples differ from frame 0). Comparing our frame_num=4 output
+    // (our[4]) against expected[1] instead still shows ~74/1024 Y wrong,
+    // i.e. a real accumulated inter error across frames 1..4 that cannot
+    // be isolated without per-frame intermediate references (the trace
+    // and expected.yuv skip frames 1-3). Two defects: (a) expected.yuv
+    // is non-consecutive / under-specified for a 5-frame stream, and
+    // (b) no intermediate reference exists to localise the accumulation.
+    // DOCS-GAP recorded in the round report. ReportOnly.
     evaluate_annex_b(&CorpusCase {
         name: "multi-ref-frames",
         width: 32,
@@ -714,6 +740,20 @@ fn corpus_qp_high_cqp() {
 fn corpus_4_4_4_high() {
     // High 4:4:4 Predictive / 1.0, 8-bit. expected.yuv is packed
     // 32×32×3 bytes (4:4:4 planar). trace: 18 lines.
+    //
+    // Round 346 finding: this fixture's `expected.yuv` LUMA plane is
+    // *bogus* — all 1024 Y bytes are a uniform 128 (verified), and the
+    // chroma planes are only partially textured (290/1024 U and V bytes
+    // are 128, with the first rows flat 128). The four MBs are CABAC
+    // I_4x4 with non-zero CBPs (0x7..0xe per trace) and non-trivial
+    // parsed residuals (e.g. MB0 block0 DC = -22) + intra pred modes, so
+    // a flat-gray luma plane is impossible — the staged YUV does not
+    // correspond to `input.h264` (same defect class as
+    // `i-only-64x64-main`). Our decoder parses sensible per-MB residual
+    // / pred-mode data (dumped + cross-checked against `transform-8x8-on`
+    // 4:2:0, which decodes the same I_4x4 structure bit-exactly) and
+    // produces correctly-textured 4:4:4 output. Stays ReportOnly; the
+    // fixture must be regenerated. DOCS-GAP recorded in the round report.
     evaluate_annex_b(&CorpusCase {
         name: "4-4-4-high",
         width: 32,
@@ -728,6 +768,18 @@ fn corpus_4_4_4_high() {
 #[test]
 fn corpus_intra_only_high444() {
     // High 4:4:4 Predictive / 1.1, all-intra. trace: 35 lines.
+    //
+    // Round 346 finding: frame 1 (the high-QP picture, qp 42..45) is
+    // bit-exact (Y 1024/1024, UV 2048/2048, max diff 0). Frame 0 is the
+    // SAME defective picture as `4-4-4-high` frame 0 — its expected.yuv
+    // luma is uniform 128 while the bitstream codes textured CABAC I_4x4
+    // MBs (low QP 27..30, non-zero residuals). So the 72.9% aggregate is
+    // entirely frame 0's bogus reference dragging down an otherwise
+    // bit-exact frame 1. Confirms the 4:4:4 I_4x4 decode path is correct
+    // (frame 1 proves luma + chroma "coded like luma" + intra-pred-mode
+    // derivation are all exact); only frame 0's expected.yuv is bad.
+    // Stays ReportOnly; fixture frame 0 must be regenerated. DOCS-GAP
+    // recorded in the round report.
     evaluate_annex_b(&CorpusCase {
         name: "intra-only-high444",
         width: 32,

@@ -84,7 +84,7 @@ decoder run separately.
 | B slices | CAVLC + CABAC | Explicit B_L0/L1/Bi_16x16 / 16x8 / 8x16, per-cell mixed B_8x8, B_Skip, B_Direct_16x16 / 8x8 (§8.4.1.2.2 spatial + §8.4.1.2.3 temporal direct), default + explicit weighted bipred |
 | MV derivation | §8.4.1.3 | mvp median + C→D substitution, P_Skip MV, spatial/temporal direct mirrored on the encoder side |
 | 4:2:2 chroma | High 4:2:2 (`profile_idc=122`), IDR-only | §8.5.11.2 4x2 chroma DC Hadamard, §8.3.4 8x16 chroma intra; P / B-slice 4:2:2 deferred |
-| 4:4:4 chroma | High 4:4:4 Predictive (`profile_idc=244`), IDR Intra_16x16 | §7.3.5.3 / §8.3.4.1 chroma "coded like luma" (per-plane 16x16 DC Hadamard + 4x4 AC); I_NxN / P / B 4:4:4 + `separate_colour_plane_flag=1` deferred |
+| 4:4:4 chroma | High 4:4:4 Predictive (`profile_idc=244`), IDR Intra_16x16 + **Intra_4x4** | §7.3.5.3 / §8.3.4.1 chroma "coded like luma" (per-plane 16x16 DC Hadamard + 4x4 AC); §8.3.4.5 I_NxN Cb/Cr reuse the per-block luma Intra_4x4 pred modes — the High 4:4:4 all-intra I_4x4 path now decodes bit-exact (`integration_high444_i4x4_bitexact`, gated on the `intra-only-high444` high-QP picture). I_8x8 4:4:4 / P / B 4:4:4 + `separate_colour_plane_flag=1` deferred |
 | Intra fallback in P / B | Intra_16x16 | Per-MB Lagrangian RDO against the inter winner (`EncoderConfig::intra_in_inter`); I_NxN / I_PCM fallback + 4:2:2 / 4:4:4 P/B paths deferred |
 | Trellis quantisation (RDOQ-lite) | §9.3.3.1.3 + §8.5.12 | Spatial-domain `D + λ·R` one-step-toward-zero refinement on inter luma 4×4 (`EncoderConfig::trellis_quant`, default on) and opt-in on Intra_16x16 luma + chroma AC; informative only — bitstream syntax is unchanged and the decoder is unaffected |
 

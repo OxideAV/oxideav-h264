@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- round 346 — enforced bit-exact gate for the High 4:4:4 Predictive
+  I_4x4 decode path (`integration_high444_i4x4_bitexact`). The
+  `intra-only-high444` fixture's high-QP picture (frame 1) decodes
+  byte-for-byte against its reference YUV, exercising §7.3.5.3 /
+  §8.3.4.5 4:4:4 Intra_4x4 luma + the "chroma coded like luma" Cb/Cr
+  reconstruction (per-block luma pred-mode reuse) at ChromaArrayType==3.
+  This path could not be gated by the multi-frame `docs_corpus` case
+  because that fixture's frame 0 reference is defective (see below).
+
 ### Other
+
+- round 346 — corpus fixture diagnosis. Root-caused the remaining
+  `ReportOnly` corpus divergences to defective/under-specified staged
+  reference data, not decoder bugs (verified, no web tools, spec-only):
+  (a) `4-4-4-high` and `intra-only-high444` frame 0 — `expected.yuv`
+  luma is a uniform 128 despite the bitstream coding textured CABAC
+  I_4x4 MBs (same defect class as `i-only-64x64-main`); our decoder
+  produces correct texture, confirmed against the bit-exact
+  `transform-8x8-on` 4:2:0 I_4x4 path. (b) `multi-ref-frames` —
+  `expected.yuv` holds 2 non-consecutive frames (IDR + the 5th coded
+  picture, `frame_num=4`) while the harness scores them as the first 2
+  decoded frames; the 94% is an artefact of the 5th picture being a
+  near-copy of the IDR. (c) `bipred-with-b-frames-main` — `expected.yuv`
+  frame 1's bottom MB row diverges from its own frame 0 by up to +16
+  despite the trace recording `mv=(0,0)`, no luma residual, identity
+  weights, and bS=0 internal edges — a delta the spec cannot produce, so
+  the reference is internally inconsistent. All recorded as docs-gaps for
+  fixture regeneration; the affected cases stay `ReportOnly`.
 
 - round 343 — fixture-validation hardening. Ran the full staged
   `docs/video/h264/fixtures/` corpus byte-for-byte against each
