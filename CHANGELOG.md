@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- round 349 — **§8.5.8 eq. 8-309 QP_Y derivation for >8-bit luma.** The
+  per-MB `QP_Y` modulo used the addend `52 + QpBdOffsetY` where the spec
+  requires `52 + 2*QpBdOffsetY` (the modulus stays `52 + QpBdOffsetY`).
+  For 8-bit luma `QpBdOffsetY == 0` so the two coincide (all 8-bit
+  fixtures were unaffected), but at 10-bit (`QpBdOffsetY = 12`) every
+  macroblock's `QP_Y` came out 12 too low, dragging `qP'Y = QP_Y +
+  QpBdOffsetY` below its true value and collapsing the §8.5.12
+  inverse-quant scale so reconstructed residuals were ~16× too small —
+  10/12/14-bit pictures decoded to a near-flat mid-gray. Extracted the
+  derivation into `reconstruct::next_qp_y` with the corrected formula and
+  spec-value unit tests at 8/10/12-bit. On the `10-bit-high10` fixture
+  this lifts the (gateable) right MB column's luma to ~93% byte-exact —
+  its top rows now match the reference exactly — and the overall match
+  from 5.6% to 46.9% (the rest is the fixture's concealed left MB column,
+  see Other).
+
 ### Added
 
 - round 349 — High10 (10-bit, `profile_idc=110`) decode-path milestone

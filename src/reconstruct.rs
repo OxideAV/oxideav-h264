@@ -552,15 +552,11 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
         // deblocking). For I_PCM / P_Skip / B_Skip we leave QP_Y
         // unchanged per §7.4.5. P_Skip / B_Skip carry no mb_qp_delta.
         let mb_qp_y = if mb.mb_type.is_i_pcm() || mb.is_skip {
+            // §7.4.5 — I_PCM / P_Skip / B_Skip carry no mb_qp_delta, QP_Y
+            // is unchanged from the previous MB.
             prev_qp_y
         } else {
-            // §8.5.8 eq. 8-309 — QP_Y = ((prev_QP_Y + mb_qp_delta + 52 + QpBdOffsetY)
-            // % (52 + QpBdOffsetY)) - QpBdOffsetY.
-            let qp_bd_offset_y = (6 * sps.bit_depth_luma_minus8) as i32;
-            let range = 52 + qp_bd_offset_y;
-            let raw = prev_qp_y + mb.mb_qp_delta + range;
-            let m = raw.rem_euclid(range);
-            m - qp_bd_offset_y
+            next_qp_y(prev_qp_y, mb.mb_qp_delta, sps.bit_depth_luma_minus8)
         };
 
         // Reconstruct this MB's samples.
@@ -704,6 +700,34 @@ fn deblock_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_DEBLOCK_TRACE").is_some())
+}
+
+/// §8.5.8 eq. 8-309 (T-REC-H.264-202408) — derive the current MB's QP_Y
+/// from the previous MB's QP_Y and the parsed `mb_qp_delta`:
+///
+/// ```text
+/// QPY = ((QPY,PREV + mb_qp_delta + 52 + 2*QpBdOffsetY) % (52 + QpBdOffsetY)) − QpBdOffsetY
+/// ```
+///
+/// The wrap addend is `52 + 2*QpBdOffsetY` while the modulus is only
+/// `52 + QpBdOffsetY`. For 8-bit luma `QpBdOffsetY == 0`, so the two
+/// coincide and the formula reduces to the familiar `(prev + delta + 52)
+/// % 52`. At >8-bit depth the *extra* `QpBdOffsetY` in the addend is
+/// mandatory: dropping it (using `52 + QpBdOffsetY` as the addend)
+/// shifts every MB's QP_Y down by `QpBdOffsetY` — e.g. −12 at 10-bit —
+/// which in turn drives qP'Y (= QP_Y + QpBdOffsetY, §7.4.2.1.1 eq. 7-40)
+/// below the true value, collapsing the §8.5.12 inverse-quant scale so
+/// the reconstructed residuals come out ~2^(QpBdOffsetY/6·?)× too small
+/// and the >8-bit picture is destroyed. `QpBdOffsetY = 6 *
+/// bit_depth_luma_minus8` (§7.4.2.1.1 eq. 7-4).
+///
+/// The result lies in `−QpBdOffsetY..=51` (Note 1 after eq. 8-309).
+#[inline]
+fn next_qp_y(prev_qp_y: i32, mb_qp_delta: i32, bit_depth_luma_minus8: u32) -> i32 {
+    let qp_bd_offset_y = 6 * bit_depth_luma_minus8 as i32;
+    let modulus = 52 + qp_bd_offset_y;
+    let raw = prev_qp_y + mb_qp_delta + 52 + 2 * qp_bd_offset_y;
+    raw.rem_euclid(modulus) - qp_bd_offset_y
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7747,6 +7771,78 @@ mod tests {
     use crate::macroblock_layer::{
         Intra16x16, Macroblock, MbPred, MbType, PcmSamples, SubMbPred, SubMbType,
     };
+
+    // ----- §8.5.8 eq. 8-309 QP_Y derivation (next_qp_y) -----------------
+
+    /// At 8-bit luma (`bit_depth_luma_minus8 == 0`, QpBdOffsetY = 0) the
+    /// formula reduces to the classic `(prev + delta + 52) % 52`, range
+    /// 0..=51. These goldens are what every bit-exact 8-bit corpus
+    /// fixture relies on, so this pins the reduction.
+    #[test]
+    fn next_qp_y_8bit_reduces_to_mod52() {
+        // No delta: QP_Y unchanged.
+        assert_eq!(next_qp_y(28, 0, 0), 28);
+        // Positive delta within range.
+        assert_eq!(next_qp_y(28, 5, 0), 33);
+        // Negative delta within range.
+        assert_eq!(next_qp_y(28, -10, 0), 18);
+        // Wrap at the top: 51 + 1 → 0.
+        assert_eq!(next_qp_y(51, 1, 0), 0);
+        // Wrap at the bottom: 0 − 1 → 51.
+        assert_eq!(next_qp_y(0, -1, 0), 51);
+        // Result always in 0..=51 for 8-bit.
+        for prev in 0..=51 {
+            for delta in -39..=39 {
+                let q = next_qp_y(prev, delta, 0);
+                assert!((0..=51).contains(&q), "8-bit QP_Y {q} out of 0..=51");
+            }
+        }
+    }
+
+    /// At 10-bit luma (`bit_depth_luma_minus8 == 2`, QpBdOffsetY = 12)
+    /// the addend is `52 + 2*12 = 76` and the modulus is `52 + 12 = 64`,
+    /// result range `−12..=51`. The golden values come from the actual
+    /// `10-bit-high10` fixture decode (round 349): SliceQPY = 39, MB0's
+    /// mb_qp_delta = −11 must yield QP_Y = 28 (so qP'Y = 40, matching the
+    /// trace's reported MB qp). The buggy `52 + QpBdOffsetY` addend gave
+    /// 16 instead — a −12 (= −QpBdOffsetY) error that collapsed recon.
+    #[test]
+    fn next_qp_y_10bit_eq_8_309() {
+        // The fixture's MB0: prev = SliceQPY = 39, delta = −11 → 28.
+        assert_eq!(next_qp_y(39, -11, 2), 28);
+        // No delta leaves QP_Y unchanged (even when it is the slice QP).
+        assert_eq!(next_qp_y(39, 0, 2), 39);
+        // Negative QP_Y is legal at 10-bit (range floor is −QpBdOffsetY).
+        assert_eq!(next_qp_y(0, -12, 2), -12);
+        // Wrap at the top of the 64-wide ring: 51 + 1 → −12.
+        assert_eq!(next_qp_y(51, 1, 2), -12);
+        // Wrap at the bottom: −12 − 1 → 51.
+        assert_eq!(next_qp_y(-12, -1, 2), 51);
+        // Result always in −12..=51 for 10-bit.
+        for prev in -12..=51 {
+            for delta in -45..=45 {
+                let q = next_qp_y(prev, delta, 2);
+                assert!((-12..=51).contains(&q), "10-bit QP_Y {q} out of −12..=51");
+            }
+        }
+    }
+
+    /// 12-bit (QpBdOffsetY = 24): addend `52 + 48 = 100`, modulus
+    /// `52 + 24 = 76`, range `−24..=51`.
+    #[test]
+    fn next_qp_y_12bit_eq_8_309() {
+        assert_eq!(next_qp_y(0, 0, 4), 0);
+        assert_eq!(next_qp_y(0, -24, 4), -24);
+        assert_eq!(next_qp_y(51, 1, 4), -24);
+        assert_eq!(next_qp_y(-24, -1, 4), 51);
+        for prev in -24..=51 {
+            for delta in -50..=50 {
+                let q = next_qp_y(prev, delta, 4);
+                assert!((-24..=51).contains(&q), "12-bit QP_Y {q} out of −24..=51");
+            }
+        }
+    }
+
     use crate::pps::Pps;
     use crate::ref_store::{NoRefs, RefPicStore};
     use crate::slice_header::{

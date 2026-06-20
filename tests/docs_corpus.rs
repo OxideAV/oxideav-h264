@@ -814,20 +814,29 @@ fn corpus_intra_only_high444() {
 // flat 0x80 left column cannot be a true decode.
 //
 // The remaining right MB column (luma x∈16..32) does carry valid 10-bit
-// data, but its §8.3.1.2 intra-4x4 prediction reads the *left-MB right
-// edge* as its left-neighbour. Because the fixture concealed the left
-// MB, no part of this `expected.yuv` provides verifiable 10-bit ground
-// truth: the right column is unreachable without the (hidden) true left
-// reconstruction. Scoring therefore stays ReportOnly. DOCS-GAP recorded
-// in the round report — the fixture must be regenerated without the
-// conceal-MB fill (same ask as the other partially-blanked fixtures).
+// data. Round 349 fixed a real §8.5.8 eq. 8-309 QP_Y bug (the modulo
+// addend was `52 + QpBdOffsetY` instead of `52 + 2*QpBdOffsetY`, which
+// shifted every 10-bit MB's QP_Y down by 12 and collapsed the dequant
+// scale; see `reconstruct::next_qp_y`). With that fix the right column's
+// luma is now ~93% (475/512) byte-exact — its top rows match the
+// reference exactly (e.g. row 0 = 171,444,695,938 across all four 4×4
+// sub-blocks), and the aggregate jumped 5.6% → 46.9%. The residual
+// right-column diffs are tiny (≤~10) and confined to the bottom MB,
+// where §8.3.1.2 intra-4x4 prediction + §8.7 deblocking read the *left-
+// MB right edge* — and the left MB is concealed in the reference, so
+// those samples are unreachable without the (hidden) true left
+// reconstruction. The full picture still cannot gate (the entire left
+// MB column is 0x80 fill), so scoring stays ReportOnly. DOCS-GAP
+// recorded in the round report — the fixture must be regenerated without
+// the conceal-MB fill (same ask as the other partially-blanked fixtures)
+// before a byte-exact High10 gate can land.
 //
 // What IS verifiable about the 10-bit path is asserted separately by
 // `corpus_10_bit_high10_emits_full_range` below: our decoder plumbs
 // `bit_depth_luma=10` end-to-end (predicted DC default `1<<(10-1)=512`,
-// `QpBdOffsetY=12` extended QP, §8.5.12 dequant at qP'=qP+12) and emits
-// genuine high-bit-depth samples spanning the full 0..1023 range, not
-// 8-bit-collapsed output.
+// `QpBdOffsetY=12` extended QP via the corrected eq. 8-309, §8.5.12
+// dequant at qP'=qP+12) and emits genuine high-bit-depth samples
+// spanning the full 0..1023 range, not 8-bit-collapsed output.
 #[test]
 fn corpus_10_bit_high10() {
     evaluate_annex_b(&CorpusCase {
