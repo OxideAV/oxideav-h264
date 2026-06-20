@@ -870,6 +870,15 @@ fn corpus_10_bit_high10() {
 ///    fraction of samples exceed 255. An 8-bit-collapsed reconstruction
 ///    (the failure mode if `QpBdOffsetY`/`bit_depth` were dropped on the
 ///    floor) would pin every sample to `<= 255`.
+/// 4. The *verifiable* right MB column (luma x∈16..32) — the half of the
+///    reference that is NOT concealed — matches `expected.yuv`
+///    byte-for-byte over a large majority of samples, and the top-right
+///    MB's first row is exact to the bit. This is the regression guard
+///    for the round-349 §8.5.8 eq. 8-309 QP_Y fix: with the pre-fix
+///    addend the right column was 0/512 exact (every MB's QP_Y was 12 too
+///    low, collapsing the dequant scale); post-fix it is ~93% exact. The
+///    unmatched right-column samples are confined to the bottom MB, whose
+///    §8.3.1.2 intra-pred + §8.7 deblock read the concealed left column.
 #[test]
 fn corpus_10_bit_high10_emits_full_range() {
     const W: usize = 32;
@@ -943,6 +952,57 @@ fn corpus_10_bit_high10_emits_full_range() {
         luma_over_8bit >= W * H / 4,
         "only {luma_over_8bit}/{} luma samples exceed 8-bit range — High10 reconstruction looks 8-bit-collapsed",
         W * H
+    );
+
+    // (4) Right MB column (x∈16..32) regression guard for the eq. 8-309
+    // QP_Y fix. Only the right half of `expected.yuv` is real (the left
+    // MB column is 0x80-concealed), so we read just that half.
+    let yuv_ref = match fs::read(dir.join("expected.yuv")) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skip right-column check: missing expected.yuv ({e})");
+            return;
+        }
+    };
+    assert_eq!(
+        yuv_ref.len(),
+        frame_bytes,
+        "reference must be one yuv420p10le frame"
+    );
+    let ref_sample = |i: usize| -> u16 { u16::from_le_bytes([yuv_ref[i * 2], yuv_ref[i * 2 + 1]]) };
+
+    // The top-right MB's first luma row (y=0, x∈16..32) is exact to the
+    // bit — it does not border the concealed left column on its top edge
+    // and its 4×4 sub-block DC/predicted values reconstruct exactly under
+    // the corrected QP_Y. A regression in eq. 8-309 immediately breaks it.
+    for x in 16..32usize {
+        let i = x; // row 0
+        assert_eq!(
+            sample(i),
+            ref_sample(i),
+            "top-right MB row-0 luma at x={x}: ours {} != ref {} — eq. 8-309 QP_Y regression",
+            sample(i),
+            ref_sample(i),
+        );
+    }
+
+    // Over the whole right MB column, a large majority must be exact.
+    let (mut rc_total, mut rc_exact) = (0usize, 0usize);
+    for y in 0..H {
+        for x in 16..32usize {
+            let i = y * W + x;
+            rc_total += 1;
+            if sample(i) == ref_sample(i) {
+                rc_exact += 1;
+            }
+        }
+    }
+    // Post-fix is 475/512 (~92.8%); pre-fix was 0/512. Gate at 85% so the
+    // guard is robust to deblock/intra coupling with the concealed column
+    // but still fails hard if the QP_Y collapse ever returns.
+    assert!(
+        rc_exact * 100 >= rc_total * 85,
+        "right MB column only {rc_exact}/{rc_total} luma exact (<85%) — the >8-bit QP_Y / dequant path regressed"
     );
 }
 
