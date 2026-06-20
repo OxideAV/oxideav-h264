@@ -18,9 +18,9 @@
 //! * §6.2 Table 6-1 — ChromaArrayType == 3 (luma and chroma planes are
 //!   the same width/height).
 //!
-//! No external decoder source is consulted; the reference YUV is an
-//! opaque byte vector produced separately by a reference H.264 decoder
-//! binary and staged in the private docs repo.
+//! No external decoder source is consulted; the expected YUV is an
+//! opaque byte vector staged in the private docs repo as a clean-room
+//! conformance fixture.
 
 use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase, VideoFrame};
