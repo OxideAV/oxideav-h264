@@ -510,6 +510,9 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
         return Err(ReconstructError::FieldOrMbaffNotSupported);
     }
     let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
+    // §6.4.10 — record MBAFF-ness on the grid so the neighbour-address
+    // derivation (Table 6-4) is selected over the raster §6.4.9 path.
+    grid.mbaff_frame_flag = mbaff_frame_flag;
 
     // §7.4.2.1 — bit depths (8..=14 supported by the transform module).
     let bit_depth_y = 8 + sps.bit_depth_luma_minus8;
@@ -625,6 +628,10 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
             // The cast is safe: first_mb_in_slice <= 2^16 for any valid
             // H.264 picture size (Table A-1 MaxMbs).
             info.slice_id = slice_header.first_mb_in_slice as i32;
+            // §7.4.4 — record the per-MB field/frame coding so the §6.4.10
+            // MBAFF neighbour derivation can query a neighbour's
+            // `mbAddrXFrameFlag`.
+            info.mb_field_decoding_flag = mb_field_decoding_flag;
         }
 
         prev_qp_y = mb_qp_y;
@@ -1092,8 +1099,9 @@ fn mb_is_intra_8x8(info: &MbInfo) -> bool {
 /// neighbour 4x4 block index) for direction `N ∈ {A, B}` of the 4x4
 /// block at position `(x, y)` inside the current MB.
 ///
-/// For non-MBAFF frame pictures only (the scope of this module).
-/// Returns `None` when the neighbour lies outside the picture.
+/// Selects the raster §6.4.9 path for non-MBAFF frame pictures, and the
+/// §6.4.10 / Table 6-4 pair-interleaved path when `grid.mbaff_frame_flag`
+/// is set. Returns `None` when the neighbour lies outside the picture.
 fn neighbour_4x4_addr(
     grid: &MbGrid,
     mb_addr: u32,
@@ -1105,29 +1113,68 @@ fn neighbour_4x4_addr(
     // Eq. 6-25 / 6-26.
     let xn = bx + xd;
     let yn = by + yd;
-    // Table 6-3 (non-MBAFF frame path).
-    let [mb_a, mb_b, _mb_c, mb_d] = grid.neighbour_mb_addrs(mb_addr);
-    let mb_n = if xn < 0 && yn < 0 {
-        mb_d
-    } else if xn < 0 && (0..16).contains(&yn) {
-        mb_a
-    } else if (0..16).contains(&xn) && yn < 0 {
-        mb_b
-    } else if (0..16).contains(&xn) && (0..16).contains(&yn) {
-        Some(mb_addr)
+    let (addr, xw, yw) = if grid.mbaff_frame_flag {
+        // §6.4.10 / Table 6-4 (MBAFF frame path) — pair-interleaved
+        // addressing; the neighbour MB depends on the current and
+        // neighbour pair's field/frame coding.
+        mbaff_neigh_loc_luma(grid, mb_addr, xn, yn)?
     } else {
-        // Other Table 6-3 cases yield mbAddrC or "not available"; for a
-        // 4x4 block of a 16x16 MB with (xD, yD) in {(-1, 0), (0, -1)},
-        // those branches are unreachable.
-        None
+        // Table 6-3 (non-MBAFF frame path).
+        let [mb_a, mb_b, _mb_c, mb_d] = grid.neighbour_mb_addrs(mb_addr);
+        let mb_n = if xn < 0 && yn < 0 {
+            mb_d
+        } else if xn < 0 && (0..16).contains(&yn) {
+            mb_a
+        } else if (0..16).contains(&xn) && yn < 0 {
+            mb_b
+        } else if (0..16).contains(&xn) && (0..16).contains(&yn) {
+            Some(mb_addr)
+        } else {
+            // Other Table 6-3 cases yield mbAddrC or "not available"; for a
+            // 4x4 block of a 16x16 MB with (xD, yD) in {(-1, 0), (0, -1)},
+            // those branches are unreachable.
+            None
+        };
+        let addr = mb_n?;
+        // Eq. 6-34 / 6-35: (xW, yW) relative to the neighbour MB.
+        let xw = (xn + 16) % 16;
+        let yw = (yn + 16) % 16;
+        (addr, xw, yw)
     };
-    let addr = mb_n?;
-    // Eq. 6-34 / 6-35: (xW, yW) relative to the neighbour MB.
-    let xw = (xn + 16) % 16;
-    let yw = (yn + 16) % 16;
     // Eq. 6-38.
     let blk = (8 * (yw / 8) + 4 * (xw / 8) + 2 * ((yw % 8) / 4) + ((xw % 8) / 4)) as usize;
     Some((addr, blk))
+}
+
+/// §6.4.10 / Table 6-4 — wrapper over [`crate::mb_address::mbaff_neigh_location`]
+/// for the luma plane (16×16 MB) of an MBAFF frame picture. Reads the
+/// current/neighbour MB field-coding flags straight off the grid.
+fn mbaff_neigh_loc_luma(grid: &MbGrid, mb_addr: u32, xn: i32, yn: i32) -> Option<(u32, i32, i32)> {
+    let pic_w = grid.width_in_mbs;
+    let pair = crate::mb_address::mbaff_pair_neighbour_addrs(mb_addr, pic_w);
+    let curr_field = grid
+        .get(mb_addr)
+        .map(|i| i.mb_field_decoding_flag)
+        .unwrap_or(false);
+    let curr_mb_frame_flag = !curr_field;
+    let mb_is_top = mb_addr % 2 == 0;
+    crate::mb_address::mbaff_neigh_location(
+        xn,
+        yn,
+        16,
+        16,
+        curr_mb_frame_flag,
+        mb_is_top,
+        mb_addr,
+        pair,
+        |addr| {
+            // `mbAddrXFrameFlag` — frame-coded ⇒ true.
+            !grid
+                .get(addr)
+                .map(|i| i.mb_field_decoding_flag)
+                .unwrap_or(false)
+        },
+    )
 }
 
 /// §6.4.11.2 / Table 6-3 / §6.4.13.3 — derive (neighbour MB address,
@@ -1143,21 +1190,26 @@ fn neighbour_8x8_addr(
     // Eq. 6-23 / 6-24.
     let xn = ((blk8 as i32) % 2) * 8 + xd;
     let yn = ((blk8 as i32) / 2) * 8 + yd;
-    let [mb_a, mb_b, _mb_c, mb_d] = grid.neighbour_mb_addrs(mb_addr);
-    let mb_n = if xn < 0 && yn < 0 {
-        mb_d
-    } else if xn < 0 && (0..16).contains(&yn) {
-        mb_a
-    } else if (0..16).contains(&xn) && yn < 0 {
-        mb_b
-    } else if (0..16).contains(&xn) && (0..16).contains(&yn) {
-        Some(mb_addr)
+    let (addr, xw, yw) = if grid.mbaff_frame_flag {
+        mbaff_neigh_loc_luma(grid, mb_addr, xn, yn)?
     } else {
-        None
+        let [mb_a, mb_b, _mb_c, mb_d] = grid.neighbour_mb_addrs(mb_addr);
+        let mb_n = if xn < 0 && yn < 0 {
+            mb_d
+        } else if xn < 0 && (0..16).contains(&yn) {
+            mb_a
+        } else if (0..16).contains(&xn) && yn < 0 {
+            mb_b
+        } else if (0..16).contains(&xn) && (0..16).contains(&yn) {
+            Some(mb_addr)
+        } else {
+            None
+        };
+        let addr = mb_n?;
+        let xw = (xn + 16) % 16;
+        let yw = (yn + 16) % 16;
+        (addr, xw, yw)
     };
-    let addr = mb_n?;
-    let xw = (xn + 16) % 16;
-    let yw = (yn + 16) % 16;
     // Eq. 6-40.
     let blk = (2 * (yw / 8) + (xw / 8)) as usize;
     Some((addr, blk))
@@ -1406,6 +1458,10 @@ fn reconstruct_intra_nxn(
         info.is_intra_nxn = true;
         info.mb_type_raw = mb.mb_type_raw;
         info.transform_size_8x8_flag = mb.transform_size_8x8_flag;
+        // §7.4.4 — set the current MB's field flag eagerly so the
+        // §6.4.10 MBAFF neighbour derivation for this MB's own later
+        // blocks reads the correct `currMbFrameFlag`.
+        info.mb_field_decoding_flag = writer.mb_field;
         // Reset the per-block pred-mode arrays so stale entries from
         // a previously-reconstructed picture can't bleed through.
         info.intra_4x4_pred_modes = [0; 16];
@@ -7771,6 +7827,56 @@ mod tests {
     use crate::macroblock_layer::{
         Intra16x16, Macroblock, MbPred, MbType, PcmSamples, SubMbPred, SubMbType,
     };
+
+    // ----- §6.4.10 MBAFF neighbour-address derivation -------------------
+
+    /// In an MBAFF frame, macroblock addresses are pair-interleaved
+    /// (§6.4.10): for a `PicWidthInMbs == 2` grid the top-left pair is
+    /// addresses {0 (top), 1 (bottom)}, the pair to its right is {2, 3},
+    /// the pair below-left is {4, 5}. The non-MBAFF raster derivation
+    /// (`mb_addr - 1` for the left neighbour) would wrongly point the
+    /// bottom MB of pair 0 (addr 1) at addr 0's *own* top — the MBAFF
+    /// path must instead resolve the geometric left/above neighbours
+    /// through the pair structure.
+    #[test]
+    fn neighbour_4x4_mbaff_uses_pair_interleaved_addressing() {
+        // 2 pairs wide, 2 pairs tall = 8 macroblocks, all frame-coded.
+        let mut grid = MbGrid::new(2, 4);
+        grid.mbaff_frame_flag = true;
+        for info in grid.info.iter_mut() {
+            info.available = true;
+            info.mb_field_decoding_flag = false; // frame-coded pair.
+        }
+
+        // Current MB = addr 5 (bottom MB of the lower-left pair, pair
+        // index 2 → pair column 0, pair row 1). Its left-neighbour 4x4
+        // block (xD=-1) at block (bx=0, by=0) lies in the lower-right...
+        // For pair column 0 there is no left pair, so A is unavailable.
+        let left = neighbour_4x4_addr(&grid, 5, 0, 0, -1, 0);
+        assert!(
+            left.is_none(),
+            "addr 5 is in pair column 0 → no left pair (A unavailable), got {left:?}"
+        );
+
+        // Above neighbour of the top MB of the lower-left pair (addr 4,
+        // bx=0,by=0, yD=-1) is the *bottom* MB of the upper-left pair,
+        // i.e. addr 1 — NOT addr 4-2=2 as a raster walk would give.
+        let above = neighbour_4x4_addr(&grid, 4, 0, 0, 0, -1);
+        assert_eq!(
+            above.map(|(a, _)| a),
+            Some(1),
+            "above neighbour of MBAFF addr 4 (top of lower-left pair) is addr 1 (bottom of upper-left pair)"
+        );
+
+        // Left neighbour of addr 2 (top of upper-right pair, bx=0) is the
+        // top MB of the upper-left pair = addr 0 (frame/frame pairing).
+        let left2 = neighbour_4x4_addr(&grid, 2, 0, 0, -1, 0);
+        assert_eq!(
+            left2.map(|(a, _)| a),
+            Some(0),
+            "left neighbour of MBAFF addr 2 is addr 0"
+        );
+    }
 
     // ----- §8.5.8 eq. 8-309 QP_Y derivation (next_qp_y) -----------------
 

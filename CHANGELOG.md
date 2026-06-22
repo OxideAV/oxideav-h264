@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **§6.4.10 / Table 6-4 MBAFF intra neighbour addressing.** In an MBAFF
+  frame (`mb_adaptive_frame_field_flag == 1 && !field_pic_flag`),
+  macroblock addresses are pair-interleaved, so the §6.4.9 raster
+  neighbour derivation (`mb_addr − 1`, `mb_addr − PicWidthInMbs`) used by
+  the §8.3.1.1 / §8.3.2.1 intra-prediction-mode derivation pointed at the
+  wrong neighbour macroblocks. The `intraMxMPredMode` predicted from
+  those mis-located neighbours cascaded reconstruction errors across the
+  whole picture (only MB 0, which has no neighbours, was correct).
+  `neighbour_4x4_addr` / `neighbour_8x8_addr` now route through the
+  §6.4.10 / Table 6-4 pair-aware derivation (via
+  `mb_address::mbaff_neigh_location`) when the new `MbGrid.mbaff_frame_flag`
+  is set, reading each macroblock's `mb_field_decoding_flag` (now recorded
+  on `MbInfo`) for the `mbAddrXFrameFlag` input. On a synthetic 128×96
+  MBAFF I-frame (libx264 `interlaced=1`) this lifts luma PSNR vs a
+  black-box ffmpeg decode from ~9 dB to ~54 dB.
+
 ### Added
 
 - round 355 — **§8.2.4.3 field reference-list modification (RPLM).**

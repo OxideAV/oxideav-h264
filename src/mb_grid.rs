@@ -111,6 +111,12 @@ pub struct MbInfo {
     ///
     /// `-1` sentinel means "unset" (MB not yet decoded in this picture).
     pub slice_id: i32,
+    /// §7.4.4 / §6.4.10 — `mb_field_decoding_flag` for this macroblock in
+    /// an MBAFF frame picture (`false` for frame-coded MBs and for all
+    /// non-MBAFF pictures). Recorded so the §6.4.10/Table 6-4 MBAFF
+    /// neighbour derivation can query the field/frame coding of a
+    /// neighbouring macroblock (the `mbAddrXFrameFlag` input).
+    pub mb_field_decoding_flag: bool,
 }
 
 impl Default for MbInfo {
@@ -142,6 +148,9 @@ impl Default for MbInfo {
             // §6.4.8 — unset until the MB is reconstructed (prevents
             // pre-decode MBs from being treated as in-slice neighbours).
             slice_id: -1,
+            // §7.4.4 — frame-coded by default; set true only for
+            // field-coded MBs of an MBAFF pair.
+            mb_field_decoding_flag: false,
         }
     }
 }
@@ -187,6 +196,12 @@ pub struct MbGrid {
     pub width_in_mbs: u32,
     pub height_in_mbs: u32,
     pub info: Vec<MbInfo>,
+    /// §7.4.2.1.1 — `MbaffFrameFlag` for the picture this grid belongs
+    /// to. When `true`, macroblock addresses are pair-interleaved
+    /// (§6.4.10) and neighbour derivation must follow Table 6-4 instead
+    /// of the raster §6.4.9 path. Set once per picture by the caller;
+    /// defaults to `false` (non-MBAFF / field / frame_mbs_only).
+    pub mbaff_frame_flag: bool,
 }
 
 impl MbGrid {
@@ -198,6 +213,7 @@ impl MbGrid {
             width_in_mbs,
             height_in_mbs,
             info: vec![MbInfo::default(); len],
+            mbaff_frame_flag: false,
         }
     }
 
