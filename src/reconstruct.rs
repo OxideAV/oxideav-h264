@@ -11034,6 +11034,69 @@ mod tests {
         }
     }
 
+    /// §8.4.2.3.2 eq. 8-274 — 4:2:2 P_L0_16x16 with explicit weighted
+    /// prediction, distinct per-plane (Cb/Cr) chroma weights, applied
+    /// across the full 8×16 chroma tile. With predC = 80, log2WDc = 2,
+    /// (wCb, oCb) = (5, 1) and (wCr, oCr) = (3, 7):
+    ///   Cb = ((80*5 + (1<<1)) >> 2) + 1 = ((400 + 2) >> 2) + 1 = 100 + 1 = 101
+    ///   Cr = ((80*3 + 2) >> 2) + 7 = ((240 + 2) >> 2) + 7 = 60 + 7 = 67
+    /// proving the 4:2:2 explicit chroma combine reads the right
+    /// per-iCbCr weight and walks all 16 chroma rows.
+    #[test]
+    fn p_l0_16x16_422_explicit_weighted_per_plane_chroma() {
+        let mut sps = make_sps(1, 1);
+        sps.profile_idc = 122;
+        sps.chroma_format_idc = 2;
+        let mut pps = make_pps();
+        pps.weighted_pred_flag = true;
+        let mut sh = make_p_slice_header();
+        // luma w=1<<0 o=0 (identity) so Y is unchanged; chroma carries the
+        // distinct per-plane weights under log2WDc = 2.
+        sh.pred_weight_table = Some(make_pwt_single_entry(
+            0,
+            2,
+            Some((1 << 0, 0)),
+            None,
+            Some((5, 1, 3, 7)),
+            None,
+        ));
+
+        let mut ref_pic = Picture::new(16, 16, 2, 8, 8);
+        for y in 0..16i32 {
+            for x in 0..16i32 {
+                ref_pic.set_luma(x, y, 30);
+            }
+        }
+        for y in 0..16i32 {
+            for x in 0..8i32 {
+                ref_pic.set_cb(x, y, 80);
+                ref_pic.set_cr(x, y, 80);
+            }
+        }
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        let mb = make_p_l0_16x16(0, [0, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 2, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid)
+            .expect("4:2:2 explicit-weighted P_L0_16x16 must reconstruct");
+
+        for y in 0..16i32 {
+            assert_eq!(pic.luma_at(0, y), 30, "Y identity-weight at row {y}");
+            for x in 0..8i32 {
+                assert_eq!(pic.cb_at(x, y), 101, "Cb 4:2:2 explicit at ({x},{y})");
+                assert_eq!(pic.cr_at(x, y), 67, "Cr 4:2:2 explicit at ({x},{y})");
+            }
+        }
+    }
+
     /// §8.4.2.3.1 eq. 8-273 — 4:2:2 B_Bi_16x16 default bipred averaging
     /// on the full-height (8×16) chroma tile. With L0 chroma flat at 40
     /// and L1 flat at 80, the default `(predL0 + predL1 + 1) >> 1`

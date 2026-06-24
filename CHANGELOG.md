@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   444_chroma` (I_8x8 4:4:4 chroma) and the P-inter tests, the README's
   stale "I_8x8 4:4:4 / P / B 4:4:4 deferred" claim is corrected — only
   `separate_colour_plane_flag=1` remains deferred for 4:4:4.
+- **Conformance gate for 4:2:2 explicit weighted prediction chroma.**
+  `p_l0_16x16_422_explicit_weighted_per_plane_chroma` exercises the
+  §8.4.2.3.2 (eq. 8-274) explicit weighted-pred combine on the 8×16 4:2:2
+  chroma tile with distinct per-iCbCr (Cb/Cr) weights and offsets,
+  asserting the per-plane weight selection and the full-height chroma
+  walk are correct (Cb `((80·5 + 2) >> 2) + 1 == 101`, Cr `((80·3 + 2) >>
+  2) + 7 == 67`).
 
 ### Fixed
 
