@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Conformance gates for 4:2:2 (ChromaArrayType == 2) P / B-slice inter
+  chroma reconstruction.** The §8.4.1.4 chroma-MV derivation (eq.
+  8-221/8-222: `mvCLX = mvLX`, SubHeightC == 1 so no vertical halving),
+  the §8.4.2.2 fractional-position rule (eq. 8-231..8-234: `yIntC +=
+  mvCLX[1] >> 2`, `yFracC = (mvCLX[1] & 3) << 1` for the full-height
+  chroma grid; `xIntC` / `xFracC` shared with 4:2:0), the §8.4.2.3
+  default / explicit / implicit weighted combine, and the §8.5 eight-4x4
+  inter chroma residual all already ran for 4:2:2 P / B slices but were
+  untested at the reconstruction level. Four new `reconstruct::tests`
+  lock them with bit-exact assertions: `mc_chroma_422_vertical_quarter_
+  pel_uses_subheightc_1` (the 4:2:2-distinguishing vertical 1/4-pel rule
+  via a step-8 ramp), `mc_chroma_422_horizontal_quarter_pel_matches_420_
+  x_rule`, `p_l0_16x16_422_zero_mv_copies_full_height_chroma` (end-to-end
+  P_L0_16x16 over the 8x16 chroma tile), and
+  `b_bi_16x16_422_default_averages_full_height_chroma` (end-to-end
+  B_Bi_16x16 default averaging across all 16 chroma rows). The README's
+  stale "P / B-slice 4:2:2 deferred" claim is corrected: only the 4:2:2
+  *encoder* P / B path remains deferred.
+
 ### Fixed
 
 - **§6.4.10 / Table 6-4 MBAFF intra neighbour addressing.** In an MBAFF

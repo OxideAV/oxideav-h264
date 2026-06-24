@@ -10870,4 +10870,223 @@ mod tests {
         assert_eq!(pic.cb_at(10, 8), 35, "Cb half-pel (luma 6-tap)");
         assert_eq!(pic.cr_at(10, 8), 35, "Cr half-pel (luma 6-tap)");
     }
+
+    /// §8.4.1.4 eq. 8-221/8-222 + §8.4.2.2 eq. 8-231..8-234 — at
+    /// ChromaArrayType == 2 (4:2:2) the chroma motion vector equals the
+    /// luma motion vector (SubHeightC == 1 → no vertical halving) and the
+    /// §8.4.2.2.2 bilinear interpolation derives the vertical fractional
+    /// position as `xIntC = … + (mvCLX[1] >> 2)`, `yFracC = (mvCLX[1] &
+    /// 3) << 1`. This is the property that distinguishes 4:2:2 from 4:2:0
+    /// (where `mvCLX[1]` would be `mvLX[1]` consumed at 1/8-pel and the
+    /// vertical plane is half-height).
+    ///
+    /// We drive `mc_chroma_partition` directly with a pure vertical
+    /// chroma ramp of step 8. With xFracC == 0 the §8.4.2.2.2 bilinear
+    /// (8-270) collapses to `cb(ix, iy) + yFracC` (algebra: `(64·A +
+    /// 64·yFracC·1 + 32) >> 6` for a step-8 ramp where `C = A + 8`), so
+    /// the exact result encodes both `yIntC` and `yFracC` and a wrong
+    /// (4:2:0-style) derivation produces a different number.
+    #[test]
+    fn mc_chroma_422_vertical_quarter_pel_uses_subheightc_1() {
+        // 4:2:2 reference: chroma plane is W/2 × H. Plant a vertical ramp
+        // cb(x, y) = 16 + 8·y (constant across x) so the bilinear result
+        // is exactly cb(ix, iy) + yFracC for xFracC == 0.
+        let w = 32u32;
+        let h = 32u32;
+        let mut ref_pic = Picture::new(w, h, 2, 8, 8);
+        assert_eq!(ref_pic.chroma_width(), 16, "4:2:2 chroma is W/2");
+        assert_eq!(ref_pic.chroma_height(), 32, "4:2:2 chroma is full H");
+        for y in 0..ref_pic.chroma_height() as i32 {
+            for x in 0..ref_pic.chroma_width() as i32 {
+                ref_pic.set_cb(x, y, 16 + 8 * y);
+                ref_pic.set_cr(x, y, 16 + 8 * y);
+            }
+        }
+
+        // Luma MV (0, 3): 1/4-pel vertical = 3. For 4:2:2 mvCLX[1] =
+        // mvLX[1] = 3 (no halving); the interpolator consumes it at
+        // 1/8-pel after the ×2 widening (mv_cy = 6): yIntC += 6 >> 3 = 0,
+        // yFracC = 6 & 7 = 6 == (3 & 3) << 1 per eq. 8-234.
+        let mv = Mv { x: 0, y: 3 };
+        let (cw, ch) = (4u32, 4u32);
+        let (c_part_x, c_part_y) = (2i32, 2i32);
+        let mut cb = vec![0i32; (cw * ch) as usize];
+        let mut cr = vec![0i32; (cw * ch) as usize];
+        mc_chroma_partition(
+            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr,
+        )
+        .unwrap();
+
+        // Expected: cb(c_part_x + x, c_part_y + y) + yFracC, with
+        // yFracC = 6 and yIntC unchanged (>> 3 == 0).
+        for yy in 0..ch as i32 {
+            for xx in 0..cw as i32 {
+                let base = 16 + 8 * (c_part_y + yy);
+                let exp = base + 6; // + yFracC
+                assert_eq!(
+                    cb[(yy * cw as i32 + xx) as usize],
+                    exp,
+                    "Cb 4:2:2 vertical 1/4-pel at ({xx},{yy})"
+                );
+                assert_eq!(cr[(yy * cw as i32 + xx) as usize], exp, "Cr 4:2:2");
+            }
+        }
+    }
+
+    /// §8.4.2.2 eq. 8-231/8-233 — 4:2:2 horizontal fractional position is
+    /// derived identically to 4:2:0 (SubWidthC == 2 for both): `xIntC =
+    /// (xAL / SubWidthC) + (mvCLX[0] >> 3)`, `xFracC = mvCLX[0] & 7`. A
+    /// pure horizontal chroma ramp of step 8 makes the bilinear collapse
+    /// to `cb(ix, iy) + xFracC` for yFracC == 0.
+    #[test]
+    fn mc_chroma_422_horizontal_quarter_pel_matches_420_x_rule() {
+        let w = 32u32;
+        let h = 32u32;
+        let mut ref_pic = Picture::new(w, h, 2, 8, 8);
+        for y in 0..ref_pic.chroma_height() as i32 {
+            for x in 0..ref_pic.chroma_width() as i32 {
+                ref_pic.set_cb(x, y, 16 + 8 * x);
+                ref_pic.set_cr(x, y, 16 + 8 * x);
+            }
+        }
+
+        // Luma MV (3, 0): mvCLX[0] = mvLX[0] = 3, consumed at 1/8-pel so
+        // xFracC = 3 & 7 = 3, xIntC += 3 >> 3 = 0.
+        let mv = Mv { x: 3, y: 0 };
+        let (cw, ch) = (4u32, 4u32);
+        let (c_part_x, c_part_y) = (2i32, 2i32);
+        let mut cb = vec![0i32; (cw * ch) as usize];
+        let mut cr = vec![0i32; (cw * ch) as usize];
+        mc_chroma_partition(
+            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr,
+        )
+        .unwrap();
+
+        for yy in 0..ch as i32 {
+            for xx in 0..cw as i32 {
+                let base = 16 + 8 * (c_part_x + xx);
+                let exp = base + 3; // + xFracC
+                assert_eq!(
+                    cb[(yy * cw as i32 + xx) as usize],
+                    exp,
+                    "Cb 4:2:2 horizontal 1/4-pel at ({xx},{yy})"
+                );
+            }
+        }
+    }
+
+    /// §8.4.2.2 — 4:2:2 P_L0_16x16 end-to-end through `reconstruct_slice`:
+    /// a zero-MV, zero-residual inter MB must copy the reference Cb/Cr
+    /// (8×16 chroma tile per §6.2 Table 6-1) sample-for-sample. Distinct
+    /// per-plane ramps catch a Cb/Cr plane swap or a 4:2:0-sized
+    /// (8×8) chroma walk.
+    #[test]
+    fn p_l0_16x16_422_zero_mv_copies_full_height_chroma() {
+        let mut sps = make_sps(1, 1);
+        sps.profile_idc = 122;
+        sps.chroma_format_idc = 2;
+        let pps = make_pps();
+        let sh = make_p_slice_header();
+
+        // 4:2:2 ref: luma 16×16, chroma 8×16.
+        let mut ref_pic = Picture::new(16, 16, 2, 8, 8);
+        assert_eq!(ref_pic.chroma_width(), 8);
+        assert_eq!(ref_pic.chroma_height(), 16);
+        for y in 0..16i32 {
+            for x in 0..16i32 {
+                ref_pic.set_luma(x, y, (y * 16 + x) & 0xFF);
+            }
+        }
+        for y in 0..16i32 {
+            for x in 0..8i32 {
+                ref_pic.set_cb(x, y, (y * 5 + x * 3 + 17) & 0xFF);
+                ref_pic.set_cr(x, y, (y * 2 + x * 7 + 40) & 0xFF);
+            }
+        }
+        let mut store = RefPicStore::new();
+        store.insert(0, ref_pic);
+        store.set_list_0(vec![0]);
+
+        let mb = make_p_l0_16x16(0, [0, 0]);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 2, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid)
+            .expect("4:2:2 P_L0_16x16 must reconstruct");
+
+        for y in 0..16i32 {
+            for x in 0..8i32 {
+                assert_eq!(
+                    pic.cb_at(x, y),
+                    (y * 5 + x * 3 + 17) & 0xFF,
+                    "Cb 4:2:2 at ({x},{y})"
+                );
+                assert_eq!(
+                    pic.cr_at(x, y),
+                    (y * 2 + x * 7 + 40) & 0xFF,
+                    "Cr 4:2:2 at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// §8.4.2.3.1 eq. 8-273 — 4:2:2 B_Bi_16x16 default bipred averaging
+    /// on the full-height (8×16) chroma tile. With L0 chroma flat at 40
+    /// and L1 flat at 80, the default `(predL0 + predL1 + 1) >> 1`
+    /// produces 60 on every chroma sample across all 16 chroma rows —
+    /// proving the bipred combine walks the 4:2:2 chroma geometry, not a
+    /// truncated 8×8 (4:2:0) tile.
+    #[test]
+    fn b_bi_16x16_422_default_averages_full_height_chroma() {
+        let mut sps = make_sps(1, 1);
+        sps.profile_idc = 122;
+        sps.chroma_format_idc = 2;
+        let pps = make_pps(); // weighted_bipred_idc = 0 → default averaging.
+        let sh = make_b_slice_header();
+
+        let mut l0 = Picture::new(16, 16, 2, 8, 8);
+        let mut l1 = Picture::new(16, 16, 2, 8, 8);
+        for y in 0..16i32 {
+            for x in 0..16i32 {
+                l0.set_luma(x, y, 40);
+                l1.set_luma(x, y, 80);
+            }
+        }
+        for y in 0..16i32 {
+            for x in 0..8i32 {
+                l0.set_cb(x, y, 40);
+                l0.set_cr(x, y, 40);
+                l1.set_cb(x, y, 80);
+                l1.set_cr(x, y, 80);
+            }
+        }
+        let mut store = RefPicStore::new();
+        store.insert(0, l0);
+        store.insert(1, l1);
+        store.set_list_0(vec![0]);
+        store.set_list_1(vec![1]);
+
+        let mb = make_b_bi_16x16(0, 0);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 2, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid)
+            .expect("4:2:2 B_Bi_16x16 must reconstruct");
+
+        for y in 0..16i32 {
+            assert_eq!(pic.luma_at(0, y), 60, "Y bipred avg at row {y}");
+            for x in 0..8i32 {
+                assert_eq!(pic.cb_at(x, y), 60, "Cb 4:2:2 bipred avg at ({x},{y})");
+                assert_eq!(pic.cr_at(x, y), 60, "Cr 4:2:2 bipred avg at ({x},{y})");
+            }
+        }
+    }
 }
