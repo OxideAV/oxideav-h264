@@ -11089,4 +11089,58 @@ mod tests {
             }
         }
     }
+
+    /// §8.4.2.2 eq. 8-235..8-238 + §8.4.2.3.1 eq. 8-273 — 4:4:4
+    /// (ChromaArrayType == 3) B_Bi_16x16 default bipred averaging on the
+    /// full-resolution 16×16 chroma planes. The 4:4:4 chroma planes are
+    /// motion-compensated by the §8.4.2.2.1 luma 6-tap kernel (eq.
+    /// 8-235..8-238), then combined by the same §8.4.2.3 default-average
+    /// dispatch. With L0 chroma flat at 50 and L1 flat at 90, every one
+    /// of the 256 chroma samples per plane equals `(50 + 90 + 1) >> 1 ==
+    /// 70`, proving the bipred combine walks the full 16×16 4:4:4 tile.
+    #[test]
+    fn b_bi_16x16_444_default_averages_full_resolution_chroma() {
+        let mut sps = make_sps(1, 1);
+        sps.profile_idc = 244;
+        sps.chroma_format_idc = 3;
+        let pps = make_pps(); // weighted_bipred_idc = 0 → default averaging.
+        let sh = make_b_slice_header();
+
+        let mut l0 = Picture::new(16, 16, 3, 8, 8);
+        let mut l1 = Picture::new(16, 16, 3, 8, 8);
+        for y in 0..16i32 {
+            for x in 0..16i32 {
+                l0.set_luma(x, y, 50);
+                l0.set_cb(x, y, 50);
+                l0.set_cr(x, y, 50);
+                l1.set_luma(x, y, 90);
+                l1.set_cb(x, y, 90);
+                l1.set_cr(x, y, 90);
+            }
+        }
+        let mut store = RefPicStore::new();
+        store.insert(0, l0);
+        store.insert(1, l1);
+        store.set_list_0(vec![0]);
+        store.set_list_1(vec![1]);
+
+        let mb = make_b_bi_16x16(0, 0);
+        let slice_data = SliceData {
+            macroblocks: vec![mb],
+            mb_field_decoding_flags: vec![false],
+            last_mb_addr: 0,
+        };
+        let mut pic = Picture::new(16, 16, 3, 8, 8);
+        let mut grid = MbGrid::new(1, 1);
+        reconstruct_slice(&slice_data, &sh, &sps, &pps, &store, &mut pic, &mut grid)
+            .expect("4:4:4 B_Bi_16x16 must reconstruct");
+
+        for y in 0..16i32 {
+            for x in 0..16i32 {
+                assert_eq!(pic.luma_at(x, y), 70, "Y 4:4:4 bipred avg at ({x},{y})");
+                assert_eq!(pic.cb_at(x, y), 70, "Cb 4:4:4 bipred avg at ({x},{y})");
+                assert_eq!(pic.cr_at(x, y), 70, "Cr 4:4:4 bipred avg at ({x},{y})");
+            }
+        }
+    }
 }

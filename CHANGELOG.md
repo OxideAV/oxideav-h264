@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   B_Bi_16x16 default averaging across all 16 chroma rows). The README's
   stale "P / B-slice 4:2:2 deferred" claim is corrected: only the 4:2:2
   *encoder* P / B path remains deferred.
+- **Conformance gate for 4:4:4 (ChromaArrayType == 3) B-slice inter
+  chroma reconstruction.** The 4:4:4 chroma planes are motion-compensated
+  by the §8.4.2.2.1 luma 6-tap kernel (eq. 8-235..8-238) and combined by
+  the §8.4.2.3 weighted-sample dispatch; the P path was already tested
+  (`p_l0_16x16_444_*`) but the B-slice bipred combine was not.
+  `b_bi_16x16_444_default_averages_full_resolution_chroma` locks the
+  default-averaging combine across the full 16×16 4:4:4 chroma tile.
+  Combined with the existing `intra_8x8_zero_residual_dc_reconstructs_
+  444_chroma` (I_8x8 4:4:4 chroma) and the P-inter tests, the README's
+  stale "I_8x8 4:4:4 / P / B 4:4:4 deferred" claim is corrected — only
+  `separate_colour_plane_flag=1` remains deferred for 4:4:4.
 
 ### Fixed
 
