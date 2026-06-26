@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§7.4.1.2.4 `bottom_field_flag` primary-coded-picture boundary.** The
+  first-VCL-of-new-picture detection now treats a change in
+  `bottom_field_flag` (when both slices are field pictures) as a picture
+  boundary, so the top field of a complementary pair finalizes before
+  the bottom field opens — the canonical condition that previously
+  relied only on the incidental `pic_order_cnt_lsb` difference between
+  the two fields. Gated off for frame pictures (`field_pic_flag == 0`),
+  where `bottom_field_flag` is inferred 0 and irrelevant. Two unit tests
+  cover the field-pair split and the frame-picture no-op.
 - **PAFF (`field_pic_flag == 1`) field-picture decode + §C.4.4
   complementary-field pairing.** A picture-adaptive frame/field stream's
   individual field pictures now decode: a field is reconstructed as a

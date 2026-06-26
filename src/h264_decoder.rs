@@ -554,6 +554,9 @@ impl H264CodecDecoder {
     ///   * `frame_num` differs
     ///   * `pic_parameter_set_id` differs
     ///   * `field_pic_flag` differs
+    ///   * `bottom_field_flag` differs (both being field pictures) — the
+    ///     two fields of a complementary pair share `frame_num` but are
+    ///     separate primary coded pictures
     ///   * `nal_ref_idc` is 0 for one and non-0 for the other
     ///   * `pic_order_cnt_lsb` differs  (pic_order_cnt_type == 0)
     ///   * `delta_pic_order_cnt_bottom` differs (pic_order_cnt_type == 0
@@ -585,6 +588,14 @@ impl H264CodecDecoder {
             return true;
         }
         if prev.field_pic_flag != header.field_pic_flag {
+            return true;
+        }
+        // §7.4.1.2.4 — `bottom_field_flag` differs (when both are field
+        // pictures). The top and bottom fields of a complementary pair
+        // carry the same `frame_num` + `field_pic_flag` but are distinct
+        // primary coded pictures; this is the condition that forces the
+        // top field to finalize before the bottom field opens.
+        if header.field_pic_flag && prev.bottom_field_flag != header.bottom_field_flag {
             return true;
         }
         if prev_is_ref != curr_is_ref {
@@ -2777,6 +2788,40 @@ mod tests {
         let mut h = hdr_base();
         h.field_pic_flag = true;
         assert!(dec.is_first_vcl_of_new_picture(1, 2, &h));
+    }
+
+    /// §7.4.1.2.4 — the two fields of a complementary pair share
+    /// `frame_num` + `field_pic_flag` but differ in `bottom_field_flag`,
+    /// so the bottom field opens a new primary coded picture (forcing
+    /// the top field to finalize first). With matching `pic_order_cnt_lsb`
+    /// only the `bottom_field_flag` condition distinguishes them.
+    #[test]
+    fn different_bottom_field_flag_is_new_picture() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let mut top = hdr_base();
+        top.field_pic_flag = true;
+        top.bottom_field_flag = false;
+        seed_in_progress(&mut dec, 1, 2, top);
+        let mut bottom = hdr_base();
+        bottom.field_pic_flag = true;
+        bottom.bottom_field_flag = true;
+        assert!(dec.is_first_vcl_of_new_picture(1, 2, &bottom));
+    }
+
+    /// §7.4.1.2.4 — `bottom_field_flag` is ignored for frame pictures
+    /// (`field_pic_flag == 0`): a stale `bottom_field_flag` difference on
+    /// two frame slices must NOT be read as a picture boundary.
+    #[test]
+    fn bottom_field_flag_ignored_for_frame_pictures() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let mut a = hdr_base();
+        a.field_pic_flag = false;
+        a.bottom_field_flag = false;
+        seed_in_progress(&mut dec, 1, 2, a);
+        let mut b = hdr_base();
+        b.field_pic_flag = false;
+        b.bottom_field_flag = true; // ignored when field_pic_flag == 0
+        assert!(!dec.is_first_vcl_of_new_picture(1, 2, &b));
     }
 
     /// §7.4.1.2.4 — nal_ref_idc zero-ness differs (prev ref, new
