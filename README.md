@@ -17,10 +17,16 @@ streams across Baseline / Main / High profiles. MBAFF
 the §6.4.10/Table 6-4 pair-interleaved neighbour addressing wired into
 the §8.3 intra-prediction-mode derivation — a synthetic libx264
 `interlaced=1` MBAFF I-frame reconstructs at ~54 dB luma PSNR vs a
-black-box ffmpeg decode (previously ~9 dB). MBAFF inter (P/B) pictures
-with field-coded pairs, PAFF field pictures, higher bit depths, and the
-Annex F/G/H/I scalable / multiview / 3D extensions are in progress (see
-the coverage matrix below).
+black-box ffmpeg decode (previously ~9 dB). **PAFF (`field_pic_flag ==
+1`)** field pictures now decode: each field reconstructs as a
+half-height picture (§7.4.2.1.1 eq. 7-26) and the §C.4.4 driver pairs
+complementary opposite-parity fields into one full-height output frame
+(top → even rows, bottom → odd; frame POC = `Min` of the two field
+POCs). MBAFF inter (P/B) pictures with field-coded pairs, PAFF P/B
+field reference handling (the §8.2.4.2.4/.2.5 field reference-list
+init + DPB complementary-field merge), and the Annex F/G/H/I scalable
+/ multiview / 3D extensions are in progress (see the coverage matrix
+below).
 
 No external decoder source is consulted while writing this
 implementation — only the spec PDF. Conformance is verified by
