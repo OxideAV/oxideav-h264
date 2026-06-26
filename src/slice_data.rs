@@ -180,13 +180,14 @@ pub fn parse_slice_data(
     // the CABAC path too so any future CABAC residual-neighbour work
     // can re-use the same store.
     let pic_w_mbs = sps.pic_width_in_mbs_minus1 + 1;
-    let pic_h_mus = sps.pic_height_in_map_units_minus1 + 1;
-    let pic_h_mbs = if sps.frame_mbs_only_flag {
-        pic_h_mus
-    } else {
-        pic_h_mus * 2
-    };
-    // §7.4.2.1.1 eq. 7-25: PicSizeInMbs = PicWidthInMbs * FrameHeightInMbs.
+    // §7.4.2.1.1 eq. (7-26) — PicHeightInMbs = FrameHeightInMbs /
+    // (1 + field_pic_flag). A field-coded picture
+    // (`field_pic_flag == 1`, PAFF) covers half the frame's MB rows; the
+    // grid + PicSizeInMbs bound below must follow the field height so the
+    // §7.3.4 walk terminates at the field's last MB rather than running
+    // a full frame's worth of addresses into the next field's data.
+    let pic_h_mbs = sps.pic_height_in_mbs(slice_header.field_pic_flag);
+    // §7.4.2.1.1 eq. 7-27: PicSizeInMbs = PicWidthInMbs * PicHeightInMbs.
     // Both terms are u32 capped by SPS (`MAX_PIC_DIM_IN_MBS_MINUS1 + 1`),
     // so the product fits in u32 by construction. Used downstream to
     // bound `mb_skip_run` and to detect MB-address overflow.

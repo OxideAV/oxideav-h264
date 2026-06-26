@@ -28,9 +28,12 @@
 //! - **Output ordering**: frames are emitted in display (POC) order
 //!   via [`crate::dpb_output::DpbOutput`] per Annex C §C.2.2 / §C.4
 //!   bumping process.
-//! - **Field pictures / MBAFF**: not supported. `field_pic_flag == 1`
-//!   or `mb_adaptive_frame_field_flag == 1` causes the reconstruct
-//!   layer to reject the slice.
+//! - **Field pictures (PAFF) / MBAFF**: PAFF field pictures
+//!   (`field_pic_flag == 1`) decode as half-height pictures and the
+//!   §C.4.4 driver pairs complementary opposite-parity fields into one
+//!   full-height output frame. MBAFF (`mb_adaptive_frame_field_flag ==
+//!   1`, `field_pic_flag == 0`) intra reconstructs; MBAFF inter (P/B)
+//!   field-coded pairs are still deferred.
 //! - **Reference picture list modification (RPLM)**: the ops are
 //!   applied via `ref_list::modify_ref_pic_list`, but the underlying
 //!   short-term / long-term derivation is a first pass and may not
@@ -139,6 +142,26 @@ struct PictureInProgress {
     any_slice_succeeded: bool,
 }
 
+/// §C.4.4 — a decoded PAFF field awaiting its complementary field so the
+/// pair can be re-interleaved into a full-height output frame. Held
+/// between the finalization of the first field of a complementary pair
+/// and the arrival of the second field (opposite parity, same
+/// access-unit `frame_num`).
+struct PendingField {
+    /// Reconstructed half-height field samples (field rows only).
+    pic: Picture,
+    /// `true` for a bottom field (the field occupies the odd output
+    /// rows), `false` for a top field (even output rows).
+    is_bottom: bool,
+    /// `frame_num` of the field — a complementary pair shares it.
+    frame_num: u32,
+    /// The field's own PicOrderCnt (Top/BottomFieldOrderCnt). The frame's
+    /// output POC is the minimum of the pair's two field POCs.
+    field_poc: i32,
+    /// Packet pts carried by whichever field opened the access unit.
+    pts: Option<i64>,
+}
+
 /// Registry factory — called by the codec registry when a container
 /// wants a decoder for H.264.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -223,6 +246,13 @@ pub struct H264CodecDecoder {
     /// when the picture boundary is detected.
     in_progress: Option<PictureInProgress>,
 
+    /// §C.4.4 — the first decoded field of an as-yet-incomplete
+    /// complementary field pair (PAFF). `None` when the decoder is not
+    /// mid-pair. When the second field of the pair is finalized the two
+    /// half-height field pictures are re-interleaved into one full-height
+    /// output frame.
+    pending_field: Option<PendingField>,
+
     // ---- ISO/IEC 14496-15 §5.2.4.1.1 avcC diagnostic snapshot --------
     /// `AVCProfileIndication` from the last `consume_extradata` call.
     /// Optional because Annex B streams have no avcC.
@@ -264,6 +294,7 @@ impl H264CodecDecoder {
             prev_reference_top_foc: 0,
             prev_ref_frame_num: None,
             in_progress: None,
+            pending_field: None,
             avcc_profile_idc: None,
             avcc_level_idc: None,
             avcc_chroma_format: None,
@@ -683,8 +714,15 @@ impl H264CodecDecoder {
             let poc = derive_poc(&poc_sps, &poc_slice, &mut self.poc_state)
                 .map_err(|e| Error::invalid(format!("h264 POC: {e:?}")))?;
 
+            // §7.4.2.1.1 eq. (7-26) — a PAFF field picture
+            // (`field_pic_flag == 1`) is decoded as a half-height picture
+            // (`PicHeightInMbs = FrameHeightInMbs / 2`). The in-progress
+            // `pic` + `grid` are sized to the coded picture's own height;
+            // the two complementary fields are re-interleaved into the
+            // full-height output frame at picture-pairing time.
+            let pic_height_in_mbs = sps.pic_height_in_mbs(header.field_pic_flag);
             let width_samples = sps.pic_width_in_mbs() * 16;
-            let height_samples = sps.frame_height_in_mbs() * 16;
+            let height_samples = pic_height_in_mbs * 16;
             let chroma_array_type = sps.chroma_array_type();
             let pic = Picture::new(
                 width_samples,
@@ -693,7 +731,7 @@ impl H264CodecDecoder {
                 sps.bit_depth_luma_minus8 + 8,
                 sps.bit_depth_chroma_minus8 + 8,
             );
-            let grid = MbGrid::new(sps.pic_width_in_mbs(), sps.frame_height_in_mbs());
+            let grid = MbGrid::new(sps.pic_width_in_mbs(), pic_height_in_mbs);
             let structure =
                 pic_structure_from_flags(header.field_pic_flag, header.bottom_field_flag);
 
@@ -705,7 +743,7 @@ impl H264CodecDecoder {
             let deblock_enabled = header.disable_deblocking_filter_idc != 1;
             let deblock_alpha_off = header.slice_alpha_c0_offset_div2 * 2;
             let deblock_beta_off = header.slice_beta_offset_div2 * 2;
-            let mb_count = (sps.pic_width_in_mbs() * sps.frame_height_in_mbs()) as usize;
+            let mb_count = (sps.pic_width_in_mbs() * pic_height_in_mbs) as usize;
             let mb_field_flags = vec![false; mb_count];
 
             self.in_progress = Some(PictureInProgress {
@@ -1146,10 +1184,12 @@ impl H264CodecDecoder {
         // CodecParameters instead. Bind to `_` to keep the destructure
         // total and document the intent.
         let _ = time_base;
-        let vf = picture_to_video_frame(&pic, pts);
 
-        // §C.4 — at IDR / MMCO-5 drain the prior sequence.
+        // §C.4 — at IDR / MMCO-5 drain the prior sequence. A leftover
+        // unpaired field from the previous sequence can never be paired
+        // now, so emit it as a half-height frame before the drain.
         if is_idr || mmco5_triggered {
+            self.flush_pending_field();
             for drained in self.output_dpb.flush() {
                 self.ready.push_back(drained.picture);
             }
@@ -1184,6 +1224,23 @@ impl H264CodecDecoder {
             poc.pic_order_cnt
         };
 
+        // §C.4.4 — PAFF field pairing. A field picture is not pushed to
+        // the output DPB on its own; it waits for its complementary field
+        // (opposite parity) and the pair is re-interleaved into a single
+        // full-height output frame whose POC is the minimum of the two
+        // field POCs (§8.2.1 eq. 8-1).
+        if first_header.field_pic_flag {
+            self.handle_field_output(
+                pic,
+                first_header.bottom_field_flag,
+                first_header.frame_num,
+                output_poc,
+                pts,
+            );
+            return Ok(());
+        }
+
+        let vf = picture_to_video_frame(&pic, pts);
         let entry = OutputEntry {
             picture: vf,
             pic_order_cnt: output_poc,
@@ -1195,6 +1252,85 @@ impl H264CodecDecoder {
         }
 
         Ok(())
+    }
+
+    /// §C.4.4 — accept a finalized PAFF field. If it completes a
+    /// complementary pair with a previously-held field (same `frame_num`,
+    /// opposite parity), interleave the two half-height field pictures
+    /// into one full-height output frame and push it to the §C.4 output
+    /// DPB. Otherwise hold the field as the pending half of a pair.
+    fn handle_field_output(
+        &mut self,
+        pic: Picture,
+        is_bottom: bool,
+        frame_num: u32,
+        field_poc: i32,
+        pts: Option<i64>,
+    ) {
+        if let Some(prev) = self.pending_field.take() {
+            // Complete the pair only when the two fields are genuinely
+            // complementary (opposite parity, same frame_num). A second
+            // same-parity field, or a field with a different frame_num,
+            // means the first field was unpaired — emit it on its own and
+            // start a fresh pending pair with the current field.
+            if prev.is_bottom != is_bottom && prev.frame_num == frame_num {
+                let (top, bottom) = if prev.is_bottom {
+                    (&pic, &prev.pic)
+                } else {
+                    (&prev.pic, &pic)
+                };
+                let frame = interleave_fields(top, bottom);
+                // §8.2.1 eq. 8-1 — PicOrderCnt(frame) =
+                // Min(TopFieldOrderCnt, BottomFieldOrderCnt).
+                let frame_poc = prev.field_poc.min(field_poc);
+                let frame_pts = prev.pts.or(pts);
+                let vf = picture_to_video_frame(&frame, frame_pts);
+                let entry = OutputEntry {
+                    picture: vf,
+                    pic_order_cnt: frame_poc,
+                    frame_num,
+                    needed_for_output: true,
+                };
+                if let Some(bumped) = self.output_dpb.push(entry) {
+                    self.ready.push_back(bumped.picture);
+                }
+                return;
+            }
+            // Not complementary — flush the orphaned previous field.
+            self.emit_unpaired_field(prev);
+        }
+        self.pending_field = Some(PendingField {
+            pic,
+            is_bottom,
+            frame_num,
+            field_poc,
+            pts,
+        });
+    }
+
+    /// Emit a leftover (unpaired) field as a standalone half-height frame,
+    /// pushed through the §C.4 output DPB in POC order. Used when a field
+    /// cannot be paired (sequence boundary, or a non-complementary
+    /// successor field).
+    fn emit_unpaired_field(&mut self, field: PendingField) {
+        let vf = picture_to_video_frame(&field.pic, field.pts);
+        let entry = OutputEntry {
+            picture: vf,
+            pic_order_cnt: field.field_poc,
+            frame_num: field.frame_num,
+            needed_for_output: true,
+        };
+        if let Some(bumped) = self.output_dpb.push(entry) {
+            self.ready.push_back(bumped.picture);
+        }
+    }
+
+    /// §C.4.4 — flush any pending unpaired field (e.g. at IDR / EOF). The
+    /// field is emitted as a standalone half-height frame.
+    fn flush_pending_field(&mut self) {
+        if let Some(field) = self.pending_field.take() {
+            self.emit_unpaired_field(field);
+        }
     }
 
     /// Resize the output DPB capacity from the active SPS's VUI
@@ -1708,6 +1844,10 @@ impl Decoder for H264CodecDecoder {
         if let Err(e) = self.finalize_in_progress_picture() {
             eprintln!("h264 flush: final picture skipped: {e}");
         }
+        // §C.4.4 — a trailing unpaired PAFF field at EOF can never gain a
+        // complementary partner; emit it as a standalone half-height
+        // frame so it is not silently dropped.
+        self.flush_pending_field();
         self.eof = true;
         Ok(())
     }
@@ -1731,6 +1871,7 @@ impl Decoder for H264CodecDecoder {
         // Drop any picture currently being assembled — reset implies we
         // discard in-flight state, not deliver it.
         self.in_progress = None;
+        self.pending_field = None;
         Ok(())
     }
 }
@@ -1769,6 +1910,59 @@ fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
         }
         pic.is_intra_grid[addr] = info.is_intra;
     }
+}
+
+/// §C.4.4 / §8.4.2 — re-interleave a complementary pair of half-height
+/// field pictures into a single full-height frame.
+///
+/// The `top` field's row `r` becomes the frame's even row `2*r`; the
+/// `bottom` field's row `r` becomes the frame's odd row `2*r + 1`. The
+/// two fields are decoded independently (each as a half-height picture)
+/// so their luma + chroma plane geometries are identical apart from
+/// occupying alternate output lines. The frame inherits the fields' bit
+/// depth, chroma format and width.
+fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
+    let w = top.width_in_samples;
+    let field_h = top.height_in_samples;
+    let frame_h = field_h * 2;
+    let mut frame = Picture::new(
+        w,
+        frame_h,
+        top.chroma_array_type,
+        top.bit_depth_luma,
+        top.bit_depth_chroma,
+    );
+
+    // Luma: copy each field row into its parity-selected frame row.
+    let wl = w as usize;
+    for r in 0..field_h as usize {
+        let src = &top.luma[r * wl..r * wl + wl];
+        let dst_row = 2 * r;
+        frame.luma[dst_row * wl..dst_row * wl + wl].copy_from_slice(src);
+        let src_b = &bottom.luma[r * wl..r * wl + wl];
+        let dst_row_b = 2 * r + 1;
+        frame.luma[dst_row_b * wl..dst_row_b * wl + wl].copy_from_slice(src_b);
+    }
+
+    // Chroma: same interleave on each chroma plane.
+    if top.chroma_array_type != 0 {
+        let cw = top.chroma_width() as usize;
+        let cfh = top.chroma_height() as usize;
+        for r in 0..cfh {
+            let dst_row = 2 * r;
+            let dst_row_b = 2 * r + 1;
+            frame.cb[dst_row * cw..dst_row * cw + cw].copy_from_slice(&top.cb[r * cw..r * cw + cw]);
+            frame.cb[dst_row_b * cw..dst_row_b * cw + cw]
+                .copy_from_slice(&bottom.cb[r * cw..r * cw + cw]);
+            frame.cr[dst_row * cw..dst_row * cw + cw].copy_from_slice(&top.cr[r * cw..r * cw + cw]);
+            frame.cr[dst_row_b * cw..dst_row_b * cw + cw]
+                .copy_from_slice(&bottom.cr[r * cw..r * cw + cw]);
+        }
+    }
+
+    frame.pic_order_cnt = top.pic_order_cnt.min(bottom.pic_order_cnt);
+    frame.frame_num = top.frame_num;
+    frame
 }
 
 /// Convert a reconstructed [`Picture`] to a [`VideoFrame`].
@@ -2906,5 +3100,120 @@ mod tests {
             .consume_extradata(&extra)
             .expect_err("missing PPS count");
         assert!(format!("{err}").contains("avcC"));
+    }
+
+    // ---- §C.4.4 PAFF field pairing + interleave ---------------------
+
+    /// Build a small half-height field [`Picture`] whose every luma
+    /// sample equals `fill` and chroma samples equal `cfill`, with the
+    /// given POC + frame_num stamped on.
+    fn field_pic(w: u32, field_h: u32, fill: i32, cfill: i32, poc: i32, frame_num: u32) -> Picture {
+        let mut p = Picture::new(w, field_h, 1, 8, 8);
+        for s in p.luma.iter_mut() {
+            *s = fill;
+        }
+        for s in p.cb.iter_mut() {
+            *s = cfill;
+        }
+        for s in p.cr.iter_mut() {
+            *s = cfill;
+        }
+        p.pic_order_cnt = poc;
+        p.frame_num = frame_num;
+        p
+    }
+
+    #[test]
+    fn interleave_fields_places_top_on_even_bottom_on_odd_rows() {
+        // 16-wide, 2-MB-tall field → 32 field rows each, 64 frame rows.
+        let w = 16u32;
+        let field_h = 4u32; // small enough to enumerate
+        let top = field_pic(w, field_h, 10, 110, 4, 7);
+        let bottom = field_pic(w, field_h, 20, 120, 6, 7);
+        let frame = interleave_fields(&top, &bottom);
+
+        assert_eq!(frame.width_in_samples, w);
+        assert_eq!(frame.height_in_samples, field_h * 2);
+        // Even luma rows come from the top field (10), odd from the
+        // bottom field (20).
+        let wl = w as usize;
+        for r in 0..(field_h * 2) as usize {
+            let expect = if r % 2 == 0 { 10 } else { 20 };
+            for c in 0..wl {
+                assert_eq!(frame.luma[r * wl + c], expect, "luma row {r}");
+            }
+        }
+        // Chroma: 4:2:0 → half-width, half field height; interleave on
+        // the chroma plane height too.
+        let cw = frame.chroma_width() as usize;
+        let cfh = top.chroma_height() as usize;
+        for r in 0..(cfh * 2) {
+            let expect = if r % 2 == 0 { 110 } else { 120 };
+            for c in 0..cw {
+                assert_eq!(frame.cb[r * cw + c], expect, "cb row {r}");
+                assert_eq!(frame.cr[r * cw + c], expect, "cr row {r}");
+            }
+        }
+        // §8.2.1 eq. 8-1 — frame POC = min(top, bottom) field POC.
+        assert_eq!(frame.pic_order_cnt, 4);
+        assert_eq!(frame.frame_num, 7);
+    }
+
+    #[test]
+    fn complementary_field_pair_outputs_single_full_height_frame() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        // Top field then bottom field of the same frame_num.
+        let top = field_pic(16, 4, 30, 128, 8, 3);
+        dec.handle_field_output(top, false, 3, 8, Some(99));
+        // The first field alone produces no output (held pending).
+        assert!(dec.ready.is_empty());
+        assert!(dec.pending_field.is_some());
+
+        let bottom = field_pic(16, 4, 40, 128, 10, 3);
+        dec.handle_field_output(bottom, true, 3, 10, None);
+        // Pair completed → pending cleared, one frame queued (possibly
+        // still inside the output DPB until bumped). Force a drain.
+        assert!(dec.pending_field.is_none());
+        dec.eof = true;
+        let f = dec.receive_frame().expect("paired frame must drain");
+        let vf = match f {
+            Frame::Video(v) => v,
+            other => panic!("expected video, got {other:?}"),
+        };
+        // Full-height (8 rows) 16-wide luma; pts inherited from the
+        // first (top) field.
+        assert_eq!(vf.pts, Some(99));
+        assert_eq!(vf.planes[0].stride, 16);
+        assert_eq!(vf.planes[0].data.len(), 16 * 8);
+        // Even rows = top field (30), odd rows = bottom (40).
+        for r in 0..8 {
+            let expect = if r % 2 == 0 { 30u8 } else { 40u8 };
+            for c in 0..16 {
+                assert_eq!(vf.planes[0].data[r * 16 + c], expect);
+            }
+        }
+    }
+
+    #[test]
+    fn non_complementary_second_field_flushes_orphan() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        // Two consecutive TOP fields (same parity) → not a pair. The
+        // first must be emitted on its own, the second held pending.
+        let top1 = field_pic(16, 4, 30, 128, 8, 3);
+        dec.handle_field_output(top1, false, 3, 8, None);
+        let top2 = field_pic(16, 4, 50, 128, 12, 4);
+        dec.handle_field_output(top2, false, 4, 12, None);
+        // First top field orphaned → one half-height frame queued; the
+        // second top field is now pending.
+        assert!(dec.pending_field.is_some());
+        dec.eof = true;
+        let f = dec.receive_frame().expect("orphan field drains");
+        let vf = match f {
+            Frame::Video(v) => v,
+            other => panic!("expected video, got {other:?}"),
+        };
+        // Half-height (4 rows) — an unpaired field is emitted as-is.
+        assert_eq!(vf.planes[0].data.len(), 16 * 4);
+        assert_eq!(vf.planes[0].data[0], 30);
     }
 }

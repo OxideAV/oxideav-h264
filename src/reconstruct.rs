@@ -500,15 +500,14 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
     // I_NxN / P / B for 4:4:4 still reject in `reconstruct_chroma_intra`
     // (and `reconstruct_inter_chroma_residual`, which never runs for 3).
     // §7.4.2.1.1 — MbaffFrameFlag = mb_adaptive_frame_field_flag &&
-    // !field_pic_flag. Field-only pictures (`field_pic_flag == 1`) still
-    // aren't handled by this reconstruction pass — MBAFF frames are, as
-    // of Phase 2, with the caveats documented in the `mb_address` MBAFF
-    // helpers (field-MB samples are placed at their pair-local start
-    // row per §6.4.1 eq. 6-10 but without the y-stride=2 interleave
-    // with the pair partner — that's a Phase-3 refinement).
-    if slice_header.field_pic_flag {
-        return Err(ReconstructError::FieldOrMbaffNotSupported);
-    }
+    // !field_pic_flag. PAFF field pictures (`field_pic_flag == 1`) are now
+    // reconstructed: a single field is decoded exactly like a half-height
+    // progressive picture — the caller sizes `pic` to `PicHeightInMbs * 16`
+    // (eq. 7-26) field rows and `grid` to `PicHeightInMbs` MB rows, so the
+    // §6.4 raster neighbour derivation (MbaffFrameFlag == 0 within a field)
+    // and the §8.3 / §8.4 sample placement operate in field-local
+    // coordinates. The decoder driver re-interleaves the two complementary
+    // fields' rows into the output frame at picture-pairing time.
     let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
     // §6.4.10 — record MBAFF-ness on the grid so the neighbour-address
     // derivation (Table 6-4) is selected over the raster §6.4.9 path.

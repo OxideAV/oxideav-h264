@@ -592,6 +592,23 @@ impl Sps {
         factor * self.pic_height_in_map_units()
     }
 
+    /// §7.4.2.1.1 eq. (7-26) — `PicHeightInMbs = FrameHeightInMbs / (1 + field_pic_flag)`.
+    ///
+    /// A field-coded picture (`field_pic_flag == 1`) is half the frame
+    /// height in macroblocks; a frame-coded picture (`field_pic_flag == 0`,
+    /// the MBAFF / progressive case) covers the full `FrameHeightInMbs`.
+    pub fn pic_height_in_mbs(&self, field_pic_flag: bool) -> u32 {
+        self.frame_height_in_mbs() / (1 + u32::from(field_pic_flag))
+    }
+
+    /// §7.4.2.1.1 eq. (7-25/7-27) — `PicSizeInMbs = PicWidthInMbs *
+    /// PicHeightInMbs`. For a field picture this is half the frame's
+    /// macroblock count.
+    pub fn pic_size_in_mbs(&self, field_pic_flag: bool) -> u32 {
+        self.pic_width_in_mbs()
+            .saturating_mul(self.pic_height_in_mbs(field_pic_flag))
+    }
+
     /// §7.4.2.1.1 eq. (7-10) — `MaxFrameNum = 2^(log2_max_frame_num_minus4 + 4)`.
     pub fn max_frame_num(&self) -> u32 {
         1u32 << (self.log2_max_frame_num_minus4 + 4)
@@ -1109,6 +1126,44 @@ mod tests {
         assert!(sps.mb_adaptive_frame_field_flag);
         // FrameHeightInMbs = 2 * (pic_height_in_map_units_minus1 + 1).
         assert_eq!(sps.frame_height_in_mbs(), 22);
+
+        // §7.4.2.1.1 eq. (7-26) — a field picture is half the frame
+        // height in MBs; a frame-coded picture keeps the full height.
+        assert_eq!(sps.pic_height_in_mbs(false), 22);
+        assert_eq!(sps.pic_height_in_mbs(true), 11);
+        // eq. (7-25/7-27) PicSizeInMbs = PicWidthInMbs * PicHeightInMbs.
+        // PicWidthInMbs = pic_width_in_mbs_minus1 + 1 = 11.
+        assert_eq!(sps.pic_width_in_mbs(), 11);
+        assert_eq!(sps.pic_size_in_mbs(false), 11 * 22);
+        assert_eq!(sps.pic_size_in_mbs(true), 11 * 11);
+    }
+
+    #[test]
+    fn pic_height_in_mbs_progressive_equals_frame_height() {
+        // frame_mbs_only_flag == 1: field_pic_flag is always 0, so
+        // PicHeightInMbs == FrameHeightInMbs regardless of the argument
+        // (a conformant stream never sets field_pic_flag here).
+        let mut w = BitWriter::new();
+        w.u(8, 66);
+        w.u(8, 0);
+        w.u(8, 30);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(1);
+        w.u(1, 0);
+        w.ue(7); // pic_width_in_mbs_minus1 → 8
+        w.ue(5); // pic_height_in_map_units_minus1 → 6
+        w.u(1, 1); // frame_mbs_only_flag = 1
+        w.u(1, 1); // direct_8x8_inference_flag
+        w.u(1, 0); // frame_cropping_flag
+        w.u(1, 0); // vui
+        w.trailing();
+        let sps = Sps::parse(&w.into_bytes()).unwrap();
+        assert_eq!(sps.frame_height_in_mbs(), 6);
+        assert_eq!(sps.pic_height_in_mbs(false), 6);
+        assert_eq!(sps.pic_size_in_mbs(false), 8 * 6);
     }
 
     #[test]

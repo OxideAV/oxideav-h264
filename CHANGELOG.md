@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PAFF (`field_pic_flag == 1`) field-picture decode + §C.4.4
+  complementary-field pairing.** A picture-adaptive frame/field stream's
+  individual field pictures now decode: a field is reconstructed as a
+  half-height picture per §7.4.2.1.1 eq. (7-26)
+  `PicHeightInMbs = FrameHeightInMbs / (1 + field_pic_flag)`, with the
+  §7.3.4 macroblock walk, CAVLC/CABAC neighbour grids and §8 sample
+  placement all operating in field-local coordinates (within a single
+  field MbaffFrameFlag == 0, so the §6.4 raster neighbour derivation
+  applies unchanged). The decoder driver sizes the in-progress
+  `Picture` + `MbGrid` to the coded field height, derives the field's
+  own Top/BottomFieldOrderCnt for output ordering, and holds the first
+  field of a complementary pair until its opposite-parity partner
+  (same `frame_num`) arrives — at which point `interleave_fields`
+  re-weaves the two half-height fields into one full-height output frame
+  (top field → even rows, bottom field → odd rows) whose POC is
+  `Min(TopFieldOrderCnt, BottomFieldOrderCnt)` (§8.2.1 eq. 8-1). A
+  trailing unpaired field at IDR / MMCO-5 / EOF is emitted as a
+  standalone half-height frame rather than dropped. New SPS geometry
+  helpers `pic_height_in_mbs(field_pic_flag)` / `pic_size_in_mbs(...)`
+  carry eq. (7-26)/(7-27); the previous blanket
+  `field_pic_flag == 1` reconstruction rejection is removed. Six new
+  unit tests cover the field geometry, the row-interleave parity
+  placement, complementary-pair frame assembly, and the
+  non-complementary orphan-flush path. (Byte-exact conformance against a
+  black-box reference is blocked: neither x264 nor the in-tree encoder
+  emits PAFF field-coded streams — x264's interlaced mode is MBAFF only
+  — so no field-picture fixture is available; see followups.)
 - **Conformance gates for 4:2:2 (ChromaArrayType == 2) P / B-slice inter
   chroma reconstruction.** The §8.4.1.4 chroma-MV derivation (eq.
   8-221/8-222: `mvCLX = mvLX`, SubHeightC == 1 so no vertical halving),
