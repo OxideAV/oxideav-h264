@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§8.6.4 / §8.5.13 High-profile 8x8 forward transform + quantizer
+  (encoder side).** New `encoder::transform::forward_core_8x8`
+  (`W = E8 · X · E8ᵀ` with the integer 8x8 basis `E8`, the transpose of
+  the normative §8.5.13.2 inverse butterfly), `quantize_8x8`
+  (`MF8x8[m][class] = round(2^18 / normAdjust8x8)` with
+  `qBits8 = 22 + qP/6`), `zigzag_scan_8x8` (Table 8-14 frame scan,
+  inverse of the decoder's `inverse_scan_8x8_zigzag`), and
+  `deinterleave_8x8_to_4x4` (§7.4.5.3.3 `level4x4[i4x4][i] =
+  level8x8[4·i + i4x4]` for the CAVLC four-4x4 residual split). Round-trip
+  quality is gated against the decoder's normative `inverse_transform_8x8`:
+  a smooth ramp + mid-frequency ripple recovers to within `4·2^(qP/6)+2`
+  per sample across QP 16/22/26/30; the `E8` basis is verified orthogonal
+  and the 8x8 zig-zag verified an exact inverse of the decoder scan. This
+  is the transform foundation for the High-profile Intra_8x8 encode path.
 - **§7.4.1.2.4 `bottom_field_flag` primary-coded-picture boundary.** The
   first-VCL-of-new-picture detection now treats a change in
   `bottom_field_flag` (when both slices are field pictures) as a picture

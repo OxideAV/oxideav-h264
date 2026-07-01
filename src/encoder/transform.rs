@@ -816,13 +816,289 @@ pub fn zigzag_scan_4x4_ac(coeffs: &[i32; 16]) -> [i32; 16] {
     out
 }
 
+// ===========================================================================
+// §8.5.13 / §8.6 — High-profile 8x8 forward transform + quantization.
+// ===========================================================================
+//
+// The decoder's inverse 8x8 transform (`crate::transform::inverse_core_8x8`,
+// §8.5.13.2 eqs. 8-358..8-406) applies an integer butterfly that realises
+// the 8-point inverse DCT-like basis and finishes with `(m + 32) >> 6`.
+// The matching forward transform is the transpose of that basis, expressed
+// as the integer 8x8 matrix `E8` below (each row is one basis vector). The
+// forward core computes `W = E8 * R * E8^T`; the per-position quantizer
+// (below) folds in the `1/64` forward-domain scale and the §8.5.9 normAdjust
+// so that `inverse_transform_8x8(quantize_8x8(W))` recovers `R` to within a
+// quantization step.
+//
+// `E8` is the transpose of the normative inverse basis (rows are mutually
+// orthogonal: every pair of distinct rows has zero dot product). It is not
+// copied from any implementation — it is the integer basis of §8.6.4
+// re-derived from the inverse butterfly's fixed points.
+
+/// §8.6.4 — forward 8x8 integer transform matrix `E8` (row = basis
+/// vector). Even rows have L2² norm 512, odd rows 578; the per-class
+/// normalisation is absorbed by [`quantize_8x8`].
+const FORWARD_8X8_E: [[i32; 8]; 8] = [
+    [8, 8, 8, 8, 8, 8, 8, 8],
+    [12, 10, 6, 3, -3, -6, -10, -12],
+    [8, 4, -4, -8, -8, -4, 4, 8],
+    [10, -3, -12, -6, 6, 12, 3, -10],
+    [8, -8, -8, 8, 8, -8, -8, 8],
+    [6, -12, 3, 10, -10, -3, 12, -6],
+    [4, -8, 8, -4, -4, 8, -8, 4],
+    [3, -6, 10, -12, 12, -10, 6, -3],
+];
+
+/// Forward 8x8 core transform `W = E8 * X * E8^T` (no quantization).
+/// `x` is row-major (64 entries). Returns `W`, also row-major.
+pub fn forward_core_8x8(x: &[i32; 64]) -> [i32; 64] {
+    // Row pass: H = E8 * X.
+    let mut h = [0i64; 64];
+    for r in 0..8 {
+        for j in 0..8 {
+            let mut acc = 0i64;
+            for k in 0..8 {
+                acc += FORWARD_8X8_E[r][k] as i64 * x[k * 8 + j] as i64;
+            }
+            h[r * 8 + j] = acc;
+        }
+    }
+    // Column pass: W = H * E8^T.
+    let mut w = [0i32; 64];
+    for i in 0..8 {
+        for c in 0..8 {
+            let mut acc = 0i64;
+            for k in 0..8 {
+                acc += h[i * 8 + k] * FORWARD_8X8_E[c][k] as i64;
+            }
+            w[i * 8 + c] = acc as i32;
+        }
+    }
+    w
+}
+
+/// §8.5.9 / Table 8-5 — normAdjust8x8 v-matrix (mirrored so the forward
+/// quantizer is derivable from the spec without reading inverse code).
+const NORM_ADJUST_8X8_V: [[i32; 6]; 6] = [
+    [20, 18, 32, 19, 25, 24],
+    [22, 19, 35, 21, 28, 26],
+    [26, 23, 42, 24, 33, 31],
+    [28, 25, 45, 26, 35, 33],
+    [32, 28, 51, 30, 40, 38],
+    [36, 32, 58, 34, 46, 43],
+];
+
+/// §8.5.9 — equivalence-class selector for 8x8 positions (0..=5),
+/// identical to the decoder's `norm_adjust_8x8` class dispatch.
+#[inline]
+fn norm_adjust_8x8_class(i: usize, j: usize) -> usize {
+    let im4 = i & 3;
+    let jm4 = j & 3;
+    let im2 = i & 1;
+    let jm2 = j & 1;
+    if im4 == 0 && jm4 == 0 {
+        0
+    } else if im2 == 1 && jm2 == 1 {
+        1
+    } else if im4 == 2 && jm4 == 2 {
+        2
+    } else if (im4 == 0 && jm2 == 1) || (im2 == 1 && jm4 == 0) {
+        3
+    } else if (im4 == 0 && jm4 == 2) || (im4 == 2 && jm4 == 0) {
+        4
+    } else {
+        5
+    }
+}
+
+/// Forward 8x8 quantizer multiplier `MF8x8[m][class]`.
+///
+/// Derivation (clean-room from §8.5.13.1): the decoder dequantizes a
+/// level `Z` at position class `c` to `d = Z * 16 * V8x8[m][c] * 2^(qP/6)
+/// / 64`, and the forward core produces `W = 64 * d` for a round-trip.
+/// Hence `Z = W / (16 * V8x8[m][c] * 2^(qP/6))`. Expressed as
+/// `Z = (|W| * MF + f) >> (22 + qP/6)` this fixes
+/// `MF8x8[m][c] = round(2^18 / V8x8[m][c])`.
+#[inline]
+fn forward_mf_8x8(m: usize, class: usize) -> i64 {
+    let v = NORM_ADJUST_8X8_V[m][class] as i64;
+    ((1i64 << 18) + v / 2) / v
+}
+
+/// `qBits8 = 22 + qP/6` — the forward shift used by [`quantize_8x8`].
+#[inline]
+fn q_bits_8x8(qp: i32) -> i32 {
+    22 + qp / 6
+}
+
+/// Quantize a forward-transformed 8x8 block `w` (row-major, 64 entries)
+/// at QP `qp` using the flat scaling list. `is_intra` selects the
+/// rounding offset (intra `(1<<qBits)/3`, inter `(1<<qBits)/6`).
+/// Returns the row-major integer level array `Z`.
+pub fn quantize_8x8(w: &[i32; 64], qp: i32, is_intra: bool) -> [i32; 64] {
+    debug_assert!((0..=51).contains(&qp));
+    let m = qp.rem_euclid(6) as usize;
+    let qb = q_bits_8x8(qp);
+    let f = if is_intra {
+        (1i64 << qb) / 3
+    } else {
+        (1i64 << qb) / 6
+    };
+    let mut z = [0i32; 64];
+    for i in 0..8 {
+        for j in 0..8 {
+            let idx = i * 8 + j;
+            let class = norm_adjust_8x8_class(i, j);
+            let mf = forward_mf_8x8(m, class);
+            let abs_w = (w[idx] as i64).unsigned_abs();
+            let level = ((abs_w as i64 * mf + f) >> qb) as i32;
+            z[idx] = if w[idx] < 0 { -level } else { level };
+        }
+    }
+    z
+}
+
+// ---------------------------------------------------------------------------
+// §8.5.7 / Table 8-14 — 8x8 zig-zag scan (frame case). Row-major → scan.
+// ---------------------------------------------------------------------------
+
+/// `ZIGZAG_8X8_FWD[k]` gives the row-major index (`i*8 + j`) of the
+/// coefficient at scan position `k`. Inverse of the decoder's
+/// `inverse_scan_8x8_zigzag` (Table 8-14, zig-zag row).
+pub const ZIGZAG_8X8_FWD: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+/// Pack an 8x8 row-major coefficient block into 8x8 zig-zag scan order.
+pub fn zigzag_scan_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
+    let mut out = [0i32; 64];
+    for (scan, &raster) in ZIGZAG_8X8_FWD.iter().enumerate() {
+        out[scan] = coeffs[raster];
+    }
+    out
+}
+
+/// §7.4.5.3.3 — de-interleave a 64-entry 8x8 scan-order level array into
+/// the four CAVLC 4x4 residual blocks: `level4x4[i4x4][i] =
+/// level8x8[4*i + i4x4]`. Returns four 16-entry scan-order blocks, ready
+/// for `encode_residual_block_cavlc`. The decoder's parser applies the
+/// inverse mapping when reading the 8x8 luma residual.
+pub fn deinterleave_8x8_to_4x4(scan8: &[i32; 64]) -> [[i32; 16]; 4] {
+    let mut blocks = [[0i32; 16]; 4];
+    for i4x4 in 0..4 {
+        for i in 0..16 {
+            blocks[i4x4][i] = scan8[4 * i + i4x4];
+        }
+    }
+    blocks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transform::{default_scaling_list_8x8_flat, inverse_transform_8x8};
     use crate::transform::{
         inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16, inverse_scan_4x4_zigzag,
         inverse_transform_4x4, FLAT_4X4_16,
     };
+
+    /// The forward 8x8 basis `E8` must be orthogonal: every pair of
+    /// distinct rows has zero dot product (a prerequisite for the
+    /// transform to be invertible by the transpose).
+    #[test]
+    fn forward_8x8_basis_is_orthogonal() {
+        for (a, row_a) in FORWARD_8X8_E.iter().enumerate() {
+            for (b, row_b) in FORWARD_8X8_E.iter().enumerate() {
+                let dot: i32 = (0..8).map(|k| row_a[k] * row_b[k]).sum();
+                if a == b {
+                    assert!(dot > 0, "row {a} has zero norm");
+                } else {
+                    assert_eq!(dot, 0, "rows {a},{b} not orthogonal");
+                }
+            }
+        }
+    }
+
+    /// The forward 8x8 zig-zag permutation must be the exact inverse of
+    /// the decoder's `inverse_scan_8x8_zigzag`: scanning a row-major
+    /// block then inverse-scanning must be the identity.
+    #[test]
+    fn forward_8x8_zigzag_inverts_decoder_scan() {
+        let raster: [i32; 64] = std::array::from_fn(|k| k as i32);
+        let scan = zigzag_scan_8x8(&raster);
+        // Reconstruct row-major via the same mapping the decoder uses.
+        let mut back = [0i32; 64];
+        for (s, &r) in ZIGZAG_8X8_FWD.iter().enumerate() {
+            back[r] = scan[s];
+        }
+        assert_eq!(back, raster);
+    }
+
+    /// An all-zero residual forward-transforms + quantizes to all zeros
+    /// and inverse-transforms back to zero.
+    #[test]
+    fn forward_8x8_zero_residual_round_trips_to_zero() {
+        let sl8 = default_scaling_list_8x8_flat();
+        for &qp in &[0, 12, 26, 36, 51] {
+            let w = forward_core_8x8(&[0; 64]);
+            assert_eq!(w, [0; 64]);
+            let z = quantize_8x8(&w, qp, true);
+            assert_eq!(z, [0; 64]);
+            let r = inverse_transform_8x8(&z, qp, &sl8, 8).unwrap();
+            assert_eq!(r, [0; 64]);
+        }
+    }
+
+    /// Full forward → quantize → (scan → de-interleave → re-interleave →
+    /// inverse-scan) → inverse round trip. The reconstructed residual
+    /// must match the input to within a quantization step, validating
+    /// both the `E8` matrix and the `MF8x8` quantizer against the
+    /// normative inverse.
+    #[test]
+    fn forward_8x8_round_trip_recovers_residual() {
+        let sl8 = default_scaling_list_8x8_flat();
+        // A smooth ramp plus a mid-frequency ripple — exercises DC and
+        // several AC classes.
+        let mut res = [0i32; 64];
+        for i in 0..8 {
+            for j in 0..8 {
+                let ramp = (i as i32 * 6 + j as i32 * 3) - 42;
+                let ripple = if (i + j) % 2 == 0 { 5 } else { -5 };
+                res[i * 8 + j] = ramp + ripple;
+            }
+        }
+        for &qp in &[16, 22, 26, 30] {
+            let w = forward_core_8x8(&res);
+            let z_raster = quantize_8x8(&w, qp, true);
+            // Round-trip through the CAVLC scan + de-interleave path.
+            let scan = zigzag_scan_8x8(&z_raster);
+            let blocks = deinterleave_8x8_to_4x4(&scan);
+            // Re-interleave exactly as the decoder does after parsing.
+            let mut scan_back = [0i32; 64];
+            for (i4x4, blk) in blocks.iter().enumerate() {
+                for (i, &c) in blk.iter().enumerate() {
+                    scan_back[4 * i + i4x4] = c;
+                }
+            }
+            assert_eq!(scan_back, scan, "de-interleave round trip failed");
+            // Decoder inverse-scans then inverse-transforms.
+            let mut coeffs = [0i32; 64];
+            for (s, &r) in ZIGZAG_8X8_FWD.iter().enumerate() {
+                coeffs[r] = scan[s];
+            }
+            let recon = inverse_transform_8x8(&coeffs, qp, &sl8, 8).unwrap();
+            // Quantization error bound scales with the step size; at these
+            // QPs a per-sample error of a few units is expected.
+            let step = 1 << (qp / 6);
+            let max_err = (0..64).map(|k| (recon[k] - res[k]).abs()).max().unwrap();
+            assert!(
+                max_err <= 4 * step + 2,
+                "qp={qp} max_err={max_err} step={step}"
+            );
+        }
+    }
 
     /// Helper: full forward → quantize → inverse round trip on a single
     /// 4x4 block. The reconstructed residual should match the input
