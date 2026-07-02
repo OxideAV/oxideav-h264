@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **P-slice inter 8x8 transform (`transform_size_8x8_flag` on
+  P_L0_16x16).** With `transform_8x8` set, `encode_p`'s coded-MB path
+  trials the §8.6.4 forward 8x8 transform of the motion-compensated
+  luma residual (one transform per quadrant, inter quantiser rounding)
+  against the sixteen-4x4 coding and keeps the lower `J = D + λ·R`
+  alternative (`forward_inter_luma_8x8` + `inter_luma_transform_cost`).
+  The §7.3.5 second-gate flag is coded after `coded_block_pattern` when
+  `cbp_luma > 0` (`PL016x16McbConfig::transform_size_8x8_flag`); the
+  4MV all-PL08x8 writer codes the mandatory flag as 0
+  (`P8x8AllPL08x8McbConfig::emit_transform_size_8x8_zero` — its
+  sub-partitions are 8x8 so `noSubMbPartSizeLessThan8x8Flag = 1`);
+  P_Skip and the Intra_16x16 fallback are gate-exempt per §7.3.5.
+  `EncodedP::i8x8_mb_count` mirrors the IDR counter. `encode_b` rejects
+  `transform_8x8` until the B-slice writers grow the flag. Gated by
+  `i8x8_p_slice_inter_8x8_transform_roundtrips_bit_exact`: a
+  low-frequency ramp residual makes the RDO pick 8x8 on P MBs and the
+  2-frame stream decodes bit-exactly through both our decoder and the
+  black-box reference decoder.
 - **Adaptive per-MB transform-size RDO (I_16x16 / I_4x4 / I_8x8).**
   With `EncoderConfig::transform_8x8` set, `encode_idr`'s per-MB
   Lagrangian RDO now runs a third **Intra_8x8** trial alongside the

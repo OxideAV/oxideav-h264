@@ -2742,6 +2742,10 @@ pub struct EncodedP {
     /// derivation (§8.4.1.2.2 step 7) needs the colocated block's L0
     /// MV / refIdx to evaluate `colZeroFlag`.
     pub partition_mvs: Vec<FrameRefPartitionMv>,
+    /// Round-382 — number of macroblocks coded with
+    /// `transform_size_8x8_flag = 1` (High-profile 8x8 transform).
+    /// Always 0 unless [`EncoderConfig::transform_8x8`] is set.
+    pub i8x8_mb_count: u32,
 }
 
 /// Per-MB encoder-side MV / refIdx slot for the §8.4.1.3 mvp neighbour
@@ -4015,6 +4019,7 @@ impl Encoder {
         // MBs were skips — we always emit one final `mb_skip_run` to
         // ensure consistency.
         let mut pending_skip: u32 = 0;
+        let mut i8x8_mb_count = 0u32;
 
         for mb_y in 0..height_mbs as usize {
             for mb_x in 0..width_mbs as usize {
@@ -4040,6 +4045,9 @@ impl Encoder {
                     &mut mv_grid,
                     &mut pending_skip,
                 );
+                if dbl.transform_size_8x8_flag {
+                    i8x8_mb_count += 1;
+                }
                 mb_deblock_infos[mb_addr] = dbl;
             }
         }
@@ -4109,6 +4117,7 @@ impl Encoder {
             frame_num,
             pic_order_cnt_lsb,
             partition_mvs,
+            i8x8_mb_count,
         }
     }
 
@@ -4259,10 +4268,10 @@ impl Encoder {
         // 4. Compute the luma residual, transform, AC-quantize, inverse,
         //    and reconstruct.
         let inter_luma = forward_inter_luma(frame.y, width, mb_x, mb_y, &pred_y, qp_y);
-        let luma_4x4_levels_scan = inter_luma.levels_scan;
+        let mut luma_4x4_levels_scan = inter_luma.levels_scan;
         let luma_4x4_quant_raster = inter_luma.quant_raster;
-        let blk_has_nz = inter_luma.blk_has_nz;
-        let recon_block_residual = inter_luma.recon_residual;
+        let mut blk_has_nz = inter_luma.blk_has_nz;
+        let mut recon_block_residual = inter_luma.recon_residual;
 
         // 5. Decide cbp_luma (per 8x8 quadrant).
         let mut cbp_luma: u8 = 0;
@@ -4270,6 +4279,51 @@ impl Encoder {
             let any_nz = (0..4).any(|sub| blk_has_nz[blk8 * 4 + sub]);
             if any_nz {
                 cbp_luma |= 1u8 << blk8;
+            }
+        }
+
+        // 5b. Round-382 — High-profile 8x8-transform alternative. When
+        // the PPS carries transform_8x8_mode_flag, trial the §8.6.4
+        // 8x8 transform of the same residual and keep the lower-J
+        // coding (the transform_size_8x8_flag bit itself is coded for
+        // both alternatives whenever cbp_luma > 0, so it cancels out
+        // of the comparison).
+        let mut transform_size_8x8 = false;
+        if self.cfg.transform_8x8 {
+            let inter_luma8 = forward_inter_luma_8x8(frame.y, width, mb_x, mb_y, &pred_y, qp_y);
+            let mut cbp_luma8: u8 = 0;
+            for blk8 in 0..4usize {
+                if inter_luma8.blk_has_nz[blk8 * 4] {
+                    cbp_luma8 |= 1u8 << blk8;
+                }
+            }
+            let lambda = lambda_ssd(qp_y, false);
+            let j4 = inter_luma_transform_cost(
+                frame.y,
+                width,
+                mb_x,
+                mb_y,
+                &pred_y,
+                &inter_luma,
+                cbp_luma,
+                lambda,
+            );
+            let j8 = inter_luma_transform_cost(
+                frame.y,
+                width,
+                mb_x,
+                mb_y,
+                &pred_y,
+                &inter_luma8,
+                cbp_luma8,
+                lambda,
+            );
+            if j8 < j4 {
+                transform_size_8x8 = true;
+                luma_4x4_levels_scan = inter_luma8.levels_scan;
+                blk_has_nz = inter_luma8.blk_has_nz;
+                recon_block_residual = inter_luma8.recon_residual;
+                cbp_luma = cbp_luma8;
             }
         }
 
@@ -4458,6 +4512,11 @@ impl Encoder {
 
         // Emit the MB syntax.
         let mb_cfg = PL016x16McbConfig {
+            transform_size_8x8_flag: if self.cfg.transform_8x8 {
+                Some(transform_size_8x8)
+            } else {
+                None
+            },
             mvd_l0_x: mvd_x,
             mvd_l0_y: mvd_y,
             cbp_luma,
@@ -4501,6 +4560,7 @@ impl Encoder {
             qp_y,
             luma_nonzero_4x4,
             chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+            transform_size_8x8_flag: transform_size_8x8,
             mv_l0: [mv_t; 16],
             ref_idx_l0: [0; 4],
             ref_poc_l0: [0; 4],
@@ -4740,6 +4800,10 @@ impl Encoder {
 
         // 8. Emit P_8x8 syntax.
         let mb_cfg = P8x8AllPL08x8McbConfig {
+            // §7.3.5 — inside a transform_8x8_mode_flag=1 stream the
+            // all-PL08x8 4MV MB codes transform_size_8x8_flag = 0 when
+            // cbp_luma > 0 (this path keeps 4x4 residual coding).
+            emit_transform_size_8x8_zero: self.cfg.transform_8x8,
             mvd_l0: mvds,
             cbp_luma,
             cbp_chroma,
@@ -5409,6 +5473,125 @@ struct InterLumaForward {
     quant_raster: [[i32; 16]; 16],
     blk_has_nz: [bool; 16],
     recon_residual: [[i32; 16]; 16],
+}
+
+/// Round-382 — §8.6.4 forward 8x8 transform + §8.5.13.1 quantisation of
+/// an inter MB's luma residual (one transform per 8x8 quadrant instead
+/// of sixteen 4x4s). Outputs use the same per-4x4-Z-index layout as
+/// [`InterLumaForward`] so the caller's recon / CAVLC / nC machinery is
+/// shared between the two transform sizes:
+///
+/// * `levels_scan[blk8*4 + i4x4]` — the §7.4.5.3.3 de-interleaved
+///   four-4x4 CAVLC split of quadrant `blk8`'s 8x8 zig-zag scan list.
+/// * `blk_has_nz[blk]` — every 4x4 of a quadrant inherits the
+///   quadrant's nonzero status (mirrors the decoder's §8.7.2.1 mask).
+/// * `recon_residual[blk]` — the §8.5.13 reconstructed residual of the
+///   4x4 sub-tile at Z-index `blk`, sliced from the quadrant's 8x8
+///   inverse transform.
+fn forward_inter_luma_8x8(
+    src_y: &[u8],
+    src_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    pred: &[i32; 256],
+    qp_y: i32,
+) -> InterLumaForward {
+    let sl8 = default_scaling_list_8x8_flat();
+    let mut levels_scan = [[0i32; 16]; 16];
+    let mut blk_has_nz = [false; 16];
+    let mut recon_residual = [[0i32; 16]; 16];
+
+    for blk8 in 0..4usize {
+        let qx = (blk8 % 2) * 8;
+        let qy = (blk8 / 2) * 8;
+        let mut res = [0i32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let s = src_y[(mb_y * 16 + qy + j) * src_stride + (mb_x * 16 + qx + i)] as i32;
+                res[j * 8 + i] = s - pred[(qy + j) * 16 + qx + i];
+            }
+        }
+        let w = forward_core_8x8(&res);
+        let z = quantize_8x8(&w, qp_y, false);
+        let any_nz = z.iter().any(|&v| v != 0);
+        let scan = zigzag_scan_8x8(&z);
+        let subs = deinterleave_8x8_to_4x4(&scan);
+        for (i4x4, sub) in subs.iter().enumerate() {
+            levels_scan[blk8 * 4 + i4x4] = *sub;
+            blk_has_nz[blk8 * 4 + i4x4] = any_nz;
+        }
+        let r = inverse_transform_8x8(&z, qp_y, &sl8, 8).expect("inv 8x8");
+        // Slice the 8x8 residual into the quadrant's four 4x4 Z-index
+        // sub-tiles (§6.4.3: within a quadrant, Z order is TL, TR, BL,
+        // BR 4x4 tiles).
+        for sub in 0..4usize {
+            let sx = (sub % 2) * 4;
+            let sy = (sub / 2) * 4;
+            let mut tile = [0i32; 16];
+            for j in 0..4 {
+                for i in 0..4 {
+                    tile[j * 4 + i] = r[(sy + j) * 8 + sx + i];
+                }
+            }
+            recon_residual[blk8 * 4 + sub] = tile;
+        }
+    }
+    InterLumaForward {
+        levels_scan,
+        quant_raster: [[0i32; 16]; 16],
+        blk_has_nz,
+        recon_residual,
+    }
+}
+
+/// Round-382 — luma Lagrangian cost `J = D + λ·R` of one inter-MB luma
+/// coding alternative (4x4 vs 8x8 transform). `D` is the SSD between
+/// the source MB and `pred + recon_residual` with non-transmitted
+/// quadrants (cbp bit 0) contributing `pred + 0`; `R` is the trial
+/// CAVLC bit count of the transmitted blocks at nC = 0 (stable
+/// estimate, same policy as the intra mode trials).
+#[allow(clippy::too_many_arguments)]
+fn inter_luma_transform_cost(
+    src_y: &[u8],
+    src_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    pred: &[i32; 256],
+    fwd: &InterLumaForward,
+    cbp_luma: u8,
+    lambda: f64,
+) -> u64 {
+    let mut d: u64 = 0;
+    for (blk, &(bx, by)) in LUMA_4X4_BLK.iter().enumerate() {
+        let send = (cbp_luma >> (blk / 4)) & 1 == 1;
+        for j in 0..4usize {
+            for i in 0..4usize {
+                let p = pred[(by * 4 + j) * 16 + bx * 4 + i];
+                let r = if send {
+                    fwd.recon_residual[blk][j * 4 + i]
+                } else {
+                    0
+                };
+                let recon = (p + r).clamp(0, 255);
+                let s =
+                    src_y[(mb_y * 16 + by * 4 + j) * src_stride + (mb_x * 16 + bx * 4 + i)] as i32;
+                let e = (s - recon) as i64;
+                d += (e * e) as u64;
+            }
+        }
+    }
+    let mut trial_w = BitWriter::new();
+    for blk in 0..16usize {
+        if (cbp_luma >> (blk / 4)) & 1 == 1 {
+            let _ = encode_residual_block_cavlc(
+                &mut trial_w,
+                CoeffTokenContext::Numeric(0),
+                16,
+                &fwd.levels_scan[blk],
+            );
+        }
+    }
+    cost_combined(d, trial_w.bits_emitted() as u64, lambda)
 }
 
 /// Forward 4x4 + AC quantization for an inter MB's luma residual. Inter
@@ -7994,6 +8177,14 @@ impl Encoder {
         assert!(
             self.cfg.profile_idc >= 77,
             "B-slices require Main profile or higher (§A.2.2 — Baseline forbids B)"
+        );
+        // Round-382 — the B-slice CAVLC writers don't yet code the
+        // §7.3.5 second-gate transform_size_8x8_flag, so a B slice
+        // inside a transform_8x8_mode_flag=1 stream would desync the
+        // decoder. Reject until the B writers grow the flag.
+        assert!(
+            !self.cfg.transform_8x8,
+            "transform_8x8 encode does not yet support B slices"
         );
 
         let width = self.cfg.width as usize;

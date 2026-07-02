@@ -921,6 +921,16 @@ pub fn inter_cbp_to_codenum_420_422(cbp_luma: u8, cbp_chroma: u8) -> u32 {
 /// `mvd_l0_*` are in **quarter-pel units** (i.e. `mv = pel * 4`), per
 /// §8.4.1.4 / §7.4.5.1.
 pub struct PL016x16McbConfig {
+    /// §7.3.5 — `transform_size_8x8_flag` for the second gate: when the
+    /// active PPS has `transform_8x8_mode_flag = 1` and this MB's
+    /// `cbp_luma > 0`, the flag MUST be coded after
+    /// `coded_block_pattern` (P_L0_16x16 has no sub-partitions, so
+    /// `noSubMbPartSizeLessThan8x8Flag` is always 1). `None` when the
+    /// PPS doesn't carry the tool (the flag is then inferred 0 and must
+    /// not be coded). `Some(true)` selects the 8x8 transform: the
+    /// `luma_4x4_levels` entries must then hold the §7.4.5.3.3
+    /// de-interleaved four-4x4 split of each 8x8 block's scan list.
+    pub transform_size_8x8_flag: Option<bool>,
     /// Motion vector difference, x component, in quarter-pel units.
     pub mvd_l0_x: i32,
     /// Motion vector difference, y component, in quarter-pel units.
@@ -984,6 +994,14 @@ pub fn write_p_l0_16x16_mb(
     let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
     w.ue(codenum);
 
+    // §7.3.5 — transform_size_8x8_flag (second gate): coded when the
+    // PPS has transform_8x8_mode_flag = 1 and cbp_luma > 0.
+    if let Some(flag) = cfg.transform_size_8x8_flag {
+        if cfg.cbp_luma > 0 {
+            w.u(1, if flag { 1 } else { 0 });
+        }
+    }
+
     // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
     let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
     if needs_qp_delta {
@@ -992,7 +1010,9 @@ pub fn write_p_l0_16x16_mb(
 
     // §7.3.5.3 — luma residual: 16 4x4 blocks grouped by 8x8 quadrant.
     // Each 8x8 quadrant covers 4 child 4x4 blocks; the cbp_luma bit
-    // gates the whole quadrant.
+    // gates the whole quadrant. (With transform_size_8x8_flag = 1 the
+    // four blocks per quadrant carry the §7.4.5.3.3 de-interleaved
+    // split of the 8x8 scan list — same syntax layout either way.)
     for blk8 in 0..4u8 {
         if (cfg.cbp_luma >> blk8) & 1 == 1 {
             for sub in 0..4u8 {
@@ -1053,6 +1073,13 @@ pub fn write_p_l0_16x16_mb(
 ///
 /// `mvd_l0` are in **quarter-pel units** per §7.4.5.1 / §8.4.1.4.
 pub struct P8x8AllPL08x8McbConfig {
+    /// §7.3.5 — when the active PPS has `transform_8x8_mode_flag = 1`
+    /// and `cbp_luma > 0`, this all-PL08x8 MB passes the second gate
+    /// (every sub-partition is 8x8, so `noSubMbPartSizeLessThan8x8Flag
+    /// = 1`) and MUST code a `transform_size_8x8_flag`. Set this to
+    /// emit the flag as 0 (the 4MV path codes 4x4 residuals); leave
+    /// `false` when the PPS doesn't carry the tool.
+    pub emit_transform_size_8x8_zero: bool,
     /// Per-8x8-partition mvd (quarter-pel units), in §6.4.3 8x8
     /// raster order: (0=TL, 1=TR, 2=BL, 3=BR). Same order as
     /// `LUMA_4X4_BLK[blk*4]` indexes the top-left 4x4 of each 8x8.
@@ -1119,6 +1146,13 @@ pub fn write_p_8x8_all_pl08x8_mb(
     // §7.3.5 — coded_block_pattern me(v) using the inter table.
     let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
     w.ue(codenum);
+
+    // §7.3.5 — transform_size_8x8_flag = 0 (second gate; all-PL08x8
+    // passes noSubMbPartSizeLessThan8x8Flag), present only when the
+    // PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
+    if cfg.emit_transform_size_8x8_zero && cfg.cbp_luma > 0 {
+        w.u(1, 0);
+    }
 
     // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
     let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
