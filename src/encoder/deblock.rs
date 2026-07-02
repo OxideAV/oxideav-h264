@@ -81,6 +81,12 @@ pub struct MbDeblockInfo {
     /// Round-20: §8.7.2.1 NOTE 1 per-8x8-partition L1 referenced POC.
     /// `i32::MIN` for intra / L1 unused.
     pub ref_poc_l1: [i32; 4],
+    /// Round-382: §7.4.5 / §8.7 — the MB uses the High-profile 8x8
+    /// transform. The §8.7 walker skips the 4x4-internal luma edges
+    /// (offsets 4 and 12) for such MBs, so the encoder-side deblock
+    /// mirror must carry the flag through to the shared
+    /// `deblock_picture_full` grid.
+    pub transform_size_8x8_flag: bool,
 }
 
 impl Default for MbDeblockInfo {
@@ -96,6 +102,7 @@ impl Default for MbDeblockInfo {
             mv_l1: [(0, 0); 16],
             ref_idx_l1: [-1; 4],
             ref_poc_l1: [i32::MIN; 4],
+            transform_size_8x8_flag: false,
         }
     }
 }
@@ -203,7 +210,7 @@ pub fn deblock_recon_with_chroma_array_type(
         mb.qp_y = info.qp_y;
         mb.luma_nonzero_4x4 = info.luma_nonzero_4x4;
         mb.chroma_nonzero_4x4 = info.chroma_nonzero_4x4;
-        mb.transform_size_8x8_flag = false;
+        mb.transform_size_8x8_flag = info.transform_size_8x8_flag;
         // §6.4.8 third bullet — single slice, slice_id 0 throughout, so
         // no "different slice" neighbour rejections fire.
         mb.slice_id = 0;

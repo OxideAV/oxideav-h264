@@ -48,6 +48,14 @@ pub struct BaselinePpsConfig {
     /// NOT permit CABAC per §A.2.1; the encoder must bump
     /// `profile_idc` to Main (77) or higher before enabling this.
     pub entropy_coding_mode_flag: bool,
+    /// §7.4.2.2 — `transform_8x8_mode_flag`. When `true`, the PPS carries
+    /// the optional trailing group (`transform_8x8_mode_flag = 1`,
+    /// `pic_scaling_matrix_present_flag = 0`, `second_chroma_qp_index_offset`)
+    /// so the decoder reads a per-MB `transform_size_8x8_flag` for I_NxN
+    /// macroblocks and accepts Intra_8x8 / 8x8-transform residuals. Only
+    /// permitted in High profile (100) and above per §A.2.4;
+    /// `second_chroma_qp_index_offset` mirrors `chroma_qp_index_offset`.
+    pub transform_8x8_mode_flag: bool,
 }
 
 /// Build a Baseline PPS RBSP body (§7.3.2.2).
@@ -85,8 +93,15 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
     // redundant_pic_cnt_present_flag = 0.
     w.u(1, 0);
 
-    // No optional tail — caller relies on inferred defaults
-    // (transform_8x8_mode_flag = 0, etc.).
+    // §7.3.2.2 — optional trailing group. Only emitted when a High-profile
+    // feature (8x8 transform) needs it; otherwise the decoder infers
+    // transform_8x8_mode_flag = 0 from the absent tail.
+    if cfg.transform_8x8_mode_flag {
+        w.u(1, 1); // transform_8x8_mode_flag
+        w.u(1, 0); // pic_scaling_matrix_present_flag = 0 (flat lists)
+        w.se(cfg.chroma_qp_index_offset); // second_chroma_qp_index_offset
+    }
+
     w.rbsp_trailing_bits();
     w.into_bytes()
 }
@@ -106,6 +121,7 @@ mod tests {
             weighted_pred_flag: false,
             weighted_bipred_idc: 0,
             entropy_coding_mode_flag: false,
+            transform_8x8_mode_flag: false,
         };
         let rbsp = build_baseline_pps_rbsp(&cfg);
         let pps = Pps::parse(&rbsp).expect("decoder parses our PPS");

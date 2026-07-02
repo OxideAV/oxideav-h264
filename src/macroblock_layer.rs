@@ -3512,23 +3512,43 @@ fn parse_residual_cavlc_only(
             }
         }
     } else if transform_size_8x8_flag {
-        // 8x8 transform: we still emit four 4x4-sized passes per 8x8
-        // block in this reader (see function comment). For nC derivation
-        // we use the luma4x4BlkIdx of the per-4x4 sub-block in scan
-        // order — that matches §7.3.5.3.1 when the per-4x4 CAVLC path
-        // is used; for a strict 8x8 decoder the residual would be a
-        // single 64-coeff call, but this code path is a known
-        // simplification (see doc comment at top of this module).
+        // §7.4.5.3.3 — 8x8 transform, CAVLC path. Each 8x8 luma block is
+        // coded as four `residual_block_cavlc(..., 0, 15, 16)` calls
+        // (one per luma4x4BlkIdx `i4x4`), and the 64 coefficients of the
+        // 8x8 block are the *interleaved* union of the four 4x4 scan
+        // lists:
+        //     level8x8[4 * i + i4x4] = level4x4[i4x4][i]
+        // nC for each 4x4 call uses that sub-block's luma4x4BlkIdx per
+        // §9.2.1.1. We read the four sub-blocks, interleave them into the
+        // 64-entry 8x8 scan order, then store the result as four
+        // contiguous 16-entry slices so `reconstruct` reassembles the
+        // 8x8 scan by simple concatenation (identical storage convention
+        // to the CABAC single-`residual_block(...,63,64)` path).
         for blk8 in 0..4u8 {
             if (cbp_luma >> blk8) & 1 == 1 {
-                for sub in 0..4u8 {
-                    let blk_idx = blk8 * 4 + sub;
+                let mut sub_scan = [[0i32; 16]; 4];
+                for (sub, dst) in sub_scan.iter_mut().enumerate() {
+                    let blk_idx = blk8 * 4 + sub as u8;
                     let nc = derive_luma(blk_idx, LumaNcKind::Ac, &own_luma_totals, grid_ref);
                     let blk =
                         parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
                     let tc = count_nonzero(&blk);
                     own_luma_totals[blk_idx as usize] = tc;
-                    out.residual_luma.push(pad_to_16(blk));
+                    *dst = pad_to_16(blk);
+                }
+                // Interleave the four 4x4 scan lists into the 8x8 scan
+                // order (§7.4.5.3.3), then re-split into four contiguous
+                // 16-entry storage blocks.
+                let mut scan8 = [0i32; 64];
+                for (i4x4, sub) in sub_scan.iter().enumerate() {
+                    for (i, &c) in sub.iter().enumerate() {
+                        scan8[4 * i + i4x4] = c;
+                    }
+                }
+                for chunk in scan8.chunks_exact(16) {
+                    let mut store = [0i32; 16];
+                    store.copy_from_slice(chunk);
+                    out.residual_luma.push(store);
                 }
             }
         }

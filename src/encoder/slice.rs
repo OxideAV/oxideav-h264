@@ -621,6 +621,7 @@ mod tests {
             weighted_pred_flag: false,
             weighted_bipred_idc: 1,
             entropy_coding_mode_flag: false,
+            transform_8x8_mode_flag: false,
         });
         let pps = Pps::parse(&pps_rbsp).unwrap();
         assert_eq!(pps.weighted_bipred_idc, 1);

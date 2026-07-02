@@ -61,10 +61,10 @@ use crate::encoder::intra_pred::{
     predict_16x16, predict_chroma_8x8, sad_8x8, I16x16Mode, IntraChromaMode,
 };
 use crate::encoder::macroblock::{
-    write_b_16x16_mb, write_b_8x8_mixed_mb, write_i_nxn_mb, write_intra16x16_mb,
+    write_b_16x16_mb, write_b_8x8_mixed_mb, write_i8x8_mb, write_i_nxn_mb, write_intra16x16_mb,
     write_intra16x16_mb_in_inter_slice, write_p_8x8_all_pl08x8_mb, write_p_l0_16x16_mb,
     B16x16McbConfig, B8x8MixedMcbConfig, BPartPred, BPred16x16, BSubMbCell, I16x16McbConfig,
-    INxNMcbConfig, P8x8AllPL08x8McbConfig, PL016x16McbConfig,
+    I8x8McbConfig, INxNMcbConfig, P8x8AllPL08x8McbConfig, PL016x16McbConfig,
 };
 use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
 use crate::encoder::nal::build_nal_unit;
@@ -76,17 +76,21 @@ use crate::encoder::slice::{
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
-    forward_core_4x4, forward_hadamard_2x2, forward_hadamard_4x4, quantize_4x4, quantize_4x4_ac,
-    quantize_chroma_dc, quantize_luma_dc, zigzag_scan_4x4, zigzag_scan_4x4_ac,
+    deinterleave_8x8_to_4x4, forward_core_4x4, forward_core_8x8, forward_hadamard_2x2,
+    forward_hadamard_4x4, quantize_4x4, quantize_4x4_ac, quantize_8x8, quantize_chroma_dc,
+    quantize_luma_dc, zigzag_scan_4x4, zigzag_scan_4x4_ac, zigzag_scan_8x8,
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
+use crate::intra_pred::{
+    filter_samples_8x8, predict_8x8, Intra8x8Mode, Neighbour4x4Availability, Samples8x8,
+};
 use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
 use crate::mv_deriv::{Mv, MvpredInputs, NeighbourMv};
 use crate::nal::NalUnitType;
 use crate::transform::{
-    inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16, inverse_scan_4x4_zigzag_ac,
-    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, qp_bd_offset,
-    qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
+    default_scaling_list_8x8_flat, inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
+    inverse_scan_4x4_zigzag_ac, inverse_transform_4x4, inverse_transform_4x4_dc_preserved,
+    inverse_transform_8x8, qp_bd_offset, qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
 };
 
 /// §6.4.3 / Figure 6-10 — luma 4x4 block scan: index 0..=15 → (x, y)
@@ -316,6 +320,16 @@ pub struct EncoderConfig {
     /// IDR with non-trivial chroma content self-roundtrips
     /// bit-equivalently through the local decoder.
     pub trellis_quant_intra_chroma: bool,
+    /// Round-382 — High-profile **8x8 transform** (Intra_8x8) on the
+    /// `encode_idr` CAVLC path. When `true`, the emitted SPS is High
+    /// (`profile_idc = 100`), the PPS carries `transform_8x8_mode_flag =
+    /// 1`, and every macroblock is coded as Intra_8x8 (I_NxN with
+    /// `transform_size_8x8_flag = 1`): §8.3.2 8x8 intra prediction (9
+    /// modes, RDO-selected) + §8.6.4 forward 8x8 transform + §8.5.13.1
+    /// quantiser + §7.4.5.3.3 CAVLC four-4x4 residual split. Requires
+    /// 4:2:0 chroma. Default `false` (the I_16x16 / I_4x4 4x4-transform
+    /// path is emitted).
+    pub transform_8x8: bool,
 }
 
 impl EncoderConfig {
@@ -338,6 +352,7 @@ impl EncoderConfig {
             trellis_quant: true,
             trellis_quant_intra: false,
             trellis_quant_intra_chroma: false,
+            transform_8x8: false,
         }
     }
 }
@@ -408,6 +423,14 @@ struct IntraGridSlot {
     /// `intra_4x4_pred_modes[i]` per §6.4.3 raster-Z order. Only
     /// populated when `is_i_nxn`.
     intra_4x4_pred_modes: [u8; 16],
+    /// Round-382 — the MB is Intra_8x8 (I_NxN with
+    /// `transform_size_8x8_flag == 1`). Mutually exclusive with
+    /// `is_i_nxn` on the encoder grid (the decoder distinguishes the two
+    /// via `mb_is_intra_4x4` / `mb_is_intra_8x8`).
+    is_i8x8: bool,
+    /// `intra_8x8_pred_modes[blk8]` per §6.4.5 8x8 raster order. Only
+    /// populated when `is_i8x8`.
+    intra_8x8_pred_modes: [u8; 4],
 }
 
 #[derive(Debug, Clone)]
@@ -514,6 +537,10 @@ fn predicted_intra4x4_mode(
         }
         if s.is_i_nxn {
             s.intra_4x4_pred_modes[nblk]
+        } else if s.is_i8x8 {
+            // §8.3.1.1 step 3 — neighbour coded Intra_8x8:
+            // intraMxMPredModeN = Intra8x8PredMode[ blkN >> 2 ].
+            s.intra_8x8_pred_modes[nblk >> 2]
         } else {
             // Intra_16x16 / I_PCM / inter neighbour → DC fallback.
             2
@@ -523,6 +550,139 @@ fn predicted_intra4x4_mode(
     let mode_b = mode_for(nb);
     let _ = pic_w_mbs;
     mode_a.min(mode_b)
+}
+
+/// §6.4.11.2 + §8.3.2.1 — predict the Intra_8x8 mode for 8x8 block
+/// `blk8` (raster 0..=3) of the MB at (mb_x, mb_y). Mirror of the
+/// decoder's `derive_intra_8x8_pred_mode` step 1..4 (non-MBAFF frame):
+///
+///   1. Neighbour locations per eq. 6-23/6-24 with (xD, yD) = (-1, 0)
+///      for A and (0, -1) for B; neighbour 8x8 index per eq. 6-40.
+///   2. dcPredModePredictedFlag: either neighbour MB unavailable.
+///   3. intraMxMPredModeN: the neighbour's `Intra8x8PredMode[blkN]`
+///      when it is Intra_8x8; `Intra4x4PredMode[blkN*4 + n]` (eq. 8-72,
+///      n = 1 for A / 2 for B in the frame case) when it is Intra_4x4;
+///      2 (DC) otherwise.
+///   4. predIntra8x8PredMode = Min(modeA, modeB).
+fn predicted_intra8x8_mode(grid: &IntraGrid, mb_x: usize, mb_y: usize, blk8: usize) -> u8 {
+    let neigh = |xd: i32, yd: i32| -> Option<(usize, usize, usize)> {
+        // Eq. 6-23 / 6-24.
+        let xn = ((blk8 as i32) % 2) * 8 + xd;
+        let yn = ((blk8 as i32) / 2) * 8 + yd;
+        let (nmb_x, nmb_y) = if xn < 0 && (0..16).contains(&yn) {
+            if mb_x == 0 {
+                return None;
+            }
+            (mb_x - 1, mb_y)
+        } else if (0..16).contains(&xn) && yn < 0 {
+            if mb_y == 0 {
+                return None;
+            }
+            (mb_x, mb_y - 1)
+        } else if (0..16).contains(&xn) && (0..16).contains(&yn) {
+            (mb_x, mb_y)
+        } else {
+            return None;
+        };
+        let xw = ((xn + 16) % 16) as usize;
+        let yw = ((yn + 16) % 16) as usize;
+        // Eq. 6-40 — neighbour luma8x8BlkIdx.
+        let nblk8 = 2 * (yw / 8) + (xw / 8);
+        Some((nmb_x, nmb_y, nblk8))
+    };
+    let na = neigh(-1, 0);
+    let nb = neigh(0, -1);
+    let avail = |n: Option<(usize, usize, usize)>| -> bool {
+        n.map(|(nx, ny, _)| grid.slot(nx, ny).available)
+            .unwrap_or(false)
+    };
+    let dc_pred_flag = !avail(na) || !avail(nb);
+    let mode_for = |n: Option<(usize, usize, usize)>, n_for_4x4: usize| -> u8 {
+        if dc_pred_flag {
+            return 2;
+        }
+        let Some((nx, ny, nblk8)) = n else {
+            return 2;
+        };
+        let s = grid.slot(nx, ny);
+        if !s.available {
+            return 2;
+        }
+        if s.is_i8x8 {
+            s.intra_8x8_pred_modes[nblk8]
+        } else if s.is_i_nxn {
+            // §8.3.2.1 eq. 8-72 — Intra_4x4 neighbour.
+            s.intra_4x4_pred_modes[nblk8 * 4 + n_for_4x4]
+        } else {
+            2
+        }
+    };
+    mode_for(na, 1).min(mode_for(nb, 2))
+}
+
+/// §8.3.2.2 — gather the raw reference samples of the 8x8 luma block
+/// `blk8` of the MB at (mb_x, mb_y) from the in-progress recon plane.
+/// Availability mirrors the decoder's `gather_samples_8x8` for the
+/// single-slice / `constrained_intra_pred = 0` case: left/top/top-left
+/// from picture bounds; top-right additionally requires `blk8 != 3`
+/// (the right-neighbour MB is not yet decoded) and the columns to fit
+/// inside the picture.
+fn gather_8x8_from_recon(
+    recon_y: &[u8],
+    width: usize,
+    mb_x: usize,
+    mb_y: usize,
+    blk8: usize,
+) -> Samples8x8 {
+    let bx = (mb_x * 16 + (blk8 % 2) * 8) as i32;
+    let by = (mb_y * 16 + (blk8 / 2) * 8) as i32;
+    let left_avail = bx > 0;
+    let top_avail = by > 0;
+    let tl_avail = bx > 0 && by > 0;
+    let tr_avail = by > 0 && blk8 != 3 && (bx + 8) < width as i32;
+    let at = |x: i32, y: i32| -> i32 { recon_y[(y as usize) * width + (x as usize)] as i32 };
+
+    let top_left = if tl_avail { at(bx - 1, by - 1) } else { 0 };
+    let mut top = [0i32; 8];
+    let mut top_right = [0i32; 8];
+    for x in 0..8i32 {
+        top[x as usize] = if top_avail { at(bx + x, by - 1) } else { 0 };
+        top_right[x as usize] = if tr_avail { at(bx + 8 + x, by - 1) } else { 0 };
+    }
+    let mut left = [0i32; 8];
+    for y in 0..8i32 {
+        left[y as usize] = if left_avail { at(bx - 1, by + y) } else { 0 };
+    }
+    Samples8x8 {
+        top_left,
+        top,
+        top_right,
+        left,
+        availability: Neighbour4x4Availability {
+            top_left: tl_avail,
+            top: top_avail,
+            top_right: tr_avail,
+            left: left_avail,
+        },
+    }
+}
+
+/// §8.3.2.2.2..2.10 — can `mode` be used given the reference-sample
+/// availability of the 8x8 block? (The encoder must only pick modes
+/// whose normative preconditions hold; the decoder assumes a
+/// conforming stream.) Top-right never gates a mode on its own — the
+/// §8.3.2.2.1 substitution fills p[8..15, -1] from p[7, -1] whenever
+/// the top row is available.
+fn intra8x8_mode_available(mode: Intra8x8Mode, avail: &Neighbour4x4Availability) -> bool {
+    use Intra8x8Mode::*;
+    match mode {
+        Dc => true,
+        Vertical | DiagonalDownLeft | VerticalLeft => avail.top,
+        Horizontal | HorizontalUp => avail.left,
+        DiagonalDownRight | VerticalRight | HorizontalDown => {
+            avail.top && avail.left && avail.top_left
+        }
+    }
 }
 
 /// Per-MB output bundle from a trial encode (round-15 RDO).
@@ -894,6 +1054,14 @@ impl Encoder {
         );
         debug_assert_eq!(frame.v.len(), chroma_width * chroma_height);
 
+        // §A.2.4 — the 8x8 transform is a High-profile tool; force
+        // profile_idc to at least High (100) when it's requested so the
+        // SPS/PPS pairing is spec-conformant.
+        let profile_idc = if self.cfg.transform_8x8 && self.cfg.profile_idc < 100 {
+            100
+        } else {
+            self.cfg.profile_idc
+        };
         // SPS / PPS bytes.
         let sps_cfg = BaselineSpsConfig {
             seq_parameter_set_id: 0,
@@ -903,7 +1071,7 @@ impl Encoder {
             log2_max_frame_num_minus4: 4,
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: self.cfg.max_num_ref_frames,
-            profile_idc: self.cfg.profile_idc,
+            profile_idc,
             chroma_format_idc: self.cfg.chroma_format_idc,
         };
         let pps_cfg = BaselinePpsConfig {
@@ -921,6 +1089,7 @@ impl Encoder {
                 0
             },
             entropy_coding_mode_flag: false,
+            transform_8x8_mode_flag: self.cfg.transform_8x8,
         };
         let sps_rbsp = build_baseline_sps_rbsp(&sps_cfg);
         let pps_rbsp = build_baseline_pps_rbsp(&pps_cfg);
@@ -1001,21 +1170,47 @@ impl Encoder {
         // Iterate MBs in raster order.
         for mb_y in 0..height_mbs {
             for mb_x in 0..width_mbs {
-                let dbl = self.encode_mb(
-                    frame,
-                    mb_x as usize,
-                    mb_y as usize,
-                    qp_y,
-                    qp_c,
-                    chroma_width,
-                    chroma_height,
-                    &mut recon_y,
-                    &mut recon_u,
-                    &mut recon_v,
-                    &mut sw,
-                    &mut nc_grid,
-                    &mut intra_grid,
-                );
+                let dbl = if self.cfg.transform_8x8 {
+                    // Round-382 — High-profile 8x8-transform picture:
+                    // every MB is Intra_8x8 (see `EncoderConfig::
+                    // transform_8x8`). Requires 4:2:0.
+                    assert_eq!(
+                        self.cfg.chroma_format_idc, 1,
+                        "transform_8x8 encode requires 4:2:0 chroma"
+                    );
+                    self.encode_mb_intra8x8(
+                        frame,
+                        mb_x as usize,
+                        mb_y as usize,
+                        qp_y,
+                        qp_c,
+                        chroma_width,
+                        chroma_height,
+                        &mut recon_y,
+                        &mut recon_u,
+                        &mut recon_v,
+                        &mut sw,
+                        &mut nc_grid,
+                        &mut intra_grid,
+                    )
+                    .deblock
+                } else {
+                    self.encode_mb(
+                        frame,
+                        mb_x as usize,
+                        mb_y as usize,
+                        qp_y,
+                        qp_c,
+                        chroma_width,
+                        chroma_height,
+                        &mut recon_y,
+                        &mut recon_u,
+                        &mut recon_v,
+                        &mut sw,
+                        &mut nc_grid,
+                        &mut intra_grid,
+                    )
+                };
                 let mb_addr = (mb_y * width_mbs + mb_x) as usize;
                 mb_deblock_infos[mb_addr] = dbl;
             }
@@ -2098,6 +2293,278 @@ impl Encoder {
                 qp_y,
                 luma_nonzero_4x4,
                 chroma_nonzero_4x4: chroma_nz_mask,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Round-382 — encode one **Intra_8x8** macroblock (I_NxN with
+    /// `transform_size_8x8_flag = 1`, High-profile 8x8 transform,
+    /// CAVLC, 4:2:0). Per 8x8 block: §8.3.2 prediction (9 modes,
+    /// Lagrangian RDO), §8.6.4 forward 8x8 transform + §8.5.13.1
+    /// quantiser, and local reconstruction through the decoder's
+    /// normative `inverse_transform_8x8` so the recon is bit-equivalent
+    /// with what any conforming decoder produces. The residual is
+    /// emitted as the §7.4.5.3.3 four-4x4 CAVLC split.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mb_intra8x8(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+    ) -> MbTrial {
+        let width = self.cfg.width as usize;
+        let lambda = lambda_ssd(qp_y, true);
+        let sl8 = default_scaling_list_8x8_flat();
+
+        // Pre-mark the slot so in-MB neighbour lookups (blocks 1..3)
+        // see this MB's earlier-block modes — mirrors the decoder,
+        // which stamps the grid entry before deriving pred modes.
+        {
+            let s = intra_grid.slot_mut(mb_x, mb_y);
+            s.available = true;
+            s.is_i_nxn = false;
+            s.is_i8x8 = true;
+            s.intra_8x8_pred_modes = [2u8; 4];
+        }
+
+        let mut prev_flag = [false; 4];
+        let mut rem = [0u8; 4];
+        // §7.4.5.3.3 de-interleaved CAVLC sub-blocks, `blk8*4 + i4x4`.
+        let mut luma_4x4_levels = [[0i32; 16]; 16];
+        let mut blk8_has_nz = [false; 4];
+        // Same MB-overhead seeding rationale as the I_NxN path (mb_type
+        // + transform_size_8x8_flag + chroma mode + cbp + qp_delta).
+        let mb_overhead_bits: u64 = 10 + 16;
+        let mut mb_luma_cost: u64 = cost_combined(0, mb_overhead_bits, lambda);
+
+        for blk8 in 0..4usize {
+            let bx = mb_x * 16 + (blk8 % 2) * 8;
+            let by = mb_y * 16 + (blk8 / 2) * 8;
+            let predicted = predicted_intra8x8_mode(intra_grid, mb_x, mb_y, blk8);
+
+            // Gather + §8.3.2.2.1 filter once per block; the nine mode
+            // predictions all consume the same filtered sample set.
+            let raw = gather_8x8_from_recon(recon_y, width, mb_x, mb_y, blk8);
+            let filtered = filter_samples_8x8(&raw, 8);
+
+            let mut best_mode = Intra8x8Mode::Dc;
+            let mut best_cost = u64::MAX;
+            let mut best_z_raster = [0i32; 64];
+            let mut best_recon = [0i32; 64];
+            for mode_idx in 0..9u8 {
+                let mode = Intra8x8Mode::from_index(mode_idx).expect("mode index in range");
+                if !intra8x8_mode_available(mode, &raw.availability) {
+                    continue;
+                }
+                let mut pred = [0i32; 64];
+                predict_8x8(mode, &filtered, 8, &mut pred);
+
+                // Residual → forward 8x8 → quantize → inverse → recon.
+                let mut res = [0i32; 64];
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let s = frame.y[(by + j) * width + bx + i] as i32;
+                        res[j * 8 + i] = s - pred[j * 8 + i];
+                    }
+                }
+                let w_coeffs = forward_core_8x8(&res);
+                let z_raster = quantize_8x8(&w_coeffs, qp_y, true);
+                let r = inverse_transform_8x8(&z_raster, qp_y, &sl8, 8).expect("inverse 8x8");
+                let mut recon_blk = [0i32; 64];
+                let mut d: u64 = 0;
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let v = (pred[j * 8 + i] + r[j * 8 + i]).clamp(0, 255);
+                        recon_blk[j * 8 + i] = v;
+                        let s = frame.y[(by + j) * width + bx + i] as i32;
+                        let e = (s - v) as i64;
+                        d += (e * e) as u64;
+                    }
+                }
+
+                // Rate: prev_flag (1) + rem (3 when miss) + trial CAVLC
+                // of the four de-interleaved sub-blocks at nC=0 (stable
+                // estimate — same policy as the I_NxN mode trial).
+                let mut bits: u64 = 1;
+                if mode_idx != predicted {
+                    bits += 3;
+                }
+                let scan = zigzag_scan_8x8(&z_raster);
+                let subs = deinterleave_8x8_to_4x4(&scan);
+                let mut trial_w = BitWriter::new();
+                for sub in &subs {
+                    if encode_residual_block_cavlc(
+                        &mut trial_w,
+                        CoeffTokenContext::Numeric(0),
+                        16,
+                        sub,
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                bits += trial_w.bits_emitted() as u64;
+                let cost = cost_combined(d, bits, lambda);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_mode = mode;
+                    best_z_raster = z_raster;
+                    best_recon = recon_blk;
+                }
+            }
+
+            let chosen = best_mode.as_index();
+            mb_luma_cost = mb_luma_cost.saturating_add(best_cost);
+            if chosen == predicted {
+                prev_flag[blk8] = true;
+            } else {
+                prev_flag[blk8] = false;
+                rem[blk8] = if chosen < predicted {
+                    chosen
+                } else {
+                    chosen - 1
+                };
+            }
+            intra_grid.slot_mut(mb_x, mb_y).intra_8x8_pred_modes[blk8] = chosen;
+
+            let scan = zigzag_scan_8x8(&best_z_raster);
+            let subs = deinterleave_8x8_to_4x4(&scan);
+            for (i4x4, sub) in subs.iter().enumerate() {
+                luma_4x4_levels[blk8 * 4 + i4x4] = *sub;
+            }
+            blk8_has_nz[blk8] = best_z_raster.iter().any(|&v| v != 0);
+
+            // Commit the recon so later blocks (and MBs) predict from
+            // it. A zero-residual block reconstructs to pred + 0, which
+            // is exactly what the decoder computes for a skipped
+            // (cbp bit 0) quadrant — no rollback pass is needed.
+            for j in 0..8 {
+                for i in 0..8 {
+                    recon_y[(by + j) * width + bx + i] = best_recon[j * 8 + i] as u8;
+                }
+            }
+        }
+
+        // §7.4.5.1 — cbp_luma bit per 8x8 quadrant.
+        let mut cbp_luma: u8 = 0;
+        for (blk8, &has_nz) in blk8_has_nz.iter().enumerate() {
+            if has_nz {
+                cbp_luma |= 1u8 << blk8;
+            }
+        }
+
+        // Chroma — identical to the I_NxN 4:2:0 path.
+        let chroma_array_type = self.cfg.chroma_format_idc;
+        debug_assert_eq!(chroma_array_type, 1, "Intra_8x8 encode is 4:2:0-only");
+        let chroma_block = encode_chroma_block(
+            chroma_array_type,
+            frame.u,
+            frame.v,
+            recon_u,
+            recon_v,
+            chroma_width,
+            chroma_height,
+            mb_x,
+            mb_y,
+            qp_c,
+        );
+        let cbp_chroma = chroma_block.cbp_chroma;
+        let n_chroma_blk = ChromaBlock::cb_block_count(chroma_array_type);
+        let mut u_dc_levels = [0i32; 4];
+        let mut v_dc_levels = [0i32; 4];
+        let mut u_ac_levels = [[0i32; 16]; 4];
+        let mut v_ac_levels = [[0i32; 16]; 4];
+        u_dc_levels.copy_from_slice(&chroma_block.dc_cb[..4]);
+        v_dc_levels.copy_from_slice(&chroma_block.dc_cr[..4]);
+        u_ac_levels.copy_from_slice(&chroma_block.ac_cb[..4]);
+        v_ac_levels.copy_from_slice(&chroma_block.ac_cr[..4]);
+        install_chroma_recon(
+            chroma_array_type,
+            chroma_width,
+            mb_x,
+            mb_y,
+            &chroma_block,
+            recon_u,
+            recon_v,
+        );
+        let _ = chroma_height;
+
+        // CAVLC nC grid — mirrors the decoder's §9.2.1.1 walk over the
+        // four 4x4 CAVLC sub-blocks of each transmitted 8x8 quadrant.
+        let pic_w_mbs = self.cfg.width / 16;
+        let mb_addr = (mb_y as u32) * pic_w_mbs + (mb_x as u32);
+        {
+            let cur = &mut nc_grid.mbs[mb_addr as usize];
+            cur.is_available = true;
+            cur.is_intra = true;
+            cur.is_skip = false;
+            cur.is_i_pcm = false;
+            cur.luma_total_coeff = [0u8; 16];
+        }
+        let mut luma_4x4_nc = [0i32; 16];
+        let mut own_totals = [0u8; 16];
+        for blk in 0..16usize {
+            let blk8 = blk / 4;
+            nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+            let nc = derive_nc_luma(nc_grid, mb_addr, blk as u8, LumaNcKind::Ac, true, false);
+            luma_4x4_nc[blk] = nc;
+            if (cbp_luma >> blk8) & 1 == 1 {
+                let tc = luma_4x4_levels[blk].iter().filter(|&&v| v != 0).count() as u8;
+                own_totals[blk] = tc;
+            } else {
+                own_totals[blk] = 0;
+            }
+        }
+        nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+
+        // Emit syntax.
+        let mb_cfg = I8x8McbConfig {
+            prev_intra8x8_pred_mode_flag: prev_flag,
+            rem_intra8x8_pred_mode: rem,
+            intra_chroma_pred_mode: chroma_block.pred_mode.as_u8(),
+            cbp_luma,
+            cbp_chroma,
+            mb_qp_delta: 0,
+            luma_4x4_levels,
+            luma_4x4_nc,
+            chroma_dc_cb: u_dc_levels,
+            chroma_dc_cr: v_dc_levels,
+            chroma_ac_cb: u_ac_levels,
+            chroma_ac_cr: v_ac_levels,
+        };
+        write_i8x8_mb(sw, &mb_cfg).expect("write I_8x8 mb");
+
+        // §8.7.2.1 — every 4x4 of a transmitted 8x8 quadrant inherits
+        // the quadrant's nonzero status (the decoder's
+        // `compute_luma_nonzero_mask` 8x8 branch does the same).
+        let mut blk_has_nz = [false; 16];
+        for blk8 in 0..4usize {
+            for sub in 0..4usize {
+                blk_has_nz[blk8 * 4 + sub] = blk8_has_nz[blk8];
+            }
+        }
+        let luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
+        let chroma_nz_mask = chroma_nz_mask_from_chroma_block(&chroma_block, n_chroma_blk);
+        MbTrial {
+            luma_cost: mb_luma_cost,
+            deblock: MbDeblockInfo {
+                is_intra: true,
+                qp_y,
+                luma_nonzero_4x4,
+                chroma_nonzero_4x4: chroma_nz_mask,
+                transform_size_8x8_flag: true,
                 ..Default::default()
             },
         }
@@ -8942,6 +9409,7 @@ impl Encoder {
             qp_y,
             luma_nonzero_4x4,
             chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
+            transform_size_8x8_flag: false,
             mv_l0: mv_l0_arr,
             ref_idx_l0,
             ref_poc_l0,

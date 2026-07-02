@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **High-profile Intra_8x8 (8x8-transform) IDR encoder — bit-exact
+  through both our decoder and a black-box reference decoder.** New
+  `EncoderConfig::transform_8x8` drives `encode_idr` to code every MB
+  as I_NxN + `transform_size_8x8_flag = 1` (§7.3.5): per-8x8-block
+  §8.3.2 intra prediction (all 9 modes, availability-gated per
+  §8.3.2.2.2..2.10, Lagrangian RDO), the §8.3.2.1 eq. 8-73
+  `predIntra8x8PredMode` derivation mirrored encoder-side (including
+  the eq. 8-72 Intra_4x4-neighbour sub-index), §8.6.4 forward 8x8
+  transform + §8.5.13.1 quantiser, Table 8-14 8x8 zig-zag, and the
+  §7.4.5.3.3 four-4x4 CAVLC split with the §9.2.1.1 per-sub-block nC
+  walk. The SPS auto-promotes to High (`profile_idc = 100`, §A.2.4) and
+  the PPS emits the §7.3.2.2 optional tail (`transform_8x8_mode_flag =
+  1`, flat scaling, `second_chroma_qp_index_offset`). The §8.7 deblock
+  runs with the 8x8-transform internal-edge skip mirrored through a new
+  `MbDeblockInfo::transform_size_8x8_flag`. Four integration tests
+  (`integration_i8x8_encoder.rs`): High-profile SPS/PPS syntax,
+  bit-exact self-roundtrip, bit-exact black-box reference-decoder
+  interop, and a PSNR-Y sanity floor at QP 26 on a mixed
+  gradient+texture fixture.
+
+### Fixed
+
+- **§7.4.5.3.3 CAVLC 8x8 luma residual de-interleave (decoder).** The
+  CAVLC path for `transform_size_8x8_flag = 1` macroblocks read the
+  four per-quadrant 4x4 residual blocks but stored them *concatenated*
+  instead of applying the normative interleave `level8x8[4·i + i4x4] =
+  level4x4[i4x4][i]`, so every CAVLC 8x8-transform macroblock
+  reconstructed from a scrambled coefficient order (a long-standing
+  documented simplification — the CABAC path was unaffected). The
+  macroblock-layer parser now interleaves the four scan lists into the
+  8x8 scan order before storage, making the CAVLC and CABAC storage
+  conventions identical for the §8.5.13 inverse-transform consumer.
+  Locked by the round-382 bit-exact encoder round-trip gates.
+
+### Added
+
 - **§8.6.4 / §8.5.13 High-profile 8x8 forward transform + quantizer
   (encoder side).** New `encoder::transform::forward_core_8x8`
   (`W = E8 · X · E8ᵀ` with the integer 8x8 basis `E8`, the transpose of

@@ -1505,16 +1505,13 @@ fn reconstruct_intra_nxn(
             // `residual_block(..., 63, 64)` call (see §7.3.5.3.1 and
             // the CABAC path in macroblock_layer.rs).
             //
-            // Assumption: the concatenated 64 entries are in 8x8
-            // zig-zag scan order (§8.5.7 / Table 8-14) — this matches
-            // the CABAC path. The CAVLC path in macroblock_layer
-            // currently emits four independent 4x4 zig-zag scans per
-            // 8x8 block (a known simplification documented at the top
-            // of that module); for that path the pixels will be wrong
-            // but at least the pipeline runs instead of erroring out.
-            // TODO: once the CAVLC 8x8 walker reads a single 64-coeff
-            // block in 8x8 zig-zag order, this will be correct for
-            // both entropy modes.
+            // The concatenated 64 entries are in 8x8 zig-zag scan order
+            // (§8.5.7 / Table 8-14) for both entropy modes: the CABAC
+            // path reads a single `residual_block(...,63,64)` and splits
+            // it into four contiguous 16-entry slices, and the CAVLC path
+            // (§7.4.5.3.3) reads four 4x4 blocks and *interleaves* them
+            // (`level8x8[4*i + i4x4] = level4x4[i4x4][i]`) into the same
+            // 8x8-scan storage layout inside the macroblock-layer parser.
             let coeffs_flat: [i32; 64] = {
                 let bit = (cbp_luma >> blk8) & 1 == 1;
                 if bit {

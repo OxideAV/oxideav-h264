@@ -1541,6 +1541,7 @@ impl Encoder {
             weighted_pred_flag: false,
             weighted_bipred_idc: 0,
             entropy_coding_mode_flag: true,
+            transform_8x8_mode_flag: false,
         };
         let pps = build_baseline_pps_rbsp(&pps_cfg);
         let mut stream: Vec<u8> = Vec::new();
@@ -5171,6 +5172,7 @@ impl Encoder {
                     mv_l1: mv_l1_arr,
                     ref_idx_l1: ref_idx_l1_arr,
                     ref_poc_l1: ref_poc_l1_arr,
+                    transform_size_8x8_flag: false,
                 };
 
                 let is_last = mb_x + 1 == width_mbs && mb_y + 1 == height_mbs;

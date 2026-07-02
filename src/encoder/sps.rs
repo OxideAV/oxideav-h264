@@ -93,9 +93,9 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
 
     // §7.3.2.1.1 — profile_idc.
     debug_assert!(
-        matches!(cfg.profile_idc, 66 | 77 | 88 | 122 | 244),
-        "this writer only emits SPS bodies for profile_idc ∈ {{66, 77, 88, 122, 244}} \
-         (Baseline / Main / Extended / High 4:2:2 / High 4:4:4 Predictive). Profile {} \
+        matches!(cfg.profile_idc, 66 | 77 | 88 | 100 | 122 | 244),
+        "this writer only emits SPS bodies for profile_idc ∈ {{66, 77, 88, 100, 122, 244}} \
+         (Baseline / Main / Extended / High / High 4:2:2 / High 4:4:4 Predictive). Profile {} \
          would require additional bit_depth_* / scaling-matrix wiring per §7.3.2.1.1.",
         cfg.profile_idc,
     );
