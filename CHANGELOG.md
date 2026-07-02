@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **B-slice second-gate `transform_size_8x8_flag` coding — full
+  IDR+P+B GOPs under `transform_8x8`.** Every coded B MB shape this
+  encoder emits (B_L0/L1/Bi_16x16, B_Direct_16x16, 16x8 / 8x16
+  partitions, all-Direct and mixed B_8x8) passes the §7.3.5 second gate
+  in a `transform_8x8_mode_flag = 1` stream (no sub-partition below
+  8x8; `direct_8x8_inference_flag = 1` in our SPS), so all six B CAVLC
+  writers now code the mandatory flag as 0 when `cbp_luma > 0` (new
+  `emit_transform_size_8x8_zero` on each B config struct); the B
+  residual itself stays on the 4x4 transform (an 8x8-residual RDO trial
+  for B MBs is a follow-up). The `encode_b` transform_8x8 rejection is
+  lifted. Gated by `i8x8_b_slice_gop_codes_second_gate_flag_and_
+  roundtrips`: a 3-frame IDR+P+B GOP (with a vacuity guard proving the
+  B slice genuinely codes MBs) decodes bit-exactly through both our
+  decoder and the black-box reference decoder.
 - **P-slice inter 8x8 transform (`transform_size_8x8_flag` on
   P_L0_16x16).** With `transform_8x8` set, `encode_p`'s coded-MB path
   trials the §8.6.4 forward 8x8 transform of the motion-compensated

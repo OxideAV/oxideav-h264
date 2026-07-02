@@ -8178,14 +8178,14 @@ impl Encoder {
             self.cfg.profile_idc >= 77,
             "B-slices require Main profile or higher (§A.2.2 — Baseline forbids B)"
         );
-        // Round-382 — the B-slice CAVLC writers don't yet code the
-        // §7.3.5 second-gate transform_size_8x8_flag, so a B slice
-        // inside a transform_8x8_mode_flag=1 stream would desync the
-        // decoder. Reject until the B writers grow the flag.
-        assert!(
-            !self.cfg.transform_8x8,
-            "transform_8x8 encode does not yet support B slices"
-        );
+        // Round-382 — inside a transform_8x8_mode_flag=1 stream every
+        // coded B MB shape used by this encoder passes the §7.3.5
+        // second gate (no sub-partition below 8x8;
+        // direct_8x8_inference_flag = 1 in our SPS), so each B writer
+        // codes the mandatory transform_size_8x8_flag as 0 when
+        // cbp_luma > 0 (`emit_transform_size_8x8_zero`). The B residual
+        // itself stays on the 4x4 transform — an 8x8-residual RDO trial
+        // for B MBs is a follow-up.
 
         let width = self.cfg.width as usize;
         let width_mbs = self.cfg.width / 16;
@@ -9441,6 +9441,7 @@ impl Encoder {
 
             if is_direct {
                 let dcfg = crate::encoder::macroblock::BDirect16x16McbConfig {
+                    emit_transform_size_8x8_zero: self.cfg.transform_8x8,
                     cbp_luma,
                     cbp_chroma,
                     mb_qp_delta: 0,
@@ -9461,6 +9462,7 @@ impl Encoder {
                 // `b_spatial_direct_derive`), so no MV / refIdx fields
                 // appear in the bitstream — only cbp + residuals.
                 let dcfg = crate::encoder::macroblock::B8x8AllDirectMcbConfig {
+                    emit_transform_size_8x8_zero: self.cfg.transform_8x8,
                     cbp_luma,
                     cbp_chroma,
                     mb_qp_delta: 0,
@@ -9479,6 +9481,7 @@ impl Encoder {
                 // cells emit their (mvd_l0, mvd_l1) pair as appropriate
                 // (§7.3.5.2 gating; ref_idx absent in single-ref setup).
                 let mcfg = B8x8MixedMcbConfig {
+                    emit_transform_size_8x8_zero: self.cfg.transform_8x8,
                     cells: mixed_cells,
                     mvd_l0: mixed_mvd_l0_per_cell,
                     mvd_l1: mixed_mvd_l1_per_cell,
@@ -9500,6 +9503,7 @@ impl Encoder {
                 match pc.shape {
                     PartitionShape::P16x8 => {
                         let cfg = B16x8McbConfig {
+                            emit_transform_size_8x8_zero: self.cfg.transform_8x8,
                             top: pc.mode_a,
                             bottom: pc.mode_b,
                             mvd_l0: mvd_l0_parts,
@@ -9518,6 +9522,7 @@ impl Encoder {
                     }
                     PartitionShape::P8x16 => {
                         let cfg = B8x16McbConfig {
+                            emit_transform_size_8x8_zero: self.cfg.transform_8x8,
                             left: pc.mode_a,
                             right: pc.mode_b,
                             mvd_l0: mvd_l0_parts,
@@ -9537,6 +9542,7 @@ impl Encoder {
                 }
             } else {
                 let mb_cfg = B16x16McbConfig {
+                    emit_transform_size_8x8_zero: self.cfg.transform_8x8,
                     pred,
                     mvd_l0_x,
                     mvd_l0_y,

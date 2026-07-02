@@ -362,3 +362,132 @@ fn i8x8_p_slice_inter_8x8_transform_roundtrips_bit_exact() {
         "P-frame Cb mismatch vs reference decoder"
     );
 }
+
+#[test]
+fn i8x8_b_slice_gop_codes_second_gate_flag_and_roundtrips() {
+    use oxideav_h264::encoder::EncodedFrameRef;
+
+    // IDR + P + B GOP inside a transform_8x8 stream. The B writers must
+    // code the mandatory §7.3.5 second-gate transform_size_8x8_flag = 0
+    // on every coded B MB with cbp_luma > 0, or the decoders desync.
+    let (y0, u0, v0) = make_source();
+    let (y2, u2, v2) = make_p_source();
+    // The B frame sits between: halfway blend, plus a small texture so
+    // B MBs carry a non-zero luma residual (forcing the flag coding).
+    let mut y1 = vec![0u8; W * H];
+    for k in 0..W * H {
+        let blend = (y0[k] as u32 + y2[k] as u32) / 2;
+        let n = ((k as u32).wrapping_mul(2654435761) >> 27) & 7;
+        y1[k] = (blend + n).min(235) as u8;
+    }
+    let f0 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let f1 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y1,
+        u: &u0,
+        v: &v0,
+    };
+    let f2 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y2,
+        u: &u2,
+        v: &v2,
+    };
+    let cfg = EncoderConfig {
+        transform_8x8: true,
+        profile_idc: 100,
+        max_num_ref_frames: 2,
+        intra_in_inter: false,
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr(&f0);
+    let p = enc.encode_p(&f2, &EncodedFrameRef::from(&idr), 1, 4);
+    let b = enc.encode_b(
+        &f1,
+        &EncodedFrameRef::from(&idr),
+        &EncodedFrameRef::from(&p),
+        2,
+        2,
+    );
+
+    // Vacuity guard: an all-skip B slice (~15 bytes) would never code
+    // cbp_luma > 0, leaving the second-gate flag path unexercised. The
+    // blended+textured B source must produce genuinely coded B MBs.
+    assert!(
+        b.annex_b.len() > 100,
+        "B slice too small ({} bytes) — likely all-skip, the \
+         transform_size_8x8_flag path is not being exercised",
+        b.annex_b.len()
+    );
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&idr.annex_b);
+    combined.extend_from_slice(&p.annex_b);
+    combined.extend_from_slice(&b.annex_b);
+
+    // Self-roundtrip: all three frames decode bit-exactly (display
+    // order: IDR, B, P).
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), combined.clone()).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let mut frames = Vec::new();
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        frames.push(vf);
+    }
+    assert_eq!(frames.len(), 3, "expected IDR + B + P decoded frames");
+    assert_eq!(plane_max_diff(&frames[0], 0, &idr.recon_y, W, H), 0);
+    assert_eq!(
+        plane_max_diff(&frames[1], 0, &b.recon_y, W, H),
+        0,
+        "B-frame luma decode differs from encoder recon"
+    );
+    assert_eq!(plane_max_diff(&frames[2], 0, &p.recon_y, W, H), 0);
+
+    // Black-box reference decoder interop over the whole GOP.
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: reference decoder binary not present");
+        return;
+    }
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!(
+        "oxideav_h264_r382_b8x8_{}.h264",
+        std::process::id()
+    ));
+    let yuv_path = tmpdir.join(format!("oxideav_h264_r382_b8x8_{}.yuv", std::process::id()));
+    std::fs::write(&h264_path, &combined).expect("write h264");
+    let status = std::process::Command::new(ffmpeg)
+        .args(["-loglevel", "error", "-y", "-f", "h264", "-i"])
+        .arg(&h264_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn reference decoder");
+    assert!(status.success(), "reference decoder rejected the stream");
+    let yuv = std::fs::read(&yuv_path).expect("read decoded yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+    let frame_bytes = W * H + 2 * (W / 2) * (H / 2);
+    assert_eq!(yuv.len(), 3 * frame_bytes, "expected three 4:2:0 frames");
+    // Display order: IDR, B, P.
+    assert_eq!(
+        &yuv[frame_bytes..frame_bytes + W * H],
+        &b.recon_y[..],
+        "B-frame luma mismatch vs reference decoder"
+    );
+    assert_eq!(
+        &yuv[2 * frame_bytes..2 * frame_bytes + W * H],
+        &p.recon_y[..],
+        "P-frame luma mismatch vs reference decoder"
+    );
+}
