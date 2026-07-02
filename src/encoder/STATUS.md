@@ -1098,3 +1098,44 @@ remain unchanged.
   `cabac_b_spatial_direct_derive`. Per-8x8 / mixed `B_8x8`+all-Direct
   CABAC variants + 4:2:2 / 4:4:4 P/B paths still deferred (they need a
   CABAC sub_mb_type writer + Yuv422/Yuv444 chroma writer plumbing).
+
+## Round 382 — landed
+
+High-profile **8x8 transform** (`EncoderConfig::transform_8x8`), CAVLC,
+4:2:0, spanning I / P / B:
+
+- **`encoder::transform`**: `forward_core_8x8` (§8.6.4 integer basis
+  `E8`, transpose of the normative §8.5.13.2 inverse butterfly),
+  `quantize_8x8` (`MF8x8[m][class] = round(2^18 / normAdjust8x8)` at
+  `qBits8 = 22 + qP/6`, intra/inter rounding), `zigzag_scan_8x8`
+  (Table 8-14) and `deinterleave_8x8_to_4x4` (§7.4.5.3.3).
+- **Intra**: `encode_mb_intra8x8` — per-8x8-block §8.3.2 prediction
+  across all 9 modes (availability-gated per §8.3.2.2.2..2.10) under
+  Lagrangian RDO, with the §8.3.2.1 eq. 8-73 `predIntra8x8PredMode`
+  derivation mirrored encoder-side (incl. the eq. 8-72 4x4-neighbour
+  sub-index). `encode_mb` runs a 3-way I_16x16 / I_4x4 / I_8x8 trial;
+  I_4x4 MBs code `transform_size_8x8_flag = 0` per §7.3.5
+  (`INxNMcbConfig::emit_transform_size_8x8_zero`).
+- **Inter**: `forward_inter_luma_8x8` + `inter_luma_transform_cost`
+  drive a per-MB 8x8-vs-4x4 residual trial in both `encode_p_mb`
+  (P_L0_16x16, `PL016x16McbConfig::transform_size_8x8_flag:
+  Option<bool>`) and `encode_b_mb` (all six B writers upgraded to the
+  same Option-flag). The P 4MV writer codes the mandatory flag as 0.
+- **SPS/PPS**: profile auto-promotes to High (100); the PPS writer
+  gains the §7.3.2.2 optional tail. **Deblock**: per-MB
+  `MbDeblockInfo::transform_size_8x8_flag` reaches the shared §8.7
+  walker (internal 4x4-edge skip).
+- **Decoder fix**: the CAVLC 8x8 luma residual is now interleaved per
+  §7.4.5.3.3 (was concatenated — every CAVLC 8x8-transform MB decoded
+  from a scrambled coefficient order).
+- **Validation**: `tests/integration_i8x8_encoder.rs` (8 gates) —
+  High SPS/PPS syntax, bit-exact self-roundtrip, bit-exact black-box
+  reference-decoder interop on IDR / IDR+P / IDR+P+B, adaptive-RDO
+  selection counters (`EncodedIdr/P/B::i8x8_mb_count`), PSNR floor.
+
+### Status caveats
+
+- CAVLC only — CABAC 8x8 (blockCat-5 residual + ctx tables) deferred.
+- 4:2:0 only; 4:2:2 / 4:4:4 8x8 (incl. the CAVLC 4:4:4 chroma-like 8x8
+  read path in the decoder) deferred.
+- Scaling lists pinned flat (PPS `pic_scaling_matrix_present_flag=0`).
