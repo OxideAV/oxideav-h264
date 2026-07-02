@@ -5224,6 +5224,8 @@ impl Encoder {
             frame_num,
             pic_order_cnt_lsb,
             partition_mvs,
+            // The CABAC B path does not code the 8x8 transform.
+            i8x8_mb_count: 0,
         }
     }
 }

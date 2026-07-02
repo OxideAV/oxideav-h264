@@ -428,6 +428,14 @@ fn i8x8_b_slice_gop_codes_second_gate_flag_and_roundtrips() {
          transform_size_8x8_flag path is not being exercised",
         b.annex_b.len()
     );
+    // The B-MB 8x8-residual RDO trial must actually win somewhere on
+    // this fixture, so the stream carries both flag values on B MBs
+    // (transform_size_8x8_flag = 1 where the RDO picked 8x8, 0 on the
+    // 4x4-coded B MBs).
+    assert!(
+        b.i8x8_mb_count > 0,
+        "B-slice RDO never picked the 8x8 transform"
+    );
 
     let mut combined = Vec::new();
     combined.extend_from_slice(&idr.annex_b);

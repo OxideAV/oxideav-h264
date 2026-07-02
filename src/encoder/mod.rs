@@ -6013,6 +6013,10 @@ pub struct EncodedB {
     /// Per-8x8-partition MV state. B-frames are non-reference so this
     /// is normally unused, but is provided for API symmetry.
     pub partition_mvs: Vec<FrameRefPartitionMv>,
+    /// Round-382 — number of macroblocks coded with
+    /// `transform_size_8x8_flag = 1` (High-profile 8x8 transform).
+    /// Always 0 unless [`EncoderConfig::transform_8x8`] is set.
+    pub i8x8_mb_count: u32,
 }
 
 impl<'a> From<&'a EncodedB> for EncodedFrameRef<'a> {
@@ -8293,6 +8297,7 @@ impl Encoder {
         // §8.4.1.2.2 spatial-direct predictor agrees with the encoder's
         // chosen MVs and the residual quantises to all-zero.
         let mut pending_skip: u32 = 0;
+        let mut i8x8_mb_count = 0u32;
         for mb_y in 0..height_mbs as usize {
             for mb_x in 0..width_mbs as usize {
                 let mb_addr = mb_y * (width_mbs as usize) + mb_x;
@@ -8320,6 +8325,9 @@ impl Encoder {
                     pic_order_cnt_lsb as i32,
                     weighted_luma_for_mb,
                 );
+                if dbl.transform_size_8x8_flag {
+                    i8x8_mb_count += 1;
+                }
                 mb_deblock_infos[mb_addr] = dbl;
             }
         }
@@ -8390,6 +8398,7 @@ impl Encoder {
             frame_num,
             pic_order_cnt_lsb,
             partition_mvs,
+            i8x8_mb_count,
         }
     }
 
@@ -9307,9 +9316,9 @@ impl Encoder {
         // 5. Forward + quantize the luma residual against the chosen
         //    predictor (re-using the inter forward path).
         let inter_luma = forward_inter_luma(frame.y, src_stride, mb_x, mb_y, &pred_y, qp_y);
-        let luma_4x4_levels_scan = inter_luma.levels_scan;
-        let blk_has_nz = inter_luma.blk_has_nz;
-        let recon_block_residual = inter_luma.recon_residual;
+        let mut luma_4x4_levels_scan = inter_luma.levels_scan;
+        let mut blk_has_nz = inter_luma.blk_has_nz;
+        let mut recon_block_residual = inter_luma.recon_residual;
 
         let mut cbp_luma: u8 = 0;
         for blk8 in 0..4usize {
@@ -9318,6 +9327,57 @@ impl Encoder {
                 cbp_luma |= 1u8 << blk8;
             }
         }
+
+        // 5b. Round-382 — 8x8-transform alternative for the B MB's luma
+        // residual (same trial as encode_p_mb; every B shape this
+        // encoder emits passes the §7.3.5 second gate, so the flag is
+        // codable for whichever writer wins below).
+        let mut transform_size_8x8 = false;
+        if self.cfg.transform_8x8 {
+            let inter_luma8 =
+                forward_inter_luma_8x8(frame.y, src_stride, mb_x, mb_y, &pred_y, qp_y);
+            let mut cbp_luma8: u8 = 0;
+            for blk8 in 0..4usize {
+                if inter_luma8.blk_has_nz[blk8 * 4] {
+                    cbp_luma8 |= 1u8 << blk8;
+                }
+            }
+            let lambda = lambda_ssd(qp_y, false);
+            let j4 = inter_luma_transform_cost(
+                frame.y,
+                src_stride,
+                mb_x,
+                mb_y,
+                &pred_y,
+                &inter_luma,
+                cbp_luma,
+                lambda,
+            );
+            let j8 = inter_luma_transform_cost(
+                frame.y,
+                src_stride,
+                mb_x,
+                mb_y,
+                &pred_y,
+                &inter_luma8,
+                cbp_luma8,
+                lambda,
+            );
+            if j8 < j4 {
+                transform_size_8x8 = true;
+                luma_4x4_levels_scan = inter_luma8.levels_scan;
+                blk_has_nz = inter_luma8.blk_has_nz;
+                recon_block_residual = inter_luma8.recon_residual;
+                cbp_luma = cbp_luma8;
+            }
+        }
+        // Flag value handed to whichever B writer is selected in the
+        // emit step: absent (None) when the PPS doesn't carry the tool.
+        let b_t8x8_flag = if self.cfg.transform_8x8 {
+            Some(transform_size_8x8)
+        } else {
+            None
+        };
 
         // 6. Forward + quantize chroma residual.
         let (u_dc_levels, u_ac_levels, u_recon_residual) =
@@ -9441,7 +9501,7 @@ impl Encoder {
 
             if is_direct {
                 let dcfg = crate::encoder::macroblock::BDirect16x16McbConfig {
-                    emit_transform_size_8x8_zero: self.cfg.transform_8x8,
+                    transform_size_8x8_flag: b_t8x8_flag,
                     cbp_luma,
                     cbp_chroma,
                     mb_qp_delta: 0,
@@ -9462,7 +9522,7 @@ impl Encoder {
                 // `b_spatial_direct_derive`), so no MV / refIdx fields
                 // appear in the bitstream — only cbp + residuals.
                 let dcfg = crate::encoder::macroblock::B8x8AllDirectMcbConfig {
-                    emit_transform_size_8x8_zero: self.cfg.transform_8x8,
+                    transform_size_8x8_flag: b_t8x8_flag,
                     cbp_luma,
                     cbp_chroma,
                     mb_qp_delta: 0,
@@ -9481,7 +9541,7 @@ impl Encoder {
                 // cells emit their (mvd_l0, mvd_l1) pair as appropriate
                 // (§7.3.5.2 gating; ref_idx absent in single-ref setup).
                 let mcfg = B8x8MixedMcbConfig {
-                    emit_transform_size_8x8_zero: self.cfg.transform_8x8,
+                    transform_size_8x8_flag: b_t8x8_flag,
                     cells: mixed_cells,
                     mvd_l0: mixed_mvd_l0_per_cell,
                     mvd_l1: mixed_mvd_l1_per_cell,
@@ -9503,7 +9563,7 @@ impl Encoder {
                 match pc.shape {
                     PartitionShape::P16x8 => {
                         let cfg = B16x8McbConfig {
-                            emit_transform_size_8x8_zero: self.cfg.transform_8x8,
+                            transform_size_8x8_flag: b_t8x8_flag,
                             top: pc.mode_a,
                             bottom: pc.mode_b,
                             mvd_l0: mvd_l0_parts,
@@ -9522,7 +9582,7 @@ impl Encoder {
                     }
                     PartitionShape::P8x16 => {
                         let cfg = B8x16McbConfig {
-                            emit_transform_size_8x8_zero: self.cfg.transform_8x8,
+                            transform_size_8x8_flag: b_t8x8_flag,
                             left: pc.mode_a,
                             right: pc.mode_b,
                             mvd_l0: mvd_l0_parts,
@@ -9542,7 +9602,7 @@ impl Encoder {
                 }
             } else {
                 let mb_cfg = B16x16McbConfig {
-                    emit_transform_size_8x8_zero: self.cfg.transform_8x8,
+                    transform_size_8x8_flag: b_t8x8_flag,
                     pred,
                     mvd_l0_x,
                     mvd_l0_y,
@@ -9721,7 +9781,7 @@ impl Encoder {
             qp_y,
             luma_nonzero_4x4,
             chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
-            transform_size_8x8_flag: false,
+            transform_size_8x8_flag: transform_size_8x8,
             mv_l0: mv_l0_arr,
             ref_idx_l0,
             ref_poc_l0,

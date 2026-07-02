@@ -1264,10 +1264,12 @@ pub struct B16x16McbConfig {
     /// and `cbp_luma > 0`, this MB shape passes the second gate (no
     /// sub-partition is smaller than 8x8, given
     /// `direct_8x8_inference_flag = 1` for the direct shapes) and MUST
-    /// code a `transform_size_8x8_flag`. Set this to emit the flag as 0
-    /// (the B paths keep 4x4 residual coding); leave `false` when the
-    /// PPS doesn't carry the tool.
-    pub emit_transform_size_8x8_zero: bool,
+    /// code a `transform_size_8x8_flag`. `None` when the PPS doesn't
+    /// carry the tool (the flag is inferred 0 and must not be coded);
+    /// `Some(true)` selects the 8x8 transform — `luma_4x4_levels` must
+    /// then hold the §7.4.5.3.3 de-interleaved four-4x4 split of each
+    /// 8x8 block's scan list.
+    pub transform_size_8x8_flag: Option<bool>,
     /// Which list(s) this MB uses (drives mb_type and which mvd fields
     /// are emitted).
     pub pred: BPred16x16,
@@ -1345,10 +1347,12 @@ pub fn write_b_16x16_mb(
     let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
     w.ue(codenum);
 
-    // §7.3.5 — transform_size_8x8_flag = 0 (second gate), present only
+    // §7.3.5 — transform_size_8x8_flag (second gate), present only
     // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if cfg.emit_transform_size_8x8_zero && cfg.cbp_luma > 0 {
-        w.u(1, 0);
+    if let Some(flag) = cfg.transform_size_8x8_flag {
+        if cfg.cbp_luma > 0 {
+            w.u(1, if flag { 1 } else { 0 });
+        }
     }
 
     // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
@@ -1415,10 +1419,12 @@ pub struct BDirect16x16McbConfig {
     /// and `cbp_luma > 0`, this MB shape passes the second gate (no
     /// sub-partition is smaller than 8x8, given
     /// `direct_8x8_inference_flag = 1` for the direct shapes) and MUST
-    /// code a `transform_size_8x8_flag`. Set this to emit the flag as 0
-    /// (the B paths keep 4x4 residual coding); leave `false` when the
-    /// PPS doesn't carry the tool.
-    pub emit_transform_size_8x8_zero: bool,
+    /// code a `transform_size_8x8_flag`. `None` when the PPS doesn't
+    /// carry the tool (the flag is inferred 0 and must not be coded);
+    /// `Some(true)` selects the 8x8 transform — `luma_4x4_levels` must
+    /// then hold the §7.4.5.3.3 de-interleaved four-4x4 split of each
+    /// 8x8 block's scan list.
+    pub transform_size_8x8_flag: Option<bool>,
     /// `cbp_luma` ∈ 0..=15.
     pub cbp_luma: u8,
     /// `cbp_chroma` ∈ {0, 1, 2}.
@@ -1458,10 +1464,12 @@ pub fn write_b_direct_16x16_mb(
     let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
     w.ue(codenum);
 
-    // §7.3.5 — transform_size_8x8_flag = 0 (second gate), present only
+    // §7.3.5 — transform_size_8x8_flag (second gate), present only
     // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if cfg.emit_transform_size_8x8_zero && cfg.cbp_luma > 0 {
-        w.u(1, 0);
+    if let Some(flag) = cfg.transform_size_8x8_flag {
+        if cfg.cbp_luma > 0 {
+            w.u(1, if flag { 1 } else { 0 });
+        }
     }
 
     // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
@@ -1617,10 +1625,12 @@ pub struct B16x8McbConfig {
     /// and `cbp_luma > 0`, this MB shape passes the second gate (no
     /// sub-partition is smaller than 8x8, given
     /// `direct_8x8_inference_flag = 1` for the direct shapes) and MUST
-    /// code a `transform_size_8x8_flag`. Set this to emit the flag as 0
-    /// (the B paths keep 4x4 residual coding); leave `false` when the
-    /// PPS doesn't carry the tool.
-    pub emit_transform_size_8x8_zero: bool,
+    /// code a `transform_size_8x8_flag`. `None` when the PPS doesn't
+    /// carry the tool (the flag is inferred 0 and must not be coded);
+    /// `Some(true)` selects the 8x8 transform — `luma_4x4_levels` must
+    /// then hold the §7.4.5.3.3 de-interleaved four-4x4 split of each
+    /// 8x8 block's scan list.
+    pub transform_size_8x8_flag: Option<bool>,
     /// Top partition prediction list selection.
     pub top: BPartPred,
     /// Bottom partition prediction list selection.
@@ -1667,7 +1677,7 @@ pub fn write_b_16x8_mb(
     );
     write_b_two_part_residuals(
         w,
-        cfg.emit_transform_size_8x8_zero,
+        cfg.transform_size_8x8_flag,
         cfg.cbp_luma,
         cfg.cbp_chroma,
         cfg.mb_qp_delta,
@@ -1687,10 +1697,12 @@ pub struct B8x16McbConfig {
     /// and `cbp_luma > 0`, this MB shape passes the second gate (no
     /// sub-partition is smaller than 8x8, given
     /// `direct_8x8_inference_flag = 1` for the direct shapes) and MUST
-    /// code a `transform_size_8x8_flag`. Set this to emit the flag as 0
-    /// (the B paths keep 4x4 residual coding); leave `false` when the
-    /// PPS doesn't carry the tool.
-    pub emit_transform_size_8x8_zero: bool,
+    /// code a `transform_size_8x8_flag`. `None` when the PPS doesn't
+    /// carry the tool (the flag is inferred 0 and must not be coded);
+    /// `Some(true)` selects the 8x8 transform — `luma_4x4_levels` must
+    /// then hold the §7.4.5.3.3 de-interleaved four-4x4 split of each
+    /// 8x8 block's scan list.
+    pub transform_size_8x8_flag: Option<bool>,
     /// Left partition prediction list selection.
     pub left: BPartPred,
     /// Right partition prediction list selection.
@@ -1735,7 +1747,7 @@ pub fn write_b_8x16_mb(
     );
     write_b_two_part_residuals(
         w,
-        cfg.emit_transform_size_8x8_zero,
+        cfg.transform_size_8x8_flag,
         cfg.cbp_luma,
         cfg.cbp_chroma,
         cfg.mb_qp_delta,
@@ -1797,7 +1809,7 @@ fn write_b_two_part_pred(
 #[allow(clippy::too_many_arguments)]
 fn write_b_two_part_residuals(
     w: &mut BitWriter,
-    emit_transform_size_8x8_zero: bool,
+    transform_size_8x8_flag: Option<bool>,
     cbp_luma: u8,
     cbp_chroma: u8,
     mb_qp_delta: i32,
@@ -1811,10 +1823,12 @@ fn write_b_two_part_residuals(
     let codenum = inter_cbp_to_codenum_420_422(cbp_luma, cbp_chroma);
     w.ue(codenum);
 
-    // §7.3.5 — transform_size_8x8_flag = 0 (second gate), present only
+    // §7.3.5 — transform_size_8x8_flag (second gate), present only
     // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if emit_transform_size_8x8_zero && cbp_luma > 0 {
-        w.u(1, 0);
+    if let Some(flag) = transform_size_8x8_flag {
+        if cbp_luma > 0 {
+            w.u(1, if flag { 1 } else { 0 });
+        }
     }
 
     let needs_qp_delta = cbp_luma > 0 || cbp_chroma > 0;
@@ -1918,10 +1932,12 @@ pub struct B8x8AllDirectMcbConfig {
     /// and `cbp_luma > 0`, this MB shape passes the second gate (no
     /// sub-partition is smaller than 8x8, given
     /// `direct_8x8_inference_flag = 1` for the direct shapes) and MUST
-    /// code a `transform_size_8x8_flag`. Set this to emit the flag as 0
-    /// (the B paths keep 4x4 residual coding); leave `false` when the
-    /// PPS doesn't carry the tool.
-    pub emit_transform_size_8x8_zero: bool,
+    /// code a `transform_size_8x8_flag`. `None` when the PPS doesn't
+    /// carry the tool (the flag is inferred 0 and must not be coded);
+    /// `Some(true)` selects the 8x8 transform — `luma_4x4_levels` must
+    /// then hold the §7.4.5.3.3 de-interleaved four-4x4 split of each
+    /// 8x8 block's scan list.
+    pub transform_size_8x8_flag: Option<bool>,
     /// `cbp_luma` ∈ 0..=15.
     pub cbp_luma: u8,
     /// `cbp_chroma` ∈ {0, 1, 2}.
@@ -1973,10 +1989,12 @@ pub fn write_b_8x8_all_direct_mb(
     let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
     w.ue(codenum);
 
-    // §7.3.5 — transform_size_8x8_flag = 0 (second gate), present only
+    // §7.3.5 — transform_size_8x8_flag (second gate), present only
     // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if cfg.emit_transform_size_8x8_zero && cfg.cbp_luma > 0 {
-        w.u(1, 0);
+    if let Some(flag) = cfg.transform_size_8x8_flag {
+        if cfg.cbp_luma > 0 {
+            w.u(1, if flag { 1 } else { 0 });
+        }
     }
 
     // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
@@ -2139,10 +2157,12 @@ pub struct B8x8MixedMcbConfig {
     /// and `cbp_luma > 0`, this MB shape passes the second gate (no
     /// sub-partition is smaller than 8x8, given
     /// `direct_8x8_inference_flag = 1` for the direct shapes) and MUST
-    /// code a `transform_size_8x8_flag`. Set this to emit the flag as 0
-    /// (the B paths keep 4x4 residual coding); leave `false` when the
-    /// PPS doesn't carry the tool.
-    pub emit_transform_size_8x8_zero: bool,
+    /// code a `transform_size_8x8_flag`. `None` when the PPS doesn't
+    /// carry the tool (the flag is inferred 0 and must not be coded);
+    /// `Some(true)` selects the 8x8 transform — `luma_4x4_levels` must
+    /// then hold the §7.4.5.3.3 de-interleaved four-4x4 split of each
+    /// 8x8 block's scan list.
+    pub transform_size_8x8_flag: Option<bool>,
     /// Per-cell sub_mb_type pick (raster Z-order: TL, TR, BL, BR).
     pub cells: [BSubMbCell; 4],
     /// Per-cell L0 mvd. Ignored on cells whose `writes_l0()` is false.
@@ -2225,10 +2245,12 @@ pub fn write_b_8x8_mixed_mb(
     let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
     w.ue(codenum);
 
-    // §7.3.5 — transform_size_8x8_flag = 0 (second gate), present only
+    // §7.3.5 — transform_size_8x8_flag (second gate), present only
     // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if cfg.emit_transform_size_8x8_zero && cfg.cbp_luma > 0 {
-        w.u(1, 0);
+    if let Some(flag) = cfg.transform_size_8x8_flag {
+        if cfg.cbp_luma > 0 {
+            w.u(1, if flag { 1 } else { 0 });
+        }
     }
 
     // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
@@ -2393,7 +2415,7 @@ mod tests {
     fn b_8x8_all_direct_zero_residual_emits_expected_bit_count() {
         let mut bw = BitWriter::new();
         let cfg = B8x8AllDirectMcbConfig {
-            emit_transform_size_8x8_zero: false,
+            transform_size_8x8_flag: None,
             cbp_luma: 0,
             cbp_chroma: 0,
             mb_qp_delta: 0,
@@ -2420,7 +2442,7 @@ mod tests {
     fn b_direct_16x16_zero_residual_emits_two_bits() {
         let mut bw = BitWriter::new();
         let cfg = BDirect16x16McbConfig {
-            emit_transform_size_8x8_zero: false,
+            transform_size_8x8_flag: None,
             cbp_luma: 0,
             cbp_chroma: 0,
             mb_qp_delta: 0,
@@ -2495,7 +2517,7 @@ mod tests {
     fn b_16x8_writer_round_trip_smoke() {
         let mut bw = BitWriter::new();
         let cfg = B16x8McbConfig {
-            emit_transform_size_8x8_zero: false,
+            transform_size_8x8_flag: None,
             top: BPartPred::Bi,
             bottom: BPartPred::Bi,
             mvd_l0: [(0, 0); 2],
@@ -2522,7 +2544,7 @@ mod tests {
     fn b_8x16_writer_l0_l1_zero_residual_bit_count() {
         let mut bw = BitWriter::new();
         let cfg = B8x16McbConfig {
-            emit_transform_size_8x8_zero: false,
+            transform_size_8x8_flag: None,
             left: BPartPred::L0,
             right: BPartPred::L1,
             mvd_l0: [(0, 0); 2],
@@ -2592,7 +2614,7 @@ mod tests {
     fn b_8x8_mixed_zero_residual_emits_expected_bit_count() {
         let mut bw = BitWriter::new();
         let cfg = B8x8MixedMcbConfig {
-            emit_transform_size_8x8_zero: false,
+            transform_size_8x8_flag: None,
             cells: [
                 BSubMbCell::Direct,
                 BSubMbCell::L0,
@@ -2623,7 +2645,7 @@ mod tests {
     fn b_8x8_mixed_all_direct_matches_dedicated_all_direct_writer_bit_count() {
         let mut bw = BitWriter::new();
         let cfg = B8x8MixedMcbConfig {
-            emit_transform_size_8x8_zero: false,
+            transform_size_8x8_flag: None,
             cells: [BSubMbCell::Direct; 4],
             mvd_l0: [(0, 0); 4],
             mvd_l1: [(0, 0); 4],
@@ -2643,7 +2665,7 @@ mod tests {
         // Sanity: matches the dedicated all-Direct writer byte-for-byte.
         let mut bw_dedicated = BitWriter::new();
         let cfg_dedicated = B8x8AllDirectMcbConfig {
-            emit_transform_size_8x8_zero: false,
+            transform_size_8x8_flag: None,
             cbp_luma: 0,
             cbp_chroma: 0,
             mb_qp_delta: 0,

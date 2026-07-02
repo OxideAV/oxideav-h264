@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **B-MB 8x8-residual RDO — the 8x8 transform now wins on B slices
+  too.** The `encode_b` per-MB path runs the same §8.6.4
+  8x8-vs-sixteen-4x4 luma-residual trial as `encode_p`
+  (`forward_inter_luma_8x8` + `inter_luma_transform_cost`, lower
+  `J = D + λ·R` wins) for every coded B shape; the six B CAVLC writers'
+  flag field is upgraded from emit-0-only to
+  `transform_size_8x8_flag: Option<bool>` so a winning trial codes the
+  §7.3.5 second-gate flag as 1 with the §7.4.5.3.3 de-interleaved
+  residual split, and the §8.7 deblock mirror carries the per-MB flag.
+  New `EncodedB::i8x8_mb_count` (CABAC paths report 0). The IDR+P+B GOP
+  gate now also asserts the B-slice RDO genuinely selects 8x8 (3/16 B
+  MBs on the fixture) while both decoders stay bit-exact.
 - **B-slice second-gate `transform_size_8x8_flag` coding — full
   IDR+P+B GOPs under `transform_8x8`.** Every coded B MB shape this
   encoder emits (B_L0/L1/Bi_16x16, B_Direct_16x16, 16x8 / 8x16
