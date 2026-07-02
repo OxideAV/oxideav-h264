@@ -7,10 +7,11 @@
 //!   * The emitted SPS is High profile (`profile_idc = 100`, §A.2.4)
 //!     and the PPS carries the §7.3.2.2 optional tail with
 //!     `transform_8x8_mode_flag = 1`.
-//!   * Every macroblock decodes as I_NxN with
-//!     `transform_size_8x8_flag = 1` (§7.3.5): §8.3.2 Intra_8x8
-//!     prediction, the §7.4.5.3.3 four-4x4 CAVLC residual split, and
-//!     the §8.5.13 inverse 8x8 transform.
+//!   * The per-MB RDO trials Intra_8x8 (I_NxN with
+//!     `transform_size_8x8_flag = 1`, §7.3.5) alongside I_16x16 and
+//!     I_4x4: §8.3.2 Intra_8x8 prediction, the §7.4.5.3.3 four-4x4
+//!     CAVLC residual split, and the §8.5.13 inverse 8x8 transform.
+//!     I_4x4 MBs in the same stream code `transform_size_8x8_flag = 0`.
 //!   * **Self-roundtrip**: our own decoder reproduces the encoder's
 //!     local recon bit-exactly (including the §8.7 deblock pass with
 //!     the 8x8-transform internal-edge skip).
@@ -206,4 +207,44 @@ fn i8x8_idr_reference_decoder_interop_bit_exact() {
     assert_eq!(ry, &idr.recon_y[..], "luma mismatch vs reference decoder");
     assert_eq!(ru, &idr.recon_u[..], "Cb mismatch vs reference decoder");
     assert_eq!(rv, &idr.recon_v[..], "Cr mismatch vs reference decoder");
+}
+
+#[test]
+fn i8x8_adaptive_rdo_selects_8x8_on_textured_content_and_roundtrips() {
+    // The per-MB RDO (I_16x16 vs I_4x4 vs I_8x8) must actually select
+    // the 8x8 transform somewhere on the mixed fixture (the textured
+    // quadrant favours 8x8: finer than 16x16 prediction, fewer mode
+    // bits than 4x4), and must NOT select it everywhere (the smooth
+    // gradient regions favour I_16x16 Plane/DC).
+    let idr = encode_i8x8();
+    let total_mbs = (W / 16) * (H / 16);
+    assert!(
+        idr.i8x8_mb_count > 0,
+        "RDO never picked Intra_8x8 on the textured quadrant"
+    );
+    assert!(
+        (idr.i8x8_mb_count as usize) < total_mbs,
+        "RDO picked Intra_8x8 for every MB — the 3-way trial is degenerate"
+    );
+
+    // The mixed-mb_type stream must still decode bit-exactly through
+    // our own decoder (exercises the §7.3.5 transform_size_8x8_flag=0
+    // emission on I_NxN 4x4 MBs inside a transform_8x8 stream).
+    let vf = decode_own(&idr.annex_b);
+    let dy = plane_max_diff(&vf, 0, &idr.recon_y, W, H);
+    assert_eq!(dy, 0, "adaptive-stream luma decode differs from recon");
+}
+
+#[test]
+fn i8x8_disabled_encoder_reports_zero_8x8_mbs() {
+    let (y, u, v) = make_source();
+    let frame = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let idr = Encoder::new(EncoderConfig::new(W as u32, H as u32)).encode_idr(&frame);
+    assert_eq!(idr.i8x8_mb_count, 0);
 }

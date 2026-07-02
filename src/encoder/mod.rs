@@ -323,12 +323,15 @@ pub struct EncoderConfig {
     /// Round-382 — High-profile **8x8 transform** (Intra_8x8) on the
     /// `encode_idr` CAVLC path. When `true`, the emitted SPS is High
     /// (`profile_idc = 100`), the PPS carries `transform_8x8_mode_flag =
-    /// 1`, and every macroblock is coded as Intra_8x8 (I_NxN with
-    /// `transform_size_8x8_flag = 1`): §8.3.2 8x8 intra prediction (9
-    /// modes, RDO-selected) + §8.6.4 forward 8x8 transform + §8.5.13.1
-    /// quantiser + §7.4.5.3.3 CAVLC four-4x4 residual split. Requires
-    /// 4:2:0 chroma. Default `false` (the I_16x16 / I_4x4 4x4-transform
-    /// path is emitted).
+    /// 1`, and the per-MB Lagrangian RDO trials **Intra_8x8** (I_NxN
+    /// with `transform_size_8x8_flag = 1`: §8.3.2 8x8 intra prediction
+    /// across all 9 modes + §8.6.4 forward 8x8 transform + §8.5.13.1
+    /// quantiser + §7.4.5.3.3 CAVLC four-4x4 residual split) alongside
+    /// the existing I_16x16 and I_4x4 trials; the lowest-J path wins
+    /// per MB. I_4x4 MBs in such a stream code
+    /// `transform_size_8x8_flag = 0` per §7.3.5. Requires 4:2:0 chroma.
+    /// Default `false` (High-profile signalling and the third trial are
+    /// omitted).
     pub transform_8x8: bool,
 }
 
@@ -1167,50 +1170,38 @@ impl Encoder {
         let mut mb_deblock_infos: Vec<MbDeblockInfo> =
             vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
 
+        // Round-382 — the High-profile 8x8 transform runs the per-MB
+        // RDO with a third (Intra_8x8) trial inside `encode_mb`; it is
+        // 4:2:0-only.
+        if self.cfg.transform_8x8 {
+            assert_eq!(
+                self.cfg.chroma_format_idc, 1,
+                "transform_8x8 encode requires 4:2:0 chroma"
+            );
+        }
+        let mut i8x8_mb_count = 0u32;
+
         // Iterate MBs in raster order.
         for mb_y in 0..height_mbs {
             for mb_x in 0..width_mbs {
-                let dbl = if self.cfg.transform_8x8 {
-                    // Round-382 — High-profile 8x8-transform picture:
-                    // every MB is Intra_8x8 (see `EncoderConfig::
-                    // transform_8x8`). Requires 4:2:0.
-                    assert_eq!(
-                        self.cfg.chroma_format_idc, 1,
-                        "transform_8x8 encode requires 4:2:0 chroma"
-                    );
-                    self.encode_mb_intra8x8(
-                        frame,
-                        mb_x as usize,
-                        mb_y as usize,
-                        qp_y,
-                        qp_c,
-                        chroma_width,
-                        chroma_height,
-                        &mut recon_y,
-                        &mut recon_u,
-                        &mut recon_v,
-                        &mut sw,
-                        &mut nc_grid,
-                        &mut intra_grid,
-                    )
-                    .deblock
-                } else {
-                    self.encode_mb(
-                        frame,
-                        mb_x as usize,
-                        mb_y as usize,
-                        qp_y,
-                        qp_c,
-                        chroma_width,
-                        chroma_height,
-                        &mut recon_y,
-                        &mut recon_u,
-                        &mut recon_v,
-                        &mut sw,
-                        &mut nc_grid,
-                        &mut intra_grid,
-                    )
-                };
+                let dbl = self.encode_mb(
+                    frame,
+                    mb_x as usize,
+                    mb_y as usize,
+                    qp_y,
+                    qp_c,
+                    chroma_width,
+                    chroma_height,
+                    &mut recon_y,
+                    &mut recon_u,
+                    &mut recon_v,
+                    &mut sw,
+                    &mut nc_grid,
+                    &mut intra_grid,
+                );
+                if dbl.transform_size_8x8_flag {
+                    i8x8_mb_count += 1;
+                }
                 let mb_addr = (mb_y * width_mbs + mb_x) as usize;
                 mb_deblock_infos[mb_addr] = dbl;
             }
@@ -1270,6 +1261,7 @@ impl Encoder {
             recon_width: self.cfg.width,
             recon_height: self.cfg.height,
             partition_mvs,
+            i8x8_mb_count,
         }
     }
 
@@ -1396,7 +1388,7 @@ impl Encoder {
             mb_addr as usize,
         );
 
-        // ----- Trial 2: I_NxN path. -----
+        // ----- Trial 2: I_NxN (Intra_4x4) path. -----
         let trial_b = self.encode_mb_intra4x4(
             frame,
             mb_x,
@@ -1413,10 +1405,124 @@ impl Encoder {
             intra_grid,
         );
 
+        // ----- Trial 3 (round-382, `transform_8x8` only): Intra_8x8. -----
+        // Runs after the I_NxN trial with the same snapshot discipline;
+        // the last trial's state is left installed, so the winner pick
+        // below restores + installs whichever snapshot won.
+        let trial_c = if self.cfg.transform_8x8 {
+            let snap_b = MbStateSnapshot::capture(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr as usize,
+                width_mbs,
+            );
+            snap.restore(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr as usize,
+            );
+            let trial_c = self.encode_mb_intra8x8(
+                frame,
+                mb_x,
+                mb_y,
+                qp_y,
+                qp_c,
+                chroma_width,
+                chroma_height,
+                recon_y,
+                recon_u,
+                recon_v,
+                sw,
+                nc_grid,
+                intra_grid,
+            );
+            Some((trial_c, snap_b))
+        } else {
+            None
+        };
+
         // ----- Pick winner. -----
         // Each path returns its own luma `J = D + λR` inside `MbTrial`.
-        // Lower J wins. On tie, prefer I_16x16 (smaller MB syntax).
-        if trial_a.luma_cost <= trial_b.luma_cost {
+        // Lower J wins. On tie, prefer I_16x16 (smaller MB syntax),
+        // then I_NxN 4x4, then I_8x8.
+        if let Some((trial_c, snap_b)) = trial_c {
+            // Three-way pick; the I_8x8 trial state is installed.
+            if trial_a.luma_cost <= trial_b.luma_cost && trial_a.luma_cost <= trial_c.luma_cost {
+                snap.restore(
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_addr as usize,
+                );
+                snap_a.install(
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_addr as usize,
+                );
+                trial_a.deblock
+            } else if trial_b.luma_cost <= trial_c.luma_cost {
+                snap.restore(
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_addr as usize,
+                );
+                snap_b.install(
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_addr as usize,
+                );
+                trial_b.deblock
+            } else {
+                trial_c.deblock
+            }
+        } else if trial_a.luma_cost <= trial_b.luma_cost {
             // Roll back the I_NxN trial; install the I_16x16 results.
             snap.restore(
                 recon_y,
@@ -2241,6 +2347,10 @@ impl Encoder {
         // ----- Emit syntax. -----
         if chroma_array_type == 1 {
             let mb_cfg = INxNMcbConfig {
+                // §7.3.5 — inside a transform_8x8_mode_flag=1 stream an
+                // I_NxN MB must code transform_size_8x8_flag = 0 to
+                // select the 4x4 transform.
+                emit_transform_size_8x8_zero: self.cfg.transform_8x8,
                 prev_intra4x4_pred_mode_flag: prev_flag,
                 rem_intra4x4_pred_mode: rem,
                 intra_chroma_pred_mode: best_chroma_mode.as_u8(),
@@ -2585,6 +2695,11 @@ pub struct EncodedIdr {
     /// §8.4.1.2.2 step 7 colZeroFlag check then short-circuits to 0
     /// (the `if is_intra` branch in `is_colocated_zero_mv`).
     pub partition_mvs: Vec<FrameRefPartitionMv>,
+    /// Round-382 — number of macroblocks the per-MB RDO coded as
+    /// Intra_8x8 (`transform_size_8x8_flag = 1`). Always 0 unless
+    /// [`EncoderConfig::transform_8x8`] is set. Exposed so callers /
+    /// tests can verify the 8x8 transform is actually being selected.
+    pub i8x8_mb_count: u32,
 }
 
 /// One 8x8 partition's per-list MV state, captured at picture-level so

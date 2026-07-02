@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Adaptive per-MB transform-size RDO (I_16x16 / I_4x4 / I_8x8).**
+  With `EncoderConfig::transform_8x8` set, `encode_idr`'s per-MB
+  Lagrangian RDO now runs a third **Intra_8x8** trial alongside the
+  existing I_16x16 and I_4x4 trials (same snapshot/rollback
+  discipline), installing the lowest-J winner per macroblock instead of
+  forcing every MB to 8x8. Mixed streams are spec-correct: I_4x4 MBs
+  code `transform_size_8x8_flag = 0` per §7.3.5 (the flag is mandatory
+  for I_NxN once the PPS signals `transform_8x8_mode_flag = 1`) via the
+  new `INxNMcbConfig::emit_transform_size_8x8_zero`. New
+  `EncodedIdr::i8x8_mb_count` surfaces how many MBs the RDO coded as
+  Intra_8x8. On the mixed gradient+texture fixture the RDO picks
+  Intra_8x8 for 4/16 MBs (the textured quadrant) and the stream stays
+  bit-exact through both our decoder and the black-box reference
+  decoder (`i8x8_adaptive_rdo_selects_8x8_on_textured_content_and_
+  roundtrips`, + a zero-count guard for non-8x8 configs).
 - **High-profile Intra_8x8 (8x8-transform) IDR encoder — bit-exact
   through both our decoder and a black-box reference decoder.** New
   `EncoderConfig::transform_8x8` drives `encode_idr` to code every MB

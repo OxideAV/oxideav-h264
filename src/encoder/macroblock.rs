@@ -576,6 +576,13 @@ pub fn write_intra16x16_mb_in_inter_slice(
 ///   if cbp_chroma == 2: chroma AC Cb (4 blocks), Cr (4 blocks)
 /// ```
 pub struct INxNMcbConfig {
+    /// §7.3.5 — when the active PPS has `transform_8x8_mode_flag = 1`,
+    /// every I_NxN macroblock codes a `transform_size_8x8_flag` before
+    /// `mb_pred()`. Set this to emit the flag as 0 (this MB uses the
+    /// 4x4 transform) inside a High-profile 8x8-transform stream; leave
+    /// `false` when the PPS doesn't carry the tool (the flag is then
+    /// inferred 0 and must not be coded).
+    pub emit_transform_size_8x8_zero: bool,
     /// `prev_intra4x4_pred_mode_flag[blk]` for each of the 16 4x4 blocks
     /// in §6.4.3 raster-Z order.
     pub prev_intra4x4_pred_mode_flag: [bool; 16],
@@ -672,6 +679,12 @@ pub fn write_i_nxn_mb(w: &mut BitWriter, cfg: &INxNMcbConfig) -> Result<(), Cavl
 
     // §7.4.5 — Table 7-11: I_NxN mb_type raw = 0 in I-slice.
     w.ue(0);
+
+    // §7.3.5 — transform_size_8x8_flag = 0, present only when the PPS
+    // signals transform_8x8_mode_flag = 1.
+    if cfg.emit_transform_size_8x8_zero {
+        w.u(1, 0);
+    }
 
     // §7.3.5.1 mb_pred(): per-block prev/rem.
     for blk in 0..16usize {

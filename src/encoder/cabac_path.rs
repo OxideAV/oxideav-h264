@@ -2068,6 +2068,8 @@ impl Encoder {
             recon_width: cfg.width,
             recon_height: cfg.height,
             partition_mvs,
+            // The CABAC IDR path does not code the 8x8 transform.
+            i8x8_mb_count: 0,
         }
     }
 
