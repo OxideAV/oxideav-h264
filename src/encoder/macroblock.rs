@@ -619,9 +619,16 @@ pub struct INxNMcbConfig {
 
 /// Emit one I_NxN (Intra_4x4) macroblock with caller-supplied chroma
 /// residual kind (round 27 — 4:2:0 or 4:2:2).
+///
+/// `emit_transform_size_8x8_zero` (round-385): inside a
+/// `transform_8x8_mode_flag = 1` stream every I_NxN MB must code
+/// `transform_size_8x8_flag` before `mb_pred()`; pass `true` to emit it
+/// as 0 (this MB keeps the 4x4 transform), `false` when the PPS doesn't
+/// carry the tool.
 #[allow(clippy::too_many_arguments)]
 pub fn write_i_nxn_mb_chroma(
     w: &mut BitWriter,
+    emit_transform_size_8x8_zero: bool,
     prev_intra4x4_pred_mode_flag: &[bool; 16],
     rem_intra4x4_pred_mode: &[u8; 16],
     intra_chroma_pred_mode: u8,
@@ -638,6 +645,11 @@ pub fn write_i_nxn_mb_chroma(
 
     // §7.4.5 — Table 7-11: I_NxN mb_type raw = 0 in I-slice.
     w.ue(0);
+    // §7.3.5 — transform_size_8x8_flag = 0, present only when the PPS
+    // signals transform_8x8_mode_flag = 1.
+    if emit_transform_size_8x8_zero {
+        w.u(1, 0);
+    }
     for blk in 0..16usize {
         let flag = prev_intra4x4_pred_mode_flag[blk];
         w.u(1, if flag { 1 } else { 0 });
@@ -804,9 +816,45 @@ pub struct I8x8McbConfig {
 /// Emit one Intra_8x8 macroblock (CAVLC, I-slice, 4:2:0 chroma). The
 /// caller must have set the PPS `transform_8x8_mode_flag = 1`.
 pub fn write_i8x8_mb(w: &mut BitWriter, cfg: &I8x8McbConfig) -> Result<(), CavlcEncodeError> {
-    debug_assert!(cfg.cbp_luma <= 15);
-    debug_assert!(cfg.cbp_chroma <= 2);
-    debug_assert!(cfg.intra_chroma_pred_mode <= 3);
+    write_i8x8_mb_chroma(
+        w,
+        &cfg.prev_intra8x8_pred_mode_flag,
+        &cfg.rem_intra8x8_pred_mode,
+        cfg.intra_chroma_pred_mode,
+        cfg.cbp_luma,
+        cfg.cbp_chroma,
+        cfg.mb_qp_delta,
+        &cfg.luma_4x4_levels,
+        &cfg.luma_4x4_nc,
+        ChromaWriteKind::Yuv420 {
+            chroma_dc_cb: &cfg.chroma_dc_cb,
+            chroma_dc_cr: &cfg.chroma_dc_cr,
+            chroma_ac_cb: &cfg.chroma_ac_cb,
+            chroma_ac_cr: &cfg.chroma_ac_cr,
+        },
+    )
+}
+
+/// Round-385 — emit one Intra_8x8 macroblock (I_NxN with
+/// `transform_size_8x8_flag = 1`) with caller-supplied chroma residual
+/// kind (4:2:0 or 4:2:2). The caller must have set the PPS
+/// `transform_8x8_mode_flag = 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_i8x8_mb_chroma(
+    w: &mut BitWriter,
+    prev_intra8x8_pred_mode_flag: &[bool; 4],
+    rem_intra8x8_pred_mode: &[u8; 4],
+    intra_chroma_pred_mode: u8,
+    cbp_luma: u8,
+    cbp_chroma: u8,
+    mb_qp_delta: i32,
+    luma_4x4_levels: &[[i32; 16]; 16],
+    luma_4x4_nc: &[i32; 16],
+    chroma: ChromaWriteKind<'_>,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cbp_luma <= 15);
+    debug_assert!(cbp_chroma <= 2);
+    debug_assert!(intra_chroma_pred_mode <= 3);
 
     // §7.4.5 — Table 7-11: I_NxN mb_type raw = 0 in I-slice.
     w.ue(0);
@@ -815,55 +863,44 @@ pub fn write_i8x8_mb(w: &mut BitWriter, cfg: &I8x8McbConfig) -> Result<(), Cavlc
 
     // §7.3.5.1 mb_pred(): per-8x8-block prev/rem intra pred mode.
     for blk8 in 0..4usize {
-        let flag = cfg.prev_intra8x8_pred_mode_flag[blk8];
+        let flag = prev_intra8x8_pred_mode_flag[blk8];
         w.u(1, if flag { 1 } else { 0 });
         if !flag {
-            debug_assert!(cfg.rem_intra8x8_pred_mode[blk8] <= 7);
-            w.u(3, cfg.rem_intra8x8_pred_mode[blk8] as u32);
+            debug_assert!(rem_intra8x8_pred_mode[blk8] <= 7);
+            w.u(3, rem_intra8x8_pred_mode[blk8] as u32);
         }
     }
     // §7.3.5.1 — chroma intra pred mode for ChromaArrayType ∈ {1, 2}.
-    w.ue(cfg.intra_chroma_pred_mode as u32);
+    w.ue(intra_chroma_pred_mode as u32);
 
     // §7.3.5 — coded_block_pattern me(v), intra Table 9-4(a).
-    let codenum = intra_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
+    let codenum = intra_cbp_to_codenum_420_422(cbp_luma, cbp_chroma);
     w.ue(codenum);
 
-    let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
+    let needs_qp_delta = cbp_luma > 0 || cbp_chroma > 0;
     if needs_qp_delta {
-        w.se(cfg.mb_qp_delta);
+        w.se(mb_qp_delta);
     }
 
     // §7.4.5.3.3 — luma residual: per 8x8 quadrant, four 4x4
     // residual_block_cavlc calls carrying the de-interleaved levels.
     for blk8 in 0..4u8 {
-        if (cfg.cbp_luma >> blk8) & 1 == 1 {
+        if (cbp_luma >> blk8) & 1 == 1 {
             for sub in 0..4u8 {
                 let blk = (blk8 * 4 + sub) as usize;
-                let nc = cfg.luma_4x4_nc[blk];
+                let nc = luma_4x4_nc[blk];
                 encode_residual_block_cavlc(
                     w,
                     CoeffTokenContext::Numeric(nc),
                     16,
-                    &cfg.luma_4x4_levels[blk],
+                    &luma_4x4_levels[blk],
                 )?;
             }
         }
     }
 
     // §7.3.5.3 — chroma residual (same structure as I_16x16 / I_NxN).
-    if cfg.cbp_chroma > 0 {
-        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
-        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
-    }
-    if cfg.cbp_chroma == 2 {
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
-        }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
-        }
-    }
+    chroma.emit(w, cbp_chroma)?;
     Ok(())
 }
 

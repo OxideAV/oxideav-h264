@@ -1171,12 +1171,13 @@ impl Encoder {
             vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
 
         // Round-382 — the High-profile 8x8 transform runs the per-MB
-        // RDO with a third (Intra_8x8) trial inside `encode_mb`; it is
-        // 4:2:0-only.
+        // RDO with a third (Intra_8x8) trial inside `encode_mb`.
+        // Round-385 extends it to 4:2:2; the 4:4:4 chroma-coded-like-
+        // luma 8x8 path is still deferred.
         if self.cfg.transform_8x8 {
-            assert_eq!(
-                self.cfg.chroma_format_idc, 1,
-                "transform_8x8 encode requires 4:2:0 chroma"
+            assert!(
+                matches!(self.cfg.chroma_format_idc, 1 | 2),
+                "transform_8x8 encode requires 4:2:0 or 4:2:2 chroma"
             );
         }
         let mut i8x8_mb_count = 0u32;
@@ -2369,6 +2370,9 @@ impl Encoder {
             // Round-27: 4:2:2 chroma layout.
             crate::encoder::macroblock::write_i_nxn_mb_chroma(
                 sw,
+                // §7.3.5 — code transform_size_8x8_flag = 0 inside a
+                // transform_8x8_mode_flag = 1 stream (round-385).
+                self.cfg.transform_8x8,
                 &prev_flag,
                 &rem,
                 best_chroma_mode.as_u8(),
@@ -2575,9 +2579,12 @@ impl Encoder {
             }
         }
 
-        // Chroma — identical to the I_NxN 4:2:0 path.
+        // Chroma — identical to the I_NxN path (4:2:0 or 4:2:2).
         let chroma_array_type = self.cfg.chroma_format_idc;
-        debug_assert_eq!(chroma_array_type, 1, "Intra_8x8 encode is 4:2:0-only");
+        debug_assert!(
+            matches!(chroma_array_type, 1 | 2),
+            "Intra_8x8 encode supports 4:2:0 and 4:2:2 chroma"
+        );
         let chroma_block = encode_chroma_block(
             chroma_array_type,
             frame.u,
@@ -2592,14 +2599,6 @@ impl Encoder {
         );
         let cbp_chroma = chroma_block.cbp_chroma;
         let n_chroma_blk = ChromaBlock::cb_block_count(chroma_array_type);
-        let mut u_dc_levels = [0i32; 4];
-        let mut v_dc_levels = [0i32; 4];
-        let mut u_ac_levels = [[0i32; 16]; 4];
-        let mut v_ac_levels = [[0i32; 16]; 4];
-        u_dc_levels.copy_from_slice(&chroma_block.dc_cb[..4]);
-        v_dc_levels.copy_from_slice(&chroma_block.dc_cr[..4]);
-        u_ac_levels.copy_from_slice(&chroma_block.ac_cb[..4]);
-        v_ac_levels.copy_from_slice(&chroma_block.ac_cr[..4]);
         install_chroma_recon(
             chroma_array_type,
             chroma_width,
@@ -2640,21 +2639,52 @@ impl Encoder {
         nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
 
         // Emit syntax.
-        let mb_cfg = I8x8McbConfig {
-            prev_intra8x8_pred_mode_flag: prev_flag,
-            rem_intra8x8_pred_mode: rem,
-            intra_chroma_pred_mode: chroma_block.pred_mode.as_u8(),
-            cbp_luma,
-            cbp_chroma,
-            mb_qp_delta: 0,
-            luma_4x4_levels,
-            luma_4x4_nc,
-            chroma_dc_cb: u_dc_levels,
-            chroma_dc_cr: v_dc_levels,
-            chroma_ac_cb: u_ac_levels,
-            chroma_ac_cr: v_ac_levels,
-        };
-        write_i8x8_mb(sw, &mb_cfg).expect("write I_8x8 mb");
+        if chroma_array_type == 1 {
+            let mut u_dc_levels = [0i32; 4];
+            let mut v_dc_levels = [0i32; 4];
+            let mut u_ac_levels = [[0i32; 16]; 4];
+            let mut v_ac_levels = [[0i32; 16]; 4];
+            u_dc_levels.copy_from_slice(&chroma_block.dc_cb[..4]);
+            v_dc_levels.copy_from_slice(&chroma_block.dc_cr[..4]);
+            u_ac_levels.copy_from_slice(&chroma_block.ac_cb[..4]);
+            v_ac_levels.copy_from_slice(&chroma_block.ac_cr[..4]);
+            let mb_cfg = I8x8McbConfig {
+                prev_intra8x8_pred_mode_flag: prev_flag,
+                rem_intra8x8_pred_mode: rem,
+                intra_chroma_pred_mode: chroma_block.pred_mode.as_u8(),
+                cbp_luma,
+                cbp_chroma,
+                mb_qp_delta: 0,
+                luma_4x4_levels,
+                luma_4x4_nc,
+                chroma_dc_cb: u_dc_levels,
+                chroma_dc_cr: v_dc_levels,
+                chroma_ac_cb: u_ac_levels,
+                chroma_ac_cr: v_ac_levels,
+            };
+            write_i8x8_mb(sw, &mb_cfg).expect("write I_8x8 mb");
+        } else {
+            // Round-385 — 4:2:2 chroma layout (§7.3.5.3: 4x2 chroma DC
+            // Hadamard + 8 AC blocks per plane, ChromaDc422 CAVLC ctx).
+            crate::encoder::macroblock::write_i8x8_mb_chroma(
+                sw,
+                &prev_flag,
+                &rem,
+                chroma_block.pred_mode.as_u8(),
+                cbp_luma,
+                cbp_chroma,
+                0,
+                &luma_4x4_levels,
+                &luma_4x4_nc,
+                crate::encoder::macroblock::ChromaWriteKind::Yuv422 {
+                    chroma_dc_cb: &chroma_block.dc_cb,
+                    chroma_dc_cr: &chroma_block.dc_cr,
+                    chroma_ac_cb: &chroma_block.ac_cb,
+                    chroma_ac_cr: &chroma_block.ac_cr,
+                },
+            )
+            .expect("write I_8x8 mb (4:2:2)");
+        }
 
         // §8.7.2.1 — every 4x4 of a transmitted 8x8 quadrant inherits
         // the quadrant's nonzero status (the decoder's

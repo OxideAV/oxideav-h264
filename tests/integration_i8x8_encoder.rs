@@ -499,3 +499,139 @@ fn i8x8_b_slice_gop_codes_second_gate_flag_and_roundtrips() {
         "P-frame luma mismatch vs reference decoder"
     );
 }
+
+/// Round-385 — 4:2:2 source for the High 4:2:2 (profile 122) + 8x8
+/// transform IDR test: the same mixed luma as `make_source` plus
+/// full-height 4:2:2 chroma gradients.
+fn make_source_422() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (y, _, _) = make_source();
+    let cw = W / 2;
+    let ch = H; // 4:2:2 — full-height chroma.
+    let mut u = vec![0u8; cw * ch];
+    let mut v = vec![0u8; cw * ch];
+    for j in 0..ch {
+        for i in 0..cw {
+            u[j * cw + i] = (96 + i * 2 + j / 4) as u8;
+            v[j * cw + i] = (170u32.saturating_sub(j as u32) + (i as u32) / 2).min(235) as u8;
+        }
+    }
+    (y, u, v)
+}
+
+#[test]
+fn i8x8_422_idr_selects_8x8_and_roundtrips_bit_exact() {
+    let (y, u, v) = make_source_422();
+    let frame = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let cfg = EncoderConfig {
+        profile_idc: 122, // High 4:2:2 — required for chroma_format_idc = 2.
+        chroma_format_idc: 2,
+        transform_8x8: true,
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let idr = Encoder::new(cfg).encode_idr(&frame);
+    assert!(
+        idr.i8x8_mb_count > 0,
+        "the 4:2:2 RDO never picked Intra_8x8 on the mixed fixture"
+    );
+
+    // The SPS must keep High 4:2:2 (no down-promotion to 100) and the
+    // PPS must carry the 8x8 tool.
+    let mut saw = (false, false);
+    for nal in AnnexBSplitter::new(&idr.annex_b) {
+        let unit = parse_nal_unit(nal).expect("parse NAL");
+        match unit.header.nal_unit_type {
+            NalUnitType::Sps => {
+                let sps = oxideav_h264::sps::Sps::parse(&unit.rbsp).expect("parse SPS");
+                assert_eq!(sps.profile_idc, 122);
+                assert_eq!(sps.chroma_format_idc, 2);
+                saw.0 = true;
+            }
+            NalUnitType::Pps => {
+                let pps = oxideav_h264::pps::Pps::parse(&unit.rbsp).expect("parse PPS");
+                assert!(pps.transform_8x8_mode_flag());
+                saw.1 = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw.0 && saw.1);
+
+    // Self-roundtrip: our decoder reproduces the encoder recon
+    // bit-exactly (luma + full-height 4:2:2 chroma).
+    let vf = decode_own(&idr.annex_b);
+    assert_eq!(plane_max_diff(&vf, 0, &idr.recon_y, W, H), 0, "luma");
+    assert_eq!(plane_max_diff(&vf, 1, &idr.recon_u, W / 2, H), 0, "Cb");
+    assert_eq!(plane_max_diff(&vf, 2, &idr.recon_v, W / 2, H), 0, "Cr");
+}
+
+#[test]
+fn i8x8_422_idr_reference_decoder_interop() {
+    let (y, u, v) = make_source_422();
+    let frame = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let cfg = EncoderConfig {
+        profile_idc: 122,
+        chroma_format_idc: 2,
+        transform_8x8: true,
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let idr = Encoder::new(cfg).encode_idr(&frame);
+    assert!(idr.i8x8_mb_count > 0);
+
+    // Black-box validator: an independent reference decoder binary
+    // (opaque I/O only).
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: reference decoder binary not present");
+        return;
+    }
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!(
+        "oxideav_h264_r385_i8x8_422_{}.h264",
+        std::process::id()
+    ));
+    let yuv_path = tmpdir.join(format!(
+        "oxideav_h264_r385_i8x8_422_{}.yuv",
+        std::process::id()
+    ));
+    std::fs::write(&h264_path, &idr.annex_b).expect("write h264");
+    let status = std::process::Command::new(ffmpeg)
+        .args(["-loglevel", "error", "-y", "-f", "h264", "-i"])
+        .arg(&h264_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv422p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn reference decoder");
+    assert!(status.success(), "reference decoder rejected the stream");
+    let yuv = std::fs::read(&yuv_path).expect("read decoded yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+    let frame_bytes = W * H + 2 * (W / 2) * H;
+    assert_eq!(yuv.len(), frame_bytes, "expected one 4:2:2 frame");
+    assert_eq!(
+        &yuv[..W * H],
+        &idr.recon_y[..],
+        "luma mismatch vs reference decoder"
+    );
+    assert_eq!(
+        &yuv[W * H..W * H + (W / 2) * H],
+        &idr.recon_u[..],
+        "Cb mismatch vs reference decoder"
+    );
+    assert_eq!(
+        &yuv[W * H + (W / 2) * H..],
+        &idr.recon_v[..],
+        "Cr mismatch vs reference decoder"
+    );
+}
