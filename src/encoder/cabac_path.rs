@@ -136,8 +136,10 @@ struct CabacEncMbInfo {
     cbf_luma_ac: [bool; 16],
     cbf_cb_dc: bool,
     cbf_cr_dc: bool,
-    cbf_cb_ac: [bool; 4],
-    cbf_cr_ac: [bool; 4],
+    /// Chroma AC CBF per 4x4 block — 4 blocks at 4:2:0, 8 at 4:2:2
+    /// (2x4 raster layout).
+    cbf_cb_ac: [bool; 8],
+    cbf_cr_ac: [bool; 8],
     /// 4:4:4 chroma AC CBF tracking — 16 4x4 blocks per plane (§7.3.5.3).
     cbf_cb_ac_444: [bool; 16],
     cbf_cr_ac_444: [bool; 16],
@@ -181,8 +183,8 @@ impl Default for CabacEncMbInfo {
             cbf_luma_ac: [false; 16],
             cbf_cb_dc: false,
             cbf_cr_dc: false,
-            cbf_cb_ac: [false; 4],
-            cbf_cr_ac: [false; 4],
+            cbf_cb_ac: [false; 8],
+            cbf_cr_ac: [false; 8],
             cbf_cb_ac_444: [false; 16],
             cbf_cr_ac_444: [false; 16],
             abs_mvd_l0_x: [0; 16],
@@ -1073,6 +1075,7 @@ fn cbf_luma_for_local(info: &CabacEncMbInfo, block_type: BlockType, bi: usize) -
 /// §9.3.3.1.1.9 — CBF for chroma AC sub-blocks. Internal neighbour
 /// reads the current MB's running CBF state, external goes to the
 /// neighbour MB. `is_cr` selects between Cb and Cr.
+#[allow(clippy::too_many_arguments)]
 fn cbf_neighbour_chroma_ac(
     grid: &CabacEncGrid,
     mb_x: usize,
@@ -1081,8 +1084,10 @@ fn cbf_neighbour_chroma_ac(
     current_is_intra: bool,
     blk_idx: u8,
     is_cr: bool,
+    chroma_array_type: u32,
 ) -> (bool, bool) {
-    // Chroma 4:2:0 layout: 2x2 blocks. Coordinates in 4-pixel units.
+    // Chroma block layout: 2x2 blocks at 4:2:0, 2x4 at 4:2:2.
+    // Coordinates in 4-pixel units.
     let cx = ((blk_idx as i32) % 2) * 4;
     let cy = ((blk_idx as i32) / 2) * 4;
     let pick = |xn: i32, yn: i32, is_left: bool| -> bool {
@@ -1112,8 +1117,15 @@ fn cbf_neighbour_chroma_ac(
             if info.is_skip {
                 return false;
             }
-            // Wrap into the neighbour's chroma.
-            let (wx, wy) = if is_left { (xn + 8, yn) } else { (xn, yn + 8) };
+            // Wrap into the neighbour's chroma tile (§9.3.3.1.1.9
+            // cat-4 → §6.4.11.5): height 8 at 4:2:0, 16 at 4:2:2 —
+            // decoder mirror (`cbf_cond_for` InternalChromaAc).
+            let wrap_h = if chroma_array_type == 2 { 16 } else { 8 };
+            let (wx, wy) = if is_left {
+                (xn + 8, yn)
+            } else {
+                (xn, yn + wrap_h)
+            };
             let bi = ((wy / 4) * 2 + (wx / 4)) as usize;
             if is_cr {
                 info.cbf_cr_ac.get(bi).copied().unwrap_or(false)
@@ -1753,13 +1765,12 @@ impl Encoder {
             cfg.profile_idc,
         );
         assert!(
-            matches!(cfg.chroma_format_idc, 1 | 3),
-            "encode_idr_cabac supports chroma_format_idc 1 (4:2:0) and 3 (4:4:4); \
-             4:2:2 CABAC IDR is not yet wired",
+            matches!(cfg.chroma_format_idc, 1..=3),
+            "encode_idr_cabac supports chroma_format_idc 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
         );
         assert!(
-            !cfg.transform_8x8 || cfg.chroma_format_idc == 1,
-            "CABAC transform_8x8 encode is 4:2:0-only (4:4:4 blockCat-9/13 8x8 deferred)",
+            !cfg.transform_8x8 || matches!(cfg.chroma_format_idc, 1 | 2),
+            "CABAC transform_8x8 encode is 4:2:0/4:2:2-only (4:4:4 blockCat-9/13 8x8 deferred)",
         );
         let width = cfg.width as usize;
         let height = cfg.height as usize;
@@ -1771,7 +1782,7 @@ impl Encoder {
             _ => width / 2,
         };
         let chroma_h = match cfg.chroma_format_idc {
-            3 => height,
+            2 | 3 => height,
             _ => height / 2,
         };
 
@@ -1869,12 +1880,18 @@ impl Encoder {
                 let mb_addr = mb_y * width_mbs + mb_x;
                 let nb = build_neighbour_ctx(&grid, mb_x, mb_y);
 
-                // Pick intra modes.
+                // Pick intra modes. 4:2:0 picks the chroma mode here;
+                // 4:2:2 delegates to `encode_chroma_block` below (8x16
+                // tile geometry); 4:4:4 reuses the luma mode (§8.3.4.1).
                 let (luma_mode, luma_pred) =
                     pick_intra16x16_mode(frame, &recon_y, width, height, mb_x, mb_y);
-                let (chroma_mode, _, _) = pick_chroma_mode(
-                    frame.u, frame.v, &recon_u, &recon_v, chroma_w, chroma_h, mb_x, mb_y,
-                );
+                let mut chroma_mode = IntraChromaMode::Dc;
+                if cfg.chroma_format_idc == 1 {
+                    let (m, _, _) = pick_chroma_mode(
+                        frame.u, frame.v, &recon_u, &recon_v, chroma_w, chroma_h, mb_x, mb_y,
+                    );
+                    chroma_mode = m;
+                }
 
                 // Residual + transform + quant.
                 let mut residual = [0i32; 256];
@@ -1946,9 +1963,31 @@ impl Encoder {
                 let mut cr_dc_420 = [0i32; 4];
                 let mut cb_ac_scan_420 = [[0i32; 16]; 4];
                 let mut cr_ac_scan_420 = [[0i32; 16]; 4];
+                // 4:2:2 chroma block (only populated when fmt==2).
+                let mut chroma_422: Option<super::ChromaBlock> = None;
                 let cbp_chroma: u8;
 
-                if cfg.chroma_format_idc == 3 {
+                if cfg.chroma_format_idc == 2 {
+                    // 4:2:2 — §8.5.11.2 chain (mode pick + 4x2-Hadamard
+                    // DC + per-4x4 AC + recon residual) shared with the
+                    // CAVLC path.
+                    let cbk = super::encode_chroma_block(
+                        2, frame.u, frame.v, &recon_u, &recon_v, chroma_w, chroma_h, mb_x, mb_y,
+                        qp_c,
+                    );
+                    chroma_mode = cbk.pred_mode;
+                    cbp_chroma = cbk.cbp_chroma;
+                    super::install_chroma_recon(
+                        2,
+                        chroma_w,
+                        mb_x,
+                        mb_y,
+                        &cbk,
+                        &mut recon_u,
+                        &mut recon_v,
+                    );
+                    chroma_422 = Some(cbk);
+                } else if cfg.chroma_format_idc == 3 {
                     // 4:4:4 — encode and reconstruct directly into recon_u/v.
                     let (cdc, cac, _, any_cb_ac_nz, _) = encode_chroma_intra16x16_444(
                         frame.u,
@@ -2302,7 +2341,20 @@ impl Encoder {
                     );
                     grid.at_mut(mb_x, mb_y).cbf_cr_dc = cbf_cr_dc;
                 } else {
-                    // 4:2:0 chroma residual.
+                    // 4:2:0 / 4:2:2 chroma residual. §7.3.5.3.3 —
+                    // ChromaDCLevel carries 4 coefficients at 4:2:0 and
+                    // 8 at 4:2:2 (NumC8x8 = 2 → eq. (9-22) contexts);
+                    // ChromaACLevel covers 4 / 8 blocks per plane.
+                    let num_c8x8: u32 = if cfg.chroma_format_idc == 2 { 2 } else { 1 };
+                    let n_dc = (4 * num_c8x8) as usize;
+                    let dc_cb_slice: &[i32] = match &chroma_422 {
+                        Some(cbk) => &cbk.dc_cb[..n_dc],
+                        None => &cb_dc_420[..],
+                    };
+                    let dc_cr_slice: &[i32] = match &chroma_422 {
+                        Some(cbk) => &cbk.dc_cr[..n_dc],
+                        None => &cr_dc_420[..],
+                    };
                     if cbp_chroma > 0 {
                         let (cb_a, cb_b) =
                             cbf_neighbour_mb_level(&grid, mb_x, mb_y, true, CbfPlane::CbDc);
@@ -2310,12 +2362,12 @@ impl Encoder {
                             &mut cabac,
                             &mut ctxs,
                             BlockType::ChromaDc,
-                            &cb_dc_420,
-                            4,
+                            dc_cb_slice,
+                            n_dc as u32,
                             Some(cb_a),
                             Some(cb_b),
                             false,
-                            1,
+                            num_c8x8,
                         );
                         grid.at_mut(mb_x, mb_y).cbf_cb_dc = cb_dc_coded;
                         let (cr_a, cr_b) =
@@ -2324,49 +2376,71 @@ impl Encoder {
                             &mut cabac,
                             &mut ctxs,
                             BlockType::ChromaDc,
-                            &cr_dc_420,
-                            4,
+                            dc_cr_slice,
+                            n_dc as u32,
                             Some(cr_a),
                             Some(cr_b),
                             false,
-                            1,
+                            num_c8x8,
                         );
                         grid.at_mut(mb_x, mb_y).cbf_cr_dc = cr_dc_coded;
                     }
                     if cbp_chroma == 2 {
-                        for blk in 0..4usize {
+                        for blk in 0..n_dc {
+                            let ac: &[i32] = match &chroma_422 {
+                                Some(cbk) => &cbk.ac_cb[blk][..15],
+                                None => &cb_ac_scan_420[blk][..15],
+                            };
                             let cur = grid.at(mb_x, mb_y).clone();
                             let (ca, cb) = cbf_neighbour_chroma_ac(
-                                &grid, mb_x, mb_y, &cur, true, blk as u8, false,
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                &cur,
+                                true,
+                                blk as u8,
+                                false,
+                                cfg.chroma_format_idc,
                             );
                             let coded = encode_residual_block_cabac(
                                 &mut cabac,
                                 &mut ctxs,
                                 BlockType::ChromaAc,
-                                &cb_ac_scan_420[blk][..15],
+                                ac,
                                 15,
                                 Some(ca),
                                 Some(cb),
                                 false,
-                                1,
+                                num_c8x8,
                             );
                             grid.at_mut(mb_x, mb_y).cbf_cb_ac[blk] = coded;
                         }
-                        for blk in 0..4usize {
+                        for blk in 0..n_dc {
+                            let ac: &[i32] = match &chroma_422 {
+                                Some(cbk) => &cbk.ac_cr[blk][..15],
+                                None => &cr_ac_scan_420[blk][..15],
+                            };
                             let cur = grid.at(mb_x, mb_y).clone();
                             let (ca, cb) = cbf_neighbour_chroma_ac(
-                                &grid, mb_x, mb_y, &cur, true, blk as u8, true,
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                &cur,
+                                true,
+                                blk as u8,
+                                true,
+                                cfg.chroma_format_idc,
                             );
                             let coded = encode_residual_block_cabac(
                                 &mut cabac,
                                 &mut ctxs,
                                 BlockType::ChromaAc,
-                                &cr_ac_scan_420[blk][..15],
+                                ac,
                                 15,
                                 Some(ca),
                                 Some(cb),
                                 false,
-                                1,
+                                num_c8x8,
                             );
                             grid.at_mut(mb_x, mb_y).cbf_cr_ac[blk] = coded;
                         }
@@ -2407,29 +2481,25 @@ impl Encoder {
                         cbp_luma == 15 && luma_ac_scan[i].iter().any(|&v| v != 0)
                     })
                 };
-                let any_chroma_ac_per4x4_cb: [bool; 4] = if cfg.chroma_format_idc == 3 {
+                let chroma_nonzero_4x4: u16 = if cfg.chroma_format_idc == 3 {
                     // 4:4:4: no separate 4-block chroma; deblock uses luma filter.
-                    [false; 4]
+                    0
+                } else if let Some(cbk) = &chroma_422 {
+                    super::chroma_nz_mask_from_chroma_block(cbk, 8)
                 } else {
-                    std::array::from_fn(|i| {
+                    let cb_nz: [bool; 4] = std::array::from_fn(|i| {
                         cbp_chroma == 2 && cb_ac_scan_420[i].iter().any(|&v| v != 0)
-                    })
-                };
-                let any_chroma_ac_per4x4_cr: [bool; 4] = if cfg.chroma_format_idc == 3 {
-                    [false; 4]
-                } else {
-                    std::array::from_fn(|i| {
+                    });
+                    let cr_nz: [bool; 4] = std::array::from_fn(|i| {
                         cbp_chroma == 2 && cr_ac_scan_420[i].iter().any(|&v| v != 0)
-                    })
+                    });
+                    chroma_nz_mask_from_blocks(&cb_nz, &cr_nz)
                 };
                 let dbl = MbDeblockInfo {
                     is_intra: true,
                     qp_y,
                     luma_nonzero_4x4: luma_nz_mask_from_blocks(&any_ac_per4x4),
-                    chroma_nonzero_4x4: chroma_nz_mask_from_blocks(
-                        &any_chroma_ac_per4x4_cb,
-                        &any_chroma_ac_per4x4_cr,
-                    ),
+                    chroma_nonzero_4x4,
                     transform_size_8x8_flag: is_i8x8_mb,
                     ..Default::default()
                 };
@@ -2455,7 +2525,7 @@ impl Encoder {
 
         // Picture-level deblocking (skip for 4:4:4 — disabled in slice header).
         if cfg.chroma_format_idc != 3 {
-            deblock_recon(
+            crate::encoder::deblock::deblock_recon_with_chroma_array_type(
                 cfg.width,
                 cfg.height,
                 chroma_w as u32,
@@ -2467,6 +2537,7 @@ impl Encoder {
                 0,
                 cfg.width / 16,
                 cfg.height / 16,
+                cfg.chroma_format_idc,
             );
         }
 
@@ -2997,7 +3068,7 @@ impl Encoder {
                     for blk in 0..4usize {
                         let cur = grid.at(mb_x, mb_y).clone();
                         let (ca, cb) = cbf_neighbour_chroma_ac(
-                            &grid, mb_x, mb_y, &cur, false, blk as u8, false,
+                            &grid, mb_x, mb_y, &cur, false, blk as u8, false, 1,
                         );
                         let coded = encode_residual_block_cabac(
                             &mut cabac,
@@ -3015,7 +3086,7 @@ impl Encoder {
                     for blk in 0..4usize {
                         let cur = grid.at(mb_x, mb_y).clone();
                         let (ca, cb) = cbf_neighbour_chroma_ac(
-                            &grid, mb_x, mb_y, &cur, false, blk as u8, true,
+                            &grid, mb_x, mb_y, &cur, false, blk as u8, true, 1,
                         );
                         let coded = encode_residual_block_cabac(
                             &mut cabac,
@@ -5271,7 +5342,7 @@ impl Encoder {
                     for blk in 0..4usize {
                         let cur = grid.at(mb_x, mb_y).clone();
                         let (ca, cb) = cbf_neighbour_chroma_ac(
-                            &grid, mb_x, mb_y, &cur, false, blk as u8, false,
+                            &grid, mb_x, mb_y, &cur, false, blk as u8, false, 1,
                         );
                         let coded = encode_residual_block_cabac(
                             &mut cabac,
@@ -5289,7 +5360,7 @@ impl Encoder {
                     for blk in 0..4usize {
                         let cur = grid.at(mb_x, mb_y).clone();
                         let (ca, cb) = cbf_neighbour_chroma_ac(
-                            &grid, mb_x, mb_y, &cur, false, blk as u8, true,
+                            &grid, mb_x, mb_y, &cur, false, blk as u8, true, 1,
                         );
                         let coded = encode_residual_block_cabac(
                             &mut cabac,
