@@ -289,6 +289,94 @@ pub fn intra_cbp_to_codenum_420_422(cbp_luma: u8, cbp_chroma: u8) -> u32 {
     INTRA_CBP_TO_CODENUM_420_422[cbp] as u32
 }
 
+/// Round-385 — Table 9-4(b) intra column inverse (ChromaArrayType ∈
+/// {0, 3}: CBP is the 4-bit luma pattern only).
+const INTRA_CBP_TO_CODENUM_0_3: [u8; 16] = {
+    // Inverse of `crate::macroblock_layer::ME_INTRA_0_3`, reproduced
+    // inline (same convention as the 4:2:0/4:2:2 table above).
+    const FWD: [u8; 16] = [15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9];
+    let mut inv = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        inv[FWD[i] as usize] = i as u8;
+        i += 1;
+    }
+    inv
+};
+
+/// §9.1.2 — encode `coded_block_pattern` for an intra MB at
+/// ChromaArrayType ∈ {0, 3}.
+pub fn intra_cbp_to_codenum_0_3(cbp_luma: u8) -> u32 {
+    debug_assert!(cbp_luma <= 15);
+    INTRA_CBP_TO_CODENUM_0_3[cbp_luma as usize] as u32
+}
+
+/// Round-385 — emit one **4:4:4** Intra_8x8 macroblock (I_NxN with
+/// `transform_size_8x8_flag = 1`, ChromaArrayType == 3, CAVLC).
+/// Per §7.3.5.1 no `intra_chroma_pred_mode` is coded; per §7.3.5.3 the
+/// Cb and Cr planes are coded like luma — the same §7.4.5.3.3
+/// de-interleaved four-4x4 split per coded 8x8 quadrant, gated by the
+/// shared `cbp_luma`. Each plane's per-4x4 nC comes from the caller
+/// (per-plane §9.2.1.1 derivation).
+#[allow(clippy::too_many_arguments)]
+pub fn write_i8x8_mb_444(
+    w: &mut BitWriter,
+    prev_intra8x8_pred_mode_flag: &[bool; 4],
+    rem_intra8x8_pred_mode: &[u8; 4],
+    cbp_luma: u8,
+    mb_qp_delta: i32,
+    luma_4x4_levels: &[[i32; 16]; 16],
+    luma_4x4_nc: &[i32; 16],
+    cb_4x4_levels: &[[i32; 16]; 16],
+    cb_4x4_nc: &[i32; 16],
+    cr_4x4_levels: &[[i32; 16]; 16],
+    cr_4x4_nc: &[i32; 16],
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cbp_luma <= 15);
+
+    // §7.4.5 — Table 7-11: I_NxN mb_type raw = 0 in I-slice.
+    w.ue(0);
+    // §7.3.5 — transform_size_8x8_flag = 1 (read before mb_pred).
+    w.u(1, 1);
+    // §7.3.5.1 mb_pred(): per-8x8-block prev/rem intra pred mode.
+    // No intra_chroma_pred_mode at ChromaArrayType == 3.
+    for blk8 in 0..4usize {
+        let flag = prev_intra8x8_pred_mode_flag[blk8];
+        w.u(1, if flag { 1 } else { 0 });
+        if !flag {
+            debug_assert!(rem_intra8x8_pred_mode[blk8] <= 7);
+            w.u(3, rem_intra8x8_pred_mode[blk8] as u32);
+        }
+    }
+    // §7.3.5 — coded_block_pattern me(v), Table 9-4(b) intra column.
+    w.ue(intra_cbp_to_codenum_0_3(cbp_luma));
+    if cbp_luma > 0 {
+        w.se(mb_qp_delta);
+    }
+    // §7.3.5.3 — luma plane, then Cb, then Cr, each walked with the
+    // §7.4.5.3.3 four-4x4 split per coded quadrant.
+    for (levels, ncs) in [
+        (luma_4x4_levels, luma_4x4_nc),
+        (cb_4x4_levels, cb_4x4_nc),
+        (cr_4x4_levels, cr_4x4_nc),
+    ] {
+        for blk8 in 0..4u8 {
+            if (cbp_luma >> blk8) & 1 == 1 {
+                for sub in 0..4u8 {
+                    let blk = (blk8 * 4 + sub) as usize;
+                    encode_residual_block_cavlc(
+                        w,
+                        CoeffTokenContext::Numeric(ncs[blk]),
+                        16,
+                        &levels[blk],
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Configuration for one Intra_16x16 macroblock.
 pub struct I16x16McbConfig {
     /// `pred_mode` ∈ 0..=3 per Table 8-4 (V/H/DC/Plane).

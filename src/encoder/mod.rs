@@ -1172,12 +1172,12 @@ impl Encoder {
 
         // Round-382 — the High-profile 8x8 transform runs the per-MB
         // RDO with a third (Intra_8x8) trial inside `encode_mb`.
-        // Round-385 extends it to 4:2:2; the 4:4:4 chroma-coded-like-
-        // luma 8x8 path is still deferred.
+        // Round-385 extends it to 4:2:2 (RDO) and to 4:4:4 (all-I_8x8
+        // via the §8.3.4.5 chroma-coded-like-luma path).
         if self.cfg.transform_8x8 {
             assert!(
-                matches!(self.cfg.chroma_format_idc, 1 | 2),
-                "transform_8x8 encode requires 4:2:0 or 4:2:2 chroma"
+                matches!(self.cfg.chroma_format_idc, 1..=3),
+                "transform_8x8 encode requires chroma_format_idc in {{1, 2, 3}}"
             );
         }
         let mut i8x8_mb_count = 0u32;
@@ -1303,12 +1303,19 @@ impl Encoder {
         let width_mbs = (self.cfg.width / 16) as usize;
         let mb_addr = (mb_y as u32) * self.cfg.width / 16 + (mb_x as u32);
 
-        // Round-28: 4:4:4 path is Intra_16x16-only (the I_NxN chroma
-        // emit and the §8.3.4.1-for-ChromaArrayType=3 chroma-as-luma
-        // 4x4 / 8x8 plumbing for the I_NxN side are out of scope this
-        // round). Skip the RDO between I_16x16 and I_NxN and run the
-        // I_16x16 path directly.
+        // Round-28: without transform_8x8 the 4:4:4 path is
+        // Intra_16x16-only (no I_NxN 4x4 chroma-as-luma emit yet).
+        // Round-385: with `transform_8x8` set, every 4:4:4 MB is coded
+        // Intra_8x8 (I_NxN + transform_size_8x8_flag = 1) with the
+        // §8.3.4.5 chroma-coded-like-luma 8x8 path; the RDO between
+        // the two 4:4:4 shapes is a follow-up.
         if self.cfg.chroma_format_idc == 3 {
+            if self.cfg.transform_8x8 {
+                return self.encode_mb_intra8x8_444(
+                    frame, mb_x, mb_y, qp_y, qp_c, recon_y, recon_u, recon_v, sw, nc_grid,
+                    intra_grid,
+                );
+            }
             let trial = self.encode_mb_intra16x16(
                 frame,
                 mb_x,
@@ -2707,6 +2714,306 @@ impl Encoder {
                 transform_size_8x8_flag: true,
                 ..Default::default()
             },
+        }
+    }
+
+    /// Round-385 — encode one **4:4:4 Intra_8x8** macroblock (I_NxN
+    /// with `transform_size_8x8_flag = 1`, ChromaArrayType == 3,
+    /// CAVLC). Luma runs the same §8.3.2 9-mode Lagrangian trial as
+    /// [`Self::encode_mb_intra8x8`]; the Cb / Cr planes are coded like
+    /// luma per §7.3.5.3 with the §8.3.4.5 mode reuse (each plane
+    /// predicts with the quadrant's chosen luma Intra_8x8 mode), the
+    /// §8.6.4 forward 8x8 transform at the chroma QP, and the
+    /// §7.4.5.3.3 de-interleaved four-4x4 CAVLC split gated by the
+    /// shared `cbp_luma` (a quadrant bit is set when ANY of the three
+    /// planes carries a non-zero level; zero planes then emit
+    /// TotalCoeff = 0 sub-blocks). Per-plane §9.2.1.1 nC comes from
+    /// [`derive_nc_plane_luma_like`] with the per-plane totals tracked
+    /// progressively in the shared [`CavlcNcGrid`] — mirroring the
+    /// decoder's plane walker exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mb_intra8x8_444(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+    ) -> MbDeblockInfo {
+        let width = self.cfg.width as usize;
+        let lambda = lambda_ssd(qp_y, true);
+        let sl8 = default_scaling_list_8x8_flat();
+
+        // Pre-mark the slot so in-MB neighbour lookups see this MB's
+        // earlier-block modes (decoder ordering mirror).
+        {
+            let s = intra_grid.slot_mut(mb_x, mb_y);
+            s.available = true;
+            s.is_i_nxn = false;
+            s.is_i8x8 = true;
+            s.intra_8x8_pred_modes = [2u8; 4];
+        }
+
+        let mut prev_flag = [false; 4];
+        let mut rem = [0u8; 4];
+        let mut luma_4x4_levels = [[0i32; 16]; 16];
+        let mut cb_4x4_levels = [[0i32; 16]; 16];
+        let mut cr_4x4_levels = [[0i32; 16]; 16];
+        let mut blk8_luma_nz = [false; 4];
+        let mut blk8_cb_nz = [false; 4];
+        let mut blk8_cr_nz = [false; 4];
+
+        for blk8 in 0..4usize {
+            let bx = mb_x * 16 + (blk8 % 2) * 8;
+            let by = mb_y * 16 + (blk8 / 2) * 8;
+            let predicted = predicted_intra8x8_mode(intra_grid, mb_x, mb_y, blk8);
+
+            // ----- Luma: §8.3.2 9-mode trial (same as the 4:2:0 path). -----
+            let raw = gather_8x8_from_recon(recon_y, width, mb_x, mb_y, blk8);
+            let filtered = filter_samples_8x8(&raw, 8);
+            let mut best_mode = Intra8x8Mode::Dc;
+            let mut best_cost = u64::MAX;
+            let mut best_z_raster = [0i32; 64];
+            let mut best_recon = [0i32; 64];
+            for mode_idx in 0..9u8 {
+                let mode = Intra8x8Mode::from_index(mode_idx).expect("mode index in range");
+                if !intra8x8_mode_available(mode, &raw.availability) {
+                    continue;
+                }
+                let mut pred = [0i32; 64];
+                predict_8x8(mode, &filtered, 8, &mut pred);
+                let mut res = [0i32; 64];
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let s = frame.y[(by + j) * width + bx + i] as i32;
+                        res[j * 8 + i] = s - pred[j * 8 + i];
+                    }
+                }
+                let w_coeffs = forward_core_8x8(&res);
+                let z_raster = quantize_8x8(&w_coeffs, qp_y, true);
+                let r = inverse_transform_8x8(&z_raster, qp_y, &sl8, 8).expect("inverse 8x8");
+                let mut recon_blk = [0i32; 64];
+                let mut d: u64 = 0;
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let v = (pred[j * 8 + i] + r[j * 8 + i]).clamp(0, 255);
+                        recon_blk[j * 8 + i] = v;
+                        let s = frame.y[(by + j) * width + bx + i] as i32;
+                        let e = (s - v) as i64;
+                        d += (e * e) as u64;
+                    }
+                }
+                let mut bits: u64 = 1;
+                if mode_idx != predicted {
+                    bits += 3;
+                }
+                let scan = zigzag_scan_8x8(&z_raster);
+                let subs = deinterleave_8x8_to_4x4(&scan);
+                let mut trial_w = BitWriter::new();
+                for sub in &subs {
+                    if encode_residual_block_cavlc(
+                        &mut trial_w,
+                        CoeffTokenContext::Numeric(0),
+                        16,
+                        sub,
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                bits += trial_w.bits_emitted() as u64;
+                let cost = cost_combined(d, bits, lambda);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_mode = mode;
+                    best_z_raster = z_raster;
+                    best_recon = recon_blk;
+                }
+            }
+            let chosen = best_mode.as_index();
+            if chosen == predicted {
+                prev_flag[blk8] = true;
+            } else {
+                prev_flag[blk8] = false;
+                rem[blk8] = if chosen < predicted {
+                    chosen
+                } else {
+                    chosen - 1
+                };
+            }
+            intra_grid.slot_mut(mb_x, mb_y).intra_8x8_pred_modes[blk8] = chosen;
+            let scan = zigzag_scan_8x8(&best_z_raster);
+            let subs = deinterleave_8x8_to_4x4(&scan);
+            for (i4x4, sub) in subs.iter().enumerate() {
+                luma_4x4_levels[blk8 * 4 + i4x4] = *sub;
+            }
+            blk8_luma_nz[blk8] = best_z_raster.iter().any(|&v| v != 0);
+            for j in 0..8 {
+                for i in 0..8 {
+                    recon_y[(by + j) * width + bx + i] = best_recon[j * 8 + i] as u8;
+                }
+            }
+
+            // ----- Chroma planes: §8.3.4.5 mode reuse + 8x8 transform. -----
+            for plane_is_cr in [false, true] {
+                let (plane_src, plane_recon): (&[u8], &mut [u8]) = if plane_is_cr {
+                    (frame.v, &mut *recon_v)
+                } else {
+                    (frame.u, &mut *recon_u)
+                };
+                let raw_c = gather_8x8_from_recon(plane_recon, width, mb_x, mb_y, blk8);
+                let filtered_c = filter_samples_8x8(&raw_c, 8);
+                let mut pred = [0i32; 64];
+                predict_8x8(best_mode, &filtered_c, 8, &mut pred);
+                let mut res = [0i32; 64];
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let s = plane_src[(by + j) * width + bx + i] as i32;
+                        res[j * 8 + i] = s - pred[j * 8 + i];
+                    }
+                }
+                let w_coeffs = forward_core_8x8(&res);
+                let z_raster = quantize_8x8(&w_coeffs, qp_c, true);
+                let r = inverse_transform_8x8(&z_raster, qp_c, &sl8, 8).expect("inverse 8x8");
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let v = (pred[j * 8 + i] + r[j * 8 + i]).clamp(0, 255);
+                        plane_recon[(by + j) * width + bx + i] = v as u8;
+                    }
+                }
+                let scan = zigzag_scan_8x8(&z_raster);
+                let subs = deinterleave_8x8_to_4x4(&scan);
+                let any_nz = z_raster.iter().any(|&v| v != 0);
+                if plane_is_cr {
+                    for (i4x4, sub) in subs.iter().enumerate() {
+                        cr_4x4_levels[blk8 * 4 + i4x4] = *sub;
+                    }
+                    blk8_cr_nz[blk8] = any_nz;
+                } else {
+                    for (i4x4, sub) in subs.iter().enumerate() {
+                        cb_4x4_levels[blk8 * 4 + i4x4] = *sub;
+                    }
+                    blk8_cb_nz[blk8] = any_nz;
+                }
+            }
+        }
+
+        // §7.4.5.1 — a quadrant's CBP bit covers all three planes.
+        let mut cbp_luma: u8 = 0;
+        for blk8 in 0..4usize {
+            if blk8_luma_nz[blk8] || blk8_cb_nz[blk8] || blk8_cr_nz[blk8] {
+                cbp_luma |= 1u8 << blk8;
+            }
+        }
+        // A cbp-0 quadrant must reconstruct as pred + 0 on every plane;
+        // all three planes quantised to zero there, so the committed
+        // recon already equals the predictor — no rollback needed.
+
+        // ----- §9.2.1.1 nC bookkeeping (luma + per-plane). -----
+        let pic_w_mbs = self.cfg.width / 16;
+        let mb_addr = (mb_y as u32) * pic_w_mbs + (mb_x as u32);
+        {
+            let cur = &mut nc_grid.mbs[mb_addr as usize];
+            cur.is_available = true;
+            cur.is_intra = true;
+            cur.is_skip = false;
+            cur.is_i_pcm = false;
+            cur.luma_total_coeff = [0u8; 16];
+            cur.cb_luma_total_coeff = [0u8; 16];
+            cur.cr_luma_total_coeff = [0u8; 16];
+        }
+        let mut luma_4x4_nc = [0i32; 16];
+        let mut own_totals = [0u8; 16];
+        for blk in 0..16usize {
+            let blk8 = blk / 4;
+            nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+            let nc = derive_nc_luma(nc_grid, mb_addr, blk as u8, LumaNcKind::Ac, true, false);
+            luma_4x4_nc[blk] = nc;
+            own_totals[blk] = if (cbp_luma >> blk8) & 1 == 1 {
+                luma_4x4_levels[blk].iter().filter(|&&v| v != 0).count() as u8
+            } else {
+                0
+            };
+        }
+        nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+
+        let mut cb_4x4_nc = [0i32; 16];
+        let mut cr_4x4_nc = [0i32; 16];
+        for plane_is_cr in [false, true] {
+            let levels = if plane_is_cr {
+                &cr_4x4_levels
+            } else {
+                &cb_4x4_levels
+            };
+            let mut own_plane = [0u8; 16];
+            for blk in 0..16usize {
+                let blk8 = blk / 4;
+                {
+                    let cur = &mut nc_grid.mbs[mb_addr as usize];
+                    if plane_is_cr {
+                        cur.cr_luma_total_coeff = own_plane;
+                    } else {
+                        cur.cb_luma_total_coeff = own_plane;
+                    }
+                }
+                let nc = crate::macroblock_layer::derive_nc_plane_luma_like(
+                    nc_grid,
+                    mb_addr,
+                    blk as u8,
+                    plane_is_cr,
+                    true,
+                    false,
+                );
+                if plane_is_cr {
+                    cr_4x4_nc[blk] = nc;
+                } else {
+                    cb_4x4_nc[blk] = nc;
+                }
+                own_plane[blk] = if (cbp_luma >> blk8) & 1 == 1 {
+                    levels[blk].iter().filter(|&&v| v != 0).count() as u8
+                } else {
+                    0
+                };
+            }
+            let cur = &mut nc_grid.mbs[mb_addr as usize];
+            if plane_is_cr {
+                cur.cr_luma_total_coeff = own_plane;
+            } else {
+                cur.cb_luma_total_coeff = own_plane;
+            }
+        }
+
+        // ----- Emit syntax. -----
+        crate::encoder::macroblock::write_i8x8_mb_444(
+            sw,
+            &prev_flag,
+            &rem,
+            cbp_luma,
+            0,
+            &luma_4x4_levels,
+            &luma_4x4_nc,
+            &cb_4x4_levels,
+            &cb_4x4_nc,
+            &cr_4x4_levels,
+            &cr_4x4_nc,
+        )
+        .expect("write I_8x8 mb (4:4:4)");
+
+        // Deblocking is disabled for 4:4:4 streams (slice header sets
+        // disable_deblocking_filter_idc = 1); the flag still drives the
+        // per-picture Intra_8x8 counter.
+        MbDeblockInfo {
+            is_intra: true,
+            qp_y,
+            transform_size_8x8_flag: true,
+            ..Default::default()
         }
     }
 }

@@ -950,6 +950,44 @@ pub(crate) fn derive_nc_luma(
     combine_nc(avail_a, n_a, avail_b, n_b)
 }
 
+/// Round-385 — §9.2.1.1 nC for a Cb/Cr 4x4 block of the 4:4:4
+/// "coded like luma" path (ChromaArrayType == 3), reading the
+/// per-plane `cb_luma_total_coeff` / `cr_luma_total_coeff` arrays.
+/// Encoder-side mirror of the parse walker's `derive_plane_luma_like`
+/// closure: internal neighbours resolve through the CURRENT MB's grid
+/// slot, so the caller must keep its own per-plane totals progressively
+/// written into the slot (the same discipline `derive_nc_luma` callers
+/// use for `luma_total_coeff`).
+pub(crate) fn derive_nc_plane_luma_like(
+    grid: &CavlcNcGrid,
+    current_mb_addr: u32,
+    blk_idx: u8,
+    is_cr: bool,
+    current_is_intra: bool,
+    constrained_intra_pred_flag: bool,
+) -> i32 {
+    let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk_idx);
+    let (a_mb_addr, a_blk) = resolve_luma_neighbour(grid, current_mb_addr, a_src);
+    let (b_mb_addr, b_blk) = resolve_luma_neighbour(grid, current_mb_addr, b_src);
+    let (avail_a, n_a) = nc_nn_plane_luma_like(
+        grid,
+        a_mb_addr,
+        a_blk,
+        is_cr,
+        current_is_intra,
+        constrained_intra_pred_flag,
+    );
+    let (avail_b, n_b) = nc_nn_plane_luma_like(
+        grid,
+        b_mb_addr,
+        b_blk,
+        is_cr,
+        current_is_intra,
+        constrained_intra_pred_flag,
+    );
+    combine_nc(avail_a, n_a, avail_b, n_b)
+}
+
 /// Turn a `NeighbourSource` (from §6.4.11.4 via `mv_deriv`) into an
 /// `(Option<mb_addr>, block_idx)` pair. `None` means the neighbour MB
 /// lies outside the picture.
