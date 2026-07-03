@@ -2744,6 +2744,12 @@ impl Encoder {
                             }
                         }
                     }
+                    // §7.3.5 — with cbp_luma == 0 the second-gate flag is
+                    // not coded and the decoder infers 0; normalise so the
+                    // grid / deblock mirrors agree with the decoder.
+                    if cbp_luma == 0 {
+                        transform_size_8x8 = false;
+                    }
                 }
 
                 // Chroma residual.
@@ -3206,11 +3212,6 @@ impl Encoder {
             cfg.profile_idc,
         );
         assert_eq!(cfg.chroma_format_idc, 1, "round-31 CABAC B is 4:2:0 only");
-        assert!(
-            !cfg.transform_8x8,
-            "encode_b_cabac does not yet code the §7.3.5 second-gate \
-             transform_size_8x8_flag required inside a transform_8x8_mode_flag=1 stream",
-        );
         assert_eq!(frame.width, cfg.width);
         assert_eq!(frame.height, cfg.height);
         assert_eq!(ref_l0.width, cfg.width);
@@ -3269,6 +3270,8 @@ impl Encoder {
         let mut grid = CabacEncGrid::new(width_mbs, height_mbs);
         let mut mb_dbl: Vec<MbDeblockInfo> = vec![MbDeblockInfo::default(); width_mbs * height_mbs];
         let mut prev_mb_qp_delta_nonzero = false;
+        // Round-385 — count of MBs coded with transform_size_8x8_flag = 1.
+        let mut i8x8_mb_count = 0u32;
 
         for mb_y in 0..height_mbs {
             for mb_x in 0..width_mbs {
@@ -4317,6 +4320,81 @@ impl Encoder {
                     }
                 }
 
+                // Round-385 — §8.6.4 inter 8x8-transform alternative on
+                // the B luma residual (same J = D + λ·R trial as the P
+                // CABAC path). Every mb_type this encoder emits passes
+                // the §7.3.5 second gate in a transform_8x8_mode_flag=1
+                // stream: no sub-partition below 8x8 and
+                // direct_8x8_inference_flag = 1 in our SPS.
+                let mut transform_size_8x8 = false;
+                let mut scan8_blocks = [[0i32; 64]; 4];
+                if cfg.transform_8x8 {
+                    let inter_luma8 =
+                        forward_inter_luma_8x8(frame.y, width, mb_x, mb_y, &pred_y, qp_y);
+                    let mut cbp_luma8: u8 = 0;
+                    for blk8 in 0..4usize {
+                        if inter_luma8.blk_has_nz[blk8 * 4] {
+                            cbp_luma8 |= 1u8 << blk8;
+                        }
+                    }
+                    let mut recon_tiles = [[0i32; 16]; 16];
+                    for (blk, &(bx, by)) in LUMA_4X4_BLK.iter().enumerate() {
+                        for j in 0..4usize {
+                            for i in 0..4usize {
+                                recon_tiles[blk][j * 4 + i] =
+                                    recon_residual_y[(by * 4 + j) * 16 + bx * 4 + i];
+                            }
+                        }
+                    }
+                    let fwd4 = InterLumaForward {
+                        levels_scan: luma_blocks,
+                        quant_raster: [[0i32; 16]; 16],
+                        blk_has_nz,
+                        recon_residual: recon_tiles,
+                    };
+                    let lambda = lambda_ssd(qp_y, false);
+                    let j4 = inter_luma_transform_cost(
+                        frame.y, width, mb_x, mb_y, &pred_y, &fwd4, cbp_luma, lambda,
+                    );
+                    let j8 = inter_luma_transform_cost(
+                        frame.y,
+                        width,
+                        mb_x,
+                        mb_y,
+                        &pred_y,
+                        &inter_luma8,
+                        cbp_luma8,
+                        lambda,
+                    );
+                    if j8 < j4 {
+                        transform_size_8x8 = true;
+                        cbp_luma = cbp_luma8;
+                        blk_has_nz = inter_luma8.blk_has_nz;
+                        for (blk, &(bx, by)) in LUMA_4X4_BLK.iter().enumerate() {
+                            for j in 0..4usize {
+                                for i in 0..4usize {
+                                    recon_residual_y[(by * 4 + j) * 16 + bx * 4 + i] =
+                                        inter_luma8.recon_residual[blk][j * 4 + i];
+                                }
+                            }
+                        }
+                        for blk8 in 0..4usize {
+                            for i4 in 0..4usize {
+                                for k in 0..16usize {
+                                    scan8_blocks[blk8][4 * k + i4] =
+                                        inter_luma8.levels_scan[blk8 * 4 + i4][k];
+                                }
+                            }
+                        }
+                    }
+                    // §7.3.5 — with cbp_luma == 0 the second-gate flag is
+                    // not coded and the decoder infers 0; normalise so the
+                    // grid / deblock mirrors agree with the decoder.
+                    if cbp_luma == 0 {
+                        transform_size_8x8 = false;
+                    }
+                }
+
                 // Chroma residual.
                 let (cb_dc, cb_ac_scan, _cb_ac_quant, _cb_dc_nz, cb_ac_nz, cb_recon_res) =
                     encode_chroma_inter_420(frame.u, &pred_u, chroma_w, mb_x, mb_y, qp_c);
@@ -5063,6 +5141,14 @@ impl Encoder {
                 // coded_block_pattern.
                 encode_coded_block_pattern(&mut cabac, &mut ctxs, &nb, 1, cbp_luma, cbp_chroma);
 
+                // §7.3.5 second gate — every coded B shape this encoder
+                // emits qualifies (no sub-partition below 8x8;
+                // direct_8x8_inference_flag = 1 covers B_Direct_16x16 and
+                // B_Direct_8x8 sub-partitions).
+                if cfg.transform_8x8 && cbp_luma > 0 {
+                    encode_transform_size_8x8_flag(&mut cabac, &mut ctxs, &nb, transform_size_8x8);
+                }
+
                 // mb_qp_delta only when CBP > 0.
                 let needs_qpd = cbp_luma > 0 || cbp_chroma > 0;
                 if needs_qpd {
@@ -5083,31 +5169,54 @@ impl Encoder {
                 }
 
                 // Luma residual blocks (per-8x8 gated).
-                for blk8 in 0..4u8 {
-                    if (cbp_luma >> blk8) & 1 == 1 {
-                        for sub in 0..4u8 {
-                            let blkz = (blk8 * 4 + sub) as usize;
-                            let cur = grid.at(mb_x, mb_y).clone();
-                            let (ca, cb) = cbf_neighbour_luma_ac(
-                                &grid,
-                                mb_x,
-                                mb_y,
-                                &cur,
-                                false,
-                                BlockType::Luma4x4,
-                                blkz as u8,
-                            );
+                if transform_size_8x8 {
+                    // §7.3.5.3.3 — blockCat-5 64-coefficient residual per
+                    // coded quadrant; CBF suppressed at 4:2:0 and folded
+                    // into the 4x4 slots (decoder mirror).
+                    for blk8 in 0..4usize {
+                        if (cbp_luma >> blk8) & 1 == 1 {
                             let coded = encode_residual_block_cabac(
                                 &mut cabac,
                                 &mut ctxs,
-                                BlockType::Luma4x4,
-                                &luma_blocks[blkz],
-                                16,
-                                Some(ca),
-                                Some(cb),
-                                false,
+                                BlockType::Luma8x8,
+                                &scan8_blocks[blk8],
+                                64,
+                                None,
+                                None,
+                                true,
                             );
-                            grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blkz] = coded;
+                            for sub in 0..4usize {
+                                grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blk8 * 4 + sub] = coded;
+                            }
+                        }
+                    }
+                } else {
+                    for blk8 in 0..4u8 {
+                        if (cbp_luma >> blk8) & 1 == 1 {
+                            for sub in 0..4u8 {
+                                let blkz = (blk8 * 4 + sub) as usize;
+                                let cur = grid.at(mb_x, mb_y).clone();
+                                let (ca, cb) = cbf_neighbour_luma_ac(
+                                    &grid,
+                                    mb_x,
+                                    mb_y,
+                                    &cur,
+                                    false,
+                                    BlockType::Luma4x4,
+                                    blkz as u8,
+                                );
+                                let coded = encode_residual_block_cabac(
+                                    &mut cabac,
+                                    &mut ctxs,
+                                    BlockType::Luma4x4,
+                                    &luma_blocks[blkz],
+                                    16,
+                                    Some(ca),
+                                    Some(cb),
+                                    false,
+                                );
+                                grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blkz] = coded;
+                            }
                         }
                     }
                 }
@@ -5240,6 +5349,10 @@ impl Encoder {
                 info.is_b_skip_or_direct = is_direct;
                 info.cbp_luma = cbp_luma;
                 info.cbp_chroma = cbp_chroma;
+                info.transform_size_8x8 = transform_size_8x8;
+                if transform_size_8x8 {
+                    i8x8_mb_count += 1;
+                }
                 if is_direct || is_direct_per_8x8 {
                     info.ref_idx_l0_8x8 = [direct.ref_idx_l0; 4];
                     info.mv_l0_8x8 = direct.mv_l0_per_8x8;
@@ -5707,7 +5820,7 @@ impl Encoder {
                     mv_l1: mv_l1_arr,
                     ref_idx_l1: ref_idx_l1_arr,
                     ref_poc_l1: ref_poc_l1_arr,
-                    transform_size_8x8_flag: false,
+                    transform_size_8x8_flag: transform_size_8x8,
                 };
 
                 let is_last = mb_x + 1 == width_mbs && mb_y + 1 == height_mbs;
@@ -5755,8 +5868,7 @@ impl Encoder {
             frame_num,
             pic_order_cnt_lsb,
             partition_mvs,
-            // The CABAC B path does not code the 8x8 transform.
-            i8x8_mb_count: 0,
+            i8x8_mb_count,
         }
     }
 }

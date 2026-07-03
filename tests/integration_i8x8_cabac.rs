@@ -302,6 +302,145 @@ fn i8x8_cabac_p_slice_second_gate_flag_roundtrips_bit_exact() {
 }
 
 #[test]
+fn i8x8_cabac_b_slice_gop_second_gate_flag_roundtrips_bit_exact() {
+    use oxideav_h264::encoder::EncodedFrameRef;
+
+    // IDR + P + B CABAC GOP inside a transform_8x8 stream. Every coded
+    // B MB with cbp_luma > 0 must code the §7.3.5 second-gate flag or
+    // the decoders desync; the halfway blend + low-frequency ramp makes
+    // the 8x8 trial win on some B MBs too.
+    let (y0, u0, v0) = make_source();
+    let (y2, u2, v2) = make_p_source();
+    let mut y1 = vec![0u8; W * H];
+    for (k, out) in y1.iter_mut().enumerate() {
+        let blend = (y0[k] as u32 + y2[k] as u32) / 2;
+        let ramp = ((k % W) / 4) as u32;
+        *out = (blend + ramp).min(235) as u8;
+    }
+    let f0 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let f1 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y1,
+        u: &u0,
+        v: &v0,
+    };
+    let f2 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y2,
+        u: &u2,
+        v: &v2,
+    };
+    let cfg = EncoderConfig {
+        cabac: true,
+        profile_idc: 100,
+        transform_8x8: true,
+        max_num_ref_frames: 2,
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&f0);
+    let p = enc.encode_p_cabac(&f2, &EncodedFrameRef::from(&idr), 1, 4);
+    let b = enc.encode_b_cabac(
+        &f1,
+        &EncodedFrameRef::from(&idr),
+        &EncodedFrameRef::from(&p),
+        2,
+        2,
+    );
+
+    // Vacuity guards: the B slice genuinely codes MBs and the 8x8
+    // trial genuinely fires on the B residual.
+    assert!(
+        b.i8x8_mb_count > 0,
+        "B-slice trial never picked the 8x8 transform on the blend+ramp residual"
+    );
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&idr.annex_b);
+    combined.extend_from_slice(&p.annex_b);
+    combined.extend_from_slice(&b.annex_b);
+
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), combined.clone()).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let mut frames = Vec::new();
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        frames.push(vf);
+    }
+    assert_eq!(frames.len(), 3, "expected IDR + B + P in output order");
+    // Output order: IDR (poc 0), B (poc 2), P (poc 4).
+    assert_eq!(plane_max_diff(&frames[0], 0, &idr.recon_y, W, H), 0);
+    assert_eq!(plane_max_diff(&frames[1], 0, &b.recon_y, W, H), 0, "B Y");
+    assert_eq!(
+        plane_max_diff(&frames[1], 1, &b.recon_u, W / 2, H / 2),
+        0,
+        "B Cb"
+    );
+    assert_eq!(
+        plane_max_diff(&frames[1], 2, &b.recon_v, W / 2, H / 2),
+        0,
+        "B Cr"
+    );
+    assert_eq!(plane_max_diff(&frames[2], 0, &p.recon_y, W, H), 0, "P Y");
+
+    // Black-box reference decoder interop on the 3-frame stream.
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: reference decoder binary not present");
+        return;
+    }
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!(
+        "oxideav_h264_r385_b8x8_cabac_{}.h264",
+        std::process::id()
+    ));
+    let yuv_path = tmpdir.join(format!(
+        "oxideav_h264_r385_b8x8_cabac_{}.yuv",
+        std::process::id()
+    ));
+    std::fs::write(&h264_path, &combined).expect("write h264");
+    let status = std::process::Command::new(ffmpeg)
+        .args(["-loglevel", "error", "-y", "-f", "h264", "-i"])
+        .arg(&h264_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn reference decoder");
+    assert!(status.success(), "reference decoder rejected the stream");
+    let yuv = std::fs::read(&yuv_path).expect("read decoded yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+    let frame_bytes = W * H + 2 * (W / 2) * (H / 2);
+    assert_eq!(yuv.len(), 3 * frame_bytes, "expected three 4:2:0 frames");
+    // Display order: IDR, B, P.
+    let fb = &yuv[frame_bytes..2 * frame_bytes];
+    assert_eq!(
+        &fb[..W * H],
+        &b.recon_y[..],
+        "B-frame luma mismatch vs reference decoder"
+    );
+    assert_eq!(
+        &fb[W * H..W * H + (W / 2) * (H / 2)],
+        &b.recon_u[..],
+        "B-frame Cb mismatch vs reference decoder"
+    );
+    assert_eq!(
+        &fb[W * H + (W / 2) * (H / 2)..],
+        &b.recon_v[..],
+        "B-frame Cr mismatch vs reference decoder"
+    );
+}
+
+#[test]
 fn i8x8_cabac_idr_reference_decoder_interop() {
     let idr = encode_i8x8_cabac();
     assert!(idr.i8x8_mb_count > 0);
