@@ -1114,7 +1114,7 @@ fn nc_nn_plane_luma_like(
 /// (xN, yN) locations and Table 6-3, we implement the same neighbour
 /// dispatch directly on the chroma block's (x, y) in the MB's chroma
 /// grid (§6.4.7 eq. 6-21/6-22 for the inverse scan).
-fn derive_nc_chroma_ac(
+pub(crate) fn derive_nc_chroma_ac(
     grid: &CavlcNcGrid,
     current_mb_addr: u32,
     blk_idx: u8,

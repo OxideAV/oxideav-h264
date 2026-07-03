@@ -51,6 +51,11 @@ pub enum ChromaWriteKind<'a> {
         /// Per-plane AC 4x4 blocks (Cb), AC-only scan layout.
         chroma_ac_cb: &'a [[i32; 16]; 4],
         chroma_ac_cr: &'a [[i32; 16]; 4],
+        /// §9.2.1.1 — per-block chroma-AC `nC` (coeff_token table
+        /// selector), derived by the caller from the `CavlcNcGrid`
+        /// neighbours + in-MB progression. First 4 entries used.
+        cb_ac_nc: &'a [i32; 8],
+        cr_ac_nc: &'a [i32; 8],
     },
     /// 4:2:2 chroma layout. The DC arrays are 8-entry already in
     /// `ChromaDCLevel` scan order (apply
@@ -61,6 +66,9 @@ pub enum ChromaWriteKind<'a> {
         chroma_dc_cr: &'a [i32; 8],
         chroma_ac_cb: &'a [[i32; 16]; 8],
         chroma_ac_cr: &'a [[i32; 16]; 8],
+        /// §9.2.1.1 — per-block chroma-AC `nC` (all 8 entries used).
+        cb_ac_nc: &'a [i32; 8],
+        cr_ac_nc: &'a [i32; 8],
     },
     /// Round-28 — 4:4:4 chroma layout. Per §7.3.5.3 chroma is "coded
     /// like luma" for ChromaArrayType==3: each plane has its own 16x16
@@ -122,6 +130,8 @@ impl<'a> ChromaWriteKind<'a> {
                 chroma_dc_cr,
                 chroma_ac_cb,
                 chroma_ac_cr,
+                cb_ac_nc,
+                cr_ac_nc,
             } => {
                 if cbp_chroma > 0 {
                     encode_residual_block_cavlc(
@@ -138,18 +148,18 @@ impl<'a> ChromaWriteKind<'a> {
                     )?;
                 }
                 if cbp_chroma == 2 {
-                    for blk in chroma_ac_cb {
+                    for (k, blk) in chroma_ac_cb.iter().enumerate() {
                         encode_residual_block_cavlc(
                             w,
-                            CoeffTokenContext::Numeric(0),
+                            CoeffTokenContext::Numeric(cb_ac_nc[k]),
                             15,
                             &blk[..15],
                         )?;
                     }
-                    for blk in chroma_ac_cr {
+                    for (k, blk) in chroma_ac_cr.iter().enumerate() {
                         encode_residual_block_cavlc(
                             w,
-                            CoeffTokenContext::Numeric(0),
+                            CoeffTokenContext::Numeric(cr_ac_nc[k]),
                             15,
                             &blk[..15],
                         )?;
@@ -161,6 +171,8 @@ impl<'a> ChromaWriteKind<'a> {
                 chroma_dc_cr,
                 chroma_ac_cb,
                 chroma_ac_cr,
+                cb_ac_nc,
+                cr_ac_nc,
             } => {
                 if cbp_chroma > 0 {
                     encode_residual_block_cavlc(
@@ -177,18 +189,18 @@ impl<'a> ChromaWriteKind<'a> {
                     )?;
                 }
                 if cbp_chroma == 2 {
-                    for blk in chroma_ac_cb {
+                    for (k, blk) in chroma_ac_cb.iter().enumerate() {
                         encode_residual_block_cavlc(
                             w,
-                            CoeffTokenContext::Numeric(0),
+                            CoeffTokenContext::Numeric(cb_ac_nc[k]),
                             15,
                             &blk[..15],
                         )?;
                     }
-                    for blk in chroma_ac_cr {
+                    for (k, blk) in chroma_ac_cr.iter().enumerate() {
                         encode_residual_block_cavlc(
                             w,
-                            CoeffTokenContext::Numeric(0),
+                            CoeffTokenContext::Numeric(cr_ac_nc[k]),
                             15,
                             &blk[..15],
                         )?;
@@ -415,6 +427,11 @@ pub struct I16x16McbConfig {
     pub chroma_ac_cb: [[i32; 16]; 4],
     /// Per-4x4-block chroma AC levels (Cr).
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// §7.4.5 — Table 7-11 row index for an Intra_16x16 macroblock with the
@@ -556,15 +573,27 @@ pub fn write_intra16x16_mb(
     if cfg.cbp_chroma == 2 {
         // Chroma AC blocks: 4 sub-blocks per plane, Cb first then Cr.
         // Each block carries 15 AC coefficients in scan order.
-        // §9.2.1 — nC for chroma AC is derived from neighbour
-        // ChromaAC TotalCoeff. Round-2 simplification: pass
-        // `Numeric(0)` for every chroma AC block — that's only
-        // bit-rate-suboptimal, never incorrect.
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        // §9.2.1 — nC for chroma AC is derived from the neighbour
+        // blocks' TotalCoeff (grid + in-MB progression), supplied by
+        // the caller. Round-388: the historical Numeric(0) shortcut
+        // was NOT merely rate-suboptimal — nC selects the coeff_token
+        // VLC *table*, so any neighbour total ≥ 2 desynchronised every
+        // spec decoder on dense chroma.
+        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -629,11 +658,21 @@ pub fn write_intra16x16_mb_in_inter_slice(
         encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
     }
     if cfg.cbp_chroma == 2 {
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -703,6 +742,11 @@ pub struct INxNMcbConfig {
     pub chroma_ac_cb: [[i32; 16]; 4],
     /// Per-4x4-block chroma AC levels (Cr).
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one I_NxN (Intra_4x4) macroblock with caller-supplied chroma
@@ -833,11 +877,21 @@ pub fn write_i_nxn_mb(w: &mut BitWriter, cfg: &INxNMcbConfig) -> Result<(), Cavl
         encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
     }
     if cfg.cbp_chroma == 2 {
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -899,6 +953,11 @@ pub struct I8x8McbConfig {
     pub chroma_ac_cb: [[i32; 16]; 4],
     /// Per-4x4-block chroma AC levels (Cr).
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one Intra_8x8 macroblock (CAVLC, I-slice, 4:2:0 chroma). The
@@ -919,6 +978,8 @@ pub fn write_i8x8_mb(w: &mut BitWriter, cfg: &I8x8McbConfig) -> Result<(), Cavlc
             chroma_dc_cr: &cfg.chroma_dc_cr,
             chroma_ac_cb: &cfg.chroma_ac_cb,
             chroma_ac_cr: &cfg.chroma_ac_cr,
+            cb_ac_nc: &cfg.chroma_ac_nc_cb,
+            cr_ac_nc: &cfg.chroma_ac_nc_cr,
         },
     )
 }
@@ -1084,6 +1145,11 @@ pub struct PL016x16McbConfig {
     pub chroma_ac_cb: [[i32; 16]; 4],
     /// Per-4x4-block chroma AC levels (Cr).
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one P_L0_16x16 macroblock (CAVLC, P-slice).
@@ -1159,11 +1225,21 @@ pub fn write_p_l0_16x16_mb(
         encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
     }
     if cfg.cbp_chroma == 2 {
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -1229,6 +1305,11 @@ pub struct P8x8AllPL08x8McbConfig {
     pub chroma_ac_cb: [[i32; 16]; 4],
     /// Per-4x4-block chroma AC levels (Cr).
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one P_8x8 macroblock with all four sub_mb_type set to
@@ -1307,11 +1388,21 @@ pub fn write_p_8x8_all_pl08x8_mb(
         encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
     }
     if cfg.cbp_chroma == 2 {
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -1428,6 +1519,11 @@ pub struct B16x16McbConfig {
     pub chroma_ac_cb: [[i32; 16]; 4],
     /// Per-4x4-block chroma AC levels (Cr).
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one B-slice explicit 16x16 macroblock (CAVLC, B-slice).
@@ -1508,11 +1604,21 @@ pub fn write_b_16x16_mb(
         encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
     }
     if cfg.cbp_chroma == 2 {
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -1568,6 +1674,11 @@ pub struct BDirect16x16McbConfig {
     pub chroma_ac_cb: [[i32; 16]; 4],
     /// Per-4x4-block chroma AC levels (Cr).
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one B-slice `B_Direct_16x16` macroblock (CAVLC).
@@ -1625,11 +1736,21 @@ pub fn write_b_direct_16x16_mb(
         encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
     }
     if cfg.cbp_chroma == 2 {
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -1776,6 +1897,11 @@ pub struct B16x8McbConfig {
     pub chroma_dc_cr: [i32; 4],
     pub chroma_ac_cb: [[i32; 16]; 4],
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one B-slice 16x8 macroblock (CAVLC, B-slice). Mirrors the field
@@ -1812,6 +1938,8 @@ pub fn write_b_16x8_mb(
         &cfg.chroma_dc_cr,
         &cfg.chroma_ac_cb,
         &cfg.chroma_ac_cr,
+        &cfg.chroma_ac_nc_cb,
+        &cfg.chroma_ac_nc_cr,
     )
 }
 
@@ -1845,6 +1973,11 @@ pub struct B8x16McbConfig {
     pub chroma_dc_cr: [i32; 4],
     pub chroma_ac_cb: [[i32; 16]; 4],
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one B-slice 8x16 macroblock. Field order identical to 16x8 —
@@ -1882,6 +2015,8 @@ pub fn write_b_8x16_mb(
         &cfg.chroma_dc_cr,
         &cfg.chroma_ac_cb,
         &cfg.chroma_ac_cr,
+        &cfg.chroma_ac_nc_cb,
+        &cfg.chroma_ac_nc_cr,
     )
 }
 
@@ -1944,6 +2079,8 @@ fn write_b_two_part_residuals(
     chroma_dc_cr: &[i32; 4],
     chroma_ac_cb: &[[i32; 16]; 4],
     chroma_ac_cr: &[[i32; 16]; 4],
+    chroma_ac_nc_cb: &[i32; 8],
+    chroma_ac_nc_cr: &[i32; 8],
 ) -> Result<(), CavlcEncodeError> {
     let codenum = inter_cbp_to_codenum_420_422(cbp_luma, cbp_chroma);
     w.ue(codenum);
@@ -1981,11 +2118,21 @@ fn write_b_two_part_residuals(
         encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, chroma_dc_cr)?;
     }
     if cbp_chroma == 2 {
-        for blk in chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -2081,6 +2228,11 @@ pub struct B8x8AllDirectMcbConfig {
     pub chroma_ac_cb: [[i32; 16]; 4],
     /// Per-4x4-block chroma AC levels (Cr).
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one B-slice `B_8x8` macroblock with all four sub-MBs as
@@ -2150,11 +2302,21 @@ pub fn write_b_8x8_all_direct_mb(
         encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
     }
     if cfg.cbp_chroma == 2 {
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -2303,6 +2465,11 @@ pub struct B8x8MixedMcbConfig {
     pub chroma_dc_cr: [i32; 4],
     pub chroma_ac_cb: [[i32; 16]; 4],
     pub chroma_ac_cr: [[i32; 16]; 4],
+    /// §9.2.1.1 — per-chroma-AC-block `nC` (coeff_token table
+    /// selector), derived by the caller from the `CavlcNcGrid`
+    /// neighbours + in-MB progression (first 4 entries used at 4:2:0).
+    pub chroma_ac_nc_cb: [i32; 8],
+    pub chroma_ac_nc_cr: [i32; 8],
 }
 
 /// Emit one B-slice `B_8x8` macroblock with mixed sub-MB types per
@@ -2406,11 +2573,21 @@ pub fn write_b_8x8_mixed_mb(
         encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
     }
     if cfg.cbp_chroma == 2 {
-        for blk in &cfg.chroma_ac_cb {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
+                15,
+                &blk[..15],
+            )?;
         }
-        for blk in &cfg.chroma_ac_cr {
-            encode_residual_block_cavlc(w, CoeffTokenContext::Numeric(0), 15, &blk[..15])?;
+        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
+                15,
+                &blk[..15],
+            )?;
         }
     }
     Ok(())
@@ -2540,6 +2717,8 @@ mod tests {
     fn b_8x8_all_direct_zero_residual_emits_expected_bit_count() {
         let mut bw = BitWriter::new();
         let cfg = B8x8AllDirectMcbConfig {
+            chroma_ac_nc_cb: [0; 8],
+            chroma_ac_nc_cr: [0; 8],
             transform_size_8x8_flag: None,
             cbp_luma: 0,
             cbp_chroma: 0,
@@ -2567,6 +2746,8 @@ mod tests {
     fn b_direct_16x16_zero_residual_emits_two_bits() {
         let mut bw = BitWriter::new();
         let cfg = BDirect16x16McbConfig {
+            chroma_ac_nc_cb: [0; 8],
+            chroma_ac_nc_cr: [0; 8],
             transform_size_8x8_flag: None,
             cbp_luma: 0,
             cbp_chroma: 0,
@@ -2642,6 +2823,8 @@ mod tests {
     fn b_16x8_writer_round_trip_smoke() {
         let mut bw = BitWriter::new();
         let cfg = B16x8McbConfig {
+            chroma_ac_nc_cb: [0; 8],
+            chroma_ac_nc_cr: [0; 8],
             transform_size_8x8_flag: None,
             top: BPartPred::Bi,
             bottom: BPartPred::Bi,
@@ -2669,6 +2852,8 @@ mod tests {
     fn b_8x16_writer_l0_l1_zero_residual_bit_count() {
         let mut bw = BitWriter::new();
         let cfg = B8x16McbConfig {
+            chroma_ac_nc_cb: [0; 8],
+            chroma_ac_nc_cr: [0; 8],
             transform_size_8x8_flag: None,
             left: BPartPred::L0,
             right: BPartPred::L1,
@@ -2739,6 +2924,8 @@ mod tests {
     fn b_8x8_mixed_zero_residual_emits_expected_bit_count() {
         let mut bw = BitWriter::new();
         let cfg = B8x8MixedMcbConfig {
+            chroma_ac_nc_cb: [0; 8],
+            chroma_ac_nc_cr: [0; 8],
             transform_size_8x8_flag: None,
             cells: [
                 BSubMbCell::Direct,
@@ -2770,6 +2957,8 @@ mod tests {
     fn b_8x8_mixed_all_direct_matches_dedicated_all_direct_writer_bit_count() {
         let mut bw = BitWriter::new();
         let cfg = B8x8MixedMcbConfig {
+            chroma_ac_nc_cb: [0; 8],
+            chroma_ac_nc_cr: [0; 8],
             transform_size_8x8_flag: None,
             cells: [BSubMbCell::Direct; 4],
             mvd_l0: [(0, 0); 4],
@@ -2790,6 +2979,8 @@ mod tests {
         // Sanity: matches the dedicated all-Direct writer byte-for-byte.
         let mut bw_dedicated = BitWriter::new();
         let cfg_dedicated = B8x8AllDirectMcbConfig {
+            chroma_ac_nc_cb: [0; 8],
+            chroma_ac_nc_cr: [0; 8],
             transform_size_8x8_flag: None,
             cbp_luma: 0,
             cbp_chroma: 0,

@@ -1975,6 +1975,15 @@ impl Encoder {
         let nc_dc_ctx = CoeffTokenContext::Numeric(nc_dc);
         if chroma_array_type == 1 {
             let chroma_block = chroma_block_for_mask.as_ref().unwrap();
+            let (nc_cb, nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+                nc_grid,
+                mb_addr,
+                true,
+                cbp_chroma,
+                &chroma_block.ac_cb[..4],
+                &chroma_block.ac_cr[..4],
+                1,
+            );
             let mb_cfg = I16x16McbConfig {
                 pred_mode: best_luma_mode.as_u8(),
                 intra_chroma_pred_mode: best_chroma_mode_u8,
@@ -1988,13 +1997,23 @@ impl Encoder {
                 chroma_dc_cr: v_dc_levels,
                 chroma_ac_cb: u_ac_levels,
                 chroma_ac_cr: v_ac_levels,
+                chroma_ac_nc_cb: nc_cb,
+                chroma_ac_nc_cr: nc_cr,
             };
-            let _ = chroma_block; // silence "unused" if helper changes.
             write_intra16x16_mb(sw, &mb_cfg, nc_dc_ctx).expect("write Intra16x16 mb");
         } else if chroma_array_type == 2 {
             // Round-27: 4:2:2 path. Pass per-plane 8-entry DC + 8-block
             // AC arrays via `ChromaWriteKind::Yuv422`.
             let chroma_block = chroma_block_for_mask.as_ref().unwrap();
+            let (nc_cb, nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+                nc_grid,
+                mb_addr,
+                true,
+                cbp_chroma,
+                &chroma_block.ac_cb,
+                &chroma_block.ac_cr,
+                2,
+            );
             crate::encoder::macroblock::write_intra16x16_mb_chroma(
                 sw,
                 best_luma_mode.as_u8(),
@@ -2010,6 +2029,8 @@ impl Encoder {
                     chroma_dc_cr: &chroma_block.dc_cr,
                     chroma_ac_cb: &chroma_block.ac_cb,
                     chroma_ac_cr: &chroma_block.ac_cr,
+                    cb_ac_nc: &nc_cb,
+                    cr_ac_nc: &nc_cr,
                 },
                 nc_dc_ctx,
             )
@@ -2438,6 +2459,17 @@ impl Encoder {
         }
         nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
 
+        // §9.2.1.1 — per-block chroma-AC nC + grid totals commit.
+        let (chroma_nc_cb, chroma_nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+            nc_grid,
+            mb_addr,
+            true,
+            cbp_chroma,
+            &chroma_block.ac_cb[..ChromaBlock::cb_block_count(chroma_array_type)],
+            &chroma_block.ac_cr[..ChromaBlock::cb_block_count(chroma_array_type)],
+            chroma_array_type,
+        );
+
         // ----- Emit syntax. -----
         if chroma_array_type == 1 {
             let mb_cfg = INxNMcbConfig {
@@ -2457,6 +2489,8 @@ impl Encoder {
                 chroma_dc_cr: v_dc_levels,
                 chroma_ac_cb: u_ac_levels,
                 chroma_ac_cr: v_ac_levels,
+                chroma_ac_nc_cb: chroma_nc_cb,
+                chroma_ac_nc_cr: chroma_nc_cr,
             };
             write_i_nxn_mb(sw, &mb_cfg).expect("write I_NxN mb");
         } else {
@@ -2479,6 +2513,8 @@ impl Encoder {
                     chroma_dc_cr: &chroma_block.dc_cr,
                     chroma_ac_cb: &chroma_block.ac_cb,
                     chroma_ac_cr: &chroma_block.ac_cr,
+                    cb_ac_nc: &chroma_nc_cb,
+                    cr_ac_nc: &chroma_nc_cr,
                 },
             )
             .expect("write I_NxN mb (4:2:2)");
@@ -2734,6 +2770,17 @@ impl Encoder {
         }
         nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
 
+        // §9.2.1.1 — per-block chroma-AC nC + grid totals commit.
+        let (chroma_nc_cb, chroma_nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+            nc_grid,
+            mb_addr,
+            true,
+            cbp_chroma,
+            &chroma_block.ac_cb[..ChromaBlock::cb_block_count(chroma_array_type)],
+            &chroma_block.ac_cr[..ChromaBlock::cb_block_count(chroma_array_type)],
+            chroma_array_type,
+        );
+
         // Emit syntax.
         if chroma_array_type == 1 {
             let mut u_dc_levels = [0i32; 4];
@@ -2757,6 +2804,8 @@ impl Encoder {
                 chroma_dc_cr: v_dc_levels,
                 chroma_ac_cb: u_ac_levels,
                 chroma_ac_cr: v_ac_levels,
+                chroma_ac_nc_cb: chroma_nc_cb,
+                chroma_ac_nc_cr: chroma_nc_cr,
             };
             write_i8x8_mb(sw, &mb_cfg).expect("write I_8x8 mb");
         } else {
@@ -2777,6 +2826,8 @@ impl Encoder {
                     chroma_dc_cr: &chroma_block.dc_cr,
                     chroma_ac_cb: &chroma_block.ac_cb,
                     chroma_ac_cr: &chroma_block.ac_cr,
+                    cb_ac_nc: &chroma_nc_cb,
+                    cr_ac_nc: &chroma_nc_cr,
                 },
             )
             .expect("write I_8x8 mb (4:2:2)");
@@ -3657,6 +3708,75 @@ fn encode_chroma_residual_inter(
         qp_c,
         &FLAT_4X4_16,
     )
+}
+
+/// §9.2.1.1 — derive the per-block chroma-AC `nC` values for the
+/// current MB and commit its per-block `TotalCoeff` into the encoder's
+/// [`CavlcNcGrid`] (progressively, so in-MB neighbour reads during the
+/// derivation see the earlier blocks — exactly the state the decoder
+/// has when it derives `nC` before parsing each block).
+///
+/// Per §9.2.1.1 NOTE 1 only AC coefficients count: when `cbp_chroma !=
+/// 2` no chroma AC block is coded and every total stays 0. The
+/// coeff_token *table* (not just the codeword) depends on `nC`, so a
+/// wrong value here desynchronises every spec decoder — the historical
+/// hard-coded `Numeric(0)` was only safe while neighbour totals stayed
+/// below 2.
+///
+/// Returns `(nc_cb, nc_cr)` sized for 4:2:2 (first 4 entries used at
+/// 4:2:0). The caller must have marked the current MB slot
+/// `is_available = true` beforehand (the luma-nC bookkeeping does).
+fn derive_chroma_ac_nc_and_commit_totals(
+    nc_grid: &mut CavlcNcGrid,
+    mb_addr: u32,
+    is_intra: bool,
+    cbp_chroma: u8,
+    ac_cb: &[[i32; 16]],
+    ac_cr: &[[i32; 16]],
+    chroma_array_type: u32,
+) -> ([i32; 8], [i32; 8]) {
+    let n_blk = if chroma_array_type == 2 { 8usize } else { 4 };
+    let mut nc_cb = [0i32; 8];
+    let mut nc_cr = [0i32; 8];
+    for is_cr in [false, true] {
+        let (ncs, acs): (&mut [i32; 8], &[[i32; 16]]) = if is_cr {
+            (&mut nc_cr, ac_cr)
+        } else {
+            (&mut nc_cb, ac_cb)
+        };
+        let mut own = [0u8; 8];
+        for blk in 0..n_blk {
+            {
+                let slot = &mut nc_grid.mbs[mb_addr as usize];
+                if is_cr {
+                    slot.cr_total_coeff = own;
+                } else {
+                    slot.cb_total_coeff = own;
+                }
+            }
+            ncs[blk] = crate::macroblock_layer::derive_nc_chroma_ac(
+                nc_grid,
+                mb_addr,
+                blk as u8,
+                is_cr,
+                chroma_array_type,
+                is_intra,
+                false,
+            );
+            own[blk] = if cbp_chroma == 2 {
+                acs[blk][..15].iter().filter(|&&v| v != 0).count() as u8
+            } else {
+                0
+            };
+        }
+        let slot = &mut nc_grid.mbs[mb_addr as usize];
+        if is_cr {
+            slot.cr_total_coeff = own;
+        } else {
+            slot.cb_total_coeff = own;
+        }
+    }
+    (nc_cb, nc_cr)
 }
 
 /// Round-27 — Chroma block encode result. Holds residual coefficients
@@ -4949,6 +5069,17 @@ impl Encoder {
         }
         nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
 
+        // §9.2.1.1 — per-block chroma-AC nC + grid totals commit.
+        let (chroma_nc_cb, chroma_nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+            nc_grid,
+            mb_addr as u32,
+            false,
+            cbp_chroma,
+            &u_ac_levels,
+            &v_ac_levels,
+            1,
+        );
+
         // Emit the MB syntax.
         let mb_cfg = PL016x16McbConfig {
             transform_size_8x8_flag: if self.cfg.transform_8x8 {
@@ -4967,6 +5098,8 @@ impl Encoder {
             chroma_dc_cr: v_dc_levels,
             chroma_ac_cb: u_ac_levels,
             chroma_ac_cr: v_ac_levels,
+            chroma_ac_nc_cb: chroma_nc_cb,
+            chroma_ac_nc_cr: chroma_nc_cr,
         };
         let _ = luma_4x4_quant_raster; // already folded into recon_block_residual
         write_p_l0_16x16_mb(sw, &mb_cfg, 0).expect("write P_L0_16x16 mb");
@@ -5237,6 +5370,17 @@ impl Encoder {
         }
         nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
 
+        // §9.2.1.1 — per-block chroma-AC nC + grid totals commit.
+        let (chroma_nc_cb, chroma_nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+            nc_grid,
+            mb_addr as u32,
+            false,
+            cbp_chroma,
+            &u_ac_levels,
+            &v_ac_levels,
+            1,
+        );
+
         // 8. Emit P_8x8 syntax.
         let mb_cfg = P8x8AllPL08x8McbConfig {
             // §7.3.5 — inside a transform_8x8_mode_flag=1 stream the
@@ -5253,6 +5397,8 @@ impl Encoder {
             chroma_dc_cr: v_dc_levels,
             chroma_ac_cb: u_ac_levels,
             chroma_ac_cr: v_ac_levels,
+            chroma_ac_nc_cb: chroma_nc_cb,
+            chroma_ac_nc_cr: chroma_nc_cr,
         };
         write_p_8x8_all_pl08x8_mb(sw, &mb_cfg, 0).expect("write P_8x8 mb");
 
@@ -5805,6 +5951,17 @@ impl Encoder {
         }
         nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
 
+        // §9.2.1.1 — per-block chroma-AC nC + grid totals commit.
+        let (chroma_nc_cb, chroma_nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+            nc_grid,
+            mb_addr as u32,
+            true,
+            cbp_chroma,
+            &u_ac_levels,
+            &v_ac_levels,
+            1,
+        );
+
         // Emit MB syntax.
         let mb_cfg = I16x16McbConfig {
             pred_mode: best_luma_mode.as_u8(),
@@ -5819,6 +5976,8 @@ impl Encoder {
             chroma_dc_cr: v_dc_levels,
             chroma_ac_cb: u_ac_levels,
             chroma_ac_cr: v_ac_levels,
+            chroma_ac_nc_cb: chroma_nc_cb,
+            chroma_ac_nc_cr: chroma_nc_cr,
         };
         write_intra16x16_mb_in_inter_slice(
             sw,
@@ -9928,6 +10087,17 @@ impl Encoder {
         }
         nc_grid.mbs[mb_addr].luma_total_coeff = own_totals;
 
+        // §9.2.1.1 — per-block chroma-AC nC + grid totals commit.
+        let (chroma_nc_cb, chroma_nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+            nc_grid,
+            mb_addr as u32,
+            false,
+            cbp_chroma,
+            &u_ac_levels,
+            &v_ac_levels,
+            1,
+        );
+
         // 9. Emit the MB syntax.
         //
         // §7.3.4 — four bitstream layouts:
@@ -9956,6 +10126,8 @@ impl Encoder {
                     chroma_dc_cr: v_dc_levels,
                     chroma_ac_cb: u_ac_levels,
                     chroma_ac_cr: v_ac_levels,
+                    chroma_ac_nc_cb: chroma_nc_cb,
+                    chroma_ac_nc_cr: chroma_nc_cr,
                 };
                 crate::encoder::macroblock::write_b_direct_16x16_mb(sw, &dcfg)
                     .expect("write B_Direct_16x16 mb");
@@ -9977,6 +10149,8 @@ impl Encoder {
                     chroma_dc_cr: v_dc_levels,
                     chroma_ac_cb: u_ac_levels,
                     chroma_ac_cr: v_ac_levels,
+                    chroma_ac_nc_cb: chroma_nc_cb,
+                    chroma_ac_nc_cr: chroma_nc_cr,
                 };
                 crate::encoder::macroblock::write_b_8x8_all_direct_mb(sw, &dcfg)
                     .expect("write B_8x8 + 4× B_Direct_8x8 mb");
@@ -9999,6 +10173,8 @@ impl Encoder {
                     chroma_dc_cr: v_dc_levels,
                     chroma_ac_cb: u_ac_levels,
                     chroma_ac_cr: v_ac_levels,
+                    chroma_ac_nc_cb: chroma_nc_cb,
+                    chroma_ac_nc_cr: chroma_nc_cr,
                 };
                 write_b_8x8_mixed_mb(sw, &mcfg, 0, 0).expect("write B_8x8 mixed mb");
             } else if let Some(pc) = partition_choice.as_ref() {
@@ -10022,6 +10198,8 @@ impl Encoder {
                             chroma_dc_cr: v_dc_levels,
                             chroma_ac_cb: u_ac_levels,
                             chroma_ac_cr: v_ac_levels,
+                            chroma_ac_nc_cb: chroma_nc_cb,
+                            chroma_ac_nc_cr: chroma_nc_cr,
                         };
                         write_b_16x8_mb(sw, &cfg, 0, 0).expect("write B_*_16x8 mb");
                     }
@@ -10041,6 +10219,8 @@ impl Encoder {
                             chroma_dc_cr: v_dc_levels,
                             chroma_ac_cb: u_ac_levels,
                             chroma_ac_cr: v_ac_levels,
+                            chroma_ac_nc_cb: chroma_nc_cb,
+                            chroma_ac_nc_cr: chroma_nc_cr,
                         };
                         write_b_8x16_mb(sw, &cfg, 0, 0).expect("write B_*_8x16 mb");
                     }
@@ -10062,6 +10242,8 @@ impl Encoder {
                     chroma_dc_cr: v_dc_levels,
                     chroma_ac_cb: u_ac_levels,
                     chroma_ac_cr: v_ac_levels,
+                    chroma_ac_nc_cb: chroma_nc_cb,
+                    chroma_ac_nc_cr: chroma_nc_cr,
                 };
                 write_b_16x16_mb(sw, &mb_cfg, 0, 0).expect("write B_*_16x16 mb");
             }
