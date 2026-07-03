@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-h264/compare/v0.1.6...v0.2.0) - 2026-07-03
+
+### Other
+
+- README + CHANGELOG + encoder STATUS — round-385 CABAC/4:2:2/4:4:4 8x8-transform rollup
+- 4:4:4 Intra_8x8 — §8.3.4.5 chroma-coded-like-luma 8x8 CAVLC encode
+- decoder CAVLC 4:4:4 8x8 read-path — §7.4.5.3.3 interleave on the chroma planes
+- 4:2:2 Intra_8x8 — High 4:2:2 + transform_8x8 CAVLC IDR encode
+- B-slice CABAC inter 8x8 transform — second-gate flag across all coded B shapes
+- P-slice CABAC inter 8x8 transform — §7.3.5 second-gate flag + blockCat-5 residual
+- Intra_8x8 under CABAC — blockCat-5 residual + ctx-399 flag in encode_idr_cabac
+- §9.3.3.1.1.10 transform_size_8x8_flag + blockCat-5 CABAC encode primitives
+- README + encoder STATUS — round-382 High-profile 8x8 transform rollup
+- B-MB 8x8-residual RDO — 8x8 transform selectable on B slices
+- B-slice second-gate transform_size_8x8_flag — full GOPs under transform_8x8
+- P-slice inter 8x8 transform via second-gate transform_size_8x8_flag
+- adaptive per-MB transform-size RDO (I_16x16 / I_4x4 / I_8x8)
+- High-profile Intra_8x8 encoder + §7.4.5.3.3 CAVLC 8x8 de-interleave fix
+- §8.6.4 forward 8x8 transform + §8.5.13 quantizer + §7.4.5.3.3 CAVLC de-interleave
+- README — document PAFF field-picture decode + field pairing
+- §7.4.1.2.4 bottom_field_flag primary-coded-picture boundary
+- PAFF field-picture decode + §C.4.4 complementary-field pairing
+- lock 4:2:2 explicit weighted-prediction chroma combine
+- lock 4:4:4 B-slice inter chroma decode + correct stale 4:4:4 README row
+- lock 4:2:2 P/B-slice inter chroma decode with bit-exact conformance gates
+- synthetic MBAFF interlaced conformance fixture + ffmpeg-gated test
+- fix MBAFF intra neighbour addressing (§6.4.10/Table 6-4)
+- document field reference-list init/RPLM as implemented
+- §8.2.4.3 field reference-list modification (RPLM)
+- §8.2.4.2.2/.2.4/.2.5 field reference-list initialisation
+- round 349 — gate the verifiable 10-bit right MB column as a QP_Y regression guard
+- round 349 — fix §8.5.8 eq. 8-309 QP_Y derivation for >8-bit luma (10-bit High10 dequant collapse)
+- round 349 — High10 (10-bit) decode-path milestone guard + root-cause the ungateable fixture
+- neutralise black-box-validator naming in §8.3.4.5 4:4:4 test doc (r346 Hat-2)
+- round 346 — enforce High 4:4:4 I_4x4 bit-exact gate + root-cause ReportOnly corpus divergences to defective fixtures
+- neutralise black-box-validator naming in fixture comment
+- round 343 — pin 10 staged fixtures to enforced BitExact tier
+- round 339 — README + CHANGELOG MBAFF decode milestone
+- round 339 — MBAFF coded_block_flag external-MB neighbours via Table 6-4; mbaff-interlaced now decodes end-to-end
+- round 339 — wire §6.4.11.1 MBAFF MB-level neighbours + correct §7.3.5.1 ref_idx override
+- round 339 — §6.4.12.2 Table 6-4 exact MBAFF neighbour-location derivation
+- round 334 — §G.13.1.7 view_dependency_change (SEI payload type 42)
+- round 330 — §H.7.3.2.1.4 seq_parameter_set_mvcd_extension (MVCD profiles 138/135)
+- round 325 — §7.3.2.1.2 seq_parameter_set_extension_rbsp (NAL 13)
+- round 321 — §F.7.3.2.1.4 SVC SPS extension + §F.14.1 SVC VUI
+- round 318 — Annex H §H.13.2.6 alternative_depth_info (SEI payload type 181)
+- round 314 — §8.4.2.2 4:4:4 (ChromaArrayType==3) inter chroma MC + residual
+- refresh to current status, drop per-round changelog cruft
+
 ### Fixed
 
 - **Round-385 — decoder CAVLC 4:4:4 8x8 read-path.** At
