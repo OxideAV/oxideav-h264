@@ -401,16 +401,19 @@ pub fn select_scaling_list_4x4(list_idx: usize, sps: &Sps, pps: &Pps) -> [i32; 1
     // with the appropriate fall-back rule set.
     let ext = pps.extension.as_ref();
     let pic_present = ext.is_some_and(|e| e.pic_scaling_matrix_present_flag);
-    if !pic_present {
+    // §8.5.9 — the derived list is in bitstream scan order; weightScale
+    // is its §8.5.6 inverse scan (row-major). Flat lists are invariant.
+    let scan_list = if !pic_present {
         // §7.4.2.2: pic_scaling_matrix_present_flag == 0 → picture-level
         // lists equal the sequence-level lists.
-        return derive_sps_4x4(list_idx, sps);
-    }
-    let pic_lists = match ext.and_then(|e| e.pic_scaling_lists.as_ref()) {
-        Some(l) => l,
-        None => return derive_sps_4x4(list_idx, sps),
+        derive_sps_4x4(list_idx, sps)
+    } else {
+        match ext.and_then(|e| e.pic_scaling_lists.as_ref()) {
+            Some(l) => derive_pps_4x4(list_idx, sps, l),
+            None => derive_sps_4x4(list_idx, sps),
+        }
     };
-    derive_pps_4x4(list_idx, sps, pic_lists)
+    weight_scale_4x4_from_scan(&scan_list)
 }
 
 /// §7.4.2.1.1.1 / §7.4.2.2 — effective 8x8 scaling list.
@@ -424,14 +427,17 @@ pub fn select_scaling_list_8x8(list_idx: usize, sps: &Sps, pps: &Pps) -> [i32; 6
     }
     let ext = pps.extension.as_ref();
     let pic_present = ext.is_some_and(|e| e.pic_scaling_matrix_present_flag);
-    if !pic_present {
-        return derive_sps_8x8(list_idx, sps);
-    }
-    let pic_lists = match ext.and_then(|e| e.pic_scaling_lists.as_ref()) {
-        Some(l) => l,
-        None => return derive_sps_8x8(list_idx, sps),
+    // §8.5.9 — inverse-scan the derived scan-order list into the
+    // row-major weightScale8x8 every consumer indexes.
+    let scan_list = if !pic_present {
+        derive_sps_8x8(list_idx, sps)
+    } else {
+        match ext.and_then(|e| e.pic_scaling_lists.as_ref()) {
+            Some(l) => derive_pps_8x8(list_idx, sps, l),
+            None => derive_sps_8x8(list_idx, sps),
+        }
     };
-    derive_pps_8x8(list_idx, sps, pic_lists)
+    weight_scale_8x8_from_scan(&scan_list)
 }
 
 /// §7.4.2.1.1.1 Table 7-2 — PPS-level derivation for 4x4 list `idx`.
@@ -569,6 +575,34 @@ const FIELD_4X4: [(usize, usize); 16] = [
     (1, 3),
     (2, 3),
     (3, 3),
+];
+
+/// §8.5.9 / §8.5.6 — derive `weightScale4x4(i, j)` (row-major) from a
+/// scaling list in bitstream scan order (Table 8-13 zig-zag row). The
+/// §7.3.2.1.1.1 scaling_list() payload — and the Table 7-3 default
+/// matrices — are specified in scan order; every LevelScale consumer
+/// indexes `w[i * 4 + j]`, so the inverse scan must run exactly once
+/// at effective-list derivation.
+pub fn weight_scale_4x4_from_scan(list: &[i32; 16]) -> [i32; 16] {
+    inverse_scan_4x4_zigzag(list)
+}
+
+/// §8.5.9 — `weightScale8x8(i, j)` (row-major) from a scan-order 8x8
+/// scaling list (Table 8-14 zig-zag order, frame coding).
+pub fn weight_scale_8x8_from_scan(list: &[i32; 64]) -> [i32; 64] {
+    let mut out = [0i32; 64];
+    for (k, &raster) in ZIGZAG_8X8_SCAN_TO_RASTER.iter().enumerate() {
+        out[raster] = list[k];
+    }
+    out
+}
+
+/// Table 8-14 (8x8 zig-zag, frame): scan position k → row-major index
+/// `i * 8 + j`. Same table as the encoder's forward scan.
+const ZIGZAG_8X8_SCAN_TO_RASTER: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
 /// §8.5.6 — invert zig-zag scan; transforms a 16-entry scan-order list
@@ -2266,6 +2300,46 @@ mod tests {
         });
         assert_eq!(select_scaling_list_4x4(0, &sps, &pps), DEFAULT_4X4_INTRA);
         assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
+    }
+
+    // ------------ weightScale derivation (§8.5.9) -----------------------
+
+    /// Table 7-3 Default_4x4_Intra is specified in scan order; the
+    /// §8.5.9 weightScale must be its inverse zig-zag — a matrix that
+    /// increases monotonically along every row and column.
+    #[test]
+    fn weight_scale_4x4_default_intra_is_monotone_raster() {
+        let w = weight_scale_4x4_from_scan(&DEFAULT_4X4_INTRA);
+        assert_eq!(w[0], 6);
+        assert_eq!(&w[0..4], &[6, 13, 20, 28]);
+        assert_eq!(&w[4..8], &[13, 20, 28, 32]);
+        assert_eq!(&w[8..12], &[20, 28, 32, 37]);
+        assert_eq!(&w[12..16], &[28, 32, 37, 42]);
+    }
+
+    #[test]
+    fn weight_scale_8x8_default_intra_corners() {
+        let w = weight_scale_8x8_from_scan(&DEFAULT_8X8_INTRA);
+        // Scan pos 0 → (0,0); last scan pos → (7,7).
+        assert_eq!(w[0], 6);
+        assert_eq!(w[63], 42);
+        // Scan pos 1 → (0,1) = 10; scan pos 2 → (1,0) = 10.
+        assert_eq!(w[1], 10);
+        assert_eq!(w[8], 10);
+        // Rows and columns are non-decreasing (frequency-increasing
+        // quantisation weights).
+        for r in 0..8 {
+            for c in 0..7 {
+                assert!(w[r * 8 + c] <= w[r * 8 + c + 1], "row {r} col {c}");
+                assert!(w[c * 8 + r] <= w[(c + 1) * 8 + r], "col {r} row {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn weight_scale_flat_is_invariant() {
+        assert_eq!(weight_scale_4x4_from_scan(&FLAT_4X4_16), FLAT_4X4_16);
+        assert_eq!(weight_scale_8x8_from_scan(&FLAT_8X8_16), FLAT_8X8_16);
     }
 
     // ------------ Inverse scan (§8.5.6) ---------------------------------

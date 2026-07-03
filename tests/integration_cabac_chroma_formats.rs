@@ -161,3 +161,40 @@ fn cabac_422_textured_low_qp_reference_stream_decodes_bit_exact() {
     };
     assert_bit_exact(stream, &reference, 64, 64, 32, 64);
 }
+
+/// High 4:2:0 CABAC intra with the JVT default quantisation matrices
+/// (Table 7-3 / 7-4 signalled via scaling_list()) and the 8x8
+/// transform — exercises the §8.5.9 weightScale inverse-scan
+/// derivation on both the 4x4 and 8x8 LevelScale paths.
+#[test]
+fn cabac_420_default_scaling_matrices_decode_bit_exact() {
+    let Some((stream, reference)) = make_reference_stream(
+        "420-cqm-jvt",
+        "mandelbrot=size=64x64:rate=25",
+        "high",
+        "yuv420p",
+        "keyint=1:qp=20:cqm=jvt",
+        Some("slower"),
+    ) else {
+        return;
+    };
+    assert_bit_exact(stream, &reference, 64, 64, 32, 32);
+}
+
+/// CAVLC variant of the default-matrix stream (coder=0) — the
+/// scaling-list path is entropy-mode independent but the residual
+/// parse is not.
+#[test]
+fn cavlc_420_default_scaling_matrices_decode_bit_exact() {
+    let Some((stream, reference)) = make_reference_stream(
+        "420-cqm-jvt-cavlc",
+        "mandelbrot=size=64x64:rate=25",
+        "high",
+        "yuv420p",
+        "keyint=1:qp=20:cqm=jvt:cabac=0",
+        Some("slower"),
+    ) else {
+        return;
+    };
+    assert_bit_exact(stream, &reference, 64, 64, 32, 32);
+}
