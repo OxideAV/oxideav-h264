@@ -2178,6 +2178,7 @@ impl Encoder {
                                 None,
                                 None,
                                 true,
+                                1,
                             );
                             for sub in 0..4usize {
                                 grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blk8 * 4 + sub] = coded;
@@ -2231,6 +2232,7 @@ impl Encoder {
                         Some(cbf_a),
                         Some(cbf_b),
                         false,
+                        1,
                     );
                     // Update current MB grid slot's running state for downstream
                     // neighbour reads (luma AC blocks and chroma DC/AC).
@@ -2261,6 +2263,7 @@ impl Encoder {
                                 Some(ca),
                                 Some(cb),
                                 false,
+                                1,
                             );
                             grid.at_mut(mb_x, mb_y).cbf_luma_ac[blkz] = coded;
                         }
@@ -2312,6 +2315,7 @@ impl Encoder {
                             Some(cb_a),
                             Some(cb_b),
                             false,
+                            1,
                         );
                         grid.at_mut(mb_x, mb_y).cbf_cb_dc = cb_dc_coded;
                         let (cr_a, cr_b) =
@@ -2325,6 +2329,7 @@ impl Encoder {
                             Some(cr_a),
                             Some(cr_b),
                             false,
+                            1,
                         );
                         grid.at_mut(mb_x, mb_y).cbf_cr_dc = cr_dc_coded;
                     }
@@ -2343,6 +2348,7 @@ impl Encoder {
                                 Some(ca),
                                 Some(cb),
                                 false,
+                                1,
                             );
                             grid.at_mut(mb_x, mb_y).cbf_cb_ac[blk] = coded;
                         }
@@ -2360,6 +2366,7 @@ impl Encoder {
                                 Some(ca),
                                 Some(cb),
                                 false,
+                                1,
                             );
                             grid.at_mut(mb_x, mb_y).cbf_cr_ac[blk] = coded;
                         }
@@ -2917,6 +2924,7 @@ impl Encoder {
                                 None,
                                 None,
                                 true,
+                                1,
                             );
                             for sub in 0..4usize {
                                 grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blk8 * 4 + sub] = coded;
@@ -2947,6 +2955,7 @@ impl Encoder {
                                     Some(ca),
                                     Some(cb),
                                     false,
+                                    1,
                                 );
                                 grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blkz] = coded;
                             }
@@ -2966,6 +2975,7 @@ impl Encoder {
                         Some(cb_a),
                         Some(cb_b),
                         false,
+                        1,
                     );
                     grid.at_mut(mb_x, mb_y).cbf_cb_dc = cb_dc_coded;
                     let (cr_a, cr_b) =
@@ -2979,6 +2989,7 @@ impl Encoder {
                         Some(cr_a),
                         Some(cr_b),
                         false,
+                        1,
                     );
                     grid.at_mut(mb_x, mb_y).cbf_cr_dc = cr_dc_coded;
                 }
@@ -2997,6 +3008,7 @@ impl Encoder {
                             Some(ca),
                             Some(cb),
                             false,
+                            1,
                         );
                         grid.at_mut(mb_x, mb_y).cbf_cb_ac[blk] = coded;
                     }
@@ -3014,6 +3026,7 @@ impl Encoder {
                             Some(ca),
                             Some(cb),
                             false,
+                            1,
                         );
                         grid.at_mut(mb_x, mb_y).cbf_cr_ac[blk] = coded;
                     }
@@ -5184,6 +5197,7 @@ impl Encoder {
                                 None,
                                 None,
                                 true,
+                                1,
                             );
                             for sub in 0..4usize {
                                 grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blk8 * 4 + sub] = coded;
@@ -5214,6 +5228,7 @@ impl Encoder {
                                     Some(ca),
                                     Some(cb),
                                     false,
+                                    1,
                                 );
                                 grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blkz] = coded;
                             }
@@ -5234,6 +5249,7 @@ impl Encoder {
                         Some(cb_a),
                         Some(cb_b),
                         false,
+                        1,
                     );
                     grid.at_mut(mb_x, mb_y).cbf_cb_dc = cb_dc_coded;
                     let (cr_a, cr_b) =
@@ -5247,6 +5263,7 @@ impl Encoder {
                         Some(cr_a),
                         Some(cr_b),
                         false,
+                        1,
                     );
                     grid.at_mut(mb_x, mb_y).cbf_cr_dc = cr_dc_coded;
                 }
@@ -5265,6 +5282,7 @@ impl Encoder {
                             Some(ca),
                             Some(cb),
                             false,
+                            1,
                         );
                         grid.at_mut(mb_x, mb_y).cbf_cb_ac[blk] = coded;
                     }
@@ -5282,6 +5300,7 @@ impl Encoder {
                             Some(ca),
                             Some(cb),
                             false,
+                            1,
                         );
                         grid.at_mut(mb_x, mb_y).cbf_cr_ac[blk] = coded;
                     }
@@ -6190,6 +6209,7 @@ fn emit_444_chroma_plane_cabac(
         Some(cbf_a),
         Some(cbf_b),
         false,
+        1,
     );
 
     let mut cbf_ac = [false; 16];
@@ -6211,6 +6231,7 @@ fn emit_444_chroma_plane_cabac(
                 Some(ca),
                 Some(cb),
                 false,
+                1,
             );
             cbf_ac[blkz] = coded;
             // Update the plane-specific 4:4:4 chroma AC CBF array so

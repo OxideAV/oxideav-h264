@@ -3107,13 +3107,15 @@ static TBL_9_43: [(u8, u8, u8); 63] = [
 
 /// §9.3.3.1.3 — significant_coeff_flag ctxIdxInc per equation (9-21)
 /// / (9-22) / Table 9-43 depending on block category.
-fn sig_coeff_inc(block_type: BlockType, level_list_idx: u32, field: bool) -> u32 {
+///
+/// `num_c8x8` is the §7.4.5.3.3 NumC8x8 variable (`4 / (SubWidthC *
+/// SubHeightC)`): 1 at 4:2:0, 2 at 4:2:2. Only consulted for
+/// ctxBlockCat 3 (chroma DC) per eq. (9-22).
+fn sig_coeff_inc(block_type: BlockType, level_list_idx: u32, field: bool, num_c8x8: u32) -> u32 {
     match block_type.ctx_block_cat() {
         3 => {
             // §9.3.3.1.3 eq. (9-22): Min(levelListIdx / NumC8x8, 2).
-            // NumC8x8 = 1 for ChromaArrayType=1, 2 for =2. Conservatively
-            // use 1 (4:2:0). Callers that need 4:2:2 may override.
-            core::cmp::min(level_list_idx, 2)
+            core::cmp::min(level_list_idx / num_c8x8.max(1), 2)
         }
         5 | 9 | 13 => {
             let row = TBL_9_43[level_list_idx as usize];
@@ -3130,42 +3132,49 @@ fn sig_coeff_inc(block_type: BlockType, level_list_idx: u32, field: bool) -> u32
     }
 }
 
-/// §9.3.3.1.3 — last_significant_coeff_flag ctxIdxInc.
-fn last_coeff_inc(block_type: BlockType, level_list_idx: u32) -> u32 {
+/// §9.3.3.1.3 — last_significant_coeff_flag ctxIdxInc. `num_c8x8` as
+/// in [`sig_coeff_inc`] (eq. (9-22) applies to the "last" flag too).
+fn last_coeff_inc(block_type: BlockType, level_list_idx: u32, num_c8x8: u32) -> u32 {
     match block_type.ctx_block_cat() {
-        3 => core::cmp::min(level_list_idx, 2),
+        3 => core::cmp::min(level_list_idx / num_c8x8.max(1), 2),
         5 | 9 | 13 => TBL_9_43[level_list_idx as usize].2 as u32,
         _ => level_list_idx,
     }
 }
 
 /// §9.3.3.1.1.9 + §9.3.3.1.3 — decode significant_coeff_flag(coeff_idx).
+///
+/// `num_c8x8` is NumC8x8 (§7.4.5.3.3): 1 at 4:2:0, 2 at 4:2:2. Only
+/// consulted for chroma-DC blocks (ctxBlockCat 3).
 pub fn decode_significant_coeff_flag(
     dec: &mut CabacDecoder<'_>,
     ctxs: &mut CabacContexts,
     block_type: BlockType,
     coeff_idx: u32,
     field: bool,
+    num_c8x8: u32,
 ) -> CabacResult<bool> {
     let base = block_type.sig_coef_ctx_offset(field);
     let cat_offset = block_type.sig_block_cat_offset();
-    let inc = sig_coeff_inc(block_type, coeff_idx, field);
+    let inc = sig_coeff_inc(block_type, coeff_idx, field, num_c8x8);
     let ctx_idx = (base + cat_offset + inc) as usize;
     let bin = dec.decode_decision(ctxs.at_mut(ctx_idx))?;
     Ok(bin == 1)
 }
 
 /// §9.3.3.1.1.9 + §9.3.3.1.3 — decode last_significant_coeff_flag.
+/// `num_c8x8` as in [`decode_significant_coeff_flag`].
 pub fn decode_last_significant_coeff_flag(
     dec: &mut CabacDecoder<'_>,
     ctxs: &mut CabacContexts,
     block_type: BlockType,
     coeff_idx: u32,
     field: bool,
+    num_c8x8: u32,
 ) -> CabacResult<bool> {
     let base = block_type.last_coef_ctx_offset(field);
     let cat_offset = block_type.sig_block_cat_offset();
-    let inc = last_coeff_inc(block_type, coeff_idx);
+    let inc = last_coeff_inc(block_type, coeff_idx, num_c8x8);
     let ctx_idx = (base + cat_offset + inc) as usize;
     let bin = dec.decode_decision(ctxs.at_mut(ctx_idx))?;
     Ok(bin == 1)

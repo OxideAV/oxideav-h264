@@ -1715,6 +1715,7 @@ fn cabac_cbf_cond_terms(
     block_type: BlockType,
     blk_idx: u8,
     is_cr: bool,
+    chroma_array_type: u32,
 ) -> (bool, bool) {
     let w = grid.width_in_mbs;
     let x = if w == 0 { 0 } else { current_mb_addr % w };
@@ -1723,9 +1724,10 @@ fn cabac_cbf_cond_terms(
     // Compute in-MB A / B neighbour block coordinates for this block type.
     // For luma 4x4 / 16x16AC blocks (indexed 0..=15): use §6.4.11.4.
     // For chroma AC (indexed 0..=7 at 4:2:2 or 0..=3 at 4:2:0): use the
-    // chroma layout. For chroma DC / luma 16x16 DC: the block is
-    // MB-level — there is no "4x4 internal neighbour"; A/B both come
-    // from the left/above MB's same category.
+    // chroma layout. For 8x8 blocks (cat 5 / 9 / 13): use §6.4.11.2 /
+    // §6.4.11.3 (2x2 grid of 8x8 blocks). For chroma DC / luma 16x16 DC:
+    // the block is MB-level — there is no "4x4 internal neighbour";
+    // A/B both come from the left/above MB's same category.
     let (a_loc, b_loc) = match block_type {
         BlockType::Luma4x4
         | BlockType::Luma16x16Ac
@@ -1739,7 +1741,7 @@ fn cabac_cbf_cond_terms(
                 CbfLoc::Internal4x4(bx, by - 1),
             )
         }
-        BlockType::ChromaAc | BlockType::Cb8x8 | BlockType::Cr8x8 => {
+        BlockType::ChromaAc => {
             // Chroma 4x4 layout (4:2:0 = 2x2, 4:2:2 = 2x4).
             let cx = ((blk_idx as i32) % 2) * 4;
             let cy = ((blk_idx as i32) / 2) * 4;
@@ -1748,14 +1750,20 @@ fn cabac_cbf_cond_terms(
                 CbfLoc::InternalChromaAc(cx, cy - 1, blk_idx),
             )
         }
+        BlockType::Luma8x8 | BlockType::Cb8x8 | BlockType::Cr8x8 => {
+            // §9.3.3.1.1.9 cat 5 / 9 / 13 → §6.4.11.2 / §6.4.11.3:
+            // 8x8 blocks live on a 2x2 grid (blk_idx raster order).
+            let x8 = (blk_idx as i32) % 2;
+            let y8 = (blk_idx as i32) / 2;
+            (
+                CbfLoc::Internal8x8(x8 - 1, y8),
+                CbfLoc::Internal8x8(x8, y8 - 1),
+            )
+        }
         BlockType::ChromaDc
         | BlockType::Luma16x16Dc
         | BlockType::CbIntra16x16Dc
         | BlockType::CrIntra16x16Dc => (CbfLoc::MbLevel, CbfLoc::MbLevel),
-        // Luma 8x8 (4:4:4 style) and reserved combos fall back to
-        // MB-level (conservative but spec-consistent for the block
-        // categories we instantiate from macroblock_layer.rs).
-        _ => (CbfLoc::MbLevel, CbfLoc::MbLevel),
     };
 
     let (left_addr, above_addr) = if grid.mbaff_frame_flag {
@@ -1788,6 +1796,7 @@ fn cabac_cbf_cond_terms(
         left_addr,
         true,
         is_cr,
+        chroma_array_type,
     );
     let cond_b = cbf_cond_for(
         grid,
@@ -1798,6 +1807,7 @@ fn cabac_cbf_cond_terms(
         above_addr,
         false,
         is_cr,
+        chroma_array_type,
     );
     (cond_a, cond_b)
 }
@@ -1807,6 +1817,10 @@ enum CbfLoc {
     /// Luma 4x4-style block at (x, y) in the MB grid. Negative coordinates
     /// dispatch to the respective external MB (A for x<0, B for y<0).
     Internal4x4(i32, i32),
+    /// 8x8-transform block (ctxBlockCat 5 / 9 / 13) at (x8, y8) on the
+    /// MB's 2x2 8x8-block grid. Negative coordinates dispatch to the
+    /// respective external MB (§6.4.11.2 / §6.4.11.3).
+    Internal8x8(i32, i32),
     /// Chroma AC block at (x, y) plus its original in-MB blk index (for
     /// fallback when already in this MB — the caller computes x,y from
     /// blk_idx).
@@ -1815,6 +1829,7 @@ enum CbfLoc {
     MbLevel,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cbf_cond_for(
     grid: &CabacNeighbourGrid,
     current_mb: &CabacMbNeighbourInfo,
@@ -1824,8 +1839,57 @@ fn cbf_cond_for(
     ext_mb_addr: Option<u32>,
     is_left_dir: bool,
     is_cr: bool,
+    chroma_array_type: u32,
 ) -> bool {
     match loc {
+        CbfLoc::Internal8x8(x8, y8) => {
+            if x8 >= 0 && y8 >= 0 {
+                // Internal — read the current MB's progressive state.
+                // The residual walker folds each 8x8 block's
+                // coded_block_flag into its four 4x4 sub-block slots,
+                // so the top-left 4x4 of the 8x8 carries the value.
+                // Quadrants whose CBP bit is 0 stay `false`, matching
+                // the §9.3.3.1.1.9 "transBlockN not available → 0" rule.
+                let blk8 = (y8 * 2 + x8) as usize;
+                cbf_8x8_for(current_mb, block_type, blk8)
+            } else {
+                // External — §6.4.11.2 / §6.4.11.3: wrap into the
+                // left/above MB's 2x2 8x8-block grid.
+                let Some(addr) = ext_mb_addr else {
+                    return unavail_cbf(current_is_intra, block_type);
+                };
+                let Some(info) = grid.mbs.get(addr as usize) else {
+                    return unavail_cbf(current_is_intra, block_type);
+                };
+                if !info.available {
+                    return unavail_cbf(current_is_intra, block_type);
+                }
+                if info.is_i_pcm {
+                    return true;
+                }
+                if info.is_skip {
+                    return false;
+                }
+                let (wx8, wy8) = if is_left_dir {
+                    (x8 + 2, y8)
+                } else {
+                    (x8, y8 + 2)
+                };
+                let blk8n = (wy8 * 2 + wx8) as usize;
+                // §9.3.3.1.1.9 cat 5 / 9 / 13 — transBlockN is assigned
+                // only when the neighbour's CBP bit covering the 8x8
+                // block is set AND the neighbour was coded with
+                // transform_size_8x8_flag == 1. Otherwise transBlockN
+                // is not available → condTermFlagN = 0 (I_PCM handled
+                // above).
+                if ((info.coded_block_pattern_luma >> blk8n) & 1) == 0
+                    || !info.transform_size_8x8_flag
+                {
+                    return trans_block_unavail_cbf();
+                }
+                cbf_8x8_for(info, block_type, blk8n)
+            }
+        }
         CbfLoc::Internal4x4(xn, yn) => {
             if xn >= 0 && yn >= 0 {
                 // Internal — read current MB's progressive state.
@@ -1950,13 +2014,16 @@ fn cbf_cond_for(
                     // filtered above).
                     return trans_block_unavail_cbf();
                 }
-                // Wrap: for chroma plane of width 8 / height 8 (4:2:0) or
-                // 16 (4:2:2). For simplicity always wrap by 8; the blk
-                // index we query is in the first 4 slots for 4:2:0.
+                // Wrap into the neighbour MB's chroma tile: width is 8
+                // samples for both formats; height is 8 (4:2:0) or 16
+                // (4:2:2). The above-neighbour of the current MB's top
+                // row is the *bottom* 4x4 row of the above MB, so the
+                // vertical wrap must use the true chroma MB height.
+                let wrap_h = if chroma_array_type == 2 { 16 } else { 8 };
                 let (wx, wy) = if is_left_dir {
                     (xn + 8, yn)
                 } else {
-                    (xn, yn + 8)
+                    (xn, yn + wrap_h)
                 };
                 let bi = (2 * (wy / 4) + (wx / 4)) as usize;
                 cbf_chroma_ac_for(info, block_type, bi.min(7), is_cr)
@@ -2081,6 +2148,20 @@ fn cbf_luma_for(info: &CabacMbNeighbourInfo, block_type: BlockType, bi: usize) -
     }
 }
 
+/// §9.3.3.1.1.9 cat 5 / 9 / 13 — coded_block_flag of an 8x8 transform
+/// block. The residual walker folds each 8x8 block's CBF into its four
+/// 4x4 sub-block slots, so slot `blk8 * 4` carries the value.
+#[inline]
+fn cbf_8x8_for(info: &CabacMbNeighbourInfo, block_type: BlockType, blk8: usize) -> bool {
+    let bi = blk8 * 4;
+    match block_type {
+        BlockType::Luma8x8 => info.cbf_luma_4x4.get(bi).copied().unwrap_or(false),
+        BlockType::Cb8x8 => info.cbf_cb_luma_4x4.get(bi).copied().unwrap_or(false),
+        BlockType::Cr8x8 => info.cbf_cr_luma_4x4.get(bi).copied().unwrap_or(false),
+        _ => false,
+    }
+}
+
 #[inline]
 fn cbf_chroma_ac_for(
     info: &CabacMbNeighbourInfo,
@@ -2097,8 +2178,6 @@ fn cbf_chroma_ac_for(
                 info.cbf_cb_ac.get(bi).copied().unwrap_or(false)
             }
         }
-        BlockType::Cb8x8 => info.cbf_cb_ac.get(bi).copied().unwrap_or(false),
-        BlockType::Cr8x8 => info.cbf_cr_ac.get(bi).copied().unwrap_or(false),
         _ => false,
     }
 }
@@ -3923,12 +4002,16 @@ fn parse_residual_block_cabac(
     let span = end_idx - start_idx + 1;
     let mut num_coeff_in_scan = span; // positions 0..num_coeff_in_scan-1 remain
     let field = false; // frame coding; MBAFF field parsing is deferred
+                       // §7.4.5.3.3 NumC8x8 — drives the eq. (9-22) chroma-DC ctxIdxInc
+                       // (Min(levelListIdx / NumC8x8, 2)); 2 at 4:2:2, 1 otherwise.
+    let num_c8x8 = if chroma_array_type == 2 { 2 } else { 1 };
     let mut i: u32 = 0;
     while i + 1 < num_coeff_in_scan {
-        let sig = decode_significant_coeff_flag(cabac, ctxs, block_type, i, field)?;
+        let sig = decode_significant_coeff_flag(cabac, ctxs, block_type, i, field, num_c8x8)?;
         significant[i as usize] = sig;
         if sig {
-            let last = decode_last_significant_coeff_flag(cabac, ctxs, block_type, i, field)?;
+            let last =
+                decode_last_significant_coeff_flag(cabac, ctxs, block_type, i, field, num_c8x8)?;
             if last {
                 num_coeff_in_scan = i + 1;
                 break;
@@ -4012,6 +4095,7 @@ fn parse_residual_cabac_only(
                 BlockType::Luma16x16Dc,
                 0,
                 false,
+                chroma_array_type,
             );
             (Some(a), Some(b))
         } else {
@@ -4045,6 +4129,7 @@ fn parse_residual_cabac_only(
                         BlockType::Luma16x16Ac,
                         blk_idx,
                         false,
+                        chroma_array_type,
                     );
                     (Some(a), Some(b))
                 } else {
@@ -4068,8 +4153,25 @@ fn parse_residual_cabac_only(
     } else if transform_size_8x8_flag {
         for blk8 in 0..4u8 {
             if (cbp_luma >> blk8) & 1 == 1 {
-                // 8x8 block: CBF is inferred from CBP (not decoded), so
-                // no neighbour lookup needed for the CBF itself.
+                // 8x8 block. At ChromaArrayType != 3 the CBF is inferred
+                // from CBP (not decoded) and the cond terms are unused;
+                // at 4:4:4 the CBF *is* decoded (§7.3.5.3.3) and the
+                // §9.3.3.1.1.9 cat-5 neighbour derivation applies.
+                let (ca, cb) = if let Some(g) = grid_ref {
+                    let (a, b) = cabac_cbf_cond_terms(
+                        g,
+                        current_mb_addr,
+                        &curr_cbf,
+                        current_is_intra,
+                        BlockType::Luma8x8,
+                        blk8,
+                        false,
+                        chroma_array_type,
+                    );
+                    (Some(a), Some(b))
+                } else {
+                    (None, None)
+                };
                 let (blk, coded) = parse_residual_block_cabac(
                     cabac,
                     ctxs,
@@ -4078,8 +4180,8 @@ fn parse_residual_cabac_only(
                     63,
                     64,
                     chroma_array_type,
-                    None,
-                    None,
+                    ca,
+                    cb,
                 )?;
                 // Propagate the inferred coded flag to the four 4x4
                 // sub-blocks for CBF neighbour tracking.
@@ -4111,6 +4213,7 @@ fn parse_residual_cabac_only(
                             BlockType::Luma4x4,
                             blk_idx,
                             false,
+                            chroma_array_type,
                         );
                         (Some(a), Some(b))
                     } else {
@@ -4152,6 +4255,7 @@ fn parse_residual_cabac_only(
                     BlockType::ChromaDc,
                     0,
                     false,
+                    chroma_array_type,
                 );
                 (Some(a), Some(b))
             } else {
@@ -4180,6 +4284,7 @@ fn parse_residual_cabac_only(
                     BlockType::ChromaDc,
                     0,
                     true,
+                    chroma_array_type,
                 );
                 (Some(a), Some(b))
             } else {
@@ -4212,6 +4317,7 @@ fn parse_residual_cabac_only(
                         BlockType::ChromaAc,
                         blk_idx,
                         false,
+                        chroma_array_type,
                     );
                     (Some(a), Some(b))
                 } else {
@@ -4241,6 +4347,7 @@ fn parse_residual_cabac_only(
                         BlockType::ChromaAc,
                         blk_idx,
                         true,
+                        chroma_array_type,
                     );
                     (Some(a), Some(b))
                 } else {
@@ -4297,6 +4404,7 @@ fn parse_residual_cabac_only(
                         bt_dc,
                         0,
                         plane_is_cr,
+                        chroma_array_type,
                     );
                     (Some(a), Some(b))
                 } else {
@@ -4335,6 +4443,7 @@ fn parse_residual_cabac_only(
                                 bt_ac,
                                 blk_idx,
                                 plane_is_cr,
+                                chroma_array_type,
                             );
                             (Some(a), Some(b))
                         } else {
@@ -4363,10 +4472,25 @@ fn parse_residual_cabac_only(
             } else if transform_size_8x8_flag {
                 for blk8 in 0..4u8 {
                     if (cbp_luma >> blk8) & 1 == 1 {
-                        // 8x8 block: CBF is inferred from CBP in 4:4:4
+                        // 8x8 chroma block at 4:4:4: the CBF IS coded
                         // (max_num_coeff == 64 AND chroma_array_type
-                        // == 3 → coded_block_flag IS coded per
-                        // §7.3.5.3.3).
+                        // == 3 per §7.3.5.3.3), with the §9.3.3.1.1.9
+                        // cat-9/13 neighbouring-8x8-block cond terms.
+                        let (ca, cb) = if let Some(g) = grid_ref {
+                            let (a, b) = cabac_cbf_cond_terms(
+                                g,
+                                current_mb_addr,
+                                &curr_cbf,
+                                current_is_intra,
+                                bt_8x8,
+                                blk8,
+                                plane_is_cr,
+                                chroma_array_type,
+                            );
+                            (Some(a), Some(b))
+                        } else {
+                            (None, None)
+                        };
                         let (blk, coded) = parse_residual_block_cabac(
                             cabac,
                             ctxs,
@@ -4375,8 +4499,8 @@ fn parse_residual_cabac_only(
                             63,
                             64,
                             chroma_array_type,
-                            None,
-                            None,
+                            ca,
+                            cb,
                         )?;
                         // Propagate coded flag to the four 4x4 sub-
                         // blocks so subsequent intra-MB neighbour
@@ -4416,6 +4540,7 @@ fn parse_residual_cabac_only(
                                     bt_4x4,
                                     blk_idx,
                                     plane_is_cr,
+                                    chroma_array_type,
                                 );
                                 (Some(a), Some(b))
                             } else {
@@ -5464,6 +5589,7 @@ mod tests {
             BlockType::Luma4x4,
             0,
             false,
+            1,
         );
         assert!(!ca);
         assert!(!cb);
@@ -5486,6 +5612,7 @@ mod tests {
             BlockType::Luma4x4,
             0,
             false,
+            1,
         );
         assert!(ca);
         assert!(cb);
@@ -5509,7 +5636,7 @@ mod tests {
         // For current MB 5, block 0's neighbour A = MB 4 block at
         // wrapped (xN=-1+16=15, yN=0) → block idx = 5.
         // Neighbour B = MB 1 block at (xN=0, yN=-1+16=15) → idx = 10.
-        let (ca, cb) = cabac_cbf_cond_terms(&grid, 5, &curr, true, BlockType::Luma4x4, 0, false);
+        let (ca, cb) = cabac_cbf_cond_terms(&grid, 5, &curr, true, BlockType::Luma4x4, 0, false, 1);
         assert!(ca);
         assert!(cb);
         // ctxIdxInc = 1 + 2*1 = 3.
@@ -5538,6 +5665,7 @@ mod tests {
             BlockType::ChromaDc,
             0,
             false,
+            1,
         );
         // Spec §9.3.3.1.1.9 cat=3: mbAddrA available, transBlockA not
         // available (CodedBlockPatternChroma == 0), mb_type != I_PCM
@@ -5559,7 +5687,8 @@ mod tests {
             is_intra: true,
             ..Default::default()
         };
-        let (ca, _cb) = cabac_cbf_cond_terms(&grid, 1, &curr, true, BlockType::Luma4x4, 0, false);
+        let (ca, _cb) =
+            cabac_cbf_cond_terms(&grid, 1, &curr, true, BlockType::Luma4x4, 0, false, 1);
         assert!(ca);
     }
 
@@ -5592,6 +5721,7 @@ mod tests {
             BlockType::Luma4x4,
             8,
             false,
+            1,
         );
         // Per spec the condTerm must be 0.
         assert!(
@@ -5623,11 +5753,146 @@ mod tests {
             BlockType::ChromaAc,
             0,
             false,
+            1,
         );
         assert!(
             !ca,
             "spec §9.3.3.1.1.9 cat=4 says condTermA = 0 when neighbour cbp_chroma != 2"
         );
+    }
+
+    /// §9.3.3.1.1.9 cat=4 at 4:2:2 — the above-neighbour of the current
+    /// MB's top chroma-AC row is the *bottom* 4x4 row of the above MB
+    /// (2x4 chroma block grid, vertical wrap by 16 samples → blocks
+    /// 6/7), not the second row (blocks 2/3).
+    #[test]
+    fn cbf_chroma_ac_422_above_wraps_to_bottom_row() {
+        let mut grid = mk_cabac_grid();
+        // MB 1 (above MB 5): available, intra, cbp_chroma = 2 with ONLY
+        // the bottom chroma-AC row coded.
+        let slot = &mut grid.mbs[1];
+        slot.available = true;
+        slot.is_intra = true;
+        slot.coded_block_pattern_chroma = 2;
+        slot.cbf_cb_ac = [false, false, false, false, false, false, true, true];
+        let curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..Default::default()
+        };
+        // Current MB 5, Cb AC block 0 (top-left). Above neighbour at
+        // 4:2:2 must read MB 1's block 6 (bottom-left) → cond_b = 1.
+        let (_ca, cb) = cabac_cbf_cond_terms(
+            &grid,
+            5,
+            &curr,
+            /*current_is_intra=*/ true,
+            BlockType::ChromaAc,
+            0,
+            false,
+            2,
+        );
+        assert!(cb, "4:2:2 above-neighbour must wrap to the bottom 4x4 row");
+        // The same lookup at 4:2:0 semantics reads block 2 (false).
+        let (_ca, cb_420) = cabac_cbf_cond_terms(
+            &grid,
+            5,
+            &curr,
+            /*current_is_intra=*/ true,
+            BlockType::ChromaAc,
+            0,
+            false,
+            1,
+        );
+        assert!(!cb_420, "4:2:0 wrap reads block 2 which is not coded");
+    }
+
+    /// §9.3.3.1.1.9 cat=5 — first MB of an intra slice: both neighbours
+    /// unavailable → condTermFlagN = 1 each (current MB intra), giving
+    /// ctxIdxInc = 3, NOT the "all zero" fallback.
+    #[test]
+    fn cbf_luma8x8_first_intra_mb_unavailable_neighbours_yield_ones() {
+        let grid = mk_cabac_grid();
+        let curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..Default::default()
+        };
+        let (ca, cb) = cabac_cbf_cond_terms(
+            &grid,
+            0,
+            &curr,
+            /*current_is_intra=*/ true,
+            BlockType::Luma8x8,
+            0,
+            false,
+            3,
+        );
+        assert!(ca && cb, "unavailable neighbours + intra MB → condTerm 1");
+    }
+
+    /// §9.3.3.1.1.9 cat=5 — the left neighbour's 8x8 block is assigned
+    /// to transBlockN only when the neighbour used the 8x8 transform
+    /// AND its CBP bit covers the wrapped 8x8 index; the folded CBF at
+    /// slot blk8*4 carries the decoded coded_block_flag.
+    #[test]
+    fn cbf_luma8x8_left_neighbour_transform_gate() {
+        let mut grid = mk_cabac_grid();
+        let slot = &mut grid.mbs[4];
+        slot.available = true;
+        slot.is_intra = true;
+        slot.coded_block_pattern_luma = 0xf;
+        slot.transform_size_8x8_flag = true;
+        // Fold: 8x8 #1 (top-right) coded → slots 4..8 true.
+        slot.cbf_luma_4x4[4] = true;
+        slot.cbf_luma_4x4[5] = true;
+        slot.cbf_luma_4x4[6] = true;
+        slot.cbf_luma_4x4[7] = true;
+        let curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..Default::default()
+        };
+        // Current MB 5, 8x8 block 0: left neighbour = MB 4's 8x8 #1.
+        let (ca, _cb) =
+            cabac_cbf_cond_terms(&grid, 5, &curr, true, BlockType::Luma8x8, 0, false, 3);
+        assert!(ca, "left neighbour 8x8 #1 CBF must be read (folded slot 4)");
+        // Same neighbour with transform_size_8x8_flag = 0 → transBlockN
+        // not available → condTerm 0.
+        grid.mbs[4].transform_size_8x8_flag = false;
+        let (ca2, _cb) =
+            cabac_cbf_cond_terms(&grid, 5, &curr, true, BlockType::Luma8x8, 0, false, 3);
+        assert!(
+            !ca2,
+            "4x4-transform neighbour → cat-5 transBlockN unavailable"
+        );
+        // 8x8-transform neighbour with the covering CBP bit clear →
+        // transBlockN not available → condTerm 0.
+        grid.mbs[4].transform_size_8x8_flag = true;
+        grid.mbs[4].coded_block_pattern_luma = 0xd; // bit 1 clear
+        let (ca3, _cb) =
+            cabac_cbf_cond_terms(&grid, 5, &curr, true, BlockType::Luma8x8, 0, false, 3);
+        assert!(!ca3, "CBP bit 0 for the wrapped 8x8 → condTerm 0");
+    }
+
+    /// §9.3.3.1.1.9 cat=9/13 — in-MB neighbour reads use the current
+    /// MB's progressively-folded per-plane 4x4 CBF slots.
+    #[test]
+    fn cbf_cb8x8_internal_neighbour_reads_folded_plane_slots() {
+        let grid = mk_cabac_grid();
+        let mut curr = CabacMbNeighbourInfo {
+            is_intra: true,
+            ..Default::default()
+        };
+        // 8x8 Cb block #0 already decoded with CBF=1 (folded to slots 0..4).
+        curr.cbf_cb_luma_4x4[0] = true;
+        // Current MB 0 (no external neighbours), Cb 8x8 block 1: its A
+        // neighbour is in-MB block 0 → condTermA = 1. B neighbour is
+        // external-unavailable → 1 (intra).
+        let (ca, cb) = cabac_cbf_cond_terms(&grid, 0, &curr, true, BlockType::Cb8x8, 1, false, 3);
+        assert!(ca, "in-MB Cb 8x8 #0 folded CBF must be read");
+        assert!(cb, "unavailable above + intra → 1");
+        // Cr plane tracks separately.
+        let (ca_cr, _cb) =
+            cabac_cbf_cond_terms(&grid, 0, &curr, true, BlockType::Cr8x8, 1, true, 3);
+        assert!(!ca_cr, "Cr plane folded slots are independent of Cb");
     }
 
     #[test]
@@ -5637,7 +5902,8 @@ mod tests {
         grid.mbs[4].is_skip = true;
         grid.mbs[4].cbf_luma_4x4 = [true; 16]; // numerically non-zero
         let curr = CabacMbNeighbourInfo::default();
-        let (ca, _cb) = cabac_cbf_cond_terms(&grid, 1, &curr, false, BlockType::Luma4x4, 0, false);
+        let (ca, _cb) =
+            cabac_cbf_cond_terms(&grid, 1, &curr, false, BlockType::Luma4x4, 0, false, 1);
         assert!(!ca);
     }
 
@@ -5658,6 +5924,7 @@ mod tests {
             BlockType::Luma4x4,
             5,
             false,
+            1,
         );
         assert!(ca, "A (internal block 4) has cbf=true");
         assert!(!cb, "B (internal block 1) has cbf=false");
@@ -5725,6 +5992,7 @@ mod tests {
             BlockType::ChromaDc,
             0,
             /*is_cr=*/ false,
+            1,
         );
         let (ca_cr, _cb_cr) = cabac_cbf_cond_terms(
             &grid,
@@ -5734,6 +6002,7 @@ mod tests {
             BlockType::ChromaDc,
             0,
             /*is_cr=*/ true,
+            1,
         );
         assert!(ca_cb, "Cb DC should see neighbour cbf_cb_dc=true");
         assert!(!ca_cr, "Cr DC should see neighbour cbf_cr_dc=false");
@@ -5760,9 +6029,9 @@ mod tests {
             ..Default::default()
         };
         let (ca_cb, _cb_cb) =
-            cabac_cbf_cond_terms(&grid, 1, &curr, true, BlockType::ChromaAc, 0, false);
+            cabac_cbf_cond_terms(&grid, 1, &curr, true, BlockType::ChromaAc, 0, false, 1);
         let (ca_cr, _cb_cr) =
-            cabac_cbf_cond_terms(&grid, 1, &curr, true, BlockType::ChromaAc, 0, true);
+            cabac_cbf_cond_terms(&grid, 1, &curr, true, BlockType::ChromaAc, 0, true, 1);
         assert!(ca_cb, "Cb AC should see neighbour cbf_cb_ac=true");
         assert!(!ca_cr, "Cr AC should see neighbour cbf_cr_ac=false");
     }
@@ -5783,9 +6052,9 @@ mod tests {
         curr.cbf_cr_ac[0] = false;
         // ChromaAc blk_idx=1 is at (4, 0) → A=(3, 0) internal block 0.
         let (ca_cb, _cb_cb) =
-            cabac_cbf_cond_terms(&grid, 0, &curr, true, BlockType::ChromaAc, 1, false);
+            cabac_cbf_cond_terms(&grid, 0, &curr, true, BlockType::ChromaAc, 1, false, 1);
         let (ca_cr, _cb_cr) =
-            cabac_cbf_cond_terms(&grid, 0, &curr, true, BlockType::ChromaAc, 1, true);
+            cabac_cbf_cond_terms(&grid, 0, &curr, true, BlockType::ChromaAc, 1, true, 1);
         assert!(ca_cb, "Cb AC internal should see cbf_cb_ac[0]=true");
         assert!(!ca_cr, "Cr AC internal should see cbf_cr_ac[0]=false");
     }

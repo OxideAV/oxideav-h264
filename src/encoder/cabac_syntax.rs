@@ -1124,10 +1124,17 @@ static TBL_9_43_ENC: [(u8, u8, u8); 63] = [
     (12, 14, 8),
 ];
 
-fn sig_coeff_inc_enc(block_type: BlockType, level_list_idx: u32, field: bool) -> u32 {
+fn sig_coeff_inc_enc(
+    block_type: BlockType,
+    level_list_idx: u32,
+    field: bool,
+    num_c8x8: u32,
+) -> u32 {
     let cat = block_type as u32;
     match cat {
-        3 => core::cmp::min(level_list_idx, 2),
+        // §9.3.3.1.3 eq. (9-22): Min(levelListIdx / NumC8x8, 2).
+        // NumC8x8 = 1 at 4:2:0, 2 at 4:2:2 (§7.4.5.3.3).
+        3 => core::cmp::min(level_list_idx / num_c8x8.max(1), 2),
         5 | 9 | 13 => {
             let row = TBL_9_43_ENC[level_list_idx as usize];
             if field {
@@ -1140,22 +1147,26 @@ fn sig_coeff_inc_enc(block_type: BlockType, level_list_idx: u32, field: bool) ->
     }
 }
 
-fn last_coeff_inc_enc(block_type: BlockType, level_list_idx: u32) -> u32 {
+fn last_coeff_inc_enc(block_type: BlockType, level_list_idx: u32, num_c8x8: u32) -> u32 {
     let cat = block_type as u32;
     match cat {
-        3 => core::cmp::min(level_list_idx, 2),
+        3 => core::cmp::min(level_list_idx / num_c8x8.max(1), 2),
         5 | 9 | 13 => TBL_9_43_ENC[level_list_idx as usize].2 as u32,
         _ => level_list_idx,
     }
 }
 
 /// §9.3.3.1.1.9 + §9.3.3.1.3 — encode `significant_coeff_flag(coeff_idx)`.
+/// `num_c8x8` is NumC8x8 (§7.4.5.3.3): 1 at 4:2:0, 2 at 4:2:2; only
+/// consulted for chroma-DC blocks (ctxBlockCat 3).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_significant_coeff_flag(
     enc: &mut CabacEncoder,
     ctxs: &mut CabacContexts,
     block_type: BlockType,
     coeff_idx: u32,
     field: bool,
+    num_c8x8: u32,
     flag: bool,
 ) {
     // Ignore field-specific offsets (round-30 is frame-only).
@@ -1167,18 +1178,21 @@ pub fn encode_significant_coeff_flag(
         sig_coef_ctx_offset(block_type)
     };
     let cat_offset = sig_block_cat_offset(block_type);
-    let inc = sig_coeff_inc_enc(block_type, coeff_idx, field);
+    let inc = sig_coeff_inc_enc(block_type, coeff_idx, field, num_c8x8);
     let ctx_idx = (base + cat_offset + inc) as usize;
     enc.encode_decision(ctxs.at_mut(ctx_idx), if flag { 1 } else { 0 });
 }
 
 /// §9.3.3.1.1.9 + §9.3.3.1.3 — encode `last_significant_coeff_flag`.
+/// `num_c8x8` as in [`encode_significant_coeff_flag`].
+#[allow(clippy::too_many_arguments)]
 pub fn encode_last_significant_coeff_flag(
     enc: &mut CabacEncoder,
     ctxs: &mut CabacContexts,
     block_type: BlockType,
     coeff_idx: u32,
     field: bool,
+    num_c8x8: u32,
     flag: bool,
 ) {
     if field {
@@ -1186,7 +1200,7 @@ pub fn encode_last_significant_coeff_flag(
     }
     let base = last_coef_ctx_offset(block_type);
     let cat_offset = sig_block_cat_offset(block_type);
-    let inc = last_coeff_inc_enc(block_type, coeff_idx);
+    let inc = last_coeff_inc_enc(block_type, coeff_idx, num_c8x8);
     let ctx_idx = (base + cat_offset + inc) as usize;
     enc.encode_decision(ctxs.at_mut(ctx_idx), if flag { 1 } else { 0 });
 }
@@ -1303,6 +1317,7 @@ pub fn encode_rem_intra_pred_mode(enc: &mut CabacEncoder, ctxs: &mut CabacContex
 ///
 /// Returns `coded_block_flag` (true if any non-zero coefficient was
 /// emitted) so the caller can update its neighbour grid.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_residual_block_cabac(
     enc: &mut CabacEncoder,
     ctxs: &mut CabacContexts,
@@ -1312,6 +1327,7 @@ pub fn encode_residual_block_cabac(
     cbf_neighbour_left: Option<bool>,
     cbf_neighbour_above: Option<bool>,
     skip_cbf: bool,
+    num_c8x8: u32,
 ) -> bool {
     debug_assert_eq!(coeffs.len(), max_num_coeff as usize);
     let bin_before = enc.bin_count();
@@ -1354,17 +1370,17 @@ pub fn encode_residual_block_cabac(
     let last_position_exclusive = max_num_coeff - 1;
     for i in 0..last_idx {
         let sig = coeffs[i as usize] != 0;
-        encode_significant_coeff_flag(enc, ctxs, block_type, i, false, sig);
+        encode_significant_coeff_flag(enc, ctxs, block_type, i, false, num_c8x8, sig);
         if sig {
-            encode_last_significant_coeff_flag(enc, ctxs, block_type, i, false, false);
+            encode_last_significant_coeff_flag(enc, ctxs, block_type, i, false, num_c8x8, false);
         }
     }
     // Position `last_idx` always has significant=1, last=1 (unless
     // last_idx == max_num_coeff - 1, in which case significance map
     // for the final position is implied — the spec stops the loop).
     if last_idx < last_position_exclusive {
-        encode_significant_coeff_flag(enc, ctxs, block_type, last_idx, false, true);
-        encode_last_significant_coeff_flag(enc, ctxs, block_type, last_idx, false, true);
+        encode_significant_coeff_flag(enc, ctxs, block_type, last_idx, false, num_c8x8, true);
+        encode_last_significant_coeff_flag(enc, ctxs, block_type, last_idx, false, num_c8x8, true);
     } else {
         // last_idx == max_num_coeff - 1. The decoder doesn't read sig/last
         // for the final position — it's implied. Nothing to emit here.
@@ -1687,20 +1703,35 @@ mod tests {
             for &last in &[false, true] {
                 roundtrip(
                     |enc, ctxs| {
-                        encode_significant_coeff_flag(enc, ctxs, BlockType::Luma4x4, 3, false, sig);
+                        encode_significant_coeff_flag(
+                            enc,
+                            ctxs,
+                            BlockType::Luma4x4,
+                            3,
+                            false,
+                            1,
+                            sig,
+                        );
                         encode_last_significant_coeff_flag(
                             enc,
                             ctxs,
                             BlockType::Luma4x4,
                             3,
                             false,
+                            1,
                             last,
                         );
                     },
                     |dec, ctxs| {
-                        let s =
-                            decode_significant_coeff_flag(dec, ctxs, BlockType::Luma4x4, 3, false)
-                                .unwrap();
+                        let s = decode_significant_coeff_flag(
+                            dec,
+                            ctxs,
+                            BlockType::Luma4x4,
+                            3,
+                            false,
+                            1,
+                        )
+                        .unwrap();
                         assert_eq!(s, sig);
                         let l = decode_last_significant_coeff_flag(
                             dec,
@@ -1708,6 +1739,7 @@ mod tests {
                             BlockType::Luma4x4,
                             3,
                             false,
+                            1,
                         )
                         .unwrap();
                         assert_eq!(l, last);
@@ -1768,7 +1800,7 @@ mod tests {
     /// Simulate the decoder's `parse_residual_block_cabac` step-for-step
     /// against our encoder, for a few known coefficient layouts.
     fn rt_residual_block(coeffs: &[i32], block_type: BlockType, max_num_coeff: u32) {
-        rt_residual_block_opts(coeffs, block_type, max_num_coeff, false);
+        rt_residual_block_opts(coeffs, block_type, max_num_coeff, false, 1);
     }
 
     /// Like [`rt_residual_block`] but with the §7.3.5.3.3 CBF
@@ -1780,6 +1812,7 @@ mod tests {
         block_type: BlockType,
         max_num_coeff: u32,
         skip_cbf: bool,
+        num_c8x8: u32,
     ) {
         let mut ctxs_enc = CabacContexts::init(SliceKind::I, None, 26).unwrap();
         let mut enc = CabacEncoder::new();
@@ -1792,6 +1825,7 @@ mod tests {
             Some(false),
             Some(false),
             skip_cbf,
+            num_c8x8,
         );
         enc.encode_terminate(1);
         let bytes = enc.finish_no_trailing();
@@ -1827,8 +1861,15 @@ mod tests {
         let mut num_coeff_in_scan = span;
         let mut i: u32 = 0;
         while i + 1 < num_coeff_in_scan {
-            let sig = decode_significant_coeff_flag(&mut dec, &mut ctxs_dec, block_type, i, false)
-                .unwrap();
+            let sig = decode_significant_coeff_flag(
+                &mut dec,
+                &mut ctxs_dec,
+                block_type,
+                i,
+                false,
+                num_c8x8,
+            )
+            .unwrap();
             significant[i as usize] = sig;
             if sig {
                 let last = decode_last_significant_coeff_flag(
@@ -1837,6 +1878,7 @@ mod tests {
                     block_type,
                     i,
                     false,
+                    num_c8x8,
                 )
                 .unwrap();
                 if last {
@@ -1913,13 +1955,32 @@ mod tests {
         rt_residual_block(&c, BlockType::Luma4x4, 16);
     }
 
+    // -- Round-388: 4:2:2 chroma DC (cat-3, 8 coefficients, NumC8x8=2). --
+
+    #[test]
+    fn rt_residual_block_chroma_dc_422() {
+        // §9.3.3.1.3 eq. (9-22) — ctxIdxInc = Min(idx / NumC8x8, 2) with
+        // NumC8x8 = 2. Walk several coefficient layouts including the
+        // implicit-final-significance position 7.
+        let mut c = [0i32; 8];
+        c[0] = 3;
+        c[2] = -1;
+        c[5] = 2;
+        rt_residual_block_opts(&c, BlockType::ChromaDc, 8, false, 2);
+        let mut c2 = [0i32; 8];
+        c2[0] = 1;
+        c2[7] = -1;
+        rt_residual_block_opts(&c2, BlockType::ChromaDc, 8, false, 2);
+        rt_residual_block_opts(&[0i32; 8], BlockType::ChromaDc, 8, false, 2);
+    }
+
     // -- Round-385: blockCat-5 (Luma8x8) 64-coefficient blocks. --
 
     #[test]
     fn rt_residual_block_8x8_single_dc() {
         let mut c = [0i32; 64];
         c[0] = 7;
-        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true);
+        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true, 1);
     }
 
     #[test]
@@ -1932,7 +1993,7 @@ mod tests {
         c[17] = 2;
         c[30] = -1;
         c[44] = 1;
-        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true);
+        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true, 1);
     }
 
     #[test]
@@ -1943,7 +2004,7 @@ mod tests {
         let mut c = [0i32; 64];
         c[0] = 1;
         c[63] = -1;
-        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true);
+        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true, 1);
     }
 
     #[test]
@@ -1960,7 +2021,7 @@ mod tests {
             };
         }
         c[0] = 200;
-        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true);
+        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true, 1);
     }
 
     #[test]
