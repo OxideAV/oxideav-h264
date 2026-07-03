@@ -2099,12 +2099,15 @@ mod tests {
         });
         let pps = minimal_pps();
 
-        assert_eq!(select_scaling_list_4x4(0, &sps, &pps), DEFAULT_4X4_INTRA);
-        assert_eq!(select_scaling_list_4x4(1, &sps, &pps), DEFAULT_4X4_INTRA);
-        assert_eq!(select_scaling_list_4x4(2, &sps, &pps), DEFAULT_4X4_INTRA);
-        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
-        assert_eq!(select_scaling_list_4x4(4, &sps, &pps), DEFAULT_4X4_INTER);
-        assert_eq!(select_scaling_list_4x4(5, &sps, &pps), DEFAULT_4X4_INTER);
+        // select_* returns the §8.5.9 weightScale (inverse-scanned).
+        let w_intra = weight_scale_4x4_from_scan(&DEFAULT_4X4_INTRA);
+        let w_inter = weight_scale_4x4_from_scan(&DEFAULT_4X4_INTER);
+        assert_eq!(select_scaling_list_4x4(0, &sps, &pps), w_intra);
+        assert_eq!(select_scaling_list_4x4(1, &sps, &pps), w_intra);
+        assert_eq!(select_scaling_list_4x4(2, &sps, &pps), w_intra);
+        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), w_inter);
+        assert_eq!(select_scaling_list_4x4(4, &sps, &pps), w_inter);
+        assert_eq!(select_scaling_list_4x4(5, &sps, &pps), w_inter);
     }
 
     #[test]
@@ -2126,10 +2129,13 @@ mod tests {
         });
         let pps = minimal_pps();
         let got = select_scaling_list_4x4(0, &sps, &pps);
-        let mut expected = [0i32; 16];
+        let mut scan = [0i32; 16];
         for (k, v) in custom.iter().enumerate() {
-            expected[k] = *v;
+            scan[k] = *v;
         }
+        // select_* returns the §8.5.9 weightScale — the explicit
+        // bitstream list inverse-zig-zag-scanned into raster order.
+        let expected = weight_scale_4x4_from_scan(&scan);
         assert_eq!(got, expected);
         // idx=1 inherits (Rule A) from idx=0 → same explicit values.
         assert_eq!(select_scaling_list_4x4(1, &sps, &pps), expected);
@@ -2137,7 +2143,10 @@ mod tests {
         assert_eq!(select_scaling_list_4x4(2, &sps, &pps), expected);
         // idx=3 is the Inter class head with no signalled list →
         // Default_4x4_Inter.
-        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
+        assert_eq!(
+            select_scaling_list_4x4(3, &sps, &pps),
+            weight_scale_4x4_from_scan(&DEFAULT_4X4_INTER)
+        );
     }
 
     #[test]
@@ -2157,10 +2166,12 @@ mod tests {
             ],
         });
         let pps = minimal_pps();
-        assert_eq!(select_scaling_list_4x4(0, &sps, &pps), DEFAULT_4X4_INTRA);
-        assert_eq!(select_scaling_list_4x4(1, &sps, &pps), DEFAULT_4X4_INTRA);
-        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
-        assert_eq!(select_scaling_list_4x4(5, &sps, &pps), DEFAULT_4X4_INTER);
+        let w_intra = weight_scale_4x4_from_scan(&DEFAULT_4X4_INTRA);
+        let w_inter = weight_scale_4x4_from_scan(&DEFAULT_4X4_INTER);
+        assert_eq!(select_scaling_list_4x4(0, &sps, &pps), w_intra);
+        assert_eq!(select_scaling_list_4x4(1, &sps, &pps), w_intra);
+        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), w_inter);
+        assert_eq!(select_scaling_list_4x4(5, &sps, &pps), w_inter);
     }
 
     #[test]
@@ -2183,8 +2194,14 @@ mod tests {
             ],
         });
         let pps = minimal_pps();
-        assert_eq!(select_scaling_list_8x8(0, &sps, &pps), DEFAULT_8X8_INTRA);
-        assert_eq!(select_scaling_list_8x8(1, &sps, &pps), DEFAULT_8X8_INTER);
+        assert_eq!(
+            select_scaling_list_8x8(0, &sps, &pps),
+            weight_scale_8x8_from_scan(&DEFAULT_8X8_INTRA)
+        );
+        assert_eq!(
+            select_scaling_list_8x8(1, &sps, &pps),
+            weight_scale_8x8_from_scan(&DEFAULT_8X8_INTER)
+        );
     }
 
     #[test]
@@ -2211,22 +2228,35 @@ mod tests {
             ],
         });
         let pps = minimal_pps();
-        // idx 0 (i=6 Intra_Y): explicit → 1..=64.
+        // idx 0 (i=6 Intra_Y): explicit 1..=64 in scan order →
+        // weightScale is its Table 8-14 inverse scan: (0,0) carries
+        // scan value 1, (1,0) carries scan pos 2 (value 3), (7,7) the
+        // final scan value 64.
         let got = select_scaling_list_8x8(0, &sps, &pps);
         assert_eq!(got[0], 1);
+        assert_eq!(got[8], 3);
         assert_eq!(got[63], 64);
         // idx 1 (i=7 Inter_Y): NotPresent, Rule A class head →
         // Default_8x8_Inter.
-        assert_eq!(select_scaling_list_8x8(1, &sps, &pps), DEFAULT_8X8_INTER);
+        assert_eq!(
+            select_scaling_list_8x8(1, &sps, &pps),
+            weight_scale_8x8_from_scan(&DEFAULT_8X8_INTER)
+        );
         // idx 2 (i=8 Intra_Cb): NotPresent, inherits from idx 0 (i=6).
         assert_eq!(select_scaling_list_8x8(2, &sps, &pps), got);
         // idx 3 (i=9 Inter_Cb): inherits from idx 1 (i=7) →
         // Default_8x8_Inter.
-        assert_eq!(select_scaling_list_8x8(3, &sps, &pps), DEFAULT_8X8_INTER);
+        assert_eq!(
+            select_scaling_list_8x8(3, &sps, &pps),
+            weight_scale_8x8_from_scan(&DEFAULT_8X8_INTER)
+        );
         // idx 4 (i=10 Intra_Cr): inherits from idx 2 (i=8) → got.
         assert_eq!(select_scaling_list_8x8(4, &sps, &pps), got);
         // idx 5 (i=11 Inter_Cr): inherits from idx 3 → Default_8x8_Inter.
-        assert_eq!(select_scaling_list_8x8(5, &sps, &pps), DEFAULT_8X8_INTER);
+        assert_eq!(
+            select_scaling_list_8x8(5, &sps, &pps),
+            weight_scale_8x8_from_scan(&DEFAULT_8X8_INTER)
+        );
     }
 
     #[test]
@@ -2273,8 +2303,12 @@ mod tests {
         assert_eq!(select_scaling_list_4x4(1, &sps, &pps), [2i32; 16]);
         // PPS idx 3 NotPresent, SPS present → Rule B. Class head (i=3)
         // falls back to the SEQUENCE-level list for index 3. SPS idx
-        // 3 is NotPresent → its Rule A chain gives Default_4x4_Inter.
-        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
+        // 3 is NotPresent → its Rule A chain gives Default_4x4_Inter
+        // (inverse-scanned into weightScale by select_*).
+        assert_eq!(
+            select_scaling_list_4x4(3, &sps, &pps),
+            weight_scale_4x4_from_scan(&DEFAULT_4X4_INTER)
+        );
     }
 
     #[test]
@@ -2298,8 +2332,14 @@ mod tests {
             }),
             second_chroma_qp_index_offset: 0,
         });
-        assert_eq!(select_scaling_list_4x4(0, &sps, &pps), DEFAULT_4X4_INTRA);
-        assert_eq!(select_scaling_list_4x4(3, &sps, &pps), DEFAULT_4X4_INTER);
+        assert_eq!(
+            select_scaling_list_4x4(0, &sps, &pps),
+            weight_scale_4x4_from_scan(&DEFAULT_4X4_INTRA)
+        );
+        assert_eq!(
+            select_scaling_list_4x4(3, &sps, &pps),
+            weight_scale_4x4_from_scan(&DEFAULT_4X4_INTER)
+        );
     }
 
     // ------------ weightScale derivation (§8.5.9) -----------------------
