@@ -768,11 +768,24 @@ struct MbTrial {
 /// of picture size.
 struct MbStateSnapshot {
     recon_y_mb: [u8; 256],
-    recon_u_mb: [u8; 64],
-    recon_v_mb: [u8; 64],
+    /// Chroma MB tiles, sized for the worst case (16x16 at 4:4:4);
+    /// 4:2:0 uses the first 64 bytes, 4:2:2 the first 128.
+    recon_u_mb: [u8; 256],
+    recon_v_mb: [u8; 256],
+    /// Chroma tile geometry: (width, height) per §6.2 Table 6-1.
+    chroma_tile: (usize, usize),
     sw: BitWriter,
     nc_slot: crate::macroblock_layer::CavlcMbNc,
     intra_slot: IntraGridSlot,
+}
+
+/// §6.2 Table 6-1 — per-MB chroma tile size for a chroma format.
+fn chroma_tile_dims(chroma_array_type: u32) -> (usize, usize) {
+    match chroma_array_type {
+        2 => (8, 16),
+        3 => (16, 16),
+        _ => (8, 8),
+    }
 }
 
 impl MbStateSnapshot {
@@ -789,12 +802,14 @@ impl MbStateSnapshot {
         nc_grid: &CavlcNcGrid,
         intra_grid: &IntraGrid,
         mb_addr: usize,
-        _width_mbs: usize,
+        chroma_array_type: u32,
     ) -> Self {
+        let (cw, ch) = chroma_tile_dims(chroma_array_type);
         let mut snap = Self {
             recon_y_mb: [0u8; 256],
-            recon_u_mb: [0u8; 64],
-            recon_v_mb: [0u8; 64],
+            recon_u_mb: [0u8; 256],
+            recon_v_mb: [0u8; 256],
+            chroma_tile: (cw, ch),
             sw: sw.clone(),
             nc_slot: nc_grid.mbs[mb_addr],
             intra_slot: intra_grid.slot(mb_x, mb_y).clone(),
@@ -803,10 +818,10 @@ impl MbStateSnapshot {
             let src = (mb_y * 16 + j) * width + mb_x * 16;
             snap.recon_y_mb[j * 16..j * 16 + 16].copy_from_slice(&recon_y[src..src + 16]);
         }
-        for j in 0..8usize {
-            let src = (mb_y * 8 + j) * chroma_width + mb_x * 8;
-            snap.recon_u_mb[j * 8..j * 8 + 8].copy_from_slice(&recon_u[src..src + 8]);
-            snap.recon_v_mb[j * 8..j * 8 + 8].copy_from_slice(&recon_v[src..src + 8]);
+        for j in 0..ch {
+            let src = (mb_y * ch + j) * chroma_width + mb_x * cw;
+            snap.recon_u_mb[j * cw..j * cw + cw].copy_from_slice(&recon_u[src..src + cw]);
+            snap.recon_v_mb[j * cw..j * cw + cw].copy_from_slice(&recon_v[src..src + cw]);
         }
         snap
     }
@@ -830,10 +845,11 @@ impl MbStateSnapshot {
             let dst = (mb_y * 16 + j) * width + mb_x * 16;
             recon_y[dst..dst + 16].copy_from_slice(&self.recon_y_mb[j * 16..j * 16 + 16]);
         }
-        for j in 0..8usize {
-            let dst = (mb_y * 8 + j) * chroma_width + mb_x * 8;
-            recon_u[dst..dst + 8].copy_from_slice(&self.recon_u_mb[j * 8..j * 8 + 8]);
-            recon_v[dst..dst + 8].copy_from_slice(&self.recon_v_mb[j * 8..j * 8 + 8]);
+        let (cw, ch) = self.chroma_tile;
+        for j in 0..ch {
+            let dst = (mb_y * ch + j) * chroma_width + mb_x * cw;
+            recon_u[dst..dst + cw].copy_from_slice(&self.recon_u_mb[j * cw..j * cw + cw]);
+            recon_v[dst..dst + cw].copy_from_slice(&self.recon_v_mb[j * cw..j * cw + cw]);
         }
         *sw = self.sw.clone();
         nc_grid.mbs[mb_addr] = self.nc_slot;
@@ -900,7 +916,7 @@ impl InterMbStateSnapshot {
         intra_grid: &IntraGrid,
         mv_grid: &MvGrid,
         mb_addr: usize,
-        width_mbs: usize,
+        _width_mbs: usize,
         pending_skip: u32,
     ) -> Self {
         Self {
@@ -916,7 +932,7 @@ impl InterMbStateSnapshot {
                 nc_grid,
                 intra_grid,
                 mb_addr,
-                width_mbs,
+                1,
             ),
             mv_l0: *mv_grid.slot(mb_x, mb_y),
             mv_l1: None,
@@ -939,7 +955,7 @@ impl InterMbStateSnapshot {
         mv_grid_l0: &MvGrid,
         mv_grid_l1: &MvGrid,
         mb_addr: usize,
-        width_mbs: usize,
+        _width_mbs: usize,
         pending_skip: u32,
     ) -> Self {
         Self {
@@ -955,7 +971,7 @@ impl InterMbStateSnapshot {
                 nc_grid,
                 intra_grid,
                 mb_addr,
-                width_mbs,
+                1,
             ),
             mv_l0: *mv_grid_l0.slot(mb_x, mb_y),
             mv_l1: Some(*mv_grid_l1.slot(mb_x, mb_y)),
@@ -1380,21 +1396,110 @@ impl Encoder {
         intra_grid: &mut IntraGrid,
     ) -> MbDeblockInfo {
         let width = self.cfg.width as usize;
-        let width_mbs = (self.cfg.width / 16) as usize;
         let mb_addr = (mb_y as u32) * self.cfg.width / 16 + (mb_x as u32);
 
         // Round-28: without transform_8x8 the 4:4:4 path is
         // Intra_16x16-only (no I_NxN 4x4 chroma-as-luma emit yet).
-        // Round-385: with `transform_8x8` set, every 4:4:4 MB is coded
-        // Intra_8x8 (I_NxN + transform_size_8x8_flag = 1) with the
-        // §8.3.4.5 chroma-coded-like-luma 8x8 path; the RDO between
-        // the two 4:4:4 shapes is a follow-up.
+        // Round-388: with `transform_8x8` set the 4:4:4 MB runs a
+        // two-way Lagrangian RDO between Intra_16x16 and Intra_8x8
+        // (chroma coded like luma either way). J = D + λR with D the
+        // SSD over all three full-resolution planes and R the actual
+        // emitted bits — both shapes go through the real writer, the
+        // loser is rolled back via the chroma-aware snapshot. The
+        // I_4x4 leg needs a 4:4:4 chroma-as-luma 4x4 emit path and
+        // stays a follow-up.
         if self.cfg.chroma_format_idc == 3 {
             if self.cfg.transform_8x8 {
-                return self.encode_mb_intra8x8_444(
+                let lambda = lambda_ssd(qp_y, true);
+                let snap = MbStateSnapshot::capture(
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_addr as usize,
+                    3,
+                );
+                let bits_before = sw.bits_emitted();
+
+                // ----- Trial A: Intra_16x16 (§7.3.5.3 chroma like luma). -----
+                let trial_a = self.encode_mb_intra16x16(
+                    frame,
+                    mb_x,
+                    mb_y,
+                    qp_y,
+                    qp_c,
+                    chroma_width,
+                    chroma_height,
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                );
+                let d_a = mb_ssd_3planes_444(frame, recon_y, recon_u, recon_v, width, mb_x, mb_y);
+                let r_a = sw.bits_emitted() - bits_before;
+                let cost_a = cost_combined(d_a, r_a as u64, lambda);
+                let post_a = MbStateSnapshot::capture(
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_addr as usize,
+                    3,
+                );
+                snap.restore(
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_addr as usize,
+                );
+
+                // ----- Trial B: Intra_8x8 (§8.3.4.5 chroma like luma). -----
+                let dbl_b = self.encode_mb_intra8x8_444(
                     frame, mb_x, mb_y, qp_y, qp_c, recon_y, recon_u, recon_v, sw, nc_grid,
                     intra_grid,
                 );
+                let d_b = mb_ssd_3planes_444(frame, recon_y, recon_u, recon_v, width, mb_x, mb_y);
+                let r_b = sw.bits_emitted() - bits_before;
+                let cost_b = cost_combined(d_b, r_b as u64, lambda);
+
+                if cost_a <= cost_b {
+                    post_a.install(
+                        recon_y,
+                        recon_u,
+                        recon_v,
+                        width,
+                        chroma_width,
+                        mb_x,
+                        mb_y,
+                        sw,
+                        nc_grid,
+                        intra_grid,
+                        mb_addr as usize,
+                    );
+                    return trial_a.deblock;
+                }
+                return dbl_b;
             }
             let trial = self.encode_mb_intra16x16(
                 frame,
@@ -1427,7 +1532,7 @@ impl Encoder {
             nc_grid,
             intra_grid,
             mb_addr as usize,
-            width_mbs,
+            1,
         );
 
         // ----- Trial 1: I_16x16 path. -----
@@ -1458,7 +1563,7 @@ impl Encoder {
             nc_grid,
             intra_grid,
             mb_addr as usize,
-            width_mbs,
+            1,
         );
 
         // -- Restore original state for the second trial. --
@@ -1510,7 +1615,7 @@ impl Encoder {
                 nc_grid,
                 intra_grid,
                 mb_addr as usize,
-                width_mbs,
+                1,
             );
             snap.restore(
                 recon_y,
@@ -2041,17 +2146,17 @@ impl Encoder {
             // blocks, gated by luma cbp==15 (per §7.3.5.3 / decoder
             // `residual_cb_16x16_dc` / `residual_cb_luma_like` etc).
             //
-            // §9.2.1.1 — nC for the per-plane DC/AC blocks should use
-            // the per-plane neighbour `cb_luma_total_coeff[]` /
-            // `cr_luma_total_coeff[]`. This encoder approximates with
-            // nC=0 across the board; the decoder is then bit-exact
-            // because both sides agree on the choice (the encoder
-            // doesn't update those fields in the neighbour grid, and
-            // the decoder's `nc_nn_plane_luma_like` lookups will see
-            // the per-plane totals as default 0). Empirically this
-            // matches what ffmpeg produces from the same parsed bits.
-            let cb_ac_nc = [0i32; 16];
-            let cr_ac_nc = [0i32; 16];
+            // §9.2.1.1 — real per-plane nC from the neighbour grid's
+            // `cb_luma_total_coeff[]` / `cr_luma_total_coeff[]` with
+            // progressive in-MB commits (decoder parse-order mirror).
+            // Round-388: the former nC=0 approximation desynchronised
+            // as soon as a 4:4:4 Intra_8x8 neighbour committed real
+            // per-plane totals (the two shapes now mix per-MB under
+            // the I_16x16-vs-I_8x8 RDO).
+            let (cb_dc_nc, cb_ac_nc) =
+                derive_plane_nc_444_i16x16(nc_grid, mb_addr, false, cbp_luma, &cb_ac_scan_444);
+            let (cr_dc_nc, cr_ac_nc) =
+                derive_plane_nc_444_i16x16(nc_grid, mb_addr, true, cbp_luma, &cr_ac_scan_444);
             crate::encoder::macroblock::write_intra16x16_mb_chroma(
                 sw,
                 best_luma_mode.as_u8(),
@@ -2069,8 +2174,8 @@ impl Encoder {
                     cr_ac_levels: &cr_ac_scan_444,
                     cb_ac_nc: &cb_ac_nc,
                     cr_ac_nc: &cr_ac_nc,
-                    cb_dc_nc: 0,
-                    cr_dc_nc: 0,
+                    cb_dc_nc,
+                    cr_dc_nc,
                     cbp_luma_for_ac_gate: cbp_luma,
                 },
                 nc_dc_ctx,
@@ -3710,6 +3815,32 @@ fn encode_chroma_residual_inter(
     )
 }
 
+/// Round-388 — SSD between the source and the reconstruction over one
+/// MB's three full-resolution planes (4:4:4). Distortion term for the
+/// I_16x16-vs-I_8x8 RDO where chroma is coded like luma and therefore
+/// dominates the trade-off just as much as luma.
+fn mb_ssd_3planes_444(
+    frame: &YuvFrame<'_>,
+    recon_y: &[u8],
+    recon_u: &[u8],
+    recon_v: &[u8],
+    width: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> u64 {
+    let mut d: u64 = 0;
+    for (src, rec) in [(frame.y, recon_y), (frame.u, recon_u), (frame.v, recon_v)] {
+        for j in 0..16usize {
+            let row = (mb_y * 16 + j) * width + mb_x * 16;
+            for i in 0..16usize {
+                let e = src[row + i] as i64 - rec[row + i] as i64;
+                d += (e * e) as u64;
+            }
+        }
+    }
+    d
+}
+
 /// §9.2.1.1 — derive the per-block chroma-AC `nC` values for the
 /// current MB and commit its per-block `TotalCoeff` into the encoder's
 /// [`CavlcNcGrid`] (progressively, so in-MB neighbour reads during the
@@ -3777,6 +3908,52 @@ fn derive_chroma_ac_nc_and_commit_totals(
         }
     }
     (nc_cb, nc_cr)
+}
+
+/// §9.2.1.1 (ChromaArrayType == 3) — per-plane nC for a 4:4:4
+/// Intra_16x16 MB's coded-like-luma chroma plane: the plane 16x16 DC
+/// nC (derived at blkIdx 0 BEFORE any of this MB's plane totals exist,
+/// mirroring the decoder's parse order) plus the 16 per-AC-block nC
+/// values with progressive TotalCoeff commits into the grid's
+/// `cb_luma_total_coeff` / `cr_luma_total_coeff` (which stay committed
+/// for subsequent MBs — I_8x8 4:4:4 neighbours read the same arrays).
+/// AC totals are zeroed when `cbp_luma != 15` (no plane AC coded).
+fn derive_plane_nc_444_i16x16(
+    nc_grid: &mut CavlcNcGrid,
+    mb_addr: u32,
+    is_cr: bool,
+    cbp_luma: u8,
+    ac_scan: &[[i32; 16]; 16],
+) -> (i32, [i32; 16]) {
+    let dc_nc =
+        crate::macroblock_layer::derive_nc_plane_luma_like(nc_grid, mb_addr, 0, is_cr, true, false);
+    let mut ac_nc = [0i32; 16];
+    let mut own = [0u8; 16];
+    for blk in 0..16usize {
+        {
+            let cur = &mut nc_grid.mbs[mb_addr as usize];
+            if is_cr {
+                cur.cr_luma_total_coeff = own;
+            } else {
+                cur.cb_luma_total_coeff = own;
+            }
+        }
+        ac_nc[blk] = crate::macroblock_layer::derive_nc_plane_luma_like(
+            nc_grid, mb_addr, blk as u8, is_cr, true, false,
+        );
+        own[blk] = if cbp_luma == 15 {
+            ac_scan[blk][..15].iter().filter(|&&v| v != 0).count() as u8
+        } else {
+            0
+        };
+    }
+    let cur = &mut nc_grid.mbs[mb_addr as usize];
+    if is_cr {
+        cur.cr_luma_total_coeff = own;
+    } else {
+        cur.cb_luma_total_coeff = own;
+    }
+    (dc_nc, ac_nc)
 }
 
 /// Round-27 — Chroma block encode result. Holds residual coefficients

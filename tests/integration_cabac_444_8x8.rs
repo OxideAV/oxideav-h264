@@ -98,12 +98,17 @@ fn plane_max_diff(vf: &VideoFrame, plane: usize, recon: &[u8]) -> u32 {
 }
 
 #[test]
-fn cabac_444_8x8_sps_shape_and_all_i8x8() {
+fn cabac_444_8x8_sps_shape_and_mixed_selection() {
     let idr = encode_cabac_444_8x8();
-    assert_eq!(
-        idr.i8x8_mb_count,
-        ((W / 16) * (H / 16)) as u32,
-        "every 4:4:4 MB must code Intra_8x8 under transform_8x8"
+    // Round-388 — the per-MB I_16x16-vs-Intra_8x8 RDO runs at 4:4:4:
+    // the textured quadrants pick Intra_8x8, the smooth ones I_16x16,
+    // so the stream carries BOTH shapes (a stronger gate than the
+    // former all-I_8x8 pin — every mixed-neighbour context path runs).
+    let total = ((W / 16) * (H / 16)) as u32;
+    assert!(
+        idr.i8x8_mb_count > 0 && idr.i8x8_mb_count < total,
+        "expected mixed I_16x16/Intra_8x8 selection, got {}/{total}",
+        idr.i8x8_mb_count
     );
     let mut saw_sps = false;
     for nal in AnnexBSplitter::new(&idr.annex_b) {

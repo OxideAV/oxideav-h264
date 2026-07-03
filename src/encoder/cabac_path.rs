@@ -2022,21 +2022,14 @@ impl Encoder {
                 // Round-385 — Intra_8x8 trial under `transform_8x8`
                 // (4:2:0 only, asserted above). The trial commits its
                 // recon + pred modes; the loser is rolled back.
+                // Round-388 — the I_16x16-vs-Intra_8x8 trial runs at
+                // every chroma format. The cost estimates are
+                // luma-only (CAVLC-rate proxy); at 4:4:4 the chroma
+                // planes follow the winning luma shape (§8.3.4.5 /
+                // §7.3.5.3 coded-like-luma), so the luma decision is a
+                // proxy for the whole-MB trade-off.
                 let mut i8x8_cand: Option<CabacI8x8Candidate> = None;
-                if cfg.transform_8x8 && cfg.chroma_format_idc == 3 {
-                    // 4:4:4 — every MB is Intra_8x8 (§8.3.4.5 chroma
-                    // coded like luma below); the I_16x16-vs-I_8x8 RDO
-                    // at 4:4:4 is the next rung (CAVLC r385 mirror).
-                    i8x8_cand = Some(trial_intra8x8_for_cabac(
-                        frame,
-                        &mut recon_y,
-                        width,
-                        mb_x,
-                        mb_y,
-                        qp_y,
-                        &mut intra_grid,
-                    ));
-                } else if cfg.transform_8x8 {
+                if cfg.transform_8x8 {
                     let cost16 = intra16x16_luma_cost_estimate(
                         frame,
                         &mut recon_y,

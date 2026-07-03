@@ -658,7 +658,7 @@ fn make_source_444() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 }
 
 #[test]
-fn i8x8_444_idr_all_i8x8_roundtrips_bit_exact() {
+fn i8x8_444_idr_mixed_rdo_roundtrips_bit_exact() {
     let (y, u, v) = make_source_444();
     let frame = YuvFrame {
         width: W as u32,
@@ -674,8 +674,16 @@ fn i8x8_444_idr_all_i8x8_roundtrips_bit_exact() {
         ..EncoderConfig::new(W as u32, H as u32)
     };
     let idr = Encoder::new(cfg).encode_idr(&frame);
-    // Every MB is coded Intra_8x8 on the 4:4:4 + transform_8x8 path.
-    assert_eq!(idr.i8x8_mb_count, ((W / 16) * (H / 16)) as u32);
+    // Round-388 — the 4:4:4 + transform_8x8 path runs a per-MB
+    // I_16x16-vs-Intra_8x8 RDO (J over all three full-resolution
+    // planes): this mixed source keeps both shapes in one stream,
+    // which also exercises the mixed-neighbour per-plane nC walks.
+    let total = ((W / 16) * (H / 16)) as u32;
+    assert!(
+        idr.i8x8_mb_count > 0 && idr.i8x8_mb_count < total,
+        "expected mixed I_16x16/Intra_8x8 selection, got {}/{total}",
+        idr.i8x8_mb_count
+    );
 
     let mut saw = (false, false);
     for nal in AnnexBSplitter::new(&idr.annex_b) {
