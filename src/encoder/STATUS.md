@@ -1139,3 +1139,68 @@ High-profile **8x8 transform** (`EncoderConfig::transform_8x8`), CAVLC,
 - 4:2:0 only; 4:2:2 / 4:4:4 8x8 (incl. the CAVLC 4:4:4 chroma-like 8x8
   read path in the decoder) deferred.
 - Scaling lists pinned flat (PPS `pic_scaling_matrix_present_flag=0`).
+
+## Round 385 — landed
+
+**8x8 transform under CABAC (blockCat-5)** across I / P / B, plus the
+**4:2:2 and 4:4:4 Intra_8x8 CAVLC** encode paths and the decoder-side
+**CAVLC 4:4:4 8x8 read-path** fix:
+
+- **`encoder::cabac_syntax`**: `encode_transform_size_8x8_flag`
+  (§9.3.3.1.1.10, FL cMax=1, ctxIdxOffset 399 with neighbour condTerms
+  from the per-MB `transform_size_8x8` grid tracking) + 64-coefficient
+  Luma8x8 (blockCat-5) roundtrip pins: Table 9-43 significance maps,
+  ctxIdxOffset 402/417/426 families, the §7.3.5.3.3 CBF suppression
+  (`maxNumCoeff == 64 && ChromaArrayType != 3`) via `skip_cbf`, and the
+  scan-position-63 implicit-final-significance path.
+- **`encode_idr_cabac`**: per-MB I_16x16-vs-Intra_8x8 Lagrangian trial
+  (full §8.3.2 9-mode candidate on a snapshot/rollback recon window +
+  the shared `IntraGrid` eq. 8-73 derivation). A winner codes I_NxN +
+  flag=1 + 4 prev/rem pairs (ctxIdx 68/69) + explicit CBP + one
+  blockCat-5 residual per coded quadrant, CBF folded into the four 4x4
+  slots for §9.3.3.1.1.9 neighbour reads (decoder mirror). SPS
+  auto-promotes to High; PPS carries the tool flag.
+- **`encode_p_cabac` / `encode_b_cabac`**: shared §8.6.4 8x8-vs-4x4
+  luma-residual trial (`forward_inter_luma_8x8` +
+  `inter_luma_transform_cost`); §7.3.5 second-gate flag after CBP
+  whenever `cbp_luma > 0` (all emitted shapes qualify;
+  `direct_8x8_inference_flag = 1` covers the Direct forms; skips
+  gate-exempt; flag normalised to the inferred 0 when cbp collapses).
+  `EncodedIdr/P/B::i8x8_mb_count` count CABAC picks.
+- **4:2:2**: the 3-way transform-size RDO runs at High 4:2:2 via
+  `write_i8x8_mb_chroma` (ChromaWriteKind; 4:2:0 delegates
+  bit-identically) and the 4:2:2 I_NxN writer's new mandatory
+  `transform_size_8x8_flag = 0` emission.
+- **4:4:4**: `encode_mb_intra8x8_444` — §8.3.4.5 chroma coded like
+  luma (per-quadrant luma-mode reuse, 8x8 transform at the chroma QP,
+  shared CBP across the three planes, Table 9-4(b) CBP inverse, real
+  per-plane §9.2.1.1 nC via the new `derive_nc_plane_luma_like`).
+- **Decoder fix**: the CAVLC 4:4:4 8x8 Cb/Cr plane residual is now
+  §7.4.5.3.3-interleaved at parse (mirror of the round-382 luma fix);
+  previously every CAVLC 4:4:4 8x8-transform chroma residual decoded
+  scrambled.
+
+### Validation
+
+- `tests/integration_i8x8_cabac.rs` (6 gates): CABAC IDR / IDR+P /
+  IDR+P+B GOPs — mixed I_16x16/I_8x8 selection, second-gate flag with
+  both values in one stream, bit-exact self-roundtrip AND bit-exact
+  black-box reference-decoder interop on every stream shape.
+- `tests/integration_i8x8_encoder.rs` grew to 12 gates: 4:2:2
+  (profile-122 SPS + full-height chroma) and 4:4:4 (profile-244,
+  all-MB Intra_8x8, textured chroma exercising the plane interleave)
+  each pinned bit-exact through both decoders.
+- `cavlc_444_i8x8_plane_residual_is_interleaved` pins the parse-side
+  storage layout in isolation.
+
+### Status caveats
+
+- CABAC 8x8 remains 4:2:0 (blockCat-9/13 Cb/Cr 8x8 encode deferred).
+- 4:4:4 codes all MBs Intra_8x8 under `transform_8x8` (I_16x16-vs-
+  I_8x8 RDO at 4:4:4 deferred).
+- Scaling lists still pinned flat (`pic_scaling_matrix_present_flag =
+  0`); non-flat list encode + the SPS/PPS scaling_list writer are the
+  named next rung.
+- No staged CAVLC 4:4:4 8x8 corpus fixture exists (`4-4-4-high` /
+  `intra-only-high444` are CABAC) — coverage is via our own encoder +
+  the black-box validator.

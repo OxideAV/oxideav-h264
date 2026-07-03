@@ -7,8 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Round-385 — decoder CAVLC 4:4:4 8x8 read-path.** At
+  ChromaArrayType == 3 with `transform_size_8x8_flag = 1` the Cb/Cr
+  plane residuals are now §7.4.5.3.3-interleaved at parse time
+  (mirroring the round-382 luma fix); previously the raw de-interleaved
+  4x4 lists were stored while the 4:4:4 8x8 reconstruction consumed
+  contiguous 8x8-scan chunks, scrambling every CAVLC 4:4:4
+  8x8-transform chroma residual.
+
 ### Added
 
+- **Round-385 — 8x8 transform under CABAC (blockCat-5), I / P / B.**
+  `encode_idr_cabac` runs a per-MB I_16x16-vs-Intra_8x8 trial: a winner
+  codes mb_type I_NxN + the §9.3.3.1.1.10 `transform_size_8x8_flag`
+  (new `encode_transform_size_8x8_flag`, ctxIdxOffset 399 with per-MB
+  neighbour condTerm tracking), four prev/rem Intra_8x8 pred-mode
+  pairs, an explicit CBP, and one §7.3.5.3.3 blockCat-5 64-coefficient
+  residual per coded quadrant (CBF suppressed at 4:2:0 and folded into
+  the four 4x4 slots — decoder mirror; Table 9-43 significance maps
+  pinned by new 64-coefficient roundtrip unit tests).
+  `encode_p_cabac` / `encode_b_cabac` run the shared §8.6.4 8x8-vs-4x4
+  luma-residual trial on every coded MB and code the §7.3.5 second-gate
+  flag after CBP whenever `cbp_luma > 0` (all emitted P/B shapes
+  qualify; skips stay gate-exempt; the flag normalises to the
+  decoder-inferred 0 when cbp collapses). `i8x8_mb_count` now counts
+  CABAC picks on IDR / P / B. Gated by
+  `tests/integration_i8x8_cabac.rs`: 6 tests, all bit-exact through
+  both our decoder and the black-box reference decoder.
+- **Round-385 — 4:2:2 Intra_8x8 encode.** The 3-way transform-size RDO
+  runs at High 4:2:2 (profile 122): new `write_i8x8_mb_chroma` writer
+  takes `ChromaWriteKind` (4:2:0 delegates bit-identically), and the
+  4:2:2 I_NxN writer gains the mandatory §7.3.5
+  `transform_size_8x8_flag = 0` emission inside a
+  `transform_8x8_mode_flag = 1` stream. Bit-exact self-roundtrip +
+  yuv422p black-box interop tests.
+- **Round-385 — 4:4:4 Intra_8x8 encode (§8.3.4.5 chroma coded like
+  luma).** With `transform_8x8` at chroma_format_idc = 3 every MB codes
+  Intra_8x8: Cb/Cr predict each quadrant with the chosen luma mode, run
+  the 8x8 transform at the chroma QP, and emit the §7.4.5.3.3 split
+  under the shared CBP (Table 9-4(b) inverse via
+  `intra_cbp_to_codenum_0_3`; real per-plane §9.2.1.1 nC via the new
+  `derive_nc_plane_luma_like`). Bit-exact self-roundtrip + yuv444p
+  black-box interop.
 - **B-MB 8x8-residual RDO — the 8x8 transform now wins on B slices
   too.** The `encode_b` per-MB path runs the same §8.6.4
   8x8-vs-sixteen-4x4 luma-residual trial as `encode_p`
