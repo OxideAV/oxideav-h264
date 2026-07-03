@@ -1204,3 +1204,80 @@ High-profile **8x8 transform** (`EncoderConfig::transform_8x8`), CAVLC,
 - No staged CAVLC 4:4:4 8x8 corpus fixture exists (`4-4-4-high` /
   `intra-only-high444` are CABAC) — coverage is via our own encoder +
   the black-box validator.
+
+## Round 388 — landed
+
+**CABAC 4:2:2 + 4:4:4-8x8 (blockCat-9/13), non-flat scaling lists,
+4:4:4 I_16x16-vs-Intra_8x8 RDO** — plus two long-standing latent
+correctness bugs surfaced and fixed (decoder weightScale inverse scan;
+encoder chroma-AC nC).
+
+- **Decoder CABAC chroma-format fixes** (pinned bit-exact against
+  x264-generated High 4:2:2 / High 4:4:4-with-8x8 streams via the
+  black-box reference decoder):
+  - §9.3.3.1.3 eq. (9-22): chroma-DC sig/last ctxIdxInc =
+    `Min(levelListIdx / NumC8x8, 2)` — the NumC8x8=2 divisor (4:2:2)
+    was dropped.
+  - §9.3.3.1.1.9 cat-4 at 4:2:2: above-neighbour wrap into the 2x4
+    chroma-AC grid now uses the true chroma MB height (16).
+  - §9.3.3.1.1.9 cat-5/9/13: the explicitly-coded CBF of 8x8 blocks
+    at ChromaArrayType==3 derives real cond terms via §6.4.11.2/.3
+    (CBP-bit + transform_size_8x8_flag gating on folded per-plane 4x4
+    slots) instead of an all-zero fallback.
+- **CABAC 4:2:2 IDR encode**: 8-coefficient ChromaDCLevel under the
+  NumC8x8=2 contexts, 8 ChromaACLevel blocks on the 2x4 grid,
+  transform_8x8 luma trial allowed; §8.5.11.2 chroma chain shared with
+  the CAVLC path; §8.7 deblock at chroma_array_type=2.
+- **CABAC 4:4:4 Intra_8x8 encode**: blockCat-9/13 64-coefficient
+  chroma residuals (§8.3.4.5 per-quadrant luma-mode reuse at the
+  chroma QP), shared §7.4.5.1 CBP across the three planes, explicit
+  cat-5/9/13 CBF. Root-caused a one-phantom-bin desync: the I_NxN
+  CBP emit had a hard-coded 4:2:0 ChromaArrayType.
+- **§8.5.9 weightScale inverse scan (decoder)**: scaling lists are
+  parsed in bitstream zig-zag order but every LevelScale consumer
+  indexes raster weightScale — the missing §8.5.6 inverse scan garbled
+  every non-flat matrix. `select_scaling_list_4x4/8x8` now return the
+  inverse-scanned weightScale (x264 `cqm=jvt` CAVLC + CABAC streams
+  byte-exact).
+- **Non-flat scaling-list encode**: `EncoderConfig::scaling_matrix`
+  ∈ {Flat, SeqDefault, PicDefault}. Default Table 7-3/7-4 matrices
+  signalled as UseDefaultScalingMatrixFlag (`delta_scale = -8` per
+  list) in the SPS or the §7.3.2.2 PPS tail; `_w` quantiser variants
+  divide by the weightScale; the I_16x16/I_4x4/I_8x8 RDO trials and
+  recon inverses all run under the effective matrices. CAVLC IDR at
+  4:2:0; P/B + CABAC assert Flat.
+- **Chroma-AC CAVLC nC (latent-bug fix)**: the round-2 `nC = 0`
+  shortcut selected the wrong coeff_token *table* whenever a
+  neighbouring chroma-AC block carried TotalCoeff >= 2 (dense chroma
+  desynchronised every spec decoder). All CAVLC writers (I/P/B,
+  4:2:0 + 4:2:2) now take per-block nC derived from the grid with
+  progressive in-MB TotalCoeff commits.
+- **4:4:4 I_16x16-vs-Intra_8x8 RDO**: CAVLC runs a real two-way trial
+  (3-plane SSD + actually-emitted bits, chroma-aware MbStateSnapshot);
+  CABAC folds the fmt-3 special case into the standard luma-cost
+  trial. Mixing the shapes exposed the fmt-3 I_16x16 per-plane
+  `nC = 0` approximation — replaced with the real §9.2.1.1 per-plane
+  derivation + grid commits (`derive_plane_nc_444_i16x16`).
+
+### Validation
+
+- `tests/integration_cabac_chroma_formats.rs` (5 gates) — x264 High
+  4:2:2 / High 4:4:4-8x8 / cqm=jvt streams decode byte-exact.
+- `tests/integration_cabac_422.rs` (5) + `integration_cabac_444_8x8.rs`
+  (3) — bit-exact self-roundtrip AND black-box interop on every new
+  CABAC wire shape (mixed-selection pins included).
+- `tests/integration_scaling_matrix.rs` (11) — SPS/PPS signalling +
+  bit-exact dual-decoder interop for SeqDefault/PicDefault ±
+  transform_8x8 + flat regression.
+- `tests/integration_chroma_nc.rs` (3) — dense-chroma IDR + GOP.
+- Full suite: 1561 tests green.
+
+### Status caveats
+
+- 4:4:4 I_4x4 encode leg deferred (needs a chroma-as-luma 4x4 emit
+  path); the RDO is two-way (I_16x16 / I_8x8).
+- Non-flat scaling matrices: CAVLC 4:2:0 IDR only; P/B + CABAC +
+  custom (non-default) list values deferred.
+- CABAC 4:2:2 remains IDR-only (P/B 4:2:2 encode deferred, matching
+  CAVLC).
+
