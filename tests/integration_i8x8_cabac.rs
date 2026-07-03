@@ -182,6 +182,125 @@ fn i8x8_cabac_idr_without_flag_never_codes_8x8() {
     assert_eq!(idr.i8x8_mb_count, 0);
 }
 
+/// P-frame source: the IDR source plus a smooth low-frequency
+/// brightness ramp over the left half — a broad-gradient residual the
+/// 8x8 transform codes more compactly than sixteen 4x4s.
+fn make_p_source() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (mut y, u, v) = make_source();
+    for j in 0..H {
+        for i in 0..W / 2 {
+            let bump = 10 + (i + j) / 4;
+            let s = y[j * W + i] as usize + bump;
+            y[j * W + i] = s.min(235) as u8;
+        }
+    }
+    (y, u, v)
+}
+
+#[test]
+fn i8x8_cabac_p_slice_second_gate_flag_roundtrips_bit_exact() {
+    use oxideav_h264::encoder::EncodedFrameRef;
+
+    let (y0, u0, v0) = make_source();
+    let (y1, u1, v1) = make_p_source();
+    let f0 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let f1 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let cfg = EncoderConfig {
+        cabac: true,
+        profile_idc: 100,
+        transform_8x8: true,
+        max_num_ref_frames: 1,
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr_cabac(&f0);
+    let p = enc.encode_p_cabac(&f1, &EncodedFrameRef::from(&idr), 1, 2);
+
+    // The low-frequency inter residual must make the trial pick the
+    // 8x8 transform on at least one P MB (the §7.3.5 second-gate flag
+    // gets coded with both values in one stream).
+    assert!(
+        p.i8x8_mb_count > 0,
+        "inter trial never picked the 8x8 transform on the ramp residual"
+    );
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&idr.annex_b);
+    combined.extend_from_slice(&p.annex_b);
+
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), combined.clone()).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let mut frames = Vec::new();
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        frames.push(vf);
+    }
+    assert_eq!(frames.len(), 2, "expected IDR + P decoded frames");
+    assert_eq!(plane_max_diff(&frames[0], 0, &idr.recon_y, W, H), 0);
+    assert_eq!(plane_max_diff(&frames[1], 0, &p.recon_y, W, H), 0);
+    assert_eq!(plane_max_diff(&frames[1], 1, &p.recon_u, W / 2, H / 2), 0);
+    assert_eq!(plane_max_diff(&frames[1], 2, &p.recon_v, W / 2, H / 2), 0);
+
+    // Black-box reference decoder interop on the 2-frame stream.
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: reference decoder binary not present");
+        return;
+    }
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!(
+        "oxideav_h264_r385_p8x8_cabac_{}.h264",
+        std::process::id()
+    ));
+    let yuv_path = tmpdir.join(format!(
+        "oxideav_h264_r385_p8x8_cabac_{}.yuv",
+        std::process::id()
+    ));
+    std::fs::write(&h264_path, &combined).expect("write h264");
+    let status = std::process::Command::new(ffmpeg)
+        .args(["-loglevel", "error", "-y", "-f", "h264", "-i"])
+        .arg(&h264_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn reference decoder");
+    assert!(status.success(), "reference decoder rejected the stream");
+    let yuv = std::fs::read(&yuv_path).expect("read decoded yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+    let frame_bytes = W * H + 2 * (W / 2) * (H / 2);
+    assert_eq!(yuv.len(), 2 * frame_bytes, "expected two 4:2:0 frames");
+    let f1_bytes = &yuv[frame_bytes..];
+    assert_eq!(
+        &f1_bytes[..W * H],
+        &p.recon_y[..],
+        "P-frame luma mismatch vs reference decoder"
+    );
+    assert_eq!(
+        &f1_bytes[W * H..W * H + (W / 2) * (H / 2)],
+        &p.recon_u[..],
+        "P-frame Cb mismatch vs reference decoder"
+    );
+    assert_eq!(
+        &f1_bytes[W * H + (W / 2) * (H / 2)..],
+        &p.recon_v[..],
+        "P-frame Cr mismatch vs reference decoder"
+    );
+}
+
 #[test]
 fn i8x8_cabac_idr_reference_decoder_interop() {
     let idr = encode_i8x8_cabac();
