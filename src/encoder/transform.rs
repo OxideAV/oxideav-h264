@@ -256,6 +256,38 @@ pub fn quantize_4x4_ac(w: &[i32; 16], qp: i32, is_intra: bool) -> [i32; 16] {
     z
 }
 
+/// [`quantize_4x4`] under a non-flat §7.4.2.1.1.1 weightScale matrix
+/// (`wscale`, row-major): the decoder's LevelScale multiplies each
+/// dequantised coefficient by `wscale(i,j) / 16`, so the forward step
+/// divides — `level = (|c| * MF * 16 / wscale + f) >> qBits`. With a
+/// flat list (all 16s) this is bit-identical to [`quantize_4x4`].
+pub fn quantize_4x4_w(w: &[i32; 16], qp: i32, is_intra: bool, wscale: &[i32; 16]) -> [i32; 16] {
+    debug_assert!((0..=51).contains(&qp));
+    let m = (qp.rem_euclid(6)) as usize;
+    let mf = forward_mf_for(m);
+    let qb = q_bits(qp);
+    let f = if is_intra {
+        (1i64 << qb) / 3
+    } else {
+        (1i64 << qb) / 6
+    };
+    let mut z = [0i32; 16];
+    for k in 0..16 {
+        let abs_w = (w[k] as i64).unsigned_abs();
+        let prod = (abs_w * mf[k] as u64 * 16) / (wscale[k].max(1) as u64);
+        let level = ((prod as i64 + f) >> qb) as i32;
+        z[k] = if w[k] < 0 { -level } else { level };
+    }
+    z
+}
+
+/// [`quantize_4x4_ac`] under a non-flat weightScale matrix.
+pub fn quantize_4x4_ac_w(w: &[i32; 16], qp: i32, is_intra: bool, wscale: &[i32; 16]) -> [i32; 16] {
+    let mut z = quantize_4x4_w(w, qp, is_intra, wscale);
+    z[0] = 0;
+    z
+}
+
 // ---------------------------------------------------------------------------
 // §8.5.10 — Intra_16x16 luma DC: forward 4x4 Hadamard + quantization.
 // ---------------------------------------------------------------------------
@@ -330,6 +362,29 @@ pub fn quantize_luma_dc(coeff: &[i32; 16], qp: i32, is_intra: bool) -> [i32; 16]
     z
 }
 
+/// [`quantize_luma_dc`] under a non-flat weightScale: §8.5.10's DC
+/// scaling uses LevelScale(qP%6, 0, 0) = wscale(0,0) * normAdjust, so
+/// the forward step divides by `w00 / 16`.
+pub fn quantize_luma_dc_w(coeff: &[i32; 16], qp: i32, is_intra: bool, w00: i32) -> [i32; 16] {
+    debug_assert!((0..=51).contains(&qp));
+    let m = (qp.rem_euclid(6)) as usize;
+    let mf = forward_mf_for(m)[0];
+    let qb = q_bits(qp) + 2;
+    let f = if is_intra {
+        (1i64 << qb) / 3
+    } else {
+        (1i64 << qb) / 6
+    };
+    let mut z = [0i32; 16];
+    for k in 0..16 {
+        let abs_c = (coeff[k] as i64).unsigned_abs();
+        let prod = (abs_c * mf as u64 * 16) / (w00.max(1) as u64);
+        let level = ((prod as i64 + f) >> qb) as i32;
+        z[k] = if coeff[k] < 0 { -level } else { level };
+    }
+    z
+}
+
 // ---------------------------------------------------------------------------
 // §8.5.11 — chroma DC (4:2:0): forward 2x2 Hadamard + quantization.
 // ---------------------------------------------------------------------------
@@ -369,6 +424,28 @@ pub fn quantize_chroma_dc(coeff: &[i32; 4], qp_c: i32, is_intra: bool) -> [i32; 
     for k in 0..4 {
         let abs_c = (coeff[k] as i64).unsigned_abs();
         let prod = abs_c * mf as u64;
+        let level = ((prod as i64 + f) >> qb) as i32;
+        z[k] = if coeff[k] < 0 { -level } else { level };
+    }
+    z
+}
+
+/// [`quantize_chroma_dc`] under a non-flat weightScale: §8.5.11.1's
+/// scaling uses LevelScale(qP%6, 0, 0) of the chroma list.
+pub fn quantize_chroma_dc_w(coeff: &[i32; 4], qp_c: i32, is_intra: bool, w00: i32) -> [i32; 4] {
+    debug_assert!((0..=51).contains(&qp_c));
+    let m = (qp_c.rem_euclid(6)) as usize;
+    let mf = forward_mf_for(m)[0];
+    let qb = q_bits(qp_c) + 1;
+    let f = if is_intra {
+        (1i64 << qb) / 3
+    } else {
+        (1i64 << qb) / 6
+    };
+    let mut z = [0i32; 4];
+    for k in 0..4 {
+        let abs_c = (coeff[k] as i64).unsigned_abs();
+        let prod = (abs_c * mf as u64 * 16) / (w00.max(1) as u64);
         let level = ((prod as i64 + f) >> qb) as i32;
         z[k] = if coeff[k] < 0 { -level } else { level };
     }
@@ -952,6 +1029,32 @@ pub fn quantize_8x8(w: &[i32; 64], qp: i32, is_intra: bool) -> [i32; 64] {
             let mf = forward_mf_8x8(m, class);
             let abs_w = (w[idx] as i64).unsigned_abs();
             let level = ((abs_w as i64 * mf + f) >> qb) as i32;
+            z[idx] = if w[idx] < 0 { -level } else { level };
+        }
+    }
+    z
+}
+
+/// [`quantize_8x8`] under a non-flat §7.4.2.1.1.1 8x8 weightScale
+/// (row-major). Flat lists reproduce [`quantize_8x8`] bit-exactly.
+pub fn quantize_8x8_w(w: &[i32; 64], qp: i32, is_intra: bool, wscale: &[i32; 64]) -> [i32; 64] {
+    debug_assert!((0..=51).contains(&qp));
+    let m = qp.rem_euclid(6) as usize;
+    let qb = q_bits_8x8(qp);
+    let f = if is_intra {
+        (1i64 << qb) / 3
+    } else {
+        (1i64 << qb) / 6
+    };
+    let mut z = [0i32; 64];
+    for i in 0..8 {
+        for j in 0..8 {
+            let idx = i * 8 + j;
+            let class = norm_adjust_8x8_class(i, j);
+            let mf = forward_mf_8x8(m, class);
+            let abs_w = (w[idx] as i64).unsigned_abs() as i64;
+            let prod = (abs_w * mf * 16) / (wscale[idx].max(1) as i64);
+            let level = ((prod + f) >> qb) as i32;
             z[idx] = if w[idx] < 0 { -level } else { level };
         }
     }

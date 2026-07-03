@@ -50,12 +50,19 @@ pub struct BaselinePpsConfig {
     pub entropy_coding_mode_flag: bool,
     /// §7.4.2.2 — `transform_8x8_mode_flag`. When `true`, the PPS carries
     /// the optional trailing group (`transform_8x8_mode_flag = 1`,
-    /// `pic_scaling_matrix_present_flag = 0`, `second_chroma_qp_index_offset`)
+    /// `pic_scaling_matrix_present_flag`, `second_chroma_qp_index_offset`)
     /// so the decoder reads a per-MB `transform_size_8x8_flag` for I_NxN
     /// macroblocks and accepts Intra_8x8 / 8x8-transform residuals. Only
     /// permitted in High profile (100) and above per §A.2.4;
     /// `second_chroma_qp_index_offset` mirrors `chroma_qp_index_offset`.
     pub transform_8x8_mode_flag: bool,
+    /// §7.3.2.2 / §7.3.2.1.1.1 — when `true`, the optional PPS tail
+    /// carries `pic_scaling_matrix_present_flag = 1` with every list
+    /// coded as UseDefaultScalingMatrixFlag (delta_scale = -8),
+    /// selecting the Table 7-3 / Table 7-4 default matrices at
+    /// picture level (6 lists, + 2 8x8 lists when
+    /// `transform_8x8_mode_flag` is set, per the §7.3.2.2 loop bound).
+    pub pic_scaling_matrix_default: bool,
 }
 
 /// Build a Baseline PPS RBSP body (§7.3.2.2).
@@ -94,11 +101,23 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
     w.u(1, 0);
 
     // §7.3.2.2 — optional trailing group. Only emitted when a High-profile
-    // feature (8x8 transform) needs it; otherwise the decoder infers
-    // transform_8x8_mode_flag = 0 from the absent tail.
-    if cfg.transform_8x8_mode_flag {
-        w.u(1, 1); // transform_8x8_mode_flag
-        w.u(1, 0); // pic_scaling_matrix_present_flag = 0 (flat lists)
+    // feature (8x8 transform / picture scaling matrices) needs it;
+    // otherwise the decoder infers transform_8x8_mode_flag = 0 and
+    // flat picture lists from the absent tail.
+    if cfg.transform_8x8_mode_flag || cfg.pic_scaling_matrix_default {
+        w.u(1, if cfg.transform_8x8_mode_flag { 1 } else { 0 });
+        if cfg.pic_scaling_matrix_default {
+            w.u(1, 1); // pic_scaling_matrix_present_flag
+                       // §7.3.2.2 loop bound: 6 + [2, 6] * transform_8x8_mode_flag
+                       // (4:2:0/4:2:2 → 2 extra 8x8 lists).
+            let n_lists = 6 + if cfg.transform_8x8_mode_flag { 2 } else { 0 };
+            for _ in 0..n_lists {
+                w.u(1, 1); // pic_scaling_list_present_flag[i]
+                w.se(-8); // delta_scale → UseDefaultScalingMatrixFlag
+            }
+        } else {
+            w.u(1, 0); // pic_scaling_matrix_present_flag = 0
+        }
         w.se(cfg.chroma_qp_index_offset); // second_chroma_qp_index_offset
     }
 
@@ -114,6 +133,7 @@ mod tests {
     #[test]
     fn baseline_pps_round_trips_through_decoder_parser() {
         let cfg = BaselinePpsConfig {
+            pic_scaling_matrix_default: false,
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: 0,

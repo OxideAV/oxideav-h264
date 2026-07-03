@@ -67,6 +67,13 @@ pub struct BaselineSpsConfig {
     /// emitting a High 4:4:4 Predictive (244) SPS. The writer asserts
     /// the (profile_idc, chroma_format_idc) pairing is one it understands.
     pub chroma_format_idc: u32,
+    /// §7.3.2.1.1 / §7.3.2.1.1.1 — when `true`, emit
+    /// `seq_scaling_matrix_present_flag = 1` with every list signalled
+    /// as **UseDefaultScalingMatrixFlag** (a single `delta_scale = -8`
+    /// drives nextScale to 0 at j == 0), selecting the Table 7-3 /
+    /// Table 7-4 default matrices. Requires a chroma-extended
+    /// profile_idc (the flag lives in the §7.3.2.1.1 optional group).
+    pub seq_scaling_matrix_default: bool,
 }
 
 impl Default for BaselineSpsConfig {
@@ -81,6 +88,7 @@ impl Default for BaselineSpsConfig {
             max_num_ref_frames: 1,
             profile_idc: 66,
             chroma_format_idc: 1,
+            seq_scaling_matrix_default: false,
         }
     }
 }
@@ -154,9 +162,21 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
         w.ue(0);
         // qpprime_y_zero_transform_bypass_flag = 0.
         w.u(1, 0);
-        // seq_scaling_matrix_present_flag = 0 (use flat scaling lists,
-        // matching what the decoder's flat path expects).
-        w.u(1, 0);
+        // §7.3.2.1.1.1 — seq_scaling_matrix_present_flag. When default
+        // matrices are requested, each of the 8 (12 at 4:4:4) lists is
+        // present and coded as UseDefaultScalingMatrixFlag: one
+        // delta_scale = -8 makes nextScale 0 at j == 0, selecting the
+        // Table 7-3 / Table 7-4 defaults for the whole list.
+        if cfg.seq_scaling_matrix_default {
+            w.u(1, 1);
+            let n_lists = if cfg.chroma_format_idc == 3 { 12 } else { 8 };
+            for _ in 0..n_lists {
+                w.u(1, 1); // seq_scaling_list_present_flag[i]
+                w.se(-8); // delta_scale → UseDefaultScalingMatrixFlag
+            }
+        } else {
+            w.u(1, 0);
+        }
     }
 
     w.ue(cfg.log2_max_frame_num_minus4);
@@ -197,6 +217,7 @@ mod tests {
     #[test]
     fn baseline_sps_round_trips_through_decoder_parser() {
         let cfg = BaselineSpsConfig {
+            seq_scaling_matrix_default: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4, // 64 samples
@@ -236,6 +257,7 @@ mod tests {
         // (chroma_format_idc=3, separate_colour_plane_flag=0) back to
         // ChromaArrayType=3).
         let cfg = BaselineSpsConfig {
+            seq_scaling_matrix_default: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -270,6 +292,7 @@ mod tests {
         // seq_scaling_matrix_present_flag tail. Round-27 emits
         // chroma_format_idc=2 (4:2:2), 8-bit depth, no scaling matrix.
         let cfg = BaselineSpsConfig {
+            seq_scaling_matrix_default: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,

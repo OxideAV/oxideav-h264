@@ -1879,6 +1879,10 @@ impl Encoder {
             matches!(cfg.chroma_format_idc, 1..=3),
             "encode_idr_cabac supports chroma_format_idc 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
         );
+        assert!(
+            cfg.scaling_matrix.is_flat(),
+            "non-flat scaling matrices are IDR/CAVLC-only (round-388 scope)",
+        );
 
         let width = cfg.width as usize;
         let height = cfg.height as usize;
@@ -1912,6 +1916,7 @@ impl Encoder {
             cfg.profile_idc
         };
         let sps = build_baseline_sps_rbsp(&BaselineSpsConfig {
+            seq_scaling_matrix_default: false,
             seq_parameter_set_id: 0,
             level_idc: cfg.level_idc,
             width_in_mbs: width_mbs as u32,
@@ -1923,6 +1928,7 @@ impl Encoder {
             chroma_format_idc: cfg.chroma_format_idc,
         });
         let pps_cfg = BaselinePpsConfig {
+            pic_scaling_matrix_default: false,
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: cfg.qp - 26,
@@ -2099,8 +2105,17 @@ impl Encoder {
                     // DC + per-4x4 AC + recon residual) shared with the
                     // CAVLC path.
                     let cbk = super::encode_chroma_block(
-                        2, frame.u, frame.v, &recon_u, &recon_v, chroma_w, chroma_h, mb_x, mb_y,
+                        2,
+                        frame.u,
+                        frame.v,
+                        &recon_u,
+                        &recon_v,
+                        chroma_w,
+                        chroma_h,
+                        mb_x,
+                        mb_y,
                         qp_c,
+                        &FLAT_4X4_16,
                     );
                     chroma_mode = cbk.pred_mode;
                     cbp_chroma = cbk.cbp_chroma;
@@ -2800,6 +2815,10 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedP {
+        assert!(
+            self.config().scaling_matrix.is_flat(),
+            "non-flat scaling matrices are IDR/CAVLC-only (round-388 scope)",
+        );
         let cfg = self.config();
         assert!(cfg.cabac);
         assert!(cfg.profile_idc >= 77);
@@ -3509,6 +3528,10 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedB {
+        assert!(
+            self.config().scaling_matrix.is_flat(),
+            "non-flat scaling matrices are IDR/CAVLC-only (round-388 scope)",
+        );
         let cfg = self.config();
         assert!(
             cfg.cabac,
