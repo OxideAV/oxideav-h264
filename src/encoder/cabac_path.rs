@@ -34,13 +34,16 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::cabac_ctx::{BlockType, CabacContexts, MvdComponent, NeighbourCtx, SliceKind};
+use crate::cavlc::CoeffTokenContext;
 use crate::encoder::bitstream::BitWriter;
 use crate::encoder::cabac_engine::CabacEncoder;
 use crate::encoder::cabac_syntax::{
     encode_coded_block_pattern, encode_end_of_slice_flag, encode_intra_chroma_pred_mode,
     encode_mb_qp_delta, encode_mb_skip_flag, encode_mb_type_b, encode_mb_type_i, encode_mb_type_p,
-    encode_mvd_lx, encode_residual_block_cabac, encode_sub_mb_type_b,
+    encode_mvd_lx, encode_prev_intra_pred_mode_flag, encode_rem_intra_pred_mode,
+    encode_residual_block_cabac, encode_sub_mb_type_b, encode_transform_size_8x8_flag,
 };
+use crate::encoder::cavlc::encode_residual_block_cavlc;
 use crate::encoder::deblock::{
     chroma_nz_mask_from_blocks, deblock_recon, luma_nz_mask_from_blocks, MbDeblockInfo,
 };
@@ -51,14 +54,16 @@ use crate::encoder::macroblock::{b_16x8_mb_type_raw, b_8x16_mb_type_raw, BPartPr
 use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
+use crate::encoder::rdo::{cost_combined, lambda_ssd};
 use crate::encoder::slice::{
     write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
     CabacSliceParams, IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
-    forward_core_4x4, forward_hadamard_2x2, forward_hadamard_4x4, quantize_4x4_ac,
-    quantize_chroma_dc, quantize_luma_dc, zigzag_scan_4x4, zigzag_scan_4x4_ac,
+    deinterleave_8x8_to_4x4, forward_core_4x4, forward_core_8x8, forward_hadamard_2x2,
+    forward_hadamard_4x4, quantize_4x4_ac, quantize_8x8, quantize_chroma_dc, quantize_luma_dc,
+    zigzag_scan_4x4, zigzag_scan_4x4_ac, zigzag_scan_8x8,
 };
 use crate::encoder::{
     best_partition_mode_b, build_b_explicit_4x4_cell_chroma, build_b_explicit_8x8_cell_luma,
@@ -76,10 +81,15 @@ use crate::mv_deriv::{
 
 // `build_inter_pred_luma` and `build_inter_pred_chroma` are private to the
 // `crate::encoder` module's `mod.rs`; we replicate them locally here.
+use crate::encoder::{
+    gather_8x8_from_recon, intra8x8_mode_available, predicted_intra8x8_mode, IntraGrid,
+};
+use crate::intra_pred::{filter_samples_8x8, predict_8x8, Intra8x8Mode};
 use crate::nal::NalUnitType;
 use crate::transform::{
-    inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
-    inverse_transform_4x4_dc_preserved, qp_bd_offset, qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
+    default_scaling_list_8x8_flat, inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
+    inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
+    qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
 };
 
 /// §6.4.3 / Figure 6-10 — luma 4x4 block scan (block index → (bx, by)).
@@ -148,6 +158,9 @@ struct CabacEncMbInfo {
     mv_l0_8x8: [Mv; 4],
     ref_idx_l1_8x8: [i32; 4],
     mv_l1_8x8: [Mv; 4],
+    /// §9.3.3.1.1.10 — this MB's `transform_size_8x8_flag`, feeding the
+    /// next MB's ctxIdxOffset-399 condTerm derivation.
+    transform_size_8x8: bool,
 }
 
 impl Default for CabacEncMbInfo {
@@ -179,6 +192,7 @@ impl Default for CabacEncMbInfo {
             mv_l0_8x8: [Mv::ZERO; 4],
             ref_idx_l1_8x8: [-1; 4],
             mv_l1_8x8: [Mv::ZERO; 4],
+            transform_size_8x8: false,
         }
     }
 }
@@ -1151,8 +1165,12 @@ fn build_neighbour_ctx(grid: &CabacEncGrid, mb_x: usize, mb_y: usize) -> Neighbo
         above_is_i_pcm: apcm,
         left_intra_chroma_pred_mode_nonzero: licpm != 0,
         above_intra_chroma_pred_mode_nonzero: aicpm != 0,
-        left_transform_8x8: false,
-        above_transform_8x8: false,
+        left_transform_8x8: left
+            .map(|m| m.available && m.transform_size_8x8)
+            .unwrap_or(false),
+        above_transform_8x8: above
+            .map(|m| m.available && m.transform_size_8x8)
+            .unwrap_or(false),
         left_cbp_luma: lcbpl,
         above_cbp_luma: acbpl,
         left_cbp_chroma: lcbpc,
@@ -1354,6 +1372,247 @@ fn reconstruct_intra16x16_luma(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Round-385 — Intra_8x8 (I_NxN with transform_size_8x8_flag = 1) trial
+// machinery for the CABAC IDR path.
+// ---------------------------------------------------------------------------
+
+/// Snapshot one MB's 16x16 luma recon window for trial rollback.
+fn save_mb_luma_window(recon_y: &[u8], width: usize, mb_x: usize, mb_y: usize) -> [u8; 256] {
+    let mut out = [0u8; 256];
+    for j in 0..16usize {
+        let row = (mb_y * 16 + j) * width + mb_x * 16;
+        out[j * 16..j * 16 + 16].copy_from_slice(&recon_y[row..row + 16]);
+    }
+    out
+}
+
+fn restore_mb_luma_window(
+    recon_y: &mut [u8],
+    width: usize,
+    mb_x: usize,
+    mb_y: usize,
+    saved: &[u8; 256],
+) {
+    for j in 0..16usize {
+        let row = (mb_y * 16 + j) * width + mb_x * 16;
+        recon_y[row..row + 16].copy_from_slice(&saved[j * 16..j * 16 + 16]);
+    }
+}
+
+/// SSD of the current recon window vs the source luma MB.
+fn mb_luma_ssd(
+    frame: &YuvFrame<'_>,
+    recon_y: &[u8],
+    width: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> u64 {
+    let mut d = 0u64;
+    for j in 0..16usize {
+        for i in 0..16usize {
+            let idx = (mb_y * 16 + j) * width + mb_x * 16 + i;
+            let e = (frame.y[idx] as i64) - (recon_y[idx] as i64);
+            d += (e * e) as u64;
+        }
+    }
+    d
+}
+
+/// Lagrangian cost estimate of the Intra_16x16 luma candidate: the
+/// §8.5.10 recon SSD plus a trial-CAVLC rate proxy of the DC + AC
+/// blocks at nC = 0 (same decision policy as the CAVLC-path RDO — the
+/// proxy only steers the per-MB choice, the emitted syntax is CABAC).
+#[allow(clippy::too_many_arguments)]
+fn intra16x16_luma_cost_estimate(
+    frame: &YuvFrame<'_>,
+    recon_y: &mut [u8],
+    width: usize,
+    mb_x: usize,
+    mb_y: usize,
+    pred: &[i32; 256],
+    dc: &[i32; 16],
+    ac_quant: &[[i32; 16]; 16],
+    ac_scan: &[[i32; 16]; 16],
+    cbp_luma: u8,
+    qp_y: i32,
+) -> u64 {
+    let saved = save_mb_luma_window(recon_y, width, mb_x, mb_y);
+    reconstruct_intra16x16_luma(
+        mb_x, mb_y, width, pred, dc, ac_quant, cbp_luma, qp_y, recon_y,
+    );
+    let d = mb_luma_ssd(frame, recon_y, width, mb_x, mb_y);
+    restore_mb_luma_window(recon_y, width, mb_x, mb_y, &saved);
+
+    let mut w = BitWriter::new();
+    let dc_scan = zigzag_scan_4x4(dc);
+    let _ = encode_residual_block_cavlc(&mut w, CoeffTokenContext::Numeric(0), 16, &dc_scan);
+    if cbp_luma == 15 {
+        for blk in ac_scan.iter() {
+            let _ =
+                encode_residual_block_cavlc(&mut w, CoeffTokenContext::Numeric(0), 15, &blk[..15]);
+        }
+    }
+    // +7 — flat mb_type-syntax seed (Table 9-36 suffix width), matching
+    // the CAVLC RDO's I_16x16 seeding so the cross-path bias carries over.
+    let bits = 7 + w.bits_emitted() as u64;
+    cost_combined(d, bits, lambda_ssd(qp_y, true))
+}
+
+/// Per-MB Intra_8x8 candidate produced by [`trial_intra8x8_for_cabac`].
+struct CabacI8x8Candidate {
+    prev_flag: [bool; 4],
+    rem: [u8; 4],
+    /// Table 8-14 zig-zag scan list per 8x8 quadrant — the blockCat-5
+    /// CABAC residual payload.
+    scan8: [[i32; 64]; 4],
+    blk8_has_nz: [bool; 4],
+    cost: u64,
+}
+
+/// §8.3.2 Intra_8x8 luma trial for the CABAC IDR path. Mirrors the
+/// CAVLC `encode_mb_intra8x8` per-quadrant loop: all nine §8.3.2.2
+/// prediction modes (availability-gated), the §8.3.2.1 eq. 8-73
+/// `predIntra8x8PredMode` derivation via the shared [`IntraGrid`], the
+/// §8.6.4 forward transform + §8.5.13.1 quantiser, and the normative
+/// inverse for the local recon. **Commits** the winning recon into
+/// `recon_y` and the chosen modes into `intra_grid` — the caller
+/// snapshots both and rolls back when the I_16x16 candidate wins.
+fn trial_intra8x8_for_cabac(
+    frame: &YuvFrame<'_>,
+    recon_y: &mut [u8],
+    width: usize,
+    mb_x: usize,
+    mb_y: usize,
+    qp_y: i32,
+    intra_grid: &mut IntraGrid,
+) -> CabacI8x8Candidate {
+    let lambda = lambda_ssd(qp_y, true);
+    let sl8 = default_scaling_list_8x8_flat();
+
+    // Pre-mark the slot so in-MB neighbour lookups (blocks 1..3) see
+    // this MB's earlier-block modes — mirrors the decoder's ordering.
+    {
+        let s = intra_grid.slot_mut(mb_x, mb_y);
+        s.available = true;
+        s.is_i_nxn = false;
+        s.is_i8x8 = true;
+        s.intra_8x8_pred_modes = [2u8; 4];
+    }
+
+    let mut prev_flag = [false; 4];
+    let mut rem = [0u8; 4];
+    let mut scan8 = [[0i32; 64]; 4];
+    let mut blk8_has_nz = [false; 4];
+    // Same MB-overhead seeding as the CAVLC I_8x8 trial (mb_type +
+    // transform_size_8x8_flag + chroma mode + cbp + qp_delta).
+    let mb_overhead_bits: u64 = 26;
+    let mut cost: u64 = cost_combined(0, mb_overhead_bits, lambda);
+
+    for blk8 in 0..4usize {
+        let bx = mb_x * 16 + (blk8 % 2) * 8;
+        let by = mb_y * 16 + (blk8 / 2) * 8;
+        let predicted = predicted_intra8x8_mode(intra_grid, mb_x, mb_y, blk8);
+
+        let raw = gather_8x8_from_recon(recon_y, width, mb_x, mb_y, blk8);
+        let filtered = filter_samples_8x8(&raw, 8);
+
+        let mut best_mode = Intra8x8Mode::Dc;
+        let mut best_cost = u64::MAX;
+        let mut best_z_raster = [0i32; 64];
+        let mut best_recon = [0i32; 64];
+        for mode_idx in 0..9u8 {
+            let mode = Intra8x8Mode::from_index(mode_idx).expect("mode index in range");
+            if !intra8x8_mode_available(mode, &raw.availability) {
+                continue;
+            }
+            let mut pred = [0i32; 64];
+            predict_8x8(mode, &filtered, 8, &mut pred);
+
+            let mut res = [0i32; 64];
+            for j in 0..8 {
+                for i in 0..8 {
+                    let s = frame.y[(by + j) * width + bx + i] as i32;
+                    res[j * 8 + i] = s - pred[j * 8 + i];
+                }
+            }
+            let w_coeffs = forward_core_8x8(&res);
+            let z_raster = quantize_8x8(&w_coeffs, qp_y, true);
+            let r = inverse_transform_8x8(&z_raster, qp_y, &sl8, 8).expect("inverse 8x8");
+            let mut recon_blk = [0i32; 64];
+            let mut d: u64 = 0;
+            for j in 0..8 {
+                for i in 0..8 {
+                    let v = (pred[j * 8 + i] + r[j * 8 + i]).clamp(0, 255);
+                    recon_blk[j * 8 + i] = v;
+                    let s = frame.y[(by + j) * width + bx + i] as i32;
+                    let e = (s - v) as i64;
+                    d += (e * e) as u64;
+                }
+            }
+
+            // Rate proxy: prev_flag (1) + rem (3 on miss) + trial CAVLC
+            // of the four §7.4.5.3.3 de-interleaved sub-blocks at nC=0.
+            let mut bits: u64 = 1;
+            if mode_idx != predicted {
+                bits += 3;
+            }
+            let scan = zigzag_scan_8x8(&z_raster);
+            let subs = deinterleave_8x8_to_4x4(&scan);
+            let mut trial_w = BitWriter::new();
+            for sub in &subs {
+                if encode_residual_block_cavlc(&mut trial_w, CoeffTokenContext::Numeric(0), 16, sub)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            bits += trial_w.bits_emitted() as u64;
+            let c = cost_combined(d, bits, lambda);
+            if c < best_cost {
+                best_cost = c;
+                best_mode = mode;
+                best_z_raster = z_raster;
+                best_recon = recon_blk;
+            }
+        }
+
+        let chosen = best_mode.as_index();
+        cost = cost.saturating_add(best_cost);
+        if chosen == predicted {
+            prev_flag[blk8] = true;
+        } else {
+            prev_flag[blk8] = false;
+            rem[blk8] = if chosen < predicted {
+                chosen
+            } else {
+                chosen - 1
+            };
+        }
+        intra_grid.slot_mut(mb_x, mb_y).intra_8x8_pred_modes[blk8] = chosen;
+
+        scan8[blk8] = zigzag_scan_8x8(&best_z_raster);
+        blk8_has_nz[blk8] = best_z_raster.iter().any(|&v| v != 0);
+
+        // Commit the recon so later blocks (and MBs) predict from it —
+        // a zero-residual quadrant reconstructs to pred + 0, exactly
+        // what the decoder computes for a cbp-bit-0 quadrant.
+        for j in 0..8 {
+            for i in 0..8 {
+                recon_y[(by + j) * width + bx + i] = best_recon[j * 8 + i] as u8;
+            }
+        }
+    }
+
+    CabacI8x8Candidate {
+        prev_flag,
+        rem,
+        scan8,
+        blk8_has_nz,
+        cost,
+    }
+}
+
 /// Encode a chroma plane (Cb or Cr) for an Intra_16x16 MB at 4:2:0.
 /// Returns (dc_levels[4], ac_scan[4][16], ac_quant_raster[4][16],
 /// any_dc_nz, any_ac_nz, recon_residual[64]).
@@ -1497,6 +1756,10 @@ impl Encoder {
             "encode_idr_cabac supports chroma_format_idc 1 (4:2:0) and 3 (4:4:4); \
              4:2:2 CABAC IDR is not yet wired",
         );
+        assert!(
+            !cfg.transform_8x8 || cfg.chroma_format_idc == 1,
+            "CABAC transform_8x8 encode is 4:2:0-only (4:4:4 blockCat-9/13 8x8 deferred)",
+        );
         let width = cfg.width as usize;
         let height = cfg.height as usize;
         let width_mbs = (cfg.width / 16) as usize;
@@ -1522,6 +1785,12 @@ impl Encoder {
         let qp_bd_offset_c = qp_bd_offset(cfg.bit_depth_chroma_minus8);
         let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
 
+        // §A.2.4 — the 8x8 transform requires High profile.
+        let profile_idc = if cfg.transform_8x8 && cfg.profile_idc < 100 {
+            100
+        } else {
+            cfg.profile_idc
+        };
         let sps = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_parameter_set_id: 0,
             level_idc: cfg.level_idc,
@@ -1530,7 +1799,7 @@ impl Encoder {
             log2_max_frame_num_minus4: 4,
             log2_max_poc_lsb_minus4: 4,
             max_num_ref_frames: cfg.max_num_ref_frames,
-            profile_idc: cfg.profile_idc,
+            profile_idc,
             chroma_format_idc: cfg.chroma_format_idc,
         });
         let pps_cfg = BaselinePpsConfig {
@@ -1541,7 +1810,7 @@ impl Encoder {
             weighted_pred_flag: false,
             weighted_bipred_idc: 0,
             entropy_coding_mode_flag: true,
-            transform_8x8_mode_flag: false,
+            transform_8x8_mode_flag: cfg.transform_8x8,
         };
         let pps = build_baseline_pps_rbsp(&pps_cfg);
         let mut stream: Vec<u8> = Vec::new();
@@ -1589,6 +1858,11 @@ impl Encoder {
         // §9.3.3.1.1.5 — prev_mb_qp_delta_nonzero is per-slice rolling state.
         let mut prev_mb_qp_delta_nonzero = false;
 
+        // Round-385 — §8.3.2.1 pred-mode grid + per-picture Intra_8x8
+        // counter for the `transform_8x8` trial.
+        let mut intra_grid = IntraGrid::new(width_mbs, height_mbs);
+        let mut i8x8_mb_count = 0u32;
+
         for mb_y in 0..height_mbs {
             for mb_x in 0..width_mbs {
                 let mb_addr = mb_y * width_mbs + mb_x;
@@ -1612,6 +1886,43 @@ impl Encoder {
                 let (luma_dc, luma_ac_quant, luma_ac_scan, any_luma_ac_nz) =
                     quantize_intra16x16_luma(&residual, qp_y, cfg.trellis_quant_intra);
                 let mut cbp_luma: u8 = if any_luma_ac_nz { 15 } else { 0 };
+
+                // Round-385 — Intra_8x8 trial under `transform_8x8`
+                // (4:2:0 only, asserted above). The trial commits its
+                // recon + pred modes; the loser is rolled back.
+                let mut i8x8_cand: Option<CabacI8x8Candidate> = None;
+                if cfg.transform_8x8 {
+                    let cost16 = intra16x16_luma_cost_estimate(
+                        frame,
+                        &mut recon_y,
+                        width,
+                        mb_x,
+                        mb_y,
+                        &luma_pred,
+                        &luma_dc,
+                        &luma_ac_quant,
+                        &luma_ac_scan,
+                        cbp_luma,
+                        qp_y,
+                    );
+                    let window_saved = save_mb_luma_window(&recon_y, width, mb_x, mb_y);
+                    let slot_saved = intra_grid.slot(mb_x, mb_y).clone();
+                    let cand = trial_intra8x8_for_cabac(
+                        frame,
+                        &mut recon_y,
+                        width,
+                        mb_x,
+                        mb_y,
+                        qp_y,
+                        &mut intra_grid,
+                    );
+                    if cand.cost < cost16 {
+                        i8x8_cand = Some(cand);
+                    } else {
+                        restore_mb_luma_window(&mut recon_y, width, mb_x, mb_y, &window_saved);
+                        *intra_grid.slot_mut(mb_x, mb_y) = slot_saved;
+                    }
+                }
 
                 // --------------- chroma encode (4:2:0 vs 4:4:4) ---------------
                 //
@@ -1781,95 +2092,177 @@ impl Encoder {
                     }
                 }
 
-                // Reconstruct luma.
-                reconstruct_intra16x16_luma(
-                    mb_x,
-                    mb_y,
-                    width,
-                    &luma_pred,
-                    &luma_dc,
-                    &luma_ac_quant,
-                    cbp_luma,
-                    qp_y,
-                    &mut recon_y,
-                );
+                // §7.4.5.1 — cbp_luma for the emitted MB: I_16x16 codes
+                // 0/15 via mb_type; Intra_8x8 codes a per-quadrant CBP.
+                let cbp_luma_i8x8: u8 = i8x8_cand
+                    .as_ref()
+                    .map(|c| {
+                        let mut v = 0u8;
+                        for (b, &nz) in c.blk8_has_nz.iter().enumerate() {
+                            if nz {
+                                v |= 1 << b;
+                            }
+                        }
+                        v
+                    })
+                    .unwrap_or(0);
+
+                if i8x8_cand.is_none() {
+                    // Reconstruct luma (the Intra_8x8 trial already
+                    // committed its recon when it won).
+                    reconstruct_intra16x16_luma(
+                        mb_x,
+                        mb_y,
+                        width,
+                        &luma_pred,
+                        &luma_dc,
+                        &luma_ac_quant,
+                        cbp_luma,
+                        qp_y,
+                        &mut recon_y,
+                    );
+                }
 
                 // ---- CABAC emit ----
-                // mb_type. Table 9-36 row index = §7.4.5.1 Intra_16x16
-                // group: 1 + group*4 + pred_mode where group is from
-                // (cbp_luma, cbp_chroma).
-                let group = match (cbp_luma, cbp_chroma) {
-                    (0, 0) => 0u32,
-                    (0, 1) => 1,
-                    (0, 2) => 2,
-                    (15, 0) => 3,
-                    (15, 1) => 4,
-                    (15, 2) => 5,
-                    _ => unreachable!(),
-                };
-                let mb_type_value = 1 + group * 4 + luma_mode as u32;
-                encode_mb_type_i(&mut cabac, &mut ctxs, &nb, mb_type_value);
-
-                // intra_chroma_pred_mode — absent for 4:4:4 (§7.3.5.1 note:
-                // "not present if ChromaArrayType is equal to 3").
-                if cfg.chroma_format_idc != 3 {
+                if let Some(c8) = &i8x8_cand {
+                    // §7.3.5 — mb_type = I_NxN (Table 9-36 row 0), then
+                    // transform_size_8x8_flag = 1 immediately after.
+                    encode_mb_type_i(&mut cabac, &mut ctxs, &nb, 0);
+                    encode_transform_size_8x8_flag(&mut cabac, &mut ctxs, &nb, true);
+                    // §7.3.5.1 mb_pred — four prev/rem Intra_8x8 pairs
+                    // (ctxIdx 68/69, shared with the Intra_4x4 forms).
+                    for blk8 in 0..4usize {
+                        encode_prev_intra_pred_mode_flag(&mut cabac, &mut ctxs, c8.prev_flag[blk8]);
+                        if !c8.prev_flag[blk8] {
+                            encode_rem_intra_pred_mode(&mut cabac, &mut ctxs, c8.rem[blk8] as u32);
+                        }
+                    }
                     encode_intra_chroma_pred_mode(&mut cabac, &mut ctxs, &nb, chroma_mode as u32);
-                }
+                    // §7.3.5 — I_NxN codes coded_block_pattern explicitly.
+                    encode_coded_block_pattern(
+                        &mut cabac,
+                        &mut ctxs,
+                        &nb,
+                        1,
+                        cbp_luma_i8x8,
+                        cbp_chroma,
+                    );
+                    // mb_qp_delta only when any CBP bit is set.
+                    if cbp_luma_i8x8 > 0 || cbp_chroma > 0 {
+                        encode_mb_qp_delta(&mut cabac, &mut ctxs, prev_mb_qp_delta_nonzero, 0);
+                    }
+                    // Absent or zero → the next MB's bin-0 ctxIdxInc sees 0.
+                    prev_mb_qp_delta_nonzero = false;
 
-                // No coded_block_pattern (carried by mb_type for Intra_16x16).
-                // mb_qp_delta — always present for Intra_16x16.
-                let qp_delta = 0i32;
-                encode_mb_qp_delta(&mut cabac, &mut ctxs, prev_mb_qp_delta_nonzero, qp_delta);
-                prev_mb_qp_delta_nonzero = qp_delta != 0;
+                    // Mark the running slot for in-MB neighbour reads.
+                    {
+                        let cur = grid.at_mut(mb_x, mb_y);
+                        cur.is_intra = true;
+                        cur.cbp_luma = cbp_luma_i8x8;
+                        cur.cbp_chroma = cbp_chroma;
+                    }
+                    // §7.3.5.3.3 — one blockCat-5 residual per coded 8x8
+                    // quadrant; coded_block_flag suppressed (maxNumCoeff
+                    // == 64, ChromaArrayType != 3), CBF inferred from CBP
+                    // and folded into the four 4x4 slots for downstream
+                    // §9.3.3.1.1.9 neighbour reads (decoder mirror).
+                    for blk8 in 0..4usize {
+                        if (cbp_luma_i8x8 >> blk8) & 1 == 1 {
+                            let coded = encode_residual_block_cabac(
+                                &mut cabac,
+                                &mut ctxs,
+                                BlockType::Luma8x8,
+                                &c8.scan8[blk8],
+                                64,
+                                None,
+                                None,
+                                true,
+                            );
+                            for sub in 0..4usize {
+                                grid.at_mut(mb_x, mb_y).cbf_luma_4x4[blk8 * 4 + sub] = coded;
+                            }
+                        }
+                    }
+                } else {
+                    // mb_type. Table 9-36 row index = §7.4.5.1 Intra_16x16
+                    // group: 1 + group*4 + pred_mode where group is from
+                    // (cbp_luma, cbp_chroma).
+                    let group = match (cbp_luma, cbp_chroma) {
+                        (0, 0) => 0u32,
+                        (0, 1) => 1,
+                        (0, 2) => 2,
+                        (15, 0) => 3,
+                        (15, 1) => 4,
+                        (15, 2) => 5,
+                        _ => unreachable!(),
+                    };
+                    let mb_type_value = 1 + group * 4 + luma_mode as u32;
+                    encode_mb_type_i(&mut cabac, &mut ctxs, &nb, mb_type_value);
 
-                // §7.3.5.3 — Luma DC block (Intra_16x16). CBF neighbour
-                // context is MB-level (LumaDC).
-                let (cbf_a, cbf_b) =
-                    cbf_neighbour_mb_level(&grid, mb_x, mb_y, true, CbfPlane::LumaDc);
-                let luma_dc_scan = zigzag_scan_4x4(&luma_dc);
-                let cbf_luma_dc = encode_residual_block_cabac(
-                    &mut cabac,
-                    &mut ctxs,
-                    BlockType::Luma16x16Dc,
-                    &luma_dc_scan,
-                    16,
-                    Some(cbf_a),
-                    Some(cbf_b),
-                    false,
-                );
-                // Update current MB grid slot's running state for downstream
-                // neighbour reads (luma AC blocks and chroma DC/AC).
-                {
-                    let cur = grid.at_mut(mb_x, mb_y);
-                    cur.is_intra = true;
-                    cur.cbf_luma_dc = cbf_luma_dc;
-                }
-                let mut cbf_luma_ac = [false; 16];
-                if cbp_luma == 15 {
-                    for blkz in 0..16usize {
-                        // Snapshot current MB info for in-MB neighbour reads.
-                        let cur_snapshot = grid.at(mb_x, mb_y).clone();
-                        let (ca, cb) = cbf_neighbour_luma_ac(
-                            &grid,
-                            mb_x,
-                            mb_y,
-                            &cur_snapshot,
-                            true,
-                            BlockType::Luma16x16Ac,
-                            blkz as u8,
-                        );
-                        let coded = encode_residual_block_cabac(
+                    // intra_chroma_pred_mode — absent for 4:4:4 (§7.3.5.1 note:
+                    // "not present if ChromaArrayType is equal to 3").
+                    if cfg.chroma_format_idc != 3 {
+                        encode_intra_chroma_pred_mode(
                             &mut cabac,
                             &mut ctxs,
-                            BlockType::Luma16x16Ac,
-                            &luma_ac_scan[blkz][..15],
-                            15,
-                            Some(ca),
-                            Some(cb),
-                            false,
+                            &nb,
+                            chroma_mode as u32,
                         );
-                        cbf_luma_ac[blkz] = coded;
-                        grid.at_mut(mb_x, mb_y).cbf_luma_ac[blkz] = coded;
+                    }
+
+                    // No coded_block_pattern (carried by mb_type for Intra_16x16).
+                    // mb_qp_delta — always present for Intra_16x16.
+                    let qp_delta = 0i32;
+                    encode_mb_qp_delta(&mut cabac, &mut ctxs, prev_mb_qp_delta_nonzero, qp_delta);
+                    prev_mb_qp_delta_nonzero = qp_delta != 0;
+
+                    // §7.3.5.3 — Luma DC block (Intra_16x16). CBF neighbour
+                    // context is MB-level (LumaDC).
+                    let (cbf_a, cbf_b) =
+                        cbf_neighbour_mb_level(&grid, mb_x, mb_y, true, CbfPlane::LumaDc);
+                    let luma_dc_scan = zigzag_scan_4x4(&luma_dc);
+                    let cbf_luma_dc = encode_residual_block_cabac(
+                        &mut cabac,
+                        &mut ctxs,
+                        BlockType::Luma16x16Dc,
+                        &luma_dc_scan,
+                        16,
+                        Some(cbf_a),
+                        Some(cbf_b),
+                        false,
+                    );
+                    // Update current MB grid slot's running state for downstream
+                    // neighbour reads (luma AC blocks and chroma DC/AC).
+                    {
+                        let cur = grid.at_mut(mb_x, mb_y);
+                        cur.is_intra = true;
+                        cur.cbf_luma_dc = cbf_luma_dc;
+                    }
+                    if cbp_luma == 15 {
+                        for blkz in 0..16usize {
+                            // Snapshot current MB info for in-MB neighbour reads.
+                            let cur_snapshot = grid.at(mb_x, mb_y).clone();
+                            let (ca, cb) = cbf_neighbour_luma_ac(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                &cur_snapshot,
+                                true,
+                                BlockType::Luma16x16Ac,
+                                blkz as u8,
+                            );
+                            let coded = encode_residual_block_cabac(
+                                &mut cabac,
+                                &mut ctxs,
+                                BlockType::Luma16x16Ac,
+                                &luma_ac_scan[blkz][..15],
+                                15,
+                                Some(ca),
+                                Some(cb),
+                                false,
+                            );
+                            grid.at_mut(mb_x, mb_y).cbf_luma_ac[blkz] = coded;
+                        }
                     }
                 }
 
@@ -1973,20 +2366,39 @@ impl Encoder {
                 }
 
                 // Update grid (final MB state for next-MB neighbour reads).
+                let is_i8x8_mb = i8x8_cand.is_some();
                 let info = grid.at_mut(mb_x, mb_y);
                 info.available = true;
                 info.is_intra = true;
                 info.is_skip = false;
                 info.is_i_pcm = false;
-                info.is_i_nxn = false;
-                info.cbp_luma = cbp_luma;
+                info.is_i_nxn = is_i8x8_mb;
+                info.transform_size_8x8 = is_i8x8_mb;
+                info.cbp_luma = if is_i8x8_mb { cbp_luma_i8x8 } else { cbp_luma };
                 info.cbp_chroma = cbp_chroma;
                 info.intra_chroma_pred_mode = chroma_mode as u8;
 
-                // §8.7 deblock info.
-                let any_ac_per4x4: [bool; 16] = std::array::from_fn(|i| {
-                    cbp_luma == 15 && luma_ac_scan[i].iter().any(|&v| v != 0)
-                });
+                // Mark the pred-mode grid for the I_16x16 winner (the
+                // Intra_8x8 trial stamps its own slot when it wins).
+                if !is_i8x8_mb {
+                    let s = intra_grid.slot_mut(mb_x, mb_y);
+                    s.available = true;
+                    s.is_i_nxn = false;
+                    s.is_i8x8 = false;
+                } else {
+                    i8x8_mb_count += 1;
+                }
+
+                // §8.7 deblock info. For Intra_8x8 every 4x4 of a coded
+                // quadrant inherits the quadrant's nonzero status
+                // (decoder's `compute_luma_nonzero_mask` 8x8 branch).
+                let any_ac_per4x4: [bool; 16] = if let Some(c8) = &i8x8_cand {
+                    std::array::from_fn(|i| c8.blk8_has_nz[i / 4])
+                } else {
+                    std::array::from_fn(|i| {
+                        cbp_luma == 15 && luma_ac_scan[i].iter().any(|&v| v != 0)
+                    })
+                };
                 let any_chroma_ac_per4x4_cb: [bool; 4] = if cfg.chroma_format_idc == 3 {
                     // 4:4:4: no separate 4-block chroma; deblock uses luma filter.
                     [false; 4]
@@ -2010,6 +2422,7 @@ impl Encoder {
                         &any_chroma_ac_per4x4_cb,
                         &any_chroma_ac_per4x4_cr,
                     ),
+                    transform_size_8x8_flag: is_i8x8_mb,
                     ..Default::default()
                 };
                 mb_dbl[mb_addr] = dbl;
@@ -2068,8 +2481,7 @@ impl Encoder {
             recon_width: cfg.width,
             recon_height: cfg.height,
             partition_mvs,
-            // The CABAC IDR path does not code the 8x8 transform.
-            i8x8_mb_count: 0,
+            i8x8_mb_count,
         }
     }
 
@@ -2089,6 +2501,11 @@ impl Encoder {
         assert!(cfg.cabac);
         assert!(cfg.profile_idc >= 77);
         assert_eq!(cfg.chroma_format_idc, 1);
+        assert!(
+            !cfg.transform_8x8,
+            "encode_p_cabac does not yet code the §7.3.5 second-gate \
+             transform_size_8x8_flag required inside a transform_8x8_mode_flag=1 stream",
+        );
         let width = cfg.width as usize;
         let height = cfg.height as usize;
         let width_mbs = (cfg.width / 16) as usize;
@@ -2680,6 +3097,11 @@ impl Encoder {
             cfg.profile_idc,
         );
         assert_eq!(cfg.chroma_format_idc, 1, "round-31 CABAC B is 4:2:0 only");
+        assert!(
+            !cfg.transform_8x8,
+            "encode_b_cabac does not yet code the §7.3.5 second-gate \
+             transform_size_8x8_flag required inside a transform_8x8_mode_flag=1 stream",
+        );
         assert_eq!(frame.width, cfg.width);
         assert_eq!(frame.height, cfg.height);
         assert_eq!(ref_l0.width, cfg.width);
