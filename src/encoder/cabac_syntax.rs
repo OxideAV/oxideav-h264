@@ -27,8 +27,16 @@
 //! - `prev_intra4x4_pred_mode_flag` / `rem_intra4x4_pred_mode`
 //! - `end_of_slice_flag`      §9.3.3.2.4
 //!
-//! Out of scope: B-slice mb_type, transform_size_8x8_flag, 4:2:2/4:4:4
-//! residual paths (the 4:2:0 paths cover the round-30 acceptance fixtures).
+//! Round-385 additions:
+//! - `transform_size_8x8_flag`  §9.3.3.1.1.10 (ctxIdxOffset 399)
+//! - blockCat-5 (Luma8x8) residual blocks — the §9.3.3.1.3 Table 9-43
+//!   significance-map routing plus the ctxIdxOffset 402/417/426 families
+//!   were already wired below; the CBF suppression for
+//!   `maxNumCoeff == 64 && ChromaArrayType != 3` (§7.3.5.3.3) is driven
+//!   by the caller through `encode_residual_block_cabac`'s `skip_cbf`.
+//!
+//! Out of scope: 4:2:2 residual paths (the 4:2:0 + 4:4:4 paths cover the
+//! current acceptance fixtures).
 
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
@@ -703,6 +711,29 @@ pub fn encode_intra_chroma_pred_mode(
     enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), 1);
     let bin2 = if value == 3 { 1u8 } else { 0 };
     enc.encode_decision(ctxs.at_mut((OFFSET + 3) as usize), bin2);
+}
+
+// ---------------------------------------------------------------------------
+// §9.3.3.1.1.10 — transform_size_8x8_flag.
+// ---------------------------------------------------------------------------
+
+/// §9.3.3.1.1.10 — encode `transform_size_8x8_flag` (FL cMax=1,
+/// ctxIdxOffset=399). `condTermFlagN = 1` iff the neighbour MB is
+/// available and its own `transform_size_8x8_flag` is 1; the caller
+/// carries those through [`NeighbourCtx::left_transform_8x8`] /
+/// [`NeighbourCtx::above_transform_8x8`]. Mirror of
+/// [`crate::cabac_ctx::decode_transform_size_8x8_flag`].
+pub fn encode_transform_size_8x8_flag(
+    enc: &mut CabacEncoder,
+    ctxs: &mut CabacContexts,
+    neighbours: &NeighbourCtx,
+    flag: bool,
+) {
+    const OFFSET: u32 = 399;
+    let cond_a = u32::from(neighbours.available_left && neighbours.left_transform_8x8);
+    let cond_b = u32::from(neighbours.available_above && neighbours.above_transform_8x8);
+    let ctx_idx = (OFFSET + cond_a + cond_b) as usize;
+    enc.encode_decision(ctxs.at_mut(ctx_idx), if flag { 1 } else { 0 });
 }
 
 // ---------------------------------------------------------------------------
@@ -1737,6 +1768,19 @@ mod tests {
     /// Simulate the decoder's `parse_residual_block_cabac` step-for-step
     /// against our encoder, for a few known coefficient layouts.
     fn rt_residual_block(coeffs: &[i32], block_type: BlockType, max_num_coeff: u32) {
+        rt_residual_block_opts(coeffs, block_type, max_num_coeff, false);
+    }
+
+    /// Like [`rt_residual_block`] but with the §7.3.5.3.3 CBF
+    /// suppression (`maxNumCoeff == 64 && ChromaArrayType != 3`) — the
+    /// blockCat-5 (Luma8x8) shape where `coded_block_flag` is inferred
+    /// from the CBP and never coded.
+    fn rt_residual_block_opts(
+        coeffs: &[i32],
+        block_type: BlockType,
+        max_num_coeff: u32,
+        skip_cbf: bool,
+    ) {
         let mut ctxs_enc = CabacContexts::init(SliceKind::I, None, 26).unwrap();
         let mut enc = CabacEncoder::new();
         encode_residual_block_cabac(
@@ -1747,7 +1791,7 @@ mod tests {
             max_num_coeff,
             Some(false),
             Some(false),
-            false,
+            skip_cbf,
         );
         enc.encode_terminate(1);
         let bytes = enc.finish_no_trailing();
@@ -1757,14 +1801,21 @@ mod tests {
         let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
 
         let any_nz = coeffs.iter().any(|&c| c != 0);
-        let coded = decode_coded_block_flag(
-            &mut dec,
-            &mut ctxs_dec,
-            block_type,
-            Some(false),
-            Some(false),
-        )
-        .unwrap();
+        let coded = if skip_cbf {
+            // §7.3.5.3.3 — coded_block_flag inferred from CBP; the
+            // caller only emits blocks with at least one non-zero level.
+            assert!(any_nz, "skip_cbf blocks must carry a non-zero level");
+            true
+        } else {
+            decode_coded_block_flag(
+                &mut dec,
+                &mut ctxs_dec,
+                block_type,
+                Some(false),
+                Some(false),
+            )
+            .unwrap()
+        };
         assert_eq!(coded, any_nz);
         if !any_nz {
             assert_eq!(dec.decode_terminate().unwrap(), 1);
@@ -1860,6 +1911,90 @@ mod tests {
         c[0] = 100;
         c[3] = -50;
         rt_residual_block(&c, BlockType::Luma4x4, 16);
+    }
+
+    // -- Round-385: blockCat-5 (Luma8x8) 64-coefficient blocks. --
+
+    #[test]
+    fn rt_residual_block_8x8_single_dc() {
+        let mut c = [0i32; 64];
+        c[0] = 7;
+        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true);
+    }
+
+    #[test]
+    fn rt_residual_block_8x8_sparse() {
+        // Exercises several distinct Table 9-43 significance-map rows
+        // (frame column) plus the ctxIdxOffset 426 level family.
+        let mut c = [0i32; 64];
+        c[0] = 12;
+        c[5] = -3;
+        c[17] = 2;
+        c[30] = -1;
+        c[44] = 1;
+        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true);
+    }
+
+    #[test]
+    fn rt_residual_block_8x8_last_pos_63() {
+        // Last non-zero at scan pos 63 — the "implicit final sig" path
+        // for the 64-coefficient shape (the while loop walks all 63
+        // explicit positions first).
+        let mut c = [0i32; 64];
+        c[0] = 1;
+        c[63] = -1;
+        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true);
+    }
+
+    #[test]
+    fn rt_residual_block_8x8_dense_large_levels() {
+        // Every scan position non-zero with mixed magnitudes — walks
+        // the whole Table 9-43 sig/last maps and the UEG0 level suffix.
+        let mut c = [0i32; 64];
+        for (i, v) in c.iter_mut().enumerate() {
+            *v = match i % 4 {
+                0 => 1,
+                1 => -2,
+                2 => 20,
+                _ => -1,
+            };
+        }
+        c[0] = 200;
+        rt_residual_block_opts(&c, BlockType::Luma8x8, 64, true);
+    }
+
+    #[test]
+    fn rt_transform_size_8x8_flag_all_neighbour_combos() {
+        for &flag in &[false, true] {
+            for &(la, lt) in &[(false, false), (true, false), (true, true)] {
+                for &(aa, at) in &[(false, false), (true, false), (true, true)] {
+                    let nb = NeighbourCtx {
+                        available_left: la,
+                        left_transform_8x8: lt,
+                        available_above: aa,
+                        above_transform_8x8: at,
+                        ..NeighbourCtx::default()
+                    };
+                    // Slice-kind P at cabac_init_idc 0 exercises the
+                    // Table 9-16 399..=401 init rows outside the I column.
+                    let mut ctxs_enc = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+                    let mut enc = CabacEncoder::new();
+                    encode_transform_size_8x8_flag(&mut enc, &mut ctxs_enc, &nb, flag);
+                    enc.encode_terminate(1);
+                    let bytes = enc.finish_no_trailing();
+                    let mut ctxs_dec = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
+                    let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
+                    let got = crate::cabac_ctx::decode_transform_size_8x8_flag(
+                        &mut dec,
+                        &mut ctxs_dec,
+                        &nb,
+                    )
+                    .unwrap();
+                    assert_eq!(got, flag, "flag={flag} la={la}/{lt} aa={aa}/{at}");
+                    assert_eq!(dec.decode_terminate().unwrap(), 1);
+                }
+            }
+        }
     }
 
     #[test]
