@@ -3714,11 +3714,62 @@ fn parse_residual_cavlc_only(
                         }
                     }
                 }
+            } else if transform_size_8x8_flag {
+                // §7.4.5.3.3 — 8x8 transform on a chroma plane coded
+                // like luma (round-385). Same syntax as the 4x4 arm
+                // (four `residual_block_cavlc(..., 0, 15, 16)` calls per
+                // coded quadrant) but the 64 coefficients are the
+                // *interleaved* union of the four 4x4 scan lists:
+                //     level8x8[4 * i + i4x4] = level4x4[i4x4][i]
+                // Mirror of the luma arm above: interleave, then store
+                // as four contiguous 16-entry slices so the 4:4:4 8x8
+                // reconstruction reassembles the 8x8 scan by simple
+                // concatenation.
+                for blk8 in 0..4u8 {
+                    if (cbp_luma >> blk8) & 1 == 1 {
+                        let mut sub_scan = [[0i32; 16]; 4];
+                        for (sub, dst) in sub_scan.iter_mut().enumerate() {
+                            let blk_idx = blk8 * 4 + sub as u8;
+                            let nc = derive_plane_luma_like(
+                                blk_idx,
+                                plane_is_cr,
+                                &own_cb_luma_totals,
+                                &own_cr_luma_totals,
+                                grid_ref,
+                            );
+                            let blk = parse_residual_block_cavlc(
+                                r,
+                                CoeffTokenContext::Numeric(nc),
+                                0,
+                                15,
+                                16,
+                            )?;
+                            let tc = count_nonzero(&blk);
+                            if plane_is_cr {
+                                own_cr_luma_totals[blk_idx as usize] = tc;
+                            } else {
+                                own_cb_luma_totals[blk_idx as usize] = tc;
+                            }
+                            *dst = pad_to_16(blk);
+                        }
+                        let mut scan8 = [0i32; 64];
+                        for (i4x4, sub) in sub_scan.iter().enumerate() {
+                            for (i, &c) in sub.iter().enumerate() {
+                                scan8[4 * i + i4x4] = c;
+                            }
+                        }
+                        for chunk in scan8.chunks_exact(16) {
+                            let mut store = [0i32; 16];
+                            store.copy_from_slice(chunk);
+                            if plane_is_cr {
+                                out.residual_cr_luma_like.push(store);
+                            } else {
+                                out.residual_cb_luma_like.push(store);
+                            }
+                        }
+                    }
+                }
             } else {
-                // §7.3.5.3 — both transform_size_8x8 and 4x4 paths
-                // currently walk the 16 × 4x4 layout (8x8 fast-path is
-                // a TODO; until then the two arms emit identical
-                // syntax, which is what the unit tests verify).
                 for blk8 in 0..4u8 {
                     if (cbp_luma >> blk8) & 1 == 1 {
                         for sub in 0..4u8 {
@@ -4754,6 +4805,107 @@ mod tests {
                 "prev_intra8x8_pred_mode_flag[{i}] should have been parsed as 1"
             );
         }
+    }
+
+    /// Round-385 — §7.4.5.3.3 on a 4:4:4 chroma plane coded like luma:
+    /// the CAVLC 8x8 residual of the Cb / Cr planes must be stored
+    /// *interleaved* (`level8x8[4*i + i4x4] = level4x4[i4x4][i]`), the
+    /// same convention the luma arm has used since the round-382 fix
+    /// (and the layout the 4:4:4 8x8 reconstruction consumes by
+    /// concatenation). Before this round the plane arm pushed the raw
+    /// de-interleaved 4x4 lists, scrambling every CAVLC 4:4:4
+    /// 8x8-transform chroma residual.
+    #[test]
+    fn cavlc_444_i8x8_plane_residual_is_interleaved() {
+        use crate::encoder::cavlc::encode_residual_block_cavlc;
+
+        // codeNum 10 → cbp_luma = 1 (quadrant 0) per Table 9-4(b) intra.
+        assert_eq!(ME_INTRA_0_3[10], 1);
+
+        let mut w = crate::encoder::bitstream::BitWriter::new();
+        w.ue(0); // mb_type = I_NxN
+        w.u(1, 1); // transform_size_8x8_flag = 1
+        for _ in 0..4 {
+            w.u(1, 1); // prev_intra8x8_pred_mode_flag
+        }
+        // intra_chroma_pred_mode is NOT present at ChromaArrayType == 3.
+        w.ue(10); // coded_block_pattern codeNum=10 → cbp_luma=1
+        w.se(0); // mb_qp_delta
+
+        // With `cavlc_nc: None` the parse derives nC = 0 for every
+        // block, so encode with Numeric(0) throughout.
+        let ctx = crate::cavlc::CoeffTokenContext::Numeric(0);
+        // Luma quadrant 0 — sub 0 carries +1 at scan pos 0; subs 1..3 zero.
+        let mut y_sub0 = [0i32; 16];
+        y_sub0[0] = 1;
+        encode_residual_block_cavlc(&mut w, ctx, 16, &y_sub0).unwrap();
+        for _ in 0..3 {
+            encode_residual_block_cavlc(&mut w, ctx, 16, &[0i32; 16]).unwrap();
+        }
+        // Cb plane quadrant 0 — distinctive per-sub values so the
+        // interleave is observable: sub0 = +1@0, sub1 = -1@0, sub2 = +1@1.
+        let mut cb_sub0 = [0i32; 16];
+        cb_sub0[0] = 1;
+        let mut cb_sub1 = [0i32; 16];
+        cb_sub1[0] = -1;
+        let mut cb_sub2 = [0i32; 16];
+        cb_sub2[1] = 1;
+        encode_residual_block_cavlc(&mut w, ctx, 16, &cb_sub0).unwrap();
+        encode_residual_block_cavlc(&mut w, ctx, 16, &cb_sub1).unwrap();
+        encode_residual_block_cavlc(&mut w, ctx, 16, &cb_sub2).unwrap();
+        encode_residual_block_cavlc(&mut w, ctx, 16, &[0i32; 16]).unwrap();
+        // Cr plane quadrant 0 — all-zero sub-blocks.
+        for _ in 0..4 {
+            encode_residual_block_cavlc(&mut w, ctx, 16, &[0i32; 16]).unwrap();
+        }
+        w.rbsp_trailing_bits();
+        let bytes = w.into_bytes();
+
+        let sps = dummy_sps();
+        let mut pps = dummy_pps();
+        pps.extension = Some(crate::pps::PpsExtension {
+            transform_8x8_mode_flag: true,
+            pic_scaling_matrix_present_flag: false,
+            pic_scaling_lists: None,
+            second_chroma_qp_index_offset: 0,
+        });
+        let hdr = dummy_slice_header(SliceType::I);
+        let mut r = BitReader::new(&bytes);
+        let mut entropy = cavlc_entropy_444();
+        entropy.transform_8x8_mode_flag = true;
+
+        let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        assert_eq!(mb.mb_type, MbType::INxN);
+        assert!(mb.transform_size_8x8_flag);
+        assert_eq!(mb.coded_block_pattern & 0xF, 1);
+
+        // Luma: interleaved → sub0's pos-0 coefficient lands at
+        // scan8[4*0 + 0] = chunk 0 slot 0.
+        assert_eq!(mb.residual_luma.len(), 4);
+        assert_eq!(mb.residual_luma[0][0], 1);
+        assert!(mb.residual_luma[0][1..].iter().all(|&c| c == 0));
+        assert!(mb.residual_luma[1..].iter().flatten().all(|&c| c == 0));
+
+        // Cb: scan8[0] = sub0@0 = +1, scan8[1] = sub1@0 = -1,
+        // scan8[4*1 + 2] = scan8[6] = sub2@1 = +1; everything else 0.
+        assert_eq!(mb.residual_cb_luma_like.len(), 4);
+        let cb0 = &mb.residual_cb_luma_like[0];
+        assert_eq!(cb0[0], 1, "scan8[0]");
+        assert_eq!(cb0[1], -1, "scan8[1]");
+        assert_eq!(cb0[6], 1, "scan8[6]");
+        for (i, &c) in cb0.iter().enumerate() {
+            if !matches!(i, 0 | 1 | 6) {
+                assert_eq!(c, 0, "scan8[{i}] must be 0");
+            }
+        }
+        assert!(mb.residual_cb_luma_like[1..]
+            .iter()
+            .flatten()
+            .all(|&c| c == 0));
+
+        // Cr: coded quadrant with all-zero levels → four zero chunks.
+        assert_eq!(mb.residual_cr_luma_like.len(), 4);
+        assert!(mb.residual_cr_luma_like.iter().flatten().all(|&c| c == 0));
     }
 
     #[test]
