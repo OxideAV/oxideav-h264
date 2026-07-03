@@ -1,5 +1,7 @@
 # oxideav-h264
 
+[![CI](https://github.com/OxideAV/oxideav-h264/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-h264/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-h264.svg)](https://crates.io/crates/oxideav-h264) [![docs.rs](https://docs.rs/oxideav-h264/badge.svg)](https://docs.rs/oxideav-h264) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **H.264 / AVC** (ITU-T Rec. H.264 | ISO/IEC 14496-10) codec
 for the [`oxideav`](https://github.com/OxideAV/oxideav-workspace)
 framework.
