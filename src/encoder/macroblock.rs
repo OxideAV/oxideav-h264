@@ -389,6 +389,89 @@ pub fn write_i8x8_mb_444(
     Ok(())
 }
 
+/// Round-391 — emit one **4:4:4** Intra_4x4 macroblock (I_NxN with
+/// the 4x4 transform, ChromaArrayType == 3, CAVLC).
+///
+/// Layout per §7.3.5 / §7.3.5.1 / §7.3.5.3:
+///   1. `mb_type ue(0)` (I_NxN, Table 7-11 raw 0).
+///   2. `transform_size_8x8_flag = 0` — only when the active PPS has
+///      `transform_8x8_mode_flag = 1` (`emit_transform_size_8x8_zero`);
+///      absent otherwise (inferred 0).
+///   3. 16 × `prev_intra4x4_pred_mode_flag` (+ optional 3-bit
+///      `rem_intra4x4_pred_mode`). No `intra_chroma_pred_mode` at
+///      ChromaArrayType == 3 (chroma reuses the luma per-block modes
+///      per §8.3.4.5).
+///   4. `coded_block_pattern me(v)` — Table 9-4(b) intra column
+///      (ChromaArrayType ∈ {0, 3}: the 4-bit luma pattern only; a
+///      quadrant's bit covers all three planes per §7.4.5.1).
+///   5. `mb_qp_delta se(v)` when CBP > 0.
+///   6. §7.3.5.3 residual: luma plane, then Cb, then Cr — each plane
+///      walks the coded 8x8 quadrants in order and emits the four
+///      full 16-coefficient 4x4 blocks (`maxNumCoeff = 16`), with the
+///      caller-supplied per-plane §9.2.1.1 nC.
+#[allow(clippy::too_many_arguments)]
+pub fn write_i4x4_mb_444(
+    w: &mut BitWriter,
+    emit_transform_size_8x8_zero: bool,
+    prev_intra4x4_pred_mode_flag: &[bool; 16],
+    rem_intra4x4_pred_mode: &[u8; 16],
+    cbp_luma: u8,
+    mb_qp_delta: i32,
+    luma_4x4_levels: &[[i32; 16]; 16],
+    luma_4x4_nc: &[i32; 16],
+    cb_4x4_levels: &[[i32; 16]; 16],
+    cb_4x4_nc: &[i32; 16],
+    cr_4x4_levels: &[[i32; 16]; 16],
+    cr_4x4_nc: &[i32; 16],
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cbp_luma <= 15);
+
+    // §7.4.5 — Table 7-11: I_NxN mb_type raw = 0 in I-slice.
+    w.ue(0);
+    // §7.3.5 — transform_size_8x8_flag = 0 (only present when the PPS
+    // carries transform_8x8_mode_flag = 1).
+    if emit_transform_size_8x8_zero {
+        w.u(1, 0);
+    }
+    // §7.3.5.1 mb_pred(): per-4x4-block prev/rem intra pred mode.
+    // No intra_chroma_pred_mode at ChromaArrayType == 3.
+    for blk in 0..16usize {
+        let flag = prev_intra4x4_pred_mode_flag[blk];
+        w.u(1, if flag { 1 } else { 0 });
+        if !flag {
+            debug_assert!(rem_intra4x4_pred_mode[blk] <= 7);
+            w.u(3, rem_intra4x4_pred_mode[blk] as u32);
+        }
+    }
+    // §7.3.5 — coded_block_pattern me(v), Table 9-4(b) intra column.
+    w.ue(intra_cbp_to_codenum_0_3(cbp_luma));
+    if cbp_luma > 0 {
+        w.se(mb_qp_delta);
+    }
+    // §7.3.5.3 — luma plane, then Cb, then Cr; per coded quadrant the
+    // four child 4x4 blocks carry the full 16-coefficient scan.
+    for (levels, ncs) in [
+        (luma_4x4_levels, luma_4x4_nc),
+        (cb_4x4_levels, cb_4x4_nc),
+        (cr_4x4_levels, cr_4x4_nc),
+    ] {
+        for blk8 in 0..4u8 {
+            if (cbp_luma >> blk8) & 1 == 1 {
+                for sub in 0..4u8 {
+                    let blk = (blk8 * 4 + sub) as usize;
+                    encode_residual_block_cavlc(
+                        w,
+                        CoeffTokenContext::Numeric(ncs[blk]),
+                        16,
+                        &levels[blk],
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Configuration for one Intra_16x16 macroblock.
 pub struct I16x16McbConfig {
     /// `pred_mode` ∈ 0..=3 per Table 8-4 (V/H/DC/Plane).

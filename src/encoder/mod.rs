@@ -1277,6 +1277,7 @@ impl Encoder {
             );
         }
         let mut i8x8_mb_count = 0u32;
+        let mut i4x4_mb_count = 0u32;
 
         // Iterate MBs in raster order.
         for mb_y in 0..height_mbs {
@@ -1298,6 +1299,9 @@ impl Encoder {
                 );
                 if dbl.transform_size_8x8_flag {
                     i8x8_mb_count += 1;
+                }
+                if dbl.is_intra_4x4 {
+                    i4x4_mb_count += 1;
                 }
                 let mb_addr = (mb_y * width_mbs + mb_x) as usize;
                 mb_deblock_infos[mb_addr] = dbl;
@@ -1359,6 +1363,7 @@ impl Encoder {
             recon_height: self.cfg.height,
             partition_mvs,
             i8x8_mb_count,
+            i4x4_mb_count,
         }
     }
 
@@ -1398,91 +1403,90 @@ impl Encoder {
         let width = self.cfg.width as usize;
         let mb_addr = (mb_y as u32) * self.cfg.width / 16 + (mb_x as u32);
 
-        // Round-28: without transform_8x8 the 4:4:4 path is
-        // Intra_16x16-only (no I_NxN 4x4 chroma-as-luma emit yet).
-        // Round-388: with `transform_8x8` set the 4:4:4 MB runs a
-        // two-way Lagrangian RDO between Intra_16x16 and Intra_8x8
-        // (chroma coded like luma either way). J = D + λR with D the
-        // SSD over all three full-resolution planes and R the actual
-        // emitted bits — both shapes go through the real writer, the
-        // loser is rolled back via the chroma-aware snapshot. The
-        // I_4x4 leg needs a 4:4:4 chroma-as-luma 4x4 emit path and
-        // stays a follow-up.
+        // Round-28: 4:4:4 started Intra_16x16-only. Round-388 added a
+        // two-way Lagrangian RDO vs Intra_8x8 under `transform_8x8`.
+        // Round-391 adds the **I_4x4 leg** (chroma-as-luma 4x4 emit
+        // with per-plane nC), making the trial two-way (I_16x16 /
+        // I_4x4) in a 4x4-transform stream and three-way (+ Intra_8x8)
+        // under `transform_8x8`. J = D + λR with D the SSD over all
+        // three full-resolution planes and R the actual emitted bits —
+        // every shape goes through the real writer, losers are rolled
+        // back via the chroma-aware snapshot.
         if self.cfg.chroma_format_idc == 3 {
-            if self.cfg.transform_8x8 {
-                let lambda = lambda_ssd(qp_y, true);
-                let snap = MbStateSnapshot::capture(
-                    recon_y,
-                    recon_u,
-                    recon_v,
-                    width,
-                    chroma_width,
-                    mb_x,
-                    mb_y,
-                    sw,
-                    nc_grid,
-                    intra_grid,
-                    mb_addr as usize,
-                    3,
-                );
-                let bits_before = sw.bits_emitted();
+            let lambda = lambda_ssd(qp_y, true);
+            let snap = MbStateSnapshot::capture(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr as usize,
+                3,
+            );
+            let bits_before = sw.bits_emitted();
 
-                // ----- Trial A: Intra_16x16 (§7.3.5.3 chroma like luma). -----
-                let trial_a = self.encode_mb_intra16x16(
-                    frame,
-                    mb_x,
-                    mb_y,
-                    qp_y,
-                    qp_c,
-                    chroma_width,
-                    chroma_height,
-                    recon_y,
-                    recon_u,
-                    recon_v,
-                    sw,
-                    nc_grid,
-                    intra_grid,
-                );
-                let d_a = mb_ssd_3planes_444(frame, recon_y, recon_u, recon_v, width, mb_x, mb_y);
-                let r_a = sw.bits_emitted() - bits_before;
-                let cost_a = cost_combined(d_a, r_a as u64, lambda);
-                let post_a = MbStateSnapshot::capture(
-                    recon_y,
-                    recon_u,
-                    recon_v,
-                    width,
-                    chroma_width,
-                    mb_x,
-                    mb_y,
-                    sw,
-                    nc_grid,
-                    intra_grid,
-                    mb_addr as usize,
-                    3,
-                );
-                snap.restore(
-                    recon_y,
-                    recon_u,
-                    recon_v,
-                    width,
-                    chroma_width,
-                    mb_x,
-                    mb_y,
-                    sw,
-                    nc_grid,
-                    intra_grid,
-                    mb_addr as usize,
-                );
+            // ----- Trial A: Intra_16x16 (§7.3.5.3 chroma like luma). -----
+            let trial_a = self.encode_mb_intra16x16(
+                frame,
+                mb_x,
+                mb_y,
+                qp_y,
+                qp_c,
+                chroma_width,
+                chroma_height,
+                recon_y,
+                recon_u,
+                recon_v,
+                sw,
+                nc_grid,
+                intra_grid,
+            );
+            let d_a = mb_ssd_3planes_444(frame, recon_y, recon_u, recon_v, width, mb_x, mb_y);
+            let r_a = sw.bits_emitted() - bits_before;
+            let cost_a = cost_combined(d_a, r_a as u64, lambda);
+            let post_a = MbStateSnapshot::capture(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr as usize,
+                3,
+            );
+            snap.restore(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr as usize,
+            );
 
-                // ----- Trial B: Intra_8x8 (§8.3.4.5 chroma like luma). -----
-                let dbl_b = self.encode_mb_intra8x8_444(
-                    frame, mb_x, mb_y, qp_y, qp_c, recon_y, recon_u, recon_v, sw, nc_grid,
-                    intra_grid,
-                );
-                let d_b = mb_ssd_3planes_444(frame, recon_y, recon_u, recon_v, width, mb_x, mb_y);
-                let r_b = sw.bits_emitted() - bits_before;
-                let cost_b = cost_combined(d_b, r_b as u64, lambda);
+            // ----- Trial B: Intra_4x4 (§8.3.4.5 chroma like luma). -----
+            let dbl_b = self.encode_mb_intra4x4_444(
+                frame, mb_x, mb_y, qp_y, qp_c, recon_y, recon_u, recon_v, sw, nc_grid, intra_grid,
+            );
+            let d_b = mb_ssd_3planes_444(frame, recon_y, recon_u, recon_v, width, mb_x, mb_y);
+            let r_b = sw.bits_emitted() - bits_before;
+            let cost_b = cost_combined(d_b, r_b as u64, lambda);
 
+            if !self.cfg.transform_8x8 {
+                // Two-way pick: I_16x16 vs I_4x4.
                 if cost_a <= cost_b {
                     post_a.install(
                         recon_y,
@@ -1501,22 +1505,76 @@ impl Encoder {
                 }
                 return dbl_b;
             }
-            let trial = self.encode_mb_intra16x16(
-                frame,
-                mb_x,
-                mb_y,
-                qp_y,
-                qp_c,
-                chroma_width,
-                chroma_height,
+
+            // ----- Trial C (`transform_8x8`): Intra_8x8. -----
+            let post_b = MbStateSnapshot::capture(
                 recon_y,
                 recon_u,
                 recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
                 sw,
                 nc_grid,
                 intra_grid,
+                mb_addr as usize,
+                3,
             );
-            return trial.deblock;
+            snap.restore(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr as usize,
+            );
+            let dbl_c = self.encode_mb_intra8x8_444(
+                frame, mb_x, mb_y, qp_y, qp_c, recon_y, recon_u, recon_v, sw, nc_grid, intra_grid,
+            );
+            let d_c = mb_ssd_3planes_444(frame, recon_y, recon_u, recon_v, width, mb_x, mb_y);
+            let r_c = sw.bits_emitted() - bits_before;
+            let cost_c = cost_combined(d_c, r_c as u64, lambda);
+
+            // Three-way pick; ties prefer A (smaller MB syntax), then B.
+            if cost_a <= cost_b && cost_a <= cost_c {
+                post_a.install(
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_addr as usize,
+                );
+                return trial_a.deblock;
+            }
+            if cost_b <= cost_c {
+                post_b.install(
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_addr as usize,
+                );
+                return dbl_b;
+            }
+            return dbl_c;
         }
 
         // -- Snapshot pre-state (so we can roll back the loser). --
@@ -2641,6 +2699,7 @@ impl Encoder {
                 qp_y,
                 luma_nonzero_4x4,
                 chroma_nonzero_4x4: chroma_nz_mask,
+                is_intra_4x4: true,
                 ..Default::default()
             },
         }
@@ -2976,6 +3035,294 @@ impl Encoder {
     /// [`derive_nc_plane_luma_like`] with the per-plane totals tracked
     /// progressively in the shared [`CavlcNcGrid`] — mirroring the
     /// decoder's plane walker exactly.
+    /// Round-391 — encode one **4:4:4 Intra_4x4** macroblock (I_NxN
+    /// with the 4x4 transform at ChromaArrayType == 3, CAVLC).
+    ///
+    /// Per 4x4 block the luma mode is picked by Lagrangian RDO over
+    /// the 9 §8.3.1.2 modes (same trial as the 4:2:0 path); the Cb and
+    /// Cr planes then reuse that per-block mode per §8.3.4.5 ("chroma
+    /// coded like luma"): the §8.3.1.2 prediction runs on each chroma
+    /// plane's own recon neighbours, the residual goes through the
+    /// forward 4x4 + §8.5.12.1 quantiser at the chroma QP, and the
+    /// recon is committed through the same normative inverse the
+    /// decoder runs. §7.4.5.1 — a quadrant's CBP bit covers all three
+    /// planes; per-plane §9.2.1.1 nC comes from the `CavlcNcGrid`
+    /// plane-luma-like derivation with progressive in-MB commits.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mb_intra4x4_444(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+    ) -> MbDeblockInfo {
+        let width = self.cfg.width as usize;
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let lambda = lambda_ssd(qp_y, true);
+        // 4:4:4 requires flat scaling lists (asserted on encode_idr).
+        let wq = self.cfg.scaling_matrix.intra_weights();
+
+        // Pre-mark the slot so in-MB neighbour lookups see this MB's
+        // earlier-block modes (decoder ordering mirror).
+        {
+            let s = intra_grid.slot_mut(mb_x, mb_y);
+            s.available = true;
+            s.is_i_nxn = true;
+            s.is_i8x8 = false;
+            s.intra_4x4_pred_modes = [0u8; 16];
+        }
+
+        let mut chosen_mode = [0u8; 16];
+        let mut prev_flag = [false; 16];
+        let mut rem = [0u8; 16];
+        let mut luma_4x4_levels = [[0i32; 16]; 16];
+        let mut cb_4x4_levels = [[0i32; 16]; 16];
+        let mut cr_4x4_levels = [[0i32; 16]; 16];
+        let mut blk_luma_nz = [false; 16];
+        let mut blk_cb_nz = [false; 16];
+        let mut blk_cr_nz = [false; 16];
+
+        for blk in 0..16usize {
+            let (bx, by) = I4X4_XY[blk];
+            let avail = i4x4_avail(mb_x, mb_y, bx, by, width_mbs);
+            let predicted = predicted_intra4x4_mode(intra_grid, mb_x, mb_y, blk, width_mbs);
+
+            // ----- Luma: 9-mode Lagrangian trial (4:2:0-path mirror). -----
+            let mut best_mode = Intra4x4Mode::Dc;
+            let mut best_cost = u64::MAX;
+            let mut best_z_scan = [0i32; 16];
+            let mut best_recon = [0i32; 16];
+            for &mode in &Intra4x4Mode::ALL {
+                let Some(pred) = predict_4x4(mode, recon_y, width, mb_x, mb_y, bx, by, avail)
+                else {
+                    continue;
+                };
+                let candidate = mode.as_u8();
+                let mut block_res = [0i32; 16];
+                for j in 0..4 {
+                    for i in 0..4 {
+                        let s = frame.y[(mb_y * 16 + by + j) * width + (mb_x * 16 + bx + i)] as i32;
+                        block_res[j * 4 + i] = s - pred[j * 4 + i];
+                    }
+                }
+                let w_coeffs = forward_core_4x4(&block_res);
+                let z_raster = quantize_4x4_w(&w_coeffs, qp_y, true, &wq.w4);
+                let z_scan = zigzag_scan_4x4(&z_raster);
+                let r = inverse_transform_4x4(&z_raster, qp_y, &wq.w4, 8).expect("inverse 4x4");
+                let mut recon_block = [0i32; 16];
+                for j in 0..4 {
+                    for i in 0..4 {
+                        recon_block[j * 4 + i] = pred[j * 4 + i] + r[j * 4 + i];
+                    }
+                }
+                let d = ssd_4x4(frame.y, width, mb_x * 16 + bx, mb_y * 16 + by, &recon_block);
+                let mut bits: u64 = 1;
+                if candidate != predicted {
+                    bits += 3;
+                }
+                let mut trial_w = BitWriter::new();
+                if encode_residual_block_cavlc(
+                    &mut trial_w,
+                    CoeffTokenContext::Numeric(0),
+                    16,
+                    &z_scan,
+                )
+                .is_ok()
+                {
+                    bits += trial_w.bits_emitted() as u64;
+                }
+                let cost = cost_combined(d, bits, lambda);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_mode = mode;
+                    best_z_scan = z_scan;
+                    best_recon = recon_block;
+                }
+            }
+            let chosen = best_mode.as_u8();
+            chosen_mode[blk] = chosen;
+            if chosen == predicted {
+                prev_flag[blk] = true;
+            } else {
+                prev_flag[blk] = false;
+                rem[blk] = if chosen < predicted {
+                    chosen
+                } else {
+                    chosen - 1
+                };
+            }
+            intra_grid.slot_mut(mb_x, mb_y).intra_4x4_pred_modes[blk] = chosen;
+            luma_4x4_levels[blk] = best_z_scan;
+            blk_luma_nz[blk] = best_z_scan.iter().any(|&v| v != 0);
+            for j in 0..4 {
+                for i in 0..4 {
+                    recon_y[(mb_y * 16 + by + j) * width + mb_x * 16 + bx + i] =
+                        best_recon[j * 4 + i].clamp(0, 255) as u8;
+                }
+            }
+
+            // ----- Chroma planes: §8.3.4.5 mode reuse at the chroma QP. -----
+            for plane_is_cr in [false, true] {
+                let (plane_src, plane_recon): (&[u8], &mut [u8]) = if plane_is_cr {
+                    (frame.v, &mut *recon_v)
+                } else {
+                    (frame.u, &mut *recon_u)
+                };
+                let pred = predict_4x4(best_mode, plane_recon, width, mb_x, mb_y, bx, by, avail)
+                    .expect("chosen mode is available on the chroma plane (same geometry)");
+                let mut block_res = [0i32; 16];
+                for j in 0..4 {
+                    for i in 0..4 {
+                        let s =
+                            plane_src[(mb_y * 16 + by + j) * width + (mb_x * 16 + bx + i)] as i32;
+                        block_res[j * 4 + i] = s - pred[j * 4 + i];
+                    }
+                }
+                let w_coeffs = forward_core_4x4(&block_res);
+                let z_raster = quantize_4x4_w(&w_coeffs, qp_c, true, &wq.w4);
+                let z_scan = zigzag_scan_4x4(&z_raster);
+                let r = inverse_transform_4x4(&z_raster, qp_c, &wq.w4, 8).expect("inverse 4x4");
+                for j in 0..4 {
+                    for i in 0..4 {
+                        let v = (pred[j * 4 + i] + r[j * 4 + i]).clamp(0, 255);
+                        plane_recon[(mb_y * 16 + by + j) * width + mb_x * 16 + bx + i] = v as u8;
+                    }
+                }
+                let any_nz = z_scan.iter().any(|&v| v != 0);
+                if plane_is_cr {
+                    cr_4x4_levels[blk] = z_scan;
+                    blk_cr_nz[blk] = any_nz;
+                } else {
+                    cb_4x4_levels[blk] = z_scan;
+                    blk_cb_nz[blk] = any_nz;
+                }
+            }
+        }
+
+        // §7.4.5.1 — a quadrant's CBP bit covers all three planes.
+        let mut cbp_luma: u8 = 0;
+        for blk8 in 0..4usize {
+            if (0..4).any(|sub| {
+                let blk = blk8 * 4 + sub;
+                blk_luma_nz[blk] || blk_cb_nz[blk] || blk_cr_nz[blk]
+            }) {
+                cbp_luma |= 1u8 << blk8;
+            }
+        }
+        // A cbp-0 quadrant has all three planes quantised to zero, so
+        // the committed recon already equals the predictor everywhere
+        // in it — no rollback needed (decoder mirror).
+
+        // ----- §9.2.1.1 nC bookkeeping (luma + per-plane). -----
+        let pic_w_mbs = self.cfg.width / 16;
+        let mb_addr = (mb_y as u32) * pic_w_mbs + (mb_x as u32);
+        {
+            let cur = &mut nc_grid.mbs[mb_addr as usize];
+            cur.is_available = true;
+            cur.is_intra = true;
+            cur.is_skip = false;
+            cur.is_i_pcm = false;
+            cur.luma_total_coeff = [0u8; 16];
+            cur.cb_luma_total_coeff = [0u8; 16];
+            cur.cr_luma_total_coeff = [0u8; 16];
+        }
+        let mut luma_4x4_nc = [0i32; 16];
+        let mut own_totals = [0u8; 16];
+        for blk in 0..16usize {
+            let blk8 = blk / 4;
+            nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+            let nc = derive_nc_luma(nc_grid, mb_addr, blk as u8, LumaNcKind::Ac, true, false);
+            luma_4x4_nc[blk] = nc;
+            own_totals[blk] = if (cbp_luma >> blk8) & 1 == 1 {
+                luma_4x4_levels[blk].iter().filter(|&&v| v != 0).count() as u8
+            } else {
+                0
+            };
+        }
+        nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+
+        let mut cb_4x4_nc = [0i32; 16];
+        let mut cr_4x4_nc = [0i32; 16];
+        for plane_is_cr in [false, true] {
+            let levels = if plane_is_cr {
+                &cr_4x4_levels
+            } else {
+                &cb_4x4_levels
+            };
+            let mut own_plane = [0u8; 16];
+            for blk in 0..16usize {
+                let blk8 = blk / 4;
+                {
+                    let cur = &mut nc_grid.mbs[mb_addr as usize];
+                    if plane_is_cr {
+                        cur.cr_luma_total_coeff = own_plane;
+                    } else {
+                        cur.cb_luma_total_coeff = own_plane;
+                    }
+                }
+                let nc = crate::macroblock_layer::derive_nc_plane_luma_like(
+                    nc_grid,
+                    mb_addr,
+                    blk as u8,
+                    plane_is_cr,
+                    true,
+                    false,
+                );
+                if plane_is_cr {
+                    cr_4x4_nc[blk] = nc;
+                } else {
+                    cb_4x4_nc[blk] = nc;
+                }
+                own_plane[blk] = if (cbp_luma >> blk8) & 1 == 1 {
+                    levels[blk].iter().filter(|&&v| v != 0).count() as u8
+                } else {
+                    0
+                };
+            }
+            let cur = &mut nc_grid.mbs[mb_addr as usize];
+            if plane_is_cr {
+                cur.cr_luma_total_coeff = own_plane;
+            } else {
+                cur.cb_luma_total_coeff = own_plane;
+            }
+        }
+
+        // ----- Emit syntax. -----
+        crate::encoder::macroblock::write_i4x4_mb_444(
+            sw,
+            // §7.3.5 — code transform_size_8x8_flag = 0 inside a
+            // transform_8x8_mode_flag = 1 stream.
+            self.cfg.transform_8x8,
+            &prev_flag,
+            &rem,
+            cbp_luma,
+            0,
+            &luma_4x4_levels,
+            &luma_4x4_nc,
+            &cb_4x4_levels,
+            &cb_4x4_nc,
+            &cr_4x4_levels,
+            &cr_4x4_nc,
+        )
+        .expect("write I_4x4 mb (4:4:4)");
+
+        // Deblocking is disabled for 4:4:4 streams (slice header sets
+        // disable_deblocking_filter_idc = 1).
+        MbDeblockInfo {
+            is_intra: true,
+            qp_y,
+            is_intra_4x4: true,
+            ..Default::default()
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_mb_intra8x8_444(
         &self,
@@ -3282,6 +3629,11 @@ pub struct EncodedIdr {
     /// [`EncoderConfig::transform_8x8`] is set. Exposed so callers /
     /// tests can verify the 8x8 transform is actually being selected.
     pub i8x8_mb_count: u32,
+    /// Round-391 — number of macroblocks the per-MB RDO coded as
+    /// I_NxN with the 4x4 transform (Intra_4x4). Exposed so tests can
+    /// verify the 4:4:4 I_4x4 leg (and the legacy 4:2:0 I_NxN trial)
+    /// is actually being selected.
+    pub i4x4_mb_count: u32,
 }
 
 /// One 8x8 partition's per-list MV state, captured at picture-level so
@@ -10592,6 +10944,7 @@ impl Encoder {
             mv_l1: mv_l1_arr,
             ref_idx_l1,
             ref_poc_l1,
+            is_intra_4x4: false,
         }
     }
 

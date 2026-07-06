@@ -2793,6 +2793,9 @@ impl Encoder {
             recon_height: cfg.height,
             partition_mvs,
             i8x8_mb_count,
+            // The CABAC IDR trial set is I_16x16 / Intra_8x8; no I_4x4
+            // leg on this path yet.
+            i4x4_mb_count: 0,
         }
     }
 
@@ -6151,6 +6154,7 @@ impl Encoder {
                     ref_idx_l1: ref_idx_l1_arr,
                     ref_poc_l1: ref_poc_l1_arr,
                     transform_size_8x8_flag: transform_size_8x8,
+                    is_intra_4x4: false,
                 };
 
                 let is_last = mb_x + 1 == width_mbs && mb_y + 1 == height_mbs;

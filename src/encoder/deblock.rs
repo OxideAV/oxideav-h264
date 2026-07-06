@@ -87,6 +87,11 @@ pub struct MbDeblockInfo {
     /// mirror must carry the flag through to the shared
     /// `deblock_picture_full` grid.
     pub transform_size_8x8_flag: bool,
+    /// Round-391 — the MB was coded I_NxN with the 4x4 transform
+    /// (Intra_4x4). Not consumed by the §8.7 walker; carried so the
+    /// per-picture encoder entry points can report selection counters
+    /// (`EncodedIdr::i4x4_mb_count`) that tests pin RDO behaviour on.
+    pub is_intra_4x4: bool,
 }
 
 impl Default for MbDeblockInfo {
@@ -103,6 +108,7 @@ impl Default for MbDeblockInfo {
             ref_idx_l1: [-1; 4],
             ref_poc_l1: [i32::MIN; 4],
             transform_size_8x8_flag: false,
+            is_intra_4x4: false,
         }
     }
 }
