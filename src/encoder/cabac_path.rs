@@ -2997,8 +2997,15 @@ impl Encoder {
                 let mut transform_size_8x8 = false;
                 let mut scan8_blocks = [[0i32; 64]; 4];
                 if cfg.transform_8x8 {
-                    let inter_luma8 =
-                        forward_inter_luma_8x8(frame.y, width, mb_x, mb_y, &pred_y, qp_y);
+                    let inter_luma8 = forward_inter_luma_8x8(
+                        frame.y,
+                        width,
+                        mb_x,
+                        mb_y,
+                        &pred_y,
+                        qp_y,
+                        &crate::transform::FLAT_8X8_16,
+                    );
                     let mut cbp_luma8: u8 = 0;
                     for blk8 in 0..4usize {
                         if inter_luma8.blk_has_nz[blk8 * 4] {
@@ -4656,8 +4663,15 @@ impl Encoder {
                 let mut transform_size_8x8 = false;
                 let mut scan8_blocks = [[0i32; 64]; 4];
                 if cfg.transform_8x8 {
-                    let inter_luma8 =
-                        forward_inter_luma_8x8(frame.y, width, mb_x, mb_y, &pred_y, qp_y);
+                    let inter_luma8 = forward_inter_luma_8x8(
+                        frame.y,
+                        width,
+                        mb_x,
+                        mb_y,
+                        &pred_y,
+                        qp_y,
+                        &crate::transform::FLAT_8X8_16,
+                    );
                     let mut cbp_luma8: u8 = 0;
                     for blk8 in 0..4usize {
                         if inter_luma8.blk_has_nz[blk8 * 4] {

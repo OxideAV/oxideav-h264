@@ -77,9 +77,9 @@ use crate::encoder::slice::{
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
     deinterleave_8x8_to_4x4, forward_core_4x4, forward_core_8x8, forward_hadamard_2x2,
-    forward_hadamard_4x4, quantize_4x4, quantize_4x4_ac, quantize_4x4_ac_w, quantize_4x4_w,
-    quantize_8x8, quantize_8x8_w, quantize_chroma_dc_w, quantize_luma_dc, quantize_luma_dc_w,
-    zigzag_scan_4x4, zigzag_scan_4x4_ac, zigzag_scan_8x8,
+    forward_hadamard_4x4, quantize_4x4_ac, quantize_4x4_ac_w, quantize_4x4_w, quantize_8x8,
+    quantize_8x8_w, quantize_chroma_dc_w, quantize_luma_dc, quantize_luma_dc_w, zigzag_scan_4x4,
+    zigzag_scan_4x4_ac, zigzag_scan_8x8,
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::intra_pred::{
@@ -4263,6 +4263,7 @@ fn encode_chroma_residual_inter(
     mb_y: usize,
     pred: &[i32; 64],
     qp_c: i32,
+    w4: &[i32; 16],
 ) -> ([i32; 4], [[i32; 16]; 4], [i32; 64]) {
     // Re-use the intra path — its only assumption on the predictor is
     // that it's a `[i32; 64]` row-major 8x8 block. The is_intra=true
@@ -4270,15 +4271,7 @@ fn encode_chroma_residual_inter(
     // but for round-16 we accept the intra rounding for chroma (the
     // bitstream is correct either way; only the rate-distortion trade-
     // off shifts marginally).
-    encode_chroma_residual(
-        src_plane,
-        chroma_stride,
-        mb_x,
-        mb_y,
-        pred,
-        qp_c,
-        &FLAT_4X4_16,
-    )
+    encode_chroma_residual(src_plane, chroma_stride, mb_x, mb_y, pred, qp_c, w4)
 }
 
 /// Round-388 — SSD between the source and the reconstruction over one
@@ -5156,10 +5149,6 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedP {
-        assert!(
-            self.cfg.scaling_matrix.is_flat(),
-            "non-flat scaling matrices are IDR/CAVLC-only (round-388 scope)",
-        );
         assert_eq!(frame.width, self.cfg.width);
         assert_eq!(frame.height, self.cfg.height);
         assert_eq!(prev.width, self.cfg.width);
@@ -5468,8 +5457,10 @@ impl Encoder {
         }
 
         // 4. Compute the luma residual, transform, AC-quantize, inverse,
-        //    and reconstruct.
-        let inter_luma = forward_inter_luma(frame.y, width, mb_x, mb_y, &pred_y, qp_y);
+        //    and reconstruct. §8.5.9 — inter MBs quantise / dequantise
+        //    under the inter weightScale lists (round-391).
+        let wq = self.cfg.scaling_matrix.inter_weights();
+        let inter_luma = forward_inter_luma(frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w4);
         let mut luma_4x4_levels_scan = inter_luma.levels_scan;
         let luma_4x4_quant_raster = inter_luma.quant_raster;
         let mut blk_has_nz = inter_luma.blk_has_nz;
@@ -5492,7 +5483,8 @@ impl Encoder {
         // of the comparison).
         let mut transform_size_8x8 = false;
         if self.cfg.transform_8x8 {
-            let inter_luma8 = forward_inter_luma_8x8(frame.y, width, mb_x, mb_y, &pred_y, qp_y);
+            let inter_luma8 =
+                forward_inter_luma_8x8(frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w8);
             let mut cbp_luma8: u8 = 0;
             for blk8 in 0..4usize {
                 if inter_luma8.blk_has_nz[blk8 * 4] {
@@ -5531,9 +5523,9 @@ impl Encoder {
 
         // 6. Encode chroma residual against the inter predictor.
         let (u_dc_levels, u_ac_levels, u_recon_residual) =
-            encode_chroma_residual_inter(frame.u, chroma_width, mb_x, mb_y, &pred_u, qp_c);
+            encode_chroma_residual_inter(frame.u, chroma_width, mb_x, mb_y, &pred_u, qp_c, &wq.w4);
         let (v_dc_levels, v_ac_levels, v_recon_residual) =
-            encode_chroma_residual_inter(frame.v, chroma_width, mb_x, mb_y, &pred_v, qp_c);
+            encode_chroma_residual_inter(frame.v, chroma_width, mb_x, mb_y, &pred_v, qp_c, &wq.w4);
         let any_dc_nz = u_dc_levels.iter().any(|&v| v != 0) || v_dc_levels.iter().any(|&v| v != 0);
         let any_ac_nz = u_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0))
             || v_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0));
@@ -5897,8 +5889,10 @@ impl Encoder {
             }
         }
 
-        // 4. Forward + quantize luma residual.
-        let inter_luma = forward_inter_luma(frame.y, width, mb_x, mb_y, &pred_y, qp_y);
+        // 4. Forward + quantize luma residual (§8.5.9 inter
+        //    weightScale — round-391).
+        let wq = self.cfg.scaling_matrix.inter_weights();
+        let inter_luma = forward_inter_luma(frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w4);
         let luma_4x4_levels_scan = inter_luma.levels_scan;
         let blk_has_nz = inter_luma.blk_has_nz;
         let recon_block_residual = inter_luma.recon_residual;
@@ -5913,9 +5907,9 @@ impl Encoder {
 
         // 5. Forward + quantize chroma residual.
         let (u_dc_levels, u_ac_levels, u_recon_residual) =
-            encode_chroma_residual_inter(frame.u, chroma_width, mb_x, mb_y, &pred_u, qp_c);
+            encode_chroma_residual_inter(frame.u, chroma_width, mb_x, mb_y, &pred_u, qp_c, &wq.w4);
         let (v_dc_levels, v_ac_levels, v_recon_residual) =
-            encode_chroma_residual_inter(frame.v, chroma_width, mb_x, mb_y, &pred_v, qp_c);
+            encode_chroma_residual_inter(frame.v, chroma_width, mb_x, mb_y, &pred_v, qp_c, &wq.w4);
         let any_dc_nz = u_dc_levels.iter().any(|&v| v != 0) || v_dc_levels.iter().any(|&v| v != 0);
         let any_ac_nz = u_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0))
             || v_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0));
@@ -6423,6 +6417,9 @@ impl Encoder {
         let width = self.cfg.width as usize;
         let height = self.cfg.height as usize;
         let lambda = lambda_ssd(qp_y, true);
+        // §8.5.9 — an intra MB in a P/B slice quantises / dequantises
+        // under the INTRA weightScale lists (round-391).
+        let wq = self.cfg.scaling_matrix.intra_weights();
 
         // Pick best luma mode by RDO (mirrors encode_mb_intra16x16's
         // luma-mode loop, with neighbour reads against `recon_y` which
@@ -6439,8 +6436,7 @@ impl Encoder {
             let Some(pred) = predict_16x16(mode, recon_y, width, height, mb_x, mb_y) else {
                 continue;
             };
-            let cost =
-                trial_intra16x16_cost(frame, &pred, mb_x, mb_y, qp_y, width, lambda, &FLAT_4X4_16);
+            let cost = trial_intra16x16_cost(frame, &pred, mb_x, mb_y, qp_y, width, lambda, &wq.w4);
             if cost < best_luma_cost {
                 best_luma_cost = cost;
                 best_luma_mode = mode;
@@ -6475,7 +6471,7 @@ impl Encoder {
             dc_coeffs[by * 4 + bx] = c[0];
         }
         let dc_t = forward_hadamard_4x4(&dc_coeffs);
-        let dc_levels = quantize_luma_dc(&dc_t, qp_y, true);
+        let dc_levels = quantize_luma_dc_w(&dc_t, qp_y, true, wq.w4[0]);
 
         // Per-block AC quantize.
         let mut luma_ac_levels = [[0i32; 16]; 16];
@@ -6484,7 +6480,7 @@ impl Encoder {
         for blkz in 0..16usize {
             let (bx, by) = LUMA_4X4_BLK[blkz];
             let raster = by * 4 + bx;
-            let z = quantize_4x4_ac(&coeffs_4x4[raster], qp_y, true);
+            let z = quantize_4x4_ac_w(&coeffs_4x4[raster], qp_y, true, &wq.w4);
             luma_ac_quant_raster[raster] = z;
             let scan_ac = zigzag_scan_4x4_ac(&z);
             luma_ac_levels[blkz] = scan_ac;
@@ -6495,8 +6491,8 @@ impl Encoder {
         let cbp_luma: u8 = if any_luma_ac_nz { 15 } else { 0 };
 
         // Inverse path → recon_y.
-        let inv_dc = inverse_hadamard_luma_dc_16x16(&dc_levels, qp_y, &FLAT_4X4_16, 8)
-            .expect("luma DC inverse");
+        let inv_dc =
+            inverse_hadamard_luma_dc_16x16(&dc_levels, qp_y, &wq.w4, 8).expect("luma DC inverse");
         #[allow(clippy::needless_range_loop)]
         for blk in 0..16usize {
             let bx = blk % 4;
@@ -6507,7 +6503,7 @@ impl Encoder {
                 [0i32; 16]
             };
             coeffs_in[0] = inv_dc[by * 4 + bx];
-            let r = inverse_transform_4x4_dc_preserved(&coeffs_in, qp_y, &FLAT_4X4_16, 8)
+            let r = inverse_transform_4x4_dc_preserved(&coeffs_in, qp_y, &wq.w4, 8)
                 .expect("inverse 4x4");
             for j in 0..4 {
                 for i in 0..4 {
@@ -6532,7 +6528,7 @@ impl Encoder {
             mb_x,
             mb_y,
             qp_c,
-            &FLAT_4X4_16,
+            &wq.w4,
         );
         let cbp_chroma = chroma_block.cbp_chroma;
         let best_chroma_mode_u8 = chroma_block.pred_mode.as_u8();
@@ -6731,6 +6727,7 @@ struct InterLumaForward {
 /// * `recon_residual[blk]` — the §8.5.13 reconstructed residual of the
 ///   4x4 sub-tile at Z-index `blk`, sliced from the quadrant's 8x8
 ///   inverse transform.
+#[allow(clippy::too_many_arguments)]
 fn forward_inter_luma_8x8(
     src_y: &[u8],
     src_stride: usize,
@@ -6738,8 +6735,8 @@ fn forward_inter_luma_8x8(
     mb_y: usize,
     pred: &[i32; 256],
     qp_y: i32,
+    w8: &[i32; 64],
 ) -> InterLumaForward {
-    let sl8 = default_scaling_list_8x8_flat();
     let mut levels_scan = [[0i32; 16]; 16];
     let mut blk_has_nz = [false; 16];
     let mut recon_residual = [[0i32; 16]; 16];
@@ -6755,7 +6752,7 @@ fn forward_inter_luma_8x8(
             }
         }
         let w = forward_core_8x8(&res);
-        let z = quantize_8x8(&w, qp_y, false);
+        let z = quantize_8x8_w(&w, qp_y, false, w8);
         let any_nz = z.iter().any(|&v| v != 0);
         let scan = zigzag_scan_8x8(&z);
         let subs = deinterleave_8x8_to_4x4(&scan);
@@ -6763,7 +6760,7 @@ fn forward_inter_luma_8x8(
             levels_scan[blk8 * 4 + i4x4] = *sub;
             blk_has_nz[blk8 * 4 + i4x4] = any_nz;
         }
-        let r = inverse_transform_8x8(&z, qp_y, &sl8, 8).expect("inv 8x8");
+        let r = inverse_transform_8x8(&z, qp_y, w8, 8).expect("inv 8x8");
         // Slice the 8x8 residual into the quadrant's four 4x4 Z-index
         // sub-tiles (§6.4.3: within a quadrant, Z order is TL, TR, BL,
         // BR 4x4 tiles).
@@ -6847,6 +6844,7 @@ fn forward_inter_luma(
     mb_y: usize,
     pred: &[i32; 256],
     qp_y: i32,
+    w4: &[i32; 16],
 ) -> InterLumaForward {
     // Build sample residual against the predictor.
     let mut residual = [0i32; 256];
@@ -6873,14 +6871,15 @@ fn forward_inter_luma(
         // Forward 4x4 + full quantize (includes DC; inter uses the
         // standard quantizer per §8.5.10).
         let w = forward_core_4x4(&block);
-        let z = quantize_4x4(&w, qp_y, false);
+        let z = quantize_4x4_w(&w, qp_y, false, w4);
         let scan = zigzag_scan_4x4(&z);
         levels_scan[blkz] = scan;
         quant_raster[blkz] = z;
         blk_has_nz[blkz] = z.iter().any(|&v| v != 0);
 
-        // Inverse path so we know the recon's residual for the block.
-        let r = inverse_transform_4x4(&z, qp_y, &FLAT_4X4_16, 8).expect("inv 4x4");
+        // Inverse path (§8.5.9 weightScale-aware — round-391) so we
+        // know the recon's residual for the block.
+        let r = inverse_transform_4x4(&z, qp_y, w4, 8).expect("inv 4x4");
         recon_residual[blkz] = r;
     }
     InterLumaForward {
@@ -9415,10 +9414,6 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedB {
-        assert!(
-            self.cfg.scaling_matrix.is_flat(),
-            "non-flat scaling matrices are IDR/CAVLC-only (round-388 scope)",
-        );
         assert_eq!(frame.width, self.cfg.width);
         assert_eq!(frame.height, self.cfg.height);
         assert_eq!(ref_l0.width, self.cfg.width);
@@ -10561,8 +10556,10 @@ impl Encoder {
         }; // (struct kept for forward documentation; the values are read directly below)
 
         // 5. Forward + quantize the luma residual against the chosen
-        //    predictor (re-using the inter forward path).
-        let inter_luma = forward_inter_luma(frame.y, src_stride, mb_x, mb_y, &pred_y, qp_y);
+        //    predictor (re-using the inter forward path; §8.5.9 inter
+        //    weightScale — round-391).
+        let wq = self.cfg.scaling_matrix.inter_weights();
+        let inter_luma = forward_inter_luma(frame.y, src_stride, mb_x, mb_y, &pred_y, qp_y, &wq.w4);
         let mut luma_4x4_levels_scan = inter_luma.levels_scan;
         let mut blk_has_nz = inter_luma.blk_has_nz;
         let mut recon_block_residual = inter_luma.recon_residual;
@@ -10582,7 +10579,7 @@ impl Encoder {
         let mut transform_size_8x8 = false;
         if self.cfg.transform_8x8 {
             let inter_luma8 =
-                forward_inter_luma_8x8(frame.y, src_stride, mb_x, mb_y, &pred_y, qp_y);
+                forward_inter_luma_8x8(frame.y, src_stride, mb_x, mb_y, &pred_y, qp_y, &wq.w8);
             let mut cbp_luma8: u8 = 0;
             for blk8 in 0..4usize {
                 if inter_luma8.blk_has_nz[blk8 * 4] {
@@ -10628,9 +10625,9 @@ impl Encoder {
 
         // 6. Forward + quantize chroma residual.
         let (u_dc_levels, u_ac_levels, u_recon_residual) =
-            encode_chroma_residual_inter(frame.u, chroma_width, mb_x, mb_y, &pred_u, qp_c);
+            encode_chroma_residual_inter(frame.u, chroma_width, mb_x, mb_y, &pred_u, qp_c, &wq.w4);
         let (v_dc_levels, v_ac_levels, v_recon_residual) =
-            encode_chroma_residual_inter(frame.v, chroma_width, mb_x, mb_y, &pred_v, qp_c);
+            encode_chroma_residual_inter(frame.v, chroma_width, mb_x, mb_y, &pred_v, qp_c, &wq.w4);
         let any_dc_nz = u_dc_levels.iter().any(|&v| v != 0) || v_dc_levels.iter().any(|&v| v != 0);
         let any_ac_nz = u_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0))
             || v_ac_levels.iter().any(|blk| blk.iter().any(|&v| v != 0));
