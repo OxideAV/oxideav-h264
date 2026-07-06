@@ -136,6 +136,10 @@ pub struct YuvFrame<'a> {
 
 /// Encoder configuration.
 /// §7.4.2.1.1.1 — encoder scaling-matrix signalling mode.
+// The custom variants inline 640 bytes of list values so the enum (and
+// `EncoderConfig`) stays `Copy` — a Box would force Clone-only configs
+// for a rarely-hot struct that is passed by reference everywhere.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScalingMatrixMode {
     /// Flat lists (all 16s) — no matrices signalled. The round-1..387
@@ -149,38 +153,139 @@ pub enum ScalingMatrixMode {
     /// Emit the default matrices at picture level
     /// (`pic_scaling_matrix_present_flag = 1` in the PPS tail).
     PicDefault,
+    /// Round-391 — emit **custom user-supplied** list values at
+    /// sequence level: every `seq_scaling_list_present_flag[i] = 1`
+    /// and the §7.3.2.1.1.1 delta_scale chain codes the caller's
+    /// values explicitly (no UseDefaultScalingMatrixFlag shortcut).
+    SeqCustom(CustomScalingLists),
+    /// Round-391 — custom user-supplied list values at picture level
+    /// (§7.3.2.2 PPS tail).
+    PicCustom(CustomScalingLists),
 }
 
-/// Effective intra weightScale matrices for the encoder's quantise +
+/// Round-391 — user-supplied §7.4.2.1.1.1 scaling-list values.
+///
+/// Values are in the **bitstream list order** (the §7.3.2.1.1.1
+/// `j`-loop order, i.e. the §8.5.6 / §8.5.7 zig-zag scan — the same
+/// layout as the Table 7-3 / 7-4 defaults) and must each be in
+/// `1..=255` (a first value of 0 would signal
+/// UseDefaultScalingMatrixFlag; later zeros would freeze the list).
+///
+/// The encoder emits the same 4x4 values for the Y / Cb / Cr list
+/// slots of a group (lists 0..=2 intra, 3..=5 inter) and applies them
+/// uniformly in its own quantiser — matching the §8.5.9 weightScale
+/// the decoder derives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustomScalingLists {
+    /// 4x4 intra list (SPS/PPS lists 0..=2), scan order.
+    pub intra4: [i32; 16],
+    /// 4x4 inter list (SPS/PPS lists 3..=5), scan order.
+    pub inter4: [i32; 16],
+    /// 8x8 intra Y list (list 6), scan order.
+    pub intra8: [i32; 64],
+    /// 8x8 inter Y list (list 7), scan order.
+    pub inter8: [i32; 64],
+}
+
+impl CustomScalingLists {
+    /// §7.4.2.1.1.1 — all entries must lie in `1..=255`.
+    pub fn is_valid(&self) -> bool {
+        self.intra4.iter().all(|v| (1..=255).contains(v))
+            && self.inter4.iter().all(|v| (1..=255).contains(v))
+            && self.intra8.iter().all(|v| (1..=255).contains(v))
+            && self.inter8.iter().all(|v| (1..=255).contains(v))
+    }
+}
+
+/// §7.3.2.1.1.1 — what an SPS / PPS scaling-list loop should emit.
+// Same `Copy` rationale as [`ScalingMatrixMode`].
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalingListsSpec {
+    /// Every list present, coded as UseDefaultScalingMatrixFlag
+    /// (`delta_scale = -8` at `j == 0`) → Table 7-3 / 7-4 defaults.
+    Default,
+    /// Every list present with explicitly coded caller values.
+    Custom(CustomScalingLists),
+}
+
+/// Effective weightScale matrices for the encoder's quantise +
 /// reconstruct pipeline (row-major, §8.5.9 layout — the same arrays
 /// the decoder's `select_scaling_list_*` return).
-pub(crate) struct IntraWeights {
+pub(crate) struct WeightPair {
     pub(crate) w4: [i32; 16],
     pub(crate) w8: [i32; 64],
 }
 
 impl ScalingMatrixMode {
     pub(crate) fn is_flat(self) -> bool {
-        self == ScalingMatrixMode::Flat
+        matches!(self, ScalingMatrixMode::Flat)
+    }
+
+    /// The `Some(spec)` to emit in the SPS scaling-list loop.
+    pub(crate) fn seq_spec(self) -> Option<ScalingListsSpec> {
+        match self {
+            ScalingMatrixMode::SeqDefault => Some(ScalingListsSpec::Default),
+            ScalingMatrixMode::SeqCustom(l) => Some(ScalingListsSpec::Custom(l)),
+            _ => None,
+        }
+    }
+
+    /// The `Some(spec)` to emit in the PPS scaling-list loop.
+    pub(crate) fn pic_spec(self) -> Option<ScalingListsSpec> {
+        match self {
+            ScalingMatrixMode::PicDefault => Some(ScalingListsSpec::Default),
+            ScalingMatrixMode::PicCustom(l) => Some(ScalingListsSpec::Custom(l)),
+            _ => None,
+        }
     }
 
     /// The intra weightScale pair this mode produces. All three 4x4
-    /// intra lists (Y/Cb/Cr) are Default_4x4_Intra under both
-    /// non-flat modes, and the 8x8 intra Y list is Default_8x8_Intra,
-    /// so one pair covers every IDR block shape.
-    pub(crate) fn intra_weights(self) -> IntraWeights {
+    /// intra lists (Y/Cb/Cr) carry the same values under every
+    /// non-flat mode this encoder emits, and the matching 8x8 intra
+    /// list covers the 8x8 shape, so one pair covers every intra
+    /// block shape.
+    pub(crate) fn intra_weights(self) -> WeightPair {
         use crate::transform::{
             weight_scale_4x4_from_scan, weight_scale_8x8_from_scan, DEFAULT_4X4_INTRA,
             DEFAULT_8X8_INTRA, FLAT_8X8_16,
         };
         match self {
-            ScalingMatrixMode::Flat => IntraWeights {
+            ScalingMatrixMode::Flat => WeightPair {
                 w4: FLAT_4X4_16,
                 w8: FLAT_8X8_16,
             },
-            ScalingMatrixMode::SeqDefault | ScalingMatrixMode::PicDefault => IntraWeights {
+            ScalingMatrixMode::SeqDefault | ScalingMatrixMode::PicDefault => WeightPair {
                 w4: weight_scale_4x4_from_scan(&DEFAULT_4X4_INTRA),
                 w8: weight_scale_8x8_from_scan(&DEFAULT_8X8_INTRA),
+            },
+            ScalingMatrixMode::SeqCustom(l) | ScalingMatrixMode::PicCustom(l) => WeightPair {
+                w4: weight_scale_4x4_from_scan(&l.intra4),
+                w8: weight_scale_8x8_from_scan(&l.intra8),
+            },
+        }
+    }
+
+    /// The inter weightScale pair (Default_4x4_Inter / Default_8x8_Inter
+    /// under the default modes; the caller's inter lists under custom).
+    /// Round-391 — consumed by the P/B residual quantisers.
+    pub(crate) fn inter_weights(self) -> WeightPair {
+        use crate::transform::{
+            weight_scale_4x4_from_scan, weight_scale_8x8_from_scan, DEFAULT_4X4_INTER,
+            DEFAULT_8X8_INTER, FLAT_8X8_16,
+        };
+        match self {
+            ScalingMatrixMode::Flat => WeightPair {
+                w4: FLAT_4X4_16,
+                w8: FLAT_8X8_16,
+            },
+            ScalingMatrixMode::SeqDefault | ScalingMatrixMode::PicDefault => WeightPair {
+                w4: weight_scale_4x4_from_scan(&DEFAULT_4X4_INTER),
+                w8: weight_scale_8x8_from_scan(&DEFAULT_8X8_INTER),
+            },
+            ScalingMatrixMode::SeqCustom(l) | ScalingMatrixMode::PicCustom(l) => WeightPair {
+                w4: weight_scale_4x4_from_scan(&l.inter4),
+                w8: weight_scale_8x8_from_scan(&l.inter8),
             },
         }
     }
@@ -1147,6 +1252,15 @@ impl Encoder {
                 "trellis intra refinement assumes flat scaling lists",
             );
         }
+        // Round-391 — §7.4.2.1.1.1 range check on user-supplied lists.
+        if let ScalingMatrixMode::SeqCustom(l) | ScalingMatrixMode::PicCustom(l) =
+            self.cfg.scaling_matrix
+        {
+            assert!(
+                l.is_valid(),
+                "custom scaling-list values must all be in 1..=255",
+            );
+        }
         // §A.2.4 — the 8x8 transform is a High-profile tool; force
         // profile_idc to at least High (100) when it's requested so the
         // SPS/PPS pairing is spec-conformant. Scaling matrices likewise
@@ -1170,10 +1284,10 @@ impl Encoder {
             max_num_ref_frames: self.cfg.max_num_ref_frames,
             profile_idc,
             chroma_format_idc: self.cfg.chroma_format_idc,
-            seq_scaling_matrix_default: self.cfg.scaling_matrix == ScalingMatrixMode::SeqDefault,
+            seq_scaling_lists: self.cfg.scaling_matrix.seq_spec(),
         };
         let pps_cfg = BaselinePpsConfig {
-            pic_scaling_matrix_default: self.cfg.scaling_matrix == ScalingMatrixMode::PicDefault,
+            pic_scaling_lists: self.cfg.scaling_matrix.pic_spec(),
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: self.cfg.qp - 26,

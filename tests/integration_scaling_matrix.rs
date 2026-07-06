@@ -273,3 +273,200 @@ fn flat_mode_unchanged_and_interops() {
     assert_self_roundtrip(&idr, "flat");
     assert_ffmpeg_interop(&idr, "flat");
 }
+
+// ---------------------------------------------------------------------------
+// Round-391 — custom user-supplied scaling-list values.
+// ---------------------------------------------------------------------------
+
+use oxideav_h264::encoder::CustomScalingLists;
+use oxideav_h264::sps::ScalingListEntry;
+
+/// A distinctly non-default, non-flat matrix set. Values are in the
+/// §7.3.2.1.1.1 scan order. Mild low-frequency emphasis so QP-26
+/// encodes stay useful, but clearly different from Table 7-3/7-4.
+fn custom_lists() -> CustomScalingLists {
+    let mut intra4 = [0i32; 16];
+    let mut inter4 = [0i32; 16];
+    for j in 0..16 {
+        intra4[j] = 12 + (j as i32) * 3; // 12..57
+        inter4[j] = 14 + (j as i32) * 2; // 14..44
+    }
+    let mut intra8 = [0i32; 64];
+    let mut inter8 = [0i32; 64];
+    for j in 0..64 {
+        intra8[j] = 10 + (j as i32); // 10..73
+        inter8[j] = 12 + (j as i32) / 2; // 12..43
+    }
+    CustomScalingLists {
+        intra4,
+        inter4,
+        intra8,
+        inter8,
+    }
+}
+
+fn encode_custom(
+    mode: ScalingMatrixMode,
+    transform_8x8: bool,
+) -> oxideav_h264::encoder::EncodedIdr {
+    let (y, u, v) = make_source();
+    let frame = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    let cfg = EncoderConfig {
+        scaling_matrix: mode,
+        transform_8x8,
+        qp: if transform_8x8 { 18 } else { 26 },
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    Encoder::new(cfg).encode_idr(&frame)
+}
+
+/// The SPS carries every list as explicit values and the decoder's
+/// parser recovers exactly the caller-supplied numbers (lists 0..=2 =
+/// intra4, 3..=5 = inter4, 6 = intra8, 7 = inter8).
+#[test]
+fn seq_custom_sps_parse_back_matches_values() {
+    let lists = custom_lists();
+    let idr = encode_custom(ScalingMatrixMode::SeqCustom(lists), false);
+    let mut saw = false;
+    for nal in AnnexBSplitter::new(&idr.annex_b) {
+        let unit = parse_nal_unit(nal).expect("parse NAL");
+        if unit.header.nal_unit_type == NalUnitType::Sps {
+            let sps = oxideav_h264::sps::Sps::parse(&unit.rbsp).expect("parse SPS");
+            assert!(sps.seq_scaling_matrix_present_flag);
+            let sl = sps.seq_scaling_lists.as_ref().expect("lists present");
+            assert_eq!(sl.entries.len(), 8, "4:2:0 SPS loop is 8 lists");
+            for (i, e) in sl.entries.iter().enumerate() {
+                let expect: Vec<i32> = match i {
+                    0..=2 => lists.intra4.to_vec(),
+                    3..=5 => lists.inter4.to_vec(),
+                    6 => lists.intra8.to_vec(),
+                    _ => lists.inter8.to_vec(),
+                };
+                assert_eq!(
+                    e,
+                    &ScalingListEntry::Explicit(expect),
+                    "SPS scaling list {i} mismatch"
+                );
+            }
+            saw = true;
+        }
+    }
+    assert!(saw);
+}
+
+/// PPS-level custom lists: the §7.3.2.2 tail carries 6 explicit 4x4
+/// lists (+ 2 8x8 lists under transform_8x8).
+#[test]
+fn pic_custom_pps_parse_back_matches_values() {
+    let lists = custom_lists();
+    for (n_expected, transform_8x8) in [(6usize, false), (8usize, true)] {
+        let idr = encode_custom(ScalingMatrixMode::PicCustom(lists), transform_8x8);
+        let mut saw = false;
+        for nal in AnnexBSplitter::new(&idr.annex_b) {
+            let unit = parse_nal_unit(nal).expect("parse NAL");
+            if unit.header.nal_unit_type == NalUnitType::Pps {
+                let pps = oxideav_h264::pps::Pps::parse(&unit.rbsp).expect("parse PPS");
+                let ext = pps.extension.as_ref().expect("PPS tail present");
+                assert!(ext.pic_scaling_matrix_present_flag);
+                let sl = ext.pic_scaling_lists.as_ref().expect("lists present");
+                assert_eq!(sl.entries.len(), n_expected);
+                for (i, e) in sl.entries.iter().enumerate() {
+                    let expect: Vec<i32> = match i {
+                        0..=2 => lists.intra4.to_vec(),
+                        3..=5 => lists.inter4.to_vec(),
+                        6 => lists.intra8.to_vec(),
+                        _ => lists.inter8.to_vec(),
+                    };
+                    assert_eq!(
+                        e,
+                        &ScalingListEntry::Explicit(expect),
+                        "PPS scaling list {i} mismatch (transform_8x8={transform_8x8})"
+                    );
+                }
+                saw = true;
+            }
+        }
+        assert!(saw);
+    }
+}
+
+#[test]
+fn seq_custom_self_roundtrip_bit_exact() {
+    let idr = encode_custom(ScalingMatrixMode::SeqCustom(custom_lists()), false);
+    assert_self_roundtrip(&idr, "seq-custom");
+    let (y, _, _) = make_source();
+    assert!(psnr_y(&y, &idr.recon_y) > 30.0, "PSNR floor");
+}
+
+#[test]
+fn seq_custom_transform_8x8_self_roundtrip_bit_exact() {
+    let idr = encode_custom(ScalingMatrixMode::SeqCustom(custom_lists()), true);
+    assert_self_roundtrip(&idr, "seq-custom-8x8");
+}
+
+#[test]
+fn pic_custom_self_roundtrip_bit_exact() {
+    let idr = encode_custom(ScalingMatrixMode::PicCustom(custom_lists()), false);
+    assert_self_roundtrip(&idr, "pic-custom");
+}
+
+#[test]
+fn pic_custom_transform_8x8_self_roundtrip_bit_exact() {
+    let idr = encode_custom(ScalingMatrixMode::PicCustom(custom_lists()), true);
+    assert_self_roundtrip(&idr, "pic-custom-8x8");
+}
+
+#[test]
+fn seq_custom_reference_decoder_interop_bit_exact() {
+    let idr = encode_custom(ScalingMatrixMode::SeqCustom(custom_lists()), false);
+    assert_ffmpeg_interop(&idr, "seq-custom");
+}
+
+#[test]
+fn pic_custom_reference_decoder_interop_bit_exact() {
+    let idr = encode_custom(ScalingMatrixMode::PicCustom(custom_lists()), false);
+    assert_ffmpeg_interop(&idr, "pic-custom");
+}
+
+#[test]
+fn pic_custom_transform_8x8_reference_decoder_interop_bit_exact() {
+    let idr = encode_custom(ScalingMatrixMode::PicCustom(custom_lists()), true);
+    assert_ffmpeg_interop(&idr, "pic-custom-8x8");
+}
+
+/// §7.3.2.1.1.1 delta_scale wrap: a value drop of more than 128
+/// between consecutive scan positions must wrap through the
+/// `(lastScale + delta_scale + 256) % 256` derivation. Pin the writer
+/// against the decoder's parser on a wrap-heavy list.
+#[test]
+fn custom_list_delta_scale_wraps_through_parser() {
+    let mut intra4 = [0i32; 16];
+    for (j, v) in intra4.iter_mut().enumerate() {
+        // Alternate 250 / 6 — every step is a ±244 raw delta that
+        // must wrap into the -128..=127 delta_scale range.
+        *v = if j % 2 == 0 { 250 } else { 6 };
+    }
+    let lists = CustomScalingLists {
+        intra4,
+        ..custom_lists()
+    };
+    let idr = encode_custom(ScalingMatrixMode::SeqCustom(lists), false);
+    for nal in AnnexBSplitter::new(&idr.annex_b) {
+        let unit = parse_nal_unit(nal).expect("parse NAL");
+        if unit.header.nal_unit_type == NalUnitType::Sps {
+            let sps = oxideav_h264::sps::Sps::parse(&unit.rbsp).expect("parse SPS");
+            let sl = sps.seq_scaling_lists.as_ref().expect("lists present");
+            assert_eq!(
+                sl.entries[0],
+                ScalingListEntry::Explicit(intra4.to_vec()),
+                "wrap-heavy list did not parse back"
+            );
+        }
+    }
+}

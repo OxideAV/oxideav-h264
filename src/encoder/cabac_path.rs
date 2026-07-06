@@ -1916,7 +1916,7 @@ impl Encoder {
             cfg.profile_idc
         };
         let sps = build_baseline_sps_rbsp(&BaselineSpsConfig {
-            seq_scaling_matrix_default: false,
+            seq_scaling_lists: None,
             seq_parameter_set_id: 0,
             level_idc: cfg.level_idc,
             width_in_mbs: width_mbs as u32,
@@ -1928,7 +1928,7 @@ impl Encoder {
             chroma_format_idc: cfg.chroma_format_idc,
         });
         let pps_cfg = BaselinePpsConfig {
-            pic_scaling_matrix_default: false,
+            pic_scaling_lists: None,
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: cfg.qp - 26,

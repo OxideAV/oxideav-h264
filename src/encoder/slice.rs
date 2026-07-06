@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn idr_slice_header_round_trips_through_decoder_parser() {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
-            seq_scaling_matrix_default: false,
+            seq_scaling_lists: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn p_slice_header_round_trips_through_decoder_parser() {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
-            seq_scaling_matrix_default: false,
+            seq_scaling_lists: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -533,7 +533,7 @@ mod tests {
         // Round-20 — non-reference B slice in a Main-profile stream
         // (B-slices are forbidden under Baseline §A.2.2).
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
-            seq_scaling_matrix_default: false,
+            seq_scaling_lists: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -605,7 +605,7 @@ mod tests {
         // `weighted_bipred_idc = 1`, slice header carries one
         // pred_weight_table entry per list at log2_wd = 5.
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
-            seq_scaling_matrix_default: false,
+            seq_scaling_lists: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -618,7 +618,7 @@ mod tests {
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
-            pic_scaling_matrix_default: false,
+            pic_scaling_lists: None,
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: 0,

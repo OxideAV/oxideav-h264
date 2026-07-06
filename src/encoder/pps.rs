@@ -56,13 +56,16 @@ pub struct BaselinePpsConfig {
     /// permitted in High profile (100) and above per §A.2.4;
     /// `second_chroma_qp_index_offset` mirrors `chroma_qp_index_offset`.
     pub transform_8x8_mode_flag: bool,
-    /// §7.3.2.2 / §7.3.2.1.1.1 — when `true`, the optional PPS tail
+    /// §7.3.2.2 / §7.3.2.1.1.1 — when `Some`, the optional PPS tail
     /// carries `pic_scaling_matrix_present_flag = 1` with every list
-    /// coded as UseDefaultScalingMatrixFlag (delta_scale = -8),
-    /// selecting the Table 7-3 / Table 7-4 default matrices at
-    /// picture level (6 lists, + 2 8x8 lists when
-    /// `transform_8x8_mode_flag` is set, per the §7.3.2.2 loop bound).
-    pub pic_scaling_matrix_default: bool,
+    /// present (6 lists, + 2 8x8 lists when `transform_8x8_mode_flag`
+    /// is set, per the §7.3.2.2 loop bound).
+    /// `ScalingListsSpec::Default` codes each list as
+    /// UseDefaultScalingMatrixFlag (delta_scale = -8), selecting the
+    /// Table 7-3 / Table 7-4 default matrices at picture level;
+    /// `ScalingListsSpec::Custom` codes the caller's values explicitly
+    /// (round-391).
+    pub pic_scaling_lists: Option<super::ScalingListsSpec>,
 }
 
 /// Build a Baseline PPS RBSP body (§7.3.2.2).
@@ -104,16 +107,16 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
     // feature (8x8 transform / picture scaling matrices) needs it;
     // otherwise the decoder infers transform_8x8_mode_flag = 0 and
     // flat picture lists from the absent tail.
-    if cfg.transform_8x8_mode_flag || cfg.pic_scaling_matrix_default {
+    if cfg.transform_8x8_mode_flag || cfg.pic_scaling_lists.is_some() {
         w.u(1, if cfg.transform_8x8_mode_flag { 1 } else { 0 });
-        if cfg.pic_scaling_matrix_default {
+        if let Some(spec) = &cfg.pic_scaling_lists {
             w.u(1, 1); // pic_scaling_matrix_present_flag
                        // §7.3.2.2 loop bound: 6 + [2, 6] * transform_8x8_mode_flag
                        // (4:2:0/4:2:2 → 2 extra 8x8 lists).
             let n_lists = 6 + if cfg.transform_8x8_mode_flag { 2 } else { 0 };
-            for _ in 0..n_lists {
+            for i in 0..n_lists {
                 w.u(1, 1); // pic_scaling_list_present_flag[i]
-                w.se(-8); // delta_scale → UseDefaultScalingMatrixFlag
+                crate::encoder::sps::write_scaling_list_slot(&mut w, spec, i);
             }
         } else {
             w.u(1, 0); // pic_scaling_matrix_present_flag = 0
@@ -133,7 +136,7 @@ mod tests {
     #[test]
     fn baseline_pps_round_trips_through_decoder_parser() {
         let cfg = BaselinePpsConfig {
-            pic_scaling_matrix_default: false,
+            pic_scaling_lists: None,
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: 0,

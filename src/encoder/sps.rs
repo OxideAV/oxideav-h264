@@ -67,13 +67,16 @@ pub struct BaselineSpsConfig {
     /// emitting a High 4:4:4 Predictive (244) SPS. The writer asserts
     /// the (profile_idc, chroma_format_idc) pairing is one it understands.
     pub chroma_format_idc: u32,
-    /// §7.3.2.1.1 / §7.3.2.1.1.1 — when `true`, emit
-    /// `seq_scaling_matrix_present_flag = 1` with every list signalled
-    /// as **UseDefaultScalingMatrixFlag** (a single `delta_scale = -8`
+    /// §7.3.2.1.1 / §7.3.2.1.1.1 — when `Some`, emit
+    /// `seq_scaling_matrix_present_flag = 1` with every list present.
+    /// `ScalingListsSpec::Default` codes each list as
+    /// **UseDefaultScalingMatrixFlag** (a single `delta_scale = -8`
     /// drives nextScale to 0 at j == 0), selecting the Table 7-3 /
-    /// Table 7-4 default matrices. Requires a chroma-extended
+    /// Table 7-4 default matrices; `ScalingListsSpec::Custom` codes
+    /// the caller's values explicitly through the §7.3.2.1.1.1
+    /// delta_scale chain (round-391). Requires a chroma-extended
     /// profile_idc (the flag lives in the §7.3.2.1.1 optional group).
-    pub seq_scaling_matrix_default: bool,
+    pub seq_scaling_lists: Option<super::ScalingListsSpec>,
 }
 
 impl Default for BaselineSpsConfig {
@@ -88,7 +91,61 @@ impl Default for BaselineSpsConfig {
             max_num_ref_frames: 1,
             profile_idc: 66,
             chroma_format_idc: 1,
-            seq_scaling_matrix_default: false,
+            seq_scaling_lists: None,
+        }
+    }
+}
+
+/// §7.3.2.1.1.1 — emit one `scaling_list()` structure carrying
+/// explicit values (each in `1..=255`, given in the `j`-loop scan
+/// order). Per the spec's derivation
+/// `nextScale = (lastScale + delta_scale + 256) % 256`, so the
+/// delta between consecutive values is wrapped into the mandated
+/// `-128..=127` `delta_scale` range.
+pub(crate) fn write_scaling_list_values(w: &mut BitWriter, values: &[i32]) {
+    let mut last = 8i32;
+    for &v in values {
+        debug_assert!(
+            (1..=255).contains(&v),
+            "scaling-list value {v} out of the 1..=255 range"
+        );
+        let mut delta = v - last;
+        if delta > 127 {
+            delta -= 256;
+        }
+        if delta < -128 {
+            delta += 256;
+        }
+        w.se(delta);
+        last = v;
+    }
+}
+
+/// Emit the body of one SPS/PPS scaling-list slot per the caller's
+/// [`super::ScalingListsSpec`]. `list_idx` follows the §7.3.2.1.1 /
+/// §7.3.2.2 loop: 0..=2 are the 4x4 intra lists (Y/Cb/Cr), 3..=5 the
+/// 4x4 inter lists, and 6.. alternate 8x8 intra / 8x8 inter (the
+/// Y/Cb/Cr repetition at 4:4:4 keeps the same parity rule).
+pub(crate) fn write_scaling_list_slot(
+    w: &mut BitWriter,
+    spec: &super::ScalingListsSpec,
+    list_idx: usize,
+) {
+    match spec {
+        super::ScalingListsSpec::Default => {
+            // delta_scale = -8 → nextScale 0 at j == 0 →
+            // UseDefaultScalingMatrixFlag (Table 7-3 / 7-4).
+            w.se(-8);
+        }
+        super::ScalingListsSpec::Custom(l) => {
+            if list_idx < 6 {
+                let vals = if list_idx < 3 { &l.intra4 } else { &l.inter4 };
+                write_scaling_list_values(w, vals);
+            } else if (list_idx - 6) % 2 == 0 {
+                write_scaling_list_values(w, &l.intra8);
+            } else {
+                write_scaling_list_values(w, &l.inter8);
+            }
         }
     }
 }
@@ -167,12 +224,12 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
         // present and coded as UseDefaultScalingMatrixFlag: one
         // delta_scale = -8 makes nextScale 0 at j == 0, selecting the
         // Table 7-3 / Table 7-4 defaults for the whole list.
-        if cfg.seq_scaling_matrix_default {
+        if let Some(spec) = &cfg.seq_scaling_lists {
             w.u(1, 1);
             let n_lists = if cfg.chroma_format_idc == 3 { 12 } else { 8 };
-            for _ in 0..n_lists {
+            for i in 0..n_lists {
                 w.u(1, 1); // seq_scaling_list_present_flag[i]
-                w.se(-8); // delta_scale → UseDefaultScalingMatrixFlag
+                write_scaling_list_slot(&mut w, spec, i);
             }
         } else {
             w.u(1, 0);
@@ -217,7 +274,7 @@ mod tests {
     #[test]
     fn baseline_sps_round_trips_through_decoder_parser() {
         let cfg = BaselineSpsConfig {
-            seq_scaling_matrix_default: false,
+            seq_scaling_lists: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4, // 64 samples
@@ -257,7 +314,7 @@ mod tests {
         // (chroma_format_idc=3, separate_colour_plane_flag=0) back to
         // ChromaArrayType=3).
         let cfg = BaselineSpsConfig {
-            seq_scaling_matrix_default: false,
+            seq_scaling_lists: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -292,7 +349,7 @@ mod tests {
         // seq_scaling_matrix_present_flag tail. Round-27 emits
         // chroma_format_idc=2 (4:2:2), 8-bit depth, no scaling matrix.
         let cfg = BaselineSpsConfig {
-            seq_scaling_matrix_default: false,
+            seq_scaling_lists: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
