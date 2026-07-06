@@ -1281,3 +1281,69 @@ encoder chroma-AC nC).
 - CABAC 4:2:2 remains IDR-only (P/B 4:2:2 encode deferred, matching
   CAVLC).
 
+## Round 391 — landed
+
+**4:4:4 I_4x4 leg, custom + P/B + CABAC scaling matrices, CABAC
+4:2:2/4:4:4 P and B** — plus a twelve-value CABAC init-table decoder
+fix surfaced by the new inter-4:4:4 interop pins.
+
+- **4:4:4 I_4x4 (CAVLC)**: `encode_mb_intra4x4_444` — per-4x4-block
+  9-mode Lagrangian luma trial; Cb/Cr reuse each block's luma mode per
+  §8.3.4.5 on their own recon neighbours, quantised at the chroma QP;
+  §7.4.5.1 CBP quadrant bits cover all three planes; per-plane
+  §9.2.1.1 nC via `derive_nc_plane_luma_like` with progressive in-MB
+  commits. `write_i4x4_mb_444` emits the I_NxN syntax (16 prev/rem
+  pairs, no intra_chroma_pred_mode, optional transform_size_8x8_flag
+  = 0). The 4:4:4 dispatch is now a two-way I_16x16/I_4x4 RDO (three-
+  way + Intra_8x8 under `transform_8x8`); `EncodedIdr::i4x4_mb_count`
+  reports selection.
+- **Custom scaling lists**: `ScalingMatrixMode::{SeqCustom,PicCustom}`
+  carry user 4x4-intra/inter + 8x8-intra/inter values (scan order,
+  validated to 1..=255); the SPS/PPS writers code them through the
+  real §7.3.2.1.1.1 delta_scale chain with the mandated -128..=127
+  wrap. Parse-back pins recover the exact values, including a
+  wrap-heavy 250/6 list.
+- **Non-flat matrices on P/B (CAVLC)**: `inter_weights()`
+  (Default_4x4/8x8_Inter or custom) drive `forward_inter_luma`,
+  `forward_inter_luma_8x8` and `encode_chroma_residual_inter`; the
+  shared intra-in-inter fallback body quantises under the intra lists.
+- **Non-flat matrices under CABAC**: I/P/B at 4:2:0 — the IDR intra
+  helpers, the inter luma/chroma quantisers and the recon inverses all
+  take the §8.5.9 weightScale; SPS/PPS emit shared with CAVLC.
+- **CABAC 4:2:2/4:4:4 P**: multi-format `encode_p_cabac` — 4:2:2
+  chroma MC (`mvC.y = mvL.y*2` in 1/8-pel) + the §8.5.11.2 inter chain
+  at NumC8x8=2; 4:4:4 luma-like chroma MC + §7.3.5.3 coded-like-luma
+  residuals (blockCat-8/12 4x4 or 5/9/13 8x8 with explicit CBF),
+  shared CBP across planes.
+- **CABAC 4:2:2/4:4:4 B**: 16x16 explicit mode set (B_L0/L1/Bi) with
+  the same chroma machinery; skip/direct + partitions + mixed B_8x8
+  remain 4:2:0-only encoder choices. Shared emit helpers
+  (`emit_inter_luma_residual_cabac` / `emit_inter_chroma_residual_cabac`)
+  carry the format dispatch for both P and B.
+- **Decoder fix**: twelve §9.3.1.1 Table 9-30/9-31/9-32 P/B-column
+  (m, n) init values (ctxIdx 805/849, 975..980, 1005..1010) were
+  mis-transcribed; every prior 4:4:4 pin was intra-only (correct I
+  column) so the bug only fired on the first inter Cb/Cr
+  coeff_abs_level_minus1 bin. The full 460..1023 init range is now
+  diffed against the spec table text (sub-460 `InitCell::all` rows
+  also verified clean).
+
+### Validation
+
+- `integration_i4x4_444_encoder.rs` (3), `integration_scaling_matrix.rs`
+  11 → 21, `integration_scaling_matrix_pb.rs` (5),
+  `integration_scaling_matrix_cabac.rs` (5),
+  `integration_cabac_pb_chroma_formats.rs` (9), plus the black-box
+  3-frame 4:4:4 CABAC P pin in `integration_cabac_chroma_formats.rs`.
+- Every new stream shape is bit-exact through our decoder AND
+  byte-exact through the black-box reference decoder.
+- Full suite: 1594 tests green.
+
+### Status caveats
+
+- CAVLC 4:2:2/4:4:4 P/B encode still deferred (CABAC landed first).
+- B at 4:2:2/4:4:4 is 16x16-explicit-only (no skip/direct/partitions).
+- Non-flat matrices remain 4:2:0-only (every entropy mode); 4:2:2 and
+  4:4:4 assert Flat.
+- The trellis intra rate-model recalibration (stretch) was not
+  reached this round.

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- 4:4:4 I_4x4 encoder leg — §8.3.4.5 chroma-as-luma 4x4 emit with
+  per-plane §9.2.1.1 nC; the CAVLC 4:4:4 IDR trial is two-way
+  (I_16x16 / Intra_4x4) or three-way (+ Intra_8x8 under transform_8x8)
+- Custom user-supplied scaling lists (ScalingMatrixMode::SeqCustom /
+  PicCustom) coded through the real §7.3.2.1.1.1 delta_scale chain
+- Non-flat scaling matrices on P/B slices (inter §8.5.9 weightScale on
+  the 4x4/8x8 inter luma + chroma quantisers) and under CABAC (I/P/B
+  at 4:2:0)
+- CABAC 4:2:2 and 4:4:4 P-slices (inter §8.5.11.2 chroma chain at
+  NumC8x8=2; §7.3.5.3 chroma-coded-like-luma blockCat-8/12 4x4 or
+  blockCat-5/9/13 8x8 inter residuals with explicit CBF)
+- CABAC 4:2:2 and 4:4:4 B-slices (16x16 explicit mode set)
+
+### Fixed
+
+- Twelve §9.3.1.1 Table 9-30/9-31/9-32 P/B-column CABAC init values
+  (ctxIdx 805/849, 975..980, 1005..1010) that desynchronised every
+  CABAC 4:4:4 P/B decode at the first inter chroma abs-level bin
+
 ## [0.1.7](https://github.com/OxideAV/oxideav-h264/compare/v0.1.6...v0.1.7) - 2026-07-03
 
 ### Other
