@@ -198,3 +198,77 @@ fn cavlc_420_default_scaling_matrices_decode_bit_exact() {
     };
     assert_bit_exact(stream, &reference, 64, 64, 32, 32);
 }
+
+/// Round-391 — High 4:4:4 CABAC **P-slices** (inter blockCat-8/12
+/// residual). Pins the twelve §9.3.1.1 Table 9-30/9-31/9-32 P/B-column
+/// (m, n) init values (ctxIdx 805/849, 975..980, 1005..1010) that were
+/// mis-transcribed until this round: the I-slice columns were correct
+/// (all prior 4:4:4 pins were intra-only), so the first inter Cb/Cr
+/// coeff_abs_level_minus1 bin desynchronised every CABAC 4:4:4 P
+/// decode. Three frames (IDR + 2 P) must decode byte-exact.
+#[test]
+fn cabac_444_p_slices_reference_stream_decodes_bit_exact() {
+    if !std::path::Path::new(FFMPEG).exists() {
+        eprintln!("skip: reference encoder binary not present");
+        return;
+    }
+    let dir = tmp_dir();
+    let h264 = dir.join("in-444p.h264");
+    let yuv = dir.join("ref-444p.yuv");
+    let status = Command::new(FFMPEG)
+        .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=64x64:rate=25,format=yuv444p")
+        .args(["-frames:v", "3", "-c:v", "libx264", "-profile:v", "high444"])
+        .args(["-pix_fmt", "yuv444p", "-coder", "1", "-x264-params"])
+        .arg(
+            "keyint=100:min-keyint=100:bframes=0:ref=1:8x8dct=0:cabac=1:no-deblock=1:\
+             subme=1:me=dia:partitions=none:weightp=0:scenecut=0",
+        )
+        .args(["-f", "h264", "-y"])
+        .arg(&h264)
+        .status()
+        .expect("spawn reference encoder");
+    if !status.success() {
+        eprintln!("skip: reference encoder unavailable for high444");
+        return;
+    }
+    let status = Command::new(FFMPEG)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&h264)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv444p", "-y"])
+        .arg(&yuv)
+        .status()
+        .expect("spawn reference decoder");
+    assert!(status.success(), "reference decoder rejected the stream");
+    let stream = std::fs::read(&h264).expect("read stream");
+    let reference = std::fs::read(&yuv).expect("read reference yuv");
+
+    const W: usize = 64;
+    const H: usize = 64;
+    let frame_len = 3 * W * H; // 4:4:4 planar
+    assert_eq!(reference.len(), 3 * frame_len, "expected 3 frames");
+
+    let mut dec = oxideav_h264::h264_decoder::H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), stream).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let mut fi = 0usize;
+    while let Ok(frame) = dec.receive_frame() {
+        let Frame::Video(vf) = frame else { continue };
+        let rf = &reference[fi * frame_len..(fi + 1) * frame_len];
+        for p in 0..3usize {
+            let plane = &vf.planes[p];
+            for r in 0..H {
+                for c in 0..W {
+                    assert_eq!(
+                        plane.data[r * plane.stride + c],
+                        rf[p * W * H + r * W + c],
+                        "frame {fi} plane {p} mismatch at ({c}, {r})"
+                    );
+                }
+            }
+        }
+        fi += 1;
+    }
+    assert_eq!(fi, 3, "expected 3 decoded frames");
+}

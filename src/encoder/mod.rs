@@ -6707,6 +6707,7 @@ impl<'a> From<&'a EncodedP> for EncodedFrameRef<'a> {
 ///   coefficient (drives cbp_luma quadrant decision).
 /// * `recon_residual[blk]` — the reconstructed 16 sample residuals for
 ///   this 4x4 block (post-inverse), ready to be added to the predictor.
+#[derive(Default)]
 struct InterLumaForward {
     levels_scan: [[i32; 16]; 16],
     quant_raster: [[i32; 16]; 16],
