@@ -3954,9 +3954,10 @@ impl Encoder {
             "CABAC + B-slices require Main profile or higher (got profile_idc={})",
             cfg.profile_idc,
         );
-        // Round-391 — CABAC B now also runs at 4:2:2 / 4:4:4 with a
-        // 16x16-only explicit mode set (B_L0/L1/Bi_16x16); the full
-        // shape set (skip/direct, partitions, mixed B_8x8) stays 4:2:0.
+        // Round-391 — CABAC B also runs at 4:2:2 / 4:4:4; round-397
+        // extends those formats with B_Skip / B_Direct_16x16 (§8.4.1.2.2
+        // spatial direct). Partitions + mixed B_8x8 stay 4:2:0-only
+        // encoder choices.
         assert!(
             matches!(cfg.chroma_format_idc, 1..=3),
             "encode_b_cabac supports chroma_format_idc 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
@@ -4011,9 +4012,9 @@ impl Encoder {
                 frame_num_bits: 8,
                 pic_order_cnt_lsb,
                 poc_lsb_bits: 8,
-                // §8.4.1.2.2 spatial direct flag — set 1 (the value is
-                // irrelevant: this round never emits B_Direct_16x16 /
-                // B_Skip, but the syntax field is mandatory in §7.3.3).
+                // §8.4.1.2.2 spatial direct — the CABAC B encoder emits
+                // B_Skip / B_Direct_16x16 against the spatial derivation
+                // (mirrored in `cabac_b_spatial_direct_derive`).
                 direct_spatial_mv_pred_flag: true,
                 slice_qp_delta: 0,
                 // 4:4:4 mirrors encode_idr_cabac: deblocking disabled.
@@ -4083,13 +4084,15 @@ impl Encoder {
                 let mvp_l0 = cabac_mvp_for_16x16(&grid, mb_x, mb_y, 0, 0);
                 let mvp_l1 = cabac_mvp_for_16x16(&grid, mb_x, mb_y, 1, 0);
 
-                // ---- Round-391: 4:2:2 / 4:4:4 CABAC B MB ----
+                // ---- Round-391/397: 4:2:2 / 4:4:4 CABAC B MB ----
                 //
-                // 16x16-only explicit mode set (B_L0 / B_L1 / B_Bi):
-                // per-list luma SAD picks the shape; chroma is
-                // motion-compensated per §8.4.1.4 (4:2:2) or like luma
-                // per §8.4.2.2 (4:4:4); the residual pipeline and the
-                // blockCat-8/12 / 5/9/13 emit mirror encode_p_cabac.
+                // Mode set: B_Skip / B_Direct_16x16 (§8.4.1.2.2 spatial
+                // direct, uniform gate — round-397) plus the explicit
+                // 16x16 rows (B_L0 / B_L1 / B_Bi). Per-list luma SAD
+                // picks the shape; chroma is motion-compensated per
+                // §8.4.1.4 (4:2:2) or like luma per §8.4.2.2 (4:4:4);
+                // the residual pipeline and the blockCat-8/12 / 5/9/13
+                // emit mirror encode_p_cabac.
                 if cfg.chroma_format_idc != 1 {
                     let pred_y_l0 = build_inter_pred_luma_local(
                         ref_l0.recon_y,
@@ -4124,21 +4127,119 @@ impl Encoder {
                     let sad_l0 = sad_of(&pred_y_l0);
                     let sad_l1 = sad_of(&pred_y_l1);
                     let sad_bi = sad_of(&pred_y_bi);
-                    // Tie-break Bi → L0 → L1 (round-20 policy).
-                    let pred_kind: u32 = if sad_bi <= sad_l0 && sad_bi <= sad_l1 {
+
+                    // Round-397 — §8.4.1.2.2 spatial-direct trial at
+                    // 4:2:2 / 4:4:4 (uniform-derivation gate as in the
+                    // 4:2:0 branch below). Direct wins when its SAD is
+                    // within the Lagrangian rate-savings bias of every
+                    // explicit candidate; a winning direct MB whose
+                    // residual quantises to zero folds into B_Skip.
+                    let direct = cabac_b_spatial_direct_derive(
+                        &grid,
+                        ref_l1.partition_mvs,
+                        width_mbs,
+                        mb_x,
+                        mb_y,
+                    );
+                    let direct_pred_kind: Option<u32> =
+                        match (direct.ref_idx_l0 >= 0, direct.ref_idx_l1 >= 0) {
+                            (true, true) => Some(3),  // Bi
+                            (true, false) => Some(1), // L0
+                            (false, true) => Some(2), // L1
+                            (false, false) => None,
+                        };
+                    let build_y_kind = |kind: u32, l0mv: Mv, l1mv: Mv| -> [i32; 256] {
+                        match kind {
+                            1 => build_inter_pred_luma_local(
+                                ref_l0.recon_y,
+                                ref_l0.width,
+                                ref_l0.height,
+                                mb_x,
+                                mb_y,
+                                l0mv,
+                            ),
+                            2 => build_inter_pred_luma_local(
+                                ref_l1.recon_y,
+                                ref_l1.width,
+                                ref_l1.height,
+                                mb_x,
+                                mb_y,
+                                l1mv,
+                            ),
+                            _ => {
+                                let a = build_inter_pred_luma_local(
+                                    ref_l0.recon_y,
+                                    ref_l0.width,
+                                    ref_l0.height,
+                                    mb_x,
+                                    mb_y,
+                                    l0mv,
+                                );
+                                let b = build_inter_pred_luma_local(
+                                    ref_l1.recon_y,
+                                    ref_l1.width,
+                                    ref_l1.height,
+                                    mb_x,
+                                    mb_y,
+                                    l1mv,
+                                );
+                                let mut bi = [0i32; 256];
+                                for i in 0..256 {
+                                    bi[i] = ((a[i] + b[i] + 1) >> 1).clamp(0, 255);
+                                }
+                                bi
+                            }
+                        }
+                    };
+                    let (direct_competitive, direct_pred_y, sad_direct) =
+                        match (direct.is_uniform(), direct_pred_kind) {
+                            (true, Some(dpk)) => {
+                                let dy = build_y_kind(dpk, direct.mv_l0(), direct.mv_l1());
+                                let dsad = sad_of(&dy);
+                                (true, dy, dsad)
+                            }
+                            _ => (false, [0i32; 256], u64::MAX),
+                        };
+                    let lambda = (qp_y / 6).clamp(0, 8) as u64;
+                    let direct_bias_sad: u64 = (lambda + 1) * 16;
+                    let is_direct = direct_competitive
+                        && sad_direct <= sad_l0.saturating_add(direct_bias_sad)
+                        && sad_direct <= sad_l1.saturating_add(direct_bias_sad)
+                        && sad_direct <= sad_bi.saturating_add(direct_bias_sad);
+
+                    // Tie-break Bi → L0 → L1 (round-20 policy); direct
+                    // overrides with mb_type raw 0 when competitive.
+                    let explicit_kind: u32 = if sad_bi <= sad_l0 && sad_bi <= sad_l1 {
                         3
                     } else if sad_l0 <= sad_l1 {
                         1
                     } else {
                         2
                     };
-                    let pred_y = match pred_kind {
-                        1 => pred_y_l0,
-                        2 => pred_y_l1,
-                        _ => pred_y_bi,
+                    // Effective list usage + MVs: direct MBs take the
+                    // §8.4.1.2.2 derivation outputs; explicit MBs take
+                    // the per-list ME winners.
+                    let (pred_y, eff_kind, eff_mv_l0, eff_mv_l1) = if is_direct {
+                        (
+                            direct_pred_y,
+                            direct_pred_kind.expect("direct chosen → kind set"),
+                            direct.mv_l0(),
+                            direct.mv_l1(),
+                        )
+                    } else {
+                        (
+                            match explicit_kind {
+                                1 => pred_y_l0,
+                                2 => pred_y_l1,
+                                _ => pred_y_bi,
+                            },
+                            explicit_kind,
+                            mv_l0,
+                            mv_l1,
+                        )
                     };
-                    let uses_l0 = pred_kind == 1 || pred_kind == 3;
-                    let uses_l1 = pred_kind == 2 || pred_kind == 3;
+                    let uses_l0 = eff_kind == 1 || eff_kind == 3;
+                    let uses_l1 = eff_kind == 2 || eff_kind == 3;
 
                     // Chroma predictor per list + format, then merge.
                     let build_c = |plane: &[u8], mv: Mv| -> Vec<i32> {
@@ -4164,20 +4265,20 @@ impl Encoder {
                         }
                     };
                     let tile = ct_w * ct_h;
-                    let (pred_u, pred_v): (Vec<i32>, Vec<i32>) = match pred_kind {
+                    let (pred_u, pred_v): (Vec<i32>, Vec<i32>) = match eff_kind {
                         1 => (
-                            build_c(ref_l0.recon_u, mv_l0),
-                            build_c(ref_l0.recon_v, mv_l0),
+                            build_c(ref_l0.recon_u, eff_mv_l0),
+                            build_c(ref_l0.recon_v, eff_mv_l0),
                         ),
                         2 => (
-                            build_c(ref_l1.recon_u, mv_l1),
-                            build_c(ref_l1.recon_v, mv_l1),
+                            build_c(ref_l1.recon_u, eff_mv_l1),
+                            build_c(ref_l1.recon_v, eff_mv_l1),
                         ),
                         _ => {
-                            let u0 = build_c(ref_l0.recon_u, mv_l0);
-                            let u1 = build_c(ref_l1.recon_u, mv_l1);
-                            let v0 = build_c(ref_l0.recon_v, mv_l0);
-                            let v1 = build_c(ref_l1.recon_v, mv_l1);
+                            let u0 = build_c(ref_l0.recon_u, eff_mv_l0);
+                            let u1 = build_c(ref_l1.recon_u, eff_mv_l1);
+                            let v0 = build_c(ref_l0.recon_v, eff_mv_l0);
+                            let v1 = build_c(ref_l1.recon_v, eff_mv_l1);
                             let mut u = vec![0i32; tile];
                             let mut v = vec![0i32; tile];
                             for k in 0..tile {
@@ -4313,14 +4414,107 @@ impl Encoder {
 
                     // ---- Emit ----
                     let nb = build_neighbour_ctx(&grid, mb_x, mb_y);
-                    encode_mb_skip_flag(&mut cabac, &mut ctxs, SliceKind::B, &nb, false);
-                    encode_mb_type_b(&mut cabac, &mut ctxs, &nb, pred_kind);
+
+                    // Round-397 — B_Skip at 4:2:2 / 4:4:4 (§7.3.4
+                    // mb_skip_flag = 1): direct winner with an all-zero
+                    // residual. No further MB syntax; the decoder
+                    // re-derives the motion via §8.4.1.2.2, applies the
+                    // predictor, and moves on.
+                    let is_b_skip = is_direct && cbp_luma == 0 && cbp_chroma == 0;
+                    encode_mb_skip_flag(&mut cabac, &mut ctxs, SliceKind::B, &nb, is_b_skip);
+                    if is_b_skip {
+                        // §9.3.3.1.1.5 — skipped MBs reset
+                        // prev_mb_qp_delta_nonzero (no qpd is emitted).
+                        prev_mb_qp_delta_nonzero = false;
+                        for j in 0..16usize {
+                            for i in 0..16usize {
+                                let py = mb_y * 16 + j;
+                                let px = mb_x * 16 + i;
+                                recon_y[py * width + px] = pred_y[j * 16 + i].clamp(0, 255) as u8;
+                            }
+                        }
+                        for j in 0..ct_h {
+                            for i in 0..ct_w {
+                                let cy = mb_y * ct_h + j;
+                                let cx = mb_x * ct_w + i;
+                                recon_u[cy * chroma_w + cx] =
+                                    pred_u[j * ct_w + i].clamp(0, 255) as u8;
+                                recon_v[cy * chroma_w + cx] =
+                                    pred_v[j * ct_w + i].clamp(0, 255) as u8;
+                            }
+                        }
+                        let info = grid.at_mut(mb_x, mb_y);
+                        info.available = true;
+                        info.is_intra = false;
+                        info.is_skip = true;
+                        info.is_b_skip_or_direct = true;
+                        info.cbp_luma = 0;
+                        info.cbp_chroma = 0;
+                        info.ref_idx_l0_8x8 = [direct.ref_idx_l0; 4];
+                        info.mv_l0_8x8 = direct.mv_l0_per_8x8;
+                        info.ref_idx_l1_8x8 = [direct.ref_idx_l1; 4];
+                        info.mv_l1_8x8 = direct.mv_l1_per_8x8;
+                        info.abs_mvd_l0_x = [0; 16];
+                        info.abs_mvd_l0_y = [0; 16];
+                        info.abs_mvd_l1_x = [0; 16];
+                        info.abs_mvd_l1_y = [0; 16];
+
+                        // §8.7.2.1 — the deblock walker's ref/MV
+                        // identity must carry BOTH lists of the direct
+                        // derivation, or an edge against a coded direct
+                        // neighbour reads a phantom ref mismatch
+                        // (bS 0 → 1) the decoder doesn't see.
+                        let clamp_mv_t = |mv: Mv| {
+                            (
+                                mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                                mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                            )
+                        };
+                        let l0_used = direct.ref_idx_l0 >= 0;
+                        let l1_used = direct.ref_idx_l1 >= 0;
+                        mb_dbl[mb_addr] = MbDeblockInfo {
+                            is_intra: false,
+                            qp_y,
+                            luma_nonzero_4x4: 0,
+                            chroma_nonzero_4x4: 0,
+                            mv_l0: [if l0_used {
+                                clamp_mv_t(direct.mv_l0())
+                            } else {
+                                (0, 0)
+                            }; 16],
+                            ref_idx_l0: [if l0_used { 0 } else { -1 }; 4],
+                            ref_poc_l0: [if l0_used { 0 } else { i32::MIN }; 4],
+                            mv_l1: [if l1_used {
+                                clamp_mv_t(direct.mv_l1())
+                            } else {
+                                (0, 0)
+                            }; 16],
+                            ref_idx_l1: [if l1_used { 0 } else { -1 }; 4],
+                            ref_poc_l1: [if l1_used { 1000 } else { i32::MIN }; 4],
+                            ..Default::default()
+                        };
+
+                        let is_last = mb_x + 1 == width_mbs && mb_y + 1 == height_mbs;
+                        encode_end_of_slice_flag(&mut cabac, is_last);
+                        continue;
+                    }
+
+                    // mb_type — raw 0 (B_Direct_16x16) for a coded
+                    // direct MB, else the explicit 16x16 row.
+                    encode_mb_type_b(
+                        &mut cabac,
+                        &mut ctxs,
+                        &nb,
+                        if is_direct { 0 } else { eff_kind },
+                    );
 
                     // mvd_l0 / mvd_l1 (single ref → no ref_idx emit).
+                    // B_Direct_16x16 carries no mvd — the decoder
+                    // re-derives the motion itself.
                     let inflight_abs = [0u32; 16];
-                    let (mvd_l0_x, mvd_l0_y) = if uses_l0 {
-                        let mvd_x = mv_l0.x - mvp_l0.x;
-                        let mvd_y = mv_l0.y - mvp_l0.y;
+                    let (mvd_l0_x, mvd_l0_y) = if !is_direct && uses_l0 {
+                        let mvd_x = eff_mv_l0.x - mvp_l0.x;
+                        let mvd_y = eff_mv_l0.y - mvp_l0.y;
                         let sum_x = cabac_enc_mvd_abs_sum(
                             &grid,
                             mb_x,
@@ -4345,9 +4539,9 @@ impl Encoder {
                     } else {
                         (0i32, 0i32)
                     };
-                    let (mvd_l1_x, mvd_l1_y) = if uses_l1 {
-                        let mvd_x = mv_l1.x - mvp_l1.x;
-                        let mvd_y = mv_l1.y - mvp_l1.y;
+                    let (mvd_l1_x, mvd_l1_y) = if !is_direct && uses_l1 {
+                        let mvd_x = eff_mv_l1.x - mvp_l1.x;
+                        let mvd_y = eff_mv_l1.y - mvp_l1.y;
                         let sum_x = cabac_enc_mvd_abs_sum(
                             &grid,
                             mb_x,
@@ -4507,7 +4701,7 @@ impl Encoder {
                     info.available = true;
                     info.is_intra = false;
                     info.is_skip = false;
-                    info.is_b_skip_or_direct = false;
+                    info.is_b_skip_or_direct = is_direct;
                     info.cbp_luma = cbp_luma;
                     info.cbp_chroma = cbp_chroma;
                     info.transform_size_8x8 = transform_size_8x8;
@@ -4516,9 +4710,9 @@ impl Encoder {
                     info.abs_mvd_l1_x = [mvd_l1_x.unsigned_abs(); 16];
                     info.abs_mvd_l1_y = [mvd_l1_y.unsigned_abs(); 16];
                     info.ref_idx_l0_8x8 = [if uses_l0 { 0 } else { -1 }; 4];
-                    info.mv_l0_8x8 = [if uses_l0 { mv_l0 } else { Mv::ZERO }; 4];
+                    info.mv_l0_8x8 = [if uses_l0 { eff_mv_l0 } else { Mv::ZERO }; 4];
                     info.ref_idx_l1_8x8 = [if uses_l1 { 0 } else { -1 }; 4];
-                    info.mv_l1_8x8 = [if uses_l1 { mv_l1 } else { Mv::ZERO }; 4];
+                    info.mv_l1_8x8 = [if uses_l1 { eff_mv_l1 } else { Mv::ZERO }; 4];
                     if transform_size_8x8 {
                         i8x8_mb_count += 1;
                     }
@@ -4551,10 +4745,10 @@ impl Encoder {
                         qp_y,
                         luma_nonzero_4x4: luma_nz_mask_from_blocks(&blk_nz),
                         chroma_nonzero_4x4,
-                        mv_l0: [if uses_l0 { clamp_mv(mv_l0) } else { (0, 0) }; 16],
+                        mv_l0: [if uses_l0 { clamp_mv(eff_mv_l0) } else { (0, 0) }; 16],
                         ref_idx_l0: [if uses_l0 { 0 } else { -1 }; 4],
                         ref_poc_l0: [if uses_l0 { 0 } else { i32::MIN }; 4],
-                        mv_l1: [if uses_l1 { clamp_mv(mv_l1) } else { (0, 0) }; 16],
+                        mv_l1: [if uses_l1 { clamp_mv(eff_mv_l1) } else { (0, 0) }; 16],
                         ref_idx_l1: [if uses_l1 { 0 } else { -1 }; 4],
                         ref_poc_l1: [if uses_l1 { 1000 } else { i32::MIN }; 4],
                         transform_size_8x8_flag: transform_size_8x8,
@@ -5720,18 +5914,39 @@ impl Encoder {
                     info.abs_mvd_l1_x = [0; 16];
                     info.abs_mvd_l1_y = [0; 16];
 
-                    let mv_l0_t = (
-                        direct.mv_l0().x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                        direct.mv_l0().y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                    );
+                    // §8.7.2.1 — carry BOTH lists of the direct
+                    // derivation into the deblock walker's ref/MV
+                    // identity (round-397 fix: the L1-less record made
+                    // edges against coded direct neighbours read a
+                    // phantom ref mismatch, bS 0 → 1, that the decoder
+                    // doesn't see).
+                    let clamp_mv_t = |mv: Mv| {
+                        (
+                            mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                            mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        )
+                    };
+                    let l0_used = direct.ref_idx_l0 >= 0;
+                    let l1_used = direct.ref_idx_l1 >= 0;
                     mb_dbl[mb_addr] = MbDeblockInfo {
                         is_intra: false,
                         qp_y,
                         luma_nonzero_4x4: 0,
                         chroma_nonzero_4x4: 0,
-                        mv_l0: [mv_l0_t; 16],
-                        ref_idx_l0: [direct.ref_idx_l0.max(0) as i8; 4],
-                        ref_poc_l0: [0; 4],
+                        mv_l0: [if l0_used {
+                            clamp_mv_t(direct.mv_l0())
+                        } else {
+                            (0, 0)
+                        }; 16],
+                        ref_idx_l0: [if l0_used { 0 } else { -1 }; 4],
+                        ref_poc_l0: [if l0_used { 0 } else { i32::MIN }; 4],
+                        mv_l1: [if l1_used {
+                            clamp_mv_t(direct.mv_l1())
+                        } else {
+                            (0, 0)
+                        }; 16],
+                        ref_idx_l1: [if l1_used { 0 } else { -1 }; 4],
+                        ref_poc_l1: [if l1_used { 1000 } else { i32::MIN }; 4],
                         ..Default::default()
                     };
 

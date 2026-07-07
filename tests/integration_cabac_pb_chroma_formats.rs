@@ -489,3 +489,63 @@ fn cabac_b_444_transform_8x8_gop_bit_exact() {
     assert_gop_b_self_roundtrip(&gop, 3, "cabac-b-444-8x8");
     assert_gop_b_ffmpeg_interop(&gop, 3, "cabac-b-444-8x8");
 }
+
+/// Round-397 — static B at 4:2:0 / 4:2:2 / 4:4:4: the CABAC B encoder
+/// must fold direct-winner MBs with an all-zero residual into B_Skip
+/// (mb_skip_flag = 1, no further MB syntax) at every chroma format,
+/// with the format-sized predictor-tile recon.
+#[test]
+fn cabac_b_skip_all_formats() {
+    for fmt in [1u32, 2, 3] {
+        let (cw, ch) = chroma_dims(fmt);
+        let y0 = vec![120u8; W * H];
+        let u0 = vec![90u8; cw * ch];
+        let v0 = vec![160u8; cw * ch];
+        let f0 = YuvFrame {
+            width: W as u32,
+            height: H as u32,
+            y: &y0,
+            u: &u0,
+            v: &v0,
+        };
+        let cfg = EncoderConfig {
+            cabac: true,
+            chroma_format_idc: fmt,
+            profile_idc: match fmt {
+                3 => 244,
+                2 => 122,
+                _ => 100,
+            },
+            max_num_ref_frames: 2,
+            ..EncoderConfig::new(W as u32, H as u32)
+        };
+        let enc = Encoder::new(cfg);
+        let idr = enc.encode_idr_cabac(&f0);
+        let p = enc.encode_p_cabac(&f0, &EncodedFrameRef::from(&idr), 1, 4);
+        let b = enc.encode_b_cabac(
+            &f0,
+            &EncodedFrameRef::from(&idr),
+            &EncodedFrameRef::from(&p),
+            2,
+            2,
+        );
+        assert!(
+            b.annex_b.len() < 32,
+            "fmt {fmt}: static-flat CABAC B should collapse to skips \
+             (B = {} bytes)",
+            b.annex_b.len()
+        );
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&idr.annex_b);
+        combined.extend_from_slice(&p.annex_b);
+        combined.extend_from_slice(&b.annex_b);
+        let gop = GopB {
+            idr,
+            p,
+            b,
+            combined,
+        };
+        assert_gop_b_self_roundtrip(&gop, fmt, &format!("cabac-b-skip-{fmt}"));
+        assert_gop_b_ffmpeg_interop(&gop, fmt, &format!("cabac-b-skip-{fmt}"));
+    }
+}
