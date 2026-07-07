@@ -490,6 +490,144 @@ fn cabac_b_444_transform_8x8_gop_bit_exact() {
     assert_gop_b_ffmpeg_interop(&gop, 3, "cabac-b-444-8x8");
 }
 
+/// Round-397 — B 16x8 / 8x16 partitions at 4:2:2 / 4:4:4 under CABAC:
+/// per-half-motion IPB fixtures (one half of every MB matches the IDR
+/// content, the other the P content) trip the partition trial; the
+/// Table 7-14 raw-4..=21 mb_type binarisation, per-partition
+/// §9.3.3.1.1.7 mvd contexts and the per-format chroma-rect MC must
+/// all mirror the decoder bit-exactly.
+#[test]
+fn cabac_b_partitions_422_444() {
+    for (fmt, vertical_split) in [(2u32, false), (3u32, false), (2, true), (3, true)] {
+        let (cw, ch) = chroma_dims(fmt);
+        let mut y0 = vec![0u8; W * H];
+        let mut u0 = vec![0u8; cw * ch];
+        let mut v0 = vec![0u8; cw * ch];
+        for j in 0..H {
+            for i in 0..W {
+                y0[j * W + i] = (60 + i + j) as u8;
+            }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                u0[j * cw + i] = (70 + i * 120 / cw + j * 30 / ch) as u8;
+                v0[j * cw + i] = (180 - (i * 90 / cw) - j * 20 / ch) as u8;
+            }
+        }
+        let cshift = if fmt == 3 { 4usize } else { 2 };
+        let mut y2 = vec![0u8; W * H];
+        let mut u2 = vec![0u8; cw * ch];
+        let mut v2 = vec![0u8; cw * ch];
+        for j in 0..H {
+            for i in 0..W {
+                y2[j * W + i] = y0[j * W + i.saturating_sub(4)];
+            }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                u2[j * cw + i] = u0[j * cw + i.saturating_sub(cshift)];
+                v2[j * cw + i] = v0[j * cw + i.saturating_sub(cshift)];
+            }
+        }
+        let mut y1 = vec![0u8; W * H];
+        for j in 0..H {
+            for i in 0..W {
+                let from_idr = if vertical_split {
+                    i % 16 < 8
+                } else {
+                    j % 16 < 8
+                };
+                y1[j * W + i] = if from_idr {
+                    y0[j * W + i]
+                } else {
+                    y2[j * W + i]
+                };
+            }
+        }
+        let (mcw, mch) = match fmt {
+            3 => (16usize, 16usize),
+            2 => (8, 16),
+            _ => (8, 8),
+        };
+        let mut u1 = vec![0u8; cw * ch];
+        let mut v1 = vec![0u8; cw * ch];
+        for j in 0..ch {
+            for i in 0..cw {
+                let from_idr = if vertical_split {
+                    i % mcw < mcw / 2
+                } else {
+                    j % mch < mch / 2
+                };
+                u1[j * cw + i] = if from_idr {
+                    u0[j * cw + i]
+                } else {
+                    u2[j * cw + i]
+                };
+                v1[j * cw + i] = if from_idr {
+                    v0[j * cw + i]
+                } else {
+                    v2[j * cw + i]
+                };
+            }
+        }
+        let f0 = YuvFrame {
+            width: W as u32,
+            height: H as u32,
+            y: &y0,
+            u: &u0,
+            v: &v0,
+        };
+        let f1 = YuvFrame {
+            width: W as u32,
+            height: H as u32,
+            y: &y1,
+            u: &u1,
+            v: &v1,
+        };
+        let f2 = YuvFrame {
+            width: W as u32,
+            height: H as u32,
+            y: &y2,
+            u: &u2,
+            v: &v2,
+        };
+        let cfg = EncoderConfig {
+            cabac: true,
+            chroma_format_idc: fmt,
+            profile_idc: match fmt {
+                3 => 244,
+                2 => 122,
+                _ => 100,
+            },
+            max_num_ref_frames: 2,
+            ..EncoderConfig::new(W as u32, H as u32)
+        };
+        let enc = Encoder::new(cfg);
+        let idr = enc.encode_idr_cabac(&f0);
+        let p = enc.encode_p_cabac(&f2, &EncodedFrameRef::from(&idr), 1, 4);
+        let b = enc.encode_b_cabac(
+            &f1,
+            &EncodedFrameRef::from(&idr),
+            &EncodedFrameRef::from(&p),
+            2,
+            2,
+        );
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&idr.annex_b);
+        combined.extend_from_slice(&p.annex_b);
+        combined.extend_from_slice(&b.annex_b);
+        let gop = GopB {
+            idr,
+            p,
+            b,
+            combined,
+        };
+        let split = if vertical_split { "8x16" } else { "16x8" };
+        assert_gop_b_self_roundtrip(&gop, fmt, &format!("cabac-b-{split}-{fmt}"));
+        assert_gop_b_ffmpeg_interop(&gop, fmt, &format!("cabac-b-{split}-{fmt}"));
+    }
+}
+
 /// Round-397 — static B at 4:2:0 / 4:2:2 / 4:4:4: the CABAC B encoder
 /// must fold direct-winner MBs with an all-zero residual into B_Skip
 /// (mb_skip_flag = 1, no further MB syntax) at every chroma format,

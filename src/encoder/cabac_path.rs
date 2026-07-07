@@ -4274,6 +4274,238 @@ impl Encoder {
                         }
                     };
 
+                    // ---- Round-397: 16x8 / 8x16 partition trial ----
+                    // (round-22 logic; per-format chroma-rect MC). The
+                    // Direct winner is never overridden — B_Skip
+                    // dominates any partition mode rate-wise.
+                    #[allow(clippy::type_complexity)]
+                    let mut partition_choice: Option<(
+                        PartitionShape,
+                        BPartPred,
+                        BPartPred,
+                        Mv,
+                        Mv,
+                        Mv,
+                        Mv,
+                    )> = None;
+                    if !is_direct {
+                        let mut me_l0_cells = [Mv::ZERO; 4];
+                        let mut me_l1_cells = [Mv::ZERO; 4];
+                        for cell in 0..4usize {
+                            let sx = cell % 2;
+                            let sy = cell / 2;
+                            let r0 = search_quarter_pel_8x8(
+                                frame.y,
+                                width,
+                                cfg.width,
+                                cfg.height,
+                                ref_l0.recon_y,
+                                ref_l0.width as usize,
+                                ref_l0.width,
+                                ref_l0.height,
+                                mb_x,
+                                mb_y,
+                                sx,
+                                sy,
+                                4,
+                                4,
+                            );
+                            let r1 = search_quarter_pel_8x8(
+                                frame.y,
+                                width,
+                                cfg.width,
+                                cfg.height,
+                                ref_l1.recon_y,
+                                ref_l1.width as usize,
+                                ref_l1.width,
+                                ref_l1.height,
+                                mb_x,
+                                mb_y,
+                                sx,
+                                sy,
+                                4,
+                                4,
+                            );
+                            me_l0_cells[cell] = Mv::new(r0.mv_x, r0.mv_y);
+                            me_l1_cells[cell] = Mv::new(r1.mv_x, r1.mv_y);
+                        }
+                        let cand_top_l0 = [mv_l0, me_l0_cells[0], me_l0_cells[1]];
+                        let cand_top_l1 = [mv_l1, me_l1_cells[0], me_l1_cells[1]];
+                        let cand_bot_l0 = [mv_l0, me_l0_cells[2], me_l0_cells[3]];
+                        let cand_bot_l1 = [mv_l1, me_l1_cells[2], me_l1_cells[3]];
+                        let (top_mode, top_mv_l0, top_mv_l1, sad_top) =
+                            best_partition_mode_b(&cand_top_l0, &cand_top_l1, |pred, mv0, mv1| {
+                                partition_sad_b_16x8(
+                                    pred, frame.y, width, ref_l0, ref_l1, mb_x, mb_y, 0, mv0, mv1,
+                                )
+                            });
+                        let (bot_mode, bot_mv_l0, bot_mv_l1, sad_bot) =
+                            best_partition_mode_b(&cand_bot_l0, &cand_bot_l1, |pred, mv0, mv1| {
+                                partition_sad_b_16x8(
+                                    pred, frame.y, width, ref_l0, ref_l1, mb_x, mb_y, 8, mv0, mv1,
+                                )
+                            });
+                        let sad_16x8_total = (sad_top as u64).saturating_add(sad_bot as u64);
+                        let cand_left_l0 = [mv_l0, me_l0_cells[0], me_l0_cells[2]];
+                        let cand_left_l1 = [mv_l1, me_l1_cells[0], me_l1_cells[2]];
+                        let cand_right_l0 = [mv_l0, me_l0_cells[1], me_l0_cells[3]];
+                        let cand_right_l1 = [mv_l1, me_l1_cells[1], me_l1_cells[3]];
+                        let (left_mode, left_mv_l0, left_mv_l1, sad_left) = best_partition_mode_b(
+                            &cand_left_l0,
+                            &cand_left_l1,
+                            |pred, mv0, mv1| {
+                                partition_sad_b_8x16(
+                                    pred, frame.y, width, ref_l0, ref_l1, mb_x, mb_y, 0, mv0, mv1,
+                                )
+                            },
+                        );
+                        let (right_mode, right_mv_l0, right_mv_l1, sad_right) =
+                            best_partition_mode_b(
+                                &cand_right_l0,
+                                &cand_right_l1,
+                                |pred, mv0, mv1| {
+                                    partition_sad_b_8x16(
+                                        pred, frame.y, width, ref_l0, ref_l1, mb_x, mb_y, 8, mv0,
+                                        mv1,
+                                    )
+                                },
+                            );
+                        let sad_8x16_total = (sad_left as u64).saturating_add(sad_right as u64);
+                        let best_16x16_sad = sad_bi.min(sad_l0).min(sad_l1);
+                        let part_bias_sad: u64 = (lambda + 1) * 8;
+                        let part_threshold = best_16x16_sad.saturating_sub(part_bias_sad);
+                        let (part_winner, part_winner_sad) = if sad_16x8_total <= sad_8x16_total {
+                            (PartitionShape::P16x8, sad_16x8_total)
+                        } else {
+                            (PartitionShape::P8x16, sad_8x16_total)
+                        };
+                        if part_winner_sad < part_threshold {
+                            partition_choice = Some(match part_winner {
+                                PartitionShape::P16x8 => (
+                                    PartitionShape::P16x8,
+                                    top_mode,
+                                    bot_mode,
+                                    top_mv_l0,
+                                    top_mv_l1,
+                                    bot_mv_l0,
+                                    bot_mv_l1,
+                                ),
+                                PartitionShape::P8x16 => (
+                                    PartitionShape::P8x16,
+                                    left_mode,
+                                    right_mode,
+                                    left_mv_l0,
+                                    left_mv_l1,
+                                    right_mv_l0,
+                                    right_mv_l1,
+                                ),
+                            });
+                        }
+                    }
+                    // Composite predictor override for the partition
+                    // winner: luma via the shared partition predictors,
+                    // chroma via the per-format rect MC (§8.4.1.4 /
+                    // §8.4.2.2 — a 16x8 luma half maps to a
+                    // ct_w x ct_h/2 chroma rect, an 8x16 half to
+                    // ct_w/2 x ct_h).
+                    let (pred_y, pred_u, pred_v) =
+                        if let Some((shape, mode_a, mode_b, mv0_a, mv1_a, mv0_b, mv1_b)) =
+                            partition_choice
+                        {
+                            let mut py = [0i32; 256];
+                            match shape {
+                                PartitionShape::P16x8 => {
+                                    let p0 = build_b_partition_pred_luma_16x8(
+                                        mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
+                                    );
+                                    let p1 = build_b_partition_pred_luma_16x8(
+                                        mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
+                                    );
+                                    for j in 0..8usize {
+                                        for i in 0..16usize {
+                                            py[j * 16 + i] = p0[j * 16 + i];
+                                            py[(8 + j) * 16 + i] = p1[j * 16 + i];
+                                        }
+                                    }
+                                }
+                                PartitionShape::P8x16 => {
+                                    let p0 = build_b_partition_pred_luma_8x16(
+                                        mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, mv0_a, mv1_a,
+                                    );
+                                    let p1 = build_b_partition_pred_luma_8x16(
+                                        mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, mv0_b, mv1_b,
+                                    );
+                                    for j in 0..16usize {
+                                        for i in 0..8usize {
+                                            py[j * 16 + i] = p0[j * 8 + i];
+                                            py[j * 16 + 8 + i] = p1[j * 8 + i];
+                                        }
+                                    }
+                                }
+                            }
+                            let mut pu = vec![0i32; tile];
+                            let mut pv = vec![0i32; tile];
+                            for (half, (mode, hmv0, hmv1)) in
+                                [(mode_a, mv0_a, mv1_a), (mode_b, mv0_b, mv1_b)]
+                                    .into_iter()
+                                    .enumerate()
+                            {
+                                let (cx0, cy0, rw, rh) = match shape {
+                                    PartitionShape::P16x8 => (
+                                        mb_x * ct_w,
+                                        mb_y * ct_h + half * (ct_h / 2),
+                                        ct_w,
+                                        ct_h / 2,
+                                    ),
+                                    PartitionShape::P8x16 => (
+                                        mb_x * ct_w + half * (ct_w / 2),
+                                        mb_y * ct_h,
+                                        ct_w / 2,
+                                        ct_h,
+                                    ),
+                                };
+                                let ru = super::build_b_partition_chroma_rect_fmt(
+                                    mode,
+                                    ref_l0.recon_u,
+                                    ref_l1.recon_u,
+                                    chroma_w as u32,
+                                    chroma_h as u32,
+                                    cx0,
+                                    cy0,
+                                    rw,
+                                    rh,
+                                    hmv0,
+                                    hmv1,
+                                    cfg.chroma_format_idc,
+                                );
+                                let rv = super::build_b_partition_chroma_rect_fmt(
+                                    mode,
+                                    ref_l0.recon_v,
+                                    ref_l1.recon_v,
+                                    chroma_w as u32,
+                                    chroma_h as u32,
+                                    cx0,
+                                    cy0,
+                                    rw,
+                                    rh,
+                                    hmv0,
+                                    hmv1,
+                                    cfg.chroma_format_idc,
+                                );
+                                let ox = cx0 - mb_x * ct_w;
+                                let oy = cy0 - mb_y * ct_h;
+                                for j in 0..rh {
+                                    for i in 0..rw {
+                                        pu[(oy + j) * ct_w + ox + i] = ru[j * rw + i];
+                                        pv[(oy + j) * ct_w + ox + i] = rv[j * rw + i];
+                                    }
+                                }
+                            }
+                            (py, pu, pv)
+                        } else {
+                            (pred_y, pred_u, pred_v)
+                        };
+
                     // Luma residual (4x4, with the §8.6.4 8x8 alternative).
                     let fwd4 = super::forward_inter_luma(
                         frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w4,
@@ -4485,72 +4717,364 @@ impl Encoder {
                     }
 
                     // mb_type — raw 0 (B_Direct_16x16) for a coded
-                    // direct MB, else the explicit 16x16 row.
-                    encode_mb_type_b(
-                        &mut cabac,
-                        &mut ctxs,
-                        &nb,
-                        if is_direct { 0 } else { eff_kind },
-                    );
+                    // direct MB, the Table 7-14 partition row for a
+                    // partition winner, else the explicit 16x16 row.
+                    let mb_type_raw = if is_direct {
+                        0
+                    } else if let Some((shape, mode_a, mode_b, ..)) = partition_choice {
+                        match shape {
+                            PartitionShape::P16x8 => b_16x8_mb_type_raw(mode_a, mode_b),
+                            PartitionShape::P8x16 => b_8x16_mb_type_raw(mode_a, mode_b),
+                        }
+                    } else {
+                        eff_kind
+                    };
+                    encode_mb_type_b(&mut cabac, &mut ctxs, &nb, mb_type_raw);
 
                     // mvd_l0 / mvd_l1 (single ref → no ref_idx emit).
                     // B_Direct_16x16 carries no mvd — the decoder
-                    // re-derives the motion itself.
-                    let inflight_abs = [0u32; 16];
-                    let (mvd_l0_x, mvd_l0_y) = if !is_direct && uses_l0 {
-                        let mvd_x = eff_mv_l0.x - mvp_l0.x;
-                        let mvd_y = eff_mv_l0.y - mvp_l0.y;
-                        let sum_x = cabac_enc_mvd_abs_sum(
-                            &grid,
-                            mb_x,
-                            mb_y,
-                            0,
-                            MvdComponent::X,
-                            0,
-                            &inflight_abs,
-                        );
-                        encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, sum_x, mvd_x);
-                        let sum_y = cabac_enc_mvd_abs_sum(
-                            &grid,
-                            mb_x,
-                            mb_y,
-                            0,
-                            MvdComponent::Y,
-                            0,
-                            &inflight_abs,
-                        );
-                        encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, sum_y, mvd_y);
-                        (mvd_x, mvd_y)
-                    } else {
-                        (0i32, 0i32)
-                    };
-                    let (mvd_l1_x, mvd_l1_y) = if !is_direct && uses_l1 {
-                        let mvd_x = eff_mv_l1.x - mvp_l1.x;
-                        let mvd_y = eff_mv_l1.y - mvp_l1.y;
-                        let sum_x = cabac_enc_mvd_abs_sum(
-                            &grid,
-                            mb_x,
-                            mb_y,
-                            1,
-                            MvdComponent::X,
-                            0,
-                            &inflight_abs,
-                        );
-                        encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, sum_x, mvd_x);
-                        let sum_y = cabac_enc_mvd_abs_sum(
-                            &grid,
-                            mb_x,
-                            mb_y,
-                            1,
-                            MvdComponent::Y,
-                            0,
-                            &inflight_abs,
-                        );
-                        encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, sum_y, mvd_y);
-                        (mvd_x, mvd_y)
-                    } else {
-                        (0i32, 0i32)
-                    };
+                    // re-derives the motion itself. Partition shapes
+                    // emit per-partition mvds below instead.
+                    let mut inflight_abs_l0_x = [0u32; 16];
+                    let mut inflight_abs_l0_y = [0u32; 16];
+                    let mut inflight_abs_l1_x = [0u32; 16];
+                    let mut inflight_abs_l1_y = [0u32; 16];
+                    let (mvd_l0_x, mvd_l0_y) =
+                        if !is_direct && partition_choice.is_none() && uses_l0 {
+                            let mvd_x = eff_mv_l0.x - mvp_l0.x;
+                            let mvd_y = eff_mv_l0.y - mvp_l0.y;
+                            let sum_x = cabac_enc_mvd_abs_sum(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                0,
+                                MvdComponent::X,
+                                0,
+                                &inflight_abs_l0_x,
+                            );
+                            encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, sum_x, mvd_x);
+                            let sum_y = cabac_enc_mvd_abs_sum(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                0,
+                                MvdComponent::Y,
+                                0,
+                                &inflight_abs_l0_y,
+                            );
+                            encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, sum_y, mvd_y);
+                            (mvd_x, mvd_y)
+                        } else {
+                            (0i32, 0i32)
+                        };
+                    let (mvd_l1_x, mvd_l1_y) =
+                        if !is_direct && partition_choice.is_none() && uses_l1 {
+                            let mvd_x = eff_mv_l1.x - mvp_l1.x;
+                            let mvd_y = eff_mv_l1.y - mvp_l1.y;
+                            let sum_x = cabac_enc_mvd_abs_sum(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                1,
+                                MvdComponent::X,
+                                0,
+                                &inflight_abs_l1_x,
+                            );
+                            encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, sum_x, mvd_x);
+                            let sum_y = cabac_enc_mvd_abs_sum(
+                                &grid,
+                                mb_x,
+                                mb_y,
+                                1,
+                                MvdComponent::Y,
+                                0,
+                                &inflight_abs_l1_y,
+                            );
+                            encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, sum_y, mvd_y);
+                            (mvd_x, mvd_y)
+                        } else {
+                            (0i32, 0i32)
+                        };
+
+                    // Partition-mode per-partition mvds: §8.4.1.3 mvp
+                    // via the shared partition helpers (with within-MB
+                    // inflight state for partition 1), then §7.3.5.1
+                    // field-order emit (mvd_l0[0..=1], mvd_l1[0..=1];
+                    // single ref → no ref_idx fields).
+                    let (part_mvd_l0_x, part_mvd_l0_y, part_mvd_l1_x, part_mvd_l1_y) =
+                        if let Some((shape, mode_a, mode_b, mv0_a, mv1_a, mv0_b, mv1_b)) =
+                            partition_choice
+                        {
+                            let mut mvd0_x = [0i32; 2];
+                            let mut mvd0_y = [0i32; 2];
+                            let mut mvd1_x = [0i32; 2];
+                            let mut mvd1_y = [0i32; 2];
+                            let inflight_avail0 = [false; 4];
+                            let mv_inflight0 = [Mv::ZERO; 4];
+                            let ref_inflight0 = [-1i32; 4];
+                            let (mvp0_l0, mvp0_l1) = match shape {
+                                PartitionShape::P16x8 => (
+                                    cabac_mvp_for_b_16x8_partition(
+                                        &grid,
+                                        mb_x,
+                                        mb_y,
+                                        true,
+                                        0,
+                                        0,
+                                        inflight_avail0,
+                                        mv_inflight0,
+                                        ref_inflight0,
+                                    ),
+                                    cabac_mvp_for_b_16x8_partition(
+                                        &grid,
+                                        mb_x,
+                                        mb_y,
+                                        true,
+                                        0,
+                                        1,
+                                        inflight_avail0,
+                                        mv_inflight0,
+                                        ref_inflight0,
+                                    ),
+                                ),
+                                PartitionShape::P8x16 => (
+                                    cabac_mvp_for_b_8x16_partition(
+                                        &grid,
+                                        mb_x,
+                                        mb_y,
+                                        true,
+                                        0,
+                                        0,
+                                        inflight_avail0,
+                                        mv_inflight0,
+                                        ref_inflight0,
+                                    ),
+                                    cabac_mvp_for_b_8x16_partition(
+                                        &grid,
+                                        mb_x,
+                                        mb_y,
+                                        true,
+                                        0,
+                                        1,
+                                        inflight_avail0,
+                                        mv_inflight0,
+                                        ref_inflight0,
+                                    ),
+                                ),
+                            };
+                            if mode_a.uses_l0() {
+                                mvd0_x[0] = mv0_a.x - mvp0_l0.x;
+                                mvd0_y[0] = mv0_a.y - mvp0_l0.y;
+                            }
+                            if mode_a.uses_l1() {
+                                mvd1_x[0] = mv1_a.x - mvp0_l1.x;
+                                mvd1_y[0] = mv1_a.y - mvp0_l1.y;
+                            }
+                            let (
+                                inflight_avail1,
+                                mv_inflight1_l0,
+                                mv_inflight1_l1,
+                                ref_inflight1_l0,
+                                ref_inflight1_l1,
+                            ) = match shape {
+                                PartitionShape::P16x8 => (
+                                    [true, true, false, false],
+                                    [mv0_a, mv0_a, Mv::ZERO, Mv::ZERO],
+                                    [mv1_a, mv1_a, Mv::ZERO, Mv::ZERO],
+                                    [
+                                        if mode_a.uses_l0() { 0 } else { -1 },
+                                        if mode_a.uses_l0() { 0 } else { -1 },
+                                        -1,
+                                        -1,
+                                    ],
+                                    [
+                                        if mode_a.uses_l1() { 0 } else { -1 },
+                                        if mode_a.uses_l1() { 0 } else { -1 },
+                                        -1,
+                                        -1,
+                                    ],
+                                ),
+                                PartitionShape::P8x16 => (
+                                    [true, false, true, false],
+                                    [mv0_a, Mv::ZERO, mv0_a, Mv::ZERO],
+                                    [mv1_a, Mv::ZERO, mv1_a, Mv::ZERO],
+                                    [
+                                        if mode_a.uses_l0() { 0 } else { -1 },
+                                        -1,
+                                        if mode_a.uses_l0() { 0 } else { -1 },
+                                        -1,
+                                    ],
+                                    [
+                                        if mode_a.uses_l1() { 0 } else { -1 },
+                                        -1,
+                                        if mode_a.uses_l1() { 0 } else { -1 },
+                                        -1,
+                                    ],
+                                ),
+                            };
+                            let (mvp1_l0, mvp1_l1) = match shape {
+                                PartitionShape::P16x8 => (
+                                    cabac_mvp_for_b_16x8_partition(
+                                        &grid,
+                                        mb_x,
+                                        mb_y,
+                                        false,
+                                        0,
+                                        0,
+                                        inflight_avail1,
+                                        mv_inflight1_l0,
+                                        ref_inflight1_l0,
+                                    ),
+                                    cabac_mvp_for_b_16x8_partition(
+                                        &grid,
+                                        mb_x,
+                                        mb_y,
+                                        false,
+                                        0,
+                                        1,
+                                        inflight_avail1,
+                                        mv_inflight1_l1,
+                                        ref_inflight1_l1,
+                                    ),
+                                ),
+                                PartitionShape::P8x16 => (
+                                    cabac_mvp_for_b_8x16_partition(
+                                        &grid,
+                                        mb_x,
+                                        mb_y,
+                                        false,
+                                        0,
+                                        0,
+                                        inflight_avail1,
+                                        mv_inflight1_l0,
+                                        ref_inflight1_l0,
+                                    ),
+                                    cabac_mvp_for_b_8x16_partition(
+                                        &grid,
+                                        mb_x,
+                                        mb_y,
+                                        false,
+                                        0,
+                                        1,
+                                        inflight_avail1,
+                                        mv_inflight1_l1,
+                                        ref_inflight1_l1,
+                                    ),
+                                ),
+                            };
+                            if mode_b.uses_l0() {
+                                mvd0_x[1] = mv0_b.x - mvp1_l0.x;
+                                mvd0_y[1] = mv0_b.y - mvp1_l0.y;
+                            }
+                            if mode_b.uses_l1() {
+                                mvd1_x[1] = mv1_b.x - mvp1_l1.x;
+                                mvd1_y[1] = mv1_b.y - mvp1_l1.y;
+                            }
+                            (mvd0_x, mvd0_y, mvd1_x, mvd1_y)
+                        } else {
+                            ([0i32; 2], [0i32; 2], [0i32; 2], [0i32; 2])
+                        };
+                    if let Some((shape, mode_a, mode_b, ..)) = partition_choice {
+                        let parts = [mode_a, mode_b];
+                        let top_left_blk = match shape {
+                            PartitionShape::P16x8 => [0u8, 8u8],
+                            PartitionShape::P8x16 => [0u8, 4u8],
+                        };
+                        let part_4x4_ranges: [[u8; 8]; 2] = match shape {
+                            PartitionShape::P16x8 => {
+                                [[0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15]]
+                            }
+                            PartitionShape::P8x16 => {
+                                [[0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7, 12, 13, 14, 15]]
+                            }
+                        };
+                        for p in 0..2 {
+                            if parts[p].uses_l0() {
+                                let blk4 = top_left_blk[p];
+                                let sum_x = cabac_enc_mvd_abs_sum(
+                                    &grid,
+                                    mb_x,
+                                    mb_y,
+                                    0,
+                                    MvdComponent::X,
+                                    blk4,
+                                    &inflight_abs_l0_x,
+                                );
+                                let sum_y = cabac_enc_mvd_abs_sum(
+                                    &grid,
+                                    mb_x,
+                                    mb_y,
+                                    0,
+                                    MvdComponent::Y,
+                                    blk4,
+                                    &inflight_abs_l0_y,
+                                );
+                                encode_mvd_lx(
+                                    &mut cabac,
+                                    &mut ctxs,
+                                    MvdComponent::X,
+                                    sum_x,
+                                    part_mvd_l0_x[p],
+                                );
+                                encode_mvd_lx(
+                                    &mut cabac,
+                                    &mut ctxs,
+                                    MvdComponent::Y,
+                                    sum_y,
+                                    part_mvd_l0_y[p],
+                                );
+                                let ax = part_mvd_l0_x[p].unsigned_abs();
+                                let ay = part_mvd_l0_y[p].unsigned_abs();
+                                for &b4 in &part_4x4_ranges[p] {
+                                    inflight_abs_l0_x[b4 as usize] = ax;
+                                    inflight_abs_l0_y[b4 as usize] = ay;
+                                }
+                            }
+                        }
+                        for p in 0..2 {
+                            if parts[p].uses_l1() {
+                                let blk4 = top_left_blk[p];
+                                let sum_x = cabac_enc_mvd_abs_sum(
+                                    &grid,
+                                    mb_x,
+                                    mb_y,
+                                    1,
+                                    MvdComponent::X,
+                                    blk4,
+                                    &inflight_abs_l1_x,
+                                );
+                                let sum_y = cabac_enc_mvd_abs_sum(
+                                    &grid,
+                                    mb_x,
+                                    mb_y,
+                                    1,
+                                    MvdComponent::Y,
+                                    blk4,
+                                    &inflight_abs_l1_y,
+                                );
+                                encode_mvd_lx(
+                                    &mut cabac,
+                                    &mut ctxs,
+                                    MvdComponent::X,
+                                    sum_x,
+                                    part_mvd_l1_x[p],
+                                );
+                                encode_mvd_lx(
+                                    &mut cabac,
+                                    &mut ctxs,
+                                    MvdComponent::Y,
+                                    sum_y,
+                                    part_mvd_l1_y[p],
+                                );
+                                let ax = part_mvd_l1_x[p].unsigned_abs();
+                                let ay = part_mvd_l1_y[p].unsigned_abs();
+                                for &b4 in &part_4x4_ranges[p] {
+                                    inflight_abs_l1_x[b4 as usize] = ax;
+                                    inflight_abs_l1_y[b4 as usize] = ay;
+                                }
+                            }
+                        }
+                    }
 
                     encode_coded_block_pattern(
                         &mut cabac,
@@ -4690,14 +5214,73 @@ impl Encoder {
                     info.cbp_luma = cbp_luma;
                     info.cbp_chroma = cbp_chroma;
                     info.transform_size_8x8 = transform_size_8x8;
-                    info.abs_mvd_l0_x = [mvd_l0_x.unsigned_abs(); 16];
-                    info.abs_mvd_l0_y = [mvd_l0_y.unsigned_abs(); 16];
-                    info.abs_mvd_l1_x = [mvd_l1_x.unsigned_abs(); 16];
-                    info.abs_mvd_l1_y = [mvd_l1_y.unsigned_abs(); 16];
-                    info.ref_idx_l0_8x8 = [if uses_l0 { 0 } else { -1 }; 4];
-                    info.mv_l0_8x8 = [if uses_l0 { eff_mv_l0 } else { Mv::ZERO }; 4];
-                    info.ref_idx_l1_8x8 = [if uses_l1 { 0 } else { -1 }; 4];
-                    info.mv_l1_8x8 = [if uses_l1 { eff_mv_l1 } else { Mv::ZERO }; 4];
+                    if let Some((shape, mode_a, mode_b, mv0_a, mv1_a, mv0_b, mv1_b)) =
+                        partition_choice
+                    {
+                        // Per-partition per-8x8 MV / ref / |mvd| layout.
+                        // 16x8: 8x8 #0/#1 = top, #2/#3 = bottom.
+                        // 8x16: 8x8 #0/#2 = left, #1/#3 = right.
+                        let (cell_a_idx, cell_b_idx): ([usize; 2], [usize; 2]) = match shape {
+                            PartitionShape::P16x8 => ([0, 1], [2, 3]),
+                            PartitionShape::P8x16 => ([0, 2], [1, 3]),
+                        };
+                        let mut ref_l0 = [-1i32; 4];
+                        let mut ref_l1 = [-1i32; 4];
+                        let mut mv_l0_arr = [Mv::ZERO; 4];
+                        let mut mv_l1_arr = [Mv::ZERO; 4];
+                        for &i in &cell_a_idx {
+                            if mode_a.uses_l0() {
+                                ref_l0[i] = 0;
+                                mv_l0_arr[i] = mv0_a;
+                            }
+                            if mode_a.uses_l1() {
+                                ref_l1[i] = 0;
+                                mv_l1_arr[i] = mv1_a;
+                            }
+                        }
+                        for &i in &cell_b_idx {
+                            if mode_b.uses_l0() {
+                                ref_l0[i] = 0;
+                                mv_l0_arr[i] = mv0_b;
+                            }
+                            if mode_b.uses_l1() {
+                                ref_l1[i] = 0;
+                                mv_l1_arr[i] = mv1_b;
+                            }
+                        }
+                        info.ref_idx_l0_8x8 = ref_l0;
+                        info.mv_l0_8x8 = mv_l0_arr;
+                        info.ref_idx_l1_8x8 = ref_l1;
+                        info.mv_l1_8x8 = mv_l1_arr;
+                        // |mvd| arrays — per-4x4 fan-out of the two
+                        // partitions' mvds (raster Z-order layout).
+                        let mut abs_mvd_l0_x = [0u32; 16];
+                        let mut abs_mvd_l0_y = [0u32; 16];
+                        let mut abs_mvd_l1_x = [0u32; 16];
+                        let mut abs_mvd_l1_y = [0u32; 16];
+                        for blkz in 0..16usize {
+                            let (bx, by) = LUMA_4X4_BLK[blkz];
+                            let cell = (by / 2) * 2 + (bx / 2);
+                            let pidx = if cell_a_idx.contains(&cell) { 0 } else { 1 };
+                            abs_mvd_l0_x[blkz] = part_mvd_l0_x[pidx].unsigned_abs();
+                            abs_mvd_l0_y[blkz] = part_mvd_l0_y[pidx].unsigned_abs();
+                            abs_mvd_l1_x[blkz] = part_mvd_l1_x[pidx].unsigned_abs();
+                            abs_mvd_l1_y[blkz] = part_mvd_l1_y[pidx].unsigned_abs();
+                        }
+                        info.abs_mvd_l0_x = abs_mvd_l0_x;
+                        info.abs_mvd_l0_y = abs_mvd_l0_y;
+                        info.abs_mvd_l1_x = abs_mvd_l1_x;
+                        info.abs_mvd_l1_y = abs_mvd_l1_y;
+                    } else {
+                        info.abs_mvd_l0_x = [mvd_l0_x.unsigned_abs(); 16];
+                        info.abs_mvd_l0_y = [mvd_l0_y.unsigned_abs(); 16];
+                        info.abs_mvd_l1_x = [mvd_l1_x.unsigned_abs(); 16];
+                        info.abs_mvd_l1_y = [mvd_l1_y.unsigned_abs(); 16];
+                        info.ref_idx_l0_8x8 = [if uses_l0 { 0 } else { -1 }; 4];
+                        info.mv_l0_8x8 = [if uses_l0 { eff_mv_l0 } else { Mv::ZERO }; 4];
+                        info.ref_idx_l1_8x8 = [if uses_l1 { 0 } else { -1 }; 4];
+                        info.mv_l1_8x8 = [if uses_l1 { eff_mv_l1 } else { Mv::ZERO }; 4];
+                    }
                     if transform_size_8x8 {
                         i8x8_mb_count += 1;
                     }
@@ -4725,17 +5308,70 @@ impl Encoder {
                         0 // deblock disabled at 4:4:4.
                     };
                     let blk_nz: [bool; 16] = fwd.blk_has_nz;
+                    // §8.7 deblock — per-4x4 MV + per-8x8 ref/POC
+                    // arrays. Partition shapes carry per-half values so
+                    // the bS derivation mirrors the decoder's.
+                    let dbl_lists = |is_l0: bool| -> ([(i16, i16); 16], [i8; 4], [i32; 4]) {
+                        let poc_used = if is_l0 { 0 } else { 1000 };
+                        if let Some((shape, mode_a, mode_b, mv0_a, mv1_a, mv0_b, mv1_b)) =
+                            partition_choice
+                        {
+                            let (used_a, used_b, mv_a, mv_b) = if is_l0 {
+                                (mode_a.uses_l0(), mode_b.uses_l0(), mv0_a, mv0_b)
+                            } else {
+                                (mode_a.uses_l1(), mode_b.uses_l1(), mv1_a, mv1_b)
+                            };
+                            let (cell_a_idx, _cell_b_idx): ([usize; 2], [usize; 2]) = match shape {
+                                PartitionShape::P16x8 => ([0, 1], [2, 3]),
+                                PartitionShape::P8x16 => ([0, 2], [1, 3]),
+                            };
+                            let mut mvs = [(0i16, 0i16); 16];
+                            let mut refs = [-1i8; 4];
+                            let mut pocs = [i32::MIN; 4];
+                            for blkz in 0..16usize {
+                                let (bx, by) = LUMA_4X4_BLK[blkz];
+                                let cell = (by / 2) * 2 + (bx / 2);
+                                let in_a = cell_a_idx.contains(&cell);
+                                let (used, mv) = if in_a { (used_a, mv_a) } else { (used_b, mv_b) };
+                                if used {
+                                    mvs[blkz] = clamp_mv(mv);
+                                }
+                            }
+                            for q in 0..4usize {
+                                let in_a = cell_a_idx.contains(&q);
+                                let used = if in_a { used_a } else { used_b };
+                                if used {
+                                    refs[q] = 0;
+                                    pocs[q] = poc_used;
+                                }
+                            }
+                            (mvs, refs, pocs)
+                        } else {
+                            let (used, mv) = if is_l0 {
+                                (uses_l0, eff_mv_l0)
+                            } else {
+                                (uses_l1, eff_mv_l1)
+                            };
+                            (
+                                [if used { clamp_mv(mv) } else { (0, 0) }; 16],
+                                [if used { 0 } else { -1 }; 4],
+                                [if used { poc_used } else { i32::MIN }; 4],
+                            )
+                        }
+                    };
+                    let (dbl_mv_l0, dbl_ref_l0, dbl_poc_l0) = dbl_lists(true);
+                    let (dbl_mv_l1, dbl_ref_l1, dbl_poc_l1) = dbl_lists(false);
                     mb_dbl[mb_addr] = MbDeblockInfo {
                         is_intra: false,
                         qp_y,
                         luma_nonzero_4x4: luma_nz_mask_from_blocks(&blk_nz),
                         chroma_nonzero_4x4,
-                        mv_l0: [if uses_l0 { clamp_mv(eff_mv_l0) } else { (0, 0) }; 16],
-                        ref_idx_l0: [if uses_l0 { 0 } else { -1 }; 4],
-                        ref_poc_l0: [if uses_l0 { 0 } else { i32::MIN }; 4],
-                        mv_l1: [if uses_l1 { clamp_mv(eff_mv_l1) } else { (0, 0) }; 16],
-                        ref_idx_l1: [if uses_l1 { 0 } else { -1 }; 4],
-                        ref_poc_l1: [if uses_l1 { 1000 } else { i32::MIN }; 4],
+                        mv_l0: dbl_mv_l0,
+                        ref_idx_l0: dbl_ref_l0,
+                        ref_poc_l0: dbl_poc_l0,
+                        mv_l1: dbl_mv_l1,
+                        ref_idx_l1: dbl_ref_l1,
+                        ref_poc_l1: dbl_poc_l1,
                         transform_size_8x8_flag: transform_size_8x8,
                         ..Default::default()
                     };

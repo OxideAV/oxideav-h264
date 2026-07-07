@@ -4195,7 +4195,7 @@ pub(crate) fn build_inter_pred_luma_8x8(
 ///   * fmt 3 (4:4:4) — the §8.4.2.2.1 LUMA 6-tap process with
 ///     `mvC = mvL` (1/4-pel, eq. 8-235..8-238).
 #[allow(clippy::too_many_arguments)]
-fn build_chroma_rect_pred_fmt(
+pub(super) fn build_chroma_rect_pred_fmt(
     plane: &[u8],
     plane_w: u32,
     plane_h: u32,
@@ -4240,7 +4240,7 @@ fn build_chroma_rect_pred_fmt(
 /// [`build_chroma_rect_pred_fmt`] merged per §8.4.2.3.1 (default
 /// average) according to the partition's list usage.
 #[allow(clippy::too_many_arguments)]
-fn build_b_partition_chroma_rect_fmt(
+pub(super) fn build_b_partition_chroma_rect_fmt(
     pred: BPartPred,
     plane_l0: &[u8],
     plane_l1: &[u8],
