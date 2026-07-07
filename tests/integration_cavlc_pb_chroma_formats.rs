@@ -278,6 +278,278 @@ fn cavlc_p_420_still_bit_exact() {
     assert_gop_ffmpeg_interop(&gop, 1, "cavlc-p-420");
 }
 
+// ---------------------------------------------------------------------------
+// Round-397 — CAVLC B-slices at 4:2:2 / 4:4:4 (B_Skip / B_Direct_16x16
+// + the explicit 16x16 mode set).
+// ---------------------------------------------------------------------------
+
+/// B target: midpoint blend of frame0 / frameP plus hash texture so
+/// coded B MBs carry residual on every plane.
+fn make_frame_b(fmt: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (y0, u0, v0) = make_frame0(fmt);
+    let (y2, u2, v2) = make_frame_p(fmt);
+    let blend = |a: &[u8], b: &[u8]| -> Vec<u8> {
+        a.iter()
+            .zip(b.iter())
+            .enumerate()
+            .map(|(k, (&x, &y))| {
+                let m = (x as u32 + y as u32) / 2;
+                let n = ((k as u32).wrapping_mul(2654435761) >> 27) & 7;
+                (m + n).min(235) as u8
+            })
+            .collect()
+    };
+    (blend(&y0, &y2), blend(&u0, &u2), blend(&v0, &v2))
+}
+
+struct GopB {
+    idr: oxideav_h264::encoder::EncodedIdr,
+    p: oxideav_h264::encoder::EncodedP,
+    b: oxideav_h264::encoder::EncodedB,
+    combined: Vec<u8>,
+}
+
+fn encode_gop_b(fmt: u32, transform_8x8: bool) -> GopB {
+    let (y0, u0, v0) = make_frame0(fmt);
+    let (y2, u2, v2) = make_frame_p(fmt);
+    let (y1, u1, v1) = make_frame_b(fmt);
+    let f0 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let f1 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let f2 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y2,
+        u: &u2,
+        v: &v2,
+    };
+    let cfg = EncoderConfig {
+        chroma_format_idc: fmt,
+        profile_idc: match fmt {
+            3 => 244,
+            2 => 122,
+            _ => 77,
+        },
+        max_num_ref_frames: 2,
+        transform_8x8,
+        qp: if transform_8x8 { 20 } else { 26 },
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let enc = Encoder::new(cfg);
+    let idr = enc.encode_idr(&f0);
+    let p = enc.encode_p(&f2, &EncodedFrameRef::from(&idr), 1, 4);
+    let b = enc.encode_b(
+        &f1,
+        &EncodedFrameRef::from(&idr),
+        &EncodedFrameRef::from(&p),
+        2,
+        2,
+    );
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&idr.annex_b);
+    combined.extend_from_slice(&p.annex_b);
+    combined.extend_from_slice(&b.annex_b);
+    GopB {
+        idr,
+        p,
+        b,
+        combined,
+    }
+}
+
+fn assert_gop_b_self_roundtrip(gop: &GopB, fmt: u32, tag: &str) {
+    let (cw, ch) = chroma_dims(fmt);
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), gop.combined.clone()).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let mut frames = Vec::new();
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        frames.push(vf);
+    }
+    assert_eq!(frames.len(), 3, "{tag}: expected IDR + B + P frames");
+    for (idx, (ry, ru, rv, name)) in [
+        (&gop.idr.recon_y, &gop.idr.recon_u, &gop.idr.recon_v, "IDR"),
+        (&gop.b.recon_y, &gop.b.recon_u, &gop.b.recon_v, "B"),
+        (&gop.p.recon_y, &gop.p.recon_u, &gop.p.recon_v, "P"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(
+            plane_max_diff(&frames[idx], 0, ry, W, H),
+            0,
+            "{tag}: {name} luma"
+        );
+        assert_eq!(
+            plane_max_diff(&frames[idx], 1, ru, cw, ch),
+            0,
+            "{tag}: {name} Cb"
+        );
+        assert_eq!(
+            plane_max_diff(&frames[idx], 2, rv, cw, ch),
+            0,
+            "{tag}: {name} Cr"
+        );
+    }
+}
+
+fn assert_gop_b_ffmpeg_interop(gop: &GopB, fmt: u32, tag: &str) {
+    let ffmpeg = std::path::Path::new("/opt/homebrew/bin/ffmpeg");
+    if !ffmpeg.exists() {
+        eprintln!("skip: reference decoder binary not present");
+        return;
+    }
+    let (cw, ch) = chroma_dims(fmt);
+    let pix_fmt = match fmt {
+        3 => "yuv444p",
+        2 => "yuv422p",
+        _ => "yuv420p",
+    };
+    let tmpdir = std::env::temp_dir();
+    let h264_path = tmpdir.join(format!(
+        "oxideav_h264_r397_cavb_{tag}_{}.h264",
+        std::process::id()
+    ));
+    let yuv_path = tmpdir.join(format!(
+        "oxideav_h264_r397_cavb_{tag}_{}.yuv",
+        std::process::id()
+    ));
+    std::fs::write(&h264_path, &gop.combined).expect("write h264");
+    let status = std::process::Command::new(ffmpeg)
+        .args(["-loglevel", "error", "-y", "-f", "h264", "-i"])
+        .arg(&h264_path)
+        .args(["-f", "rawvideo", "-pix_fmt", pix_fmt])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn reference decoder");
+    assert!(status.success(), "reference decoder rejected {tag}");
+    let yuv = std::fs::read(&yuv_path).expect("read decoded yuv");
+    let _ = std::fs::remove_file(&h264_path);
+    let _ = std::fs::remove_file(&yuv_path);
+    let frame_len = W * H + 2 * cw * ch;
+    assert_eq!(yuv.len(), 3 * frame_len, "{tag}: expected 3 frames");
+    for (idx, (ry, ru, rv, name)) in [
+        (&gop.idr.recon_y, &gop.idr.recon_u, &gop.idr.recon_v, "IDR"),
+        (&gop.b.recon_y, &gop.b.recon_u, &gop.b.recon_v, "B"),
+        (&gop.p.recon_y, &gop.p.recon_u, &gop.p.recon_v, "P"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let f = &yuv[idx * frame_len..(idx + 1) * frame_len];
+        assert_eq!(&f[..W * H], &ry[..], "{tag}: {name} luma vs reference");
+        assert_eq!(
+            &f[W * H..W * H + cw * ch],
+            &ru[..],
+            "{tag}: {name} Cb vs reference"
+        );
+        assert_eq!(
+            &f[W * H + cw * ch..],
+            &rv[..],
+            "{tag}: {name} Cr vs reference"
+        );
+    }
+}
+
+#[test]
+fn cavlc_b_422_gop_bit_exact() {
+    let gop = encode_gop_b(2, false);
+    assert!(gop.b.annex_b.len() > 100, "B too small — likely all-zero");
+    assert_gop_b_self_roundtrip(&gop, 2, "cavlc-b-422");
+    assert_gop_b_ffmpeg_interop(&gop, 2, "cavlc-b-422");
+}
+
+#[test]
+fn cavlc_b_444_gop_bit_exact() {
+    let gop = encode_gop_b(3, false);
+    assert!(gop.b.annex_b.len() > 100, "B too small — likely all-zero");
+    assert_gop_b_self_roundtrip(&gop, 3, "cavlc-b-444");
+    assert_gop_b_ffmpeg_interop(&gop, 3, "cavlc-b-444");
+}
+
+#[test]
+fn cavlc_b_422_transform_8x8_gop_bit_exact() {
+    let gop = encode_gop_b(2, true);
+    assert_gop_b_self_roundtrip(&gop, 2, "cavlc-b-422-8x8");
+    assert_gop_b_ffmpeg_interop(&gop, 2, "cavlc-b-422-8x8");
+}
+
+#[test]
+fn cavlc_b_444_transform_8x8_gop_bit_exact() {
+    let gop = encode_gop_b(3, true);
+    assert_gop_b_self_roundtrip(&gop, 3, "cavlc-b-444-8x8");
+    assert_gop_b_ffmpeg_interop(&gop, 3, "cavlc-b-444-8x8");
+}
+
+/// Static B at 4:2:2 / 4:4:4 — B_Skip (spatial direct, cbp == 0) must
+/// carry through the §7.3.4 mb_skip_run walker at every chroma format.
+#[test]
+fn cavlc_b_skip_all_formats() {
+    for fmt in [1u32, 2, 3] {
+        let (cw, ch) = chroma_dims(fmt);
+        let y0 = vec![120u8; W * H];
+        let u0 = vec![90u8; cw * ch];
+        let v0 = vec![160u8; cw * ch];
+        let f0 = YuvFrame {
+            width: W as u32,
+            height: H as u32,
+            y: &y0,
+            u: &u0,
+            v: &v0,
+        };
+        let cfg = EncoderConfig {
+            chroma_format_idc: fmt,
+            profile_idc: match fmt {
+                3 => 244,
+                2 => 122,
+                _ => 77,
+            },
+            max_num_ref_frames: 2,
+            ..EncoderConfig::new(W as u32, H as u32)
+        };
+        let enc = Encoder::new(cfg);
+        let idr = enc.encode_idr(&f0);
+        let p = enc.encode_p(&f0, &EncodedFrameRef::from(&idr), 1, 4);
+        let b = enc.encode_b(
+            &f0,
+            &EncodedFrameRef::from(&idr),
+            &EncodedFrameRef::from(&p),
+            2,
+            2,
+        );
+        assert!(
+            b.annex_b.len() < 32,
+            "fmt {fmt}: static-flat B should collapse to skip runs \
+             (B = {} bytes)",
+            b.annex_b.len()
+        );
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&idr.annex_b);
+        combined.extend_from_slice(&p.annex_b);
+        combined.extend_from_slice(&b.annex_b);
+        let gop = GopB {
+            idr,
+            p,
+            b,
+            combined,
+        };
+        assert_gop_b_self_roundtrip(&gop, fmt, &format!("cavlc-b-skip-{fmt}"));
+        assert_gop_b_ffmpeg_interop(&gop, fmt, &format!("cavlc-b-skip-{fmt}"));
+    }
+}
+
 /// Static P at 4:2:2 / 4:4:4 — the §7.3.4 mb_skip_run walker must
 /// carry P_Skip MBs at every chroma format (the skip recon copies the
 /// format-sized chroma predictor tile).

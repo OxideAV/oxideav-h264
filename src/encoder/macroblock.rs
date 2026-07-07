@@ -1737,6 +1737,35 @@ pub fn write_b_16x16_mb(
     num_ref_idx_l0_active_minus1: u32,
     num_ref_idx_l1_active_minus1: u32,
 ) -> Result<(), CavlcEncodeError> {
+    write_b_16x16_mb_chroma(
+        w,
+        cfg,
+        num_ref_idx_l0_active_minus1,
+        num_ref_idx_l1_active_minus1,
+        1,
+        ChromaWriteKind::Yuv420 {
+            chroma_dc_cb: &cfg.chroma_dc_cb,
+            chroma_dc_cr: &cfg.chroma_dc_cr,
+            chroma_ac_cb: &cfg.chroma_ac_cb,
+            chroma_ac_cr: &cfg.chroma_ac_cr,
+            cb_ac_nc: &cfg.chroma_ac_nc_cb,
+            cr_ac_nc: &cfg.chroma_ac_nc_cr,
+        },
+    )
+}
+
+/// Round-397 — emit one B-slice explicit 16x16 macroblock with an
+/// explicit chroma layout (CAVLC, ChromaArrayType ∈ {1, 2, 3}). The
+/// embedded 4:2:0 chroma fields of `cfg` are ignored; the chroma
+/// residual comes from `chroma`.
+pub fn write_b_16x16_mb_chroma(
+    w: &mut BitWriter,
+    cfg: &B16x16McbConfig,
+    num_ref_idx_l0_active_minus1: u32,
+    num_ref_idx_l1_active_minus1: u32,
+    chroma_array_type: u32,
+    chroma: ChromaWriteKind<'_>,
+) -> Result<(), CavlcEncodeError> {
     debug_assert!(cfg.cbp_luma <= 15);
     debug_assert!(cfg.cbp_chroma <= 2);
 
@@ -1764,64 +1793,19 @@ pub fn write_b_16x16_mb(
         w.se(cfg.mvd_l1_y);
     }
 
-    // §7.3.5 — coded_block_pattern me(v) using the inter table.
-    let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
-    w.ue(codenum);
-
-    // §7.3.5 — transform_size_8x8_flag (second gate), present only
-    // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if let Some(flag) = cfg.transform_size_8x8_flag {
-        if cfg.cbp_luma > 0 {
-            w.u(1, if flag { 1 } else { 0 });
-        }
-    }
-
-    // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
-    let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
-    if needs_qp_delta {
-        w.se(cfg.mb_qp_delta);
-    }
-
-    // §7.3.5.3 — luma residual: 16 4x4 blocks grouped by 8x8 quadrant.
-    for blk8 in 0..4u8 {
-        if (cfg.cbp_luma >> blk8) & 1 == 1 {
-            for sub in 0..4u8 {
-                let blk = (blk8 * 4 + sub) as usize;
-                let nc = cfg.luma_4x4_nc[blk];
-                encode_residual_block_cavlc(
-                    w,
-                    CoeffTokenContext::Numeric(nc),
-                    16,
-                    &cfg.luma_4x4_levels[blk],
-                )?;
-            }
-        }
-    }
-
-    // §7.3.5.3 — chroma residual: same structure as P_L0_16x16.
-    if cfg.cbp_chroma > 0 {
-        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
-        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
-    }
-    if cfg.cbp_chroma == 2 {
-        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
-            encode_residual_block_cavlc(
-                w,
-                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
-                15,
-                &blk[..15],
-            )?;
-        }
-        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
-            encode_residual_block_cavlc(
-                w,
-                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
-                15,
-                &blk[..15],
-            )?;
-        }
-    }
-    Ok(())
+    // §7.3.5 — cbp + second-gate flag + mb_qp_delta + luma residual +
+    // chroma residual (shared inter tail).
+    emit_inter_mb_tail(
+        w,
+        chroma_array_type,
+        cfg.cbp_luma,
+        cfg.cbp_chroma,
+        cfg.transform_size_8x8_flag,
+        cfg.mb_qp_delta,
+        &cfg.luma_4x4_levels,
+        &cfg.luma_4x4_nc,
+        chroma,
+    )
 }
 
 /// Configuration for one B-slice **B_Direct_16x16** macroblock
@@ -1890,70 +1874,51 @@ pub fn write_b_direct_16x16_mb(
     w: &mut BitWriter,
     cfg: &BDirect16x16McbConfig,
 ) -> Result<(), CavlcEncodeError> {
+    write_b_direct_16x16_mb_chroma(
+        w,
+        cfg,
+        1,
+        ChromaWriteKind::Yuv420 {
+            chroma_dc_cb: &cfg.chroma_dc_cb,
+            chroma_dc_cr: &cfg.chroma_dc_cr,
+            chroma_ac_cb: &cfg.chroma_ac_cb,
+            chroma_ac_cr: &cfg.chroma_ac_cr,
+            cb_ac_nc: &cfg.chroma_ac_nc_cb,
+            cr_ac_nc: &cfg.chroma_ac_nc_cr,
+        },
+    )
+}
+
+/// Round-397 — emit one B-slice `B_Direct_16x16` macroblock with an
+/// explicit chroma layout (CAVLC, ChromaArrayType ∈ {1, 2, 3}). The
+/// embedded 4:2:0 chroma fields of `cfg` are ignored; the chroma
+/// residual comes from `chroma`.
+pub fn write_b_direct_16x16_mb_chroma(
+    w: &mut BitWriter,
+    cfg: &BDirect16x16McbConfig,
+    chroma_array_type: u32,
+    chroma: ChromaWriteKind<'_>,
+) -> Result<(), CavlcEncodeError> {
     debug_assert!(cfg.cbp_luma <= 15);
     debug_assert!(cfg.cbp_chroma <= 2);
 
     // §7.4.5 Table 7-14 — raw mb_type 0 = B_Direct_16x16.
     w.ue(0);
 
-    // §7.3.5 — coded_block_pattern me(v) using the inter table.
-    let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
-    w.ue(codenum);
-
-    // §7.3.5 — transform_size_8x8_flag (second gate), present only
-    // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if let Some(flag) = cfg.transform_size_8x8_flag {
-        if cfg.cbp_luma > 0 {
-            w.u(1, if flag { 1 } else { 0 });
-        }
-    }
-
-    // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
-    let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
-    if needs_qp_delta {
-        w.se(cfg.mb_qp_delta);
-    }
-
-    // §7.3.5.3 — luma residual blocks (when cbp_luma != 0).
-    for blk8 in 0..4u8 {
-        if (cfg.cbp_luma >> blk8) & 1 == 1 {
-            for sub in 0..4u8 {
-                let blk = (blk8 * 4 + sub) as usize;
-                let nc = cfg.luma_4x4_nc[blk];
-                encode_residual_block_cavlc(
-                    w,
-                    CoeffTokenContext::Numeric(nc),
-                    16,
-                    &cfg.luma_4x4_levels[blk],
-                )?;
-            }
-        }
-    }
-
-    // §7.3.5.3 — chroma residual: same structure as P_L0_16x16 / B_L0_16x16.
-    if cfg.cbp_chroma > 0 {
-        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
-        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
-    }
-    if cfg.cbp_chroma == 2 {
-        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
-            encode_residual_block_cavlc(
-                w,
-                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
-                15,
-                &blk[..15],
-            )?;
-        }
-        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
-            encode_residual_block_cavlc(
-                w,
-                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
-                15,
-                &blk[..15],
-            )?;
-        }
-    }
-    Ok(())
+    // §7.3.5 — cbp + second-gate flag + mb_qp_delta + luma residual +
+    // chroma residual (shared inter tail). No mvd / ref_idx fields —
+    // the decoder derives the motion per §8.4.1.2.
+    emit_inter_mb_tail(
+        w,
+        chroma_array_type,
+        cfg.cbp_luma,
+        cfg.cbp_chroma,
+        cfg.transform_size_8x8_flag,
+        cfg.mb_qp_delta,
+        &cfg.luma_4x4_levels,
+        &cfg.luma_4x4_nc,
+        chroma,
+    )
 }
 
 // ---------------------------------------------------------------------------
