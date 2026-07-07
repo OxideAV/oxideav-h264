@@ -619,6 +619,7 @@ mod tests {
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
             pic_scaling_lists: None,
+            chroma_format_idc: 1,
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: 0,

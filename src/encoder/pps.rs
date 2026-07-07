@@ -66,6 +66,10 @@ pub struct BaselinePpsConfig {
     /// `ScalingListsSpec::Custom` codes the caller's values explicitly
     /// (round-391).
     pub pic_scaling_lists: Option<super::ScalingListsSpec>,
+    /// §7.3.2.2 — the active SPS's `chroma_format_idc`. Only consulted
+    /// for the scaling-list loop bound (4:4:4 carries 6 extra 8x8
+    /// lists when `transform_8x8_mode_flag = 1`). Default 1 (4:2:0).
+    pub chroma_format_idc: u32,
 }
 
 /// Build a Baseline PPS RBSP body (§7.3.2.2).
@@ -113,7 +117,15 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
             w.u(1, 1); // pic_scaling_matrix_present_flag
                        // §7.3.2.2 loop bound: 6 + [2, 6] * transform_8x8_mode_flag
                        // (4:2:0/4:2:2 → 2 extra 8x8 lists).
-            let n_lists = 6 + if cfg.transform_8x8_mode_flag { 2 } else { 0 };
+                       // §7.3.2.2 loop bound:
+                       //   6 + ((chroma_format_idc != 3) ? 2 : 6) * transform_8x8_mode_flag
+            let n_lists = 6 + if !cfg.transform_8x8_mode_flag {
+                0
+            } else if cfg.chroma_format_idc != 3 {
+                2
+            } else {
+                6
+            };
             for i in 0..n_lists {
                 w.u(1, 1); // pic_scaling_list_present_flag[i]
                 crate::encoder::sps::write_scaling_list_slot(&mut w, spec, i);
@@ -137,6 +149,7 @@ mod tests {
     fn baseline_pps_round_trips_through_decoder_parser() {
         let cfg = BaselinePpsConfig {
             pic_scaling_lists: None,
+            chroma_format_idc: 1,
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: 0,

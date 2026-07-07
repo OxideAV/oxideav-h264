@@ -516,6 +516,15 @@ pub fn forward_hadamard_4x2(dc: &[i32; 8]) -> [i32; 8] {
 /// produced — convert to spec scan order via [`scan_chroma_dc_422`]
 /// before handing to CAVLC.
 pub fn quantize_chroma_dc_422(coeff: &[i32; 8], qp_c: i32, is_intra: bool) -> [i32; 8] {
+    quantize_chroma_dc_422_w(coeff, qp_c, is_intra, 16)
+}
+
+/// [`quantize_chroma_dc_422`] under a non-flat weightScale: the
+/// §8.5.11.2 eq. 8-328/8-329 scaling uses `LevelScale4x4(qP % 6, 0, 0)`
+/// of the chroma list, i.e. `weightScale(0, 0) * normAdjust / 16` —
+/// so the forward step divides by `w00 / 16`. With `w00 == 16` this is
+/// bit-identical to the flat quantiser.
+pub fn quantize_chroma_dc_422_w(coeff: &[i32; 8], qp_c: i32, is_intra: bool, w00: i32) -> [i32; 8] {
     debug_assert!((0..=51).contains(&qp_c));
     let m = (qp_c.rem_euclid(6)) as usize;
     let mf = forward_mf_for(m)[0];
@@ -528,7 +537,7 @@ pub fn quantize_chroma_dc_422(coeff: &[i32; 8], qp_c: i32, is_intra: bool) -> [i
     let mut z = [0i32; 8];
     for k in 0..8 {
         let abs_c = (coeff[k] as i64).unsigned_abs();
-        let prod = abs_c * mf as u64;
+        let prod = (abs_c * mf as u64 * 16) / (w00.max(1) as u64);
         let level = ((prod as i64 + f) >> qb) as i32;
         z[k] = if coeff[k] < 0 { -level } else { level };
     }

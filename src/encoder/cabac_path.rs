@@ -62,7 +62,7 @@ use crate::encoder::slice::{
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
     deinterleave_8x8_to_4x4, forward_core_4x4, forward_core_8x8, forward_hadamard_2x2,
-    forward_hadamard_4x4, quantize_4x4_ac, quantize_4x4_ac_w, quantize_8x8_w, quantize_chroma_dc_w,
+    forward_hadamard_4x4, quantize_4x4_ac_w, quantize_8x8_w, quantize_chroma_dc_w,
     quantize_luma_dc_w, zigzag_scan_4x4, zigzag_scan_4x4_ac, zigzag_scan_8x8,
 };
 use crate::encoder::{
@@ -88,9 +88,9 @@ use crate::encoder::{
 use crate::intra_pred::{filter_samples_8x8, predict_8x8, Intra8x8Mode};
 use crate::nal::NalUnitType;
 use crate::transform::{
-    default_scaling_list_8x8_flat, inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
+    inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
     inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
-    qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
+    qp_y_to_qp_c_with_bd_offset,
 };
 
 /// §6.4.3 / Figure 6-10 — luma 4x4 block scan (block index → (bx, by)).
@@ -1645,8 +1645,9 @@ fn chroma_plane_i8x8_444_cabac(
     mb_y: usize,
     luma_modes: &[u8; 4],
     qp_c: i32,
+    w8: &[i32; 64],
 ) -> ([[i32; 64]; 4], [bool; 4]) {
-    let sl8 = default_scaling_list_8x8_flat();
+    let sl8 = *w8;
     let mut scan8 = [[0i32; 64]; 4];
     let mut has_nz = [false; 4];
     for blk8 in 0..4usize {
@@ -1883,14 +1884,10 @@ impl Encoder {
             matches!(cfg.chroma_format_idc, 1..=3),
             "encode_idr_cabac supports chroma_format_idc 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
         );
-        // Round-391 — non-flat scaling matrices now run under CABAC at
-        // 4:2:0 (I/P/B). The 4:2:2 / 4:4:4 CABAC paths keep the flat
-        // requirement.
+        // Round-397 — non-flat scaling matrices run under CABAC at
+        // every chroma format (see encode_idr). The trellis
+        // refinements still assume flat dequantisation.
         if !cfg.scaling_matrix.is_flat() {
-            assert_eq!(
-                cfg.chroma_format_idc, 1,
-                "non-flat scaling matrices are 4:2:0-only on encode_idr_cabac",
-            );
             assert!(
                 !cfg.trellis_quant_intra && !cfg.trellis_quant_intra_chroma,
                 "trellis intra refinement assumes flat scaling lists",
@@ -1953,6 +1950,7 @@ impl Encoder {
         });
         let pps_cfg = BaselinePpsConfig {
             pic_scaling_lists: cfg.scaling_matrix.pic_spec(),
+            chroma_format_idc: cfg.chroma_format_idc,
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: cfg.qp - 26,
@@ -2129,17 +2127,8 @@ impl Encoder {
                     // DC + per-4x4 AC + recon residual) shared with the
                     // CAVLC path.
                     let cbk = super::encode_chroma_block(
-                        2,
-                        frame.u,
-                        frame.v,
-                        &recon_u,
-                        &recon_v,
-                        chroma_w,
-                        chroma_h,
-                        mb_x,
-                        mb_y,
-                        qp_c,
-                        &FLAT_4X4_16,
+                        2, frame.u, frame.v, &recon_u, &recon_v, chroma_w, chroma_h, mb_x, mb_y,
+                        qp_c, &wq_i.w4,
                     );
                     chroma_mode = cbk.pred_mode;
                     cbp_chroma = cbk.cbp_chroma;
@@ -2166,6 +2155,7 @@ impl Encoder {
                         mb_y,
                         &luma_modes,
                         qp_c,
+                        &wq_i.w8,
                     );
                     cb_scan8_444 = cbs;
                     cb8_nz_444 = cbnz;
@@ -2177,6 +2167,7 @@ impl Encoder {
                         mb_y,
                         &luma_modes,
                         qp_c,
+                        &wq_i.w8,
                     );
                     cr_scan8_444 = crs;
                     cr8_nz_444 = crnz;
@@ -2193,6 +2184,7 @@ impl Encoder {
                         luma_mode,
                         qp_c,
                         cfg.trellis_quant_intra_chroma,
+                        &wq_i.w4,
                     );
                     cb_dc_444 = cdc;
                     cb_ac_scan_444 = cac;
@@ -2206,6 +2198,7 @@ impl Encoder {
                         luma_mode,
                         qp_c,
                         cfg.trellis_quant_intra_chroma,
+                        &wq_i.w4,
                     );
                     cr_dc_444 = cdc2;
                     cr_ac_scan_444 = cac2;
@@ -2824,12 +2817,8 @@ impl Encoder {
         // path at 4:2:0: inter residuals quantise / dequantise under
         // the inter weightScale lists (flat reduces to the legacy
         // arithmetic bit-exactly).
-        if !cfg.scaling_matrix.is_flat() {
-            assert_eq!(
-                cfg.chroma_format_idc, 1,
-                "non-flat scaling matrices are 4:2:0-only on encode_p_cabac",
-            );
-        }
+        // Round-397 — non-flat scaling matrices run at every chroma
+        // format (see encode_idr).
         let wq = cfg.scaling_matrix.inter_weights();
         let width = cfg.width as usize;
         let height = cfg.height as usize;
@@ -3217,10 +3206,10 @@ impl Encoder {
                         let pu: &[i32; 128] = pred_u[..128].try_into().expect("pred tile");
                         let pv: &[i32; 128] = pred_v[..128].try_into().expect("pred tile");
                         let (dcu, acu, ru) = super::encode_chroma_residual_422(
-                            frame.u, chroma_w, mb_x, mb_y, pu, qp_c,
+                            frame.u, chroma_w, mb_x, mb_y, pu, qp_c, &wq.w4,
                         );
                         let (dcv, acv, rv) = super::encode_chroma_residual_422(
-                            frame.v, chroma_w, mb_x, mb_y, pv, qp_c,
+                            frame.v, chroma_w, mb_x, mb_y, pv, qp_c, &wq.w4,
                         );
                         cb_dc8 = dcu;
                         cr_dc8 = dcv;
@@ -3962,12 +3951,8 @@ impl Encoder {
             matches!(cfg.chroma_format_idc, 1..=3),
             "encode_b_cabac supports chroma_format_idc 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
         );
-        if !cfg.scaling_matrix.is_flat() {
-            assert_eq!(
-                cfg.chroma_format_idc, 1,
-                "non-flat scaling matrices are 4:2:0-only on encode_b_cabac",
-            );
-        }
+        // Round-397 — non-flat scaling matrices run at every chroma
+        // format (see encode_idr).
         assert_eq!(frame.width, cfg.width);
         assert_eq!(frame.height, cfg.height);
         assert_eq!(ref_l0.width, cfg.width);
@@ -4385,10 +4370,10 @@ impl Encoder {
                         let pu: &[i32; 128] = pred_u[..128].try_into().expect("pred tile");
                         let pv: &[i32; 128] = pred_v[..128].try_into().expect("pred tile");
                         let (dcu, acu, ru) = super::encode_chroma_residual_422(
-                            frame.u, chroma_w, mb_x, mb_y, pu, qp_c,
+                            frame.u, chroma_w, mb_x, mb_y, pu, qp_c, &wq.w4,
                         );
                         let (dcv, acv, rv) = super::encode_chroma_residual_422(
-                            frame.v, chroma_w, mb_x, mb_y, pv, qp_c,
+                            frame.v, chroma_w, mb_x, mb_y, pv, qp_c, &wq.w4,
                         );
                         cb_dc8 = dcu;
                         cr_dc8 = dcv;
@@ -7800,6 +7785,7 @@ fn encode_chroma_intra16x16_444(
     mode: I16x16Mode,
     qp_c: i32,
     trellis: bool,
+    w4: &[i32; 16],
 ) -> (
     [i32; 16],
     [[i32; 16]; 16],
@@ -7807,7 +7793,7 @@ fn encode_chroma_intra16x16_444(
     bool,
     [i32; 256],
 ) {
-    use crate::encoder::transform::{forward_core_4x4, forward_hadamard_4x4, quantize_luma_dc};
+    use crate::encoder::transform::{forward_core_4x4, forward_hadamard_4x4, quantize_luma_dc_w};
     use crate::transform::{inverse_hadamard_luma_dc_16x16, inverse_transform_4x4_dc_preserved};
 
     // (1) Predictor from chroma recon plane (treated like luma).
@@ -7848,7 +7834,7 @@ fn encode_chroma_intra16x16_444(
         dc_coeffs[by * 4 + bx] = c[0];
     }
     let dc_t = forward_hadamard_4x4(&dc_coeffs);
-    let dc_levels = quantize_luma_dc(&dc_t, qp_c, true);
+    let dc_levels = quantize_luma_dc_w(&dc_t, qp_c, true, w4[0]);
 
     // (4) Per-block AC quantize (raster and scan order). Trellis
     // (round-151) refines each 4x4 with `skip_dc=true` so the §8.5.10
@@ -7865,7 +7851,7 @@ fn encode_chroma_intra16x16_444(
     for blkz in 0..16usize {
         let (bx, by) = LUMA_4X4_BLK[blkz];
         let raster = by * 4 + bx;
-        let mut z = quantize_4x4_ac(&coeffs_4x4[raster], qp_c, true);
+        let mut z = quantize_4x4_ac_w(&coeffs_4x4[raster], qp_c, true, w4);
         if trellis && z.iter().any(|&v| v != 0) {
             z = crate::encoder::transform::trellis_refine_4x4_ac(
                 &residual_4x4[raster],
@@ -7884,8 +7870,8 @@ fn encode_chroma_intra16x16_444(
     }
 
     // (5) Inverse path → produce decoder-bit-exact recon tile.
-    let inv_dc = inverse_hadamard_luma_dc_16x16(&dc_levels, qp_c, &FLAT_4X4_16, 8)
-        .expect("4:4:4 chroma DC inverse");
+    let inv_dc =
+        inverse_hadamard_luma_dc_16x16(&dc_levels, qp_c, w4, 8).expect("4:4:4 chroma DC inverse");
     let mut recon_tile = [0i32; 256];
     #[allow(clippy::needless_range_loop)]
     for blk in 0..16usize {
@@ -7897,7 +7883,7 @@ fn encode_chroma_intra16x16_444(
             [0i32; 16]
         };
         coeffs_in[0] = inv_dc[by * 4 + bx];
-        let r = inverse_transform_4x4_dc_preserved(&coeffs_in, qp_c, &FLAT_4X4_16, 8)
+        let r = inverse_transform_4x4_dc_preserved(&coeffs_in, qp_c, w4, 8)
             .expect("4:4:4 chroma 4x4 inverse");
         for j in 0..4 {
             for i in 0..4 {

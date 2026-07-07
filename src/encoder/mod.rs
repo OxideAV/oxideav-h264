@@ -77,9 +77,8 @@ use crate::encoder::slice::{
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
     deinterleave_8x8_to_4x4, forward_core_4x4, forward_core_8x8, forward_hadamard_2x2,
-    forward_hadamard_4x4, quantize_4x4_ac, quantize_4x4_ac_w, quantize_4x4_w, quantize_8x8,
-    quantize_8x8_w, quantize_chroma_dc_w, quantize_luma_dc, quantize_luma_dc_w, zigzag_scan_4x4,
-    zigzag_scan_4x4_ac, zigzag_scan_8x8,
+    forward_hadamard_4x4, quantize_4x4_ac_w, quantize_4x4_w, quantize_8x8_w, quantize_chroma_dc_w,
+    quantize_luma_dc_w, zigzag_scan_4x4, zigzag_scan_4x4_ac, zigzag_scan_8x8,
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::intra_pred::{
@@ -89,9 +88,9 @@ use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
 use crate::mv_deriv::{Mv, MvpredInputs, NeighbourMv};
 use crate::nal::NalUnitType;
 use crate::transform::{
-    default_scaling_list_8x8_flat, inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
-    inverse_scan_4x4_zigzag_ac, inverse_transform_4x4, inverse_transform_4x4_dc_preserved,
-    inverse_transform_8x8, qp_bd_offset, qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
+    inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16, inverse_scan_4x4_zigzag_ac,
+    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
+    qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
 };
 
 /// §6.4.3 / Figure 6-10 — luma 4x4 block scan: index 0..=15 → (x, y)
@@ -1239,14 +1238,13 @@ impl Encoder {
         );
         debug_assert_eq!(frame.v.len(), chroma_width * chroma_height);
 
-        // Round-388 scope — non-flat scaling matrices are wired for the
-        // CAVLC 4:2:0 intra path; the trellis refinements assume flat
+        // Round-397 — non-flat scaling matrices run at every chroma
+        // format: the 4:2:2 §8.5.11.2 chroma chain and the 4:4:4
+        // coded-like-luma planes quantise / reconstruct under the
+        // §8.5.9 weightScale; the SPS/PPS writers emit the 12-list
+        // loop at 4:4:4. The trellis refinements still assume flat
         // dequantisation.
         if !self.cfg.scaling_matrix.is_flat() {
-            assert_eq!(
-                self.cfg.chroma_format_idc, 1,
-                "non-flat scaling matrices are 4:2:0-only on encode_idr",
-            );
             assert!(
                 !self.cfg.trellis_quant_intra && !self.cfg.trellis_quant_intra_chroma,
                 "trellis intra refinement assumes flat scaling lists",
@@ -1288,6 +1286,7 @@ impl Encoder {
         };
         let pps_cfg = BaselinePpsConfig {
             pic_scaling_lists: self.cfg.scaling_matrix.pic_spec(),
+            chroma_format_idc: self.cfg.chroma_format_idc,
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: self.cfg.qp - 26,
@@ -2109,6 +2108,7 @@ impl Encoder {
                 mb_x,
                 mb_y,
                 qp_c,
+                &wq.w4,
             );
             let (cr_dc, cr_ac_scan, cr_ac_quant, cr_nz) = encode_intra16x16_chroma_plane_luma_like(
                 best_luma_mode,
@@ -2119,6 +2119,7 @@ impl Encoder {
                 mb_x,
                 mb_y,
                 qp_c,
+                &wq.w4,
             );
             cb_dc_444 = cb_dc;
             cr_dc_444 = cr_dc;
@@ -3454,7 +3455,10 @@ impl Encoder {
     ) -> MbDeblockInfo {
         let width = self.cfg.width as usize;
         let lambda = lambda_ssd(qp_y, true);
-        let sl8 = default_scaling_list_8x8_flat();
+        // §8.5.9 — round-397: the 8x8 quantise / reconstruct chain
+        // honours the intra weightScale (flat reduces bit-exactly).
+        let wq = self.cfg.scaling_matrix.intra_weights();
+        let sl8 = wq.w8;
 
         // Pre-mark the slot so in-MB neighbour lookups see this MB's
         // earlier-block modes (decoder ordering mirror).
@@ -3502,7 +3506,7 @@ impl Encoder {
                     }
                 }
                 let w_coeffs = forward_core_8x8(&res);
-                let z_raster = quantize_8x8(&w_coeffs, qp_y, true);
+                let z_raster = quantize_8x8_w(&w_coeffs, qp_y, true, &sl8);
                 let r = inverse_transform_8x8(&z_raster, qp_y, &sl8, 8).expect("inverse 8x8");
                 let mut recon_blk = [0i32; 64];
                 let mut d: u64 = 0;
@@ -3586,7 +3590,7 @@ impl Encoder {
                     }
                 }
                 let w_coeffs = forward_core_8x8(&res);
-                let z_raster = quantize_8x8(&w_coeffs, qp_c, true);
+                let z_raster = quantize_8x8_w(&w_coeffs, qp_c, true, &sl8);
                 let r = inverse_transform_8x8(&z_raster, qp_c, &sl8, 8).expect("inverse 8x8");
                 for j in 0..8 {
                     for i in 0..8 {
@@ -4590,10 +4594,24 @@ fn encode_chroma_block(
         recon_cb[..64].copy_from_slice(&u_recon);
         recon_cr[..64].copy_from_slice(&v_recon);
     } else {
-        let (u_dc, u_ac, u_recon) =
-            encode_chroma_residual_422(frame_u, chroma_width, mb_x, mb_y, &best_pred_u_128, qp_c);
-        let (v_dc, v_ac, v_recon) =
-            encode_chroma_residual_422(frame_v, chroma_width, mb_x, mb_y, &best_pred_v_128, qp_c);
+        let (u_dc, u_ac, u_recon) = encode_chroma_residual_422(
+            frame_u,
+            chroma_width,
+            mb_x,
+            mb_y,
+            &best_pred_u_128,
+            qp_c,
+            w4,
+        );
+        let (v_dc, v_ac, v_recon) = encode_chroma_residual_422(
+            frame_v,
+            chroma_width,
+            mb_x,
+            mb_y,
+            &best_pred_v_128,
+            qp_c,
+            w4,
+        );
         dc_cb = u_dc;
         dc_cr = v_dc;
         ac_cb = u_ac;
@@ -4695,6 +4713,7 @@ fn encode_intra16x16_chroma_plane_luma_like(
     mb_x: usize,
     mb_y: usize,
     qp_c: i32,
+    w4: &[i32; 16],
 ) -> ([i32; 16], [[i32; 16]; 16], [[i32; 16]; 16], bool) {
     // (1) Build the 16x16 predictor from the chroma plane's prior
     // recon. `predict_16x16` is plane-agnostic — it just reads u8
@@ -4737,7 +4756,7 @@ fn encode_intra16x16_chroma_plane_luma_like(
     // Forward Hadamard + quantize. Same helper as luma — chroma DC
     // for 4:4:4 follows the luma DC path per §8.5.10.
     let dc_t = forward_hadamard_4x4(&dc_coeffs);
-    let dc_levels = quantize_luma_dc(&dc_t, qp_c, true);
+    let dc_levels = quantize_luma_dc_w(&dc_t, qp_c, true, w4[0]);
 
     // (4) Per-block AC quantize. Reorder into §6.4.3 raster-Z.
     let mut ac_quant_raster = [[0i32; 16]; 16];
@@ -4746,7 +4765,7 @@ fn encode_intra16x16_chroma_plane_luma_like(
     for blkz in 0..16usize {
         let (bx, by) = LUMA_4X4_BLK[blkz];
         let raster = by * 4 + bx;
-        let z = quantize_4x4_ac(&coeffs_4x4[raster], qp_c, true);
+        let z = quantize_4x4_ac_w(&coeffs_4x4[raster], qp_c, true, w4);
         ac_quant_raster[raster] = z;
         ac_scan[blkz] = zigzag_scan_4x4_ac(&z);
         if ac_scan[blkz].iter().any(|&v| v != 0) {
@@ -4755,8 +4774,8 @@ fn encode_intra16x16_chroma_plane_luma_like(
     }
 
     // (5) Inverse path — produce decoder-bit-exact recon.
-    let inv_dc = inverse_hadamard_luma_dc_16x16(&dc_levels, qp_c, &FLAT_4X4_16, 8)
-        .expect("4:4:4 chroma DC inverse");
+    let inv_dc =
+        inverse_hadamard_luma_dc_16x16(&dc_levels, qp_c, w4, 8).expect("4:4:4 chroma DC inverse");
     #[allow(clippy::needless_range_loop)] // raster row-major over 16 4x4 blocks
     for blk in 0..16usize {
         let bx = blk % 4;
@@ -4767,7 +4786,7 @@ fn encode_intra16x16_chroma_plane_luma_like(
             [0i32; 16]
         };
         coeffs_in[0] = inv_dc[by * 4 + bx];
-        let r = inverse_transform_4x4_dc_preserved(&coeffs_in, qp_c, &FLAT_4X4_16, 8)
+        let r = inverse_transform_4x4_dc_preserved(&coeffs_in, qp_c, w4, 8)
             .expect("4:4:4 chroma 4x4 inverse");
         for j in 0..4 {
             for i in 0..4 {
@@ -4838,9 +4857,10 @@ fn encode_chroma_residual_422(
     mb_y: usize,
     pred: &[i32; 128],
     qp_c: i32,
+    w4: &[i32; 16],
 ) -> ([i32; 8], [[i32; 16]; 8], [i32; 128]) {
     use crate::encoder::transform::{
-        forward_hadamard_4x2, quantize_chroma_dc_422, scan_chroma_dc_422,
+        forward_hadamard_4x2, quantize_4x4_ac_w, quantize_chroma_dc_422_w, scan_chroma_dc_422,
     };
     use crate::transform::inverse_hadamard_chroma_dc_422;
 
@@ -4896,23 +4916,25 @@ fn encode_chroma_residual_422(
         sub_coeffs[7][0], // c[3,1]
     ];
 
-    // Forward 4x2 Hadamard + quantize.
+    // Forward 4x2 Hadamard + quantize. §8.5.11.2 — the DC scaling
+    // uses LevelScale4x4(qP % 6, 0, 0) of the chroma list (round-397:
+    // non-flat weightScale honoured; a flat list reduces bit-exactly).
     let dc_t = forward_hadamard_4x2(&dc_in);
-    let dc_q = quantize_chroma_dc_422(&dc_t, qp_c, true);
+    let dc_q = quantize_chroma_dc_422_w(&dc_t, qp_c, true, w4[0]);
     // Pack into spec scan order so the bitstream can carry it directly.
     let dc_levels = scan_chroma_dc_422(&dc_q);
 
     // Quantize AC of each sub-block (positions 1..15 in scan order).
     let mut ac_levels = [[0i32; 16]; 8];
     for (k, coeffs) in sub_coeffs.iter().enumerate() {
-        let z = quantize_4x4_ac(coeffs, qp_c, true);
+        let z = quantize_4x4_ac_w(coeffs, qp_c, true, w4);
         ac_levels[k] = zigzag_scan_4x4_ac(&z);
     }
 
     // ------- Reconstruct the chroma 8x16 residual -------
     // §8.5.11.2: inverse Hadamard → per-block DC-preserved inverse.
-    let dc_back = inverse_hadamard_chroma_dc_422(&dc_levels, qp_c, &FLAT_4X4_16, 8)
-        .expect("chroma DC 422 inverse");
+    let dc_back =
+        inverse_hadamard_chroma_dc_422(&dc_levels, qp_c, w4, 8).expect("chroma DC 422 inverse");
     // dc_back is row-major 4x2 → maps to blocks 0..=7 by (k as above).
     let dc_block_index_to_dc_back: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
@@ -4920,7 +4942,7 @@ fn encode_chroma_residual_422(
     for (k, &(bx, by)) in blocks_xy.iter().enumerate() {
         let mut coeffs = inverse_scan_4x4_zigzag_ac(&ac_levels[k]);
         coeffs[0] = dc_back[dc_block_index_to_dc_back[k]];
-        let r = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, &FLAT_4X4_16, 8)
+        let r = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, w4, 8)
             .expect("chroma 4x4 422 inverse");
         for j in 0..4 {
             for i in 0..4 {
@@ -5680,9 +5702,9 @@ impl Encoder {
                 let pu: &[i32; 128] = pred_u[..128].try_into().expect("pred tile");
                 let pv: &[i32; 128] = pred_v[..128].try_into().expect("pred tile");
                 let (dcu, acu, ru) =
-                    encode_chroma_residual_422(frame.u, chroma_width, mb_x, mb_y, pu, qp_c);
+                    encode_chroma_residual_422(frame.u, chroma_width, mb_x, mb_y, pu, qp_c, &wq.w4);
                 let (dcv, acv, rv) =
-                    encode_chroma_residual_422(frame.v, chroma_width, mb_x, mb_y, pv, qp_c);
+                    encode_chroma_residual_422(frame.v, chroma_width, mb_x, mb_y, pv, qp_c, &wq.w4);
                 u_dc8 = dcu;
                 v_dc8 = dcv;
                 u_ac8 = acu;
@@ -11824,9 +11846,9 @@ impl Encoder {
                 let pu: &[i32; 128] = pred_u[..128].try_into().expect("pred tile");
                 let pv: &[i32; 128] = pred_v[..128].try_into().expect("pred tile");
                 let (dcu, acu, ru) =
-                    encode_chroma_residual_422(frame.u, chroma_width, mb_x, mb_y, pu, qp_c);
+                    encode_chroma_residual_422(frame.u, chroma_width, mb_x, mb_y, pu, qp_c, &wq.w4);
                 let (dcv, acv, rv) =
-                    encode_chroma_residual_422(frame.v, chroma_width, mb_x, mb_y, pv, qp_c);
+                    encode_chroma_residual_422(frame.v, chroma_width, mb_x, mb_y, pv, qp_c, &wq.w4);
                 u_dc8 = dcu;
                 v_dc8 = dcv;
                 u_ac8 = acu;

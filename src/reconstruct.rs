@@ -5868,11 +5868,15 @@ fn reconstruct_inter_chroma_residual_444(
     let qp_cr = qp_y_to_qp_c_with_bd_offset(qp_y, cr_offset, qp_bd_offset_c) + qp_bd_offset_c;
 
     // §7.4.2.1.1.1 Table 7-2 — inter chroma lists. 4x4: i=4 (Cb) / i=5
-    // (Cr). 8x8: i=9 (Inter_Cb) / i=11 (Inter_Cr).
+    // (Cr). 8x8: spec i=9 (Inter_Cb) / i=11 (Inter_Cr) —
+    // `select_scaling_list_8x8` takes the 0-based 8x8 SUB-index
+    // (spec i - 6), so Inter_Cb = 3 and Inter_Cr = 5. (Round-397 fix:
+    // the spec indices 9/11 fell into the >= 6 flat fallback, so every
+    // non-flat 4:4:4 inter chroma 8x8 residual dequantised flat.)
     let sl4_cb = select_scaling_list_4x4(4, sps, pps);
     let sl4_cr = select_scaling_list_4x4(5, sps, pps);
-    let sl8_cb = select_scaling_list_8x8(9, sps, pps);
-    let sl8_cr = select_scaling_list_8x8(11, sps, pps);
+    let sl8_cb = select_scaling_list_8x8(3, sps, pps);
+    let sl8_cr = select_scaling_list_8x8(5, sps, pps);
 
     for plane in 0..2u8 {
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
