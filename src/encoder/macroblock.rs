@@ -107,6 +107,28 @@ pub enum ChromaWriteKind<'a> {
         /// argument.
         cbp_luma_for_ac_gate: u8,
     },
+    /// Round-397 — 4:4:4 **inter** (non-Intra_16x16) chroma layout.
+    /// Per §7.3.5.3 at ChromaArrayType == 3 each chroma plane is coded
+    /// like luma: 16 full 4x4 residual blocks (startIdx=0, endIdx=15,
+    /// maxNumCoeff=16) in §6.4.3 raster-Z order, gated by the SHARED
+    /// `cbp_luma` quadrant bits (no chroma CBP exists at 4:4:4 —
+    /// Table 9-4(b)). With `transform_size_8x8_flag = 1` each entry
+    /// carries the §7.4.5.3.3 de-interleaved four-4x4 split of the 8x8
+    /// scan list, exactly like the luma plane. Per-block nC is the
+    /// §9.2.1.1 per-plane (`derive_nc_plane_luma_like`) derivation.
+    Yuv444Inter {
+        /// Cb plane 4x4 residual blocks (§6.4.3 raster-Z order).
+        cb_levels: &'a [[i32; 16]; 16],
+        /// Cr plane 4x4 residual blocks.
+        cr_levels: &'a [[i32; 16]; 16],
+        /// Per-Cb-block §9.2.1.1 nC.
+        cb_nc: &'a [i32; 16],
+        /// Per-Cr-block §9.2.1.1 nC.
+        cr_nc: &'a [i32; 16],
+        /// The shared luma CBP whose quadrant bits gate each plane's
+        /// residual blocks.
+        cbp_luma: u8,
+    },
 }
 
 impl<'a> ChromaWriteKind<'a> {
@@ -258,6 +280,35 @@ impl<'a> ChromaWriteKind<'a> {
                             15,
                             &blk[..15],
                         )?;
+                    }
+                }
+            }
+            ChromaWriteKind::Yuv444Inter {
+                cb_levels,
+                cr_levels,
+                cb_nc,
+                cr_nc,
+                cbp_luma,
+            } => {
+                // §7.3.5.3 — ChromaArrayType == 3, non-Intra_16x16:
+                // residual_luma() is invoked once per chroma plane (Cb
+                // then Cr), walking the coded 8x8 quadrants of the
+                // SHARED cbp_luma with full 16-coefficient blocks.
+                // `cbp_chroma` carries no information at 4:4:4.
+                let _ = cbp_chroma;
+                for (levels, ncs) in [(cb_levels, cb_nc), (cr_levels, cr_nc)] {
+                    for blk8 in 0..4u8 {
+                        if (cbp_luma >> blk8) & 1 == 1 {
+                            for sub in 0..4u8 {
+                                let blk = (blk8 * 4 + sub) as usize;
+                                encode_residual_block_cavlc(
+                                    w,
+                                    CoeffTokenContext::Numeric(ncs[blk]),
+                                    16,
+                                    &levels[blk],
+                                )?;
+                            }
+                        }
                     }
                 }
             }
@@ -1169,6 +1220,94 @@ pub fn inter_cbp_to_codenum_420_422(cbp_luma: u8, cbp_chroma: u8) -> u32 {
     INTER_CBP_TO_CODENUM_420_422[cbp] as u32
 }
 
+/// Round-397 — Table 9-4(b) inter column inverse (ChromaArrayType ∈
+/// {0, 3}: CBP is the 4-bit luma pattern only; there is no chroma CBP
+/// suffix — at 4:4:4 the shared luma bits gate all three planes).
+const INTER_CBP_TO_CODENUM_0_3: [u8; 16] = {
+    // Inverse of `crate::macroblock_layer::ME_INTER_0_3`, reproduced
+    // inline (same convention as the 4:2:0/4:2:2 table above).
+    const FWD: [u8; 16] = [0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9];
+    let mut inv = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        inv[FWD[i] as usize] = i as u8;
+        i += 1;
+    }
+    inv
+};
+
+/// §9.1.2 — encode `coded_block_pattern` for a P/B inter MB at
+/// ChromaArrayType ∈ {0, 3}.
+pub fn inter_cbp_to_codenum_0_3(cbp_luma: u8) -> u32 {
+    debug_assert!(cbp_luma <= 15);
+    INTER_CBP_TO_CODENUM_0_3[cbp_luma as usize] as u32
+}
+
+/// Round-397 — shared §7.3.5 inter-MB tail: `coded_block_pattern`
+/// me(v) (Table 9-4(a) inter column at ChromaArrayType ∈ {1, 2},
+/// Table 9-4(b) at {0, 3}), the §7.3.5 second-gate
+/// `transform_size_8x8_flag`, `mb_qp_delta`, the 16 luma 4x4 residual
+/// blocks gated per 8x8 quadrant, and the chroma residual per
+/// [`ChromaWriteKind`]. Every CAVLC inter writer (P and B shapes)
+/// funnels through this once its head syntax (mb_type / sub_mb_type /
+/// ref_idx / mvd) is emitted.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_inter_mb_tail(
+    w: &mut BitWriter,
+    chroma_array_type: u32,
+    cbp_luma: u8,
+    cbp_chroma: u8,
+    transform_size_8x8_flag: Option<bool>,
+    mb_qp_delta: i32,
+    luma_4x4_levels: &[[i32; 16]; 16],
+    luma_4x4_nc: &[i32; 16],
+    chroma: ChromaWriteKind<'_>,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cbp_luma <= 15);
+    debug_assert!(cbp_chroma <= 2);
+
+    // §7.3.5 — coded_block_pattern me(v) with the ChromaArrayType-
+    // matched inter table.
+    let codenum = if chroma_array_type == 3 {
+        debug_assert_eq!(cbp_chroma, 0, "no chroma CBP at ChromaArrayType 3");
+        inter_cbp_to_codenum_0_3(cbp_luma)
+    } else {
+        inter_cbp_to_codenum_420_422(cbp_luma, cbp_chroma)
+    };
+    w.ue(codenum);
+
+    // §7.3.5 — transform_size_8x8_flag (second gate): coded when the
+    // PPS has transform_8x8_mode_flag = 1 and cbp_luma > 0.
+    if let Some(flag) = transform_size_8x8_flag {
+        if cbp_luma > 0 {
+            w.u(1, if flag { 1 } else { 0 });
+        }
+    }
+
+    // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
+    if cbp_luma > 0 || cbp_chroma > 0 {
+        w.se(mb_qp_delta);
+    }
+
+    // §7.3.5.3 — luma residual: 16 4x4 blocks grouped by 8x8 quadrant.
+    for blk8 in 0..4u8 {
+        if (cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(luma_4x4_nc[blk]),
+                    16,
+                    &luma_4x4_levels[blk],
+                )?;
+            }
+        }
+    }
+
+    // §7.3.5.3 — chroma residual per layout.
+    chroma.emit(w, cbp_chroma)
+}
+
 /// Configuration for one P_L0_16x16 macroblock (round-16 inter encoder).
 ///
 /// Layout per §7.3.5 / §7.3.5.1 with `mb_type == P_L0_16x16` (raw value
@@ -1246,6 +1385,33 @@ pub fn write_p_l0_16x16_mb(
     cfg: &PL016x16McbConfig,
     num_ref_idx_l0_active_minus1: u32,
 ) -> Result<(), CavlcEncodeError> {
+    write_p_l0_16x16_mb_chroma(
+        w,
+        cfg,
+        num_ref_idx_l0_active_minus1,
+        1,
+        ChromaWriteKind::Yuv420 {
+            chroma_dc_cb: &cfg.chroma_dc_cb,
+            chroma_dc_cr: &cfg.chroma_dc_cr,
+            chroma_ac_cb: &cfg.chroma_ac_cb,
+            chroma_ac_cr: &cfg.chroma_ac_cr,
+            cb_ac_nc: &cfg.chroma_ac_nc_cb,
+            cr_ac_nc: &cfg.chroma_ac_nc_cr,
+        },
+    )
+}
+
+/// Round-397 — emit one P_L0_16x16 macroblock with an explicit chroma
+/// layout (CAVLC, P-slice, ChromaArrayType ∈ {1, 2, 3}). The embedded
+/// 4:2:0 chroma fields of `cfg` are ignored; the chroma residual comes
+/// from `chroma`. `chroma_array_type` selects the Table 9-4 CBP column.
+pub fn write_p_l0_16x16_mb_chroma(
+    w: &mut BitWriter,
+    cfg: &PL016x16McbConfig,
+    num_ref_idx_l0_active_minus1: u32,
+    chroma_array_type: u32,
+    chroma: ChromaWriteKind<'_>,
+) -> Result<(), CavlcEncodeError> {
     debug_assert!(cfg.cbp_luma <= 15);
     debug_assert!(cfg.cbp_chroma <= 2);
 
@@ -1264,68 +1430,19 @@ pub fn write_p_l0_16x16_mb(
     w.se(cfg.mvd_l0_x);
     w.se(cfg.mvd_l0_y);
 
-    // §7.3.5 — coded_block_pattern me(v) using the inter table.
-    let codenum = inter_cbp_to_codenum_420_422(cfg.cbp_luma, cfg.cbp_chroma);
-    w.ue(codenum);
-
-    // §7.3.5 — transform_size_8x8_flag (second gate): coded when the
-    // PPS has transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if let Some(flag) = cfg.transform_size_8x8_flag {
-        if cfg.cbp_luma > 0 {
-            w.u(1, if flag { 1 } else { 0 });
-        }
-    }
-
-    // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
-    let needs_qp_delta = cfg.cbp_luma > 0 || cfg.cbp_chroma > 0;
-    if needs_qp_delta {
-        w.se(cfg.mb_qp_delta);
-    }
-
-    // §7.3.5.3 — luma residual: 16 4x4 blocks grouped by 8x8 quadrant.
-    // Each 8x8 quadrant covers 4 child 4x4 blocks; the cbp_luma bit
-    // gates the whole quadrant. (With transform_size_8x8_flag = 1 the
-    // four blocks per quadrant carry the §7.4.5.3.3 de-interleaved
-    // split of the 8x8 scan list — same syntax layout either way.)
-    for blk8 in 0..4u8 {
-        if (cfg.cbp_luma >> blk8) & 1 == 1 {
-            for sub in 0..4u8 {
-                let blk = (blk8 * 4 + sub) as usize;
-                let nc = cfg.luma_4x4_nc[blk];
-                encode_residual_block_cavlc(
-                    w,
-                    CoeffTokenContext::Numeric(nc),
-                    16,
-                    &cfg.luma_4x4_levels[blk],
-                )?;
-            }
-        }
-    }
-
-    // §7.3.5.3 — chroma residual: same structure as for I_16x16.
-    if cfg.cbp_chroma > 0 {
-        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cb)?;
-        encode_residual_block_cavlc(w, CoeffTokenContext::ChromaDc420, 4, &cfg.chroma_dc_cr)?;
-    }
-    if cfg.cbp_chroma == 2 {
-        for (k, blk) in cfg.chroma_ac_cb.iter().enumerate() {
-            encode_residual_block_cavlc(
-                w,
-                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cb[k]),
-                15,
-                &blk[..15],
-            )?;
-        }
-        for (k, blk) in cfg.chroma_ac_cr.iter().enumerate() {
-            encode_residual_block_cavlc(
-                w,
-                CoeffTokenContext::Numeric(cfg.chroma_ac_nc_cr[k]),
-                15,
-                &blk[..15],
-            )?;
-        }
-    }
-    Ok(())
+    // §7.3.5 — cbp + second-gate flag + mb_qp_delta + luma residual +
+    // chroma residual (shared inter tail).
+    emit_inter_mb_tail(
+        w,
+        chroma_array_type,
+        cfg.cbp_luma,
+        cfg.cbp_chroma,
+        cfg.transform_size_8x8_flag,
+        cfg.mb_qp_delta,
+        &cfg.luma_4x4_levels,
+        &cfg.luma_4x4_nc,
+        chroma,
+    )
 }
 
 // ---------------------------------------------------------------------------

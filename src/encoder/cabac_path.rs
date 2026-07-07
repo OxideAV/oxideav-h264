@@ -7422,7 +7422,7 @@ fn build_inter_pred_luma_local(
 /// §8.4.1.4 / §8.4.2.2.2 — 4:2:2 chroma predictor for one 8x16 MB
 /// tile. Horizontal is subsampled like 4:2:0; vertical is full height,
 /// so the 1/8-pel chroma MV is `mvC.y = mvL.y * 2` (mvL in 1/4-pel).
-fn build_inter_pred_chroma_local_422(
+pub(super) fn build_inter_pred_chroma_local_422(
     ref_c: &[u8],
     ref_cw: u32,
     ref_ch: u32,
