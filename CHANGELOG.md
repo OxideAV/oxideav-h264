@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- CAVLC 4:2:2 and 4:4:4 P-slices (multi-format `encode_p`: per-format
+  chroma MC, §8.5.11.2 inter chroma chain at 4:2:2, §7.3.5.3
+  coded-like-luma chroma with Table 9-4(b) inter CBP at 4:4:4, real
+  per-format §9.2.1.1 nC)
+- CAVLC 4:2:2 and 4:4:4 B-slices (B_Skip / B_Direct_16x16 — spatial
+  and temporal — plus the explicit 16x16 mode set)
+- B_Skip / B_Direct_16x16 at 4:2:2 / 4:4:4 under CABAC (spatial
+  §8.4.1.2.2 direct with the uniform gate)
+- B 16x8 / 8x16 partitions at 4:2:2 / 4:4:4 under BOTH entropy coders
+  (per-format chroma-rect MC via `build_chroma_rect_pred_fmt`)
+- Non-flat scaling matrices at 4:2:2 and 4:4:4 (every entropy coder,
+  I/P/B): weighted §8.5.11.2 4:2:2 chroma chain
+  (`quantize_chroma_dc_422_w`), weighted 4:4:4 coded-like-luma plane
+  chains, and the §7.3.2.2 PPS 12-list loop at 4:4:4
+
+### Fixed
+
+- CABAC B_Skip deblock records only carried the L0 side of the direct
+  derivation — the encoder-side §8.7.2.1 walker read a phantom ref/MV
+  mismatch (bS 0 → 1) on edges against coded B_Direct neighbours and
+  filtered samples the decoder leaves alone
+- Decoder: the 4:4:4 inter chroma 8x8 dequant selected its scaling
+  lists with spec indices (9/11) where `select_scaling_list_8x8`
+  takes the 0-based sub-index — every non-flat 4:4:4 inter chroma 8x8
+  residual dequantised flat
+
 - 4:4:4 I_4x4 encoder leg — §8.3.4.5 chroma-as-luma 4x4 emit with
   per-plane §9.2.1.1 nC; the CAVLC 4:4:4 IDR trial is two-way
   (I_16x16 / Intra_4x4) or three-way (+ Intra_8x8 under transform_8x8)

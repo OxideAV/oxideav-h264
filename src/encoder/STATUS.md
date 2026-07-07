@@ -1347,3 +1347,74 @@ fix surfaced by the new inter-4:4:4 interop pins.
   4:4:4 assert Flat.
 - The trellis intra rate-model recalibration (stretch) was not
   reached this round.
+
+## Round 397 — landed
+
+**The encoder's chroma-format matrix is complete**: every
+(entropy coder × chroma format × slice type) cell encodes and decodes
+bit-exact through both this crate's decoder and the black-box
+reference decoder.
+
+- **CAVLC 4:2:2/4:4:4 P** (`encode_p` multi-format): Table 6-1 plane
+  dims, per-format chroma MC (§8.4.1.4 `mvC.y = mvL.y·2` at 4:2:2;
+  §8.4.2.2.1 luma 6-tap per chroma plane at 4:4:4), the §8.5.11.2
+  2x4-Hadamard inter chain + `ChromaDc422` contexts at 4:2:2, and
+  §7.3.5.3 coded-like-luma chroma at 4:4:4 (Table 9-4(b) inter CBP,
+  `ChromaWriteKind::Yuv444Inter`, `derive_plane_nc_444_inter`). All
+  CAVLC inter writers now funnel through a shared `emit_inter_mb_tail`
+  (legacy 4:2:0 delegates bit-identically). P slice header/deblock
+  mirror encode_idr (4:2:2 deblocks at chroma_array_type=2; 4:4:4
+  disables deblocking).
+- **CAVLC 4:2:2/4:4:4 B** (`encode_b_mb_multifmt`): B_Skip /
+  B_Direct_16x16 (spatial §8.4.1.2.2 AND temporal §8.4.1.2.3 behind
+  the round-21 uniform gate), explicit B_L0/L1/Bi_16x16 (round-26
+  explicit weighted luma merge included), and the 16x8 / 8x16
+  partition shapes.
+- **CABAC B skip/direct at 4:2:2/4:4:4**: the r391 explicit-only
+  branch gains the spatial-direct trial; a zero-residual direct
+  winner folds into B_Skip. Fixed alongside: the B_Skip deblock
+  record only carried the L0 list (phantom bS 0→1 against coded
+  direct neighbours — latent at 4:2:0 on flat fixtures, surfaced by
+  the 4:2:2 pin as a 1-LSB Cb divergence from BOTH decoders).
+- **CABAC B partitions at 4:2:2/4:4:4**: Table 7-14 raw-4..=21
+  binarisation, per-partition §8.4.1.3 mvps with within-MB inflight
+  state, §9.3.3.1.1.7 |mvd|-sum contexts at the partition top-left
+  4x4 with per-4x4 fan-out, per-half grid + deblock identity.
+- **Per-format partition chroma MC**: `build_chroma_rect_pred_fmt`
+  motion-compensates an arbitrary chroma rectangle at any format
+  (1/8-pel bilinear at 4:2:0/4:2:2, luma 6-tap at 4:4:4); a 16x8 luma
+  half maps to a ct_w × ct_h/2 chroma rect, an 8x16 half to
+  ct_w/2 × ct_h.
+- **Non-flat scaling matrices at 4:2:2/4:4:4** (every entropy coder,
+  I/P/B): `quantize_chroma_dc_422_w` (eq. 8-328/8-329
+  `LevelScale4x4(qP%6, 0, 0)`), weighted 4:2:2 AC + recon inverses,
+  weighted 4:4:4 coded-like-luma plane chains (I_16x16 DC/AC, I_8x8,
+  inter), and the §7.3.2.2 PPS
+  `6 + ((chroma_format_idc != 3) ? 2 : 6) · transform_8x8` list loop.
+  Decoder fix: the 4:4:4 inter chroma 8x8 dequant passed SPEC list
+  indices (9/11) to the sub-index-based `select_scaling_list_8x8` —
+  the >= 6 flat fallback silently dequantised every non-flat 4:4:4
+  inter chroma 8x8 residual flat (Inter_Cb = 3, Inter_Cr = 5).
+
+### Validation
+
+- `tests/integration_cavlc_pb_chroma_formats.rs` (13 gates): CAVLC
+  P/B GOPs at 4:2:2 + 4:4:4 (± transform_8x8), flat-source P_Skip /
+  B_Skip runs at all three formats, per-half-motion partition
+  fixtures (16x8 + 8x16; selection instrumented: 17/26 partition MBs).
+- `tests/integration_cabac_pb_chroma_formats.rs` grows to 11 gates:
+  CABAC B skip runs + partition fixtures at 4:2:2/4:4:4.
+- `tests/integration_scaling_matrix_chroma_formats.rs` (8 gates):
+  SeqDefault / PicDefault / SeqCustom × {4:2:2, 4:4:4} × {CAVLC,
+  CABAC} ± transform_8x8, with flat-vs-non-flat discriminators.
+- Every stream bit-exact through our decoder AND byte-exact through
+  the black-box reference decoder. Full suite: 1617 tests green.
+
+### Status caveats
+
+- 4MV P_8x8, B_8x8 (all-direct / mixed) and the Intra_16x16-in-inter
+  fallback remain 4:2:0-only encoder mode choices (the 4:2:2/4:4:4
+  cells are fully encodable without them).
+- Trellis refinement still asserts flat scaling lists.
+- The trellis intra rate-model recalibration (stretch, named in r391)
+  was again not reached.
