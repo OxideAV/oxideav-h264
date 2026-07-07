@@ -2185,6 +2185,80 @@ pub fn write_b_8x16_mb(
     )
 }
 
+/// Round-397 — emit one B-slice 16x8 macroblock with an explicit
+/// chroma layout (CAVLC, ChromaArrayType ∈ {1, 2, 3}). The embedded
+/// 4:2:0 chroma fields of `cfg` are ignored.
+pub fn write_b_16x8_mb_chroma(
+    w: &mut BitWriter,
+    cfg: &B16x8McbConfig,
+    num_ref_idx_l0_active_minus1: u32,
+    num_ref_idx_l1_active_minus1: u32,
+    chroma_array_type: u32,
+    chroma: ChromaWriteKind<'_>,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+
+    // §7.4.5 — Table 7-14 mb_type for the (top, bottom) pair.
+    w.ue(b_16x8_mb_type_raw(cfg.top, cfg.bottom));
+    write_b_two_part_pred(
+        w,
+        [cfg.top, cfg.bottom],
+        cfg.mvd_l0,
+        cfg.mvd_l1,
+        num_ref_idx_l0_active_minus1,
+        num_ref_idx_l1_active_minus1,
+    );
+    emit_inter_mb_tail(
+        w,
+        chroma_array_type,
+        cfg.cbp_luma,
+        cfg.cbp_chroma,
+        cfg.transform_size_8x8_flag,
+        cfg.mb_qp_delta,
+        &cfg.luma_4x4_levels,
+        &cfg.luma_4x4_nc,
+        chroma,
+    )
+}
+
+/// Round-397 — emit one B-slice 8x16 macroblock with an explicit
+/// chroma layout (CAVLC, ChromaArrayType ∈ {1, 2, 3}). The embedded
+/// 4:2:0 chroma fields of `cfg` are ignored.
+pub fn write_b_8x16_mb_chroma(
+    w: &mut BitWriter,
+    cfg: &B8x16McbConfig,
+    num_ref_idx_l0_active_minus1: u32,
+    num_ref_idx_l1_active_minus1: u32,
+    chroma_array_type: u32,
+    chroma: ChromaWriteKind<'_>,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+
+    // §7.4.5 — Table 7-14 mb_type for the (left, right) pair.
+    w.ue(b_8x16_mb_type_raw(cfg.left, cfg.right));
+    write_b_two_part_pred(
+        w,
+        [cfg.left, cfg.right],
+        cfg.mvd_l0,
+        cfg.mvd_l1,
+        num_ref_idx_l0_active_minus1,
+        num_ref_idx_l1_active_minus1,
+    );
+    emit_inter_mb_tail(
+        w,
+        chroma_array_type,
+        cfg.cbp_luma,
+        cfg.cbp_chroma,
+        cfg.transform_size_8x8_flag,
+        cfg.mb_qp_delta,
+        &cfg.luma_4x4_levels,
+        &cfg.luma_4x4_nc,
+        chroma,
+    )
+}
+
 /// §7.3.5.1 — emit ref_idx_l0[0..=1], ref_idx_l1[0..=1], mvd_l0[0..=1],
 /// mvd_l1[0..=1] for the two partitions of a B 16x8 or B 8x16 MB.
 ///

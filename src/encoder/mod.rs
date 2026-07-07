@@ -4186,6 +4186,93 @@ pub(crate) fn build_inter_pred_luma_8x8(
     dst
 }
 
+/// Round-397 — motion-compensate one chroma rectangle at any chroma
+/// format. `(cx0, cy0)` is the rect's top-left in CHROMA samples and
+/// `(rw, rh)` its size. Per §8.4.1.4 / §8.4.2.2:
+///   * fmt 1 (4:2:0) / 2 (4:2:2) — 1/8-pel bilinear; `mvC.x = mvL.x`
+///     and `mvC.y = mvL.y` (4:2:0) or `mvL.y * 2` (4:2:2, eq. 8-227)
+///     in 1/8-pel units.
+///   * fmt 3 (4:4:4) — the §8.4.2.2.1 LUMA 6-tap process with
+///     `mvC = mvL` (1/4-pel, eq. 8-235..8-238).
+#[allow(clippy::too_many_arguments)]
+fn build_chroma_rect_pred_fmt(
+    plane: &[u8],
+    plane_w: u32,
+    plane_h: u32,
+    cx0: usize,
+    cy0: usize,
+    rw: usize,
+    rh: usize,
+    mv: Mv,
+    fmt: u32,
+) -> Vec<i32> {
+    let stride = plane_w as usize;
+    let h = plane_h as usize;
+    let ref_i32: Vec<i32> = plane.iter().take(stride * h).map(|&v| v as i32).collect();
+    let mut dst = vec![0i32; rw * rh];
+    if fmt == 3 {
+        let int_x = cx0 as i32 + (mv.x >> 2);
+        let int_y = cy0 as i32 + (mv.y >> 2);
+        let x_frac = (mv.x & 3) as u8;
+        let y_frac = (mv.y & 3) as u8;
+        interpolate_luma(
+            &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, rw as u32, rh as u32, 8,
+            &mut dst, rw,
+        )
+        .expect("4:4:4 luma-like chroma interpolation");
+    } else {
+        let mv_cx = mv.x;
+        let mv_cy = if fmt == 2 { mv.y * 2 } else { mv.y };
+        let int_x = cx0 as i32 + (mv_cx >> 3);
+        let int_y = cy0 as i32 + (mv_cy >> 3);
+        let x_frac = (mv_cx & 7) as u8;
+        let y_frac = (mv_cy & 7) as u8;
+        interpolate_chroma(
+            &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, rw as u32, rh as u32, 8,
+            &mut dst, rw,
+        )
+        .expect("chroma rect interpolation");
+    }
+    dst
+}
+
+/// Round-397 — B-partition chroma rect predictor: per-list rect MC via
+/// [`build_chroma_rect_pred_fmt`] merged per §8.4.2.3.1 (default
+/// average) according to the partition's list usage.
+#[allow(clippy::too_many_arguments)]
+fn build_b_partition_chroma_rect_fmt(
+    pred: BPartPred,
+    plane_l0: &[u8],
+    plane_l1: &[u8],
+    plane_w: u32,
+    plane_h: u32,
+    cx0: usize,
+    cy0: usize,
+    rw: usize,
+    rh: usize,
+    mv_l0: Mv,
+    mv_l1: Mv,
+    fmt: u32,
+) -> Vec<i32> {
+    match pred {
+        BPartPred::L0 => {
+            build_chroma_rect_pred_fmt(plane_l0, plane_w, plane_h, cx0, cy0, rw, rh, mv_l0, fmt)
+        }
+        BPartPred::L1 => {
+            build_chroma_rect_pred_fmt(plane_l1, plane_w, plane_h, cx0, cy0, rw, rh, mv_l1, fmt)
+        }
+        BPartPred::Bi => {
+            let a = build_chroma_rect_pred_fmt(
+                plane_l0, plane_w, plane_h, cx0, cy0, rw, rh, mv_l0, fmt,
+            );
+            let b = build_chroma_rect_pred_fmt(
+                plane_l1, plane_w, plane_h, cx0, cy0, rw, rh, mv_l1, fmt,
+            );
+            a.iter().zip(&b).map(|(&x, &y)| (x + y + 1) >> 1).collect()
+        }
+    }
+}
+
 /// Round-19 — generate the inter predictor for one 4x4 chroma sub-MB
 /// partition of a P_8x8 MB (4:2:0). `(sub_x, sub_y) ∈ {0, 1}` selects
 /// the sub-block. Output is `[i32; 16]` row-major.
@@ -10093,10 +10180,10 @@ impl Encoder {
         // then uses §8.4.2.3.2 eq. 8-276 instead of the default average.
         weighted: Option<WeightedBipredLuma>,
     ) -> MbDeblockInfo {
-        // Round-397 — 4:2:2 / 4:4:4 B MBs take a dedicated body
-        // restricted to the {B_Skip, B_Direct_16x16, B_L0/L1/Bi_16x16}
-        // mode set with per-format chroma MC + residual coding.
-        // Partition shapes / B_8x8 remain 4:2:0-only encoder choices.
+        // Round-397 — 4:2:2 / 4:4:4 B MBs take a dedicated body with
+        // the {B_Skip, B_Direct_16x16, B_L0/L1/Bi_16x16, 16x8 / 8x16
+        // partitions} mode set and per-format chroma MC + residual
+        // coding. B_8x8 remains a 4:2:0-only encoder choice.
         if self.cfg.chroma_format_idc != 1 {
             return self.encode_b_mb_multifmt(
                 frame,
@@ -11494,11 +11581,12 @@ impl Encoder {
     ///
     /// Mode set: `B_Skip`, `B_Direct_16x16` (spatial §8.4.1.2.2 or
     /// temporal §8.4.1.2.3 per the slice header, uniform-derivation
-    /// gate as in round 21), and the explicit `B_L0_16x16` /
-    /// `B_L1_16x16` / `B_Bi_16x16` set. Partition shapes and `B_8x8`
-    /// stay 4:2:0-only encoder choices — the bitstream cell is fully
-    /// decodable either way, the multi-format body just never picks
-    /// them.
+    /// gate as in round 21), the explicit `B_L0_16x16` / `B_L1_16x16`
+    /// / `B_Bi_16x16` set, and the 16x8 / 8x16 partition shapes
+    /// (Table 7-14 raw 4..=21) with per-format chroma-rect MC.
+    /// `B_8x8` (all-direct / mixed) stays a 4:2:0-only encoder choice
+    /// — the bitstream cell is fully decodable either way, the
+    /// multi-format body just never picks it.
     ///
     /// Chroma per format (§8.4.1.4 / §8.4.2.2):
     ///   * 4:2:2 — x subsampled, y full height (`mvC.y = mvL.y·2` in
@@ -11736,21 +11824,241 @@ impl Encoder {
         } else {
             (BPred16x16::L1, pred_y_l1, Mv::ZERO, mv_l1)
         };
-        let (pred_u, pred_v) = build_chroma(pred, eff_mv_l0, eff_mv_l1);
 
-        // 4. mvds against the §8.4.1.3 mvp for each used list (only
-        //    when the mode carries mvd fields).
+        // ---- Round-397: 16x8 / 8x16 partition trial (round-22 logic
+        // with per-format chroma). Direct is never overridden — B_Skip
+        // dominates any partition mode rate-wise. ----
+        let mut me_l0_cells: [Mv; 4] = [Mv::ZERO; 4];
+        let mut me_l1_cells: [Mv; 4] = [Mv::ZERO; 4];
+        for cell in 0..4usize {
+            let sx = cell % 2;
+            let sy = cell / 2;
+            let r0 = search_quarter_pel_8x8(
+                frame.y,
+                src_stride,
+                self.cfg.width,
+                self.cfg.height,
+                ref_l0.recon_y,
+                ref_l0.width as usize,
+                ref_l0.width,
+                ref_l0.height,
+                mb_x,
+                mb_y,
+                sx,
+                sy,
+                4,
+                4,
+            );
+            let r1 = search_quarter_pel_8x8(
+                frame.y,
+                src_stride,
+                self.cfg.width,
+                self.cfg.height,
+                ref_l1.recon_y,
+                ref_l1.width as usize,
+                ref_l1.width,
+                ref_l1.height,
+                mb_x,
+                mb_y,
+                sx,
+                sy,
+                4,
+                4,
+            );
+            me_l0_cells[cell] = Mv::new(r0.mv_x, r0.mv_y);
+            me_l1_cells[cell] = Mv::new(r1.mv_x, r1.mv_y);
+        }
+        let cand_top_l0 = [mv_l0, me_l0_cells[0], me_l0_cells[1]];
+        let cand_top_l1 = [mv_l1, me_l1_cells[0], me_l1_cells[1]];
+        let cand_bot_l0 = [mv_l0, me_l0_cells[2], me_l0_cells[3]];
+        let cand_bot_l1 = [mv_l1, me_l1_cells[2], me_l1_cells[3]];
+        let (top_mode, top_mv_l0, top_mv_l1, sad_top) =
+            best_partition_mode_b(&cand_top_l0, &cand_top_l1, |pred, mv0, mv1| {
+                partition_sad_b_16x8(
+                    pred, frame.y, src_stride, ref_l0, ref_l1, mb_x, mb_y, 0, mv0, mv1,
+                )
+            });
+        let (bot_mode, bot_mv_l0, bot_mv_l1, sad_bot) =
+            best_partition_mode_b(&cand_bot_l0, &cand_bot_l1, |pred, mv0, mv1| {
+                partition_sad_b_16x8(
+                    pred, frame.y, src_stride, ref_l0, ref_l1, mb_x, mb_y, 8, mv0, mv1,
+                )
+            });
+        let sad_16x8_total = sad_top.saturating_add(sad_bot);
+        let cand_left_l0 = [mv_l0, me_l0_cells[0], me_l0_cells[2]];
+        let cand_left_l1 = [mv_l1, me_l1_cells[0], me_l1_cells[2]];
+        let cand_right_l0 = [mv_l0, me_l0_cells[1], me_l0_cells[3]];
+        let cand_right_l1 = [mv_l1, me_l1_cells[1], me_l1_cells[3]];
+        let (left_mode, left_mv_l0, left_mv_l1, sad_left) =
+            best_partition_mode_b(&cand_left_l0, &cand_left_l1, |pred, mv0, mv1| {
+                partition_sad_b_8x16(
+                    pred, frame.y, src_stride, ref_l0, ref_l1, mb_x, mb_y, 0, mv0, mv1,
+                )
+            });
+        let (right_mode, right_mv_l0, right_mv_l1, sad_right) =
+            best_partition_mode_b(&cand_right_l0, &cand_right_l1, |pred, mv0, mv1| {
+                partition_sad_b_8x16(
+                    pred, frame.y, src_stride, ref_l0, ref_l1, mb_x, mb_y, 8, mv0, mv1,
+                )
+            });
+        let sad_8x16_total = sad_left.saturating_add(sad_right);
+
+        let best_16x16_sad = if is_direct {
+            direct_sad
+        } else {
+            sad_bi.min(sad_l0).min(sad_l1)
+        };
+        let part_bias_sad: u32 = {
+            let lambda = (qp_y / 6).clamp(0, 8) as u32;
+            (lambda + 1) * 8
+        };
+        let part_threshold = best_16x16_sad.saturating_sub(part_bias_sad);
+        let (part_winner, part_winner_sad) = if sad_16x8_total <= sad_8x16_total {
+            (PartitionShape::P16x8, sad_16x8_total)
+        } else {
+            (PartitionShape::P8x16, sad_8x16_total)
+        };
+        let mut partition_choice: Option<PartitionChoiceB> = None;
+        if !is_direct && part_winner_sad < part_threshold {
+            partition_choice = Some(match part_winner {
+                PartitionShape::P16x8 => PartitionChoiceB {
+                    shape: PartitionShape::P16x8,
+                    mode_a: top_mode,
+                    mode_b: bot_mode,
+                    mv_l0_a: top_mv_l0,
+                    mv_l1_a: top_mv_l1,
+                    mv_l0_b: bot_mv_l0,
+                    mv_l1_b: bot_mv_l1,
+                },
+                PartitionShape::P8x16 => PartitionChoiceB {
+                    shape: PartitionShape::P8x16,
+                    mode_a: left_mode,
+                    mode_b: right_mode,
+                    mv_l0_a: left_mv_l0,
+                    mv_l1_a: left_mv_l1,
+                    mv_l0_b: right_mv_l0,
+                    mv_l1_b: right_mv_l1,
+                },
+            });
+        }
+
+        // Composite predictor: partition override or the 16x16 pick.
+        let (ct_w, ct_h) = chroma_tile_dims(chroma_array_type);
+        let (pred_y, pred_u, pred_v) = if let Some(pc) = partition_choice.as_ref() {
+            let mut py = [0i32; 256];
+            let mut pu = vec![0i32; ct_w * ct_h];
+            let mut pv = vec![0i32; ct_w * ct_h];
+            // Luma halves via the shared partition predictors.
+            match pc.shape {
+                PartitionShape::P16x8 => {
+                    let py0 = build_b_partition_pred_luma_16x8(
+                        pc.mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, pc.mv_l0_a, pc.mv_l1_a,
+                    );
+                    let py1 = build_b_partition_pred_luma_16x8(
+                        pc.mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, pc.mv_l0_b, pc.mv_l1_b,
+                    );
+                    for j in 0..8usize {
+                        for i in 0..16usize {
+                            py[j * 16 + i] = py0[j * 16 + i];
+                            py[(8 + j) * 16 + i] = py1[j * 16 + i];
+                        }
+                    }
+                }
+                PartitionShape::P8x16 => {
+                    let py0 = build_b_partition_pred_luma_8x16(
+                        pc.mode_a, ref_l0, ref_l1, mb_x, mb_y, 0, pc.mv_l0_a, pc.mv_l1_a,
+                    );
+                    let py1 = build_b_partition_pred_luma_8x16(
+                        pc.mode_b, ref_l0, ref_l1, mb_x, mb_y, 8, pc.mv_l0_b, pc.mv_l1_b,
+                    );
+                    for j in 0..16usize {
+                        for i in 0..8usize {
+                            py[j * 16 + i] = py0[j * 8 + i];
+                            py[j * 16 + 8 + i] = py1[j * 8 + i];
+                        }
+                    }
+                }
+            }
+            // Chroma halves via the per-format rect MC (§8.4.1.4 /
+            // §8.4.2.2): a 16x8 luma half maps to a ct_w × ct_h/2
+            // chroma rect, an 8x16 half to ct_w/2 × ct_h.
+            for (half, (mode, hmv0, hmv1)) in [
+                (pc.mode_a, pc.mv_l0_a, pc.mv_l1_a),
+                (pc.mode_b, pc.mv_l0_b, pc.mv_l1_b),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (cx0, cy0, rw, rh) = match pc.shape {
+                    PartitionShape::P16x8 => {
+                        (mb_x * ct_w, mb_y * ct_h + half * (ct_h / 2), ct_w, ct_h / 2)
+                    }
+                    PartitionShape::P8x16 => {
+                        (mb_x * ct_w + half * (ct_w / 2), mb_y * ct_h, ct_w / 2, ct_h)
+                    }
+                };
+                let ru = build_b_partition_chroma_rect_fmt(
+                    mode,
+                    ref_l0.recon_u,
+                    ref_l1.recon_u,
+                    chroma_w,
+                    chroma_h,
+                    cx0,
+                    cy0,
+                    rw,
+                    rh,
+                    hmv0,
+                    hmv1,
+                    chroma_array_type,
+                );
+                let rv = build_b_partition_chroma_rect_fmt(
+                    mode,
+                    ref_l0.recon_v,
+                    ref_l1.recon_v,
+                    chroma_w,
+                    chroma_h,
+                    cx0,
+                    cy0,
+                    rw,
+                    rh,
+                    hmv0,
+                    hmv1,
+                    chroma_array_type,
+                );
+                let ox = cx0 - mb_x * ct_w;
+                let oy = cy0 - mb_y * ct_h;
+                for j in 0..rh {
+                    for i in 0..rw {
+                        pu[(oy + j) * ct_w + ox + i] = ru[j * rw + i];
+                        pv[(oy + j) * ct_w + ox + i] = rv[j * rw + i];
+                    }
+                }
+            }
+            (py, pu, pv)
+        } else {
+            let (pu, pv) = build_chroma(pred, eff_mv_l0, eff_mv_l1);
+            (pred_y, pu, pv)
+        };
+
+        // 4. mvds against the §8.4.1.3 mvp. 16x16 shapes derive a
+        //    single pair per used list; partition shapes derive
+        //    per-partition mvds via the shared §8.4.1.3 helper.
         let mvp_l0 = mvp_for_16x16(mv_grid_l0, mb_x, mb_y, 0);
         let mvp_l1 = mvp_for_16x16(mv_grid_l1, mb_x, mb_y, 0);
-        let (mvd_l0_x, mvd_l0_y) = if !is_direct && pred.uses_l0() {
+        let (mvd_l0_x, mvd_l0_y) = if !is_direct && partition_choice.is_none() && pred.uses_l0() {
             (eff_mv_l0.x - mvp_l0.x, eff_mv_l0.y - mvp_l0.y)
         } else {
             (0, 0)
         };
-        let (mvd_l1_x, mvd_l1_y) = if !is_direct && pred.uses_l1() {
+        let (mvd_l1_x, mvd_l1_y) = if !is_direct && partition_choice.is_none() && pred.uses_l1() {
             (eff_mv_l1.x - mvp_l1.x, eff_mv_l1.y - mvp_l1.y)
         } else {
             (0, 0)
+        };
+        let (mvd_l0_parts, mvd_l1_parts) = if let Some(pc) = partition_choice.as_ref() {
+            partition_mvds_b(pc, mv_grid_l0, mv_grid_l1, mb_x, mb_y)
+        } else {
+            ([(0, 0); 2], [(0, 0); 2])
         };
 
         // 5. Luma residual (+ optional §8.6.4 8x8-transform trial).
@@ -12078,6 +12386,67 @@ impl Encoder {
                     chroma_kind,
                 )
                 .expect("write B_Direct_16x16 mb (4:2:2/4:4:4)");
+            } else if let Some(pc) = partition_choice.as_ref() {
+                match pc.shape {
+                    PartitionShape::P16x8 => {
+                        let cfg = crate::encoder::macroblock::B16x8McbConfig {
+                            transform_size_8x8_flag: b_t8x8_flag,
+                            top: pc.mode_a,
+                            bottom: pc.mode_b,
+                            mvd_l0: mvd_l0_parts,
+                            mvd_l1: mvd_l1_parts,
+                            cbp_luma,
+                            cbp_chroma,
+                            mb_qp_delta: 0,
+                            luma_4x4_levels: luma_4x4_levels_scan,
+                            luma_4x4_nc,
+                            chroma_dc_cb: [0; 4],
+                            chroma_dc_cr: [0; 4],
+                            chroma_ac_cb: [[0; 16]; 4],
+                            chroma_ac_cr: [[0; 16]; 4],
+                            chroma_ac_nc_cb: [0; 8],
+                            chroma_ac_nc_cr: [0; 8],
+                        };
+                        crate::encoder::macroblock::write_b_16x8_mb_chroma(
+                            sw,
+                            &cfg,
+                            0,
+                            0,
+                            chroma_array_type,
+                            chroma_kind,
+                        )
+                        .expect("write B_*_16x8 mb (4:2:2/4:4:4)");
+                    }
+                    PartitionShape::P8x16 => {
+                        let cfg = crate::encoder::macroblock::B8x16McbConfig {
+                            transform_size_8x8_flag: b_t8x8_flag,
+                            left: pc.mode_a,
+                            right: pc.mode_b,
+                            mvd_l0: mvd_l0_parts,
+                            mvd_l1: mvd_l1_parts,
+                            cbp_luma,
+                            cbp_chroma,
+                            mb_qp_delta: 0,
+                            luma_4x4_levels: luma_4x4_levels_scan,
+                            luma_4x4_nc,
+                            chroma_dc_cb: [0; 4],
+                            chroma_dc_cr: [0; 4],
+                            chroma_ac_cb: [[0; 16]; 4],
+                            chroma_ac_cr: [[0; 16]; 4],
+                            chroma_ac_nc_cb: [0; 8],
+                            chroma_ac_nc_cr: [0; 8],
+                        };
+                        crate::encoder::macroblock::write_b_8x16_mb_chroma(
+                            sw,
+                            &cfg,
+                            0,
+                            0,
+                            chroma_array_type,
+                            chroma_kind,
+                        )
+                        .expect("write B_*_8x16 mb (4:2:2/4:4:4)");
+                    }
+                }
             } else {
                 let mb_cfg = B16x16McbConfig {
                     transform_size_8x8_flag: b_t8x8_flag,
@@ -12109,10 +12478,14 @@ impl Encoder {
                 .expect("write B_*_16x16 mb (4:2:2/4:4:4)");
             }
         }
-        // 10. Grids (16x16 / Direct shapes — all four 8x8 slots share
-        //     the MB-level state).
-        let (l0_mvs_8x8, l0_refs_8x8, l0_used) = grid_state_b(None, true, pred, eff_mv_l0);
-        let (l1_mvs_8x8, l1_refs_8x8, l1_used) = grid_state_b(None, false, pred, eff_mv_l1);
+        // 10. Grids. 16x16 / Direct shapes share the MB-level state
+        //     across the four 8x8 slots; partition shapes carry
+        //     per-half MVs (top = slots 0/1, bottom = 2/3 for 16x8;
+        //     left = 0/2, right = 1/3 for 8x16).
+        let (l0_mvs_8x8, l0_refs_8x8, l0_used) =
+            grid_state_b(partition_choice.as_ref(), true, pred, eff_mv_l0);
+        let (l1_mvs_8x8, l1_refs_8x8, l1_used) =
+            grid_state_b(partition_choice.as_ref(), false, pred, eff_mv_l1);
         *mv_grid_l0.slot_mut(mb_x, mb_y) = if l0_used {
             MvGridSlot {
                 available: true,
@@ -12166,9 +12539,10 @@ impl Encoder {
                 m
             }
         };
-        let (mv_l0_arr, ref_idx_l0, ref_poc_l0) = deblock_mv_arr_b(None, true, pred, eff_mv_l0, 0);
+        let (mv_l0_arr, ref_idx_l0, ref_poc_l0) =
+            deblock_mv_arr_b(partition_choice.as_ref(), true, pred, eff_mv_l0, 0);
         let (mv_l1_arr, ref_idx_l1, ref_poc_l1) =
-            deblock_mv_arr_b(None, false, pred, eff_mv_l1, 1000);
+            deblock_mv_arr_b(partition_choice.as_ref(), false, pred, eff_mv_l1, 1000);
         MbDeblockInfo {
             is_intra: false,
             qp_y,
