@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error" both turned out to be artifacts of the defective references,
   not decoder bugs: the decoder is byte-exact end-to-end on every
   staged fixture except `mbaff-interlaced` (809/12288 bytes off).
+- Round-410 corpus extension: 11 freshly generated black-box
+  conformance fixtures staged in docs and gated in
+  `tests/docs_corpus.rs` — 4:2:2 8-bit CABAC + CAVLC I/P/B GOPs,
+  10-bit High10 inter, 10-bit 4:2:2, 10-bit 4:4:4, temporal-direct B,
+  implicit weighted bipred (`weighted_bipred_idc=2`), `cqm=jvt`
+  non-flat matrices with 8x8 transform on I/P/B, CAVLC B-slices (nine
+  BitExact), plus two report-only decode-gap pins: `mbaff-field-pairs`
+  (MBAFF FIELD-coded-pair inter reconstruction — per-field references,
+  §7.4.4 skipped-pair flag inference — still deferred; its all-frame
+  MBAFF I frame IS byte-exact) and `lossless-transform-bypass`
+  (§8.5.15 qpprime_y_zero bypass unimplemented). Corpus now: 29
+  fixtures, 27 BitExact over full frame counts.
 - `corpus_cavlc_444_intra8x8` gate: the CAVLC 4:4:4 Intra_8x8 fixture
   (§7.4.5.3.3 8×8 residual interleave at ChromaArrayType==3) had no
   corpus driver entry; added at `Tier::BitExact` (exact on first run).

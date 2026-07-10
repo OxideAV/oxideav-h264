@@ -130,6 +130,8 @@ fn diff_planes(our: (&[u8], &[u8], &[u8]), refp: (&[u8], &[u8], &[u8])) -> Frame
 enum ChromaFmt {
     /// 4:2:0 planar (Y full-res, U/V half each axis).
     Yuv420,
+    /// 4:2:2 planar (U/V half width, full height).
+    Yuv422,
     /// 4:4:4 planar (Y/U/V all same size).
     Yuv444,
 }
@@ -139,6 +141,7 @@ impl ChromaFmt {
     fn chroma_dims(&self, w: usize, h: usize) -> (usize, usize) {
         match self {
             ChromaFmt::Yuv420 => (w / 2, h / 2),
+            ChromaFmt::Yuv422 => (w / 2, h),
             ChromaFmt::Yuv444 => (w, h),
         }
     }
@@ -950,6 +953,193 @@ fn corpus_cavlc_444_intra8x8() {
         chroma: ChromaFmt::Yuv444,
         n_frames: 2,
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+// --- Round-410 corpus extension (fixtures 19-29) ---------------------------
+//
+// Freshly generated black-box conformance streams filling the corpus
+// matrix's largest holes (see each fixture's notes.md for the encoder
+// command). All BitExact except the two decode-gap pins at the end.
+
+#[test]
+fn corpus_4_2_2_cabac() {
+    // High 4:2:2 / CABAC, 5-frame I/P/B GOP. Byte-exact after the
+    // round-410 §8.5.11.2 eq. 8-328 chroma-DC dequant fix (the inter
+    // frames' high-QP chroma DC crosses into the qPDC>=36 leg).
+    evaluate_annex_b(&CorpusCase {
+        name: "4-2-2-cabac",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv422,
+        n_frames: 5,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_4_2_2_cavlc() {
+    // High 4:2:2 / CAVLC twin of the above (§9.2.1.1 4:2:2 chroma nC).
+    evaluate_annex_b(&CorpusCase {
+        name: "4-2-2-cavlc",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv422,
+        n_frames: 5,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_10_bit_high10_inter() {
+    // High 10 inter: 5-frame 10-bit 4:2:0 I/P/B GOP — the inter
+    // complement to the all-intra `10-bit-high10` fixture.
+    evaluate_annex_b(&CorpusCase {
+        name: "10-bit-high10-inter",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 5,
+        tier: Tier::BitExact,
+        bytes_per_sample: 2,
+    });
+}
+
+#[test]
+fn corpus_10_bit_high422() {
+    // 10-bit 4:2:2 I/P/B — the decisive eq. 8-328 stream: QpBdOffsetC
+    // pushes qPDC past 36 at ordinary QPs, so EVERY chroma-DC block
+    // takes the leg the round-410 fix corrected. Whole-picture chroma
+    // was ~55% wrong before the fix.
+    evaluate_annex_b(&CorpusCase {
+        name: "10-bit-high422",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv422,
+        n_frames: 5,
+        tier: Tier::BitExact,
+        bytes_per_sample: 2,
+    });
+}
+
+#[test]
+fn corpus_10_bit_high444() {
+    // 10-bit 4:4:4 Predictive I/P/B — chroma coded like luma at
+    // BitDepthC=10 (full-res 6-tap chroma MC, luma-style deblock).
+    evaluate_annex_b(&CorpusCase {
+        name: "10-bit-high444",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv444,
+        n_frames: 5,
+        tier: Tier::BitExact,
+        bytes_per_sample: 2,
+    });
+}
+
+#[test]
+fn corpus_temporal_direct_b() {
+    // Main / CABAC, direct=temporal — §8.4.1.2.3 co-located MV scaling
+    // (DistScaleFactor) against a real encoder's mode decisions.
+    evaluate_annex_b(&CorpusCase {
+        name: "temporal-direct-b",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 6,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_weighted_bipred_implicit() {
+    // Main / CABAC, weighted_bipred_idc=2 — §8.4.2.3.2 implicit
+    // POC-distance weights (the explicit-weights fixture's complement).
+    evaluate_annex_b(&CorpusCase {
+        name: "weighted-bipred-implicit",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 6,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_scaling_matrix_jvt() {
+    // High / CABAC, cqm=jvt + transform_8x8 on an I/P/B GOP — non-flat
+    // Table 7-3/7-4 matrices through §8.5.9 on intra AND inter, 4x4
+    // AND 8x8, in one stream.
+    evaluate_annex_b(&CorpusCase {
+        name: "scaling-matrix-jvt",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 6,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_cavlc_b_slices() {
+    // Main / CAVLC with real B-slices — previously B-slices existed in
+    // the corpus only under CABAC.
+    evaluate_annex_b(&CorpusCase {
+        name: "cavlc-b-slices",
+        width: 64,
+        height: 64,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 6,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_mbaff_field_pairs() {
+    // MBAFF with REAL field-coded MB pairs (frame 2 has 26 field MBs;
+    // the `mbaff-interlaced` fixture's pairs are all frame-coded).
+    // Frame 0 (all-frame-pair MBAFF I) became byte-exact with the
+    // round-410 §8.7 pair-interleaved deblock-order fix. The two P
+    // frames pin the deferred MBAFF field-pair INTER path: field MBs
+    // reference individual FIELDS of stored frames (§8.4.2.1 refIdx
+    // parity mapping), field MC on parity-interleaved rows, §7.4.4
+    // spatial inference of mb_field_decoding_flag for skipped pairs,
+    // and the §8.7.2 mixed-mode deblock cascade. ReportOnly until that
+    // subsystem lands; the current decoder emits frame 0 then rejects
+    // the P slices ("reference picture 0:1 not available").
+    evaluate_annex_b(&CorpusCase {
+        name: "mbaff-field-pairs",
+        width: 64,
+        height: 128,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 3,
+        tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_lossless_transform_bypass() {
+    // High 4:4:4 Predictive, qpprime_y_zero_transform_bypass_flag=1 at
+    // QP'Y == 0 — the §8.5 transform/scaling stages are bypassed and
+    // §8.5.15 intra residual DPCM applies for horizontal/vertical
+    // I_NxN modes. ReportOnly: the bypass reconstruction path is not
+    // yet implemented (the decoder currently runs the normal
+    // transform, so nearly every sample diverges).
+    evaluate_annex_b(&CorpusCase {
+        name: "lossless-transform-bypass",
+        width: 32,
+        height: 32,
+        chroma: ChromaFmt::Yuv444,
+        n_frames: 2,
+        tier: Tier::ReportOnly,
         bytes_per_sample: 1,
     });
 }
