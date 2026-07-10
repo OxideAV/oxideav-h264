@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Corpus re-baseline (round 410): after regenerating 13 defective
+  staged `expected.yuv` references from a clean black-box reference
+  decode of the unchanged bitstreams, 15 of 17 staged fixtures now
+  gate `Tier::BitExact` over their FULL frame counts (previously 9,
+  several of those on truncated 1-frame references) — including
+  10-bit High10, both High 4:4:4 fixtures, the 5-frame multi-ref /
+  bipred GOPs and the 4-slice-per-frame picture. The "remaining ~7%
+  High10 right-column divergence" and the r346 "accumulated inter
+  error" both turned out to be artifacts of the defective references,
+  not decoder bugs: the decoder is byte-exact end-to-end on every
+  staged fixture except `mbaff-interlaced` (809/12288 bytes off).
+- `corpus_cavlc_444_intra8x8` gate: the CAVLC 4:4:4 Intra_8x8 fixture
+  (§7.4.5.3.3 8×8 residual interleave at ChromaArrayType==3) had no
+  corpus driver entry; added at `Tier::BitExact` (exact on first run).
+- `dump_yuv` example: decode an Annex B stream and dump every visible
+  frame as tightly-packed planar YUV for offline byte-diff against a
+  black-box reference decode.
 - CAVLC 4:2:2 and 4:4:4 P-slices (multi-format `encode_p`: per-format
   chroma MC, §8.5.11.2 inter chroma chain at 4:2:2, §7.3.5.3
   coded-like-luma chroma with Table 9-4(b) inter CBP at 4:4:4, real
