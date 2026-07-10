@@ -1228,11 +1228,19 @@ pub fn inverse_hadamard_chroma_dc_422(
     let qp_dc = qp + 3;
     let mut out = [0i32; 8];
     if qp_dc >= 36 {
-        // Eq. 8-328 — shift uses qP/6 (NOT qPDC/6), LevelScale uses qP%6.
-        //   dcCij = ( ( fij * LevelScale4x4(qP % 6, 0, 0) ) << (qP/6 - 6) )
-        let qp_mod = (qp % 6) as usize;
-        let ls = level_scale_4x4(scaling_list, qp_mod, 0, 0);
-        let shift = ((qp / 6) - 6) as u32 & 31;
+        // Eq. 8-328 — both the LevelScale row and the shift use qPDC:
+        //   dcCij = ( fij * LevelScale4x4(qPDC % 6, 0, 0) ) << (qPDC/6 - 6)
+        // (the qPDC >= 36 gate guarantees qPDC/6 - 6 >= 0). Round-410
+        // fix: this was mis-transcribed as qP%6 / qP/6-6, which is
+        // non-monotone across the 8-329→8-328 boundary and yields a
+        // NEGATIVE shift for qP in 33..=35 — and every >8-bit 4:2:2
+        // stream (QpBdOffsetC pushes qP past 36) dequantised its
+        // chroma DC at the wrong scale. Verified against the ISO/IEC
+        // 14496-10:2012 rendering of eq. 8-328, where the qPDC
+        // subscripts are unambiguous.
+        let qp_dc_mod = (qp_dc % 6) as usize;
+        let ls = level_scale_4x4(scaling_list, qp_dc_mod, 0, 0);
+        let shift = ((qp_dc / 6) - 6) as u32 & 31;
         for k in 0..8 {
             out[k] = f[k].wrapping_mul(ls).wrapping_shl(shift);
         }
@@ -1865,28 +1873,46 @@ mod tests {
         assert_eq!(out, [7i32; 8]);
     }
 
-    // Regression: §8.5.11.2 Eq. 8-328 (4:2:2, qPDC>=36) uses qP/6,
-    // not qPDC/6, for the shift amount. These differ at the boundary
-    // where qP is a multiple of 3.
+    // Regression: §8.5.11.2 Eq. 8-328 (4:2:2, qPDC >= 36) uses qPDC
+    // for BOTH the LevelScale row (qPDC % 6) and the shift
+    // (qPDC/6 - 6). Round 349-era code mis-transcribed it as qP%6 /
+    // qP/6-6 (from an ambiguous PDF rendering of the qPDC subscripts):
+    // that yields a NEGATIVE shift for qP in 33..=35 and a
+    // non-monotone dequant scale across the 8-329→8-328 boundary,
+    // garbling the chroma DC of any 4:2:2 stream whose qPDC reaches 36
+    // (all >8-bit streams via QpBdOffsetC, and 8-bit streams at high
+    // QP). The ISO/IEC 14496-10:2012 rendering of eq. 8-328 shows the
+    // subscripts unambiguously.
     #[test]
     fn chroma_dc_422_regression_qpdc_vs_qp_shift() {
-        // Choose qP=33: qP/6=5, qP%6=3 -> LevelScale(3,0,0)=16*14=224.
-        // qpDC=36, qpDC>=36 path. Shift = qP/6 - 6 = -1? No, that's a
-        // negative shift. The spec requires qP/6 >= 6 which means
-        // qP >= 36. For qpDC>=36 to hold with qP<36, qP in [33, 35]:
-        // qP/6 = 5 → shift = 5 - 6 = -1 (undefined behavior in plain
-        // Rust). The spec intends qpDC>=36 to imply qP>=33 but the
-        // shift is indeed qP/6 - 6 which is negative for qP<36. So the
-        // formula can only apply when qP>=36 in practice.
-        //
-        // Pick qP=36: qP/6=6, shift = 0. qpDC=39, qpDC>=36.
-        //   LevelScale(0,0,0) = 16*10 = 160.
-        //   dcC = (1*160) << 0 = 160 per entry.
+        let sl = default_scaling_list_4x4_flat();
+        // A single DC coefficient L[0]=1 spreads to fij = 1 for all 8
+        // entries after the 4x2 Hadamard, so `out` is the raw dequant
+        // scale itself.
         let mut dc = [0i32; 8];
         dc[0] = 1;
-        let sl = default_scaling_list_4x4_flat();
+
+        // qP=36 → qPDC=39 (8-328 path):
+        //   LevelScale4x4(39 % 6 = 3, 0, 0) = 16 * 14 = 224,
+        //   shift = 39/6 - 6 = 0 → dcC = 224.
+        // (The old qP-based transcription produced (1*160) << 0 = 160.)
         let out = inverse_hadamard_chroma_dc_422(&dc, 36, &sl, 8).unwrap();
+        assert_eq!(out, [224i32; 8]);
+
+        // Boundary qP=33 → qPDC=36 (smallest 8-328 input):
+        //   LevelScale4x4(0, 0, 0) = 160, shift = 36/6 - 6 = 0 → 160.
+        // (The old transcription's shift was 33/6 - 6 = -1 here —
+        // masked into a garbage left-shift of 31.)
+        let out = inverse_hadamard_chroma_dc_422(&dc, 33, &sl, 8).unwrap();
         assert_eq!(out, [160i32; 8]);
+
+        // One step below the boundary, qP=32 → qPDC=35 (8-329 path):
+        //   (1 * LevelScale4x4(5,0,0)=288 + 2^(5-5)=1) >> (6-5) = 144.
+        // 144 → 160 → 224 across qP 32/33/36 is the expected monotone
+        // ~2^(1/6)-per-step quantiser progression; the old code's
+        // 144 → garbage → 160 sequence was the regression.
+        let out = inverse_hadamard_chroma_dc_422(&dc, 32, &sl, 8).unwrap();
+        assert_eq!(out, [144i32; 8]);
     }
 
     // Regression: §8.5.4 Eq. 8-305 — 4:2:2 chroma DC input must be

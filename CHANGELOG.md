@@ -61,6 +61,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   addressing on the pair-interleaved grid — it now routes through the
   §6.4.12.2 Table 6-4 probe and applies the §8.4.1.3.2
   eq. 8-217..8-220 field/frame vertical-MV / refIdx adjustment.
+- §8.5.11.2 eq. 8-328 (4:2:2 chroma DC dequant at qPDC >= 36) was
+  mis-transcribed: both the LevelScale row and the shift use qPDC, not
+  qP (the 2024-08 PDF renders the qPDC subscripts ambiguously; the
+  ISO/IEC 14496-10:2012 rendering is unambiguous). The old form
+  produced a negative shift for qP 33..=35 and a non-monotone dequant
+  scale — every >8-bit 4:2:2 stream (QpBdOffsetC pushes qPDC past 36)
+  and any 8-bit 4:2:2 stream at high QP garbled its chroma DC. Found
+  by black-box conformance diff on freshly generated High 4:2:2
+  streams (8-bit CABAC/CAVLC inter chroma + 10-bit whole-picture
+  chroma all now byte-exact); the old unit test that enshrined the
+  mis-transcription was rewritten against the corrected equation with
+  a monotonicity argument.
+- §8.7 deblock macroblock processing order under MBAFF: macroblocks
+  are filtered in increasing mbAddr order, which in an MBAFF frame is
+  pair-interleaved (top MB, bottom MB, next column) — not the raster
+  scan the plane walkers used. Observable at corners where a vertical
+  MB edge crosses the pair-internal horizontal edge.
 - CABAC B_Skip deblock records only carried the L0 side of the direct
   derivation — the encoder-side §8.7.2.1 walker read a phantom ref/MV
   mismatch (bS 0 → 1) on edges against coded B_Direct neighbours and

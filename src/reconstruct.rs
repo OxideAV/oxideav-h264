@@ -6241,6 +6241,25 @@ fn deblock_picture(
     let _ = pps;
 }
 
+/// §8.7 — geometric `(mb_x, mb_y)` position of the `flat`-th
+/// macroblock in the deblock processing order. Macroblocks are
+/// processed in order of increasing macroblock address; in a
+/// non-MBAFF picture that is the raster scan, but in an MBAFF frame
+/// the addresses are §6.4.1 pair-interleaved, so the walk is: pair
+/// row, then column, then top/bottom MB within the pair. The order is
+/// observable wherever a later MB's edge filter reads samples already
+/// modified by an earlier MB's edges (e.g. the corner where a
+/// vertical MB edge crosses the pair-internal horizontal edge).
+fn deblock_scan_pos(flat: i32, mb_w: i32, mbaff_frame_flag: bool) -> (i32, i32) {
+    if !mbaff_frame_flag {
+        (flat % mb_w, flat / mb_w)
+    } else {
+        let pair_row = flat / (2 * mb_w);
+        let rem = flat % (2 * mb_w);
+        (rem / 2, pair_row * 2 + rem % 2)
+    }
+}
+
 /// §6.4.1 — map picture luma sample coordinates `(x, y)` to the MB
 /// address containing that sample, honouring MBAFF pair structure +
 /// per-pair `mb_field_decoding_flag`.
@@ -6572,8 +6591,12 @@ fn deblock_plane_luma(
     // pictures. Mixed-mode edges (one frame-MB + one field-MB across a
     // horizontal pair boundary) are NOT detected here; that's part of
     // the future-work simplification.
-    for mb_y in 0..mb_h {
-        for mb_x in 0..mb_w {
+    for mb_scan_y in 0..mb_h {
+        for mb_scan_x in 0..mb_w {
+            // §8.7 — increasing-mbAddr processing order (pair-
+            // interleaved under MBAFF).
+            let (mb_x, mb_y) =
+                deblock_scan_pos(mb_scan_y * mb_w + mb_scan_x, mb_w, mbaff_frame_flag);
             // --- 4 vertical edges of this MB, in left-to-right order ---
             for edge_off in 0..4 {
                 let edge_x = mb_x * 16 + edge_off * 4;
@@ -6829,8 +6852,12 @@ fn deblock_plane_chroma(
     let chroma_mb_w = 16 / sub_w.max(1);
     let chroma_mb_h = 16 / sub_h.max(1);
     for plane in 0..2u8 {
-        for mb_y in 0..mb_h {
-            for mb_x in 0..mb_w {
+        for mb_scan_y in 0..mb_h {
+            for mb_scan_x in 0..mb_w {
+                // §8.7 — increasing-mbAddr processing order (pair-
+                // interleaved under MBAFF).
+                let (mb_x, mb_y) =
+                    deblock_scan_pos(mb_scan_y * mb_w + mb_scan_x, mb_w, mbaff_frame_flag);
                 // Vertical chroma edges: chroma-x = mb_x*chroma_mb_w + {0, 4, ...}
                 // For 4:2:0 / 4:2:2, only offsets {0, 4} are valid (chroma MB 8 wide).
                 for edge_off in (0..chroma_mb_w).step_by(4) {
@@ -7149,8 +7176,12 @@ fn deblock_plane_chroma_444(
 
     for plane in 0..2u8 {
         let offset = if plane == 0 { cb_offset } else { cr_offset };
-        for mb_y in 0..mb_h {
-            for mb_x in 0..mb_w {
+        for mb_scan_y in 0..mb_h {
+            for mb_scan_x in 0..mb_w {
+                // §8.7 — increasing-mbAddr processing order (pair-
+                // interleaved under MBAFF).
+                let (mb_x, mb_y) =
+                    deblock_scan_pos(mb_scan_y * mb_w + mb_scan_x, mb_w, mbaff_frame_flag);
                 // --- 4 vertical edges, left-to-right (mirrors luma) ---
                 for edge_off in 0..4 {
                     let edge_x = mb_x * 16 + edge_off * 4;
