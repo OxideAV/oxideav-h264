@@ -43,6 +43,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MBAFF frame-picture reconstruction is now byte-exact on the staged
+  `mbaff-interlaced` conformance fixture (MBAFF I + MBAFF P with a
+  16x8 partition; previously 809/12288 bytes diverged). Three real
+  bugs: (1) the deblock walker's `pixel_to_mb_addr` computed
+  raster-style MBAFF addresses while the grid is §6.4.1
+  pair-interleaved, so per-MB deblock metadata (QP / intra flag /
+  coefficient masks) was read from the wrong macroblock; (2) §8.7.2.1
+  bS derivation — the first two bS=4 bullets ("p0 and q0 are both in
+  frame macroblocks") apply to horizontal MB edges between frame-coded
+  pairs inside an MBAFF picture (previously downgraded to bS=3), the
+  bS=4 block wrongly required mixedModeEdgeFlag==0, and
+  mixedModeEdgeFlag itself is now computed for real (was hardcoded 0);
+  field pictures are recognised through a new `field_pic` parameter on
+  the deblock drivers so their horizontal intra MB edges correctly
+  take bS=3; (3) the inter MV-prediction neighbour fetch used raster
+  addressing on the pair-interleaved grid — it now routes through the
+  §6.4.12.2 Table 6-4 probe and applies the §8.4.1.3.2
+  eq. 8-217..8-220 field/frame vertical-MV / refIdx adjustment.
 - CABAC B_Skip deblock records only carried the L0 side of the direct
   derivation — the encoder-side §8.7.2.1 walker read a phantom ref/MV
   mismatch (bS 0 → 1) on edges against coded B_Direct neighbours and

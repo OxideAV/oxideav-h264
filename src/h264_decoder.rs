@@ -1091,6 +1091,7 @@ impl H264CodecDecoder {
                 bit_depth_c,
                 &pps,
                 mbaff_frame_flag,
+                first_header.field_pic_flag,
                 &mb_field_flags,
             );
         }

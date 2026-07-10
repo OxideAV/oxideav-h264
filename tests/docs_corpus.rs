@@ -961,13 +961,20 @@ fn corpus_cavlc_444_intra8x8() {
 // completion without CABAC desync, and the MBAFF-frame reconstruct
 // path (§6.4.1 field/frame y-stride) produces both visible frames.
 // Round 410 regenerated `expected.yuv` from a clean black-box decode
-// (the original capture contained MB concealment), so the fixture IS
-// now a strict pixel-conformance target: current divergence is
-// 809/12288 bytes (~93.4% exact, both frames affected) — the residual
-// MBAFF reconstruction gap. Scoring stays ReportOnly until that gap
-// closes; `corpus_mbaff_interlaced_parses` below asserts the parse
-// milestone: both frames decode end-to-end (no MbaffNotSupported, no
-// FieldOrMbaffNotSupported, no CABAC read-past-end).
+// (the original capture contained MB concealment), making the fixture
+// a strict pixel-conformance target, and closed the remaining
+// 809/12288-byte divergence with three real decoder fixes: (1) the
+// deblock walker's `pixel_to_mb_addr` computed raster-style MBAFF
+// addresses while the grid is §6.4.1 pair-interleaved, so per-MB
+// deblock metadata (QP / intra / coeffs) came from the wrong MB;
+// (2) §8.7.2.1 bS=4 first-bullet handling — a horizontal intra MB
+// edge between two FRAME-coded MBAFF pairs takes bS=4 ("p0 and q0
+// both in frame macroblocks"), not the vertical-only bS=3 downgrade;
+// (3) the inter MV-prediction neighbour fetch used raster addressing
+// on the pair-interleaved grid — it now routes through the Table 6-4
+// probe with the §8.4.1.3.2 eq. 8-217..8-220 field/frame MV/refIdx
+// adjustment. Both frames (MBAFF I with all-frame pairs + MBAFF P
+// with a 16x8 partition) now gate BitExact.
 #[test]
 fn corpus_mbaff_interlaced() {
     evaluate_annex_b(&CorpusCase {
@@ -976,7 +983,7 @@ fn corpus_mbaff_interlaced() {
         height: 64,
         chroma: ChromaFmt::Yuv420,
         n_frames: 2,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
         bytes_per_sample: 1,
     });
 }

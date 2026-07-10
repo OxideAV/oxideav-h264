@@ -474,6 +474,7 @@ pub fn reconstruct_slice<R: RefPicProvider>(
             bit_depth_c,
             pps,
             mbaff_frame_flag,
+            slice_header.field_pic_flag,
             &slice_data.mb_field_decoding_flags,
         );
     }
@@ -746,6 +747,7 @@ pub fn deblock_picture_full(
     bit_depth_c: u32,
     pps: &Pps,
     mbaff_frame_flag: bool,
+    field_pic: bool,
     mb_field_flags: &[bool],
 ) {
     let deblock_env_off = deblock_no_op_cached();
@@ -761,6 +763,7 @@ pub fn deblock_picture_full(
         bit_depth_c,
         pps,
         mbaff_frame_flag,
+        field_pic,
         mb_field_flags,
     );
 }
@@ -3025,8 +3028,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     // §6.4.8 — stamp the current MB's slice identity eagerly so that
     // later partitions' MVpred neighbour lookups (within the same MB)
     // see this MB as in-slice via `same_slice_at` / `neighbour_from_block`.
+    // §7.4.4 — stamp the field/frame coding eagerly too, so the
+    // §6.4.12.2 MBAFF neighbour probe inside `neighbour_from_block`
+    // reads the correct `currMbFrameFlag` for this in-flight MB.
     if let Some(info) = grid.get_mut(mb_addr) {
         info.slice_id = current_slice_id;
+        info.mb_field_decoding_flag = mb_field_decoding_flag;
     }
 
     for part in &partitions {
@@ -4621,29 +4628,44 @@ fn neighbour_from_block(
     list: u8,
     current_slice_id: i32,
 ) -> NeighbourMv {
-    // Wrap to neighbour MB.
-    let mut nx = mb_xx;
-    let mut ny = mb_yy;
-    let mut bxw = bx;
-    let mut byw = by;
-    if bxw < 0 {
-        nx -= 1;
-        bxw += 4;
-    } else if bxw >= 4 {
-        nx += 1;
-        bxw -= 4;
-    }
-    if byw < 0 {
-        ny -= 1;
-        byw += 4;
-    } else if byw >= 4 {
-        ny += 1;
-        byw -= 4;
-    }
-    if nx < 0 || ny < 0 || nx >= width {
-        return NeighbourMv::UNAVAILABLE;
-    }
-    let addr = (ny as u32) * (width as u32) + (nx as u32);
+    let (addr, bxw, byw) = if grid.mbaff_frame_flag {
+        // §6.4.12.2 — in an MBAFF frame the macroblock addresses are
+        // pair-interleaved and the neighbouring-4x4-block derivation
+        // must run through the §6.4.10/Table 6-4 process. Convert the
+        // relative 4x4-block offset to a relative luma sample offset
+        // (block −1 → sample −1, the neighbour MB's rightmost/lowest
+        // line; block 4 → sample 16) and probe.
+        let xn = if bx < 0 { 4 * bx + 3 } else { 4 * bx };
+        let yn = if by < 0 { 4 * by + 3 } else { 4 * by };
+        match mbaff_neigh_loc_luma(grid, curr_mb_addr, xn, yn) {
+            Some((addr, xw, yw)) => (addr, xw / 4, yw / 4),
+            None => return NeighbourMv::UNAVAILABLE,
+        }
+    } else {
+        // Non-MBAFF: wrap to the raster neighbour MB.
+        let mut nx = mb_xx;
+        let mut ny = mb_yy;
+        let mut bxw = bx;
+        let mut byw = by;
+        if bxw < 0 {
+            nx -= 1;
+            bxw += 4;
+        } else if bxw >= 4 {
+            nx += 1;
+            bxw -= 4;
+        }
+        if byw < 0 {
+            ny -= 1;
+            byw += 4;
+        } else if byw >= 4 {
+            ny += 1;
+            byw -= 4;
+        }
+        if nx < 0 || ny < 0 || nx >= width {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        ((ny as u32) * (width as u32) + (nx as u32), bxw, byw)
+    };
     let Some(info) = grid.get(addr) else {
         return NeighbourMv::UNAVAILABLE;
     };
@@ -4719,12 +4741,33 @@ fn neighbour_from_block(
         }
         return NeighbourMv::intra_but_mb_available();
     }
+    // §8.4.1.3.2 eq. 8-217..8-220 — MBAFF field/frame adjustment of
+    // the neighbour's vertical MV component and reference index when
+    // the current MB and mbAddrN differ in field/frame coding.
+    let mut mv_y = mv.1 as i32;
+    let mut ref_idx = ref_idx as i32;
+    if grid.mbaff_frame_flag {
+        let curr_field = grid
+            .get(curr_mb_addr)
+            .map(|i| i.mb_field_decoding_flag)
+            .unwrap_or(false);
+        let n_field = info.mb_field_decoding_flag;
+        if curr_field && !n_field {
+            // Current field MB, neighbour frame MB.
+            mv_y /= 2; // eq. 8-217
+            ref_idx *= 2; // eq. 8-218
+        } else if !curr_field && n_field {
+            // Current frame MB, neighbour field MB.
+            mv_y *= 2; // eq. 8-219
+            ref_idx /= 2; // eq. 8-220
+        }
+    }
     NeighbourMv {
         available: true,
         mb_available: true,
         partition_available: true,
-        ref_idx: ref_idx as i32,
-        mv: Mv::new(mv.0 as i32, mv.1 as i32),
+        ref_idx,
+        mv: Mv::new(mv.0 as i32, mv_y),
     }
 }
 
@@ -6130,6 +6173,7 @@ fn deblock_picture(
     bit_depth_c: u32,
     pps: &Pps,
     mbaff_frame_flag: bool,
+    field_pic: bool,
     mb_field_flags: &[bool],
 ) {
     // For simplicity, walk the luma plane and filter each 4x4 block
@@ -6155,6 +6199,7 @@ fn deblock_picture(
         beta_off,
         bit_depth_y,
         mbaff_frame_flag,
+        field_pic,
         mb_field_flags,
     );
     if pic.chroma_array_type == 1 || pic.chroma_array_type == 2 {
@@ -6166,6 +6211,7 @@ fn deblock_picture(
             bit_depth_c,
             pps,
             mbaff_frame_flag,
+            field_pic,
             mb_field_flags,
         );
     } else if pic.chroma_array_type == 3 {
@@ -6187,6 +6233,7 @@ fn deblock_picture(
             bit_depth_c,
             pps,
             mbaff_frame_flag,
+            field_pic,
             mb_field_flags,
         );
     }
@@ -6231,14 +6278,19 @@ fn pixel_to_mb_addr(
         }
         return Some((mb_y as u32) * grid.width_in_mbs + mb_x as u32);
     }
-    // MBAFF frame: pair row is 32 luma rows tall.
+    // MBAFF frame: pair row is 32 luma rows tall. §6.4.1 — macroblock
+    // addresses are PAIR-INTERLEAVED in an MBAFF frame: the top MB of
+    // pair (mb_x, pair_row) is `2 * (pair_row * PicWidthInMbs + mb_x)`
+    // and the bottom MB is that + 1 (matching `mbaff_mb_to_sample_xy`,
+    // which the reconstruction stage used to POPULATE `grid.info` —
+    // the grid is indexed by this same pair-interleaved address).
     let pair_row = y / 32;
     if pair_row * 2 >= grid.height_in_mbs as i32 {
         return None;
     }
-    let pair_top_addr = (pair_row as u32 * 2) * grid.width_in_mbs + mb_x as u32;
-    let bot_addr = pair_top_addr + grid.width_in_mbs; // bottom MB of the pair
-                                                      // Inspect the top MB's mb_field_decoding_flag (shared within a pair).
+    let pair_top_addr = 2 * (pair_row as u32 * grid.width_in_mbs + mb_x as u32);
+    let bot_addr = pair_top_addr + 1; // bottom MB of the pair
+                                      // Inspect the top MB's mb_field_decoding_flag (shared within a pair).
     let pair_field = mb_field_flags
         .get(pair_top_addr as usize)
         .copied()
@@ -6256,6 +6308,42 @@ fn pixel_to_mb_addr(
     } else {
         Some(pair_top_addr)
     }
+}
+
+/// §8.7.2.1 — per-edge MBAFF/field facts feeding the bS derivation.
+/// Returns `(mbaff_or_field, both_in_frame_mbs, mixed_mode_edge)` for
+/// the edge between the MBs at `p_addr` / `q_addr`:
+///
+/// * `mbaff_or_field` — `MbaffFrameFlag == 1 || field_pic_flag == 1`.
+/// * `both_in_frame_mbs` — the samples p0 and q0 are both in frame
+///   macroblocks (first/second §8.7.2.1 bS=4 bullets). In a non-MBAFF
+///   frame picture this is always true; in a field picture always
+///   false; in an MBAFF frame it depends on the two pairs'
+///   `mb_field_decoding_flag`.
+/// * `mixed_mode_edge` — §8.7.2.1 `mixedModeEdgeFlag`: MbaffFrameFlag
+///   is 1 and p0/q0 are in DIFFERENT macroblock pairs, one field- and
+///   one frame-coded. MBAFF addresses are pair-interleaved (§6.4.1),
+///   so the pair index is `addr / 2`.
+fn bs_pair_flags(
+    p_addr: u32,
+    q_addr: u32,
+    mbaff_frame_flag: bool,
+    field_pic: bool,
+    mb_field_flags: &[bool],
+) -> (bool, bool, bool) {
+    if !mbaff_frame_flag {
+        return (field_pic, !field_pic, false);
+    }
+    let p_field = mb_field_flags
+        .get(p_addr as usize)
+        .copied()
+        .unwrap_or(false);
+    let q_field = mb_field_flags
+        .get(q_addr as usize)
+        .copied()
+        .unwrap_or(false);
+    let mixed = (p_addr / 2 != q_addr / 2) && (p_field != q_field);
+    (true, !p_field && !q_field, mixed)
 }
 
 /// §8.7.2.1 — `different_ref_or_mv` test for a pair of 4x4 luma blocks
@@ -6451,6 +6539,7 @@ fn deblock_plane_luma(
     beta_off: i32,
     bit_depth: u32,
     mbaff_frame_flag: bool,
+    field_pic: bool,
     mb_field_flags: &[bool],
 ) {
     let w = pic.width_in_samples as i32;
@@ -6556,6 +6645,8 @@ fn deblock_plane_luma(
                         blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
                     let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
                     let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                    let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
+                        bs_pair_flags(p_addr, q_addr, mbaff_frame_flag, field_pic, mb_field_flags);
                     let bs = derive_boundary_strength(BsInputs {
                         p_is_intra: p_info.is_intra,
                         q_is_intra: q_info.is_intra,
@@ -6563,9 +6654,10 @@ fn deblock_plane_luma(
                         is_sp_or_si: false,
                         either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                         different_ref_or_mv: diff_ref_mv,
-                        mixed_mode_edge: false,
+                        mixed_mode_edge,
                         vertical_edge: true,
-                        mbaff_or_field: mbaff_frame_flag,
+                        mbaff_or_field,
+                        both_in_frame_mbs,
                     });
                     if bs == 0 {
                         continue;
@@ -6647,6 +6739,8 @@ fn deblock_plane_luma(
                         blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
                     let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
                     let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                    let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
+                        bs_pair_flags(p_addr, q_addr, mbaff_frame_flag, field_pic, mb_field_flags);
                     let bs = derive_boundary_strength(BsInputs {
                         p_is_intra: p_info.is_intra,
                         q_is_intra: q_info.is_intra,
@@ -6654,9 +6748,10 @@ fn deblock_plane_luma(
                         is_sp_or_si: false,
                         either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                         different_ref_or_mv: diff_ref_mv,
-                        mixed_mode_edge: false,
+                        mixed_mode_edge,
                         vertical_edge: false,
-                        mbaff_or_field: mbaff_frame_flag,
+                        mbaff_or_field,
+                        both_in_frame_mbs,
                     });
                     if bs == 0 {
                         continue;
@@ -6691,6 +6786,7 @@ fn deblock_plane_chroma(
     bit_depth: u32,
     pps: &Pps,
     mbaff_frame_flag: bool,
+    field_pic: bool,
     mb_field_flags: &[bool],
 ) {
     let _ = pps; // QPc derivation keeps QP_Y indirectly; handled inside.
@@ -6807,6 +6903,14 @@ fn deblock_plane_chroma(
                                     as usize;
                             let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
                             let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                            let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
+                                bs_pair_flags(
+                                    p_addr,
+                                    q_addr,
+                                    mbaff_frame_flag,
+                                    field_pic,
+                                    mb_field_flags,
+                                );
                             let bs = derive_boundary_strength(BsInputs {
                                 p_is_intra: p_info.is_intra,
                                 q_is_intra: q_info.is_intra,
@@ -6814,9 +6918,10 @@ fn deblock_plane_chroma(
                                 is_sp_or_si: false,
                                 either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                                 different_ref_or_mv: diff_ref_mv,
-                                mixed_mode_edge: false,
+                                mixed_mode_edge,
                                 vertical_edge: true,
-                                mbaff_or_field: mbaff_frame_flag,
+                                mbaff_or_field,
+                                both_in_frame_mbs,
                             });
                             if deblock_trace_enabled() {
                                 eprintln!(
@@ -6913,6 +7018,14 @@ fn deblock_plane_chroma(
                                     as usize;
                             let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
                             let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                            let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
+                                bs_pair_flags(
+                                    p_addr,
+                                    q_addr,
+                                    mbaff_frame_flag,
+                                    field_pic,
+                                    mb_field_flags,
+                                );
                             let bs = derive_boundary_strength(BsInputs {
                                 p_is_intra: p_info.is_intra,
                                 q_is_intra: q_info.is_intra,
@@ -6920,9 +7033,10 @@ fn deblock_plane_chroma(
                                 is_sp_or_si: false,
                                 either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                                 different_ref_or_mv: diff_ref_mv,
-                                mixed_mode_edge: false,
+                                mixed_mode_edge,
                                 vertical_edge: false,
-                                mbaff_or_field: mbaff_frame_flag,
+                                mbaff_or_field,
+                                both_in_frame_mbs,
                             });
                             if bs == 0 {
                                 continue;
@@ -7007,6 +7121,7 @@ fn deblock_plane_chroma_444(
     bit_depth: u32,
     pps: &Pps,
     mbaff_frame_flag: bool,
+    field_pic: bool,
     mb_field_flags: &[bool],
 ) {
     let w = pic.width_in_samples as i32;
@@ -7093,7 +7208,13 @@ fn deblock_plane_chroma_444(
                             q_in_mb_x,
                             q_in_mb_y,
                             true,
-                            mbaff_frame_flag,
+                            bs_pair_flags(
+                                p_addr,
+                                q_addr,
+                                mbaff_frame_flag,
+                                field_pic,
+                                mb_field_flags,
+                            ),
                         );
                         if bs == 0 {
                             continue;
@@ -7161,7 +7282,13 @@ fn deblock_plane_chroma_444(
                             q_in_mb_x,
                             q_in_mb_y,
                             false,
-                            mbaff_frame_flag,
+                            bs_pair_flags(
+                                p_addr,
+                                q_addr,
+                                mbaff_frame_flag,
+                                field_pic,
+                                mb_field_flags,
+                            ),
                         );
                         if bs == 0 {
                             continue;
@@ -7191,8 +7318,9 @@ fn derive_chroma_444_bs(
     q_in_mb_x: u32,
     q_in_mb_y: u32,
     vertical_edge: bool,
-    mbaff_frame_flag: bool,
+    pair_flags: (bool, bool, bool),
 ) -> u8 {
+    let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) = pair_flags;
     let diff_ref_mv = !p_info.is_intra
         && !q_info.is_intra
         && different_ref_or_mv_luma(p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y);
@@ -7207,9 +7335,10 @@ fn derive_chroma_444_bs(
         is_sp_or_si: false,
         either_has_nonzero_coeffs: p_has_nz || q_has_nz,
         different_ref_or_mv: diff_ref_mv,
-        mixed_mode_edge: false,
+        mixed_mode_edge,
         vertical_edge,
-        mbaff_or_field: mbaff_frame_flag,
+        mbaff_or_field,
+        both_in_frame_mbs,
     })
 }
 
@@ -8899,7 +9028,17 @@ mod tests {
         }
         let before_cb: Vec<i32> = pic.cb.clone();
         let before_cr: Vec<i32> = pic.cr.clone();
-        deblock_plane_chroma_444(&mut pic, &grid, 0, 0, 8, &pps, false, &[false, false]);
+        deblock_plane_chroma_444(
+            &mut pic,
+            &grid,
+            0,
+            0,
+            8,
+            &pps,
+            false,
+            false,
+            &[false, false],
+        );
         // The Cb/Cr columns adjacent to the x=16 edge must have changed.
         let cw = pic.chroma_width() as usize;
         let edge_changed_cb = (0..16).any(|y| {
@@ -8955,7 +9094,17 @@ mod tests {
             }
         }
         let before_cb = pic.cb.clone();
-        deblock_plane_chroma_444(&mut pic, &grid, 0, 0, 8, &pps, false, &[false, false]);
+        deblock_plane_chroma_444(
+            &mut pic,
+            &grid,
+            0,
+            0,
+            8,
+            &pps,
+            false,
+            false,
+            &[false, false],
+        );
         assert_eq!(
             pic.cb, before_cb,
             "bS=0 chroma edge must not be filtered at 4:4:4"

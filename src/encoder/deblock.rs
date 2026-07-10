@@ -275,6 +275,7 @@ pub fn deblock_recon_with_chroma_array_type(
         /* bit_depth_c */ 8,
         &pps,
         /* mbaff_frame_flag */ false,
+        /* field_pic */ false,
         &[], // mb_field_flags — empty in non-MBAFF
     );
 

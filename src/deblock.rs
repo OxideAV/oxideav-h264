@@ -106,15 +106,23 @@ pub struct BsInputs {
     /// different macroblock pairs, one of which is field and the
     /// other frame. Forces bS=1 when nothing stronger fires.
     pub mixed_mode_edge: bool,
-    /// `verticalEdgeFlag` from §8.7.2.1 — bS=4 requires either a
-    /// frame-mb MB edge OR `verticalEdgeFlag == 1` (with MbaffFrameFlag
-    /// / field_pic_flag set); we fold that into `is_mb_edge` for the
-    /// non-MBAFF case but keep this for the MBAFF/field path.
+    /// `verticalEdgeFlag` from §8.7.2.1 — in MBAFF / field pictures a
+    /// MB-edge intra/SP/SI can reach bS=4 through the third/fourth
+    /// bullets only when the edge is vertical.
     pub vertical_edge: bool,
-    /// True if `MbaffFrameFlag == 1` or `field_pic_flag == 1`, which
-    /// is the "allow bS=4 only on vertical edges" gating condition
-    /// per §8.7.2.1 (second bS=4 bullet).
+    /// True if `MbaffFrameFlag == 1` or `field_pic_flag == 1`. When
+    /// false, every macroblock of the picture is a frame macroblock,
+    /// so the first two §8.7.2.1 bS=4 bullets ("p0 and q0 are both in
+    /// frame macroblocks") apply unconditionally.
     pub mbaff_or_field: bool,
+    /// §8.7.2.1 first/second bS=4 bullets — true when the samples p0
+    /// and q0 are BOTH in frame macroblocks. Only consulted when
+    /// `mbaff_or_field` is true (an MBAFF frame picture mixes frame-
+    /// and field-coded macroblock pairs; a field picture contains no
+    /// frame macroblocks at all, so callers pass `false` there). When
+    /// `mbaff_or_field` is false the derivation treats both sides as
+    /// frame macroblocks regardless of this field.
+    pub both_in_frame_mbs: bool,
 }
 
 // --------------------------------------------------------------------
@@ -293,27 +301,31 @@ pub fn tc0_from(bs: u8, index_a: i32, bit_depth: u32) -> i32 {
 /// the caller gathers. The spec's case ordering (bS=4 strongest down
 /// to bS=0) is preserved here.
 pub fn derive_boundary_strength(inputs: BsInputs) -> u8 {
-    // bS = 4: MB-edge intra or SP/SI (first two bullets of §8.7.2.1),
-    // with caveats for MBAFF/field that we fold into a single flag.
-    if inputs.is_mb_edge && !inputs.mixed_mode_edge {
-        // Frame-MB MB-edge intra or SP/SI.
-        if !inputs.mbaff_or_field && (inputs.p_is_intra || inputs.q_is_intra || inputs.is_sp_or_si)
-        {
+    let intra_or_spsi = inputs.p_is_intra || inputs.q_is_intra || inputs.is_sp_or_si;
+
+    // bS = 4: the edge is a macroblock edge AND (first/second bullets)
+    // p0 and q0 are both in frame macroblocks with an intra / SP / SI
+    // side, OR (third/fourth bullets) the picture is MBAFF or field
+    // (MbaffFrameFlag == 1 or field_pic_flag == 1), the edge is
+    // VERTICAL, and a side is intra / SP / SI. Note the spec does NOT
+    // gate bS=4 on mixedModeEdgeFlag: a vertical MB edge between a
+    // frame pair and a field pair still takes bS=4 when intra.
+    if inputs.is_mb_edge && intra_or_spsi {
+        // First/second bullets — "p0 and q0 are both in frame
+        // macroblocks". In a non-MBAFF frame picture every MB is a
+        // frame MB; in MBAFF the caller reports the two sides' pair
+        // coding; in a field picture no MB is a frame MB.
+        if !inputs.mbaff_or_field || inputs.both_in_frame_mbs {
             return 4;
         }
-        // MBAFF/field: bS=4 requires verticalEdgeFlag == 1
-        // (3rd/4th bullets of §8.7.2.1).
-        if inputs.mbaff_or_field
-            && inputs.vertical_edge
-            && (inputs.p_is_intra || inputs.q_is_intra || inputs.is_sp_or_si)
-        {
+        // Third/fourth bullets — MBAFF/field vertical edges.
+        if inputs.vertical_edge {
             return 4;
         }
     }
 
     // bS = 3: non-mixed-mode intra, or mixed-mode-and-horizontal intra,
     // or SP/SI counterparts (§8.7.2.1 second block).
-    let intra_or_spsi = inputs.p_is_intra || inputs.q_is_intra || inputs.is_sp_or_si;
     if intra_or_spsi {
         if !inputs.mixed_mode_edge {
             return 3;
