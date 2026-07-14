@@ -1627,3 +1627,48 @@ fn find_box<'a>(container: &'a [u8], target: &[u8; 4]) -> Result<(&'a [u8], usiz
     }
     Err(format!("box {target:?} not found"))
 }
+
+// --- Round-413 corpus extension (fixtures 30-31) ---------------------------
+
+#[test]
+fn corpus_mbaff_field_8x8t() {
+    // High profile MBAFF with FIELD-coded pairs AND transform_8x8_mode:
+    // pins the §8.5.7 Table 8-14 8x8 FIELD inverse scan and the
+    // ctxBlockCat=5 field significance contexts (Table 9-24 field
+    // column) on real field-coded 8x8 residual blocks. Bit-exact on
+    // first run after the round-413 MBAFF field-pair subsystem landed.
+    evaluate_annex_b(&CorpusCase {
+        name: "mbaff-field-8x8t",
+        width: 64,
+        height: 128,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 3,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_mbaff_field_cavlc() {
+    // Main profile CAVLC MBAFF with FIELD-coded pairs — pins the
+    // §9.2.1 CAVLC decode path under MBAFF (the corpus previously
+    // exercised MBAFF only under CABAC). ReportOnly: round 413 routed
+    // the §9.2.1.1 nC neighbour probes through the exact §6.4.12.2
+    // Table 6-4 process, doubled the te(v) ref_idx range for field
+    // MBs, and wired §7.4.4 inference + field flags into the CAVLC
+    // walker, but the I slice still desyncs at MB #1 (a coeff_token
+    // nC mismatch) — plain CAVLC MBAFF (even all-frame-pair I) was
+    // never previously decodable, and the remaining divergence is in
+    // the CAVLC-specific MBAFF path.
+    // TODO(h264-corpus): find the remaining CAVLC MBAFF nC divergence
+    // (first failing element: MB 1 residual, slice 1) and promote.
+    evaluate_annex_b(&CorpusCase {
+        name: "mbaff-field-cavlc",
+        width: 64,
+        height: 128,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 3,
+        tier: Tier::ReportOnly,
+        bytes_per_sample: 1,
+    });
+}

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-413 corpus extension: two freshly generated black-box MBAFF
+  field-pair fixtures staged in docs and gated in
+  `tests/docs_corpus.rs` — `mbaff-field-8x8t` (High profile, field
+  pairs + `transform_8x8_mode_flag=1`, pinning the Table 8-14 8x8
+  FIELD inverse scan and the ctxBlockCat=5 field significance
+  contexts; BitExact on first run) and `mbaff-field-cavlc` (Main
+  profile CAVLC MBAFF with field pairs; report-only decode-gap pin).
+  CAVLC MBAFF groundwork landed with the pin: the §9.2.1.1 nC
+  neighbour probes route through the exact §6.4.12.2 Table 6-4
+  process on MBAFF grids (luma, 4:4:4 luma-like planes, and chroma
+  AC), the §7.4.5 te(v) ref_idx range doubles for field MBs, and the
+  CAVLC slice-data walker stamps real MBAFF field flags (§7.4.4
+  inference for skipped pairs, retro-patch on bottom-MB reads) into
+  the nC grid and the macroblock-layer entropy state. The I slice of
+  the CAVLC pin still desyncs at MB 1 (coeff_token nC mismatch) —
+  plain CAVLC MBAFF was never previously decodable; the fixture keeps
+  the remaining divergence grep-able.
 - MBAFF field-pair INTER decode (round 413) — the `mbaff-field-pairs`
   fixture (MBAFF IDR + 2 P frames with real FIELD-coded MB pairs) now
   decodes all three frames byte-exact and gates `Tier::BitExact`

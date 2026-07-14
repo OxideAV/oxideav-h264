@@ -845,6 +845,10 @@ pub struct CavlcMbNc {
     /// §7.3.5.3 / §9.2.1.1 — per-4x4 Cr block `TotalCoeff` for
     /// ChromaArrayType == 3.
     pub cr_luma_total_coeff: [u8; 16],
+    /// §7.4.4 — `mb_field_decoding_flag` of this MB (pair-shared).
+    /// Drives the §6.4.12.2 Table 6-4 neighbouring-location process
+    /// for the §9.2.1.1 nC derivation in MBAFF frames.
+    pub mb_field_decoding_flag: bool,
 }
 
 /// Slice-scoped MB grid for CAVLC neighbour lookups (§9.2.1.1).
@@ -859,6 +863,10 @@ pub struct CavlcNcGrid {
     pub pic_width_in_mbs: u32,
     pub pic_height_in_mbs: u32,
     pub mbs: Vec<CavlcMbNc>,
+    /// §7.3.4 — `MbaffFrameFlag`. When set, external neighbours for
+    /// the §9.2.1.1 nC derivation resolve through the §6.4.12.2
+    /// Table 6-4 process on the pair-interleaved grid.
+    pub mbaff_frame_flag: bool,
 }
 
 impl CavlcNcGrid {
@@ -869,6 +877,75 @@ impl CavlcNcGrid {
             pic_width_in_mbs,
             pic_height_in_mbs,
             mbs: vec![CavlcMbNc::default(); len],
+            mbaff_frame_flag: false,
+        }
+    }
+
+    /// Allocate a grid flagged as an MBAFF frame (§7.3.4).
+    pub fn new_mbaff(pic_width_in_mbs: u32, pic_height_in_mbs: u32, mbaff: bool) -> Self {
+        let mut g = Self::new(pic_width_in_mbs, pic_height_in_mbs);
+        g.mbaff_frame_flag = mbaff;
+        g
+    }
+
+    /// §6.4.12 — resolve a neighbouring sample location `(xN, yN)` to
+    /// `(mbAddrN, xW, yW)`, honouring the §6.4.12.2 Table 6-4 process
+    /// in MBAFF frames (mirror of
+    /// [`CabacNeighbourGrid::neighbour_block_loc`], reading the field
+    /// flags from the CAVLC slots).
+    pub fn neighbour_block_loc(
+        &self,
+        mb_addr: u32,
+        xn: i32,
+        yn: i32,
+        max_w: i32,
+        max_h: i32,
+    ) -> Option<(u32, i32, i32)> {
+        let w = self.pic_width_in_mbs;
+        if w == 0 {
+            return None;
+        }
+        if self.mbaff_frame_flag {
+            let curr_field = self
+                .mbs
+                .get(mb_addr as usize)
+                .map(|m| m.mb_field_decoding_flag)
+                .unwrap_or(false);
+            let pair = crate::mb_address::mbaff_pair_neighbour_addrs(mb_addr, w);
+            let frame_flag_of = |addr: u32| -> bool {
+                self.mbs
+                    .get(addr as usize)
+                    .map(|m| !m.mb_field_decoding_flag)
+                    .unwrap_or(true)
+            };
+            return crate::mb_address::mbaff_neigh_location(
+                xn,
+                yn,
+                max_w,
+                max_h,
+                !curr_field,
+                mb_addr % 2 == 0,
+                mb_addr,
+                pair,
+                frame_flag_of,
+            );
+        }
+        let x = mb_addr % w;
+        let y = mb_addr / w;
+        if xn < 0 && (0..max_h).contains(&yn) {
+            if x == 0 {
+                return None;
+            }
+            Some((mb_addr - 1, xn + max_w, yn))
+        } else if yn < 0 && (0..max_w).contains(&xn) {
+            if y == 0 {
+                return None;
+            }
+            Some((mb_addr - w, xn, yn + max_h))
+        } else if (0..max_w).contains(&xn) && (0..max_h).contains(&yn) {
+            Some((mb_addr, xn, yn))
+        } else {
+            None
         }
     }
 
@@ -925,10 +1002,27 @@ pub(crate) fn derive_nc_luma(
         LumaNcKind::Ac => blk_idx,
     };
 
-    // §6.4.11.4 — derive blkA/blkB for this luma4x4BlkIdx.
-    let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk);
-    let (a_mb_addr, a_blk) = resolve_luma_neighbour(grid, current_mb_addr, a_src);
-    let (b_mb_addr, b_blk) = resolve_luma_neighbour(grid, current_mb_addr, b_src);
+    // §6.4.11.4 — derive blkA/blkB for this luma4x4BlkIdx. In MBAFF
+    // frames the probes route through the exact §6.4.12.2 Table 6-4
+    // process (sample locations (x-1, y) / (x, y-1) of the block's
+    // upper-left corner); otherwise the precomputed §6.4.9 raster map
+    // applies.
+    let ((a_mb_addr, a_blk), (b_mb_addr, b_blk)) = if grid.mbaff_frame_flag {
+        let (bx, by) = blk4x4_xy(blk);
+        let probe = |xn: i32, yn: i32| -> (Option<u32>, u8) {
+            match grid.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16) {
+                Some((addr, wx, wy)) => (Some(addr), blk4x4_idx(wx, wy)),
+                None => (None, 0),
+            }
+        };
+        (probe(bx - 1, by), probe(bx, by - 1))
+    } else {
+        let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk);
+        (
+            resolve_luma_neighbour(grid, current_mb_addr, a_src),
+            resolve_luma_neighbour(grid, current_mb_addr, b_src),
+        )
+    };
 
     // §9.2.1.1 step 5 — availability + step 6 — nN derivation.
     let (avail_a, n_a) = nc_nn_luma(
@@ -966,9 +1060,22 @@ pub(crate) fn derive_nc_plane_luma_like(
     current_is_intra: bool,
     constrained_intra_pred_flag: bool,
 ) -> i32 {
-    let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk_idx);
-    let (a_mb_addr, a_blk) = resolve_luma_neighbour(grid, current_mb_addr, a_src);
-    let (b_mb_addr, b_blk) = resolve_luma_neighbour(grid, current_mb_addr, b_src);
+    let ((a_mb_addr, a_blk), (b_mb_addr, b_blk)) = if grid.mbaff_frame_flag {
+        let (bx, by) = blk4x4_xy(blk_idx);
+        let probe = |xn: i32, yn: i32| -> (Option<u32>, u8) {
+            match grid.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16) {
+                Some((addr, wx, wy)) => (Some(addr), blk4x4_idx(wx, wy)),
+                None => (None, 0),
+            }
+        };
+        (probe(bx - 1, by), probe(bx, by - 1))
+    } else {
+        let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk_idx);
+        (
+            resolve_luma_neighbour(grid, current_mb_addr, a_src),
+            resolve_luma_neighbour(grid, current_mb_addr, b_src),
+        )
+    };
     let (avail_a, n_a) = nc_nn_plane_luma_like(
         grid,
         a_mb_addr,
@@ -1171,6 +1278,14 @@ fn resolve_chroma_neighbour(
     max_w: i32,
     max_h: i32,
 ) -> (Option<u32>, u8) {
+    // MBAFF frames: exact §6.4.12.2 Table 6-4 process in the chroma
+    // sample geometry, then §6.4.13.2 eq. 6-39 for the block index.
+    if grid.mbaff_frame_flag {
+        return match grid.neighbour_block_loc(current_mb_addr, xn, yn, max_w, max_h) {
+            Some((addr, xw, yw)) => (Some(addr), (2 * (yw / 4) + (xw / 4)) as u8),
+            None => (None, 0),
+        };
+    }
     let w = grid.pic_width_in_mbs;
     let x = if w == 0 { 0 } else { current_mb_addr % w };
     let y = current_mb_addr.checked_div(w).unwrap_or(0);
@@ -2874,8 +2989,19 @@ fn parse_mb_pred(
         let mbaff_override = entropy.mbaff_frame_flag && entropy.mb_field_decoding_flag;
         let ref_l0_present = entropy.num_ref_idx_l0_active_minus1 > 0 || mbaff_override;
         let ref_l1_present = entropy.num_ref_idx_l1_active_minus1 > 0 || mbaff_override;
-        let x_l0 = entropy.num_ref_idx_l0_active_minus1;
-        let x_l1 = entropy.num_ref_idx_l1_active_minus1;
+        // §7.4.5.1 — te(v) range: for a FIELD MB in an MBAFF frame the
+        // reference list is the doubled per-field list, so ref_idx_lX
+        // ranges 0..=2*num_ref_idx_lX_active_minus1 + 1.
+        let x_l0 = if mbaff_override {
+            2 * entropy.num_ref_idx_l0_active_minus1 + 1
+        } else {
+            entropy.num_ref_idx_l0_active_minus1
+        };
+        let x_l1 = if mbaff_override {
+            2 * entropy.num_ref_idx_l1_active_minus1 + 1
+        } else {
+            entropy.num_ref_idx_l1_active_minus1
+        };
 
         // Map MB partition index to the 8x8 partition covering it for
         // ref_idx neighbour lookups. Per §7.4.5 / Table 7-13:
@@ -3254,8 +3380,17 @@ fn parse_sub_mb_pred(
     let mbaff_override = entropy.mbaff_frame_flag && entropy.mb_field_decoding_flag;
     let ref_l0_present = entropy.num_ref_idx_l0_active_minus1 > 0 || mbaff_override;
     let ref_l1_present = entropy.num_ref_idx_l1_active_minus1 > 0 || mbaff_override;
-    let x_l0 = entropy.num_ref_idx_l0_active_minus1;
-    let x_l1 = entropy.num_ref_idx_l1_active_minus1;
+    // §7.4.5.2 — te(v) range doubling for FIELD MBs (see mb_pred).
+    let x_l0 = if mbaff_override {
+        2 * entropy.num_ref_idx_l0_active_minus1 + 1
+    } else {
+        entropy.num_ref_idx_l0_active_minus1
+    };
+    let x_l1 = if mbaff_override {
+        2 * entropy.num_ref_idx_l1_active_minus1 + 1
+    } else {
+        entropy.num_ref_idx_l1_active_minus1
+    };
 
     // Scratch neighbour info populated as ref_idx/mvd are decoded.
     let mut curr_nb = CabacMbNeighbourInfo::default();

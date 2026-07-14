@@ -192,7 +192,7 @@ pub fn parse_slice_data(
     // so the product fits in u32 by construction. Used downstream to
     // bound `mb_skip_run` and to detect MB-address overflow.
     let pic_size_in_mbs = pic_w_mbs.saturating_mul(pic_h_mbs);
-    let mut cavlc_nc = CavlcNcGrid::new(pic_w_mbs, pic_h_mbs);
+    let mut cavlc_nc = CavlcNcGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag);
 
     if pps.entropy_coding_mode_flag {
         // ---------------------------------------------------------
@@ -791,12 +791,18 @@ pub fn parse_slice_data(
                 }
                 prev_mb_skipped = pending_skip > 0;
                 for _ in 0..pending_skip {
-                    // §7.4.4 — inferred mb_field_decoding_flag for a
-                    // skipped MB whose pair flag hasn't been read.
-                    // Phase-1 uses 0 as the spec's default-when-no-
-                    // neighbour inference outcome; full spatial
-                    // inference is out of scope.
-                    let flag = pending_pair_flag.unwrap_or(false);
+                    // §7.4.4 — mb_field_decoding_flag for a skipped MB
+                    // whose pair flag hasn't been read: the spatial
+                    // inference (left pair in the same slice, else
+                    // above pair, else 0). A coded bottom MB's decoded
+                    // flag retro-patches this per the §7.4.4 NOTE.
+                    let flag = pending_pair_flag.unwrap_or_else(|| {
+                        if mbaff_frame_flag {
+                            infer_pair_field_flag_cavlc(&cavlc_nc, curr_mb_addr, pic_w_mbs)
+                        } else {
+                            false
+                        }
+                    });
                     macroblocks.push(Macroblock::new_skip(slice_header.slice_type));
                     mb_field_decoding_flags.push(flag);
                     // §9.2.1.1 step 6 — skipped MB contributes nN = 0.
@@ -808,6 +814,9 @@ pub fn parse_slice_data(
                         slot.luma_total_coeff = [0; 16];
                         slot.cb_total_coeff = [0; 8];
                         slot.cr_total_coeff = [0; 8];
+                        // §6.4.12.2 — the pair flag drives the Table
+                        // 6-4 neighbour derivation for later MBs.
+                        slot.mb_field_decoding_flag = flag;
                     }
                     // If we rolled through the bottom of a pair, the
                     // pair is complete — clear the pending flag.
@@ -836,14 +845,26 @@ pub fn parse_slice_data(
                 let flag = r.u(1)? != 0;
                 pending_pair_flag = Some(flag);
                 // Retroactively patch the (skipped) top MB of this
-                // pair if we're at the bottom.
+                // pair if we're at the bottom — output vector AND the
+                // nC grid slot (§7.4.4 NOTE).
                 if curr_mb_addr % 2 == 1 {
                     if let Some(last) = mb_field_decoding_flags.last_mut() {
                         *last = flag;
                     }
+                    if let Some(slot) = cavlc_nc.mbs.get_mut((curr_mb_addr - 1) as usize) {
+                        slot.mb_field_decoding_flag = flag;
+                    }
                 }
             }
             let flag = pending_pair_flag.unwrap_or(false);
+            // §6.4.12.2 — stamp the current MB's pair flag before the
+            // macroblock-layer parse so the §9.2.1.1 nC Table 6-4
+            // derivations read the correct currMbFrameFlag.
+            if mbaff_frame_flag {
+                if let Some(slot) = cavlc_nc.mbs.get_mut(curr_mb_addr as usize) {
+                    slot.mb_field_decoding_flag = flag;
+                }
+            }
             let mut entropy = EntropyState {
                 cabac: None,
                 slice_kind: kind,
@@ -856,11 +877,11 @@ pub fn parse_slice_data(
                 constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
                 num_ref_idx_l0_active_minus1: slice_header.num_ref_idx_l0_active_minus1,
                 num_ref_idx_l1_active_minus1: slice_header.num_ref_idx_l1_active_minus1,
-                mbaff_frame_flag: false,
-                mb_field_decoding_flag: false,
+                mbaff_frame_flag,
+                mb_field_decoding_flag: flag,
                 // CABAC neighbour grid unused on the CAVLC path.
                 cabac_nb: None,
-                pic_width_in_mbs: 0,
+                pic_width_in_mbs: pic_w_mbs,
                 bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
                 bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
             };
@@ -954,6 +975,25 @@ fn infer_pair_field_flag(
     for addr in [a_top, b_top].into_iter().flatten() {
         if let Some(info) = grid.mbs.get(addr as usize) {
             if info.available {
+                return info.mb_field_decoding_flag;
+            }
+        }
+    }
+    false
+}
+
+/// §7.4.4 — CAVLC-path twin of [`infer_pair_field_flag`], reading the
+/// per-slice CAVLC nC grid (its `is_available` likewise means "decoded
+/// earlier in this same slice").
+fn infer_pair_field_flag_cavlc(
+    grid: &crate::macroblock_layer::CavlcNcGrid,
+    curr_mb_addr: u32,
+    pic_width_in_mbs: u32,
+) -> bool {
+    let [a_top, b_top, _c, _d] = mbaff_pair_neighbour_addrs(curr_mb_addr, pic_width_in_mbs);
+    for addr in [a_top, b_top].into_iter().flatten() {
+        if let Some(info) = grid.mbs.get(addr as usize) {
+            if info.is_available {
                 return info.mb_field_decoding_flag;
             }
         }
