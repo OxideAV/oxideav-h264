@@ -58,9 +58,10 @@ use crate::slice_data::SliceData;
 use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sps::Sps;
 use crate::transform::{
-    inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422, inverse_hadamard_luma_dc_16x16,
-    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
-    qp_y_to_qp_c_with_bd_offset, select_scaling_list_4x4, select_scaling_list_8x8, TransformError,
+    intra_bypass_dpcm, inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422,
+    inverse_hadamard_luma_dc_16x16, inverse_transform_4x4, inverse_transform_4x4_dc_preserved,
+    inverse_transform_8x8, qp_bd_offset, qp_y_to_qp_c_with_bd_offset, select_scaling_list_4x4,
+    select_scaling_list_8x8, TransformError,
 };
 
 use thiserror::Error;
@@ -962,11 +963,19 @@ fn reconstruct_intra_16x16(
     // luma QpBdOffsetY = 0 and qp_prime_y == qp_y.
     let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
     let qp_prime_y = qp_y + qp_bd_offset_y;
+    // §7.4.2.1.1 — lossless bypass: all §8.5.10/§8.5.12 stages are the
+    // identity and §8.5.15 DPCM applies below for V/H prediction.
+    let bypass = transform_bypass_active(sps, qp_prime_y);
     let dc_levels = mb.residual_luma_dc.as_ref().copied().unwrap_or([0i32; 16]);
     // DC coefficients are in zig-zag scan order; inverse-scan to a
     // 4x4 matrix before the Hadamard.
     let dc_matrix = crate::transform::inverse_scan_4x4_zigzag(&dc_levels);
-    let dc_y = inverse_hadamard_luma_dc_16x16(&dc_matrix, qp_prime_y, &sl4, bit_depth_y)?;
+    let dc_y = if bypass {
+        // §8.5.10 eq. 8-319 — dcY = c (no Hadamard, no scaling).
+        dc_matrix
+    } else {
+        inverse_hadamard_luma_dc_16x16(&dc_matrix, qp_prime_y, &sl4, bit_depth_y)?
+    };
 
     // -------- §8.5.12 — each of the 16 AC blocks --------------------
     // Residual layout from macroblock_layer:
@@ -977,6 +986,12 @@ fn reconstruct_intra_16x16(
     //   Intra16x16ACLevel per §7.3.5.3.3 / Table 9-42). Slot 15 is
     //   unused (padding by `pad_to_16`).
     //   When cbp_luma == 0, residual_luma is empty (only DC).
+    //
+    // The per-block residuals are assembled into the §8.5.2 16x16 rMb
+    // array (eq. 8-301) first: the §8.5.15 lossless DPCM (step 3 of
+    // §8.5.2) operates on the WHOLE 16x16 rMb, crossing 4x4 block
+    // boundaries, before the eq. 8-302 prediction add.
+    let mut rmb = [0i32; 256];
     #[allow(clippy::needless_range_loop)] // spec §8.5.10 raster-Z 4x4 walk
     for block_idx in 0..16usize {
         let (bx, by) = LUMA_4X4_XY[block_idx];
@@ -1001,11 +1016,33 @@ fn reconstruct_intra_16x16(
         let dc_col = (bx / 4) as usize;
         coeffs[0] = dc_y[dc_row * 4 + dc_col];
 
-        let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_prime_y, &sl4, bit_depth_y)?;
+        let residual = if bypass {
+            // §8.5.12 eq. 8-334 — r = c.
+            coeffs
+        } else {
+            inverse_transform_4x4_dc_preserved(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
+        };
+        for yy in 0..4usize {
+            for xx in 0..4usize {
+                rmb[(by as usize + yy) * 16 + bx as usize + xx] = residual[yy * 4 + xx];
+            }
+        }
+    }
 
-        // Add prediction + residual, clip, write via MbWriter so
-        // §6.4.1 eq. (6-10) field-MB y-stride is applied.
-        write_block_luma(writer, pic, &pred, bx, by, &residual, bit_depth_y);
+    // §8.5.2 step 3 — lossless V/H intra DPCM over the full 16x16 rMb
+    // (Intra16x16PredMode 0 = vertical → horPredFlag 0, 1 = horizontal).
+    if bypass && pred_mode_idx <= 1 {
+        intra_bypass_dpcm(&mut rmb, 16, 16, pred_mode_idx == 1);
+    }
+
+    // §8.5.2 step 4 (eq. 8-302) — add prediction + residual, clip,
+    // write via MbWriter so §6.4.1 eq. (6-10) field-MB y-stride is
+    // applied.
+    for y in 0..16usize {
+        for x in 0..16usize {
+            let v = clip_sample(pred[y * 16 + x] + rmb[y * 16 + x], bit_depth_y);
+            writer.set_luma(pic, x as i32, y as i32, v);
+        }
     }
 
     // Chroma for the same MB.
@@ -1444,6 +1481,11 @@ fn reconstruct_intra_nxn(
     // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY.
     let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
     let qp_prime_y = qp_y + qp_bd_offset_y;
+    // §7.4.2.1.1 — lossless bypass: §8.5.12/§8.5.13 are the identity
+    // (eqs. 8-334 / 8-355) and §8.5.15 per-block DPCM applies for
+    // vertical/horizontal Intra_4x4 / Intra_8x8 prediction modes
+    // (§8.5.1 / §8.5.3 step 3).
+    let bypass = transform_bypass_active(sps, qp_prime_y);
 
     // The Intra_4x4/Intra_8x8 pred-mode derivation consults the
     // already-set `intra_4x4_pred_modes` / `intra_8x8_pred_modes` of
@@ -1542,7 +1584,17 @@ fn reconstruct_intra_nxn(
                     [0i32; 64]
                 }
             };
-            let residual = inverse_transform_8x8(&coeffs_flat, qp_prime_y, &sl8, bit_depth_y)?;
+            let residual = if bypass {
+                // §8.5.13 eq. 8-355 — r = c; §8.5.3 step 3 — §8.5.15
+                // DPCM per 8x8 block when Intra8x8PredMode is V/H.
+                let mut r = coeffs_flat;
+                if matches!(mode, Intra8x8Mode::Vertical | Intra8x8Mode::Horizontal) {
+                    intra_bypass_dpcm(&mut r, 8, 8, mode == Intra8x8Mode::Horizontal);
+                }
+                r
+            } else {
+                inverse_transform_8x8(&coeffs_flat, qp_prime_y, &sl8, bit_depth_y)?
+            };
 
             // Add prediction + residual; write back via MbWriter so
             // §6.4.1 eq. (6-10) field-MB y-stride is applied.
@@ -1633,7 +1685,17 @@ fn reconstruct_intra_nxn(
                 [0i32; 16]
             };
             let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
-            let residual = inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?;
+            let residual = if bypass {
+                // §8.5.12 eq. 8-334 — r = c; §8.5.1 step 3 — §8.5.15
+                // DPCM per 4x4 block when Intra4x4PredMode is V/H.
+                let mut r = coeffs;
+                if matches!(mode, Intra4x4Mode::Vertical | Intra4x4Mode::Horizontal) {
+                    intra_bypass_dpcm(&mut r, 4, 4, mode == Intra4x4Mode::Horizontal);
+                }
+                r
+            } else {
+                inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
+            };
 
             if debug && (block_idx == 0 || block_idx == 3) {
                 eprintln!(
@@ -1778,6 +1840,12 @@ fn reconstruct_chroma_intra(
     let qp_cb = qp_y_to_qp_c_with_bd_offset(qp_y, cb_offset, qp_bd_offset_c) + qp_bd_offset_c;
     let qp_cr = qp_y_to_qp_c_with_bd_offset(qp_y, cr_offset, qp_bd_offset_c) + qp_bd_offset_c;
 
+    // §7.4.2.1.1 — TransformBypassModeFlag is derived from the LUMA
+    // QP′Y (not QP′C), and gates the §8.5.11/§8.5.12 identity legs
+    // (eqs. 8-323 / 8-334) plus §8.5.4 step 3 chroma DPCM below.
+    let qp_prime_y = qp_y + qp_bd_offset(sps.bit_depth_luma_minus8);
+    let bypass = transform_bypass_active(sps, qp_prime_y);
+
     let cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
     // §7.4.2.1.1.1 Table 7-2 — intra chroma lists: i=1 (Cb) / i=2 (Cr).
     let sl4_cb = select_scaling_list_4x4(1, sps, pps);
@@ -1832,8 +1900,28 @@ fn reconstruct_chroma_intra(
         let (dc_cb4, dc_cb8): (Option<[i32; 4]>, Option<[i32; 8]>) = if cbp_chroma > 0 {
             if chroma_array_type == 1 {
                 let dc4: [i32; 4] = [dc_flat[0], dc_flat[1], dc_flat[2], dc_flat[3]];
-                let out = inverse_hadamard_chroma_dc_420(&dc4, qp_c, sl4, bit_depth_c)?;
-                (Some(out), None)
+                if bypass {
+                    // §8.5.11 eq. 8-323 — dcC = c. For 4:2:0 the 2x2 c
+                    // (eq. 8-304, raster from ChromaDCLevel) maps to
+                    // chroma4x4BlkIdx in the same raster order
+                    // (Figure 8-7a), so the identity is index-for-index.
+                    (Some(dc4), None)
+                } else {
+                    let out = inverse_hadamard_chroma_dc_420(&dc4, qp_c, sl4, bit_depth_c)?;
+                    (Some(out), None)
+                }
+            } else if bypass {
+                // §8.5.11 eq. 8-323 for 4:2:2: c is the eq. 8-305 4x2
+                // array (a NON-raster pickup from ChromaDCLevel), and
+                // dcC[i][j] feeds chroma4x4BlkIdx = 2*i + j
+                // (Figure 8-7b) — apply the eq. 8-305 permutation.
+                let out = [
+                    dc_flat[0], dc_flat[2], // row 0: L[0], L[2]
+                    dc_flat[1], dc_flat[5], // row 1: L[1], L[5]
+                    dc_flat[3], dc_flat[6], // row 2: L[3], L[6]
+                    dc_flat[4], dc_flat[7], // row 3: L[4], L[7]
+                ];
+                (None, Some(out))
             } else {
                 let out = inverse_hadamard_chroma_dc_422(&dc_flat, qp_c, sl4, bit_depth_c)?;
                 (None, Some(out))
@@ -1852,6 +1940,10 @@ fn reconstruct_chroma_intra(
             &mb.residual_chroma_ac_cr
         };
 
+        // §8.5.4 step 2 — assemble the (MbWidthC)x(MbHeightC) rMb
+        // (eq. 8-307) first: the §8.5.15 lossless DPCM (§8.5.4 step 3)
+        // spans the WHOLE chroma MB, crossing 4x4 block boundaries.
+        let mut rmb = vec![0i32; out_len];
         for blk in 0..n_ac {
             // DC coefficient for this 4x4 block.
             let dc_c = if chroma_array_type == 1 {
@@ -1867,7 +1959,12 @@ fn reconstruct_chroma_intra(
             // Chroma AC: parser slots 0..=14 are spec scan positions 1..=15.
             let mut coeffs = crate::transform::inverse_scan_4x4_zigzag_ac(&ac_scan);
             coeffs[0] = dc_c;
-            let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?;
+            let residual = if bypass {
+                // §8.5.12 eq. 8-334 — r = c.
+                coeffs
+            } else {
+                inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?
+            };
 
             // Position of this 4x4 chroma block inside the MB.
             // For 4:2:0 (8x8 chroma MB): blocks laid out in 2x2 at (0,0) (4,0) (0,4) (4,4).
@@ -1876,12 +1973,31 @@ fn reconstruct_chroma_intra(
             for yy in 0..4 {
                 for xx in 0..4 {
                     let pidx = ((by as usize + yy) * (mbw_c as usize)) + (bx as usize + xx);
-                    let v = clip_sample(pred_samples[pidx] + residual[yy * 4 + xx], bit_depth_c);
-                    if plane == 0 {
-                        writer.set_cb(pic, bx + xx as i32, by + yy as i32, v);
-                    } else {
-                        writer.set_cr(pic, bx + xx as i32, by + yy as i32, v);
-                    }
+                    rmb[pidx] = residual[yy * 4 + xx];
+                }
+            }
+        }
+
+        // §8.5.4 step 3 — lossless chroma DPCM: intra_chroma_pred_mode
+        // 1 (horizontal) / 2 (vertical) → horPredFlag = 2 − mode.
+        if bypass && (chroma_mode_idx == 1 || chroma_mode_idx == 2) {
+            intra_bypass_dpcm(
+                &mut rmb,
+                mbw_c as usize,
+                mbh_c as usize,
+                chroma_mode_idx == 1,
+            );
+        }
+
+        // §8.5.4 step 4 (eq. 8-308) — prediction add + clip + write.
+        for y in 0..mbh_c as usize {
+            for x in 0..mbw_c as usize {
+                let pidx = y * (mbw_c as usize) + x;
+                let v = clip_sample(pred_samples[pidx] + rmb[pidx], bit_depth_c);
+                if plane == 0 {
+                    writer.set_cb(pic, x as i32, y as i32, v);
+                } else {
+                    writer.set_cr(pic, x as i32, y as i32, v);
                 }
             }
         }
@@ -1945,6 +2061,12 @@ fn reconstruct_chroma_intra_444(
     let sl4_cb = select_scaling_list_4x4(1, sps, pps);
     let sl4_cr = select_scaling_list_4x4(2, sps, pps);
 
+    // §7.4.2.1.1 / §8.5.5 — lossless bypass (from the luma QP′Y): the
+    // Cb/Cr planes follow the §8.5.2 process verbatim, including the
+    // §8.5.15 DPCM over the full 16x16 rMb for V/H Intra16x16PredMode.
+    let qp_prime_y = qp_y + qp_bd_offset(sps.bit_depth_luma_minus8);
+    let bypass = transform_bypass_active(sps, qp_prime_y);
+
     for plane in 0..2u8 {
         // (1) Build 16x16 chroma intra prediction by gathering neighbour
         // samples from the chroma plane (same geometry as luma — chroma
@@ -1975,7 +2097,12 @@ fn reconstruct_chroma_intra_444(
         // via residual_block_cavlc / inverse-scan). Apply the inverse
         // scan + Hadamard.
         let dc_matrix = crate::transform::inverse_scan_4x4_zigzag(&dc_levels);
-        let dc_inv = inverse_hadamard_luma_dc_16x16(&dc_matrix, qp_c, sl4, bit_depth_c)?;
+        let dc_inv = if bypass {
+            // §8.5.10 eq. 8-319 (via the §8.5.5 substitution) — dcC = c.
+            dc_matrix
+        } else {
+            inverse_hadamard_luma_dc_16x16(&dc_matrix, qp_c, sl4, bit_depth_c)?
+        };
 
         // (3) Per-AC-block inverse 4x4 transform with c[0,0] from DC,
         // add to predictor, write to the picture.
@@ -1984,6 +2111,10 @@ fn reconstruct_chroma_intra_444(
         } else {
             &mb.residual_cr_luma_like
         };
+        // Assemble the 16x16 rMb (eq. 8-301) first so the §8.5.15
+        // lossless DPCM can span the whole plane MB (§8.5.2 step 3 via
+        // the §8.5.5 substitution).
+        let mut rmb = [0i32; 256];
         #[allow(clippy::needless_range_loop)] // §6.4.3 raster-Z 4x4 walk
         for block_idx in 0..16usize {
             let (bx, by) = LUMA_4X4_XY[block_idx];
@@ -1997,17 +2128,34 @@ fn reconstruct_chroma_intra_444(
             let dc_col = (bx / 4) as usize;
             coeffs[0] = dc_inv[dc_row * 4 + dc_col];
 
-            let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?;
+            let residual = if bypass {
+                // §8.5.12 eq. 8-334 — r = c.
+                coeffs
+            } else {
+                inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?
+            };
 
-            for yy in 0..4i32 {
-                for xx in 0..4i32 {
-                    let p = pred[((by + yy) as usize) * 16 + (bx + xx) as usize];
-                    let v = clip_sample(p + residual[(yy * 4 + xx) as usize], bit_depth_c);
-                    if plane == 0 {
-                        writer.set_cb(pic, bx + xx, by + yy, v);
-                    } else {
-                        writer.set_cr(pic, bx + xx, by + yy, v);
-                    }
+            for yy in 0..4usize {
+                for xx in 0..4usize {
+                    rmb[(by as usize + yy) * 16 + bx as usize + xx] = residual[yy * 4 + xx];
+                }
+            }
+        }
+
+        // §8.5.2 step 3 (via §8.5.5) — V/H lossless DPCM over the full
+        // 16x16 chroma-plane rMb.
+        if bypass && pred_mode_idx <= 1 {
+            intra_bypass_dpcm(&mut rmb, 16, 16, pred_mode_idx == 1);
+        }
+
+        for y in 0..16i32 {
+            for x in 0..16i32 {
+                let idx = (y * 16 + x) as usize;
+                let v = clip_sample(pred[idx] + rmb[idx], bit_depth_c);
+                if plane == 0 {
+                    writer.set_cb(pic, x, y, v);
+                } else {
+                    writer.set_cr(pic, x, y, v);
                 }
             }
         }
@@ -2075,6 +2223,12 @@ fn reconstruct_chroma_intra_nxn_444(
         None => ([0u8; 16], [0u8; 4]),
     };
 
+    // §7.4.2.1.1 / §8.5.5 — lossless bypass (from the luma QP′Y): the
+    // §8.5.1 / §8.5.3 per-block §8.5.15 DPCM applies on each chroma
+    // plane with the shared luma Intra_NxN prediction modes.
+    let qp_prime_y = qp_y + qp_bd_offset(sps.bit_depth_luma_minus8);
+    let bypass = transform_bypass_active(sps, qp_prime_y);
+
     for plane in 0..2u8 {
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
         let ac_blocks = if plane == 0 {
@@ -2123,7 +2277,17 @@ fn reconstruct_chroma_intra_nxn_444(
                 } else {
                     [0i32; 64]
                 };
-                let residual = inverse_transform_8x8(&coeffs_flat, qp_c, sl8, bit_depth_c)?;
+                let residual = if bypass {
+                    // §8.5.13 eq. 8-355 — r = c; §8.5.3 step 3 (via
+                    // §8.5.5) — per-8x8 §8.5.15 DPCM for V/H modes.
+                    let mut r = coeffs_flat;
+                    if matches!(mode, Intra8x8Mode::Vertical | Intra8x8Mode::Horizontal) {
+                        intra_bypass_dpcm(&mut r, 8, 8, mode == Intra8x8Mode::Horizontal);
+                    }
+                    r
+                } else {
+                    inverse_transform_8x8(&coeffs_flat, qp_c, sl8, bit_depth_c)?
+                };
 
                 for y in 0..8i32 {
                     for x in 0..8i32 {
@@ -2167,7 +2331,17 @@ fn reconstruct_chroma_intra_nxn_444(
                     [0i32; 16]
                 };
                 let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
-                let residual = inverse_transform_4x4(&coeffs, qp_c, sl4, bit_depth_c)?;
+                let residual = if bypass {
+                    // §8.5.12 eq. 8-334 — r = c; §8.5.1 step 3 (via
+                    // §8.5.5) — per-4x4 §8.5.15 DPCM for V/H modes.
+                    let mut r = coeffs;
+                    if matches!(mode, Intra4x4Mode::Vertical | Intra4x4Mode::Horizontal) {
+                        intra_bypass_dpcm(&mut r, 4, 4, mode == Intra4x4Mode::Horizontal);
+                    }
+                    r
+                } else {
+                    inverse_transform_4x4(&coeffs, qp_c, sl4, bit_depth_c)?
+                };
 
                 for yy in 0..4i32 {
                     for xx in 0..4i32 {
@@ -2842,6 +3016,18 @@ fn clip_sample(v: i32, bit_depth: u32) -> i32 {
     v.clamp(0, hi)
 }
 
+/// §7.4.2.1.1 — TransformBypassModeFlag: 1 iff
+/// `qpprime_y_zero_transform_bypass_flag` is 1 AND QP′Y == 0 (eq.
+/// 7-40: QP′Y = QPY + QpBdOffsetY). When set, every §8.5.10 / §8.5.11
+/// / §8.5.12 / §8.5.13 scaling+transform stage becomes the identity
+/// (eqs. 8-319 / 8-323 / 8-334 / 8-355) and §8.5.15 intra residual
+/// DPCM applies for vertical/horizontal intra prediction modes.
+/// The flag is derived from the LUMA QP′Y even for chroma blocks.
+#[inline]
+fn transform_bypass_active(sps: &Sps, qp_prime_y: i32) -> bool {
+    sps.qpprime_y_zero_transform_bypass_flag && qp_prime_y == 0
+}
+
 /// §6.2 / Table 6-1 — chroma MB dimensions per ChromaArrayType.
 fn chroma_mb_dims(chroma_array_type: u32) -> (u32, u32) {
     match chroma_array_type {
@@ -3072,6 +3258,10 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY.
     let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
     let qp_prime_y = qp_y + qp_bd_offset_y;
+    // §7.4.2.1.1 — lossless bypass: §8.5.12/§8.5.13 are the identity
+    // (eqs. 8-334 / 8-355). No §8.5.15 DPCM for inter macroblocks —
+    // it applies only to Intra_4x4/8x8/16x16 prediction modes.
+    let bypass = transform_bypass_active(sps, qp_prime_y);
 
     if mb.transform_size_8x8_flag {
         // §8.5.13 — 8x8 inter residual path (four 8x8 blocks).
@@ -3104,7 +3294,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             } else {
                 [0i32; 64]
             };
-            let residual = inverse_transform_8x8(&coeffs, qp_prime_y, &sl8, bit_depth_y)?;
+            let residual = if bypass {
+                // §8.5.13 eq. 8-355 — r = c.
+                coeffs
+            } else {
+                inverse_transform_8x8(&coeffs, qp_prime_y, &sl8, bit_depth_y)?
+            };
             for y in 0..8 {
                 for x in 0..8 {
                     let v =
@@ -3140,7 +3335,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
                 [0i32; 16]
             };
             let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
-            let residual = inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?;
+            let residual = if bypass {
+                // §8.5.12 eq. 8-334 — r = c.
+                coeffs
+            } else {
+                inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
+            };
             for yy in 0..4 {
                 for xx in 0..4 {
                     let v = pred_luma[(by as usize + yy) * 16 + (bx as usize + xx)]
@@ -5796,6 +5996,12 @@ fn reconstruct_inter_chroma_residual(
     let qp_cb = qp_y_to_qp_c_with_bd_offset(qp_y, cb_offset, qp_bd_offset_c) + qp_bd_offset_c;
     let qp_cr = qp_y_to_qp_c_with_bd_offset(qp_y, cr_offset, qp_bd_offset_c) + qp_bd_offset_c;
 
+    // §7.4.2.1.1 — lossless bypass (derived from the luma QP′Y): the
+    // §8.5.11/§8.5.12 stages are the identity (eqs. 8-323 / 8-334).
+    // No §8.5.15 DPCM on inter macroblocks.
+    let qp_prime_y = qp_y + qp_bd_offset(sps.bit_depth_luma_minus8);
+    let bypass = transform_bypass_active(sps, qp_prime_y);
+
     // §7.4.2.1.1.1 Table 7-2 — inter chroma lists: i=4 (Cb) / i=5 (Cr).
     let sl4_cb = select_scaling_list_4x4(4, sps, pps);
     let sl4_cr = select_scaling_list_4x4(5, sps, pps);
@@ -5820,8 +6026,24 @@ fn reconstruct_inter_chroma_residual(
         let (dc4, dc8): (Option<[i32; 4]>, Option<[i32; 8]>) = if cbp_chroma > 0 {
             if chroma_array_type == 1 {
                 let dc4: [i32; 4] = [dc_flat[0], dc_flat[1], dc_flat[2], dc_flat[3]];
-                let out = inverse_hadamard_chroma_dc_420(&dc4, qp_c, sl4, bit_depth_c)?;
-                (Some(out), None)
+                if bypass {
+                    // §8.5.11 eq. 8-323 — dcC = c (identity; the 4:2:0
+                    // raster c order matches Figure 8-7a blk order).
+                    (Some(dc4), None)
+                } else {
+                    let out = inverse_hadamard_chroma_dc_420(&dc4, qp_c, sl4, bit_depth_c)?;
+                    (Some(out), None)
+                }
+            } else if bypass {
+                // §8.5.11 eq. 8-323 with the eq. 8-305 4:2:2 pickup
+                // (dcC[i][j] → chroma4x4BlkIdx 2*i+j, Figure 8-7b).
+                let out = [
+                    dc_flat[0], dc_flat[2], // row 0: L[0], L[2]
+                    dc_flat[1], dc_flat[5], // row 1: L[1], L[5]
+                    dc_flat[3], dc_flat[6], // row 2: L[3], L[6]
+                    dc_flat[4], dc_flat[7], // row 3: L[4], L[7]
+                ];
+                (None, Some(out))
             } else {
                 let out = inverse_hadamard_chroma_dc_422(&dc_flat, qp_c, sl4, bit_depth_c)?;
                 (None, Some(out))
@@ -5848,7 +6070,12 @@ fn reconstruct_inter_chroma_residual(
             // Chroma AC: parser slots 0..=14 are spec scan positions 1..=15.
             let mut coeffs = crate::transform::inverse_scan_4x4_zigzag_ac(&ac_scan);
             coeffs[0] = dc_c;
-            let residual = inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?;
+            let residual = if bypass {
+                // §8.5.12 eq. 8-334 — r = c.
+                coeffs
+            } else {
+                inverse_transform_4x4_dc_preserved(&coeffs, qp_c, sl4, bit_depth_c)?
+            };
             let (bx, by) = chroma_block_xy(chroma_array_type, blk);
             for yy in 0..4 {
                 for xx in 0..4 {
@@ -5921,6 +6148,11 @@ fn reconstruct_inter_chroma_residual_444(
     let sl8_cb = select_scaling_list_8x8(3, sps, pps);
     let sl8_cr = select_scaling_list_8x8(5, sps, pps);
 
+    // §7.4.2.1.1 — lossless bypass (from the luma QP′Y): §8.5.12 /
+    // §8.5.13 are the identity. No §8.5.15 DPCM on inter macroblocks.
+    let qp_prime_y = qp_y + qp_bd_offset(sps.bit_depth_luma_minus8);
+    let bypass = transform_bypass_active(sps, qp_prime_y);
+
     for plane in 0..2u8 {
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
         let ac_blocks = if plane == 0 {
@@ -5950,7 +6182,12 @@ fn reconstruct_inter_chroma_residual_444(
                 } else {
                     [0i32; 64]
                 };
-                let residual = inverse_transform_8x8(&coeffs_flat, qp_c, sl8, bit_depth_c)?;
+                let residual = if bypass {
+                    // §8.5.13 eq. 8-355 — r = c.
+                    coeffs_flat
+                } else {
+                    inverse_transform_8x8(&coeffs_flat, qp_c, sl8, bit_depth_c)?
+                };
                 for y in 0..8i32 {
                     for x in 0..8i32 {
                         let pidx = ((by + y) as usize) * 16 + (bx + x) as usize;
@@ -5983,7 +6220,12 @@ fn reconstruct_inter_chroma_residual_444(
                     [0i32; 16]
                 };
                 let coeffs = crate::transform::inverse_scan_4x4_zigzag(&coeffs_scan);
-                let residual = inverse_transform_4x4(&coeffs, qp_c, sl4, bit_depth_c)?;
+                let residual = if bypass {
+                    // §8.5.12 eq. 8-334 — r = c.
+                    coeffs
+                } else {
+                    inverse_transform_4x4(&coeffs, qp_c, sl4, bit_depth_c)?
+                };
                 for yy in 0..4i32 {
                     for xx in 0..4i32 {
                         let pidx = ((by + yy) as usize) * 16 + (bx + xx) as usize;

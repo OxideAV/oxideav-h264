@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- §8.5.15 lossless transform-bypass decode (round 413): when
+  `qpprime_y_zero_transform_bypass_flag` is 1 and QP′Y == 0, every
+  §8.5.10/§8.5.11/§8.5.12/§8.5.13 scaling+transform stage takes its
+  identity leg (eqs. 8-319 / 8-323 / 8-334 / 8-355) and the §8.5.15
+  intra residual DPCM (eqs. 8-411..8-413) is applied for
+  vertical/horizontal intra prediction modes — per 4x4/8x8 block for
+  Intra_4x4/Intra_8x8, across the assembled 16x16 rMb for
+  Intra_16x16, and across the full chroma MB (4:2:0/4:2:2, with the
+  eq. 8-305 4:2:2 DC pickup preserved in the bypass) or per
+  luma-style block at 4:4:4. Covers intra AND inter macroblocks in
+  all three ChromaArrayType layouts. The staged
+  `lossless-transform-bypass` fixture (High 4:4:4, IDR + P) now
+  decodes bit-exact — true lossless round-trip — and gates
+  `Tier::BitExact` (28/29 staged fixture targets green).
+
 - Corpus re-baseline (round 410): after regenerating 13 defective
   staged `expected.yuv` references from a clean black-box reference
   decode of the unchanged bitstreams, 15 of 17 staged fixtures now

@@ -989,6 +989,45 @@ pub fn inverse_transform_8x8(
 }
 
 // ---------------------------------------------------------------------------
+// §8.5.15 — Intra residual transform-bypass decoding process.
+// ---------------------------------------------------------------------------
+
+/// §8.5.15 — intra residual transform-bypass decoding (eqs.
+/// 8-411..8-413). Invoked only when TransformBypassModeFlag is 1
+/// (§7.4.2.1.1: `qpprime_y_zero_transform_bypass_flag` == 1 and
+/// QP′Y == 0), the macroblock prediction mode is Intra_4x4 / Intra_8x8
+/// / Intra_16x16, and the applicable prediction mode is vertical or
+/// horizontal.
+///
+/// `r` is the (nW)x(nH) residual array in row-major order
+/// (`r[i * n_w + j]` = r_ij); it is modified in place:
+/// * `hor_pred_flag == false` (vertical prediction): eq. 8-412 —
+///   r_ij = Σ_{k=0..i} f_kj (running sums down each column).
+/// * `hor_pred_flag == true` (horizontal prediction): eq. 8-413 —
+///   r_ij = Σ_{k=0..j} f_ik (running sums along each row).
+///
+/// Wrapping adds keep malformed-bitstream coefficient extremes from
+/// panicking in debug builds — conformant lossless streams stay well
+/// within i32 (each r_ij reconstructs a sample delta), and the caller
+/// clips to bit-depth range per eq. 8-299/8-302/8-303/8-308.
+pub fn intra_bypass_dpcm(r: &mut [i32], n_w: usize, n_h: usize, hor_pred_flag: bool) {
+    debug_assert_eq!(r.len(), n_w * n_h);
+    if hor_pred_flag {
+        for i in 0..n_h {
+            for j in 1..n_w {
+                r[i * n_w + j] = r[i * n_w + j].wrapping_add(r[i * n_w + j - 1]);
+            }
+        }
+    } else {
+        for i in 1..n_h {
+            for j in 0..n_w {
+                r[i * n_w + j] = r[i * n_w + j].wrapping_add(r[(i - 1) * n_w + j]);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // §8.5.10 — Intra_16x16 luma DC block: 4x4 Hadamard + scaling.
 // ---------------------------------------------------------------------------
 
@@ -1267,6 +1306,68 @@ pub fn inverse_hadamard_chroma_dc_422(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------ §8.5.15 intra residual transform bypass ---------------
+
+    #[test]
+    fn bypass_dpcm_vertical_4x4_column_sums() {
+        // Eq. 8-412: r_ij = Σ_{k=0..i} f_kj — running sums down columns.
+        #[rustfmt::skip]
+        let mut r = [
+            1, 2, 3, 4,
+            1, 0, -1, 2,
+            0, 5, 0, -4,
+            2, 1, 1, 1,
+        ];
+        intra_bypass_dpcm(&mut r, 4, 4, false);
+        #[rustfmt::skip]
+        let expect = [
+            1, 2, 3, 4,
+            2, 2, 2, 6,
+            2, 7, 2, 2,
+            4, 8, 3, 3,
+        ];
+        assert_eq!(r, expect);
+    }
+
+    #[test]
+    fn bypass_dpcm_horizontal_4x4_row_sums() {
+        // Eq. 8-413: r_ij = Σ_{k=0..j} f_ik — running sums along rows.
+        #[rustfmt::skip]
+        let mut r = [
+            1, 2, 3, 4,
+            1, 0, -1, 2,
+            0, 5, 0, -4,
+            2, 1, 1, 1,
+        ];
+        intra_bypass_dpcm(&mut r, 4, 4, true);
+        #[rustfmt::skip]
+        let expect = [
+            1, 3, 6, 10,
+            1, 1, 0, 2,
+            0, 5, 5, 1,
+            2, 3, 4, 5,
+        ];
+        assert_eq!(r, expect);
+    }
+
+    #[test]
+    fn bypass_dpcm_rectangular_8x16_chroma_shape() {
+        // §8.5.4 step 3 uses nW=MbWidthC, nH=MbHeightC (8x16 at 4:2:2).
+        // Vertical DPCM on a row-0 seed pattern must replicate the
+        // seed down every column.
+        let (n_w, n_h) = (8usize, 16usize);
+        let mut r = vec![0i32; n_w * n_h];
+        for (j, v) in r.iter_mut().enumerate().take(n_w) {
+            *v = j as i32; // row 0 seeds; rest zero
+        }
+        intra_bypass_dpcm(&mut r, n_w, n_h, false);
+        for i in 0..n_h {
+            for j in 0..n_w {
+                assert_eq!(r[i * n_w + j], j as i32, "({i},{j})");
+            }
+        }
+    }
 
     // ------------ QPc lookup (§8.5.8 / Table 8-15) ----------------------
 

@@ -1128,18 +1128,19 @@ fn corpus_mbaff_field_pairs() {
 #[test]
 fn corpus_lossless_transform_bypass() {
     // High 4:4:4 Predictive, qpprime_y_zero_transform_bypass_flag=1 at
-    // QP'Y == 0 — the §8.5 transform/scaling stages are bypassed and
-    // §8.5.15 intra residual DPCM applies for horizontal/vertical
-    // I_NxN modes. ReportOnly: the bypass reconstruction path is not
-    // yet implemented (the decoder currently runs the normal
-    // transform, so nearly every sample diverges).
+    // QP'Y == 0 — the §8.5 transform/scaling stages are bypassed
+    // (identity legs of eqs. 8-319/8-323/8-334/8-355) and §8.5.15
+    // intra residual DPCM applies for horizontal/vertical intra
+    // modes. Round 413 implemented the bypass reconstruction path;
+    // both frames (all-intra IDR + P) decode bit-exact — i.e.
+    // LOSSLESS: the output equals the encoder input sample-for-sample.
     evaluate_annex_b(&CorpusCase {
         name: "lossless-transform-bypass",
         width: 32,
         height: 32,
         chroma: ChromaFmt::Yuv444,
         n_frames: 2,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
         bytes_per_sample: 1,
     });
 }
