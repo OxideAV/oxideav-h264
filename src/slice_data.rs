@@ -258,6 +258,21 @@ pub fn parse_slice_data(
                     bit_pos,
                 );
             }
+            // §7.4.4 / §9.3.3.1.1.1 — before ANY ctxIdxInc derivation
+            // for this MB, make the grid's view of the CURRENT pair's
+            // field flag spec-correct: the decoded pair flag when
+            // known, else the §7.4.4 spatial inference (left pair,
+            // else above pair, else 0). Every §6.4.10.x neighbour
+            // derivation reads currMbFrameFlag from this slot; leaving
+            // the default (frame) for a field pair selects the wrong
+            // MB of the neighbouring pair and desyncs CABAC.
+            if mbaff_frame_flag {
+                let eff = pending_pair_flag
+                    .unwrap_or_else(|| infer_pair_field_flag(&cabac_nb, curr_mb_addr, pic_w_mbs));
+                if let Some(slot) = cabac_nb.mbs.get_mut(curr_mb_addr as usize) {
+                    slot.mb_field_decoding_flag = eff;
+                }
+            }
             let mut skipped = false;
             let mut mb_skip_flag_this_iter = false;
             // §9.3.3.1.1.1 — mb_skip_flag's ctxIdxInc uses the A/B
@@ -306,12 +321,20 @@ pub fn parse_slice_data(
                 }
                 if mb_skip_flag {
                     // §7.4.4 — mb_field_decoding_flag for this MB is
-                    // not read here. If this MB is the top of a pair
-                    // whose flag was never read, the inference from
-                    // §7.4.4 applies (Phase-1: default to 0 = frame
-                    // pair; real spatial inference needs MBAFF
-                    // neighbour addressing which is out of scope).
-                    let flag = pending_pair_flag.unwrap_or(false);
+                    // not read here. If this MB belongs to a pair
+                    // whose flag was never read, the §7.4.4 spatial
+                    // inference applies provisionally (left pair, else
+                    // above pair, else 0). Should the BOTTOM MB turn
+                    // out to be coded, its mb_field_decoding_flag read
+                    // retro-patches this MB (per the §7.4.4 NOTE, the
+                    // top MB's decode waits for the bottom's flag).
+                    let flag = pending_pair_flag.unwrap_or_else(|| {
+                        if mbaff_frame_flag {
+                            infer_pair_field_flag(&cabac_nb, curr_mb_addr, pic_w_mbs)
+                        } else {
+                            false
+                        }
+                    });
                     macroblocks.push(Macroblock::new_skip(slice_header.slice_type));
                     mb_field_decoding_flags.push(flag);
                     // §9.2.1.1 step 6 — a P_Skip / B_Skip neighbour
@@ -400,11 +423,27 @@ pub fn parse_slice_data(
                         pic_w_mbs,
                     )?;
                     pending_pair_flag = Some(flag);
+                    // Stamp the freshly decoded flag into the current
+                    // MB's grid slot immediately: the §6.4.10.x
+                    // neighbour derivations for the syntax elements of
+                    // macroblock_layer() below need the real
+                    // currMbFrameFlag (the loop-top stamp used the
+                    // §7.4.4 inference, which the decoded bit may
+                    // contradict).
+                    if let Some(slot) = cabac_nb.mbs.get_mut(curr_mb_addr as usize) {
+                        slot.mb_field_decoding_flag = flag;
+                    }
                     // Retroactively patch the top MB of this pair if
-                    // it was skipped (CurrMbAddr % 2 == 1 path).
+                    // it was skipped (CurrMbAddr % 2 == 1 path) — per
+                    // the §7.4.4 NOTE the skipped top MB takes the
+                    // bottom MB's decoded flag, both in the output
+                    // flag vector and in the CABAC neighbour grid.
                     if curr_mb_addr % 2 == 1 {
                         if let Some(last) = mb_field_decoding_flags.last_mut() {
                             *last = flag;
+                        }
+                        if let Some(slot) = cabac_nb.mbs.get_mut((curr_mb_addr - 1) as usize) {
+                            slot.mb_field_decoding_flag = flag;
                         }
                     }
                 }
@@ -868,6 +907,28 @@ pub fn parse_slice_data(
 ///
 /// Per Table 9-34: ctxIdxOffset = 70, binarization FL with cMax = 1,
 /// so a single decode_decision call.
+/// §7.4.4 — spatial inference of `mb_field_decoding_flag` for a pair
+/// whose flag is absent (both MBs skipped) or not yet decoded
+/// (§9.3.3.1.1.1): the flag of the pair immediately to the LEFT in
+/// the same slice; otherwise the pair immediately ABOVE in the same
+/// slice; otherwise 0. The neighbour grid is allocated per slice, so
+/// slot `available` == "decoded earlier in this same slice".
+fn infer_pair_field_flag(
+    grid: &CabacNeighbourGrid,
+    curr_mb_addr: u32,
+    pic_width_in_mbs: u32,
+) -> bool {
+    let [a_top, b_top, _c, _d] = mbaff_pair_neighbour_addrs(curr_mb_addr, pic_width_in_mbs);
+    for addr in [a_top, b_top].into_iter().flatten() {
+        if let Some(info) = grid.mbs.get(addr as usize) {
+            if info.available {
+                return info.mb_field_decoding_flag;
+            }
+        }
+    }
+    false
+}
+
 fn decode_mb_field_decoding_flag_cabac(
     dec: &mut CabacDecoder<'_>,
     ctxs: &mut CabacContexts,

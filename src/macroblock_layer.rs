@@ -1502,6 +1502,79 @@ impl CabacNeighbourGrid {
         .map(|(addr, _, _)| addr);
         (a, b)
     }
+
+    /// §6.4.12 — resolve a neighbouring sample location `(xN, yN)`
+    /// relative to the current MB's upper-left corner to the containing
+    /// macroblock's address plus the in-MB location `(xW, yW)`.
+    ///
+    /// * Non-MBAFF: eqs. 6-31..6-35 raster containment.
+    /// * MBAFF frames: the exact §6.4.12.2 Table 6-4 process, with
+    ///   `currMbFrameFlag` read from the current MB's grid slot (the
+    ///   slice_data walker stamps the decoded pair flag — or its §7.4.4
+    ///   inference — there before any ctxIdxInc derivation) and
+    ///   `mbAddrXFrameFlag` from the neighbouring pairs' slots.
+    ///
+    /// `max_w`/`max_h` are the plane's MB dimensions (16/16 for luma and
+    /// the 4:4:4 chroma planes, MbWidthC/MbHeightC otherwise). Returns
+    /// `None` when the location falls outside the picture (the caller
+    /// still gates on the slot's `available` for same-slice checks).
+    pub fn neighbour_block_loc(
+        &self,
+        mb_addr: u32,
+        xn: i32,
+        yn: i32,
+        max_w: i32,
+        max_h: i32,
+    ) -> Option<(u32, i32, i32)> {
+        let w = self.width_in_mbs;
+        if w == 0 {
+            return None;
+        }
+        if self.mbaff_frame_flag {
+            let curr_field = self
+                .mbs
+                .get(mb_addr as usize)
+                .map(|m| m.mb_field_decoding_flag)
+                .unwrap_or(false);
+            let pair = crate::mb_address::mbaff_pair_neighbour_addrs(mb_addr, w);
+            let frame_flag_of = |addr: u32| -> bool {
+                self.mbs
+                    .get(addr as usize)
+                    .map(|m| !m.mb_field_decoding_flag)
+                    .unwrap_or(true)
+            };
+            return crate::mb_address::mbaff_neigh_location(
+                xn,
+                yn,
+                max_w,
+                max_h,
+                !curr_field,
+                mb_addr % 2 == 0,
+                mb_addr,
+                pair,
+                frame_flag_of,
+            );
+        }
+        // §6.4.12 non-MBAFF (eqs. 6-31..6-35): only the left / above /
+        // internal cells are consumed by the ctxIdxInc helpers.
+        let x = mb_addr % w;
+        let y = mb_addr / w;
+        if xn < 0 && (0..max_h).contains(&yn) {
+            if x == 0 {
+                return None;
+            }
+            Some((mb_addr - 1, xn + max_w, yn))
+        } else if yn < 0 && (0..max_w).contains(&xn) {
+            if y == 0 {
+                return None;
+            }
+            Some((mb_addr - w, xn, yn + max_h))
+        } else if (0..max_w).contains(&xn) && (0..max_h).contains(&yn) {
+            Some((mb_addr, xn, yn))
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1534,63 +1607,47 @@ fn cabac_ref_idx_cond_terms(
     list: u8,
     part8x8: u8,
 ) -> (bool, bool) {
-    let w = grid.width_in_mbs;
-    let x = if w == 0 { 0 } else { current_mb_addr % w };
-    let y = current_mb_addr.checked_div(w).unwrap_or(0);
-    let left_mb = if x > 0 {
-        grid.mbs.get((current_mb_addr - 1) as usize)
-    } else {
-        None
-    };
-    let above_mb = if y > 0 {
-        grid.mbs.get((current_mb_addr - w) as usize)
-    } else {
-        None
-    };
+    // 8x8 partition origin in luma samples (2x2 raster layout).
+    let px = ((part8x8 as i32) % 2) * 8;
+    let py = ((part8x8 as i32) / 2) * 8;
 
-    // Map (part, direction) → (neighbour_mb, neighbour_part, is_internal).
-    // `is_internal = true` means the neighbour is another 8x8 partition
-    // of the *current* MB (already decoded earlier in the same syntax
-    // walk). For internal neighbours we do NOT gate on `available` —
-    // that flag tracks "this MB has been fully parsed" and is only
-    // valid for *external* (left / above) neighbour MBs. The partial
-    // ref_idx_l0/l1 arrays in `current_mb` are always trustworthy for
-    // already-decoded partitions, analogous to `cabac_mvd_abs_sum`
-    // which also ignores `available` for in-MB neighbour reads.
-    let (a_mb, a_part, a_internal): (Option<&CabacMbNeighbourInfo>, u8, bool) = match part8x8 {
-        0 => (left_mb, 1, false),
-        1 => (Some(current_mb), 0, true),
-        2 => (left_mb, 3, false),
-        3 => (Some(current_mb), 2, true),
-        _ => (None, 0, false),
-    };
-    let (b_mb, b_part, b_internal): (Option<&CabacMbNeighbourInfo>, u8, bool) = match part8x8 {
-        0 => (above_mb, 2, false),
-        1 => (above_mb, 3, false),
-        2 => (Some(current_mb), 0, true),
-        3 => (Some(current_mb), 1, true),
-        _ => (None, 0, false),
-    };
-
-    let cond = |mb: Option<&CabacMbNeighbourInfo>, part: u8, internal: bool| -> bool {
-        let Some(info) = mb else { return false };
-        if !internal && !info.available {
-            return false;
-        }
+    // §6.4.11.7 — the A neighbour is the partition covering
+    // (px - 1, py), the B neighbour the one covering (px, py - 1).
+    // Internal probes (both coordinates >= 0) read the *current* MB's
+    // partially-filled ref_idx arrays: those partitions were decoded
+    // earlier in this same syntax walk, so `available` (which tracks
+    // "MB fully parsed") does not gate them. External probes resolve
+    // through §6.4.12 (raster) or §6.4.12.2 Table 6-4 (MBAFF), which
+    // for field/frame-mixed pairs can select either MB of the
+    // neighbouring pair and remap the vertical block coordinate.
+    let cond = |xn: i32, yn: i32| -> bool {
+        let (info, wxn, wyn): (&CabacMbNeighbourInfo, i32, i32) = if xn >= 0 && yn >= 0 {
+            (current_mb, xn, yn)
+        } else {
+            let Some((addr, wx, wy)) = grid.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16)
+            else {
+                return false;
+            };
+            let Some(info) = grid.mbs.get(addr as usize) else {
+                return false;
+            };
+            if !info.available {
+                return false;
+            }
+            (info, wx, wy)
+        };
         if info.is_skip || info.is_intra {
             return false;
         }
+        let part = ((wyn / 8) * 2 + (wxn / 8)) as usize;
         let arr = if list == 0 {
             info.ref_idx_l0
         } else {
             info.ref_idx_l1
         };
-        arr[part as usize] > 0
+        arr[part] > 0
     };
-    (
-        cond(a_mb, a_part, a_internal),
-        cond(b_mb, b_part, b_internal),
-    )
+    (cond(px - 1, py), cond(px, py - 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -1617,7 +1674,11 @@ fn blk4x4_xy(idx: u8) -> (i32, i32) {
 
 /// §9.3.3.1.1.7 — derive `absMvdCompA + absMvdCompB` for the current
 /// 4x4 block `blk4x4` of the given list / component. Skip / intra /
-/// unavailable neighbours contribute 0 per the spec.
+/// unavailable neighbours contribute 0 per the spec. In MBAFF frames
+/// the neighbour probes route through the §6.4.12.2 Table 6-4 process
+/// and the vertical component applies the eq. 9-15 / 9-16 field/frame
+/// scaling (×2 when a frame MB reads a field neighbour, ÷2 when a
+/// field MB reads a frame neighbour).
 fn cabac_mvd_abs_sum(
     grid: &CabacNeighbourGrid,
     current_mb_addr: u32,
@@ -1626,23 +1687,25 @@ fn cabac_mvd_abs_sum(
     comp: MvdComponent,
     blk4x4: u8,
 ) -> u32 {
-    let w = grid.width_in_mbs;
-    let x0 = if w == 0 { 0 } else { current_mb_addr % w };
-    let y0 = current_mb_addr.checked_div(w).unwrap_or(0);
     let (bx, by) = blk4x4_xy(blk4x4);
+    // §9.3.3.1.1.7 eqs. 9-15/9-16 — the current MB's field/frame mode.
+    // The slice_data walker stamps the pair flag (decoded or §7.4.4-
+    // inferred) into the current slot before any ctxIdxInc derivation.
+    let curr_field = grid.mbaff_frame_flag
+        && grid
+            .mbs
+            .get(current_mb_addr as usize)
+            .map(|m| m.mb_field_decoding_flag)
+            .unwrap_or(false);
 
     // Neighbour A: (bx-1, by); Neighbour B: (bx, by-1).
     let pick = |xn: i32, yn: i32| -> u32 {
         if xn >= 0 && yn >= 0 {
-            // Internal to current MB.
-            if !current_mb.available {
-                // Current MB not yet marked available → the block has
-                // not yet been decoded. For in-MB neighbours the mvd
-                // will have been written into current_mb before we
-                // query it (the parser fills mvds in raster order and
-                // writes back per-block). So `available` doesn't gate
-                // in-MB lookups — we still read the slot value.
-            }
+            // Internal to the current MB (same field/frame mode — the
+            // eq. 9-15/9-16 scaling is the identity). The mvd slots of
+            // already-decoded blocks are written into `current_mb`
+            // before this query, so `available` doesn't gate in-MB
+            // lookups.
             let idx = blk4x4_idx(xn, yn) as usize;
             let v = match (list, comp) {
                 (0, MvdComponent::X) => current_mb.mvd_l0_x[idx],
@@ -1652,19 +1715,10 @@ fn cabac_mvd_abs_sum(
             };
             return v.unsigned_abs() as u32;
         }
-        // External neighbour lookup.
-        let (nbr_mb_addr, nxn, nyn) = if xn < 0 && yn >= 0 {
-            if x0 == 0 {
-                return 0;
-            }
-            (current_mb_addr - 1, xn + 16, yn)
-        } else if xn >= 0 && yn < 0 {
-            if y0 == 0 {
-                return 0;
-            }
-            (current_mb_addr - w, xn, yn + 16)
-        } else {
-            // Corner diagonal (xn<0 && yn<0) — not used by (A, B).
+        // External neighbour lookup — §6.4.11.7 → §6.4.12 / Table 6-4.
+        let Some((nbr_mb_addr, wxn, wyn)) =
+            grid.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16)
+        else {
             return 0;
         };
         let Some(info) = grid.mbs.get(nbr_mb_addr as usize) else {
@@ -1677,14 +1731,26 @@ fn cabac_mvd_abs_sum(
         if info.is_skip || info.is_intra {
             return 0;
         }
-        let idx = blk4x4_idx(nxn, nyn) as usize;
+        let idx = blk4x4_idx(wxn, wyn) as usize;
         let v = match (list, comp) {
             (0, MvdComponent::X) => info.mvd_l0_x[idx],
             (0, MvdComponent::Y) => info.mvd_l0_y[idx],
             (1, MvdComponent::X) => info.mvd_l1_x[idx],
             _ => info.mvd_l1_y[idx],
         };
-        v.unsigned_abs() as u32
+        let abs = v.unsigned_abs() as u32;
+        // Eqs. 9-15 / 9-16 — vertical-component field/frame scaling in
+        // MBAFF frames (compIdx == 1 only).
+        if grid.mbaff_frame_flag && matches!(comp, MvdComponent::Y) {
+            let nbr_field = info.mb_field_decoding_flag;
+            if !curr_field && nbr_field {
+                return abs * 2;
+            }
+            if curr_field && !nbr_field {
+                return abs / 2;
+            }
+        }
+        abs
     };
     pick(bx - 1, by) + pick(bx, by - 1)
 }
@@ -1717,10 +1783,6 @@ fn cabac_cbf_cond_terms(
     is_cr: bool,
     chroma_array_type: u32,
 ) -> (bool, bool) {
-    let w = grid.width_in_mbs;
-    let x = if w == 0 { 0 } else { current_mb_addr % w };
-    let y = current_mb_addr.checked_div(w).unwrap_or(0);
-
     // Compute in-MB A / B neighbour block coordinates for this block type.
     // For luma 4x4 / 16x16AC blocks (indexed 0..=15): use §6.4.11.4.
     // For chroma AC (indexed 0..=7 at 4:2:2 or 0..=3 at 4:2:0): use the
@@ -1752,60 +1814,39 @@ fn cabac_cbf_cond_terms(
         }
         BlockType::Luma8x8 | BlockType::Cb8x8 | BlockType::Cr8x8 => {
             // §9.3.3.1.1.9 cat 5 / 9 / 13 → §6.4.11.2 / §6.4.11.3:
-            // 8x8 blocks live on a 2x2 grid (blk_idx raster order).
-            let x8 = (blk_idx as i32) % 2;
-            let y8 = (blk_idx as i32) / 2;
+            // 8x8 blocks live on a 2x2 grid (blk_idx raster order);
+            // probe in luma-sample space so the §6.4.12 containment
+            // (and, for MBAFF, the Table 6-4 remap) applies directly.
+            let px = ((blk_idx as i32) % 2) * 8;
+            let py = ((blk_idx as i32) / 2) * 8;
             (
-                CbfLoc::Internal8x8(x8 - 1, y8),
-                CbfLoc::Internal8x8(x8, y8 - 1),
+                CbfLoc::Internal8x8(px - 1, py),
+                CbfLoc::Internal8x8(px, py - 1),
             )
         }
         BlockType::ChromaDc
         | BlockType::Luma16x16Dc
         | BlockType::CbIntra16x16Dc
-        | BlockType::CrIntra16x16Dc => (CbfLoc::MbLevel, CbfLoc::MbLevel),
+        | BlockType::CrIntra16x16Dc => (CbfLoc::MbLevel(-1, 0), CbfLoc::MbLevel(0, -1)),
     };
 
-    let (left_addr, above_addr) = if grid.mbaff_frame_flag {
-        // §9.3.3.1.1.9 → §6.4.11.4 → §6.4.12.2: the external MB for the
-        // left/above block edge is the MB containing block location
-        // (bx-1, by) / (bx, by-1). For all-frame MBAFF pairs this equals
-        // the MB-level (mbAddrA, mbAddrB); field/frame-mixed pairs remap
-        // per Table 6-4 (a Phase-4 refinement — block-internal index
-        // remapping isn't applied here yet).
-        grid.neighbour_mb_addrs_mbaff(current_mb_addr, true)
-    } else {
-        let la = if x > 0 {
-            Some(current_mb_addr - 1)
-        } else {
-            None
-        };
-        let ab = if y > 0 {
-            Some(current_mb_addr - w)
-        } else {
-            None
-        };
-        (la, ab)
-    };
     let cond_a = cbf_cond_for(
         grid,
+        current_mb_addr,
         current_mb,
         current_is_intra,
         block_type,
         a_loc,
-        left_addr,
-        true,
         is_cr,
         chroma_array_type,
     );
     let cond_b = cbf_cond_for(
         grid,
+        current_mb_addr,
         current_mb,
         current_is_intra,
         block_type,
         b_loc,
-        above_addr,
-        false,
         is_cr,
         chroma_array_type,
     );
@@ -1817,45 +1858,48 @@ enum CbfLoc {
     /// Luma 4x4-style block at (x, y) in the MB grid. Negative coordinates
     /// dispatch to the respective external MB (A for x<0, B for y<0).
     Internal4x4(i32, i32),
-    /// 8x8-transform block (ctxBlockCat 5 / 9 / 13) at (x8, y8) on the
-    /// MB's 2x2 8x8-block grid. Negative coordinates dispatch to the
+    /// 8x8-transform block (ctxBlockCat 5 / 9 / 13) probed at luma
+    /// sample location (x, y). Negative coordinates dispatch to the
     /// respective external MB (§6.4.11.2 / §6.4.11.3).
     Internal8x8(i32, i32),
     /// Chroma AC block at (x, y) plus its original in-MB blk index (for
     /// fallback when already in this MB — the caller computes x,y from
     /// blk_idx).
     InternalChromaAc(i32, i32, u8),
-    /// MB-level block (chroma DC / luma 16x16 DC) — no in-MB neighbour.
-    MbLevel,
+    /// MB-level block (chroma DC / luma 16x16 DC) probed at luma sample
+    /// location (x, y) — always external ((-1, 0) for A, (0, -1) for B)
+    /// per §6.4.11.1.
+    MbLevel(i32, i32),
 }
 
 #[allow(clippy::too_many_arguments)]
 fn cbf_cond_for(
     grid: &CabacNeighbourGrid,
+    current_mb_addr: u32,
     current_mb: &CabacMbNeighbourInfo,
     current_is_intra: bool,
     block_type: BlockType,
     loc: CbfLoc,
-    ext_mb_addr: Option<u32>,
-    is_left_dir: bool,
     is_cr: bool,
     chroma_array_type: u32,
 ) -> bool {
     match loc {
-        CbfLoc::Internal8x8(x8, y8) => {
-            if x8 >= 0 && y8 >= 0 {
+        CbfLoc::Internal8x8(px, py) => {
+            if px >= 0 && py >= 0 {
                 // Internal — read the current MB's progressive state.
                 // The residual walker folds each 8x8 block's
                 // coded_block_flag into its four 4x4 sub-block slots,
                 // so the top-left 4x4 of the 8x8 carries the value.
                 // Quadrants whose CBP bit is 0 stay `false`, matching
                 // the §9.3.3.1.1.9 "transBlockN not available → 0" rule.
-                let blk8 = (y8 * 2 + x8) as usize;
+                let blk8 = ((py / 8) * 2 + (px / 8)) as usize;
                 cbf_8x8_for(current_mb, block_type, blk8)
             } else {
-                // External — §6.4.11.2 / §6.4.11.3: wrap into the
-                // left/above MB's 2x2 8x8-block grid.
-                let Some(addr) = ext_mb_addr else {
+                // External — §6.4.11.2 / §6.4.11.3 via §6.4.12 (raster)
+                // or §6.4.12.2 Table 6-4 (MBAFF).
+                let Some((addr, wx, wy)) =
+                    grid.neighbour_block_loc(current_mb_addr, px, py, 16, 16)
+                else {
                     return unavail_cbf(current_is_intra, block_type);
                 };
                 let Some(info) = grid.mbs.get(addr as usize) else {
@@ -1870,12 +1914,7 @@ fn cbf_cond_for(
                 if info.is_skip {
                     return false;
                 }
-                let (wx8, wy8) = if is_left_dir {
-                    (x8 + 2, y8)
-                } else {
-                    (x8, y8 + 2)
-                };
-                let blk8n = (wy8 * 2 + wx8) as usize;
+                let blk8n = ((wy / 8) * 2 + (wx / 8)) as usize;
                 // §9.3.3.1.1.9 cat 5 / 9 / 13 — transBlockN is assigned
                 // only when the neighbour's CBP bit covering the 8x8
                 // block is set AND the neighbour was coded with
@@ -1896,8 +1935,11 @@ fn cbf_cond_for(
                 let bi = blk4x4_idx(xn, yn) as usize;
                 cbf_luma_for(current_mb, block_type, bi)
             } else {
-                // External — xn<0 → left MB, yn<0 → above MB. Wrap coords.
-                let Some(addr) = ext_mb_addr else {
+                // External — §6.4.11.4 via §6.4.12 (raster, eq.
+                // 6-34/6-35 wrap) or §6.4.12.2 Table 6-4 (MBAFF).
+                let Some((addr, wx, wy)) =
+                    grid.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16)
+                else {
                     return unavail_cbf(current_is_intra, block_type);
                 };
                 let Some(info) = grid.mbs.get(addr as usize) else {
@@ -1912,12 +1954,6 @@ fn cbf_cond_for(
                 if info.is_skip {
                     return false;
                 }
-                // Wrap coordinates into the neighbour MB (eq. 6-34/6-35).
-                let (wx, wy) = if is_left_dir {
-                    (xn + 16, yn)
-                } else {
-                    (xn, yn + 16)
-                };
                 let bi = blk4x4_idx(wx, wy) as usize;
                 // §9.3.3.1.1.9 — transBlockN availability for Luma4x4 /
                 // Luma16x16Ac / CbLuma4x4 / CrLuma4x4 / CbIntra16x16Ac /
@@ -1986,8 +2022,16 @@ fn cbf_cond_for(
                 let bi = (2 * (yn / 4) + (xn / 4)) as usize;
                 cbf_chroma_ac_for(current_mb, block_type, bi.min(7), is_cr)
             } else {
-                // External — use left or above MB's same category.
-                let Some(addr) = ext_mb_addr else {
+                // External — §6.4.11.5 via §6.4.12 in the chroma
+                // sample geometry: width 8 for both 4:2:x formats,
+                // height 8 (4:2:0) or 16 (4:2:2). The above-neighbour
+                // of the current MB's top row is the *bottom* 4x4 row
+                // of the above MB, so containment / the MBAFF Table
+                // 6-4 remap must use the true chroma MB height.
+                let mbh_c = if chroma_array_type == 2 { 16 } else { 8 };
+                let Some((addr, wx, wy)) =
+                    grid.neighbour_block_loc(current_mb_addr, xn, yn, 8, mbh_c)
+                else {
                     return unavail_cbf(current_is_intra, block_type);
                 };
                 let Some(info) = grid.mbs.get(addr as usize) else {
@@ -2014,23 +2058,13 @@ fn cbf_cond_for(
                     // filtered above).
                     return trans_block_unavail_cbf();
                 }
-                // Wrap into the neighbour MB's chroma tile: width is 8
-                // samples for both formats; height is 8 (4:2:0) or 16
-                // (4:2:2). The above-neighbour of the current MB's top
-                // row is the *bottom* 4x4 row of the above MB, so the
-                // vertical wrap must use the true chroma MB height.
-                let wrap_h = if chroma_array_type == 2 { 16 } else { 8 };
-                let (wx, wy) = if is_left_dir {
-                    (xn + 8, yn)
-                } else {
-                    (xn, yn + wrap_h)
-                };
                 let bi = (2 * (wy / 4) + (wx / 4)) as usize;
                 cbf_chroma_ac_for(info, block_type, bi.min(7), is_cr)
             }
         }
-        CbfLoc::MbLevel => {
-            let Some(addr) = ext_mb_addr else {
+        CbfLoc::MbLevel(xn, yn) => {
+            let Some((addr, _wx, _wy)) = grid.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16)
+            else {
                 return unavail_cbf(current_is_intra, block_type);
             };
             let Some(info) = grid.mbs.get(addr as usize) else {
