@@ -1103,24 +1103,27 @@ fn corpus_cavlc_b_slices() {
 
 #[test]
 fn corpus_mbaff_field_pairs() {
-    // MBAFF with REAL field-coded MB pairs (frame 2 has 26 field MBs;
-    // the `mbaff-interlaced` fixture's pairs are all frame-coded).
-    // Frame 0 (all-frame-pair MBAFF I) became byte-exact with the
-    // round-410 §8.7 pair-interleaved deblock-order fix. The two P
-    // frames pin the deferred MBAFF field-pair INTER path: field MBs
-    // reference individual FIELDS of stored frames (§8.4.2.1 refIdx
-    // parity mapping), field MC on parity-interleaved rows, §7.4.4
-    // spatial inference of mb_field_decoding_flag for skipped pairs,
-    // and the §8.7.2 mixed-mode deblock cascade. ReportOnly until that
-    // subsystem lands; the current decoder emits frame 0 then rejects
-    // the P slices ("reference picture 0:1 not available").
+    // MBAFF with REAL field-coded MB pairs (the `mbaff-interlaced`
+    // fixture's pairs are all frame-coded). Frame 0 (all-frame-pair
+    // MBAFF I) became byte-exact with the round-410 §8.7
+    // pair-interleaved deblock-order fix; round 413 landed the full
+    // MBAFF field-pair INTER subsystem and all three frames now gate
+    // BitExact: §8.4.2.1 per-field reference selection (refIdx / 2 +
+    // parity), zero-copy field-view MC on parity-interleaved rows,
+    // §8.4.1.4 Table 8-10 chroma MV offset for opposite-parity refs,
+    // §7.4.4 skipped-pair mb_field_decoding_flag inference, the
+    // §9.3.3.1.x FIELD CABAC ctx column (Tables 9-22/9-23 inits +
+    // field ctxIdxOffsets), §8.5.6/§8.5.7 field inverse scans, exact
+    // Table 6-4 block-level neighbour probes, and the §8.7 per-MB
+    // MBAFF deblock walker with the §8.7.2.1 NOTE 3 field MV
+    // threshold.
     evaluate_annex_b(&CorpusCase {
         name: "mbaff-field-pairs",
         width: 64,
         height: 128,
         chroma: ChromaFmt::Yuv420,
         n_frames: 3,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
         bytes_per_sample: 1,
     });
 }

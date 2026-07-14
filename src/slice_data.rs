@@ -490,6 +490,38 @@ pub fn parse_slice_data(
                         }
                     }
                 }
+                if mbaff_frame_flag {
+                    // §9.3.3.1.1.4 + §6.4.11.2 — resolve the per-bin
+                    // EXTERNAL luma CBP probes through the Table 6-4
+                    // process (the MB-level A/B + fixed bit indices in
+                    // NeighbourCtx only match non-MBAFF geometry). The
+                    // probe locations are the sample immediately left /
+                    // above of each 8x8 luma block's corner: A probes
+                    // (-1, 0) and (-1, 8) for bins 0/2, B probes
+                    // (0, -1) and (8, -1) for bins 0/1.
+                    let probe = |xn: i32, yn: i32| -> crate::cabac_ctx::CbpMbaffProbe {
+                        match cabac_nb.neighbour_block_loc(curr_mb_addr, xn, yn, 16, 16) {
+                            Some((addr, wx, wy)) => match cabac_nb.mbs.get(addr as usize) {
+                                Some(info) if info.available => {
+                                    let blk8n = ((wy / 8) * 2 + (wx / 8)) as u8;
+                                    crate::cabac_ctx::CbpMbaffProbe {
+                                        available: true,
+                                        is_i_pcm: info.is_i_pcm,
+                                        is_skip: info.is_skip,
+                                        cbp_bit_set: ((info.coded_block_pattern_luma >> blk8n) & 1)
+                                            != 0,
+                                    }
+                                }
+                                _ => crate::cabac_ctx::CbpMbaffProbe::default(),
+                            },
+                            None => crate::cabac_ctx::CbpMbaffProbe::default(),
+                        }
+                    };
+                    let d = crate::cabac_ctx::CbpMbaffProbe::default();
+                    let a = [probe(-1, 0), d, probe(-1, 8), d];
+                    let b = [probe(0, -1), probe(8, -1), d, d];
+                    nctx.cbp_luma_mbaff = Some([a, b]);
+                }
                 let mut entropy = EntropyState {
                     cabac: Some((&mut cabac_dec, &mut ctxs)),
                     slice_kind: kind,

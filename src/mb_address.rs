@@ -770,8 +770,8 @@ pub fn mbaff_neigh_location(
                     // mbAddrX = CurrMbAddr; mbAddrN = CurrMbAddr - 1; yM = yN.
                     (Some(curr_mb_addr - 1), yn)
                 }
-            } else {
-                // currMbFrameFlag == 0; mbAddrX = mbAddrB.
+            } else if top {
+                // currMbFrameFlag == 0, mbIsTopMbFlag == 1; mbAddrX = mbAddrB.
                 match mb_b {
                     Some(b) => {
                         if frame_flag_of(b) {
@@ -780,6 +780,14 @@ pub fn mbaff_neigh_location(
                             (Some(b), yn)
                         }
                     }
+                    None => (None, 0),
+                }
+            } else {
+                // currMbFrameFlag == 0, mbIsTopMbFlag == 0 (bottom
+                // field MB): Table 6-4 row — mbAddrN = mbAddrB + 1,
+                // yM = yN, REGARDLESS of mbAddrBFrameFlag.
+                match mb_b {
+                    Some(b) => (Some(b + 1), yn),
                     None => (None, 0),
                 }
             }
@@ -796,7 +804,8 @@ pub fn mbaff_neigh_location(
                     // currMbFrameFlag==1, bottom → not available.
                     (None, 0)
                 }
-            } else {
+            } else if top {
+                // currMbFrameFlag == 0, mbIsTopMbFlag == 1; mbAddrX = mbAddrC.
                 match mb_c {
                     Some(c) => {
                         if frame_flag_of(c) {
@@ -805,6 +814,14 @@ pub fn mbaff_neigh_location(
                             (Some(c), yn)
                         }
                     }
+                    None => (None, 0),
+                }
+            } else {
+                // currMbFrameFlag == 0, mbIsTopMbFlag == 0 (bottom
+                // field MB): Table 6-4 row — mbAddrN = mbAddrC + 1,
+                // yM = yN, REGARDLESS of mbAddrCFrameFlag.
+                match mb_c {
+                    Some(c) => (Some(c + 1), yn),
                     None => (None, 0),
                 }
             }

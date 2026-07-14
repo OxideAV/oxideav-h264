@@ -1190,6 +1190,9 @@ fn build_neighbour_ctx(grid: &CabacEncGrid, mb_x: usize, mb_y: usize) -> Neighbo
         above_cbp_chroma: acbpc,
         left_is_p_or_b_skip: ls,
         above_is_p_or_b_skip: as_,
+        // Encoder emits progressive (non-MBAFF) streams only — the
+        // legacy MB-level CBP derivation applies (§9.3.3.1.1.4).
+        cbp_luma_mbaff: None,
     }
 }
 

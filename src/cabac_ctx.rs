@@ -617,6 +617,232 @@ const TBL_9_21: &[(usize, InitCell)] = &[
     (275, InitCell::all((-14, 97), (-8, 85), (-4, 78), (-10, 87))),
 ];
 
+// Table 9-22 — ctxIdx 277..=337 (significant_coeff_flag, FIELD-coded macroblocks, ctxBlockCat < 5).
+const TBL_9_22: &[(usize, InitCell)] = &[
+    (
+        277,
+        InitCell::all((-6, 93), (-13, 106), (-21, 126), (-22, 127)),
+    ),
+    (
+        278,
+        InitCell::all((-6, 84), (-16, 106), (-23, 124), (-25, 127)),
+    ),
+    (
+        279,
+        InitCell::all((-8, 79), (-10, 87), (-20, 110), (-25, 120)),
+    ),
+    (
+        280,
+        InitCell::all((0, 66), (-21, 114), (-26, 126), (-27, 127)),
+    ),
+    (
+        281,
+        InitCell::all((-1, 71), (-18, 110), (-25, 124), (-19, 114)),
+    ),
+    (
+        282,
+        InitCell::all((0, 62), (-14, 98), (-17, 105), (-23, 117)),
+    ),
+    (
+        283,
+        InitCell::all((-2, 60), (-22, 110), (-27, 121), (-25, 118)),
+    ),
+    (
+        284,
+        InitCell::all((-2, 59), (-21, 106), (-27, 117), (-26, 117)),
+    ),
+    (
+        285,
+        InitCell::all((-5, 75), (-18, 103), (-17, 102), (-24, 113)),
+    ),
+    (
+        286,
+        InitCell::all((-3, 62), (-21, 107), (-26, 117), (-28, 118)),
+    ),
+    (
+        287,
+        InitCell::all((-4, 58), (-23, 108), (-27, 116), (-31, 120)),
+    ),
+    (
+        288,
+        InitCell::all((-9, 66), (-26, 112), (-33, 122), (-37, 124)),
+    ),
+    (
+        289,
+        InitCell::all((-1, 79), (-10, 96), (-10, 95), (-10, 94)),
+    ),
+    (
+        290,
+        InitCell::all((0, 71), (-12, 95), (-14, 100), (-15, 102)),
+    ),
+    (291, InitCell::all((3, 68), (-5, 91), (-8, 95), (-10, 99))),
+    (
+        292,
+        InitCell::all((10, 44), (-9, 93), (-17, 111), (-13, 106)),
+    ),
+    (
+        293,
+        InitCell::all((-7, 62), (-22, 94), (-28, 114), (-50, 127)),
+    ),
+    (294, InitCell::all((15, 36), (-5, 86), (-6, 89), (-5, 92))),
+    (295, InitCell::all((14, 40), (9, 67), (-2, 80), (17, 57))),
+    (296, InitCell::all((16, 27), (-4, 80), (-4, 82), (-5, 86))),
+    (297, InitCell::all((12, 29), (-10, 85), (-9, 85), (-13, 94))),
+    (298, InitCell::all((1, 44), (-1, 70), (-8, 81), (-12, 91))),
+    (299, InitCell::all((20, 36), (7, 60), (-1, 72), (-2, 77))),
+    (300, InitCell::all((18, 32), (9, 58), (5, 64), (0, 71))),
+    (301, InitCell::all((5, 42), (5, 61), (1, 67), (-1, 73))),
+    (302, InitCell::all((1, 48), (12, 50), (9, 56), (4, 64))),
+    (303, InitCell::all((10, 62), (15, 50), (0, 69), (-7, 81))),
+    (304, InitCell::all((17, 46), (18, 49), (1, 69), (5, 64))),
+    (305, InitCell::all((9, 64), (17, 54), (7, 69), (15, 57))),
+    (306, InitCell::all((-12, 104), (10, 41), (-7, 69), (1, 67))),
+    (307, InitCell::all((-11, 97), (7, 46), (-6, 67), (0, 68))),
+    (
+        308,
+        InitCell::all((-16, 96), (-1, 51), (-16, 77), (-10, 67)),
+    ),
+    (309, InitCell::all((-7, 88), (7, 49), (-2, 64), (1, 68))),
+    (310, InitCell::all((-8, 85), (8, 52), (2, 61), (0, 77))),
+    (311, InitCell::all((-7, 85), (9, 41), (-6, 67), (2, 64))),
+    (312, InitCell::all((-9, 85), (6, 47), (-3, 64), (0, 68))),
+    (313, InitCell::all((-13, 88), (2, 55), (2, 57), (-5, 78))),
+    (314, InitCell::all((4, 66), (13, 41), (-3, 65), (7, 55))),
+    (315, InitCell::all((-3, 77), (10, 44), (-3, 66), (5, 59))),
+    (316, InitCell::all((-3, 76), (6, 50), (0, 62), (2, 65))),
+    (317, InitCell::all((-6, 76), (5, 53), (9, 51), (14, 54))),
+    (318, InitCell::all((10, 58), (13, 49), (-1, 66), (15, 44))),
+    (319, InitCell::all((-1, 76), (4, 63), (-2, 71), (5, 60))),
+    (320, InitCell::all((-1, 83), (6, 64), (-2, 75), (2, 70))),
+    (321, InitCell::all((-7, 99), (-2, 69), (-1, 70), (-2, 76))),
+    (322, InitCell::all((-14, 95), (-2, 59), (-9, 72), (-18, 86))),
+    (323, InitCell::all((2, 95), (6, 70), (14, 60), (12, 70))),
+    (324, InitCell::all((0, 76), (10, 44), (16, 37), (5, 64))),
+    (325, InitCell::all((-5, 74), (9, 31), (0, 47), (-12, 70))),
+    (326, InitCell::all((0, 70), (12, 43), (18, 35), (11, 55))),
+    (327, InitCell::all((-11, 75), (3, 53), (11, 37), (5, 56))),
+    (328, InitCell::all((1, 68), (14, 34), (12, 41), (0, 69))),
+    (329, InitCell::all((0, 65), (10, 38), (10, 41), (2, 65))),
+    (330, InitCell::all((-14, 73), (-3, 52), (2, 48), (-6, 74))),
+    (331, InitCell::all((3, 62), (13, 40), (12, 41), (5, 54))),
+    (332, InitCell::all((4, 62), (17, 32), (13, 41), (7, 54))),
+    (333, InitCell::all((-1, 68), (7, 44), (0, 59), (-6, 76))),
+    (334, InitCell::all((-13, 75), (7, 38), (3, 50), (-11, 82))),
+    (335, InitCell::all((11, 55), (13, 50), (19, 40), (-2, 77))),
+    (336, InitCell::all((5, 64), (10, 57), (3, 66), (-2, 77))),
+    (337, InitCell::all((12, 70), (26, 43), (18, 50), (25, 42))),
+];
+
+// Table 9-23 — ctxIdx 338..=398 (last_significant_coeff_flag, FIELD-coded macroblocks, ctxBlockCat < 5).
+const TBL_9_23: &[(usize, InitCell)] = &[
+    (338, InitCell::all((15, 6), (14, 11), (19, -6), (17, -13))),
+    (339, InitCell::all((6, 19), (11, 14), (18, -6), (16, -9))),
+    (340, InitCell::all((7, 16), (9, 11), (14, 0), (17, -12))),
+    (341, InitCell::all((12, 14), (18, 11), (26, -12), (27, -21))),
+    (342, InitCell::all((18, 13), (21, 9), (31, -16), (37, -30))),
+    (343, InitCell::all((13, 11), (23, -2), (33, -25), (41, -40))),
+    (
+        344,
+        InitCell::all((13, 15), (32, -15), (33, -22), (42, -41)),
+    ),
+    (
+        345,
+        InitCell::all((15, 16), (32, -15), (37, -28), (48, -47)),
+    ),
+    (
+        346,
+        InitCell::all((12, 23), (34, -21), (39, -30), (39, -32)),
+    ),
+    (
+        347,
+        InitCell::all((13, 23), (39, -23), (42, -30), (46, -40)),
+    ),
+    (
+        348,
+        InitCell::all((15, 20), (42, -33), (47, -42), (52, -51)),
+    ),
+    (
+        349,
+        InitCell::all((14, 26), (41, -31), (45, -36), (46, -41)),
+    ),
+    (
+        350,
+        InitCell::all((14, 44), (46, -28), (49, -34), (52, -39)),
+    ),
+    (
+        351,
+        InitCell::all((17, 40), (38, -12), (41, -17), (43, -19)),
+    ),
+    (352, InitCell::all((17, 47), (21, 29), (32, 9), (32, 11))),
+    (
+        353,
+        InitCell::all((24, 17), (45, -24), (69, -71), (61, -55)),
+    ),
+    (
+        354,
+        InitCell::all((21, 21), (53, -45), (63, -63), (56, -46)),
+    ),
+    (
+        355,
+        InitCell::all((25, 22), (48, -26), (66, -64), (62, -50)),
+    ),
+    (
+        356,
+        InitCell::all((31, 27), (65, -43), (77, -74), (81, -67)),
+    ),
+    (
+        357,
+        InitCell::all((22, 29), (43, -19), (54, -39), (45, -20)),
+    ),
+    (358, InitCell::all((19, 35), (39, -10), (52, -35), (35, -2))),
+    (359, InitCell::all((14, 50), (30, 9), (41, -10), (28, 15))),
+    (360, InitCell::all((10, 57), (18, 26), (36, 0), (34, 1))),
+    (361, InitCell::all((7, 63), (20, 27), (40, -1), (39, 1))),
+    (362, InitCell::all((-2, 77), (0, 57), (30, 14), (30, 17))),
+    (363, InitCell::all((-4, 82), (-14, 82), (28, 26), (20, 38))),
+    (364, InitCell::all((-3, 94), (-5, 75), (23, 37), (18, 45))),
+    (365, InitCell::all((9, 69), (-19, 97), (12, 55), (15, 54))),
+    (
+        366,
+        InitCell::all((-12, 109), (-35, 125), (11, 65), (0, 79)),
+    ),
+    (367, InitCell::all((36, -35), (27, 0), (37, -33), (36, -16))),
+    (368, InitCell::all((36, -34), (28, 0), (39, -36), (37, -14))),
+    (
+        369,
+        InitCell::all((32, -26), (31, -4), (40, -37), (37, -17)),
+    ),
+    (370, InitCell::all((37, -30), (27, 6), (38, -30), (32, 1))),
+    (371, InitCell::all((44, -32), (34, 8), (46, -33), (34, 15))),
+    (372, InitCell::all((34, -18), (30, 10), (42, -30), (29, 15))),
+    (373, InitCell::all((34, -15), (24, 22), (40, -24), (24, 25))),
+    (374, InitCell::all((40, -15), (33, 19), (49, -29), (34, 22))),
+    (375, InitCell::all((33, -7), (22, 32), (38, -12), (31, 16))),
+    (376, InitCell::all((35, -5), (26, 31), (40, -10), (35, 18))),
+    (377, InitCell::all((33, 0), (21, 41), (38, -3), (31, 28))),
+    (378, InitCell::all((38, 2), (26, 44), (46, -5), (33, 41))),
+    (379, InitCell::all((33, 13), (23, 47), (31, 20), (36, 28))),
+    (380, InitCell::all((23, 35), (16, 65), (29, 30), (27, 47))),
+    (381, InitCell::all((13, 58), (14, 71), (25, 44), (21, 62))),
+    (382, InitCell::all((29, -3), (8, 60), (12, 48), (18, 31))),
+    (383, InitCell::all((26, 0), (6, 63), (11, 49), (19, 26))),
+    (384, InitCell::all((22, 30), (17, 65), (26, 45), (36, 24))),
+    (385, InitCell::all((31, -7), (21, 24), (22, 22), (24, 23))),
+    (386, InitCell::all((35, -15), (23, 20), (23, 22), (27, 16))),
+    (387, InitCell::all((34, -3), (26, 23), (27, 21), (24, 30))),
+    (388, InitCell::all((34, 3), (27, 32), (33, 20), (31, 29))),
+    (389, InitCell::all((36, -1), (28, 23), (26, 28), (22, 41))),
+    (390, InitCell::all((34, 5), (28, 24), (30, 24), (22, 42))),
+    (391, InitCell::all((32, 11), (23, 40), (27, 34), (16, 60))),
+    (392, InitCell::all((35, 5), (24, 32), (18, 42), (15, 52))),
+    (393, InitCell::all((34, 12), (28, 29), (25, 39), (14, 60))),
+    (394, InitCell::all((39, 11), (23, 42), (18, 50), (3, 78))),
+    (395, InitCell::all((30, 29), (19, 57), (12, 70), (-16, 123))),
+    (396, InitCell::all((34, 26), (22, 53), (21, 54), (21, 53))),
+    (397, InitCell::all((29, 39), (22, 61), (14, 71), (22, 56))),
+    (398, InitCell::all((19, 66), (11, 86), (11, 83), (25, 61))),
+];
+
 // Table 9-24 — ctxIdx 402..=459 (Luma8x8 frame/field sig/last/level
 // + Luma8x8 frame coeff_abs_level_minus1).
 //
@@ -1812,8 +2038,8 @@ fn init_table() -> &'static [InitCell; NUM_CTX_IDX] {
         let mut arr = [InitCell::none(); NUM_CTX_IDX];
         for table in &[
             TBL_9_12, TBL_9_13, TBL_9_14, TBL_9_15, TBL_9_16, TBL_9_17, TBL_9_18, TBL_9_19,
-            TBL_9_20, TBL_9_21, TBL_9_24, TBL_9_25, TBL_9_26, TBL_9_27, TBL_9_28, TBL_9_29,
-            TBL_9_30, TBL_9_31, TBL_9_32, TBL_9_33,
+            TBL_9_20, TBL_9_21, TBL_9_22, TBL_9_23, TBL_9_24, TBL_9_25, TBL_9_26, TBL_9_27,
+            TBL_9_28, TBL_9_29, TBL_9_30, TBL_9_31, TBL_9_32, TBL_9_33,
         ] {
             for (idx, cell) in *table {
                 arr[*idx] = *cell;
@@ -1930,6 +2156,32 @@ pub struct NeighbourCtx {
     pub above_cbp_chroma: u8,
     pub left_is_p_or_b_skip: bool,
     pub above_is_p_or_b_skip: bool,
+    /// §9.3.3.1.1.4 + §6.4.11.2 under MBAFF — per-bin EXTERNAL luma
+    /// CBP probes. In an MBAFF frame the neighbouring 8x8 luma block
+    /// of a CBP luma bin resolves through the §6.4.12.2 Table 6-4
+    /// process, which for field/frame-mixed pairs can select either
+    /// MB of the neighbouring pair AND remap the 8x8 block index —
+    /// the MB-level `left_cbp_luma`/`above_cbp_luma` + fixed bit
+    /// indices are only correct for non-MBAFF geometry.
+    ///
+    /// Layout: `[0]` = A (left) probes indexed by binIdx, `[1]` = B
+    /// (above) probes. Only the external bins are consulted (A: bins
+    /// 0/2; B: bins 0/1); internal bins keep the prior-bin rule.
+    /// `None` (non-MBAFF) selects the legacy MB-level derivation.
+    pub cbp_luma_mbaff: Option<[[CbpMbaffProbe; 4]; 2]>,
+}
+
+/// One resolved external §6.4.11.2 luma-CBP neighbour probe for MBAFF
+/// frames (see [`NeighbourCtx::cbp_luma_mbaff`]).
+#[derive(Debug, Copy, Clone, Default)]
+pub struct CbpMbaffProbe {
+    /// mbAddrN available (in-picture, decoded, same slice).
+    pub available: bool,
+    pub is_i_pcm: bool,
+    pub is_skip: bool,
+    /// `(CodedBlockPatternLuma >> luma8x8BlkIdxN) & 1` of mbAddrN with
+    /// the Table 6-4-remapped block index already applied.
+    pub cbp_bit_set: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2854,16 +3106,42 @@ pub fn decode_coded_block_pattern(
     // the current MB, the "internal" branch reads the prior decoded
     // bin value b_k; for those outside it, the external MB's CBP bit
     // is consulted.
+    // MBAFF frames supply per-bin externally-resolved probes (§6.4.12.2
+    // Table 6-4); the closure evaluates the same condTermFlagN rules on
+    // a resolved probe.
+    let cond_probe = |p: &CbpMbaffProbe| -> u32 {
+        if !p.available {
+            return 0;
+        }
+        if p.is_i_pcm {
+            return 0;
+        }
+        if p.is_skip {
+            return 1;
+        }
+        if p.cbp_bit_set {
+            0
+        } else {
+            1
+        }
+    };
+
     for bin_idx in 0..4u32 {
         // Left neighbour (A).
         let cond_a = match bin_idx {
-            0 => cond_ext(
-                neighbours.available_left,
-                neighbours.left_is_i_pcm,
-                neighbours.left_is_p_or_b_skip,
-                neighbours.left_cbp_luma,
-                1,
-            ),
+            0 | 2 => {
+                if let Some(probes) = &neighbours.cbp_luma_mbaff {
+                    cond_probe(&probes[0][bin_idx as usize])
+                } else {
+                    cond_ext(
+                        neighbours.available_left,
+                        neighbours.left_is_i_pcm,
+                        neighbours.left_is_p_or_b_skip,
+                        neighbours.left_cbp_luma,
+                        if bin_idx == 0 { 1 } else { 3 },
+                    )
+                }
+            }
             1 => {
                 // Left neighbour is block 0 of the current MB.
                 let b_k = prev_bins[0];
@@ -2873,13 +3151,6 @@ pub fn decode_coded_block_pattern(
                     1
                 }
             }
-            2 => cond_ext(
-                neighbours.available_left,
-                neighbours.left_is_i_pcm,
-                neighbours.left_is_p_or_b_skip,
-                neighbours.left_cbp_luma,
-                3,
-            ),
             3 => {
                 // Left neighbour is block 2 of the current MB.
                 let b_k = prev_bins[2];
@@ -2894,20 +3165,19 @@ pub fn decode_coded_block_pattern(
 
         // Above neighbour (B).
         let cond_b = match bin_idx {
-            0 => cond_ext(
-                neighbours.available_above,
-                neighbours.above_is_i_pcm,
-                neighbours.above_is_p_or_b_skip,
-                neighbours.above_cbp_luma,
-                2,
-            ),
-            1 => cond_ext(
-                neighbours.available_above,
-                neighbours.above_is_i_pcm,
-                neighbours.above_is_p_or_b_skip,
-                neighbours.above_cbp_luma,
-                3,
-            ),
+            0 | 1 => {
+                if let Some(probes) = &neighbours.cbp_luma_mbaff {
+                    cond_probe(&probes[1][bin_idx as usize])
+                } else {
+                    cond_ext(
+                        neighbours.available_above,
+                        neighbours.above_is_i_pcm,
+                        neighbours.above_is_p_or_b_skip,
+                        neighbours.above_cbp_luma,
+                        if bin_idx == 0 { 2 } else { 3 },
+                    )
+                }
+            }
             2 => {
                 // Above neighbour is block 0 of the current MB.
                 let b_k = prev_bins[0];

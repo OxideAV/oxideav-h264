@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- MBAFF field-pair INTER decode (round 413) — the `mbaff-field-pairs`
+  fixture (MBAFF IDR + 2 P frames with real FIELD-coded MB pairs) now
+  decodes all three frames byte-exact and gates `Tier::BitExact`
+  (29/29 staged fixture targets). The subsystem spans both the parser
+  and the reconstructor:
+  - §8.4.2.1 per-field reference selection: a field MB resolves
+    RefPicListX[refIdxLX / 2] and refIdxLX % 2 picks the same/opposite
+    parity field; motion compensation runs on a zero-copy half-height
+    field view (doubled stride + parity row offset) for luma and
+    chroma, with §8.4.1.4 Table 8-10's ±2 vertical chroma-MV offset
+    for opposite-parity references at 4:2:0, §8.4.3 refIdxLX >> 1
+    weighted-prediction table indexing, and parity-aware picture
+    identity keys for the deblock §8.7.2.1 NOTE 1 comparison.
+  - §7.4.4 spatial inference of `mb_field_decoding_flag` for
+    fully-skipped pairs (left pair, else above pair, else 0), stamped
+    into the CABAC neighbour grid BEFORE any ctxIdxInc derivation and
+    retro-patched when the bottom MB's decoded flag arrives.
+  - FIELD-coded-MB CABAC residual contexts: Tables 9-22/9-23
+    (ctxIdx 277..=398) were missing from the context-initialisation
+    registry entirely, and the significance-map decode always used the
+    frame ctxIdxOffset column — field MBs now select the §9.3.3.1.3
+    field offsets over properly initialised contexts.
+  - §8.5.6/§8.5.7 field inverse scans (4x4 Table 8-13 + new 8x8
+    Table 8-14 field scan) selected per-MB in every residual
+    reconstruction path.
+  - Exact §6.4.12.2 Table 6-4 block-level neighbour probes for the
+    §9.3.3.1.1.6/.7/.9 ctxIdxInc derivations (previously raster
+    addressing that reads the wrong MB in a pair-interleaved grid),
+    per-bin §6.4.11.2 CBP luma probes, eq. 9-12's doubled refIdx
+    threshold, and eq. 9-15/9-16 vertical mvd scaling. Fixed two
+    mis-transcribed Table 6-4 rows (TopCentre/TopRight for bottom
+    field MBs must select mbAddrB/C + 1 with yM = yN unconditionally).
+  - §8.7 spec-shaped per-MB MBAFF deblocking walker (eqs.
+    8-442..8-449): field MBs filter edges on parity rows (dy = 2), a
+    field pair has no pair-internal horizontal edge, the top edge of a
+    frame top MB below a field pair is filtered twice in field mode
+    ((k, 0) and (k, 1)), and the §8.7.2.1 NOTE 3 vertical |Δmv|
+    threshold halves to 2 quarter-FIELD samples between field MBs.
+
 - §8.5.15 lossless transform-bypass decode (round 413): when
   `qpprime_y_zero_transform_bypass_flag` is 1 and QP′Y == 0, every
   §8.5.10/§8.5.11/§8.5.12/§8.5.13 scaling+transform stage takes its
