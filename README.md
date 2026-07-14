@@ -15,21 +15,29 @@ slices (4:2:0, 4:2:2 and 4:4:4 chroma) through full intra / inter
 prediction, transform, deblocking and DPB output ordering on both the
 CAVLC and CABAC entropy paths; the encoder emits CAVLC and CABAC
 streams across Baseline / Main / High profiles. MBAFF
-(macroblock-adaptive frame/field) frame pictures with frame-coded
-pairs — I *and* P, including 16x8 inter partitions — now decode
-**byte-exact** (round 410: pair-interleaved deblock addressing,
-spec-exact §8.7.2.1 bS, Table 6-4 inter MV neighbour derivation, and
-increasing-mbAddr deblock order; see the `mbaff-interlaced` BitExact
-gate). **PAFF (`field_pic_flag ==
+(macroblock-adaptive frame/field) frame pictures decode **byte-exact**
+with frame-coded pairs (round 410: pair-interleaved deblock
+addressing, spec-exact §8.7.2.1 bS, Table 6-4 inter MV neighbour
+derivation; `mbaff-interlaced` BitExact gate) *and* with FIELD-coded
+pairs (round 413: §8.4.2.1 per-field reference selection with
+zero-copy field-view MC, §7.4.4 skipped-pair flag inference, the
+§9.3.3.1.x FIELD CABAC residual contexts (Tables 9-22/9-23) with
+§8.5.6/§8.5.7 field inverse scans, exact Table 6-4 block-level ctx
+probes, and the §8.7 per-MB MBAFF deblock walker incl. the dual
+field-mode top edge and the NOTE 3 field |Δmv| threshold;
+`mbaff-field-pairs` BitExact gate). §8.5.15 lossless transform-bypass
+(`qpprime_y_zero_transform_bypass_flag=1`, QP′Y == 0) decodes
+losslessly — identity §8.5.10..§8.5.13 legs + V/H intra residual DPCM
+(`lossless-transform-bypass` BitExact gate). **PAFF (`field_pic_flag ==
 1`)** field pictures now decode: each field reconstructs as a
 half-height picture (§7.4.2.1.1 eq. 7-26) and the §C.4.4 driver pairs
 complementary opposite-parity fields into one full-height output frame
 (top → even rows, bottom → odd; frame POC = `Min` of the two field
-POCs). MBAFF inter (P/B) pictures with field-coded pairs, PAFF P/B
-field reference handling (the §8.2.4.2.4/.2.5 field reference-list
-init + DPB complementary-field merge), and the Annex F/G/H/I scalable
-/ multiview / 3D extensions are in progress (see the coverage matrix
-below).
+POCs). PAFF P/B field reference handling (the §8.2.4.2.4/.2.5 field
+reference-list init + DPB complementary-field merge, field CABAC
+contexts for `field_pic_flag == 1` slices), and the Annex F/G/H/I
+scalable / multiview / 3D extensions are in progress (see the coverage
+matrix below).
 
 No external decoder source is consulted while writing this
 implementation — only the spec PDF. Conformance is verified by
@@ -37,17 +45,15 @@ behavioural diff: our decoder is run against synthetic and
 public-domain real-world streams and the YUV output is compared
 against an independent reference decoder run separately. The staged
 fixture corpus (`tests/docs_corpus.rs`) decodes each fixture
-byte-for-byte against its `expected.yuv`. As of round 410 the corpus
-holds 29 fixtures and **27 gate `BitExact` over their full frame
-counts** — every profile/tool combination staged (Baseline/Main/High/
-High10/High422/High444; 8- and 10-bit; 4:2:0/4:2:2/4:4:4; CAVLC +
+byte-for-byte against its `expected.yuv`. As of round 413 the corpus
+holds 29 fixtures and **all 29 targets gate `BitExact` over their full
+frame counts** — every profile/tool combination staged (Baseline/Main/
+High/High10/High422/High444; 8- and 10-bit; 4:2:0/4:2:2/4:4:4; CAVLC +
 CABAC; I/P/B with temporal + spatial direct, explicit + implicit
 weighted prediction, multi-ref, multi-slice, non-flat scaling
-matrices, 8×8 transform, MBAFF interlaced, Annex-B + avcC framing)
-decodes byte-exactly. The two report-only fixtures pin the remaining
-decode gaps: MBAFF field-coded-pair inter reconstruction
-(`mbaff-field-pairs`) and §8.5.15 lossless transform-bypass
-(`lossless-transform-bypass`).
+matrices, 8×8 transform, MBAFF interlaced frame- AND field-coded
+pairs, lossless transform-bypass, Annex-B + avcC framing) decodes
+byte-exactly.
 
 The spec PDF itself can't be redistributed (ITU-T copyright) so it
 lives in the private OxideAV/docs repo at
@@ -70,7 +76,7 @@ https://www.itu.int/rec/T-REC-H.264 (pick the 2024-08 edition).
 | VUI parameters (+ HRD) | §E.1 | integrated into SPS |
 | AUD + SEI framing + filler + end-of-seq/stream | §7.3.2.3..7 | parsed |
 | Slice header | §7.3.3 | parsed (incl. RPLM, pred_weight_table, dec_ref_pic_marking) |
-| Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2 + 4:4:4; I_PCM honours `BitDepth{Y,C}` from the SPS on both CAVLC and CABAC paths, incl. §9.3.1.2 post-PCM arithmetic-engine re-init; 4:4:4 P/B inter reconstruction now wired. MBAFF (`mb_adaptive_frame_field_flag == 1`, `field_pic_flag == 0`): the §7.3.4 MB-pair walker reads `mb_field_decoding_flag` per pair and decodes both MBs without CABAC desync — neighbour-MB addressing for §9.3.3.1.1.* context modeling routes through the exact §6.4.12.2 Table 6-4 process (`mb_address::mbaff_neigh_location`); all-frame MBAFF pairs reconstruct through the §6.4.1 field/frame y-stride path, and the §8.3.1.1/§8.3.2.1 intra-prediction-mode neighbour derivation now routes through the same §6.4.10/Table 6-4 pair-interleaved addressing (an MBAFF I-frame previously decoded at ~9 dB owing to raster neighbour mis-resolution; ~54 dB after the fix, see `tests/integration_mbaff_interlaced_conformance.rs`). **PAFF (`field_pic_flag == 1`)** field pictures now decode: each field reconstructs as a half-height picture (§7.4.2.1.1 eq. 7-26 `PicHeightInMbs = FrameHeightInMbs / (1 + field_pic_flag)`) with the §7.3.4 walk + §6.4 raster neighbours in field-local coordinates, and the §C.4.4 decoder driver pairs complementary opposite-parity fields (same `frame_num`) into one full-height output frame via `interleave_fields` (top → even rows, bottom → odd; frame POC = `Min(Top,Bottom)FieldOrderCnt` per eq. 8-1), emitting a trailing unpaired field as a standalone half-height frame at IDR/EOF. Round 410 made MBAFF frame pictures with frame-coded pairs byte-exact end-to-end (`mbaff-interlaced` gates BitExact): the deblock walker's pair-interleaved `pixel_to_mb_addr`, the spec-exact §8.7.2.1 bS derivation (both-in-frame-MBs bS=4 bullet, real mixedModeEdgeFlag, field-picture bS=3 horizontals), the §8.7 increasing-mbAddr (pair-interleaved) deblock processing order, and the §6.4.12.2/Table 6-4 inter MV-prediction neighbour fetch with §8.4.1.3.2 eq. 8-217..8-220 field/frame adjustment. MBAFF FIELD-coded-pair inter reconstruction (per-field references §8.4.2.1, field MC on parity-interleaved rows, §7.4.4 skipped-pair flag inference) is pinned report-only by the `mbaff-field-pairs` fixture and still deferred) |
+| Slice data + macroblock layer | §7.3.4, §7.3.5 | parsed (I/P/B; 4:2:0 + 4:2:2 + 4:4:4; I_PCM honours `BitDepth{Y,C}` from the SPS on both CAVLC and CABAC paths, incl. §9.3.1.2 post-PCM arithmetic-engine re-init; 4:4:4 P/B inter reconstruction now wired. MBAFF (`mb_adaptive_frame_field_flag == 1`, `field_pic_flag == 0`): the §7.3.4 MB-pair walker reads `mb_field_decoding_flag` per pair and decodes both MBs without CABAC desync — neighbour-MB addressing for §9.3.3.1.1.* context modeling routes through the exact §6.4.12.2 Table 6-4 process (`mb_address::mbaff_neigh_location`); all-frame MBAFF pairs reconstruct through the §6.4.1 field/frame y-stride path, and the §8.3.1.1/§8.3.2.1 intra-prediction-mode neighbour derivation now routes through the same §6.4.10/Table 6-4 pair-interleaved addressing (an MBAFF I-frame previously decoded at ~9 dB owing to raster neighbour mis-resolution; ~54 dB after the fix, see `tests/integration_mbaff_interlaced_conformance.rs`). **PAFF (`field_pic_flag == 1`)** field pictures now decode: each field reconstructs as a half-height picture (§7.4.2.1.1 eq. 7-26 `PicHeightInMbs = FrameHeightInMbs / (1 + field_pic_flag)`) with the §7.3.4 walk + §6.4 raster neighbours in field-local coordinates, and the §C.4.4 decoder driver pairs complementary opposite-parity fields (same `frame_num`) into one full-height output frame via `interleave_fields` (top → even rows, bottom → odd; frame POC = `Min(Top,Bottom)FieldOrderCnt` per eq. 8-1), emitting a trailing unpaired field as a standalone half-height frame at IDR/EOF. Round 410 made MBAFF frame pictures with frame-coded pairs byte-exact end-to-end (`mbaff-interlaced` gates BitExact): the deblock walker's pair-interleaved `pixel_to_mb_addr`, the spec-exact §8.7.2.1 bS derivation (both-in-frame-MBs bS=4 bullet, real mixedModeEdgeFlag, field-picture bS=3 horizontals), the §8.7 increasing-mbAddr (pair-interleaved) deblock processing order, and the §6.4.12.2/Table 6-4 inter MV-prediction neighbour fetch with §8.4.1.3.2 eq. 8-217..8-220 field/frame adjustment. Round 413 completed the MBAFF FIELD-coded-pair inter subsystem end-to-end (per-field references §8.4.2.1 with zero-copy field-view MC + Table 8-10 chroma MV offset, §7.4.4 skipped-pair flag inference, FIELD CABAC residual contexts (Tables 9-22/9-23 + field ctxIdxOffsets), §8.5.6/§8.5.7 field inverse scans, exact Table 6-4 block-level ctx probes, §8.7 per-MB MBAFF deblock walker with the NOTE 3 field |Δmv| threshold) — the `mbaff-field-pairs` fixture gates BitExact on all three frames) |
 | FMO MB address derivation | §8.2.2, §8.2.3 | implemented (all 7 slice_group_map_types + NextMbAddress) |
 | Top-level decoder driver | §7.4.1.2.1 | implemented (events: SPS/PPS stored, AUD, Slice, SEI, end markers, Ignored) |
 | I-slice reconstruction (Picture + MB grid + intra + deblock) | §8 / §6.4 | implemented (I_PCM, Intra_4x4, Intra_8x8, Intra_16x16, chroma; §8.3.4.5 4:4:4 I_NxN chroma reconstruction at ChromaArrayType==3 — Cb/Cr "coded like luma" per §7.3.5.3, reusing the per-block luma pred modes with neighbour samples at BitDepthC) |
