@@ -1673,3 +1673,71 @@ fn corpus_mbaff_field_cavlc() {
         bytes_per_sample: 1,
     });
 }
+
+// --- Round-416 corpus extension (fixtures 32-34): PAFF -------------------
+//
+// Field-coded pictures (`field_pic_flag = 1`) under an interlaced SPS
+// (`frame_mbs_only_flag = 0`, `mb_adaptive_frame_field_flag = 0`). The
+// bitstreams come from this crate's clean-room PAFF field encoder
+// (`encoder::field`) because no stock encoder binary in the toolchain
+// emits PAFF; `expected.yuv` is a BLACK-BOX decode by a stock FFmpeg
+// 8.1 binary, so the reference binary — not our own decoder — defines
+// the conformance contract these tests gate against.
+
+#[test]
+fn corpus_paff_i_fields() {
+    // 6 intra field pictures (IDR top + non-IDR I bottom sharing
+    // frame_num=0 per §7.4.3, then I/I reference pairs). Pins the
+    // §7.3.3 field slice header, §7.4.2.1.1 eq. 7-26 half-height field
+    // decode, §8.5.6 FIELD coefficient scan, §8.2.1 field POC, field
+    // §8.7 deblock (horizontal intra MB edges bS=3) and the §C.4.4
+    // complementary-pair output interleave.
+    evaluate_annex_b(&CorpusCase {
+        name: "paff-i-fields",
+        width: 64,
+        height: 96,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 3,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_paff_p_fields() {
+    // P/P reference field pairs after the IDR pair, single active L0
+    // ref. Pins the §8.2.4.2.2 + §8.2.4.2.5 field reference-list
+    // initialisation — RefPicList0[0] is the SAME-parity field of the
+    // previous frame for both the first and the second field of a
+    // frame (round 416 fixed the driver, which previously sorted by
+    // per-field PicNum only and handed every second field its own
+    // frame's complementary field) — plus half-height field MC and
+    // per-field inter deblock with per-FIELD reference POCs.
+    evaluate_annex_b(&CorpusCase {
+        name: "paff-p-fields",
+        width: 64,
+        height: 96,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 4,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
+fn corpus_paff_mixed_frame_field() {
+    // Field pair, then a full-height I FRAME picture
+    // (field_pic_flag=0), then another field pair — the
+    // picture-adaptive axis proper: PicHeightInMbs, the §8.5.6
+    // zig-zag/field scan selection and the §8.7 frame/field bS rules
+    // all toggle per access unit under one interlaced SPS.
+    evaluate_annex_b(&CorpusCase {
+        name: "paff-mixed-frame-field",
+        width: 64,
+        height: 96,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 3,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
