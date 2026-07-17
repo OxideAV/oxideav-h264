@@ -1725,6 +1725,25 @@ fn corpus_paff_p_fields() {
 }
 
 #[test]
+fn corpus_paff_p_crossparity() {
+    // Frame 0's bottom field is a P field referencing the IDR TOP
+    // field — the §8.2.4.2.5 second-field fall-through when the
+    // same-parity sub-list is empty — pinning cross-parity field MC
+    // and the §8.4.1.4 Table 8-10 vertical chroma-MV adjustment
+    // (mvCLX[1] = mvLX[1] + 2 for a top reference from a bottom
+    // field).
+    evaluate_annex_b(&CorpusCase {
+        name: "paff-p-crossparity",
+        width: 64,
+        height: 96,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 3,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
 fn corpus_paff_mixed_frame_field() {
     // Field pair, then a full-height I FRAME picture
     // (field_pic_flag=0), then another field pair — the
