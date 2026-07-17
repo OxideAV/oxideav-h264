@@ -1652,23 +1652,24 @@ fn corpus_mbaff_field_8x8t() {
 fn corpus_mbaff_field_cavlc() {
     // Main profile CAVLC MBAFF with FIELD-coded pairs — pins the
     // §9.2.1 CAVLC decode path under MBAFF (the corpus previously
-    // exercised MBAFF only under CABAC). ReportOnly: round 413 routed
-    // the §9.2.1.1 nC neighbour probes through the exact §6.4.12.2
+    // exercised MBAFF only under CABAC). Round 413 routed the
+    // §9.2.1.1 nC neighbour probes through the exact §6.4.12.2
     // Table 6-4 process, doubled the te(v) ref_idx range for field
     // MBs, and wired §7.4.4 inference + field flags into the CAVLC
-    // walker, but the I slice still desyncs at MB #1 (a coeff_token
-    // nC mismatch) — plain CAVLC MBAFF (even all-frame-pair I) was
-    // never previously decodable, and the remaining divergence is in
-    // the CAVLC-specific MBAFF path.
-    // TODO(h264-corpus): find the remaining CAVLC MBAFF nC divergence
-    // (first failing element: MB 1 residual, slice 1) and promote.
+    // walker. Round 416 closed the remaining desync: the residual
+    // walker's own luma/plane nC closures still resolved EXTERNAL
+    // neighbours through the raster-scan map, so on the
+    // pair-interleaved MBAFF grid the bottom MB of the leftmost pair
+    // read its own pair-top as "left" (a dense I MB → bogus nC=9).
+    // The closures now route through the same Table 6-4 probe as the
+    // chroma AC path — all three frames gate BitExact.
     evaluate_annex_b(&CorpusCase {
         name: "mbaff-field-cavlc",
         width: 64,
         height: 128,
         chroma: ChromaFmt::Yuv420,
         n_frames: 3,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
         bytes_per_sample: 1,
     });
 }

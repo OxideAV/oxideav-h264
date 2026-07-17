@@ -3701,6 +3701,33 @@ fn parse_residual_cavlc_only(
                 LumaNcKind::Intra16x16Dc => 0u8,
                 LumaNcKind::Ac => blk_idx,
             };
+            // MBAFF frames: the §6.4.11.4 neighbour derivation routes
+            // through the §6.4.12.2 Table 6-4 process on the block's
+            // upper-left sample — the raster map below would resolve
+            // pair-interleaved addresses to the wrong MB (e.g. the
+            // bottom MB of the leftmost pair would read its own pair
+            // top as "left"). Probes resolving into the current MB use
+            // the progressively-filled own totals (§9.2.1.1 step 3);
+            // external MBs go through the grid slots.
+            if let Some(g) = grid.filter(|g| g.mbaff_frame_flag) {
+                let (bx, by) = blk4x4_xy(blk);
+                let probe = |xn: i32, yn: i32| -> (bool, u8) {
+                    match g.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16) {
+                        Some((addr, wx, wy)) => {
+                            let bi = blk4x4_idx(wx, wy);
+                            if addr == current_mb_addr {
+                                (true, own[bi as usize])
+                            } else {
+                                nc_nn_luma(g, Some(addr), bi, current_is_intra, cip)
+                            }
+                        }
+                        None => (false, 0),
+                    }
+                };
+                let (avail_a, n_a) = probe(bx - 1, by);
+                let (avail_b, n_b) = probe(bx, by - 1);
+                return combine_nc(avail_a, n_a, avail_b, n_b);
+            }
             let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk);
             // A:
             let (avail_a, n_a) = match a_src {
@@ -3772,8 +3799,29 @@ fn parse_residual_cavlc_only(
                                   own_cr_lt: &[u8; 16],
                                   grid: Option<&CavlcNcGrid>|
      -> i32 {
-        let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk_idx);
         let own = if is_cr { own_cr_lt } else { own_cb_lt };
+        // MBAFF frames: same §6.4.12.2 Table 6-4 routing as the luma
+        // closure above (the 4:4:4 planes share luma's block geometry).
+        if let Some(g) = grid.filter(|g| g.mbaff_frame_flag) {
+            let (bx, by) = blk4x4_xy(blk_idx);
+            let probe = |xn: i32, yn: i32| -> (bool, u8) {
+                match g.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16) {
+                    Some((addr, wx, wy)) => {
+                        let bi = blk4x4_idx(wx, wy);
+                        if addr == current_mb_addr {
+                            (true, own[bi as usize])
+                        } else {
+                            nc_nn_plane_luma_like(g, Some(addr), bi, is_cr, current_is_intra, cip)
+                        }
+                    }
+                    None => (false, 0),
+                }
+            };
+            let (avail_a, n_a) = probe(bx - 1, by);
+            let (avail_b, n_b) = probe(bx, by - 1);
+            return combine_nc(avail_a, n_a, avail_b, n_b);
+        }
+        let [a_src, b_src, _c, _d] = neighbour_4x4_map(blk_idx);
         let (avail_a, n_a) = match a_src {
             NeighbourSource::InternalBlock(i) => (true, own[i as usize]),
             _ => {

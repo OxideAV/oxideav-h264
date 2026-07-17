@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CAVLC MBAFF decode is now byte-exact: the residual walker's luma /
+  4:4:4-plane `nC` closures (§9.2.1.1) resolved EXTERNAL neighbour
+  blocks through the non-MBAFF raster-scan map, so on the
+  pair-interleaved MBAFF grid (§6.4.1) the bottom macroblock of the
+  leftmost pair read its own pair-top as "left" and derived a bogus
+  `nC` (a dense I MB pushed `nC` into the 6-bit FLC column and the
+  coeff_token decode desynced at MB #1). The closures now route
+  external probes through the same §6.4.12.2 Table 6-4 neighbouring
+  location process the chroma AC path already used, with
+  probes resolving into the current MB served from the
+  progressively-filled own-block totals (§9.2.1.1 step 3). The staged
+  `mbaff-field-cavlc` fixture (Main profile CAVLC, real FIELD-coded
+  pairs, IDR + 2 P) is promoted from ReportOnly to BitExact — all
+  three frames byte-for-byte.
+
 - Scheduled-Fuzz red (2026-07-12 → 2026-07-16): the `ffmpeg_oracle_decode`
   differential harness was binding the wrong reference decoder by
   numeric codec id, so every frame our decoder legitimately produced
