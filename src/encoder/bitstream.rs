@@ -25,6 +25,17 @@ pub struct BitWriter {
     /// the previous byte is fully written; the next `write_bit` will
     /// push a new zero byte and start at MSB.
     bit_pos: u8,
+    /// Round-416 PAFF — when set, the CAVLC residual-block writer
+    /// re-permutes each 4x4 coefficient list from the zig-zag scan the
+    /// encoder pipeline builds internally into the §8.5.6 Table 8-13
+    /// FIELD scan that a field macroblock's decoder inverse-applies
+    /// (every MB of a `field_pic_flag == 1` picture is a field MB).
+    /// Carried on the writer so the single
+    /// `encode_residual_block_cavlc` choke point sees it without
+    /// threading a flag through every MB-emit config struct. Fresh RDO
+    /// trial writers (`BitWriter::new()`) default to `false` and thus
+    /// measure zig-zag bit lengths — informative-only rate estimates.
+    field_scan: bool,
 }
 
 impl BitWriter {
@@ -32,6 +43,7 @@ impl BitWriter {
         Self {
             bytes: Vec::new(),
             bit_pos: 0,
+            field_scan: false,
         }
     }
 
@@ -39,6 +51,7 @@ impl BitWriter {
         Self {
             bytes: Vec::with_capacity(cap),
             bit_pos: 0,
+            field_scan: false,
         }
     }
 
@@ -48,6 +61,19 @@ impl BitWriter {
 
     pub fn byte_aligned(&self) -> bool {
         self.bit_pos == 0
+    }
+
+    /// Round-416 PAFF — mark this writer as emitting a FIELD picture's
+    /// `slice_data()`: 4x4 CAVLC residual lists are re-permuted from
+    /// the pipeline's zig-zag order into the §8.5.6 field scan at the
+    /// residual-block writer. See the `field_scan` field docs.
+    pub fn set_field_scan(&mut self, on: bool) {
+        self.field_scan = on;
+    }
+
+    /// Round-416 PAFF — whether [`Self::set_field_scan`] is active.
+    pub fn field_scan(&self) -> bool {
+        self.field_scan
     }
 
     /// Total number of bits written so far.

@@ -256,6 +256,14 @@ pub fn encode_run_before(
 // High-level encoder for one residual_block_cavlc(...) syntax element.
 // ---------------------------------------------------------------------------
 
+/// Round-416 PAFF — position map from the zig-zag 4x4 scan list the
+/// encoder pipeline builds (Table 8-13 zig-zag row) to the §8.5.6
+/// FIELD scan list a field macroblock's decoder inverse-applies:
+/// `field_list[k] = zigzag_list[ZZ_TO_FIELD_16[k]]`. Derived by
+/// composing Table 8-13's two rows (verified against the decoder's
+/// `inverse_scan_4x4_field` in the tests below).
+const ZZ_TO_FIELD_16: [usize; 16] = [0, 2, 1, 3, 9, 4, 8, 10, 5, 7, 11, 14, 6, 12, 13, 15];
+
 /// §7.3.5.3.1 + §9.2 — encode one `residual_block_cavlc(coeffLevel,
 /// startIdx, endIdx, maxNumCoeff)` block.
 ///
@@ -263,7 +271,49 @@ pub fn encode_run_before(
 /// `startIdx..=endIdx`, **in scan order** (caller has already applied
 /// the forward zig-zag scan). The slice length must equal
 /// `endIdx - startIdx + 1`.
+///
+/// When the writer is in field-scan mode
+/// ([`BitWriter::set_field_scan`], round-416 PAFF), 4x4 luma/chroma
+/// lists (16-coeff full blocks and 15-coeff AC-only blocks under a
+/// `Numeric` nC context) are re-permuted from the caller's zig-zag
+/// order into the §8.5.6 Table 8-13 field scan before coding — the
+/// chroma DC contexts keep their own §8.5.4/§8.5.11 scans, which have
+/// no field variant.
 pub fn encode_residual_block_cavlc(
+    w: &mut BitWriter,
+    ctx: CoeffTokenContext,
+    max_num_coeff: u32,
+    coeff_level_in_scan_order: &[i32],
+) -> CavlcEncodeResult<()> {
+    if w.field_scan() && matches!(ctx, CoeffTokenContext::Numeric(_)) {
+        let list = coeff_level_in_scan_order;
+        match list.len() {
+            16 => {
+                let mut remapped = [0i32; 16];
+                for (k, &src) in ZZ_TO_FIELD_16.iter().enumerate() {
+                    remapped[k] = list[src];
+                }
+                return encode_residual_block_scanned(w, ctx, max_num_coeff, &remapped);
+            }
+            15 => {
+                // AC-only layout: slot s holds spec scan position
+                // s + 1; both scans fix position 0 at c00 so the DC
+                // slot never moves between them.
+                let mut remapped = [0i32; 15];
+                for k in 1..16 {
+                    remapped[k - 1] = list[ZZ_TO_FIELD_16[k] - 1];
+                }
+                return encode_residual_block_scanned(w, ctx, max_num_coeff, &remapped);
+            }
+            _ => {}
+        }
+    }
+    encode_residual_block_scanned(w, ctx, max_num_coeff, coeff_level_in_scan_order)
+}
+
+/// Body of [`encode_residual_block_cavlc`] after any field-scan remap:
+/// the input list is in the exact scan order the bitstream carries.
+fn encode_residual_block_scanned(
     w: &mut BitWriter,
     ctx: CoeffTokenContext,
     max_num_coeff: u32,
@@ -406,6 +456,77 @@ mod tests {
     use crate::cavlc::{
         decode_coeff_token, decode_run_before, decode_total_zeros, parse_residual_block_cavlc,
     };
+
+    /// Round-416 PAFF — `ZZ_TO_FIELD_16` must be exactly the
+    /// composition of the decoder's two Table 8-13 rows: packing a
+    /// raster block with the encoder's zig-zag scan, remapping with
+    /// the table, then inverse-applying the decoder's FIELD scan has
+    /// to reproduce the raster block (full 16-coeff form), and the
+    /// AC-only variant must agree slot-for-slot.
+    #[test]
+    fn zz_to_field_16_matches_decoder_inverse_field_scan() {
+        use crate::encoder::transform::{zigzag_scan_4x4, zigzag_scan_4x4_ac};
+        use crate::transform::{inverse_scan_4x4_field, inverse_scan_4x4_field_ac};
+        let raster: [i32; 16] = core::array::from_fn(|i| i as i32 + 1);
+        let zz = zigzag_scan_4x4(&raster);
+        let mut field_list = [0i32; 16];
+        for (k, &src) in ZZ_TO_FIELD_16.iter().enumerate() {
+            field_list[k] = zz[src];
+        }
+        assert_eq!(inverse_scan_4x4_field(&field_list), raster);
+
+        // AC-only: position 0 (c00) is pinned in both scans; slots
+        // 0..=14 carry spec scan positions 1..=15.
+        let mut ac_raster = raster;
+        ac_raster[0] = 0;
+        let zz_ac = zigzag_scan_4x4_ac(&ac_raster);
+        let mut field_ac = [0i32; 16];
+        for k in 1..16 {
+            field_ac[k - 1] = zz_ac[ZZ_TO_FIELD_16[k] - 1];
+        }
+        assert_eq!(inverse_scan_4x4_field_ac(&field_ac), ac_raster);
+    }
+
+    /// The writer-carried field-scan mode must re-permute a `Numeric`
+    /// 16-coeff list so that a FIELD-scan decode recovers the same
+    /// raster coefficients a zig-zag decode of the unflagged emission
+    /// recovers.
+    #[test]
+    fn field_scan_mode_emits_field_ordered_lists() {
+        use crate::encoder::transform::zigzag_scan_4x4;
+        use crate::transform::{inverse_scan_4x4_field, inverse_scan_4x4_zigzag};
+        let raster: [i32; 16] = [3, 0, -1, 0, 2, 1, 0, 0, 0, 1, 0, 0, -1, 0, 0, 1];
+        let zz = zigzag_scan_4x4(&raster);
+
+        let decode_list = |bytes: &[u8]| -> Vec<i32> {
+            let mut r = BitReader::new(bytes);
+            parse_residual_block_cavlc(&mut r, CoeffTokenContext::Numeric(0), 0, 15, 16)
+                .expect("parse")
+        };
+
+        let mut w_frame = BitWriter::new();
+        encode_residual_block_cavlc(&mut w_frame, CoeffTokenContext::Numeric(0), 16, &zz)
+            .expect("encode frame");
+        w_frame.align_to_byte_zero();
+        let mut frame_list = decode_list(&w_frame.into_bytes());
+        frame_list.resize(16, 0);
+        assert_eq!(
+            inverse_scan_4x4_zigzag(&frame_list.clone().try_into().unwrap()),
+            raster,
+        );
+
+        let mut w_field = BitWriter::new();
+        w_field.set_field_scan(true);
+        encode_residual_block_cavlc(&mut w_field, CoeffTokenContext::Numeric(0), 16, &zz)
+            .expect("encode field");
+        w_field.align_to_byte_zero();
+        let mut field_list = decode_list(&w_field.into_bytes());
+        field_list.resize(16, 0);
+        assert_eq!(
+            inverse_scan_4x4_field(&field_list.clone().try_into().unwrap()),
+            raster,
+        );
+    }
 
     #[test]
     fn coeff_token_roundtrips() {

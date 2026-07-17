@@ -77,6 +77,15 @@ pub struct BaselineSpsConfig {
     /// delta_scale chain (round-391). Requires a chroma-extended
     /// profile_idc (the flag lives in the §7.3.2.1.1 optional group).
     pub seq_scaling_lists: Option<super::ScalingListsSpec>,
+    /// Round-416 — PAFF: when `true` the writer emits
+    /// `frame_mbs_only_flag = 0` + `mb_adaptive_frame_field_flag = 0`
+    /// (field pictures, no MBAFF) and interprets `height_in_mbs` as
+    /// **FrameHeightInMbs** — `pic_height_in_map_units_minus1` is then
+    /// coded as `height_in_mbs / 2 - 1` per §7.4.2.1.1 eq. 7-15/7-16
+    /// (a map unit is a field-MB row pair when `frame_mbs_only_flag`
+    /// is 0). `height_in_mbs` must be even. Requires `profile_idc !=
+    /// 66` — §A.2.1 pins `frame_mbs_only_flag = 1` in Baseline.
+    pub interlaced_fields: bool,
 }
 
 impl Default for BaselineSpsConfig {
@@ -92,6 +101,7 @@ impl Default for BaselineSpsConfig {
             profile_idc: 66,
             chroma_format_idc: 1,
             seq_scaling_lists: None,
+            interlaced_fields: false,
         }
     }
 }
@@ -248,10 +258,29 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
     debug_assert!(cfg.width_in_mbs >= 1);
     debug_assert!(cfg.height_in_mbs >= 1);
     w.ue(cfg.width_in_mbs - 1);
-    w.ue(cfg.height_in_mbs - 1);
-
-    // frame_mbs_only_flag = 1 (no field/MBAFF).
-    w.u(1, 1);
+    if cfg.interlaced_fields {
+        // §A.2.1 — Baseline requires frame_mbs_only_flag = 1.
+        debug_assert!(
+            cfg.profile_idc != 66,
+            "interlaced_fields requires a non-Baseline profile (§A.2.1)",
+        );
+        debug_assert!(
+            cfg.height_in_mbs % 2 == 0,
+            "FrameHeightInMbs must be even for field coding",
+        );
+        // §7.4.2.1.1 eq. 7-15/7-16 — with frame_mbs_only_flag == 0 a
+        // pic height map unit covers two frame MB rows:
+        // FrameHeightInMbs = 2 * PicHeightInMapUnits.
+        w.ue(cfg.height_in_mbs / 2 - 1);
+        // frame_mbs_only_flag = 0 (field pictures allowed).
+        w.u(1, 0);
+        // mb_adaptive_frame_field_flag = 0 (PAFF, no MBAFF).
+        w.u(1, 0);
+    } else {
+        w.ue(cfg.height_in_mbs - 1);
+        // frame_mbs_only_flag = 1 (no field/MBAFF).
+        w.u(1, 1);
+    }
     // direct_8x8_inference_flag = 1 (recommended even for I-only —
     // some decoders verify this is set when frame_mbs_only_flag=1).
     w.u(1, 1);
@@ -275,6 +304,7 @@ mod tests {
     fn baseline_sps_round_trips_through_decoder_parser() {
         let cfg = BaselineSpsConfig {
             seq_scaling_lists: None,
+            interlaced_fields: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4, // 64 samples
@@ -315,6 +345,7 @@ mod tests {
         // ChromaArrayType=3).
         let cfg = BaselineSpsConfig {
             seq_scaling_lists: None,
+            interlaced_fields: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -350,6 +381,7 @@ mod tests {
         // chroma_format_idc=2 (4:2:2), 8-bit depth, no scaling matrix.
         let cfg = BaselineSpsConfig {
             seq_scaling_lists: None,
+            interlaced_fields: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,

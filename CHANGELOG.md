@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PAFF (picture-adaptive frame/field) end-to-end. Decoder: coded FIELD
+  pictures (`field_pic_flag == 1`) now build their reference lists
+  through the §8.2.4.2.2/.2.4 + §8.2.4.2.5 field initialisation
+  (per-field entries interleaved by alternating parity starting from
+  the current field's own parity) and the §8.2.4.3 field RPLM — the
+  driver previously routed field slices through the frame init, whose
+  descending per-field-PicNum order put the complementary field of the
+  CURRENT frame at index 0 for every second field (top P fields
+  decoded correctly by coincidence; bottom P fields referenced the
+  wrong field). List entries naming one parity field of a picture
+  stored as a FRAME are materialised as half-height field views
+  (`Picture::field_view`) carried as per-index provider overrides, and
+  per-entry POCs are the FIELD order counts (a stored frame's two
+  fields share a `dpb_key` but carry distinct field POCs).
+- Encoder: a PAFF field-coding driver (`encoder::field`) — interlaced
+  frames split into top/bottom field pictures (IDR top + non-IDR I
+  bottom for frame 0 sharing `frame_num` per §7.4.3, then I/I or P/P
+  reference field pairs with the §8.2.4.2.5-implied same-parity
+  previous-frame field at `ref_idx` 0), optional full-height I FRAME
+  pictures inside the interlaced stream (the picture-adaptive axis),
+  interlaced SPS emission (`frame_mbs_only_flag = 0`), §7.3.3
+  `field_pic_flag` / `bottom_field_flag` slice-header signalling, and
+  per-field §8.7 deblock under the field-picture bS rules. The CAVLC
+  residual writer re-permutes 4x4 coefficient lists from the internal
+  zig-zag order into the §8.5.6 Table 8-13 FIELD scan for field
+  pictures (every MB of a field picture is a field MB).
+- `tests/integration_paff_encoder.rs`: I-field, P-field and mixed
+  frame/field PAFF sequences self-roundtrip byte-exactly through our
+  decoder AND decode byte-identically in a stock black-box reference
+  binary.
+
 ### Fixed
 
 - CAVLC MBAFF decode is now byte-exact: the residual walker's luma /

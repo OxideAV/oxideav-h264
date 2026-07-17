@@ -127,6 +127,48 @@ impl Picture {
         }
     }
 
+    /// §8.4.2.1 / §8.2.4.2.5 — extract one parity field of this FRAME
+    /// picture as a standalone half-height picture (top field = even
+    /// sample rows of every plane, bottom = odd rows; the chroma planes
+    /// of every interlace-capable format have even height and split by
+    /// the same row parity). Used when a coded FIELD picture references
+    /// a field of a picture that was stored as a frame. Sample planes
+    /// only — the motion/colocated grids are left empty (a temporal
+    /// direct colocated picture is `RefPicList1[0]`, resolved
+    /// separately). The caller stamps `pic_order_cnt` with the FIELD's
+    /// own order count.
+    pub fn field_view(&self, bottom: bool) -> Picture {
+        let mut out = Picture::new(
+            self.width_in_samples,
+            self.height_in_samples / 2,
+            self.chroma_array_type,
+            self.bit_depth_luma,
+            self.bit_depth_chroma,
+        );
+        let take_rows = |src: &[i32], width: usize, height: usize| -> Vec<i32> {
+            let mut v = Vec::with_capacity(width * height / 2);
+            for row in (usize::from(bottom)..height).step_by(2) {
+                v.extend_from_slice(&src[row * width..(row + 1) * width]);
+            }
+            v
+        };
+        out.luma = take_rows(
+            &self.luma,
+            self.width_in_samples as usize,
+            self.height_in_samples as usize,
+        );
+        let cw = self.chroma_width() as usize;
+        let ch = self.chroma_height() as usize;
+        if ch > 0 {
+            out.cb = take_rows(&self.cb, cw, ch);
+            out.cr = take_rows(&self.cr, cw, ch);
+        }
+        out.non_existing = self.non_existing;
+        out.frame_num = self.frame_num;
+        out.pic_order_cnt = self.pic_order_cnt;
+        out
+    }
+
     /// §6.2 — chroma plane width in samples.
     pub fn chroma_width(&self) -> u32 {
         chroma_dims(

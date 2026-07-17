@@ -16,6 +16,45 @@
 
 use crate::encoder::bitstream::BitWriter;
 
+/// §7.3.3 — `field_pic_flag` / `bottom_field_flag` signalling for the
+/// slice-header writers (round-416 PAFF support).
+///
+/// The pair of flags is only present in the bitstream when the active
+/// SPS has `frame_mbs_only_flag == 0`; the writer trusts the caller to
+/// pick the variant matching the SPS it emitted
+/// ([`crate::encoder::sps::BaselineSpsConfig::interlaced_fields`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FieldPicSignal {
+    /// SPS has `frame_mbs_only_flag = 1` — neither flag is coded.
+    #[default]
+    FrameMbsOnly,
+    /// Interlaced SPS, frame picture: `field_pic_flag = 0`.
+    FramePicture,
+    /// Field picture: `field_pic_flag = 1`, `bottom_field_flag = 0`.
+    TopField,
+    /// Field picture: `field_pic_flag = 1`, `bottom_field_flag = 1`.
+    BottomField,
+}
+
+impl FieldPicSignal {
+    /// Emit the §7.3.3 `field_pic_flag` (+ conditional
+    /// `bottom_field_flag`) bits at the post-`frame_num` position.
+    fn write(self, w: &mut BitWriter) {
+        match self {
+            FieldPicSignal::FrameMbsOnly => {}
+            FieldPicSignal::FramePicture => w.u(1, 0),
+            FieldPicSignal::TopField => {
+                w.u(1, 1);
+                w.u(1, 0);
+            }
+            FieldPicSignal::BottomField => {
+                w.u(1, 1);
+                w.u(1, 1);
+            }
+        }
+    }
+}
+
 /// Configuration for [`build_idr_i_slice_header_rbsp`]. Holds only the
 /// slice-header fields. Caller appends `slice_data()` and trailing bits.
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +84,20 @@ pub struct IdrSliceHeaderConfig {
     /// §7.4.3 — `slice_beta_offset_div2` ∈ -6..=6. Only emitted when
     /// `disable_deblocking_filter_idc != 1`.
     pub slice_beta_offset_div2: i32,
+    /// Round-416 — PAFF field signalling (see [`FieldPicSignal`]).
+    pub field: FieldPicSignal,
+    /// Round-416 — when `false`, the writer emits a **non-IDR I slice**
+    /// header: `idr_pic_id` is omitted and `dec_ref_pic_marking()` uses
+    /// the non-IDR path (`adaptive_ref_pic_marking_mode_flag = 0`,
+    /// gated on `nal_ref_idc != 0`). Needed for the second I field of a
+    /// PAFF IDR frame pair, which per §7.4.3 shares `frame_num = 0`
+    /// with the IDR first field but is itself a non-IDR picture
+    /// (`nal_unit_type = 1`).
+    pub idr: bool,
+    /// §7.3.3 — `nal_ref_idc` of the parent NAL; gates
+    /// `dec_ref_pic_marking()` on the non-IDR path. Ignored when
+    /// `idr == true` (IDR marking is always present).
+    pub nal_ref_idc: u32,
 }
 
 /// Round-30 — extra parameters for the CABAC-enabled slice writers.
@@ -65,19 +118,31 @@ pub fn write_idr_i_slice_header(w: &mut BitWriter, cfg: &IdrSliceHeaderConfig) {
     w.ue(cfg.pic_parameter_set_id);
     // No `colour_plane_id` (separate_colour_plane_flag == 0 in our SPS).
     w.u(cfg.frame_num_bits, cfg.frame_num);
-    // No field_pic_flag / bottom_field_flag — frame_mbs_only_flag == 1.
-    // idr_pic_id only on IDR — and we always emit IDR here.
-    w.ue(cfg.idr_pic_id);
+    // §7.3.3 — field_pic_flag / bottom_field_flag when the SPS has
+    // frame_mbs_only_flag == 0 (round-416 PAFF).
+    cfg.field.write(w);
+    // idr_pic_id only on IDR pictures (§7.3.3).
+    if cfg.idr {
+        w.ue(cfg.idr_pic_id);
+    }
     // POC type 0 branch: pic_order_cnt_lsb. No delta_pic_order_cnt_bottom
     // (bottom_field_pic_order_in_frame_present_flag == 0 in our PPS).
     w.u(cfg.poc_lsb_bits, cfg.pic_order_cnt_lsb);
     // I-slice: no num_ref_idx_active_override_flag,
     // no ref_pic_list_modification, no pred_weight_table.
 
-    // §7.3.3.3 — dec_ref_pic_marking() (nal_ref_idc != 0 always for IDR).
-    // IDR path: no_output_of_prior_pics_flag = 0, long_term_reference_flag = 0.
-    w.u(1, 0);
-    w.u(1, 0);
+    // §7.3.3.3 — dec_ref_pic_marking().
+    if cfg.idr {
+        // IDR path (nal_ref_idc != 0 always for IDR):
+        // no_output_of_prior_pics_flag = 0, long_term_reference_flag = 0.
+        w.u(1, 0);
+        w.u(1, 0);
+    } else if cfg.nal_ref_idc != 0 {
+        // Non-IDR reference I picture (e.g. the second field of a PAFF
+        // IDR pair): adaptive_ref_pic_marking_mode_flag = 0 (sliding
+        // window).
+        w.u(1, 0);
+    }
 
     // No cabac_init_idc — entropy_coding_mode_flag == 0 (CAVLC).
     w.se(cfg.slice_qp_delta);
@@ -138,6 +203,8 @@ pub struct PSliceHeaderConfig {
     /// `slice_qp_delta`). Required when the PPS has
     /// `entropy_coding_mode_flag = 1` and the slice is non-I/SI.
     pub cabac: Option<CabacSliceParams>,
+    /// Round-416 — PAFF field signalling (see [`FieldPicSignal`]).
+    pub field: FieldPicSignal,
 }
 
 /// Emit the bits of a single P-slice header (non-IDR) into the supplied
@@ -150,7 +217,9 @@ pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig) {
     w.ue(cfg.pic_parameter_set_id);
     // No `colour_plane_id` (separate_colour_plane_flag == 0).
     w.u(cfg.frame_num_bits, cfg.frame_num);
-    // No field_pic_flag — frame_mbs_only_flag == 1.
+    // §7.3.3 — field_pic_flag / bottom_field_flag when the SPS has
+    // frame_mbs_only_flag == 0 (round-416 PAFF).
+    cfg.field.write(w);
     // No idr_pic_id — non-IDR.
     // POC type 0 branch.
     w.u(cfg.poc_lsb_bits, cfg.pic_order_cnt_lsb);
@@ -400,6 +469,7 @@ mod tests {
     fn idr_slice_header_round_trips_through_decoder_parser() {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: None,
+            interlaced_fields: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -430,6 +500,9 @@ mod tests {
                 disable_deblocking_filter_idc: 1,
                 slice_alpha_c0_offset_div2: 0,
                 slice_beta_offset_div2: 0,
+                field: FieldPicSignal::FrameMbsOnly,
+                idr: true,
+                nal_ref_idc: 3,
             },
         );
         // Append a trivial slice_data placeholder + rbsp_trailing_bits so
@@ -465,6 +538,7 @@ mod tests {
     fn p_slice_header_round_trips_through_decoder_parser() {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: None,
+            interlaced_fields: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -496,6 +570,7 @@ mod tests {
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 2,
                 cabac: None,
+                field: FieldPicSignal::FrameMbsOnly,
             },
         );
         // Append a dummy bit + trailing so the parser doesn't blow up.
@@ -534,6 +609,7 @@ mod tests {
         // (B-slices are forbidden under Baseline §A.2.2).
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: None,
+            interlaced_fields: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -606,6 +682,7 @@ mod tests {
         // pred_weight_table entry per list at log2_wd = 5.
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: None,
+            interlaced_fields: false,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,

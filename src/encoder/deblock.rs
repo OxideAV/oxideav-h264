@@ -177,6 +177,78 @@ pub fn deblock_recon_with_chroma_array_type(
     height_mbs: u32,
     chroma_array_type: u32,
 ) {
+    deblock_recon_inner(
+        width,
+        height,
+        chroma_width,
+        chroma_height,
+        recon_y,
+        recon_u,
+        recon_v,
+        mb_infos,
+        chroma_qp_index_offset,
+        width_mbs,
+        height_mbs,
+        chroma_array_type,
+        /* field_pic */ false,
+    )
+}
+
+/// Round-416 — PAFF variant: deblock one coded FIELD picture
+/// (`field_pic_flag == 1`). The planes are the field's own half-height
+/// samples; the §8.7 pass runs with `field_pic = true` so the walker
+/// applies the field-picture bS rules of §8.7.2.1 (a horizontal intra
+/// macroblock edge takes bS = 3 — the bS = 4 first bullet requires
+/// "both in frame macroblocks" or a vertical edge — and the NOTE 3
+/// |Δmv| threshold is 2 in quarter luma FIELD sample units).
+#[allow(clippy::too_many_arguments)]
+pub fn deblock_recon_field(
+    width: u32,
+    height: u32,
+    chroma_width: u32,
+    chroma_height: u32,
+    recon_y: &mut [u8],
+    recon_u: &mut [u8],
+    recon_v: &mut [u8],
+    mb_infos: &[MbDeblockInfo],
+    chroma_qp_index_offset: i32,
+    width_mbs: u32,
+    height_mbs: u32,
+    chroma_array_type: u32,
+) {
+    deblock_recon_inner(
+        width,
+        height,
+        chroma_width,
+        chroma_height,
+        recon_y,
+        recon_u,
+        recon_v,
+        mb_infos,
+        chroma_qp_index_offset,
+        width_mbs,
+        height_mbs,
+        chroma_array_type,
+        /* field_pic */ true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deblock_recon_inner(
+    width: u32,
+    height: u32,
+    chroma_width: u32,
+    chroma_height: u32,
+    recon_y: &mut [u8],
+    recon_u: &mut [u8],
+    recon_v: &mut [u8],
+    mb_infos: &[MbDeblockInfo],
+    chroma_qp_index_offset: i32,
+    width_mbs: u32,
+    height_mbs: u32,
+    chroma_array_type: u32,
+    field_pic: bool,
+) {
     debug_assert_eq!(recon_y.len(), (width as usize) * (height as usize));
     debug_assert_eq!(
         recon_u.len(),
@@ -275,7 +347,7 @@ pub fn deblock_recon_with_chroma_array_type(
         /* bit_depth_c */ 8,
         &pps,
         /* mbaff_frame_flag */ false,
-        /* field_pic */ false,
+        field_pic,
         &[], // mb_field_flags — empty in non-MBAFF
     );
 

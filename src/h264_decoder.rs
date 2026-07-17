@@ -887,8 +887,91 @@ impl H264CodecDecoder {
         let is_idr = in_progress.is_idr;
 
         // Build per-slice RefPicList0 / RefPicList1.
+        //
+        // Round-416 PAFF: a coded FIELD picture (`field_pic_flag == 1`)
+        // initialises its lists through the §8.2.4.2.2/.2.4 +
+        // §8.2.4.2.5 field process — per-field entries interleaved by
+        // alternating parity starting from the current field's own
+        // parity — and the §8.2.4.3 field RPLM (eq. 8-30..8-33 PicNum
+        // forms). The plain frame init below sorts by per-field PicNum
+        // only, which puts the complementary field of the CURRENT frame
+        // (highest PicNum but opposite parity) at index 0 for a second
+        // field — the §8.2.4.2.5 alternation instead starts with the
+        // same-parity field of the previous frame.
+        let mut l0_overrides: Vec<Option<Picture>> = Vec::new();
+        let mut l1_overrides: Vec<Option<Picture>> = Vec::new();
+        let mut field_pocs_lt: Option<FieldListPocsLt> = None;
         let (list0, list1) = if is_idr {
             (Vec::new(), Vec::new())
+        } else if current_is_field {
+            let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
+            let (mut fl0, mut fl1) = match header.slice_type {
+                SliceType::P | SliceType::SP => (
+                    ref_list::init_ref_pic_list_p_field(
+                        &self.dpb_entries,
+                        header.frame_num,
+                        max_frame_num,
+                        current_bottom,
+                    ),
+                    Vec::new(),
+                ),
+                SliceType::B => ref_list::init_ref_pic_lists_b_field(
+                    &self.dpb_entries,
+                    pic_order_cnt,
+                    current_bottom,
+                ),
+                SliceType::I | SliceType::SI => (Vec::new(), Vec::new()),
+            };
+            // §8.2.4 — same all-'no reference picture' refusal as the
+            // frame path below.
+            if header.slice_type.has_list_0() && fl0.is_empty() {
+                return Err(Error::invalid(format!(
+                    "h264 slice_header: {:?} field slice but the DPB holds no reference field (§8.2.4 RefPicList0 would be all 'no reference picture')",
+                    header.slice_type
+                )));
+            }
+            if header.slice_type.has_list_0() {
+                let ops_l0: Vec<RplmOp> = header
+                    .ref_pic_list_modification
+                    .modifications_l0
+                    .iter()
+                    .map(slice_rplm_to_ref_rplm)
+                    .collect();
+                ref_list::modify_ref_pic_list_field(
+                    &mut fl0,
+                    &ops_l0,
+                    &self.dpb_entries,
+                    header.num_ref_idx_l0_active_minus1 + 1,
+                    header.frame_num,
+                    max_frame_num,
+                    current_bottom,
+                );
+            }
+            if header.slice_type.has_list_1() {
+                let ops_l1: Vec<RplmOp> = header
+                    .ref_pic_list_modification
+                    .modifications_l1
+                    .iter()
+                    .map(slice_rplm_to_ref_rplm)
+                    .collect();
+                ref_list::modify_ref_pic_list_field(
+                    &mut fl1,
+                    &ops_l1,
+                    &self.dpb_entries,
+                    header.num_ref_idx_l1_active_minus1 + 1,
+                    header.frame_num,
+                    max_frame_num,
+                    current_bottom,
+                );
+            }
+            let (k0, o0, p0, t0) =
+                Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl0);
+            let (k1, o1, p1, t1) =
+                Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl1);
+            l0_overrides = o0;
+            l1_overrides = o1;
+            field_pocs_lt = Some((p0, t0, p1, t1));
+            (k0, k1)
         } else {
             let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
             let (mut l0, mut l1) = match header.slice_type {
@@ -983,44 +1066,54 @@ impl H264CodecDecoder {
         // the colocated picture and invokes MapColToList0 which
         // requires picture-identity lookup (by POC) back into the
         // list that was active when this picture was decoded.
-        let list_0_pocs: Vec<i32> = list0
-            .iter()
-            .map(|&key| {
-                self.ref_store
-                    .get_by_key(key)
-                    .map(|p| p.pic_order_cnt)
-                    .unwrap_or(0)
-            })
-            .collect();
-        let list_0_longterm: Vec<bool> = list0
-            .iter()
-            .map(|&key| {
-                self.dpb_entries
+        // Round-416 PAFF: field slices already computed per-FIELD POCs
+        // (top/bottom field order counts) during list resolution — a
+        // stored frame's two fields share a dpb_key but carry distinct
+        // field POCs, so the key-based lookup below would be ambiguous.
+        let (list_0_pocs, list_0_longterm, list_1_pocs, list_1_longterm) =
+            if let Some(t) = field_pocs_lt {
+                t
+            } else {
+                let list_0_pocs: Vec<i32> = list0
                     .iter()
-                    .find(|e| e.dpb_key == key)
-                    .map(|e| e.is_long_term())
-                    .unwrap_or(false)
-            })
-            .collect();
-        let list_1_pocs: Vec<i32> = list1
-            .iter()
-            .map(|&key| {
-                self.ref_store
-                    .get_by_key(key)
-                    .map(|p| p.pic_order_cnt)
-                    .unwrap_or(0)
-            })
-            .collect();
-        let list_1_longterm: Vec<bool> = list1
-            .iter()
-            .map(|&key| {
-                self.dpb_entries
+                    .map(|&key| {
+                        self.ref_store
+                            .get_by_key(key)
+                            .map(|p| p.pic_order_cnt)
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                let list_0_longterm: Vec<bool> = list0
                     .iter()
-                    .find(|e| e.dpb_key == key)
-                    .map(|e| e.is_long_term())
-                    .unwrap_or(false)
-            })
-            .collect();
+                    .map(|&key| {
+                        self.dpb_entries
+                            .iter()
+                            .find(|e| e.dpb_key == key)
+                            .map(|e| e.is_long_term())
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                let list_1_pocs: Vec<i32> = list1
+                    .iter()
+                    .map(|&key| {
+                        self.ref_store
+                            .get_by_key(key)
+                            .map(|p| p.pic_order_cnt)
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                let list_1_longterm: Vec<bool> = list1
+                    .iter()
+                    .map(|&key| {
+                        self.dpb_entries
+                            .iter()
+                            .find(|e| e.dpb_key == key)
+                            .map(|e| e.is_long_term())
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                (list_0_pocs, list_0_longterm, list_1_pocs, list_1_longterm)
+            };
         // Idempotent across slices: once set for a picture, only
         // update if still empty (shared lists across slices of one
         // primary coded picture have the same POCs — but RPLM may
@@ -1040,6 +1133,8 @@ impl H264CodecDecoder {
             list_0_pocs,
             list_0_longterm,
             list_1_longterm,
+            list_0_overrides: l0_overrides,
+            list_1_overrides: l1_overrides,
         };
         reconstruct::reconstruct_slice_no_deblock(
             &sd,
@@ -1076,6 +1171,62 @@ impl H264CodecDecoder {
         in_progress.any_slice_succeeded = true;
 
         Ok(())
+    }
+
+    /// Round-416 PAFF — resolve a §8.2.4.2.5 per-field reference list
+    /// into the provider's shape: parallel vectors of (dpb_key,
+    /// optional field-view override, per-FIELD POC, long-term flag).
+    ///
+    /// * an entry naming a stored coded field maps to that field's own
+    ///   dpb_key (the stored picture already IS the half-height field);
+    /// * an entry naming one parity field of a picture stored as a
+    ///   FRAME materialises a [`Picture::field_view`] override stamped
+    ///   with the field's own order count (top/bottom FOC);
+    /// * the §8.2.4.2 "no reference picture" sentinel (`u32::MAX`)
+    ///   stays unresolvable — the provider returns `None` and motion
+    ///   compensation refuses the reference, per conformance.
+    fn resolve_field_list(
+        dpb_entries: &[DpbEntry],
+        ref_store: &RefPicStore,
+        entries: &[ref_list::RefFieldEntry],
+    ) -> (Vec<u32>, Vec<Option<Picture>>, Vec<i32>, Vec<bool>) {
+        let mut keys = Vec::with_capacity(entries.len());
+        let mut overrides = Vec::with_capacity(entries.len());
+        let mut pocs = Vec::with_capacity(entries.len());
+        let mut lts = Vec::with_capacity(entries.len());
+        for e in entries {
+            let Some(dpb) = dpb_entries.iter().find(|d| d.dpb_key == e.dpb_key) else {
+                keys.push(u32::MAX);
+                overrides.push(None);
+                pocs.push(0);
+                lts.push(false);
+                continue;
+            };
+            let bottom = e.parity == ref_list::FieldParity::Bottom;
+            let field_poc = if bottom {
+                dpb.bottom_field_order_cnt
+            } else {
+                dpb.top_field_order_cnt
+            };
+            match dpb.structure {
+                PicStructure::TopField | PicStructure::BottomField => {
+                    keys.push(e.dpb_key);
+                    overrides.push(None);
+                }
+                PicStructure::Frame | PicStructure::FieldPair => {
+                    let ov = ref_store.get_by_key(e.dpb_key).map(|p| {
+                        let mut v = p.field_view(bottom);
+                        v.pic_order_cnt = field_poc;
+                        v
+                    });
+                    keys.push(e.dpb_key);
+                    overrides.push(ov);
+                }
+            }
+            pocs.push(field_poc);
+            lts.push(dpb.is_long_term());
+        }
+        (keys, overrides, pocs, lts)
     }
 
     /// Complete the picture currently held in `self.in_progress`: run the
@@ -1630,6 +1781,11 @@ fn gray_picture(
 /// Per-slice [`RefPicProvider`] that borrows pictures from a long-running
 /// [`RefPicStore`] but carries its own RefPicList0 / RefPicList1 key
 /// arrays. Avoids cloning every DPB Picture on every slice.
+/// Round-416 PAFF — per-field-list POC / long-term metadata:
+/// (list0 per-FIELD POCs, list0 long-term flags, list1 POCs, list1
+/// long-term flags), produced by `resolve_field_list`.
+type FieldListPocsLt = (Vec<i32>, Vec<bool>, Vec<i32>, Vec<bool>);
+
 struct BorrowedRefProvider<'a> {
     store: &'a RefPicStore,
     list_0: &'a [u32],
@@ -1642,15 +1798,27 @@ struct BorrowedRefProvider<'a> {
     /// §8.4.1.2.2 — long-term flag for RefPicList1. Spatial-direct
     /// mode suppresses colZeroFlag when `RefPicList1[0]` is long-term.
     list_1_longterm: Vec<bool>,
+    /// Round-416 PAFF — per-index owned field-view pictures for field
+    /// slices whose §8.2.4.2.5 list entry names one parity field of a
+    /// picture stored as a FRAME (`Picture::field_view` materialised at
+    /// slice setup, stamped with the field's own POC). `Some` entries
+    /// shadow the key-based `ref_store` lookup at that index; entries
+    /// resolving to stored coded fields stay `None` and read the
+    /// half-height stored picture directly.
+    list_0_overrides: Vec<Option<Picture>>,
+    list_1_overrides: Vec<Option<Picture>>,
 }
 
 impl RefPicProvider for BorrowedRefProvider<'_> {
     fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture> {
-        let keys = match list {
-            0 => self.list_0,
-            1 => self.list_1,
+        let (keys, overrides) = match list {
+            0 => (self.list_0, &self.list_0_overrides),
+            1 => (self.list_1, &self.list_1_overrides),
             _ => return None,
         };
+        if let Some(Some(p)) = overrides.get(idx as usize) {
+            return Some(p);
+        }
         let key = *keys.get(idx as usize)?;
         self.store.get_by_key(key)
     }

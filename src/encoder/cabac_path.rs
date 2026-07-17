@@ -57,7 +57,7 @@ use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::rdo::{cost_combined, lambda_ssd};
 use crate::encoder::slice::{
     write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
-    CabacSliceParams, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    CabacSliceParams, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
@@ -1941,6 +1941,7 @@ impl Encoder {
             };
         let sps = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: cfg.scaling_matrix.seq_spec(),
+            interlaced_fields: false,
             seq_parameter_set_id: 0,
             level_idc: cfg.level_idc,
             width_in_mbs: width_mbs as u32,
@@ -1989,6 +1990,9 @@ impl Encoder {
                 disable_deblocking_filter_idc: if cfg.chroma_format_idc == 3 { 1 } else { 0 },
                 slice_alpha_c0_offset_div2: 0,
                 slice_beta_offset_div2: 0,
+                field: FieldPicSignal::FrameMbsOnly,
+                idr: true,
+                nal_ref_idc: 3,
             },
         );
         // §7.3.4 — cabac_alignment_one_bit until byte aligned.
@@ -2869,6 +2873,7 @@ impl Encoder {
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 2,
                 cabac: Some(CabacSliceParams { cabac_init_idc: 0 }),
+                field: FieldPicSignal::FrameMbsOnly,
             },
         );
         while !sw.byte_aligned() {

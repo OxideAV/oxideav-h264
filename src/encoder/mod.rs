@@ -43,6 +43,7 @@ pub mod cabac_syntax;
 pub mod cavlc;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod deblock;
+pub mod field;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod intra4x4;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -88,7 +89,7 @@ use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::rdo::{cost_combined, lambda_ssd, ssd_16x16, ssd_4x4};
 use crate::encoder::slice::{
     write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
-    ExplicitBipredWeightTable, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    ExplicitBipredWeightTable, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
@@ -1299,6 +1300,7 @@ impl Encoder {
             profile_idc,
             chroma_format_idc: self.cfg.chroma_format_idc,
             seq_scaling_lists: self.cfg.scaling_matrix.seq_spec(),
+            interlaced_fields: false,
         };
         let pps_cfg = BaselinePpsConfig {
             pic_scaling_lists: self.cfg.scaling_matrix.pic_spec(),
@@ -1358,6 +1360,9 @@ impl Encoder {
                 },
                 slice_alpha_c0_offset_div2: 0,
                 slice_beta_offset_div2: 0,
+                field: FieldPicSignal::FrameMbsOnly,
+                idr: true,
+                nal_ref_idc: 3,
             },
         );
 
@@ -5365,6 +5370,7 @@ impl Encoder {
                 slice_beta_offset_div2: 0,
                 nal_ref_idc: 2,
                 cabac: None,
+                field: FieldPicSignal::FrameMbsOnly,
             },
         );
 
