@@ -39,6 +39,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frame/field PAFF sequences self-roundtrip byte-exactly through our
   decoder AND decode byte-identically in a stock black-box reference
   binary.
+- §8.4.1.4 Table 8-10 on the PAFF path: a coded field picture
+  referencing the OPPOSITE-parity field now applies the
+  `mvCLX[1] = mvLX[1] ± 2` vertical chroma-MV adjustment — the
+  reference field's parity travels on the provider
+  (`RefPicProvider::ref_field_parity`, resolved from the §8.2.4.2.5
+  per-field list), and the current parity comes from
+  `bottom_field_flag` (the MBAFF field-MB path keeps its existing
+  per-pair derivation). The PAFF encoder gained the matching
+  cross-parity axis (`cross_parity_first_bottom`: frame 0's bottom
+  field P-references the IDR top field — the only candidate
+  §8.2.4.2.5 can offer when the same-parity sub-list is empty) with
+  the Table 8-10 offset applied in its chroma predictors; the
+  resulting stream round-trips byte-exactly through our decoder and a
+  stock black-box reference binary.
 
 ### Fixed
 

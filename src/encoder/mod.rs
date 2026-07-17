@@ -514,6 +514,18 @@ pub struct EncoderConfig {
     /// (all three intra transform shapes); every other entry point
     /// requires `Flat`.
     pub scaling_matrix: ScalingMatrixMode,
+    /// Round-416 PAFF — §8.4.1.4 Table 8-10 vertical chroma-MV
+    /// adjustment, in the same numeric units as `mvLX[1]`
+    /// (quarter-luma == eighth-chroma sample units at 4:2:0). A FIELD
+    /// picture referencing the OPPOSITE-parity field derives
+    /// `mvCLX[1] = mvLX[1] + 2` (top reference, bottom current) or
+    /// `mvLX[1] - 2` (bottom reference, top current); same-parity
+    /// references and frame pictures keep 0. Applied to the P-path
+    /// chroma predictors only (luma MC uses `mvLX` unchanged), so the
+    /// encoder's local recon matches what a conformant decoder
+    /// produces for a cross-parity field reference. Set by the
+    /// `encoder::field` PAFF driver; leave 0 everywhere else.
+    pub table_8_10_cy_offset: i32,
 }
 
 impl EncoderConfig {
@@ -538,6 +550,7 @@ impl EncoderConfig {
             trellis_quant_intra_chroma: false,
             transform_8x8: false,
             scaling_matrix: ScalingMatrixMode::default(),
+            table_8_10_cy_offset: 0,
         }
     }
 }
@@ -5605,12 +5618,17 @@ impl Encoder {
                 )
                 .to_vec(),
             ),
-            _ => (
-                build_inter_pred_chroma(prev.recon_u, chroma_w, chroma_h, mb_x, mb_y, chosen_mv)
-                    .to_vec(),
-                build_inter_pred_chroma(prev.recon_v, chroma_w, chroma_h, mb_x, mb_y, chosen_mv)
-                    .to_vec(),
-            ),
+            _ => {
+                // §8.4.1.4 Table 8-10 — cross-parity field reference
+                // chroma-MV adjustment (0 for frame coding).
+                let cmv = Mv::new(chosen_mv.x, chosen_mv.y + self.cfg.table_8_10_cy_offset);
+                (
+                    build_inter_pred_chroma(prev.recon_u, chroma_w, chroma_h, mb_x, mb_y, cmv)
+                        .to_vec(),
+                    build_inter_pred_chroma(prev.recon_v, chroma_w, chroma_h, mb_x, mb_y, cmv)
+                        .to_vec(),
+                )
+            }
         };
 
         // ----- Round-19: 4MV (P_8x8) ME trial -----
@@ -6349,6 +6367,9 @@ impl Encoder {
         for (sub_idx, &mv) in mvs.iter().enumerate() {
             let sub_x = sub_idx % 2;
             let sub_y = sub_idx / 2;
+            // §8.4.1.4 Table 8-10 — cross-parity field reference
+            // chroma-MV adjustment (0 for frame coding).
+            let cmv = Mv::new(mv.x, mv.y + self.cfg.table_8_10_cy_offset);
             let pu = build_inter_pred_chroma_4x4(
                 prev.recon_u,
                 chroma_w,
@@ -6357,7 +6378,7 @@ impl Encoder {
                 mb_y,
                 sub_x,
                 sub_y,
-                mv,
+                cmv,
             );
             let pv = build_inter_pred_chroma_4x4(
                 prev.recon_v,
@@ -6367,7 +6388,7 @@ impl Encoder {
                 mb_y,
                 sub_x,
                 sub_y,
-                mv,
+                cmv,
             );
             for j in 0..4usize {
                 for i in 0..4usize {

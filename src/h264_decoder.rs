@@ -900,6 +900,8 @@ impl H264CodecDecoder {
         // same-parity field of the previous frame.
         let mut l0_overrides: Vec<Option<Picture>> = Vec::new();
         let mut l1_overrides: Vec<Option<Picture>> = Vec::new();
+        let mut l0_parities: Vec<Option<u8>> = Vec::new();
+        let mut l1_parities: Vec<Option<u8>> = Vec::new();
         let mut field_pocs_lt: Option<FieldListPocsLt> = None;
         let (list0, list1) = if is_idr {
             (Vec::new(), Vec::new())
@@ -964,14 +966,14 @@ impl H264CodecDecoder {
                     current_bottom,
                 );
             }
-            let (k0, o0, p0, t0) =
-                Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl0);
-            let (k1, o1, p1, t1) =
-                Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl1);
-            l0_overrides = o0;
-            l1_overrides = o1;
-            field_pocs_lt = Some((p0, t0, p1, t1));
-            (k0, k1)
+            let r0 = Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl0);
+            let r1 = Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl1);
+            l0_overrides = r0.overrides;
+            l1_overrides = r1.overrides;
+            l0_parities = r0.parities;
+            l1_parities = r1.parities;
+            field_pocs_lt = Some((r0.pocs, r0.longterm, r1.pocs, r1.longterm));
+            (r0.keys, r1.keys)
         } else {
             let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
             let (mut l0, mut l1) = match header.slice_type {
@@ -1135,6 +1137,8 @@ impl H264CodecDecoder {
             list_1_longterm,
             list_0_overrides: l0_overrides,
             list_1_overrides: l1_overrides,
+            list_0_parities: l0_parities,
+            list_1_parities: l1_parities,
         };
         reconstruct::reconstruct_slice_no_deblock(
             &sd,
@@ -1189,17 +1193,19 @@ impl H264CodecDecoder {
         dpb_entries: &[DpbEntry],
         ref_store: &RefPicStore,
         entries: &[ref_list::RefFieldEntry],
-    ) -> (Vec<u32>, Vec<Option<Picture>>, Vec<i32>, Vec<bool>) {
+    ) -> ResolvedFieldList {
         let mut keys = Vec::with_capacity(entries.len());
         let mut overrides = Vec::with_capacity(entries.len());
         let mut pocs = Vec::with_capacity(entries.len());
         let mut lts = Vec::with_capacity(entries.len());
+        let mut parities = Vec::with_capacity(entries.len());
         for e in entries {
             let Some(dpb) = dpb_entries.iter().find(|d| d.dpb_key == e.dpb_key) else {
                 keys.push(u32::MAX);
                 overrides.push(None);
                 pocs.push(0);
                 lts.push(false);
+                parities.push(None);
                 continue;
             };
             let bottom = e.parity == ref_list::FieldParity::Bottom;
@@ -1225,8 +1231,15 @@ impl H264CodecDecoder {
             }
             pocs.push(field_poc);
             lts.push(dpb.is_long_term());
+            parities.push(Some(u8::from(bottom)));
         }
-        (keys, overrides, pocs, lts)
+        ResolvedFieldList {
+            keys,
+            overrides,
+            pocs,
+            longterm: lts,
+            parities,
+        }
     }
 
     /// Complete the picture currently held in `self.in_progress`: run the
@@ -1786,6 +1799,18 @@ fn gray_picture(
 /// long-term flags), produced by `resolve_field_list`.
 type FieldListPocsLt = (Vec<i32>, Vec<bool>, Vec<i32>, Vec<bool>);
 
+/// Round-416 PAFF — one resolved §8.2.4.2.5 field reference list:
+/// parallel per-index vectors (see `resolve_field_list`).
+struct ResolvedFieldList {
+    keys: Vec<u32>,
+    overrides: Vec<Option<Picture>>,
+    pocs: Vec<i32>,
+    longterm: Vec<bool>,
+    /// Parity of each reference FIELD (0 = top, 1 = bottom) for the
+    /// §8.4.1.4 Table 8-10 chroma-MV adjustment.
+    parities: Vec<Option<u8>>,
+}
+
 struct BorrowedRefProvider<'a> {
     store: &'a RefPicStore,
     list_0: &'a [u32],
@@ -1807,6 +1832,11 @@ struct BorrowedRefProvider<'a> {
     /// half-height stored picture directly.
     list_0_overrides: Vec<Option<Picture>>,
     list_1_overrides: Vec<Option<Picture>>,
+    /// Round-416 PAFF — §8.4.1.4 Table 8-10: per-index parity of the
+    /// reference FIELD (0 = top, 1 = bottom) for field slices; empty
+    /// for frame slices.
+    list_0_parities: Vec<Option<u8>>,
+    list_1_parities: Vec<Option<u8>>,
 }
 
 impl RefPicProvider for BorrowedRefProvider<'_> {
@@ -1821,6 +1851,15 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
         }
         let key = *keys.get(idx as usize)?;
         self.store.get_by_key(key)
+    }
+
+    fn ref_field_parity(&self, list: u8, idx: u32) -> Option<u8> {
+        let parities = match list {
+            0 => &self.list_0_parities,
+            1 => &self.list_1_parities,
+            _ => return None,
+        };
+        parities.get(idx as usize).copied().flatten()
     }
 
     fn ref_list_0_pocs(&self) -> &[i32] {

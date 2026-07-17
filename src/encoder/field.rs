@@ -83,6 +83,15 @@ pub struct PaffConfig {
     /// when `p_fields` is set and must not contain 0 (frame 0 is the
     /// IDR field pair).
     pub frame_picture_indices: Vec<usize>,
+    /// Round-416 — §8.4.1.4 Table 8-10 axis: when `true` (requires
+    /// `p_fields`), the bottom field of frame 0 is coded as a P field
+    /// whose single reference is the IDR TOP field — an
+    /// OPPOSITE-parity field reference (the only candidate the
+    /// §8.2.4.2.5 init can offer a second field whose same-parity list
+    /// is empty). The chroma predictor then applies the Table 8-10
+    /// `mvCLX[1] = mvLX[1] + 2` adjustment (top reference, bottom
+    /// current field).
+    pub cross_parity_first_bottom: bool,
 }
 
 /// A reconstructed reference field: (Y, Cb, Cr) half-height planes +
@@ -255,6 +264,10 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         !cfg.frame_picture_indices.contains(&0),
         "frame 0 is the IDR field pair",
     );
+    assert!(
+        !cfg.cross_parity_first_bottom || cfg.p_fields,
+        "cross_parity_first_bottom is a P-field axis",
+    );
 
     let width = cfg.width as usize;
     let frame_h = cfg.frame_height as usize;
@@ -278,6 +291,14 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
     };
     let field_enc = Encoder::new(mk_cfg(field_h));
     let frame_enc = Encoder::new(mk_cfg(cfg.frame_height));
+    // §8.4.1.4 Table 8-10 — dedicated field encoder for the
+    // cross-parity picture (bottom field referencing the top field):
+    // chroma predictors add +2 to the vertical MV.
+    let xpar_enc = Encoder::new({
+        let mut c = mk_cfg(field_h);
+        c.table_8_10_cy_offset = 2;
+        c
+    });
 
     // SPS (interlaced, FrameHeightInMbs) + PPS.
     let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
@@ -396,7 +417,16 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
             // Same-parity reference field of the previous frame — what
             // §8.2.4.2.5 puts at RefPicList0[0] for this field.
             let ref_field = if bottom { &last_bottom } else { &last_top };
-            let as_p = cfg.p_fields && ref_field.is_some();
+            // Cross-parity axis: frame 0's bottom field P-references
+            // the IDR top field (opposite parity) instead of being an
+            // I field. Every other P field references the same-parity
+            // field of the previous frame.
+            let cross = cfg.cross_parity_first_bottom && k == 0 && bottom;
+            let (as_p, p_enc, p_ref) = if cross {
+                (last_top.is_some(), &xpar_enc, &last_top)
+            } else {
+                (cfg.p_fields && ref_field.is_some(), &field_enc, ref_field)
+            };
 
             let mut sw = BitWriter::new();
             // §8.5.6 — every MB of a field picture is a field MB: the
@@ -449,7 +479,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
             }
 
             let (mut ry, mut ru, mut rv, infos) = if as_p {
-                let (py, pu, pv, ppoc) = ref_field.as_ref().unwrap();
+                let (py, pu, pv, ppoc) = p_ref.as_ref().unwrap();
                 let prev = EncodedFrameRef {
                     width: cfg.width,
                     height: field_h,
@@ -459,7 +489,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                     partition_mvs: &[],
                     pic_order_cnt: *ppoc,
                 };
-                encode_p_slice_data(&field_enc, &src, &prev, &mut sw)
+                encode_p_slice_data(p_enc, &src, &prev, &mut sw)
             } else {
                 encode_i_slice_data(&field_enc, &src, &mut sw)
             };

@@ -4219,9 +4219,27 @@ fn process_partition<R: RefPicProvider>(
         // chroma MV: ref top field + current bottom → +2, ref bottom
         // field + current top → −2 (quarter-luma == eighth-chroma
         // units). Same-parity references and frame MBs use mvLX as-is.
-        let chroma_mv = |mv: Mv, ref_field: Option<u8>| -> Mv {
+        // Round-416 PAFF: in a coded FIELD picture every MB is a field
+        // MB of the picture's parity — the current parity comes from
+        // the slice header and the reference field's parity from the
+        // provider's §8.2.4.2.5-resolved list (MBAFF field MBs instead
+        // derive both from `field_parity` / `resolve_ref`).
+        let paff_parity: Option<u8> = if slice_header.field_pic_flag {
+            Some(u8::from(slice_header.bottom_field_flag))
+        } else {
+            None
+        };
+        let chroma_mv = |mv: Mv, list: u8, ref_idx: i8, ref_field: Option<u8>| -> Mv {
             if chroma_array_type == 1 {
-                if let (Some(cur_par), Some(ref_par)) = (field_parity, ref_field) {
+                let cur = field_parity.or(paff_parity);
+                let refp = ref_field.or_else(|| {
+                    if paff_parity.is_some() {
+                        ref_pics.ref_field_parity(list, ref_idx.max(0) as u32)
+                    } else {
+                        None
+                    }
+                });
+                if let (Some(cur_par), Some(ref_par)) = (cur, refp) {
                     if ref_par != cur_par {
                         let d = if ref_par == 0 { 2 } else { -2 };
                         return Mv::new(mv.x, mv.y + d);
@@ -4236,7 +4254,7 @@ fn process_partition<R: RefPicProvider>(
                 rp,
                 c_mb_px + c_part_x,
                 c_mb_py + c_part_y,
-                chroma_mv(mv_l0, fld),
+                chroma_mv(mv_l0, 0, part.ref_idx_l0, fld),
                 c_w,
                 c_h,
                 chroma_array_type,
@@ -4252,7 +4270,7 @@ fn process_partition<R: RefPicProvider>(
                 rp,
                 c_mb_px + c_part_x,
                 c_mb_py + c_part_y,
-                chroma_mv(mv_l1, fld),
+                chroma_mv(mv_l1, 1, part.ref_idx_l1, fld),
                 c_w,
                 c_h,
                 chroma_array_type,

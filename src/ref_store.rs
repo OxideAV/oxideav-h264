@@ -62,6 +62,15 @@ pub trait RefPicProvider {
     fn ref_list_1_longterm(&self) -> &[bool] {
         &[]
     }
+
+    /// Round-416 PAFF — §8.4.1.4 Table 8-10: parity of the reference
+    /// FIELD at `(list, idx)` when the current slice is a coded field
+    /// picture (`0` = top field, `1` = bottom field). `None` for frame
+    /// references or non-field slices; the default suits every
+    /// provider that never serves field-picture slices.
+    fn ref_field_parity(&self, _list: u8, _idx: u32) -> Option<u8> {
+        None
+    }
 }
 
 /// A caller-supplied store mapping list indices to decoded pictures.
