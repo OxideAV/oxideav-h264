@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Internal plumbing modules (the slice/CABAC/reconstruction modules at
+  the crate root and every `encoder::*` submodule) are now
+  `#[doc(hidden)]`: they stay `pub` for tests/fuzz but are not part of
+  the stable API, which is the registry surface (`register` /
+  `register_codecs` / `CODEC_ID_STR`), `h264_decoder` (`make_decoder` /
+  `H264CodecDecoder`), the `encoder` top-level config/frame/entry
+  types, and the `sei` typed payloads.
+
 ### Added
 
 - Round-413 corpus extension: two freshly generated black-box MBAFF

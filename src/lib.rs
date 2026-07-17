@@ -17,32 +17,58 @@ pub(crate) mod bitstream;
 pub(crate) mod cabac;
 pub(crate) mod cabac_ctx;
 pub(crate) mod cavlc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod deblock;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod decoder;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod dpb_output;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod inter_pred;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod intra_pred;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod macroblock_layer;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mb_address;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mb_grid;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mv_deriv;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod nal;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod non_vcl;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod picture;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod poc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod pps;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod reconstruct;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ref_list;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ref_store;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod scaling_list;
 pub mod sei;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod simd;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod slice_data;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod slice_header;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod sps;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod sps_extension;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod subset_sps;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod transform;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod vui;
 
 pub mod h264_decoder;

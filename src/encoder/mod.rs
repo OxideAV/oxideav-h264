@@ -31,21 +31,37 @@
 
 #![allow(dead_code)]
 
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod bitstream;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod cabac_engine;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod cabac_path;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod cabac_syntax;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod cavlc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod deblock;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod intra4x4;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod intra_pred;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod macroblock;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod me;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod nal;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod pps;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod rdo;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod slice;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod sps;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod transform;
 
 use crate::cavlc::CoeffTokenContext;

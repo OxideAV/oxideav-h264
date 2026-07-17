@@ -180,6 +180,7 @@ pub struct H264CodecDecoder {
     length_size: Option<u8>,
     driver: H264Driver,
     /// Last slice header we parsed — useful for probes / asserts.
+    #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
     pub last_slice: Option<SliceHeader>,
     eof: bool,
     /// §C.2.2 / §C.4 — POC-ordered output DPB. Entries live here until
