@@ -1725,6 +1725,25 @@ fn corpus_paff_p_fields() {
 }
 
 #[test]
+fn corpus_paff_frame_refs() {
+    // An IDR full-height FRAME picture, then P field pairs whose
+    // frame-1 references are the parity FIELDS of that stored frame —
+    // pins the §8.2.4.2.5 frame-supplies-fields rule (half-height
+    // field views of a stored frame picture serve field MC) and the
+    // §8.7.2.1 NOTE 1 identity distinction between the two same-POC
+    // fields of one frame.
+    evaluate_annex_b(&CorpusCase {
+        name: "paff-frame-refs",
+        width: 64,
+        height: 96,
+        chroma: ChromaFmt::Yuv420,
+        n_frames: 3,
+        tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+#[test]
 fn corpus_paff_p_crossparity() {
     // Frame 0's bottom field is a P field referencing the IDR TOP
     // field — the §8.2.4.2.5 second-field fall-through when the
