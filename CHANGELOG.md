@@ -39,6 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frame/field PAFF sequences self-roundtrip byte-exactly through our
   decoder AND decode byte-identically in a stock black-box reference
   binary.
+- PAFF frame-as-field-reference axis: an IDR full-height FRAME
+  picture followed by P field pairs whose frame-1 references are the
+  parity FIELDS of that stored frame — per §8.2.4.2.5 a stored frame
+  supplies either parity field as a distinct reference picture, which
+  the decoder materialises as a `Picture::field_view` provider
+  override. The PAFF deblock reference identity now folds the
+  resolved field parity into the §8.7.2.1 NOTE 1 comparison key (the
+  two fields of one stored frame share its POC but are different
+  reference pictures). Encoder: `PaffConfig::idr_frame_first` codes
+  the pattern; round-trips byte-exactly through our decoder and the
+  stock black-box reference binary.
 - §8.4.1.4 Table 8-10 on the PAFF path: a coded field picture
   referencing the OPPOSITE-parity field now applies the
   `mvCLX[1] = mvLX[1] ± 2` vertical chroma-MV adjustment — the

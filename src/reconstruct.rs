@@ -3896,10 +3896,27 @@ fn process_partition<R: RefPicProvider>(
                                     .map(|p| p.wrapping_mul(4).wrapping_add(1 + sel as i32))
                                     .unwrap_or(i32::MIN)
                             }
-                            None => ref_pics
-                                .ref_pic_poc(list, idx)
-                                .map(|p| p.wrapping_mul(4))
-                                .unwrap_or(i32::MIN),
+                            None => {
+                                // Round-416 PAFF — the two parity
+                                // fields of one stored FRAME share the
+                                // frame's POC but are DIFFERENT
+                                // reference pictures for the §8.7.2.1
+                                // NOTE 1 comparison; fold the resolved
+                                // field parity into the identity key
+                                // (frame refs keep the bare poc*4).
+                                let par_term = if slice_header.field_pic_flag {
+                                    ref_pics
+                                        .ref_field_parity(list, idx)
+                                        .map(|p| 1 + p as i32)
+                                        .unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                ref_pics
+                                    .ref_pic_poc(list, idx)
+                                    .map(|p| p.wrapping_mul(4).wrapping_add(par_term))
+                                    .unwrap_or(i32::MIN)
+                            }
                         }
                     };
                     if part.mode != PartMode::L1Only {

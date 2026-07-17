@@ -92,6 +92,14 @@ pub struct PaffConfig {
     /// `mvCLX[1] = mvLX[1] + 2` adjustment (top reference, bottom
     /// current field).
     pub cross_parity_first_bottom: bool,
+    /// Round-416 — frame-reference axis: when `true` (requires
+    /// `p_fields`), frame 0 is coded as an **IDR full-height FRAME
+    /// picture** (`field_pic_flag = 0`) and frame 1's P fields
+    /// reference the parity fields OF THAT FRAME — per §8.2.4.2.5 a
+    /// stored frame supplies either parity field as a distinct
+    /// reference picture, which a decoder serves as a half-height
+    /// field view of the stored frame.
+    pub idr_frame_first: bool,
 }
 
 /// A reconstructed reference field: (Y, Cb, Cr) half-height planes +
@@ -268,6 +276,14 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         !cfg.cross_parity_first_bottom || cfg.p_fields,
         "cross_parity_first_bottom is a P-field axis",
     );
+    assert!(
+        !cfg.idr_frame_first || cfg.p_fields,
+        "idr_frame_first is a P-field axis",
+    );
+    assert!(
+        !(cfg.idr_frame_first && cfg.cross_parity_first_bottom),
+        "idr_frame_first replaces frame 0's field pair",
+    );
 
     let width = cfg.width as usize;
     let frame_h = cfg.frame_height as usize;
@@ -338,6 +354,66 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
     for (k, &(fy, fu, fv)) in frames.iter().enumerate() {
         assert_eq!(fy.len(), width * frame_h);
         let frame_num = (k as u32) % (1 << frame_num_bits);
+
+        if k == 0 && cfg.idr_frame_first {
+            // ---- IDR full-height FRAME picture (field_pic_flag = 0). ----
+            let src = YuvFrame {
+                width: cfg.width,
+                height: cfg.frame_height,
+                y: fy,
+                u: fu,
+                v: fv,
+            };
+            let mut sw = BitWriter::new();
+            write_idr_i_slice_header(
+                &mut sw,
+                &IdrSliceHeaderConfig {
+                    first_mb_in_slice: 0,
+                    slice_type_raw: 7,
+                    pic_parameter_set_id: 0,
+                    frame_num: 0,
+                    frame_num_bits,
+                    idr_pic_id: 0,
+                    pic_order_cnt_lsb: 0,
+                    poc_lsb_bits,
+                    slice_qp_delta: 0,
+                    disable_deblocking_filter_idc: 0,
+                    slice_alpha_c0_offset_div2: 0,
+                    slice_beta_offset_div2: 0,
+                    field: FieldPicSignal::FramePicture,
+                    idr: true,
+                    nal_ref_idc: 3,
+                },
+            );
+            let (mut ry, mut ru, mut rv, infos) = encode_i_slice_data(&frame_enc, &src, &mut sw);
+            sw.rbsp_trailing_bits();
+            stream.extend_from_slice(&build_nal_unit(3, NalUnitType::SliceIdr, &sw.into_bytes()));
+            deblock_recon_with_chroma_array_type(
+                cfg.width,
+                cfg.frame_height,
+                cfg.width / 2,
+                cfg.frame_height / 2,
+                &mut ry,
+                &mut ru,
+                &mut rv,
+                &infos,
+                0,
+                width_mbs,
+                frame_h_mbs,
+                1,
+            );
+            // §8.2.4.2.5 — either parity field of this stored frame is
+            // a distinct reference picture: the next frame's P fields
+            // reference its parity rows (what a decoder materialises
+            // as a field view of the stored frame). Both field POCs
+            // equal the frame's (TopFOC == BotFOC == 0 for the IDR).
+            let (ty, tu, tv) = extract_field(&ry, &ru, &rv, width, frame_h, false);
+            let (by, bu, bv) = extract_field(&ry, &ru, &rv, width, frame_h, true);
+            last_top = Some((ty, tu, tv, 0));
+            last_bottom = Some((by, bu, bv, 0));
+            recon_frames.push((ry, ru, rv));
+            continue;
+        }
 
         if cfg.frame_picture_indices.contains(&k) {
             // ---- Full-height I FRAME picture (field_pic_flag = 0). ----

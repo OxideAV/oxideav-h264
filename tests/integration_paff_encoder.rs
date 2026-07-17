@@ -52,11 +52,12 @@ fn make_interlaced_frame(k: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (y, u, v)
 }
 
-fn encode_cfg(
+fn encode_cfg2(
     p_fields: bool,
     frame_pictures: Vec<usize>,
     n_frames: usize,
     cross_parity: bool,
+    idr_frame_first: bool,
 ) -> PaffEncoded {
     let frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =
         (0..n_frames).map(make_interlaced_frame).collect();
@@ -72,9 +73,19 @@ fn encode_cfg(
             p_fields,
             frame_picture_indices: frame_pictures,
             cross_parity_first_bottom: cross_parity,
+            idr_frame_first,
         },
         &refs,
     )
+}
+
+fn encode_cfg(
+    p_fields: bool,
+    frame_pictures: Vec<usize>,
+    n_frames: usize,
+    cross_parity: bool,
+) -> PaffEncoded {
+    encode_cfg2(p_fields, frame_pictures, n_frames, cross_parity, false)
 }
 
 fn encode(p_fields: bool, frame_pictures: Vec<usize>, n_frames: usize) -> PaffEncoded {
@@ -219,6 +230,23 @@ fn paff_p_cross_parity_ffmpeg_bit_exact() {
 }
 
 #[test]
+fn paff_idr_frame_then_p_fields_self_roundtrip_bit_exact() {
+    // IDR full-height FRAME picture, then P field pairs whose frame-1
+    // references are the parity FIELDS of that stored frame — pins the
+    // §8.2.4.2.5 frame-supplies-fields rule and the decoder's
+    // field-view materialisation of a frame reference.
+    let enc = encode_cfg2(true, Vec::new(), 3, false, true);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-idr-frame-p-fields");
+}
+
+#[test]
+fn paff_idr_frame_then_p_fields_ffmpeg_bit_exact() {
+    let enc = encode_cfg2(true, Vec::new(), 3, false, true);
+    ffmpeg_check(&enc, "paff-idrframe-ffmpeg");
+}
+
+#[test]
 fn paff_i_fields_ffmpeg_bit_exact() {
     let enc = encode(false, Vec::new(), 3);
     ffmpeg_check(&enc, "paff-i-ffmpeg");
@@ -246,13 +274,14 @@ fn paff_dump_streams_for_diag() {
     };
     let dir = std::path::PathBuf::from(dir);
     std::fs::create_dir_all(&dir).unwrap();
-    for (name, p_fields, frame_pics, n, xpar) in [
-        ("paff-i", false, Vec::new(), 3usize, false),
-        ("paff-p", true, Vec::new(), 4, false),
-        ("paff-mixed", false, vec![1], 3, false),
-        ("paff-p-crossparity", true, Vec::new(), 3, true),
+    for (name, p_fields, frame_pics, n, xpar, idr_frame) in [
+        ("paff-i", false, Vec::new(), 3usize, false, false),
+        ("paff-p", true, Vec::new(), 4, false, false),
+        ("paff-mixed", false, vec![1], 3, false, false),
+        ("paff-p-crossparity", true, Vec::new(), 3, true, false),
+        ("paff-idr-frame-p-fields", true, Vec::new(), 3, false, true),
     ] {
-        let enc = encode_cfg(p_fields, frame_pics, n, xpar);
+        let enc = encode_cfg2(p_fields, frame_pics, n, xpar, idr_frame);
         std::fs::write(dir.join(format!("{name}.h264")), &enc.annex_b).unwrap();
         let mut recon = Vec::new();
         for (y, u, v) in &enc.recon_frames {
