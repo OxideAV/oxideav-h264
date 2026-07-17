@@ -9,8 +9,8 @@
 //! of panicking.
 //!
 //! Workspace policy bars consulting libavcodec / x264 / openh264 source;
-//! we only inspect the public C header (`<libavcodec/avcodec.h>`) for
-//! function signatures + the documented `AV_CODEC_ID_H264` constant.
+//! we only inspect the public C headers (`<libavcodec/avcodec.h>` and
+//! friends) for function signatures + documented struct layouts.
 //!
 //! Install on Debian / Ubuntu via `apt-get install -y ffmpeg` (which
 //! pulls `libavcodec61` or whichever is current). On macOS use
@@ -22,11 +22,6 @@ pub mod libavcodec {
     use libloading::{Library, Symbol};
     use std::ffi::c_void;
     use std::sync::OnceLock;
-
-    /// `AV_CODEC_ID_H264` — documented value `28` in the public
-    /// `enum AVCodecID` (libavcodec/codec_id.h). Stable across all
-    /// libavcodec major versions we target (58 through 62).
-    pub const AV_CODEC_ID_H264: i32 = 28;
 
     /// `AVERROR(EAGAIN)` — `-EAGAIN` per the documented AVERROR macro.
     /// `EAGAIN == 11` on Linux/glibc; on macOS it's `35`. We only test
@@ -46,6 +41,13 @@ pub mod libavcodec {
         "libavcodec.so.58",
         "libavcodec.so",
         "libavcodec.dylib",
+        // macOS: dlopen's default search path does not include the
+        // Homebrew prefix, so a bare `libavcodec.dylib` fails even with
+        // ffmpeg installed. Try the conventional absolute locations
+        // (Apple Silicon, then Intel) so the oracle is reproducible
+        // locally, not just on the Linux CI runner.
+        "/opt/homebrew/lib/libavcodec.dylib",
+        "/usr/local/lib/libavcodec.dylib",
     ];
 
     fn lib() -> Option<&'static Library> {
@@ -96,11 +98,17 @@ pub mod libavcodec {
     pub enum OracleResult {
         /// Library not loadable / decoder factory not registered.
         Unavailable,
-        /// libavcodec rejected the input (parser or decoder error,
-        /// or accepted-but-no-frame-emitted). Our decoder MUST also
-        /// reject in this case (fuzz contract).
+        /// libavcodec rejected the input: parser or decoder error
+        /// (opened with `err_detect=explode`, so detected bitstream
+        /// errors fail instead of being concealed),
+        /// accepted-but-no-frame-emitted, or a frame in a pixel format
+        /// this harness cannot represent (anything but 8-bit planar
+        /// 4:2:0 / 4:2:2 / 4:4:4). The fuzz contract for this outcome
+        /// lives in the harness: our decoder must not CLEANLY decode a
+        /// full-fidelity frame from such an input (partial/concealed
+        /// output from our resilient slice-skipping path is fine).
         Rejected,
-        /// libavcodec produced a frame.
+        /// libavcodec produced a frame with no detected decode errors.
         Frame(DecodedYuv),
     }
 
@@ -124,9 +132,10 @@ pub mod libavcodec {
     }
 
     /// Feed `data` (Annex-B byte stream OR raw NAL bytes) to
-    /// libavcodec's H.264 decoder, then drain a single frame. Returns:
-    /// - `Unavailable` when libavcodec / `avcodec_find_decoder(H264)`
-    ///   isn't installed
+    /// libavcodec's H.264 decoder (bound by name), then drain a single
+    /// frame. Returns:
+    /// - `Unavailable` when libavcodec /
+    ///   `avcodec_find_decoder_by_name("h264")` isn't installed
     /// - `Rejected` when the input fails to decode (any error path)
     /// - `Frame(...)` on the first picture produced
     ///
@@ -142,7 +151,14 @@ pub mod libavcodec {
         // AVDictionary) are kept as `*mut c_void` since we never
         // dereference them from Rust — only pass them back to the C
         // side or read selected fields by documented byte offset.
-        type FindDecoderFn = unsafe extern "C" fn(i32) -> *const c_void;
+        type FindDecoderByNameFn = unsafe extern "C" fn(*const std::ffi::c_char) -> *const c_void;
+        type DictSetFn = unsafe extern "C" fn(
+            *mut *mut c_void,
+            *const std::ffi::c_char,
+            *const std::ffi::c_char,
+            i32,
+        ) -> i32;
+        type DictFreeFn = unsafe extern "C" fn(*mut *mut c_void);
         type AllocContext3Fn = unsafe extern "C" fn(*const c_void) -> *mut c_void;
         type Open2Fn = unsafe extern "C" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32;
         type PacketAllocFn = unsafe extern "C" fn() -> *mut c_void;
@@ -157,10 +173,20 @@ pub mod libavcodec {
             return OracleResult::Unavailable;
         };
         unsafe {
-            let find_decoder: Symbol<FindDecoderFn> = match l.get(b"avcodec_find_decoder") {
-                Ok(s) => s,
-                Err(_) => return OracleResult::Unavailable,
-            };
+            // Bind the decoder BY NAME, not by numeric `AVCodecID`.
+            // `avcodec_find_decoder_by_name("h264")` (public API in
+            // <libavcodec/codec.h>) cannot silently bind a different
+            // codec the way a miscounted enum value can — a previous
+            // revision of this harness passed the wrong integer and
+            // spent its whole budget comparing against a decoder for a
+            // completely different codec, turning every frame our
+            // decoder legitimately produced into a bogus "reject
+            // parity" crash.
+            let find_decoder_by_name: Symbol<FindDecoderByNameFn> =
+                match l.get(b"avcodec_find_decoder_by_name") {
+                    Ok(s) => s,
+                    Err(_) => return OracleResult::Unavailable,
+                };
             let alloc_context3: Symbol<AllocContext3Fn> = match l.get(b"avcodec_alloc_context3") {
                 Ok(s) => s,
                 Err(_) => return OracleResult::Unavailable,
@@ -198,9 +224,36 @@ pub mod libavcodec {
                 Err(_) => return OracleResult::Unavailable,
             };
 
-            let codec = find_decoder(AV_CODEC_ID_H264);
+            // libavutil symbols resolve through the libavcodec handle
+            // (dlsym searches the loaded image plus its dependencies on
+            // both Linux and macOS; libavcodec always links libavutil).
+            // Optional: when missing we simply open the decoder without
+            // options.
+            let dict_set: Option<Symbol<DictSetFn>> = l.get(b"av_dict_set").ok();
+            let dict_free: Option<Symbol<DictFreeFn>> = l.get(b"av_dict_free").ok();
+
+            let codec = find_decoder_by_name(c"h264".as_ptr());
             if codec.is_null() {
                 return OracleResult::Unavailable;
+            }
+            // Harness-premise guard: `AVCodec.name` is the documented
+            // FIRST field of the public `struct AVCodec` (codec.h), so
+            // one pointer read tells us which decoder we actually
+            // bound. If this ever isn't "h264" the whole differential
+            // premise is void — fail loudly instead of producing
+            // nonsense "divergences".
+            {
+                let name_ptr = (codec as *const *const std::ffi::c_char).read_unaligned();
+                let name = if name_ptr.is_null() {
+                    None
+                } else {
+                    std::ffi::CStr::from_ptr(name_ptr).to_str().ok()
+                };
+                assert_eq!(
+                    name,
+                    Some("h264"),
+                    "oracle premise violated: bound decoder is {name:?}, not the H.264 decoder"
+                );
             }
             let mut ctx = alloc_context3(codec);
             if ctx.is_null() {
@@ -221,7 +274,34 @@ pub mod libavcodec {
             // Result is computed inside a closure so the cleanup
             // epilogue runs unconditionally on every early return.
             let result = (|| -> OracleResult {
-                if open2(ctx, codec, std::ptr::null_mut()) < 0 {
+                // Open with `err_detect=explode` (the public
+                // `AV_EF_EXPLODE` error-recognition mode, defs.h /
+                // AVCodecContext.err_recognition) so the oracle FAILS on
+                // detected bitstream errors instead of concealing them.
+                // Concealed output is implementation-defined — the spec
+                // says nothing about what samples a decoder should
+                // invent for a broken macroblock — so a concealed frame
+                // must never reach the pixel-parity assertions. With
+                // explode set, `Frame(...)` means "decoded cleanly per
+                // the reference" and is fair to compare against.
+                let mut opts: *mut c_void = std::ptr::null_mut();
+                // Only build the dict when both set + free resolved, so
+                // nothing can leak on the exit path.
+                if let (Some(ds), Some(_)) = (&dict_set, &dict_free) {
+                    let _ = ds(&mut opts, c"err_detect".as_ptr(), c"explode".as_ptr(), 0);
+                    // Single-threaded decode: frame threading spawns
+                    // one context per thread (a hostile SPS declaring a
+                    // huge picture then allocates its frame buffers
+                    // once PER THREAD → libFuzzer rss_limit OOM), and
+                    // it defers error reporting across frames, which
+                    // blunts err_detect=explode.
+                    let _ = ds(&mut opts, c"threads".as_ptr(), c"1".as_ptr(), 0);
+                }
+                let rc = open2(ctx, codec, &mut opts);
+                if let Some(ref df) = dict_free {
+                    df(&mut opts); // no-op when opts is NULL
+                }
+                if rc < 0 {
                     return OracleResult::Rejected;
                 }
 

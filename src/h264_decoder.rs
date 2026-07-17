@@ -182,6 +182,12 @@ pub struct H264CodecDecoder {
     /// Last slice header we parsed — useful for probes / asserts.
     #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
     pub last_slice: Option<SliceHeader>,
+    /// Count of per-slice / per-picture reconstruction errors that were
+    /// swallowed to keep the stream alive (the `h264 slice skipped: …`
+    /// paths). Zero means every slice fed so far decoded cleanly; any
+    /// frame emitted while this is non-zero may be partial/concealed
+    /// output. Diagnostic only — see [`Self::decode_error_count`].
+    decode_errors: u64,
     eof: bool,
     /// §C.2.2 / §C.4 — POC-ordered output DPB. Entries live here until
     /// the bumping process releases them to `receive_frame`. Created
@@ -282,6 +288,7 @@ impl H264CodecDecoder {
             length_size: None,
             driver: H264Driver::new(),
             last_slice: None,
+            decode_errors: 0,
             eof: false,
             output_dpb: DpbOutput::<VideoFrame>::new(16, 16),
             ready: VecDeque::new(),
@@ -505,6 +512,31 @@ impl H264CodecDecoder {
         self.avcc_bit_depth_chroma
     }
 
+    /// Number of per-slice / per-picture reconstruction errors that were
+    /// swallowed so the stream could keep decoding (the paths that log
+    /// `h264 slice skipped: …`). Zero means every slice fed so far
+    /// decoded cleanly; when non-zero, frames produced by this decoder
+    /// instance may be partial (missing slices) rather than a faithful
+    /// reconstruction. Resets with [`Decoder::reset`].
+    #[doc(hidden)] // internal diagnostic — exposed for tests/fuzz; not part of the stable API
+    pub fn decode_error_count(&self) -> u64 {
+        self.decode_errors
+    }
+
+    /// §7.4.1.2.1 — the currently active SPS, or `None` before any slice
+    /// has been processed.
+    #[doc(hidden)] // internal diagnostic — exposed for tests/fuzz; not part of the stable API
+    pub fn active_sps(&self) -> Option<&Sps> {
+        self.driver.active_sps()
+    }
+
+    /// Look up a stored SPS by `seq_parameter_set_id` (§7.4.1.2.1,
+    /// 0..=31).
+    #[doc(hidden)] // internal diagnostic — exposed for tests/fuzz; not part of the stable API
+    pub fn stored_sps(&self, id: u32) -> Option<&Sps> {
+        self.driver.sps(id)
+    }
+
     /// Handle a single emitted driver event.
     fn handle_event(&mut self, ev: Event) -> Result<()> {
         match ev {
@@ -540,6 +572,18 @@ impl H264CodecDecoder {
             Event::EndOfSequence | Event::EndOfStream => {
                 self.finalize_in_progress_picture()?;
                 Ok(())
+            }
+            // §7.3.2.9.x — slice data partitions (NAL types 2/3/4)
+            // carry VCL content (partition A holds the slice header +
+            // macroblock headers) that this decoder does not implement.
+            // Silently discarding coded picture data would fabricate
+            // output that omits content the encoder emitted, so surface
+            // the gap as an error the stream driver can count/skip —
+            // the rest of the stream still decodes.
+            Event::Ignored { nal_unit_type, .. } if (2..=4).contains(&nal_unit_type) => {
+                Err(Error::invalid(format!(
+                    "h264: slice data partition NAL (type {nal_unit_type}) is not supported; coded slice content would be lost"
+                )))
             }
             _ => Ok(()),
         }
@@ -698,6 +742,27 @@ impl H264CodecDecoder {
                 )));
             }
 
+            // §7.4.3 — frame_num discipline. When
+            // `gaps_in_frame_num_value_allowed_flag` is 0 and the
+            // current picture's `frame_num` differs from
+            // `PrevRefFrameNum`, conformance requires `frame_num ==
+            // (PrevRefFrameNum + 1) % MaxFrameNum` exactly. (Equality
+            // with `PrevRefFrameNum` itself is the
+            // second-field / non-reference-following-reference case and
+            // is checked by the §7.4.1.2.4 picture-boundary logic.)
+            if !is_idr && !sps.gaps_in_frame_num_value_allowed_flag {
+                if let Some(prev) = self.prev_ref_frame_num {
+                    let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
+                    let expected = (prev + 1) % max_frame_num;
+                    if header.frame_num != prev && header.frame_num != expected {
+                        return Err(Error::invalid(format!(
+                            "h264 slice_header: frame_num {} after PrevRefFrameNum {} (§7.4.3 requires {} when gaps_in_frame_num_value_allowed_flag is 0)",
+                            header.frame_num, prev, expected
+                        )));
+                    }
+                }
+            }
+
             // §8.2.5.2 — gaps in frame_num. When the stream signals a
             // gap (`frame_num != (PrevRefFrameNum + 1) mod MaxFrameNum`)
             // and the SPS allows gaps, synthesize "non-existing" short-term
@@ -845,6 +910,25 @@ impl H264CodecDecoder {
                 ),
                 SliceType::I | SliceType::SI => (Vec::new(), Vec::new()),
             };
+
+            // §8.2.4 — an inter-predicted (P/SP/B) slice with NO usable
+            // reference picture in the DPB at all. §8.2.4.2.1 pads a
+            // too-short RefPicList with "no reference picture" entries,
+            // and referring to one of those is barred by conformance —
+            // so when the initial list is completely empty every
+            // ref_idx the slice could code is invalid before a single
+            // macroblock is parsed. A stream can only be entered at an
+            // IDR (or with the references it needs); decoding such a
+            // slice — even one whose macroblocks all happen to be
+            // intra-coded — silently fabricates a picture the encoder
+            // never meant to exist on its own, so refuse it up front
+            // like reference decoders do.
+            if header.slice_type.has_list_0() && l0.is_empty() {
+                return Err(Error::invalid(format!(
+                    "h264 slice_header: {:?} slice but the DPB holds no reference picture (§8.2.4 RefPicList0 would be all 'no reference picture')",
+                    header.slice_type
+                )));
+            }
 
             if header.slice_type.has_list_0() {
                 let ops_l0: Vec<RplmOp> = header
@@ -1528,6 +1612,7 @@ fn gray_picture(
         bit_depth_y,
         bit_depth_c,
     );
+    p.non_existing = true;
     let grey_y: i32 = 1 << (bit_depth_y.saturating_sub(1));
     let grey_c: i32 = 1 << (bit_depth_c.saturating_sub(1));
     for v in p.luma.iter_mut() {
@@ -1788,6 +1873,7 @@ impl Decoder for H264CodecDecoder {
                     // them for now to avoid killing the stream on one
                     // broken slice (e.g. unsupported MB type).
                     if let Err(e) = self.handle_event(ev) {
+                        self.decode_errors += 1;
                         eprintln!("h264 slice skipped: {e}");
                     }
                     i += len;
@@ -1804,6 +1890,7 @@ impl Decoder for H264CodecDecoder {
                     match ev {
                         Ok(ev) => {
                             if let Err(e) = self.handle_event(ev) {
+                                self.decode_errors += 1;
                                 eprintln!("h264 slice skipped: {e}");
                             }
                         }
@@ -1855,6 +1942,7 @@ impl Decoder for H264CodecDecoder {
         // §7.4.1.2 — close any picture we've been assembling so it reaches
         // the DPB + output queue before the caller drains at EOF.
         if let Err(e) = self.finalize_in_progress_picture() {
+            self.decode_errors += 1;
             eprintln!("h264 flush: final picture skipped: {e}");
         }
         // §C.4.4 — a trailing unpaired PAFF field at EOF can never gain a
@@ -1868,6 +1956,7 @@ impl Decoder for H264CodecDecoder {
     fn reset(&mut self) -> Result<()> {
         self.driver = H264Driver::new();
         self.last_slice = None;
+        self.decode_errors = 0;
         self.eof = false;
         // §C.4 — wipe the output queue and any picture that was
         // already bumped but not yet consumed.

@@ -42,8 +42,7 @@ const PAYLOAD_TYPES: &[u32] = &[
     // §D.1.29..§D.1.35 — HDR + 360 family
     137, 142, 144, 147, 148, 149, 150, 151, 154, 155, 156,
     // Annex H §H.13.2.6 — alternative_depth_info
-    181,
-    // §D.1.36..§D.1.38 — transport-layer hints
+    181, // §D.1.36..§D.1.38 — transport-layer hints
     200, 201, 205,
     // Annex F/G/H/I numeric ranges + reserved values — hit the `Unknown`
     // fallback path so the catch-all doesn't go unfuzzed.
@@ -95,7 +94,7 @@ fn context_from_byte(b: u8) -> SeiContext {
         // bounded under fuzzing.
         mvc_view_ref_counts: (0..((b as usize) & 0x03))
             .map(|i| {
-                let n = ((b >> (i % 6)) & 0x03) as u8;
+                let n = (b >> (i % 6)) & 0x03;
                 MvcViewRefCounts {
                     num_anchor_refs_l0: n,
                     num_anchor_refs_l1: (b >> 1) & 0x03,

@@ -208,6 +208,74 @@ pub struct Neighbour4x4Availability {
     pub left: bool,
 }
 
+// ---------------------------------------------------------------------------
+// §8.3.1.2 / §8.3.2.2 / §8.3.3 / §8.3.4 — bitstream-conformance
+// availability constraints ("shall be used only when ... marked as
+// available"). A conforming encoder never signals a prediction mode
+// whose required reference samples are unavailable; when a bitstream
+// does, decoding is undefined, so the decoder surfaces it as invalid
+// data instead of inventing substitute samples.
+// ---------------------------------------------------------------------------
+
+/// §8.3.1.2.1–.9 — true iff `mode` is permitted with this neighbour
+/// availability. DC (§8.3.1.2.4) defines fallbacks for every
+/// availability combination and is always permitted. Diagonal-Down-Left
+/// / Vertical-Left need only p[0..=3, -1]: the §8.3.1.2 substitution
+/// rule fills p[4..=7, -1] from p[3, -1]. Modes reading p[-1, -1]
+/// (Diagonal-Down-Right, Vertical-Right, Horizontal-Down) require the
+/// corner too — Intra_4x4 has no corner-substitution rule.
+pub fn intra_4x4_mode_permitted(mode: Intra4x4Mode, av: &Neighbour4x4Availability) -> bool {
+    match mode {
+        Intra4x4Mode::Dc => true,
+        Intra4x4Mode::Vertical | Intra4x4Mode::DiagonalDownLeft | Intra4x4Mode::VerticalLeft => {
+            av.top
+        }
+        Intra4x4Mode::Horizontal | Intra4x4Mode::HorizontalUp => av.left,
+        Intra4x4Mode::DiagonalDownRight
+        | Intra4x4Mode::VerticalRight
+        | Intra4x4Mode::HorizontalDown => av.top && av.left && av.top_left,
+    }
+}
+
+/// §8.3.2.2.2–.9 — Intra_8x8 variant. Unlike Intra_4x4, the §8.3.2.2.1
+/// reference-sample filtering derives p'[-1, -1] from p[0, -1] /
+/// p[-1, 0] when the corner is unavailable, so the corner-reading modes
+/// only require top + left here.
+pub fn intra_8x8_mode_permitted(mode: Intra8x8Mode, av: &Neighbour4x4Availability) -> bool {
+    match mode {
+        Intra8x8Mode::Dc => true,
+        Intra8x8Mode::Vertical | Intra8x8Mode::DiagonalDownLeft | Intra8x8Mode::VerticalLeft => {
+            av.top
+        }
+        Intra8x8Mode::Horizontal | Intra8x8Mode::HorizontalUp => av.left,
+        Intra8x8Mode::DiagonalDownRight
+        | Intra8x8Mode::VerticalRight
+        | Intra8x8Mode::HorizontalDown => av.top && av.left,
+    }
+}
+
+/// §8.3.3.1–.4 — Intra_16x16 variant. Plane (§8.3.3.4) reads
+/// p[-1, -1] with no substitution rule, so it needs the corner as well.
+pub fn intra_16x16_mode_permitted(mode: Intra16x16Mode, av: &Neighbour4x4Availability) -> bool {
+    match mode {
+        Intra16x16Mode::Dc => true,
+        Intra16x16Mode::Vertical => av.top,
+        Intra16x16Mode::Horizontal => av.left,
+        Intra16x16Mode::Plane => av.top && av.left && av.top_left,
+    }
+}
+
+/// §8.3.4.1–.4 — chroma variant (DC has per-block fallbacks; Plane
+/// reads p[-1, -1] directly).
+pub fn intra_chroma_mode_permitted(mode: IntraChromaMode, av: &Neighbour4x4Availability) -> bool {
+    match mode {
+        IntraChromaMode::Dc => true,
+        IntraChromaMode::Horizontal => av.left,
+        IntraChromaMode::Vertical => av.top,
+        IntraChromaMode::Plane => av.top && av.left && av.top_left,
+    }
+}
+
 /// Reference samples for a 4x4 predictor, per §8.3.1.1.
 /// Layout:
 ///   p[-1, -1]   = top_left

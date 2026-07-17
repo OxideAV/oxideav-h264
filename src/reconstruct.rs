@@ -93,6 +93,118 @@ pub enum ReconstructError {
     /// list resolves to an uninitialised DPB slot.
     #[error("inter MC against zero-dim reference picture (width={width}, height={height})")]
     InvalidRefDims { width: u32, height: u32 },
+    /// §8.2.5.2 — the resolved reference is a synthesised "non-existing"
+    /// frame (frame_num-gap placeholder). Its samples are "not available
+    /// for prediction of other pictures"; a bitstream whose inter
+    /// prediction samples one is non-conforming, and reconstructing from
+    /// the placeholder would silently fabricate picture content.
+    #[error("inter MC against a non-existing (frame_num-gap) reference picture (§8.2.5.2)")]
+    NonExistingRef,
+    /// §8.3.1.2 / §8.3.2.2 / §8.3.3 / §8.3.4 — the bitstream requested
+    /// an intra prediction mode whose required neighbour samples are
+    /// marked "not available for Intra prediction". Every non-DC mode
+    /// carries a "shall be used only when ... marked as available"
+    /// conformance constraint; only a non-conforming encoder emits a
+    /// mode that violates it, and prediction from unavailable samples
+    /// is undefined, so the slice is refused rather than reconstructed
+    /// from invented values.
+    #[error("intra mode {mode} requires unavailable neighbour samples (§{clause})")]
+    IntraModeNeighboursUnavailable {
+        mode: &'static str,
+        clause: &'static str,
+    },
+}
+
+// -------------------------------------------------------------------------
+// §8.3.x intra-mode availability enforcement (see
+// `intra_pred::intra_*_mode_permitted`). One guard per block class,
+// invoked immediately before the corresponding `predict_*` call.
+// -------------------------------------------------------------------------
+
+fn require_intra_4x4_mode(
+    mode: Intra4x4Mode,
+    av: &Neighbour4x4Availability,
+) -> Result<(), ReconstructError> {
+    if crate::intra_pred::intra_4x4_mode_permitted(mode, av) {
+        Ok(())
+    } else {
+        Err(ReconstructError::IntraModeNeighboursUnavailable {
+            mode: match mode {
+                Intra4x4Mode::Vertical => "Intra_4x4_Vertical",
+                Intra4x4Mode::Horizontal => "Intra_4x4_Horizontal",
+                Intra4x4Mode::Dc => "Intra_4x4_DC",
+                Intra4x4Mode::DiagonalDownLeft => "Intra_4x4_Diagonal_Down_Left",
+                Intra4x4Mode::DiagonalDownRight => "Intra_4x4_Diagonal_Down_Right",
+                Intra4x4Mode::VerticalRight => "Intra_4x4_Vertical_Right",
+                Intra4x4Mode::HorizontalDown => "Intra_4x4_Horizontal_Down",
+                Intra4x4Mode::VerticalLeft => "Intra_4x4_Vertical_Left",
+                Intra4x4Mode::HorizontalUp => "Intra_4x4_Horizontal_Up",
+            },
+            clause: "8.3.1.2",
+        })
+    }
+}
+
+fn require_intra_8x8_mode(
+    mode: Intra8x8Mode,
+    av: &Neighbour4x4Availability,
+) -> Result<(), ReconstructError> {
+    if crate::intra_pred::intra_8x8_mode_permitted(mode, av) {
+        Ok(())
+    } else {
+        Err(ReconstructError::IntraModeNeighboursUnavailable {
+            mode: match mode {
+                Intra8x8Mode::Vertical => "Intra_8x8_Vertical",
+                Intra8x8Mode::Horizontal => "Intra_8x8_Horizontal",
+                Intra8x8Mode::Dc => "Intra_8x8_DC",
+                Intra8x8Mode::DiagonalDownLeft => "Intra_8x8_Diagonal_Down_Left",
+                Intra8x8Mode::DiagonalDownRight => "Intra_8x8_Diagonal_Down_Right",
+                Intra8x8Mode::VerticalRight => "Intra_8x8_Vertical_Right",
+                Intra8x8Mode::HorizontalDown => "Intra_8x8_Horizontal_Down",
+                Intra8x8Mode::VerticalLeft => "Intra_8x8_Vertical_Left",
+                Intra8x8Mode::HorizontalUp => "Intra_8x8_Horizontal_Up",
+            },
+            clause: "8.3.2.2",
+        })
+    }
+}
+
+fn require_intra_16x16_mode(
+    mode: Intra16x16Mode,
+    av: &Neighbour4x4Availability,
+) -> Result<(), ReconstructError> {
+    if crate::intra_pred::intra_16x16_mode_permitted(mode, av) {
+        Ok(())
+    } else {
+        Err(ReconstructError::IntraModeNeighboursUnavailable {
+            mode: match mode {
+                Intra16x16Mode::Vertical => "Intra_16x16_Vertical",
+                Intra16x16Mode::Horizontal => "Intra_16x16_Horizontal",
+                Intra16x16Mode::Dc => "Intra_16x16_DC",
+                Intra16x16Mode::Plane => "Intra_16x16_Plane",
+            },
+            clause: "8.3.3",
+        })
+    }
+}
+
+fn require_intra_chroma_mode(
+    mode: IntraChromaMode,
+    av: &Neighbour4x4Availability,
+) -> Result<(), ReconstructError> {
+    if crate::intra_pred::intra_chroma_mode_permitted(mode, av) {
+        Ok(())
+    } else {
+        Err(ReconstructError::IntraModeNeighboursUnavailable {
+            mode: match mode {
+                IntraChromaMode::Dc => "Intra_Chroma_DC",
+                IntraChromaMode::Horizontal => "Intra_Chroma_Horizontal",
+                IntraChromaMode::Vertical => "Intra_Chroma_Vertical",
+                IntraChromaMode::Plane => "Intra_Chroma_Plane",
+            },
+            clause: "8.3.4",
+        })
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -1019,6 +1131,7 @@ fn reconstruct_intra_16x16(
     let mode = Intra16x16Mode::from_index(pred_mode_idx).ok_or_else(|| {
         ReconstructError::UnsupportedMbType(format!("Intra_16x16 pred_mode {}", pred_mode_idx))
     })?;
+    require_intra_16x16_mode(mode, &samples.availability)?;
     let mut pred = [0i32; 256];
     predict_16x16(mode, &samples, bit_depth_y, &mut pred);
 
@@ -1606,6 +1719,7 @@ fn reconstruct_intra_nxn(
                 current_slice_id,
                 cip,
             );
+            require_intra_8x8_mode(mode, &raw.availability)?;
             let filtered = filter_samples_8x8(&raw, bit_depth_y);
             let mut pred_samples = [0i32; 64];
             predict_8x8(mode, &filtered, bit_depth_y, &mut pred_samples);
@@ -1732,6 +1846,7 @@ fn reconstruct_intra_nxn(
                 current_slice_id,
                 cip,
             );
+            require_intra_4x4_mode(mode, &samples.availability)?;
             let mut pred_samples = [0i32; 16];
             predict_4x4(mode, &samples, bit_depth_y, &mut pred_samples);
 
@@ -1949,6 +2064,7 @@ fn reconstruct_chroma_intra(
             pps.constrained_intra_pred_flag,
         );
         let out_len = (mbw_c as usize) * (mbh_c as usize);
+        require_intra_chroma_mode(chroma_mode, &samples.availability)?;
         let mut pred_samples = vec![0i32; out_len];
         predict_chroma(chroma_mode, &samples, ct, bit_depth_c, &mut pred_samples);
 
@@ -2155,6 +2271,7 @@ fn reconstruct_chroma_intra_444(
             current_slice_id,
             pps.constrained_intra_pred_flag,
         );
+        require_intra_16x16_mode(mode, &samples.availability)?;
         let mut pred = [0i32; 256];
         predict_16x16(mode, &samples, bit_depth_c, &mut pred);
 
@@ -2329,6 +2446,7 @@ fn reconstruct_chroma_intra_nxn_444(
                     current_slice_id,
                     cip,
                 );
+                require_intra_8x8_mode(mode, &raw.availability)?;
                 let filtered = filter_samples_8x8(&raw, bit_depth_c);
                 let mut pred_samples = [0i32; 64];
                 predict_8x8(mode, &filtered, bit_depth_c, &mut pred_samples);
@@ -2393,6 +2511,7 @@ fn reconstruct_chroma_intra_nxn_444(
                     current_slice_id,
                     cip,
                 );
+                require_intra_4x4_mode(mode, &samples.availability)?;
                 let mut pred_samples = [0i32; 16];
                 predict_4x4(mode, &samples, bit_depth_c, &mut pred_samples);
 
@@ -4576,6 +4695,13 @@ fn mc_luma_partition(
             width: ref_pic.width_in_samples,
             height: ref_pic.height_in_samples,
         });
+    }
+    // §8.2.5.2 — refuse to sample a synthesised "non-existing"
+    // reference (see `ReconstructError::NonExistingRef`). Every inter
+    // partition motion-compensates luma, so this single gate covers the
+    // chroma paths as well.
+    if ref_pic.non_existing {
+        return Err(ReconstructError::NonExistingRef);
     }
     // §8.4.1.4 — MV is in 1/4-pel luma units. Integer part = mv / 4
     // (with spec's "truncate toward zero" via i32 division); fractional

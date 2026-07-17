@@ -32,6 +32,13 @@ pub struct Picture {
     pub luma: Vec<i32>,
     pub cb: Vec<i32>,
     pub cr: Vec<i32>,
+    /// §8.2.5.2 — set on the placeholder pictures synthesised to fill a
+    /// gap in `frame_num`. Their samples are "not available for
+    /// prediction of other pictures": a conforming bitstream never
+    /// samples a non-existing frame, so motion compensation refuses to
+    /// (reconstructing from invented placeholder samples would silently
+    /// fabricate picture content).
+    pub non_existing: bool,
     /// Set by caller after reconstruction.
     pub pic_order_cnt: i32,
     pub frame_num: u32,
@@ -104,6 +111,7 @@ impl Picture {
             luma: vec![0; luma_len],
             cb: vec![0; chroma_len],
             cr: vec![0; chroma_len],
+            non_existing: false,
             pic_order_cnt: 0,
             frame_num: 0,
             mb_width_in_picture: 0,

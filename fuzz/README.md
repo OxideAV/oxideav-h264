@@ -9,6 +9,40 @@ Three `cargo-fuzz` (libFuzzer) targets live in `fuzz_targets/`:
 * `ffmpeg_oracle_decode` — cross-validates `H264CodecDecoder` against a
   `dlopen`-loaded `libavcodec` (when the shared library is present at
   runtime). The harness skips silently when libavcodec is unavailable.
+
+  Oracle premises (2026-07 rework, after a week of scheduled-Fuzz reds
+  traced to the harness itself):
+  * the reference decoder is bound **by name**
+    (`avcodec_find_decoder_by_name("h264")`), with a runtime guard on
+    the bound codec's `name` field — an earlier revision passed a wrong
+    numeric `AVCodecID` and spent its budget diffing against a decoder
+    for a different codec entirely;
+  * it is opened with `err_detect=explode` so oracle frames are never
+    concealment output;
+  * our side is classified before parity asserts: output produced with
+    `decode_error_count() > 0` is *concealed* (never pixel-compared),
+    and streams whose stored SPSes use >8-bit depths / monochrome /
+    separate colour planes are *incomparable* (the wrapper only
+    represents 8-bit planar YUV);
+  * the oracle drains exactly one frame from its single-packet feed,
+    so its frame must match **one of** our drained frames rather than
+    a specific one;
+  * "reference rejected, we decoded cleanly" is an **advisory stderr
+    report**, not a crash — the reference layers stream-discipline
+    heuristics beyond bitstream conformance (it refuses non-paired
+    fields, for one), so its rejection does not prove the input
+    malformed. Triaging these reports surfaced four decoder-side
+    conformance gaps (all now enforced: §8.3.x intra-mode neighbour
+    availability, §8.2.4 empty-DPB inter slices, §8.2.5.2 non-existing
+    references, §7.4.3 frame_num discipline), so grep CI logs for
+    `[oracle strictness]` when hunting for more.
+
+  The fuzzer-found inputs from the 2026-07 reds are archived under
+  `tests/fixtures/fuzz_regressions/` and replayed by
+  `tests/fuzz_oracle_regressions.rs` in the normal test suite.
+  `examples/repro_oracle.rs` runs a single input through both decoders
+  and prints the classification — the fastest way to triage a fresh
+  `crash-*` artifact from CI.
 * `sei_payload` — exercises the §D.2 / §G.13.2 SEI parser surface with
   arbitrary bytes under varied `SeiContext` shapes.
 

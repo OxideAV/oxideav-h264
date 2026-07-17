@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Scheduled-Fuzz red (2026-07-12 → 2026-07-16): the `ffmpeg_oracle_decode`
+  differential harness was binding the wrong reference decoder by
+  numeric codec id, so every frame our decoder legitimately produced
+  was reported as a bogus "reject parity" divergence. The oracle now
+  binds the H.264 decoder **by name**, guards the binding at runtime,
+  opens it with `err_detect=explode` (concealed reference output never
+  reaches pixel asserts), and classifies our side as
+  clean / concealed / incomparable before asserting parity
+  (`decode_error_count()` + stored-SPS bit-depth/chroma gates; frames
+  produced from >8-bit or monochrome/separate-plane streams are outside
+  the 8-bit-planar comparison domain). "Reference rejected, we decoded
+  cleanly" is now an advisory stderr report rather than a crash: the
+  reference layers stream-discipline heuristics beyond bitstream
+  conformance (e.g. refusing non-paired fields), so reject-superset
+  parity with it is not a soundness property; mis-decode is asserted by
+  the frame-parity arm.
+- Decode-side strictness gaps the corrected oracle then surfaced, each
+  rooted in a T-REC-H.264 conformance clause:
+  - §8.3.1.2 / §8.3.2.2 / §8.3.3 / §8.3.4 — an intra prediction mode
+    whose required neighbour samples are unavailable ("shall be used
+    only when ... marked as available") is now an invalid-data error
+    instead of predicting from substituted values.
+  - §8.2.4 — a P/SP/B slice arriving with an empty reference DPB (no
+    picture RefPicList0 could hold) is refused at the slice header
+    instead of decoding its intra macroblocks into a fabricated frame.
+  - §8.2.5.2 — motion compensation now refuses to sample a synthesised
+    "non-existing" (frame_num-gap placeholder) reference picture.
+  - §7.4.3 — with `gaps_in_frame_num_value_allowed_flag == 0`, a
+    non-IDR picture whose `frame_num` is neither `PrevRefFrameNum` nor
+    `(PrevRefFrameNum + 1) % MaxFrameNum` is refused.
+  - NAL types 2/3/4 (slice data partitions, unimplemented) now surface
+    an error instead of being silently discarded VCL content.
+
+### Added
+
+- `H264CodecDecoder::decode_error_count()` plus `active_sps()` /
+  `stored_sps()` diagnostic accessors (`#[doc(hidden)]`, for
+  tests/fuzz): callers can tell clean output from partial/concealed
+  output produced by the slice-skipping resilience path.
+- `tests/fuzz_oracle_regressions.rs` + the archived fuzzer inputs under
+  `tests/fixtures/fuzz_regressions/`: pins that hostile streams never
+  yield a *clean* comparable frame (they must be flagged degraded or
+  incomparable) and that conforming streams keep
+  `decode_error_count() == 0`.
+
 ### Changed
 
 - Internal plumbing modules (the slice/CABAC/reconstruction modules at
