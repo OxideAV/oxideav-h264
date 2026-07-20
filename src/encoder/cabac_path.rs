@@ -1873,6 +1873,19 @@ impl Encoder {
     /// Round-30 — encode an IDR access unit using **CABAC** entropy coding.
     /// `EncoderConfig::cabac` must be `true` and `profile_idc >= 77`.
     pub fn encode_idr_cabac(&self, frame: &YuvFrame<'_>) -> EncodedIdr {
+        self.encode_idr_cabac_with_qp(frame, self.config().qp)
+    }
+
+    /// [`encode_idr_cabac`](Self::encode_idr_cabac) with a per-frame
+    /// QP override. The PPS keeps `pic_init_qp_minus26 = cfg.qp - 26`;
+    /// the §7.4.3 `slice_qp_delta` moves this picture to `frame_qp`,
+    /// and the §9.3.1.1 context initialisation runs at the resulting
+    /// SliceQP_Y. `frame_qp` must be in 0..=51.
+    pub fn encode_idr_cabac_with_qp(&self, frame: &YuvFrame<'_>, frame_qp: i32) -> EncodedIdr {
+        assert!(
+            (0..=51).contains(&frame_qp),
+            "frame_qp {frame_qp} out of 0..=51"
+        );
         let cfg = self.config();
         assert!(
             cfg.cabac,
@@ -1919,7 +1932,7 @@ impl Encoder {
             _ => height / 2,
         };
 
-        let qp_y = cfg.qp;
+        let qp_y = frame_qp;
         // §8.5.8 BD-aware chroma-QP. `qp_bd_offset_c = 6 *
         // bit_depth_chroma_minus8` extends the eq. 8-311 qPI clamp
         // from 0..=51 to −QpBdOffsetC..=51. Today the SPS pins
@@ -1982,7 +1995,7 @@ impl Encoder {
                 idr_pic_id: 0,
                 pic_order_cnt_lsb: 0,
                 poc_lsb_bits: 8,
-                slice_qp_delta: 0,
+                slice_qp_delta: frame_qp - cfg.qp,
                 // Disable deblocking for 4:4:4 — the deblock module's
                 // chroma filter assumes 4:2:0 8x8 planes; 4:4:4 uses the
                 // luma filter on full-size chroma planes which is not yet
@@ -2811,6 +2824,24 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedP {
+        self.encode_p_cabac_with_qp(frame, prev, frame_num, pic_order_cnt_lsb, self.config().qp)
+    }
+
+    /// [`encode_p_cabac`](Self::encode_p_cabac) with a per-frame QP
+    /// override — same mechanics as
+    /// [`encode_idr_cabac_with_qp`](Self::encode_idr_cabac_with_qp).
+    pub fn encode_p_cabac_with_qp(
+        &self,
+        frame: &YuvFrame<'_>,
+        prev: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+    ) -> EncodedP {
+        assert!(
+            (0..=51).contains(&frame_qp),
+            "frame_qp {frame_qp} out of 0..=51"
+        );
         let cfg = self.config();
         assert!(cfg.cabac);
         assert!(cfg.profile_idc >= 77);
@@ -2846,7 +2877,7 @@ impl Encoder {
             2 => (8usize, 16usize),
             _ => (8usize, 8usize),
         };
-        let qp_y = cfg.qp;
+        let qp_y = frame_qp;
         // §8.5.8 BD-aware chroma-QP — see encode_idr_cabac; identical reasoning.
         let qp_bd_offset_c = qp_bd_offset(cfg.bit_depth_chroma_minus8);
         let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
@@ -2865,7 +2896,7 @@ impl Encoder {
                 frame_num_bits: 8,
                 pic_order_cnt_lsb,
                 poc_lsb_bits: 8,
-                slice_qp_delta: 0,
+                slice_qp_delta: frame_qp - cfg.qp,
                 // 4:4:4 mirrors encode_idr_cabac: deblocking disabled
                 // (the §8.7 luma-filter-on-chroma path is not wired).
                 disable_deblocking_filter_idc: if cfg.chroma_format_idc == 3 { 1 } else { 0 },
@@ -3938,6 +3969,32 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedB {
+        self.encode_b_cabac_with_qp(
+            frame,
+            ref_l0,
+            ref_l1,
+            frame_num,
+            pic_order_cnt_lsb,
+            self.config().qp,
+        )
+    }
+
+    /// [`encode_b_cabac`](Self::encode_b_cabac) with a per-frame QP
+    /// override — same mechanics as
+    /// [`encode_idr_cabac_with_qp`](Self::encode_idr_cabac_with_qp).
+    pub fn encode_b_cabac_with_qp(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+    ) -> EncodedB {
+        assert!(
+            (0..=51).contains(&frame_qp),
+            "frame_qp {frame_qp} out of 0..=51"
+        );
         let cfg = self.config();
         assert!(
             cfg.cabac,
@@ -3988,7 +4045,7 @@ impl Encoder {
             _ => (8usize, 8usize),
         };
 
-        let qp_y = cfg.qp;
+        let qp_y = frame_qp;
         let qp_bd_offset_c = qp_bd_offset(cfg.bit_depth_chroma_minus8);
         let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
 
@@ -4009,7 +4066,7 @@ impl Encoder {
                 // B_Skip / B_Direct_16x16 against the spatial derivation
                 // (mirrored in `cabac_b_spatial_direct_derive`).
                 direct_spatial_mv_pred_flag: true,
-                slice_qp_delta: 0,
+                slice_qp_delta: frame_qp - cfg.qp,
                 // 4:4:4 mirrors encode_idr_cabac: deblocking disabled.
                 disable_deblocking_filter_idc: if cfg.chroma_format_idc == 3 { 1 } else { 0 },
                 slice_alpha_c0_offset_div2: 0,

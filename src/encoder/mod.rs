@@ -1239,6 +1239,21 @@ impl Encoder {
     /// the decoder is expected to produce — useful for round-trip
     /// validation in tests.
     pub fn encode_idr(&self, frame: &YuvFrame<'_>) -> EncodedIdr {
+        self.encode_idr_with_qp(frame, self.cfg.qp)
+    }
+
+    /// [`encode_idr`](Self::encode_idr) with a per-frame QP override.
+    ///
+    /// The PPS still carries `pic_init_qp_minus26 = cfg.qp - 26`; the
+    /// difference is signalled through the §7.4.3 `slice_qp_delta`
+    /// (`SliceQP_Y = 26 + pic_init_qp_minus26 + slice_qp_delta`), so a
+    /// rate-controlled sequence keeps one PPS while every picture
+    /// picks its own QP. `frame_qp` must be in 0..=51.
+    pub fn encode_idr_with_qp(&self, frame: &YuvFrame<'_>, frame_qp: i32) -> EncodedIdr {
+        assert!(
+            (0..=51).contains(&frame_qp),
+            "frame_qp {frame_qp} out of 0..=51"
+        );
         assert_eq!(frame.width, self.cfg.width);
         assert_eq!(frame.height, self.cfg.height);
         let width_mbs = self.cfg.width / 16;
@@ -1355,7 +1370,10 @@ impl Encoder {
                 idr_pic_id: 0,
                 pic_order_cnt_lsb: 0,
                 poc_lsb_bits: sps_cfg.log2_max_poc_lsb_minus4 + 4,
-                slice_qp_delta: 0, // total QP = pic_init_qp_minus26 + 26
+                // §7.4.3 — SliceQP_Y = 26 + pic_init_qp_minus26 +
+                // slice_qp_delta; the PPS carries cfg.qp, the delta
+                // moves this picture to frame_qp.
+                slice_qp_delta: frame_qp - self.cfg.qp,
                 // §7.4.3 / round 14 — enable in-loop deblocking. We
                 // mirror the decoder's §8.7 pass on the local recon so
                 // EncodedIdr.recon_* matches what the decoder produces.
@@ -1385,7 +1403,7 @@ impl Encoder {
         let mut recon_u = vec![0u8; chroma_width * chroma_height];
         let mut recon_v = vec![0u8; chroma_width * chroma_height];
 
-        let qp_y = self.cfg.qp;
+        let qp_y = frame_qp;
         // §8.5.8 — chroma-QP derivation, BD-aware. `qp_bd_offset_c =
         // 6 * bit_depth_chroma_minus8` extends the eq. 8-311 qPI clamp
         // from `0..=51` to `−QpBdOffsetC..=51`. Today the SPS pins
@@ -5335,6 +5353,24 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedP {
+        self.encode_p_with_qp(frame, prev, frame_num, pic_order_cnt_lsb, self.cfg.qp)
+    }
+
+    /// [`encode_p`](Self::encode_p) with a per-frame QP override —
+    /// same §7.4.3 `slice_qp_delta` mechanics as
+    /// [`encode_idr_with_qp`](Self::encode_idr_with_qp).
+    pub fn encode_p_with_qp(
+        &self,
+        frame: &YuvFrame<'_>,
+        prev: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+    ) -> EncodedP {
+        assert!(
+            (0..=51).contains(&frame_qp),
+            "frame_qp {frame_qp} out of 0..=51"
+        );
         assert_eq!(frame.width, self.cfg.width);
         assert_eq!(frame.height, self.cfg.height);
         assert_eq!(prev.width, self.cfg.width);
@@ -5371,7 +5407,7 @@ impl Encoder {
                 frame_num_bits: log2_max_frame_num_minus4 + 4,
                 pic_order_cnt_lsb,
                 poc_lsb_bits: log2_max_poc_lsb_minus4 + 4,
-                slice_qp_delta: 0,
+                slice_qp_delta: frame_qp - self.cfg.qp,
                 // 4:4:4 mirrors encode_idr: deblocking disabled per
                 // §7.4.3 (the §8.7 luma-filter-on-chroma path for
                 // ChromaArrayType == 3 is not wired).
@@ -5393,7 +5429,7 @@ impl Encoder {
         let mut recon_u = vec![0u8; chroma_width * chroma_height];
         let mut recon_v = vec![0u8; chroma_width * chroma_height];
 
-        let qp_y = self.cfg.qp;
+        let qp_y = frame_qp;
         // §8.5.8 BD-aware chroma-QP — see encode_idr; identical reasoning.
         let qp_bd_offset_c = qp_bd_offset(self.cfg.bit_depth_chroma_minus8);
         let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, chroma_qp_index_offset, qp_bd_offset_c);
@@ -9928,6 +9964,32 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedB {
+        self.encode_b_with_qp(
+            frame,
+            ref_l0,
+            ref_l1,
+            frame_num,
+            pic_order_cnt_lsb,
+            self.cfg.qp,
+        )
+    }
+
+    /// [`encode_b`](Self::encode_b) with a per-frame QP override —
+    /// same §7.4.3 `slice_qp_delta` mechanics as
+    /// [`encode_idr_with_qp`](Self::encode_idr_with_qp).
+    pub fn encode_b_with_qp(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+    ) -> EncodedB {
+        assert!(
+            (0..=51).contains(&frame_qp),
+            "frame_qp {frame_qp} out of 0..=51"
+        );
         assert_eq!(frame.width, self.cfg.width);
         assert_eq!(frame.height, self.cfg.height);
         assert_eq!(ref_l0.width, self.cfg.width);
@@ -10023,7 +10085,7 @@ impl Encoder {
                 pic_order_cnt_lsb,
                 poc_lsb_bits: log2_max_poc_lsb_minus4 + 4,
                 direct_spatial_mv_pred_flag: direct_spatial,
-                slice_qp_delta: 0,
+                slice_qp_delta: frame_qp - self.cfg.qp,
                 // 4:4:4 mirrors encode_idr / encode_p: deblocking
                 // disabled per §7.4.3 (the §8.7 luma-filter-on-chroma
                 // path for ChromaArrayType == 3 is not wired).
@@ -10045,7 +10107,7 @@ impl Encoder {
         let mut recon_u = vec![0u8; chroma_width * chroma_height];
         let mut recon_v = vec![0u8; chroma_width * chroma_height];
 
-        let qp_y = self.cfg.qp;
+        let qp_y = frame_qp;
         // §8.5.8 BD-aware chroma-QP — see encode_idr; identical reasoning.
         let qp_bd_offset_c = qp_bd_offset(self.cfg.bit_depth_chroma_minus8);
         let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, chroma_qp_index_offset, qp_bd_offset_c);
