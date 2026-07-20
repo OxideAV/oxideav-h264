@@ -73,6 +73,8 @@ pub mod vui;
 
 pub mod h264_decoder;
 
+pub mod h264_encoder;
+
 pub mod encoder;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
@@ -95,6 +97,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(h264_decoder::make_decoder)
+            .encoder(h264_encoder::make_encoder)
+            .encoder_options::<h264_encoder::H264EncoderOptions>()
             .tags([
                 CodecTag::fourcc(b"H264"),
                 CodecTag::fourcc(b"h264"),
