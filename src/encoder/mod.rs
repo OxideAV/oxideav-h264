@@ -59,6 +59,7 @@ pub mod pps;
 pub mod rate_control;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod rdo;
+pub mod session;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod slice;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API

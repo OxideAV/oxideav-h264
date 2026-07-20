@@ -185,8 +185,11 @@ pub struct RateController {
     /// Bits per frame interval at the channel/arrival rate.
     arrival_per_frame: f64,
     /// Modelled decoder-side CPB fullness in bits, after the most
-    /// recent removal. Starts at 90% of the buffer (a typical
-    /// initial_cpb_removal_delay position) so the first IDR has room.
+    /// recent removal. Starts just above the 55% steering setpoint
+    /// (0.6 x buffer, i.e. a 0.6-buffer initial_cpb_removal_delay):
+    /// enough banked bits for the opening IDR without a long
+    /// spend-down transient that would inflate the early payload rate
+    /// above target.
     fullness: f64,
     /// Complexity model per frame kind: EWMA of `bits * qstep(qp)`.
     cplx: [f64; 2],
@@ -219,7 +222,7 @@ impl RateController {
             cfg,
             bits_per_frame,
             arrival_per_frame,
-            fullness: 0.9 * f64::from(cfg.vbv_buffer_bits),
+            fullness: 0.6 * f64::from(cfg.vbv_buffer_bits),
             cplx: [0.0; 2],
             cplx_seeded: [false; 2],
             last_qp: [None; 2],
@@ -288,26 +291,44 @@ impl RateController {
     }
 
     /// Soft bit target for the next frame of `kind`, before QP
-    /// mapping. Combines the pro-rata per-frame budget, a buffer-
-    /// position term pulling the CPB toward 55% fullness over about
-    /// one second, and (capped VBR) a long-term integrator that keeps
-    /// the running average on target even though the bucket is fed at
-    /// the peak rate.
+    /// mapping. Pro-rata per-frame budget, plus mode-specific
+    /// steering:
+    ///
+    /// * CBR — a buffer-position term pulling the CPB toward 55%
+    ///   fullness over about one second. Because the CBR bucket is
+    ///   fed at exactly the target rate, holding fullness steady IS
+    ///   holding the average on target, so no separate integrator is
+    ///   needed.
+    /// * Capped VBR — the bucket is fed at the peak rate, so its
+    ///   position says nothing about the long-term average; instead a
+    ///   proportional-on-accumulated-error integrator (gain 2 /
+    ///   window, i.e. a ~half-second time constant) drives the
+    ///   running payload average onto the target, and a low-water
+    ///   penalty term backs off when the bucket drops under 35%.
     fn frame_target(&self, kind: RcFrameKind) -> f64 {
         let buffer = f64::from(self.cfg.vbv_buffer_bits);
         let fps = f64::from(self.cfg.fps_num) / f64::from(self.cfg.fps_den);
         let window = fps.max(1.0);
 
         let mut t = self.bits_per_frame;
-        // Buffer position: fullness above the setpoint means the
-        // channel has banked bits we are entitled to spend.
-        t += 0.5 * (self.fullness - 0.55 * buffer) / window;
-
-        if self.cfg.mode == RateControlMode::CappedVbr && self.frames > 0 {
-            let ideal = self.bits_per_frame * self.frames as f64;
-            let err = self.total_bits as f64 - ideal;
-            let correction = (err / window).clamp(-0.5 * t, 0.5 * t);
-            t -= correction;
+        match self.cfg.mode {
+            RateControlMode::Cbr => {
+                // Fullness above the setpoint means the channel has
+                // banked bits we are entitled to spend.
+                t += 0.5 * (self.fullness - 0.55 * buffer) / window;
+            }
+            RateControlMode::CappedVbr => {
+                if self.frames > 0 {
+                    let ideal = self.bits_per_frame * self.frames as f64;
+                    let err = self.total_bits as f64 - ideal;
+                    let correction = (2.0 * err / window).clamp(-0.6 * t, 0.6 * t);
+                    t -= correction;
+                }
+                // Only a penalty: peak-rate arrivals refill fast, so a
+                // high bucket is not licence to overspend the target.
+                let low_water = 0.25 * (self.fullness - 0.35 * buffer) / window;
+                t += low_water.min(0.0);
+            }
         }
 
         // Intra frames get a larger slice of the budget: scale by the

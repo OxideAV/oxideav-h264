@@ -64,6 +64,19 @@ pub fn build_nal_unit(nal_ref_idc: u8, nal_unit_type: NalUnitType, rbsp: &[u8]) 
     out
 }
 
+/// Build a §7.3.2.7 `filler_data_rbsp` NAL unit carrying `ff_count`
+/// bytes of `ff_byte` (0xFF). Wire size is `4 + 1 + ff_count + 1`
+/// bytes (start code + header + payload + `rbsp_trailing_bits`). Used
+/// by the CBR rate-control session to keep the Annex C channel busy
+/// when the picture underspends its slot; `nal_ref_idc` is 0 per
+/// §7.4.1 (filler is never a reference).
+pub fn build_filler_nal(ff_count: usize) -> Vec<u8> {
+    let mut rbsp = vec![0xFFu8; ff_count];
+    // rbsp_trailing_bits: stop bit + alignment (§7.3.2.11).
+    rbsp.push(0x80);
+    build_nal_unit(0, NalUnitType::FillerData, &rbsp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +92,23 @@ mod tests {
     fn header_byte_encodes_idr() {
         // IDR with nal_ref_idc=3 → 0b 0 11 00101 = 0x65.
         assert_eq!(nal_header_byte(3, NalUnitType::SliceIdr), 0x65);
+    }
+
+    #[test]
+    fn filler_nal_wire_shape_and_reparse() {
+        let nal = build_filler_nal(10);
+        // 4 start code + 1 header + 10 ff + 1 trailing. 0xFF payload
+        // never needs emulation prevention.
+        assert_eq!(nal.len(), 16);
+        assert_eq!(&nal[..4], &[0, 0, 0, 1]);
+        assert_eq!(nal[4], 0x0C); // nal_ref_idc=0, type 12
+        assert!(nal[5..15].iter().all(|&b| b == 0xFF));
+        assert_eq!(nal[15], 0x80);
+        let mut split = AnnexBSplitter::new(&nal);
+        let raw = split.next().expect("one NAL");
+        let parsed = parse_nal_unit(raw).expect("parse");
+        assert_eq!(parsed.header.nal_unit_type, NalUnitType::FillerData);
+        assert!(split.next().is_none());
     }
 
     #[test]
