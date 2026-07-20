@@ -56,6 +56,7 @@ pub mod me;
 pub mod nal;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod pps;
+pub mod rate_control;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod rdo;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
