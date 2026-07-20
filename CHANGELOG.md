@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-h264/compare/v0.1.7...v0.2.0) - 2026-07-20
+
+### Other
+
+- rate-control validation matrix — accuracy across a signal matrix + RD check vs fixed-QP anchors
+- MB-row QP modulation on the CAVLC P path (mb_qp_delta emission)
+- H.264 encoder factory with rate-control options
+- rate-controlled GOP session — VBV retry loop, CBR filler NALs, capped-VBR integrator
+- per-frame QP overrides on all six frame entry points
+- rate-control core — CBR/capped-VBR feedback controller + Annex C leaky-bucket CPB model
+- corpus count 36/36 (paff-frame-refs)
+- gate paff-frame-refs BitExact — 36/36
+- PAFF frame-as-field-reference: field views of a stored FRAME picture serve P fields byte-exactly
+- round-416 rollup — CAVLC MBAFF closed + PAFF byte-exact end-to-end, corpus 35/35 BitExact
+- gate paff-p-crossparity BitExact — 35/35
+- PAFF cross-parity field references: $8.4.1.4 Table 8-10 chroma-MV adjustment end-to-end
+- gate the round-416 PAFF fixture extension — 34/34 BitExact
+- PAFF end-to-end: $8.2.4.2.5 field reference lists in the decoder + field-picture encoder, byte-exact both ways
+- CAVLC MBAFF byte-exact: route residual nC probes through Table 6-4 — mbaff-field-cavlc gates BitExact (31/31)
+- fuzz oracle: bind reference decoder by name + premise rework; enforce 5 conformance clauses the corrected oracle surfaced
+- Hide internal plumbing from the public API surface with #[doc(hidden)]
+- CAVLC MBAFF groundwork + round-413 fixture extension (mbaff-field-8x8t BitExact, mbaff-field-cavlc pin)
+- round-413 rollup — 29/29 corpus targets BitExact (MBAFF field pairs + lossless bypass)
+- MBAFF field-pair INTER decode byte-exact — mbaff-field-pairs gates BitExact (29/29 fixture targets)
+- MBAFF CABAC ctx: §7.4.4 pair-flag inference + Table 6-4 block-level neighbour probes + eq. 9-15/9-16 mvd scaling
+- §8.5.15 lossless transform-bypass decode — lossless-transform-bypass fixture BitExact
+- gate the round-410 fixture extension — 27/29 BitExact
+- 2:2 chroma DC dequant: spec-exact eq. 8-328 (qPDC, not qP) + MBAFF deblock processing order
+- MBAFF frame pictures byte-exact: pair-interleaved deblock addressing, spec-exact §8.7.2.1 bS, Table 6-4 inter MV neighbours
+- corpus re-baseline: 15/17 fixtures BitExact over full frame counts
+- README + CHANGELOG + encoder STATUS — round-397 rollup
+- CABAC B 16x8/8x16 partitions at 4:2:2/4:4:4
+- B 16x8/8x16 partitions at 4:2:2/4:4:4 — CAVLC
+- non-flat scaling matrices at 4:2:2/4:4:4 — every entropy coder, I/P/B + decoder 8x8 chroma-list index fix
+- CABAC B_Skip/B_Direct_16x16 at 4:2:2/4:4:4 + B_Skip deblock L1 identity fix
+- CAVLC 4:2:2/4:4:4 B-slices — skip/direct + explicit 16x16
+- CAVLC 4:2:2/4:4:4 P-slices — multi-format encode_p
+- README + CHANGELOG + encoder STATUS — round-391 rollup
+- CABAC 4:2:2/4:4:4 B-slices — 16x16 explicit mode set
+- CABAC 4:2:2/4:4:4 P-slices + twelve Table 9-30/31/32 P/B init-value fixes
+- non-flat scaling matrices under CABAC — 4:2:0 I/P/B
+- non-flat scaling matrices on P/B slices — §8.5.9 inter weightScale
+- custom user-supplied scaling lists — real §7.3.2.1.1.1 delta_scale emit
+- 4:4:4 I_4x4 leg — §8.3.4.5 chroma-as-luma 4x4 emit with per-plane nC
+- add CI / crates.io / docs.rs / MIT-license badges
+- README + encoder STATUS — round-388 rollup
+- 4:4:4 I_16x16-vs-Intra_8x8 RDO (CAVLC + CABAC) + real per-plane nC for mixed shapes
+- real §9.2.1.1 chroma-AC nC — dense chroma no longer desynchronises CAVLC
+- non-flat scaling-list emit — §7.3.2.1.1.1 seq/pic default matrices honoured end-to-end
+- transform unit tests updated to §8.5.9 weightScale semantics
+- §8.5.9 weightScale inverse-scan — non-flat scaling lists now honoured
+- CABAC 4:4:4 Intra_8x8 — blockCat-9/13 chroma residual + explicit cat-5/9/13 CBF
+- CABAC 4:2:2 IDR — 8-coefficient chroma DC + 2x4 chroma-AC grid + 8x8-luma trial
+- CABAC 4:2:2/4:4:4 residual contexts — eq. (9-22) NumC8x8 + §9.3.3.1.1.9 cat-5/9/13 CBF neighbours
+
 ### Added
 
 - Encoder rate control (round 420). `encoder::rate_control` implements
