@@ -115,10 +115,15 @@ https://www.itu.int/rec/T-REC-H.264 (pick the 2024-08 edition).
 
 The encoder emits both CAVLC and CABAC elementary streams; every coded
 stream is cross-checked bit-exact against an independent reference
-decoder run separately.
+decoder run separately. Round 420 added **rate control** (CBR +
+capped VBR) and a **registry encoder factory** — the codec registry
+now carries `h264_encoder::make_encoder` next to the decoder, with a
+typed option schema (`rc=auto/cqp/cbr/vbr`, `qp`, `bitrate`,
+`max_bitrate`, `buffer_size`, `gop`, `cabac`).
 
 | Coding tool | Scope | Notes |
 | ----------- | ----- | ----- |
+| **Rate control (r420)** | CBR + capped VBR, CAVLC + CABAC IDR/P GOPs; MB-row delta-QP on the CAVLC P path | Non-normative feedback controller (`encoder::rate_control`): complexity-times-quantiser-step model (§8.5.9 doubles-every-6 anchor) over an Annex C-style leaky-bucket CPB, per-frame QP via §7.4.3 `slice_qp_delta` (single PPS; §9.3.1.1 CABAC ctx init at the resulting SliceQP_Y), VBV hard-cap re-encode retry, §7.3.2.7 filler NALs in CBR, and `Encoder::encode_p_rate_adaptive` MB-row modulation riding §7.4.5 `mb_qp_delta` (coded-residual-only emission + skip/cbp==0 inheritance mirrored decoder-exactly, deblock chain included). Measured (80x64 synthetic matrix, post-warmup): CBR drift-corrected payload error **0.0%** across smooth / texture / scene-cut signals with channel (payload+filler) conservation 0.0%; capped-VBR payload error **≤ 1.5%**; RD check — CBR lands **on** the fixed-QP anchor curve (43.94 dB vs 43.93 dB interpolated at equal rate). Registry encoder factory (`h264_encoder`) with `rc/qp/bitrate/max_bitrate/buffer_size/gop/cabac` options; all rate-controlled streams (filler included) decode byte-exactly in our decoder and a black-box reference decoder |
 | P slices | CAVLC + CABAC | Single + multi L0, integer + quarter-pel ME, P_Skip / P_L0_16x16 / P_8x8 (per-8x8 4MV) |
 | B slices | CAVLC + CABAC | Explicit B_L0/L1/Bi_16x16 / 16x8 / 8x16, per-cell mixed B_8x8, B_Skip, B_Direct_16x16 / 8x8 (§8.4.1.2.2 spatial + §8.4.1.2.3 temporal direct), default + explicit weighted bipred |
 | MV derivation | §8.4.1.3 | mvp median + C→D substitution, P_Skip MV, spatial/temporal direct mirrored on the encoder side |
@@ -143,7 +148,9 @@ decoder run separately.
   implementation. Conformance is verified by output diff against an
   independent reference decoder, not by code reading.
 * Pluggable into the existing oxideav `Decoder` / `Encoder` trait
-  surface (the decoder is registered with the codec registry).
+  surface (decoder AND encoder factories are registered with the
+  codec registry; both stay directly callable per the dual-API
+  convention).
 
 ## Benchmarks
 

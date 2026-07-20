@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Encoder rate control (round 420). `encoder::rate_control` implements
+  a CBR / capped-VBR feedback controller (complexity-times-quantiser-
+  step model, §8.5.9 doubles-every-6 anchor) over an Annex C-style
+  leaky-bucket CPB: per-frame QP planning, a hard per-frame bit
+  ceiling, CBR §7.3.2.7 filler accounting and capped-VBR long-term
+  integration. All six frame entry points gained `_with_qp` variants —
+  the per-picture QP travels in the §7.4.3 `slice_qp_delta` while the
+  PPS stays fixed (CABAC context init runs at the resulting
+  SliceQP_Y). `encoder::session::EncoderSession` layers GOP cadence,
+  reference carry, VBV re-encode retry and filler-NAL emission
+  (`encoder::nal::build_filler_nal`); `Encoder::encode_p_rate_adaptive`
+  adds MB-row QP modulation on the CAVLC P path — per-row budget
+  feedback rides §7.4.5 `mb_qp_delta` (emitted only on
+  coded-residual MBs, with the skipped / cbp==0 inheritance and the
+  §8.7 deblock chain mirrored decoder-exactly via `MbQpTracker`).
+  The codec registry now also carries an encoder factory
+  (`h264_encoder::make_encoder`, dual-API) with a typed option schema:
+  `rc` (auto / cqp / cbr / vbr), `qp`, `bitrate`, `max_bitrate`,
+  `buffer_size`, `gop`, `cabac`; Annex B packets with in-band SPS/PPS.
+  Validation: rate-accuracy matrix across smooth / texture / scene-cut
+  signals (CBR + capped VBR), RD comparison against fixed-QP anchors,
+  and every rate-controlled stream (filler NALs included) decoding
+  byte-exactly through our decoder and a black-box reference decoder
+  (`integration_rate_control_session.rs`, `integration_frame_qp.rs`,
+  `integration_mb_row_qp.rs`, `integration_rate_validation.rs`,
+  `integration_registry_encoder.rs`).
 - PAFF (picture-adaptive frame/field) end-to-end. Decoder: coded FIELD
   pictures (`field_pic_flag == 1`) now build their reference lists
   through the §8.2.4.2.2/.2.4 + §8.2.4.2.5 field initialisation
