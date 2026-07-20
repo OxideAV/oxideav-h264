@@ -224,6 +224,9 @@ fn encode_p_slice_data(
     let mut mv_grid = MvGrid::new(width_mbs as usize, height_mbs as usize);
     let mut infos = vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
     let mut pending_skip: u32 = 0;
+    // Constant-QP field picture: the §7.4.5 chain never moves, but the
+    // per-MB writers still thread it (delta stays 0).
+    let mut qp_tracker = super::MbQpTracker { cur: qp_y };
     for mb_y in 0..height_mbs as usize {
         for mb_x in 0..width_mbs as usize {
             let dbl = enc.encode_p_mb_with_intra_fallback(
@@ -243,6 +246,7 @@ fn encode_p_slice_data(
                 &mut intra_grid,
                 &mut mv_grid,
                 &mut pending_skip,
+                &mut qp_tracker,
             );
             infos[mb_y * width_mbs as usize + mb_x] = dbl;
         }

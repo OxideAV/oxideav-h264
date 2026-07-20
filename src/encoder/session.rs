@@ -172,6 +172,7 @@ impl EncoderSession {
         frame_num: u32,
         poc_lsb: u32,
         qp: i32,
+        row_budget_bits: Option<u64>,
     ) -> PrevPic {
         if is_idr {
             let e = if self.cfg.cabac {
@@ -186,6 +187,11 @@ impl EncoderSession {
             let e = if self.cfg.cabac {
                 self.enc
                     .encode_p_cabac_with_qp(frame, &r, frame_num, poc_lsb, qp)
+            } else if let Some(budget) = row_budget_bits {
+                // CAVLC + rate control: MB-row QP modulation toward
+                // the controller's per-frame target.
+                self.enc
+                    .encode_p_rate_adaptive(frame, &r, frame_num, poc_lsb, qp, budget)
             } else {
                 self.enc.encode_p_with_qp(frame, &r, frame_num, poc_lsb, qp)
             };
@@ -235,14 +241,15 @@ impl EncoderSession {
                     SessionRateControl::Controlled(_) => unreachable!(),
                 };
                 (
-                    self.encode_at(&frame, is_idr, frame_num, poc_lsb, qp),
+                    self.encode_at(&frame, is_idr, frame_num, poc_lsb, qp, None),
                     qp,
                     0,
                 )
             }
             Some((plan, max_qp)) => {
+                let row_budget = Some(plan.target_bits.max(1.0) as u64);
                 let mut qp = plan.qp;
-                let mut pic = self.encode_at(&frame, is_idr, frame_num, poc_lsb, qp);
+                let mut pic = self.encode_at(&frame, is_idr, frame_num, poc_lsb, qp, row_budget);
                 // VBV hard-cap retry: the stateless encoder makes
                 // re-encoding at a higher QP a pure call.
                 for _ in 0..MAX_VBV_RETRIES {
@@ -251,7 +258,7 @@ impl EncoderSession {
                         break;
                     }
                     qp = (qp + 2).min(max_qp);
-                    pic = self.encode_at(&frame, is_idr, frame_num, poc_lsb, qp);
+                    pic = self.encode_at(&frame, is_idr, frame_num, poc_lsb, qp, row_budget);
                 }
                 let bits = 8 * pic_annex_b(&pic).len() as u64;
                 let outcome = self
