@@ -223,9 +223,12 @@ pub struct H264CodecDecoder {
     /// §8.2.1 POC derivation state (prev_pic_order_cnt_msb, etc.).
     poc_state: PocState,
     /// Monotonic counter used to mint fresh DPB slot keys. Never
-    /// reused within a stream so the sparse `RefPicStore` never
-    /// aliases — if this wraps we recycle (stream length in the
-    /// billions of frames is not something we need to worry about).
+    /// reused within a stream so `RefPicStore` keys never alias — if
+    /// this wraps we recycle (stream length in the billions of frames
+    /// is not something we need to worry about). Store memory stays
+    /// bounded despite the monotonic keys because every marking pass
+    /// prunes pictures whose keys left `dpb_entries`
+    /// (`prune_ref_store`).
     next_dpb_key: u32,
     /// Set when the previous *reference* picture's
     /// `dec_ref_pic_marking()` contained MMCO-5. Consumed by the next
@@ -535,6 +538,15 @@ impl H264CodecDecoder {
     #[doc(hidden)] // internal diagnostic — exposed for tests/fuzz; not part of the stable API
     pub fn stored_sps(&self, id: u32) -> Option<&Sps> {
         self.driver.sps(id)
+    }
+
+    /// Number of reference pictures whose samples the decoder is
+    /// currently holding (§8.2.5 DPB contents). Bounded by the DPB
+    /// size for the active SPS — regression hook for the round-430
+    /// unbounded-store fix.
+    #[doc(hidden)] // internal diagnostic — exposed for tests/fuzz; not part of the stable API
+    pub fn ref_picture_count(&self) -> usize {
+        self.ref_store.stored_count()
     }
 
     /// Handle a single emitted driver event.
@@ -1413,6 +1425,13 @@ impl H264CodecDecoder {
 
             self.ref_store.insert(current_entry.dpb_key, pic.clone());
             self.dpb_entries.push(current_entry);
+            // §8.2.5 — pictures the marking pass just evicted can never
+            // be referenced again; release their samples so store
+            // memory stays bounded by the DPB size (round 430: the
+            // store previously retained every reference picture of the
+            // session — unbounded growth, surfaced by the 2026-07-25
+            // scheduled-fuzz OOM triage).
+            self.prune_ref_store();
         }
 
         if is_reference {
@@ -1628,6 +1647,19 @@ impl H264CodecDecoder {
         k
     }
 
+    /// Release stored reference pictures whose DPB entries are gone.
+    ///
+    /// §8.2.5 — a picture marked "unused for reference" can never
+    /// appear in a later slice's reference picture list, so once its
+    /// metadata entry leaves `dpb_entries` its samples are
+    /// unreachable. Called after every marking pass; keeps
+    /// `ref_store` memory bounded by the DPB size instead of growing
+    /// with each reference picture decoded in the session.
+    fn prune_ref_store(&mut self) {
+        let live: Vec<u32> = self.dpb_entries.iter().map(|e| e.dpb_key).collect();
+        self.ref_store.retain_keys(&live);
+    }
+
     /// §8.2.5.2 — synthesise "non-existing" short-term reference frames
     /// to fill a gap between `PrevRefFrameNum` and the current picture's
     /// `frame_num`. Each synthetic frame advances the sliding-window
@@ -1656,29 +1688,20 @@ impl H264CodecDecoder {
             return Ok(());
         }
 
-        let width_samples = sps.pic_width_in_mbs() * 16;
-        let height_samples = sps.frame_height_in_mbs() * 16;
-        let chroma_array_type = sps.chroma_array_type();
-        let bit_depth_y = sps.bit_depth_luma_minus8 + 8;
-        let bit_depth_c = sps.bit_depth_chroma_minus8 + 8;
-
         // Guard against a runaway loop from a bogus `current_frame_num`;
         // the spec allows up to MaxFrameNum iterations.
+        //
+        // Round 430 (2026-07-25 scheduled-fuzz OOM triage): the loop
+        // used to allocate a full placeholder picture for EVERY missing
+        // frame_num — up to MaxFrameNum (2^16) sample buffers per gap,
+        // even though the §8.2.5.3 sliding window immediately evicts
+        // all but the newest `max_num_ref_frames` of them. Now the loop
+        // only maintains the metadata state (DPB entries, POC
+        // stepping); sample buffers are materialised afterwards for the
+        // few gap entries that actually survived the window.
+        let first_gap_key = self.next_dpb_key;
         let mut iterations: u32 = 0;
         while expected != current_frame_num && iterations < max_frame_num {
-            // §8.2.5.2 — a neutral placeholder picture. Samples are
-            // mid-grey (2^(bit_depth-1)) because the spec only guarantees
-            // "not available for prediction"; mid-grey keeps any
-            // accidental reference from producing wildly out-of-range
-            // residuals.
-            let pic = gray_picture(
-                width_samples,
-                height_samples,
-                chroma_array_type,
-                bit_depth_y,
-                bit_depth_c,
-            );
-
             // §8.2.1.3 POC type 2 (and also §8.2.1.2 type 1) treat each
             // non-existing frame as a reference picture with its own
             // `frame_num`, so step the POC state's `prev_frame_num` and
@@ -1721,12 +1744,38 @@ impl H264CodecDecoder {
                 long_term_frame_idx: 0,
                 dpb_key: key,
             };
-            self.ref_store.insert(key, pic);
             self.dpb_entries.push(entry);
 
             self.prev_ref_frame_num = Some(expected);
             expected = (expected + 1) % max_frame_num;
             iterations += 1;
+        }
+
+        if iterations > 0 {
+            // §8.2.5.2 — a neutral placeholder picture for each gap
+            // entry that survived the sliding window. Samples are
+            // mid-grey (2^(bit_depth-1)) because the spec only
+            // guarantees "not available for prediction"; mid-grey keeps
+            // any accidental reference from producing wildly
+            // out-of-range residuals. Only the surviving entries (at
+            // most `max_num_ref_frames`) get sample buffers — the
+            // evicted majority were never observable by later slices.
+            let gray = gray_picture(
+                sps.pic_width_in_mbs() * 16,
+                sps.frame_height_in_mbs() * 16,
+                sps.chroma_array_type(),
+                sps.bit_depth_luma_minus8 + 8,
+                sps.bit_depth_chroma_minus8 + 8,
+            );
+            let gap_keys = first_gap_key..self.next_dpb_key;
+            for entry in &self.dpb_entries {
+                if gap_keys.contains(&entry.dpb_key) {
+                    self.ref_store.insert(entry.dpb_key, gray.clone());
+                }
+            }
+            // Real reference pictures evicted by the gap's sliding
+            // window are dead now — release their samples too.
+            self.prune_ref_store();
         }
 
         Ok(())
@@ -3558,5 +3607,80 @@ mod tests {
         // Half-height (4 rows) — an unpaired field is emitted as-is.
         assert_eq!(vf.planes[0].data.len(), 16 * 4);
         assert_eq!(vf.planes[0].data[0], 30);
+    }
+
+    /// Round 430 (2026-07-25 scheduled-fuzz OOM triage) — §8.2.5.2
+    /// frame_num gap fill must stay memory-bounded. A hostile stream
+    /// can declare `gaps_in_frame_num_value_allowed_flag = 1` with
+    /// MaxFrameNum = 2^16 and jump `frame_num` by tens of thousands;
+    /// the gap loop used to allocate a full placeholder picture per
+    /// missing frame_num (and the store never released ANY picture),
+    /// which is an unbounded allocation driven by a few input bytes.
+    /// Post-fix: only the gap entries that survive the §8.2.5.3
+    /// sliding window carry sample buffers, and the store holds
+    /// exactly the DPB's pictures.
+    #[test]
+    fn frame_num_gap_fill_is_memory_bounded() {
+        use crate::sps::Sps;
+
+        let sps = Sps {
+            profile_idc: 66,
+            constraint_set_flags: 0,
+            level_idc: 30,
+            seq_parameter_set_id: 0,
+            chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            qpprime_y_zero_transform_bypass_flag: false,
+            seq_scaling_matrix_present_flag: false,
+            seq_scaling_lists: None,
+            log2_max_frame_num_minus4: 12, // MaxFrameNum = 65536
+            pic_order_cnt_type: 2,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            delta_pic_order_always_zero_flag: false,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_ref_frame: Vec::new(),
+            max_num_ref_frames: 3,
+            gaps_in_frame_num_value_allowed_flag: true,
+            pic_width_in_mbs_minus1: 3, // 64x64 — sample buffers exist but stay small
+            pic_height_in_map_units_minus1: 3,
+            frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
+            direct_8x8_inference_flag: true,
+            frame_cropping: None,
+            vui_parameters_present_flag: false,
+            vui: None,
+        };
+
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.prev_ref_frame_num = Some(0);
+        dec.fill_frame_num_gap(&sps, 40_000)
+            .expect("gap fill must succeed");
+
+        // §8.2.5.3 sliding window: only the newest
+        // `max_num_ref_frames` synthetic references survive.
+        assert_eq!(dec.dpb_entries.len(), 3);
+        let frame_nums: Vec<u32> = dec.dpb_entries.iter().map(|e| e.frame_num).collect();
+        assert_eq!(frame_nums, vec![39_997, 39_998, 39_999]);
+
+        // The store holds sample buffers for exactly the surviving
+        // entries — not one per skipped frame_num.
+        assert_eq!(dec.ref_picture_count(), 3);
+        for e in &dec.dpb_entries {
+            let pic = dec.ref_store.get_by_key(e.dpb_key).expect("stored");
+            assert!(pic.non_existing, "gap placeholders are non-existing");
+        }
+
+        // §8.2.5.2 stepped the POC state across every gap frame.
+        assert_eq!(dec.poc_state.prev_frame_num, 39_999);
+        assert_eq!(dec.prev_ref_frame_num, Some(39_999));
+
+        // A second, small gap right after must keep the bound.
+        dec.fill_frame_num_gap(&sps, 40_010).expect("second gap");
+        assert_eq!(dec.dpb_entries.len(), 3);
+        assert_eq!(dec.ref_picture_count(), 3);
     }
 }

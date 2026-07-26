@@ -87,6 +87,22 @@ const FIXTURES: &[(&str, &[u8], Expect)] = &[
         include_bytes!("fixtures/fuzz_regressions/crash-b741d946292d96dd1a04b334523ddcd8e5846431"),
         Expect::NoPanic,
     ),
+    // -- 2026-07-25 scheduled-run OOM artifact (round 430). The input
+    //    carries one SPS our parser rejects (frame-cropping window
+    //    outside the 16x16 picture) plus a parseable 16x16 SPS with
+    //    gaps_in_frame_num_value_allowed_flag=1. The libFuzzer OOM was
+    //    oracle-side (an older reference build balloons on the stream's
+    //    gap/concealment handling; current builds reject it), but the
+    //    triage exposed two decoder-side unbounded-memory hazards fixed
+    //    in the same arc: the reference store never released evicted
+    //    pictures, and §8.2.5.2 gap fill allocated one full placeholder
+    //    picture per missing frame_num. The harness now also skips any
+    //    input whose SPS NALs cannot all be parsed and size-vetted.
+    (
+        "oom-ccf7388c (gap-fill / ref-store memory bounds, oracle-side OOM)",
+        include_bytes!("fixtures/fuzz_regressions/oom-ccf7388c0de1c3e0ac24b05afffb58a959f76e26"),
+        Expect::NoPanic,
+    ),
 ];
 
 /// Decode one input the way the fuzz harness does: single Annex-B
@@ -181,5 +197,56 @@ fn conforming_stream_reports_zero_decode_errors() {
     assert!(
         dec.active_sps().is_some(),
         "active SPS should be exposed after decoding"
+    );
+}
+
+/// Round 430 (2026-07-25 scheduled-fuzz OOM triage) — the reference
+/// picture store must stay DPB-bounded across a long decode session.
+/// Before the fix, `RefPicStore` kept EVERY reference picture ever
+/// decoded (the sparse key-indexed vector had no release path), so a
+/// 64-frame IPP session held 64 pictures at EOF and a real-time stream
+/// grew without bound. Post-fix the store holds exactly the live DPB.
+#[test]
+fn long_session_reference_store_stays_dpb_bounded() {
+    use oxideav_h264::encoder::session::{EncoderSession, SessionConfig};
+
+    const W: u32 = 48;
+    const H: u32 = 48;
+    const FRAMES: usize = 64;
+
+    // One IDR + 63 P frames referencing the previous picture.
+    let mut cfg = SessionConfig::constant_qp(W, H, 30);
+    cfg.gop_length = FRAMES as u32;
+    let mut session = EncoderSession::new(cfg);
+    let mut stream = Vec::new();
+    for n in 0..FRAMES {
+        let (w, h) = (W as usize, H as usize);
+        let mut y = vec![0u8; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 3 + j * 5 + n * 7) % 200) as u8 + 20;
+            }
+        }
+        let u = vec![110u8; (w / 2) * (h / 2)];
+        let v = vec![140u8; (w / 2) * (h / 2)];
+        stream.extend_from_slice(&session.encode_frame(&y, &u, &v).annex_b);
+    }
+
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 30), stream);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let mut frames = 0usize;
+    while let Ok(Frame::Video(_)) = dec.receive_frame() {
+        frames += 1;
+    }
+    assert_eq!(frames, FRAMES, "own decoder must emit every frame");
+    assert_eq!(dec.decode_error_count(), 0, "session stream is conforming");
+
+    let held = dec.ref_picture_count();
+    assert!(
+        held <= 4,
+        "reference store holds {held} pictures after a {FRAMES}-frame session — \
+         must stay bounded by the DPB (pre-round-430 bug held one per reference frame)"
     );
 }

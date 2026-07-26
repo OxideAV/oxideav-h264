@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Decoder memory bounds (round 430, from the 2026-07-25 scheduled-fuzz
+  OOM triage). The reference picture store never released pictures
+  whose DPB entries had been evicted by §8.2.5 marking, so a decode
+  session held every reference picture it had ever reconstructed
+  (linear growth on long streams); the store is now pruned to the live
+  DPB after every marking pass and after §8.2.5.2 gap fill. The
+  §8.2.5.2 frame_num-gap loop also allocated a full mid-grey
+  placeholder picture for every missing frame_num — up to MaxFrameNum
+  (65536) sample buffers from one hostile slice header; it now steps
+  the DPB/POC metadata for the whole gap but materialises sample
+  buffers only for the (at most `max_num_ref_frames`) synthetic
+  references that survive the §8.2.5.3 sliding window. Regression
+  pins: `frame_num_gap_fill_is_memory_bounded`,
+  `long_session_reference_store_stays_dpb_bounded`, plus the archived
+  OOM artifact in `tests/fixtures/fuzz_regressions/`. The differential
+  fuzz harness additionally skips inputs carrying SPS NALs it cannot
+  parse-and-size-vet and inputs whose gap exposure
+  (`picture_mbs * MaxFrameNum` with gaps allowed) exceeds a fixed
+  budget — the scheduled-run OOM itself was oracle-side
+  (version-dependent ballooning on a stream whose SPS our parser
+  rejects for an out-of-range cropping window).
+
 ### Added
 
 - Encoder rate control (round 420). `encoder::rate_control` implements

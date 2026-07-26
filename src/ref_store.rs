@@ -15,6 +15,7 @@
 //! Clean-room: derived only from ITU-T Rec. H.264 (08/2024).
 
 use crate::picture::Picture;
+use std::collections::HashMap;
 
 /// Trait the reconstruction layer consumes to fetch reference picture
 /// samples for inter prediction (§8.4.2).
@@ -81,10 +82,18 @@ pub trait RefPicProvider {
 ///      ref-picture-list key arrays (produced by [`crate::ref_list`]).
 ///   3. Pass `&store` into [`crate::reconstruct::reconstruct_slice`].
 ///
-/// `pictures` is a sparse `Vec<Option<Picture>>` indexed by key, so
-/// callers can reuse numeric keys across pictures.
+/// `pictures` maps caller-supplied numeric keys to stored pictures.
+/// Keys may be minted monotonically without bounding memory: callers
+/// prune dropped references via [`RefPicStore::retain_keys`], so the
+/// live set stays at DPB size (§8.2.5 keeps at most
+/// `max_num_ref_frames` + in-flight pictures marked "used for
+/// reference"). A sparse `Vec<Option<Picture>>` indexed by key was
+/// used before round 430; with monotonic keys that representation
+/// retained EVERY picture ever decoded for the whole session
+/// (unbounded growth — the 2026-07-25 scheduled-fuzz OOM triage
+/// surfaced it).
 pub struct RefPicStore {
-    pictures: Vec<Option<Picture>>,
+    pictures: HashMap<u32, Picture>,
     ref_pic_list_0: Vec<u32>,
     ref_pic_list_1: Vec<u32>,
 }
@@ -98,19 +107,35 @@ impl Default for RefPicStore {
 impl RefPicStore {
     pub fn new() -> Self {
         Self {
-            pictures: Vec::new(),
+            pictures: HashMap::new(),
             ref_pic_list_0: Vec::new(),
             ref_pic_list_1: Vec::new(),
         }
     }
 
-    /// Insert a picture at `key`. Grows the storage vector as needed.
+    /// Insert (or replace) the picture stored at `key`.
     pub fn insert(&mut self, key: u32, pic: Picture) {
-        let k = key as usize;
-        if k >= self.pictures.len() {
-            self.pictures.resize_with(k + 1, || None);
-        }
-        self.pictures[k] = Some(pic);
+        self.pictures.insert(key, pic);
+    }
+
+    /// Drop every stored picture whose key is NOT in `live`.
+    ///
+    /// §8.2.5 — once a reference picture is marked "unused for
+    /// reference" (sliding window or MMCO) no later slice can name it
+    /// in a reference picture list, so its samples are dead weight.
+    /// The decoder calls this after each marking pass with the keys
+    /// still present in its DPB so store memory stays bounded by the
+    /// DPB size instead of growing with every reference picture of
+    /// the session. `live` is at most DPB-sized, so the linear
+    /// `contains` scan is cheap.
+    pub fn retain_keys(&mut self, live: &[u32]) {
+        self.pictures.retain(|k, _| live.contains(k));
+    }
+
+    /// Number of pictures currently stored. Exposed for the decoder's
+    /// bounded-memory accounting (and its regression tests).
+    pub fn stored_count(&self) -> usize {
+        self.pictures.len()
     }
 
     /// Replace the RefPicList0 key array.
@@ -125,7 +150,7 @@ impl RefPicStore {
 
     /// Fetch a picture directly by key.
     pub fn get_by_key(&self, key: u32) -> Option<&Picture> {
-        self.pictures.get(key as usize).and_then(|p| p.as_ref())
+        self.pictures.get(&key)
     }
 }
 
@@ -169,7 +194,7 @@ mod tests {
         s.insert(0, pic(16, 10));
         s.insert(3, pic(16, 40));
         assert!(s.get_by_key(0).is_some());
-        // Sparse slot at 1 and 2 is None.
+        // Keys never inserted resolve to None.
         assert!(s.get_by_key(1).is_none());
         assert!(s.get_by_key(2).is_none());
         assert!(s.get_by_key(3).is_some());
@@ -196,6 +221,29 @@ mod tests {
         s.insert(0, pic(16, 1));
         s.set_list_1(vec![0]);
         assert_eq!(s.ref_pic(1, 0).unwrap().luma[0], 1);
+    }
+
+    /// Round 430 — `retain_keys` drops every picture not named live so
+    /// store memory stays bounded by the DPB instead of accumulating
+    /// one picture per reference frame for the whole session (the
+    /// 2026-07-25 scheduled-fuzz OOM triage found the old sparse-Vec
+    /// store never released anything).
+    #[test]
+    fn store_retain_keys_prunes_dead_pictures() {
+        let mut s = RefPicStore::new();
+        for k in 0..10 {
+            s.insert(k, pic(16, k as i32));
+        }
+        assert_eq!(s.stored_count(), 10);
+        s.retain_keys(&[3, 7]);
+        assert_eq!(s.stored_count(), 2);
+        assert!(s.get_by_key(3).is_some());
+        assert!(s.get_by_key(7).is_some());
+        assert!(s.get_by_key(0).is_none());
+        assert!(s.get_by_key(9).is_none());
+        // Empty live set clears the store.
+        s.retain_keys(&[]);
+        assert_eq!(s.stored_count(), 0);
     }
 
     #[test]

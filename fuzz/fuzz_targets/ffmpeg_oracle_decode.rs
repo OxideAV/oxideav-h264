@@ -82,9 +82,38 @@ const MAX_OURS_FRAMES: usize = 8;
 /// `panic_free_decode` target.
 const MAX_SPS_MBS: u32 = 64 * 64;
 
+/// Budget (in macroblock-frames) for §8.2.5.2 frame_num-gap exposure:
+/// when a parseable SPS allows gaps, the worst-case number of
+/// "non-existing" frames a single slice can force is MaxFrameNum, and
+/// what that costs a decoder is proportional to `picture_mbs *
+/// gap_count`. Our decoder is window-bounded there (round 430), but
+/// the ORACLE is a black box whose gap/concealment memory behaviour is
+/// version-dependent — the 2026-07-25 scheduled run OOMed with ~2.7 GB
+/// live inside the reference's allocator on exactly this input class.
+/// 2^18 mb-frames ≈ a few hundred MB worst-case oracle-side; plenty
+/// for real streams (a 1024x1024 SPS stays allowed up to MaxFrameNum
+/// 64, a 16x16 SPS up to the full 65536).
+const MAX_GAP_MB_FRAMES: u64 = 1 << 18;
+
 /// Pre-scan the Annex-B buffer's SPS NAL units (type 7). Returns false
-/// when any parseable SPS declares a picture larger than
-/// [`MAX_SPS_MBS`] — the input is skipped before either decoder runs.
+/// (skip the input — neither decoder runs) when:
+///
+/// * any SPS NAL FAILS to parse — an SPS we cannot parse is an SPS we
+///   cannot size-vet, and the oracle may still activate its own
+///   (version-dependent) reading of it. The 2026-07-25 scheduled-run
+///   OOM input carried exactly that: an SPS our parser rejects for an
+///   out-of-range frame-cropping window, which one oracle version also
+///   rejects but the CI runner's older build sanitised, activated, and
+///   then ballooned on (~2.7 GB live in its allocator; libFuzzer
+///   rss_limit fired). Unvettable inputs are not worth the risk —
+///   robustness of OUR decoder on them stays covered by the ungated
+///   `panic_free_decode` target;
+/// * any parseable SPS declares a picture larger than [`MAX_SPS_MBS`];
+/// * any parseable SPS allows frame_num gaps whose worst-case
+///   `picture_mbs * MaxFrameNum` product exceeds [`MAX_GAP_MB_FRAMES`]
+///   (§8.2.5.2 non-existing-frame generation is the other
+///   allocation-amplifier the oracle handles in version-dependent
+///   ways).
 fn sps_sizes_are_sane(data: &[u8]) -> bool {
     for nal in AnnexBSplitter::new(data) {
         let Some((&header, payload)) = nal.split_first() else {
@@ -94,10 +123,18 @@ fn sps_sizes_are_sane(data: &[u8]) -> bool {
             continue;
         }
         let rbsp = rbsp_from_nal_payload(payload);
-        if let Ok(sps) = Sps::parse(&rbsp) {
-            let mbs = (sps.pic_width_in_mbs_minus1 + 1)
-                .saturating_mul(sps.pic_height_in_map_units_minus1 + 1);
-            if mbs > MAX_SPS_MBS {
+        let Ok(sps) = Sps::parse(&rbsp) else {
+            // Unparseable SPS — cannot be size-vetted; skip the input.
+            return false;
+        };
+        let mbs = (sps.pic_width_in_mbs_minus1 + 1)
+            .saturating_mul(sps.pic_height_in_map_units_minus1 + 1);
+        if mbs > MAX_SPS_MBS {
+            return false;
+        }
+        if sps.gaps_in_frame_num_value_allowed_flag {
+            let max_frame_num = 1u64 << (sps.log2_max_frame_num_minus4 + 4);
+            if u64::from(mbs).saturating_mul(max_frame_num) > MAX_GAP_MB_FRAMES {
                 return false;
             }
         }
