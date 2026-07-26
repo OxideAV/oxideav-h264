@@ -177,6 +177,9 @@ fn encode_i_slice_data(
     let mut nc_grid = CavlcNcGrid::new(width_mbs, height_mbs);
     let mut intra_grid = IntraGrid::new(width_mbs as usize, height_mbs as usize);
     let mut infos = vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
+    // Constant-QP field picture: the §7.4.5 chain never moves, but the
+    // per-MB writer threads it (every delta stays 0).
+    let mut qp_tracker = super::MbQpTracker { cur: qp_y };
     for mb_y in 0..height_mbs as usize {
         for mb_x in 0..width_mbs as usize {
             let dbl = enc.encode_mb(
@@ -193,6 +196,7 @@ fn encode_i_slice_data(
                 sw,
                 &mut nc_grid,
                 &mut intra_grid,
+                &mut qp_tracker,
             );
             infos[mb_y * width_mbs as usize + mb_x] = dbl;
         }
@@ -333,6 +337,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         chroma_format_idc: 1,
         seq_scaling_lists: None,
         interlaced_fields: true,
+        vui: None,
     });
     let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
         pic_scaling_lists: None,

@@ -16,8 +16,14 @@
 //! [`SessionConfig::cabac`].
 
 use crate::encoder::nal::build_filler_nal;
-use crate::encoder::rate_control::{RateControlConfig, RateController, RcFrameKind};
+use crate::encoder::rate_control::{
+    RateControlConfig, RateControlMode, RateController, RcFrameKind,
+};
+use crate::encoder::sei::{
+    build_buffering_period_payload, build_pic_timing_payload, build_sei_nal,
+};
 use crate::encoder::{EncodedFrameRef, EncodedIdr, EncodedP, Encoder, EncoderConfig, YuvFrame};
+use crate::vui::{HrdParameters, TimingInfo, VuiParameters};
 
 /// Rate-control selection for a session.
 #[derive(Debug, Clone, Copy)]
@@ -79,8 +85,16 @@ pub struct SessionFrame {
     pub is_idr: bool,
     /// QP the picture was finally encoded at (after any VBV retry).
     pub qp: i32,
-    /// Picture payload size in bits (excluding filler).
+    /// Access-unit payload size in bits (excluding filler). Includes
+    /// the HRD annotation SEI of rate-controlled sessions — those
+    /// bits ride the same channel and the CPB model accounts for
+    /// them.
     pub payload_bits: u64,
+    /// Round-430 — bits of the HRD annotation SEI included in
+    /// `payload_bits` (0 for constant-QP sessions). Lets quality-per-
+    /// coding-bit comparisons (RD curves vs unannotated fixed-QP
+    /// anchors) separate picture coding from metadata overhead.
+    pub sei_bits: u64,
     /// Filler bits appended after the picture (CBR underspend), 0
     /// otherwise.
     pub filler_bits: u64,
@@ -107,11 +121,73 @@ pub struct EncoderSession {
     enc: Encoder,
     cfg: SessionConfig,
     rc: Option<RateController>,
+    /// Round-430 — §E.1.2 NAL HRD block emitted in the SPS VUI of
+    /// rate-controlled sessions; also supplies the §D.1.2 / §D.1.3
+    /// field widths for the buffering_period / pic_timing SEI. `None`
+    /// for constant-QP sessions (no HRD annotation).
+    hrd: Option<HrdParameters>,
     /// Absolute frame index (0-based).
     idx: u64,
     /// Most recent reference picture (None before the first frame and
     /// right after construction).
     prev: Option<PrevPic>,
+}
+
+/// Round-430 — derive the §E.1.2 NAL HRD block from the rate-control
+/// config. One CPB schedule (SchedSelIdx 0): BitRate is the Annex C
+/// arrival (channel) rate, CpbSize the VBV size, `cbr_flag` set in CBR
+/// mode. Values are coded at scale 0 (64-bit-per-second / 16-bit
+/// granularity), rounded UP so the declared bucket never understates
+/// the model.
+fn session_hrd_parameters(rcfg: &RateControlConfig) -> HrdParameters {
+    let arrival = match rcfg.mode {
+        RateControlMode::Cbr => rcfg.target_bitrate,
+        RateControlMode::CappedVbr => rcfg.max_bitrate.max(rcfg.target_bitrate),
+    };
+    HrdParameters {
+        cpb_cnt_minus1: 0,
+        bit_rate_scale: 0,
+        cpb_size_scale: 0,
+        // §E.2.2 — BitRate[0] = (bit_rate_value_minus1 + 1) << (6 + 0).
+        bit_rate_value_minus1: vec![arrival.div_ceil(64) - 1],
+        // §E.2.2 — CpbSize[0] = (cpb_size_value_minus1 + 1) << (4 + 0).
+        cpb_size_value_minus1: vec![rcfg.vbv_buffer_bits.div_ceil(16) - 1],
+        cbr_flag: vec![rcfg.mode == RateControlMode::Cbr],
+        // 24-bit delay fields (90 kHz units) + 24-bit time_offset —
+        // ample for any buffer this controller models.
+        initial_cpb_removal_delay_length_minus1: 23,
+        cpb_removal_delay_length_minus1: 23,
+        dpb_output_delay_length_minus1: 23,
+        time_offset_length: 24,
+    }
+}
+
+/// Insert `sei` (a complete Annex B SEI NAL) immediately before the
+/// first VCL NAL (type 1..=5) of `annex_b`. §7.4.1.2.3 — SEI NALs
+/// must precede the slices of the access unit they describe; the
+/// encoder entry points return `[SPS, PPS,] slice`, so the SEI slots
+/// in right before the slice. Every NAL our encoder emits uses the
+/// 4-byte start code.
+fn insert_sei_before_first_vcl(annex_b: &[u8], sei: &[u8]) -> Vec<u8> {
+    let mut insert_at = annex_b.len();
+    let mut i = 0usize;
+    while i + 4 < annex_b.len() {
+        if annex_b[i..i + 4] == [0, 0, 0, 1] {
+            let nal_type = annex_b[i + 4] & 0x1F;
+            if (1..=5).contains(&nal_type) {
+                insert_at = i;
+                break;
+            }
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(annex_b.len() + sei.len());
+    out.extend_from_slice(&annex_b[..insert_at]);
+    out.extend_from_slice(sei);
+    out.extend_from_slice(&annex_b[insert_at..]);
+    out
 }
 
 /// Maximum VBV re-encode attempts per picture. Each retry raises QP
@@ -139,16 +215,40 @@ impl EncoderSession {
         if let SessionRateControl::ConstantQp(qp) = cfg.rate_control {
             ecfg.qp = qp;
         }
-        let rc = match cfg.rate_control {
-            SessionRateControl::ConstantQp(_) => None,
+        let (rc, hrd) = match cfg.rate_control {
+            SessionRateControl::ConstantQp(_) => (None, None),
             SessionRateControl::Controlled(rcfg) => {
-                Some(RateController::new(rcfg, cfg.width, cfg.height))
+                // Round-430 — HRD/VUI signalling: annotate the stream
+                // with §E.1.1 timing info + a §E.1.2 NAL HRD block
+                // matching the Annex C leaky-bucket model the
+                // controller runs, so the CBR contract is declared
+                // in-band (buffering_period / pic_timing SEI carry the
+                // per-AU schedule below).
+                let hrd = session_hrd_parameters(&rcfg);
+                ecfg.vui = Some(VuiParameters {
+                    timing_info: Some(TimingInfo {
+                        // §E.2.1 — frame duration = 2 clock ticks under
+                        // fixed_frame_rate_flag (field-based ticks):
+                        // fps = time_scale / (2 * num_units_in_tick).
+                        num_units_in_tick: rcfg.fps_den,
+                        time_scale: 2 * rcfg.fps_num,
+                        fixed_frame_rate_flag: true,
+                    }),
+                    nal_hrd_parameters: Some(hrd.clone()),
+                    low_delay_hrd_flag: Some(false),
+                    ..VuiParameters::default()
+                });
+                (
+                    Some(RateController::new(rcfg, cfg.width, cfg.height)),
+                    Some(hrd),
+                )
             }
         };
         Self {
             enc: Encoder::new(ecfg),
             cfg,
             rc,
+            hrd,
             idx: 0,
             prev: None,
         }
@@ -175,25 +275,33 @@ impl EncoderSession {
         row_budget_bits: Option<u64>,
     ) -> PrevPic {
         if is_idr {
-            let e = if self.cfg.cabac {
-                self.enc.encode_idr_cabac_with_qp(frame, qp)
-            } else {
-                self.enc.encode_idr_with_qp(frame, qp)
+            // Round 430 — rate-controlled sessions row-modulate IDR
+            // pictures too (they are the largest of a CBR GOP; a
+            // mid-frame overshoot used to cost a whole VBV re-encode).
+            let e = match (self.cfg.cabac, row_budget_bits) {
+                (true, Some(budget)) => self.enc.encode_idr_cabac_rate_adaptive(frame, qp, budget),
+                (true, None) => self.enc.encode_idr_cabac_with_qp(frame, qp),
+                (false, Some(budget)) => self.enc.encode_idr_rate_adaptive(frame, qp, budget),
+                (false, None) => self.enc.encode_idr_with_qp(frame, qp),
             };
             PrevPic::Idr(e)
         } else {
             let prev = self.prev.as_ref().expect("P frame requires a reference");
             let r = prev.as_ref();
-            let e = if self.cfg.cabac {
-                self.enc
-                    .encode_p_cabac_with_qp(frame, &r, frame_num, poc_lsb, qp)
-            } else if let Some(budget) = row_budget_bits {
-                // CAVLC + rate control: MB-row QP modulation toward
-                // the controller's per-frame target.
-                self.enc
-                    .encode_p_rate_adaptive(frame, &r, frame_num, poc_lsb, qp, budget)
-            } else {
-                self.enc.encode_p_with_qp(frame, &r, frame_num, poc_lsb, qp)
+            // Rate control: MB-row QP modulation toward the
+            // controller's per-frame target (round 420 CAVLC, round
+            // 430 CABAC).
+            let e = match (self.cfg.cabac, row_budget_bits) {
+                (true, Some(budget)) => self
+                    .enc
+                    .encode_p_cabac_rate_adaptive(frame, &r, frame_num, poc_lsb, qp, budget),
+                (true, None) => self
+                    .enc
+                    .encode_p_cabac_with_qp(frame, &r, frame_num, poc_lsb, qp),
+                (false, Some(budget)) => self
+                    .enc
+                    .encode_p_rate_adaptive(frame, &r, frame_num, poc_lsb, qp, budget),
+                (false, None) => self.enc.encode_p_with_qp(frame, &r, frame_num, poc_lsb, qp),
             };
             PrevPic::P(e)
         }
@@ -230,6 +338,43 @@ impl EncoderSession {
             RcFrameKind::P
         };
 
+        // Round-430 — HRD annotation SEI: every rate-controlled AU
+        // carries a §D.1.3 pic_timing (cpb_removal_delay in §E.2.1
+        // clock ticks since the last buffering-period AU — 2 per frame
+        // under the field-based tick — and dpb_output_delay 0: this
+        // IPP session outputs each picture at its removal time); IDR
+        // AUs additionally lead with a §D.1.2 buffering_period whose
+        // initial_cpb_removal_delay is the controller's modelled CPB
+        // fill converted to 90 kHz units.
+        let sei_nal: Option<Vec<u8>> = match (&self.hrd, &self.rc) {
+            (Some(hrd), Some(rc)) => {
+                let mut msgs = Vec::new();
+                if is_idr {
+                    let rcfg = rc.config();
+                    let arrival = match rcfg.mode {
+                        RateControlMode::Cbr => f64::from(rcfg.target_bitrate),
+                        RateControlMode::CappedVbr => {
+                            f64::from(rcfg.max_bitrate.max(rcfg.target_bitrate))
+                        }
+                    };
+                    // §D.2.2 — 90 kHz units; delay > 0 mandated.
+                    let delay = ((90_000.0 * rc.cpb_fullness() / arrival).round() as u32).max(1);
+                    let full =
+                        (90_000.0 * f64::from(rcfg.vbv_buffer_bits) / arrival).round() as u32;
+                    let offset = full.saturating_sub(delay);
+                    msgs.push((
+                        0u32,
+                        build_buffering_period_payload(0, hrd, &[(delay, offset)]),
+                    ));
+                }
+                let cpb_removal_delay = (2 * idx_in_gop) as u32;
+                msgs.push((1u32, build_pic_timing_payload(hrd, cpb_removal_delay, 0)));
+                Some(build_sei_nal(&msgs))
+            }
+            _ => None,
+        };
+        let sei_bits = sei_nal.as_ref().map_or(0, |s| 8 * s.len() as u64);
+
         let rc_plan = self
             .rc
             .as_ref()
@@ -253,14 +398,16 @@ impl EncoderSession {
                 // VBV hard-cap retry: the stateless encoder makes
                 // re-encoding at a higher QP a pure call.
                 for _ in 0..MAX_VBV_RETRIES {
-                    let bits = 8 * pic_annex_b(&pic).len() as u64;
+                    let bits = sei_bits + 8 * pic_annex_b(&pic).len() as u64;
                     if bits <= plan.max_bits || qp >= max_qp {
                         break;
                     }
                     qp = (qp + 2).min(max_qp);
                     pic = self.encode_at(&frame, is_idr, frame_num, poc_lsb, qp, row_budget);
                 }
-                let bits = 8 * pic_annex_b(&pic).len() as u64;
+                // The SEI annotation rides the same channel — count it
+                // in the committed AU size so the CPB model stays honest.
+                let bits = sei_bits + 8 * pic_annex_b(&pic).len() as u64;
                 let outcome = self
                     .rc
                     .as_mut()
@@ -270,8 +417,13 @@ impl EncoderSession {
             }
         };
 
-        let payload_bits = 8 * pic_annex_b(&pic).len() as u64;
-        let mut annex_b = pic_annex_b(&pic).to_vec();
+        let payload_bits = sei_bits + 8 * pic_annex_b(&pic).len() as u64;
+        let mut annex_b = match &sei_nal {
+            // §7.4.1.2.3 — the SEI precedes the slices of its AU
+            // (after SPS/PPS on IDR frames).
+            Some(sei) => insert_sei_before_first_vcl(pic_annex_b(&pic), sei),
+            None => pic_annex_b(&pic).to_vec(),
+        };
         let mut emitted_filler = 0u64;
         if filler_bits > 0 {
             // Whole-NAL rounding: 6 fixed bytes (start code + header +
@@ -295,6 +447,7 @@ impl EncoderSession {
             is_idr,
             qp: qp_used,
             payload_bits,
+            sei_bits,
             filler_bits: emitted_filler,
         }
     }

@@ -1882,6 +1882,40 @@ impl Encoder {
     /// and the §9.3.1.1 context initialisation runs at the resulting
     /// SliceQP_Y. `frame_qp` must be in 0..=51.
     pub fn encode_idr_cabac_with_qp(&self, frame: &YuvFrame<'_>, frame_qp: i32) -> EncodedIdr {
+        self.encode_idr_cabac_impl(frame, frame_qp, None)
+    }
+
+    /// [`encode_idr_cabac_with_qp`](Self::encode_idr_cabac_with_qp)
+    /// plus **MB-row QP modulation** toward a whole-picture bit budget
+    /// (round 430) — the IDR counterpart of
+    /// [`encode_p_cabac_rate_adaptive`](Self::encode_p_cabac_rate_adaptive).
+    /// IDR pictures are the largest of a CBR GOP, so a mid-frame
+    /// overshoot here is exactly where the VBV retry loop used to pay
+    /// a whole re-encode; row modulation absorbs most of it in-slice.
+    /// Row-QP steps ride §7.4.5 `mb_qp_delta` under the §9.3.3.1.1.5
+    /// prev-delta-nonzero context chain (Intra_16x16 always carries
+    /// the delta; I_NxN only when cbp > 0, resetting the chain
+    /// otherwise). 4:2:0 only, mirroring the P-path entry.
+    pub fn encode_idr_cabac_rate_adaptive(
+        &self,
+        frame: &YuvFrame<'_>,
+        frame_qp: i32,
+        frame_budget_bits: u64,
+    ) -> EncodedIdr {
+        assert_eq!(
+            self.config().chroma_format_idc,
+            1,
+            "encode_idr_cabac_rate_adaptive requires 4:2:0"
+        );
+        self.encode_idr_cabac_impl(frame, frame_qp, Some(frame_budget_bits))
+    }
+
+    fn encode_idr_cabac_impl(
+        &self,
+        frame: &YuvFrame<'_>,
+        frame_qp: i32,
+        row_budget_bits: Option<u64>,
+    ) -> EncodedIdr {
         assert!(
             (0..=51).contains(&frame_qp),
             "frame_qp {frame_qp} out of 0..=51"
@@ -1932,7 +1966,6 @@ impl Encoder {
             _ => height / 2,
         };
 
-        let qp_y = frame_qp;
         // §8.5.8 BD-aware chroma-QP. `qp_bd_offset_c = 6 *
         // bit_depth_chroma_minus8` extends the eq. 8-311 qPI clamp
         // from 0..=51 to −QpBdOffsetC..=51. Today the SPS pins
@@ -1941,7 +1974,13 @@ impl Encoder {
         // a future High10/422/444 round wire a non-zero BD without
         // re-touching the encoder math.
         let qp_bd_offset_c = qp_bd_offset(cfg.bit_depth_chroma_minus8);
-        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
+        // §7.4.5 decoded-QP chain (round 430) — see
+        // `encode_p_cabac_impl`: `chain_qp` is the decoder's rolling
+        // QP_Y, `want_qp` the row-modulated target. Without a row
+        // budget both stay at `frame_qp` and the bitstream matches the
+        // pre-round-430 output exactly.
+        let mut chain_qp = frame_qp;
+        let mut want_qp = frame_qp;
 
         // §A.2.4 — the 8x8 transform requires High profile; scaling
         // matrices likewise need the §7.3.2.1.1 chroma-extended SPS
@@ -1964,6 +2003,9 @@ impl Encoder {
             max_num_ref_frames: cfg.max_num_ref_frames,
             profile_idc,
             chroma_format_idc: cfg.chroma_format_idc,
+            // Round-430 — rate-controlled sessions annotate CBR
+            // streams with §E.1.1 VUI timing + §E.1.2 NAL HRD.
+            vui: cfg.vui.clone(),
         });
         let pps_cfg = BaselinePpsConfig {
             pic_scaling_lists: cfg.scaling_matrix.pic_spec(),
@@ -2015,7 +2057,9 @@ impl Encoder {
 
         // ---- CABAC engine setup ----
         let mut cabac = CabacEncoder::new();
-        let mut ctxs = CabacContexts::init(SliceKind::I, None, qp_y).expect("ctx init");
+        // §9.3.1.1 — context variables initialise from SliceQP_Y (the
+        // slice-header QP), NOT the row-modulated per-MB QP.
+        let mut ctxs = CabacContexts::init(SliceKind::I, None, frame_qp).expect("ctx init");
 
         // §8.5.9 — effective intra weightScale (round-391): all intra
         // shapes on this path quantise / dequantise under it. Flat mode
@@ -2037,6 +2081,32 @@ impl Encoder {
         let mut i8x8_mb_count = 0u32;
 
         for mb_y in 0..height_mbs {
+            // Round 430 — MB-row QP modulation (IDR): identical
+            // response curve to `encode_p_cabac_impl` (see there for
+            // the rationale on the asymmetric clamp windows).
+            if let Some(budget) = row_budget_bits {
+                if mb_y > 0 && budget > 0 {
+                    let frac = mb_y as f64 / height_mbs as f64;
+                    let spent = (sw.bits_emitted() + cabac.bits_emitted()) as f64;
+                    let expected = (budget as f64 * frac).max(1.0);
+                    let ratio = spent.max(1.0) / expected;
+                    let adj = if ratio >= 1.0 {
+                        (6.0 * ratio.log2()).round() as i32
+                    } else {
+                        (3.0 * ratio.log2()).round() as i32
+                    };
+                    let mut new_want = frame_qp + adj;
+                    if new_want < frame_qp && frac < 0.6 {
+                        new_want = frame_qp;
+                    }
+                    want_qp = new_want
+                        .clamp(want_qp - 1, want_qp + 2)
+                        .clamp(frame_qp - 2, frame_qp + 6)
+                        .clamp(0, 51);
+                }
+            }
+            let qp_y = want_qp;
+            let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
             for mb_x in 0..width_mbs {
                 let mb_addr = mb_y * width_mbs + mb_x;
                 let nb = build_neighbour_ctx(&grid, mb_x, mb_y);
@@ -2378,12 +2448,20 @@ impl Encoder {
                         cbp_luma_i8x8,
                         cbp_chroma,
                     );
-                    // mb_qp_delta only when any CBP bit is set.
+                    // mb_qp_delta only when any CBP bit is set —
+                    // §7.4.5: only then does the decoded QP_Y chain
+                    // advance to this MB's (row-modulated) QP.
                     if cbp_luma_i8x8 > 0 || cbp_chroma > 0 {
-                        encode_mb_qp_delta(&mut cabac, &mut ctxs, prev_mb_qp_delta_nonzero, 0);
+                        let qpd = qp_y - chain_qp;
+                        chain_qp = qp_y;
+                        encode_mb_qp_delta(&mut cabac, &mut ctxs, prev_mb_qp_delta_nonzero, qpd);
+                        // §9.3.3.1.1.5 — the next MB's bin-0 ctxIdxInc
+                        // follows whether THIS delta was non-zero.
+                        prev_mb_qp_delta_nonzero = qpd != 0;
+                    } else {
+                        // Absent → decoder infers 0; chain QP unchanged.
+                        prev_mb_qp_delta_nonzero = false;
                     }
-                    // Absent or zero → the next MB's bin-0 ctxIdxInc sees 0.
-                    prev_mb_qp_delta_nonzero = false;
 
                     // Mark the running slot for in-MB neighbour reads.
                     {
@@ -2460,8 +2538,12 @@ impl Encoder {
                     }
 
                     // No coded_block_pattern (carried by mb_type for Intra_16x16).
-                    // mb_qp_delta — always present for Intra_16x16.
-                    let qp_delta = 0i32;
+                    // mb_qp_delta — always present for Intra_16x16
+                    // (§7.3.5: the luma DC block is always coded), so
+                    // the chain steps onto the row-modulated QP here
+                    // unconditionally.
+                    let qp_delta = qp_y - chain_qp;
+                    chain_qp = qp_y;
                     encode_mb_qp_delta(&mut cabac, &mut ctxs, prev_mb_qp_delta_nonzero, qp_delta);
                     prev_mb_qp_delta_nonzero = qp_delta != 0;
 
@@ -2742,7 +2824,11 @@ impl Encoder {
                 };
                 let dbl = MbDeblockInfo {
                     is_intra: true,
-                    qp_y,
+                    // §7.4.5 / §8.7 — the decoder's chain QP_Y: equals
+                    // `qp_y` when this MB carried a delta (Intra_16x16
+                    // always; I_NxN with cbp > 0), otherwise the
+                    // inherited previous-MB QP.
+                    qp_y: chain_qp,
                     luma_nonzero_4x4: luma_nz_mask_from_blocks(&any_ac_per4x4),
                     chroma_nonzero_4x4,
                     transform_size_8x8_flag: is_i8x8_mb,
@@ -2838,6 +2924,59 @@ impl Encoder {
         pic_order_cnt_lsb: u32,
         frame_qp: i32,
     ) -> EncodedP {
+        self.encode_p_cabac_impl(frame, prev, frame_num, pic_order_cnt_lsb, frame_qp, None)
+    }
+
+    /// [`encode_p_cabac_with_qp`](Self::encode_p_cabac_with_qp) plus
+    /// **MB-row QP modulation** toward a whole-slice bit budget — the
+    /// CABAC counterpart of
+    /// [`encode_p_rate_adaptive`](Self::encode_p_rate_adaptive)
+    /// (round 430; round 420 landed the CAVLC path only).
+    ///
+    /// Row-QP steps ride the §7.4.5 `mb_qp_delta` syntax, binarised
+    /// per §9.3.2.7 and coded with the §9.3.3.1.1.5 context chain:
+    /// ctxIdxInc(bin 0) is 1 exactly when the PREVIOUS MB in decoding
+    /// order carried a non-zero `mb_qp_delta` — P_Skip MBs and coded
+    /// MBs without residual (cbp == 0) reset the chain, and the
+    /// encoder mirrors that decoder-side rolling state bit-exactly.
+    /// The decoded QP_Y chain (skip / cbp==0 MBs inherit the previous
+    /// QP) also feeds the §8.7 deblock strengths, exactly as the
+    /// decoder derives them.
+    ///
+    /// 4:2:0 only, mirroring the CAVLC entry point.
+    pub fn encode_p_cabac_rate_adaptive(
+        &self,
+        frame: &YuvFrame<'_>,
+        prev: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+        frame_budget_bits: u64,
+    ) -> EncodedP {
+        assert_eq!(
+            self.config().chroma_format_idc,
+            1,
+            "encode_p_cabac_rate_adaptive requires 4:2:0"
+        );
+        self.encode_p_cabac_impl(
+            frame,
+            prev,
+            frame_num,
+            pic_order_cnt_lsb,
+            frame_qp,
+            Some(frame_budget_bits),
+        )
+    }
+
+    fn encode_p_cabac_impl(
+        &self,
+        frame: &YuvFrame<'_>,
+        prev: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+        row_budget_bits: Option<u64>,
+    ) -> EncodedP {
         assert!(
             (0..=51).contains(&frame_qp),
             "frame_qp {frame_qp} out of 0..=51"
@@ -2877,10 +3016,17 @@ impl Encoder {
             2 => (8usize, 16usize),
             _ => (8usize, 8usize),
         };
-        let qp_y = frame_qp;
         // §8.5.8 BD-aware chroma-QP — see encode_idr_cabac; identical reasoning.
         let qp_bd_offset_c = qp_bd_offset(cfg.bit_depth_chroma_minus8);
-        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
+        // §7.4.5 decoded-QP chain (round 430): `chain_qp` is the QP_Y
+        // the decoder holds after the most recent MB — the predictor
+        // for the next `mb_qp_delta`. `want_qp` is the row-modulated
+        // target QP; the two diverge only until the next MB with coded
+        // residual carries the delta. Without a row budget both stay
+        // pinned at `frame_qp` and every emitted delta is 0, matching
+        // the pre-round-430 bitstream exactly.
+        let mut chain_qp = frame_qp;
+        let mut want_qp = frame_qp;
 
         // SPS / PPS not re-emitted (caller shipped them with IDR).
         let mut stream: Vec<u8> = Vec::new();
@@ -2912,7 +3058,9 @@ impl Encoder {
         }
 
         let mut cabac = CabacEncoder::new();
-        let mut ctxs = CabacContexts::init(SliceKind::P, Some(0), qp_y).expect("ctx init");
+        // §9.3.1.1 — context variables initialise from SliceQP_Y (the
+        // slice-header QP), NOT the row-modulated per-MB QP.
+        let mut ctxs = CabacContexts::init(SliceKind::P, Some(0), frame_qp).expect("ctx init");
 
         let mut recon_y = vec![0u8; width * height];
         let mut recon_u = vec![0u8; chroma_w * chroma_h];
@@ -2930,6 +3078,37 @@ impl Encoder {
         // simply won't pick P_Skip in those cases (cbp will be non-zero
         // or MV will differ).
         for mb_y in 0..height_mbs {
+            // Round 430 — MB-row QP modulation, CABAC counterpart of
+            // the round-420 CAVLC controller (same response curve, see
+            // `encode_p_impl`): compare bits spent so far (slice
+            // header + arithmetic payload) against the pro-rata share
+            // of the slice budget, step the working QP by up to +2 /
+            // −1 per row inside frame_qp −2..+6. Overshoot reacts
+            // fast, undershoot is only trusted once 60% of the slice
+            // has proven cheap.
+            if let Some(budget) = row_budget_bits {
+                if mb_y > 0 && budget > 0 {
+                    let frac = mb_y as f64 / height_mbs as f64;
+                    let spent = (sw.bits_emitted() + cabac.bits_emitted()) as f64;
+                    let expected = (budget as f64 * frac).max(1.0);
+                    let ratio = spent.max(1.0) / expected;
+                    let adj = if ratio >= 1.0 {
+                        (6.0 * ratio.log2()).round() as i32
+                    } else {
+                        (3.0 * ratio.log2()).round() as i32
+                    };
+                    let mut new_want = frame_qp + adj;
+                    if new_want < frame_qp && frac < 0.6 {
+                        new_want = frame_qp;
+                    }
+                    want_qp = new_want
+                        .clamp(want_qp - 1, want_qp + 2)
+                        .clamp(frame_qp - 2, frame_qp + 6)
+                        .clamp(0, 51);
+                }
+            }
+            let qp_y = want_qp;
+            let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
             for mb_x in 0..width_mbs {
                 let mb_addr = mb_y * width_mbs + mb_x;
 
@@ -3352,7 +3531,10 @@ impl Encoder {
                     );
                     mb_dbl[mb_addr] = MbDeblockInfo {
                         is_intra: false,
-                        qp_y,
+                        // §7.4.5 — a skipped MB carries no mb_qp_delta;
+                        // the decoder keeps the previous chain QP_Y and
+                        // the §8.7 strengths follow it.
+                        qp_y: chain_qp,
                         luma_nonzero_4x4: 0,
                         chroma_nonzero_4x4: 0,
                         mv_l0: [skip_mv_t; 16],
@@ -3422,14 +3604,22 @@ impl Encoder {
                 // mb_qp_delta if cbp > 0.
                 let needs_qpd = cbp_luma > 0 || cbp_chroma > 0;
                 if needs_qpd {
-                    let qpd = 0i32;
+                    // §7.4.5 — step the decoded QP_Y chain onto the
+                    // row-modulated target (delta 0 while they agree).
+                    // §9.3.3.1.1.5 — ctxIdxInc(bin 0) of the NEXT
+                    // mb_qp_delta follows whether THIS one was
+                    // non-zero; the residual was quantised at `qp_y`,
+                    // which the decoder now adopts via the delta.
+                    let qpd = qp_y - chain_qp;
+                    chain_qp = qp_y;
                     encode_mb_qp_delta(&mut cabac, &mut ctxs, prev_mb_qp_delta_nonzero, qpd);
                     prev_mb_qp_delta_nonzero = qpd != 0;
                 } else {
                     // §9.3.3.1.1.5 — when mb_qp_delta is not present, the
                     // decoder treats it as 0 → prev_mb_qp_delta_nonzero
                     // becomes false. Mirror that here so the next MB's
-                    // ctxIdxInc(bin 0) lookup is identical.
+                    // ctxIdxInc(bin 0) lookup is identical. The chain
+                    // QP_Y likewise stays at the previous MB's value.
                     prev_mb_qp_delta_nonzero = false;
                 }
 
@@ -3857,7 +4047,10 @@ impl Encoder {
                 };
                 mb_dbl[mb_addr] = MbDeblockInfo {
                     is_intra: false,
-                    qp_y,
+                    // §7.4.5 / §8.7 — the decoder's chain QP_Y: equals
+                    // `qp_y` when this MB carried a delta (cbp > 0),
+                    // otherwise the inherited previous-MB QP.
+                    qp_y: chain_qp,
                     luma_nonzero_4x4: luma_nz_mask_from_blocks(&blk_has_nz),
                     chroma_nonzero_4x4,
                     mv_l0: [mv_t; 16],

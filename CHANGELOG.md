@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Encoder rate-control signalling completion (round 430, the r420
+  follow-ups). MB-row QP modulation now covers every slice kind the
+  GOP sessions drive: the **CABAC P** path
+  (`encode_p_cabac_rate_adaptive` — §7.4.5 `mb_qp_delta` under the
+  §9.3.3.1.1.5 prev-delta-nonzero context chain, with P_Skip / cbp==0
+  chain resets mirrored decoder-exactly) and **IDR pictures** on both
+  entropy coders (`encode_idr_rate_adaptive` /
+  `encode_idr_cabac_rate_adaptive` — Intra_16x16 always carries the
+  delta, I_NxN only with cbp > 0, and the §8.7 deblock-QP chain
+  follows the decoder's derivation through the CAVLC RDO trials).
+  **HRD/VUI signalling**: `BaselineSpsConfig::vui` +
+  `write_vui_parameters` / `write_hrd_parameters` (§E.1.1/§E.1.2
+  write side, field-for-field mirror of the parse side) and
+  `encoder::sei` with `buffering_period` / `pic_timing` writers
+  (§D.1.2/§D.1.3 + §7.3.2.3 framing). Rate-controlled
+  `EncoderSession`s now annotate their streams in-band: SPS VUI
+  timing info (field-based ticks, fixed frame rate) + a NAL HRD block
+  mirroring the controller's Annex C bucket (`cbr_flag` per mode,
+  round-up-to-granule BitRate/CpbSize), a buffering-period SEI on
+  every IDR (initial_cpb_removal_delay from the modelled CPB fill)
+  and a pic-timing SEI on every access unit; the SEI bits are
+  committed to the CPB model and reported via
+  `SessionFrame::sei_bits`. Validation: byte-exact roundtrips
+  (own + black-box reference decoder) for row-modulated CABAC-P /
+  CAVLC-IDR / CABAC-IDR streams incl. non-zero delta chains
+  (`integration_row_qp_cabac_idr.rs`), and HRD acceptance —
+  field-exact SPS/VUI/SEI re-parse through our own parsers, strict
+  `err_detect`-hard black-box decode, and black-box probing deriving
+  the tick rate from our VUI (`integration_hrd_signalling.rs`).
+
 ### Fixed
 
 - Decoder memory bounds (round 430, from the 2026-07-25 scheduled-fuzz

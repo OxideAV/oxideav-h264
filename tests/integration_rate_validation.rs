@@ -92,6 +92,9 @@ fn make_frame(sig: Signal, n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 
 struct RunResult {
     payload_bits_total: u64,
+    /// Round-430 — HRD-annotation SEI bits contained in
+    /// `payload_bits_total` (0 for constant-QP anchors).
+    sei_bits_total: u64,
     payload_bits_tail: u64,
     /// Payload + CBR filler over the tail window.
     sent_bits_tail: u64,
@@ -116,6 +119,7 @@ fn run_and_measure(
     let mut stream = Vec::new();
     let mut sources: Vec<Vec<u8>> = Vec::new();
     let mut total = 0u64;
+    let mut sei_total = 0u64;
     let mut tail = 0u64;
     let mut sent_tail = 0u64;
     let mut fullness_at_skip = 0.0f64;
@@ -129,6 +133,7 @@ fn run_and_measure(
         let (y, u, v) = make_frame(sig, n);
         let sf = session.encode_frame(&y, &u, &v);
         total += sf.payload_bits;
+        sei_total += sf.sei_bits;
         if n >= skip {
             tail += sf.payload_bits;
             sent_tail += sf.payload_bits + sf.filler_bits;
@@ -173,6 +178,7 @@ fn run_and_measure(
 
     RunResult {
         payload_bits_total: total,
+        sei_bits_total: sei_total,
         payload_bits_tail: tail,
         sent_bits_tail: sent_tail,
         fullness_at_skip,
@@ -310,7 +316,13 @@ fn rate_control_holds_the_rd_curve() {
     // CBR at the middle anchor's rate.
     let target = anchors[1].0.round() as u32;
     let r = run_and_measure(cbr_session(target), Signal::SceneCut, 60, 0);
-    let cbr_bps = r.payload_bits_total as f64 / (r.frames as f64 / FPS);
+    let cbr_channel_bps = r.payload_bits_total as f64 / (r.frames as f64 / FPS);
+    // Round-430 — rate-controlled sessions annotate the stream with
+    // HRD SEI (buffering_period / pic_timing). Those bits are channel
+    // payload but not picture coding; at this deliberately tiny test
+    // rate they are a measurable share, so the RD comparison against
+    // the UNANNOTATED fixed-QP anchors runs on picture-coding bits.
+    let cbr_bps = (r.payload_bits_total - r.sei_bits_total) as f64 / (r.frames as f64 / FPS);
     eprintln!(
         "CBR @ {target} bps: {cbr_bps:.0} bps, PSNR_Y {:.2} dB (anchor {:.2} dB)",
         r.psnr_y, anchors[1].1
@@ -338,7 +350,8 @@ fn rate_control_holds_the_rd_curve() {
         loss < 1.5,
         "rate control lost {loss:.2} dB versus the fixed-QP RD curve"
     );
-    // And the rate itself must have been respected.
-    let err = (cbr_bps - f64::from(target)).abs() / f64::from(target);
+    // And the rate itself must have been respected — on channel
+    // bits, annotation included.
+    let err = (cbr_channel_bps - f64::from(target)).abs() / f64::from(target);
     assert!(err < 0.12, "RD-check CBR rate err {err:.4}");
 }

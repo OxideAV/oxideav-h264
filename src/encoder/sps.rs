@@ -37,9 +37,10 @@
 //! `ChromaArrayType=3`, the "chroma coded like luma" path of §7.3.5.3.
 
 use crate::encoder::bitstream::BitWriter;
+use crate::vui::{HrdParameters, VuiParameters};
 
 /// Configuration for [`build_baseline_sps_rbsp`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BaselineSpsConfig {
     pub seq_parameter_set_id: u32,
     pub level_idc: u8,
@@ -86,6 +87,13 @@ pub struct BaselineSpsConfig {
     /// is 0). `height_in_mbs` must be even. Requires `profile_idc !=
     /// 66` — §A.2.1 pins `frame_mbs_only_flag = 1` in Baseline.
     pub interlaced_fields: bool,
+    /// Round-430 — §E.1.1 `vui_parameters()` to append (with
+    /// `vui_parameters_present_flag = 1`). `None` keeps the historical
+    /// `vui_parameters_present_flag = 0` emission. Used by the
+    /// rate-controlled sessions to annotate CBR streams with §E.1.2
+    /// NAL HRD parameters + timing info so the Annex C buffering model
+    /// is formally declared in-band.
+    pub vui: Option<VuiParameters>,
 }
 
 impl Default for BaselineSpsConfig {
@@ -102,6 +110,7 @@ impl Default for BaselineSpsConfig {
             chroma_format_idc: 1,
             seq_scaling_lists: None,
             interlaced_fields: false,
+            vui: None,
         }
     }
 }
@@ -286,8 +295,13 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
     w.u(1, 1);
     // frame_cropping_flag = 0.
     w.u(1, 0);
-    // vui_parameters_present_flag = 0.
-    w.u(1, 0);
+    // §E.1.1 — vui_parameters_present_flag + vui_parameters().
+    if let Some(vui) = &cfg.vui {
+        w.u(1, 1);
+        write_vui_parameters(&mut w, vui);
+    } else {
+        w.u(1, 0);
+    }
 
     // §7.3.2.11 — rbsp_trailing_bits().
     w.rbsp_trailing_bits();
@@ -295,16 +309,196 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
     w.into_bytes()
 }
 
+/// §E.1.1 — emit a `vui_parameters()` structure. Field-for-field
+/// mirror of [`crate::vui::VuiParameters::parse`]; every `Option`
+/// drives the corresponding `*_present_flag`.
+pub fn write_vui_parameters(w: &mut BitWriter, vui: &VuiParameters) {
+    // aspect_ratio_info_present_flag + aspect_ratio_info.
+    if let Some(ar) = &vui.aspect_ratio {
+        w.u(1, 1);
+        w.u(8, ar.aspect_ratio_idc as u32);
+        // §E.2.1 Table E-1 — Extended_SAR (255) carries explicit
+        // sar_width / sar_height u(16) fields.
+        if ar.aspect_ratio_idc == 255 {
+            let (sw_, sh) = ar
+                .extended_sar
+                .expect("aspect_ratio_idc == Extended_SAR requires extended_sar");
+            w.u(16, sw_ as u32);
+            w.u(16, sh as u32);
+        } else {
+            debug_assert!(
+                ar.extended_sar.is_none(),
+                "extended_sar is only writable with aspect_ratio_idc == 255"
+            );
+        }
+    } else {
+        w.u(1, 0);
+    }
+    // overscan_info_present_flag + overscan_appropriate_flag.
+    if let Some(f) = vui.overscan_appropriate_flag {
+        w.u(1, 1);
+        w.u(1, u32::from(f));
+    } else {
+        w.u(1, 0);
+    }
+    // video_signal_type_present_flag + block.
+    if let Some(vst) = &vui.video_signal_type {
+        w.u(1, 1);
+        w.u(3, vst.video_format as u32);
+        w.u(1, u32::from(vst.video_full_range_flag));
+        if let Some(cd) = &vst.colour_description {
+            w.u(1, 1);
+            w.u(8, cd.colour_primaries as u32);
+            w.u(8, cd.transfer_characteristics as u32);
+            w.u(8, cd.matrix_coefficients as u32);
+        } else {
+            w.u(1, 0);
+        }
+    } else {
+        w.u(1, 0);
+    }
+    // chroma_loc_info_present_flag + block.
+    if let Some(cl) = &vui.chroma_loc_info {
+        w.u(1, 1);
+        w.ue(cl.chroma_sample_loc_type_top_field);
+        w.ue(cl.chroma_sample_loc_type_bottom_field);
+    } else {
+        w.u(1, 0);
+    }
+    // timing_info_present_flag + block.
+    if let Some(t) = &vui.timing_info {
+        w.u(1, 1);
+        w.u(32, t.num_units_in_tick);
+        w.u(32, t.time_scale);
+        w.u(1, u32::from(t.fixed_frame_rate_flag));
+    } else {
+        w.u(1, 0);
+    }
+    // nal_hrd_parameters_present_flag + hrd_parameters().
+    if let Some(h) = &vui.nal_hrd_parameters {
+        w.u(1, 1);
+        write_hrd_parameters(w, h);
+    } else {
+        w.u(1, 0);
+    }
+    // vcl_hrd_parameters_present_flag + hrd_parameters().
+    if let Some(h) = &vui.vcl_hrd_parameters {
+        w.u(1, 1);
+        write_hrd_parameters(w, h);
+    } else {
+        w.u(1, 0);
+    }
+    // §E.1.1 — low_delay_hrd_flag only when either HRD block present.
+    if vui.nal_hrd_parameters.is_some() || vui.vcl_hrd_parameters.is_some() {
+        w.u(1, u32::from(vui.low_delay_hrd_flag.unwrap_or(false)));
+    } else {
+        debug_assert!(
+            vui.low_delay_hrd_flag.is_none(),
+            "low_delay_hrd_flag is only writable when an HRD block is present"
+        );
+    }
+    // pic_struct_present_flag.
+    w.u(1, u32::from(vui.pic_struct_present_flag));
+    // bitstream_restriction_flag + block.
+    if let Some(br) = &vui.bitstream_restriction {
+        w.u(1, 1);
+        w.u(1, u32::from(br.motion_vectors_over_pic_boundaries_flag));
+        w.ue(br.max_bytes_per_pic_denom);
+        w.ue(br.max_bits_per_mb_denom);
+        w.ue(br.log2_max_mv_length_horizontal);
+        w.ue(br.log2_max_mv_length_vertical);
+        w.ue(br.max_num_reorder_frames);
+        w.ue(br.max_dec_frame_buffering);
+    } else {
+        w.u(1, 0);
+    }
+}
+
+/// §E.1.2 — emit an `hrd_parameters()` structure. Field-for-field
+/// mirror of [`crate::vui::HrdParameters::parse`].
+pub fn write_hrd_parameters(w: &mut BitWriter, h: &HrdParameters) {
+    debug_assert!(
+        h.cpb_cnt_minus1 <= 31,
+        "cpb_cnt_minus1 range 0..=31 (§E.2.2)"
+    );
+    let count = h.cpb_cnt_minus1 as usize + 1;
+    debug_assert_eq!(h.bit_rate_value_minus1.len(), count);
+    debug_assert_eq!(h.cpb_size_value_minus1.len(), count);
+    debug_assert_eq!(h.cbr_flag.len(), count);
+    w.ue(h.cpb_cnt_minus1);
+    w.u(4, h.bit_rate_scale as u32);
+    w.u(4, h.cpb_size_scale as u32);
+    for i in 0..count {
+        w.ue(h.bit_rate_value_minus1[i]);
+        w.ue(h.cpb_size_value_minus1[i]);
+        w.u(1, u32::from(h.cbr_flag[i]));
+    }
+    w.u(5, h.initial_cpb_removal_delay_length_minus1 as u32);
+    w.u(5, h.cpb_removal_delay_length_minus1 as u32);
+    w.u(5, h.dpb_output_delay_length_minus1 as u32);
+    w.u(5, h.time_offset_length as u32);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sps::Sps;
+    use crate::vui::TimingInfo;
+
+    /// Round-430 — an SPS carrying §E.1.1 VUI timing + §E.1.2 NAL HRD
+    /// round-trips through the decoder's parser field-exactly.
+    #[test]
+    fn sps_with_vui_timing_and_nal_hrd_round_trips() {
+        let hrd = HrdParameters {
+            cpb_cnt_minus1: 0,
+            bit_rate_scale: 0,
+            cpb_size_scale: 0,
+            bit_rate_value_minus1: vec![1874],
+            cpb_size_value_minus1: vec![7499],
+            cbr_flag: vec![true],
+            initial_cpb_removal_delay_length_minus1: 23,
+            cpb_removal_delay_length_minus1: 23,
+            dpb_output_delay_length_minus1: 23,
+            time_offset_length: 24,
+        };
+        let vui = VuiParameters {
+            timing_info: Some(TimingInfo {
+                num_units_in_tick: 1,
+                time_scale: 60,
+                fixed_frame_rate_flag: true,
+            }),
+            nal_hrd_parameters: Some(hrd),
+            low_delay_hrd_flag: Some(false),
+            ..VuiParameters::default()
+        };
+        let cfg = BaselineSpsConfig {
+            width_in_mbs: 5,
+            height_in_mbs: 4,
+            vui: Some(vui.clone()),
+            ..BaselineSpsConfig::default()
+        };
+        let rbsp = build_baseline_sps_rbsp(&cfg);
+        let sps = Sps::parse(&rbsp).expect("decoder parses our SPS");
+        assert!(sps.vui_parameters_present_flag);
+        assert_eq!(sps.vui.as_ref(), Some(&vui), "VUI must round-trip exactly");
+        let parsed_hrd = sps
+            .vui
+            .as_ref()
+            .and_then(|v| v.nal_hrd_parameters.as_ref())
+            .expect("nal hrd present");
+        // BitRate[0] = (bit_rate_value_minus1 + 1) << (6 + bit_rate_scale)
+        assert_eq!((parsed_hrd.bit_rate_value_minus1[0] + 1) << 6, 120_000);
+        // CpbSize[0] = (cpb_size_value_minus1 + 1) << (4 + cpb_size_scale)
+        assert_eq!((parsed_hrd.cpb_size_value_minus1[0] + 1) << 4, 120_000);
+        assert!(parsed_hrd.cbr_flag[0]);
+    }
 
     #[test]
     fn baseline_sps_round_trips_through_decoder_parser() {
         let cfg = BaselineSpsConfig {
             seq_scaling_lists: None,
             interlaced_fields: false,
+            vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4, // 64 samples
@@ -346,6 +540,7 @@ mod tests {
         let cfg = BaselineSpsConfig {
             seq_scaling_lists: None,
             interlaced_fields: false,
+            vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -382,6 +577,7 @@ mod tests {
         let cfg = BaselineSpsConfig {
             seq_scaling_lists: None,
             interlaced_fields: false,
+            vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,

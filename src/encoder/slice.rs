@@ -470,6 +470,7 @@ mod tests {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: None,
             interlaced_fields: false,
+            vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -539,6 +540,7 @@ mod tests {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: None,
             interlaced_fields: false,
+            vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -610,6 +612,7 @@ mod tests {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: None,
             interlaced_fields: false,
+            vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,
@@ -683,6 +686,7 @@ mod tests {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: None,
             interlaced_fields: false,
+            vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
             width_in_mbs: 4,

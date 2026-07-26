@@ -59,6 +59,7 @@ pub mod pps;
 pub mod rate_control;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod rdo;
+pub mod sei;
 pub mod session;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod slice;
@@ -319,7 +320,7 @@ impl ScalingMatrixMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub width: u32,
     pub height: u32,
@@ -409,6 +410,12 @@ pub struct EncoderConfig {
     /// CABAC is forbidden by Baseline profile (§A.2.1); enabling this
     /// flag requires `profile_idc >= 77` (Main).
     pub cabac: bool,
+    /// Round-430 — §E.1.1 `vui_parameters()` appended to every SPS
+    /// this encoder emits (`None` keeps the historical
+    /// `vui_parameters_present_flag = 0`). The rate-controlled
+    /// sessions set VUI timing info + §E.1.2 NAL HRD parameters here
+    /// so CBR streams are formally HRD-annotated in-band.
+    pub vui: Option<crate::vui::VuiParameters>,
     /// §7.4.2.1.1 / Annex A Table A-1 — `level_idc` to emit in the
     /// SPS. Default: derived from `(width, height)` so the smallest
     /// level whose `MaxFS` covers the picture is selected. A 720p
@@ -555,6 +562,7 @@ impl EncoderConfig {
             intra_in_inter: true,
             chroma_format_idc: 1,
             cabac: false,
+            vui: None,
             level_idc: min_level_idc_for_picture_size(width_in_mbs, height_in_mbs),
             bit_depth_chroma_minus8: 0,
             trellis_quant: true,
@@ -1261,6 +1269,43 @@ impl Encoder {
     /// rate-controlled sequence keeps one PPS while every picture
     /// picks its own QP. `frame_qp` must be in 0..=51.
     pub fn encode_idr_with_qp(&self, frame: &YuvFrame<'_>, frame_qp: i32) -> EncodedIdr {
+        self.encode_idr_impl(frame, frame_qp, None)
+    }
+
+    /// [`encode_idr_with_qp`](Self::encode_idr_with_qp) plus **MB-row
+    /// QP modulation** toward a whole-picture bit budget (round 430) —
+    /// the IDR counterpart of
+    /// [`encode_p_rate_adaptive`](Self::encode_p_rate_adaptive). IDR
+    /// pictures are the largest of a CBR GOP, so a mid-frame overshoot
+    /// here is exactly where the session's VBV retry loop used to pay
+    /// a whole re-encode; row modulation absorbs most of it in-slice.
+    ///
+    /// Row-QP steps ride the §7.4.5 `mb_qp_delta` syntax: Intra_16x16
+    /// MBs always carry the delta (the luma DC block is always coded),
+    /// I_NxN MBs only when cbp > 0 — a cbp==0 MB leaves the decoded
+    /// QP_Y chain (and the §8.7 deblock strengths that follow it) at
+    /// the previous MB's value, which the encoder mirrors exactly.
+    ///
+    /// 4:2:0 only, mirroring the P-path entry.
+    pub fn encode_idr_rate_adaptive(
+        &self,
+        frame: &YuvFrame<'_>,
+        frame_qp: i32,
+        frame_budget_bits: u64,
+    ) -> EncodedIdr {
+        assert_eq!(
+            self.cfg.chroma_format_idc, 1,
+            "encode_idr_rate_adaptive requires 4:2:0"
+        );
+        self.encode_idr_impl(frame, frame_qp, Some(frame_budget_bits))
+    }
+
+    fn encode_idr_impl(
+        &self,
+        frame: &YuvFrame<'_>,
+        frame_qp: i32,
+        row_budget_bits: Option<u64>,
+    ) -> EncodedIdr {
         assert!(
             (0..=51).contains(&frame_qp),
             "frame_qp {frame_qp} out of 0..=51"
@@ -1341,6 +1386,9 @@ impl Encoder {
             chroma_format_idc: self.cfg.chroma_format_idc,
             seq_scaling_lists: self.cfg.scaling_matrix.seq_spec(),
             interlaced_fields: false,
+            // Round-430 — rate-controlled sessions annotate CBR
+            // streams with §E.1.1 VUI timing + §E.1.2 NAL HRD.
+            vui: self.cfg.vui.clone(),
         };
         let pps_cfg = BaselinePpsConfig {
             pic_scaling_lists: self.cfg.scaling_matrix.pic_spec(),
@@ -1414,7 +1462,13 @@ impl Encoder {
         let mut recon_u = vec![0u8; chroma_width * chroma_height];
         let mut recon_v = vec![0u8; chroma_width * chroma_height];
 
-        let qp_y = frame_qp;
+        // §7.4.5 decoded-QP chain (round 430): `qp_tracker.cur` is the
+        // QP_Y the decoder holds after the most recent MB, `want_qp`
+        // the row-modulated target. Without a row budget both stay at
+        // `frame_qp`, every emitted mb_qp_delta is 0 and the bitstream
+        // matches the pre-round-430 output exactly.
+        let mut qp_tracker = MbQpTracker { cur: frame_qp };
+        let mut want_qp = frame_qp;
         // §8.5.8 — chroma-QP derivation, BD-aware. `qp_bd_offset_c =
         // 6 * bit_depth_chroma_minus8` extends the eq. 8-311 qPI clamp
         // from `0..=51` to `−QpBdOffsetC..=51`. Today the SPS pins
@@ -1422,8 +1476,6 @@ impl Encoder {
         // path; the BD-aware call lets a future High10/422/444 round
         // wire a non-zero BD without re-touching the encoder math.
         let qp_bd_offset_c = qp_bd_offset(self.cfg.bit_depth_chroma_minus8);
-        let qp_c =
-            qp_y_to_qp_c_with_bd_offset(qp_y, pps_cfg.chroma_qp_index_offset, qp_bd_offset_c);
 
         // §9.2.1.1 — neighbour grid for CAVLC nC derivation. Encoder
         // mirrors what the decoder will reconstruct as it walks the MBs:
@@ -1458,6 +1510,33 @@ impl Encoder {
 
         // Iterate MBs in raster order.
         for mb_y in 0..height_mbs {
+            // Round 430 — MB-row QP modulation (IDR): identical
+            // response curve to the round-420 P controller (see
+            // `encode_p_impl` for the asymmetric-clamp rationale).
+            if let Some(budget) = row_budget_bits {
+                if mb_y > 0 && budget > 0 {
+                    let frac = f64::from(mb_y) / f64::from(height_mbs);
+                    let spent = sw.bits_emitted() as f64;
+                    let expected = (budget as f64 * frac).max(1.0);
+                    let ratio = spent.max(1.0) / expected;
+                    let adj = if ratio >= 1.0 {
+                        (6.0 * ratio.log2()).round() as i32
+                    } else {
+                        (3.0 * ratio.log2()).round() as i32
+                    };
+                    let mut new_want = frame_qp + adj;
+                    if new_want < frame_qp && frac < 0.6 {
+                        new_want = frame_qp;
+                    }
+                    want_qp = new_want
+                        .clamp(want_qp - 1, want_qp + 2)
+                        .clamp(frame_qp - 2, frame_qp + 6)
+                        .clamp(0, 51);
+                }
+            }
+            let qp_y = want_qp;
+            let qp_c =
+                qp_y_to_qp_c_with_bd_offset(qp_y, pps_cfg.chroma_qp_index_offset, qp_bd_offset_c);
             for mb_x in 0..width_mbs {
                 let dbl = self.encode_mb(
                     frame,
@@ -1473,6 +1552,7 @@ impl Encoder {
                     &mut sw,
                     &mut nc_grid,
                     &mut intra_grid,
+                    &mut qp_tracker,
                 );
                 if dbl.transform_size_8x8_flag {
                     i8x8_mb_count += 1;
@@ -1561,6 +1641,7 @@ impl Encoder {
     /// CAVLC encode), so the comparison is calibrated. λ comes from
     /// [`rdo::lambda_ssd`].
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn encode_mb(
         &self,
         frame: &YuvFrame<'_>,
@@ -1576,6 +1657,51 @@ impl Encoder {
         sw: &mut BitWriter,
         nc_grid: &mut CavlcNcGrid,
         intra_grid: &mut IntraGrid,
+        qp_tracker: &mut MbQpTracker,
+    ) -> MbDeblockInfo {
+        // §7.4.5 — the delta that moves the decoded QP_Y chain onto
+        // this MB's (possibly row-modulated) target QP. Whether it is
+        // actually transmitted depends on the winning shape
+        // (Intra_16x16 always; I_NxN only with cbp > 0); the winner's
+        // deblock info reports the resulting chain QP either way.
+        let mb_qp_delta = qp_y - qp_tracker.cur;
+        let dbl = self.encode_mb_inner(
+            frame,
+            mb_x,
+            mb_y,
+            qp_y,
+            qp_c,
+            chroma_width,
+            chroma_height,
+            recon_y,
+            recon_u,
+            recon_v,
+            sw,
+            nc_grid,
+            intra_grid,
+            mb_qp_delta,
+        );
+        qp_tracker.cur = dbl.qp_y;
+        dbl
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mb_inner(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mb_qp_delta: i32,
     ) -> MbDeblockInfo {
         let width = self.cfg.width as usize;
         let mb_addr = (mb_y as u32) * self.cfg.width / 16 + (mb_x as u32);
@@ -1622,6 +1748,7 @@ impl Encoder {
                 sw,
                 nc_grid,
                 intra_grid,
+                mb_qp_delta,
             );
             let d_a = mb_ssd_3planes_444(frame, recon_y, recon_u, recon_v, width, mb_x, mb_y);
             let r_a = sw.bits_emitted() - bits_before;
@@ -1785,6 +1912,7 @@ impl Encoder {
             sw,
             nc_grid,
             intra_grid,
+            mb_qp_delta,
         );
         let snap_a = MbStateSnapshot::capture(
             recon_y,
@@ -1831,6 +1959,7 @@ impl Encoder {
             sw,
             nc_grid,
             intra_grid,
+            mb_qp_delta,
         );
 
         // ----- Trial 3 (round-382, `transform_8x8` only): Intra_8x8. -----
@@ -1879,6 +2008,7 @@ impl Encoder {
                 sw,
                 nc_grid,
                 intra_grid,
+                mb_qp_delta,
             );
             Some((trial_c, snap_b))
         } else {
@@ -2003,7 +2133,13 @@ impl Encoder {
         sw: &mut BitWriter,
         nc_grid: &mut CavlcNcGrid,
         intra_grid: &mut IntraGrid,
+        mb_qp_delta: i32,
     ) -> MbTrial {
+        debug_assert!(
+            self.cfg.chroma_format_idc == 1 || mb_qp_delta == 0,
+            "round-430 row modulation (non-zero mb_qp_delta) is 4:2:0-only; \
+             the 4:2:2 / 4:4:4 writer branches still hard-code delta 0",
+        );
         let width = self.cfg.width as usize;
         let height = self.cfg.height as usize;
         let lambda = lambda_ssd(qp_y, true);
@@ -2331,7 +2467,12 @@ impl Encoder {
                 intra_chroma_pred_mode: best_chroma_mode_u8,
                 cbp_luma,
                 cbp_chroma,
-                mb_qp_delta: 0,
+                // §7.3.5 — Intra_16x16 always codes the luma DC block,
+                // so the delta is always transmitted and the decoded
+                // QP_Y chain lands on `qp_y` (round-430 row modulation
+                // is 4:2:0-only; the other formats assert delta == 0
+                // below).
+                mb_qp_delta,
                 luma_dc_levels_raster: dc_levels,
                 luma_ac_levels,
                 luma_ac_nc,
@@ -2502,7 +2643,13 @@ impl Encoder {
         sw: &mut BitWriter,
         nc_grid: &mut CavlcNcGrid,
         intra_grid: &mut IntraGrid,
+        mb_qp_delta: i32,
     ) -> MbTrial {
+        debug_assert!(
+            self.cfg.chroma_format_idc == 1 || mb_qp_delta == 0,
+            "round-430 row modulation (non-zero mb_qp_delta) is 4:2:0-only; \
+             the 4:2:2 / 4:4:4 writer branches still hard-code delta 0",
+        );
         let width = self.cfg.width as usize;
         let width_mbs = (self.cfg.width / 16) as usize;
         let lambda = lambda_ssd(qp_y, true);
@@ -2824,7 +2971,10 @@ impl Encoder {
                 intra_chroma_pred_mode: best_chroma_mode.as_u8(),
                 cbp_luma,
                 cbp_chroma,
-                mb_qp_delta: 0,
+                // §7.3.5 — transmitted only when cbp > 0 (the writer
+                // gates on that); a cbp==0 MB leaves the decoded QP_Y
+                // chain untouched, mirrored in `deblock.qp_y` below.
+                mb_qp_delta,
                 luma_4x4_levels: luma_4x4_levels_scan,
                 luma_4x4_nc,
                 chroma_dc_cb: u_dc_levels,
@@ -2875,7 +3025,14 @@ impl Encoder {
             luma_cost: mb_luma_cost,
             deblock: MbDeblockInfo {
                 is_intra: true,
-                qp_y,
+                // §7.4.5 / §8.7 — the decoder's chain QP_Y after this
+                // MB: `qp_y` when the delta was transmitted (cbp > 0),
+                // otherwise the inherited previous-MB QP.
+                qp_y: if cbp_luma > 0 || cbp_chroma > 0 {
+                    qp_y
+                } else {
+                    qp_y - mb_qp_delta
+                },
                 luma_nonzero_4x4,
                 chroma_nonzero_4x4: chroma_nz_mask,
                 is_intra_4x4: true,
@@ -2908,7 +3065,13 @@ impl Encoder {
         sw: &mut BitWriter,
         nc_grid: &mut CavlcNcGrid,
         intra_grid: &mut IntraGrid,
+        mb_qp_delta: i32,
     ) -> MbTrial {
+        debug_assert!(
+            self.cfg.chroma_format_idc == 1 || mb_qp_delta == 0,
+            "round-430 row modulation (non-zero mb_qp_delta) is 4:2:0-only; \
+             the 4:2:2 / 4:4:4 writer branches still hard-code delta 0",
+        );
         let width = self.cfg.width as usize;
         let lambda = lambda_ssd(qp_y, true);
         // §8.5.9 — effective intra weightScale (8x8 intra Y list).
@@ -3140,7 +3303,9 @@ impl Encoder {
                 intra_chroma_pred_mode: chroma_block.pred_mode.as_u8(),
                 cbp_luma,
                 cbp_chroma,
-                mb_qp_delta: 0,
+                // §7.3.5 — transmitted only when cbp > 0 (the writer
+                // gates on that); see `deblock.qp_y` below.
+                mb_qp_delta,
                 luma_4x4_levels,
                 luma_4x4_nc,
                 chroma_dc_cb: u_dc_levels,
@@ -3191,7 +3356,12 @@ impl Encoder {
             luma_cost: mb_luma_cost,
             deblock: MbDeblockInfo {
                 is_intra: true,
-                qp_y,
+                // §7.4.5 / §8.7 — chain QP_Y: see encode_mb_intra4x4.
+                qp_y: if cbp_luma > 0 || cbp_chroma > 0 {
+                    qp_y
+                } else {
+                    qp_y - mb_qp_delta
+                },
                 luma_nonzero_4x4,
                 chroma_nonzero_4x4: chroma_nz_mask,
                 transform_size_8x8_flag: true,
