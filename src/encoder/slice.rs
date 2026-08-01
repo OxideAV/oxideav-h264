@@ -334,6 +334,10 @@ pub struct BSliceHeaderConfig {
     /// `slice_qp_delta`). Required when the PPS has
     /// `entropy_coding_mode_flag = 1` and the slice is non-I/SI.
     pub cabac: Option<CabacSliceParams>,
+    /// Round-436 — PAFF field signalling (see [`FieldPicSignal`]).
+    /// `FrameMbsOnly` (the default) matches the historical writer
+    /// (SPS `frame_mbs_only_flag = 1`, no field bits coded).
+    pub field: FieldPicSignal,
 }
 
 /// Round-26 — minimal explicit weighted-prediction table for a
@@ -366,7 +370,9 @@ pub fn write_b_slice_header(w: &mut BitWriter, cfg: &BSliceHeaderConfig) {
     w.ue(cfg.pic_parameter_set_id);
     // No `colour_plane_id` (separate_colour_plane_flag == 0).
     w.u(cfg.frame_num_bits, cfg.frame_num);
-    // No field_pic_flag — frame_mbs_only_flag == 1.
+    // §7.3.3 — field_pic_flag / bottom_field_flag when the SPS has
+    // frame_mbs_only_flag == 0 (round-436 PAFF B fields).
+    cfg.field.write(w);
     // No idr_pic_id — non-IDR.
     // POC type 0 branch.
     w.u(cfg.poc_lsb_bits, cfg.pic_order_cnt_lsb);
@@ -646,6 +652,7 @@ mod tests {
                 nal_ref_idc: 0, // non-reference B
                 pred_weight_table: None,
                 cabac: None,
+                field: FieldPicSignal::FrameMbsOnly,
             },
         );
         // Dummy bit + trailing so the parser doesn't blow up on EOF.
@@ -739,6 +746,7 @@ mod tests {
                 nal_ref_idc: 0,
                 pred_weight_table: Some(pwt),
                 cabac: None,
+                field: FieldPicSignal::FrameMbsOnly,
             },
         );
         // Dummy bit + trailing so the parser doesn't blow up on EOF.

@@ -1729,6 +1729,7 @@ impl H264CodecDecoder {
                 sps.max_num_ref_frames,
                 expected,
                 max_frame_num,
+                None,
             );
             self.dpb_entries
                 .retain(|e| !matches!(e.marking, RefMarking::Unused));

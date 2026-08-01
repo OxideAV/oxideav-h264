@@ -7,7 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- §8.2.5.3 sliding-window marking now counts reference **units** the
+  way the spec defines numShortTerm / numLongTerm: a complementary
+  reference field pair (two coded-field DPB entries sharing
+  `frame_num`) is ONE frame slot, the second field of such a pair
+  triggers no eviction at all (first branch of §8.2.5.3), and an
+  eviction marks BOTH fields of the chosen frame/pair. The per-entry
+  count previously halved the effective DPB for field streams —
+  invisible to P-field chains (which only reference the immediately
+  previous frame) but fatal to B fields, whose two anchor pairs must
+  both survive: at `max_num_ref_frames = 2` the earlier anchor's
+  fields were evicted while the P anchor pair of the following frame
+  was stored, so every B field resolved `RefPicList0[0]` /
+  `RefPicList1[0]` to the wrong picture (and the §8.2.4.2.4 List1
+  identical-lists swap then flipped the parity too). Unit tests pin
+  the pair-as-one-unit count, the second-field exemption and the
+  non-paired-field unit.
+
 ### Added
+
+- PAFF **B field pictures** (round 436, encode + decode arms). The
+  `encoder::field` driver gains `PaffConfig::b_fields`: anchors at
+  even display indices (IDR/I pair, then P/P pairs), non-reference
+  B/B field pairs at odd display indices coded AFTER their following
+  anchor (coding order 0, 2, 1, 4, 3, …), each B field predicting L0
+  from the same-parity field of the previous anchor and L1 from the
+  same-parity field of the next anchor — where the §8.2.4.2.4 +
+  §8.2.4.2.5 field initialisation places them with single-entry
+  active lists. `PaffConfig::b_temporal_direct` switches the B-field
+  slices to `direct_spatial_mv_pred_flag = 0`: B_Skip /
+  B_Direct_16x16 MVs derive through §8.4.1.2.3 temporal direct with
+  colPic = the same-parity anchor field (§8.4.1.2.1, motion grid read
+  in field coordinates) and every eq. 8-201/8-202 tb/td distance on
+  per-FIELD §8.2.1 order counts. The B slice-header writer gained the
+  §7.3.3 `field_pic_flag` / `bottom_field_flag` position
+  (`BSliceHeaderConfig::field`). Five new gates in
+  `tests/integration_paff_encoder.rs`: spatial-direct and
+  temporal-direct 5-frame sequences plus an even-frame-count
+  trailing-P layout self-roundtrip **byte-exactly** through our
+  decoder, and both direct variants decode byte-identically in a
+  stock reference binary (black-box).
 
 - Encoder rate-control signalling completion (round 430, the r420
   follow-ups). MB-row QP modulation now covers every slice kind the

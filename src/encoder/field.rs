@@ -43,9 +43,11 @@
 //! edge).
 //!
 //! Scope (fixture-grade, mirrors what the staged PAFF fixtures pin):
-//! CAVLC, 4:2:0, top-field-first, same-parity P references only (no
-//! cross-parity refs, no B fields), frame pictures only in all-I
-//! sequences.
+//! CAVLC, 4:2:0, top-field-first, frame pictures only in all-I
+//! sequences. P fields reference the same-parity field of the previous
+//! frame (plus the round-416 cross-parity + frame-reference axes);
+//! round-436 adds non-reference **B field pairs** ([`PaffConfig::
+//! b_fields`]) with spatial or temporal direct derivation.
 
 use crate::encoder::deblock::{
     deblock_recon_field, deblock_recon_with_chroma_array_type, MbDeblockInfo,
@@ -53,12 +55,13 @@ use crate::encoder::deblock::{
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::slice::{
-    write_idr_i_slice_header, write_p_slice_header, FieldPicSignal, IdrSliceHeaderConfig,
-    PSliceHeaderConfig,
+    write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
+    FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::{
-    min_level_idc_for_picture_size, EncodedFrameRef, Encoder, EncoderConfig, YuvFrame,
+    min_level_idc_for_picture_size, EncodedFrameRef, Encoder, EncoderConfig, FrameRefPartitionMv,
+    YuvFrame,
 };
 use crate::encoder::{BitWriter, CavlcNcGrid, IntraGrid, MvGrid};
 use crate::nal::NalUnitType;
@@ -100,11 +103,89 @@ pub struct PaffConfig {
     /// reference picture, which a decoder serves as a half-height
     /// field view of the stored frame.
     pub idr_frame_first: bool,
+    /// Round-436 — **B field** axis (requires `p_fields`; incompatible
+    /// with the other optional axes). Even display indices code as
+    /// anchor field pairs (frame 0 = the IDR/I pair, later anchors =
+    /// P/P pairs referencing the previous anchor), odd display indices
+    /// code as **non-reference B/B field pairs** emitted AFTER the
+    /// following anchor (coding order 0, 2, 1, 4, 3, …). Per the
+    /// §8.2.4.2.4 + §8.2.4.2.5 B-field list initialisation (reference
+    /// entries ordered by field POC around the current field, parities
+    /// alternating starting from the current field's own), each B
+    /// field finds the **same-parity field of the previous anchor at
+    /// `RefPicList0[0]`** and the **same-parity field of the next
+    /// anchor at `RefPicList1[0]`** — exactly the two references the
+    /// per-field mode decision uses. A trailing odd display frame
+    /// (no following anchor) codes as a P/P pair.
+    pub b_fields: bool,
+    /// Round-436 — when `true` (requires `b_fields`), the B field
+    /// slices signal `direct_spatial_mv_pred_flag = 0` and the
+    /// B_Skip / B_Direct_16x16 MVs come from the §8.4.1.2.3
+    /// **temporal direct** derivation: colPic is `RefPicList1[0]` (the
+    /// same-parity field of the next anchor, §8.4.1.2.1 — a coded
+    /// field, so its motion grid is read in field coordinates), and
+    /// every DiffPicOrderCnt of eq. 8-201/8-202 runs on the fields'
+    /// own §8.2.1 order counts. When `false`, B fields use the
+    /// §8.4.1.2.2 spatial direct derivation.
+    pub b_temporal_direct: bool,
 }
 
 /// A reconstructed reference field: (Y, Cb, Cr) half-height planes +
 /// the field's own picture order count.
 type ReconField = (Vec<u8>, Vec<u8>, Vec<u8>, i32);
+
+/// Round-436 — a reconstructed anchor field used as a B-field
+/// reference: half-height planes, the field's own §8.2.1 order count,
+/// and the per-8x8 L0 motion snapshot the §8.4.1.2 direct derivations
+/// read from the colocated picture (`RefPicList1[0]`).
+struct AnchorField {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    poc: i32,
+    partition_mvs: Vec<FrameRefPartitionMv>,
+}
+
+impl AnchorField {
+    fn as_frame_ref(&self, width: u32, field_h: u32) -> EncodedFrameRef<'_> {
+        EncodedFrameRef {
+            width,
+            height: field_h,
+            recon_y: &self.y,
+            recon_u: &self.u,
+            recon_v: &self.v,
+            partition_mvs: &self.partition_mvs,
+            pic_order_cnt: self.poc,
+        }
+    }
+}
+
+/// Round-436 — snapshot the per-8x8 L0 motion state of an encoded
+/// picture from its `MvGrid`, in the shape `EncodedFrameRef::
+/// partition_mvs` expects (mirrors the `encode_p` / `encode_b` export:
+/// unencoded or intra slots become `refIdxCol = -1` "intra" entries per
+/// the §8.4.1.2.1 colocated probe).
+fn partition_mvs_from_grid(mv_grid: &MvGrid) -> Vec<FrameRefPartitionMv> {
+    let mut out = Vec::with_capacity(mv_grid.slots.len() * 4);
+    for slot in &mv_grid.slots {
+        for part in 0..4usize {
+            let (mv, ref_idx, is_intra) = if !slot.available || slot.is_intra {
+                (crate::mv_deriv::Mv::ZERO, -1, true)
+            } else {
+                (slot.mv_l0_8x8[part], slot.ref_idx_l0_8x8[part], false)
+            };
+            out.push(FrameRefPartitionMv {
+                mv_l0: (
+                    mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                ),
+                ref_idx_l0: ref_idx.clamp(-1, 127) as i8,
+                is_intra,
+            });
+        }
+    }
+    out
+}
 
 /// One encoded PAFF sequence: the Annex B stream plus the full-height
 /// per-frame reconstruction (fields re-interleaved, §8.7 post-filter)
@@ -204,6 +285,18 @@ fn encode_i_slice_data(
     (recon_y, recon_u, recon_v, infos)
 }
 
+/// Round-436 — return shape of [`encode_p_slice_data`]: pre-deblock
+/// recon planes, per-MB deblock facts, and the per-8x8 L0 motion
+/// snapshot (the §8.4.1.2.1 colocated data a later B field reads when
+/// this field sits at `RefPicList1[0]`).
+type PSliceDataOut = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<MbDeblockInfo>,
+    Vec<FrameRefPartitionMv>,
+);
+
 /// Encode one P picture's `slice_data()` bits into `sw` against a
 /// single same-sized reference, returning the pre-deblock recon planes
 /// and per-MB deblock facts. Mirrors the `encode_p` MB loop, with the
@@ -213,7 +306,7 @@ fn encode_p_slice_data(
     src: &YuvFrame<'_>,
     prev: &EncodedFrameRef<'_>,
     sw: &mut BitWriter,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<MbDeblockInfo>) {
+) -> PSliceDataOut {
     let width_mbs = enc.cfg.width / 16;
     let height_mbs = enc.cfg.height / 16;
     let chroma_width = (enc.cfg.width / 2) as usize;
@@ -259,6 +352,75 @@ fn encode_p_slice_data(
     if pending_skip > 0 {
         sw.ue(pending_skip);
     }
+    let partition_mvs = partition_mvs_from_grid(&mv_grid);
+    (recon_y, recon_u, recon_v, infos, partition_mvs)
+}
+
+/// Round-436 — encode one non-reference B field picture's
+/// `slice_data()` bits into `sw` against one reference per list,
+/// returning the pre-deblock recon planes and per-MB deblock facts.
+/// Mirrors the `encode_b` MB loop (B_Skip / B_Direct_16x16 / explicit
+/// 16x16 / partitions with the §8.4.1.2.2 spatial or §8.4.1.2.3
+/// temporal direct derivation per `enc.cfg.direct_temporal_mv_pred`),
+/// with the §7.3.4 CAVLC `mb_skip_run` accounting included. All POC
+/// arithmetic (temporal direct eq. 8-201/8-202) runs on the fields'
+/// own §8.2.1 order counts carried by the `EncodedFrameRef`s.
+fn encode_b_slice_data(
+    enc: &Encoder,
+    src: &YuvFrame<'_>,
+    ref_l0: &EncodedFrameRef<'_>,
+    ref_l1: &EncodedFrameRef<'_>,
+    curr_poc: i32,
+    sw: &mut BitWriter,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<MbDeblockInfo>) {
+    let width = enc.cfg.width as usize;
+    let width_mbs = enc.cfg.width / 16;
+    let height_mbs = enc.cfg.height / 16;
+    let chroma_width = (enc.cfg.width / 2) as usize;
+    let chroma_height = (enc.cfg.height / 2) as usize;
+    let mut recon_y = vec![0u8; (enc.cfg.width * enc.cfg.height) as usize];
+    let mut recon_u = vec![0u8; chroma_width * chroma_height];
+    let mut recon_v = vec![0u8; chroma_width * chroma_height];
+    let qp_y = enc.cfg.qp;
+    let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset(enc.cfg.bit_depth_chroma_minus8));
+    let mut nc_grid = CavlcNcGrid::new(width_mbs, height_mbs);
+    let mut intra_grid = IntraGrid::new(width_mbs as usize, height_mbs as usize);
+    // §8.4.1.3 — one MV-prediction grid per reference list.
+    let mut mv_grid_l0 = MvGrid::new(width_mbs as usize, height_mbs as usize);
+    let mut mv_grid_l1 = MvGrid::new(width_mbs as usize, height_mbs as usize);
+    let mut infos = vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
+    let mut pending_skip: u32 = 0;
+    for mb_y in 0..height_mbs as usize {
+        for mb_x in 0..width_mbs as usize {
+            let dbl = enc.encode_b_mb_with_intra_fallback(
+                src,
+                ref_l0,
+                ref_l1,
+                mb_x,
+                mb_y,
+                qp_y,
+                qp_c,
+                chroma_width,
+                chroma_height,
+                width,
+                &mut recon_y,
+                &mut recon_u,
+                &mut recon_v,
+                sw,
+                &mut nc_grid,
+                &mut intra_grid,
+                &mut mv_grid_l0,
+                &mut mv_grid_l1,
+                &mut pending_skip,
+                curr_poc,
+                None,
+            );
+            infos[mb_y * width_mbs as usize + mb_x] = dbl;
+        }
+    }
+    // §7.3.4 — flush the trailing skip run (mirrors `encode_b`: the
+    // final `mb_skip_run` is emitted even when zero).
+    sw.ue(pending_skip);
     (recon_y, recon_u, recon_v, infos)
 }
 
@@ -291,6 +453,15 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
     assert!(
         !(cfg.idr_frame_first && cfg.cross_parity_first_bottom),
         "idr_frame_first replaces frame 0's field pair",
+    );
+    assert!(!cfg.b_fields || cfg.p_fields, "b_fields is a P-field axis");
+    assert!(
+        !cfg.b_fields || (!cfg.cross_parity_first_bottom && !cfg.idr_frame_first),
+        "b_fields is incompatible with the other optional axes",
+    );
+    assert!(
+        !cfg.b_temporal_direct || cfg.b_fields,
+        "b_temporal_direct requires b_fields",
     );
 
     let width = cfg.width as usize;
@@ -354,6 +525,12 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
     let mut stream: Vec<u8> = Vec::new();
     stream.extend_from_slice(&build_nal_unit(3, NalUnitType::Sps, &sps_rbsp));
     stream.extend_from_slice(&build_nal_unit(3, NalUnitType::Pps, &pps_rbsp));
+
+    // Round-436 — the B-field coding order (0, 2, 1, 4, 3, …) needs
+    // its own driver loop.
+    if cfg.b_fields {
+        return encode_paff_b_sequence(cfg, frames, stream, frame_num_bits, poc_lsb_bits);
+    }
 
     // Last reconstructed field of each parity — the P references.
     let mut last_top: Option<ReconField> = None;
@@ -574,7 +751,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                     partition_mvs: &[],
                     pic_order_cnt: *ppoc,
                 };
-                encode_p_slice_data(p_enc, &src, &prev, &mut sw)
+                let (ry, ru, rv, infos, _mvs) = encode_p_slice_data(p_enc, &src, &prev, &mut sw);
+                (ry, ru, rv, infos)
             } else {
                 encode_i_slice_data(&field_enc, &src, &mut sw)
             };
@@ -617,6 +795,307 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
             interleave_planes(tu, bu, width / 2),
             interleave_planes(tv, bv, width / 2),
         ));
+    }
+
+    PaffEncoded {
+        annex_b: stream,
+        recon_frames,
+    }
+}
+
+/// Round-436 — PAFF **B-field** sequence driver (see
+/// [`PaffConfig::b_fields`]). Coding order interleaves anchors and B
+/// pairs: display 0 (IDR top + I bottom), display 2 (P/P), display 1
+/// (B/B), display 4 (P/P), display 3 (B/B), … — every B field pair is
+/// non-reference (`nal_ref_idc = 0`) and predicts L0 from the
+/// same-parity field of the previous anchor and L1 from the
+/// same-parity field of the following anchor, which is where the
+/// §8.2.4.2.4 + §8.2.4.2.5 field initialisation puts them with the
+/// single-entry active lists. `stream` arrives holding the SPS + PPS.
+fn encode_paff_b_sequence(
+    cfg: &PaffConfig,
+    frames: &[(&[u8], &[u8], &[u8])],
+    mut stream: Vec<u8>,
+    frame_num_bits: u32,
+    poc_lsb_bits: u32,
+) -> PaffEncoded {
+    let width = cfg.width as usize;
+    let frame_h = cfg.frame_height as usize;
+    let field_h = cfg.frame_height / 2;
+    let width_mbs = cfg.width / 16;
+
+    let mk_cfg = || {
+        let mut c = EncoderConfig::new(cfg.width, field_h);
+        c.qp = cfg.qp;
+        c.profile_idc = 77;
+        c.max_num_ref_frames = 2;
+        c
+    };
+    let field_enc = Encoder::new(mk_cfg());
+    let b_enc = Encoder::new({
+        let mut c = mk_cfg();
+        c.direct_temporal_mv_pred = cfg.b_temporal_direct;
+        c
+    });
+
+    let mut recon_frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+        vec![(Vec::new(), Vec::new(), Vec::new()); frames.len()];
+
+    // Encode one anchor field pair (display index `d`): IDR top +
+    // non-IDR I bottom when `d == 0`, else P/P referencing the
+    // same-parity fields of `prev` (§8.2.4.2.5 `RefPicList0[0]`).
+    let encode_anchor_pair = |d: usize,
+                              frame_num: u32,
+                              prev: Option<&[AnchorField; 2]>,
+                              stream: &mut Vec<u8>,
+                              recon_frames: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>|
+     -> [AnchorField; 2] {
+        let (fy, fu, fv) = frames[d];
+        assert_eq!(fy.len(), width * frame_h);
+        let mut out: Vec<AnchorField> = Vec::with_capacity(2);
+        for bottom in [false, true] {
+            let (sy, su, sv) = extract_field(fy, fu, fv, width, frame_h, bottom);
+            let src = YuvFrame {
+                width: cfg.width,
+                height: field_h,
+                y: &sy,
+                u: &su,
+                v: &sv,
+            };
+            let field_signal = if bottom {
+                FieldPicSignal::BottomField
+            } else {
+                FieldPicSignal::TopField
+            };
+            let poc = 2 * d as i32 + i32::from(bottom);
+            let poc_lsb = (poc as u32) % (1 << poc_lsb_bits);
+            let is_idr = d == 0 && !bottom;
+            let mut sw = BitWriter::new();
+            // §8.5.6 — every MB of a field picture is a field MB.
+            sw.set_field_scan(true);
+            let (mut ry, mut ru, mut rv, infos, mvs) = if let Some(prev) = prev {
+                let prev_field = &prev[usize::from(bottom)];
+                let prev_ref = prev_field.as_frame_ref(cfg.width, field_h);
+                write_p_slice_header(
+                    &mut sw,
+                    &PSliceHeaderConfig {
+                        first_mb_in_slice: 0,
+                        slice_type_raw: 5,
+                        pic_parameter_set_id: 0,
+                        frame_num,
+                        frame_num_bits,
+                        pic_order_cnt_lsb: poc_lsb,
+                        poc_lsb_bits,
+                        slice_qp_delta: 0,
+                        disable_deblocking_filter_idc: 0,
+                        slice_alpha_c0_offset_div2: 0,
+                        slice_beta_offset_div2: 0,
+                        nal_ref_idc: 2,
+                        cabac: None,
+                        field: field_signal,
+                    },
+                );
+                encode_p_slice_data(&field_enc, &src, &prev_ref, &mut sw)
+            } else {
+                write_idr_i_slice_header(
+                    &mut sw,
+                    &IdrSliceHeaderConfig {
+                        first_mb_in_slice: 0,
+                        slice_type_raw: 7,
+                        pic_parameter_set_id: 0,
+                        frame_num,
+                        frame_num_bits,
+                        idr_pic_id: 0,
+                        pic_order_cnt_lsb: poc_lsb,
+                        poc_lsb_bits,
+                        slice_qp_delta: 0,
+                        disable_deblocking_filter_idc: 0,
+                        slice_alpha_c0_offset_div2: 0,
+                        slice_beta_offset_div2: 0,
+                        field: field_signal,
+                        idr: is_idr,
+                        nal_ref_idc: if is_idr { 3 } else { 2 },
+                    },
+                );
+                let (ry, ru, rv, infos) = encode_i_slice_data(&field_enc, &src, &mut sw);
+                // I fields carry no inter motion — the colocated probe
+                // treats every partition as intra (refIdxCol = -1).
+                let n_parts = (width_mbs as usize) * ((field_h / 16) as usize) * 4;
+                let mvs = vec![
+                    FrameRefPartitionMv {
+                        mv_l0: (0, 0),
+                        ref_idx_l0: -1,
+                        is_intra: true,
+                    };
+                    n_parts
+                ];
+                (ry, ru, rv, infos, mvs)
+            };
+            sw.rbsp_trailing_bits();
+            let (ref_idc, nal_type) = if is_idr {
+                (3, NalUnitType::SliceIdr)
+            } else {
+                (2, NalUnitType::SliceNonIdr)
+            };
+            stream.extend_from_slice(&build_nal_unit(ref_idc, nal_type, &sw.into_bytes()));
+            // §8.7 with field_pic = 1 — reference fields must carry the
+            // post-filter samples.
+            deblock_recon_field(
+                cfg.width,
+                field_h,
+                cfg.width / 2,
+                field_h / 2,
+                &mut ry,
+                &mut ru,
+                &mut rv,
+                &infos,
+                0,
+                width_mbs,
+                field_h / 16,
+                1,
+            );
+            out.push(AnchorField {
+                y: ry,
+                u: ru,
+                v: rv,
+                poc,
+                partition_mvs: mvs,
+            });
+        }
+        recon_frames[d] = (
+            interleave_planes(&out[0].y, &out[1].y, width),
+            interleave_planes(&out[0].u, &out[1].u, width / 2),
+            interleave_planes(&out[0].v, &out[1].v, width / 2),
+        );
+        let mut it = out.into_iter();
+        [it.next().unwrap(), it.next().unwrap()]
+    };
+
+    // Encode the non-reference B field pair for display index `d`
+    // between anchors `l0` (earlier) and `l1` (later). Per the
+    // round-20 convention (validated against the black-box reference
+    // decoder), the non-reference B carries the `frame_num` of the
+    // reference picture that precedes it in decoding order.
+    let encode_b_pair =
+        |d: usize,
+         frame_num: u32,
+         l0: &[AnchorField; 2],
+         l1: &[AnchorField; 2],
+         stream: &mut Vec<u8>,
+         recon_frames: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>| {
+            let (fy, fu, fv) = frames[d];
+            assert_eq!(fy.len(), width * frame_h);
+            let mut pair: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(2);
+            for bottom in [false, true] {
+                let (sy, su, sv) = extract_field(fy, fu, fv, width, frame_h, bottom);
+                let src = YuvFrame {
+                    width: cfg.width,
+                    height: field_h,
+                    y: &sy,
+                    u: &su,
+                    v: &sv,
+                };
+                let field_signal = if bottom {
+                    FieldPicSignal::BottomField
+                } else {
+                    FieldPicSignal::TopField
+                };
+                let poc = 2 * d as i32 + i32::from(bottom);
+                let poc_lsb = (poc as u32) % (1 << poc_lsb_bits);
+                let ref_l0 = l0[usize::from(bottom)].as_frame_ref(cfg.width, field_h);
+                let ref_l1 = l1[usize::from(bottom)].as_frame_ref(cfg.width, field_h);
+                let mut sw = BitWriter::new();
+                sw.set_field_scan(true);
+                write_b_slice_header(
+                    &mut sw,
+                    &BSliceHeaderConfig {
+                        first_mb_in_slice: 0,
+                        slice_type_raw: 6,
+                        pic_parameter_set_id: 0,
+                        frame_num,
+                        frame_num_bits,
+                        pic_order_cnt_lsb: poc_lsb,
+                        poc_lsb_bits,
+                        direct_spatial_mv_pred_flag: !cfg.b_temporal_direct,
+                        slice_qp_delta: 0,
+                        disable_deblocking_filter_idc: 0,
+                        slice_alpha_c0_offset_div2: 0,
+                        slice_beta_offset_div2: 0,
+                        nal_ref_idc: 0,
+                        pred_weight_table: None,
+                        cabac: None,
+                        field: field_signal,
+                    },
+                );
+                let (mut ry, mut ru, mut rv, infos) =
+                    encode_b_slice_data(&b_enc, &src, &ref_l0, &ref_l1, poc, &mut sw);
+                sw.rbsp_trailing_bits();
+                stream.extend_from_slice(&build_nal_unit(
+                    0,
+                    NalUnitType::SliceNonIdr,
+                    &sw.into_bytes(),
+                ));
+                // §8.7 with field_pic = 1 — the decoder outputs post-filter
+                // samples for the B fields too.
+                deblock_recon_field(
+                    cfg.width,
+                    field_h,
+                    cfg.width / 2,
+                    field_h / 2,
+                    &mut ry,
+                    &mut ru,
+                    &mut rv,
+                    &infos,
+                    0,
+                    width_mbs,
+                    field_h / 16,
+                    1,
+                );
+                pair.push((ry, ru, rv));
+            }
+            recon_frames[d] = (
+                interleave_planes(&pair[0].0, &pair[1].0, width),
+                interleave_planes(&pair[0].1, &pair[1].1, width / 2),
+                interleave_planes(&pair[0].2, &pair[1].2, width / 2),
+            );
+        };
+
+    // Coding order: anchor 0, then per following anchor (display 2, 4,
+    // …) the anchor pair followed by the B pair it encloses; a
+    // trailing odd display frame becomes a P/P anchor pair.
+    let mut prev_anchor = encode_anchor_pair(0, 0, None, &mut stream, &mut recon_frames);
+    let mut anchor_fn: u32 = 0;
+    let mut d = 2usize;
+    while d < frames.len() {
+        anchor_fn += 1;
+        let next_anchor = encode_anchor_pair(
+            d,
+            anchor_fn % (1 << frame_num_bits),
+            Some(&prev_anchor),
+            &mut stream,
+            &mut recon_frames,
+        );
+        encode_b_pair(
+            d - 1,
+            anchor_fn % (1 << frame_num_bits),
+            &prev_anchor,
+            &next_anchor,
+            &mut stream,
+            &mut recon_frames,
+        );
+        prev_anchor = next_anchor;
+        d += 2;
+    }
+    if frames.len() % 2 == 0 {
+        // Trailing odd display frame without a following anchor.
+        anchor_fn += 1;
+        let _ = encode_anchor_pair(
+            frames.len() - 1,
+            anchor_fn % (1 << frame_num_bits),
+            Some(&prev_anchor),
+            &mut stream,
+            &mut recon_frames,
+        );
     }
 
     PaffEncoded {

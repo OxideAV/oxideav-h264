@@ -74,6 +74,35 @@ fn encode_cfg2(
             frame_picture_indices: frame_pictures,
             cross_parity_first_bottom: cross_parity,
             idr_frame_first,
+            b_fields: false,
+            b_temporal_direct: false,
+        },
+        &refs,
+    )
+}
+
+/// Round-436 — B-field sequences: anchors at even display indices,
+/// non-reference B/B field pairs at odd ones (coding order 0, 2, 1,
+/// 4, 3, …), with the direct-mode derivation selected by
+/// `b_temporal_direct`.
+fn encode_b_fields(n_frames: usize, b_temporal_direct: bool) -> PaffEncoded {
+    let frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+        (0..n_frames).map(make_interlaced_frame).collect();
+    let refs: Vec<(&[u8], &[u8], &[u8])> = frames
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    encode_paff_sequence(
+        &PaffConfig {
+            width: W as u32,
+            frame_height: H as u32,
+            qp: 26,
+            p_fields: true,
+            frame_picture_indices: Vec::new(),
+            cross_parity_first_bottom: false,
+            idr_frame_first: false,
+            b_fields: true,
+            b_temporal_direct,
         },
         &refs,
     )
@@ -262,6 +291,54 @@ fn paff_p_fields_ffmpeg_bit_exact() {
 fn paff_mixed_ffmpeg_bit_exact() {
     let enc = encode(false, vec![1], 3);
     ffmpeg_check(&enc, "paff-mixed-ffmpeg");
+}
+
+#[test]
+fn paff_b_fields_spatial_direct_self_roundtrip_bit_exact() {
+    // Display 0 (I/I), 2 (P/P), 4 (P/P) anchors + non-reference B/B
+    // pairs at displays 1 and 3, coded AFTER their following anchor —
+    // pins the §8.2.4.2.4 + §8.2.4.2.5 B-field list initialisation
+    // (L0[0] / L1[0] = same-parity fields of the enclosing anchors),
+    // the §8.4.1.2.2 spatial direct derivation on field pictures, the
+    // field CAVLC scan on every B residual, the §8.7 field deblock on
+    // B fields, and the §C.4.4 POC-ordered output of non-reference
+    // field pairs between their anchors.
+    let enc = encode_b_fields(5, false);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-b-fields-spatial");
+}
+
+#[test]
+fn paff_b_fields_spatial_direct_ffmpeg_bit_exact() {
+    let enc = encode_b_fields(5, false);
+    ffmpeg_check(&enc, "paff-b-spatial-ffmpeg");
+}
+
+#[test]
+fn paff_b_fields_temporal_direct_self_roundtrip_bit_exact() {
+    // Same layout with `direct_spatial_mv_pred_flag = 0`: B_Skip /
+    // B_Direct MVs come from §8.4.1.2.3 temporal direct — colPic is
+    // the same-parity field of the following anchor (§8.4.1.2.1), its
+    // motion grid is read in field coordinates, and the eq. 8-201/
+    // 8-202 tb/td distances run on per-FIELD order counts.
+    let enc = encode_b_fields(5, true);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-b-fields-temporal");
+}
+
+#[test]
+fn paff_b_fields_temporal_direct_ffmpeg_bit_exact() {
+    let enc = encode_b_fields(5, true);
+    ffmpeg_check(&enc, "paff-b-temporal-ffmpeg");
+}
+
+#[test]
+fn paff_b_fields_trailing_p_pair_self_roundtrip_bit_exact() {
+    // Even frame count: the last display frame has no following anchor
+    // and codes as a trailing P/P pair after the final B pair.
+    let enc = encode_b_fields(4, false);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-b-fields-trailing-p");
 }
 
 /// Diagnostic (env-gated): write the three PAFF streams + our-decoder /

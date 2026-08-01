@@ -4267,6 +4267,7 @@ impl Encoder {
                 nal_ref_idc: 0, // non-reference B
                 pred_weight_table: None,
                 cabac: Some(CabacSliceParams { cabac_init_idc: 0 }),
+                field: FieldPicSignal::FrameMbsOnly,
             },
         );
         // §7.3.4 — cabac_alignment_one_bit until byte aligned.

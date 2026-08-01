@@ -10438,6 +10438,7 @@ impl Encoder {
                 nal_ref_idc: 0, // non-reference B
                 pred_weight_table: weighted_table,
                 cabac: None,
+                field: FieldPicSignal::FrameMbsOnly,
             },
         );
 

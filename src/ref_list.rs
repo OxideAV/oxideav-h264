@@ -1088,9 +1088,44 @@ pub fn sliding_window_marking(
     max_num_ref_frames: u32,
     current_frame_num: u32,
     max_frame_num: u32,
+    current_entry: Option<&DpbEntry>,
 ) {
-    let num_short = dpb.iter().filter(|e| e.is_short_term()).count() as u32;
-    let num_long = dpb.iter().filter(|e| e.is_long_term()).count() as u32;
+    // §8.2.5.3 first branch — when the current picture is a coded
+    // field that is the SECOND field (in decoding order) of a
+    // complementary reference field pair whose first field is marked
+    // "used for short-term reference", the current picture joins the
+    // pair's marking and NO eviction takes place (the pair occupies
+    // one frame slot that the first field already claimed).
+    if let Some(cur) = current_entry {
+        if cur.structure.is_field() {
+            let first_field_is_short_term_ref = dpb.iter().any(|e| {
+                e.structure.is_field()
+                    && e.frame_num == cur.frame_num
+                    && e.structure.is_bottom() != cur.structure.is_bottom()
+                    && e.is_short_term()
+            });
+            if first_field_is_short_term_ref {
+                return;
+            }
+        }
+    }
+
+    // §8.2.5.3 step 1 — numShortTerm / numLongTerm count reference
+    // FRAMES, complementary reference field PAIRS and non-paired
+    // reference fields (a pair of coded fields is ONE unit, not two).
+    // Round 436: the per-entry count evicted a stored field pair's
+    // fields after only `max_num_ref_frames / 2` frames — invisible to
+    // P-field chains (which reference the immediately previous frame)
+    // but fatal to B fields, whose two anchors must both survive.
+    let units = ref_units(dpb);
+    let num_short = units
+        .iter()
+        .filter(|u| u.iter().any(|&i| dpb[i].is_short_term()))
+        .count() as u32;
+    let num_long = units
+        .iter()
+        .filter(|u| u.iter().any(|&i| dpb[i].is_long_term()))
+        .count() as u32;
     let cap = max_num_ref_frames.max(1);
 
     if num_short + num_long < cap {
@@ -1102,26 +1137,62 @@ pub fn sliding_window_marking(
                 // branch, but we guard anyway).
     }
 
-    // Find index of short-term ref with smallest FrameNumWrap.
-    let mut best: Option<(usize, i64)> = None;
-    for (i, e) in dpb.iter().enumerate() {
-        if !e.is_short_term() {
+    // §8.2.5.3 step 2 — the short-term unit with the smallest
+    // FrameNumWrap is marked "unused for reference"; when it is a
+    // frame or a complementary field pair, BOTH fields are marked.
+    let fnw = |frame_num: u32| -> i64 {
+        if frame_num > current_frame_num {
+            frame_num as i64 - max_frame_num as i64
+        } else {
+            frame_num as i64
+        }
+    };
+    let best = units
+        .iter()
+        .filter(|u| u.iter().any(|&i| dpb[i].is_short_term()))
+        .min_by_key(|u| fnw(dpb[u[0]].frame_num));
+    if let Some(unit) = best {
+        for &i in unit {
+            dpb[i].marking = RefMarking::Unused;
+        }
+    }
+}
+
+/// §8.2.5.3 / §8.2.4.1 — group the reference DPB entries into
+/// reference "units": a decoded reference frame, a complementary
+/// reference field pair, or a non-paired reference field. Two
+/// coded-field entries of opposite parity sharing `frame_num` form one
+/// complementary-pair unit; every other entry is a unit of its own.
+/// Returns the entry indices belonging to each unit (non-reference
+/// entries are excluded).
+fn ref_units(dpb: &[DpbEntry]) -> Vec<Vec<usize>> {
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    let mut used = vec![false; dpb.len()];
+    for i in 0..dpb.len() {
+        if used[i] || !dpb[i].is_ref() {
             continue;
         }
-        let fnw: i64 = if e.frame_num > current_frame_num {
-            e.frame_num as i64 - max_frame_num as i64
-        } else {
-            e.frame_num as i64
-        };
-        match best {
-            None => best = Some((i, fnw)),
-            Some((_, cur_fnw)) if fnw < cur_fnw => best = Some((i, fnw)),
-            _ => {}
+        used[i] = true;
+        let mut unit = vec![i];
+        if dpb[i].structure.is_field() {
+            // §3 — complementary field pair: the opposite-parity field
+            // of the same frame (shared `frame_num`).
+            for (j, e) in dpb.iter().enumerate().skip(i + 1) {
+                if !used[j]
+                    && e.is_ref()
+                    && e.structure.is_field()
+                    && e.frame_num == dpb[i].frame_num
+                    && e.structure.is_bottom() != dpb[i].structure.is_bottom()
+                {
+                    used[j] = true;
+                    unit.push(j);
+                    break;
+                }
+            }
         }
+        units.push(unit);
     }
-    if let Some((i, _)) = best {
-        dpb[i].marking = RefMarking::Unused;
-    }
+    units
 }
 
 /// §8.2.5.4 — Adaptive memory control decoded reference picture
@@ -1307,7 +1378,13 @@ pub fn perform_marking(
             mmco5
         }
         None => {
-            sliding_window_marking(dpb, max_num_ref_frames, current_frame_num, max_frame_num);
+            sliding_window_marking(
+                dpb,
+                max_num_ref_frames,
+                current_frame_num,
+                max_frame_num,
+                Some(current_entry),
+            );
             // §8.2.5.1 step 3.
             current_entry.marking = RefMarking::ShortTerm;
             false
@@ -1601,7 +1678,7 @@ mod tests {
         let mut dpb = vec![st_frame(1, 0, 1), st_frame(2, 0, 2), st_frame(3, 0, 3)];
         // max_num_ref=2 with 3 short-term refs ⇒ evict smallest
         // FrameNumWrap = 1 (dpb_key=1).
-        sliding_window_marking(&mut dpb, 2, 4, 16);
+        sliding_window_marking(&mut dpb, 2, 4, 16, None);
         assert_eq!(dpb[0].marking, RefMarking::Unused);
         assert_eq!(dpb[1].marking, RefMarking::ShortTerm);
         assert_eq!(dpb[2].marking, RefMarking::ShortTerm);
@@ -1610,8 +1687,67 @@ mod tests {
     #[test]
     fn sliding_window_no_eviction_when_below_cap() {
         let mut dpb = vec![st_frame(1, 0, 1)];
-        sliding_window_marking(&mut dpb, 2, 2, 16);
+        sliding_window_marking(&mut dpb, 2, 2, 16, None);
         assert_eq!(dpb[0].marking, RefMarking::ShortTerm);
+    }
+
+    /// §8.2.5.3 step 1 — a complementary reference field pair (two
+    /// coded-field entries sharing `frame_num`) counts as ONE unit
+    /// toward numShortTerm: two stored pairs at `max_num_ref_frames =
+    /// 2` are exactly at capacity, so the FIRST field of a new frame
+    /// evicts the oldest PAIR (both fields), not a single field.
+    #[test]
+    fn sliding_window_counts_field_pair_as_one_frame() {
+        let mut dpb = vec![
+            st_single_field(0, FieldParity::Top, 0, 10),
+            st_single_field(0, FieldParity::Bottom, 1, 11),
+            st_single_field(1, FieldParity::Top, 4, 12),
+            st_single_field(1, FieldParity::Bottom, 5, 13),
+        ];
+        // First (top) field of frame_num 2 — NOT the second field of
+        // any stored pair.
+        let cur = st_single_field(2, FieldParity::Top, 8, 14);
+        sliding_window_marking(&mut dpb, 2, 2, 16, Some(&cur));
+        // Whole frame-0 pair evicted; frame-1 pair untouched.
+        assert_eq!(dpb[0].marking, RefMarking::Unused);
+        assert_eq!(dpb[1].marking, RefMarking::Unused);
+        assert_eq!(dpb[2].marking, RefMarking::ShortTerm);
+        assert_eq!(dpb[3].marking, RefMarking::ShortTerm);
+    }
+
+    /// §8.2.5.3 first branch — the SECOND field of a complementary
+    /// reference field pair whose first field is short-term does not
+    /// trigger any eviction (the pair occupies the slot the first
+    /// field already claimed), even when the DPB is at capacity.
+    #[test]
+    fn sliding_window_second_field_of_ref_pair_is_exempt() {
+        let mut dpb = vec![
+            st_single_field(0, FieldParity::Top, 0, 10),
+            st_single_field(0, FieldParity::Bottom, 1, 11),
+            // First field of frame 1 (the current picture's frame).
+            st_single_field(1, FieldParity::Top, 4, 12),
+        ];
+        // Current = the BOTTOM field completing frame 1's pair.
+        let cur = st_single_field(1, FieldParity::Bottom, 5, 13);
+        sliding_window_marking(&mut dpb, 2, 1, 16, Some(&cur));
+        assert!(dpb.iter().all(|e| e.marking == RefMarking::ShortTerm));
+    }
+
+    /// §8.2.5.3 — a non-paired reference field is its own unit: one
+    /// stored pair + one non-paired field at cap 2 → the first field
+    /// of a new frame evicts the unit with the smallest FrameNumWrap.
+    #[test]
+    fn sliding_window_non_paired_field_is_own_unit() {
+        let mut dpb = vec![
+            st_single_field(0, FieldParity::Top, 0, 10),
+            st_single_field(1, FieldParity::Top, 4, 12),
+            st_single_field(1, FieldParity::Bottom, 5, 13),
+        ];
+        let cur = st_single_field(2, FieldParity::Top, 8, 14);
+        sliding_window_marking(&mut dpb, 2, 2, 16, Some(&cur));
+        assert_eq!(dpb[0].marking, RefMarking::Unused);
+        assert_eq!(dpb[1].marking, RefMarking::ShortTerm);
+        assert_eq!(dpb[2].marking, RefMarking::ShortTerm);
     }
 
     // §8.2.5.4.1 — MMCO 1 (mark short-term unused).
