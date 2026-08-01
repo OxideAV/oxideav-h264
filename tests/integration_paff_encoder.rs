@@ -503,14 +503,7 @@ fn paff_dump_streams_for_diag() {
     };
     let dir = std::path::PathBuf::from(dir);
     std::fs::create_dir_all(&dir).unwrap();
-    for (name, p_fields, frame_pics, n, xpar, idr_frame) in [
-        ("paff-i", false, Vec::new(), 3usize, false, false),
-        ("paff-p", true, Vec::new(), 4, false, false),
-        ("paff-mixed", false, vec![1], 3, false, false),
-        ("paff-p-crossparity", true, Vec::new(), 3, true, false),
-        ("paff-idr-frame-p-fields", true, Vec::new(), 3, false, true),
-    ] {
-        let enc = encode_cfg2(p_fields, frame_pics, n, xpar, idr_frame);
+    let mut dump = |name: &str, enc: &PaffEncoded| {
         std::fs::write(dir.join(format!("{name}.h264")), &enc.annex_b).unwrap();
         let mut recon = Vec::new();
         for (y, u, v) in &enc.recon_frames {
@@ -526,5 +519,22 @@ fn paff_dump_streams_for_diag() {
             }
         }
         std::fs::write(dir.join(format!("{name}-oursdec.yuv")), ours).unwrap();
+    };
+    for (name, p_fields, frame_pics, n, xpar, idr_frame) in [
+        ("paff-i", false, Vec::new(), 3usize, false, false),
+        ("paff-p", true, Vec::new(), 4, false, false),
+        ("paff-mixed", false, vec![1], 3, false, false),
+        ("paff-p-crossparity", true, Vec::new(), 3, true, false),
+        ("paff-idr-frame-p-fields", true, Vec::new(), 3, false, true),
+    ] {
+        dump(name, &encode_cfg2(p_fields, frame_pics, n, xpar, idr_frame));
     }
+    // Round-436 stream classes.
+    dump("paff-b-fields-spatial", &encode_b_fields(5, false));
+    dump("paff-b-fields-temporal", &encode_b_fields(5, true));
+    dump("paff-i-8x8t", &encode_8x8_fields(3, false, false));
+    dump("paff-p-8x8t", &encode_8x8_fields(4, true, false));
+    dump("paff-b-8x8t", &encode_8x8_fields(5, true, true));
+    dump("paff-lt-anchor", &encode_marking_axis(5, true, false));
+    dump("paff-mmco1-field", &encode_marking_axis(3, false, true));
 }
