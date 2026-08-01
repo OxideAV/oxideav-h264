@@ -3284,8 +3284,9 @@ impl Encoder {
                 let mut transform_size_8x8 = false;
                 let mut scan8_blocks = [[0i32; 64]; 4];
                 if cfg.transform_8x8 {
-                    let inter_luma8 =
-                        forward_inter_luma_8x8(frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w8);
+                    let inter_luma8 = forward_inter_luma_8x8(
+                        frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w8, false,
+                    );
                     let mut cbp_luma8: u8 = 0;
                     for blk8 in 0..4usize {
                         if inter_luma8.blk_has_nz[blk8 * 4] {
@@ -3384,10 +3385,10 @@ impl Encoder {
                         let pv: &[i32; 256] = pred_v[..256].try_into().expect("pred tile");
                         if transform_size_8x8 {
                             cb444 = forward_inter_luma_8x8(
-                                frame.u, chroma_w, mb_x, mb_y, pu, qp_c, &wq.w8,
+                                frame.u, chroma_w, mb_x, mb_y, pu, qp_c, &wq.w8, false,
                             );
                             cr444 = forward_inter_luma_8x8(
-                                frame.v, chroma_w, mb_x, mb_y, pv, qp_c, &wq.w8,
+                                frame.v, chroma_w, mb_x, mb_y, pv, qp_c, &wq.w8, false,
                             );
                             // Re-interleave the §7.4.5.3.3 four-4x4 split back
                             // into the Table 8-14 64-entry scan per quadrant.
@@ -4780,7 +4781,7 @@ impl Encoder {
                     let mut scan8_blocks = [[0i32; 64]; 4];
                     if cfg.transform_8x8 {
                         let fwd8 = forward_inter_luma_8x8(
-                            frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w8,
+                            frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w8, false,
                         );
                         let mut cbp_luma8: u8 = 0;
                         for blk8 in 0..4usize {
@@ -4827,10 +4828,10 @@ impl Encoder {
                         let pv: &[i32; 256] = pred_v[..256].try_into().expect("pred tile");
                         if transform_size_8x8 {
                             cb444 = forward_inter_luma_8x8(
-                                frame.u, chroma_w, mb_x, mb_y, pu, qp_c, &wq.w8,
+                                frame.u, chroma_w, mb_x, mb_y, pu, qp_c, &wq.w8, false,
                             );
                             cr444 = forward_inter_luma_8x8(
-                                frame.v, chroma_w, mb_x, mb_y, pv, qp_c, &wq.w8,
+                                frame.v, chroma_w, mb_x, mb_y, pv, qp_c, &wq.w8, false,
                             );
                             for blk8 in 0..4usize {
                                 for i4 in 0..4usize {
@@ -6656,8 +6657,9 @@ impl Encoder {
                 let mut transform_size_8x8 = false;
                 let mut scan8_blocks = [[0i32; 64]; 4];
                 if cfg.transform_8x8 {
-                    let inter_luma8 =
-                        forward_inter_luma_8x8(frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w8);
+                    let inter_luma8 = forward_inter_luma_8x8(
+                        frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w8, false,
+                    );
                     let mut cbp_luma8: u8 = 0;
                     for blk8 in 0..4usize {
                         if inter_luma8.blk_has_nz[blk8 * 4] {

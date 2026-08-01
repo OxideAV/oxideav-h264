@@ -76,6 +76,7 @@ fn encode_cfg2(
             idr_frame_first,
             b_fields: false,
             b_temporal_direct: false,
+            transform_8x8: false,
         },
         &refs,
     )
@@ -103,6 +104,7 @@ fn encode_b_fields(n_frames: usize, b_temporal_direct: bool) -> PaffEncoded {
             idr_frame_first: false,
             b_fields: true,
             b_temporal_direct,
+            transform_8x8: false,
         },
         &refs,
     )
@@ -330,6 +332,85 @@ fn paff_b_fields_temporal_direct_self_roundtrip_bit_exact() {
 fn paff_b_fields_temporal_direct_ffmpeg_bit_exact() {
     let enc = encode_b_fields(5, true);
     ffmpeg_check(&enc, "paff-b-temporal-ffmpeg");
+}
+
+/// Round-436 — sequences with `EncoderConfig::transform_8x8` in the
+/// field pictures: the CAVLC 8x8 luma coefficients must be emitted in
+/// the §8.5.7 Table 8-14 FIELD scan (via the split-pipeline
+/// pre-composed scan).
+fn encode_8x8_fields(n_frames: usize, p_fields: bool, b_fields: bool) -> PaffEncoded {
+    let frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+        (0..n_frames).map(make_interlaced_frame).collect();
+    let refs: Vec<(&[u8], &[u8], &[u8])> = frames
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    encode_paff_sequence(
+        &PaffConfig {
+            width: W as u32,
+            frame_height: H as u32,
+            // Low QP so the 8x8 trial genuinely wins on part of the
+            // gradient content (denser coefficients).
+            qp: 22,
+            p_fields,
+            frame_picture_indices: Vec::new(),
+            cross_parity_first_bottom: false,
+            idr_frame_first: false,
+            b_fields,
+            b_temporal_direct: false,
+            transform_8x8: true,
+        },
+        &refs,
+    )
+}
+
+#[test]
+fn paff_i_fields_transform_8x8_self_roundtrip_bit_exact() {
+    // All-I field pairs under High profile with transform_8x8: the
+    // 3-way intra RDO can pick I_8x8, whose CAVLC coefficients must
+    // ride the §8.5.7 Table 8-14 FIELD scan (every MB of a field
+    // picture is a field MB).
+    let enc = encode_8x8_fields(3, false, false);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-i-8x8t");
+}
+
+#[test]
+fn paff_i_fields_transform_8x8_ffmpeg_bit_exact() {
+    let enc = encode_8x8_fields(3, false, false);
+    ffmpeg_check(&enc, "paff-i-8x8t-ffmpeg");
+}
+
+#[test]
+fn paff_p_fields_transform_8x8_self_roundtrip_bit_exact() {
+    // P field pairs with the inter 8x8-vs-4x4 residual trial active —
+    // the §7.3.5 second-gate transform_size_8x8_flag rides the field
+    // CAVLC path and 8x8 winners emit field-scanned coefficients.
+    let enc = encode_8x8_fields(4, true, false);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-p-8x8t");
+}
+
+#[test]
+fn paff_p_fields_transform_8x8_ffmpeg_bit_exact() {
+    let enc = encode_8x8_fields(4, true, false);
+    ffmpeg_check(&enc, "paff-p-8x8t-ffmpeg");
+}
+
+#[test]
+fn paff_b_fields_transform_8x8_self_roundtrip_bit_exact() {
+    // B field pairs + transform_8x8: every coded B shape passes the
+    // §7.3.5 second gate; 8x8 winners in B fields also emit the
+    // Table 8-14 FIELD scan.
+    let enc = encode_8x8_fields(5, true, true);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-b-8x8t");
+}
+
+#[test]
+fn paff_b_fields_transform_8x8_ffmpeg_bit_exact() {
+    let enc = encode_8x8_fields(5, true, true);
+    ffmpeg_check(&enc, "paff-b-8x8t-ffmpeg");
 }
 
 #[test]

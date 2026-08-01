@@ -108,7 +108,7 @@ use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
     deinterleave_8x8_to_4x4, forward_core_4x4, forward_core_8x8, forward_hadamard_2x2,
     forward_hadamard_4x4, quantize_4x4_ac_w, quantize_4x4_w, quantize_8x8_w, quantize_chroma_dc_w,
-    quantize_luma_dc_w, zigzag_scan_4x4, zigzag_scan_4x4_ac, zigzag_scan_8x8,
+    quantize_luma_dc_w, scan_8x8_for_cavlc, zigzag_scan_4x4, zigzag_scan_4x4_ac,
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::intra_pred::{
@@ -3151,7 +3151,7 @@ impl Encoder {
                 if mode_idx != predicted {
                     bits += 3;
                 }
-                let scan = zigzag_scan_8x8(&z_raster);
+                let scan = scan_8x8_for_cavlc(&z_raster, sw.field_scan());
                 let subs = deinterleave_8x8_to_4x4(&scan);
                 let mut trial_w = BitWriter::new();
                 for sub in &subs {
@@ -3190,7 +3190,7 @@ impl Encoder {
             }
             intra_grid.slot_mut(mb_x, mb_y).intra_8x8_pred_modes[blk8] = chosen;
 
-            let scan = zigzag_scan_8x8(&best_z_raster);
+            let scan = scan_8x8_for_cavlc(&best_z_raster, sw.field_scan());
             let subs = deinterleave_8x8_to_4x4(&scan);
             for (i4x4, sub) in subs.iter().enumerate() {
                 luma_4x4_levels[blk8 * 4 + i4x4] = *sub;
@@ -3757,7 +3757,7 @@ impl Encoder {
                 if mode_idx != predicted {
                     bits += 3;
                 }
-                let scan = zigzag_scan_8x8(&z_raster);
+                let scan = scan_8x8_for_cavlc(&z_raster, sw.field_scan());
                 let subs = deinterleave_8x8_to_4x4(&scan);
                 let mut trial_w = BitWriter::new();
                 for sub in &subs {
@@ -3793,7 +3793,7 @@ impl Encoder {
                 };
             }
             intra_grid.slot_mut(mb_x, mb_y).intra_8x8_pred_modes[blk8] = chosen;
-            let scan = zigzag_scan_8x8(&best_z_raster);
+            let scan = scan_8x8_for_cavlc(&best_z_raster, sw.field_scan());
             let subs = deinterleave_8x8_to_4x4(&scan);
             for (i4x4, sub) in subs.iter().enumerate() {
                 luma_4x4_levels[blk8 * 4 + i4x4] = *sub;
@@ -3832,7 +3832,7 @@ impl Encoder {
                         plane_recon[(by + j) * width + bx + i] = v as u8;
                     }
                 }
-                let scan = zigzag_scan_8x8(&z_raster);
+                let scan = scan_8x8_for_cavlc(&z_raster, sw.field_scan());
                 let subs = deinterleave_8x8_to_4x4(&scan);
                 let any_nz = z_raster.iter().any(|&v| v != 0);
                 if plane_is_cr {
@@ -6060,8 +6060,16 @@ impl Encoder {
         // of the comparison).
         let mut transform_size_8x8 = false;
         if self.cfg.transform_8x8 {
-            let inter_luma8 =
-                forward_inter_luma_8x8(frame.y, width, mb_x, mb_y, &pred_y, qp_y, &wq.w8);
+            let inter_luma8 = forward_inter_luma_8x8(
+                frame.y,
+                width,
+                mb_x,
+                mb_y,
+                &pred_y,
+                qp_y,
+                &wq.w8,
+                sw.field_scan(),
+            );
             let mut cbp_luma8: u8 = 0;
             for blk8 in 0..4usize {
                 if inter_luma8.blk_has_nz[blk8 * 4] {
@@ -6124,10 +6132,26 @@ impl Encoder {
                 let pu: &[i32; 256] = pred_u[..256].try_into().expect("pred tile");
                 let pv: &[i32; 256] = pred_v[..256].try_into().expect("pred tile");
                 if transform_size_8x8 {
-                    cb444 =
-                        forward_inter_luma_8x8(frame.u, chroma_width, mb_x, mb_y, pu, qp_c, &wq.w8);
-                    cr444 =
-                        forward_inter_luma_8x8(frame.v, chroma_width, mb_x, mb_y, pv, qp_c, &wq.w8);
+                    cb444 = forward_inter_luma_8x8(
+                        frame.u,
+                        chroma_width,
+                        mb_x,
+                        mb_y,
+                        pu,
+                        qp_c,
+                        &wq.w8,
+                        sw.field_scan(),
+                    );
+                    cr444 = forward_inter_luma_8x8(
+                        frame.v,
+                        chroma_width,
+                        mb_x,
+                        mb_y,
+                        pv,
+                        qp_c,
+                        &wq.w8,
+                        sw.field_scan(),
+                    );
                 } else {
                     cb444 = forward_inter_luma(frame.u, chroma_width, mb_x, mb_y, pu, qp_c, &wq.w4);
                     cr444 = forward_inter_luma(frame.v, chroma_width, mb_x, mb_y, pv, qp_c, &wq.w4);
@@ -7625,6 +7649,7 @@ fn forward_inter_luma_8x8(
     pred: &[i32; 256],
     qp_y: i32,
     w8: &[i32; 64],
+    field_scan: bool,
 ) -> InterLumaForward {
     let mut levels_scan = [[0i32; 16]; 16];
     let mut blk_has_nz = [false; 16];
@@ -7643,7 +7668,7 @@ fn forward_inter_luma_8x8(
         let w = forward_core_8x8(&res);
         let z = quantize_8x8_w(&w, qp_y, false, w8);
         let any_nz = z.iter().any(|&v| v != 0);
-        let scan = zigzag_scan_8x8(&z);
+        let scan = scan_8x8_for_cavlc(&z, field_scan);
         let subs = deinterleave_8x8_to_4x4(&scan);
         for (i4x4, sub) in subs.iter().enumerate() {
             levels_scan[blk8 * 4 + i4x4] = *sub;
@@ -11542,8 +11567,16 @@ impl Encoder {
         // codable for whichever writer wins below).
         let mut transform_size_8x8 = false;
         if self.cfg.transform_8x8 {
-            let inter_luma8 =
-                forward_inter_luma_8x8(frame.y, src_stride, mb_x, mb_y, &pred_y, qp_y, &wq.w8);
+            let inter_luma8 = forward_inter_luma_8x8(
+                frame.y,
+                src_stride,
+                mb_x,
+                mb_y,
+                &pred_y,
+                qp_y,
+                &wq.w8,
+                sw.field_scan(),
+            );
             let mut cbp_luma8: u8 = 0;
             for blk8 in 0..4usize {
                 if inter_luma8.blk_has_nz[blk8 * 4] {
@@ -12521,8 +12554,16 @@ impl Encoder {
         }
         let mut transform_size_8x8 = false;
         if self.cfg.transform_8x8 {
-            let inter_luma8 =
-                forward_inter_luma_8x8(frame.y, src_stride, mb_x, mb_y, &pred_y, qp_y, &wq.w8);
+            let inter_luma8 = forward_inter_luma_8x8(
+                frame.y,
+                src_stride,
+                mb_x,
+                mb_y,
+                &pred_y,
+                qp_y,
+                &wq.w8,
+                sw.field_scan(),
+            );
             let mut cbp_luma8: u8 = 0;
             for blk8 in 0..4usize {
                 if inter_luma8.blk_has_nz[blk8 * 4] {
@@ -12575,10 +12616,26 @@ impl Encoder {
                 let pu: &[i32; 256] = pred_u[..256].try_into().expect("pred tile");
                 let pv: &[i32; 256] = pred_v[..256].try_into().expect("pred tile");
                 if transform_size_8x8 {
-                    cb444 =
-                        forward_inter_luma_8x8(frame.u, chroma_width, mb_x, mb_y, pu, qp_c, &wq.w8);
-                    cr444 =
-                        forward_inter_luma_8x8(frame.v, chroma_width, mb_x, mb_y, pv, qp_c, &wq.w8);
+                    cb444 = forward_inter_luma_8x8(
+                        frame.u,
+                        chroma_width,
+                        mb_x,
+                        mb_y,
+                        pu,
+                        qp_c,
+                        &wq.w8,
+                        sw.field_scan(),
+                    );
+                    cr444 = forward_inter_luma_8x8(
+                        frame.v,
+                        chroma_width,
+                        mb_x,
+                        mb_y,
+                        pv,
+                        qp_c,
+                        &wq.w8,
+                        sw.field_scan(),
+                    );
                 } else {
                     cb444 = forward_inter_luma(frame.u, chroma_width, mb_x, mb_y, pu, qp_c, &wq.w4);
                     cr444 = forward_inter_luma(frame.v, chroma_width, mb_x, mb_y, pv, qp_c, &wq.w4);

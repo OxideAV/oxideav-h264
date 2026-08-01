@@ -128,6 +128,16 @@ pub struct PaffConfig {
     /// own §8.2.1 order counts. When `false`, B fields use the
     /// §8.4.1.2.2 spatial direct derivation.
     pub b_temporal_direct: bool,
+    /// Round-436 — enable the **8x8 transform** in the field pictures
+    /// (`EncoderConfig::transform_8x8`; SPS auto-promotes to High,
+    /// PPS codes `transform_8x8_mode_flag = 1`). Every MB of a field
+    /// picture is a field MB, so the CAVLC 8x8 luma coefficients are
+    /// emitted in the §8.5.7 Table 8-14 **FIELD scan** (via the
+    /// split-pipeline pre-composed scan,
+    /// [`crate::encoder::transform::field_scan_8x8_for_cavlc_split`])
+    /// — I_8x8 gets a real 3-way intra RDO, P/B MBs run the
+    /// 8x8-vs-4x4 inter residual trial.
+    pub transform_8x8: bool,
 }
 
 /// A reconstructed reference field: (Y, Cb, Cr) half-height planes +
@@ -477,11 +487,16 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
     // Field-sized encoder (all field pictures) + frame-sized encoder
     // (mixed FRAME pictures). §A.2.1 bars interlace from Baseline —
     // Main (77) it is; CAVLC only.
+    // §A.2.1 bars interlace from Baseline — Main (77); the 8x8
+    // transform is a High-profile tool (§A.2.4) so the 8x8 axis
+    // promotes to High (100).
+    let profile_idc: u8 = if cfg.transform_8x8 { 100 } else { 77 };
     let mk_cfg = |h: u32| {
         let mut c = EncoderConfig::new(cfg.width, h);
         c.qp = cfg.qp;
-        c.profile_idc = 77;
+        c.profile_idc = profile_idc;
         c.max_num_ref_frames = 2;
+        c.transform_8x8 = cfg.transform_8x8;
         c
     };
     let field_enc = Encoder::new(mk_cfg(field_h));
@@ -504,7 +519,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         log2_max_frame_num_minus4,
         log2_max_poc_lsb_minus4,
         max_num_ref_frames: 2,
-        profile_idc: 77,
+        profile_idc,
         chroma_format_idc: 1,
         seq_scaling_lists: None,
         interlaced_fields: true,
@@ -520,7 +535,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         weighted_pred_flag: false,
         weighted_bipred_idc: 0,
         entropy_coding_mode_flag: false,
-        transform_8x8_mode_flag: false,
+        transform_8x8_mode_flag: cfg.transform_8x8,
     });
     let mut stream: Vec<u8> = Vec::new();
     stream.extend_from_slice(&build_nal_unit(3, NalUnitType::Sps, &sps_rbsp));
@@ -691,11 +706,10 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
             };
 
             let mut sw = BitWriter::new();
-            // §8.5.6 — every MB of a field picture is a field MB: the
-            // CAVLC residual writer must emit the Table 8-13 FIELD
-            // scan. (The 8x8 transform would need the Table 8-14 field
-            // scan — not wired; the configs above leave it disabled.)
-            debug_assert!(!field_enc.cfg.transform_8x8);
+            // §8.5.6/§8.5.7 — every MB of a field picture is a field
+            // MB: the CAVLC residual writer emits the Table 8-13 FIELD
+            // scan (4x4) and, under `transform_8x8`, the encoder scans
+            // 8x8 coefficients with the Table 8-14 field scan.
             sw.set_field_scan(true);
             if as_p {
                 write_p_slice_header(
@@ -827,8 +841,9 @@ fn encode_paff_b_sequence(
     let mk_cfg = || {
         let mut c = EncoderConfig::new(cfg.width, field_h);
         c.qp = cfg.qp;
-        c.profile_idc = 77;
+        c.profile_idc = if cfg.transform_8x8 { 100u8 } else { 77 };
         c.max_num_ref_frames = 2;
+        c.transform_8x8 = cfg.transform_8x8;
         c
     };
     let field_enc = Encoder::new(mk_cfg());

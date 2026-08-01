@@ -1092,6 +1092,81 @@ pub fn zigzag_scan_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
     out
 }
 
+/// §8.5.7 / Table 8-14 (field row, Figure 8-9 b) — forward 8x8 FIELD
+/// scan: `FIELD_8X8_FWD[k]` is the row-major index (`i*8 + j`) of the
+/// coefficient at field-scan position `k`. Inverse of the decoder's
+/// Table 8-14 field mapping (round-436 PAFF field-picture 8x8
+/// transform).
+#[rustfmt::skip]
+pub const FIELD_8X8_FWD: [usize; 64] = [
+     0,  8, 16,  1,  9, 24, 32, 17,  2, 25, 40, 48, 56, 33, 10,  3,
+    18, 41, 49, 57, 26, 11,  4, 19, 34, 42, 50, 58, 27, 12,  5, 20,
+    35, 43, 51, 59, 28, 13,  6, 21, 36, 44, 52, 60, 29, 14, 22, 37,
+    45, 53, 61, 30,  7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63,
+];
+
+/// Pack an 8x8 row-major coefficient block into the §8.5.7 Table 8-14
+/// FIELD scan order.
+pub fn field_scan_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
+    let mut out = [0i32; 64];
+    for (scan, &raster) in FIELD_8X8_FWD.iter().enumerate() {
+        out[scan] = coeffs[raster];
+    }
+    out
+}
+
+/// Round-436 — the FIELD 8x8 scan **pre-composed for the CAVLC split
+/// pipeline**. The CAVLC 8x8 luma residual travels through two fixed
+/// downstream permutations before hitting the bitstream:
+///
+///  1. [`deinterleave_8x8_to_4x4`] — the §7.4.5.3.3 stride-4 split
+///     into four 16-coefficient sub-blocks, and
+///  2. the residual writer's per-sub-block field remap
+///     ([`crate::encoder::cavlc::encode_residual_block_cavlc`] applies
+///     the 4x4 Table 8-13 `ZZ_TO_FIELD_16` permutation to EVERY
+///     16-entry `Numeric` list when the writer is in field-scan mode —
+///     correct for real 4x4 blocks, but the writer cannot distinguish
+///     an 8x8 split sub-block from a 4x4 block).
+///
+/// This table bakes the inverse of both stages into the scan itself:
+/// `FIELD_8X8_FWD_CAVLC_SPLIT[4 * ZZ_TO_FIELD_16[k] + sub] =
+/// FIELD_8X8_FWD[4 * k + sub]`, so that after the split (1) and the
+/// writer remap (2) the emitted sub-block streams carry exactly the
+/// §7.4.5.3.3 split of the Table 8-14 FIELD scan — what a §8.5.7
+/// decoder re-interleaves and inverse-field-scans. Pinned against the
+/// plain [`field_scan_8x8`] by
+/// `cavlc::tests::field_8x8_precomposed_scan_survives_split_and_writer_remap`.
+#[rustfmt::skip]
+pub const FIELD_8X8_FWD_CAVLC_SPLIT: [usize; 64] = [
+     0,  8, 16,  1,  2, 25, 40, 48,  9, 24, 32, 17, 56, 33, 10,  3,
+    26, 11,  4, 19, 35, 43, 51, 59, 45, 53, 61, 30, 28, 13,  6, 21,
+    34, 42, 50, 58, 18, 41, 49, 57, 27, 12,  5, 20, 36, 44, 52, 60,
+     7, 15, 38, 46, 54, 62, 23, 31, 29, 14, 22, 37, 39, 47, 55, 63,
+];
+
+/// [`field_scan_8x8`] pre-composed for the CAVLC split pipeline — see
+/// [`FIELD_8X8_FWD_CAVLC_SPLIT`]. Use THIS scan (instead of
+/// [`zigzag_scan_8x8`]) for CAVLC 8x8 luma coefficients when the
+/// slice's residual writer is in field-scan mode.
+pub fn field_scan_8x8_for_cavlc_split(coeffs: &[i32; 64]) -> [i32; 64] {
+    let mut out = [0i32; 64];
+    for (scan, &raster) in FIELD_8X8_FWD_CAVLC_SPLIT.iter().enumerate() {
+        out[scan] = coeffs[raster];
+    }
+    out
+}
+
+/// Scan an 8x8 coefficient block for the CAVLC split pipeline: frame
+/// MBs use the Table 8-14 zig-zag, FIELD MBs (field pictures) the
+/// pre-composed field scan.
+pub fn scan_8x8_for_cavlc(coeffs: &[i32; 64], field: bool) -> [i32; 64] {
+    if field {
+        field_scan_8x8_for_cavlc_split(coeffs)
+    } else {
+        zigzag_scan_8x8(coeffs)
+    }
+}
+
 /// §7.4.5.3.3 — de-interleave a 64-entry 8x8 scan-order level array into
 /// the four CAVLC 4x4 residual blocks: `level4x4[i4x4][i] =
 /// level8x8[4*i + i4x4]`. Returns four 16-entry scan-order blocks, ready

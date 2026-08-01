@@ -487,6 +487,58 @@ mod tests {
         assert_eq!(inverse_scan_4x4_field_ac(&field_ac), ac_raster);
     }
 
+    /// Round-436 — the pre-composed 8x8 FIELD scan
+    /// (`field_scan_8x8_for_cavlc_split`) must survive the full CAVLC
+    /// split pipeline: after the §7.4.5.3.3 stride-4 de-interleave AND
+    /// the writer's per-sub-block `ZZ_TO_FIELD_16` remap, the emitted
+    /// sub-block lists must equal the §7.4.5.3.3 split of the plain
+    /// Table 8-14 FIELD scan — i.e. what a §8.5.7 decoder
+    /// re-interleaves and inverse-field-scans back to the raster block.
+    #[test]
+    fn field_8x8_precomposed_scan_survives_split_and_writer_remap() {
+        use crate::encoder::transform::{
+            deinterleave_8x8_to_4x4, field_scan_8x8, field_scan_8x8_for_cavlc_split,
+        };
+        use crate::reconstruct::inverse_scan_8x8_field;
+        let raster: [i32; 64] = core::array::from_fn(|i| i as i32 + 1);
+
+        // Encoder emission path: pre-composed scan → split → writer
+        // remap per sub-block.
+        let pre = field_scan_8x8_for_cavlc_split(&raster);
+        let subs = deinterleave_8x8_to_4x4(&pre);
+        let mut emitted = [[0i32; 16]; 4];
+        for (sub, list) in subs.iter().enumerate() {
+            for (k, &src) in ZZ_TO_FIELD_16.iter().enumerate() {
+                emitted[sub][k] = list[src];
+            }
+        }
+
+        // The emitted sub-blocks must be the §7.4.5.3.3 split of the
+        // plain field scan …
+        let field = field_scan_8x8(&raster);
+        assert_eq!(emitted, deinterleave_8x8_to_4x4(&field));
+
+        // … and re-interleaving + the decoder's §8.5.7 inverse FIELD
+        // scan must reproduce the raster block exactly.
+        let mut reinterleaved = [0i32; 64];
+        for i in 0..16 {
+            for (sub, e) in emitted.iter().enumerate() {
+                reinterleaved[4 * i + sub] = e[i];
+            }
+        }
+        assert_eq!(inverse_scan_8x8_field(&reinterleaved), raster);
+    }
+
+    /// Round-436 — the plain forward Table 8-14 FIELD scan must be the
+    /// exact inverse of the decoder's `inverse_scan_8x8_field`.
+    #[test]
+    fn field_scan_8x8_matches_decoder_inverse() {
+        use crate::encoder::transform::field_scan_8x8;
+        use crate::reconstruct::inverse_scan_8x8_field;
+        let raster: [i32; 64] = core::array::from_fn(|i| (i as i32 * 7) % 101 - 50);
+        assert_eq!(inverse_scan_8x8_field(&field_scan_8x8(&raster)), raster);
+    }
+
     /// The writer-carried field-scan mode must re-permute a `Numeric`
     /// 16-coeff list so that a FIELD-scan decode recovers the same
     /// raster coefficients a zig-zag decode of the unflagged emission

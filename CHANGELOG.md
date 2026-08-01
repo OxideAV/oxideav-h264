@@ -28,6 +28,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Encoder **field-mode 8x8 transform scan** (round 436, the r416
+  "encoder field 8x8 scan" follow-up). New §8.5.7 Table 8-14 FIELD
+  scan on the encoder side (`encoder::transform::field_scan_8x8` +
+  `FIELD_8X8_FWD`), plus a **split-pipeline pre-composed variant**
+  (`field_scan_8x8_for_cavlc_split`): the CAVLC 8x8 luma residual
+  passes through the §7.4.5.3.3 stride-4 de-interleave and then the
+  residual writer's per-sub-block Table 8-13 field remap (the writer
+  cannot distinguish an 8x8 split sub-block from a real 4x4 block),
+  so the scan bakes the inverse of both fixed stages in — the emitted
+  sub-block streams carry exactly the §7.4.5.3.3 split of the
+  Table 8-14 FIELD scan. All CAVLC 8x8 scan sites (I_8x8 4:2:0 +
+  4:4:4 intra RDO, the P/B inter 8x8-vs-4x4 trial via
+  `forward_inter_luma_8x8`) select frame/field by the live writer's
+  field-scan mode. `PaffConfig::transform_8x8` enables the tool in
+  PAFF field pictures (SPS promotes to High 100, PPS codes
+  `transform_8x8_mode_flag = 1`). Unit tests pin the forward scan as
+  the exact inverse of the decoder's §8.5.7 field scan and the
+  pre-composed scan surviving the full split + writer-remap pipeline;
+  six new integration gates (I / P / B field sequences, decoder
+  self-roundtrip + black-box reference decoder, byte-exact — with the
+  8x8 trial verified to genuinely win on part of the content).
+
 - PAFF **B field pictures** (round 436, encode + decode arms). The
   `encoder::field` driver gains `PaffConfig::b_fields`: anchors at
   even display indices (IDR/I pair, then P/P pairs), non-reference

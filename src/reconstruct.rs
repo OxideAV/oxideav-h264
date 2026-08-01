@@ -353,7 +353,9 @@ const FIELD_SCAN_POS_8X8: [u8; 64] = [
 ];
 
 /// §8.5.7 — inverse 8x8 field scan (see [`FIELD_SCAN_POS_8X8`]).
-fn inverse_scan_8x8_field(levels: &[i32; 64]) -> [i32; 64] {
+/// `pub(crate)` so the encoder's forward Table 8-14 field scan is
+/// unit-tested as its exact inverse (round-436).
+pub(crate) fn inverse_scan_8x8_field(levels: &[i32; 64]) -> [i32; 64] {
     let mut out = [0i32; 64];
     for (pos, &scan_idx) in FIELD_SCAN_POS_8X8.iter().enumerate() {
         out[pos] = levels[scan_idx as usize];
