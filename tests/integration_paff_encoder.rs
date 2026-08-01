@@ -503,7 +503,7 @@ fn paff_dump_streams_for_diag() {
     };
     let dir = std::path::PathBuf::from(dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let mut dump = |name: &str, enc: &PaffEncoded| {
+    let dump = |name: &str, enc: &PaffEncoded| {
         std::fs::write(dir.join(format!("{name}.h264")), &enc.annex_b).unwrap();
         let mut recon = Vec::new();
         for (y, u, v) in &enc.recon_frames {
