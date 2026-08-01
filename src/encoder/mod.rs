@@ -1454,6 +1454,8 @@ impl Encoder {
                 field: FieldPicSignal::FrameMbsOnly,
                 idr: true,
                 nal_ref_idc: 3,
+                long_term_reference_flag: false,
+                mmco: &[],
             },
         );
 
@@ -5652,6 +5654,8 @@ impl Encoder {
                 nal_ref_idc: 2,
                 cabac: None,
                 field: FieldPicSignal::FrameMbsOnly,
+                rplm_l0: &[],
+                mmco: &[],
             },
         );
 

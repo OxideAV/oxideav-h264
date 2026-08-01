@@ -56,7 +56,7 @@ use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::slice::{
     write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
-    FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    EncMmcoOp, EncRplmOp, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::{
@@ -128,6 +128,37 @@ pub struct PaffConfig {
     /// own §8.2.1 order counts. When `false`, B fields use the
     /// §8.4.1.2.2 spatial direct derivation.
     pub b_temporal_direct: bool,
+    /// Round-436 — §8.2.5 **long-term anchor** axis (requires
+    /// `p_fields`; incompatible with the other optional axes). Frame
+    /// 1's TOP P field promotes BOTH fields of frame 0 to long-term
+    /// with a §8.2.5.4.4 MMCO 4 (MaxLongTermFrameIdx = 0) followed by
+    /// two §8.2.5.4.3 field MMCO 3 ops — first the same-parity frame-0
+    /// top field (eq. 8-30 PicNum 1 ⇒ diff_minus1 1), then the
+    /// opposite-parity bottom field (eq. 8-31 PicNum 0 ⇒ diff_minus1
+    /// 2; its eviction pre-pass must SPARE the just-promoted top
+    /// field, which holds the same LongTermFrameIdx but belongs to the
+    /// pair including the new target). From frame 2 on, every P field
+    /// references the same-parity long-term frame-0 field, spliced to
+    /// `ref_idx` 0 by a §8.2.4.3.2 RPLM `long_term_pic_num` op
+    /// (eq. 8-32 same-parity LongTermPicNum = 1), while the short-term
+    /// P pairs keep sliding through the §8.2.5.3 window — pinning
+    /// per-field long-term promotion, the §8.2.5.4.3 pair exception,
+    /// per-field LongTermPicNum arithmetic, the refFrameListLongTerm
+    /// §8.2.4.2.5 interleave and long-term RPLM splicing.
+    pub long_term_anchor: bool,
+    /// Round-436 — §8.2.5.4.1 **field MMCO 1** axis (requires
+    /// `p_fields`; incompatible with the other optional axes). Frame
+    /// 1's BOTTOM P field carries an MMCO 1 unmarking the frame-1 TOP
+    /// field (the first field of its own complementary pair —
+    /// eq. 8-39 with CurrPicNum = 3, opposite-parity PicNum = 2 ⇒
+    /// difference_of_pic_nums_minus1 = 0). Frame 2's TOP field then
+    /// finds no short-term same-parity field in frame 1 and the
+    /// §8.2.4.2.5 alternation serves the FRAME-0 top field at
+    /// `RefPicList0[0]` (the "missing field is ignored" rule) — the
+    /// encoder codes it against frame 0's top field recon, so a
+    /// decoder that ignores the per-field unmarking mispredicts every
+    /// inter MB of that field.
+    pub mmco_unpair_first_top: bool,
     /// Round-436 — enable the **8x8 transform** in the field pictures
     /// (`EncoderConfig::transform_8x8`; SPS auto-promotes to High,
     /// PPS codes `transform_8x8_mode_flag = 1`). Every MB of a field
@@ -473,6 +504,23 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         !cfg.b_temporal_direct || cfg.b_fields,
         "b_temporal_direct requires b_fields",
     );
+    assert!(
+        !cfg.long_term_anchor
+            || (cfg.p_fields
+                && !cfg.b_fields
+                && !cfg.cross_parity_first_bottom
+                && !cfg.idr_frame_first
+                && !cfg.mmco_unpair_first_top),
+        "long_term_anchor is a standalone P-field axis",
+    );
+    assert!(
+        !cfg.mmco_unpair_first_top
+            || (cfg.p_fields
+                && !cfg.b_fields
+                && !cfg.cross_parity_first_bottom
+                && !cfg.idr_frame_first),
+        "mmco_unpair_first_top is a standalone P-field axis",
+    );
 
     let width = cfg.width as usize;
     let frame_h = cfg.frame_height as usize;
@@ -550,6 +598,12 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
     // Last reconstructed field of each parity — the P references.
     let mut last_top: Option<ReconField> = None;
     let mut last_bottom: Option<ReconField> = None;
+    // Round-436 — the frame-0 fields, kept for the long_term_anchor
+    // axis (every P field references them) and for the
+    // mmco_unpair_first_top axis (frame 2's top field falls back to
+    // frame 0's top after frame 1's top is unmarked).
+    let mut anchor_top: Option<ReconField> = None;
+    let mut anchor_bottom: Option<ReconField> = None;
     let mut recon_frames = Vec::with_capacity(frames.len());
 
     for (k, &(fy, fu, fv)) in frames.iter().enumerate() {
@@ -584,6 +638,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                     field: FieldPicSignal::FramePicture,
                     idr: true,
                     nal_ref_idc: 3,
+                    long_term_reference_flag: false,
+                    mmco: &[],
                 },
             );
             let (mut ry, mut ru, mut rv, infos) = encode_i_slice_data(&frame_enc, &src, &mut sw);
@@ -644,6 +700,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                     field: FieldPicSignal::FramePicture,
                     idr: false,
                     nal_ref_idc: 2,
+                    long_term_reference_flag: false,
+                    mmco: &[],
                 },
             );
             let (mut ry, mut ru, mut rv, infos) = encode_i_slice_data(&frame_enc, &src, &mut sw);
@@ -692,8 +750,25 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
             let poc_lsb = (2 * k as u32 + u32::from(bottom)) % (1 << poc_lsb_bits);
             let is_idr = k == 0 && !bottom;
             // Same-parity reference field of the previous frame — what
-            // §8.2.4.2.5 puts at RefPicList0[0] for this field.
-            let ref_field = if bottom { &last_bottom } else { &last_top };
+            // §8.2.4.2.5 puts at RefPicList0[0] for this field. The
+            // long-term axis instead references the frame-0 anchor
+            // field (spliced to ref_idx 0 by the RPLM below); the
+            // MMCO-1 axis sends frame 2's top field back to frame 0's
+            // top (the §8.2.4.2.5 "missing field is ignored" fallback
+            // after frame 1's top was unmarked).
+            let ref_field = if cfg.long_term_anchor && k > 0 {
+                if bottom {
+                    &anchor_bottom
+                } else {
+                    &anchor_top
+                }
+            } else if cfg.mmco_unpair_first_top && k == 2 && !bottom {
+                &anchor_top
+            } else if bottom {
+                &last_bottom
+            } else {
+                &last_top
+            };
             // Cross-parity axis: frame 0's bottom field P-references
             // the IDR top field (opposite parity) instead of being an
             // I field. Every other P field references the same-parity
@@ -729,6 +804,44 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                         nal_ref_idc: 2,
                         cabac: None,
                         field: field_signal,
+                        // Long-term axis — §8.2.4.3.2 idc-2: splice
+                        // the same-parity long-term anchor field
+                        // (eq. 8-32 LongTermPicNum = 2*0 + 1 = 1) to
+                        // ref_idx 0. Frame 1's TOP field still sees
+                        // the frame-0 fields as ordinary short-term
+                        // pictures (the promotion runs AFTER it
+                        // decodes) so it needs no RPLM — but every
+                        // field from frame 1's BOTTOM on does (the
+                        // §8.2.4.2.2 initial list now leads with
+                        // short-term fields of the newer frames).
+                        rplm_l0: if cfg.long_term_anchor && (k > 1 || (k == 1 && bottom)) {
+                            &[EncRplmOp::LongTerm(1)]
+                        } else {
+                            &[]
+                        },
+                        mmco: if cfg.long_term_anchor && k == 1 && !bottom {
+                            // Long-term axis — promote the frame-0
+                            // pair: MMCO 4 unlocks LongTermFrameIdx 0
+                            // (§7.4.3.3 requires it before any MMCO
+                            // 3/6), then two field MMCO 3 ops
+                            // (CurrPicNum = 3: same-parity top PicNum
+                            // 1 ⇒ diff 1, opposite-parity bottom
+                            // PicNum 0 ⇒ diff 2).
+                            &[
+                                EncMmcoOp::SetMaxLongTermIdx(1),
+                                EncMmcoOp::AssignLongTerm(1, 0),
+                                EncMmcoOp::AssignLongTerm(2, 0),
+                            ]
+                        } else if cfg.mmco_unpair_first_top && k == 1 && bottom {
+                            // MMCO-1 axis — frame 1's bottom field
+                            // unmarks its own pair's first (top)
+                            // field: eq. 8-39 picNumX = CurrPicNum(3)
+                            // − 1 = 2 = the opposite-parity eq. 8-31
+                            // PicNum of frame 1's top field.
+                            &[EncMmcoOp::MarkShortTermUnused(0)]
+                        } else {
+                            &[]
+                        },
                     },
                 );
             } else {
@@ -750,6 +863,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                         field: field_signal,
                         idr: is_idr,
                         nal_ref_idc: if is_idr { 3 } else { 2 },
+                        long_term_reference_flag: false,
+                        mmco: &[],
                     },
                 );
             }
@@ -795,6 +910,13 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                 1,
             );
             let slot = (ry.clone(), ru.clone(), rv.clone(), poc_lsb as i32);
+            if k == 0 {
+                if bottom {
+                    anchor_bottom = Some(slot.clone());
+                } else {
+                    anchor_top = Some(slot.clone());
+                }
+            }
             if bottom {
                 last_bottom = Some(slot);
             } else {
@@ -908,6 +1030,8 @@ fn encode_paff_b_sequence(
                         nal_ref_idc: 2,
                         cabac: None,
                         field: field_signal,
+                        rplm_l0: &[],
+                        mmco: &[],
                     },
                 );
                 encode_p_slice_data(&field_enc, &src, &prev_ref, &mut sw)
@@ -930,6 +1054,8 @@ fn encode_paff_b_sequence(
                         field: field_signal,
                         idr: is_idr,
                         nal_ref_idc: if is_idr { 3 } else { 2 },
+                        long_term_reference_flag: false,
+                        mmco: &[],
                     },
                 );
                 let (ry, ru, rv, infos) = encode_i_slice_data(&field_enc, &src, &mut sw);

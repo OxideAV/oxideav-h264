@@ -122,6 +122,23 @@ pub struct DpbEntry {
     pub long_term_frame_idx: u32,
     /// Storage key — caller-supplied, this module doesn't interpret.
     pub dpb_key: u32,
+    /// Round-436 §8.2.5.4 — per-parity marking `[top, bottom]`.
+    ///
+    /// §8.2.4.1 treats each field of a stored reference frame as a
+    /// reference picture with its own marking, and the field forms of
+    /// the MMCO operations (§8.2.5.4.1/.4.2/.4.3, field_pic_flag = 1)
+    /// mark **individual fields** — one field of a frame can be
+    /// "unused for reference" or long-term while the other stays
+    /// short-term. For a single-field entry the own-parity slot
+    /// mirrors `marking` (the other slot is `Unused`); for
+    /// `Frame`/`FieldPair` entries both slots usually equal `marking`
+    /// until a field MMCO diverges them. The unit-level `marking`
+    /// stays the FRAME-level marking (§8.2.5.4.1: unmarking one field
+    /// also unmarks the frame/pair, "but the marking of the other
+    /// field is not changed") — keep the two in sync through
+    /// [`DpbEntry::set_field_marking`] / [`DpbEntry::mark_all`] /
+    /// [`DpbEntry::sync_field_markings`].
+    pub field_markings: [RefMarking; 2],
 }
 
 impl DpbEntry {
@@ -248,6 +265,70 @@ impl DpbEntry {
     /// True if this entry is used for reference at all.
     fn is_ref(&self) -> bool {
         !matches!(self.marking, RefMarking::Unused)
+    }
+
+    /// Round-436 §8.2.5.4 — the marking of one parity field.
+    fn field_marking(&self, parity: FieldParity) -> RefMarking {
+        self.field_markings[usize::from(parity == FieldParity::Bottom)]
+    }
+
+    /// Round-436 §8.2.5.4 — set one parity field's marking and resync
+    /// the unit-level `marking`: a single-field entry mirrors its own
+    /// field; a frame/pair keeps the FRAME-level marking only while
+    /// both fields agree (§8.2.5.4.1: unmarking one field unmarks the
+    /// frame/pair without touching the other field; §8.2.5.4.3: the
+    /// pair becomes long-term only when BOTH fields are long-term).
+    fn set_field_marking(&mut self, parity: FieldParity, m: RefMarking) {
+        self.field_markings[usize::from(parity == FieldParity::Bottom)] = m;
+        self.marking = match self.structure {
+            PicStructure::TopField => self.field_markings[0],
+            PicStructure::BottomField => self.field_markings[1],
+            PicStructure::Frame | PicStructure::FieldPair => {
+                if self.field_markings[0] == self.field_markings[1] {
+                    self.field_markings[0]
+                } else {
+                    RefMarking::Unused
+                }
+            }
+        };
+    }
+
+    /// Round-436 §8.2.5.4 — mark the whole unit (frame-level marking +
+    /// every decoded field).
+    fn mark_all(&mut self, m: RefMarking) {
+        self.marking = m;
+        self.sync_field_markings();
+    }
+
+    /// Initialise / resync `field_markings` from the unit-level
+    /// `marking` + `structure`.
+    pub fn sync_field_markings(&mut self) {
+        self.field_markings = match self.structure {
+            PicStructure::TopField => [self.marking, RefMarking::Unused],
+            PicStructure::BottomField => [RefMarking::Unused, self.marking],
+            PicStructure::Frame | PicStructure::FieldPair => [self.marking, self.marking],
+        };
+    }
+
+    /// True when any decoded field of this entry carries marking `m`.
+    fn any_field_is(&self, m: RefMarking) -> bool {
+        [FieldParity::Top, FieldParity::Bottom]
+            .into_iter()
+            .any(|p| self.has_field(p) && self.field_marking(p) == m)
+    }
+
+    /// True when any decoded field is still a reference (drives DPB
+    /// retention — a frame whose frame-level marking dropped may still
+    /// carry one referenced field).
+    pub fn is_any_field_ref(&self) -> bool {
+        self.any_field_is(RefMarking::ShortTerm) || self.any_field_is(RefMarking::LongTerm)
+    }
+
+    /// §8.2.4.2.5 — is the `parity` field decoded AND marked with the
+    /// reference class `m`? ("not marked as 'used for short-term
+    /// reference'" fields are skipped by the interleave.)
+    fn has_field_marked(&self, parity: FieldParity, m: RefMarking) -> bool {
+        self.has_field(parity) && self.field_marking(parity) == m
     }
 
     /// §8.2.4.2.5 — does this stored frame carry a *decoded* field of the
@@ -494,6 +575,7 @@ fn interleave_fields(
     frame_order: &[u32],
     dpb: &[DpbEntry],
     current_parity: FieldParity,
+    class: RefMarking,
 ) -> Vec<RefFieldEntry> {
     // Index from dpb_key → entry for the `has_field` lookups.
     let lookup = |key: u32| -> Option<&DpbEntry> { dpb.iter().find(|e| e.dpb_key == key) };
@@ -526,7 +608,7 @@ fn interleave_fields(
                 continue;
             }
             if lookup(frame_order[i])
-                .map(|e| e.has_field(want))
+                .map(|e| e.has_field_marked(want, class))
                 .unwrap_or(false)
             {
                 found = Some(i);
@@ -552,7 +634,10 @@ fn interleave_fields(
                         FieldParity::Top => used_top[i],
                         FieldParity::Bottom => used_bot[i],
                     };
-                    !used_other && lookup(k).map(|e| e.has_field(other)).unwrap_or(false)
+                    !used_other
+                        && lookup(k)
+                            .map(|e| e.has_field_marked(other, class))
+                            .unwrap_or(false)
                 });
                 if other_has_more {
                     want = other;
@@ -592,9 +677,11 @@ pub fn init_ref_pic_list_p_field(
     // ordered by descending FrameNumWrap (eq. 8-27). `pic_num` with
     // `current_is_field = false` yields FrameNumWrap directly (eq. 8-28),
     // which is the frame-level ordering key the spec asks for here.
+    // §8.2.4.2.2 step 1: frames having one or more fields marked
+    // "used for short-term reference".
     let mut short: Vec<(i32, u32)> = dpb
         .iter()
-        .filter(|e| e.is_short_term())
+        .filter(|e| e.any_field_is(RefMarking::ShortTerm))
         .map(|e| {
             (
                 e.pic_num(current_frame_num, max_frame_num, false, false),
@@ -605,17 +692,24 @@ pub fn init_ref_pic_list_p_field(
     short.sort_by_key(|e| std::cmp::Reverse(e.0));
     let short_frames: Vec<u32> = short.into_iter().map(|(_, k)| k).collect();
 
-    // refFrameList0LongTerm — ascending LongTermFrameIdx.
+    // refFrameList0LongTerm — ascending LongTermFrameIdx (§8.2.4.2.2
+    // step 2: frames having one or more fields marked "used for
+    // long-term reference").
     let mut long: Vec<(u32, u32)> = dpb
         .iter()
-        .filter(|e| e.is_long_term())
+        .filter(|e| e.any_field_is(RefMarking::LongTerm))
         .map(|e| (e.long_term_frame_idx, e.dpb_key))
         .collect();
     long.sort_by_key(|a| a.0);
     let long_frames: Vec<u32> = long.into_iter().map(|(_, k)| k).collect();
 
-    let mut out = interleave_fields(&short_frames, dpb, current_parity);
-    out.extend(interleave_fields(&long_frames, dpb, current_parity));
+    let mut out = interleave_fields(&short_frames, dpb, current_parity, RefMarking::ShortTerm);
+    out.extend(interleave_fields(
+        &long_frames,
+        dpb,
+        current_parity,
+        RefMarking::LongTerm,
+    ));
     out
 }
 
@@ -655,7 +749,7 @@ pub fn init_ref_pic_lists_b_field(
     let mut l1_gt: Vec<(i32, u32)> = Vec::new();
     let mut l1_le: Vec<(i32, u32)> = Vec::new();
 
-    for e in dpb.iter().filter(|e| e.is_short_term()) {
+    for e in dpb.iter().filter(|e| e.any_field_is(RefMarking::ShortTerm)) {
         let poc = e.pic_order_cnt;
         if poc <= current_poc {
             l0_le.push((poc, e.dpb_key));
@@ -677,20 +771,32 @@ pub fn init_ref_pic_lists_b_field(
     l1_frames.extend(l1_gt.iter().map(|(_, k)| *k));
     l1_frames.extend(l1_le.iter().map(|(_, k)| *k));
 
-    // refFrameListLongTerm — ascending LongTermFrameIdx (shared).
+    // refFrameListLongTerm — ascending LongTermFrameIdx (shared;
+    // §8.2.4.2.4 NOTE 5: an entry with only one field marked long-term
+    // is included — the interleave then skips the other field).
     let mut long: Vec<(u32, u32)> = dpb
         .iter()
-        .filter(|e| e.is_long_term())
+        .filter(|e| e.any_field_is(RefMarking::LongTerm))
         .map(|e| (e.long_term_frame_idx, e.dpb_key))
         .collect();
     long.sort_by_key(|a| a.0);
     let long_frames: Vec<u32> = long.into_iter().map(|(_, k)| k).collect();
 
-    let mut list0 = interleave_fields(&l0_frames, dpb, current_parity);
-    list0.extend(interleave_fields(&long_frames, dpb, current_parity));
+    let mut list0 = interleave_fields(&l0_frames, dpb, current_parity, RefMarking::ShortTerm);
+    list0.extend(interleave_fields(
+        &long_frames,
+        dpb,
+        current_parity,
+        RefMarking::LongTerm,
+    ));
 
-    let mut list1 = interleave_fields(&l1_frames, dpb, current_parity);
-    list1.extend(interleave_fields(&long_frames, dpb, current_parity));
+    let mut list1 = interleave_fields(&l1_frames, dpb, current_parity, RefMarking::ShortTerm);
+    list1.extend(interleave_fields(
+        &long_frames,
+        dpb,
+        current_parity,
+        RefMarking::LongTerm,
+    ));
 
     // §8.2.4.2.4 final rule — when RefPicList1 has more than one entry and
     // is identical to RefPicList0, swap [0] and [1] of List1.
@@ -995,9 +1101,9 @@ fn find_field_short_term(
     max_frame_num: u32,
     current_bottom: bool,
 ) -> RefFieldEntry {
-    for e in dpb.iter().filter(|e| e.is_short_term()) {
+    for e in dpb.iter() {
         for parity in [FieldParity::Top, FieldParity::Bottom] {
-            if e.has_field(parity)
+            if e.has_field_marked(parity, RefMarking::ShortTerm)
                 && e.field_pic_num(parity, current_frame_num, max_frame_num, current_bottom)
                     == pic_num_lx
             {
@@ -1018,9 +1124,9 @@ fn find_field_long_term(
     long_term_pic_num: i32,
     current_bottom: bool,
 ) -> RefFieldEntry {
-    for e in dpb.iter().filter(|e| e.is_long_term()) {
+    for e in dpb.iter() {
         for parity in [FieldParity::Top, FieldParity::Bottom] {
-            if e.has_field(parity)
+            if e.has_field_marked(parity, RefMarking::LongTerm)
                 && e.field_long_term_pic_num(parity, current_bottom) == long_term_pic_num
             {
                 return RefFieldEntry {
@@ -1120,11 +1226,14 @@ pub fn sliding_window_marking(
     let units = ref_units(dpb);
     let num_short = units
         .iter()
-        .filter(|u| u.iter().any(|&i| dpb[i].is_short_term()))
+        .filter(|u| {
+            u.iter()
+                .any(|&i| dpb[i].any_field_is(RefMarking::ShortTerm))
+        })
         .count() as u32;
     let num_long = units
         .iter()
-        .filter(|u| u.iter().any(|&i| dpb[i].is_long_term()))
+        .filter(|u| u.iter().any(|&i| dpb[i].any_field_is(RefMarking::LongTerm)))
         .count() as u32;
     let cap = max_num_ref_frames.max(1);
 
@@ -1149,11 +1258,14 @@ pub fn sliding_window_marking(
     };
     let best = units
         .iter()
-        .filter(|u| u.iter().any(|&i| dpb[i].is_short_term()))
+        .filter(|u| {
+            u.iter()
+                .any(|&i| dpb[i].any_field_is(RefMarking::ShortTerm))
+        })
         .min_by_key(|u| fnw(dpb[u[0]].frame_num));
     if let Some(unit) = best {
         for &i in unit {
-            dpb[i].marking = RefMarking::Unused;
+            dpb[i].mark_all(RefMarking::Unused);
         }
     }
 }
@@ -1169,7 +1281,7 @@ fn ref_units(dpb: &[DpbEntry]) -> Vec<Vec<usize>> {
     let mut units: Vec<Vec<usize>> = Vec::new();
     let mut used = vec![false; dpb.len()];
     for i in 0..dpb.len() {
-        if used[i] || !dpb[i].is_ref() {
+        if used[i] || !dpb[i].is_any_field_ref() {
             continue;
         }
         used[i] = true;
@@ -1179,7 +1291,7 @@ fn ref_units(dpb: &[DpbEntry]) -> Vec<Vec<usize>> {
             // of the same frame (shared `frame_num`).
             for (j, e) in dpb.iter().enumerate().skip(i + 1) {
                 if !used[j]
-                    && e.is_ref()
+                    && e.is_any_field_ref()
                     && e.structure.is_field()
                     && e.frame_num == dpb[i].frame_num
                     && e.structure.is_bottom() != dpb[i].structure.is_bottom()
@@ -1225,74 +1337,176 @@ pub fn apply_mmco(
         current_frame_num as i32
     };
 
+    // §8.2.5.4.1/.4.3 field forms — locate the short-term reference
+    // FIELD whose eq. 8-30/8-31 PicNum equals `pic_num_x`, returning
+    // `(entry index, parity)`.
+    let find_st_field = |dpb: &[DpbEntry], pic_num_x: i32| -> Option<(usize, FieldParity)> {
+        for (i, e) in dpb.iter().enumerate() {
+            for parity in [FieldParity::Top, FieldParity::Bottom] {
+                if e.has_field_marked(parity, RefMarking::ShortTerm)
+                    && e.field_pic_num(parity, current_frame_num, max_frame_num, current_bottom)
+                        == pic_num_x
+                {
+                    return Some((i, parity));
+                }
+            }
+        }
+        None
+    };
+
+    // §8.2.5.4.3/.4.6 — shared eviction pre-pass: a LongTermFrameIdx
+    // being (re)assigned first unmarks its previous holder(s):
+    //   * a long-term FRAME or long-term complementary field PAIR with
+    //     that index: the frame/pair AND both fields become "unused
+    //     for reference";
+    //   * a long-term reference FIELD with that index: becomes "unused
+    //     for reference" UNLESS it is part of the complementary field
+    //     pair that includes the picture gaining the index (for MMCO 3
+    //     the picNumX target — `spare` names its (entry, parity) and
+    //     `spare_frame_num` its frame; for MMCO 6 the current picture
+    //     — `spare_frame_num` names the current frame).
+    let evict_ltfi = |dpb: &mut [DpbEntry],
+                      ltfi: u32,
+                      spare: Option<(usize, FieldParity)>,
+                      spare_frame_num: Option<u32>| {
+        for (j, e) in dpb.iter_mut().enumerate() {
+            if e.long_term_frame_idx != ltfi {
+                continue;
+            }
+            let top_lt = e.has_field_marked(FieldParity::Top, RefMarking::LongTerm);
+            let bot_lt = e.has_field_marked(FieldParity::Bottom, RefMarking::LongTerm);
+            if !top_lt && !bot_lt {
+                continue;
+            }
+            if top_lt && bot_lt {
+                // Long-term frame / complementary pair holder.
+                e.mark_all(RefMarking::Unused);
+                continue;
+            }
+            // Single long-term field holder.
+            let lt_parity = if top_lt {
+                FieldParity::Top
+            } else {
+                FieldParity::Bottom
+            };
+            // Pair exception — the protected field is the other parity
+            // of the SAME Frame/FieldPair entry as the target …
+            if let Some((si, sp)) = spare {
+                if si == j && sp != lt_parity {
+                    continue;
+                }
+            }
+            // … or a separate coded-field entry of the same frame
+            // (shared `frame_num`) as the picture gaining the index.
+            if let Some(sfn) = spare_frame_num {
+                if e.structure.is_field() && e.frame_num == sfn {
+                    continue;
+                }
+            }
+            e.set_field_marking(lt_parity, RefMarking::Unused);
+        }
+    };
+
     for op in ops {
         match *op {
             MmcoOp::MarkShortTermUnused(diff) => {
                 // §8.2.5.4.1 eq. 8-39.
                 let pic_num_x = curr_pic_num - (diff as i32 + 1);
-                for e in dpb.iter_mut() {
-                    if e.is_short_term()
-                        && e.pic_num(
-                            current_frame_num,
-                            max_frame_num,
-                            current_is_field,
-                            current_bottom,
-                        ) == pic_num_x
-                    {
-                        e.marking = RefMarking::Unused;
+                if current_is_field {
+                    // Field form — only the named FIELD is marked
+                    // "unused for reference"; the frame-level marking
+                    // drops but the other field's marking is not
+                    // changed (`set_field_marking`).
+                    if let Some((i, parity)) = find_st_field(dpb, pic_num_x) {
+                        dpb[i].set_field_marking(parity, RefMarking::Unused);
+                    }
+                } else {
+                    // Frame form — the frame / complementary pair AND
+                    // both fields. A pair stored as two coded-field
+                    // entries shares `frame_num`, so both match.
+                    for e in dpb.iter_mut() {
+                        if e.is_short_term()
+                            && e.pic_num(current_frame_num, max_frame_num, false, false)
+                                == pic_num_x
+                        {
+                            e.mark_all(RefMarking::Unused);
+                        }
                     }
                 }
             }
             MmcoOp::MarkLongTermUnused(ltpn) => {
                 // §8.2.5.4.2.
-                for e in dpb.iter_mut() {
-                    if e.is_long_term()
-                        && e.long_term_pic_num(current_is_field, current_bottom) == ltpn as i32
-                    {
-                        e.marking = RefMarking::Unused;
+                if current_is_field {
+                    // Field form — eq. 8-32/8-33 LongTermPicNum names
+                    // one FIELD.
+                    let mut found: Option<(usize, FieldParity)> = None;
+                    'outer: for (i, e) in dpb.iter().enumerate() {
+                        for parity in [FieldParity::Top, FieldParity::Bottom] {
+                            if e.has_field_marked(parity, RefMarking::LongTerm)
+                                && e.field_long_term_pic_num(parity, current_bottom) == ltpn as i32
+                            {
+                                found = Some((i, parity));
+                                break 'outer;
+                            }
+                        }
+                    }
+                    if let Some((i, parity)) = found {
+                        dpb[i].set_field_marking(parity, RefMarking::Unused);
+                    }
+                } else {
+                    for e in dpb.iter_mut() {
+                        if e.is_long_term() && e.long_term_pic_num(false, false) == ltpn as i32 {
+                            e.mark_all(RefMarking::Unused);
+                        }
                     }
                 }
             }
             MmcoOp::AssignLongTerm(diff, ltfi) => {
-                // §8.2.5.4.3. First, evict any existing long-term with
-                // the same LongTermFrameIdx.
-                for e in dpb.iter_mut() {
-                    if e.is_long_term() && e.long_term_frame_idx == ltfi {
-                        e.marking = RefMarking::Unused;
-                    }
-                }
-                // Then promote the short-term ref identified by
-                // picNumX to long-term.
+                // §8.2.5.4.3.
                 let pic_num_x = curr_pic_num - (diff as i32 + 1);
-                for e in dpb.iter_mut() {
-                    if e.is_short_term()
-                        && e.pic_num(
-                            current_frame_num,
-                            max_frame_num,
-                            current_is_field,
-                            current_bottom,
-                        ) == pic_num_x
-                    {
-                        e.marking = RefMarking::LongTerm;
-                        e.long_term_frame_idx = ltfi;
+                if current_is_field {
+                    let target = find_st_field(dpb, pic_num_x);
+                    let spare_frame_num = target.map(|(i, _)| dpb[i].frame_num);
+                    evict_ltfi(dpb, ltfi, target, spare_frame_num);
+                    if let Some((i, parity)) = target {
+                        // Promote the FIELD. When the other field of
+                        // the same frame is already long-term with
+                        // this index the frame/pair marking follows
+                        // (`set_field_marking` derives it; a pair
+                        // stored as two coded-field entries is
+                        // long-term through both entries).
+                        dpb[i].set_field_marking(parity, RefMarking::LongTerm);
+                        dpb[i].long_term_frame_idx = ltfi;
+                    }
+                } else {
+                    evict_ltfi(dpb, ltfi, None, None);
+                    for e in dpb.iter_mut() {
+                        if e.is_short_term()
+                            && e.pic_num(current_frame_num, max_frame_num, false, false)
+                                == pic_num_x
+                        {
+                            e.mark_all(RefMarking::LongTerm);
+                            e.long_term_frame_idx = ltfi;
+                        }
                     }
                 }
             }
             MmcoOp::SetMaxLongTermIdx(max_plus1) => {
                 // §8.2.5.4.4 — MaxLongTermFrameIdx = max_plus1 - 1 when
                 // max_plus1 > 0; "no long-term frame indices" when 0.
-                if max_plus1 == 0 {
-                    // All long-terms become unused.
-                    for e in dpb.iter_mut() {
-                        if e.is_long_term() {
-                            e.marking = RefMarking::Unused;
-                        }
+                // Every field/frame marked long-term with an index
+                // above the new maximum becomes unused.
+                let clear_all = max_plus1 == 0;
+                let max_ltfi = max_plus1.saturating_sub(1);
+                for e in dpb.iter_mut() {
+                    if !e.any_field_is(RefMarking::LongTerm) {
+                        continue;
                     }
-                } else {
-                    let max_ltfi = max_plus1 - 1;
-                    for e in dpb.iter_mut() {
-                        if e.is_long_term() && e.long_term_frame_idx > max_ltfi {
-                            e.marking = RefMarking::Unused;
+                    if clear_all || e.long_term_frame_idx > max_ltfi {
+                        for parity in [FieldParity::Top, FieldParity::Bottom] {
+                            if e.has_field_marked(parity, RefMarking::LongTerm) {
+                                e.set_field_marking(parity, RefMarking::Unused);
+                            }
                         }
                     }
                 }
@@ -1304,21 +1518,39 @@ pub fn apply_mmco(
                 // that tracks `MaxLongTermFrameIdx` separately should
                 // reset it when `mmco5_triggered == true`.
                 for e in dpb.iter_mut() {
-                    e.marking = RefMarking::Unused;
+                    e.mark_all(RefMarking::Unused);
                 }
                 mmco5 = true;
             }
             MmcoOp::AssignCurrentLongTerm(ltfi) => {
                 // §8.2.5.4.6 — mark the *current* picture as long-term.
-                // If a different pic already carries this LongTermFrameIdx,
-                // mark it as unused first.
-                for e in dpb.iter_mut() {
-                    if e.is_long_term() && e.long_term_frame_idx == ltfi {
-                        e.marking = RefMarking::Unused;
-                    }
-                }
+                // A previous holder of the index is unmarked first,
+                // except a long-term reference FIELD that is part of
+                // the complementary field pair including the CURRENT
+                // picture (the second-field pair-completion case).
+                let spare_frame_num = if current_is_field {
+                    Some(current_entry_ref.frame_num)
+                } else {
+                    None
+                };
+                evict_ltfi(dpb, ltfi, None, spare_frame_num);
                 current_entry_ref.marking = RefMarking::LongTerm;
                 current_entry_ref.long_term_frame_idx = ltfi;
+                current_entry_ref.sync_field_markings();
+                if current_is_field {
+                    // Pair completion — when the first field of the
+                    // current frame is already long-term, the pair
+                    // shares LongTermFrameIdx.
+                    for e in dpb.iter_mut() {
+                        if e.structure.is_field()
+                            && e.frame_num == current_entry_ref.frame_num
+                            && e.structure.is_bottom() != current_bottom
+                            && e.any_field_is(RefMarking::LongTerm)
+                        {
+                            e.long_term_frame_idx = ltfi;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1356,7 +1588,7 @@ pub fn perform_marking(
         // to "no long-term frame indices") or as long-term with
         // LongTermFrameIdx = 0 and MaxLongTermFrameIdx = 0.
         for e in dpb.iter_mut() {
-            e.marking = RefMarking::Unused;
+            e.mark_all(RefMarking::Unused);
         }
         if long_term_reference_flag_for_idr {
             current_entry.marking = RefMarking::LongTerm;
@@ -1364,6 +1596,7 @@ pub fn perform_marking(
         } else {
             current_entry.marking = RefMarking::ShortTerm;
         }
+        current_entry.sync_field_markings();
         return false;
     }
 
@@ -1375,6 +1608,7 @@ pub fn perform_marking(
             if !matches!(current_entry.marking, RefMarking::LongTerm) {
                 current_entry.marking = RefMarking::ShortTerm;
             }
+            current_entry.sync_field_markings();
             mmco5
         }
         None => {
@@ -1387,6 +1621,7 @@ pub fn perform_marking(
             );
             // §8.2.5.1 step 3.
             current_entry.marking = RefMarking::ShortTerm;
+            current_entry.sync_field_markings();
             false
         }
     }
@@ -1401,7 +1636,7 @@ mod tests {
     use super::*;
 
     fn st_frame(frame_num: u32, poc: i32, key: u32) -> DpbEntry {
-        DpbEntry {
+        let mut e = DpbEntry {
             frame_num,
             top_field_order_cnt: poc,
             bottom_field_order_cnt: poc,
@@ -1410,11 +1645,14 @@ mod tests {
             marking: RefMarking::ShortTerm,
             long_term_frame_idx: 0,
             dpb_key: key,
-        }
+            field_markings: [RefMarking::Unused; 2],
+        };
+        e.sync_field_markings();
+        e
     }
 
     fn lt_frame(ltfi: u32, poc: i32, key: u32) -> DpbEntry {
-        DpbEntry {
+        let mut e = DpbEntry {
             frame_num: 0,
             top_field_order_cnt: poc,
             bottom_field_order_cnt: poc,
@@ -1423,13 +1661,16 @@ mod tests {
             marking: RefMarking::LongTerm,
             long_term_frame_idx: ltfi,
             dpb_key: key,
-        }
+            field_markings: [RefMarking::Unused; 2],
+        };
+        e.sync_field_markings();
+        e
     }
 
     /// A short-term reference *frame* whose two fields carry distinct
     /// POCs (`top_poc` / `bot_poc`); `pic_order_cnt` is `min` per eq. 8-1.
     fn st_pair(frame_num: u32, top_poc: i32, bot_poc: i32, key: u32) -> DpbEntry {
-        DpbEntry {
+        let mut e = DpbEntry {
             frame_num,
             top_field_order_cnt: top_poc,
             bottom_field_order_cnt: bot_poc,
@@ -1438,7 +1679,10 @@ mod tests {
             marking: RefMarking::ShortTerm,
             long_term_frame_idx: 0,
             dpb_key: key,
-        }
+            field_markings: [RefMarking::Unused; 2],
+        };
+        e.sync_field_markings();
+        e
     }
 
     /// A single short-term reference field of the given parity.
@@ -1447,7 +1691,7 @@ mod tests {
             FieldParity::Top => PicStructure::TopField,
             FieldParity::Bottom => PicStructure::BottomField,
         };
-        DpbEntry {
+        let mut e = DpbEntry {
             frame_num,
             top_field_order_cnt: poc,
             bottom_field_order_cnt: poc,
@@ -1456,12 +1700,15 @@ mod tests {
             marking: RefMarking::ShortTerm,
             long_term_frame_idx: 0,
             dpb_key: key,
-        }
+            field_markings: [RefMarking::Unused; 2],
+        };
+        e.sync_field_markings();
+        e
     }
 
     /// A long-term reference frame whose two fields are both available.
     fn lt_pair(ltfi: u32, poc: i32, key: u32) -> DpbEntry {
-        DpbEntry {
+        let mut e = DpbEntry {
             frame_num: 0,
             top_field_order_cnt: poc,
             bottom_field_order_cnt: poc,
@@ -1470,7 +1717,10 @@ mod tests {
             marking: RefMarking::LongTerm,
             long_term_frame_idx: ltfi,
             dpb_key: key,
-        }
+            field_markings: [RefMarking::Unused; 2],
+        };
+        e.sync_field_markings();
+        e
     }
 
     fn top(key: u32) -> RefFieldEntry {
@@ -1849,6 +2099,186 @@ mod tests {
         assert_eq!(current.long_term_frame_idx, 3);
     }
 
+    /// A single long-term reference field of the given parity.
+    fn lt_single_field(frame_num: u32, parity: FieldParity, ltfi: u32, key: u32) -> DpbEntry {
+        let mut e = st_single_field(frame_num, parity, 0, key);
+        e.marking = RefMarking::LongTerm;
+        e.long_term_frame_idx = ltfi;
+        e.sync_field_markings();
+        e
+    }
+
+    // ------------------------------------------------------------------
+    // Round-436 — §8.2.5.4 FIELD forms (field_pic_flag == 1: MMCO ops
+    // apply to individual reference fields).
+    // ------------------------------------------------------------------
+
+    /// §8.2.5.4.1 field form — MMCO 1 from a coded field marks exactly
+    /// ONE field of a stored pair unused; the other field's marking is
+    /// not changed.
+    #[test]
+    fn mmco1_field_marks_single_field_of_pair() {
+        // Pair of coded fields, frame_num 1 (fields decoded, both ST).
+        let mut dpb = vec![
+            st_single_field(1, FieldParity::Top, 2, 10),
+            st_single_field(1, FieldParity::Bottom, 3, 11),
+        ];
+        // Current: TOP field of frame 2. CurrPicNum = 2*2+1 = 5.
+        // Target: the frame-1 TOP field (same parity) — eq. 8-30
+        // PicNum = 2*1+1 = 3 ⇒ difference_of_pic_nums_minus1 = 1.
+        let mut current = st_single_field(2, FieldParity::Top, 4, 12);
+        let ops = [MmcoOp::MarkShortTermUnused(1)];
+        apply_mmco(&mut dpb, &ops, &mut current, 2, 16);
+        assert_eq!(dpb[0].marking, RefMarking::Unused);
+        assert_eq!(
+            dpb[1].marking,
+            RefMarking::ShortTerm,
+            "other field untouched"
+        );
+    }
+
+    /// §8.2.5.4.1 field form on a stored FRAME — one parity field of
+    /// the frame becomes unused; the frame-level marking drops but the
+    /// other field stays a short-term reference (visible to the
+    /// §8.2.4.2.2 field lists, invisible to the frame lists).
+    #[test]
+    fn mmco1_field_unmarks_one_parity_of_stored_frame() {
+        let mut dpb = vec![st_frame(1, 0, 10)];
+        // Current: TOP field of frame 2. CurrPicNum = 5. Target: the
+        // stored frame's BOTTOM field (opposite parity) — eq. 8-31
+        // PicNum = 2*1 = 2 ⇒ diff_minus1 = 5 - 2 - 1 = 2.
+        let mut current = st_single_field(2, FieldParity::Top, 4, 12);
+        let ops = [MmcoOp::MarkShortTermUnused(2)];
+        apply_mmco(&mut dpb, &ops, &mut current, 2, 16);
+        let e = &dpb[0];
+        // Frame-level marking dropped …
+        assert_eq!(e.marking, RefMarking::Unused);
+        // … but the TOP field is still a short-term reference.
+        assert!(e.has_field_marked(FieldParity::Top, RefMarking::ShortTerm));
+        assert!(!e.has_field_marked(FieldParity::Bottom, RefMarking::ShortTerm));
+        assert!(e.is_any_field_ref());
+        // The §8.2.4.2.2 P-field list still serves the live TOP field
+        // (and only it).
+        let list = init_ref_pic_list_p_field(&dpb, 2, 16, false);
+        assert_eq!(list, vec![top(10)]);
+    }
+
+    /// §8.2.5.4.2 field form — MMCO 2 unmarks one long-term FIELD by
+    /// its eq. 8-32/8-33 LongTermPicNum.
+    #[test]
+    fn mmco2_field_marks_single_long_term_field() {
+        let mut dpb = vec![
+            lt_single_field(0, FieldParity::Top, 0, 10),
+            lt_single_field(0, FieldParity::Bottom, 0, 11),
+        ];
+        // Current: TOP field. Same-parity LT field (top): eq. 8-32
+        // LongTermPicNum = 2*0+1 = 1; opposite parity = 0.
+        let mut current = st_single_field(1, FieldParity::Top, 2, 12);
+        let ops = [MmcoOp::MarkLongTermUnused(0)];
+        apply_mmco(&mut dpb, &ops, &mut current, 1, 16);
+        assert_eq!(dpb[0].marking, RefMarking::LongTerm, "top LT survives");
+        assert_eq!(dpb[1].marking, RefMarking::Unused, "bottom LT unmarked");
+    }
+
+    /// §8.2.5.4.3 field form — MMCO 3 promotes ONE short-term field to
+    /// long-term; the complementary long-term field of the SAME frame
+    /// (already holding the index) is NOT evicted (the pair exception),
+    /// and the pair ends up long-term with the shared index.
+    #[test]
+    fn mmco3_field_promotion_completes_long_term_pair() {
+        let mut dpb = vec![
+            // First field of frame 1: already long-term idx 0.
+            lt_single_field(1, FieldParity::Top, 0, 10),
+            // Second field of frame 1: still short-term.
+            st_single_field(1, FieldParity::Bottom, 3, 11),
+        ];
+        // Current: TOP field of frame 2 (CurrPicNum = 5). Target: the
+        // frame-1 BOTTOM field — opposite parity ⇒ eq. 8-31 PicNum =
+        // 2*1 = 2 ⇒ diff_minus1 = 2.
+        let mut current = st_single_field(2, FieldParity::Top, 4, 12);
+        let ops = [MmcoOp::AssignLongTerm(2, 0)];
+        apply_mmco(&mut dpb, &ops, &mut current, 2, 16);
+        assert_eq!(
+            dpb[0].marking,
+            RefMarking::LongTerm,
+            "pair exception spares the first field"
+        );
+        assert_eq!(
+            dpb[1].marking,
+            RefMarking::LongTerm,
+            "target field promoted"
+        );
+        assert_eq!(dpb[0].long_term_frame_idx, 0);
+        assert_eq!(dpb[1].long_term_frame_idx, 0);
+    }
+
+    /// §8.2.5.4.3 field form — a long-term FIELD of a DIFFERENT frame
+    /// holding the index IS evicted before the promotion.
+    #[test]
+    fn mmco3_field_promotion_evicts_unrelated_long_term_field() {
+        let mut dpb = vec![
+            lt_single_field(0, FieldParity::Top, 0, 10),
+            st_single_field(1, FieldParity::Top, 2, 11),
+        ];
+        // Current: TOP field of frame 2 (CurrPicNum = 5). Target: the
+        // frame-1 TOP field (same parity) — PicNum = 2*1+1 = 3 ⇒
+        // diff_minus1 = 1.
+        let mut current = st_single_field(2, FieldParity::Top, 4, 12);
+        let ops = [MmcoOp::AssignLongTerm(1, 0)];
+        apply_mmco(&mut dpb, &ops, &mut current, 2, 16);
+        assert_eq!(dpb[0].marking, RefMarking::Unused, "old holder evicted");
+        assert_eq!(dpb[1].marking, RefMarking::LongTerm);
+        assert_eq!(dpb[1].long_term_frame_idx, 0);
+    }
+
+    /// §8.2.5.4.6 field form — the SECOND field of a pair whose first
+    /// field is already long-term with the same index: the first field
+    /// is NOT evicted (it is part of the complementary pair including
+    /// the current picture) and the pair shares LongTermFrameIdx.
+    #[test]
+    fn mmco6_second_field_completes_long_term_pair() {
+        let mut dpb = vec![lt_single_field(0, FieldParity::Top, 0, 10)];
+        // Current: the BOTTOM field of the same frame 0.
+        let mut current = st_single_field(0, FieldParity::Bottom, 1, 11);
+        let ops = [MmcoOp::AssignCurrentLongTerm(0)];
+        apply_mmco(&mut dpb, &ops, &mut current, 0, 16);
+        assert_eq!(dpb[0].marking, RefMarking::LongTerm, "first field spared");
+        assert_eq!(dpb[0].long_term_frame_idx, 0);
+        assert_eq!(current.marking, RefMarking::LongTerm);
+        assert_eq!(current.long_term_frame_idx, 0);
+    }
+
+    /// §8.2.5.4.6 field form — a long-term FIELD of a DIFFERENT frame
+    /// holding the requested index is evicted.
+    #[test]
+    fn mmco6_field_evicts_unrelated_holder() {
+        let mut dpb = vec![lt_single_field(0, FieldParity::Top, 0, 10)];
+        let mut current = st_single_field(2, FieldParity::Top, 4, 11);
+        let ops = [MmcoOp::AssignCurrentLongTerm(0)];
+        apply_mmco(&mut dpb, &ops, &mut current, 2, 16);
+        assert_eq!(dpb[0].marking, RefMarking::Unused);
+        assert_eq!(current.marking, RefMarking::LongTerm);
+    }
+
+    /// §8.2.4.2.5 — the short-term interleave skips a field that is no
+    /// longer marked "used for short-term reference" (e.g. after a
+    /// field MMCO 1) and continues with the next field of the wanted
+    /// parity.
+    #[test]
+    fn interleave_skips_unmarked_parity_field() {
+        let mut pair0_top = st_single_field(0, FieldParity::Top, 0, 10);
+        let pair0_bot = st_single_field(0, FieldParity::Bottom, 1, 11);
+        let pair1_top = st_single_field(1, FieldParity::Top, 2, 12);
+        let pair1_bot = st_single_field(1, FieldParity::Bottom, 3, 13);
+        pair0_top.mark_all(RefMarking::Unused);
+        let dpb = vec![pair0_top, pair0_bot, pair1_top, pair1_bot];
+        // Current: TOP field of frame 2 — same-parity-first alternation
+        // over frames [1, 0] (descending FrameNumWrap).
+        let list = init_ref_pic_list_p_field(&dpb, 2, 16, false);
+        // Tops available: only frame 1's. Bottoms: frame 1's, frame 0's.
+        assert_eq!(list, vec![top(12), bot(13), bot(11)]);
+    }
+
     // §8.2.5.1 — IDR path.
     #[test]
     fn marking_idr_short_term() {
@@ -1952,7 +2382,7 @@ mod tests {
     fn interleave_two_full_frames_top_first() {
         let dpb = vec![st_pair(1, 0, 1, 1), st_pair(2, 2, 3, 2)];
         let order = vec![1u32, 2];
-        let out = interleave_fields(&order, &dpb, FieldParity::Top);
+        let out = interleave_fields(&order, &dpb, FieldParity::Top, RefMarking::ShortTerm);
         assert_eq!(out, vec![top(1), bot(1), top(2), bot(2)]);
     }
 
@@ -1964,7 +2394,7 @@ mod tests {
     fn interleave_two_full_frames_bottom_first() {
         let dpb = vec![st_pair(1, 0, 1, 1), st_pair(2, 2, 3, 2)];
         let order = vec![1u32, 2];
-        let out = interleave_fields(&order, &dpb, FieldParity::Bottom);
+        let out = interleave_fields(&order, &dpb, FieldParity::Bottom, RefMarking::ShortTerm);
         assert_eq!(out, vec![bot(1), top(1), bot(2), top(2)]);
     }
 
@@ -1982,7 +2412,7 @@ mod tests {
             st_single_field(2, FieldParity::Top, 2, 2),
         ];
         let order = vec![1u32, 2];
-        let out = interleave_fields(&order, &dpb, FieldParity::Top);
+        let out = interleave_fields(&order, &dpb, FieldParity::Top, RefMarking::ShortTerm);
         assert_eq!(out, vec![top(1), bot(1), top(2)]);
     }
 
@@ -1996,7 +2426,7 @@ mod tests {
             st_single_field(3, FieldParity::Top, 4, 3),
         ];
         let order = vec![1u32, 2, 3];
-        let out = interleave_fields(&order, &dpb, FieldParity::Top);
+        let out = interleave_fields(&order, &dpb, FieldParity::Top, RefMarking::ShortTerm);
         assert_eq!(out, vec![top(1), top(2), top(3)]);
     }
 
@@ -2010,14 +2440,14 @@ mod tests {
             st_single_field(2, FieldParity::Bottom, 2, 2),
         ];
         let order = vec![1u32, 2];
-        let out = interleave_fields(&order, &dpb, FieldParity::Top);
+        let out = interleave_fields(&order, &dpb, FieldParity::Top, RefMarking::ShortTerm);
         assert_eq!(out, vec![bot(1), bot(2)]);
     }
 
     #[test]
     fn interleave_empty() {
         let dpb: Vec<DpbEntry> = vec![];
-        let out = interleave_fields(&[], &dpb, FieldParity::Top);
+        let out = interleave_fields(&[], &dpb, FieldParity::Top, RefMarking::ShortTerm);
         assert!(out.is_empty());
     }
 

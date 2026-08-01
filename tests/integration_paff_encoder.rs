@@ -77,6 +77,8 @@ fn encode_cfg2(
             b_fields: false,
             b_temporal_direct: false,
             transform_8x8: false,
+            long_term_anchor: false,
+            mmco_unpair_first_top: false,
         },
         &refs,
     )
@@ -105,6 +107,8 @@ fn encode_b_fields(n_frames: usize, b_temporal_direct: bool) -> PaffEncoded {
             b_fields: true,
             b_temporal_direct,
             transform_8x8: false,
+            long_term_anchor: false,
+            mmco_unpair_first_top: false,
         },
         &refs,
     )
@@ -359,6 +363,8 @@ fn encode_8x8_fields(n_frames: usize, p_fields: bool, b_fields: bool) -> PaffEnc
             b_fields,
             b_temporal_direct: false,
             transform_8x8: true,
+            long_term_anchor: false,
+            mmco_unpair_first_top: false,
         },
         &refs,
     )
@@ -411,6 +417,71 @@ fn paff_b_fields_transform_8x8_self_roundtrip_bit_exact() {
 fn paff_b_fields_transform_8x8_ffmpeg_bit_exact() {
     let enc = encode_8x8_fields(5, true, true);
     ffmpeg_check(&enc, "paff-b-8x8t-ffmpeg");
+}
+
+/// Round-436 — §8.2.5 field-marking axes.
+fn encode_marking_axis(n_frames: usize, long_term: bool, unpair: bool) -> PaffEncoded {
+    let frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+        (0..n_frames).map(make_interlaced_frame).collect();
+    let refs: Vec<(&[u8], &[u8], &[u8])> = frames
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    encode_paff_sequence(
+        &PaffConfig {
+            width: W as u32,
+            frame_height: H as u32,
+            qp: 26,
+            p_fields: true,
+            frame_picture_indices: Vec::new(),
+            cross_parity_first_bottom: false,
+            idr_frame_first: false,
+            b_fields: false,
+            b_temporal_direct: false,
+            transform_8x8: false,
+            long_term_anchor: long_term,
+            mmco_unpair_first_top: unpair,
+        },
+        &refs,
+    )
+}
+
+#[test]
+fn paff_long_term_anchor_fields_self_roundtrip_bit_exact() {
+    // IDR top field long-term (long_term_reference_flag), bottom I
+    // field completes the pair via MMCO 6, and every later P field
+    // references the same-parity long-term anchor field through an
+    // RPLM long_term_pic_num splice — while the short-term P pairs
+    // keep sliding through the §8.2.5.3 window. 5 frames make the
+    // long-term pair outlive several sliding-window evictions.
+    let enc = encode_marking_axis(5, true, false);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-lt-anchor");
+}
+
+#[test]
+fn paff_long_term_anchor_fields_ffmpeg_bit_exact() {
+    let enc = encode_marking_axis(5, true, false);
+    ffmpeg_check(&enc, "paff-lt-anchor-ffmpeg");
+}
+
+#[test]
+fn paff_mmco1_field_unmark_self_roundtrip_bit_exact() {
+    // Frame 1's bottom P field carries a §8.2.5.4.1 field MMCO 1 that
+    // unmarks the frame-1 TOP field; frame 2's top field must then
+    // resolve RefPicList0[0] to FRAME 0's top field (the §8.2.4.2.5
+    // "missing field is ignored" rule). A decoder that ignores the
+    // per-field unmarking predicts frame 2's top field from the wrong
+    // picture.
+    let enc = encode_marking_axis(3, false, true);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-mmco1-field");
+}
+
+#[test]
+fn paff_mmco1_field_unmark_ffmpeg_bit_exact() {
+    let enc = encode_marking_axis(3, false, true);
+    ffmpeg_check(&enc, "paff-mmco1-ffmpeg");
 }
 
 #[test]

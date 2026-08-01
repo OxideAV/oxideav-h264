@@ -58,7 +58,7 @@ impl FieldPicSignal {
 /// Configuration for [`build_idr_i_slice_header_rbsp`]. Holds only the
 /// slice-header fields. Caller appends `slice_data()` and trailing bits.
 #[derive(Debug, Clone, Copy)]
-pub struct IdrSliceHeaderConfig {
+pub struct IdrSliceHeaderConfig<'a> {
     pub first_mb_in_slice: u32,
     /// Raw `slice_type` value. For an "all-I, all slices same type"
     /// picture use 7 (`slice_type % 5 == 2` and `slice_type >= 5`).
@@ -98,6 +98,115 @@ pub struct IdrSliceHeaderConfig {
     /// `dec_ref_pic_marking()` on the non-IDR path. Ignored when
     /// `idr == true` (IDR marking is always present).
     pub nal_ref_idc: u32,
+    /// Round-436 — §7.4.3.3 `long_term_reference_flag` on the IDR
+    /// path: `true` marks the IDR picture "used for long-term
+    /// reference" with LongTermFrameIdx = 0 (and MaxLongTermFrameIdx =
+    /// 0, unblocking later MMCO 3/6 without an MMCO 4).
+    pub long_term_reference_flag: bool,
+    /// Round-436 — §7.3.3.3 adaptive marking ops for the NON-IDR
+    /// branch (e.g. the second I field of a PAFF IDR pair completing a
+    /// long-term pair via MMCO 6). Empty = sliding window. Ignored
+    /// when `idr == true`.
+    pub mmco: &'a [EncMmcoOp],
+}
+
+/// Round-436 — §7.3.3.3 / Table 7-9 `memory_management_control_operation`
+/// for the encoder's `dec_ref_pic_marking()` writer. Each variant
+/// carries the operation's trailing syntax element(s); the writer emits
+/// `adaptive_ref_pic_marking_mode_flag = 1`, the ops in order, then the
+/// op-0 terminator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncMmcoOp {
+    /// op 1 — `difference_of_pic_nums_minus1`.
+    MarkShortTermUnused(u32),
+    /// op 2 — `long_term_pic_num`.
+    MarkLongTermUnused(u32),
+    /// op 3 — `(difference_of_pic_nums_minus1, long_term_frame_idx)`.
+    AssignLongTerm(u32, u32),
+    /// op 4 — `max_long_term_frame_idx_plus1`.
+    SetMaxLongTermIdx(u32),
+    /// op 5 — mark all reference pictures unused.
+    MarkAllUnused,
+    /// op 6 — `long_term_frame_idx` for the current picture.
+    AssignCurrentLongTerm(u32),
+}
+
+/// Round-436 — emit the §7.3.3.3 non-IDR `dec_ref_pic_marking()` body:
+/// sliding window when `mmco` is empty, else the adaptive op list with
+/// its op-0 terminator.
+fn write_dec_ref_pic_marking_non_idr(w: &mut BitWriter, mmco: &[EncMmcoOp]) {
+    if mmco.is_empty() {
+        w.u(1, 0); // adaptive_ref_pic_marking_mode_flag = 0
+        return;
+    }
+    w.u(1, 1); // adaptive_ref_pic_marking_mode_flag = 1
+    for op in mmco {
+        match *op {
+            EncMmcoOp::MarkShortTermUnused(diff) => {
+                w.ue(1);
+                w.ue(diff);
+            }
+            EncMmcoOp::MarkLongTermUnused(ltpn) => {
+                w.ue(2);
+                w.ue(ltpn);
+            }
+            EncMmcoOp::AssignLongTerm(diff, ltfi) => {
+                w.ue(3);
+                w.ue(diff);
+                w.ue(ltfi);
+            }
+            EncMmcoOp::SetMaxLongTermIdx(max_plus1) => {
+                w.ue(4);
+                w.ue(max_plus1);
+            }
+            EncMmcoOp::MarkAllUnused => w.ue(5),
+            EncMmcoOp::AssignCurrentLongTerm(ltfi) => {
+                w.ue(6);
+                w.ue(ltfi);
+            }
+        }
+    }
+    w.ue(0); // memory_management_control_operation = 0 (end)
+}
+
+/// Round-436 — §7.3.3.1 / Table 7-7 `modification_of_pic_nums_idc` for
+/// the encoder's `ref_pic_list_modification()` writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncRplmOp {
+    /// idc 0 — `abs_diff_pic_num_minus1`, subtract from picNumLXPred.
+    Subtract(u32),
+    /// idc 1 — `abs_diff_pic_num_minus1`, add to picNumLXPred.
+    Add(u32),
+    /// idc 2 — `long_term_pic_num` of the reference to splice in.
+    LongTerm(u32),
+}
+
+/// Round-436 — emit one list's §7.3.3.1 `ref_pic_list_modification()`
+/// body: flag 0 when `ops` is empty, else flag 1 + the ops + the idc-3
+/// terminator.
+fn write_rplm_list(w: &mut BitWriter, ops: &[EncRplmOp]) {
+    if ops.is_empty() {
+        w.u(1, 0);
+        return;
+    }
+    w.u(1, 1); // ref_pic_list_modification_flag_lX = 1
+    for op in ops {
+        match *op {
+            EncRplmOp::Subtract(v) => {
+                w.ue(0);
+                w.ue(v);
+            }
+            EncRplmOp::Add(v) => {
+                w.ue(1);
+                w.ue(v);
+            }
+            EncRplmOp::LongTerm(v) => {
+                w.ue(2);
+                w.ue(v);
+            }
+        }
+    }
+    w.ue(3); // modification_of_pic_nums_idc = 3 (end)
 }
 
 /// Round-30 — extra parameters for the CABAC-enabled slice writers.
@@ -112,7 +221,7 @@ pub struct CabacSliceParams {
 /// Emit the bits of a single IDR I-slice header into the supplied
 /// `BitWriter`. The writer is left at the position where `slice_data()`
 /// should begin.
-pub fn write_idr_i_slice_header(w: &mut BitWriter, cfg: &IdrSliceHeaderConfig) {
+pub fn write_idr_i_slice_header(w: &mut BitWriter, cfg: &IdrSliceHeaderConfig<'_>) {
     w.ue(cfg.first_mb_in_slice);
     w.ue(cfg.slice_type_raw);
     w.ue(cfg.pic_parameter_set_id);
@@ -134,14 +243,15 @@ pub fn write_idr_i_slice_header(w: &mut BitWriter, cfg: &IdrSliceHeaderConfig) {
     // §7.3.3.3 — dec_ref_pic_marking().
     if cfg.idr {
         // IDR path (nal_ref_idc != 0 always for IDR):
-        // no_output_of_prior_pics_flag = 0, long_term_reference_flag = 0.
+        // no_output_of_prior_pics_flag = 0; long_term_reference_flag
+        // per config (round-436 long-term IDR fields).
         w.u(1, 0);
-        w.u(1, 0);
+        w.u(1, u32::from(cfg.long_term_reference_flag));
     } else if cfg.nal_ref_idc != 0 {
         // Non-IDR reference I picture (e.g. the second field of a PAFF
-        // IDR pair): adaptive_ref_pic_marking_mode_flag = 0 (sliding
-        // window).
-        w.u(1, 0);
+        // IDR pair): sliding window, or the round-436 adaptive MMCO
+        // list.
+        write_dec_ref_pic_marking_non_idr(w, cfg.mmco);
     }
 
     // No cabac_init_idc — entropy_coding_mode_flag == 0 (CAVLC).
@@ -181,7 +291,7 @@ pub fn write_idr_i_slice_header(w: &mut BitWriter, cfg: &IdrSliceHeaderConfig) {
 ///   (sliding-window default — works for our 1-ref short-term setup).
 /// * No `pred_weight_table` (PPS `weighted_pred_flag = 0`).
 #[derive(Debug, Clone, Copy)]
-pub struct PSliceHeaderConfig {
+pub struct PSliceHeaderConfig<'a> {
     pub first_mb_in_slice: u32,
     /// Raw `slice_type` per Table 7-6. Use 5 for "all slices in picture
     /// are P" (slice_type % 5 == 0 and >= 5).
@@ -205,12 +315,18 @@ pub struct PSliceHeaderConfig {
     pub cabac: Option<CabacSliceParams>,
     /// Round-416 — PAFF field signalling (see [`FieldPicSignal`]).
     pub field: FieldPicSignal,
+    /// Round-436 — §7.3.3.1 list-0 modification ops (e.g. idc 2
+    /// splicing a long-term field to `ref_idx` 0). Empty = flag 0.
+    pub rplm_l0: &'a [EncRplmOp],
+    /// Round-436 — §7.3.3.3 adaptive marking ops (Table 7-9). Empty =
+    /// sliding window.
+    pub mmco: &'a [EncMmcoOp],
 }
 
 /// Emit the bits of a single P-slice header (non-IDR) into the supplied
 /// `BitWriter`. The writer is left at the position where `slice_data()`
 /// should begin.
-pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig) {
+pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig<'_>) {
     debug_assert!(cfg.slice_type_raw % 5 == 0); // P-slice
     w.ue(cfg.first_mb_in_slice);
     w.ue(cfg.slice_type_raw);
@@ -232,17 +348,15 @@ pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig) {
     w.u(1, 0);
 
     // §7.3.3.1 — ref_pic_list_modification(): list-0 only for P-slice.
-    // ref_pic_list_modification_flag_l0 = 0 (no modifications).
-    w.u(1, 0);
+    write_rplm_list(w, cfg.rplm_l0);
     // No list-1 loop for P-slice.
 
     // §7.3.3.2 — pred_weight_table() absent (PPS weighted_pred_flag == 0).
 
-    // §7.3.3.3 — dec_ref_pic_marking() when nal_ref_idc != 0. For the
-    // non-IDR path we choose adaptive_ref_pic_marking_mode_flag = 0
-    // (sliding window).
+    // §7.3.3.3 — dec_ref_pic_marking() when nal_ref_idc != 0: sliding
+    // window, or the round-436 adaptive MMCO list.
     if cfg.nal_ref_idc != 0 {
-        w.u(1, 0); // adaptive_ref_pic_marking_mode_flag = 0
+        write_dec_ref_pic_marking_non_idr(w, cfg.mmco);
     }
 
     // §7.3.3 — cabac_init_idc when CABAC is enabled and slice is non-I/SI.
@@ -510,6 +624,8 @@ mod tests {
                 field: FieldPicSignal::FrameMbsOnly,
                 idr: true,
                 nal_ref_idc: 3,
+                long_term_reference_flag: false,
+                mmco: &[],
             },
         );
         // Append a trivial slice_data placeholder + rbsp_trailing_bits so
@@ -579,6 +695,8 @@ mod tests {
                 nal_ref_idc: 2,
                 cabac: None,
                 field: FieldPicSignal::FrameMbsOnly,
+                rplm_l0: &[],
+                mmco: &[],
             },
         );
         // Append a dummy bit + trailing so the parser doesn't blow up.

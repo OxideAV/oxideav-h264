@@ -28,6 +28,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- §8.2.5.4 **MMCO field-marking operations** (round 436). The DPB
+  model gains per-parity markings (`DpbEntry::field_markings`):
+  §8.2.4.1 treats each field of a stored reference frame as a
+  reference picture with its own marking, and the field forms of the
+  MMCO ops (`field_pic_flag = 1`) mark individual FIELDS — MMCO 1/2
+  unmark exactly one field by its eq. 8-30/8-31 PicNum / eq. 8-32/
+  8-33 LongTermPicNum (the frame-level marking drops, "but the
+  marking of the other field is not changed"), MMCO 3 promotes one
+  field to long-term with the §8.2.5.4.3 eviction pre-pass sparing a
+  long-term field of the pair that includes the picNumX target,
+  MMCO 4 clears per-field by LongTermFrameIdx, and MMCO 6 spares the
+  complementary field of the CURRENT picture and completes long-term
+  pairs with a shared index. The §8.2.4.2.2/.2.4 field-list
+  initialisation now keys unit membership on "one or more fields
+  marked" and the §8.2.4.2.5 interleave skips fields not marked with
+  the matching reference class; DPB retention keeps an entry while
+  ANY field is referenced. Encoder side: the P / non-IDR-I slice
+  header writers emit §7.3.3.3 adaptive `dec_ref_pic_marking()` op
+  lists (`EncMmcoOp`) and §7.3.3.1 `ref_pic_list_modification()` op
+  lists (`EncRplmOp`); IDR headers can signal
+  `long_term_reference_flag`. Two new PAFF stream axes gate the
+  subsystem end-to-end byte-exactly (our decoder AND a black-box
+  reference decoder): `PaffConfig::long_term_anchor` (MMCO 4 + two
+  field MMCO 3 ops promote the frame-0 field pair; every later P
+  field splices the same-parity long-term field to ref_idx 0 via RPLM
+  `long_term_pic_num` while short-term pairs keep sliding) and
+  `PaffConfig::mmco_unpair_first_top` (a field MMCO 1 unmarks one
+  field of a reference pair; the following same-parity P field must
+  fall back across the unmarked field per the §8.2.4.2.5 "missing
+  field is ignored" rule). Eight new §8.2.5.4 unit tests pin the
+  per-field op semantics.
+
 - Encoder **field-mode 8x8 transform scan** (round 436, the r416
   "encoder field 8x8 scan" follow-up). New §8.5.7 Table 8-14 FIELD
   scan on the encoder side (`encoder::transform::field_scan_8x8` +

@@ -2048,6 +2048,8 @@ impl Encoder {
                 field: FieldPicSignal::FrameMbsOnly,
                 idr: true,
                 nal_ref_idc: 3,
+                long_term_reference_flag: false,
+                mmco: &[],
             },
         );
         // §7.3.4 — cabac_alignment_one_bit until byte aligned.
@@ -3051,6 +3053,8 @@ impl Encoder {
                 nal_ref_idc: 2,
                 cabac: Some(CabacSliceParams { cabac_init_idc: 0 }),
                 field: FieldPicSignal::FrameMbsOnly,
+                rplm_l0: &[],
+                mmco: &[],
             },
         );
         while !sw.byte_aligned() {

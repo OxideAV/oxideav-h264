@@ -1371,7 +1371,9 @@ impl H264CodecDecoder {
             },
             long_term_frame_idx: 0,
             dpb_key: self.mint_dpb_key(),
+            field_markings: [RefMarking::Unused; 2],
         };
+        current_entry.sync_field_markings();
 
         let mut mmco5_triggered = false;
         if is_reference {
@@ -1394,8 +1396,10 @@ impl H264CodecDecoder {
                 1u32 << (sps.log2_max_frame_num_minus4 + 4),
             );
 
-            self.dpb_entries
-                .retain(|e| !matches!(e.marking, RefMarking::Unused));
+            // §8.2.5.4 field forms can leave one field of an entry
+            // referenced while the frame-level marking dropped — keep
+            // the entry while ANY field is still a reference.
+            self.dpb_entries.retain(|e| e.is_any_field_ref());
 
             // §7.4.1.2.4 / §8.2.1 NOTE 1 — when the current picture
             // carries MMCO 5, its frame_num is inferred to 0 and its
@@ -1731,11 +1735,13 @@ impl H264CodecDecoder {
                 max_frame_num,
                 None,
             );
-            self.dpb_entries
-                .retain(|e| !matches!(e.marking, RefMarking::Unused));
+            // §8.2.5.4 field forms can leave one field of an entry
+            // referenced while the frame-level marking dropped — keep
+            // the entry while ANY field is still a reference.
+            self.dpb_entries.retain(|e| e.is_any_field_ref());
 
             let key = self.mint_dpb_key();
-            let entry = DpbEntry {
+            let mut entry = DpbEntry {
                 frame_num: expected,
                 top_field_order_cnt: top_foc,
                 bottom_field_order_cnt: bot_foc,
@@ -1744,7 +1750,9 @@ impl H264CodecDecoder {
                 marking: RefMarking::ShortTerm,
                 long_term_frame_idx: 0,
                 dpb_key: key,
+                field_markings: [RefMarking::Unused; 2],
             };
+            entry.sync_field_markings();
             self.dpb_entries.push(entry);
 
             self.prev_ref_frame_num = Some(expected);
