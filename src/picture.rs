@@ -13,6 +13,17 @@
 //!
 //! Clean-room: derived only from ITU-T Rec. H.264 (08/2024).
 
+/// §8.4.1.2.1 Table 8-7 — `PicCodingStruct( X )` of a decoded picture:
+/// FLD (coded with `field_pic_flag` = 1), FRM (frame,
+/// `mb_adaptive_frame_field_flag` = 0) or AFRM (MBAFF frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PicCodingStruct {
+    #[default]
+    Frm,
+    Fld,
+    Afrm,
+}
+
 /// A decoded picture sample buffer.
 ///
 /// `luma` is a row-major `i32` buffer of size
@@ -83,6 +94,42 @@ pub struct Picture {
     /// eq. 8-195 short-circuit.
     pub ref_list_0_longterm: Vec<bool>,
     pub ref_list_1_longterm: Vec<bool>,
+    /// §8.4.1.2.1 Table 8-7 — how this picture was coded (FLD / FRM /
+    /// AFRM). Drives the Table 8-8 mbAddrCol / yM / vertMvScale rows
+    /// when this picture serves as `colPic`.
+    pub coding_struct: PicCodingStruct,
+    /// §7.4.3 — for a coded FIELD picture, its parity (`true` =
+    /// bottom). Meaningless for frames.
+    pub is_bottom_field: bool,
+    /// §8.2.1 — TopFieldOrderCnt / BottomFieldOrderCnt of the coded
+    /// picture (for a coded field only its own parity is meaningful).
+    /// Needed for the §8.4.1.2.3 per-field tb/td distances when the
+    /// current macroblock is a field macroblock of an MBAFF frame.
+    pub top_field_order_cnt: i32,
+    pub bottom_field_order_cnt: i32,
+    /// §6.4.12.2 / Table 8-8 — per-MB `mb_field_decoding_flag`
+    /// snapshot for AFRM pictures (`fieldDecodingFlagX` of the
+    /// co-located macroblock). Empty for FLD / FRM pictures.
+    pub mb_field_flags: Vec<bool>,
+    /// §8.4.1.2.1 Table 8-6 — set on a [`Picture::field_view`] of a
+    /// stored FRAME (the view's parity). When `RefPicList1[ 0 ]` of a
+    /// field slice resolves to such a view, colPic is "the frame
+    /// containing RefPicList1[ 0 ]": the view carries the FRAME's
+    /// motion grids / coding struct / reference-list snapshots so the
+    /// temporal-direct derivation can address it in frame coordinates.
+    pub view_of_frame_parity: Option<u8>,
+    /// §8.4.1.2.3 MapColToList0 — picture-identity snapshot of the
+    /// reference lists active when this picture was decoded: per-entry
+    /// DPB storage key, field parity (`None` for frame/pair units) and
+    /// the frame-level UNIT key containing the entry (for a coded
+    /// field of a complementary pair: the pair's unit key; for frame
+    /// units: the entry's own key). Parallel to `ref_list_*_pocs`.
+    pub ref_list_0_keys: Vec<u32>,
+    pub ref_list_0_parities: Vec<Option<u8>>,
+    pub ref_list_0_unit_keys: Vec<u32>,
+    pub ref_list_1_keys: Vec<u32>,
+    pub ref_list_1_parities: Vec<Option<u8>>,
+    pub ref_list_1_unit_keys: Vec<u32>,
 }
 
 impl Picture {
@@ -124,6 +171,18 @@ impl Picture {
             ref_list_1_pocs: Vec::new(),
             ref_list_0_longterm: Vec::new(),
             ref_list_1_longterm: Vec::new(),
+            coding_struct: PicCodingStruct::default(),
+            is_bottom_field: false,
+            top_field_order_cnt: 0,
+            bottom_field_order_cnt: 0,
+            mb_field_flags: Vec::new(),
+            view_of_frame_parity: None,
+            ref_list_0_keys: Vec::new(),
+            ref_list_0_parities: Vec::new(),
+            ref_list_0_unit_keys: Vec::new(),
+            ref_list_1_keys: Vec::new(),
+            ref_list_1_parities: Vec::new(),
+            ref_list_1_unit_keys: Vec::new(),
         }
     }
 
@@ -132,11 +191,13 @@ impl Picture {
     /// sample rows of every plane, bottom = odd rows; the chroma planes
     /// of every interlace-capable format have even height and split by
     /// the same row parity). Used when a coded FIELD picture references
-    /// a field of a picture that was stored as a frame. Sample planes
-    /// only — the motion/colocated grids are left empty (a temporal
-    /// direct colocated picture is `RefPicList1[0]`, resolved
-    /// separately). The caller stamps `pic_order_cnt` with the FIELD's
-    /// own order count.
+    /// a field of a picture that was stored as a frame. The FRAME's
+    /// motion / colocated grids, per-MB field flags, coding struct and
+    /// reference-list identity snapshots are carried on the view (in
+    /// FRAME addressing) with `view_of_frame_parity` marking it, so
+    /// the §8.4.1.2.1 Table 8-6 "colPic = the frame containing
+    /// RefPicList1[ 0 ]" row can address the containing frame. The
+    /// caller stamps `pic_order_cnt` with the FIELD's own order count.
     pub fn field_view(&self, bottom: bool) -> Picture {
         let mut out = Picture::new(
             self.width_in_samples,
@@ -166,6 +227,30 @@ impl Picture {
         out.non_existing = self.non_existing;
         out.frame_num = self.frame_num;
         out.pic_order_cnt = self.pic_order_cnt;
+        // §8.4.1.2.1 — carry the FRAME's colocated-motion state so the
+        // view can serve as "the frame containing RefPicList1[ 0 ]"
+        // (Table 8-6, field_pic_flag == 1 row 1).
+        out.coding_struct = self.coding_struct;
+        out.top_field_order_cnt = self.top_field_order_cnt;
+        out.bottom_field_order_cnt = self.bottom_field_order_cnt;
+        out.mb_width_in_picture = self.mb_width_in_picture;
+        out.mv_l0_grid = self.mv_l0_grid.clone();
+        out.mv_l1_grid = self.mv_l1_grid.clone();
+        out.ref_idx_l0_grid = self.ref_idx_l0_grid.clone();
+        out.ref_idx_l1_grid = self.ref_idx_l1_grid.clone();
+        out.is_intra_grid = self.is_intra_grid.clone();
+        out.mb_field_flags = self.mb_field_flags.clone();
+        out.ref_list_0_pocs = self.ref_list_0_pocs.clone();
+        out.ref_list_1_pocs = self.ref_list_1_pocs.clone();
+        out.ref_list_0_longterm = self.ref_list_0_longterm.clone();
+        out.ref_list_1_longterm = self.ref_list_1_longterm.clone();
+        out.ref_list_0_keys = self.ref_list_0_keys.clone();
+        out.ref_list_0_parities = self.ref_list_0_parities.clone();
+        out.ref_list_0_unit_keys = self.ref_list_0_unit_keys.clone();
+        out.ref_list_1_keys = self.ref_list_1_keys.clone();
+        out.ref_list_1_parities = self.ref_list_1_parities.clone();
+        out.ref_list_1_unit_keys = self.ref_list_1_unit_keys.clone();
+        out.view_of_frame_parity = Some(u8::from(bottom));
         out
     }
 

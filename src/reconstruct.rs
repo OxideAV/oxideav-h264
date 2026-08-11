@@ -6222,7 +6222,7 @@ fn derive_inter_partitions<R: RefPicProvider>(
             let is_skip = matches!(mb.mb_type, BSkip);
             if !slice_header.direct_spatial_mv_pred_flag {
                 Ok(build_temporal_direct_partitions(
-                    sps, ref_pics, pic, mb_addr, is_skip,
+                    sps, ref_pics, pic, grid, mb_addr, is_skip,
                 ))
             } else {
                 Ok(build_spatial_direct_partitions(
@@ -6372,7 +6372,7 @@ fn derive_inter_partitions<R: RefPicProvider>(
                 if matches!(sub_type, SubMbType::BDirect8x8) {
                     if !slice_header.direct_spatial_mv_pred_flag {
                         parts.extend(build_temporal_direct_sub_partitions(
-                            sps, ref_pics, pic, mb_addr, part_x, part_y,
+                            sps, ref_pics, pic, grid, mb_addr, part_x, part_y,
                         ));
                     } else {
                         parts.extend(build_spatial_direct_partitions(
@@ -6441,34 +6441,189 @@ fn sub_mb_partitions(t: SubMbType) -> Vec<(u8, u8, u8, u8)> {
     }
 }
 
-/// §8.4.1.2.3 — derive one temporal-direct partition's `(refIdxL0,
-/// mvL0, mvL1)` for a single (mbAddr, block) colocated position.
+/// §8.4.1.2.3 / §8.4.1.2.1 — derive one temporal-direct partition's
+/// `(refIdxL0, mvL0, mvL1)` for the co-located 4x4 sub-macroblock
+/// partition selected by `luma4x4_blk_idx`.
 ///
-/// Returns `Some((ref_idx_l0, mv_l0, mv_l1))` when the colocated
+/// Implements the complete co-located derivation:
+/// * Table 8-6 colPic selection — RefPicList1[0] as decoded frame,
+///   decoded field, field of a decoded frame ("the frame containing"),
+///   or complementary field pair (parity by the eq. 8-175/8-176
+///   topAbsDiffPOC comparison for frame MBs, by `CurrMbAddr & 1` for
+///   MBAFF field MBs).
+/// * Table 8-7 PicCodingStruct + Table 8-8 mbAddrCol / yM /
+///   vertMvScale, including the AFRM variants (mbAddrCol2/3/5/6/7 with
+///   `fieldDecodingFlagX` read off the colPic's per-MB field-flag
+///   snapshot and the eq. 8-182 tie-break).
+/// * eq. 8-193/8-194 vertical mvCol scaling (Frm_To_Fld halves,
+///   Fld_To_Frm doubles).
+/// * MapColToList0 by picture IDENTITY: the colPic's reference-list
+///   snapshot names DPB unit keys + parities; the current list is
+///   searched per the One_To_One / Frm_To_Fld / Fld_To_Frm forms
+///   (field↔frame index doubling included).
+/// * eq. 8-201/8-202 tb/td on currPicOrField / pic0 / pic1 — per-FIELD
+///   order counts when the current macroblock is a field macroblock.
+///
+/// Returns `Some((ref_idx_l0, mv_l0, mv_l1))` when the co-located
 /// picture is available; `None` if the provider didn't ship motion
-/// data (caller should fall back to (0,0,0,0)).
+/// data (caller falls back to (0, 0, 0, 0)).
 fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
     ref_pics: &R,
+    pic: &Picture,
+    grid: &MbGrid,
     mb_addr: u32,
-    col_blk4: usize,
-    curr_poc: i32,
+    luma4x4_blk_idx: usize,
 ) -> Option<(i8, Mv, Mv)> {
-    // §8.4.1.2.1 / Table 8-6 — colPic = RefPicList1[0] (frame-only
-    // decode — field / AFRM coding paths deferred).
-    let col_pic = ref_pics.ref_pic(1, 0)?;
-    let poc_pic1 = col_pic.pic_order_cnt;
+    use crate::picture::PicCodingStruct as Pcs;
 
-    // §8.4.1.2.1 — read (mvCol, refIdxCol) from the colocated block.
-    // Rule: if predFlagL0Col = 1, use L0; else if predFlagL1Col = 1,
-    // use L1; else (intra) mvCol = 0, refIdxCol = -1.
-    let l0 = col_pic.colocated_l0(mb_addr, col_blk4);
-    let l1 = col_pic.colocated_l1(mb_addr, col_blk4);
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum VertMvScale {
+        OneToOne,
+        FrmToFld,
+        FldToFrm,
+    }
+
+    let curr_struct = pic.coding_struct;
+    let w = grid.width_in_mbs;
+    if w == 0 {
+        return None;
+    }
+    // §7.4.4 — current MB's frame/field coding (AFRM only).
+    let curr_mb_field = curr_struct == Pcs::Afrm
+        && grid
+            .get(mb_addr)
+            .map(|i| i.mb_field_decoding_flag)
+            .unwrap_or(false);
+    let curr_mb_bottom_parity = (mb_addr % 2) as u8; // AFRM within-pair
+    let curr_field_parity = u8::from(pic.is_bottom_field); // FLD pictures
+
+    // §6.4.3 — inverse 4x4 luma block scan: ( xCol, yCol ).
+    let (x_col, y_col) = LUMA_4X4_XY[luma4x4_blk_idx & 15];
+    let (x_col, y_col) = (x_col as u32, y_col as u32);
+
+    // ---- Table 8-6 — colPic ------------------------------------------
+    // `col_pic` is the picture whose colocated grids we address;
+    // `col_struct` its Table 8-7 classification.
+    let (col_pic, col_struct): (&Picture, Pcs) = if curr_struct == Pcs::Fld {
+        let c = ref_pics.ref_pic(1, 0)?;
+        if c.view_of_frame_parity.is_some() {
+            // Row 1 — "a field of a decoded frame": colPic is the
+            // FRAME containing RefPicList1[0]; the view carries the
+            // frame's grids + coding struct in frame addressing.
+            (c, c.coding_struct)
+        } else {
+            (c, Pcs::Fld)
+        }
+    } else if ref_pics.ref_pair_field(1, 0, false).is_some() {
+        // RefPicList1[0] is a complementary field pair — pick the
+        // parity per Table 8-6.
+        let bottom = if curr_mb_field {
+            curr_mb_bottom_parity != 0
+        } else {
+            let (t_foc, b_foc) = ref_pics.ref_entry_unit_focs(1, 0)?;
+            let top_abs = (t_foc - pic.pic_order_cnt).abs();
+            let bottom_abs = (b_foc - pic.pic_order_cnt).abs();
+            top_abs >= bottom_abs
+        };
+        (ref_pics.ref_pair_field(1, 0, bottom)?, Pcs::Fld)
+    } else {
+        let c = ref_pics.ref_pic(1, 0)?;
+        (c, c.coding_struct)
+    };
+
+    // §6.4.12.2-analog — `fieldDecodingFlagX` of a colPic MB.
+    let col_mb_field = |addr: u32| -> bool {
+        col_pic
+            .mb_field_flags
+            .get(addr as usize)
+            .copied()
+            .unwrap_or(false)
+    };
+
+    // ---- Table 8-8 — mbAddrCol, yM, vertMvScale ----------------------
+    let curr = mb_addr;
+    let (mb_addr_col, y_m, vert): (u32, u32, VertMvScale) = match (curr_struct, col_struct) {
+        (Pcs::Fld, Pcs::Fld) => (curr, y_col, VertMvScale::OneToOne),
+        (Pcs::Fld, Pcs::Frm) => (
+            // eq. 8-177.
+            2 * w * (curr / w) + (curr % w) + w * (y_col / 8),
+            (2 * y_col) % 16,
+            VertMvScale::FrmToFld,
+        ),
+        (Pcs::Fld, Pcs::Afrm) => {
+            // mbAddrX = 2 * CurrMbAddr (top MB of the co-located pair).
+            if !col_mb_field(2 * curr) {
+                // eq. 8-178.
+                (
+                    2 * curr + (y_col / 8),
+                    (2 * y_col) % 16,
+                    VertMvScale::FrmToFld,
+                )
+            } else {
+                // eq. 8-179.
+                (
+                    2 * curr + u32::from(curr_field_parity),
+                    y_col,
+                    VertMvScale::OneToOne,
+                )
+            }
+        }
+        (Pcs::Frm, Pcs::Fld) => (
+            // eq. 8-180.
+            w * (curr / (2 * w)) + (curr % w),
+            8 * ((curr / w) % 2) + 4 * (y_col / 8),
+            VertMvScale::FldToFrm,
+        ),
+        (Pcs::Frm, _) => (curr, y_col, VertMvScale::OneToOne),
+        (Pcs::Afrm, Pcs::Fld) => {
+            // eq. 8-181.
+            let a = curr / 2;
+            if !curr_mb_field {
+                (a, 8 * (curr % 2) + 4 * (y_col / 8), VertMvScale::FldToFrm)
+            } else {
+                (a, y_col, VertMvScale::OneToOne)
+            }
+        }
+        (Pcs::Afrm, _) => {
+            // (AFRM, AFRM) — mbAddrX = CurrMbAddr; also reached for a
+            // (frame-coded) colPic classified Frm inside an AFRM
+            // stream boundary case, which behaves identically because
+            // every col MB reads as frame-coded.
+            let col_field_x = col_mb_field(curr);
+            match (curr_mb_field, col_field_x) {
+                (false, false) | (true, true) => (curr, y_col, VertMvScale::OneToOne),
+                (false, true) => {
+                    // eq. 8-182 — tie-break on topAbsDiffPOC.
+                    let (t_foc, b_foc) = ref_pics
+                        .ref_entry_unit_focs(1, 0)
+                        .unwrap_or((col_pic.top_field_order_cnt, col_pic.bottom_field_order_cnt));
+                    let top_abs = (t_foc - pic.pic_order_cnt).abs();
+                    let bottom_abs = (b_foc - pic.pic_order_cnt).abs();
+                    (
+                        2 * (curr / 2) + u32::from(top_abs >= bottom_abs),
+                        8 * (curr % 2) + 4 * (y_col / 8),
+                        VertMvScale::FldToFrm,
+                    )
+                }
+                (true, false) => (
+                    // eq. 8-183.
+                    2 * (curr / 2) + (y_col / 8),
+                    (2 * y_col) % 16,
+                    VertMvScale::FrmToFld,
+                ),
+            }
+        }
+    };
+
+    // eq. 6-38 — colocated 4x4 block from ( xCol, yM ).
+    let col_blk4 =
+        (8 * (y_m / 8) + 4 * (x_col / 8) + 2 * ((y_m % 8) / 4) + ((x_col % 8) / 4)) as usize;
+
+    // ---- read (mvCol, refIdxCol) -------------------------------------
+    let l0 = col_pic.colocated_l0(mb_addr_col, col_blk4);
+    let l1 = col_pic.colocated_l1(mb_addr_col, col_blk4);
     let is_intra =
         l0.as_ref().map(|t| t.2).unwrap_or(false) || l1.as_ref().map(|t| t.2).unwrap_or(false);
-
-    // Extract (mvCol, refIdxCol, which_list) — "which_list" is the
-    // colocated picture's list index (0 or 1) the MV came from,
-    // needed to look up the referenced picture's POC later.
     let (mv_col_i16, ref_idx_col, used_l1) = if is_intra {
         ((0i16, 0i16), -1i8, false)
     } else {
@@ -6479,76 +6634,190 @@ fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
         }
     };
 
-    // §8.4.1.2.3 eq. 8-191 — refIdxL0 = (refIdxCol < 0) ? 0 :
-    //                                     MapColToList0(refIdxCol).
-    // MapColToList0: find the index in the current slice's
-    // RefPicList0 that refers to the picture the colocated block
-    // pointed at. We match by POC (picture identity).
-    //
-    // To perform that lookup, we need the colocated picture's
-    // reference list POCs. Those are snapshotted into the Picture
-    // struct at reconstruction time (`ref_list_0_pocs` /
-    // `ref_list_1_pocs`).
-    let curr_list0_pocs = ref_pics.ref_list_0_pocs();
+    // eq. 8-193/8-194 — vertMvScale on mvCol[1] ("/" truncates toward
+    // zero per §5.7; Rust integer division matches).
+    let mut mv_col = Mv::new(mv_col_i16.0 as i32, mv_col_i16.1 as i32);
+    match vert {
+        VertMvScale::FrmToFld => mv_col.y /= 2,
+        VertMvScale::FldToFrm => mv_col.y *= 2,
+        VertMvScale::OneToOne => {}
+    }
+
+    // ---- eq. 8-191 MapColToList0 by picture identity -----------------
+    let curr_parities = ref_pics.ref_list_0_parities();
+    let curr_units = ref_pics.ref_list_0_unit_keys();
     let curr_list0_lt = ref_pics.ref_list_0_longterm();
-    let ref_idx_l0: i8 = if ref_idx_col < 0 {
-        0
+    let curr_list0_pocs = ref_pics.ref_list_0_pocs();
+
+    // refPicCol identity: (unit key, Some(parity) when it is a FIELD).
+    let ref_pic_col: Option<(u32, Option<u8>)> = if ref_idx_col < 0 {
+        None
     } else {
+        let i = ref_idx_col as usize;
+        let (keys, parities, units) = if used_l1 {
+            (
+                &col_pic.ref_list_1_keys,
+                &col_pic.ref_list_1_parities,
+                &col_pic.ref_list_1_unit_keys,
+            )
+        } else {
+            (
+                &col_pic.ref_list_0_keys,
+                &col_pic.ref_list_0_parities,
+                &col_pic.ref_list_0_unit_keys,
+            )
+        };
+        let col_mb_is_field = match col_struct {
+            Pcs::Fld => false, // field lists carry parities directly
+            Pcs::Frm => false,
+            Pcs::Afrm => col_mb_field(mb_addr_col),
+        };
+        if col_struct == Pcs::Afrm && col_mb_is_field {
+            // The col FIELD MB's refIdxCol indexes the doubled
+            // per-field view of the frame list: unit = idx >> 1,
+            // parity = colMB parity for even indices, opposite for
+            // odd (§8.4.2.1 field references in MBAFF).
+            let unit = units.get(i >> 1).copied();
+            let col_parity = (mb_addr_col % 2) as u8;
+            let parity = if i % 2 == 0 {
+                col_parity
+            } else {
+                1 - col_parity
+            };
+            unit.map(|u| (u, Some(parity)))
+        } else {
+            match (keys.get(i), units.get(i)) {
+                (Some(_), Some(u)) => {
+                    let parity = parities.get(i).copied().flatten();
+                    Some((*u, parity))
+                }
+                _ => None,
+            }
+        }
+    };
+
+    let ref_idx_l0: i32 = match ref_pic_col {
+        None => 0,
+        Some((unit, parity)) => {
+            let found: Option<i32> = match vert {
+                VertMvScale::OneToOne => {
+                    if curr_struct == Pcs::Fld {
+                        // Field current: entries are fields — match
+                        // unit + parity.
+                        (0..curr_units.len()).find_map(|k| {
+                            (curr_units[k] == unit
+                                && curr_parities.get(k).copied().flatten() == parity)
+                                .then_some(k as i32)
+                        })
+                    } else if curr_mb_field {
+                        // AFRM field MB: refIdxL0Frm << 1 (+1 for
+                        // opposite parity).
+                        let p = parity.unwrap_or(curr_mb_bottom_parity);
+                        (0..curr_units.len())
+                            .find(|&k| curr_units[k] == unit)
+                            .map(|k| ((k as i32) << 1) + i32::from(p != curr_mb_bottom_parity))
+                    } else {
+                        (0..curr_units.len())
+                            .find(|&k| curr_units[k] == unit)
+                            .map(|k| k as i32)
+                    }
+                }
+                VertMvScale::FrmToFld => {
+                    if curr_struct == Pcs::Fld {
+                        // Field of refPicCol with the current PICTURE's
+                        // parity.
+                        (0..curr_units.len()).find_map(|k| {
+                            (curr_units[k] == unit
+                                && curr_parities.get(k).copied().flatten()
+                                    == Some(curr_field_parity))
+                            .then_some(k as i32)
+                        })
+                    } else {
+                        // AFRM field MB, frame col MB: refIdxL0Frm << 1.
+                        (0..curr_units.len())
+                            .find(|&k| curr_units[k] == unit)
+                            .map(|k| (k as i32) << 1)
+                    }
+                }
+                VertMvScale::FldToFrm => (0..curr_units.len())
+                    .find(|&k| curr_units[k] == unit)
+                    .map(|k| k as i32),
+            };
+            found.unwrap_or(0)
+        }
+    };
+
+    // Fallback safety for providers without identity snapshots (unit
+    // tests / legacy paths): when no identity was resolvable but a POC
+    // list exists, keep the historical POC match on One_To_One frame
+    // decode.
+    let ref_idx_l0 = if curr_units.is_empty() && ref_idx_col >= 0 && !curr_list0_pocs.is_empty() {
         let col_list = if used_l1 {
             &col_pic.ref_list_1_pocs
         } else {
             &col_pic.ref_list_0_pocs
         };
-        // POC of the picture the colocated block referenced.
         match col_list.get(ref_idx_col as usize).copied() {
-            Some(ref_poc) => {
-                // Lowest-valued index in current slice's RefPicList0
-                // whose picture has the same POC (picture identity).
-                match curr_list0_pocs.iter().position(|&p| p == ref_poc) {
-                    Some(idx) => idx as i8,
-                    None => 0, // Fallback: pic not in current L0 → 0.
-                }
-            }
+            Some(ref_poc) => curr_list0_pocs
+                .iter()
+                .position(|&p| p == ref_poc)
+                .map(|k| k as i32)
+                .unwrap_or(0),
             None => 0,
         }
+    } else {
+        ref_idx_l0
     };
 
-    // pic0 = RefPicList0[refIdxL0] of the current slice.
-    let poc_pic0 = ref_pics
-        .ref_pic_poc(0, ref_idx_l0 as u32)
-        .unwrap_or(curr_poc);
-
-    // §8.4.1.2.3 eq. 8-195/8-196 short-circuit:
-    //   (a) refIdxL0 picture is long-term,
-    //   (b) DiffPicOrderCnt(pic1, pic0) == 0.
-    // Either triggers: mvL0 = mvCol, mvL1 = 0.
-    let pic0_is_long_term = curr_list0_lt
-        .get(ref_idx_l0 as usize)
-        .copied()
-        .unwrap_or(false);
-    let mv_col = Mv::new(mv_col_i16.0 as i32, mv_col_i16.1 as i32);
-
-    if pic0_is_long_term || poc_pic1 == poc_pic0 {
-        return Some((ref_idx_l0, mv_col, Mv::ZERO));
+    // ---- eq. 8-201/8-202 POC distances -------------------------------
+    // currPicOrField / pic1 / pic0 per the field-macroblock rules.
+    let (curr_poc, poc_pic1, poc_pic0, pic0_long_term) = if curr_mb_field {
+        let curr_p = if curr_mb_bottom_parity == 0 {
+            pic.top_field_order_cnt
+        } else {
+            pic.bottom_field_order_cnt
+        };
+        let (t1, b1) = ref_pics.ref_entry_unit_focs(1, 0)?;
+        let poc1 = if curr_mb_bottom_parity == 0 { t1 } else { b1 };
+        let unit0 = (ref_idx_l0 >> 1) as u32;
+        let (t0, b0) = ref_pics.ref_entry_unit_focs(0, unit0)?;
+        let same_parity = ref_idx_l0 % 2 == 0;
+        let pic0_parity_bottom = if same_parity {
+            curr_mb_bottom_parity != 0
+        } else {
+            curr_mb_bottom_parity == 0
+        };
+        let poc0 = if pic0_parity_bottom { b0 } else { t0 };
+        let lt = curr_list0_lt.get(unit0 as usize).copied().unwrap_or(false);
+        (curr_p, poc1, poc0, lt)
+    } else {
+        let curr_p = pic.pic_order_cnt;
+        let poc1 = ref_pics.ref_pic_poc(1, 0).unwrap_or(col_pic.pic_order_cnt);
+        let poc0 = ref_pics.ref_pic_poc(0, ref_idx_l0 as u32).unwrap_or(curr_p);
+        let lt = curr_list0_lt
+            .get(ref_idx_l0 as usize)
+            .copied()
+            .unwrap_or(false);
+        (curr_p, poc1, poc0, lt)
+    };
+    if pic0_long_term || poc_pic1 == poc_pic0 {
+        return Some((ref_idx_l0 as i8, mv_col, Mv::ZERO));
     }
 
-    // eq. 8-201/8-202.
     let tb = clip3_i32(-128, 127, curr_poc - poc_pic0);
     let td = clip3_i32(-128, 127, poc_pic1 - poc_pic0);
     if td == 0 {
-        return Some((ref_idx_l0, mv_col, Mv::ZERO));
+        return Some((ref_idx_l0 as i8, mv_col, Mv::ZERO));
     }
 
-    // eq. 8-197/8-198/8-199/8-200.
-    // tx = (16384 + Abs(td/2)) / td
-    // Per spec §5.7 "/" truncates toward zero; Rust i32/i32 matches.
+    // eq. 8-197..8-200 ("/" truncates toward zero per §5.7).
     let tx = (16384 + (td / 2).abs()) / td;
     let dsf = clip3_i32(-1024, 1023, (tb * tx + 32) >> 6);
     let mvx_l0 = ((dsf * mv_col.x) + 128) >> 8;
     let mvy_l0 = ((dsf * mv_col.y) + 128) >> 8;
     let mv_l0 = Mv::new(mvx_l0, mvy_l0);
     let mv_l1 = Mv::new(mv_l0.x - mv_col.x, mv_l0.y - mv_col.y);
-    Some((ref_idx_l0, mv_l0, mv_l1))
+    Some((ref_idx_l0 as i8, mv_l0, mv_l1))
 }
 
 /// §8.4.1.2.3 — expand a B_Skip / B_Direct_16x16 macroblock into
@@ -6573,10 +6842,10 @@ fn build_temporal_direct_partitions<R: RefPicProvider>(
     sps: &Sps,
     ref_pics: &R,
     pic: &Picture,
+    grid: &MbGrid,
     mb_addr: u32,
     is_skip: bool,
 ) -> Vec<InterPartition> {
-    let curr_poc = pic.pic_order_cnt;
     let use_8x8 = sps.direct_8x8_inference_flag;
     let block_size: u8 = if use_8x8 { 8 } else { 4 };
     let step = block_size as usize;
@@ -6607,7 +6876,7 @@ fn build_temporal_direct_partitions<R: RefPicProvider>(
             };
 
             let (ref_idx_l0, mv_l0, mv_l1) =
-                derive_temporal_direct_mvs_for_block(ref_pics, mb_addr, col_blk4, curr_poc)
+                derive_temporal_direct_mvs_for_block(ref_pics, pic, grid, mb_addr, col_blk4)
                     .unwrap_or((0, Mv::ZERO, Mv::ZERO));
 
             partitions.push(InterPartition {
@@ -6643,11 +6912,11 @@ fn build_temporal_direct_sub_partitions<R: RefPicProvider>(
     sps: &Sps,
     ref_pics: &R,
     pic: &Picture,
+    grid: &MbGrid,
     mb_addr: u32,
     part_x: u8,
     part_y: u8,
 ) -> Vec<InterPartition> {
-    let curr_poc = pic.pic_order_cnt;
     let use_8x8 = sps.direct_8x8_inference_flag;
     let block_size: u8 = if use_8x8 { 8 } else { 4 };
     let step = block_size as usize;
@@ -6673,7 +6942,7 @@ fn build_temporal_direct_sub_partitions<R: RefPicProvider>(
             };
 
             let (ref_idx_l0, mv_l0, mv_l1) =
-                derive_temporal_direct_mvs_for_block(ref_pics, mb_addr, col_blk4, curr_poc)
+                derive_temporal_direct_mvs_for_block(ref_pics, pic, grid, mb_addr, col_blk4)
                     .unwrap_or((0, Mv::ZERO, Mv::ZERO));
 
             partitions.push(InterPartition {

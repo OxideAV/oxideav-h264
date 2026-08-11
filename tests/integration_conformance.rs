@@ -1618,19 +1618,32 @@ fn run_staged_conformance(name: &str, file: &str) -> Option<StreamReport> {
     Some(report)
 }
 
+/// Assert every compared frame matched byte-for-byte.
+fn assert_staged_bit_exact(report: &StreamReport) {
+    let compare_n = report.ours_frames.min(report.ffmpeg_frames);
+    assert_eq!(
+        report.matched,
+        compare_n,
+        "{}: {}/{} frames byte-exact (first mismatch: {:?})",
+        report.name,
+        report.matched,
+        compare_n,
+        report.first_mismatch.as_ref().map(|d| d.index)
+    );
+}
+
 /// Motorola `camp_mot_picaff0_full` — 720x480, 30 frames, PAFF, CABAC,
 /// IBBP, temporal direct. Exercises the Table 8-8 (FLD, FRM) and
-/// (FRM, FLD) cross rows within its first nine pictures.
-///
-/// Pixel equality is report-only while the Table 8-8 cross-row
-/// derivation lands; promote via `assert_staged_bit_exact` once exact.
+/// (FRM, FLD) cross rows within its first nine pictures. All 30 frames
+/// gate BYTE-EXACT (round 440).
 #[test]
 fn conformance_staged_camp_mot_picaff0() {
-    let Some(_report) =
+    let Some(report) =
         run_staged_conformance("staged_camp_mot_picaff0", "camp_mot_picaff0_full.26l")
     else {
         return;
     };
+    assert_staged_bit_exact(&report);
 }
 
 /// Sand Video `CAPAMA3_Sand_F` — CIF, PAFF + MBAFF, CABAC, IDR-B-B-P,
@@ -1645,24 +1658,27 @@ fn conformance_staged_capama3_sand_f() {
 }
 
 /// Toshiba `CAPA1_TOSHIBA_B` — CIF, 90 frames, PAFF, CABAC, temporal
-/// direct; highest cross-row density of the four staged streams.
+/// direct; highest cross-row density of the four staged streams. All
+/// 90 frames gate BYTE-EXACT (round 440).
 #[test]
 fn conformance_staged_capa1_toshiba_b() {
-    let Some(_report) = run_staged_conformance("staged_CAPA1_TOSHIBA_B", "CAPA1_TOSHIBA_B.264")
+    let Some(report) = run_staged_conformance("staged_CAPA1_TOSHIBA_B", "CAPA1_TOSHIBA_B.264")
     else {
         return;
     };
+    assert_staged_bit_exact(&report);
 }
 
 /// Toshiba `CVPA1_TOSHIBA_B` — the CAVLC twin of CAPA1 (same source and
 /// structure); separates an entropy-decode defect from a direct-mode
-/// defect.
+/// defect. All 90 frames gate BYTE-EXACT (round 440).
 #[test]
 fn conformance_staged_cvpa1_toshiba_b() {
-    let Some(_report) = run_staged_conformance("staged_CVPA1_TOSHIBA_B", "CVPA1_TOSHIBA_B.264")
+    let Some(report) = run_staged_conformance("staged_CVPA1_TOSHIBA_B", "CVPA1_TOSHIBA_B.264")
     else {
         return;
     };
+    assert_staged_bit_exact(&report);
 }
 
 // ------------------------------ helpers tests --------------------------

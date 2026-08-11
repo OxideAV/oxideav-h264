@@ -72,6 +72,41 @@ pub trait RefPicProvider {
     fn ref_field_parity(&self, _list: u8, _idx: u32) -> Option<u8> {
         None
     }
+
+    /// §8.4.1.2.3 MapColToList0 — picture-identity view of the current
+    /// slice's RefPicList0: per-entry DPB storage keys, field parities
+    /// (`None` for frame/pair units) and containing frame-level UNIT
+    /// keys. Defaults return empty slices — providers that never serve
+    /// temporal-direct B slices need not override.
+    fn ref_list_0_keys(&self) -> &[u32] {
+        &[]
+    }
+    fn ref_list_0_unit_keys(&self) -> &[u32] {
+        &[]
+    }
+    fn ref_list_0_parities(&self) -> &[Option<u8>] {
+        &[]
+    }
+    /// §8.4.1.2.1 — identity of the picture at `(list, idx)`: the
+    /// entry's storage key, parity (`None` = frame/pair unit) and its
+    /// containing frame-level unit key.
+    fn ref_entry_identity(&self, _list: u8, _idx: u32) -> Option<(u32, Option<u8>, u32)> {
+        None
+    }
+    /// §8.4.1.2.3 — TopFieldOrderCnt / BottomFieldOrderCnt of the
+    /// frame-level unit at `(list, idx)` of a FRAME slice's list (used
+    /// for the per-field tb/td distances of MBAFF field macroblocks
+    /// and the Table 8-6 / eq. 8-182 topAbsDiffPOC comparison).
+    fn ref_entry_unit_focs(&self, _list: u8, _idx: u32) -> Option<(i32, i32)> {
+        None
+    }
+    /// §8.4.1.2.1 Table 8-6 — when the entry at `(list, idx)` of a
+    /// FRAME slice's list is a complementary field PAIR, the stored
+    /// coded-field picture of the given parity (`false` = top). `None`
+    /// for genuine frame references.
+    fn ref_pair_field(&self, _list: u8, _idx: u32, _bottom: bool) -> Option<&Picture> {
+        None
+    }
 }
 
 /// A caller-supplied store mapping list indices to decoded pictures.

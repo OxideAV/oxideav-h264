@@ -63,12 +63,12 @@ pub enum PicStructure {
 impl PicStructure {
     /// True when this is a coded field (`field_pic_flag == 1` at decode
     /// time).
-    fn is_field(self) -> bool {
+    pub fn is_field(self) -> bool {
         matches!(self, PicStructure::TopField | PicStructure::BottomField)
     }
 
     /// True when this is a bottom field.
-    fn is_bottom(self) -> bool {
+    pub fn is_bottom(self) -> bool {
         matches!(self, PicStructure::BottomField)
     }
 }

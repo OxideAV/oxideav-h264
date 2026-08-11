@@ -914,6 +914,16 @@ impl H264CodecDecoder {
         let mut l1_overrides: Vec<Option<Picture>> = Vec::new();
         let mut l0_parities: Vec<Option<u8>> = Vec::new();
         let mut l1_parities: Vec<Option<u8>> = Vec::new();
+        let mut l0_unit_keys: Vec<u32> = Vec::new();
+        let mut l1_unit_keys: Vec<u32> = Vec::new();
+        // §8.4.1.2.3 — per-entry frame-level (TopFOC, BottomFOC) of
+        // FRAME-slice list units (per-field tb/td + eq. 8-182).
+        let mut l0_focs: Vec<(i32, i32)> = Vec::new();
+        let mut l1_focs: Vec<(i32, i32)> = Vec::new();
+        // §8.4.1.2.1 Table 8-6 — the (top, bottom) stored-field keys
+        // behind complementary-PAIR units of a FRAME slice's lists.
+        let mut l0_pair_keys: Vec<Option<(u32, u32)>> = Vec::new();
+        let mut l1_pair_keys: Vec<Option<(u32, u32)>> = Vec::new();
         let mut field_pocs_lt: Option<FieldListPocsLt> = None;
         let (list0, list1) = if is_idr {
             (Vec::new(), Vec::new())
@@ -984,6 +994,14 @@ impl H264CodecDecoder {
             l1_overrides = r1.overrides;
             l0_parities = r0.parities;
             l1_parities = r1.parities;
+            l0_unit_keys = r0.unit_keys;
+            l1_unit_keys = r1.unit_keys;
+            // Field lists: each entry is itself a field — its tb/td
+            // POC is the per-field POC already carried in `pocs`.
+            l0_focs = r0.pocs.iter().map(|&p| (p, p)).collect();
+            l1_focs = r1.pocs.iter().map(|&p| (p, p)).collect();
+            l0_pair_keys = vec![None; r0.keys.len()];
+            l1_pair_keys = vec![None; r1.keys.len()];
             field_pocs_lt = Some((r0.pocs, r0.longterm, r1.pocs, r1.longterm));
             (r0.keys, r1.keys)
         } else {
@@ -1079,10 +1097,19 @@ impl H264CodecDecoder {
             // the unit entries (a pair's POC is Min of its field POCs
             // — the stored top FIELD picture alone carries only its
             // own field POC).
-            let resolve_frame_list = |keys: &[u32]| -> (Vec<Option<Picture>>, Vec<i32>, Vec<bool>) {
+            type FrameListResolution = (
+                Vec<Option<Picture>>,
+                Vec<i32>,
+                Vec<bool>,
+                Vec<(i32, i32)>,
+                Vec<Option<(u32, u32)>>,
+            );
+            let resolve_frame_list = |keys: &[u32]| -> FrameListResolution {
                 let mut overrides = Vec::with_capacity(keys.len());
                 let mut pocs = Vec::with_capacity(keys.len());
                 let mut lts = Vec::with_capacity(keys.len());
+                let mut focs = Vec::with_capacity(keys.len());
+                let mut pair_keys = Vec::with_capacity(keys.len());
                 for &key in keys {
                     let unit = frame_units.iter().find(|u| u.dpb_key == key);
                     let pairing = pairings.iter().find(|p| p.unit_key == key);
@@ -1104,13 +1131,26 @@ impl H264CodecDecoder {
                             .unwrap_or(0)
                     }));
                     lts.push(unit.map(|u| u.is_long_term()).unwrap_or(false));
+                    focs.push(
+                        unit.map(|u| (u.top_field_order_cnt, u.bottom_field_order_cnt))
+                            .unwrap_or((0, 0)),
+                    );
+                    pair_keys.push(pairing.map(|p| (p.top_key, p.bottom_key)));
                 }
-                (overrides, pocs, lts)
+                (overrides, pocs, lts, focs, pair_keys)
             };
-            let (ov0, pocs0, lt0) = resolve_frame_list(&l0);
-            let (ov1, pocs1, lt1) = resolve_frame_list(&l1);
+            let (ov0, pocs0, lt0, focs0, pk0) = resolve_frame_list(&l0);
+            let (ov1, pocs1, lt1, focs1, pk1) = resolve_frame_list(&l1);
             l0_overrides = ov0;
             l1_overrides = ov1;
+            l0_unit_keys = l0.clone();
+            l1_unit_keys = l1.clone();
+            l0_parities = vec![None; l0.len()];
+            l1_parities = vec![None; l1.len()];
+            l0_focs = focs0;
+            l1_focs = focs1;
+            l0_pair_keys = pk0;
+            l1_pair_keys = pk1;
             field_pocs_lt = Some((pocs0, lt0, pocs1, lt1));
 
             (l0, l1)
@@ -1123,6 +1163,19 @@ impl H264CodecDecoder {
         // consistency).
         in_progress.pic.pic_order_cnt = in_progress.poc.pic_order_cnt;
         in_progress.pic.frame_num = header.frame_num;
+        // §8.4.1.2.1 Table 8-7 + §8.4.1.2.3 — the current picture's
+        // coding structure, field parity and per-field order counts
+        // feed the temporal-direct co-located derivation.
+        in_progress.pic.coding_struct = if header.field_pic_flag {
+            crate::picture::PicCodingStruct::Fld
+        } else if sps.mb_adaptive_frame_field_flag {
+            crate::picture::PicCodingStruct::Afrm
+        } else {
+            crate::picture::PicCodingStruct::Frm
+        };
+        in_progress.pic.is_bottom_field = header.bottom_field_flag;
+        in_progress.pic.top_field_order_cnt = in_progress.poc.top_field_order_cnt;
+        in_progress.pic.bottom_field_order_cnt = in_progress.poc.bottom_field_order_cnt;
 
         // §8.4.1.2.3 — precompute POCs + long-term flags for the
         // slice's RefPicList0. A later B-slice uses this picture as
@@ -1187,6 +1240,15 @@ impl H264CodecDecoder {
             in_progress.pic.ref_list_0_longterm = list_0_longterm.clone();
             in_progress.pic.ref_list_1_pocs = list_1_pocs.clone();
             in_progress.pic.ref_list_1_longterm = list_1_longterm.clone();
+            // §8.4.1.2.3 MapColToList0 — picture-identity snapshot: a
+            // later B slice using this picture as colPic resolves the
+            // colocated block's refIdxCol to a concrete DPB unit.
+            in_progress.pic.ref_list_0_keys = list0.clone();
+            in_progress.pic.ref_list_1_keys = list1.clone();
+            in_progress.pic.ref_list_0_parities = l0_parities.clone();
+            in_progress.pic.ref_list_1_parities = l1_parities.clone();
+            in_progress.pic.ref_list_0_unit_keys = l0_unit_keys.clone();
+            in_progress.pic.ref_list_1_unit_keys = l1_unit_keys.clone();
         }
         let _ = list_1_pocs;
         let provider = BorrowedRefProvider {
@@ -1200,6 +1262,12 @@ impl H264CodecDecoder {
             list_1_overrides: l1_overrides,
             list_0_parities: l0_parities,
             list_1_parities: l1_parities,
+            list_0_unit_keys: l0_unit_keys,
+            list_1_unit_keys: l1_unit_keys,
+            list_0_focs: l0_focs,
+            list_1_focs: l1_focs,
+            list_0_pair_keys: l0_pair_keys,
+            list_1_pair_keys: l1_pair_keys,
         };
         reconstruct::reconstruct_slice_no_deblock(
             &sd,
@@ -1260,6 +1328,31 @@ impl H264CodecDecoder {
         let mut pocs = Vec::with_capacity(entries.len());
         let mut lts = Vec::with_capacity(entries.len());
         let mut parities = Vec::with_capacity(entries.len());
+        let mut unit_keys = Vec::with_capacity(entries.len());
+        // §8.2.4.1 — frame-level unit key of a coded-field entry: the
+        // complementary pair's key (top field's storage key) when the
+        // opposite-parity partner exists, else the entry's own key.
+        let unit_key_of = |dpb: &DpbEntry| -> u32 {
+            if dpb.structure.is_field() {
+                let partner = dpb_entries.iter().find(|d| {
+                    d.structure.is_field()
+                        && d.frame_num == dpb.frame_num
+                        && d.structure.is_bottom() != dpb.structure.is_bottom()
+                });
+                match partner {
+                    Some(p) => {
+                        if dpb.structure.is_bottom() {
+                            p.dpb_key
+                        } else {
+                            dpb.dpb_key
+                        }
+                    }
+                    None => dpb.dpb_key,
+                }
+            } else {
+                dpb.dpb_key
+            }
+        };
         for e in entries {
             let Some(dpb) = dpb_entries.iter().find(|d| d.dpb_key == e.dpb_key) else {
                 keys.push(u32::MAX);
@@ -1267,8 +1360,10 @@ impl H264CodecDecoder {
                 pocs.push(0);
                 lts.push(false);
                 parities.push(None);
+                unit_keys.push(u32::MAX);
                 continue;
             };
+            unit_keys.push(unit_key_of(dpb));
             let bottom = e.parity == ref_list::FieldParity::Bottom;
             let field_poc = if bottom {
                 dpb.bottom_field_order_cnt
@@ -1300,6 +1395,7 @@ impl H264CodecDecoder {
             pocs,
             longterm: lts,
             parities,
+            unit_keys,
         }
     }
 
@@ -1916,6 +2012,11 @@ struct ResolvedFieldList {
     /// Parity of each reference FIELD (0 = top, 1 = bottom) for the
     /// §8.4.1.4 Table 8-10 chroma-MV adjustment.
     parities: Vec<Option<u8>>,
+    /// §8.4.1.2.3 MapColToList0 — the frame-level UNIT key containing
+    /// each field entry (a coded field of a complementary pair maps to
+    /// the pair's unit key = the top field's storage key; a field of a
+    /// stored frame maps to the frame's key).
+    unit_keys: Vec<u32>,
 }
 
 struct BorrowedRefProvider<'a> {
@@ -1944,6 +2045,17 @@ struct BorrowedRefProvider<'a> {
     /// for frame slices.
     list_0_parities: Vec<Option<u8>>,
     list_1_parities: Vec<Option<u8>>,
+    /// §8.4.1.2.3 MapColToList0 — frame-level unit key per entry.
+    list_0_unit_keys: Vec<u32>,
+    list_1_unit_keys: Vec<u32>,
+    /// §8.4.1.2.3 — per-entry (TopFOC, BottomFOC) of the entry's unit
+    /// for FRAME slices (per-field pocs duplicated for field slices).
+    list_0_focs: Vec<(i32, i32)>,
+    list_1_focs: Vec<(i32, i32)>,
+    /// §8.4.1.2.1 Table 8-6 — (top, bottom) stored-field keys of
+    /// complementary-PAIR units in a FRAME slice's lists.
+    list_0_pair_keys: Vec<Option<(u32, u32)>>,
+    list_1_pair_keys: Vec<Option<(u32, u32)>>,
 }
 
 impl RefPicProvider for BorrowedRefProvider<'_> {
@@ -1979,6 +2091,50 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
 
     fn ref_list_1_longterm(&self) -> &[bool] {
         &self.list_1_longterm
+    }
+
+    fn ref_list_0_keys(&self) -> &[u32] {
+        self.list_0
+    }
+
+    fn ref_list_0_unit_keys(&self) -> &[u32] {
+        &self.list_0_unit_keys
+    }
+
+    fn ref_list_0_parities(&self) -> &[Option<u8>] {
+        &self.list_0_parities
+    }
+
+    fn ref_entry_identity(&self, list: u8, idx: u32) -> Option<(u32, Option<u8>, u32)> {
+        let (keys, parities, unit_keys) = match list {
+            0 => (self.list_0, &self.list_0_parities, &self.list_0_unit_keys),
+            1 => (self.list_1, &self.list_1_parities, &self.list_1_unit_keys),
+            _ => return None,
+        };
+        let key = *keys.get(idx as usize)?;
+        let parity = parities.get(idx as usize).copied().flatten();
+        let unit = unit_keys.get(idx as usize).copied().unwrap_or(key);
+        Some((key, parity, unit))
+    }
+
+    fn ref_entry_unit_focs(&self, list: u8, idx: u32) -> Option<(i32, i32)> {
+        let focs = match list {
+            0 => &self.list_0_focs,
+            1 => &self.list_1_focs,
+            _ => return None,
+        };
+        focs.get(idx as usize).copied()
+    }
+
+    fn ref_pair_field(&self, list: u8, idx: u32, bottom: bool) -> Option<&Picture> {
+        let pair_keys = match list {
+            0 => &self.list_0_pair_keys,
+            1 => &self.list_1_pair_keys,
+            _ => return None,
+        };
+        let (top_key, bottom_key) = (*pair_keys.get(idx as usize)?)?;
+        self.store
+            .get_by_key(if bottom { bottom_key } else { top_key })
     }
 }
 
@@ -2313,6 +2469,9 @@ fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
     pic.ref_idx_l0_grid = vec![-1i8; nmb * 4];
     pic.ref_idx_l1_grid = vec![-1i8; nmb * 4];
     pic.is_intra_grid = vec![false; nmb];
+    // §6.4.12.2 / Table 8-8 — `fieldDecodingFlagX` of every MB, for
+    // AFRM pictures serving as colPic.
+    pic.mb_field_flags = vec![false; nmb];
     for (addr, info) in grid.info.iter().enumerate() {
         let base_mv = addr * 16;
         let base_r = addr * 4;
@@ -2325,6 +2484,7 @@ fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
             pic.ref_idx_l1_grid[base_r + blk8] = info.ref_idx_l1[blk8];
         }
         pic.is_intra_grid[addr] = info.is_intra;
+        pic.mb_field_flags[addr] = info.mb_field_decoding_flag;
     }
 }
 
