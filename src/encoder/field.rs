@@ -169,6 +169,34 @@ pub struct PaffConfig {
     /// — I_8x8 gets a real 3-way intra RDO, P/B MBs run the
     /// 8x8-vs-4x4 inter residual trial.
     pub transform_8x8: bool,
+    /// Round-440 — §8.4.2.3.3 **implicit weighted prediction** axis
+    /// (requires `b_fields`). The PPS signals
+    /// `weighted_bipred_idc = 2` and anchors move to a stride-3
+    /// display layout (anchor, B, B, anchor, …) so the two
+    /// non-reference B field pairs between anchors sit at UNEQUAL
+    /// per-field POC distances: every bipred / direct-Bi macroblock of
+    /// a B field combines its two predictions with the
+    /// eq. 8-197/8-198 + 8-282/8-283 POC-derived (w0, w1) pair — at
+    /// logWD = 5, zero offsets — computed on the FIELDS' own §8.2.1
+    /// order counts (first B pair w0/w1 = 43/21, second = 22/42; a
+    /// stride-2 layout would collapse every pair to the trivial
+    /// 32/32). Applies to luma AND chroma per §8.4.2.3.3.
+    pub b_implicit_weight: bool,
+    /// Round-440 — **B reference fields** axis (requires `b_fields`).
+    /// Anchors move to a stride-4 display layout with a REFERENCE
+    /// B field pair midway (`nal_ref_idc = 2`, stored through the
+    /// §8.2.5.3 sliding window as a complementary reference field
+    /// pair) and two non-reference B pairs on either side:
+    /// display/coding order 0, 4, 2ref, 1, 3, 8, 6ref, 5, 7, …. The
+    /// non-reference B pairs reference the B fields themselves — the
+    /// pair before the reference-B finds it at `RefPicList1[0]`
+    /// (making a coded B FIELD the §8.4.1.2.1 colPic of a
+    /// temporal-direct derivation), the pair after finds it at
+    /// `RefPicList0[0]`. The reference-B pair's mode decision is
+    /// restricted to L0/Bi/intra (`EncoderConfig::b_l0_bi_only`) so
+    /// its stored L0 motion snapshot matches what a decoder's
+    /// co-located read returns.
+    pub b_reference_fields: bool,
 }
 
 /// A reconstructed reference field: (Y, Cb, Cr) half-height planes +
@@ -413,7 +441,10 @@ fn encode_b_slice_data(
     ref_l1: &EncodedFrameRef<'_>,
     curr_poc: i32,
     sw: &mut BitWriter,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<MbDeblockInfo>) {
+    // Round-440 — §8.4.2.3.3 implicit weights for the bipred merges
+    // (`None` = §8.4.2.3.1 default average).
+    weighted: Option<super::WeightedBipredLuma>,
+) -> PSliceDataOut {
     let width = enc.cfg.width as usize;
     let width_mbs = enc.cfg.width / 16;
     let height_mbs = enc.cfg.height / 16;
@@ -454,7 +485,7 @@ fn encode_b_slice_data(
                 &mut mv_grid_l1,
                 &mut pending_skip,
                 curr_poc,
-                None,
+                weighted,
             );
             infos[mb_y * width_mbs as usize + mb_x] = dbl;
         }
@@ -462,7 +493,43 @@ fn encode_b_slice_data(
     // §7.3.4 — flush the trailing skip run (mirrors `encode_b`: the
     // final `mb_skip_run` is emitted even when zero).
     sw.ue(pending_skip);
-    (recon_y, recon_u, recon_v, infos)
+    // Round-440 — B fields can themselves serve as references
+    // (`PaffConfig::b_reference_fields`): snapshot the per-8x8 L0
+    // motion for later direct derivations reading this picture as
+    // colPic.
+    let partition_mvs = partition_mvs_from_grid(&mv_grid_l0);
+    (recon_y, recon_u, recon_v, infos, partition_mvs)
+}
+
+/// Round-440 — §8.4.2.3.3 implicit weighted-prediction (w0, w1) pair
+/// for one B FIELD, from the fields' own §8.2.1 order counts
+/// (eq. 8-201/8-202 distances, eq. 8-197/8-198 DistScaleFactor,
+/// eq. 8-280..8-283 weight selection at logWD = 5, zero offsets).
+/// Mirrors the decoder's derivation so the encoder's local recon stays
+/// bit-exact.
+fn implicit_field_weights(curr_poc: i32, poc0: i32, poc1: i32) -> super::WeightedBipredLuma {
+    let td = (poc1 - poc0).clamp(-128, 127);
+    let (w0, w1) = if td == 0 {
+        (32, 32)
+    } else {
+        let tb = (curr_poc - poc0).clamp(-128, 127);
+        let tx = (16384 + (td / 2).abs()) / td;
+        let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+        let w1 = dsf >> 2;
+        if !(-64..=128).contains(&w1) {
+            (32, 32)
+        } else {
+            (64 - w1, w1)
+        }
+    };
+    super::WeightedBipredLuma {
+        log2_wd: 5,
+        weight_l0: w0,
+        offset_l0: 0,
+        weight_l1: w1,
+        offset_l1: 0,
+        apply_chroma: true,
+    }
 }
 
 /// Encode an interlaced 4:2:0 sequence with PAFF field pictures. See
@@ -505,6 +572,18 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         "b_temporal_direct requires b_fields",
     );
     assert!(
+        !cfg.b_implicit_weight || cfg.b_fields,
+        "b_implicit_weight requires b_fields",
+    );
+    assert!(
+        !cfg.b_reference_fields || cfg.b_fields,
+        "b_reference_fields requires b_fields",
+    );
+    assert!(
+        !(cfg.b_implicit_weight && cfg.b_reference_fields),
+        "b_implicit_weight and b_reference_fields are separate stream axes",
+    );
+    assert!(
         !cfg.long_term_anchor
             || (cfg.p_fields
                 && !cfg.b_fields
@@ -539,11 +618,15 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
     // transform is a High-profile tool (§A.2.4) so the 8x8 axis
     // promotes to High (100).
     let profile_idc: u8 = if cfg.transform_8x8 { 100 } else { 77 };
+    // Round-440 — the B-reference-fields layout holds up to four
+    // frame-level reference units live (two anchors + two reference-B
+    // pairs across a group boundary).
+    let max_num_ref_frames: u32 = if cfg.b_reference_fields { 4 } else { 2 };
     let mk_cfg = |h: u32| {
         let mut c = EncoderConfig::new(cfg.width, h);
         c.qp = cfg.qp;
         c.profile_idc = profile_idc;
-        c.max_num_ref_frames = 2;
+        c.max_num_ref_frames = max_num_ref_frames;
         c.transform_8x8 = cfg.transform_8x8;
         c
     };
@@ -566,7 +649,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         height_in_mbs: frame_h_mbs,
         log2_max_frame_num_minus4,
         log2_max_poc_lsb_minus4,
-        max_num_ref_frames: 2,
+        max_num_ref_frames,
         profile_idc,
         chroma_format_idc: 1,
         seq_scaling_lists: None,
@@ -581,7 +664,10 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         pic_init_qp_minus26: cfg.qp - 26,
         chroma_qp_index_offset: 0,
         weighted_pred_flag: false,
-        weighted_bipred_idc: 0,
+        // Round-440 — §7.4.2.2: 2 = §8.4.2.3.3 implicit weighted
+        // bipred (weights derived from POC distances, nothing coded
+        // in the slice headers).
+        weighted_bipred_idc: if cfg.b_implicit_weight { 2 } else { 0 },
         entropy_coding_mode_flag: false,
         transform_8x8_mode_flag: cfg.transform_8x8,
     });
@@ -984,6 +1070,14 @@ fn encode_paff_b_sequence(
     let encode_anchor_pair = |d: usize,
                               frame_num: u32,
                               prev: Option<&[AnchorField; 2]>,
+                              // §8.2.4.3 — L0 RPLM ops for the P fields
+                              // (round-440: the stride-4 layout's later
+                              // anchors must splice the PREVIOUS ANCHOR
+                              // pair to index 0 — the §8.2.4.2.2 default
+                              // list orders by FrameNumWrap, which puts
+                              // the more recently coded REFERENCE B pair
+                              // first).
+                              rplm_l0: &[EncRplmOp],
                               stream: &mut Vec<u8>,
                               recon_frames: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>|
      -> [AnchorField; 2] {
@@ -1030,7 +1124,7 @@ fn encode_paff_b_sequence(
                         nal_ref_idc: 2,
                         cabac: None,
                         field: field_signal,
-                        rplm_l0: &[],
+                        rplm_l0,
                         mmco: &[],
                     },
                 );
@@ -1112,131 +1206,279 @@ fn encode_paff_b_sequence(
         [it.next().unwrap(), it.next().unwrap()]
     };
 
-    // Encode the non-reference B field pair for display index `d`
-    // between anchors `l0` (earlier) and `l1` (later). Per the
-    // round-20 convention (validated against the black-box reference
-    // decoder), the non-reference B carries the `frame_num` of the
-    // reference picture that precedes it in decoding order.
-    let encode_b_pair =
-        |d: usize,
-         frame_num: u32,
-         l0: &[AnchorField; 2],
-         l1: &[AnchorField; 2],
-         stream: &mut Vec<u8>,
-         recon_frames: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>| {
-            let (fy, fu, fv) = frames[d];
-            assert_eq!(fy.len(), width * frame_h);
-            let mut pair: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(2);
-            for bottom in [false, true] {
-                let (sy, su, sv) = extract_field(fy, fu, fv, width, frame_h, bottom);
-                let src = YuvFrame {
-                    width: cfg.width,
-                    height: field_h,
-                    y: &sy,
-                    u: &su,
-                    v: &sv,
-                };
-                let field_signal = if bottom {
-                    FieldPicSignal::BottomField
-                } else {
-                    FieldPicSignal::TopField
-                };
-                let poc = 2 * d as i32 + i32::from(bottom);
-                let poc_lsb = (poc as u32) % (1 << poc_lsb_bits);
-                let ref_l0 = l0[usize::from(bottom)].as_frame_ref(cfg.width, field_h);
-                let ref_l1 = l1[usize::from(bottom)].as_frame_ref(cfg.width, field_h);
-                let mut sw = BitWriter::new();
-                sw.set_field_scan(true);
-                write_b_slice_header(
-                    &mut sw,
-                    &BSliceHeaderConfig {
-                        first_mb_in_slice: 0,
-                        slice_type_raw: 6,
-                        pic_parameter_set_id: 0,
-                        frame_num,
-                        frame_num_bits,
-                        pic_order_cnt_lsb: poc_lsb,
-                        poc_lsb_bits,
-                        direct_spatial_mv_pred_flag: !cfg.b_temporal_direct,
-                        slice_qp_delta: 0,
-                        disable_deblocking_filter_idc: 0,
-                        slice_alpha_c0_offset_div2: 0,
-                        slice_beta_offset_div2: 0,
-                        nal_ref_idc: 0,
-                        pred_weight_table: None,
-                        cabac: None,
-                        field: field_signal,
-                    },
-                );
-                let (mut ry, mut ru, mut rv, infos) =
-                    encode_b_slice_data(&b_enc, &src, &ref_l0, &ref_l1, poc, &mut sw);
-                sw.rbsp_trailing_bits();
-                stream.extend_from_slice(&build_nal_unit(
-                    0,
-                    NalUnitType::SliceNonIdr,
-                    &sw.into_bytes(),
-                ));
-                // §8.7 with field_pic = 1 — the decoder outputs post-filter
-                // samples for the B fields too.
-                deblock_recon_field(
-                    cfg.width,
-                    field_h,
-                    cfg.width / 2,
-                    field_h / 2,
-                    &mut ry,
-                    &mut ru,
-                    &mut rv,
-                    &infos,
-                    0,
-                    width_mbs,
-                    field_h / 16,
-                    1,
-                );
-                pair.push((ry, ru, rv));
-            }
-            recon_frames[d] = (
-                interleave_planes(&pair[0].0, &pair[1].0, width),
-                interleave_planes(&pair[0].1, &pair[1].1, width / 2),
-                interleave_planes(&pair[0].2, &pair[1].2, width / 2),
+    // Encode one B field pair for display index `d` between anchors
+    // `l0` (earlier) and `l1` (later). Per the round-20 convention
+    // (validated against the black-box reference decoder), a
+    // non-reference B carries the `frame_num` of the reference picture
+    // that precedes it in decoding order; a REFERENCE B pair
+    // (round-440 `b_reference_fields`) carries its own incremented
+    // frame_num and `nal_ref_idc = 2`, and returns its reconstructed
+    // fields + L0 motion snapshots so later B pairs can reference it.
+    let encode_b_pair = |d: usize,
+                         frame_num: u32,
+                         l0: &[AnchorField; 2],
+                         l1: &[AnchorField; 2],
+                         is_ref: bool,
+                         enc: &Encoder,
+                         stream: &mut Vec<u8>,
+                         recon_frames: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>|
+     -> Option<[AnchorField; 2]> {
+        let (fy, fu, fv) = frames[d];
+        assert_eq!(fy.len(), width * frame_h);
+        let mut pair: Vec<AnchorField> = Vec::with_capacity(2);
+        for bottom in [false, true] {
+            let (sy, su, sv) = extract_field(fy, fu, fv, width, frame_h, bottom);
+            let src = YuvFrame {
+                width: cfg.width,
+                height: field_h,
+                y: &sy,
+                u: &su,
+                v: &sv,
+            };
+            let field_signal = if bottom {
+                FieldPicSignal::BottomField
+            } else {
+                FieldPicSignal::TopField
+            };
+            let poc = 2 * d as i32 + i32::from(bottom);
+            let poc_lsb = (poc as u32) % (1 << poc_lsb_bits);
+            let ref_l0 = l0[usize::from(bottom)].as_frame_ref(cfg.width, field_h);
+            let ref_l1 = l1[usize::from(bottom)].as_frame_ref(cfg.width, field_h);
+            // Round-440 — §8.4.2.3.3 implicit weights on the FIELDS'
+            // own order counts (`None` keeps the default average).
+            let weighted = if cfg.b_implicit_weight {
+                Some(implicit_field_weights(
+                    poc,
+                    l0[usize::from(bottom)].poc,
+                    l1[usize::from(bottom)].poc,
+                ))
+            } else {
+                None
+            };
+            let ref_idc: u32 = if is_ref { 2 } else { 0 };
+            let mut sw = BitWriter::new();
+            sw.set_field_scan(true);
+            write_b_slice_header(
+                &mut sw,
+                &BSliceHeaderConfig {
+                    first_mb_in_slice: 0,
+                    slice_type_raw: 6,
+                    pic_parameter_set_id: 0,
+                    frame_num,
+                    frame_num_bits,
+                    pic_order_cnt_lsb: poc_lsb,
+                    poc_lsb_bits,
+                    direct_spatial_mv_pred_flag: !cfg.b_temporal_direct,
+                    slice_qp_delta: 0,
+                    disable_deblocking_filter_idc: 0,
+                    slice_alpha_c0_offset_div2: 0,
+                    slice_beta_offset_div2: 0,
+                    nal_ref_idc: ref_idc,
+                    pred_weight_table: None,
+                    cabac: None,
+                    field: field_signal,
+                },
             );
-        };
+            let (mut ry, mut ru, mut rv, infos, mvs) =
+                encode_b_slice_data(enc, &src, &ref_l0, &ref_l1, poc, &mut sw, weighted);
+            sw.rbsp_trailing_bits();
+            stream.extend_from_slice(&build_nal_unit(
+                ref_idc as u8,
+                NalUnitType::SliceNonIdr,
+                &sw.into_bytes(),
+            ));
+            // §8.7 with field_pic = 1 — the decoder outputs post-filter
+            // samples for the B fields too (and a REFERENCE B pair
+            // must store the post-filter samples).
+            deblock_recon_field(
+                cfg.width,
+                field_h,
+                cfg.width / 2,
+                field_h / 2,
+                &mut ry,
+                &mut ru,
+                &mut rv,
+                &infos,
+                0,
+                width_mbs,
+                field_h / 16,
+                1,
+            );
+            pair.push(AnchorField {
+                y: ry,
+                u: ru,
+                v: rv,
+                poc,
+                partition_mvs: mvs,
+            });
+        }
+        recon_frames[d] = (
+            interleave_planes(&pair[0].y, &pair[1].y, width),
+            interleave_planes(&pair[0].u, &pair[1].u, width / 2),
+            interleave_planes(&pair[0].v, &pair[1].v, width / 2),
+        );
+        if is_ref {
+            let mut it = pair.into_iter();
+            Some([it.next().unwrap(), it.next().unwrap()])
+        } else {
+            None
+        }
+    };
 
-    // Coding order: anchor 0, then per following anchor (display 2, 4,
-    // …) the anchor pair followed by the B pair it encloses; a
-    // trailing odd display frame becomes a P/P anchor pair.
-    let mut prev_anchor = encode_anchor_pair(0, 0, None, &mut stream, &mut recon_frames);
-    let mut anchor_fn: u32 = 0;
-    let mut d = 2usize;
-    while d < frames.len() {
-        anchor_fn += 1;
-        let next_anchor = encode_anchor_pair(
-            d,
-            anchor_fn % (1 << frame_num_bits),
-            Some(&prev_anchor),
-            &mut stream,
-            &mut recon_frames,
+    // Round-440 — reference-B pairs restrict their mode decision so
+    // the stored L0 motion snapshot matches a decoder's co-located
+    // read (`EncoderConfig::b_l0_bi_only`).
+    let ref_b_enc = Encoder::new({
+        let mut c = mk_cfg();
+        c.direct_temporal_mv_pred = cfg.b_temporal_direct;
+        c.b_l0_bi_only = true;
+        c
+    });
+
+    if cfg.b_reference_fields {
+        // Stride-4 layout: 0, 4, 2ref, 1, 3, 8, 6ref, 5, 7, …
+        assert!(
+            frames.len() >= 5 && frames.len() % 4 == 1,
+            "b_reference_fields needs 4k+1 display frames (anchors at multiples of 4)",
         );
-        encode_b_pair(
-            d - 1,
-            anchor_fn % (1 << frame_num_bits),
-            &prev_anchor,
-            &next_anchor,
-            &mut stream,
-            &mut recon_frames,
+        let mut prev_anchor = encode_anchor_pair(0, 0, None, &[], &mut stream, &mut recon_frames);
+        let mut ref_fn: u32 = 0;
+        let mut d = 4usize;
+        while d < frames.len() {
+            ref_fn += 1;
+            // §8.2.4.3.1 — from the second P/P anchor on, the DPB also
+            // holds the previous group's reference-B pair (higher
+            // FrameNumWrap than the previous anchor): splice the
+            // previous anchor pair back to RefPicList0[0]. Same-parity
+            // eq. 8-30 PicNums: CurrPicNum = 2*fn + 1, target =
+            // 2*(fn - 2) + 1 ⇒ abs_diff_pic_num_minus1 = 3.
+            let anchor_rplm: &[EncRplmOp] = if ref_fn >= 3 {
+                &[EncRplmOp::Subtract(3)]
+            } else {
+                &[]
+            };
+            let next_anchor = encode_anchor_pair(
+                d,
+                ref_fn % (1 << frame_num_bits),
+                Some(&prev_anchor),
+                anchor_rplm,
+                &mut stream,
+                &mut recon_frames,
+            );
+            ref_fn += 1;
+            let ref_b = encode_b_pair(
+                d - 2,
+                ref_fn % (1 << frame_num_bits),
+                &prev_anchor,
+                &next_anchor,
+                true,
+                &ref_b_enc,
+                &mut stream,
+                &mut recon_frames,
+            )
+            .expect("reference B pair returns its fields");
+            let _ = encode_b_pair(
+                d - 3,
+                ref_fn % (1 << frame_num_bits),
+                &prev_anchor,
+                &ref_b,
+                false,
+                &b_enc,
+                &mut stream,
+                &mut recon_frames,
+            );
+            let _ = encode_b_pair(
+                d - 1,
+                ref_fn % (1 << frame_num_bits),
+                &ref_b,
+                &next_anchor,
+                false,
+                &b_enc,
+                &mut stream,
+                &mut recon_frames,
+            );
+            prev_anchor = next_anchor;
+            d += 4;
+        }
+    } else if cfg.b_implicit_weight {
+        // Stride-3 layout: 0, 3, 1, 2, 6, 4, 5, … — the two B pairs
+        // between anchors sit at unequal POC distances, so the
+        // §8.4.2.3.3 weights genuinely leave (32, 32).
+        assert!(
+            frames.len() >= 4 && frames.len() % 3 == 1,
+            "b_implicit_weight needs 3k+1 display frames (anchors at multiples of 3)",
         );
-        prev_anchor = next_anchor;
-        d += 2;
-    }
-    if frames.len() % 2 == 0 {
-        // Trailing odd display frame without a following anchor.
-        anchor_fn += 1;
-        let _ = encode_anchor_pair(
-            frames.len() - 1,
-            anchor_fn % (1 << frame_num_bits),
-            Some(&prev_anchor),
-            &mut stream,
-            &mut recon_frames,
-        );
+        let mut prev_anchor = encode_anchor_pair(0, 0, None, &[], &mut stream, &mut recon_frames);
+        let mut anchor_fn: u32 = 0;
+        let mut d = 3usize;
+        while d < frames.len() {
+            anchor_fn += 1;
+            let next_anchor = encode_anchor_pair(
+                d,
+                anchor_fn % (1 << frame_num_bits),
+                Some(&prev_anchor),
+                &[],
+                &mut stream,
+                &mut recon_frames,
+            );
+            for b_d in [d - 2, d - 1] {
+                let _ = encode_b_pair(
+                    b_d,
+                    anchor_fn % (1 << frame_num_bits),
+                    &prev_anchor,
+                    &next_anchor,
+                    false,
+                    &b_enc,
+                    &mut stream,
+                    &mut recon_frames,
+                );
+            }
+            prev_anchor = next_anchor;
+            d += 3;
+        }
+    } else {
+        // Round-436 stride-2 layout: anchor 0, then per following
+        // anchor (display 2, 4, …) the anchor pair followed by the B
+        // pair it encloses; a trailing odd display frame becomes a
+        // P/P anchor pair.
+        let mut prev_anchor = encode_anchor_pair(0, 0, None, &[], &mut stream, &mut recon_frames);
+        let mut anchor_fn: u32 = 0;
+        let mut d = 2usize;
+        while d < frames.len() {
+            anchor_fn += 1;
+            let next_anchor = encode_anchor_pair(
+                d,
+                anchor_fn % (1 << frame_num_bits),
+                Some(&prev_anchor),
+                &[],
+                &mut stream,
+                &mut recon_frames,
+            );
+            let _ = encode_b_pair(
+                d - 1,
+                anchor_fn % (1 << frame_num_bits),
+                &prev_anchor,
+                &next_anchor,
+                false,
+                &b_enc,
+                &mut stream,
+                &mut recon_frames,
+            );
+            prev_anchor = next_anchor;
+            d += 2;
+        }
+        if frames.len() % 2 == 0 {
+            // Trailing odd display frame without a following anchor.
+            anchor_fn += 1;
+            let _ = encode_anchor_pair(
+                frames.len() - 1,
+                anchor_fn % (1 << frame_num_bits),
+                Some(&prev_anchor),
+                &[],
+                &mut stream,
+                &mut recon_frames,
+            );
+        }
     }
 
     PaffEncoded {

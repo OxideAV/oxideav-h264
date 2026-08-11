@@ -346,6 +346,15 @@ pub struct EncoderConfig {
     /// refIdxL1) are computed by POC-scaling the colocated L1
     /// anchor's L0 motion vectors. Round-24.
     pub direct_temporal_mv_pred: bool,
+    /// Round-440 — restrict the B mode decision to modes whose motion
+    /// stays representable in the L0-only colocated snapshot
+    /// ([`FrameRefPartitionMv`]) a later B picture's §8.4.1.2
+    /// direct-mode derivation reads: drops the explicit L1-only 16x16
+    /// candidate and the Mixed8x8 candidate. Used when the coded B
+    /// picture will itself serve as a REFERENCE (PAFF B reference
+    /// fields) so the encoder-side co-located model matches what a
+    /// decoder reads back from the stored picture.
+    pub b_l0_bi_only: bool,
     /// Round-26 — §7.4.2.2 / §8.4.2.3.2 explicit weighted bipred for B
     /// slices. When `true` the encoder:
     ///   * Sets PPS `weighted_bipred_idc = 1` so the decoder pulls a
@@ -558,6 +567,7 @@ impl EncoderConfig {
             profile_idc: 66,
             max_num_ref_frames: 1,
             direct_temporal_mv_pred: false,
+            b_l0_bi_only: false,
             explicit_weighted_bipred: false,
             intra_in_inter: true,
             chroma_format_idc: 1,
@@ -8234,6 +8244,23 @@ struct WeightedBipredLuma {
     offset_l0: i32,
     weight_l1: i32,
     offset_l1: i32,
+    /// Round-440 — apply the same (w0, w1) pair to the CHROMA merges
+    /// too. §8.4.2.3.3 IMPLICIT weighting weights every plane with the
+    /// POC-derived pair; the round-26 explicit path keeps chroma on
+    /// the §8.4.2.3.1 default average (its pred_weight_table signals
+    /// `chroma_weight_lN_flag = 0`).
+    apply_chroma: bool,
+}
+
+/// §8.4.2.3.2 eq. 8-276 — merge two predictor slices with the
+/// (w0, w1, logWD) triple (offsets folded by the caller; the implicit
+/// path has none per eq. 8-278/8-279).
+#[inline]
+fn weighted_bipred_merge(a: i32, b: i32, wp: &WeightedBipredLuma) -> i32 {
+    let round = 1i32 << wp.log2_wd;
+    let off_avg = (wp.offset_l0 + wp.offset_l1 + 1) >> 1;
+    let v = (a * wp.weight_l0 + b * wp.weight_l1 + round) >> (wp.log2_wd + 1);
+    (v + off_avg).clamp(0, 255)
 }
 
 /// Round-26 — slice-wide weight selector for explicit weighted bipred.
@@ -8514,13 +8541,22 @@ fn build_b_predictors(
             }
             let l0_u = p_u_l0.unwrap();
             let l1_u = p_u_l1.unwrap();
-            for i in 0..64 {
-                pred_u[i] = (l0_u[i] + l1_u[i] + 1) >> 1;
-            }
             let l0_v = p_v_l0.unwrap();
             let l1_v = p_v_l1.unwrap();
-            for i in 0..64 {
-                pred_v[i] = (l0_v[i] + l1_v[i] + 1) >> 1;
+            match weighted {
+                Some(wp) if wp.apply_chroma => {
+                    // §8.4.2.3.3 — implicit weights apply to chroma too.
+                    for i in 0..64 {
+                        pred_u[i] = weighted_bipred_merge(l0_u[i], l1_u[i], &wp);
+                        pred_v[i] = weighted_bipred_merge(l0_v[i], l1_v[i], &wp);
+                    }
+                }
+                _ => {
+                    for i in 0..64 {
+                        pred_u[i] = (l0_u[i] + l1_u[i] + 1) >> 1;
+                        pred_v[i] = (l0_v[i] + l1_v[i] + 1) >> 1;
+                    }
+                }
             }
         }
     }
@@ -8597,7 +8633,9 @@ fn direct_per_8x8_kinds(d: &BDirectDerivation) -> [DirectPart8x8; 4] {
 /// chroma predictors are computed via `build_inter_pred_luma_8x8` /
 /// `build_inter_pred_chroma_4x4`. Bi-pred uses the same §8.4.2.3.1
 /// default weighted average `(L0+L1+1)>>1` as 16x16 / 16x8 / 8x16.
+#[allow(clippy::too_many_arguments)]
 fn build_b_direct_8x8_predictors(
+    weighted: Option<WeightedBipredLuma>,
     kinds: [DirectPart8x8; 4],
     mv_l0_per_8x8: [Mv; 4],
     mv_l1_per_8x8: [Mv; 4],
@@ -8663,8 +8701,18 @@ fn build_b_direct_8x8_predictors(
                 let l0 = l0_y.unwrap();
                 let l1 = l1_y.unwrap();
                 let mut out = [0i32; 64];
-                for i in 0..64 {
-                    out[i] = (l0[i] + l1[i] + 1) >> 1;
+                match weighted {
+                    // §8.4.2.3.2/.3.3 — weighted bipred merge.
+                    Some(wp) => {
+                        for i in 0..64 {
+                            out[i] = weighted_bipred_merge(l0[i], l1[i], &wp);
+                        }
+                    }
+                    None => {
+                        for i in 0..64 {
+                            out[i] = (l0[i] + l1[i] + 1) >> 1;
+                        }
+                    }
                 }
                 out
             }
@@ -8748,8 +8796,18 @@ fn build_b_direct_8x8_predictors(
                     let a = c0.unwrap();
                     let b = c1.unwrap();
                     let mut out = [0i32; 16];
-                    for i in 0..16 {
-                        out[i] = (a[i] + b[i] + 1) >> 1;
+                    match weighted {
+                        // §8.4.2.3.3 — implicit weights every plane.
+                        Some(wp) if wp.apply_chroma => {
+                            for i in 0..16 {
+                                out[i] = weighted_bipred_merge(a[i], b[i], &wp);
+                            }
+                        }
+                        _ => {
+                            for i in 0..16 {
+                                out[i] = (a[i] + b[i] + 1) >> 1;
+                            }
+                        }
                     }
                     out
                 }
@@ -10439,6 +10497,7 @@ impl Encoder {
                 offset_l0: t.luma_offset_l0,
                 weight_l1: t.luma_weight_l1,
                 offset_l1: t.luma_offset_l1,
+                apply_chroma: false,
             });
 
         let mut sw = BitWriter::new();
@@ -10804,6 +10863,12 @@ impl Encoder {
             )
         };
         let direct_uniform = direct.is_uniform();
+        // Round-440 — under `b_l0_bi_only` a direct derivation whose
+        // refIdxL0 collapsed below 0 (L1-only prediction) is not
+        // representable in the L0-only colocated snapshot this
+        // picture's consumers read; drop the direct candidates for
+        // this MB (legal mode-choice restriction).
+        let direct_l0_ok = !(self.cfg.b_l0_bi_only && direct.ref_idx_l0 < 0);
         // Map (refIdxL0 >= 0, refIdxL1 >= 0) onto the same BPred16x16
         // enum the explicit-inter writer uses, so the predictor builder
         // is shared. Direct mode where neither list is used should not
@@ -10821,7 +10886,7 @@ impl Encoder {
         // is exploitable (uniform across 8x8 partitions and at least one
         // list is used).
         let (direct_competitive, direct_pred_y, direct_pred_u, direct_pred_v, direct_sad) =
-            match (direct_uniform, direct_pred_kind) {
+            match (direct_uniform && direct_l0_ok, direct_pred_kind) {
                 (true, Some(dpk)) => {
                     let (dy, du, dv) = build_b_predictors(
                         dpk,
@@ -10855,9 +10920,10 @@ impl Encoder {
             direct_8x8_pred_u,
             direct_8x8_pred_v,
             direct_8x8_sad,
-        ) = match direct_pred_kind {
+        ) = match direct_pred_kind.filter(|_| direct_l0_ok) {
             Some(_) => {
                 let (dy, du, dv) = build_b_direct_8x8_predictors(
+                    weighted,
                     direct_8x8_kinds,
                     direct.mv_l0_per_8x8,
                     direct.mv_l1_per_8x8,
@@ -10969,7 +11035,16 @@ impl Encoder {
         // picked a non-Direct kind (otherwise the round-23 all-Direct
         // writer is tighter and produces the same predictor).
         let mixed_has_non_direct = mixed_cells.iter().any(|&c| c != BSubMbCell::Direct);
-        let mixed_competitive_for_pick = mixed_competitive && mixed_has_non_direct;
+        // Round-440 — the Mixed8x8 per-cell merges are not wired for
+        // the §8.4.2.3.3 implicit weighted combine, and its cells may
+        // pick L1-only prediction; drop the candidate under the
+        // implicit-weight axis and under `b_l0_bi_only` (a legal
+        // encoder mode-choice restriction — the emitted syntax stays
+        // fully conforming).
+        let mixed_competitive_for_pick = mixed_competitive
+            && mixed_has_non_direct
+            && !weighted.map(|w| w.apply_chroma).unwrap_or(false)
+            && !self.cfg.b_l0_bi_only;
 
         // Stitch the per-cell mixed luma + chroma composite predictors.
         let (mixed_pred_y, mixed_pred_u, mixed_pred_v) = if mixed_competitive_for_pick {
@@ -11072,6 +11147,7 @@ impl Encoder {
         // ~200-440. Empirically a fixed margin of 16 bits' worth on
         // top of the explicit candidate's SAD is sufficient for static
         // / smooth content where ME is searching a flat SAD landscape.
+        #[derive(Debug, Clone, Copy)]
         enum BMode {
             Direct,
             /// Round-23: `B_8x8` with all four sub_mb_type=B_Direct_8x8.
@@ -11177,9 +11253,14 @@ impl Encoder {
             } else {
                 BMode::Direct
             }
-        } else if sad_bi <= sad_l0 && sad_bi <= sad_l1 {
+        } else if sad_bi <= sad_l0 && (sad_bi <= sad_l1 || self.cfg.b_l0_bi_only) {
             BMode::Explicit(BPred16x16::Bi)
-        } else if sad_l0 <= sad_l1 {
+        } else if sad_l0 <= sad_l1 || self.cfg.b_l0_bi_only {
+            // Round-440 — `b_l0_bi_only` keeps every coded MB's motion
+            // representable in the L0-only colocated snapshot a later
+            // temporal-direct derivation reads (§8.4.1.2.1 prefers the
+            // colocated L0 motion; an L1-only macroblock would make
+            // the co-located read fall through to L1).
             BMode::Explicit(BPred16x16::L0)
         } else {
             BMode::Explicit(BPred16x16::L1)
@@ -11397,7 +11478,21 @@ impl Encoder {
         // with the explicit 16x8 / 8x16 partition shapes (mb_type 4..=21).
         // Partition mode override only applies to explicit-inter 16x16
         // candidates.
-        if !is_direct && !is_direct_per_8x8 && !is_mixed_8x8 && part_winner_sad < part_threshold {
+        // Round-440 — the 16x8 / 8x16 partition composites merge Bi
+        // halves with the §8.4.2.3.1 default average and may pick
+        // L1-only halves: drop the candidate under the §8.4.2.3.3
+        // implicit-weight axis (the decoder would weight those merges)
+        // and under `b_l0_bi_only` (an L1-only half is not
+        // representable in the L0-only colocated snapshot). Both are
+        // legal encoder mode-choice restrictions.
+        let partitions_allowed =
+            !weighted.map(|w| w.apply_chroma).unwrap_or(false) && !self.cfg.b_l0_bi_only;
+        if partitions_allowed
+            && !is_direct
+            && !is_direct_per_8x8
+            && !is_mixed_8x8
+            && part_winner_sad < part_threshold
+        {
             partition_choice = Some(match part_winner {
                 PartitionShape::P16x8 => PartitionChoiceB {
                     shape: PartitionShape::P16x8,

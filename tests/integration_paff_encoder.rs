@@ -79,6 +79,8 @@ fn encode_cfg2(
             transform_8x8: false,
             long_term_anchor: false,
             mmco_unpair_first_top: false,
+            b_implicit_weight: false,
+            b_reference_fields: false,
         },
         &refs,
     )
@@ -109,6 +111,8 @@ fn encode_b_fields(n_frames: usize, b_temporal_direct: bool) -> PaffEncoded {
             transform_8x8: false,
             long_term_anchor: false,
             mmco_unpair_first_top: false,
+            b_implicit_weight: false,
+            b_reference_fields: false,
         },
         &refs,
     )
@@ -144,6 +148,21 @@ fn decode_ours(annex_b: &[u8]) -> Vec<oxideav_core::VideoFrame> {
 }
 
 fn assert_frames_match_recon(enc: &PaffEncoded, decoded: &[oxideav_core::VideoFrame], tag: &str) {
+    if let Ok(dir) = std::env::var("OXIDEAV_DUMP_RECON") {
+        for (i, (ry, ru, rv)) in enc.recon_frames.iter().enumerate() {
+            let mut buf = ry.clone();
+            buf.extend_from_slice(ru);
+            buf.extend_from_slice(rv);
+            let _ = std::fs::write(format!("{dir}/{tag}-recon-{i}.yuv"), &buf);
+        }
+        for (i, vf) in decoded.iter().enumerate() {
+            let mut buf = Vec::new();
+            for p in &vf.planes {
+                buf.extend_from_slice(&p.data);
+            }
+            let _ = std::fs::write(format!("{dir}/{tag}-dec-{i}.yuv"), &buf);
+        }
+    }
     assert_eq!(
         decoded.len(),
         enc.recon_frames.len(),
@@ -163,6 +182,22 @@ fn assert_frames_match_recon(enc: &PaffEncoded, decoded: &[oxideav_core::VideoFr
                 .zip(exp.iter())
                 .filter(|(&a, &b)| a != b)
                 .count();
+            if mismatches != 0 {
+                // Diagnostic: distinct diverging MBs (frame coords).
+                let w = plane.stride;
+                let mut mbs: Vec<(usize, usize, i32)> = Vec::new();
+                for (off, (&a, &b)) in plane.data.iter().zip(exp.iter()).enumerate() {
+                    if a != b {
+                        let (x, y) = (off % w, off / w);
+                        let key = (x / 16, y / 16);
+                        match mbs.iter_mut().find(|(mx, my, _)| (*mx, *my) == key) {
+                            Some((_, _, dmax)) => *dmax = (*dmax).max((a as i32 - b as i32).abs()),
+                            None => mbs.push((key.0, key.1, (a as i32 - b as i32).abs())),
+                        }
+                    }
+                }
+                eprintln!("{tag}: frame {i} plane {name} diverging MBs {mbs:?}");
+            }
             assert_eq!(
                 mismatches,
                 0,
@@ -244,7 +279,11 @@ fn ffmpeg_check(enc: &PaffEncoded, tag: &str) {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    if std::env::var("OXIDEAV_KEEP_STREAM").is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        eprintln!("kept stream at {}", bs.display());
+    }
 }
 
 #[test]
@@ -365,6 +404,8 @@ fn encode_8x8_fields(n_frames: usize, p_fields: bool, b_fields: bool) -> PaffEnc
             transform_8x8: true,
             long_term_anchor: false,
             mmco_unpair_first_top: false,
+            b_implicit_weight: false,
+            b_reference_fields: false,
         },
         &refs,
     )
@@ -441,6 +482,8 @@ fn encode_marking_axis(n_frames: usize, long_term: bool, unpair: bool) -> PaffEn
             transform_8x8: false,
             long_term_anchor: long_term,
             mmco_unpair_first_top: unpair,
+            b_implicit_weight: false,
+            b_reference_fields: false,
         },
         &refs,
     )
@@ -537,4 +580,111 @@ fn paff_dump_streams_for_diag() {
     dump("paff-b-8x8t", &encode_8x8_fields(5, true, true));
     dump("paff-lt-anchor", &encode_marking_axis(5, true, false));
     dump("paff-mmco1-field", &encode_marking_axis(3, false, true));
+}
+
+/// Round-440 — the two new B-field stream axes: §8.4.2.3.3 implicit
+/// weighted prediction (stride-3 anchors, unequal POC distances) and
+/// B REFERENCE fields (stride-4 anchors with a reference B pair
+/// midway).
+fn encode_b_ext(n_frames: usize, temporal: bool, implicit: bool, ref_b: bool) -> PaffEncoded {
+    let frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+        (0..n_frames).map(make_interlaced_frame).collect();
+    let refs: Vec<(&[u8], &[u8], &[u8])> = frames
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    encode_paff_sequence(
+        &PaffConfig {
+            width: W as u32,
+            frame_height: H as u32,
+            qp: 26,
+            p_fields: true,
+            frame_picture_indices: Vec::new(),
+            cross_parity_first_bottom: false,
+            idr_frame_first: false,
+            b_fields: true,
+            b_temporal_direct: temporal,
+            transform_8x8: false,
+            long_term_anchor: false,
+            mmco_unpair_first_top: false,
+            b_implicit_weight: implicit,
+            b_reference_fields: ref_b,
+        },
+        &refs,
+    )
+}
+
+#[test]
+fn paff_b_fields_implicit_weight_self_roundtrip_bit_exact() {
+    // Stride-3 layout (anchors at displays 0, 3, 6): the PPS signals
+    // `weighted_bipred_idc = 2` and the two non-reference B pairs
+    // between anchors sit at UNEQUAL per-field POC distances, so every
+    // bipred / direct-Bi macroblock combines its predictions with the
+    // §8.4.2.3.3 POC-derived weights — (w0, w1) = (43, 21) for the
+    // first pair, (22, 42) for the second, at logWD = 5 on the
+    // fields' own §8.2.1 order counts — on luma AND chroma. A decoder
+    // that ignored implicit weighting (or ran it on frame-level POCs)
+    // would mispredict every bipred macroblock.
+    let enc = encode_b_ext(7, false, true, false);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-b-implicit");
+}
+
+#[test]
+fn paff_b_fields_implicit_weight_temporal_self_roundtrip_bit_exact() {
+    // Same layout with §8.4.1.2.3 temporal direct: the direct-derived
+    // bipred macroblocks ALSO combine through the implicit weights.
+    let enc = encode_b_ext(7, true, true, false);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-b-implicit-temporal");
+}
+
+#[test]
+fn paff_b_fields_implicit_weight_ffmpeg_bit_exact() {
+    let enc = encode_b_ext(7, false, true, false);
+    ffmpeg_check(&enc, "paff-b-implicit-ffmpeg");
+}
+
+#[test]
+fn paff_b_fields_implicit_weight_temporal_ffmpeg_bit_exact() {
+    let enc = encode_b_ext(7, true, true, false);
+    ffmpeg_check(&enc, "paff-b-implicit-temporal-ffmpeg");
+}
+
+#[test]
+fn paff_b_reference_fields_self_roundtrip_bit_exact() {
+    // Stride-4 layout 0, 4, 2ref, 1, 3, 8, 6ref, 5, 7: the midway B
+    // pair is COD as a reference (`nal_ref_idc = 2`) and stored
+    // through the §8.2.5.3 sliding window as a complementary
+    // reference field pair; the non-reference B pairs then find the
+    // B REFERENCE fields at `RefPicList1[0]` (display d−3 — making a
+    // coded B field the §8.4.1.2.1 colPic of the direct derivation)
+    // and `RefPicList0[0]` (display d−1) per the §8.2.4.2.4 +
+    // §8.2.4.2.5 per-field POC ordering.
+    let enc = encode_b_ext(9, false, false, true);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-b-ref-fields");
+}
+
+#[test]
+fn paff_b_reference_fields_temporal_self_roundtrip_bit_exact() {
+    // Temporal-direct variant: the B pair before the reference-B runs
+    // §8.4.1.2.3 with colPic = a coded B FIELD (reading its stored L0
+    // motion — the reference-B's mode decision is restricted to
+    // L0/Bi/intra so the co-located read matches the encoder model).
+    let enc = encode_b_ext(9, true, false, true);
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "paff-b-ref-fields-temporal");
+}
+
+#[test]
+fn paff_b_reference_fields_ffmpeg_bit_exact() {
+    let enc = encode_b_ext(9, false, false, true);
+    ffmpeg_check(&enc, "paff-b-ref-fields-ffmpeg");
+}
+
+#[test]
+fn paff_b_reference_fields_temporal_ffmpeg_bit_exact() {
+    let enc = encode_b_ext(9, true, false, true);
+    ffmpeg_check(&enc, "paff-b-ref-fields-temporal-ffmpeg");
 }
