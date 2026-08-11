@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/integration_conformance.rs`; `CAPAMA3_Sand_F` (PAFF + MBAFF)
   0/50 → 12/50 (remainder under triage — single-bin CABAC elements
   can diverge between decoders without desynchronising the engine,
-  which needs the upstream JM syntax trace to arbitrate).
+  which needs the upstream conformance-package syntax trace to arbitrate).
 
 - Round 440 — **§8.2.4.2.1/.2.3 frame-slice reference lists over
   complementary field-pair UNITS** (`ref_list::collapse_field_pairs`):
