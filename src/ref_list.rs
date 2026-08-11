@@ -1337,9 +1337,9 @@ pub struct FieldPairKeys {
 ///     pair has both fields marked as reference; §8.2.4.2.1 ranges
 ///     over "short-term complementary reference field pairs" and
 ///     §8.2.5.4.3's completion rule gives a long-term pair a shared
-///     `LongTermFrameIdx` only when both fields are long-term). A pair
-///   with mixed / partial markings is not a frame-reference unit and
-///   is dropped.
+///     `LongTermFrameIdx` only when both fields are long-term). A
+///     pair with mixed / partial markings is not a frame-reference
+///     unit and is dropped.
 /// * Non-paired reference fields are EXCLUDED (§8.2.4.2.1 NOTE and
 ///   §8.2.4.2.3 NOTE 2: "a non-paired reference field is not used for
 ///   inter prediction for decoding a frame").
