@@ -978,6 +978,20 @@ fn reconstruct_mb_intra(
         chroma_array_type,
     );
 
+    // §7.4.4 / §6.4.8 — stamp the current MB's field/frame coding and
+    // slice identity eagerly, BEFORE any neighbour-sample gathering:
+    // the §6.4.12.2 Table 6-4 process reads `currMbFrameFlag` for the
+    // in-flight MB off the grid (the I_NxN path additionally stamps
+    // its pred-mode bookkeeping in its own preamble; Intra_16x16 and
+    // I_PCM previously left the flag at its default `false`, which
+    // mis-resolved the above-neighbour of a bottom FIELD MB to the top
+    // MB of its own pair — Table 6-4 wants mbAddrB + 1).
+    if let Some(info) = grid.get_mut(mb_addr) {
+        info.slice_id = current_slice_id;
+        info.mb_field_decoding_flag = mb_field_decoding_flag;
+        info.is_intra = true;
+    }
+
     match &mb.mb_type {
         MbType::IPcm => {
             // §8.3.5 — I_PCM: raw samples are the decoded output. The
@@ -1024,6 +1038,7 @@ fn reconstruct_mb_intra(
                 bit_depth_c,
                 mb_px,
                 mb_py,
+                mb_addr,
                 &writer,
                 sps,
                 pps,
@@ -1075,6 +1090,7 @@ fn reconstruct_mb_intra(
                     bit_depth_c,
                     mb_px,
                     mb_py,
+                    mb_addr,
                     &writer,
                     sps,
                     pps,
@@ -1113,6 +1129,7 @@ fn reconstruct_intra_16x16(
     bit_depth_c: u32,
     mb_px: i32,
     mb_py: i32,
+    mb_addr: u32,
     writer: &MbWriter,
     sps: &Sps,
     pps: &Pps,
@@ -1129,6 +1146,7 @@ fn reconstruct_intra_16x16(
         mb_py,
         current_slice_id,
         pps.constrained_intra_pred_flag,
+        mb_addr,
     );
     let mode = Intra16x16Mode::from_index(pred_mode_idx).ok_or_else(|| {
         ReconstructError::UnsupportedMbType(format!("Intra_16x16 pred_mode {}", pred_mode_idx))
@@ -1236,6 +1254,7 @@ fn reconstruct_intra_16x16(
         bit_depth_c,
         mb_px,
         mb_py,
+        mb_addr,
         writer,
         sps,
         pps,
@@ -1398,6 +1417,215 @@ fn mbaff_neigh_loc_luma(grid: &MbGrid, mb_addr: u32, xn: i32, yn: i32) -> Option
                 .unwrap_or(false)
         },
     )
+}
+
+/// §6.4.12 / Table 6-4 — the same pair-interleaved neighbour-location
+/// process as [`mbaff_neigh_loc_luma`] but with caller-supplied block
+/// dimensions, for the chroma planes (`maxW = MbWidthC`,
+/// `maxH = MbHeightC` per §6.4.12).
+fn mbaff_neigh_loc_plane(
+    grid: &MbGrid,
+    mb_addr: u32,
+    xn: i32,
+    yn: i32,
+    max_w: i32,
+    max_h: i32,
+) -> Option<(u32, i32, i32)> {
+    let pic_w = grid.width_in_mbs;
+    let pair = crate::mb_address::mbaff_pair_neighbour_addrs(mb_addr, pic_w);
+    let curr_field = grid
+        .get(mb_addr)
+        .map(|i| i.mb_field_decoding_flag)
+        .unwrap_or(false);
+    crate::mb_address::mbaff_neigh_location(
+        xn,
+        yn,
+        max_w,
+        max_h,
+        !curr_field,
+        mb_addr % 2 == 0,
+        mb_addr,
+        pair,
+        |addr| {
+            !grid
+                .get(addr)
+                .map(|i| i.mb_field_decoding_flag)
+                .unwrap_or(false)
+        },
+    )
+}
+
+// -------------------------------------------------------------------------
+// §6.4.12 + §6.4.1 — MBAFF neighbouring-SAMPLE derivation (intra pred)
+// -------------------------------------------------------------------------
+//
+// The §8.3.1.2 / §8.3.2.2 / §8.3.3.1 / §8.3.4 intra reference samples
+// p[x, y] of an MBAFF frame picture must be located through the
+// §6.4.12 (Table 6-4) neighbouring-location process and the §6.4.1
+// inverse MBAFF scan: the neighbour MB depends on the current and
+// neighbouring PAIR's frame/field coding, and the sample row inside
+// the resolved MB is interleaved with its pair partner when that MB is
+// field-coded (eq. 6-10 y-stride 2). Raster-adjacent picture samples
+// are only correct when every pair involved is frame-coded — a field
+// MB's left/above reference samples come from same-parity rows, and a
+// frame MB whose neighbouring pair is field-coded reads de-interleaved
+// rows of ONE parity field.
+
+/// §6.4.1 — picture-absolute luma coordinates of the sample at
+/// (`xw`, `yw`) inside macroblock `addr` of an MBAFF frame picture,
+/// honouring that MB's own frame/field sample interleave.
+fn mbaff_abs_luma(grid: &MbGrid, addr: u32, xw: i32, yw: i32) -> (i32, i32) {
+    let field = grid
+        .get(addr)
+        .map(|i| i.mb_field_decoding_flag)
+        .unwrap_or(false);
+    let (ox, oy) = mb_sample_origin(grid, addr, true, field);
+    (ox + xw, oy + yw * if field { 2 } else { 1 })
+}
+
+/// §6.4.1 — picture-absolute CHROMA coordinates of the sample at
+/// (`xw`, `yw`) inside macroblock `addr`'s chroma block of an MBAFF
+/// frame picture (mirror of [`MbWriter::chroma_mb_px`] /
+/// [`MbWriter::chroma_mb_py`] for an arbitrary MB address).
+fn mbaff_abs_chroma(
+    grid: &MbGrid,
+    addr: u32,
+    xw: i32,
+    yw: i32,
+    chroma_array_type: u32,
+) -> (i32, i32) {
+    let field = grid
+        .get(addr)
+        .map(|i| i.mb_field_decoding_flag)
+        .unwrap_or(false);
+    let w = grid.width_in_mbs.max(1);
+    let pair_idx = addr / 2;
+    let is_top = addr % 2 == 0;
+    let (sub_w, sub_h) = chroma_subsample(chroma_array_type);
+    if sub_w == 0 || sub_h == 0 {
+        return (0, 0);
+    }
+    let (_, mb_h_c) = chroma_mb_dims(chroma_array_type);
+    let pair_cx = ((pair_idx % w) as i32) * 16 / sub_w;
+    let pair_cy = ((pair_idx / w) as i32) * 32 / sub_h;
+    let (oy, stride) = if field {
+        (pair_cy + if is_top { 0 } else { 1 }, 2)
+    } else {
+        (pair_cy + if is_top { 0 } else { mb_h_c as i32 }, 1)
+    };
+    (pair_cx + xw, oy + yw * stride)
+}
+
+/// §6.4.8 / §8.3.1.2 — availability of macroblock `addr` as an intra
+/// reference-sample source for the current MB: must be reconstructed,
+/// in the same slice, and (under `constrained_intra_pred_flag`) not an
+/// inter MB. The current MB itself is always usable (its earlier
+/// blocks are legitimate references for later blocks).
+fn mbaff_neigh_mb_usable(
+    grid: &MbGrid,
+    mb_addr: u32,
+    addr: u32,
+    current_slice_id: i32,
+    constrained_intra_pred: bool,
+) -> bool {
+    if addr == mb_addr {
+        return true;
+    }
+    let Some(info) = grid.get(addr) else {
+        return false;
+    };
+    if !info.available {
+        return false;
+    }
+    if current_slice_id >= 0 && info.slice_id >= 0 && info.slice_id != current_slice_id {
+        return false;
+    }
+    if constrained_intra_pred && !info.is_intra {
+        return false;
+    }
+    true
+}
+
+/// Resolve + read one neighbouring reference sample of an MBAFF frame
+/// picture. `plane`: 0 = luma, 1 = Cb, 2 = Cr. (`xn`, `yn`) is the
+/// sample offset relative to the current MB's own block origin, in the
+/// plane's sample units. Returns `None` when the §6.4.12 process marks
+/// the sample not available for intra prediction.
+fn mbaff_neigh_sample(
+    pic: &Picture,
+    grid: &MbGrid,
+    mb_addr: u32,
+    plane: u8,
+    xn: i32,
+    yn: i32,
+    current_slice_id: i32,
+    constrained_intra_pred: bool,
+) -> Option<i32> {
+    let (addr, xw, yw, ax, ay) = if plane == 0 {
+        let (addr, xw, yw) = mbaff_neigh_loc_luma(grid, mb_addr, xn, yn)?;
+        let (ax, ay) = mbaff_abs_luma(grid, addr, xw, yw);
+        (addr, xw, yw, ax, ay)
+    } else {
+        let (mb_w_c, mb_h_c) = chroma_mb_dims(pic.chroma_array_type);
+        let (addr, xw, yw) =
+            mbaff_neigh_loc_plane(grid, mb_addr, xn, yn, mb_w_c as i32, mb_h_c as i32)?;
+        let (ax, ay) = mbaff_abs_chroma(grid, addr, xw, yw, pic.chroma_array_type);
+        (addr, xw, yw, ax, ay)
+    };
+    let _ = (xw, yw);
+    if !mbaff_neigh_mb_usable(
+        grid,
+        mb_addr,
+        addr,
+        current_slice_id,
+        constrained_intra_pred,
+    ) {
+        return None;
+    }
+    Some(match plane {
+        0 => pic.luma_at(ax, ay),
+        1 => pic.cb_at(ax, ay),
+        _ => pic.cr_at(ax, ay),
+    })
+}
+
+/// Gather one edge of `N` neighbouring samples starting at (`x0`, `y0`)
+/// stepping by (`dx`, `dy`), via [`mbaff_neigh_sample`]. Returns the
+/// samples (zeros where unresolved) and whether the WHOLE edge was
+/// available (H.264 intra availability is per-edge: all samples of an
+/// edge come from macroblocks of one neighbouring pair with identical
+/// availability).
+#[allow(clippy::too_many_arguments)]
+fn mbaff_gather_edge<const N: usize>(
+    pic: &Picture,
+    grid: &MbGrid,
+    mb_addr: u32,
+    plane: u8,
+    x0: i32,
+    y0: i32,
+    dx: i32,
+    dy: i32,
+    current_slice_id: i32,
+    cip: bool,
+) -> ([i32; N], bool) {
+    let mut out = [0i32; N];
+    let mut avail = true;
+    for (i, slot) in out.iter_mut().enumerate() {
+        match mbaff_neigh_sample(
+            pic,
+            grid,
+            mb_addr,
+            plane,
+            x0 + dx * i as i32,
+            y0 + dy * i as i32,
+            current_slice_id,
+            cip,
+        ) {
+            Some(v) => *slot = v,
+            None => avail = false,
+        }
+    }
+    (out, avail)
 }
 
 /// §6.4.11.2 / Table 6-3 / §6.4.13.3 — derive (neighbour MB address,
@@ -1720,6 +1948,9 @@ fn reconstruct_intra_nxn(
                 blk8,
                 current_slice_id,
                 cip,
+                mb_addr,
+                bx,
+                by,
             );
             require_intra_8x8_mode(mode, &raw.availability)?;
             let filtered = filter_samples_8x8(&raw, bit_depth_y);
@@ -1847,6 +2078,9 @@ fn reconstruct_intra_nxn(
                 block_idx,
                 current_slice_id,
                 cip,
+                mb_addr,
+                bx,
+                by,
             );
             require_intra_4x4_mode(mode, &samples.availability)?;
             let mut pred_samples = [0i32; 16];
@@ -1952,6 +2186,7 @@ fn reconstruct_chroma_intra(
     bit_depth_c: u32,
     mb_px: i32,
     mb_py: i32,
+    mb_addr: u32,
     writer: &MbWriter,
     sps: &Sps,
     pps: &Pps,
@@ -1984,6 +2219,7 @@ fn reconstruct_chroma_intra(
             bit_depth_c,
             mb_px,
             mb_py,
+            mb_addr,
             writer,
             sps,
             pps,
@@ -2064,6 +2300,7 @@ fn reconstruct_chroma_intra(
             sub_width_c,
             sub_height_c,
             pps.constrained_intra_pred_flag,
+            mb_addr,
         );
         let out_len = (mbw_c as usize) * (mbh_c as usize);
         require_intra_chroma_mode(chroma_mode, &samples.availability)?;
@@ -2218,6 +2455,7 @@ fn reconstruct_chroma_intra_444(
     bit_depth_c: u32,
     mb_px: i32,
     mb_py: i32,
+    mb_addr: u32,
     writer: &MbWriter,
     sps: &Sps,
     pps: &Pps,
@@ -2272,6 +2510,7 @@ fn reconstruct_chroma_intra_444(
             plane,
             current_slice_id,
             pps.constrained_intra_pred_flag,
+            mb_addr,
         );
         require_intra_16x16_mode(mode, &samples.availability)?;
         let mut pred = [0i32; 256];
@@ -2447,6 +2686,9 @@ fn reconstruct_chroma_intra_nxn_444(
                     plane,
                     current_slice_id,
                     cip,
+                    mb_addr,
+                    bx,
+                    by,
                 );
                 require_intra_8x8_mode(mode, &raw.availability)?;
                 let filtered = filter_samples_8x8(&raw, bit_depth_c);
@@ -2512,6 +2754,9 @@ fn reconstruct_chroma_intra_nxn_444(
                     plane,
                     current_slice_id,
                     cip,
+                    mb_addr,
+                    bx,
+                    by,
                 );
                 require_intra_4x4_mode(mode, &samples.availability)?;
                 let mut pred_samples = [0i32; 16];
@@ -2558,6 +2803,7 @@ fn reconstruct_chroma_intra_nxn_444(
 /// Round-28 — gather chroma neighbour samples for §8.3.3 16x16 luma-
 /// style prediction on a chroma plane (ChromaArrayType==3 only). Same
 /// geometry as `gather_samples_16x16` but reads from `pic.cb`/`pic.cr`.
+#[allow(clippy::too_many_arguments)]
 fn gather_samples_16x16_chroma(
     pic: &Picture,
     grid: &MbGrid,
@@ -2566,7 +2812,58 @@ fn gather_samples_16x16_chroma(
     plane: u8,
     current_slice_id: i32,
     constrained_intra_pred: bool,
+    mb_addr: u32,
 ) -> Samples16x16 {
+    // §6.4.12 — MBAFF path (4:4:4 chroma has luma geometry; the chroma
+    // resolver runs with MbWidthC = MbHeightC = 16).
+    if grid.mbaff_frame_flag {
+        let p = plane + 1;
+        let (top, top_avail) = mbaff_gather_edge::<16>(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            0,
+            -1,
+            1,
+            0,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let (left, left_avail) = mbaff_gather_edge::<16>(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            -1,
+            0,
+            0,
+            1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let tl = mbaff_neigh_sample(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            -1,
+            -1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        return Samples16x16 {
+            top_left: tl.unwrap_or(0),
+            top,
+            left,
+            availability: Neighbour4x4Availability {
+                top_left: tl.is_some(),
+                top: top_avail,
+                top_right: false,
+                left: left_avail,
+            },
+        };
+    }
     let left_avail = mb_px > 0
         && same_slice_at(grid, mb_px - 1, mb_py, current_slice_id)
         && cip_ok_at(grid, mb_px - 1, mb_py, constrained_intra_pred);
@@ -2662,7 +2959,56 @@ fn gather_samples_16x16(
     mb_py: i32,
     current_slice_id: i32,
     constrained_intra_pred: bool,
+    mb_addr: u32,
 ) -> Samples16x16 {
+    // §6.4.12 — MBAFF path (see `gather_samples_4x4`).
+    if grid.mbaff_frame_flag {
+        let (top, top_avail) = mbaff_gather_edge::<16>(
+            pic,
+            grid,
+            mb_addr,
+            0,
+            0,
+            -1,
+            1,
+            0,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let (left, left_avail) = mbaff_gather_edge::<16>(
+            pic,
+            grid,
+            mb_addr,
+            0,
+            -1,
+            0,
+            0,
+            1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let tl = mbaff_neigh_sample(
+            pic,
+            grid,
+            mb_addr,
+            0,
+            -1,
+            -1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        return Samples16x16 {
+            top_left: tl.unwrap_or(0),
+            top,
+            left,
+            availability: Neighbour4x4Availability {
+                top_left: tl.is_some(),
+                top: top_avail,
+                top_right: false,
+                left: left_avail,
+            },
+        };
+    }
     let left_avail = mb_px > 0
         && same_slice_at(grid, mb_px - 1, mb_py, current_slice_id)
         && cip_ok_at(grid, mb_px - 1, mb_py, constrained_intra_pred);
@@ -2720,6 +3066,7 @@ fn gather_samples_16x16(
 /// is marked "not available for Intra_4x4 prediction"; the §8.3.1.2
 /// substitution rule (copy p[3, -1] into p[4..7, -1]) then kicks in
 /// inside the intra-pred helpers.
+#[allow(clippy::too_many_arguments)]
 fn gather_samples_4x4(
     pic: &Picture,
     grid: &MbGrid,
@@ -2728,7 +3075,79 @@ fn gather_samples_4x4(
     block_idx: usize,
     current_slice_id: i32,
     constrained_intra_pred: bool,
+    mb_addr: u32,
+    lbx: i32,
+    lby: i32,
 ) -> Samples4x4 {
+    // §6.4.12 — MBAFF frame pictures locate every reference sample
+    // through the Table 6-4 pair-interleaved process (see the module
+    // section above); raster-adjacent addressing is wrong as soon as a
+    // field-coded MB or a mixed frame/field pair is involved.
+    if grid.mbaff_frame_flag {
+        let tr_scan_ok = !matches!(block_idx, 3 | 7 | 11 | 13 | 15);
+        let (top, top_avail) = mbaff_gather_edge::<4>(
+            pic,
+            grid,
+            mb_addr,
+            0,
+            lbx,
+            lby - 1,
+            1,
+            0,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let (top_right, tr_edge_avail) = if tr_scan_ok {
+            mbaff_gather_edge::<4>(
+                pic,
+                grid,
+                mb_addr,
+                0,
+                lbx + 4,
+                lby - 1,
+                1,
+                0,
+                current_slice_id,
+                constrained_intra_pred,
+            )
+        } else {
+            ([0i32; 4], false)
+        };
+        let (left, left_avail) = mbaff_gather_edge::<4>(
+            pic,
+            grid,
+            mb_addr,
+            0,
+            lbx - 1,
+            lby,
+            0,
+            1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let tl = mbaff_neigh_sample(
+            pic,
+            grid,
+            mb_addr,
+            0,
+            lbx - 1,
+            lby - 1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        return Samples4x4 {
+            top_left: tl.unwrap_or(0),
+            top,
+            top_right,
+            left,
+            availability: Neighbour4x4Availability {
+                top_left: tl.is_some(),
+                top: top_avail,
+                top_right: tr_scan_ok && tr_edge_avail,
+                left: left_avail,
+            },
+        };
+    }
     let left_avail = bx > 0
         && same_slice_at(grid, bx - 1, by, current_slice_id)
         && cip_ok_at(grid, bx - 1, by, constrained_intra_pred);
@@ -2871,6 +3290,7 @@ fn cip_ok_at(grid: &MbGrid, x: i32, y: i32, constrained_intra_pred: bool) -> boo
 /// so its top-right is always "not available" regardless of the
 /// picture bounds. The §8.3.2.2 substitution rule (copy p[7, -1] into
 /// p[8..15, -1]) then applies inside `filter_samples_8x8`.
+#[allow(clippy::too_many_arguments)]
 fn gather_samples_8x8(
     pic: &Picture,
     grid: &MbGrid,
@@ -2879,7 +3299,76 @@ fn gather_samples_8x8(
     blk8: usize,
     current_slice_id: i32,
     constrained_intra_pred: bool,
+    mb_addr: u32,
+    lbx: i32,
+    lby: i32,
 ) -> Samples8x8 {
+    // §6.4.12 — MBAFF path (see `gather_samples_4x4`).
+    if grid.mbaff_frame_flag {
+        let tr_scan_ok = blk8 != 3;
+        let (top, top_avail) = mbaff_gather_edge::<8>(
+            pic,
+            grid,
+            mb_addr,
+            0,
+            lbx,
+            lby - 1,
+            1,
+            0,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let (top_right, tr_edge_avail) = if tr_scan_ok {
+            mbaff_gather_edge::<8>(
+                pic,
+                grid,
+                mb_addr,
+                0,
+                lbx + 8,
+                lby - 1,
+                1,
+                0,
+                current_slice_id,
+                constrained_intra_pred,
+            )
+        } else {
+            ([0i32; 8], false)
+        };
+        let (left, left_avail) = mbaff_gather_edge::<8>(
+            pic,
+            grid,
+            mb_addr,
+            0,
+            lbx - 1,
+            lby,
+            0,
+            1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let tl = mbaff_neigh_sample(
+            pic,
+            grid,
+            mb_addr,
+            0,
+            lbx - 1,
+            lby - 1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        return Samples8x8 {
+            top_left: tl.unwrap_or(0),
+            top,
+            top_right,
+            left,
+            availability: Neighbour4x4Availability {
+                top_left: tl.is_some(),
+                top: top_avail,
+                top_right: tr_scan_ok && tr_edge_avail,
+                left: left_avail,
+            },
+        };
+    }
     let left_avail = bx > 0
         && same_slice_at(grid, bx - 1, by, current_slice_id)
         && cip_ok_at(grid, bx - 1, by, constrained_intra_pred);
@@ -2956,7 +3445,77 @@ fn gather_samples_4x4_chroma(
     plane: u8,
     current_slice_id: i32,
     constrained_intra_pred: bool,
+    mb_addr: u32,
+    lbx: i32,
+    lby: i32,
 ) -> Samples4x4 {
+    // §6.4.12 — MBAFF path (4:4:4 chroma has luma geometry).
+    if grid.mbaff_frame_flag {
+        let p = plane + 1;
+        let tr_scan_ok = !matches!(block_idx, 3 | 7 | 11 | 13 | 15);
+        let (top, top_avail) = mbaff_gather_edge::<4>(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            lbx,
+            lby - 1,
+            1,
+            0,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let (top_right, tr_edge_avail) = if tr_scan_ok {
+            mbaff_gather_edge::<4>(
+                pic,
+                grid,
+                mb_addr,
+                p,
+                lbx + 4,
+                lby - 1,
+                1,
+                0,
+                current_slice_id,
+                constrained_intra_pred,
+            )
+        } else {
+            ([0i32; 4], false)
+        };
+        let (left, left_avail) = mbaff_gather_edge::<4>(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            lbx - 1,
+            lby,
+            0,
+            1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let tl = mbaff_neigh_sample(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            lbx - 1,
+            lby - 1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        return Samples4x4 {
+            top_left: tl.unwrap_or(0),
+            top,
+            top_right,
+            left,
+            availability: Neighbour4x4Availability {
+                top_left: tl.is_some(),
+                top: top_avail,
+                top_right: tr_scan_ok && tr_edge_avail,
+                left: left_avail,
+            },
+        };
+    }
     let left_avail = bx > 0
         && same_slice_at(grid, bx - 1, by, current_slice_id)
         && cip_ok_at(grid, bx - 1, by, constrained_intra_pred);
@@ -3029,7 +3588,77 @@ fn gather_samples_8x8_chroma(
     plane: u8,
     current_slice_id: i32,
     constrained_intra_pred: bool,
+    mb_addr: u32,
+    lbx: i32,
+    lby: i32,
 ) -> Samples8x8 {
+    // §6.4.12 — MBAFF path (4:4:4 chroma has luma geometry).
+    if grid.mbaff_frame_flag {
+        let p = plane + 1;
+        let tr_scan_ok = blk8 != 3;
+        let (top, top_avail) = mbaff_gather_edge::<8>(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            lbx,
+            lby - 1,
+            1,
+            0,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let (top_right, tr_edge_avail) = if tr_scan_ok {
+            mbaff_gather_edge::<8>(
+                pic,
+                grid,
+                mb_addr,
+                p,
+                lbx + 8,
+                lby - 1,
+                1,
+                0,
+                current_slice_id,
+                constrained_intra_pred,
+            )
+        } else {
+            ([0i32; 8], false)
+        };
+        let (left, left_avail) = mbaff_gather_edge::<8>(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            lbx - 1,
+            lby,
+            0,
+            1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        let tl = mbaff_neigh_sample(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            lbx - 1,
+            lby - 1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        return Samples8x8 {
+            top_left: tl.unwrap_or(0),
+            top,
+            top_right,
+            left,
+            availability: Neighbour4x4Availability {
+                top_left: tl.is_some(),
+                top: top_avail,
+                top_right: tr_scan_ok && tr_edge_avail,
+                left: left_avail,
+            },
+        };
+    }
     let left_avail = bx > 0
         && same_slice_at(grid, bx - 1, by, current_slice_id)
         && cip_ok_at(grid, bx - 1, by, constrained_intra_pred);
@@ -3096,9 +3725,70 @@ fn gather_samples_chroma(
     sub_width_c: i32,
     sub_height_c: i32,
     constrained_intra_pred: bool,
+    mb_addr: u32,
 ) -> SamplesChroma {
     let w = ct.width();
     let h = ct.height();
+    // §6.4.12 — MBAFF path: resolve every reference sample through the
+    // Table 6-4 process at chroma-block dimensions (MbWidthC/MbHeightC).
+    if grid.mbaff_frame_flag {
+        let p = plane + 1;
+        let mut top = vec![0i32; w];
+        let mut top_avail = true;
+        for (x, slot) in top.iter_mut().enumerate() {
+            match mbaff_neigh_sample(
+                pic,
+                grid,
+                mb_addr,
+                p,
+                x as i32,
+                -1,
+                current_slice_id,
+                constrained_intra_pred,
+            ) {
+                Some(v) => *slot = v,
+                None => top_avail = false,
+            }
+        }
+        let mut left = vec![0i32; h];
+        let mut left_avail = true;
+        for (y, slot) in left.iter_mut().enumerate() {
+            match mbaff_neigh_sample(
+                pic,
+                grid,
+                mb_addr,
+                p,
+                -1,
+                y as i32,
+                current_slice_id,
+                constrained_intra_pred,
+            ) {
+                Some(v) => *slot = v,
+                None => left_avail = false,
+            }
+        }
+        let tl = mbaff_neigh_sample(
+            pic,
+            grid,
+            mb_addr,
+            p,
+            -1,
+            -1,
+            current_slice_id,
+            constrained_intra_pred,
+        );
+        return SamplesChroma {
+            top_left: tl.unwrap_or(0),
+            top,
+            left,
+            availability: Neighbour4x4Availability {
+                top_left: tl.is_some(),
+                top: top_avail,
+                top_right: false,
+                left: left_avail,
+            },
+        };
+    }
     // Chroma (c_mb_px, c_mb_py) → picture-absolute luma sample coordinate
     // so we can look the owning MB up in the slice grid.
     let to_lx = |cx: i32| cx * sub_width_c;
@@ -12151,7 +12841,7 @@ mod tests {
 
         let grid = crate::mb_grid::MbGrid::new(4, 2);
         for (idx, (bx, by)) in xy.iter().copied().enumerate() {
-            let s = super::gather_samples_4x4(&pic, &grid, bx, by, idx, -1, false);
+            let s = super::gather_samples_4x4(&pic, &grid, bx, by, idx, -1, false, 0, bx, by);
             let expected = match idx {
                 // Scan-order "top-right not yet decoded" set.
                 3 | 7 | 11 | 13 | 15 => false,
@@ -12179,7 +12869,7 @@ mod tests {
         let pic = Picture::new(64, 32, 1, 8, 8);
         let grid = crate::mb_grid::MbGrid::new(4, 2);
         // LUMA_8X8_XY[3] == (8, 8).
-        let s = super::gather_samples_8x8(&pic, &grid, 8, 8, 3, -1, false);
+        let s = super::gather_samples_8x8(&pic, &grid, 8, 8, 3, -1, false, 0, 8, 8);
         assert!(
             !s.availability.top_right,
             "blk8 3: tr should be false (right-neighbour MB not decoded)"
@@ -12187,7 +12877,7 @@ mod tests {
         // And blk8 == 2 at (0, 8) — top-right here is block 1 within
         // the current MB, which HAS been decoded; report true (the
         // top row is also inside the picture).
-        let s2 = super::gather_samples_8x8(&pic, &grid, 0, 8, 2, -1, false);
+        let s2 = super::gather_samples_8x8(&pic, &grid, 0, 8, 2, -1, false, 0, 0, 8);
         assert!(s2.availability.top_right);
     }
 
