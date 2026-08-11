@@ -1576,6 +1576,95 @@ jvt_test!(
     "/tmp/LS_SVA_D/LS_SVA_D_rec.yuv"
 );
 
+// ---------------- staged JVT conformance (docs/video/h264/conformance) ----
+//
+// Four upstream JVT AVCv1 bitstreams staged in the private docs repo,
+// chosen because they are the only streams exercising §8.4.1.2.1
+// temporal-direct co-located derivation where CurrPic and colPic differ
+// in coding structure (Table 8-8 `Frm_To_Fld` / `Fld_To_Frm` rows, plus
+// the AFRM MBAFF variants). The reference YUV is produced by a stock
+// black-box decoder on PATH (the docs staging pinned the digests of
+// both the streams and the upstream reference YUVs; the black-box
+// decode was verified byte-identical to the upstream references at
+// staging time). Tests skip cleanly when the docs checkout or ffmpeg
+// is absent, so crate-only CI is unaffected.
+
+/// Locate a staged conformance bitstream under
+/// `../../docs/video/h264/conformance/` (tests run with CWD at the
+/// crate root), overridable via `OXIDEAV_H264_CONFORMANCE_DIR`.
+fn staged_conformance_path(name: &str) -> PathBuf {
+    let dir = std::env::var("OXIDEAV_H264_CONFORMANCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("../../docs/video/h264/conformance"));
+    dir.join(name)
+}
+
+/// Run one staged conformance stream: black-box reference decode via
+/// ffmpeg, our decode, frame-count hard assert. Returns the report so
+/// per-stream tests can additionally gate pixel exactness.
+fn run_staged_conformance(name: &str, file: &str) -> Option<StreamReport> {
+    if !ffmpeg_available() {
+        eprintln!("[{name}] skip: ffmpeg not on PATH");
+        return None;
+    }
+    let path = staged_conformance_path(file);
+    let report = run_conformance(name, &path)?;
+    print_report(&report);
+    assert_eq!(
+        report.ours_frames, report.ffmpeg_frames,
+        "frame-count mismatch: ours={} reference={}",
+        report.ours_frames, report.ffmpeg_frames
+    );
+    Some(report)
+}
+
+/// Motorola `camp_mot_picaff0_full` — 720x480, 30 frames, PAFF, CABAC,
+/// IBBP, temporal direct. Exercises the Table 8-8 (FLD, FRM) and
+/// (FRM, FLD) cross rows within its first nine pictures.
+///
+/// Pixel equality is report-only while the Table 8-8 cross-row
+/// derivation lands; promote via `assert_staged_bit_exact` once exact.
+#[test]
+fn conformance_staged_camp_mot_picaff0() {
+    let Some(_report) =
+        run_staged_conformance("staged_camp_mot_picaff0", "camp_mot_picaff0_full.26l")
+    else {
+        return;
+    };
+}
+
+/// Sand Video `CAPAMA3_Sand_F` — CIF, PAFF + MBAFF, CABAC, IDR-B-B-P,
+/// temporal direct. AFRM pictures give the mbAddrCol2/3/5/6 MBAFF
+/// variants including the eq. 8-182 topAbsDiffPOC tie-break.
+#[test]
+fn conformance_staged_capama3_sand_f() {
+    let Some(_report) = run_staged_conformance("staged_CAPAMA3_Sand_F", "CAPAMA3_Sand_F.264")
+    else {
+        return;
+    };
+}
+
+/// Toshiba `CAPA1_TOSHIBA_B` — CIF, 90 frames, PAFF, CABAC, temporal
+/// direct; highest cross-row density of the four staged streams.
+#[test]
+fn conformance_staged_capa1_toshiba_b() {
+    let Some(_report) = run_staged_conformance("staged_CAPA1_TOSHIBA_B", "CAPA1_TOSHIBA_B.264")
+    else {
+        return;
+    };
+}
+
+/// Toshiba `CVPA1_TOSHIBA_B` — the CAVLC twin of CAPA1 (same source and
+/// structure); separates an entropy-decode defect from a direct-mode
+/// defect.
+#[test]
+fn conformance_staged_cvpa1_toshiba_b() {
+    let Some(_report) = run_staged_conformance("staged_CVPA1_TOSHIBA_B", "CVPA1_TOSHIBA_B.264")
+    else {
+        return;
+    };
+}
+
 // ------------------------------ helpers tests --------------------------
 
 #[cfg(test)]
