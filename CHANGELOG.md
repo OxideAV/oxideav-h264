@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 440 — **§8.4.1.2.1 co-located derivation completed** (Table
+  8-6 / 8-7 / 8-8, all frame/field cross rows). Temporal direct was
+  frame-only (colPic taken verbatim from `RefPicList1[0]`, mbAddrCol =
+  CurrMbAddr, no vertMvScale); it now implements the full clause:
+  Table 8-6 colPic selection (decoded frame, decoded field, field of a
+  decoded frame — the field VIEW carries the containing FRAME's motion
+  grids / per-MB field flags / coding struct / list snapshots — and
+  complementary field pair with the eq. 8-175/8-176 topAbsDiffPOC
+  parity choice), Table 8-7 PicCodingStruct classification, every
+  Table 8-8 mbAddrCol1..7 / yM / vertMvScale row incl. the AFRM MBAFF
+  variants with `fieldDecodingFlagX` and the eq. 8-182 tie-break,
+  eq. 8-193/8-194 mvCol[1] halving/doubling, MapColToList0 by picture
+  IDENTITY (per-entry DPB unit keys + field parities snapshotted on
+  every decoded picture; the One_To_One / Frm_To_Fld / Fld_To_Frm
+  forms including the field↔frame refIdxL0Frm << 1 index doubling),
+  and eq. 8-201/8-202 tb/td on per-FIELD order counts for field
+  macroblocks. Measured on the four staged JVT conformance
+  bitstreams: `camp_mot_picaff0_full` 5/30 → **30/30**,
+  `CAPA1_TOSHIBA_B` 10/90 → **90/90**, `CVPA1_TOSHIBA_B` 10/90 →
+  **90/90** frames byte-exact — all three now gate as hard asserts in
+  `tests/integration_conformance.rs`; `CAPAMA3_Sand_F` (PAFF + MBAFF)
+  0/50 → 12/50 (remainder under triage — single-bin CABAC elements
+  can diverge between decoders without desynchronising the engine,
+  which needs the upstream JM syntax trace to arbitrate).
+
+- Round 440 — **§8.2.4.2.1/.2.3 frame-slice reference lists over
+  complementary field-pair UNITS** (`ref_list::collapse_field_pairs`):
+  two opposite-parity coded-field DPB entries sharing `frame_num`
+  collapse into one frame-level unit (eq. 8-1 Min POC, frame-level
+  PicNum, short/long-term only when BOTH fields carry the marking) and
+  non-paired reference fields are excluded per the §8.2.4.2.1 NOTE;
+  the driver materialises a pair unit's full-height reference by
+  re-interleaving its two stored fields for frame-slice MC. Any P/B
+  FRAME in a mixed frame/field stream previously motion-compensated
+  from a half-height field picture.
+
+- Round 440 — **§6.4.12 MBAFF neighbouring-SAMPLE derivation for intra
+  prediction**: every intra reference-sample gatherer (4x4 / 8x8 /
+  16x16 / §8.3.4 chroma / 4:4:4 luma-geometry chroma) resolves samples
+  through the Table 6-4 pair-interleaved process + the §6.4.1 inverse
+  MBAFF scan when MbaffFrameFlag is set (raster-adjacent addressing is
+  only correct when every involved pair is frame-coded). Two eager
+  grid stampings landed with it: `reconstruct_mb_intra` and the inter
+  partition derivation both record the in-flight MB's §7.4.4
+  `mb_field_decoding_flag` BEFORE any neighbour probing — an AFRM
+  bottom FIELD MB previously mis-resolved its above neighbour (and an
+  AFRM B field MB's temporal-direct derivation ran the wrong Table 8-8
+  row). CAPAMA3's IDR MBAFF frame with mixed field/frame pairs now
+  decodes byte-exact.
+
+- Round 440 — encoder **PAFF B-field tail**: `PaffConfig::
+  b_implicit_weight` codes a stride-3 anchor layout whose two
+  non-reference B pairs sit at unequal per-field POC distances, with
+  PPS `weighted_bipred_idc = 2` and every bipred / direct-Bi
+  macroblock combined through the §8.4.2.3.3 POC-derived (w0, w1)
+  pair (43/21 and 22/42 at logWD = 5, on the fields' own §8.2.1 order
+  counts, luma AND chroma); `PaffConfig::b_reference_fields` codes a
+  stride-4 layout with a REFERENCE B field pair midway (stored
+  through the §8.2.5.3 sliding window; the non-reference B pairs use
+  the B fields as `RefPicList1[0]` / `RefPicList0[0]`, making a coded
+  B FIELD the colPic of the §8.4.1.2 direct derivations), supported
+  by `EncoderConfig::b_l0_bi_only` (mode restriction keeping the
+  stored L0-only colocated snapshot decoder-consistent) and a
+  §8.2.4.3.1 RPLM on the later P/P anchors (the §8.2.4.2.2
+  FrameNumWrap ordering puts the newer reference-B pair at index 0).
+  Eight new gates: each axis (spatial + temporal direct)
+  self-roundtrips byte-exactly through our decoder and decodes
+  byte-identically in a stock reference binary.
+
 ### Fixed
 
 - §8.2.5.3 sliding-window marking now counts reference **units** the

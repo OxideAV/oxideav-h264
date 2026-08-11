@@ -68,9 +68,35 @@ the "missing field is ignored" list fallback). The **encoder field
 the §7.4.5.3.3 CAVLC split + writer-remap pipeline) enables
 `transform_8x8` in field pictures across I/P/B. All 13 new PAFF
 gates decode byte-exactly in our decoder and a black-box reference
-binary. Implicit-weight (§8.4.2.3.3) B fields on the ENCODE side and
-the Annex F/G/H/I scalable / multiview / 3D extensions remain in
-progress (see the coverage matrix below).
+binary. **Round 440 completed the interlaced co-located derivation and
+the PAFF encoder tail.** Decoder: the §8.4.1.2.1 process now
+implements every Table 8-6/8-7/8-8 frame/field cross row (colPic as a
+decoded frame / decoded field / field of a decoded frame /
+complementary field pair; mbAddrCol1..7 with vertMvScale and the
+eq. 8-182 AFRM tie-break; MapColToList0 by picture identity with the
+field↔frame index doubling; per-FIELD eq. 8-201/8-202 distances),
+frame-slice reference lists collapse complementary field pairs into
+§8.2.4.2.1/.2.3 frame-level UNITS (re-interleaved for MC; non-paired
+fields excluded), and MBAFF intra prediction gathers its reference
+SAMPLES through the §6.4.12 Table 6-4 process (mixed field/frame
+pairs previously read raster-adjacent rows). Three of the four staged
+JVT conformance bitstreams now gate **byte-exact end-to-end** as hard
+asserts: `camp_mot_picaff0_full` (PAFF CABAC IBBP temporal direct,
+30/30), `CAPA1_TOSHIBA_B` (90/90) and `CVPA1_TOSHIBA_B` (90/90);
+`CAPAMA3_Sand_F` (PAFF + MBAFF) is at 12/50 with the remainder under
+triage. Encoder: **implicit-weight B fields**
+(`PaffConfig::b_implicit_weight` — stride-3 anchors put the two
+non-reference B pairs at unequal per-field POC distances so the
+§8.4.2.3.3 weights genuinely leave 32/32: 43/21 and 22/42 at
+logWD = 5, applied to luma AND chroma) and **B REFERENCE fields**
+(`PaffConfig::b_reference_fields` — a stride-4 layout stores a
+reference B pair through the sliding window and the non-reference B
+pairs use the coded B FIELDS as `RefPicList0[0]` / `RefPicList1[0]`
+— a B field as the §8.4.1.2.1 colPic — with an §8.2.4.3.1 RPLM
+re-splicing the previous anchor on later P fields), both
+self-roundtrip byte-exact and black-box-validated under spatial AND
+temporal direct. The Annex F/G/H/I scalable / multiview / 3D
+extensions remain in progress (see the coverage matrix below).
 
 No external decoder source is consulted while writing this
 implementation — only the spec PDF. Conformance is verified by
@@ -80,7 +106,10 @@ against an independent reference decoder run separately. The staged
 fixture corpus (`tests/docs_corpus.rs`) decodes each fixture
 byte-for-byte against its `expected.yuv`. As of round 416 the corpus
 holds 36 fixtures and **all 36 targets gate `BitExact` over their full
-frame counts** — every profile/tool combination staged (Baseline/Main/
+frame counts**; round 440 added four staged upstream JVT conformance
+bitstreams (`docs/video/h264/conformance/`) of which three gate
+byte-exact as hard asserts (camp_mot_picaff0_full 30/30,
+CAPA1_TOSHIBA_B 90/90, CVPA1_TOSHIBA_B 90/90) — every profile/tool combination staged (Baseline/Main/
 High/High10/High422/High444; 8- and 10-bit; 4:2:0/4:2:2/4:4:4; CAVLC +
 CABAC; I/P/B with temporal + spatial direct, explicit + implicit
 weighted prediction, multi-ref, multi-slice, non-flat scaling
