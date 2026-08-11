@@ -988,10 +988,16 @@ impl H264CodecDecoder {
             (r0.keys, r1.keys)
         } else {
             let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
+            // §8.2.4.1 / §8.2.4.2.1 / §8.2.4.2.3 — a FRAME slice's
+            // reference lists range over frame-level UNITS: decoded
+            // reference frames and complementary reference field
+            // PAIRS (two stored coded-field entries collapse into one
+            // unit; non-paired reference fields are excluded).
+            let (frame_units, pairings) = ref_list::collapse_field_pairs(&self.dpb_entries);
             let (mut l0, mut l1) = match header.slice_type {
                 SliceType::P | SliceType::SP => (
                     ref_list::init_ref_pic_list_p(
-                        &self.dpb_entries,
+                        &frame_units,
                         header.frame_num,
                         max_frame_num,
                         current_structure,
@@ -1000,7 +1006,7 @@ impl H264CodecDecoder {
                     Vec::new(),
                 ),
                 SliceType::B => ref_list::init_ref_pic_lists_b(
-                    &self.dpb_entries,
+                    &frame_units,
                     pic_order_cnt,
                     current_structure,
                     current_bottom,
@@ -1037,7 +1043,7 @@ impl H264CodecDecoder {
                 ref_list::modify_ref_pic_list(
                     &mut l0,
                     &ops_l0,
-                    &self.dpb_entries,
+                    &frame_units,
                     header.num_ref_idx_l0_active_minus1 + 1,
                     header.frame_num,
                     max_frame_num,
@@ -1055,7 +1061,7 @@ impl H264CodecDecoder {
                 ref_list::modify_ref_pic_list(
                     &mut l1,
                     &ops_l1,
-                    &self.dpb_entries,
+                    &frame_units,
                     header.num_ref_idx_l1_active_minus1 + 1,
                     header.frame_num,
                     max_frame_num,
@@ -1063,6 +1069,49 @@ impl H264CodecDecoder {
                     current_bottom,
                 );
             }
+
+            // §8.4.2.1 — resolve each unit key: a complementary-pair
+            // unit materialises the full-height reference frame by
+            // re-interleaving its two stored half-height fields (top →
+            // even rows, bottom → odd rows), stamped with the pair's
+            // eq. 8-1 PicOrderCnt. Plain frame units resolve through
+            // the store as before. POC / long-term metadata come from
+            // the unit entries (a pair's POC is Min of its field POCs
+            // — the stored top FIELD picture alone carries only its
+            // own field POC).
+            let resolve_frame_list = |keys: &[u32]| -> (Vec<Option<Picture>>, Vec<i32>, Vec<bool>) {
+                let mut overrides = Vec::with_capacity(keys.len());
+                let mut pocs = Vec::with_capacity(keys.len());
+                let mut lts = Vec::with_capacity(keys.len());
+                for &key in keys {
+                    let unit = frame_units.iter().find(|u| u.dpb_key == key);
+                    let pairing = pairings.iter().find(|p| p.unit_key == key);
+                    let ov = pairing.and_then(|p| {
+                        let top = self.ref_store.get_by_key(p.top_key)?;
+                        let bottom = self.ref_store.get_by_key(p.bottom_key)?;
+                        let mut merged = interleave_fields(top, bottom);
+                        if let Some(u) = unit {
+                            merged.pic_order_cnt = u.pic_order_cnt;
+                            merged.frame_num = u.frame_num;
+                        }
+                        Some(merged)
+                    });
+                    overrides.push(ov);
+                    pocs.push(unit.map(|u| u.pic_order_cnt).unwrap_or_else(|| {
+                        self.ref_store
+                            .get_by_key(key)
+                            .map(|p| p.pic_order_cnt)
+                            .unwrap_or(0)
+                    }));
+                    lts.push(unit.map(|u| u.is_long_term()).unwrap_or(false));
+                }
+                (overrides, pocs, lts)
+            };
+            let (ov0, pocs0, lt0) = resolve_frame_list(&l0);
+            let (ov1, pocs1, lt1) = resolve_frame_list(&l1);
+            l0_overrides = ov0;
+            l1_overrides = ov1;
+            field_pocs_lt = Some((pocs0, lt0, pocs1, lt1));
 
             (l0, l1)
         };

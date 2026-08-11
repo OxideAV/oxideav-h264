@@ -1307,6 +1307,99 @@ fn ref_units(dpb: &[DpbEntry]) -> Vec<Vec<usize>> {
     units
 }
 
+/// §8.2.4.2.1 / §8.2.4.2.3 — the two stored coded-field halves behind a
+/// synthetic complementary-pair unit produced by
+/// [`collapse_field_pairs`]. The caller materialises the full-height
+/// reference frame by re-interleaving the two half-height stored
+/// pictures (top → even rows, bottom → odd rows per §8.4.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldPairKeys {
+    /// The synthetic unit's `dpb_key` (= the top field's key).
+    pub unit_key: u32,
+    pub top_key: u32,
+    pub bottom_key: u32,
+}
+
+/// §8.2.4.1 / §8.2.4.2.1 / §8.2.4.2.3 — collapse the per-coded-picture
+/// DPB entries into the frame-level reference UNITS a FRAME slice's
+/// list initialisation ranges over: "decoded reference frames or
+/// complementary reference field pairs".
+///
+/// * `Frame` / `FieldPair` entries pass through unchanged.
+/// * Two coded-field entries of opposite parity sharing `frame_num`
+///   collapse into ONE synthetic `FieldPair` entry whose
+///   - `dpb_key` is the top field's key (resolvable through the
+///     returned [`FieldPairKeys`] map),
+///   - `top/bottom_field_order_cnt` come from the respective fields
+///     and `pic_order_cnt` is eq. 8-1 `Min(top, bottom)`,
+///   - unit `marking` is short-term / long-term only when BOTH fields
+///     carry that marking (§3.36 a complementary *reference* field
+///     pair has both fields marked as reference; §8.2.4.2.1 ranges
+///     over "short-term complementary reference field pairs" and
+///     §8.2.5.4.3's completion rule gives a long-term pair a shared
+///     `LongTermFrameIdx` only when both fields are long-term). A pair
+///   with mixed / partial markings is not a frame-reference unit and
+///   is dropped.
+/// * Non-paired reference fields are EXCLUDED (§8.2.4.2.1 NOTE and
+///   §8.2.4.2.3 NOTE 2: "a non-paired reference field is not used for
+///   inter prediction for decoding a frame").
+pub fn collapse_field_pairs(dpb: &[DpbEntry]) -> (Vec<DpbEntry>, Vec<FieldPairKeys>) {
+    let mut out: Vec<DpbEntry> = Vec::with_capacity(dpb.len());
+    let mut pairings: Vec<FieldPairKeys> = Vec::new();
+    for unit in ref_units(dpb) {
+        match unit.as_slice() {
+            [i] => {
+                let e = &dpb[*i];
+                match e.structure {
+                    PicStructure::Frame | PicStructure::FieldPair => out.push(e.clone()),
+                    // Non-paired reference field — excluded for frames.
+                    PicStructure::TopField | PicStructure::BottomField => {}
+                }
+            }
+            [i, j] => {
+                let (top, bottom) = if dpb[*i].structure.is_bottom() {
+                    (&dpb[*j], &dpb[*i])
+                } else {
+                    (&dpb[*i], &dpb[*j])
+                };
+                let top_m = top.field_marking(FieldParity::Top);
+                let bottom_m = bottom.field_marking(FieldParity::Bottom);
+                let marking = if top_m == bottom_m {
+                    top_m
+                } else {
+                    RefMarking::Unused
+                };
+                if marking == RefMarking::Unused {
+                    continue;
+                }
+                let top_poc = top.field_poc(FieldParity::Top);
+                let bottom_poc = bottom.field_poc(FieldParity::Bottom);
+                out.push(DpbEntry {
+                    frame_num: top.frame_num,
+                    top_field_order_cnt: top_poc,
+                    bottom_field_order_cnt: bottom_poc,
+                    // eq. 8-1 — PicOrderCnt of a complementary field
+                    // pair = Min(TopFieldOrderCnt, BottomFieldOrderCnt).
+                    pic_order_cnt: top_poc.min(bottom_poc),
+                    structure: PicStructure::FieldPair,
+                    marking,
+                    // §8.2.5.4.3 — a long-term pair shares one index.
+                    long_term_frame_idx: top.long_term_frame_idx,
+                    dpb_key: top.dpb_key,
+                    field_markings: [top_m, bottom_m],
+                });
+                pairings.push(FieldPairKeys {
+                    unit_key: top.dpb_key,
+                    top_key: top.dpb_key,
+                    bottom_key: bottom.dpb_key,
+                });
+            }
+            _ => unreachable!("ref_units yields 1- or 2-entry units"),
+        }
+    }
+    (out, pairings)
+}
+
 /// §8.2.5.4 — Adaptive memory control decoded reference picture
 /// marking. Applies MMCO ops 1..=6 in order.
 ///
