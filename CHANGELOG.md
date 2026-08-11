@@ -2710,7 +2710,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alternative is accepted iff the spatial-domain `D + λ·R` cost
   strictly drops, where the rate term is approximated from §9.3.3.1.3
   (significant_coeff_flag + last_significant_coeff_flag + truncated-
-  unary prefix + sign), λ follows the JM `0.85 · 2^((QP-12)/3) · 2/3`
+  unary prefix + sign), λ follows the `0.85 · 2^((QP-12)/3) · 2/3`
   RDOQ relaxation, and D is the SSD between source and reconstructed
   residual after the actual §8.5.12 inverse transform. The refinement
   is informative — the decoder is unchanged, the bitstream syntax is
