@@ -4039,6 +4039,19 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         chroma_array_type,
     );
 
+    // §6.4.8 / §7.4.4 — stamp the current MB's slice identity and
+    // field/frame coding BEFORE partition derivation: the §8.4.1.2
+    // direct-mode derivations (Table 8-8 rows, §8.4.1.2.2 neighbour
+    // probes) and the §8.4.1.3.2 MVpred neighbour lookups all read the
+    // in-flight MB's `mb_field_decoding_flag` off the grid. Stamping
+    // only before the partition LOOP (the old behaviour) left an AFRM
+    // B field MB's temporal-direct derivation running with
+    // `currMbFrameFlag = 1`, selecting the wrong Table 8-8 row.
+    if let Some(info) = grid.get_mut(mb_addr) {
+        info.slice_id = current_slice_id;
+        info.mb_field_decoding_flag = mb_field_decoding_flag;
+    }
+
     // -------- Derive inter partitions --------------------------------
     let partitions = derive_inter_partitions(
         mb,
@@ -5694,7 +5707,6 @@ fn derive_partition_mvs(
         neighbour_mvs_for_list(part, mb_addr, grid, 0, current_slice_id);
     let (neigh_a_l1, neigh_b_l1, neigh_c_l1, neigh_d_l1) =
         neighbour_mvs_for_list(part, mb_addr, grid, 1, current_slice_id);
-
     let (mv_l0, mv_l1) = match part.mode {
         PartMode::Direct => {
             // §8.4.1.2 direct mode — for now use spatial-direct median

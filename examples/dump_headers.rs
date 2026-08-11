@@ -27,6 +27,7 @@ fn main() {
                 nal_ref_idc,
                 header: h,
                 sps,
+                pps,
                 ..
             }) => {
                 if h.first_mb_in_slice == 0 {
@@ -47,7 +48,7 @@ fn main() {
                     "FRM"
                 };
                 println!(
-                    "pic#{:3} nal={} ref_idc={} {:7} type={:?} frame_num={} poc_lsb={} first_mb={} dsmvp={} nref=({},{})",
+                    "pic#{:3} nal={} ref_idc={} {:7} type={:?} frame_num={} poc_lsb={} first_mb={} dsmvp={} nref=({},{}) wp={}/{} has_wt={}",
                     n - 1,
                     nal_unit_type,
                     nal_ref_idc,
@@ -59,6 +60,9 @@ fn main() {
                     u8::from(h.direct_spatial_mv_pred_flag),
                     h.num_ref_idx_l0_active_minus1 + 1,
                     h.num_ref_idx_l1_active_minus1 + 1,
+                    u8::from(pps.weighted_pred_flag),
+                    pps.weighted_bipred_idc,
+                    h.pred_weight_table.is_some(),
                 );
             }
             Ok(_) => {}
