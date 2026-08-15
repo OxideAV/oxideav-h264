@@ -4189,6 +4189,67 @@ impl Encoder {
         pic_order_cnt_lsb: u32,
         frame_qp: i32,
     ) -> EncodedB {
+        self.encode_b_cabac_impl(
+            frame,
+            ref_l0,
+            ref_l1,
+            frame_num,
+            pic_order_cnt_lsb,
+            frame_qp,
+            None,
+        )
+    }
+
+    /// [`encode_b_cabac_with_qp`](Self::encode_b_cabac_with_qp) plus
+    /// **MB-row QP modulation** toward a whole-slice bit budget
+    /// (round-443) — the CABAC sibling of
+    /// [`encode_b_rate_adaptive`](Self::encode_b_rate_adaptive), with
+    /// the same row controller as
+    /// [`encode_p_cabac_rate_adaptive`](Self::encode_p_cabac_rate_adaptive).
+    /// Row-QP steps ride §7.4.5 `mb_qp_delta` under the §9.3.3.1.1.5
+    /// context chain (B_Skip and cbp == 0 MBs reset
+    /// `prev_mb_qp_delta_nonzero` and inherit the previous QP_Y; the
+    /// §8.7 deblock strengths follow the decoder's chain).
+    ///
+    /// 4:2:0 only, mirroring the CAVLC entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_b_cabac_rate_adaptive(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+        frame_budget_bits: u64,
+    ) -> EncodedB {
+        assert_eq!(
+            self.config().chroma_format_idc,
+            1,
+            "encode_b_cabac_rate_adaptive requires 4:2:0"
+        );
+        self.encode_b_cabac_impl(
+            frame,
+            ref_l0,
+            ref_l1,
+            frame_num,
+            pic_order_cnt_lsb,
+            frame_qp,
+            Some(frame_budget_bits),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_b_cabac_impl(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+        row_budget_bits: Option<u64>,
+    ) -> EncodedB {
         assert!(
             (0..=51).contains(&frame_qp),
             "frame_qp {frame_qp} out of 0..=51"
@@ -4243,9 +4304,15 @@ impl Encoder {
             _ => (8usize, 8usize),
         };
 
-        let qp_y = frame_qp;
         let qp_bd_offset_c = qp_bd_offset(cfg.bit_depth_chroma_minus8);
-        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
+        // §7.4.5 decoded-QP chain (round 443): `chain_qp` is the QP_Y
+        // the decoder holds after the most recent MB — the predictor
+        // for the next `mb_qp_delta`. `want_qp` is the row-modulated
+        // target QP. Without a row budget both stay pinned at
+        // `frame_qp` and every emitted delta is 0, matching the
+        // pre-round-443 bitstream exactly.
+        let mut chain_qp = frame_qp;
+        let mut want_qp = frame_qp;
 
         let mut stream: Vec<u8> = Vec::new();
 
@@ -4281,7 +4348,9 @@ impl Encoder {
         }
 
         let mut cabac = CabacEncoder::new();
-        let mut ctxs = CabacContexts::init(SliceKind::B, Some(0), qp_y).expect("ctx init");
+        // §9.3.1.1 — context variables initialise from SliceQP_Y (the
+        // slice-header QP), NOT the row-modulated per-MB QP.
+        let mut ctxs = CabacContexts::init(SliceKind::B, Some(0), frame_qp).expect("ctx init");
 
         let mut recon_y = vec![0u8; width * height];
         let mut recon_u = vec![0u8; chroma_w * chroma_h];
@@ -4293,6 +4362,32 @@ impl Encoder {
         let mut i8x8_mb_count = 0u32;
 
         for mb_y in 0..height_mbs {
+            // Round 443 — MB-row QP modulation, CABAC B counterpart of
+            // the round-420/430 controllers (same response curve, see
+            // `encode_p_cabac_impl`).
+            if let Some(budget) = row_budget_bits {
+                if mb_y > 0 && budget > 0 {
+                    let frac = mb_y as f64 / height_mbs as f64;
+                    let spent = (sw.bits_emitted() + cabac.bits_emitted()) as f64;
+                    let expected = (budget as f64 * frac).max(1.0);
+                    let ratio = spent.max(1.0) / expected;
+                    let adj = if ratio >= 1.0 {
+                        (6.0 * ratio.log2()).round() as i32
+                    } else {
+                        (3.0 * ratio.log2()).round() as i32
+                    };
+                    let mut new_want = frame_qp + adj;
+                    if new_want < frame_qp && frac < 0.6 {
+                        new_want = frame_qp;
+                    }
+                    want_qp = new_want
+                        .clamp(want_qp - 1, want_qp + 2)
+                        .clamp(frame_qp - 2, frame_qp + 6)
+                        .clamp(0, 51);
+                }
+            }
+            let qp_y = want_qp;
+            let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
             for mb_x in 0..width_mbs {
                 let mb_addr = mb_y * width_mbs + mb_x;
 
@@ -6816,7 +6911,10 @@ impl Encoder {
                     let l1_used = direct.ref_idx_l1 >= 0;
                     mb_dbl[mb_addr] = MbDeblockInfo {
                         is_intra: false,
-                        qp_y,
+                        // §7.4.5 — a skipped MB carries no mb_qp_delta;
+                        // its QP_Y (for the §8.7 deblock strengths) is
+                        // the decoder's running chain value.
+                        qp_y: chain_qp,
                         luma_nonzero_4x4: 0,
                         chroma_nonzero_4x4: 0,
                         mv_l0: [if l0_used {
@@ -7503,10 +7601,14 @@ impl Encoder {
                     encode_transform_size_8x8_flag(&mut cabac, &mut ctxs, &nb, transform_size_8x8);
                 }
 
-                // mb_qp_delta only when CBP > 0.
+                // mb_qp_delta only when CBP > 0. Round-443 row
+                // modulation: emit the step from the decoder's running
+                // §7.4.5 predictor; cbp == 0 MBs inherit it (and reset
+                // the §9.3.3.1.1.5 context chain).
                 let needs_qpd = cbp_luma > 0 || cbp_chroma > 0;
                 if needs_qpd {
-                    let qpd = 0i32;
+                    let qpd = qp_y - chain_qp;
+                    chain_qp = qp_y;
                     encode_mb_qp_delta(&mut cabac, &mut ctxs, prev_mb_qp_delta_nonzero, qpd);
                     prev_mb_qp_delta_nonzero = qpd != 0;
                 } else {
@@ -8171,7 +8273,11 @@ impl Encoder {
 
                 mb_dbl[mb_addr] = MbDeblockInfo {
                     is_intra: false,
-                    qp_y,
+                    // §7.4.5 chain: chain_qp equals qp_y when this MB
+                    // coded a residual (delta emitted above), else the
+                    // inherited predecessor QP — the value the
+                    // decoder's §8.7 deblock will use.
+                    qp_y: chain_qp,
                     luma_nonzero_4x4: luma_nz_mask_from_blocks(&blk_has_nz),
                     chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_ac_per4x4, &cr_ac_per4x4),
                     mv_l0: mv_l0_arr,

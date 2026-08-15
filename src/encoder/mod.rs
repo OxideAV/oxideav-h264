@@ -10412,6 +10412,67 @@ impl Encoder {
         pic_order_cnt_lsb: u32,
         frame_qp: i32,
     ) -> EncodedB {
+        self.encode_b_impl(
+            frame,
+            ref_l0,
+            ref_l1,
+            frame_num,
+            pic_order_cnt_lsb,
+            frame_qp,
+            None,
+        )
+    }
+
+    /// [`encode_b_with_qp`](Self::encode_b_with_qp) plus **MB-row QP
+    /// modulation** toward a whole-slice bit budget (round-443) —
+    /// the B-picture sibling of
+    /// [`encode_p_rate_adaptive`](Self::encode_p_rate_adaptive):
+    /// identical row controller (asymmetric ±2-per-row stepping
+    /// bounded to `frame_qp − 2 ..= frame_qp + 6`), with the QP
+    /// changes riding §7.4.5 `mb_qp_delta` on MBs with coded
+    /// residual; B_Skip and cbp==0 MBs inherit the previous MB's
+    /// QP_Y exactly as the decoder derives it (the §8.7 deblock
+    /// strengths follow the same chain).
+    ///
+    /// 4:2:0 only (the modulated writers' §7.3.5 mb_qp_delta gating
+    /// is exercised at ChromaArrayType == 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_b_rate_adaptive(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+        frame_budget_bits: u64,
+    ) -> EncodedB {
+        assert_eq!(
+            self.cfg.chroma_format_idc, 1,
+            "encode_b_rate_adaptive requires 4:2:0"
+        );
+        self.encode_b_impl(
+            frame,
+            ref_l0,
+            ref_l1,
+            frame_num,
+            pic_order_cnt_lsb,
+            frame_qp,
+            Some(frame_budget_bits),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_b_impl(
+        &self,
+        frame: &YuvFrame<'_>,
+        ref_l0: &EncodedFrameRef<'_>,
+        ref_l1: &EncodedFrameRef<'_>,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        frame_qp: i32,
+        row_budget_bits: Option<u64>,
+    ) -> EncodedB {
         assert!(
             (0..=51).contains(&frame_qp),
             "frame_qp {frame_qp} out of 0..=51"
@@ -10535,10 +10596,8 @@ impl Encoder {
         let mut recon_u = vec![0u8; chroma_width * chroma_height];
         let mut recon_v = vec![0u8; chroma_width * chroma_height];
 
-        let qp_y = frame_qp;
         // §8.5.8 BD-aware chroma-QP — see encode_idr; identical reasoning.
         let qp_bd_offset_c = qp_bd_offset(self.cfg.bit_depth_chroma_minus8);
-        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, chroma_qp_index_offset, qp_bd_offset_c);
 
         let mut nc_grid = CavlcNcGrid::new(width_mbs, height_mbs);
         let mut intra_grid = IntraGrid::new(width_mbs as usize, height_mbs as usize);
@@ -10559,7 +10618,41 @@ impl Encoder {
         // chosen MVs and the residual quantises to all-zero.
         let mut pending_skip: u32 = 0;
         let mut i8x8_mb_count = 0u32;
+        // §7.4.5 decoded-QP chain: starts at SliceQP_Y (§7.4.3).
+        let mut qp_tracker = MbQpTracker { cur: frame_qp };
+        let mut want_qp = frame_qp;
         for mb_y in 0..height_mbs as usize {
+            // Round-443 — MB-row QP modulation, identical controller
+            // to `encode_p_impl` (round 420): compare bits spent so
+            // far to the pro-rata share of the slice budget and step
+            // the working QP, asymmetrically (overshoot climbs up to
+            // +2 per row toward frame_qp + 6, undershoot descends one
+            // step toward frame_qp - 2 and only once most of the
+            // slice has proven cheap).
+            if let Some(budget) = row_budget_bits {
+                if mb_y > 0 && budget > 0 {
+                    let frac = mb_y as f64 / height_mbs as f64;
+                    let spent = sw.bits_emitted() as f64;
+                    let expected = (budget as f64 * frac).max(1.0);
+                    let ratio = spent.max(1.0) / expected;
+                    let adj = if ratio >= 1.0 {
+                        (6.0 * ratio.log2()).round() as i32
+                    } else {
+                        (3.0 * ratio.log2()).round() as i32
+                    };
+                    let mut new_want = frame_qp + adj;
+                    if new_want < frame_qp && frac < 0.6 {
+                        new_want = frame_qp;
+                    }
+                    want_qp = new_want
+                        .clamp(want_qp - 1, want_qp + 2)
+                        .clamp(frame_qp - 2, frame_qp + 6)
+                        .clamp(0, 51);
+                }
+            }
+            let qp_y = want_qp;
+            let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, chroma_qp_index_offset, qp_bd_offset_c);
+
             for mb_x in 0..width_mbs as usize {
                 let mb_addr = mb_y * (width_mbs as usize) + mb_x;
                 // Round-29: Intra fallback in B-slice via RDO wrapper.
@@ -10585,6 +10678,7 @@ impl Encoder {
                     &mut pending_skip,
                     pic_order_cnt_lsb as i32,
                     weighted_luma_for_mb,
+                    &mut qp_tracker,
                 );
                 if dbl.transform_size_8x8_flag {
                     i8x8_mb_count += 1;
@@ -10713,12 +10807,21 @@ impl Encoder {
         // `pred_weight_table()`; the bipred merge in `build_b_predictors`
         // then uses §8.4.2.3.2 eq. 8-276 instead of the default average.
         weighted: Option<WeightedBipredLuma>,
+        // Round-443 — §7.4.5 decoded-QP chain for MB-row modulation
+        // (`encode_b_rate_adaptive`); at frame-constant QP the chain
+        // always equals `qp_y` and every emitted delta is 0.
+        qp_tracker: &mut MbQpTracker,
     ) -> MbDeblockInfo {
         // Round-397 — 4:2:2 / 4:4:4 B MBs take a dedicated body with
         // the {B_Skip, B_Direct_16x16, B_L0/L1/Bi_16x16, 16x8 / 8x16
         // partitions} mode set and per-format chroma MC + residual
-        // coding. B_8x8 remains a 4:2:0-only encoder choice.
+        // coding. B_8x8 remains a 4:2:0-only encoder choice. Row
+        // modulation is 4:2:0-only, so the chain is degenerate here.
         if self.cfg.chroma_format_idc != 1 {
+            debug_assert_eq!(
+                qp_tracker.cur, qp_y,
+                "row modulation (non-zero mb_qp_delta) is 4:2:0-only"
+            );
             return self.encode_b_mb_multifmt(
                 frame,
                 ref_l0,
@@ -11844,6 +11947,17 @@ impl Encoder {
         //                        + per-partition mvds + cbp + …
         // Skips never flush their own ue(v); they are folded into the
         // run that precedes the next coded MB (or the trailing flush).
+        // Round-443 — §7.4.5 mb_qp_delta: present only on coded MBs
+        // with residual (cbp != 0); B_Skip and cbp==0 MBs inherit the
+        // previous MB's QP_Y (the deblock info below records the
+        // decoder's chain value either way).
+        let mb_qp_delta = if !mb_is_skip && (cbp_luma > 0 || cbp_chroma > 0) {
+            let d = qp_y - qp_tracker.cur;
+            qp_tracker.cur = qp_y;
+            d
+        } else {
+            0
+        };
         if mb_is_skip {
             *pending_skip += 1;
         } else {
@@ -11855,7 +11969,7 @@ impl Encoder {
                     transform_size_8x8_flag: b_t8x8_flag,
                     cbp_luma,
                     cbp_chroma,
-                    mb_qp_delta: 0,
+                    mb_qp_delta,
                     luma_4x4_levels: luma_4x4_levels_scan,
                     luma_4x4_nc,
                     chroma_dc_cb: u_dc_levels,
@@ -11878,7 +11992,7 @@ impl Encoder {
                     transform_size_8x8_flag: b_t8x8_flag,
                     cbp_luma,
                     cbp_chroma,
-                    mb_qp_delta: 0,
+                    mb_qp_delta,
                     luma_4x4_levels: luma_4x4_levels_scan,
                     luma_4x4_nc,
                     chroma_dc_cb: u_dc_levels,
@@ -11902,7 +12016,7 @@ impl Encoder {
                     mvd_l1: mixed_mvd_l1_per_cell,
                     cbp_luma,
                     cbp_chroma,
-                    mb_qp_delta: 0,
+                    mb_qp_delta,
                     luma_4x4_levels: luma_4x4_levels_scan,
                     luma_4x4_nc,
                     chroma_dc_cb: u_dc_levels,
@@ -11927,7 +12041,7 @@ impl Encoder {
                             mvd_l1: mvd_l1_parts,
                             cbp_luma,
                             cbp_chroma,
-                            mb_qp_delta: 0,
+                            mb_qp_delta,
                             luma_4x4_levels: luma_4x4_levels_scan,
                             luma_4x4_nc,
                             chroma_dc_cb: u_dc_levels,
@@ -11948,7 +12062,7 @@ impl Encoder {
                             mvd_l1: mvd_l1_parts,
                             cbp_luma,
                             cbp_chroma,
-                            mb_qp_delta: 0,
+                            mb_qp_delta,
                             luma_4x4_levels: luma_4x4_levels_scan,
                             luma_4x4_nc,
                             chroma_dc_cb: u_dc_levels,
@@ -11971,7 +12085,7 @@ impl Encoder {
                     mvd_l1_y,
                     cbp_luma,
                     cbp_chroma,
-                    mb_qp_delta: 0,
+                    mb_qp_delta,
                     luma_4x4_levels: luma_4x4_levels_scan,
                     luma_4x4_nc,
                     chroma_dc_cb: u_dc_levels,
@@ -12141,7 +12255,11 @@ impl Encoder {
 
         MbDeblockInfo {
             is_intra: false,
-            qp_y,
+            // §7.4.5 chain: qp_tracker.cur is qp_y when this MB coded
+            // a residual (delta emitted above), else the inherited
+            // predecessor QP — the value the decoder's §8.7 deblock
+            // will use.
+            qp_y: qp_tracker.cur,
             luma_nonzero_4x4,
             chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
             transform_size_8x8_flag: transform_size_8x8,
@@ -13189,6 +13307,7 @@ impl Encoder {
         pending_skip: &mut u32,
         curr_poc: i32,
         weighted: Option<WeightedBipredLuma>,
+        qp_tracker: &mut MbQpTracker,
     ) -> MbDeblockInfo {
         // Round-397 — the Intra_16x16-in-inter trial body is
         // 4:2:0-only (its chroma trial + snapshot windows are 8x8);
@@ -13216,6 +13335,7 @@ impl Encoder {
                 pending_skip,
                 curr_poc,
                 weighted,
+                qp_tracker,
             );
         }
 
@@ -13242,6 +13362,10 @@ impl Encoder {
             *pending_skip,
         );
         let pre_bits = sw.bits_emitted();
+        // §7.4.5 chain state must be trialled + restored alongside the
+        // bitstream snapshot: each trial may or may not emit an
+        // mb_qp_delta (mirrors `encode_p_mb_with_intra_fallback`).
+        let qp_tracker_pre = *qp_tracker;
 
         // -- Trial 1: inter (B_Skip / B_Direct / B_L0/L1/Bi / partitions / 8x8). --
         let inter_dbl = self.encode_b_mb(
@@ -13266,6 +13390,7 @@ impl Encoder {
             pending_skip,
             curr_poc,
             weighted,
+            qp_tracker,
         );
         let inter_bits = sw.bits_emitted() - pre_bits;
         let inter_d = ssd_16x16(frame.y, width, mb_x * 16, mb_y * 16, &{
@@ -13299,6 +13424,8 @@ impl Encoder {
             *pending_skip,
         );
 
+        let qp_tracker_inter = *qp_tracker;
+
         // -- Restore pre-state for the intra trial. --
         snap_pre.restore_b(
             recon_y,
@@ -13316,6 +13443,7 @@ impl Encoder {
             mb_addr,
             pending_skip,
         );
+        *qp_tracker = qp_tracker_pre;
 
         // -- Trial 2: Intra_16x16 in B-slice. --
         let intra_dbl = self.encode_b_mb_intra16x16(
@@ -13335,6 +13463,7 @@ impl Encoder {
             mv_grid_l0,
             mv_grid_l1,
             pending_skip,
+            qp_tracker,
         );
         let intra_bits = sw.bits_emitted() - pre_bits;
         let intra_d = ssd_16x16(frame.y, width, mb_x * 16, mb_y * 16, &{
@@ -13382,6 +13511,7 @@ impl Encoder {
                 mb_addr,
                 pending_skip,
             );
+            *qp_tracker = qp_tracker_inter;
             inter_dbl
         } else {
             intra_dbl
@@ -13410,11 +13540,17 @@ impl Encoder {
         mv_grid_l0: &mut MvGrid,
         mv_grid_l1: &mut MvGrid,
         pending_skip: &mut u32,
+        qp_tracker: &mut MbQpTracker,
     ) -> MbDeblockInfo {
         // Flush any pending B_Skip run.
         sw.ue(*pending_skip);
         *pending_skip = 0;
 
+        // §7.3.5 — Intra_16x16 always codes mb_qp_delta (the luma DC
+        // block is unconditional): emit the step from the decoder's
+        // running predictor (round-443 row modulation).
+        let mb_qp_delta = qp_y - qp_tracker.cur;
+        qp_tracker.cur = qp_y;
         self.encode_intra16x16_in_inter_slice(
             frame,
             mb_x,
@@ -13430,9 +13566,7 @@ impl Encoder {
             nc_grid,
             intra_grid,
             23,
-            // B slices run at frame-constant QP (no row modulation),
-            // so the §7.4.5 predictor always equals this MB's QP.
-            0,
+            mb_qp_delta,
         );
 
         // Update both MV grids for the intra MB.

@@ -355,6 +355,180 @@ fn constant_qp_b_session_decodes_and_matches_reference() {
     cross_check_reference(&stream, &own, "cqp-b-session");
 }
 
+/// Vertical complexity cliff for the row-modulation tests: smooth top
+/// half, noisy bottom half (deterministic xorshift), shifted by `n`.
+fn make_cliff_frame(n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn xorshift(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+    let (w, h) = (W as usize, H as usize);
+    let mut y = vec![0u8; w * h];
+    let mut u = vec![128u8; (w / 2) * (h / 2)];
+    let mut v = vec![128u8; (w / 2) * (h / 2)];
+    let mut rng = 0x1234_5678u32 ^ (n as u32).wrapping_mul(0x9E37_79B9);
+    for j in 0..h {
+        for i in 0..w {
+            y[j * w + i] = if j < h / 2 {
+                (40 + ((i + j + n * 3) % 60)) as u8
+            } else {
+                (xorshift(&mut rng) % 200 + 20) as u8
+            };
+        }
+    }
+    for j in 0..h / 2 {
+        for i in 0..w / 2 {
+            u[j * (w / 2) + i] = (110 + ((i + n) % 30)) as u8;
+            v[j * (w / 2) + i] = (120 + ((j + n) % 30)) as u8;
+        }
+    }
+    (y, u, v)
+}
+
+/// Round-443 — `encode_b_rate_adaptive` / `encode_b_cabac_rate_adaptive`:
+/// a tight budget must coarsen rows (smaller stream than the flat-QP
+/// encode of the same picture), and the emitted §7.4.5 mb_qp_delta
+/// chain must agree byte-exactly with both decoders (recon == our
+/// decode == reference decode).
+fn row_adaptive_b_case(cabac: bool, tag: &str) {
+    use oxideav_h264::encoder::{EncodedFrameRef, Encoder, EncoderConfig, YuvFrame};
+    let mut cfg = EncoderConfig::new(W, H);
+    cfg.profile_idc = 77;
+    cfg.max_num_ref_frames = 2;
+    cfg.cabac = cabac;
+    let enc = Encoder::new(cfg);
+
+    let (y0, u0, v0) = make_cliff_frame(0);
+    let (y2, u2, v2) = make_cliff_frame(2);
+    let (y1, u1, v1) = make_cliff_frame(1);
+    let f0 = YuvFrame {
+        width: W,
+        height: H,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let f2 = YuvFrame {
+        width: W,
+        height: H,
+        y: &y2,
+        u: &u2,
+        v: &v2,
+    };
+    let f1 = YuvFrame {
+        width: W,
+        height: H,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+
+    let qp = 30;
+    let (idr_bytes, p_bytes, l0, l1, flat_len, b) = if cabac {
+        let idr = enc.encode_idr_cabac_with_qp(&f0, qp);
+        let p = enc.encode_p_cabac_with_qp(&f2, &EncodedFrameRef::from(&idr), 1, 4, qp);
+        let flat = enc.encode_b_cabac_with_qp(
+            &f1,
+            &EncodedFrameRef::from(&idr),
+            &EncodedFrameRef::from(&p),
+            1,
+            2,
+            qp,
+        );
+        let budget = (8 * flat.annex_b.len() as u64) / 2;
+        let adapted = enc.encode_b_cabac_rate_adaptive(
+            &f1,
+            &EncodedFrameRef::from(&idr),
+            &EncodedFrameRef::from(&p),
+            1,
+            2,
+            qp,
+            budget,
+        );
+        let flat_len = flat.annex_b.len();
+        (
+            idr.annex_b.clone(),
+            p.annex_b.clone(),
+            idr,
+            p,
+            flat_len,
+            adapted,
+        )
+    } else {
+        let idr = enc.encode_idr_with_qp(&f0, qp);
+        let p = enc.encode_p_with_qp(&f2, &EncodedFrameRef::from(&idr), 1, 4, qp);
+        let flat = enc.encode_b_with_qp(
+            &f1,
+            &EncodedFrameRef::from(&idr),
+            &EncodedFrameRef::from(&p),
+            1,
+            2,
+            qp,
+        );
+        let budget = (8 * flat.annex_b.len() as u64) / 2;
+        let adapted = enc.encode_b_rate_adaptive(
+            &f1,
+            &EncodedFrameRef::from(&idr),
+            &EncodedFrameRef::from(&p),
+            1,
+            2,
+            qp,
+            budget,
+        );
+        let flat_len = flat.annex_b.len();
+        (
+            idr.annex_b.clone(),
+            p.annex_b.clone(),
+            idr,
+            p,
+            flat_len,
+            adapted,
+        )
+    };
+    let _ = (&l0, &l1);
+
+    eprintln!(
+        "{tag}: flat B {} bytes, half-budget adapted B {} bytes",
+        flat_len,
+        b.annex_b.len()
+    );
+    assert!(
+        b.annex_b.len() < flat_len,
+        "{tag}: tight budget did not shrink the B slice ({} vs {flat_len})",
+        b.annex_b.len()
+    );
+
+    // Full-stream decode: display order is IDR (poc 0), B (poc 2),
+    // P (poc 4) — the B comes back second.
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&idr_bytes);
+    stream.extend_from_slice(&p_bytes);
+    stream.extend_from_slice(&b.annex_b);
+    let own = decode_own(&stream);
+    assert_eq!(own.len(), 3, "{tag}: decoded frame count");
+    assert_eq!(
+        own[1].planes[0].data, b.recon_y,
+        "{tag}: B luma decode != encoder recon (mb_qp_delta chain broken)"
+    );
+    assert_eq!(own[1].planes[1].data, b.recon_u, "{tag}: B cb mismatch");
+    assert_eq!(own[1].planes[2].data, b.recon_v, "{tag}: B cr mismatch");
+    cross_check_reference(&stream, &own, tag);
+}
+
+#[test]
+fn row_adaptive_b_cavlc_coarsens_and_stays_bit_exact() {
+    row_adaptive_b_case(false, "row-b-cavlc");
+}
+
+#[test]
+fn row_adaptive_b_cabac_coarsens_and_stays_bit_exact() {
+    row_adaptive_b_case(true, "row-b-cabac");
+}
+
 #[test]
 fn b_rate_control_holds_the_rd_curve() {
     // Fixed-QP B-GOP anchors (gop 30, b 2 — the same GOP shape the

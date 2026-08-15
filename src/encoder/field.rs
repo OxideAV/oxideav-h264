@@ -462,6 +462,9 @@ fn encode_b_slice_data(
     let mut mv_grid_l1 = MvGrid::new(width_mbs as usize, height_mbs as usize);
     let mut infos = vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
     let mut pending_skip: u32 = 0;
+    // Field B slices run at frame-constant QP: the §7.4.5 chain stays
+    // at qp_y and every emitted mb_qp_delta is 0.
+    let mut qp_tracker = crate::encoder::MbQpTracker { cur: qp_y };
     for mb_y in 0..height_mbs as usize {
         for mb_x in 0..width_mbs as usize {
             let dbl = enc.encode_b_mb_with_intra_fallback(
@@ -486,6 +489,7 @@ fn encode_b_slice_data(
                 &mut pending_skip,
                 curr_poc,
                 weighted,
+                &mut qp_tracker,
             );
             infos[mb_y * width_mbs as usize + mb_x] = dbl;
         }

@@ -414,7 +414,8 @@ impl EncoderSession {
 
     /// Encode a non-reference B picture between the retained previous
     /// anchor (`RefPicList0[0]`) and `l1` (the mini-GOP's just-coded
-    /// anchor, `RefPicList1[0]`).
+    /// anchor, `RefPicList1[0]`). Rate-controlled sessions row-
+    /// modulate B pictures like the anchors (round 443).
     fn encode_b_at(
         &self,
         frame: &YuvFrame<'_>,
@@ -422,6 +423,7 @@ impl EncoderSession {
         frame_num: u32,
         poc_lsb: u32,
         qp: i32,
+        row_budget_bits: Option<u64>,
     ) -> EncodedB {
         let l0 = self
             .prev
@@ -429,12 +431,19 @@ impl EncoderSession {
             .expect("B frame requires a previous anchor");
         let r0 = l0.as_ref();
         let r1 = l1.as_ref();
-        if self.cfg.cabac {
-            self.enc
-                .encode_b_cabac_with_qp(frame, &r0, &r1, frame_num, poc_lsb, qp)
-        } else {
-            self.enc
-                .encode_b_with_qp(frame, &r0, &r1, frame_num, poc_lsb, qp)
+        match (self.cfg.cabac, row_budget_bits) {
+            (true, Some(budget)) => self
+                .enc
+                .encode_b_cabac_rate_adaptive(frame, &r0, &r1, frame_num, poc_lsb, qp, budget),
+            (true, None) => self
+                .enc
+                .encode_b_cabac_with_qp(frame, &r0, &r1, frame_num, poc_lsb, qp),
+            (false, Some(budget)) => self
+                .enc
+                .encode_b_rate_adaptive(frame, &r0, &r1, frame_num, poc_lsb, qp, budget),
+            (false, None) => self
+                .enc
+                .encode_b_with_qp(frame, &r0, &r1, frame_num, poc_lsb, qp),
         }
     }
 
@@ -660,13 +669,9 @@ impl EncoderSession {
             }
             Some((plan, max_qp)) => {
                 // MB-row modulation toward the controller's soft
-                // target rides the anchor paths (round 420 CAVLC /
-                // round 430 CABAC); B pictures code at the plan QP
-                // whole-slice.
-                let row_budget = match kind {
-                    SessionFrameKind::B => None,
-                    _ => Some(plan.target_bits.max(1.0) as u64),
-                };
+                // target: anchors since rounds 420/430, B pictures
+                // since round 443.
+                let row_budget = Some(plan.target_bits.max(1.0) as u64);
                 let mut qp = plan.qp;
                 let mut pic = self.encode_pic(frame, kind, frame_num, poc_lsb, qp, row_budget, l1);
                 // VBV hard-cap retry: the stateless encoder makes
@@ -766,6 +771,7 @@ impl EncoderSession {
                 frame_num,
                 poc_lsb,
                 qp,
+                row_budget_bits,
             )),
         }
     }

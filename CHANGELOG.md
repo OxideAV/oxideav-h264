@@ -46,15 +46,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     per §A.2.2 and switches packets to real reordering: `dts` =
     decode counter, `pts` = display index + 1, `flush` drains the
     lookahead tail).
+  * **MB-row QP modulation on B pictures**
+    (`Encoder::encode_b_rate_adaptive` +
+    `Encoder::encode_b_cabac_rate_adaptive`): the round-420/430 row
+    controller (asymmetric ±2-per-row stepping inside `frame_qp − 2
+    ..= frame_qp + 6` toward the whole-slice budget) now runs on
+    both B entropy paths, with the QP steps riding §7.4.5
+    `mb_qp_delta` on MBs with coded residual — B_Skip and cbp == 0
+    MBs inherit the previous MB's QP_Y (and reset the §9.3.3.1.1.5
+    `prev_mb_qp_delta_nonzero` context chain on CABAC), the §8.7
+    deblock strengths follow the decoder's chain, and the
+    Intra_16x16-in-B fallback trials/restores the chain state like
+    the P path. Rate-controlled sessions row-modulate every AU kind.
   Measured (80x64 moving-texture suite, 30 fps, `b_frames = 2`,
-  post-warmup): CBR payload error **2.1%** (CAVLC) / **0.1%**
-  (CABAC), capped-VBR **0.03%**; steady-state mean QPs I 17.3 ≤
-  P 18.5 < B 20.6 (the designed +2 λ offset); RD check — the CBR
-  B-GOP encode lands **0.96 dB ABOVE** the fixed-QP B-GOP anchor
-  curve at equal picture-coding rate. Every stream (reordered
-  output, SEI + filler included) decodes byte-identically in our
-  decoder and a black-box reference decoder
-  (`tests/integration_b_rate_control.rs`, 6 gates + registry
+  post-warmup, row modulation on all kinds): CBR payload error
+  **2.8%** (CAVLC) / **1.1%** (CABAC), capped-VBR **0.04%**;
+  steady-state mean QPs I 17.0 ≤ P 18.0 < B 20.2 (the designed +2 λ
+  offset); RD check — the CBR B-GOP encode lands **1.2 dB ABOVE**
+  the fixed-QP B-GOP anchor curve at equal picture-coding rate.
+  Every stream (reordered output, SEI + filler included) decodes
+  byte-identically in our decoder and a black-box reference decoder
+  (`tests/integration_b_rate_control.rs`, 8 gates + registry
   reorder gate in `tests/integration_registry_encoder.rs`).
 
 - Round 440 — **§8.4.1.2.1 co-located derivation completed** (Table
