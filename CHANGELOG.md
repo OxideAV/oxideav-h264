@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 443 — **B-frame rate control**. The encoder's rate-control
+  machinery extends to non-reference B pictures across all three
+  layers:
+  * `RateController` models THREE frame kinds (`RcFrameKind::B`
+    joins Idr/P): per-kind complexity EWMAs feed a budget split
+    `t_kind = t · u_kind / Σ_j f_j·u_j` over the observed GOP mix
+    (cumulative kind frequencies + a one-GOP prior), which conserves
+    the steered per-frame budget exactly for any GOP structure and
+    yields a λ-scaled QP hierarchy: equal quantiser step for I and P
+    (complexity-proportional anchor allocation), and B pictures a
+    constant 2 QP coarser (their weight is divided by the matching
+    §8.5.9 step ratio — non-reference distortion does not propagate,
+    so the bits move to the anchors both lists predict from).
+    Cold-start QPs for an unseeded kind derive from the nearest
+    seeded kind shifted by the nominal inter-kind biases.
+  * `EncoderSession` gains `SessionConfig::b_frames` (0..=16):
+    display-order input buffers up to `b_frames` pictures until the
+    next anchor, then the mini-GOP emits in decode order — the P
+    anchor first (predicting from the previous anchor), then each B
+    with `RefPicList0`/`RefPicList1` = the two enclosing anchors
+    (§8.4.1.2.2 spatial direct, `nal_ref_idc = 0`, anchor-shared
+    `frame_num`, POC lsb = 2 × display index). New `push_frame` /
+    `finish` streaming API (0..=b+1 AUs out per push; `encode_frame`
+    stays for `b_frames == 0`). Mini-GOPs truncate before each IDR
+    (the last pre-IDR picture anchors as P) so a B never predicts
+    across an IDR, and `finish` drains the tail the same way. The
+    Annex C plan → VBV-retry → commit loop runs per AU in decode
+    order; CBR filler and the round-430 HRD SEI annotate every AU,
+    with `pic_timing`'s `dpb_output_delay` now covering the
+    one-frame B-reorder latency (`2·(disp + 1 − dec)` ticks; anchors
+    carry `2·(b_count+1)`, Bs 0) and `cpb_removal_delay` counting
+    decode-order AUs.
+  * The registry encoder factory (`h264_encoder`) gains the
+    `bframes` option (0..=16; > 0 promotes CAVLC signalling to Main
+    per §A.2.2 and switches packets to real reordering: `dts` =
+    decode counter, `pts` = display index + 1, `flush` drains the
+    lookahead tail).
+  Measured (80x64 moving-texture suite, 30 fps, `b_frames = 2`,
+  post-warmup): CBR payload error **2.1%** (CAVLC) / **0.1%**
+  (CABAC), capped-VBR **0.03%**; steady-state mean QPs I 17.3 ≤
+  P 18.5 < B 20.6 (the designed +2 λ offset); RD check — the CBR
+  B-GOP encode lands **0.96 dB ABOVE** the fixed-QP B-GOP anchor
+  curve at equal picture-coding rate. Every stream (reordered
+  output, SEI + filler included) decodes byte-identically in our
+  decoder and a black-box reference decoder
+  (`tests/integration_b_rate_control.rs`, 6 gates + registry
+  reorder gate in `tests/integration_registry_encoder.rs`).
+
 - Round 440 — **§8.4.1.2.1 co-located derivation completed** (Table
   8-6 / 8-7 / 8-8, all frame/field cross rows). Temporal direct was
   frame-only (colPic taken verbatim from `RefPicList1[0]`, mbAddrCol =

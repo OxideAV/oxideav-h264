@@ -14,8 +14,14 @@
 //! * `rc=auto` (default) — `cbr` when a bitrate is known (option or
 //!   `CodecParameters::bit_rate`), else `cqp`.
 //!
-//! One packet out per frame in; no lookahead, so `flush` has nothing
-//! to drain and `pts == dts`.
+//! With `bframes=0` (default) there is no lookahead: one packet out
+//! per frame in, `flush` has nothing to drain and `pts == dts`. With
+//! `bframes=N` the session buffers up to N pictures until the next
+//! anchor, then emits the mini-GOP in decode order (anchor first) —
+//! packets carry `dts` = decode counter and `pts` = display index + 1
+//! (both in frame-duration units; the +1 is the one-frame reorder
+//! latency, keeping `pts >= dts` on every packet), and `flush` drains
+//! the buffered tail.
 
 use std::collections::VecDeque;
 
@@ -50,6 +56,11 @@ pub struct H264EncoderOptions {
     /// CABAC entropy coding (Main profile signalling). Default false
     /// (CAVLC / Baseline).
     pub cabac: bool,
+    /// Consecutive non-reference B pictures between anchors (0..=16).
+    /// Any non-zero value promotes CAVLC signalling to Main profile
+    /// and introduces one frame interval of reorder latency
+    /// (`pts != dts`). Default 0.
+    pub bframes: u32,
 }
 
 impl Default for H264EncoderOptions {
@@ -62,6 +73,7 @@ impl Default for H264EncoderOptions {
             buffer_size: 0,
             gop: 30,
             cabac: false,
+            bframes: 0,
         }
     }
 }
@@ -110,6 +122,12 @@ impl CodecOptionsStruct for H264EncoderOptions {
             default: OptionValue::Bool(false),
             help: "CABAC entropy coding (Main profile); default CAVLC (Baseline)",
         },
+        OptionField {
+            name: "bframes",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "non-reference B pictures between anchors (0..=16; >0 implies Main profile)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
@@ -121,6 +139,7 @@ impl CodecOptionsStruct for H264EncoderOptions {
             "buffer_size" => self.buffer_size = value.as_u32()?,
             "gop" => self.gop = value.as_u32()?,
             "cabac" => self.cabac = value.as_bool()?,
+            "bframes" => self.bframes = value.as_u32()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -137,6 +156,11 @@ pub struct H264CodecEncoder {
     width: usize,
     height: usize,
     frame_index: i64,
+    /// Reorder mode: `bframes > 0` (dts = decode counter, pts =
+    /// display index + 1).
+    reordered: bool,
+    /// Decode-order packet counter (dts source in reorder mode).
+    decode_index: i64,
     queue: VecDeque<Packet>,
 }
 
@@ -170,6 +194,12 @@ impl H264CodecEncoder {
         }
         if opts.qp > 51 {
             return Err(Error::invalid(format!("qp {} out of 0..=51", opts.qp)));
+        }
+        if opts.bframes > 16 {
+            return Err(Error::invalid(format!(
+                "bframes {} out of 0..=16",
+                opts.bframes
+            )));
         }
 
         // Frame rate: needed to convert bits/s into per-frame budgets.
@@ -246,6 +276,7 @@ impl H264CodecEncoder {
             height,
             gop_length: opts.gop,
             cabac: opts.cabac,
+            b_frames: opts.bframes,
             rate_control,
         });
 
@@ -267,8 +298,30 @@ impl H264CodecEncoder {
             width: width as usize,
             height: height as usize,
             frame_index: 0,
+            reordered: opts.bframes > 0,
+            decode_index: 0,
             queue: VecDeque::new(),
         })
+    }
+
+    /// Package the session AUs into packets on the queue.
+    fn enqueue(&mut self, frames: Vec<crate::encoder::session::SessionFrame>, input_pts: i64) {
+        for sf in frames {
+            let (pts, dts) = if self.reordered {
+                // Frame-duration units: display slot + the one-frame
+                // reorder latency vs the decode counter.
+                (sf.display_index as i64 + 1, self.decode_index)
+            } else {
+                (input_pts, input_pts)
+            };
+            let mut packet = Packet::new(0, self.time_base, sf.annex_b)
+                .with_pts(pts)
+                .with_dts(dts);
+            packet.duration = Some(1);
+            packet.flags.keyframe = sf.is_idr;
+            self.queue.push_back(packet);
+            self.decode_index += 1;
+        }
     }
 
     /// Copy a possibly padded plane into a tightly packed buffer.
@@ -318,15 +371,9 @@ impl CoreEncoder for H264CodecEncoder {
         let u = Self::packed_plane(&planes[1], w / 2, h / 2)?;
         let v = Self::packed_plane(&planes[2], w / 2, h / 2)?;
 
-        let sf = self.session.encode_frame(&y, &u, &v);
-
-        let pts = vf.pts.unwrap_or(self.frame_index);
-        let mut packet = Packet::new(0, self.time_base, sf.annex_b)
-            .with_pts(pts)
-            .with_dts(pts);
-        packet.duration = Some(1);
-        packet.flags.keyframe = sf.is_idr;
-        self.queue.push_back(packet);
+        let frames = self.session.push_frame(&y, &u, &v);
+        let input_pts = vf.pts.unwrap_or(self.frame_index);
+        self.enqueue(frames, input_pts);
         self.frame_index += 1;
         Ok(())
     }
@@ -336,7 +383,10 @@ impl CoreEncoder for H264CodecEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // No lookahead: every send_frame already produced its packet.
+        // Drain the reorder buffer (bframes > 0; a no-op otherwise —
+        // every send_frame already produced its packet).
+        let tail = self.session.finish();
+        self.enqueue(tail, self.frame_index);
         Ok(())
     }
 }

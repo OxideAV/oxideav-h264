@@ -219,6 +219,51 @@ fn invalid_configs_error_cleanly() {
     let mut p = base_params();
     p.options.insert("gop", "0");
     assert!(ctx.codecs.first_encoder(&p).is_err());
+
+    // bframes out of range.
+    let mut p = base_params();
+    p.options.insert("bframes", "17");
+    assert!(ctx.codecs.first_encoder(&p).is_err());
+}
+
+#[test]
+fn bframes_registry_roundtrip_reorders_and_decodes() {
+    // Round-443 — `bframes=2`: mini-GOPs of P + 2 non-reference B.
+    // Packets come out in DECODE order (dts = decode counter) with
+    // pts = display index + 1 (one-frame reorder latency).
+    let mut params = base_params();
+    params.options.insert("rc", "cbr");
+    params.options.insert("bitrate", "150000");
+    params.options.insert("bframes", "2");
+    params.options.insert("gop", "12");
+    let packets = encode_n(&params, 20, 0);
+    assert_eq!(packets.len(), 20, "one packet per frame after flush");
+
+    // dts strictly monotone, pts >= dts on every packet, and the pts
+    // set is exactly the display slots 1..=20.
+    let mut ptss: Vec<i64> = Vec::new();
+    for (n, p) in packets.iter().enumerate() {
+        assert_eq!(p.dts, Some(n as i64), "decode-order dts");
+        let pts = p.pts.expect("pts set");
+        assert!(pts >= n as i64, "pts {pts} below dts {n}");
+        ptss.push(pts);
+    }
+    let mut sorted = ptss.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (1..=20).collect::<Vec<i64>>(), "display slots");
+    // The anchor of the first mini-GOP (display 3) precedes its Bs
+    // (display 1, 2) in decode order.
+    assert_eq!(&ptss[..4], &[1, 4, 2, 3], "IDR then anchor-first mini-GOP");
+    // IDR cadence: keyframes at display slots 0 and 12 → pts 1, 13.
+    let kf: Vec<i64> = packets
+        .iter()
+        .filter(|p| p.flags.keyframe)
+        .map(|p| p.pts.unwrap())
+        .collect();
+    assert_eq!(kf, vec![1, 13], "IDR packets at gop boundaries");
+
+    let frames = decode_all(&packets);
+    assert_eq!(frames.len(), 20, "registry decoder frame count");
 }
 
 #[test]
