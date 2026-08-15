@@ -4251,6 +4251,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             } else {
                 inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
             };
+            if inter_debug {
+                eprintln!(
+                    "    RES blk4={blk4} has_res={has_res} qp'={qp_prime_y} res={:?}",
+                    residual
+                );
+            }
             for yy in 0..4 {
                 for xx in 0..4 {
                     let v = pred_luma[(by as usize + yy) * 16 + (bx as usize + xx)]
@@ -4698,6 +4704,17 @@ fn process_partition<R: RefPicProvider>(
 
     if has_l0 {
         let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
+        if inter_debug {
+            eprintln!(
+                "    L0 ref idx={} pic {}x{} poc={} fld={:?} ysum0={}",
+                part.ref_idx_l0,
+                rp.width_in_samples,
+                rp.height_in_samples,
+                rp.pic_order_cnt,
+                fld,
+                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+            );
+        }
         mc_luma_partition(
             rp,
             part_abs_x,
@@ -4712,6 +4729,17 @@ fn process_partition<R: RefPicProvider>(
     }
     if has_l1 {
         let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
+        if inter_debug {
+            eprintln!(
+                "    L1 ref idx={} pic {}x{} poc={} fld={:?} ysum0={}",
+                part.ref_idx_l1,
+                rp.width_in_samples,
+                rp.height_in_samples,
+                rp.pic_order_cnt,
+                fld,
+                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+            );
+        }
         mc_luma_partition(
             rp,
             part_abs_x,
@@ -4723,6 +4751,18 @@ fn process_partition<R: RefPicProvider>(
             &mut l1_buf,
             fld,
         )?;
+        if inter_debug {
+            eprintln!(
+                "    L1 buf abs=({part_abs_x},{part_abs_y}) mv={:?} row sums: {:?}",
+                (mv_l1.x, mv_l1.y),
+                (0..h as usize)
+                    .map(|j| l1_buf[j * w as usize..(j + 1) * w as usize]
+                        .iter()
+                        .sum::<i32>()
+                        / w as i32)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     // §8.4.2.3 — combine L0 / L1 prediction buffers into the final
@@ -5827,44 +5867,53 @@ fn neighbour_mvs_for_list(
     let mb_xx = mb_xx as i32;
     let mb_yy = mb_yy as i32;
 
-    // A = (px-1, py) — left.
+    // §8.4.1.3.2 / §6.4.11.7 — the neighbouring partitions are probed
+    // at LUMA SAMPLE locations relative to the partition origin
+    // ( xP, yP ) = ( 4*px, 4*py ): A = ( xP − 1, yP ), B =
+    // ( xP, yP − 1 ), C = ( xP + partWidth, yP − 1 ), D =
+    // ( xP − 1, yP − 1 ). The exact sample row/column matters in an
+    // MBAFF frame: Table 6-4 selects the neighbouring FIELD MB of a
+    // pair by the PARITY of yN (`yN % 2`), so probing D of a bottom
+    // partition at the block's top row ( 4*py − 4, even) instead of
+    // the spec's ( 4*py − 1, odd) reads the WRONG field macroblock of
+    // a field-coded left pair (CAPAMA3 frame 1 MB 8: the §8.4.1.3.1
+    // median pulled mb6's L1 data where the text says mb7's).
     let a = neighbour_from_block(
         grid,
         mb_addr,
         mb_xx,
         mb_yy,
         width,
-        px - 1,
-        py,
+        4 * px - 1,
+        4 * py,
         list,
         current_slice_id,
     );
-    // B = (px, py-1) — above.
+    // B = ( xP, yP − 1 ) — above.
     let b = neighbour_from_block(
         grid,
         mb_addr,
         mb_xx,
         mb_yy,
         width,
-        px,
-        py - 1,
+        4 * px,
+        4 * py - 1,
         list,
         current_slice_id,
     );
-    // C = (px + w/4, py - 1) — above-right of the partition.
-    let c_off_x = part.w as i32 / 4;
+    // C = ( xP + partWidth, yP − 1 ) — above-right of the partition.
     let c = neighbour_from_block(
         grid,
         mb_addr,
         mb_xx,
         mb_yy,
         width,
-        px + c_off_x,
-        py - 1,
+        4 * px + part.w as i32,
+        4 * py - 1,
         list,
         current_slice_id,
     );
-    // D = (px - 1, py - 1) — above-left (used for §8.4.1.3.2 C→D
+    // D = ( xP − 1, yP − 1 ) — above-left (used for §8.4.1.3.2 C→D
     // substitution). Only consulted when C is unavailable.
     let d = neighbour_from_block(
         grid,
@@ -5872,18 +5921,18 @@ fn neighbour_mvs_for_list(
         mb_xx,
         mb_yy,
         width,
-        px - 1,
-        py - 1,
+        4 * px - 1,
+        4 * py - 1,
         list,
         current_slice_id,
     );
     (a, b, c, d)
 }
 
-/// Fetch a NeighbourMv at (bx, by) in 4x4-block coordinates relative
-/// to the current MB. Negative coordinates cross into adjacent MBs
-/// (§6.4.12). Returns `UNAVAILABLE` if the neighbour lies outside the
-/// picture or hasn't been decoded yet.
+/// Fetch a NeighbourMv at the luma SAMPLE location (xn, yn) relative
+/// to the current MB's top-left sample. Negative coordinates cross
+/// into adjacent MBs (§6.4.12). Returns `UNAVAILABLE` if the
+/// neighbour lies outside the picture or hasn't been decoded yet.
 ///
 /// `curr_mb_addr` is the address of the current (in-flight) MB: when
 /// the wrapped neighbour turns out to be the same MB (i.e. an earlier
@@ -5899,30 +5948,29 @@ fn neighbour_from_block(
     mb_xx: i32,
     mb_yy: i32,
     width: i32,
-    bx: i32,
-    by: i32,
+    xn: i32,
+    yn: i32,
     list: u8,
     current_slice_id: i32,
 ) -> NeighbourMv {
     let (addr, bxw, byw) = if grid.mbaff_frame_flag {
         // §6.4.12.2 — in an MBAFF frame the macroblock addresses are
         // pair-interleaved and the neighbouring-4x4-block derivation
-        // must run through the §6.4.10/Table 6-4 process. Convert the
-        // relative 4x4-block offset to a relative luma sample offset
-        // (block −1 → sample −1, the neighbour MB's rightmost/lowest
-        // line; block 4 → sample 16) and probe.
-        let xn = if bx < 0 { 4 * bx + 3 } else { 4 * bx };
-        let yn = if by < 0 { 4 * by + 3 } else { 4 * by };
+        // must run through the §6.4.10/Table 6-4 process on the EXACT
+        // sample location: the parity of yN picks the field MB of a
+        // field-coded neighbouring pair.
         match mbaff_neigh_loc_luma(grid, curr_mb_addr, xn, yn) {
             Some((addr, xw, yw)) => (addr, xw / 4, yw / 4),
             None => return NeighbourMv::UNAVAILABLE,
         }
     } else {
-        // Non-MBAFF: wrap to the raster neighbour MB.
+        // Non-MBAFF: wrap to the raster neighbour MB in 4x4-block
+        // coordinates (floor division keeps sample −1 in the left /
+        // above neighbour's last block line).
         let mut nx = mb_xx;
         let mut ny = mb_yy;
-        let mut bxw = bx;
-        let mut byw = by;
+        let mut bxw = xn.div_euclid(4);
+        let mut byw = yn.div_euclid(4);
         if bxw < 0 {
             nx -= 1;
             bxw += 4;

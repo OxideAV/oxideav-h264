@@ -1648,13 +1648,19 @@ fn conformance_staged_camp_mot_picaff0() {
 
 /// Sand Video `CAPAMA3_Sand_F` — CIF, PAFF + MBAFF, CABAC, IDR-B-B-P,
 /// temporal direct. AFRM pictures give the mbAddrCol2/3/5/6 MBAFF
-/// variants including the eq. 8-182 topAbsDiffPOC tie-break.
+/// variants including the eq. 8-182 topAbsDiffPOC tie-break. All 50
+/// frames gate BYTE-EXACT (round 443: the §6.4.11.7 / Table 6-4 MVP
+/// neighbour probes now use exact sample locations — the parity of
+/// yN selects the field MB of a field-coded neighbouring pair, so
+/// the D/B/C probes at yP − 1 of a partition previously read the
+/// WRONG field macroblock's motion data in mixed field/frame AFRM
+/// pictures).
 #[test]
 fn conformance_staged_capama3_sand_f() {
-    let Some(_report) = run_staged_conformance("staged_CAPAMA3_Sand_F", "CAPAMA3_Sand_F.264")
-    else {
+    let Some(report) = run_staged_conformance("staged_CAPAMA3_Sand_F", "CAPAMA3_Sand_F.264") else {
         return;
     };
+    assert_staged_bit_exact(&report);
 }
 
 /// Toshiba `CAPA1_TOSHIBA_B` — CIF, 90 frames, PAFF, CABAC, temporal

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 443 — **§6.4.11.7 / Table 6-4 MVP neighbour probes now use
+  exact sample locations; `CAPAMA3_Sand_F` decodes 50/50 byte-exact
+  — every staged JVT conformance bitstream now gates byte-exact.**
+  The §8.4.1.3 motion-vector-prediction neighbour fetch converted
+  4x4-block offsets to sample offsets with the block's TOP row
+  (`yN = 4*by`), which loses the exact row the text probes: the
+  B / C / D neighbours of a partition at ( xP, yP ) sit at
+  `yN = yP − 1` — an ODD sample row for the bottom partitions of a
+  top macroblock — and in an MBAFF frame Table 6-4 selects which
+  FIELD macroblock of a field-coded neighbouring pair supplies the
+  motion data by the PARITY of yN (`yN % 2`). Probing the D
+  substitute of a bottom 16x8 partition at row 4 instead of row 7
+  read the TOP field MB's motion where the text names the BOTTOM
+  field MB's, so the §8.4.1.3.1 median pulled the wrong vector
+  (first divergence: CAPAMA3 frame 1 MB 8 — the median resolved to
+  (0, 0) instead of (20, 123); localised by black-box search of the
+  reference decoder's prediction source against the parsed
+  residual). Non-MBAFF behaviour is unchanged (floor division
+  restores the identical block). This closes the round-440 triage
+  residue: the suspected "single-bin CABAC divergence" was never an
+  entropy-layer issue — the CABAC parse was byte-exact throughout,
+  and the divergence class was reconstruction-only (MVP neighbour
+  identity), which is exactly why the engine never desynchronised.
+  `CAPAMA3_Sand_F` (PAFF + MBAFF, CABAC, temporal direct) goes
+  12/50 → **50/50** frames byte-exact and now gates as a hard
+  assert alongside camp_mot_picaff0_full (30/30), CAPA1_TOSHIBA_B
+  (90/90) and CVPA1_TOSHIBA_B (90/90). Per-MB inter triage
+  instrumentation (resolved reference identity, MC row means,
+  per-block residuals under `OXIDEAV_H264_RECON_DEBUG_MB`) landed
+  alongside.
+
 ### Added
 
 - Round 443 — **B-frame rate control**. The encoder's rate-control

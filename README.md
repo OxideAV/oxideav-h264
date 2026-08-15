@@ -79,12 +79,16 @@ frame-slice reference lists collapse complementary field pairs into
 §8.2.4.2.1/.2.3 frame-level UNITS (re-interleaved for MC; non-paired
 fields excluded), and MBAFF intra prediction gathers its reference
 SAMPLES through the §6.4.12 Table 6-4 process (mixed field/frame
-pairs previously read raster-adjacent rows). Three of the four staged
-JVT conformance bitstreams now gate **byte-exact end-to-end** as hard
+pairs previously read raster-adjacent rows). **All four staged
+JVT conformance bitstreams gate byte-exact end-to-end** as hard
 asserts: `camp_mot_picaff0_full` (PAFF CABAC IBBP temporal direct,
-30/30), `CAPA1_TOSHIBA_B` (90/90) and `CVPA1_TOSHIBA_B` (90/90);
-`CAPAMA3_Sand_F` (PAFF + MBAFF) is at 12/50 with the remainder under
-triage. Encoder: **implicit-weight B fields**
+30/30), `CAPA1_TOSHIBA_B` (90/90), `CVPA1_TOSHIBA_B` (90/90) and —
+round 443 — `CAPAMA3_Sand_F` (PAFF + MBAFF, 50/50): the §8.4.1.3
+MVP neighbour probes now use the §6.4.11.7 exact sample locations,
+whose yN PARITY drives the Table 6-4 field-MB selection inside a
+field-coded neighbouring pair (the B/C/D probes at yP − 1 of a
+partition previously read the wrong field macroblock's motion data
+in mixed field/frame AFRM pictures). Encoder: **implicit-weight B fields**
 (`PaffConfig::b_implicit_weight` — stride-3 anchors put the two
 non-reference B pairs at unequal per-field POC distances so the
 §8.4.2.3.3 weights genuinely leave 32/32: 43/21 and 22/42 at
@@ -107,9 +111,10 @@ fixture corpus (`tests/docs_corpus.rs`) decodes each fixture
 byte-for-byte against its `expected.yuv`. As of round 416 the corpus
 holds 36 fixtures and **all 36 targets gate `BitExact` over their full
 frame counts**; round 440 added four staged upstream JVT conformance
-bitstreams (`docs/video/h264/conformance/`) of which three gate
-byte-exact as hard asserts (camp_mot_picaff0_full 30/30,
-CAPA1_TOSHIBA_B 90/90, CVPA1_TOSHIBA_B 90/90) — every profile/tool combination staged (Baseline/Main/
+bitstreams (`docs/video/h264/conformance/`) and as of round 443 **all
+four gate byte-exact as hard asserts** (camp_mot_picaff0_full 30/30,
+CAPA1_TOSHIBA_B 90/90, CVPA1_TOSHIBA_B 90/90, CAPAMA3_Sand_F 50/50)
+— every profile/tool combination staged (Baseline/Main/
 High/High10/High422/High444; 8- and 10-bit; 4:2:0/4:2:2/4:4:4; CAVLC +
 CABAC; I/P/B with temporal + spatial direct, explicit + implicit
 weighted prediction, multi-ref, multi-slice, non-flat scaling
