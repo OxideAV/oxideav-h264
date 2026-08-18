@@ -42,6 +42,12 @@ use crate::encoder::transform::zigzag_scan_4x4;
 ///   first), 8 chroma AC 4x4 blocks per plane, CAVLC ctx `ChromaDc422`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromaWriteKind<'a> {
+    /// Round-448 — ChromaArrayType == 0 (monochrome 4:0:0, or one
+    /// colour plane of a `separate_colour_plane_flag = 1` stream).
+    /// Per §7.3.5.3 no chroma residual syntax exists: `residual()`
+    /// only invokes `residual_luma(...)`, and §7.3.5.1 omits
+    /// `intra_chroma_pred_mode`. `emit` writes nothing.
+    Mono,
     /// 4:2:0 chroma layout. The DC arrays are 4-entry, AC are 4-block.
     Yuv420 {
         /// Cb DC levels in the order the inverse 2x2 Hadamard expects.
@@ -147,6 +153,10 @@ impl<'a> ChromaWriteKind<'a> {
     pub fn emit(self, w: &mut BitWriter, cbp_chroma: u8) -> Result<(), CavlcEncodeError> {
         debug_assert!(cbp_chroma <= 2);
         match self {
+            ChromaWriteKind::Mono => {
+                // §7.3.5.3 — ChromaArrayType == 0: no chroma residual.
+                debug_assert_eq!(cbp_chroma, 0, "no chroma CBP at ChromaArrayType 0");
+            }
             ChromaWriteKind::Yuv420 {
                 chroma_dc_cb,
                 chroma_dc_cr,
@@ -619,7 +629,10 @@ pub fn write_intra16x16_mb_chroma(
     w.ue(raw);
     // §7.3.5.1 — intra_chroma_pred_mode is absent when ChromaArrayType
     // is 0 (monochrome) or 3 (4:4:4).
-    if !matches!(chroma, ChromaWriteKind::Yuv444 { .. }) {
+    if !matches!(
+        chroma,
+        ChromaWriteKind::Yuv444 { .. } | ChromaWriteKind::Mono
+    ) {
         w.ue(intra_chroma_pred_mode as u32);
     }
     // §7.3.5 — coded_block_pattern absent for Intra_16x16; mb_qp_delta
@@ -1268,8 +1281,8 @@ pub fn emit_inter_mb_tail(
 
     // §7.3.5 — coded_block_pattern me(v) with the ChromaArrayType-
     // matched inter table.
-    let codenum = if chroma_array_type == 3 {
-        debug_assert_eq!(cbp_chroma, 0, "no chroma CBP at ChromaArrayType 3");
+    let codenum = if chroma_array_type == 0 || chroma_array_type == 3 {
+        debug_assert_eq!(cbp_chroma, 0, "no chroma CBP at ChromaArrayType 0 / 3");
         inter_cbp_to_codenum_0_3(cbp_luma)
     } else {
         inter_cbp_to_codenum_420_422(cbp_luma, cbp_chroma)

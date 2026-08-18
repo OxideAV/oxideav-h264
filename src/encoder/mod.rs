@@ -946,6 +946,7 @@ struct MbStateSnapshot {
 /// §6.2 Table 6-1 — per-MB chroma tile size for a chroma format.
 fn chroma_tile_dims(chroma_array_type: u32) -> (usize, usize) {
     match chroma_array_type {
+        0 => (0, 0),
         2 => (8, 16),
         3 => (16, 16),
         _ => (8, 8),
@@ -1238,9 +1239,10 @@ impl Encoder {
         );
         assert!((0..=51).contains(&cfg.qp));
         assert!(
-            matches!(cfg.chroma_format_idc, 1..=3),
-            "encoder only supports 4:2:0 (chroma_format_idc=1), 4:2:2 \
-             (chroma_format_idc=2), and 4:4:4 (chroma_format_idc=3); got {}",
+            matches!(cfg.chroma_format_idc, 0..=3),
+            "encoder only supports 4:0:0 (chroma_format_idc=0), 4:2:0 \
+             (chroma_format_idc=1), 4:2:2 (chroma_format_idc=2), and \
+             4:4:4 (chroma_format_idc=3); got {}",
             cfg.chroma_format_idc,
         );
         // Round-27: 4:2:2 currently requires the High 4:2:2 profile (122).
@@ -1248,6 +1250,18 @@ impl Encoder {
         // profile (244). The 4:2:0-only P/B paths still pin profile_idc
         // to 66/77; the chroma-extended IDR paths need a profile in the
         // §7.3.2.1.1 chroma-extended group.
+        //
+        // Round-448: 4:0:0 (monochrome) needs a High-family profile —
+        // §A.2.4 (High, 100) is the lowest profile whose supported
+        // chroma range includes chroma_format_idc = 0.
+        if cfg.chroma_format_idc == 0 {
+            assert!(
+                matches!(cfg.profile_idc, 100 | 110 | 122 | 244),
+                "4:0:0 (chroma_format_idc=0) requires a High-family profile \
+                 (100 / 110 / 122 / 244); got {}",
+                cfg.profile_idc,
+            );
+        }
         if cfg.chroma_format_idc == 2 {
             assert_eq!(
                 cfg.profile_idc, 122,
@@ -1325,12 +1339,15 @@ impl Encoder {
         let width_mbs = self.cfg.width / 16;
         let height_mbs = self.cfg.height / 16;
         // §6.2 / Table 6-1 — chroma plane dimensions per chroma_format_idc.
-        // 4:2:0 → (W/2, H/2); 4:2:2 → (W/2, H); 4:4:4 → (W, H).
+        // 4:0:0 → none; 4:2:0 → (W/2, H/2); 4:2:2 → (W/2, H);
+        // 4:4:4 → (W, H).
         let chroma_width = match self.cfg.chroma_format_idc {
+            0 => 0usize,
             3 => self.cfg.width as usize,
             _ => (self.cfg.width / 2) as usize,
         };
         let chroma_height = match self.cfg.chroma_format_idc {
+            0 => 0usize,
             2 => self.cfg.height as usize,
             3 => self.cfg.height as usize,
             _ => (self.cfg.height / 2) as usize,
@@ -1717,6 +1734,32 @@ impl Encoder {
     ) -> MbDeblockInfo {
         let width = self.cfg.width as usize;
         let mb_addr = (mb_y as u32) * self.cfg.width / 16 + (mb_x as u32);
+
+        // Round-448 — ChromaArrayType == 0 (monochrome, or one colour
+        // plane of a `separate_colour_plane_flag = 1` stream): the MB
+        // is luma-only, coded as Intra_16x16 (mirrors the round-28
+        // 4:4:4 bring-up — the I_NxN / I_8x8 writers on this CAVLC
+        // path still assume an intra_chroma_pred_mode field).
+        if self.cfg.chroma_format_idc == 0 {
+            return self
+                .encode_mb_intra16x16(
+                    frame,
+                    mb_x,
+                    mb_y,
+                    qp_y,
+                    qp_c,
+                    chroma_width,
+                    chroma_height,
+                    recon_y,
+                    recon_u,
+                    recon_v,
+                    sw,
+                    nc_grid,
+                    intra_grid,
+                    mb_qp_delta,
+                )
+                .deblock;
+        }
 
         // Round-28: 4:4:4 started Intra_16x16-only. Round-388 added a
         // two-way Lagrangian RDO vs Intra_8x8 under `transform_8x8`.
@@ -2148,8 +2191,8 @@ impl Encoder {
         mb_qp_delta: i32,
     ) -> MbTrial {
         debug_assert!(
-            self.cfg.chroma_format_idc == 1 || mb_qp_delta == 0,
-            "round-430 row modulation (non-zero mb_qp_delta) is 4:2:0-only; \
+            matches!(self.cfg.chroma_format_idc, 0 | 1) || mb_qp_delta == 0,
+            "round-430 row modulation (non-zero mb_qp_delta) is 4:2:0/4:0:0-only; \
              the 4:2:2 / 4:4:4 writer branches still hard-code delta 0",
         );
         let width = self.cfg.width as usize;
@@ -2353,6 +2396,10 @@ impl Encoder {
                 cbp_luma = 15;
             }
             (0u8, 0u8)
+        } else if chroma_array_type == 0 {
+            // Round-448 — monochrome: no chroma planes, no chroma
+            // syntax (§7.3.5.1 / §7.3.5.3 at ChromaArrayType == 0).
+            (0u8, 0u8)
         } else {
             let chroma_block = encode_chroma_block(
                 chroma_array_type,
@@ -2496,6 +2543,24 @@ impl Encoder {
                 chroma_ac_nc_cr: nc_cr,
             };
             write_intra16x16_mb(sw, &mb_cfg, nc_dc_ctx).expect("write Intra16x16 mb");
+        } else if chroma_array_type == 0 {
+            // Round-448 — monochrome: luma syntax only. No
+            // intra_chroma_pred_mode (§7.3.5.1), no chroma residual
+            // (§7.3.5.3); `ChromaWriteKind::Mono` emits nothing.
+            crate::encoder::macroblock::write_intra16x16_mb_chroma(
+                sw,
+                best_luma_mode.as_u8(),
+                /* intra_chroma_pred_mode: absent at ChromaArrayType 0 */ 0,
+                cbp_luma,
+                cbp_chroma,
+                mb_qp_delta,
+                &dc_levels,
+                &luma_ac_levels,
+                &luma_ac_nc,
+                crate::encoder::macroblock::ChromaWriteKind::Mono,
+                nc_dc_ctx,
+            )
+            .expect("write Intra16x16 mb (4:0:0)");
         } else if chroma_array_type == 2 {
             // Round-27: 4:2:2 path. Pass per-plane 8-entry DC + 8-block
             // AC arrays via `ChromaWriteKind::Yuv422`.
@@ -5621,12 +5686,15 @@ impl Encoder {
         let width_mbs = self.cfg.width / 16;
         let height_mbs = self.cfg.height / 16;
         // §6.2 Table 6-1 — chroma plane dimensions per chroma format
-        // (round-397: encode_p runs at 4:2:0, 4:2:2 and 4:4:4).
+        // (round-397: encode_p runs at 4:2:0, 4:2:2 and 4:4:4;
+        // round-448 adds 4:0:0).
         let chroma_width = match self.cfg.chroma_format_idc {
+            0 => 0usize,
             3 => self.cfg.width as usize,
             _ => (self.cfg.width / 2) as usize,
         };
         let chroma_height = match self.cfg.chroma_format_idc {
+            0 => 0usize,
             2 | 3 => self.cfg.height as usize,
             _ => (self.cfg.height / 2) as usize,
         };
@@ -5929,6 +5997,8 @@ impl Encoder {
         let chroma_w = chroma_width as u32;
         let chroma_h = chroma_height as u32;
         let (pred_u, pred_v): (Vec<i32>, Vec<i32>) = match chroma_array_type {
+            // Round-448 — 4:0:0: no chroma planes to predict.
+            0 => (Vec::new(), Vec::new()),
             3 => (
                 build_inter_pred_luma(prev.recon_u, chroma_w, chroma_h, mb_x, mb_y, chosen_mv)
                     .to_vec(),
@@ -6142,6 +6212,9 @@ impl Encoder {
         let mut cr444 = InterLumaForward::default();
         let mut cbp_chroma: u8 = 0;
         match chroma_array_type {
+            // Round-448 — 4:0:0: no chroma residual exists
+            // (§7.3.5.3 residual() is luma-only); cbp_chroma stays 0.
+            0 => {}
             3 => {
                 let pu: &[i32; 256] = pred_u[..256].try_into().expect("pred tile");
                 let pv: &[i32; 256] = pred_v[..256].try_into().expect("pred tile");
@@ -6366,6 +6439,8 @@ impl Encoder {
             }
         }
         match chroma_array_type {
+            // Round-448 — 4:0:0: nothing to reconstruct.
+            0 => {}
             3 => {
                 // §7.3.5.3 — per-plane luma-like recon: pred + residual
                 // on coded quadrants, pred-only elsewhere (mirror of
@@ -6515,6 +6590,18 @@ impl Encoder {
         };
         let _ = luma_4x4_quant_raster; // already folded into recon_block_residual
         match chroma_array_type {
+            // Round-448 — 4:0:0: luma-only P_L0_16x16 syntax; the
+            // Table 9-4(b) inter CBP column applies (shared with 4:4:4).
+            0 => {
+                crate::encoder::macroblock::write_p_l0_16x16_mb_chroma(
+                    sw,
+                    &mb_cfg,
+                    0,
+                    0,
+                    crate::encoder::macroblock::ChromaWriteKind::Mono,
+                )
+                .expect("write P_L0_16x16 mb (4:0:0)");
+            }
             3 => {
                 let cb_nc = derive_plane_nc_444_inter(
                     nc_grid,
@@ -6617,7 +6704,7 @@ impl Encoder {
         // unused).
         let luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
         let chroma_nonzero_4x4: u16 = match chroma_array_type {
-            3 => 0,
+            0 | 3 => 0,
             2 => {
                 let mut m = 0u16;
                 for blk in 0..8usize {
@@ -12829,6 +12916,9 @@ impl Encoder {
         let mut cr444 = InterLumaForward::default();
         let mut cbp_chroma: u8 = 0;
         match chroma_array_type {
+            // Round-448 — 4:0:0: no chroma residual exists
+            // (§7.3.5.3 residual() is luma-only); cbp_chroma stays 0.
+            0 => {}
             3 => {
                 let pu: &[i32; 256] = pred_u[..256].try_into().expect("pred tile");
                 let pv: &[i32; 256] = pred_v[..256].try_into().expect("pred tile");

@@ -183,17 +183,22 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
          would require additional bit_depth_* / scaling-matrix wiring per §7.3.2.1.1.",
         cfg.profile_idc,
     );
-    // Round-27/28: chroma_format_idc accepted values.
+    // Round-27/28: chroma_format_idc accepted values. Round-448 adds
+    // 0 (monochrome 4:0:0).
     debug_assert!(
-        matches!(cfg.chroma_format_idc, 1..=3),
-        "chroma_format_idc {} not in writer scope (1=4:2:0, 2=4:2:2, 3=4:4:4)",
+        matches!(cfg.chroma_format_idc, 0..=3),
+        "chroma_format_idc {} not in writer scope (0=4:0:0, 1=4:2:0, 2=4:2:2, 3=4:4:4)",
         cfg.chroma_format_idc,
     );
     // Round-27: 4:2:2 only with profile 122. Round-28: 4:4:4 only with
-    // profile 244. The other chroma-extended-group profiles aren't
-    // emitted by this writer.
+    // profile 244. Round-448: 4:0:0 is a High-family tool — §A.2.4
+    // (High) lists chroma_format_idc ∈ {0, 1}, and the higher-fidelity
+    // High profiles (§A.2.5..§A.2.7) include monochrome in their
+    // supported chroma range too. The other chroma-extended-group
+    // profiles aren't emitted by this writer.
     debug_assert!(
         match cfg.chroma_format_idc {
+            0 => matches!(cfg.profile_idc, 100 | 110 | 122 | 244),
             1 => true,
             2 => cfg.profile_idc == 122,
             3 => cfg.profile_idc == 244,

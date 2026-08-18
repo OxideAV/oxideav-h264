@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 448 — **monochrome (4:0:0, `chroma_format_idc = 0`) encode +
+  decode**. ChromaArrayType 0 pictures code a luma plane only
+  (§7.4.2.1.1 / §6.2); the decoder's parse layer already carried the
+  monochrome branches (no `intra_chroma_pred_mode` per §7.3.5.1,
+  luma-only `residual()` per §7.3.5.3, the Table 9-4(b)
+  `coded_block_pattern` column shared with ChromaArrayType 3) and now
+  decodes 4:0:0 streams end-to-end: `Picture` carries empty chroma
+  planes, §8.7 deblocking filters luma only, and the emitted
+  `VideoFrame` is single-plane. The encoder gains the 4:0:0 legs:
+  `EncoderConfig::chroma_format_idc = 0` under a High-family profile
+  (§A.2.4 lists monochrome in the High profile's supported chroma
+  range) encodes IDR (Intra_16x16, 4-mode RDO) and P pictures
+  (P_Skip / P_L0_16x16 with quarter-pel ME) through
+  `ChromaWriteKind::Mono` — luma-only MB syntax, chroma work skipped
+  at every stage (prediction, residual, recon, deblock mask, nC
+  grid). Gates (`tests/integration_mono.rs`): bit-exact
+  self-roundtrip on IDR / IDR+P+P GOPs at QP 12 / 26 / 44 plus
+  byte-exact luma comparison against a stock black-box reference
+  decoder binary (which surfaces 4:0:0 as yuv420p output with
+  synthetic chroma — the gate compares the luma portion).
+
 ### Fixed
 
 - Round 443 — **§6.4.11.7 / Table 6-4 MVP neighbour probes now use
