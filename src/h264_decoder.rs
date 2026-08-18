@@ -162,6 +162,42 @@ struct PendingField {
     pts: Option<i64>,
 }
 
+/// §8.1 — separate-colour-plane decode state (round 448). When the
+/// active SPS carries `separate_colour_plane_flag == 1`, "the decoding
+/// process is invoked three times: … the decoding process of NAL units
+/// with a particular value of colour_plane_id is specified as if only
+/// a coded video sequence with monochrome colour format with that
+/// particular value of colour_plane_id would be present in the
+/// bitstream" — so the driver literally keeps three monochrome
+/// sub-decoders and routes every coded slice to the one selected by
+/// its §7.4.3 `colour_plane_id`. Each sub-decoder runs the complete
+/// monochrome pipeline (POC, reference marking, DPB, reconstruction,
+/// §8.7 deblocking, §C.4 output ordering) on its own plane; the
+/// outputs are re-assembled into one three-plane picture per access
+/// unit (plane 0 → S_L, 1 → S_Cb, 2 → S_Cr).
+struct ScpState {
+    subs: [Box<H264CodecDecoder>; 3],
+    /// Per-plane decoded (monochrome) frames awaiting their two
+    /// siblings. The three sub-decoders run identical §8.2.1 / §C.4
+    /// machinery on identical slice-header fields, so their output
+    /// streams pair 1:1 in emission order.
+    queues: [VecDeque<VideoFrame>; 3],
+}
+
+impl ScpState {
+    fn new(codec_id: &CodecId) -> Self {
+        let mk = || {
+            let mut d = H264CodecDecoder::new(codec_id.clone());
+            d.scp_plane_mode = true;
+            Box::new(d)
+        };
+        Self {
+            subs: [mk(), mk(), mk()],
+            queues: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
+        }
+    }
+}
+
 /// Registry factory — called by the codec registry when a container
 /// wants a decoder for H.264.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -263,6 +299,17 @@ pub struct H264CodecDecoder {
     /// output frame.
     pending_field: Option<PendingField>,
 
+    /// §8.1 / §7.4.2.1.1 — separate-colour-plane routing state,
+    /// created lazily at the first coded slice whose SPS carries
+    /// `separate_colour_plane_flag == 1`. See [`ScpState`].
+    scp: Option<Box<ScpState>>,
+    /// True on the three [`ScpState`] sub-decoders: this instance
+    /// decodes ONE colour plane of a `separate_colour_plane_flag == 1`
+    /// stream as a monochrome picture (ChromaArrayType == 0) instead
+    /// of routing — the recursion stop for the §8.1 three-invocation
+    /// process.
+    scp_plane_mode: bool,
+
     // ---- ISO/IEC 14496-15 §5.2.4.1.1 avcC diagnostic snapshot --------
     /// `AVCProfileIndication` from the last `consume_extradata` call.
     /// Optional because Annex B streams have no avcC.
@@ -306,6 +353,8 @@ impl H264CodecDecoder {
             prev_ref_frame_num: None,
             in_progress: None,
             pending_field: None,
+            scp: None,
+            scp_plane_mode: false,
             avcc_profile_idc: None,
             avcc_level_idc: None,
             avcc_chroma_format: None,
@@ -562,6 +611,21 @@ impl H264CodecDecoder {
                 sps,
             } => {
                 self.last_slice = Some(header.clone());
+                // §8.1 — a coded slice of a separate-colour-plane
+                // stream routes to the monochrome sub-decoder of its
+                // §7.4.3 colour_plane_id (unless THIS instance already
+                // is one of those sub-decoders).
+                if sps.separate_colour_plane_flag && !self.scp_plane_mode {
+                    return self.route_scp_slice(
+                        nal_unit_type,
+                        nal_ref_idc,
+                        header,
+                        rbsp,
+                        slice_data_cursor,
+                        sps,
+                        pps,
+                    );
+                }
                 self.handle_slice(
                     nal_unit_type,
                     nal_ref_idc,
@@ -576,12 +640,14 @@ impl H264CodecDecoder {
             // access unit boundary. Any picture we've been assembling is
             // finalized here so the next slice opens a fresh one.
             Event::AccessUnitDelimiter(_) => {
+                self.forward_event_to_scp_subs(&ev)?;
                 self.finalize_in_progress_picture()?;
                 Ok(())
             }
             // §7.3.2.5 / §7.3.2.6 — end of sequence / stream close any
             // picture currently being assembled.
             Event::EndOfSequence | Event::EndOfStream => {
+                self.forward_event_to_scp_subs(&ev)?;
                 self.finalize_in_progress_picture()?;
                 Ok(())
             }
@@ -598,6 +664,92 @@ impl H264CodecDecoder {
                 )))
             }
             _ => Ok(()),
+        }
+    }
+
+    /// §8.1 — route one coded slice of a `separate_colour_plane_flag
+    /// == 1` stream to the monochrome sub-decoder selected by its
+    /// §7.4.3 `colour_plane_id`, then re-assemble any completed
+    /// plane triples into three-plane output frames.
+    #[allow(clippy::too_many_arguments)] // mirrors Event::Slice's flat layout
+    fn route_scp_slice(
+        &mut self,
+        nal_unit_type: u8,
+        nal_ref_idc: u8,
+        header: SliceHeader,
+        rbsp: Vec<u8>,
+        slice_data_cursor: (usize, u8),
+        sps: Sps,
+        pps: crate::pps::Pps,
+    ) -> Result<()> {
+        let plane = header.colour_plane_id as usize;
+        if plane > 2 {
+            return Err(Error::invalid(format!(
+                "h264 slice_header: colour_plane_id {} out of range (§7.4.3 requires 0..=2)",
+                header.colour_plane_id
+            )));
+        }
+        let scp = self
+            .scp
+            .get_or_insert_with(|| Box::new(ScpState::new(&self.codec_id)));
+        // The packet pts belongs to the access unit; the plane-0
+        // (luma) sub-decoder stamps it and the merged frame reuses it.
+        if plane == 0 {
+            if let Some(pts) = self.pending_pts.take() {
+                scp.subs[0].pending_pts = Some(pts);
+            }
+            scp.subs[0].pending_time_base = self.pending_time_base;
+        }
+        scp.subs[plane].handle_event(Event::Slice {
+            nal_unit_type,
+            nal_ref_idc,
+            header,
+            rbsp,
+            slice_data_cursor,
+            pps,
+            sps,
+        })?;
+        self.drain_and_merge_scp();
+        Ok(())
+    }
+
+    /// Forward a non-slice access-unit-boundary event (AUD /
+    /// end-of-sequence / end-of-stream) to the three
+    /// separate-colour-plane sub-decoders, when they exist.
+    fn forward_event_to_scp_subs(&mut self, ev: &Event) -> Result<()> {
+        if let Some(scp) = self.scp.as_mut() {
+            for sub in scp.subs.iter_mut() {
+                sub.handle_event(ev.clone())?;
+            }
+            self.drain_and_merge_scp();
+        }
+        Ok(())
+    }
+
+    /// Pull every frame the separate-colour-plane sub-decoders have
+    /// released into the per-plane queues, then emit one three-plane
+    /// frame per completed (S_L, S_Cb, S_Cr) triple (§8.1: "the output
+    /// of each of the three decoding processes is assigned to the 3
+    /// sample arrays of the current picture").
+    fn drain_and_merge_scp(&mut self) {
+        let Some(scp) = self.scp.as_mut() else {
+            return;
+        };
+        for (sub, queue) in scp.subs.iter_mut().zip(scp.queues.iter_mut()) {
+            while let Ok(Frame::Video(vf)) = sub.receive_frame() {
+                queue.push_back(vf);
+            }
+        }
+        while scp.queues.iter().all(|q| !q.is_empty()) {
+            let y = scp.queues[0].pop_front().expect("checked non-empty");
+            let cb = scp.queues[1].pop_front().expect("checked non-empty");
+            let cr = scp.queues[2].pop_front().expect("checked non-empty");
+            let mut planes = y.planes;
+            // Each sub-decoder emitted a single-plane monochrome frame
+            // of identical geometry (all three planes share the SPS).
+            planes.extend(cb.planes);
+            planes.extend(cr.planes);
+            self.ready.push_back(VideoFrame { pts: y.pts, planes });
         }
     }
 
@@ -2419,6 +2571,14 @@ impl Decoder for H264CodecDecoder {
         // complementary partner; emit it as a standalone half-height
         // frame so it is not silently dropped.
         self.flush_pending_field();
+        // §8.1 — flush the three separate-colour-plane sub-decoders and
+        // merge their drained plane pictures into three-plane frames.
+        if let Some(scp) = self.scp.as_mut() {
+            for sub in scp.subs.iter_mut() {
+                sub.flush()?;
+            }
+            self.drain_and_merge_scp();
+        }
         self.eof = true;
         Ok(())
     }
@@ -2444,6 +2604,9 @@ impl Decoder for H264CodecDecoder {
         // discard in-flight state, not deliver it.
         self.in_progress = None;
         self.pending_field = None;
+        // §8.1 — drop the separate-colour-plane sub-decoders wholesale;
+        // a post-reset stream re-creates them at its first SCP slice.
+        self.scp = None;
         Ok(())
     }
 }

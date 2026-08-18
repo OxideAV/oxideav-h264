@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 448 — **separate-colour-plane decode + encode**
+  (`separate_colour_plane_flag = 1`, High 4:4:4 Predictive — the last
+  deferred leg of the High 4:4:4 decode surface). Decoder: the §8.1
+  three-invocation model is implemented literally — when the active
+  SPS carries the flag, the driver routes every coded slice to one of
+  three internal monochrome sub-decoders selected by the §7.4.3
+  `colour_plane_id` (u(2) between `pic_parameter_set_id` and
+  `frame_num`, already parsed), each running the complete
+  ChromaArrayType-0 pipeline (POC, marking, DPB, reconstruction, §8.7
+  luma deblocking, §C.4 bumping) on its own plane "as if only a coded
+  video sequence with monochrome colour format with that particular
+  value of colour_plane_id would be present"; the three §C.4 output
+  streams re-assemble 1:1 into three-plane (yuv444p-shaped) frames
+  (plane 0 → S_L, 1 → S_Cb, 2 → S_Cr). Per §8.5.9 the luma-path
+  scaling-list selection now takes `iYCbCr = colour_plane_id`
+  (4x4 list `iYCbCr + (mbIsInterFlag ? 3 : 0)`, 8x8 list
+  `2 * iYCbCr + mbIsInterFlag`) instead of the fixed luma indices,
+  and per the §7.4.2.2 NOTE no chroma-QP offset applies. Encoder:
+  `EncoderConfig::colour_plane_id = Some(plane)` turns an
+  (internally monochrome) High 4:4:4 Predictive encoder into a
+  per-plane SCP encoder — the SPS codes the on-wire pair
+  (`chroma_format_idc = 3`, `separate_colour_plane_flag = 1`), every
+  slice header codes `colour_plane_id` — and
+  `encoder::scp::encode_scp_sequence` drives three such encoders over
+  the Y/Cb/Cr planes (CAVLC and CABAC, IDR + P chains, per-plane
+  §8.4 motion) with per-access-unit slice interleaving in increasing
+  plane order. Gates (`tests/integration_scp.rs`, 10): bit-exact
+  self-roundtrip on IDR / IDR+P+P at QP 12/26/44 under both entropy
+  coders; the §8.1 **compositional identity** — every plane of the
+  SCP decode is byte-identical to decoding the same coded plane data
+  wrapped as a standalone 4:0:0 stream (whose decode is itself
+  black-box-validated); and a black-box probe that documents the
+  stock reference decoder binary rejecting SCP streams ("separate
+  color planes are not supported"), so the byte-exact cross-check
+  arms automatically if a capable binary appears.
+
 - Round 448 — **monochrome (4:0:0, `chroma_format_idc = 0`) encode +
   decode**. ChromaArrayType 0 pictures code a luma plane only
   (§7.4.2.1.1 / §6.2); the decoder's parse layer already carried the

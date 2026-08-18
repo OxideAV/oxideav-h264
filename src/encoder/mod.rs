@@ -59,6 +59,7 @@ pub mod pps;
 pub mod rate_control;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod rdo;
+pub mod scp;
 pub mod sei;
 pub mod session;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -409,6 +410,20 @@ pub struct EncoderConfig {
     /// out of scope). Other values (0 monochrome) and the P/B-slice
     /// paths remain 4:2:0-only.
     pub chroma_format_idc: u32,
+    /// Round-448 — separate-colour-plane per-plane encoding. When
+    /// `Some(plane)`, this encoder instance codes ONE colour plane
+    /// (0 = Y, 1 = Cb, 2 = Cr per §7.4.3) of a
+    /// `separate_colour_plane_flag = 1` High 4:4:4 Predictive stream:
+    /// the emitted SPS carries the on-wire pair
+    /// (`chroma_format_idc = 3`, `separate_colour_plane_flag = 1`),
+    /// every slice header codes `colour_plane_id = plane`, and the
+    /// picture itself is coded with the monochrome pipeline
+    /// (ChromaArrayType 0 — requires `chroma_format_idc = 0` and
+    /// `profile_idc = 244`). A full three-plane stream is assembled by
+    /// running three such encoders (one per plane) over the Y / Cb /
+    /// Cr sample arrays and interleaving their slice NALs per access
+    /// unit — see `encoder::scp::encode_scp_sequence`.
+    pub colour_plane_id: Option<u8>,
     /// Round-30 — when `true`, the encoder emits CABAC entropy coding
     /// (`entropy_coding_mode_flag = 1` in the PPS). Use the
     /// [`Encoder::encode_idr_cabac`] / [`Encoder::encode_p_cabac`]
@@ -571,6 +586,7 @@ impl EncoderConfig {
             explicit_weighted_bipred: false,
             intra_in_inter: true,
             chroma_format_idc: 1,
+            colour_plane_id: None,
             cabac: false,
             vui: None,
             level_idc: min_level_idc_for_picture_size(width_in_mbs, height_in_mbs),
@@ -1262,6 +1278,23 @@ impl Encoder {
                 cfg.profile_idc,
             );
         }
+        if let Some(plane) = cfg.colour_plane_id {
+            assert!(plane <= 2, "colour_plane_id must be 0..=2 (§7.4.3)");
+            assert_eq!(
+                cfg.chroma_format_idc, 0,
+                "a separate-colour-plane per-plane encoder codes monochrome \
+                 pictures (ChromaArrayType 0): set chroma_format_idc = 0",
+            );
+            assert_eq!(
+                cfg.profile_idc, 244,
+                "separate_colour_plane_flag lives in the 4:4:4 SPS syntax \
+                 (§7.3.2.1.1): profile_idc must be 244",
+            );
+            assert!(
+                cfg.scaling_matrix.is_flat(),
+                "separate-colour-plane encoding currently requires flat scaling lists",
+            );
+        }
         if cfg.chroma_format_idc == 2 {
             assert_eq!(
                 cfg.profile_idc, 122,
@@ -1411,6 +1444,7 @@ impl Encoder {
             max_num_ref_frames: self.cfg.max_num_ref_frames,
             profile_idc,
             chroma_format_idc: self.cfg.chroma_format_idc,
+            separate_colour_plane: self.cfg.colour_plane_id.is_some(),
             seq_scaling_lists: self.cfg.scaling_matrix.seq_spec(),
             interlaced_fields: false,
             // Round-430 — rate-controlled sessions annotate CBR
@@ -1451,6 +1485,7 @@ impl Encoder {
                 first_mb_in_slice: 0,
                 slice_type_raw: 7,
                 pic_parameter_set_id: 0,
+                colour_plane_id: self.cfg.colour_plane_id,
                 frame_num: 0,
                 frame_num_bits: sps_cfg.log2_max_frame_num_minus4 + 4,
                 idr_pic_id: 0,
@@ -5714,6 +5749,7 @@ impl Encoder {
                 first_mb_in_slice: 0,
                 slice_type_raw: 5, // P, all-same-type
                 pic_parameter_set_id: 0,
+                colour_plane_id: self.cfg.colour_plane_id,
                 frame_num,
                 frame_num_bits: log2_max_frame_num_minus4 + 4,
                 pic_order_cnt_lsb,
@@ -10655,6 +10691,7 @@ impl Encoder {
                 first_mb_in_slice: 0,
                 slice_type_raw: 6, // B, all-same-type
                 pic_parameter_set_id: 0,
+                colour_plane_id: self.cfg.colour_plane_id,
                 frame_num,
                 frame_num_bits: log2_max_frame_num_minus4 + 4,
                 pic_order_cnt_lsb,

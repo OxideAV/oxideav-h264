@@ -757,6 +757,10 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
                 // §8.5.6/§8.5.7 — field inverse scans for FIELD-coded
                 // MBs (MBAFF field pair or field picture).
                 (mbaff_frame_flag && mb_field_decoding_flag) || slice_header.field_pic_flag,
+                // §8.5.9 — iYCbCr: with separate_colour_plane_flag the
+                // "luma" residual of this slice dequantises under the
+                // scaling lists of ITS colour plane (colour_plane_id).
+                luma_scaling_plane(sps, slice_header),
             )?;
         } else {
             reconstruct_mb_inter(
@@ -964,6 +968,9 @@ fn reconstruct_mb_intra(
     // §8.5.6/§8.5.7 — FIELD-coded MB: residual levels use the field
     // inverse scans (field MB in an MBAFF frame, or field picture).
     field_scan: bool,
+    // §8.5.9 — iYCbCr for the luma-path scaling lists: 0 normally,
+    // colour_plane_id when separate_colour_plane_flag == 1.
+    luma_plane: usize,
 ) -> Result<(), ReconstructError> {
     // §6.4.1 — MB sample origin (non-MBAFF eqs. 6-3/6-4 or MBAFF eqs.
     // 6-5..6-10 depending on `mb_field_decoding_flag`).
@@ -1028,6 +1035,7 @@ fn reconstruct_mb_intra(
         }
         MbType::Intra16x16(cfg) => {
             reconstruct_intra_16x16(
+                luma_plane,
                 mb,
                 cfg.pred_mode,
                 cfg.cbp_luma,
@@ -1050,6 +1058,7 @@ fn reconstruct_mb_intra(
         }
         MbType::INxN => {
             reconstruct_intra_nxn(
+                luma_plane,
                 mb,
                 qp_y,
                 bit_depth_y,
@@ -1119,6 +1128,7 @@ fn reconstruct_mb_intra(
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_intra_16x16(
+    luma_plane: usize,
     mb: &Macroblock,
     pred_mode_idx: u8,
     cbp_luma: u8,
@@ -1156,8 +1166,10 @@ fn reconstruct_intra_16x16(
     predict_16x16(mode, &samples, bit_depth_y, &mut pred);
 
     // -------- §8.5.10 — luma DC block (always present for I_16x16) --
-    // §7.4.2.1.1.1 Table 7-2 — Intra luma 4x4 list (index 0).
-    let sl4 = select_scaling_list_4x4(0, sps, pps);
+    // §7.4.2.1.1.1 Table 7-2 — Intra luma 4x4 list (index 0), or per
+    // §8.5.9 the list of THIS colour plane (iYCbCr = colour_plane_id)
+    // when separate_colour_plane_flag == 1.
+    let sl4 = select_scaling_list_4x4(luma_plane, sps, pps);
     // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY is the
     // value the §8.5.10 / §8.5.12 scaling formulas consume. For 8-bit
     // luma QpBdOffsetY = 0 and qp_prime_y == qp_y.
@@ -1868,6 +1880,7 @@ fn derive_intra_8x8_pred_mode(
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_intra_nxn(
+    luma_plane: usize,
     mb: &Macroblock,
     qp_y: i32,
     bit_depth_y: u32,
@@ -1886,9 +1899,12 @@ fn reconstruct_intra_nxn(
         .mb_pred
         .as_ref()
         .ok_or_else(|| ReconstructError::UnsupportedMbType("I_NxN without mb_pred".into()))?;
-    // §7.4.2.1.1.1 Table 7-2 — intra-luma 4x4 list (i=0) / 8x8 list (i=6 → sub-idx 0).
-    let sl4 = select_scaling_list_4x4(0, sps, pps);
-    let sl8 = select_scaling_list_8x8(0, sps, pps);
+    // §7.4.2.1.1.1 Table 7-2 — intra-luma 4x4 list (i=0) / 8x8 list
+    // (i=6 → sub-idx 0); per §8.5.9 iYCbCr = colour_plane_id when
+    // separate_colour_plane_flag == 1 (4x4 index iYCbCr, 8x8 index
+    // 2 * iYCbCr).
+    let sl4 = select_scaling_list_4x4(luma_plane, sps, pps);
+    let sl8 = select_scaling_list_8x8(2 * luma_plane, sps, pps);
     let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
     let cip = pps.constrained_intra_pred_flag;
     // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY.
@@ -3927,6 +3943,18 @@ fn chroma_mb_dims(chroma_array_type: u32) -> (u32, u32) {
 /// per ChromaArrayType. ChromaArrayType 0 (monochrome) returns `(1, 1)`
 /// as a safe fallback; ChromaArrayType 3 (4:4:4) returns `(1, 1)`.
 #[inline]
+/// §8.5.9 — the `iYCbCr` index feeding the luma-path scaling-list
+/// selection: `colour_plane_id` when `separate_colour_plane_flag == 1`
+/// (each colour plane decodes as a monochrome picture but dequantises
+/// under its OWN plane's scaling lists), 0 otherwise.
+fn luma_scaling_plane(sps: &Sps, header: &SliceHeader) -> usize {
+    if sps.separate_colour_plane_flag {
+        (header.colour_plane_id as usize).min(2)
+    } else {
+        0
+    }
+}
+
 fn chroma_subsample(chroma_array_type: u32) -> (i32, i32) {
     match chroma_array_type {
         1 => (2, 2),
@@ -4161,8 +4189,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
     let cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
     // §7.4.2.1.1.1 Table 7-2 — inter-luma lists: 4x4 i=3 / 8x8 i=7 (sub-idx 1).
-    let sl4 = select_scaling_list_4x4(3, sps, pps);
-    let sl8 = select_scaling_list_8x8(1, sps, pps);
+    // §8.5.9 — inter luma lists: 4x4 index iYCbCr + 3, 8x8 index
+    // 2 * iYCbCr + 1, with iYCbCr = colour_plane_id when
+    // separate_colour_plane_flag == 1 and 0 otherwise.
+    let luma_plane = luma_scaling_plane(sps, slice_header);
+    let sl4 = select_scaling_list_4x4(luma_plane + 3, sps, pps);
+    let sl8 = select_scaling_list_8x8(2 * luma_plane + 1, sps, pps);
     // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY.
     let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
     let qp_prime_y = qp_y + qp_bd_offset_y;

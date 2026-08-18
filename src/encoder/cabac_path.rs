@@ -2005,6 +2005,7 @@ impl Encoder {
             max_num_ref_frames: cfg.max_num_ref_frames,
             profile_idc,
             chroma_format_idc: cfg.chroma_format_idc,
+            separate_colour_plane: cfg.colour_plane_id.is_some(),
             // Round-430 — rate-controlled sessions annotate CBR
             // streams with §E.1.1 VUI timing + §E.1.2 NAL HRD.
             vui: cfg.vui.clone(),
@@ -2034,6 +2035,7 @@ impl Encoder {
                 first_mb_in_slice: 0,
                 slice_type_raw: 7,
                 pic_parameter_set_id: 0,
+                colour_plane_id: cfg.colour_plane_id,
                 frame_num: 0,
                 frame_num_bits: 8,
                 idr_pic_id: 0,
@@ -3052,6 +3054,7 @@ impl Encoder {
                 first_mb_in_slice: 0,
                 slice_type_raw: 5,
                 pic_parameter_set_id: 0,
+                colour_plane_id: cfg.colour_plane_id,
                 frame_num,
                 frame_num_bits: 8,
                 pic_order_cnt_lsb,
@@ -4346,6 +4349,7 @@ impl Encoder {
                 first_mb_in_slice: 0,
                 slice_type_raw: 6, // B, all-same-type
                 pic_parameter_set_id: 0,
+                colour_plane_id: cfg.colour_plane_id,
                 frame_num,
                 frame_num_bits: 8,
                 pic_order_cnt_lsb,

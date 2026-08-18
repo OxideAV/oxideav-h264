@@ -68,6 +68,15 @@ pub struct BaselineSpsConfig {
     /// emitting a High 4:4:4 Predictive (244) SPS. The writer asserts
     /// the (profile_idc, chroma_format_idc) pairing is one it understands.
     pub chroma_format_idc: u32,
+    /// Round-448 — §7.3.2.1.1 `separate_colour_plane_flag`. When
+    /// `true` the SPS codes `chroma_format_idc = 3` followed by
+    /// `separate_colour_plane_flag = 1` (the coded planes each use the
+    /// monochrome syntax — ChromaArrayType 0 — per §7.4.2.1.1), and
+    /// `cfg.chroma_format_idc` must be 0 (the caller's per-plane
+    /// encoder runs the monochrome pipeline). Requires
+    /// `profile_idc = 244` (§A.2.7: 4:4:4 syntax) and flat scaling
+    /// lists (`seq_scaling_lists = None`).
+    pub separate_colour_plane: bool,
     /// §7.3.2.1.1 / §7.3.2.1.1.1 — when `Some`, emit
     /// `seq_scaling_matrix_present_flag = 1` with every list present.
     /// `ScalingListsSpec::Default` codes each list as
@@ -108,6 +117,7 @@ impl Default for BaselineSpsConfig {
             max_num_ref_frames: 1,
             profile_idc: 66,
             chroma_format_idc: 1,
+            separate_colour_plane: false,
             seq_scaling_lists: None,
             interlaced_fields: false,
             vui: None,
@@ -197,6 +207,14 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
     // supported chroma range too. The other chroma-extended-group
     // profiles aren't emitted by this writer.
     debug_assert!(
+        !cfg.separate_colour_plane
+            || (cfg.profile_idc == 244
+                && cfg.chroma_format_idc == 0
+                && cfg.seq_scaling_lists.is_none()),
+        "separate_colour_plane requires profile 244, an internally-monochrome \
+         (chroma_format_idc = 0) per-plane encoder, and flat scaling lists",
+    );
+    debug_assert!(
         match cfg.chroma_format_idc {
             0 => matches!(cfg.profile_idc, 100 | 110 | 122 | 244),
             1 => true,
@@ -232,10 +250,19 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
         cfg.profile_idc,
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
     ) {
-        w.ue(cfg.chroma_format_idc);
-        if cfg.chroma_format_idc == 3 {
-            // separate_colour_plane_flag — 4:4:4 only, out of scope.
-            w.u(1, 0);
+        // Round-448 — a separate-colour-plane SPS codes the on-wire
+        // pair (chroma_format_idc = 3, separate_colour_plane_flag = 1)
+        // while the per-plane coding stays monochrome (§7.4.2.1.1:
+        // ChromaArrayType is 0 when separate_colour_plane_flag is 1).
+        let wire_chroma_format_idc = if cfg.separate_colour_plane {
+            3
+        } else {
+            cfg.chroma_format_idc
+        };
+        w.ue(wire_chroma_format_idc);
+        if wire_chroma_format_idc == 3 {
+            // §7.3.2.1.1 — separate_colour_plane_flag (4:4:4 only).
+            w.u(1, u32::from(cfg.separate_colour_plane));
         }
         // bit_depth_luma_minus8 = 0 (8-bit luma).
         w.ue(0);
@@ -513,6 +540,7 @@ mod tests {
             max_num_ref_frames: 1,
             profile_idc: 66,
             chroma_format_idc: 1,
+            separate_colour_plane: false,
         };
         let rbsp = build_baseline_sps_rbsp(&cfg);
         let sps = Sps::parse(&rbsp).expect("decoder parses our SPS");
@@ -555,6 +583,7 @@ mod tests {
             max_num_ref_frames: 1,
             profile_idc: 244,
             chroma_format_idc: 3,
+            separate_colour_plane: false,
         };
         let rbsp = build_baseline_sps_rbsp(&cfg);
         let sps = Sps::parse(&rbsp).expect("decoder parses our 4:4:4 SPS");
@@ -592,6 +621,7 @@ mod tests {
             max_num_ref_frames: 1,
             profile_idc: 122,
             chroma_format_idc: 2,
+            separate_colour_plane: false,
         };
         let rbsp = build_baseline_sps_rbsp(&cfg);
         let sps = Sps::parse(&rbsp).expect("decoder parses our 4:2:2 SPS");

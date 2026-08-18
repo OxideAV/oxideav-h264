@@ -64,6 +64,11 @@ pub struct IdrSliceHeaderConfig<'a> {
     /// picture use 7 (`slice_type % 5 == 2` and `slice_type >= 5`).
     pub slice_type_raw: u32,
     pub pic_parameter_set_id: u32,
+    /// §7.3.3 — `colour_plane_id` u(2), emitted between
+    /// `pic_parameter_set_id` and `frame_num` when the active SPS has
+    /// `separate_colour_plane_flag == 1` (round 448). `None` for
+    /// ordinary streams.
+    pub colour_plane_id: Option<u8>,
     /// `frame_num` width is `log2_max_frame_num_minus4 + 4`. We supply
     /// the value, the bit width is derived by the caller.
     pub frame_num: u32,
@@ -225,6 +230,11 @@ pub fn write_idr_i_slice_header(w: &mut BitWriter, cfg: &IdrSliceHeaderConfig<'_
     w.ue(cfg.first_mb_in_slice);
     w.ue(cfg.slice_type_raw);
     w.ue(cfg.pic_parameter_set_id);
+    // §7.3.3 — colour_plane_id u(2) (separate_colour_plane_flag == 1).
+    if let Some(plane) = cfg.colour_plane_id {
+        debug_assert!(plane <= 2, "colour_plane_id must be 0..=2 (§7.4.3)");
+        w.u(2, plane as u32);
+    }
     // No `colour_plane_id` (separate_colour_plane_flag == 0 in our SPS).
     w.u(cfg.frame_num_bits, cfg.frame_num);
     // §7.3.3 — field_pic_flag / bottom_field_flag when the SPS has
@@ -297,6 +307,11 @@ pub struct PSliceHeaderConfig<'a> {
     /// are P" (slice_type % 5 == 0 and >= 5).
     pub slice_type_raw: u32,
     pub pic_parameter_set_id: u32,
+    /// §7.3.3 — `colour_plane_id` u(2), emitted between
+    /// `pic_parameter_set_id` and `frame_num` when the active SPS has
+    /// `separate_colour_plane_flag == 1` (round 448). `None` for
+    /// ordinary streams.
+    pub colour_plane_id: Option<u8>,
     pub frame_num: u32,
     pub frame_num_bits: u32,
     pub pic_order_cnt_lsb: u32,
@@ -331,6 +346,11 @@ pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig<'_>) {
     w.ue(cfg.first_mb_in_slice);
     w.ue(cfg.slice_type_raw);
     w.ue(cfg.pic_parameter_set_id);
+    // §7.3.3 — colour_plane_id u(2) (separate_colour_plane_flag == 1).
+    if let Some(plane) = cfg.colour_plane_id {
+        debug_assert!(plane <= 2, "colour_plane_id must be 0..=2 (§7.4.3)");
+        w.u(2, plane as u32);
+    }
     // No `colour_plane_id` (separate_colour_plane_flag == 0).
     w.u(cfg.frame_num_bits, cfg.frame_num);
     // §7.3.3 — field_pic_flag / bottom_field_flag when the SPS has
@@ -416,6 +436,11 @@ pub struct BSliceHeaderConfig {
     /// are B" (slice_type % 5 == 1 and >= 5).
     pub slice_type_raw: u32,
     pub pic_parameter_set_id: u32,
+    /// §7.3.3 — `colour_plane_id` u(2), emitted between
+    /// `pic_parameter_set_id` and `frame_num` when the active SPS has
+    /// `separate_colour_plane_flag == 1` (round 448). `None` for
+    /// ordinary streams.
+    pub colour_plane_id: Option<u8>,
     pub frame_num: u32,
     pub frame_num_bits: u32,
     pub pic_order_cnt_lsb: u32,
@@ -482,6 +507,11 @@ pub fn write_b_slice_header(w: &mut BitWriter, cfg: &BSliceHeaderConfig) {
     w.ue(cfg.first_mb_in_slice);
     w.ue(cfg.slice_type_raw);
     w.ue(cfg.pic_parameter_set_id);
+    // §7.3.3 — colour_plane_id u(2) (separate_colour_plane_flag == 1).
+    if let Some(plane) = cfg.colour_plane_id {
+        debug_assert!(plane <= 2, "colour_plane_id must be 0..=2 (§7.4.3)");
+        w.u(2, plane as u32);
+    }
     // No `colour_plane_id` (separate_colour_plane_flag == 0).
     w.u(cfg.frame_num_bits, cfg.frame_num);
     // §7.3.3 — field_pic_flag / bottom_field_flag when the SPS has
@@ -600,6 +630,7 @@ mod tests {
             max_num_ref_frames: 1,
             profile_idc: 66,
             chroma_format_idc: 1,
+            separate_colour_plane: false,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig::default());
@@ -612,6 +643,7 @@ mod tests {
                 first_mb_in_slice: 0,
                 slice_type_raw: 7, // I, all-same-type
                 pic_parameter_set_id: 0,
+                colour_plane_id: None,
                 frame_num: 0,
                 frame_num_bits: sps.log2_max_frame_num_minus4 + 4,
                 idr_pic_id: 0,
@@ -672,6 +704,7 @@ mod tests {
             max_num_ref_frames: 1,
             profile_idc: 66,
             chroma_format_idc: 1,
+            separate_colour_plane: false,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig::default());
@@ -684,6 +717,7 @@ mod tests {
                 first_mb_in_slice: 0,
                 slice_type_raw: 5, // P, all-same-type
                 pic_parameter_set_id: 0,
+                colour_plane_id: None,
                 frame_num: 1,
                 frame_num_bits: sps.log2_max_frame_num_minus4 + 4,
                 pic_order_cnt_lsb: 2,
@@ -746,6 +780,7 @@ mod tests {
             max_num_ref_frames: 2,
             profile_idc: 77,
             chroma_format_idc: 1,
+            separate_colour_plane: false,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig::default());
@@ -758,6 +793,7 @@ mod tests {
                 first_mb_in_slice: 0,
                 slice_type_raw: 6, // B, all-same-type
                 pic_parameter_set_id: 0,
+                colour_plane_id: None,
                 frame_num: 2,
                 frame_num_bits: sps.log2_max_frame_num_minus4 + 4,
                 pic_order_cnt_lsb: 1,
@@ -821,6 +857,7 @@ mod tests {
             max_num_ref_frames: 2,
             profile_idc: 77,
             chroma_format_idc: 1,
+            separate_colour_plane: false,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
@@ -852,6 +889,7 @@ mod tests {
                 first_mb_in_slice: 0,
                 slice_type_raw: 6,
                 pic_parameter_set_id: 0,
+                colour_plane_id: None,
                 frame_num: 2,
                 frame_num_bits: sps.log2_max_frame_num_minus4 + 4,
                 pic_order_cnt_lsb: 1,
