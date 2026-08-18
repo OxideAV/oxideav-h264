@@ -1565,9 +1565,14 @@ impl Encoder {
         // via the §8.3.4.5 chroma-coded-like-luma path).
         if self.cfg.transform_8x8 {
             assert!(
-                matches!(self.cfg.chroma_format_idc, 1..=3),
-                "transform_8x8 encode requires chroma_format_idc in {{1, 2, 3}}"
+                matches!(self.cfg.chroma_format_idc, 0..=3),
+                "transform_8x8 encode requires chroma_format_idc in {{0, 1, 2, 3}}"
             );
+            // Round-448 — at 4:0:0 the CAVLC IDR path stays
+            // Intra_16x16-only (no transform_size_8x8_flag is coded
+            // for that mb_type), so the PPS merely PERMITS the 8x8
+            // transform; the P/B inter paths run the §8.6.4 8x8-vs-4x4
+            // luma trial and code the §7.3.5 second-gate flag.
         }
         let mut i8x8_mb_count = 0u32;
         let mut i4x4_mb_count = 0u32;

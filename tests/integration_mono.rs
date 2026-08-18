@@ -394,3 +394,136 @@ fn mono_b_temporal_reference_decoder_byte_exact() {
     let gop = encode_mono_ibp(26, false, true);
     reference_decoder_check(&gop, "mono-b-temporal-ref");
 }
+
+// ---- 8x8 transform at 4:0:0 (round-448) ----
+
+fn encode_mono_gop_t8x8(qp: i32, n_p: usize, cabac: bool) -> MonoGop {
+    let cfg = EncoderConfig {
+        chroma_format_idc: 0,
+        profile_idc: 100,
+        cabac,
+        qp,
+        transform_8x8: true,
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let enc = Encoder::new(cfg);
+    let y0 = make_luma(0);
+    let f0 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y0,
+        u: &[],
+        v: &[],
+    };
+    let idr = if cabac {
+        enc.encode_idr_cabac(&f0)
+    } else {
+        enc.encode_idr(&f0)
+    };
+    let mut annex_b = idr.annex_b.clone();
+    let mut recon = vec![idr.recon_y.clone()];
+    let mut prev_idr = Some(idr);
+    let mut prev_p: Option<oxideav_h264::encoder::EncodedP> = None;
+    for k in 1..=n_p {
+        let yk = make_luma(k);
+        let fk = YuvFrame {
+            width: W as u32,
+            height: H as u32,
+            y: &yk,
+            u: &[],
+            v: &[],
+        };
+        let encode = |prev_ref: &EncodedFrameRef<'_>| {
+            if cabac {
+                enc.encode_p_cabac(&fk, prev_ref, k as u32, 2 * k as u32)
+            } else {
+                enc.encode_p(&fk, prev_ref, k as u32, 2 * k as u32)
+            }
+        };
+        let p = if let Some(prev) = prev_p.take() {
+            encode(&EncodedFrameRef::from(&prev))
+        } else {
+            let idr = prev_idr.take().expect("idr present");
+            encode(&EncodedFrameRef::from(&idr))
+        };
+        annex_b.extend_from_slice(&p.annex_b);
+        recon.push(p.recon_y.clone());
+        prev_p = Some(p);
+    }
+    MonoGop { annex_b, recon }
+}
+
+#[test]
+fn mono_transform_8x8_cavlc_self_roundtrip_bit_exact() {
+    // Low QP so the inter 8x8 trial genuinely wins on textured MBs.
+    let gop = encode_mono_gop_t8x8(20, 2, false);
+    assert_mono_roundtrip(&gop, "mono-t8x8-cavlc");
+}
+
+#[test]
+fn mono_transform_8x8_cabac_self_roundtrip_bit_exact() {
+    let gop = encode_mono_gop_t8x8(20, 2, true);
+    assert_mono_roundtrip(&gop, "mono-t8x8-cabac");
+}
+
+#[test]
+fn mono_transform_8x8_cabac_idr_codes_intra_8x8_mbs() {
+    // Coverage pin: the CABAC 4:0:0 IDR must genuinely code Intra_8x8
+    // macroblocks under transform_8x8 (not silently fall back to
+    // I_16x16 everywhere) so the §7.3.5.3.3 blockCat-5 luma-only
+    // residual path is exercised on the wire.
+    let cfg = EncoderConfig {
+        chroma_format_idc: 0,
+        profile_idc: 100,
+        cabac: true,
+        qp: 30,
+        transform_8x8: true,
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let enc = Encoder::new(cfg);
+    // Smooth low-frequency content: the 8x8 transform's coarser basis
+    // wins the Lagrangian trial on gentle ramps, where 4x4 spends
+    // extra coefficients re-describing the gradient per sub-block.
+    let mut y0 = vec![0u8; W * H];
+    for j in 0..H {
+        for i in 0..W {
+            let v = 40.0
+                + 60.0 * ((i as f64) * 0.07).sin()
+                + 50.0 * ((j as f64) * 0.05).cos()
+                + (i as f64) * 0.3;
+            y0[j * W + i] = v.clamp(16.0, 235.0) as u8;
+        }
+    }
+    let f0 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y0,
+        u: &[],
+        v: &[],
+    };
+    let idr = enc.encode_idr_cabac(&f0);
+    // The stream (whatever the per-MB picks) must still roundtrip.
+    let gop = MonoGop {
+        annex_b: idr.annex_b.clone(),
+        recon: vec![idr.recon_y.clone()],
+    };
+    assert_mono_roundtrip(&gop, "mono-t8x8-i8x8-pin");
+    reference_decoder_check(&gop, "mono-t8x8-i8x8-pin-ref");
+    eprintln!("mono CABAC t8x8 IDR: {} Intra_8x8 MBs", idr.i8x8_mb_count);
+    assert!(
+        idr.i8x8_mb_count > 0,
+        "expected at least one Intra_8x8 MB in the 4:0:0 CABAC IDR"
+    );
+}
+
+#[test]
+fn mono_transform_8x8_cavlc_reference_decoder_byte_exact() {
+    let gop = encode_mono_gop_t8x8(20, 2, false);
+    reference_decoder_check(&gop, "mono-t8x8-cavlc-ref");
+}
+
+#[test]
+fn mono_transform_8x8_cabac_reference_decoder_byte_exact() {
+    let gop = encode_mono_gop_t8x8(20, 2, true);
+    reference_decoder_check(&gop, "mono-t8x8-cabac-ref");
+}

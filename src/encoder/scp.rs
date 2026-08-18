@@ -57,6 +57,13 @@ pub struct ScpConfig {
     /// §7.4.3 `direct_spatial_mv_pred_flag` = 0 (temporal direct) when
     /// `true`. Only consulted with `b_frame`.
     pub direct_temporal: bool,
+    /// Round-448 — when `true` the PPS signals
+    /// `transform_8x8_mode_flag = 1` and every plane's inter path runs
+    /// the §8.6.4 8x8-vs-4x4 luma trial (the §7.3.5 second-gate flag
+    /// is coded on qualifying MBs). Per §8.5.9 with
+    /// `separate_colour_plane_flag = 1` the 8x8 dequant of plane p
+    /// uses scaling list `2 * p + mbIsInterFlag` — flat here.
+    pub transform_8x8: bool,
 }
 
 /// One encoded separate-colour-plane sequence plus the per-frame
@@ -126,6 +133,7 @@ pub fn encode_scp_sequence(cfg: &ScpConfig, frames: &[(&[u8], &[u8], &[u8])]) ->
             cabac: cfg.cabac,
             qp: cfg.qp,
             direct_temporal_mv_pred: cfg.direct_temporal,
+            transform_8x8: cfg.transform_8x8,
             max_num_ref_frames: 2,
             ..EncoderConfig::new(cfg.width, cfg.height)
         })

@@ -75,6 +75,29 @@ fn encode_scp(qp: i32, n_p: usize, cabac: bool) -> ScpEncoded {
             cabac,
             b_frame: false,
             direct_temporal: false,
+            transform_8x8: false,
+        },
+        &refs,
+    )
+}
+
+/// IDR + P + P with `transform_8x8_mode_flag = 1`: each plane's inter
+/// MBs run the §8.6.4 8x8-vs-4x4 luma trial.
+fn encode_scp_t8x8(qp: i32, cabac: bool) -> ScpEncoded {
+    let frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..=2).map(make_planes).collect();
+    let refs: Vec<(&[u8], &[u8], &[u8])> = frames
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    encode_scp_sequence(
+        &ScpConfig {
+            width: W as u32,
+            height: H as u32,
+            qp,
+            cabac,
+            b_frame: false,
+            direct_temporal: false,
+            transform_8x8: true,
         },
         &refs,
     )
@@ -98,6 +121,7 @@ fn encode_scp_b(qp: i32, cabac: bool, temporal: bool) -> ScpEncoded {
             cabac,
             b_frame: true,
             direct_temporal: temporal,
+            transform_8x8: false,
         },
         &refs,
     )
@@ -360,4 +384,18 @@ fn scp_cabac_b_spatial_self_roundtrip_bit_exact() {
 fn scp_cabac_b_temporal_self_roundtrip_bit_exact() {
     let enc = encode_scp_b(26, true, true);
     assert_scp_roundtrip(&enc, "scp-cabac-b-temporal");
+}
+
+// ---- 8x8 transform at ChromaArrayType 0 (round-448) ----
+
+#[test]
+fn scp_cavlc_transform_8x8_self_roundtrip_bit_exact() {
+    let enc = encode_scp_t8x8(20, false);
+    assert_scp_roundtrip(&enc, "scp-cavlc-t8x8");
+}
+
+#[test]
+fn scp_cabac_transform_8x8_self_roundtrip_bit_exact() {
+    let enc = encode_scp_t8x8(20, true);
+    assert_scp_roundtrip(&enc, "scp-cabac-t8x8");
 }

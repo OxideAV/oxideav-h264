@@ -53,7 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside its own plane, and the gates grow to 20 (mono) + 14 (SCP):
   IBP self-roundtrips under both entropy coders and both direct
   modes, with the 4:0:0 IBP streams additionally byte-exact against
-  the black-box reference decoder.
+  the black-box reference decoder. The **8x8 transform** also runs at
+  ChromaArrayType 0 (`transform_8x8_mode_flag = 1` on 4:0:0 and
+  separate-colour-plane streams): the P/B §8.6.4 8x8-vs-4x4 luma
+  trials code the §7.3.5 second-gate flag, the CABAC IDR trials
+  Intra_8x8 (a coverage pin asserts real Intra_8x8 MBs on the wire
+  and byte-exact reference decode), and per §8.5.9 the SCP 8x8
+  dequant selects list `2 * colour_plane_id + mbIsInterFlag` —
+  6 more gates (25 mono + 16 SCP total).
 
 - Round 448 — **monochrome (4:0:0, `chroma_format_idc = 0`) encode +
   decode**. ChromaArrayType 0 pictures code a luma plane only
