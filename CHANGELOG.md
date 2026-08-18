@@ -43,7 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   black-box-validated); and a black-box probe that documents the
   stock reference decoder binary rejecting SCP streams ("separate
   color planes are not supported"), so the byte-exact cross-check
-  arms automatically if a capable binary appears.
+  arms automatically if a capable binary appears. **B pictures**
+  joined both new surfaces in the same round: `encode_b` /
+  `encode_b_cabac` run at `chroma_format_idc = 0` (B_Skip /
+  B_Direct_16x16 with §8.4.1.2.2 spatial AND §8.4.1.2.3 temporal
+  direct, explicit 16x16 rows, 16x8 / 8x16 partitions — all
+  luma-only), `ScpConfig::b_frame` codes an IDR-B-P
+  separate-colour-plane mini-GOP with each plane's B bi-predicting
+  inside its own plane, and the gates grow to 20 (mono) + 14 (SCP):
+  IBP self-roundtrips under both entropy coders and both direct
+  modes, with the 4:0:0 IBP streams additionally byte-exact against
+  the black-box reference decoder.
 
 - Round 448 — **monochrome (4:0:0, `chroma_format_idc = 0`) encode +
   decode**. ChromaArrayType 0 pictures code a luma plane only

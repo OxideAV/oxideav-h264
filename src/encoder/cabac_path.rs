@@ -4295,8 +4295,8 @@ impl Encoder {
         // spatial direct). Partitions + mixed B_8x8 stay 4:2:0-only
         // encoder choices.
         assert!(
-            matches!(cfg.chroma_format_idc, 1..=3),
-            "encode_b_cabac supports chroma_format_idc 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
+            matches!(cfg.chroma_format_idc, 0..=3),
+            "encode_b_cabac supports chroma_format_idc 0 (4:0:0), 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
         );
         // Round-397 — non-flat scaling matrices run at every chroma
         // format (see encode_idr).
@@ -4615,6 +4615,8 @@ impl Encoder {
                     // Chroma predictor per list + format, then merge.
                     let build_c = |plane: &[u8], mv: Mv| -> Vec<i32> {
                         match cfg.chroma_format_idc {
+                            // Round-448 — 4:0:0: no chroma planes.
+                            0 => Vec::new(),
                             3 => build_inter_pred_luma_local(
                                 plane,
                                 chroma_w as u32,
@@ -4984,6 +4986,8 @@ impl Encoder {
                                 cbp_luma |= 1u8 << blk8;
                             }
                         }
+                    } else if cfg.chroma_format_idc == 0 {
+                        // Round-448 — 4:0:0: no chroma residual.
                     } else {
                         let pu: &[i32; 128] = pred_u[..128].try_into().expect("pred tile");
                         let pv: &[i32; 128] = pred_v[..128].try_into().expect("pred tile");
@@ -5571,7 +5575,7 @@ impl Encoder {
                                 }
                             }
                         }
-                    } else {
+                    } else if cfg.chroma_format_idc != 0 {
                         // 4:2:2 — cbp_chroma == 1 has all-zero AC, so the
                         // full recon residual is already DC-only.
                         for j in 0..16usize {
@@ -8559,6 +8563,10 @@ fn emit_inter_chroma_residual_cabac(
                 }
             }
         }
+        return;
+    }
+    // 4:0:0 — no chroma residual syntax at all (§7.3.5.3).
+    if chroma_format_idc == 0 {
         return;
     }
     // 4:2:0 / 4:2:2.

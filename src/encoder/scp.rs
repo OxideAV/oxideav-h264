@@ -46,6 +46,17 @@ pub struct ScpConfig {
     /// When `true`, use the CABAC entropy coder (`encode_idr_cabac` /
     /// `encode_p_cabac`); otherwise CAVLC.
     pub cabac: bool,
+    /// When `true`, code an IDR-B-P mini-GOP (requires exactly THREE
+    /// input frames, display order 0 / 1 / 2): access units are
+    /// emitted in decode order IDR(0), P(2), B(1), with each plane's B
+    /// slice bi-predicting from ITS OWN plane's IDR and P
+    /// reconstructions (`RefPicList0[0]` = IDR, `RefPicList1[0]` = P).
+    /// `direct_temporal` picks §8.4.1.2.3 temporal (else §8.4.1.2.2
+    /// spatial) direct derivation inside each plane.
+    pub b_frame: bool,
+    /// §7.4.3 `direct_spatial_mv_pred_flag` = 0 (temporal direct) when
+    /// `true`. Only consulted with `b_frame`.
+    pub direct_temporal: bool,
 }
 
 /// One encoded separate-colour-plane sequence plus the per-frame
@@ -114,6 +125,8 @@ pub fn encode_scp_sequence(cfg: &ScpConfig, frames: &[(&[u8], &[u8], &[u8])]) ->
             colour_plane_id: Some(plane),
             cabac: cfg.cabac,
             qp: cfg.qp,
+            direct_temporal_mv_pred: cfg.direct_temporal,
+            max_num_ref_frames: 2,
             ..EncoderConfig::new(cfg.width, cfg.height)
         })
     };
@@ -163,6 +176,52 @@ pub fn encode_scp_sequence(cfg: &ScpConfig, frames: &[(&[u8], &[u8], &[u8])]) ->
         idrs[1].recon_y.clone(),
         idrs[2].recon_y.clone(),
     ]);
+
+    // ---- IDR-B-P mini-GOP mode (round-448 B leg). ----
+    if cfg.b_frame {
+        assert_eq!(
+            frames.len(),
+            3,
+            "b_frame mode codes exactly one IDR-B-P mini-GOP (3 frames)"
+        );
+        // Decode order: P anchor (display 2, frame_num 1, POC lsb 4)…
+        let mut ps: Vec<EncodedP> = Vec::with_capacity(3);
+        for (p, enc) in encs.iter().enumerate() {
+            let f = plane_yuv(cfg.width, cfg.height, plane_src(2, p));
+            let coded = if cfg.cabac {
+                enc.encode_p_cabac(&f, &EncodedFrameRef::from(&idrs[p]), 1, 4)
+            } else {
+                enc.encode_p(&f, &EncodedFrameRef::from(&idrs[p]), 1, 4)
+            };
+            annex_b.extend_from_slice(&coded.annex_b);
+            ps.push(coded);
+        }
+        // …then the non-reference B (display 1, frame_num 1, POC lsb 2).
+        let mut recon_b: Vec<Vec<u8>> = Vec::with_capacity(3);
+        for (p, enc) in encs.iter().enumerate() {
+            let f = plane_yuv(cfg.width, cfg.height, plane_src(1, p));
+            let l0 = EncodedFrameRef::from(&idrs[p]);
+            let l1 = EncodedFrameRef::from(&ps[p]);
+            let coded = if cfg.cabac {
+                enc.encode_b_cabac(&f, &l0, &l1, 1, 2)
+            } else {
+                enc.encode_b(&f, &l0, &l1, 1, 2)
+            };
+            annex_b.extend_from_slice(&coded.annex_b);
+            recon_b.push(coded.recon_y.clone());
+        }
+        // Display order: IDR (already pushed), B, P.
+        recon_frames.push([recon_b[0].clone(), recon_b[1].clone(), recon_b[2].clone()]);
+        recon_frames.push([
+            ps[0].recon_y.clone(),
+            ps[1].recon_y.clone(),
+            ps[2].recon_y.clone(),
+        ]);
+        return ScpEncoded {
+            annex_b,
+            recon_frames,
+        };
+    }
 
     // ---- Access units 1..: P, each plane predicting from itself. ----
     let mut prev_p: Option<[EncodedP; 3]> = None;

@@ -293,3 +293,104 @@ fn mono_cabac_low_qp_reference_decoder_byte_exact() {
     let gop = encode_mono_gop_entropy(12, 2, true);
     reference_decoder_check(&gop, "mono-cabac-lowqp-ref");
 }
+
+// ---- B pictures at 4:0:0 (round-448 B leg) ----
+
+fn encode_mono_ibp(qp: i32, cabac: bool, temporal: bool) -> MonoGop {
+    let cfg = EncoderConfig {
+        chroma_format_idc: 0,
+        profile_idc: 100,
+        cabac,
+        qp,
+        direct_temporal_mv_pred: temporal,
+        max_num_ref_frames: 2,
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let enc = Encoder::new(cfg);
+    let planes: Vec<Vec<u8>> = (0..3).map(make_luma).collect();
+    let mk = |k: usize| YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &planes[k],
+        u: &[],
+        v: &[],
+    };
+    let idr = if cabac {
+        enc.encode_idr_cabac(&mk(0))
+    } else {
+        enc.encode_idr(&mk(0))
+    };
+    // Decode order IDR (poc 0), P (display 2, poc 4), B (display 1, poc 2).
+    let p = if cabac {
+        enc.encode_p_cabac(&mk(2), &EncodedFrameRef::from(&idr), 1, 4)
+    } else {
+        enc.encode_p(&mk(2), &EncodedFrameRef::from(&idr), 1, 4)
+    };
+    let b = if cabac {
+        enc.encode_b_cabac(
+            &mk(1),
+            &EncodedFrameRef::from(&idr),
+            &EncodedFrameRef::from(&p),
+            1,
+            2,
+        )
+    } else {
+        enc.encode_b(
+            &mk(1),
+            &EncodedFrameRef::from(&idr),
+            &EncodedFrameRef::from(&p),
+            1,
+            2,
+        )
+    };
+    let mut annex_b = idr.annex_b.clone();
+    annex_b.extend_from_slice(&p.annex_b);
+    annex_b.extend_from_slice(&b.annex_b);
+    // Display order: IDR, B, P.
+    MonoGop {
+        annex_b,
+        recon: vec![idr.recon_y, b.recon_y, p.recon_y],
+    }
+}
+
+#[test]
+fn mono_b_cavlc_spatial_self_roundtrip_bit_exact() {
+    let gop = encode_mono_ibp(26, false, false);
+    assert_mono_roundtrip(&gop, "mono-b-cavlc-spatial");
+}
+
+#[test]
+fn mono_b_cavlc_temporal_self_roundtrip_bit_exact() {
+    let gop = encode_mono_ibp(26, false, true);
+    assert_mono_roundtrip(&gop, "mono-b-cavlc-temporal");
+}
+
+#[test]
+fn mono_b_cabac_spatial_self_roundtrip_bit_exact() {
+    let gop = encode_mono_ibp(26, true, false);
+    assert_mono_roundtrip(&gop, "mono-b-cabac-spatial");
+}
+
+#[test]
+fn mono_b_cabac_temporal_self_roundtrip_bit_exact() {
+    let gop = encode_mono_ibp(26, true, true);
+    assert_mono_roundtrip(&gop, "mono-b-cabac-temporal");
+}
+
+#[test]
+fn mono_b_cavlc_reference_decoder_byte_exact() {
+    let gop = encode_mono_ibp(26, false, false);
+    reference_decoder_check(&gop, "mono-b-cavlc-ref");
+}
+
+#[test]
+fn mono_b_cabac_reference_decoder_byte_exact() {
+    let gop = encode_mono_ibp(26, true, false);
+    reference_decoder_check(&gop, "mono-b-cabac-ref");
+}
+
+#[test]
+fn mono_b_temporal_reference_decoder_byte_exact() {
+    let gop = encode_mono_ibp(26, false, true);
+    reference_decoder_check(&gop, "mono-b-temporal-ref");
+}

@@ -4552,6 +4552,10 @@ pub(super) fn build_chroma_rect_pred_fmt(
     mv: Mv,
     fmt: u32,
 ) -> Vec<i32> {
+    // Round-448 — 4:0:0: no chroma planes, no rect to predict.
+    if fmt == 0 || rw == 0 || rh == 0 {
+        return Vec::new();
+    }
     let stride = plane_w as usize;
     let h = plane_h as usize;
     let ref_i32: Vec<i32> = plane.iter().take(stride * h).map(|&v| v as i32).collect();
@@ -10623,12 +10627,15 @@ impl Encoder {
         let width_mbs = self.cfg.width / 16;
         let height_mbs = self.cfg.height / 16;
         // §6.2 Table 6-1 — chroma plane dimensions per chroma format
-        // (round-397: encode_b runs at 4:2:0, 4:2:2 and 4:4:4).
+        // (round-397: encode_b runs at 4:2:0, 4:2:2 and 4:4:4;
+        // round-448 adds 4:0:0).
         let chroma_width = match self.cfg.chroma_format_idc {
+            0 => 0usize,
             3 => self.cfg.width as usize,
             _ => (self.cfg.width / 2) as usize,
         };
         let chroma_height = match self.cfg.chroma_format_idc {
+            0 => 0usize,
             2 | 3 => self.cfg.height as usize,
             _ => (self.cfg.height / 2) as usize,
         };
@@ -12440,7 +12447,7 @@ impl Encoder {
         weighted: Option<WeightedBipredLuma>,
     ) -> MbDeblockInfo {
         let chroma_array_type = self.cfg.chroma_format_idc;
-        debug_assert!(matches!(chroma_array_type, 2 | 3));
+        debug_assert!(matches!(chroma_array_type, 0 | 2 | 3));
         let width_mbs = (self.cfg.width / 16) as usize;
         let mb_addr = mb_y * width_mbs + mb_x;
         let chroma_w = chroma_width as u32;
@@ -12482,6 +12489,8 @@ impl Encoder {
         //    4:2:0 path; chroma dispatches per §8.4.1.4 / §8.4.2.2.
         let chroma_plane_pred = |plane: &[u8], mv: Mv| -> Vec<i32> {
             match chroma_array_type {
+                // Round-448 — 4:0:0: no chroma planes to predict.
+                0 => Vec::new(),
                 3 => build_inter_pred_luma(plane, chroma_w, chroma_h, mb_x, mb_y, mv).to_vec(),
                 _ => cabac_path::build_inter_pred_chroma_local_422(
                     plane, chroma_w, chroma_h, mb_x, mb_y, mv,
@@ -13057,6 +13066,8 @@ impl Encoder {
             }
         }
         match chroma_array_type {
+            // Round-448 — 4:0:0: nothing to reconstruct.
+            0 => {}
             3 => {
                 for (pred_c, fwd, recon) in [
                     (&pred_u, &cb444, &mut *recon_u),
@@ -13158,10 +13169,15 @@ impl Encoder {
             *pending_skip = 0;
             // Per-format chroma writer payload + §9.2.1.1 nC commits.
             enum BChromaEmit {
+                Mono,
                 C422 { nc_cb: [i32; 8], nc_cr: [i32; 8] },
                 C444 { cb_nc: [i32; 16], cr_nc: [i32; 16] },
             }
-            let emit = if chroma_array_type == 3 {
+            let emit = if chroma_array_type == 0 {
+                // Round-448 — 4:0:0: no chroma payload, no chroma nC
+                // commits (§7.3.5.3 residual() is luma-only).
+                BChromaEmit::Mono
+            } else if chroma_array_type == 3 {
                 BChromaEmit::C444 {
                     cb_nc: derive_plane_nc_444_inter(
                         nc_grid,
@@ -13191,6 +13207,7 @@ impl Encoder {
                 BChromaEmit::C422 { nc_cb, nc_cr }
             };
             let chroma_kind = match &emit {
+                BChromaEmit::Mono => crate::encoder::macroblock::ChromaWriteKind::Mono,
                 BChromaEmit::C444 { cb_nc, cr_nc } => {
                     crate::encoder::macroblock::ChromaWriteKind::Yuv444Inter {
                         cb_levels: &cb444.levels_scan,
@@ -13372,7 +13389,7 @@ impl Encoder {
         //     disabled so the mask is unused.
         let luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
         let chroma_nonzero_4x4: u16 = match chroma_array_type {
-            3 => 0,
+            0 | 3 => 0,
             _ => {
                 let mut m = 0u16;
                 for blk in 0..8usize {

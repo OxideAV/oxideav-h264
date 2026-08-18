@@ -73,6 +73,31 @@ fn encode_scp(qp: i32, n_p: usize, cabac: bool) -> ScpEncoded {
             height: H as u32,
             qp,
             cabac,
+            b_frame: false,
+            direct_temporal: false,
+        },
+        &refs,
+    )
+}
+
+/// IDR-B-P mini-GOP: three display frames, the middle one coded as a
+/// non-reference B whose two references are the SAME PLANE's IDR and
+/// P reconstructions (§8.4.1.2.2 spatial or §8.4.1.2.3 temporal
+/// direct inside each plane).
+fn encode_scp_b(qp: i32, cabac: bool, temporal: bool) -> ScpEncoded {
+    let frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..=2).map(make_planes).collect();
+    let refs: Vec<(&[u8], &[u8], &[u8])> = frames
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    encode_scp_sequence(
+        &ScpConfig {
+            width: W as u32,
+            height: H as u32,
+            qp,
+            cabac,
+            b_frame: true,
+            direct_temporal: temporal,
         },
         &refs,
     )
@@ -309,4 +334,30 @@ fn scp_cavlc_gop_reference_decoder_byte_exact() {
 fn scp_cabac_gop_reference_decoder_byte_exact() {
     let enc = encode_scp(26, 2, true);
     reference_decoder_check(&enc, "scp-cabac-ref");
+}
+
+// ---- B access units (round-448 B leg) ----
+
+#[test]
+fn scp_cavlc_b_spatial_self_roundtrip_bit_exact() {
+    let enc = encode_scp_b(26, false, false);
+    assert_scp_roundtrip(&enc, "scp-cavlc-b-spatial");
+}
+
+#[test]
+fn scp_cavlc_b_temporal_self_roundtrip_bit_exact() {
+    let enc = encode_scp_b(26, false, true);
+    assert_scp_roundtrip(&enc, "scp-cavlc-b-temporal");
+}
+
+#[test]
+fn scp_cabac_b_spatial_self_roundtrip_bit_exact() {
+    let enc = encode_scp_b(26, true, false);
+    assert_scp_roundtrip(&enc, "scp-cabac-b-spatial");
+}
+
+#[test]
+fn scp_cabac_b_temporal_self_roundtrip_bit_exact() {
+    let enc = encode_scp_b(26, true, true);
+    assert_scp_roundtrip(&enc, "scp-cabac-b-temporal");
 }
