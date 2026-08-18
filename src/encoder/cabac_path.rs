@@ -1931,8 +1931,8 @@ impl Encoder {
             cfg.profile_idc,
         );
         assert!(
-            matches!(cfg.chroma_format_idc, 1..=3),
-            "encode_idr_cabac supports chroma_format_idc 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
+            matches!(cfg.chroma_format_idc, 0..=3),
+            "encode_idr_cabac supports chroma_format_idc 0 (4:0:0), 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
         );
         // Round-397 — non-flat scaling matrices run under CABAC at
         // every chroma format (see encode_idr). The trellis
@@ -1958,10 +1958,12 @@ impl Encoder {
         let height_mbs = (cfg.height / 16) as usize;
         // §6.2 Table 6-1 — chroma plane dimensions.
         let chroma_w = match cfg.chroma_format_idc {
+            0 => 0,
             3 => width,
             _ => width / 2,
         };
         let chroma_h = match cfg.chroma_format_idc {
+            0 => 0,
             2 | 3 => height,
             _ => height / 2,
         };
@@ -2303,6 +2305,10 @@ impl Encoder {
                         cbp_luma = 15;
                     }
                     cbp_chroma = 0;
+                } else if cfg.chroma_format_idc == 0 {
+                    // Round-448 — 4:0:0: no chroma planes, no chroma
+                    // syntax (§7.3.5.1 / §7.3.5.3 at ChromaArrayType 0).
+                    cbp_chroma = 0;
                 } else {
                     // 4:2:0 encode.
                     let (cdc, cac, _, _, any_cb_ac_nz, cb_res) = encode_chroma_intra16x16_420(
@@ -2430,8 +2436,9 @@ impl Encoder {
                         }
                     }
                     // §7.3.5.1 — intra_chroma_pred_mode is absent when
-                    // ChromaArrayType == 3 (chroma coded like luma).
-                    if cfg.chroma_format_idc != 3 {
+                    // ChromaArrayType == 0 (monochrome) or 3 (chroma
+                    // coded like luma).
+                    if !matches!(cfg.chroma_format_idc, 0 | 3) {
                         encode_intra_chroma_pred_mode(
                             &mut cabac,
                             &mut ctxs,
@@ -2528,9 +2535,10 @@ impl Encoder {
                     let mb_type_value = 1 + group * 4 + luma_mode as u32;
                     encode_mb_type_i(&mut cabac, &mut ctxs, &nb, mb_type_value);
 
-                    // intra_chroma_pred_mode — absent for 4:4:4 (§7.3.5.1 note:
-                    // "not present if ChromaArrayType is equal to 3").
-                    if cfg.chroma_format_idc != 3 {
+                    // intra_chroma_pred_mode — absent for 4:0:0 and
+                    // 4:4:4 (§7.3.5.1: present only when ChromaArrayType
+                    // is 1 or 2).
+                    if !matches!(cfg.chroma_format_idc, 0 | 3) {
                         encode_intra_chroma_pred_mode(
                             &mut cabac,
                             &mut ctxs,
@@ -2669,7 +2677,7 @@ impl Encoder {
                         BlockType::CrIntra16x16Ac,
                     );
                     grid.at_mut(mb_x, mb_y).cbf_cr_dc = cbf_cr_dc;
-                } else {
+                } else if cfg.chroma_format_idc != 0 {
                     // 4:2:0 / 4:2:2 chroma residual. §7.3.5.3.3 —
                     // ChromaDCLevel carries 4 coefficients at 4:2:0 and
                     // 8 at 4:2:2 (NumC8x8 = 2 → eq. (9-22) contexts);
@@ -2810,8 +2818,9 @@ impl Encoder {
                         cbp_luma == 15 && luma_ac_scan[i].iter().any(|&v| v != 0)
                     })
                 };
-                let chroma_nonzero_4x4: u16 = if cfg.chroma_format_idc == 3 {
-                    // 4:4:4: no separate 4-block chroma; deblock uses luma filter.
+                let chroma_nonzero_4x4: u16 = if matches!(cfg.chroma_format_idc, 0 | 3) {
+                    // 4:0:0: no chroma at all; 4:4:4: no separate
+                    // 4-block chroma (deblock uses the luma filter).
                     0
                 } else if let Some(cbk) = &chroma_422 {
                     super::chroma_nz_mask_from_chroma_block(cbk, 8)
@@ -2989,8 +2998,8 @@ impl Encoder {
         // Round-391 — CABAC P now runs at 4:2:0, 4:2:2 (High 4:2:2)
         // and 4:4:4 (High 4:4:4 Predictive, chroma coded like luma).
         assert!(
-            matches!(cfg.chroma_format_idc, 1..=3),
-            "encode_p_cabac supports chroma_format_idc 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
+            matches!(cfg.chroma_format_idc, 0..=3),
+            "encode_p_cabac supports chroma_format_idc 0 (4:0:0), 1 (4:2:0), 2 (4:2:2) and 3 (4:4:4)",
         );
         // Round-391 — non-flat scaling matrices run on the CABAC P
         // path at 4:2:0: inter residuals quantise / dequantise under
@@ -3005,15 +3014,18 @@ impl Encoder {
         let height_mbs = (cfg.height / 16) as usize;
         // §6.2 Table 6-1 — chroma plane dimensions.
         let chroma_w = match cfg.chroma_format_idc {
+            0 => 0,
             3 => width,
             _ => width / 2,
         };
         let chroma_h = match cfg.chroma_format_idc {
+            0 => 0,
             2 | 3 => height,
             _ => height / 2,
         };
         // Per-MB chroma tile dimensions.
         let (ct_w, ct_h) = match cfg.chroma_format_idc {
+            0 => (0usize, 0usize),
             3 => (16usize, 16usize),
             2 => (8usize, 16usize),
             _ => (8usize, 8usize),
@@ -3155,6 +3167,8 @@ impl Encoder {
                 //   * 4:4:4 — the §8.4.2.2.1 LUMA 6-tap process on each
                 //     chroma plane with mvC = mvL (eq. 8-235..8-238).
                 let (pred_u, pred_v): (Vec<i32>, Vec<i32>) = match cfg.chroma_format_idc {
+                    // Round-448 — 4:0:0: no chroma planes to predict.
+                    0 => (Vec::new(), Vec::new()),
                     3 => (
                         build_inter_pred_luma_local(
                             prev.recon_u,
@@ -3384,6 +3398,9 @@ impl Encoder {
                 let mut cr444_scan8 = [[0i32; 64]; 4];
                 let mut cbp_chroma: u8 = 0;
                 match cfg.chroma_format_idc {
+                    // Round-448 — 4:0:0: no chroma residual
+                    // (§7.3.5.3 residual() is luma-only); cbp_chroma stays 0.
+                    0 => {}
                     3 => {
                         let pu: &[i32; 256] = pred_u[..256].try_into().expect("pred tile");
                         let pv: &[i32; 256] = pred_v[..256].try_into().expect("pred tile");
@@ -3790,7 +3807,7 @@ impl Encoder {
                             }
                         }
                     }
-                } else {
+                } else if cfg.chroma_format_idc != 0 {
                     // 4:2:0 / 4:2:2 — ChromaDCLevel (4 / 8 coefficients,
                     // NumC8x8-aware eq. (9-22) contexts) + per-plane
                     // ChromaACLevel blocks on the 2x2 / 2x4 grid.
@@ -3923,6 +3940,8 @@ impl Encoder {
                 }
                 // Reconstruct chroma — apply the residual to the predictor.
                 match cfg.chroma_format_idc {
+                    // Round-448 — 4:0:0: nothing to reconstruct.
+                    0 => {}
                     3 => {
                         // §8.5.5 — per-quadrant gating by the shared
                         // cbp_luma, like luma (a cbp-0 quadrant is pred+0).
@@ -4025,6 +4044,7 @@ impl Encoder {
                     chosen_mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 );
                 let chroma_nonzero_4x4: u16 = match cfg.chroma_format_idc {
+                    0 => 0, // no chroma at 4:0:0.
                     3 => 0, // deblock disabled at 4:4:4.
                     2 => {
                         let mut mask = 0u16;
@@ -4290,15 +4310,18 @@ impl Encoder {
         let height_mbs = (cfg.height / 16) as usize;
         // §6.2 Table 6-1 — chroma plane dimensions.
         let chroma_w = match cfg.chroma_format_idc {
+            0 => 0,
             3 => width,
             _ => width / 2,
         };
         let chroma_h = match cfg.chroma_format_idc {
+            0 => 0,
             2 | 3 => height,
             _ => height / 2,
         };
         // Per-MB chroma tile dimensions.
         let (ct_w, ct_h) = match cfg.chroma_format_idc {
+            0 => (0usize, 0usize),
             3 => (16usize, 16usize),
             2 => (8usize, 16usize),
             _ => (8usize, 8usize),

@@ -24,11 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (P_Skip / P_L0_16x16 with quarter-pel ME) through
   `ChromaWriteKind::Mono` — luma-only MB syntax, chroma work skipped
   at every stage (prediction, residual, recon, deblock mask, nC
-  grid). Gates (`tests/integration_mono.rs`): bit-exact
-  self-roundtrip on IDR / IDR+P+P GOPs at QP 12 / 26 / 44 plus
-  byte-exact luma comparison against a stock black-box reference
-  decoder binary (which surfaces 4:0:0 as yuv420p output with
-  synthetic chroma — the gate compares the luma portion).
+  grid). The **CABAC entropy path** carries the same legs
+  (`encode_idr_cabac` / `encode_p_cabac` at `chroma_format_idc = 0`):
+  no §9.3.3.1.1.8 `intra_chroma_pred_mode` bins, no chroma CBP
+  suffix after the four §9.3.3.1.1.4 luma prefix bins, no
+  ChromaDCLevel / ChromaACLevel residual blocks. Gates
+  (`tests/integration_mono.rs`, 13): bit-exact self-roundtrip on
+  IDR / IDR+P+P GOPs at QP 12 / 26 / 44 under CAVLC **and** CABAC,
+  plus byte-exact luma comparison against a stock black-box
+  reference decoder binary (which surfaces 4:0:0 as yuv420p output
+  with synthetic chroma — the gate compares the luma portion).
 
 ### Fixed
 

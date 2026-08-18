@@ -49,10 +49,11 @@ struct MonoGop {
     recon: Vec<Vec<u8>>,
 }
 
-fn encode_mono_gop(qp: i32, n_p: usize) -> MonoGop {
+fn encode_mono_gop_entropy(qp: i32, n_p: usize, cabac: bool) -> MonoGop {
     let cfg = EncoderConfig {
         chroma_format_idc: 0,
         profile_idc: 100,
+        cabac,
         qp,
         ..EncoderConfig::new(W as u32, H as u32)
     };
@@ -66,7 +67,11 @@ fn encode_mono_gop(qp: i32, n_p: usize) -> MonoGop {
         u: &[],
         v: &[],
     };
-    let idr = enc.encode_idr(&f0);
+    let idr = if cabac {
+        enc.encode_idr_cabac(&f0)
+    } else {
+        enc.encode_idr(&f0)
+    };
     let mut annex_b = idr.annex_b.clone();
     let mut recon = vec![idr.recon_y.clone()];
 
@@ -82,17 +87,28 @@ fn encode_mono_gop(qp: i32, n_p: usize) -> MonoGop {
             u: &[],
             v: &[],
         };
+        let encode = |prev_ref: &EncodedFrameRef<'_>| {
+            if cabac {
+                enc.encode_p_cabac(&fk, prev_ref, k as u32, 2 * k as u32)
+            } else {
+                enc.encode_p(&fk, prev_ref, k as u32, 2 * k as u32)
+            }
+        };
         let p = if let Some(prev) = prev_p.take() {
-            enc.encode_p(&fk, &EncodedFrameRef::from(&prev), k as u32, 2 * k as u32)
+            encode(&EncodedFrameRef::from(&prev))
         } else {
             let idr = prev_idr.take().expect("idr present");
-            enc.encode_p(&fk, &EncodedFrameRef::from(&idr), k as u32, 2 * k as u32)
+            encode(&EncodedFrameRef::from(&idr))
         };
         annex_b.extend_from_slice(&p.annex_b);
         recon.push(p.recon_y.clone());
         prev_p = Some(p);
     }
     MonoGop { annex_b, recon }
+}
+
+fn encode_mono_gop(qp: i32, n_p: usize) -> MonoGop {
+    encode_mono_gop_entropy(qp, n_p, false)
 }
 
 fn decode_ours(annex_b: &[u8]) -> Vec<VideoFrame> {
@@ -237,4 +253,43 @@ fn mono_idr_p_p_reference_decoder_byte_exact() {
 fn mono_low_qp_reference_decoder_byte_exact() {
     let gop = encode_mono_gop(12, 2);
     reference_decoder_check(&gop, "mono-lowqp-ref");
+}
+
+// ---- CABAC entropy path (round-448 second leg) ----
+
+#[test]
+fn mono_cabac_idr_self_roundtrip_bit_exact() {
+    let gop = encode_mono_gop_entropy(26, 0, true);
+    assert_mono_roundtrip(&gop, "mono-cabac-idr");
+}
+
+#[test]
+fn mono_cabac_idr_p_p_self_roundtrip_bit_exact() {
+    let gop = encode_mono_gop_entropy(26, 2, true);
+    assert_mono_roundtrip(&gop, "mono-cabac-idr-p-p");
+}
+
+#[test]
+fn mono_cabac_low_qp_self_roundtrip_bit_exact() {
+    let gop = encode_mono_gop_entropy(12, 2, true);
+    assert_mono_roundtrip(&gop, "mono-cabac-low-qp");
+}
+
+#[test]
+fn mono_cabac_high_qp_self_roundtrip_bit_exact() {
+    // Sparse residual: real mb_skip_flag runs through §9.3.3.1.1.1.
+    let gop = encode_mono_gop_entropy(44, 2, true);
+    assert_mono_roundtrip(&gop, "mono-cabac-high-qp");
+}
+
+#[test]
+fn mono_cabac_gop_reference_decoder_byte_exact() {
+    let gop = encode_mono_gop_entropy(26, 2, true);
+    reference_decoder_check(&gop, "mono-cabac-gop-ref");
+}
+
+#[test]
+fn mono_cabac_low_qp_reference_decoder_byte_exact() {
+    let gop = encode_mono_gop_entropy(12, 2, true);
+    reference_decoder_check(&gop, "mono-cabac-lowqp-ref");
 }
