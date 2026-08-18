@@ -450,6 +450,70 @@ pub fn write_i8x8_mb_444(
     Ok(())
 }
 
+/// Round-448 — emit one **monochrome** Intra_4x4 macroblock (I_NxN
+/// with the 4x4 transform, ChromaArrayType == 0, CAVLC).
+///
+/// Layout per §7.3.5 / §7.3.5.1 / §7.3.5.3 at ChromaArrayType 0:
+///   1. `mb_type ue(0)` (I_NxN, Table 7-11 raw 0).
+///   2. `transform_size_8x8_flag = 0` — only inside a
+///      `transform_8x8_mode_flag = 1` stream.
+///   3. 16 × `prev_intra4x4_pred_mode_flag` (+ optional 3-bit
+///      `rem_intra4x4_pred_mode`). No `intra_chroma_pred_mode`
+///      (§7.3.5.1: present only when ChromaArrayType is 1 or 2).
+///   4. `coded_block_pattern me(v)` — Table 9-4(b) intra column.
+///   5. `mb_qp_delta se(v)` when CBP > 0.
+///   6. §7.3.5.3 residual: the luma plane only.
+#[allow(clippy::too_many_arguments)]
+pub fn write_i4x4_mb_mono(
+    w: &mut BitWriter,
+    emit_transform_size_8x8_zero: bool,
+    prev_intra4x4_pred_mode_flag: &[bool; 16],
+    rem_intra4x4_pred_mode: &[u8; 16],
+    cbp_luma: u8,
+    mb_qp_delta: i32,
+    luma_4x4_levels: &[[i32; 16]; 16],
+    luma_4x4_nc: &[i32; 16],
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(cbp_luma <= 15);
+    // §7.4.5 — Table 7-11: I_NxN mb_type raw = 0 in I-slice.
+    w.ue(0);
+    // §7.3.5 — transform_size_8x8_flag (read before mb_pred when the
+    // PPS carries transform_8x8_mode_flag).
+    if emit_transform_size_8x8_zero {
+        w.u(1, 0);
+    }
+    // §7.3.5.1 mb_pred(): per-4x4-block prev/rem intra pred mode.
+    for blk in 0..16usize {
+        let flag = prev_intra4x4_pred_mode_flag[blk];
+        w.u(1, if flag { 1 } else { 0 });
+        if !flag {
+            debug_assert!(rem_intra4x4_pred_mode[blk] <= 7);
+            w.u(3, rem_intra4x4_pred_mode[blk] as u32);
+        }
+    }
+    // §7.3.5 — coded_block_pattern me(v), Table 9-4(b) intra column.
+    w.ue(intra_cbp_to_codenum_0_3(cbp_luma));
+    if cbp_luma > 0 {
+        w.se(mb_qp_delta);
+    }
+    // §7.3.5.3 — luma residual: full 16-coefficient 4x4 blocks per
+    // coded 8x8 quadrant.
+    for blk8 in 0..4u8 {
+        if (cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(luma_4x4_nc[blk]),
+                    16,
+                    &luma_4x4_levels[blk],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Round-391 — emit one **4:4:4** Intra_4x4 macroblock (I_NxN with
 /// the 4x4 transform, ChromaArrayType == 3, CAVLC).
 ///

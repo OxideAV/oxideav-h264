@@ -60,7 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Intra_8x8 (a coverage pin asserts real Intra_8x8 MBs on the wire
   and byte-exact reference decode), and per §8.5.9 the SCP 8x8
   dequant selects list `2 * colour_plane_id + mbIsInterFlag` —
-  6 more gates (25 mono + 16 SCP total).
+  6 more gates (25 mono + 16 SCP total). Finally the CAVLC 4:0:0 IDR
+  gained the **I_NxN (Intra_4x4) leg**: `write_i4x4_mb_mono` codes
+  the §7.3.5 monochrome I_NxN layout (no `intra_chroma_pred_mode`,
+  Table 9-4(b) intra CBP, luma-only residual) and the mono
+  `encode_mb` dispatch became a two-way I_16x16 / Intra_4x4
+  Lagrangian RDO with the shared snapshot discipline — a coverage
+  pin asserts real I_NxN MBs on edge content, byte-exact in the
+  black-box reference decoder (27 mono gates).
 
 - Round 448 — **monochrome (4:0:0, `chroma_format_idc = 0`) encode +
   decode**. ChromaArrayType 0 pictures code a luma plane only

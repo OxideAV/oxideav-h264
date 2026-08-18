@@ -1777,28 +1777,120 @@ impl Encoder {
 
         // Round-448 — ChromaArrayType == 0 (monochrome, or one colour
         // plane of a `separate_colour_plane_flag = 1` stream): the MB
-        // is luma-only, coded as Intra_16x16 (mirrors the round-28
-        // 4:4:4 bring-up — the I_NxN / I_8x8 writers on this CAVLC
-        // path still assume an intra_chroma_pred_mode field).
+        // is luma-only. Two-way Lagrangian RDO between Intra_16x16 and
+        // Intra_4x4 (I_NxN), each measured as J = D + λR over the real
+        // emitted bits — the same snapshot discipline as the 4:4:4
+        // block above, minus the chroma planes.
         if self.cfg.chroma_format_idc == 0 {
-            return self
-                .encode_mb_intra16x16(
-                    frame,
-                    mb_x,
-                    mb_y,
-                    qp_y,
-                    qp_c,
-                    chroma_width,
-                    chroma_height,
+            let lambda = lambda_ssd(qp_y, true);
+            let snap = MbStateSnapshot::capture(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr as usize,
+                0,
+            );
+            let bits_before = sw.bits_emitted();
+            let mb_ssd_luma = |recon_y: &[u8]| -> u64 {
+                let mut d = 0u64;
+                for j in 0..16usize {
+                    for i in 0..16usize {
+                        let s = frame.y[(mb_y * 16 + j) * width + mb_x * 16 + i] as i64;
+                        let r = recon_y[(mb_y * 16 + j) * width + mb_x * 16 + i] as i64;
+                        d += ((s - r) * (s - r)) as u64;
+                    }
+                }
+                d
+            };
+
+            // ----- Trial A: Intra_16x16. -----
+            let trial_a = self.encode_mb_intra16x16(
+                frame,
+                mb_x,
+                mb_y,
+                qp_y,
+                qp_c,
+                chroma_width,
+                chroma_height,
+                recon_y,
+                recon_u,
+                recon_v,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_qp_delta,
+            );
+            let d_a = mb_ssd_luma(recon_y);
+            let r_a = sw.bits_emitted() - bits_before;
+            let cost_a = cost_combined(d_a, r_a as u64, lambda);
+            let post_a = MbStateSnapshot::capture(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr as usize,
+                0,
+            );
+            snap.restore(
+                recon_y,
+                recon_u,
+                recon_v,
+                width,
+                chroma_width,
+                mb_x,
+                mb_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_addr as usize,
+            );
+
+            // ----- Trial B: Intra_4x4 (I_NxN). -----
+            let dbl_b = self.encode_mb_intra4x4_mono(
+                frame,
+                mb_x,
+                mb_y,
+                qp_y,
+                recon_y,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_qp_delta,
+            );
+            let d_b = mb_ssd_luma(recon_y);
+            let r_b = sw.bits_emitted() - bits_before;
+            let cost_b = cost_combined(d_b, r_b as u64, lambda);
+
+            if cost_a <= cost_b {
+                post_a.install(
                     recon_y,
                     recon_u,
                     recon_v,
+                    width,
+                    chroma_width,
+                    mb_x,
+                    mb_y,
                     sw,
                     nc_grid,
                     intra_grid,
-                    mb_qp_delta,
-                )
-                .deblock;
+                    mb_addr as usize,
+                );
+                return trial_a.deblock;
+            }
+            return dbl_b;
         }
 
         // Round-28: 4:4:4 started Intra_16x16-only. Round-388 added a
@@ -3784,6 +3876,198 @@ impl Encoder {
         MbDeblockInfo {
             is_intra: true,
             qp_y,
+            is_intra_4x4: true,
+            ..Default::default()
+        }
+    }
+
+    /// Round-448 — **monochrome** Intra_4x4 macroblock (I_NxN,
+    /// ChromaArrayType == 0, CAVLC): the luma half of the
+    /// [`Self::encode_mb_intra4x4_444`] pipeline — per-block 9-mode
+    /// Lagrangian trial, luma-only CBP (Table 9-4(b)), §9.2.1.1 luma
+    /// nC chain — with no chroma work at any stage (§7.3.5.1 /
+    /// §7.3.5.3 at ChromaArrayType 0). `mb_qp_delta` is transmitted
+    /// only when cbp > 0 (§7.3.5); with cbp == 0 the decoder's QP_Y
+    /// chain keeps the previous MB's value, which the returned
+    /// deblock info mirrors.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mb_intra4x4_mono(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        recon_y: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mb_qp_delta: i32,
+    ) -> MbDeblockInfo {
+        let width = self.cfg.width as usize;
+        let width_mbs = (self.cfg.width / 16) as usize;
+        let lambda = lambda_ssd(qp_y, true);
+        let wq = self.cfg.scaling_matrix.intra_weights();
+
+        // Pre-mark the slot so in-MB neighbour lookups see this MB's
+        // earlier-block modes (decoder ordering mirror).
+        {
+            let s = intra_grid.slot_mut(mb_x, mb_y);
+            s.available = true;
+            s.is_i_nxn = true;
+            s.is_i8x8 = false;
+            s.intra_4x4_pred_modes = [0u8; 16];
+        }
+
+        let mut prev_flag = [false; 16];
+        let mut rem = [0u8; 16];
+        let mut luma_4x4_levels = [[0i32; 16]; 16];
+        let mut blk_luma_nz = [false; 16];
+
+        for blk in 0..16usize {
+            let (bx, by) = I4X4_XY[blk];
+            let avail = i4x4_avail(mb_x, mb_y, bx, by, width_mbs);
+            let predicted = predicted_intra4x4_mode(intra_grid, mb_x, mb_y, blk, width_mbs);
+
+            // 9-mode Lagrangian trial (mirror of the 4:2:0 / 4:4:4 legs).
+            let mut best_mode = Intra4x4Mode::Dc;
+            let mut best_cost = u64::MAX;
+            let mut best_z_scan = [0i32; 16];
+            let mut best_recon = [0i32; 16];
+            for &mode in &Intra4x4Mode::ALL {
+                let Some(pred) = predict_4x4(mode, recon_y, width, mb_x, mb_y, bx, by, avail)
+                else {
+                    continue;
+                };
+                let candidate = mode.as_u8();
+                let mut block_res = [0i32; 16];
+                for j in 0..4 {
+                    for i in 0..4 {
+                        let s = frame.y[(mb_y * 16 + by + j) * width + (mb_x * 16 + bx + i)] as i32;
+                        block_res[j * 4 + i] = s - pred[j * 4 + i];
+                    }
+                }
+                let w_coeffs = forward_core_4x4(&block_res);
+                let z_raster = quantize_4x4_w(&w_coeffs, qp_y, true, &wq.w4);
+                let z_scan = zigzag_scan_4x4(&z_raster);
+                let r = inverse_transform_4x4(&z_raster, qp_y, &wq.w4, 8).expect("inverse 4x4");
+                let mut recon_block = [0i32; 16];
+                for j in 0..4 {
+                    for i in 0..4 {
+                        recon_block[j * 4 + i] = pred[j * 4 + i] + r[j * 4 + i];
+                    }
+                }
+                let d = ssd_4x4(frame.y, width, mb_x * 16 + bx, mb_y * 16 + by, &recon_block);
+                let mut bits: u64 = 1;
+                if candidate != predicted {
+                    bits += 3;
+                }
+                let mut trial_w = BitWriter::new();
+                if encode_residual_block_cavlc(
+                    &mut trial_w,
+                    CoeffTokenContext::Numeric(0),
+                    16,
+                    &z_scan,
+                )
+                .is_ok()
+                {
+                    bits += trial_w.bits_emitted() as u64;
+                }
+                let cost = cost_combined(d, bits, lambda);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_mode = mode;
+                    best_z_scan = z_scan;
+                    best_recon = recon_block;
+                }
+            }
+            let chosen = best_mode.as_u8();
+            if chosen == predicted {
+                prev_flag[blk] = true;
+            } else {
+                prev_flag[blk] = false;
+                rem[blk] = if chosen < predicted {
+                    chosen
+                } else {
+                    chosen - 1
+                };
+            }
+            intra_grid.slot_mut(mb_x, mb_y).intra_4x4_pred_modes[blk] = chosen;
+            luma_4x4_levels[blk] = best_z_scan;
+            blk_luma_nz[blk] = best_z_scan.iter().any(|&v| v != 0);
+            for j in 0..4 {
+                for i in 0..4 {
+                    recon_y[(mb_y * 16 + by + j) * width + mb_x * 16 + bx + i] =
+                        best_recon[j * 4 + i].clamp(0, 255) as u8;
+                }
+            }
+        }
+
+        // §7.4.5.1 — luma-only CBP (no chroma planes exist).
+        let mut cbp_luma: u8 = 0;
+        for blk8 in 0..4usize {
+            if (0..4).any(|sub| blk_luma_nz[blk8 * 4 + sub]) {
+                cbp_luma |= 1u8 << blk8;
+            }
+        }
+        // A cbp-0 quadrant quantised to zero everywhere: the committed
+        // recon already equals the predictor (decoder mirror).
+
+        // ----- §9.2.1.1 luma nC bookkeeping. -----
+        let pic_w_mbs = self.cfg.width / 16;
+        let mb_addr = (mb_y as u32) * pic_w_mbs + (mb_x as u32);
+        {
+            let cur = &mut nc_grid.mbs[mb_addr as usize];
+            cur.is_available = true;
+            cur.is_intra = true;
+            cur.is_skip = false;
+            cur.is_i_pcm = false;
+            cur.luma_total_coeff = [0u8; 16];
+        }
+        let mut luma_4x4_nc = [0i32; 16];
+        let mut own_totals = [0u8; 16];
+        for blk in 0..16usize {
+            let blk8 = blk / 4;
+            nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+            let nc = derive_nc_luma(nc_grid, mb_addr, blk as u8, LumaNcKind::Ac, true, false);
+            luma_4x4_nc[blk] = nc;
+            own_totals[blk] = if (cbp_luma >> blk8) & 1 == 1 {
+                luma_4x4_levels[blk].iter().filter(|&&v| v != 0).count() as u8
+            } else {
+                0
+            };
+        }
+        nc_grid.mbs[mb_addr as usize].luma_total_coeff = own_totals;
+
+        // ----- Emit syntax. -----
+        crate::encoder::macroblock::write_i4x4_mb_mono(
+            sw,
+            self.cfg.transform_8x8,
+            &prev_flag,
+            &rem,
+            cbp_luma,
+            mb_qp_delta,
+            &luma_4x4_levels,
+            &luma_4x4_nc,
+        )
+        .expect("write I_4x4 mb (4:0:0)");
+
+        // §8.7 — the luma deblock pass runs on 4:0:0 pictures; per-4x4
+        // nonzero bits promote internal edges to bS = 2.
+        let mut nz = [false; 16];
+        for (blk, &b) in blk_luma_nz.iter().enumerate() {
+            nz[blk] = b && (cbp_luma >> (blk / 4)) & 1 == 1;
+        }
+        MbDeblockInfo {
+            is_intra: true,
+            // §7.4.5 — no delta transmitted with cbp == 0: the decoded
+            // QP_Y chain (and the §8.7 strengths) keep the previous
+            // MB's value.
+            qp_y: if cbp_luma > 0 {
+                qp_y
+            } else {
+                qp_y - mb_qp_delta
+            },
+            luma_nonzero_4x4: luma_nz_mask_from_blocks(&nz),
             is_intra_4x4: true,
             ..Default::default()
         }

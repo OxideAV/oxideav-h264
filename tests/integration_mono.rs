@@ -527,3 +527,56 @@ fn mono_transform_8x8_cabac_reference_decoder_byte_exact() {
     let gop = encode_mono_gop_t8x8(20, 2, true);
     reference_decoder_check(&gop, "mono-t8x8-cabac-ref");
 }
+
+// ---- Intra_4x4 (I_NxN) at 4:0:0 (round-448 CAVLC leg) ----
+
+#[test]
+fn mono_i4x4_idr_codes_i_nxn_and_roundtrips() {
+    // Sharp diagonal structure at low QP: the per-block 9-mode
+    // Intra_4x4 trial beats Intra_16x16 on edges, so the two-way RDO
+    // genuinely codes I_NxN macroblocks (coverage pin below).
+    let cfg = EncoderConfig {
+        chroma_format_idc: 0,
+        profile_idc: 100,
+        qp: 16,
+        ..EncoderConfig::new(W as u32, H as u32)
+    };
+    let enc = Encoder::new(cfg);
+    let mut y0 = vec![0u8; W * H];
+    for j in 0..H {
+        for i in 0..W {
+            // Diagonal bands + a hard step every 8 px.
+            let band = ((i + j) / 4) % 2;
+            let step = if (i / 8) % 2 == 0 { 60 } else { 0 };
+            y0[j * W + i] = (60 + band * 90 + step) as u8;
+        }
+    }
+    let f0 = YuvFrame {
+        width: W as u32,
+        height: H as u32,
+        y: &y0,
+        u: &[],
+        v: &[],
+    };
+    let idr = enc.encode_idr(&f0);
+    eprintln!("mono I_NxN IDR: {} Intra_4x4 MBs", idr.i4x4_mb_count);
+    assert!(
+        idr.i4x4_mb_count > 0,
+        "expected at least one I_NxN (Intra_4x4) MB in the 4:0:0 CAVLC IDR"
+    );
+    let gop = MonoGop {
+        annex_b: idr.annex_b.clone(),
+        recon: vec![idr.recon_y.clone()],
+    };
+    assert_mono_roundtrip(&gop, "mono-i4x4");
+    reference_decoder_check(&gop, "mono-i4x4-ref");
+}
+
+#[test]
+fn mono_i4x4_gop_self_roundtrip_and_reference() {
+    // The textured pan content at low QP mixes I_16x16 and I_NxN MBs
+    // in one picture and chains P pictures on top.
+    let gop = encode_mono_gop(16, 2);
+    assert_mono_roundtrip(&gop, "mono-i4x4-gop");
+    reference_decoder_check(&gop, "mono-i4x4-gop-ref");
+}
