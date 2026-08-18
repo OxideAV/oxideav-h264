@@ -751,6 +751,22 @@ impl H264CodecDecoder {
             planes.extend(cr.planes);
             self.ready.push_back(VideoFrame { pts: y.pts, planes });
         }
+        // Anti-OOM guard for NON-conforming streams: §7.4.1.2 requires
+        // every access unit to carry all three colour planes, so the
+        // per-plane queues stay shallow on legal input. A malformed
+        // stream feeding only one colour_plane_id would otherwise grow
+        // its queue without bound — drop the oldest unpairable plane
+        // pictures past a generous cap and count them as decode
+        // errors.
+        const SCP_QUEUE_CAP: usize = 64;
+        let mut dropped = 0u64;
+        for q in scp.queues.iter_mut() {
+            while q.len() > SCP_QUEUE_CAP {
+                q.pop_front();
+                dropped += 1;
+            }
+        }
+        self.decode_errors += dropped;
     }
 
     /// §7.4.1.2.4 — decide whether `header` opens a new primary coded

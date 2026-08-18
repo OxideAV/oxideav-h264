@@ -399,3 +399,55 @@ fn scp_cabac_transform_8x8_self_roundtrip_bit_exact() {
     let enc = encode_scp_t8x8(20, true);
     assert_scp_roundtrip(&enc, "scp-cabac-t8x8");
 }
+
+/// Anti-OOM guard: a NON-conforming stream that carries only
+/// `colour_plane_id = 0` slices (§7.4.1.2 requires all three planes
+/// per access unit) must neither panic nor grow the plane-pairing
+/// queue without bound — the decoder drops unpairable plane pictures
+/// past a cap and counts them as decode errors.
+#[test]
+fn scp_plane0_only_stream_is_bounded_and_errors() {
+    use oxideav_h264::encoder::{EncodedFrameRef, Encoder, EncoderConfig, YuvFrame};
+
+    const SW: usize = 32;
+    const SH: usize = 32;
+    let enc = Encoder::new(EncoderConfig {
+        chroma_format_idc: 0,
+        profile_idc: 244,
+        colour_plane_id: Some(0),
+        qp: 40,
+        ..EncoderConfig::new(SW as u32, SH as u32)
+    });
+    let y: Vec<u8> = (0..SW * SH).map(|i| (i % 251) as u8).collect();
+    let f = YuvFrame {
+        width: SW as u32,
+        height: SH as u32,
+        y: &y,
+        u: &[],
+        v: &[],
+    };
+    let idr = enc.encode_idr(&f);
+    let mut stream = idr.annex_b.clone();
+    let mut prev: Option<oxideav_h264::encoder::EncodedP> = None;
+    for k in 1..90u32 {
+        let p = if let Some(pp) = prev.take() {
+            enc.encode_p(&f, &EncodedFrameRef::from(&pp), k, 2 * k)
+        } else {
+            enc.encode_p(&f, &EncodedFrameRef::from(&idr), k, 2 * k)
+        };
+        stream.extend_from_slice(&p.annex_b);
+        prev = Some(p);
+    }
+
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), stream).with_pts(0);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    // No complete (Y, Cb, Cr) triple ever forms → no video frames.
+    assert!(!matches!(dec.receive_frame(), Ok(Frame::Video(_))));
+    // The overflow past the pairing cap was surfaced as decode errors.
+    assert!(
+        dec.decode_error_count() > 0,
+        "expected dropped unpairable plane pictures to be counted"
+    );
+}

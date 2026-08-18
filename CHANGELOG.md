@@ -67,7 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `encode_mb` dispatch became a two-way I_16x16 / Intra_4x4
   Lagrangian RDO with the shared snapshot discipline — a coverage
   pin asserts real I_NxN MBs on edge content, byte-exact in the
-  black-box reference decoder (27 mono gates).
+  black-box reference decoder (27 mono gates). A robustness guard
+  bounds NON-conforming separate-colour-plane input: a stream
+  feeding only one `colour_plane_id` (§7.4.1.2 requires all three
+  planes per access unit) can never pair plane triples, so the
+  per-plane queues drop past a generous cap with the overflow
+  surfaced through `decode_error_count` (gated by a 90-picture
+  plane-0-only stream test).
 
 - Round 448 — **monochrome (4:0:0, `chroma_format_idc = 0`) encode +
   decode**. ChromaArrayType 0 pictures code a luma plane only
