@@ -3471,8 +3471,15 @@ fn same_slice_at(grid: &MbGrid, x: i32, y: i32, current_slice_id: i32) -> bool {
     }
     let addr = mb_y * grid.width_in_mbs + mb_x;
     match grid.get(addr) {
-        Some(info) if info.slice_id >= 0 => info.slice_id == current_slice_id,
-        _ => true,
+        // §6.4.8 — a neighbouring macroblock is available only when it
+        // has already been DECODED (its grid slot stamped) and belongs
+        // to the same slice. An unstamped in-picture slot used to
+        // count as "same slice", which was invisible under raster
+        // decode order (everything above/left is always decoded first)
+        // but read zero-initialised picture samples once ASO delivered
+        // a picture's slices out of order (round 451).
+        Some(info) => info.slice_id >= 0 && info.slice_id == current_slice_id,
+        None => true,
     }
 }
 

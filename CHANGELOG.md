@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **Arbitrary slice order (ASO) decode** (§A.2.1 /
+  §A.2.3 — Baseline and Extended allow a picture's slices to arrive
+  in any order). Two changes: the "first slice of a picture must
+  cover MB 0" strictness rejection is now scoped to the profiles
+  where ASO is disallowed (for Baseline 66 / Extended 88 a picture
+  may open at any `first_mb_in_slice`; the zero-luma-emission hazard
+  the rejection guarded stays closed independently by the
+  finalize-time full-coverage drop, so the `crash-957ac808` pin still
+  holds), and a real ordering defect in the §6.4.8 neighbour
+  availability was fixed: `same_slice_at` treated an UNSTAMPED
+  (not-yet-decoded) grid slot as "same slice", invisible under raster
+  order but reading zero-initialised picture samples for intra
+  prediction once slices arrived out of order. `integration_aso`
+  gates a 3-slice Intra_16x16-DC-residual picture and a 3-slice
+  I_PCM picture: byte-identical decodes under every slice-order
+  rotation, in-order form byte-matched against the black-box
+  reference decoder.
+
 - Round 451 — **12-bit / 14-bit decode coverage** (§7.4.2.1.1
   `bit_depth_*_minus8` up to 6 — the High 4:4:4 Predictive depth
   range, §A.2.7). The parse/transform plumbing supported 8..=14 all

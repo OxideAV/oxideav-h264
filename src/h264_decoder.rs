@@ -1035,29 +1035,29 @@ impl H264CodecDecoder {
 
             // §7.4.3 + Annex A — `first_mb_in_slice` of the first
             // coded slice of a coded picture must be 0 when arbitrary
-            // slice order (ASO) is not allowed. ASO is gated on
-            // Baseline / Extended profiles AND FMO usage, both of
-            // which we already reject at PPS-activation time
-            // (`DecoderError::FmoNotSupported`, see `decoder.rs`).
-            // So for every stream we accept, the first VCL NAL of a
-            // primary coded picture must cover macroblock 0.
+            // slice order (ASO) is not allowed. §A.2.1 (Baseline) and
+            // §A.2.3 (Extended) DO allow ASO — the slices of a coded
+            // picture may arrive in any order, so the picture-opening
+            // slice may legitimately cover any macroblock range
+            // (round 451: previously rejected unconditionally, which
+            // blocked every ASO stream). For every other profile the
+            // slices form a contiguous raster walk and a non-zero
+            // opener is a conformance violation.
             //
-            // Without this check, a stream whose every "first" slice
-            // carries `first_mb_in_slice > 0` opens a fresh picture
-            // whose MBs `0..first_mb_in_slice` are never coded,
-            // leaving the picture's luma + chroma planes
-            // zero-initialised. We then emit a `Frame::Video` with
-            // all-zero luma — a strictness divergence from
-            // common H.264 decoders, which reject the access unit outright.
-            //
-            // Caught by the fuzz oracle on `crash-957ac808…` (440 B,
-            // four IDR slices, all with `first_mb_in_slice == 2`,
-            // 1×6-MB picture; common H.264 decoders reject, we previously
-            // emitted two zero-luma frames).
-            if header.first_mb_in_slice != 0 {
+            // The hazard this rejection used to guard — a hostile
+            // stream whose "first" slices never cover the leading MBs,
+            // which would emit a Frame::Video with zero-initialised
+            // luma (fuzz oracle `crash-957ac808…`: 440 B, four IDR
+            // slices all with `first_mb_in_slice == 2`) — is closed
+            // independently by `finalize_in_progress_picture`'s
+            // full-coverage check: a picture whose MbGrid still has
+            // unavailable entries at finalize time is dropped, never
+            // emitted. ASO streams that DO cover the whole picture
+            // pass that check whatever order their slices arrived in.
+            if header.first_mb_in_slice != 0 && !matches!(sps.profile_idc, 66 | 88) {
                 return Err(Error::invalid(format!(
-                    "h264 slice_header: first_mb_in_slice = {} for first slice of a coded picture (§7.4.3 / Annex A require 0 when ASO/FMO is disabled)",
-                    header.first_mb_in_slice
+                    "h264 slice_header: first_mb_in_slice = {} for first slice of a coded picture (§7.4.3 / Annex A require 0 when ASO is not allowed — profile_idc {})",
+                    header.first_mb_in_slice, sps.profile_idc
                 )));
             }
 
