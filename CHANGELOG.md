@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **SP / SI encoder + bit-exact switching gates**
+  (`encoder::sp`). The Extended-profile switching-picture system is
+  now exercised end-to-end: `encode_sp_picture` emits primary SP
+  access units (`sp_for_switch_flag = 0` — all-`P_L0_16x16`, zero
+  motion, per-block transform-domain residual selection inverting the
+  eq. 8-416/8-428 dequants, with a §8.6-mirror reconstruction and the
+  final quantised coefficient arrays retained as switching TARGETS);
+  `encode_sp_switch_picture` emits a switching SP picture that
+  reproduces a primary picture's reconstruction **byte-exactly while
+  predicting from a different stream's decode state** (per block
+  `cr = c_target − Q_QSY(T(pred))`, the eq. 8-433/8-437 sums land on
+  the target exactly; the chroma DC rides eq. 8-440's additive level
+  with the eq. 8-431 scale shown integral for QSC >= 6); and
+  `encode_si_picture` does the same with **no reference at all**
+  (Table 7-12 SI macroblocks, DC Intra_4x4 + DC chroma prediction
+  against the already-switched samples). An all-I_PCM IDR writer
+  provides a bit-exact anchor, and the Extended (88) SPS profile is
+  wired through the SPS writer. Five `integration_sp_si` gates:
+  a two-frame chained primary SP stream decodes byte-exactly to the
+  encoder mirror at `QP != QS` (pinning the QPY-vs-QSY split) with
+  PSNR floors; the switching SP identity and the SI identity both
+  hold BYTE-EXACTLY with deblocking on (so the §8.7.2.1 SP/SI
+  strengths are inside the equality) and the SI identity again with
+  deblocking off; and a black-box cross-check against a stock
+  reference decoder binary (byte-exact I_PCM anchor; close-agreement
+  PSNR bounds on the SP frames — probing showed the binary rounds
+  negative §8.6 coefficients off the literal equations by ±1 level
+  and does not model the switching semantics at all, so the literal
+  fine behaviour rides the mirror + identity gates). Two defects were
+  flushed out by these gates during bring-up: the §8.6 chroma DC
+  needed the §8.5.4-raster reading of the eq. 8-428/8-431 index pairs
+  (the transposed alternative mis-places the PREDICTION DC — the
+  H2 sandwich is transpose-invariant, so only the black-box
+  comparison and the qs-insensitive quality floor exposed it), and
+  the chroma quantisers keep the literal sign-inside-the-shift form
+  (eqs. 8-425/8-429/8-435/8-439) that differs from the luma
+  eqs. 8-420/8-432 — the asymmetry repeats across all six equations
+  and is transcribed as printed.
+
 - Round 451 — **SP / SI slice decode (§8.6)** — the Extended-profile
   switching-picture surface. The slice-type plumbing existed
   (`sp_for_switch_flag` / `slice_qs_delta` parsed since the first

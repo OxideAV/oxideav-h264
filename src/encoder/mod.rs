@@ -64,6 +64,7 @@ pub mod sei;
 pub mod session;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod slice;
+pub mod sp;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod sps;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API

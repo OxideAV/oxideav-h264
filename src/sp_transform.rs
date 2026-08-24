@@ -126,33 +126,40 @@ fn dequant_8_416(cr: i32, qp: i32, weight_scale: &[i32; 16], i: usize, j: usize)
     ((cr as i64 * level_scale4x4(weight_scale, m, i, j) * a_ij(i, j)) << (qp / 6)) >> 10
 }
 
-/// Eq. 8-420 (luma, sign applied AFTER the shift):
+/// Eqs. 8-420 / 8-432 (luma):
 /// `c = Sign(cs) · ( ( Abs(cs) · LevelScale2(QS % 6, i, j)
-///                    + ( 1 << ( 14 + QS / 6 ) ) ) >> ( 15 + QS / 6 ) )`.
+///                    + ( 1 << ( 14 + QS / 6 ) ) ) >> ( 15 + QS / 6 ) )`
+/// — the sign multiplies the SHIFTED magnitude.
 #[inline]
-fn quant_qs_sign_outside(cs: i64, qs: i32, i: usize, j: usize) -> i32 {
+fn quant_qs_luma(cs: i64, qs: i32, i: usize, j: usize) -> i32 {
     let m = (qs % 6) as usize;
     let shift = 15 + qs / 6;
     let mag = (cs.abs() * level_scale2(m, i, j) + (1i64 << (14 + qs / 6))) >> shift;
     (cs.signum() * mag) as i32
 }
 
-/// Eqs. 8-425 / 8-435 (chroma AC, sign applied BEFORE the arithmetic
-/// shift): `c = ( Sign(cs) · ( Abs(cs) · LevelScale2(QS % 6, i, j)
-///                + ( 1 << ( 14 + QS / 6 ) ) ) ) >> ( 15 + QS / 6 )`.
+/// Eqs. 8-425 / 8-435 (chroma AC):
+/// `c = ( Sign(cs) · ( Abs(cs) · LevelScale2(QS % 6, i, j)
+///        + ( 1 << ( 14 + QS / 6 ) ) ) ) >> ( 15 + QS / 6 )`
+/// — unlike the luma eqs. 8-420 / 8-432, the sign multiplies the
+/// PRE-shift magnitude and the arithmetic right shift then floors
+/// (negatives round differently than the luma form). The asymmetry
+/// repeats identically across both the §8.6.1 and §8.6.2 chroma
+/// equations, so it is transcribed literally.
 #[inline]
-fn quant_qs_sign_inside(cs: i64, qs: i32, i: usize, j: usize) -> i32 {
+fn quant_qs_chroma(cs: i64, qs: i32, i: usize, j: usize) -> i32 {
     let m = (qs % 6) as usize;
     let shift = 15 + qs / 6;
     ((cs.signum() * (cs.abs() * level_scale2(m, i, j) + (1i64 << (14 + qs / 6)))) >> shift) as i32
 }
 
-/// Eqs. 8-429 / 8-439 (chroma DC, one extra bit in the rounding term
-/// and the shift; sign applied BEFORE the arithmetic shift):
+/// Eqs. 8-429 / 8-439 (chroma DC — one extra bit in the rounding term
+/// and the shift; sign inside the shifted product like the chroma AC
+/// quantiser, see [`quant_qs_chroma`]):
 /// `dc = ( Sign(x) · ( Abs(x) · LevelScale2(QS % 6, 0, 0)
 ///          + ( 1 << ( 15 + QS / 6 ) ) ) ) >> ( 16 + QS / 6 )`.
 #[inline]
-fn quant_qs_dc(x: i64, qs: i32) -> i64 {
+pub(crate) fn quant_qs_dc(x: i64, qs: i32) -> i64 {
     let m = (qs % 6) as usize;
     let shift = 16 + qs / 6;
     (x.signum() * (x.abs() * level_scale2(m, 0, 0) + (1i64 << (15 + qs / 6)))) >> shift
@@ -185,7 +192,7 @@ pub fn sp_luma_non_switching(
             // Eq. 8-416.
             let cs = cp[idx] as i64 + dequant_8_416(cr[idx], qp_y, weight_scale, i, j);
             // Eq. 8-420.
-            c[idx] = quant_qs_sign_outside(cs, qs_y, i, j);
+            c[idx] = quant_qs_luma(cs, qs_y, i, j);
         }
     }
     c
@@ -204,8 +211,8 @@ pub fn sp_luma_switching(pred: &[i32; 16], cr: &[i32; 16], qs_y: i32) -> [i32; 1
     for i in 0..4 {
         for j in 0..4 {
             let idx = i * 4 + j;
-            // Eq. 8-432 (sign outside the shift, like the luma 8-420).
-            let cs = quant_qs_sign_outside(cp[idx] as i64, qs_y, i, j);
+            // Eq. 8-432.
+            let cs = quant_qs_luma(cp[idx] as i64, qs_y, i, j);
             // Eq. 8-433.
             c[idx] = cr[idx] + cs;
         }
@@ -250,7 +257,7 @@ pub fn sp_chroma_non_switching(
                 let cs =
                     cp[blk][idx] as i64 + dequant_8_416(ac[blk][idx], qp_c, weight_scale, i, j);
                 // Eq. 8-425.
-                out[blk][idx] = quant_qs_sign_inside(cs, qs_c, i, j);
+                out[blk][idx] = quant_qs_chroma(cs, qs_c, i, j);
             }
         }
     }
@@ -266,26 +273,27 @@ pub fn sp_chroma_non_switching(
     let m = (qp_c % 6) as usize;
     let ls_dc_qp = level_scale4x4(weight_scale, m, 0, 0);
     let mut dcr = [0i64; 4];
-    for i in 0..2 {
-        for j in 0..2 {
-            let pos = i * 2 + j;
-            // Eq. 8-428 — note the ChromaDCLevel index is j * 2 + i and
-            // the shift is >> 9 (one less than the AC's >> 10 to account
-            // for the un-normalised 2x2 Hadamard).
-            let level = dc_levels[j * 2 + i] as i64;
-            let dcs = dcp[pos] + (((level * ls_dc_qp * a_ij(0, 0)) << (qp_c / 6)) >> 9);
-            // Eq. 8-429.
-            dcr[pos] = quant_qs_dc(dcs, qs_c);
-        }
+    for pos in 0..4 {
+        // Eq. 8-428 — ChromaDCLevel[ j * 2 + i ] with the (i, j) of the
+        // dc arrays read as the same positional index pair eq. 8-304
+        // rasterises ChromaDCLevel with (the §8.5.11 2x2 chain is
+        // transpose-invariant, so the level pickup and the eq. 8-431
+        // block distribution must simply agree with the §8.5.4 raster
+        // convention — level k belongs to dc position k and to
+        // chroma4x4BlkIdx k). The shift is >> 9, one less than the
+        // AC's >> 10, to account for the un-normalised 2x2 Hadamard.
+        let level = dc_levels[pos] as i64;
+        let dcs = dcp[pos] + (((level * ls_dc_qp * a_ij(0, 0)) << (qp_c / 6)) >> 9);
+        // Eq. 8-429.
+        dcr[pos] = quant_qs_dc(dcs, qs_c);
     }
     // Eq. 8-430.
     let f = hadamard_2x2(&dcr);
-    // Eq. 8-431 — scale and distribute to the per-block DC slots.
+    // Eq. 8-431 — scale and distribute to the per-block DC slots
+    // (raster: f position k → chroma4x4BlkIdx k, as in §8.5.4).
     let ls_dc_qs = level_scale4x4(weight_scale, (qs_c % 6) as usize, 0, 0);
-    for i in 0..2 {
-        for j in 0..2 {
-            out[j * 2 + i][0] = (((f[i * 2 + j] * ls_dc_qs) << (qs_c / 6)) >> 5) as i32;
-        }
+    for (blk, fv) in f.iter().enumerate() {
+        out[blk][0] = (((fv * ls_dc_qs) << (qs_c / 6)) >> 5) as i32;
     }
     out
 }
@@ -314,7 +322,7 @@ pub fn sp_chroma_switching(
                 }
                 let idx = i * 4 + j;
                 // Eq. 8-435.
-                let cs = quant_qs_sign_inside(cp[blk][idx] as i64, qs_c, i, j);
+                let cs = quant_qs_chroma(cp[blk][idx] as i64, qs_c, i, j);
                 // Eq. 8-437.
                 out[blk][idx] = ac[blk][idx] + cs;
             }
@@ -329,22 +337,18 @@ pub fn sp_chroma_switching(
         cp[3][0] as i64,
     ]);
     let mut dcr = [0i64; 4];
-    for i in 0..2 {
-        for j in 0..2 {
-            let pos = i * 2 + j;
-            // Eq. 8-439.
-            let dcs = quant_qs_dc(dcp[pos], qs_c);
-            // Eq. 8-440 — ChromaDCLevel index j * 2 + i.
-            dcr[pos] = dcs + dc_levels[j * 2 + i] as i64;
-        }
+    for pos in 0..4 {
+        // Eq. 8-439.
+        let dcs = quant_qs_dc(dcp[pos], qs_c);
+        // Eq. 8-440 — level pickup in the §8.5.4 raster convention
+        // (see the eq. 8-428 note in `sp_chroma_non_switching`).
+        dcr[pos] = dcs + dc_levels[pos] as i64;
     }
     // Eq. 8-430.
     let f = hadamard_2x2(&dcr);
-    // Eq. 8-441 — copied verbatim into the DC slots.
-    for i in 0..2 {
-        for j in 0..2 {
-            out[j * 2 + i][0] = f[i * 2 + j] as i32;
-        }
+    // Eq. 8-441 — copied verbatim into the DC slots (raster).
+    for (blk, fv) in f.iter().enumerate() {
+        out[blk][0] = *fv as i32;
     }
     out
 }
@@ -352,7 +356,7 @@ pub fn sp_chroma_switching(
 /// Steps shared by both chroma paths: split the 8x8 component
 /// prediction into the four 4x4 blocks (§6.4.7 raster order) and apply
 /// eq. 8-415 to each.
-fn chroma_pred_transform(pred: &[i32; 64]) -> [[i32; 16]; 4] {
+pub(crate) fn chroma_pred_transform(pred: &[i32; 64]) -> [[i32; 16]; 4] {
     let mut cp = [[0i32; 16]; 4];
     for (blk, dst) in cp.iter_mut().enumerate() {
         let (bx, by) = ((blk % 2) * 4, (blk / 2) * 4);
@@ -535,17 +539,15 @@ mod tests {
         let k = chroma_dc_switch_scale(qs_c, &FLAT).expect("QSC >= 6 scale is integral");
 
         // Recover the primary's dcr from its c00 values: c00 = k · f,
-        // f = H2(dcr) ⇒ H2(f) = 4 · dcr (H2 is 2·orthogonal).
-        let f_scaled = [
+        // f = H2(dcr) ⇒ H2(f) = 4 · dcr (H2 is 2·orthogonal). The
+        // distribution is raster: c00(blk) = k · f[blk].
+        let kf = [
             c_a[0][0] as i64,
             c_a[1][0] as i64,
             c_a[2][0] as i64,
             c_a[3][0] as i64,
         ];
-        // f_scaled[blk = j*2+i] = k · f[i*2+j] — undo the transposed
-        // distribution to get k·f in matrix order.
-        let kf = [f_scaled[0], f_scaled[2], f_scaled[1], f_scaled[3]];
-        let h_kf = hadamard_2x2(&kf); // = 4k · dcr (matrix order)
+        let h_kf = hadamard_2x2(&kf); // = 4k · dcr
         assert!(h_kf.iter().all(|v| v % 4 == 0));
         let target_dcr = [h_kf[0] / 4, h_kf[1] / 4, h_kf[2] / 4, h_kf[3] / 4];
         assert!(target_dcr.iter().all(|v| v % k == 0 || k == 1));
@@ -559,12 +561,9 @@ mod tests {
             cp_b[3][0] as i64,
         ]);
         let mut dc_levels_sw = [0i32; 4];
-        for i in 0..2 {
-            for j in 0..2 {
-                let pos = i * 2 + j;
-                let dcs = quant_qs_dc(dcp_b[pos], qs_c);
-                dc_levels_sw[j * 2 + i] = (target_dcr[pos] - dcs) as i32;
-            }
+        for pos in 0..4 {
+            let dcs = quant_qs_dc(dcp_b[pos], qs_c);
+            dc_levels_sw[pos] = (target_dcr[pos] - dcs) as i32;
         }
         let c_sw = sp_chroma_switching(&pred_b, &dc_levels_sw, &ac_zero, qs_c);
         // The switching DC slots must equal the primary's scaled DCs.
