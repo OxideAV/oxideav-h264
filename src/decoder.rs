@@ -21,6 +21,7 @@
 
 #![allow(dead_code)]
 
+use crate::bitstream::BitReader;
 use crate::nal::{self, AnnexBSplitter, AvccSplitter, NalHeader, NalUnitType};
 use crate::non_vcl::{self, AccessUnitDelimiter, PrimaryPicType, SeiMessage};
 use crate::pps::{Pps, PpsError};
@@ -72,6 +73,10 @@ pub enum DecoderError {
     /// the reference decoder refuses.
     #[error("FMO (num_slice_groups_minus1={0} > 0) is not supported in this decoder build")]
     FmoNotSupported(u32),
+    /// §7.3.2.9 — a data-partitioned slice combines with a tool shape
+    /// this decoder does not model (e.g. separate colour planes).
+    #[error("slice data partitioning unsupported shape: {0}")]
+    DataPartitionUnsupportedShape(&'static str),
     /// §G.7.4.1.2.1 — a coded slice MVC extension NAL (type 20)
     /// activated a PPS whose referenced `seq_parameter_set_id` has no
     /// subset SPS (NAL 15) stored. Per the activation rule a type-20
@@ -144,6 +149,44 @@ pub enum Event {
         /// at slice-header parse time. Mirrors the snapshot rationale for
         /// `pps` above (though SPS re-transmission is rarer in practice).
         sps: Sps,
+    },
+    /// §7.3.2.9.1 — slice data partition A (`nal_unit_type == 2`):
+    /// the §7.3.3 `slice_header()` plus the §7.4.2.9.1 `slice_id`,
+    /// followed by the category-2 parts of `slice_data()`. The caller
+    /// pairs this with the matching partition-B/C events (same
+    /// `slice_id`) and feeds
+    /// [`crate::slice_data::parse_slice_data_partitioned`].
+    SliceDataPartitionA {
+        /// 2-bit `nal_ref_idc` value.
+        nal_ref_idc: u8,
+        header: SliceHeader,
+        /// §7.4.2.9.1 — `slice_id`.
+        slice_id: u32,
+        /// RBSP after the NAL header byte, emulation bytes removed.
+        rbsp: Vec<u8>,
+        /// First bit of the category-2 `slice_data()` (just past
+        /// `slice_id`).
+        slice_data_cursor: (usize, u8),
+        pps: Pps,
+        sps: Sps,
+    },
+    /// §7.3.2.9.2 / §7.3.2.9.3 — slice data partition B
+    /// (`nal_unit_type == 3`, category-3 residual: intra collective
+    /// types + I_PCM samples) or C (`nal_unit_type == 4`, category-4
+    /// residual: inter collective types).
+    SliceDataPartitionBc {
+        /// `true` for partition C (NAL 4), `false` for B (NAL 3).
+        is_c: bool,
+        /// §7.4.2.9.1 — `slice_id` (pairs with the partition A of the
+        /// same slice).
+        slice_id: u32,
+        /// §7.4.2.9.2 — `redundant_pic_cnt` (0 when the PPS does not
+        /// carry the flag).
+        redundant_pic_cnt: u32,
+        /// RBSP after the NAL header byte, emulation bytes removed.
+        rbsp: Vec<u8>,
+        /// First bit of the partition's `slice_data()` payload.
+        slice_data_cursor: (usize, u8),
     },
     /// §G.7.3.2.13 — coded slice MVC extension (`nal_unit_type == 20`,
     /// `svc_extension_flag == 0`). The `slice_layer_extension_rbsp()`
@@ -349,13 +392,15 @@ impl Decoder {
             NalUnitType::SliceNonIdr | NalUnitType::SliceIdr => {
                 self.process_slice_nal(&header, &rbsp)
             }
-            // Data-partition NAL types are a legacy Baseline/Extended
-            // feature we don't model here. Treat them as "ignored" with
-            // the raw NAL bytes so callers can route them elsewhere.
-            NalUnitType::SliceDataPartitionA
-            | NalUnitType::SliceDataPartitionB
-            | NalUnitType::SliceDataPartitionC
-            | NalUnitType::SliceAuxiliary => Ok(Event::Ignored {
+            // §7.3.2.9 — slice data partitions (Extended profile,
+            // CAVLC-only). Partition A carries the slice header +
+            // slice_id + category-2 slice data; B/C carry the
+            // category-3/-4 residual payloads keyed by slice_id.
+            NalUnitType::SliceDataPartitionA => self.process_dp_a_nal(&header, &rbsp),
+            NalUnitType::SliceDataPartitionB | NalUnitType::SliceDataPartitionC => {
+                self.process_dp_bc_nal(&header, &rbsp)
+            }
+            NalUnitType::SliceAuxiliary => Ok(Event::Ignored {
                 nal_unit_type: header.nal_unit_type.as_u8(),
                 nal_bytes: nal_bytes.to_vec(),
             }),
@@ -531,6 +576,90 @@ impl Decoder {
         })
     }
 
+    /// §7.3.2.9.1 — parse a slice data partition A NAL: the ordinary
+    /// §7.3.3 slice header (with the same PPS/SPS activation rules as
+    /// a coded slice), then `slice_id`. The returned cursor points at
+    /// the first bit of the category-2 slice data.
+    fn process_dp_a_nal(&mut self, header: &NalHeader, rbsp: &[u8]) -> DecoderResult<Event> {
+        if self.pps_by_id.iter().all(|p| p.is_none()) {
+            return Err(DecoderError::NoActiveParameterSets);
+        }
+        let pps_id = peek_slice_pps_id(rbsp)?;
+        let pps = self
+            .pps_by_id
+            .get(pps_id as usize)
+            .and_then(|p| p.as_ref())
+            .ok_or(DecoderError::UnknownPps(pps_id))?
+            .clone();
+        if pps.num_slice_groups_minus1 > 0 {
+            return Err(DecoderError::FmoNotSupported(pps.num_slice_groups_minus1));
+        }
+        let sps_id = pps.seq_parameter_set_id;
+        let sps = self
+            .sps_by_id
+            .get(sps_id as usize)
+            .and_then(|p| p.as_ref())
+            .ok_or(DecoderError::UnknownSps(sps_id))?
+            .clone();
+        let (parsed, header_cursor) = SliceHeader::parse_and_tell(rbsp, &sps, &pps, header)?;
+        // §7.3.2.9.1 — slice_id ue(v) follows the slice header.
+        let (slice_id, slice_data_cursor) = read_ue_at(rbsp, header_cursor)?;
+        self.active_pps_id = Some(pps_id);
+        self.active_sps_id = Some(sps_id);
+        Ok(Event::SliceDataPartitionA {
+            nal_ref_idc: header.nal_ref_idc,
+            header: parsed,
+            slice_id,
+            rbsp: rbsp.to_vec(),
+            slice_data_cursor,
+            pps,
+            sps,
+        })
+    }
+
+    /// §7.3.2.9.2 / §7.3.2.9.3 — parse a slice data partition B / C
+    /// NAL prefix: `slice_id`, the conditional `colour_plane_id`
+    /// (rejected — separate-colour-plane data partitioning is not
+    /// modelled) and `redundant_pic_cnt` (gated on the ACTIVE PPS —
+    /// B/C partitions carry no pic_parameter_set_id of their own and
+    /// rely on the partition A's activation, §7.4.2.9).
+    fn process_dp_bc_nal(&mut self, header: &NalHeader, rbsp: &[u8]) -> DecoderResult<Event> {
+        let pps = self
+            .active_pps_id
+            .and_then(|id| self.pps_by_id.get(id as usize).and_then(|p| p.as_ref()))
+            .ok_or(DecoderError::NoActiveParameterSets)?;
+        let sps = self
+            .active_sps_id
+            .and_then(|id| self.sps_by_id.get(id as usize).and_then(|p| p.as_ref()))
+            .ok_or(DecoderError::NoActiveParameterSets)?;
+        let mut r = BitReader::new(rbsp);
+        let slice_id = r
+            .ue()
+            .map_err(|e| DecoderError::SliceHeader(SliceHeaderError::Bitstream(e)))?;
+        if sps.separate_colour_plane_flag {
+            // §7.3.2.9.2 — the colour_plane_id u(2) would follow here.
+            // Separate-colour-plane data partitioning is not modelled;
+            // reject rather than mis-pair partitions across planes.
+            return Err(DecoderError::DataPartitionUnsupportedShape(
+                "separate_colour_plane_flag with slice data partitioning",
+            ));
+        }
+        let redundant_pic_cnt = if pps.redundant_pic_cnt_present_flag {
+            r.ue()
+                .map_err(|e| DecoderError::SliceHeader(SliceHeaderError::Bitstream(e)))?
+        } else {
+            0
+        };
+        let slice_data_cursor = r.position();
+        Ok(Event::SliceDataPartitionBc {
+            is_c: header.nal_unit_type == NalUnitType::SliceDataPartitionC,
+            slice_id,
+            redundant_pic_cnt,
+            rbsp: rbsp.to_vec(),
+            slice_data_cursor,
+        })
+    }
+
     /// §B.1 — consume an Annex B byte stream. Each iteration yields one
     /// [`Event`] per NAL unit (or a [`DecoderError`]). The iterator
     /// borrows the decoder mutably, so events must be consumed before
@@ -616,6 +745,28 @@ impl Default for Decoder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Read one `ue(v)` at a `(byte, bit)` cursor into `rbsp`, returning
+/// the value and the advanced cursor (byte index relative to the full
+/// `rbsp`).
+fn read_ue_at(rbsp: &[u8], cursor: (usize, u8)) -> DecoderResult<(u32, (usize, u8))> {
+    let (byte, bit) = cursor;
+    let tail = rbsp
+        .get(byte..)
+        .ok_or(DecoderError::SliceHeader(SliceHeaderError::Bitstream(
+            crate::bitstream::BitError::Eof,
+        )))?;
+    let mut r = BitReader::new(tail);
+    if bit > 0 {
+        r.u(u32::from(bit))
+            .map_err(|e| DecoderError::SliceHeader(SliceHeaderError::Bitstream(e)))?;
+    }
+    let v = r
+        .ue()
+        .map_err(|e| DecoderError::SliceHeader(SliceHeaderError::Bitstream(e)))?;
+    let (b2, bit2) = r.position();
+    Ok((v, (byte + b2, bit2)))
 }
 
 /// §7.3.3 — peek the `pic_parameter_set_id` from the front of a slice

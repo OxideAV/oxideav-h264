@@ -47,8 +47,8 @@ use crate::cabac_ctx::{
     decode_end_of_slice_flag, decode_mb_skip_flag, CabacContexts, NeighbourCtx, SliceKind,
 };
 use crate::macroblock_layer::{
-    parse_macroblock, CabacNeighbourGrid, CavlcNcGrid, EntropyState, Macroblock,
-    MacroblockLayerError, MbType, PcmSamples,
+    parse_macroblock, parse_macroblock_dp, CabacNeighbourGrid, CavlcNcGrid, DpResidualReaders,
+    EntropyState, Macroblock, MacroblockLayerError, MbType, PcmSamples,
 };
 use crate::mb_address::mbaff_pair_neighbour_addrs;
 use crate::pps::Pps;
@@ -57,6 +57,9 @@ use crate::sps::Sps;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SliceDataError {
+    /// §7.3.2.9 / A.2.3 — data-partitioned slices are CAVLC-only.
+    #[error("slice data partitioning with CABAC entropy coding is not supported")]
+    DataPartitioningCabacUnsupported,
     #[error("bitstream read failed: {0}")]
     Bitstream(#[from] BitError),
     #[error("CABAC engine failed: {0}")]
@@ -147,6 +150,66 @@ pub fn parse_slice_data(
     sps: &Sps,
     pps: &Pps,
 ) -> SliceDataResult<SliceData> {
+    parse_slice_data_impl(
+        rbsp,
+        bit_cursor_bytes,
+        bit_cursor_bits,
+        None,
+        None,
+        slice_header,
+        sps,
+        pps,
+    )
+}
+
+/// §7.3.2.9 — parse the slice data of a DATA-PARTITIONED slice: the
+/// category-2 syntax elements (macroblock headers, motion, CBP,
+/// mb_qp_delta, skip runs — and the loop's `more_rbsp_data()` guard)
+/// read from the partition-A RBSP at `(bit_cursor_bytes,
+/// bit_cursor_bits)` (just past the §7.3.2.9.1 `slice_id`), while the
+/// `residual()` structures read from the partition-B (intra
+/// collective types + I_PCM samples) and partition-C (inter) payloads
+/// — each an `(rbsp, byte, bit)` triple positioned just past that
+/// partition's §7.3.2.9.2/.3 prefix. A missing partition is only an
+/// error if the category-2 elements call for its data (§7.4.2.9).
+/// CAVLC only (A.2.3).
+#[allow(clippy::too_many_arguments)]
+pub fn parse_slice_data_partitioned(
+    rbsp_a: &[u8],
+    bit_cursor_bytes: usize,
+    bit_cursor_bits: u8,
+    part_b: Option<(&[u8], usize, u8)>,
+    part_c: Option<(&[u8], usize, u8)>,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+) -> SliceDataResult<SliceData> {
+    if pps.entropy_coding_mode_flag {
+        return Err(SliceDataError::DataPartitioningCabacUnsupported);
+    }
+    parse_slice_data_impl(
+        rbsp_a,
+        bit_cursor_bytes,
+        bit_cursor_bits,
+        part_b,
+        part_c,
+        slice_header,
+        sps,
+        pps,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_slice_data_impl(
+    rbsp: &[u8],
+    bit_cursor_bytes: usize,
+    bit_cursor_bits: u8,
+    part_b: Option<(&[u8], usize, u8)>,
+    part_c: Option<(&[u8], usize, u8)>,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+) -> SliceDataResult<SliceData> {
     // §7.3.4 — MbaffFrameFlag = mb_adaptive_frame_field_flag &&
     // !field_pic_flag. Phase 1: the walker steps in MB pairs and
     // reads mb_field_decoding_flag per pair, but downstream
@@ -198,6 +261,9 @@ pub fn parse_slice_data(
         // ---------------------------------------------------------
         // CABAC path (§7.3.4).
         // ---------------------------------------------------------
+        if part_b.is_some() || part_c.is_some() {
+            return Err(SliceDataError::DataPartitioningCabacUnsupported);
+        }
         while !r.byte_aligned() {
             // §7.3.4 — cabac_alignment_one_bit. The spec mandates each
             // alignment bit be equal to 1; we tolerate any value for
@@ -764,6 +830,22 @@ pub fn parse_slice_data(
         // ---------------------------------------------------------
         // CAVLC path (§7.3.4).
         // ---------------------------------------------------------
+        // §7.3.2.9 — position the partition-B / partition-C residual
+        // readers (data-partitioned slices only).
+        let mut dp_readers: Option<DpResidualReaders<'_>> = if part_b.is_some() || part_c.is_some()
+        {
+            let b = match part_b {
+                Some((buf, by, bi)) => Some(position_reader(buf, by, bi)?),
+                None => None,
+            };
+            let c = match part_c {
+                Some((buf, by, bi)) => Some(position_reader(buf, by, bi)?),
+                None => None,
+            };
+            Some(DpResidualReaders { b, c })
+        } else {
+            None
+        };
         // §7.3.4 — prevMbSkipped is the "top MB of this pair was
         // skipped" signal. CAVLC sets it from (mb_skip_run > 0).
         let mut prev_mb_skipped = false;
@@ -886,8 +968,16 @@ pub fn parse_slice_data(
                 bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
             };
             let (byte, bit) = r.position();
-            let mb = parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)
-                .map_err(|source| SliceDataError::MacroblockAt {
+            let mb = parse_macroblock_dp(
+                &mut r,
+                dp_readers.as_mut(),
+                &mut entropy,
+                slice_header,
+                sps,
+                pps,
+                curr_mb_addr,
+            )
+            .map_err(|source| SliceDataError::MacroblockAt {
                 mb_addr: curr_mb_addr,
                 byte,
                 bit,

@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **Slice data partitioning (§7.3.2.9, NAL types 2/3/4)**
+  — the second Extended-profile tool of the round, decode + emit.
+  Decoder: NAL 2 parses the §7.3.3 slice header (ordinary PPS/SPS
+  activation) plus the §7.4.2.9.1 `slice_id`; NAL 3/4 parse the
+  `slice_id` / `redundant_pic_cnt` prefix against the ACTIVE
+  parameter sets (B/C partitions carry no pic_parameter_set_id of
+  their own); the decode driver holds a partition-A slice until any
+  non-B/C event (the partitions of a slice are consecutive,
+  §7.4.1.2.3) and then parses the slice with the category-2 elements
+  reading from partition A while every `residual()` — and the I_PCM
+  sample payload, category 3 with alignment relative to partition
+  B's own bitstream — routes to the partition selected by the
+  macroblock's collective type (intra → B, inter → C, §7.4.2.9.2/.3).
+  A missing partition whose data the category-2 elements call for is
+  a decode error, as are orphan B/C partitions; partitions of
+  redundant pictures (`redundant_pic_cnt > 0`) are discarded; CABAC +
+  partitioning is rejected (A.2.3 makes the combination impossible in
+  conforming streams). Emit: `encoder::sp` gains dual-form emitters
+  producing the SAME coded content as one single-NAL slice AND as an
+  A(+B)(+C) triple — a mixed SP picture (inter `P_L0_16x16` + I_PCM
+  macroblocks: all three partitions) and a partitioned SI picture.
+  Four `integration_dp` gates: the mixed three-partition slice
+  decodes byte-exactly to its single-NAL form and to the §8.6/I_PCM
+  mirror; the partitioned SI picture holds the §8.6.2 switching
+  identity byte-exactly through deblocking; dropping partition C is a
+  surfaced decode error; orphan B/C partitions land in the decode
+  error counter. **The identical-decode gate flushed out a real
+  pre-existing decoder defect**: the CAVLC I_PCM parse early-returns
+  before the §9.2.1.1 nC-grid commit, leaving PCM macroblocks
+  "unavailable" to every later nC derivation instead of contributing
+  nN = 16 — invisible in all-PCM slices, but desyncing any CAVLC
+  slice that mixes I_PCM with coded macroblocks as soon as a
+  neighbouring nC crosses a coeff_token table boundary. The PCM
+  branch now commits its slot (available + is_i_pcm).
+
 - Round 451 — **SP / SI encoder + bit-exact switching gates**
   (`encoder::sp`). The Extended-profile switching-picture system is
   now exercised end-to-end: `encode_sp_picture` emits primary SP

@@ -32,11 +32,16 @@
 //! intra modes on SI pictures, `mb_qp_delta == 0`.
 
 use super::bitstream::BitWriter;
-use super::macroblock::{write_i_nxn_mb, write_p_l0_16x16_mb, INxNMcbConfig, PL016x16McbConfig};
+use super::cavlc::encode_residual_block_cavlc;
+use super::macroblock::{
+    inter_cbp_to_codenum_420_422, intra_cbp_to_codenum_420_422, write_i_nxn_mb,
+    write_p_l0_16x16_mb, INxNMcbConfig, PL016x16McbConfig,
+};
 use super::nal::build_nal_unit;
 use super::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use super::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use super::transform::{zigzag_scan_4x4, zigzag_scan_4x4_ac};
+use crate::cavlc::CoeffTokenContext;
 use crate::intra_pred::{
     predict_4x4, predict_chroma, ChromaArrayType, Intra4x4Mode, IntraChromaMode,
     Neighbour4x4Availability, Samples4x4, SamplesChroma,
@@ -839,120 +844,11 @@ pub fn encode_si_picture(
     write_si_slice_header(&mut bw, cfg, frame_num, poc_lsb);
     let mut nc_grid = CavlcNcGrid::new(w_mbs as u32, h_mbs as u32);
 
-    // The reconstruction the decoder builds block-by-block IS the
-    // primary picture's pre-deblock reconstruction (bit-exact
-    // identity), so neighbour samples for the §8.3 predictions read
-    // straight from the target planes.
-    let ry = &targets.recon_y;
-    let ru = &targets.recon_u;
-    let rv = &targets.recon_v;
-
     for mby in 0..h_mbs {
         for mbx in 0..w_mbs {
             let mb_addr = (mby * w_mbs + mbx) as u32;
-            let mb_targets = &targets.mbs[mb_addr as usize];
-
-            // ---- Luma: per-block Intra_4x4 DC prediction from the
-            // target reconstruction, then cr = c_target − cs.
-            let mut luma_cr = [[0i32; 16]; 16];
-            for blk in 0..16 {
-                let (bx, by) = BLK4_XY[blk];
-                let (gx, gy) = (mbx * 16 + bx, mby * 16 + by);
-                let av = Neighbour4x4Availability {
-                    top_left: gx > 0 && gy > 0,
-                    top: gy > 0,
-                    // DC never reads top-right; keep the flag exact for
-                    // the in-picture cases that matter to it anyway.
-                    top_right: false,
-                    left: gx > 0,
-                };
-                let samples = Samples4x4 {
-                    top_left: if av.top_left {
-                        ry[(gy - 1) * width + gx - 1] as i32
-                    } else {
-                        0
-                    },
-                    top: core::array::from_fn(|i| {
-                        if av.top {
-                            ry[(gy - 1) * width + gx + i] as i32
-                        } else {
-                            0
-                        }
-                    }),
-                    top_right: [0i32; 4],
-                    left: core::array::from_fn(|i| {
-                        if av.left {
-                            ry[(gy + i) * width + gx - 1] as i32
-                        } else {
-                            0
-                        }
-                    }),
-                    availability: av,
-                };
-                let mut pred = [0i32; 16];
-                predict_4x4(Intra4x4Mode::Dc, &samples, 8, &mut pred);
-                let cs = sp_luma_switching(&pred, &[0i32; 16], cfg.qs);
-                for idx in 0..16 {
-                    luma_cr[blk][idx] = mb_targets.luma_c[blk][idx] - cs[idx];
-                }
-            }
-
-            // ---- Chroma: Intra_Chroma DC prediction per plane.
-            let mut dc_levels = [[0i32; 4]; 2];
-            let mut ac_levels = [[[0i32; 16]; 4]; 2];
-            for plane in 0..2 {
-                let rp_: &[u8] = if plane == 0 { ru } else { rv };
-                let (cx, cy) = (mbx * 8, mby * 8);
-                let av = Neighbour4x4Availability {
-                    top_left: cx > 0 && cy > 0,
-                    top: cy > 0,
-                    top_right: false,
-                    left: cx > 0,
-                };
-                let samples = SamplesChroma {
-                    top_left: if av.top_left {
-                        rp_[(cy - 1) * cw + cx - 1] as i32
-                    } else {
-                        0
-                    },
-                    top: (0..8)
-                        .map(|i| {
-                            if av.top {
-                                rp_[(cy - 1) * cw + cx + i] as i32
-                            } else {
-                                0
-                            }
-                        })
-                        .collect(),
-                    left: (0..8)
-                        .map(|i| {
-                            if av.left {
-                                rp_[(cy + i) * cw + cx - 1] as i32
-                            } else {
-                                0
-                            }
-                        })
-                        .collect(),
-                    availability: av,
-                };
-                let mut pred = vec![0i32; 64];
-                predict_chroma(
-                    IntraChromaMode::Dc,
-                    &samples,
-                    ChromaArrayType::Yuv420,
-                    8,
-                    &mut pred,
-                );
-                let mut pred8 = [0i32; 64];
-                pred8.copy_from_slice(&pred);
-                switch_chroma_levels_from_pred(
-                    &pred8,
-                    &mb_targets.chroma_c[plane],
-                    qs_c,
-                    &mut dc_levels[plane],
-                    &mut ac_levels[plane],
-                );
-            }
+            let (luma_cr, dc_levels, ac_levels) =
+                si_mb_levels(cfg, targets, mbx, mby, width, cw, qs_c);
 
             // ---- Emit the SI macroblock (write_i_nxn_mb emits
             // mb_type ue(0), which in an SI slice IS the Table 7-12 SI
@@ -998,4 +894,612 @@ pub fn encode_si_picture(
     }
     bw.rbsp_trailing_bits();
     build_nal_unit(0, NalUnitType::SliceNonIdr, &bw.into_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// §7.3.2.9 — data-partitioned emission (round 451).
+//
+// The Extended profile allows the coded data of a slice to be split
+// into three NAL units: partition A (NAL 2 — slice header, slice_id
+// and every category-2 element), partition B (NAL 3 — the residual of
+// the intra collective types, I_PCM sample payloads included) and
+// partition C (NAL 4 — the residual of the inter collective types).
+// The emitters below produce BOTH forms of the same coded content —
+// one single-NAL slice and one A(+B)(+C) triple — so a gate can
+// require the decoder to reconstruct them identically.
+// ---------------------------------------------------------------------------
+
+/// Category-2 + residual level data of one prepared SP/SI macroblock.
+struct PreppedMbLevels {
+    levels: MbLevels,
+    luma_nc: [i32; 16],
+    nc_cb: [i32; 8],
+    nc_cr: [i32; 8],
+}
+
+fn prep_mb_levels(
+    nc_grid: &mut CavlcNcGrid,
+    mb_addr: u32,
+    is_intra: bool,
+    luma_cr: &[[i32; 16]; 16],
+    dc_levels: &[[i32; 4]; 2],
+    ac_levels: &[[[i32; 16]; 4]; 2],
+) -> PreppedMbLevels {
+    let levels = pack_levels(luma_cr, dc_levels, ac_levels);
+    let luma_nc = luma_nc_and_commit(nc_grid, mb_addr, is_intra, &levels);
+    let (nc_cb, nc_cr) = super::derive_chroma_ac_nc_and_commit_totals(
+        nc_grid,
+        mb_addr,
+        is_intra,
+        levels.cbp_chroma,
+        &levels.ac_cb_scan,
+        &levels.ac_cr_scan,
+        1,
+    );
+    PreppedMbLevels {
+        levels,
+        luma_nc,
+        nc_cb,
+        nc_cr,
+    }
+}
+
+/// §7.3.5.3 — write the residual() of a prepared macroblock into the
+/// given sink (the slice's own bitstream, or the partition-B/C
+/// stream). Byte-for-byte the layout `write_p_l0_16x16_mb` /
+/// `write_i_nxn_mb` emit after the category-2 prefix.
+fn write_mb_residual(res: &mut BitWriter, p: &PreppedMbLevels) {
+    for blk8 in 0..4u8 {
+        if (p.levels.cbp_luma >> blk8) & 1 == 1 {
+            for sub in 0..4u8 {
+                let blk = (blk8 * 4 + sub) as usize;
+                encode_residual_block_cavlc(
+                    res,
+                    CoeffTokenContext::Numeric(p.luma_nc[blk]),
+                    16,
+                    &p.levels.luma_scan[blk],
+                )
+                .expect("luma residual emit");
+            }
+        }
+    }
+    if p.levels.cbp_chroma > 0 {
+        encode_residual_block_cavlc(res, CoeffTokenContext::ChromaDc420, 4, &p.levels.dc_cb)
+            .expect("chroma DC emit");
+        encode_residual_block_cavlc(res, CoeffTokenContext::ChromaDc420, 4, &p.levels.dc_cr)
+            .expect("chroma DC emit");
+    }
+    if p.levels.cbp_chroma == 2 {
+        for (k, blk) in p.levels.ac_cb_scan.iter().enumerate() {
+            encode_residual_block_cavlc(
+                res,
+                CoeffTokenContext::Numeric(p.nc_cb[k]),
+                15,
+                &blk[..15],
+            )
+            .expect("chroma AC emit");
+        }
+        for (k, blk) in p.levels.ac_cr_scan.iter().enumerate() {
+            encode_residual_block_cavlc(
+                res,
+                CoeffTokenContext::Numeric(p.nc_cr[k]),
+                15,
+                &blk[..15],
+            )
+            .expect("chroma AC emit");
+        }
+    }
+}
+
+/// Category-2 prefix of a `P_L0_16x16` SP macroblock (mb_skip_run 0,
+/// zero mvd, `mb_qp_delta` 0).
+fn write_inter_mb_cat2(a: &mut BitWriter, p: &PreppedMbLevels) {
+    a.ue(0); // mb_skip_run
+    a.ue(0); // mb_type — P_L0_16x16 (Table 7-13)
+    a.se(0); // mvd_l0_x
+    a.se(0); // mvd_l0_y
+    a.ue(inter_cbp_to_codenum_420_422(
+        p.levels.cbp_luma,
+        p.levels.cbp_chroma,
+    ));
+    if p.levels.cbp_luma > 0 || p.levels.cbp_chroma > 0 {
+        a.se(0); // mb_qp_delta
+    }
+}
+
+/// Category-2 prefix of an SI macroblock (Table 7-12 raw 0 — the
+/// all-DC `prev_intra4x4_pred_mode_flag = 1` shape the SI encoder
+/// emits).
+fn write_si_mb_cat2(a: &mut BitWriter, p: &PreppedMbLevels) {
+    a.ue(0); // mb_type — SI (Table 7-12)
+    for _ in 0..16 {
+        a.u(1, 1); // prev_intra4x4_pred_mode_flag
+    }
+    a.ue(0); // intra_chroma_pred_mode = DC
+    a.ue(intra_cbp_to_codenum_420_422(
+        p.levels.cbp_luma,
+        p.levels.cbp_chroma,
+    ));
+    if p.levels.cbp_luma > 0 || p.levels.cbp_chroma > 0 {
+        a.se(0); // mb_qp_delta
+    }
+}
+
+/// §7.3.5 — I_PCM sample payload (category 3: partition B in a
+/// data-partitioned slice; alignment is relative to THAT bitstream).
+fn write_ipcm_payload(b: &mut BitWriter, y_mb: &[u8; 256], cb_mb: &[u8; 64], cr_mb: &[u8; 64]) {
+    b.align_to_byte_zero();
+    for v in y_mb {
+        b.u(8, u32::from(*v));
+    }
+    for v in cb_mb {
+        b.u(8, u32::from(*v));
+    }
+    for v in cr_mb {
+        b.u(8, u32::from(*v));
+    }
+}
+
+/// Both emitted forms of one coded picture, plus the mirror
+/// reconstruction shared by construction.
+pub struct SpDualFormPicture {
+    /// One-NAL coded slice access unit.
+    pub single_annex_b: Vec<u8>,
+    /// The same slice as §7.3.2.9 partitions (NAL 2 + optional 3/4).
+    pub partitioned_annex_b: Vec<u8>,
+    pub recon_y: Vec<u8>,
+    pub recon_u: Vec<u8>,
+    pub recon_v: Vec<u8>,
+}
+
+/// Encode one SP picture MIXING inter and I_PCM macroblocks (every
+/// `pcm_period`-th macroblock is I_PCM — an I collective type, whose
+/// sample payload is category 3), in both single-NAL and
+/// data-partitioned form. With both intra and inter macroblocks in
+/// one slice, the partitioned form exercises all three partitions
+/// A + B + C.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_sp_dual_form_picture(
+    cfg: &SpConfig,
+    src: (&[u8], &[u8], &[u8]),
+    refp: (&[u8], &[u8], &[u8]),
+    frame_num: u32,
+    poc_lsb: u32,
+    nal_ref_idc: u8,
+    pcm_period: usize,
+) -> SpDualFormPicture {
+    assert!(pcm_period >= 1);
+    let (w_mbs, h_mbs) = (cfg.width_mbs(), cfg.height_mbs());
+    let width = cfg.width as usize;
+    let cw = width / 2;
+    let qp_c = qp_y_to_qp_c(cfg.qp, 0);
+    let qs_c = qp_y_to_qp_c(cfg.qs, 0);
+
+    // Single-NAL form.
+    let mut w_single = BitWriter::new();
+    write_sp_slice_header(
+        &mut w_single,
+        cfg,
+        frame_num,
+        poc_lsb,
+        u32::from(nal_ref_idc),
+        false,
+    );
+    // Partitioned form: A + B + C sinks.
+    let mut w_a = BitWriter::new();
+    write_sp_slice_header(
+        &mut w_a,
+        cfg,
+        frame_num,
+        poc_lsb,
+        u32::from(nal_ref_idc),
+        false,
+    );
+    w_a.ue(0); // §7.3.2.9.1 slice_id
+               // §7.3.2.9.2/.3 — each partition's RBSP is one continuous
+               // bitstream: slice_id first (our PPS carries no redundant_pic_cnt
+               // and the SPS no separate colour planes), then that category's
+               // slice-data bits.
+    let mut w_b = BitWriter::new();
+    w_b.ue(0); // slice_id
+    let mut w_c = BitWriter::new();
+    w_c.ue(0); // slice_id
+    let (mut b_used, mut c_used) = (false, false);
+
+    // The two forms must carry IDENTICAL macroblock data, so levels +
+    // nC state are computed once per MB (two independent grids would
+    // drift only if the emission differed — it must not).
+    let mut nc_grid = CavlcNcGrid::new(w_mbs as u32, h_mbs as u32);
+    let mut recon_y = vec![0u8; width * cfg.height as usize];
+    let mut recon_u = vec![0u8; cw * (cfg.height as usize / 2)];
+    let mut recon_v = vec![0u8; cw * (cfg.height as usize / 2)];
+
+    for mby in 0..h_mbs {
+        for mbx in 0..w_mbs {
+            let mb_addr = (mby * w_mbs + mbx) as u32;
+            if (mb_addr as usize) % pcm_period == pcm_period - 1 {
+                // ---- I_PCM macroblock: recon = source samples.
+                let mut y_mb = [0u8; 256];
+                let mut cb_mb = [0u8; 64];
+                let mut cr_mb = [0u8; 64];
+                for row in 0..16 {
+                    for col in 0..16 {
+                        let v = src.0[(mby * 16 + row) * width + mbx * 16 + col];
+                        y_mb[row * 16 + col] = v;
+                        recon_y[(mby * 16 + row) * width + mbx * 16 + col] = v;
+                    }
+                }
+                for row in 0..8 {
+                    for col in 0..8 {
+                        let u = src.1[(mby * 8 + row) * cw + mbx * 8 + col];
+                        let v = src.2[(mby * 8 + row) * cw + mbx * 8 + col];
+                        cb_mb[row * 8 + col] = u;
+                        cr_mb[row * 8 + col] = v;
+                        recon_u[(mby * 8 + row) * cw + mbx * 8 + col] = u;
+                        recon_v[(mby * 8 + row) * cw + mbx * 8 + col] = v;
+                    }
+                }
+                // nC bookkeeping: I_PCM contributes nN = 16 (§9.2.1.1).
+                {
+                    let cur = &mut nc_grid.mbs[mb_addr as usize];
+                    cur.is_available = true;
+                    cur.is_intra = true;
+                    cur.is_skip = false;
+                    cur.is_i_pcm = true;
+                }
+                // Single form: skip run + mb_type + payload inline.
+                w_single.ue(0); // mb_skip_run
+                w_single.ue(30); // Table 7-13: I types at 5 + raw; I_PCM = 5 + 25
+                write_ipcm_payload(&mut w_single, &y_mb, &cb_mb, &cr_mb);
+                // Partitioned: category 2 in A, payload in B.
+                w_a.ue(0);
+                w_a.ue(30);
+                write_ipcm_payload(&mut w_b, &y_mb, &cb_mb, &cr_mb);
+                b_used = true;
+                continue;
+            }
+
+            // ---- P_L0_16x16 SP macroblock (as in encode_sp_picture).
+            let pred_mb = gather16(refp.0, width, mbx * 16, mby * 16);
+            let src_mb = gather16(src.0, width, mbx * 16, mby * 16);
+            let mut luma_cr = [[0i32; 16]; 16];
+            let mut luma_c = [[0i32; 16]; 16];
+            for blk in 0..16 {
+                let (bx, by) = BLK4_XY[blk];
+                let p = blk4(&pred_mb, bx, by);
+                let s_blk = blk4(&src_mb, bx, by);
+                let cp = crate::sp_transform::forward_core_4x4(&p);
+                let cwc = crate::sp_transform::forward_core_4x4(&s_blk);
+                let mut cr = [0i32; 16];
+                for i in 0..4 {
+                    for j in 0..4 {
+                        let idx = i * 4 + j;
+                        cr[idx] =
+                            encoder_quant_8_416((cwc[idx] - cp[idx]) as i64, cfg.qp, &FLAT, i, j);
+                    }
+                }
+                luma_cr[blk] = cr;
+                luma_c[blk] = sp_luma_non_switching(&p, &cr, cfg.qp, cfg.qs, &FLAT);
+            }
+            let mut dc_levels = [[0i32; 4]; 2];
+            let mut ac_levels = [[[0i32; 16]; 4]; 2];
+            let mut chroma_c = [[[0i32; 16]; 4]; 2];
+            for plane in 0..2 {
+                let (sp_, rp_) = if plane == 0 {
+                    (src.1, refp.1)
+                } else {
+                    (src.2, refp.2)
+                };
+                let pred8 = gather8(rp_, cw, mbx * 8, mby * 8);
+                let src8 = gather8(sp_, cw, mbx * 8, mby * 8);
+                let cp_blocks = chroma_pred_transform(&pred8);
+                let cw_blocks = chroma_pred_transform(&src8);
+                for blk in 0..4 {
+                    for i in 0..4 {
+                        for j in 0..4 {
+                            if i == 0 && j == 0 {
+                                continue;
+                            }
+                            let idx = i * 4 + j;
+                            ac_levels[plane][blk][idx] = encoder_quant_8_416(
+                                (cw_blocks[blk][idx] - cp_blocks[blk][idx]) as i64,
+                                qp_c,
+                                &FLAT,
+                                i,
+                                j,
+                            );
+                        }
+                    }
+                }
+                let dcp = hadamard_2x2(&[
+                    cp_blocks[0][0] as i64,
+                    cp_blocks[1][0] as i64,
+                    cp_blocks[2][0] as i64,
+                    cp_blocks[3][0] as i64,
+                ]);
+                let dcw = hadamard_2x2(&[
+                    cw_blocks[0][0] as i64,
+                    cw_blocks[1][0] as i64,
+                    cw_blocks[2][0] as i64,
+                    cw_blocks[3][0] as i64,
+                ]);
+                for pos in 0..4 {
+                    dc_levels[plane][pos] = encoder_quant_8_428(dcw[pos] - dcp[pos], qp_c, &FLAT);
+                }
+                chroma_c[plane] = sp_chroma_non_switching(
+                    &pred8,
+                    &dc_levels[plane],
+                    &ac_levels[plane],
+                    qp_c,
+                    qs_c,
+                    &FLAT,
+                );
+            }
+            let targets = SpMbTargets { luma_c, chroma_c };
+            mirror_recon_mb(
+                &targets,
+                cfg.qs,
+                qs_c,
+                mbx,
+                mby,
+                width,
+                &mut recon_y,
+                &mut recon_u,
+                &mut recon_v,
+            );
+            let prepped = prep_mb_levels(
+                &mut nc_grid,
+                mb_addr,
+                false,
+                &luma_cr,
+                &dc_levels,
+                &ac_levels,
+            );
+            // Single form: category 2 + residual inline.
+            write_inter_mb_cat2(&mut w_single, &prepped);
+            write_mb_residual(&mut w_single, &prepped);
+            // Partitioned: category 2 in A, residual (category 4) in C.
+            write_inter_mb_cat2(&mut w_a, &prepped);
+            if prepped.levels.cbp_luma > 0 || prepped.levels.cbp_chroma > 0 {
+                write_mb_residual(&mut w_c, &prepped);
+                c_used = true;
+            }
+        }
+    }
+
+    w_single.rbsp_trailing_bits();
+    let single_annex_b = build_nal_unit(
+        nal_ref_idc,
+        NalUnitType::SliceNonIdr,
+        &w_single.into_bytes(),
+    );
+
+    w_a.rbsp_trailing_bits();
+    let mut partitioned_annex_b = build_nal_unit(
+        nal_ref_idc,
+        NalUnitType::SliceDataPartitionA,
+        &w_a.into_bytes(),
+    );
+    // §7.4.2.9.2/.3 — a partition RBSP is present exactly when the
+    // category-2 elements indicate data of its category.
+    if b_used {
+        let mut body = w_b;
+        body.rbsp_trailing_bits();
+        partitioned_annex_b.extend_from_slice(&build_nal_unit(
+            nal_ref_idc,
+            NalUnitType::SliceDataPartitionB,
+            &body.into_bytes(),
+        ));
+    }
+    if c_used {
+        let mut body = w_c;
+        body.rbsp_trailing_bits();
+        partitioned_annex_b.extend_from_slice(&build_nal_unit(
+            nal_ref_idc,
+            NalUnitType::SliceDataPartitionC,
+            &body.into_bytes(),
+        ));
+    }
+
+    SpDualFormPicture {
+        single_annex_b,
+        partitioned_annex_b,
+        recon_y,
+        recon_u,
+        recon_v,
+    }
+}
+
+/// Per-MB SI level computation shared by [`encode_si_picture`] and
+/// the dual-form emitter: DC Intra_4x4 / Intra_Chroma prediction
+/// against the target reconstruction (bit-exact identity — the
+/// decoder's progressively-built samples ARE the primary picture's),
+/// then `cr = c_target − cs` per §8.6.2.
+#[allow(clippy::type_complexity)]
+fn si_mb_levels(
+    cfg: &SpConfig,
+    targets: &SpTargets,
+    mbx: usize,
+    mby: usize,
+    width: usize,
+    cw: usize,
+    qs_c: i32,
+) -> ([[i32; 16]; 16], [[i32; 4]; 2], [[[i32; 16]; 4]; 2]) {
+    let mb_addr = (mby * (width / 16) + mbx) as u32;
+    let mb_targets = &targets.mbs[mb_addr as usize];
+    let ry = &targets.recon_y;
+    let ru = &targets.recon_u;
+    let rv = &targets.recon_v;
+
+    let mut luma_cr = [[0i32; 16]; 16];
+    for blk in 0..16 {
+        let (bx, by) = BLK4_XY[blk];
+        let (gx, gy) = (mbx * 16 + bx, mby * 16 + by);
+        let av = Neighbour4x4Availability {
+            top_left: gx > 0 && gy > 0,
+            top: gy > 0,
+            // DC never reads top-right; keep the flag exact for the
+            // in-picture cases that matter to it anyway.
+            top_right: false,
+            left: gx > 0,
+        };
+        let samples = Samples4x4 {
+            top_left: if av.top_left {
+                ry[(gy - 1) * width + gx - 1] as i32
+            } else {
+                0
+            },
+            top: core::array::from_fn(|i| {
+                if av.top {
+                    ry[(gy - 1) * width + gx + i] as i32
+                } else {
+                    0
+                }
+            }),
+            top_right: [0i32; 4],
+            left: core::array::from_fn(|i| {
+                if av.left {
+                    ry[(gy + i) * width + gx - 1] as i32
+                } else {
+                    0
+                }
+            }),
+            availability: av,
+        };
+        let mut pred = [0i32; 16];
+        predict_4x4(Intra4x4Mode::Dc, &samples, 8, &mut pred);
+        let cs = sp_luma_switching(&pred, &[0i32; 16], cfg.qs);
+        for idx in 0..16 {
+            luma_cr[blk][idx] = mb_targets.luma_c[blk][idx] - cs[idx];
+        }
+    }
+
+    let mut dc_levels = [[0i32; 4]; 2];
+    let mut ac_levels = [[[0i32; 16]; 4]; 2];
+    for plane in 0..2 {
+        let rp_: &[u8] = if plane == 0 { ru } else { rv };
+        let (cx, cy) = (mbx * 8, mby * 8);
+        let av = Neighbour4x4Availability {
+            top_left: cx > 0 && cy > 0,
+            top: cy > 0,
+            top_right: false,
+            left: cx > 0,
+        };
+        let samples = SamplesChroma {
+            top_left: if av.top_left {
+                rp_[(cy - 1) * cw + cx - 1] as i32
+            } else {
+                0
+            },
+            top: (0..8)
+                .map(|i| {
+                    if av.top {
+                        rp_[(cy - 1) * cw + cx + i] as i32
+                    } else {
+                        0
+                    }
+                })
+                .collect(),
+            left: (0..8)
+                .map(|i| {
+                    if av.left {
+                        rp_[(cy + i) * cw + cx - 1] as i32
+                    } else {
+                        0
+                    }
+                })
+                .collect(),
+            availability: av,
+        };
+        let mut pred = vec![0i32; 64];
+        predict_chroma(
+            IntraChromaMode::Dc,
+            &samples,
+            ChromaArrayType::Yuv420,
+            8,
+            &mut pred,
+        );
+        let mut pred8 = [0i32; 64];
+        pred8.copy_from_slice(&pred);
+        switch_chroma_levels_from_pred(
+            &pred8,
+            &mb_targets.chroma_c[plane],
+            qs_c,
+            &mut dc_levels[plane],
+            &mut ac_levels[plane],
+        );
+    }
+    (luma_cr, dc_levels, ac_levels)
+}
+
+/// Encode an SI picture in both single-NAL and §7.3.2.9 partitioned
+/// (A + B) form — every SI macroblock is an intra collective type, so
+/// the whole residual is category 3 and lands in partition B.
+pub fn encode_si_dual_form_picture(
+    cfg: &SpConfig,
+    targets: &SpTargets,
+    frame_num: u32,
+    poc_lsb: u32,
+) -> SpDualFormPicture {
+    let (w_mbs, h_mbs) = (cfg.width_mbs(), cfg.height_mbs());
+    let width = cfg.width as usize;
+    let cw = width / 2;
+    let qs_c = qp_y_to_qp_c(cfg.qs, 0);
+    let _k = chroma_dc_switch_scale(qs_c, &FLAT)
+        .expect("switching construction requires QSC >= 6 (choose qs >= 6)");
+
+    let mut w_single = BitWriter::new();
+    write_si_slice_header(&mut w_single, cfg, frame_num, poc_lsb);
+    let mut w_a = BitWriter::new();
+    write_si_slice_header(&mut w_a, cfg, frame_num, poc_lsb);
+    w_a.ue(0); // §7.3.2.9.1 slice_id
+    let mut w_b = BitWriter::new();
+    w_b.ue(0); // slice_id
+    let mut b_used = false;
+
+    let mut nc_grid = CavlcNcGrid::new(w_mbs as u32, h_mbs as u32);
+    for mby in 0..h_mbs {
+        for mbx in 0..w_mbs {
+            let mb_addr = (mby * w_mbs + mbx) as u32;
+            let (luma_cr, dc_levels, ac_levels) =
+                si_mb_levels(cfg, targets, mbx, mby, width, cw, qs_c);
+            let prepped = prep_mb_levels(
+                &mut nc_grid,
+                mb_addr,
+                true,
+                &luma_cr,
+                &dc_levels,
+                &ac_levels,
+            );
+            write_si_mb_cat2(&mut w_single, &prepped);
+            write_mb_residual(&mut w_single, &prepped);
+            write_si_mb_cat2(&mut w_a, &prepped);
+            if prepped.levels.cbp_luma > 0 || prepped.levels.cbp_chroma > 0 {
+                write_mb_residual(&mut w_b, &prepped);
+                b_used = true;
+            }
+        }
+    }
+
+    w_single.rbsp_trailing_bits();
+    let single_annex_b = build_nal_unit(0, NalUnitType::SliceNonIdr, &w_single.into_bytes());
+    w_a.rbsp_trailing_bits();
+    let mut partitioned_annex_b =
+        build_nal_unit(0, NalUnitType::SliceDataPartitionA, &w_a.into_bytes());
+    if b_used {
+        let mut body = w_b;
+        body.rbsp_trailing_bits();
+        partitioned_annex_b.extend_from_slice(&build_nal_unit(
+            0,
+            NalUnitType::SliceDataPartitionB,
+            &body.into_bytes(),
+        ));
+    }
+    SpDualFormPicture {
+        single_annex_b,
+        partitioned_annex_b,
+        recon_y: targets.recon_y.clone(),
+        recon_u: targets.recon_u.clone(),
+        recon_v: targets.recon_v.clone(),
+    }
 }

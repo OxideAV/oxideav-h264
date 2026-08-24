@@ -209,6 +209,22 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 }
 
 /// Full per-slice decoder with DPB wiring.
+/// §7.3.2.9 — a partition-A slice held while its partition-B/C
+/// payloads arrive (the partitions of one slice are consecutive in
+/// the NAL stream, §7.4.1.2.3). Flushed — parsed + reconstructed —
+/// when any non-partition-B/C event follows, or at stream end.
+struct PendingDpSlice {
+    nal_ref_idc: u8,
+    header: SliceHeader,
+    rbsp_a: Vec<u8>,
+    cursor_a: (usize, u8),
+    slice_id: u32,
+    sps: Sps,
+    pps: crate::pps::Pps,
+    part_b: Option<(Vec<u8>, (usize, u8))>,
+    part_c: Option<(Vec<u8>, (usize, u8))>,
+}
+
 pub struct H264CodecDecoder {
     codec_id: CodecId,
     /// NAL unit length-prefix size from `avcC`, when present. `None`
@@ -244,6 +260,9 @@ pub struct H264CodecDecoder {
     /// Packet-level pts passed on the most recent `send_packet`. We
     /// stamp the first frame produced from that packet with it.
     pending_pts: Option<i64>,
+    /// §7.3.2.9 — in-flight data-partitioned slice (partition A held
+    /// until its B/C payloads arrive).
+    pending_dp: Option<PendingDpSlice>,
     /// Packet time_base so downstream consumers can rescale.
     pending_time_base: TimeBase,
 
@@ -343,6 +362,7 @@ impl H264CodecDecoder {
             output_dpb: DpbOutput::<VideoFrame>::new(16, 16),
             ready: VecDeque::new(),
             pending_pts: None,
+            pending_dp: None,
             pending_time_base: TimeBase::new(1, 1),
             ref_store: RefPicStore::new(),
             dpb_entries: Vec::new(),
@@ -600,6 +620,13 @@ impl H264CodecDecoder {
 
     /// Handle a single emitted driver event.
     fn handle_event(&mut self, ev: Event) -> Result<()> {
+        // §7.4.1.2.3 — the partitions of a data-partitioned slice are
+        // consecutive: any event other than a partition-B/C payload
+        // means the pending partitioned slice is complete — decode it
+        // before processing the new event.
+        if !matches!(ev, Event::SliceDataPartitionBc { .. }) {
+            self.flush_pending_dp_slice()?;
+        }
         match ev {
             Event::Slice {
                 nal_unit_type,
@@ -651,20 +678,103 @@ impl H264CodecDecoder {
                 self.finalize_in_progress_picture()?;
                 Ok(())
             }
-            // §7.3.2.9.x — slice data partitions (NAL types 2/3/4)
-            // carry VCL content (partition A holds the slice header +
-            // macroblock headers) that this decoder does not implement.
-            // Silently discarding coded picture data would fabricate
-            // output that omits content the encoder emitted, so surface
-            // the gap as an error the stream driver can count/skip —
-            // the rest of the stream still decodes.
-            Event::Ignored { nal_unit_type, .. } if (2..=4).contains(&nal_unit_type) => {
-                Err(Error::invalid(format!(
-                    "h264: slice data partition NAL (type {nal_unit_type}) is not supported; coded slice content would be lost"
-                )))
+            // §7.3.2.9.1 — partition A opens a pending partitioned
+            // slice (any previous one was flushed above).
+            Event::SliceDataPartitionA {
+                nal_ref_idc,
+                header,
+                slice_id,
+                rbsp,
+                slice_data_cursor,
+                pps,
+                sps,
+            } => {
+                if sps.separate_colour_plane_flag {
+                    return Err(Error::invalid(
+                        "h264: separate_colour_plane_flag with slice data partitioning is not supported",
+                    ));
+                }
+                self.last_slice = Some(header.clone());
+                self.pending_dp = Some(PendingDpSlice {
+                    nal_ref_idc,
+                    header,
+                    rbsp_a: rbsp,
+                    cursor_a: slice_data_cursor,
+                    slice_id,
+                    sps,
+                    pps,
+                    part_b: None,
+                    part_c: None,
+                });
+                Ok(())
+            }
+            // §7.3.2.9.2/.3 — partition B/C payloads attach to the
+            // pending partition A by slice_id.
+            Event::SliceDataPartitionBc {
+                is_c,
+                slice_id,
+                redundant_pic_cnt,
+                rbsp,
+                slice_data_cursor,
+            } => {
+                // §7.4.2.9.2 — partitions of redundant coded pictures
+                // (redundant_pic_cnt > 0) may be discarded; the
+                // primary picture's data is what we decode.
+                if redundant_pic_cnt > 0 {
+                    return Ok(());
+                }
+                let Some(pending) = self.pending_dp.as_mut() else {
+                    return Err(Error::invalid(format!(
+                        "h264: slice data partition {} (slice_id {slice_id}) without a preceding partition A",
+                        if is_c { 'C' } else { 'B' },
+                    )));
+                };
+                if pending.slice_id != slice_id {
+                    return Err(Error::invalid(format!(
+                        "h264: slice data partition {} slice_id {slice_id} does not match partition A slice_id {}",
+                        if is_c { 'C' } else { 'B' },
+                        pending.slice_id,
+                    )));
+                }
+                let slot = if is_c {
+                    &mut pending.part_c
+                } else {
+                    &mut pending.part_b
+                };
+                if slot.is_some() {
+                    return Err(Error::invalid(format!(
+                        "h264: duplicate slice data partition {} for slice_id {slice_id}",
+                        if is_c { 'C' } else { 'B' },
+                    )));
+                }
+                *slot = Some((rbsp, slice_data_cursor));
+                Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    /// Decode a held §7.3.2.9 partitioned slice (no-op when none is
+    /// pending). The partition A's slice header runs the ordinary
+    /// picture-bookkeeping path; the slice-data parse routes each
+    /// macroblock's residual to the partition-B/C payloads.
+    fn flush_pending_dp_slice(&mut self) -> Result<()> {
+        let Some(pending) = self.pending_dp.take() else {
+            return Ok(());
+        };
+        self.handle_slice_with_dp(
+            // §7.4.1 — partition A's NAL type is 2 (never IDR; an IDR
+            // picture cannot be data-partitioned, §7.4.3 idr_pic_id
+            // presence is keyed on nal_unit_type == 5).
+            2,
+            pending.nal_ref_idc,
+            pending.header,
+            pending.rbsp_a,
+            pending.cursor_a,
+            pending.sps,
+            pending.pps,
+            Some((pending.part_b, pending.part_c)),
+        )
     }
 
     /// §8.1 — route one coded slice of a `separate_colour_plane_flag
@@ -879,6 +989,35 @@ impl H264CodecDecoder {
         sps: Sps,
         pps: crate::pps::Pps,
     ) -> Result<()> {
+        self.handle_slice_with_dp(
+            nal_unit_type,
+            nal_ref_idc,
+            header,
+            rbsp,
+            cursor,
+            sps,
+            pps,
+            None,
+        )
+    }
+
+    /// [`handle_slice`] with optional §7.3.2.9 data-partition payloads
+    /// (`(partition B, partition C)`, each `(rbsp, cursor)`).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn handle_slice_with_dp(
+        &mut self,
+        nal_unit_type: u8,
+        nal_ref_idc: u8,
+        header: SliceHeader,
+        rbsp: Vec<u8>,
+        cursor: (usize, u8),
+        sps: Sps,
+        pps: crate::pps::Pps,
+        dp: Option<(
+            Option<(Vec<u8>, (usize, u8))>,
+            Option<(Vec<u8>, (usize, u8))>,
+        )>,
+    ) -> Result<()> {
         // The SPS and PPS have been snapshotted at slice-header parse
         // time (see [`Event::Slice::pps`] for why — same-id PPS
         // re-transmission at access-unit boundaries, as in JVT CACQP3).
@@ -1026,7 +1165,15 @@ impl H264CodecDecoder {
         }
 
         // Reconstruct this slice into the in-progress picture.
-        self.reconstruct_slice_into_in_progress(nal_ref_idc, &header, &rbsp, cursor, &sps, &pps)?;
+        self.reconstruct_slice_into_in_progress(
+            nal_ref_idc,
+            &header,
+            &rbsp,
+            cursor,
+            &sps,
+            &pps,
+            dp,
+        )?;
 
         Ok(())
     }
@@ -1036,6 +1183,7 @@ impl H264CodecDecoder {
     /// `is_reference` so a picture is marked a reference picture as
     /// soon as any of its slices carries nal_ref_idc != 0 (§7.4.1.2.4
     /// requires this to be uniform across slices, but we're tolerant).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn reconstruct_slice_into_in_progress(
         &mut self,
         nal_ref_idc: u8,
@@ -1044,10 +1192,28 @@ impl H264CodecDecoder {
         cursor: (usize, u8),
         sps: &Sps,
         pps: &crate::pps::Pps,
+        dp: Option<(
+            Option<(Vec<u8>, (usize, u8))>,
+            Option<(Vec<u8>, (usize, u8))>,
+        )>,
     ) -> Result<()> {
-        // Parse slice_data — common to I / P / B paths.
-        let sd = slice_data::parse_slice_data(rbsp, cursor.0, cursor.1, header, sps, pps)
-            .map_err(|e| Error::invalid(format!("h264 slice_data: {e}")))?;
+        // Parse slice_data — common to I / P / B paths. A §7.3.2.9
+        // data-partitioned slice routes its residual reads to the
+        // partition-B/C payloads.
+        let sd = match &dp {
+            None => slice_data::parse_slice_data(rbsp, cursor.0, cursor.1, header, sps, pps),
+            Some((b, c)) => slice_data::parse_slice_data_partitioned(
+                rbsp,
+                cursor.0,
+                cursor.1,
+                b.as_ref().map(|(buf, cur)| (&buf[..], cur.0, cur.1)),
+                c.as_ref().map(|(buf, cur)| (&buf[..], cur.0, cur.1)),
+                header,
+                sps,
+                pps,
+            ),
+        }
+        .map_err(|e| Error::invalid(format!("h264 slice_data: {e}")))?;
 
         let in_progress = self
             .in_progress
@@ -2577,6 +2743,9 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
+        // §7.3.2.9 — decode any partitioned slice still waiting for
+        // (possibly absent) partition-B/C payloads at EOF.
+        self.flush_pending_dp_slice()?;
         // §7.4.1.2 — close any picture we've been assembling so it reaches
         // the DPB + output queue before the caller drains at EOF.
         if let Err(e) = self.finalize_in_progress_picture() {

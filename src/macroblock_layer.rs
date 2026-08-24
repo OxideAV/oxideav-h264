@@ -122,6 +122,16 @@ pub enum MacroblockLayerError {
     /// (A.2.3).
     #[error("CABAC entropy coding in an SI slice is not supported")]
     CabacSiSliceUnsupported,
+    /// §7.3.2.9 — slice data partitioning is a CAVLC-only Extended
+    /// profile tool (A.2.3); a partitioned slice under
+    /// `entropy_coding_mode_flag == 1` is rejected.
+    #[error("slice data partitioning with CABAC entropy coding is not supported")]
+    DataPartitioningCabacUnsupported,
+    /// §7.4.2.9.2 / §7.4.2.9.3 — the category-2 syntax elements
+    /// indicate residual data of this category, but the corresponding
+    /// slice data partition RBSP was not supplied.
+    #[error("slice data partition {0} required by the slice data is missing")]
+    MissingDataPartition(char),
     /// §7.3.5 / §9.3.1.2 — I_PCM macroblock encountered in CABAC mode.
     /// Reading the `pcm_sample_*` bits and re-initialising the CABAC
     /// engine (codIRange = 510, codIOffset = read_bits(9)) cannot happen
@@ -2493,14 +2503,99 @@ pub struct EntropyState<'ctx, 'data> {
 /// CABAC mode for I_PCM (which byte-aligns and reads from the CABAC
 /// reader — our CABAC engine doesn't expose that, so CABAC I_PCM is a
 /// documented limitation in this pass).
+/// §7.3.5 — read the I_PCM alignment bits + sample payload from the
+/// given bitstream (the slice's own stream, or partition B of a
+/// data-partitioned slice — the payload is category 3).
+#[allow(clippy::type_complexity)]
+fn read_pcm_payload(
+    pr: &mut BitReader<'_>,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    num_cb: usize,
+    num_cr: usize,
+) -> McblResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+    while !pr.byte_aligned() {
+        // §7.3.5: pcm_alignment_zero_bit shall be 0. We tolerate any
+        // value since the spec wording is "shall be" rather than
+        // "shall be parsed as".
+        let _ = pr.u(1)?;
+    }
+    let mut luma = Vec::with_capacity(256);
+    for _ in 0..256 {
+        luma.push(pr.u(bit_depth_y)?);
+    }
+    let mut cb = Vec::with_capacity(num_cb);
+    for _ in 0..num_cb {
+        cb.push(pr.u(bit_depth_c)?);
+    }
+    let mut cr = Vec::with_capacity(num_cr);
+    for _ in 0..num_cr {
+        cr.push(pr.u(bit_depth_c)?);
+    }
+    Ok((luma, cb, cr))
+}
+
+/// §7.3.2.9 — the category-3 / category-4 bit sources of a
+/// data-partitioned slice (partitions B and C). Category-2 syntax
+/// elements keep reading from the partition-A reader passed as `r`;
+/// the `residual()` structures (and the I_PCM sample payload, which
+/// the §7.3.5 syntax table marks category 3) read from these.
+pub struct DpResidualReaders<'a> {
+    /// Partition B — residual data of the collective I / SI
+    /// macroblock types (§7.4.2.9.2), and I_PCM samples.
+    pub b: Option<BitReader<'a>>,
+    /// Partition C — residual data of the collective P / B
+    /// macroblock types (§7.4.2.9.3).
+    pub c: Option<BitReader<'a>>,
+}
+
+impl<'a> DpResidualReaders<'a> {
+    /// Select the partition reader for the current macroblock's
+    /// collective type (§7.4.2.9.2/.3: intra → B, inter → C). A
+    /// missing partition whose data is needed is a stream error.
+    fn select(&mut self, intra: bool) -> McblResult<&mut BitReader<'a>> {
+        if intra {
+            self.b
+                .as_mut()
+                .ok_or(MacroblockLayerError::MissingDataPartition('B'))
+        } else {
+            self.c
+                .as_mut()
+                .ok_or(MacroblockLayerError::MissingDataPartition('C'))
+        }
+    }
+}
+
 pub fn parse_macroblock(
     r: &mut BitReader<'_>,
+    entropy: &mut EntropyState<'_, '_>,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    current_mb_addr: u32,
+) -> McblResult<Macroblock> {
+    parse_macroblock_dp(r, None, entropy, slice_header, sps, pps, current_mb_addr)
+}
+
+/// [`parse_macroblock`] with optional §7.3.2.9 data-partition residual
+/// readers: when `dp` is `Some`, every `residual()` read (and the
+/// I_PCM sample payload) comes from the partition-B / partition-C
+/// bitstream selected by the macroblock's collective type, while all
+/// category-2 elements keep reading from `r` (the partition-A
+/// stream). CAVLC only.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_macroblock_dp(
+    r: &mut BitReader<'_>,
+    mut dp: Option<&mut DpResidualReaders<'_>>,
     entropy: &mut EntropyState<'_, '_>,
     slice_header: &SliceHeader,
     sps: &Sps,
     _pps: &Pps,
     _current_mb_addr: u32,
 ) -> McblResult<Macroblock> {
+    if dp.is_some() && entropy.cabac.is_some() {
+        return Err(MacroblockLayerError::DataPartitioningCabacUnsupported);
+    }
     let slice_type = slice_header.slice_type;
     let dbg = dbg_general_enabled();
     let mb_addr_dbg = entropy.current_mb_addr;
@@ -2597,12 +2692,6 @@ pub fn parse_macroblock(
                 cabac_bit_pos: bit,
             });
         }
-        while !r.byte_aligned() {
-            // §7.3.5: pcm_alignment_zero_bit shall be 0. We tolerate
-            // any value since the spec wording is "shall be" rather
-            // than "shall be parsed as".
-            let _ = r.u(1)?;
-        }
         // §7.4.5 — pcm_sample_luma[i] is u(v) with v = BitDepthY, and
         // pcm_sample_chroma[i] is u(v) with v = BitDepthC. Both are
         // derived from the active SPS via BitDepthY = 8 +
@@ -2625,22 +2714,40 @@ pub fn parse_macroblock(
                 ))
             }
         };
-        let mut luma = Vec::with_capacity(256);
-        for _ in 0..256 {
-            luma.push(r.u(bit_depth_y)?);
-        }
-        let mut cb = Vec::with_capacity(num_cb);
-        for _ in 0..num_cb {
-            cb.push(r.u(bit_depth_c)?);
-        }
-        let mut cr = Vec::with_capacity(num_cr);
-        for _ in 0..num_cr {
-            cr.push(r.u(bit_depth_c)?);
-        }
+        // §7.3.5 — the pcm_alignment_zero_bit / pcm_sample_* elements
+        // are category 3: in a data-partitioned slice they read from
+        // partition B (alignment is relative to THAT bitstream).
+        let (luma, cb, cr) = match dp.as_deref_mut() {
+            Some(d) => read_pcm_payload(d.select(true)?, bit_depth_y, bit_depth_c, num_cb, num_cr)?,
+            None => read_pcm_payload(r, bit_depth_y, bit_depth_c, num_cb, num_cr)?,
+        };
         // §9.3.3.1.1.5 — I_PCM forces the next MB's mb_qp_delta
         // ctxIdxInc to 0. Reset the rolling flag so the slice walker
         // propagates the correct state.
         entropy.prev_mb_qp_delta_nonzero = false;
+        // §9.2.1.1 step 6 — an I_PCM neighbour contributes nN = 16.
+        // This early-return path used to skip the CAVLC nC-grid commit
+        // at the end of the function entirely, leaving the PCM MB
+        // "unavailable" for every later nC derivation — invisible in
+        // all-PCM slices (nothing after them reads nC) but desyncing
+        // any CAVLC slice that mixes I_PCM with coded macroblocks the
+        // moment a neighbouring nC crosses a coeff_token table
+        // boundary (round-451, found by the data-partition gates).
+        if entropy.cabac.is_none() {
+            if let Some(grid) = entropy.cavlc_nc.as_deref_mut() {
+                if let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize) {
+                    slot.is_available = true;
+                    slot.is_skip = false;
+                    slot.is_intra = true;
+                    slot.is_i_pcm = true;
+                    slot.luma_total_coeff = [0; 16];
+                    slot.cb_total_coeff = [0; 8];
+                    slot.cr_total_coeff = [0; 8];
+                    slot.cb_luma_total_coeff = [0; 16];
+                    slot.cr_luma_total_coeff = [0; 16];
+                }
+            }
+        }
         return Ok(Macroblock {
             mb_type,
             mb_type_raw,
@@ -2903,15 +3010,29 @@ pub fn parse_macroblock(
             }
         }
     } else {
-        parse_residual_cavlc_only(
-            r,
-            entropy,
-            &mb_type,
-            cbp_luma,
-            cbp_chroma,
-            transform_size_8x8_flag,
-            &mut out,
-        )?;
+        // §7.3.5.3 — residual() is category 3 (intra collective
+        // types) or 4 (inter): a data-partitioned slice reads it from
+        // the matching partition's bitstream.
+        match dp {
+            Some(d) => parse_residual_cavlc_only(
+                d.select(mb_type.is_intra())?,
+                entropy,
+                &mb_type,
+                cbp_luma,
+                cbp_chroma,
+                transform_size_8x8_flag,
+                &mut out,
+            )?,
+            None => parse_residual_cavlc_only(
+                r,
+                entropy,
+                &mb_type,
+                cbp_luma,
+                cbp_chroma,
+                transform_size_8x8_flag,
+                &mut out,
+            )?,
+        }
     }
 
     // §9.2.1.1 — mark this MB's slot "available" in the CAVLC neighbour

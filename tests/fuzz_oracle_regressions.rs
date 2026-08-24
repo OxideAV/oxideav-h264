@@ -33,8 +33,12 @@ enum Expect {
     /// The stream must register decode errors (its defect is a
     /// conformance violation the decoder now refuses: §8.3.x intra
     /// mode with unavailable neighbours, §8.2.4 empty-DPB inter slice,
-    /// slice-data-partition NALs, ...).
+    /// ...).
     Errors,
+    /// The stream must be refused outright — `send_packet` or `flush`
+    /// errors, zero frames emitted. Stronger than [`Expect::Errors`]:
+    /// nothing decodes at all.
+    Rejected,
     /// Decoding cleanly is accepted behaviour (reference-side
     /// heuristic strictness only, e.g. refusing non-paired fields);
     /// the pin is just "no panic".
@@ -77,10 +81,15 @@ const FIXTURES: &[(&str, &[u8], Expect)] = &[
         include_bytes!("fixtures/fuzz_regressions/crash-874295dc5eb97498eabc3cfa844f74af658f8540"),
         Expect::Errors,
     ),
+    // Round 451 — slice data partitioning (NAL 2/3/4) is now
+    // implemented, so the pin moved from "unimplemented VCL content
+    // registers slice errors" to the stream's actual defect: its
+    // partition NALs arrive before any SPS/PPS activation, which the
+    // §7.4.1.2.1 activation rule rejects at the NAL level.
     (
-        "c9b7f418 (slice data partition NALs, unimplemented VCL content)",
+        "c9b7f418 (slice data partition NALs before any SPS/PPS activation)",
         include_bytes!("fixtures/fuzz_regressions/crash-c9b7f418e56b1d191950778dc6507f50dedf5010"),
-        Expect::Errors,
+        Expect::Rejected,
     ),
     (
         "b741d946 (non-paired fields; reference-side heuristic strictness)",
@@ -108,11 +117,12 @@ const FIXTURES: &[(&str, &[u8], Expect)] = &[
 /// Decode one input the way the fuzz harness does: single Annex-B
 /// packet, flush, drain. Returns (frames_emitted, error_count,
 /// any_sps_beyond_8bit_planar).
-fn drive(data: &[u8]) -> (usize, u64, bool) {
+fn drive(data: &[u8]) -> (usize, u64, bool, bool) {
     let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
     let pkt = Packet::new(0, TimeBase::new(1, 30), data.to_vec());
     let mut frames = 0usize;
-    if dec.send_packet(&pkt).is_ok() && dec.flush().is_ok() {
+    let accepted = dec.send_packet(&pkt).is_ok() && dec.flush().is_ok();
+    if accepted {
         while let Ok(Frame::Video(_)) = dec.receive_frame() {
             frames += 1;
             if frames > 64 {
@@ -128,13 +138,13 @@ fn drive(data: &[u8]) -> (usize, u64, bool) {
                 || sps.separate_colour_plane_flag
         })
     });
-    (frames, dec.decode_error_count(), beyond_8bit)
+    (frames, dec.decode_error_count(), beyond_8bit, accepted)
 }
 
 #[test]
 fn archived_fuzz_inputs_hold_their_pinned_classification() {
     for (name, data, expect) in FIXTURES {
-        let (frames, errors, beyond_8bit) = drive(data);
+        let (frames, errors, beyond_8bit, accepted) = drive(data);
         eprintln!(
             "fixture {name}: {} bytes -> frames={frames} errors={errors} beyond_8bit={beyond_8bit}",
             data.len()
@@ -157,6 +167,12 @@ fn archived_fuzz_inputs_hold_their_pinned_classification() {
                      (conformance-violation stream), got a clean run with {frames} frame(s)"
                 );
             }
+            Expect::Rejected => {
+                assert!(
+                    !accepted && frames == 0,
+                    "fixture {name}: expected outright rejection (send_packet/flush error,                      zero frames), got accepted={accepted} with {frames} frame(s)"
+                );
+            }
             Expect::NoPanic => { /* reaching here without a panic is the pin */ }
         }
     }
@@ -167,7 +183,7 @@ fn archived_fuzz_inputs_hold_their_pinned_classification() {
 /// that through `stored_sps`; pin it.
 #[test]
 fn stored_sps_exposes_high_bit_depth_parameters() {
-    let (_, _, beyond_8bit) = drive(FIXTURES[0].1);
+    let (_, _, beyond_8bit, _) = drive(FIXTURES[0].1);
     assert!(
         beyond_8bit,
         "expected the profile-244 fixture to store an SPS outside the 8-bit-planar domain"
