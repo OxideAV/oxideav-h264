@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **SP / SI slice decode (§8.6)** — the Extended-profile
+  switching-picture surface. The slice-type plumbing existed
+  (`sp_for_switch_flag` / `slice_qs_delta` parsed since the first
+  slice-header round) but SP slices previously reconstructed as plain
+  P and SI mb_types mis-mapped through the I-slice table. Now:
+  `MbType::SI` implements the §7.4.5 Table 7-12 mapping (raw 0 = the
+  SI macroblock type, coded as an Intra_4x4 prediction MB; raw 1..=26
+  the I types offset by one), and a new `sp_transform` module carries
+  the literal §8.6 math — eq. 8-415 forward core transform,
+  eq. 8-417 `Aij`, eqs. 8-418/8-419 `LevelScale2`, the §8.6.1
+  non-switching chain (eq. 8-416 QPY dequant-and-add, eq. 8-420 QSY
+  re-quantisation, chroma DC 8-427..8-431) and the §8.6.2
+  switching/SI chain (eqs. 8-432/8-433, 8-435/8-437, chroma DC
+  8-439..8-441, including the spec's asymmetric sign-vs-shift
+  placement between the luma and chroma quantisers). Reconstruction
+  routes every P macroblock of an SP slice (P_Skip included — an SP
+  skip re-quantises its prediction rather than copying samples) and
+  every SI macroblock through the transform-domain path, with the
+  final §8.5.12 scaling at qP = QSY / QSC (eqs. 8-331/8-333,
+  `sMbFlag == 1`) and `Clip1(rij)` sample output (no second
+  prediction add). QSY derives per eq. 7-33 from the PPS
+  `pic_init_qs_minus26` + `slice_qs_delta`; QSC through the §8.5.8
+  Table 8-15 process. §8.7 deblocking now honours the SP/SI bS
+  bullets: every edge touching an MB of an SP/SI slice takes the
+  intra strengths (bS = 4 on MB edges / 3 internally) via a new
+  per-MB `in_sp_si_slice` grid flag — the bS derivation itself had
+  modelled the input all along, but every call site pinned it false.
+  CABAC + SI is rejected explicitly (SP/SI live in the CAVLC-only
+  Extended profile, A.2.3), as are SP/SI at non-4:2:0 chroma, >8-bit
+  depth, lossless bypass, and 8x8-transform SP macroblocks.
+
 - Round 448 — **separate-colour-plane decode + encode**
   (`separate_colour_plane_flag = 1`, High 4:4:4 Predictive — the last
   deferred leg of the High 4:4:4 decode surface). Decoder: the §8.1

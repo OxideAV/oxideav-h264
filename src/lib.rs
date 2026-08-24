@@ -61,6 +61,8 @@ pub mod slice_data;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod slice_header;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod sp_transform;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod sps;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod sps_extension;

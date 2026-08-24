@@ -56,6 +56,9 @@ use crate::ref_store::RefPicProvider;
 use crate::simd::{interpolate_chroma, interpolate_luma};
 use crate::slice_data::SliceData;
 use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
+use crate::sp_transform::{
+    sp_chroma_non_switching, sp_chroma_switching, sp_luma_non_switching, sp_luma_switching,
+};
 use crate::sps::Sps;
 use crate::transform::{
     intra_bypass_dpcm, inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422,
@@ -73,6 +76,12 @@ pub enum ReconstructError {
     UnsupportedMbType(String),
     #[error("unsupported ChromaArrayType: {0}")]
     UnsupportedChromaArrayType(u32),
+    /// §8.6 / A.2.3 — an SP or SI slice with a configuration outside
+    /// the Extended-profile envelope the §8.6 paths model (non-4:2:0
+    /// chroma, >8-bit depth, lossless transform bypass, or an 8x8
+    /// transform inter MB).
+    #[error("SP/SI slice unsupported configuration: {0}")]
+    SpSiUnsupported(String),
     #[error("field / MBAFF pictures are not supported in this reconstruction pass")]
     FieldOrMbaffNotSupported,
     #[error("transform error: {0}")]
@@ -696,6 +705,9 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
     // then updated by mb_qp_delta (§8.5.8 eq. 8-309).
     let mut prev_qp_y = slice_qp_y;
 
+    // §7.4.3 / §8.6 — SP/SI slice context (None for I/P/B slices).
+    let sp_si_ctx = sp_si_ctx_for_slice(slice_header, sps, pps, chroma_array_type)?;
+
     // §7.3.3 — deblocking filter control from the slice header.
     let (alpha_off, beta_off) = (
         slice_header.slice_alpha_c0_offset_div2 * 2,
@@ -761,6 +773,7 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
                 // "luma" residual of this slice dequantises under the
                 // scaling lists of ITS colour plane (colour_plane_id).
                 luma_scaling_plane(sps, slice_header),
+                sp_si_ctx,
             )?;
         } else {
             reconstruct_mb_inter(
@@ -779,6 +792,7 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
                 mbaff_frame_flag,
                 mb_field_decoding_flag,
                 current_slice_id,
+                sp_si_ctx,
             )?;
         }
 
@@ -786,6 +800,9 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
         if let Some(info) = grid.get_mut(curr_addr) {
             info.available = true;
             info.is_intra = mb.mb_type.is_intra();
+            // §8.7.2.1 — every MB of an SP/SI slice takes the
+            // intra-strength bS rules.
+            info.in_sp_si_slice = sp_si_ctx.is_some();
             info.is_i_pcm = mb.mb_type.is_i_pcm();
             info.is_intra_nxn = mb.mb_type.is_i_nxn();
             info.mb_type_raw = mb.mb_type_raw;
@@ -950,6 +967,137 @@ pub fn deblock_picture_full(
 // Per-MB reconstruction
 // -------------------------------------------------------------------------
 
+/// §7.4.3 / §8.6 — per-slice SP/SI reconstruction context.
+///
+/// * `qs_y` — eq. 7-33 `QSY = 26 + pic_init_qs_minus26 + slice_qs_delta`
+///   (range-checked 0..=51 at derivation).
+/// * `switching` — true for SP slices with `sp_for_switch_flag == 1`
+///   and for SI slices (the §8.6.2 path); false for the ordinary
+///   §8.6.1 non-switching SP decode.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpSiCtx {
+    pub qs_y: i32,
+    pub switching: bool,
+}
+
+/// Derive the [`SpSiCtx`] for a slice, validating the §8.6 envelope:
+/// SP/SI slices belong to the Extended profile (A.2.3) — 4:2:0 chroma,
+/// 8-bit, no lossless bypass. Returns `Ok(None)` for non-SP/SI slices.
+fn sp_si_ctx_for_slice(
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    chroma_array_type: u32,
+) -> Result<Option<SpSiCtx>, ReconstructError> {
+    if !matches!(slice_header.slice_type, SliceType::SP | SliceType::SI) {
+        return Ok(None);
+    }
+    // §7.4.3 eq. 7-33.
+    let qs_y = 26 + pps.pic_init_qs_minus26 + slice_header.slice_qs_delta;
+    if !(0..=51).contains(&qs_y) {
+        return Err(ReconstructError::SpSiUnsupported(format!(
+            "QSY {qs_y} out of the §7.4.3 range 0..=51"
+        )));
+    }
+    if chroma_array_type != 1 {
+        return Err(ReconstructError::SpSiUnsupported(format!(
+            "ChromaArrayType {chroma_array_type} (SP/SI is 4:2:0-only, A.2.3)"
+        )));
+    }
+    if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
+        return Err(ReconstructError::SpSiUnsupported(
+            "SP/SI at >8-bit depth".into(),
+        ));
+    }
+    if sps.qpprime_y_zero_transform_bypass_flag {
+        return Err(ReconstructError::SpSiUnsupported(
+            "SP/SI with qpprime_y_zero_transform_bypass_flag".into(),
+        ));
+    }
+    Ok(Some(SpSiCtx {
+        qs_y,
+        switching: slice_header.slice_type == SliceType::SI || slice_header.sp_for_switch_flag,
+    }))
+}
+
+/// §8.6.1.2 / §8.6.2.2 — reconstruct one chroma component (4:2:0) of
+/// an SP P macroblock or an SI macroblock. `pred` holds the 8x8
+/// prediction samples of this component (Inter for SP, §8.3.4 intra
+/// for SI). The residual levels are pulled from `mb` with the same
+/// cbp gating / compaction as the ordinary chroma paths, and the final
+/// samples are `Clip1C(rij)` of the §8.5.12 output at qP = QSC
+/// (eqs. 8-333, 8-426, 8-438 — the prediction is not added again).
+#[allow(clippy::too_many_arguments)]
+fn sp_reconstruct_chroma_plane(
+    mb: &Macroblock,
+    plane: u8,
+    cbp_chroma: u8,
+    pred: &[i32],
+    switching: bool,
+    qp_c: i32,
+    qs_c: i32,
+    weight_scale: &[i32; 16],
+    field_scan: bool,
+    writer: &MbWriter,
+    pic: &mut Picture,
+    bit_depth_c: u32,
+) -> Result<(), ReconstructError> {
+    let mut pred64 = [0i32; 64];
+    pred64.copy_from_slice(&pred[..64]);
+
+    // §7.3.5.3 — ChromaDCLevel (cbp_chroma >= 1) and ChromaACLevel
+    // (cbp_chroma == 2); absent levels are zero. §8.6 runs the full
+    // transform-domain chain regardless (even an SP P_Skip
+    // re-quantises the prediction).
+    let mut dc_levels = [0i32; 4];
+    if cbp_chroma > 0 {
+        let dc_block = if plane == 0 {
+            &mb.residual_chroma_dc_cb
+        } else {
+            &mb.residual_chroma_dc_cr
+        };
+        for (k, v) in dc_block.iter().take(4).enumerate() {
+            dc_levels[k] = *v;
+        }
+    }
+    let mut ac = [[0i32; 16]; 4];
+    if cbp_chroma == 2 {
+        let ac_blocks = if plane == 0 {
+            &mb.residual_chroma_ac_cb
+        } else {
+            &mb.residual_chroma_ac_cr
+        };
+        for (blk, dst) in ac.iter_mut().enumerate() {
+            let scan = ac_blocks.get(blk).copied().unwrap_or([0i32; 16]);
+            // Parser slots 0..=14 are spec scan positions 1..=15.
+            *dst = inv_scan_4x4_ac(&scan, field_scan);
+        }
+    }
+
+    let c_blocks = if switching {
+        sp_chroma_switching(&pred64, &dc_levels, &ac, qs_c)
+    } else {
+        sp_chroma_non_switching(&pred64, &dc_levels, &ac, qp_c, qs_c, weight_scale)
+    };
+    for (blk, c) in c_blocks.iter().enumerate() {
+        // §8.5.12 with qP = QSC (eq. 8-333); §8.5.12.1 preserves the
+        // chroma DC slot (eq. 8-335) exactly as §8.6 requires.
+        let r = inverse_transform_4x4_dc_preserved(c, qs_c, weight_scale, bit_depth_c)?;
+        let (bx, by) = chroma_block_xy(1, blk);
+        for yy in 0..4 {
+            for xx in 0..4 {
+                let v = clip_sample(r[yy * 4 + xx], bit_depth_c);
+                if plane == 0 {
+                    writer.set_cb(pic, bx + xx as i32, by + yy as i32, v);
+                } else {
+                    writer.set_cr(pic, bx + xx as i32, by + yy as i32, v);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_mb_intra(
     mb: &Macroblock,
@@ -971,6 +1119,9 @@ fn reconstruct_mb_intra(
     // §8.5.9 — iYCbCr for the luma-path scaling lists: 0 normally,
     // colour_plane_id when separate_colour_plane_flag == 1.
     luma_plane: usize,
+    // §8.6 — Some for MBs of SP/SI slices; the SI macroblock type
+    // reconstructs through §8.6.2 with QSY/QSC.
+    sp_si: Option<SpSiCtx>,
 ) -> Result<(), ReconstructError> {
     // §6.4.1 — MB sample origin (non-MBAFF eqs. 6-3/6-4 or MBAFF eqs.
     // 6-5..6-10 depending on `mb_field_decoding_flag`).
@@ -1056,7 +1207,19 @@ fn reconstruct_mb_intra(
                 field_scan,
             )?;
         }
-        MbType::INxN => {
+        MbType::INxN | MbType::SI => {
+            // §8.6.2 — the Table 7-12 SI macroblock type is coded as an
+            // Intra_4x4 prediction MB but reconstructs in the transform
+            // domain with QSY / QSC. Ordinary I macroblocks inside
+            // SP/SI slices keep the §8.5 path (si_qs = None).
+            let si_qs = if mb.mb_type.is_si() {
+                let ctx = sp_si.ok_or_else(|| {
+                    ReconstructError::UnsupportedMbType("SI macroblock outside an SI slice".into())
+                })?;
+                Some(ctx.qs_y)
+            } else {
+                None
+            };
             reconstruct_intra_nxn(
                 luma_plane,
                 mb,
@@ -1072,6 +1235,7 @@ fn reconstruct_mb_intra(
                 grid,
                 current_slice_id,
                 field_scan,
+                si_qs,
             )?;
             if chroma_array_type == 3 {
                 // §8.3.4.5 — 4:4:4 I_NxN: Cb/Cr coded like luma, reusing
@@ -1107,6 +1271,7 @@ fn reconstruct_mb_intra(
                     grid,
                     current_slice_id,
                     field_scan,
+                    si_qs,
                 )?;
             }
         }
@@ -1274,6 +1439,7 @@ fn reconstruct_intra_16x16(
         grid,
         current_slice_id,
         field_scan,
+        None,
     )?;
 
     Ok(())
@@ -1894,6 +2060,12 @@ fn reconstruct_intra_nxn(
     grid: &mut MbGrid,
     current_slice_id: i32,
     field_scan: bool,
+    // §8.6.2 — Some(QSY) for the SI macroblock type: each 4x4 block's
+    // Intra_4x4 prediction is forward-transformed, quantised with QSY
+    // (eq. 8-432), combined with the parsed residual (eq. 8-433) and
+    // run through §8.5.12 at qP = QSY; the output samples are
+    // Clip1Y(rij) (eq. 8-434) with no second prediction add.
+    si_switch_qs: Option<i32>,
 ) -> Result<(), ReconstructError> {
     let pred = mb
         .mb_pred
@@ -1946,6 +2118,14 @@ fn reconstruct_intra_nxn(
     }
 
     if mb.transform_size_8x8_flag {
+        // §7.3.5 — the SI macroblock type never codes
+        // transform_size_8x8_flag (it is not I_NxN in the syntax
+        // condition), so §8.6.2 is 4x4-only by construction.
+        if si_switch_qs.is_some() {
+            return Err(ReconstructError::SpSiUnsupported(
+                "SI macroblock with transform_size_8x8_flag".into(),
+            ));
+        }
         // §8.3.2 — Intra_8x8 path.
         #[allow(clippy::needless_range_loop)] // spec §8.3.2 8x8 block walk
         for blk8 in 0..4usize {
@@ -2123,7 +2303,15 @@ fn reconstruct_intra_nxn(
                 [0i32; 16]
             };
             let coeffs = inv_scan_4x4(&coeffs_scan, field_scan);
-            let residual = if bypass {
+            let residual = if let Some(qs_y) = si_switch_qs {
+                // §8.6.2.1 — quantise the transformed prediction with
+                // QSY, add the parsed residual coefficients, and scale
+                // through §8.5.12 at qP = QSY (eq. 8-331). The output
+                // r IS the sample value (eq. 8-434) — written below
+                // against a zero prediction block.
+                let c = sp_luma_switching(&pred_samples, &coeffs, qs_y);
+                inverse_transform_4x4(&c, qs_y, &sl4, bit_depth_y)?
+            } else if bypass {
                 // §8.5.12 eq. 8-334 — r = c; §8.5.1 step 3 — §8.5.15
                 // DPCM per 4x4 block when Intra4x4PredMode is V/H.
                 let mut r = coeffs;
@@ -2152,16 +2340,15 @@ fn reconstruct_intra_nxn(
                 eprintln!("    residual: {:?}", residual);
             }
 
-            // Combine + clip + write.
-            write_block_luma(
-                writer,
-                pic,
-                &pred_block_to_mb(&pred_samples, bx, by),
-                bx,
-                by,
-                &residual,
-                bit_depth_y,
-            );
+            // Combine + clip + write. For the §8.6.2 SI path the
+            // prediction already entered through the transform domain
+            // (eq. 8-432), so the sample write is Clip1Y(rij) alone.
+            let pred_for_write = if si_switch_qs.is_some() {
+                [0i32; 256]
+            } else {
+                pred_block_to_mb(&pred_samples, bx, by)
+            };
+            write_block_luma(writer, pic, &pred_for_write, bx, by, &residual, bit_depth_y);
 
             // Track intra_4x4_pred_modes in the grid BEFORE the next
             // 4x4 block is derived — its neighbour lookup reads this.
@@ -2210,6 +2397,10 @@ fn reconstruct_chroma_intra(
     grid: &MbGrid,
     current_slice_id: i32,
     field_scan: bool,
+    // §8.6.2.2 — Some(QSY) for the SI macroblock type: the §8.3.4
+    // chroma prediction is re-routed through the transform-domain
+    // reconstruction at QSC (derived from QSY via §8.5.8).
+    si_switch_qs: Option<i32>,
 ) -> Result<(), ReconstructError> {
     // Monochrome: no chroma work to do.
     if chroma_array_type == 0 {
@@ -2325,6 +2516,29 @@ fn reconstruct_chroma_intra(
 
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
         let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
+
+        if let Some(qs_y) = si_switch_qs {
+            // §8.6.2.2 — SI macroblock chroma: transform-domain
+            // reconstruction at QSC. QSC derives from QSY through the
+            // same §8.5.8 process as QPC from QPY (per-plane offsets).
+            let offset = if plane == 0 { cb_offset } else { cr_offset };
+            let qs_c = qp_y_to_qp_c_with_bd_offset(qs_y, offset, qp_bd_offset_c) + qp_bd_offset_c;
+            sp_reconstruct_chroma_plane(
+                mb,
+                plane,
+                cbp_chroma,
+                &pred_samples,
+                true,
+                qp_c,
+                qs_c,
+                sl4,
+                field_scan,
+                writer,
+                pic,
+                bit_depth_c,
+            )?;
+            continue;
+        }
 
         // §8.5.11 — chroma DC Hadamard.
         let dc_block = if plane == 0 {
@@ -4053,6 +4267,10 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     mbaff_frame_flag: bool,
     mb_field_decoding_flag: bool,
     current_slice_id: i32,
+    // §8.6 — Some for MBs of an SP slice: the residual stage is
+    // replaced by the §8.6.1 (non-switching) or §8.6.2 (switching)
+    // transform-domain reconstruction.
+    sp_si: Option<SpSiCtx>,
 ) -> Result<(), ReconstructError> {
     // §6.4.1 — MB sample origin (MBAFF-aware).
     let (mb_px, mb_py) = mb_sample_origin(grid, mb_addr, mbaff_frame_flag, mb_field_decoding_flag);
@@ -4178,6 +4396,31 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             current_slice_id,
             field_parity,
         )?;
+    }
+
+    // -------- §8.6 SP residual path ---------------------------------
+    // P macroblock types in an SP slice (P_Skip included) never take
+    // the §8.5 sample-domain residual add: the prediction is forward-
+    // transformed, combined with the residual coefficients and
+    // re-quantised with QSY / QSC, then scaled back through §8.5.12
+    // (qP = QSY / QSC per eqs. 8-331 / 8-333). The output samples are
+    // Clip1(rij) — no second prediction add (eqs. 8-421 / 8-426).
+    if let Some(ctx) = sp_si {
+        return sp_reconstruct_inter_residual(
+            mb,
+            ctx,
+            qp_y,
+            bit_depth_y,
+            bit_depth_c,
+            sps,
+            pps,
+            &pred_luma,
+            &pred_cb,
+            &pred_cr,
+            &writer,
+            pic,
+            (mbaff_frame_flag && mb_field_decoding_flag) || slice_header.field_pic_flag,
+        );
     }
 
     // -------- Residual add (§8.5 inverse transform) ------------------
@@ -7380,6 +7623,121 @@ fn b_sub_mode(t: SubMbType, r0: i8, r1: i8) -> (PartMode, i8, i8) {
     }
 }
 
+/// §8.6.1 / §8.6.2 — replacement residual stage for P macroblock types
+/// in SP slices. `pred_luma` / `pred_cb` / `pred_cr` hold the §8.4
+/// Inter prediction of the whole MB (P_Skip included — an SP skip
+/// still re-quantises its prediction, unlike a P_Skip sample copy).
+#[allow(clippy::too_many_arguments)]
+fn sp_reconstruct_inter_residual(
+    mb: &Macroblock,
+    ctx: SpSiCtx,
+    qp_y: i32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    sps: &Sps,
+    pps: &Pps,
+    pred_luma: &[i32; 256],
+    pred_cb: &[i32],
+    pred_cr: &[i32],
+    writer: &MbWriter,
+    pic: &mut Picture,
+    field_scan: bool,
+) -> Result<(), ReconstructError> {
+    // §8.6 is defined for the 4x4 transform only; the Extended profile
+    // (A.2.3) never signals transform_8x8_mode_flag.
+    if mb.transform_size_8x8_flag {
+        return Err(ReconstructError::SpSiUnsupported(
+            "SP inter macroblock with transform_size_8x8_flag".into(),
+        ));
+    }
+    let cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
+    let cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
+
+    // §7.4.2.1.1.1 Table 7-2 — inter-luma 4x4 list (i=3); flat in the
+    // Extended profile (no SPS/PPS scaling matrices).
+    let sl4 = select_scaling_list_4x4(3, sps, pps);
+    let qs_y = ctx.qs_y;
+
+    #[allow(clippy::needless_range_loop)] // spec §8.6.1.1 raster-Z 4x4 walk
+    for blk4 in 0..16usize {
+        let (bx, by) = LUMA_4X4_XY[blk4];
+        let blk8 = blk4 / 4;
+        let coeffs_scan = if (cbp_luma >> blk8) & 1 == 1 {
+            let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+            let compact_idx = set_before * 4 + (blk4 % 4);
+            mb.residual_luma
+                .get(compact_idx)
+                .copied()
+                .unwrap_or([0i32; 16])
+        } else {
+            [0i32; 16]
+        };
+        let cr = inv_scan_4x4(&coeffs_scan, field_scan);
+        // Prediction block p (eq. 8-414).
+        let mut p = [0i32; 16];
+        for yy in 0..4 {
+            for xx in 0..4 {
+                p[yy * 4 + xx] = pred_luma[(by as usize + yy) * 16 + (bx as usize + xx)];
+            }
+        }
+        let c = if ctx.switching {
+            // §8.6.2.1 — eqs. 8-432 / 8-433.
+            sp_luma_switching(&p, &cr, qs_y)
+        } else {
+            // §8.6.1.1 — eqs. 8-415..8-420 (the parsed residual is
+            // dequantised with the MB's QPY, the re-quantisation uses
+            // the slice QSY).
+            sp_luma_non_switching(&p, &cr, qp_y, qs_y, &sl4)
+        };
+        // §8.5.12 at qP = QSY (eq. 8-331); output samples are
+        // Clip1Y(rij) (eq. 8-421).
+        let r = inverse_transform_4x4(&c, qs_y, &sl4, bit_depth_y)?;
+        for yy in 0..4 {
+            for xx in 0..4 {
+                writer.set_luma(
+                    pic,
+                    bx + xx as i32,
+                    by + yy as i32,
+                    clip_sample(r[yy * 4 + xx], bit_depth_y),
+                );
+            }
+        }
+    }
+
+    // §8.6.1.2 / §8.6.2.2 — chroma (4:2:0 enforced at slice level).
+    let cb_offset = pps.chroma_qp_index_offset;
+    let cr_offset = pps
+        .extension
+        .as_ref()
+        .map(|e| e.second_chroma_qp_index_offset)
+        .unwrap_or(pps.chroma_qp_index_offset);
+    // 8-bit only (enforced in `sp_si_ctx_for_slice`) — QpBdOffsetC = 0.
+    let sl4_cb = select_scaling_list_4x4(4, sps, pps);
+    let sl4_cr = select_scaling_list_4x4(5, sps, pps);
+    for plane in 0..2u8 {
+        let offset = if plane == 0 { cb_offset } else { cr_offset };
+        let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, offset, 0);
+        let qs_c = qp_y_to_qp_c_with_bd_offset(qs_y, offset, 0);
+        let sl = if plane == 0 { &sl4_cb } else { &sl4_cr };
+        let pred = if plane == 0 { pred_cb } else { pred_cr };
+        sp_reconstruct_chroma_plane(
+            mb,
+            plane,
+            cbp_chroma,
+            pred,
+            ctx.switching,
+            qp_c,
+            qs_c,
+            sl,
+            field_scan,
+            writer,
+            pic,
+            bit_depth_c,
+        )?;
+    }
+    Ok(())
+}
+
 /// §8.5.12 / §8.5.11 — inter chroma residual path: for every 4x4 chroma
 /// block, dequantise AC, combine with the pre-computed pred buffer, and
 /// write out. Shares code with the intra chroma path except the
@@ -8195,7 +8553,7 @@ fn mbaff_edge_bs(
         p_is_intra: p_info.is_intra,
         q_is_intra: q_info.is_intra,
         is_mb_edge,
-        is_sp_or_si: false,
+        is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
         either_has_nonzero_coeffs: p_has_nz || q_has_nz,
         different_ref_or_mv: diff_ref_mv,
         mixed_mode_edge,
@@ -9177,7 +9535,7 @@ fn deblock_plane_luma(
                         p_is_intra: p_info.is_intra,
                         q_is_intra: q_info.is_intra,
                         is_mb_edge,
-                        is_sp_or_si: false,
+                        is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
                         either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                         different_ref_or_mv: diff_ref_mv,
                         mixed_mode_edge,
@@ -9289,7 +9647,7 @@ fn deblock_plane_luma(
                         p_is_intra: p_info.is_intra,
                         q_is_intra: q_info.is_intra,
                         is_mb_edge,
-                        is_sp_or_si: false,
+                        is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
                         either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                         different_ref_or_mv: diff_ref_mv,
                         mixed_mode_edge,
@@ -9481,7 +9839,7 @@ fn deblock_plane_chroma(
                                 p_is_intra: p_info.is_intra,
                                 q_is_intra: q_info.is_intra,
                                 is_mb_edge,
-                                is_sp_or_si: false,
+                                is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
                                 either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                                 different_ref_or_mv: diff_ref_mv,
                                 mixed_mode_edge,
@@ -9614,7 +9972,7 @@ fn deblock_plane_chroma(
                                 p_is_intra: p_info.is_intra,
                                 q_is_intra: q_info.is_intra,
                                 is_mb_edge,
-                                is_sp_or_si: false,
+                                is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
                                 either_has_nonzero_coeffs: p_has_nz || q_has_nz,
                                 different_ref_or_mv: diff_ref_mv,
                                 mixed_mode_edge,
@@ -9954,7 +10312,7 @@ fn derive_chroma_444_bs(
         p_is_intra: p_info.is_intra,
         q_is_intra: q_info.is_intra,
         is_mb_edge,
-        is_sp_or_si: false,
+        is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
         either_has_nonzero_coeffs: p_has_nz || q_has_nz,
         different_ref_or_mv: diff_ref_mv,
         mixed_mode_edge,

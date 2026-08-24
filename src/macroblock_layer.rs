@@ -117,6 +117,11 @@ pub enum MacroblockLayerError {
     /// Unsupported ChromaArrayType for the residual walker.
     #[error("ChromaArrayType {0} not supported in residual walker")]
     UnsupportedChromaArrayType(u32),
+    /// §9.3.2.5 — SI-slice mb_type CABAC binarisation is not modelled;
+    /// SP/SI slices only occur in the CAVLC-only Extended profile
+    /// (A.2.3).
+    #[error("CABAC entropy coding in an SI slice is not supported")]
+    CabacSiSliceUnsupported,
     /// §7.3.5 / §9.3.1.2 — I_PCM macroblock encountered in CABAC mode.
     /// Reading the `pcm_sample_*` bits and re-initialising the CABAC
     /// engine (codIRange = 510, codIOffset = read_bits(9)) cannot happen
@@ -194,6 +199,13 @@ pub enum MbType {
     /// mb_type == 25 — I_PCM.
     IPcm,
 
+    // --- SI slices (Table 7-12) ---
+    /// SI-slice mb_type == 0 — the SI macroblock type. Coded exactly
+    /// like an Intra_4x4 prediction macroblock (§7.4.5 Table 7-12
+    /// semantics: `MbPartPredMode == Intra_4x4`) but reconstructed via
+    /// the §8.6.2 transform-domain process with QSY / QSC.
+    SI,
+
     // --- P / SP slices (Table 7-13) ---
     PL016x16,
     PL0L016x8,
@@ -243,9 +255,17 @@ impl MbType {
     }
 
     /// §7.4.5 — true for I_NxN (intra 4x4 / 8x8 per
-    /// `transform_size_8x8_flag`).
+    /// `transform_size_8x8_flag`) and for the Table 7-12 SI macroblock
+    /// type, which is coded as an Intra_4x4 prediction macroblock
+    /// (same mb_pred() syntax, same §8.3.1.1 neighbour semantics).
     pub fn is_i_nxn(&self) -> bool {
-        matches!(self, MbType::INxN)
+        matches!(self, MbType::INxN | MbType::SI)
+    }
+
+    /// Table 7-12 — true for the SI macroblock type (SI-slice raw
+    /// mb_type 0). Reconstructed via §8.6.2, never via §8.5.
+    pub fn is_si(&self) -> bool {
+        matches!(self, MbType::SI)
     }
 
     /// §7.4.5 — true for any Intra_16x16 variant.
@@ -255,7 +275,10 @@ impl MbType {
 
     /// §7.4.5 — true for any intra macroblock.
     pub fn is_intra(&self) -> bool {
-        matches!(self, MbType::INxN | MbType::Intra16x16(_) | MbType::IPcm)
+        matches!(
+            self,
+            MbType::INxN | MbType::Intra16x16(_) | MbType::IPcm | MbType::SI
+        )
     }
 
     /// §7.4.5 — true for P_Skip / B_Skip.
@@ -276,7 +299,7 @@ impl MbType {
         use MbType::*;
         match self {
             // Intra → 1.
-            INxN | Intra16x16(_) | IPcm => 1,
+            INxN | Intra16x16(_) | IPcm | SI => 1,
             // P inter.
             PL016x16 | PSkip => 1,
             PL0L016x8 | PL0L08x16 => 2,
@@ -387,7 +410,7 @@ impl MbType {
             }
             BBiBi16x8 | BBiBi8x16 => Some(BiPred),
             B8x8 => None,
-            INxN | Intra16x16(_) | IPcm | Reserved(_) => None,
+            INxN | Intra16x16(_) | IPcm | SI | Reserved(_) => None,
         }
     }
 
@@ -406,6 +429,18 @@ impl MbType {
             Some(i.cbp_chroma)
         } else {
             None
+        }
+    }
+
+    /// Table 7-12 + Table 7-11 — decoded `MbType` for an SI slice:
+    /// raw mb_type 0 is the SI macroblock type; raw values 1..=26 map
+    /// to the Table 7-11 I macroblock types "indexed by subtracting 1
+    /// from the value of mb_type" (§7.4.5).
+    pub fn from_si_slice(raw: u32) -> McblResult<Self> {
+        if raw == 0 {
+            Ok(MbType::SI)
+        } else {
+            Self::from_i_slice(raw - 1)
         }
     }
 
@@ -2498,7 +2533,13 @@ pub fn parse_macroblock(
     let mb_type_raw = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
         let bins_before = dec.bin_count();
         let v = match slice_type {
-            SliceType::I | SliceType::SI => decode_mb_type_i(dec, ctxs, &entropy.neighbours)?,
+            SliceType::I => decode_mb_type_i(dec, ctxs, &entropy.neighbours)?,
+            // §9.3.2.5 — SI-slice mb_type binarisation (prefix bin +
+            // Table 9-33 I suffix) is not modelled: SP/SI slices only
+            // occur in the CAVLC-only Extended profile (A.2.3).
+            SliceType::SI => {
+                return Err(MacroblockLayerError::CabacSiSliceUnsupported);
+            }
             SliceType::P | SliceType::SP => decode_mb_type_p(dec, ctxs, &entropy.neighbours)?,
             SliceType::B => decode_mb_type_b(dec, ctxs, &entropy.neighbours)?,
         };
@@ -2524,7 +2565,14 @@ pub fn parse_macroblock(
     }
 
     let mb_type = match slice_type {
-        SliceType::I | SliceType::SI => MbType::from_i_slice(mb_type_raw)?,
+        SliceType::I => MbType::from_i_slice(mb_type_raw)?,
+        // §7.4.5 Table 7-12 — SI slices: raw 0 is the SI macroblock
+        // type, raw 1..=26 are the I types offset by one. The SI+CABAC
+        // combination never occurs in conforming streams (SP/SI live in
+        // the Extended profile, A.2.3, which mandates CAVLC) and the
+        // §9.3.2.5 SI prefix binarisation is not modelled — reject it
+        // above rather than mis-parsing.
+        SliceType::SI => MbType::from_si_slice(mb_type_raw)?,
         SliceType::P | SliceType::SP => MbType::from_p_slice(mb_type_raw)?,
         SliceType::B => MbType::from_b_slice(mb_type_raw)?,
     };
@@ -2638,7 +2686,7 @@ pub fn parse_macroblock(
         sub_mb_pred = Some(parse_sub_mb_pred(r, entropy, &mb_type)?);
     } else {
         // §7.3.5 — read transform_size_8x8_flag for I_NxN when allowed.
-        if mb_type.is_i_nxn() && entropy.transform_8x8_mode_flag {
+        if matches!(mb_type, MbType::INxN) && entropy.transform_8x8_mode_flag {
             transform_size_8x8_flag = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
                 decode_transform_size_8x8_flag(dec, ctxs, &entropy.neighbours)?
             } else {
@@ -5052,6 +5100,23 @@ mod tests {
     // -----------------------------------------------------------------
     // MbType mapping tests (Tables 7-11 / 7-13 / 7-14).
     // -----------------------------------------------------------------
+
+    #[test]
+    fn si_slice_mb_type_mapping_table_7_12() {
+        // §7.4.5 Table 7-12 — raw 0 is the SI macroblock type; raw
+        // 1..=26 are the Table 7-11 I types offset by one.
+        assert_eq!(MbType::from_si_slice(0).unwrap(), MbType::SI);
+        assert!(MbType::from_si_slice(0).unwrap().is_si());
+        assert!(MbType::from_si_slice(0).unwrap().is_i_nxn());
+        assert!(MbType::from_si_slice(0).unwrap().is_intra());
+        assert_eq!(MbType::from_si_slice(1).unwrap(), MbType::INxN);
+        assert_eq!(
+            MbType::from_si_slice(2).unwrap(),
+            MbType::from_i_slice(1).unwrap()
+        );
+        assert_eq!(MbType::from_si_slice(26).unwrap(), MbType::IPcm);
+        assert!(MbType::from_si_slice(27).is_err());
+    }
 
     #[test]
     fn i_slice_mb_type_0_is_i_nxn() {

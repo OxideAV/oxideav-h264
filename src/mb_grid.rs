@@ -43,6 +43,12 @@ pub struct MbInfo {
     pub is_intra_nxn: bool,
     /// Raw mb_type value from the bitstream (for diagnostics).
     pub mb_type_raw: u32,
+    /// §8.7.2.1 — true when this MB belongs to a slice with
+    /// `slice_type` equal to SP or SI. The bS derivation treats every
+    /// edge touching such an MB like an intra edge (bS = 4 on MB
+    /// edges, bS = 3 internally) regardless of the MB's own
+    /// prediction mode.
+    pub in_sp_si_slice: bool,
     /// §7.4.5 — QP_Y post-adjustment for this macroblock.
     pub qp_y: i32,
     /// CodedBlockPatternLuma — low 4 bits one-per-8x8-luma.
@@ -127,6 +133,7 @@ impl Default for MbInfo {
             is_i_pcm: false,
             is_intra_nxn: false,
             mb_type_raw: 0,
+            in_sp_si_slice: false,
             qp_y: 0,
             cbp_luma: 0,
             cbp_chroma: 0,
