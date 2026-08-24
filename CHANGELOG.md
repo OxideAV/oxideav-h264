@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **Redundant coded pictures are discarded**
+  (§7.4.2.2 / §7.4.1.2). A slice with `redundant_pic_cnt > 0` is an
+  approximation of (part of) the primary picture that a decoder may
+  use for error recovery and may otherwise discard; previously such
+  a slice would run the ordinary decode path and overwrite the
+  primary picture's macroblocks. The decode driver now drops
+  redundant slices (the §7.4.1.2.4 first-VCL detection keys on the
+  primary picture, so they never open a picture of their own), the
+  PPS writer can emit `redundant_pic_cnt_present_flag`, and a gate
+  decodes a stream with a deliberately-different redundant IDR slice
+  byte-identically to the primary-only stream.
+
 - Round 451 — **Arbitrary slice order (ASO) decode** (§A.2.1 /
   §A.2.3 — Baseline and Extended allow a picture's slices to arrive
   in any order). Two changes: the "first slice of a picture must

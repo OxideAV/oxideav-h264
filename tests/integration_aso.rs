@@ -51,6 +51,7 @@ fn parameter_sets() -> Vec<u8> {
         vui: None,
     });
     let pps = build_baseline_pps_rbsp(&BaselinePpsConfig {
+        redundant_pic_cnt_present_flag: false,
         pic_parameter_set_id: 0,
         seq_parameter_set_id: 0,
         pic_init_qp_minus26: 0,

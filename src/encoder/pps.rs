@@ -70,6 +70,11 @@ pub struct BaselinePpsConfig {
     /// for the scaling-list loop bound (4:4:4 carries 6 extra 8x8
     /// lists when `transform_8x8_mode_flag = 1`). Default 1 (4:2:0).
     pub chroma_format_idc: u32,
+    /// Round-451 — §7.4.2.2 `redundant_pic_cnt_present_flag`. When
+    /// `true` every slice header referencing this PPS carries a
+    /// §7.3.3 `redundant_pic_cnt` (used by the redundant-coded-picture
+    /// gates; ordinary streams leave it `false`).
+    pub redundant_pic_cnt_present_flag: bool,
 }
 
 /// Build a Baseline PPS RBSP body (§7.3.2.2).
@@ -104,8 +109,9 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
     w.u(1, 1);
     // constrained_intra_pred_flag = 0.
     w.u(1, 0);
-    // redundant_pic_cnt_present_flag = 0.
-    w.u(1, 0);
+    // §7.4.2.2 — redundant_pic_cnt_present_flag (round-451:
+    // caller-selectable for the redundant-coded-picture gates).
+    w.u(1, u32::from(cfg.redundant_pic_cnt_present_flag));
 
     // §7.3.2.2 — optional trailing group. Only emitted when a High-profile
     // feature (8x8 transform / picture scaling matrices) needs it;
@@ -148,6 +154,7 @@ mod tests {
     #[test]
     fn baseline_pps_round_trips_through_decoder_parser() {
         let cfg = BaselinePpsConfig {
+            redundant_pic_cnt_present_flag: false,
             pic_scaling_lists: None,
             chroma_format_idc: 1,
             pic_parameter_set_id: 0,

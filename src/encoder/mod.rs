@@ -1455,6 +1455,7 @@ impl Encoder {
             vui: self.cfg.vui.clone(),
         };
         let pps_cfg = BaselinePpsConfig {
+            redundant_pic_cnt_present_flag: false,
             pic_scaling_lists: self.cfg.scaling_matrix.pic_spec(),
             chroma_format_idc: self.cfg.chroma_format_idc,
             pic_parameter_set_id: 0,

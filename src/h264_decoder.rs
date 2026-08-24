@@ -1018,6 +1018,19 @@ impl H264CodecDecoder {
             Option<(Vec<u8>, (usize, u8))>,
         )>,
     ) -> Result<()> {
+        // §7.4.2.2 / §7.4.1.2 — a slice with `redundant_pic_cnt > 0`
+        // belongs to a REDUNDANT coded picture: an approximation of
+        // (part of) the primary picture that a decoder "may" use for
+        // error recovery and may otherwise discard. We decode primary
+        // data only — letting a redundant slice through here would
+        // overwrite the primary picture's already-decoded macroblocks
+        // with the approximation (the §7.4.1.2.4 first-VCL detection
+        // deliberately keys on the PRIMARY picture's header fields, so
+        // a redundant slice never opens a picture of its own).
+        if header.redundant_pic_cnt > 0 {
+            return Ok(());
+        }
+
         // The SPS and PPS have been snapshotted at slice-header parse
         // time (see [`Event::Slice::pps`] for why — same-id PPS
         // re-transmission at access-unit boundaries, as in JVT CACQP3).
