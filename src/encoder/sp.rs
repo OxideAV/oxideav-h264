@@ -166,6 +166,8 @@ pub fn sp_parameter_sets(cfg: &SpConfig) -> Vec<u8> {
         chroma_format_idc: 1,
         separate_colour_plane: false,
         seq_scaling_lists: None,
+        bit_depth_luma_minus8: 0,
+        bit_depth_chroma_minus8: 0,
         interlaced_fields: false,
         vui: None,
     });

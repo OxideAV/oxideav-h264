@@ -658,6 +658,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         chroma_format_idc: 1,
         separate_colour_plane: false,
         seq_scaling_lists: None,
+        bit_depth_luma_minus8: 0,
+        bit_depth_chroma_minus8: 0,
         interlaced_fields: true,
         vui: None,
     });

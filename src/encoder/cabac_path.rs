@@ -1995,6 +1995,8 @@ impl Encoder {
             };
         let sps = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_scaling_lists: cfg.scaling_matrix.seq_spec(),
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             interlaced_fields: false,
             seq_parameter_set_id: 0,
             level_idc: cfg.level_idc,

@@ -618,6 +618,8 @@ mod tests {
     #[test]
     fn idr_slice_header_round_trips_through_decoder_parser() {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
             vui: None,
@@ -692,6 +694,8 @@ mod tests {
     #[test]
     fn p_slice_header_round_trips_through_decoder_parser() {
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
             vui: None,
@@ -768,6 +772,8 @@ mod tests {
         // Round-20 — non-reference B slice in a Main-profile stream
         // (B-slices are forbidden under Baseline §A.2.2).
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
             vui: None,
@@ -845,6 +851,8 @@ mod tests {
         // `weighted_bipred_idc = 1`, slice header carries one
         // pred_weight_table entry per list at log2_wd = 5.
         let sps_rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
             vui: None,

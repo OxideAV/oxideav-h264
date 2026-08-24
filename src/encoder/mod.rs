@@ -1447,6 +1447,8 @@ impl Encoder {
             chroma_format_idc: self.cfg.chroma_format_idc,
             separate_colour_plane: self.cfg.colour_plane_id.is_some(),
             seq_scaling_lists: self.cfg.scaling_matrix.seq_spec(),
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             interlaced_fields: false,
             // Round-430 — rate-controlled sessions annotate CBR
             // streams with §E.1.1 VUI timing + §E.1.2 NAL HRD.

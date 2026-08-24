@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **12-bit / 14-bit decode coverage** (§7.4.2.1.1
+  `bit_depth_*_minus8` up to 6 — the High 4:4:4 Predictive depth
+  range, §A.2.7). The parse/transform plumbing supported 8..=14 all
+  along but no stream deeper than the staged 10-bit fixtures ever
+  ran. The SPS writer now emits caller-selected
+  `bit_depth_luma/chroma_minus8` in the chroma-extended group, and
+  `integration_high_bit_depth` builds its own streams from the
+  low-level writers: all-I_PCM pictures at 12 and 14 bits (payload
+  is `u(v)` at BitDepth — decode must return the exact samples in
+  LE-u16 planes, ranges genuinely beyond the 10-bit ceiling) and
+  Intra_16x16 DC pictures with coded luma/chroma DC residual
+  (arbitrary quantised levels through the §8.5.10 luma DC Hadamard,
+  §8.5.11 chroma DC and §8.5.12 scaling at qP′ = QP + QpBdOffset =
+  36 / 50), byte-compared against the black-box reference decoder —
+  an independent oracle with no self-mirror in the loop.
+
 - Round 451 — **Slice data partitioning (§7.3.2.9, NAL types 2/3/4)**
   — the second Extended-profile tool of the round, decode + emit.
   Decoder: NAL 2 parses the §7.3.3 slice header (ordinary PPS/SPS

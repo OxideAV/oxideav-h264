@@ -77,6 +77,15 @@ pub struct BaselineSpsConfig {
     /// `profile_idc = 244` (§A.2.7: 4:4:4 syntax) and flat scaling
     /// lists (`seq_scaling_lists = None`).
     pub separate_colour_plane: bool,
+    /// Round-451 — §7.3.2.1.1 `bit_depth_luma_minus8` /
+    /// `bit_depth_chroma_minus8` (0..=6, i.e. 8..=14-bit). Non-zero
+    /// values require a chroma-extended profile that admits the depth
+    /// (§A.2: High 10 up to 10-bit, High 4:4:4 Predictive up to
+    /// 14-bit); the writer only emits the fields inside the
+    /// chroma-extended group.
+    pub bit_depth_luma_minus8: u32,
+    /// See [`Self::bit_depth_luma_minus8`].
+    pub bit_depth_chroma_minus8: u32,
     /// §7.3.2.1.1 / §7.3.2.1.1.1 — when `Some`, emit
     /// `seq_scaling_matrix_present_flag = 1` with every list present.
     /// `ScalingListsSpec::Default` codes each list as
@@ -120,6 +129,8 @@ impl Default for BaselineSpsConfig {
             separate_colour_plane: false,
             seq_scaling_lists: None,
             interlaced_fields: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             vui: None,
         }
     }
@@ -226,6 +237,11 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
         cfg.chroma_format_idc,
         cfg.profile_idc,
     );
+    debug_assert!(
+        (cfg.bit_depth_luma_minus8 == 0 && cfg.bit_depth_chroma_minus8 == 0)
+            || matches!(cfg.profile_idc, 100 | 110 | 122 | 244),
+        ">8-bit depths require a chroma-extended profile (§A.2)",
+    );
     w.u(8, cfg.profile_idc as u32);
     // §A.2 — constraint_set flags. constraint_set0_flag is the Baseline
     // subset gate (only meaningful when the bitstream conforms to
@@ -264,10 +280,11 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
             // §7.3.2.1.1 — separate_colour_plane_flag (4:4:4 only).
             w.u(1, u32::from(cfg.separate_colour_plane));
         }
-        // bit_depth_luma_minus8 = 0 (8-bit luma).
-        w.ue(0);
-        // bit_depth_chroma_minus8 = 0 (8-bit chroma).
-        w.ue(0);
+        // §7.3.2.1.1 — bit_depth_luma_minus8 / bit_depth_chroma_minus8
+        // (round-451: caller-selectable, 0..=6).
+        debug_assert!(cfg.bit_depth_luma_minus8 <= 6 && cfg.bit_depth_chroma_minus8 <= 6);
+        w.ue(cfg.bit_depth_luma_minus8);
+        w.ue(cfg.bit_depth_chroma_minus8);
         // qpprime_y_zero_transform_bypass_flag = 0.
         w.u(1, 0);
         // §7.3.2.1.1.1 — seq_scaling_matrix_present_flag. When default
@@ -504,6 +521,8 @@ mod tests {
             ..VuiParameters::default()
         };
         let cfg = BaselineSpsConfig {
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             width_in_mbs: 5,
             height_in_mbs: 4,
             vui: Some(vui.clone()),
@@ -528,6 +547,8 @@ mod tests {
     #[test]
     fn baseline_sps_round_trips_through_decoder_parser() {
         let cfg = BaselineSpsConfig {
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
             vui: None,
@@ -571,6 +592,8 @@ mod tests {
         // (chroma_format_idc=3, separate_colour_plane_flag=0) back to
         // ChromaArrayType=3).
         let cfg = BaselineSpsConfig {
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
             vui: None,
@@ -609,6 +632,8 @@ mod tests {
         // seq_scaling_matrix_present_flag tail. Round-27 emits
         // chroma_format_idc=2 (4:2:2), 8-bit depth, no scaling matrix.
         let cfg = BaselineSpsConfig {
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
             vui: None,
