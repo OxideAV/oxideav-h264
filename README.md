@@ -150,8 +150,15 @@ the SAME coded content as one NAL and as an A+B+C triple and
 require identical reconstruction — which flushed out a real
 pre-existing defect (the CAVLC I_PCM parse never committed its
 §9.2.1.1 nC-grid slot, desyncing any CAVLC slice mixing I_PCM with
-coded macroblocks). The Annex F/G/H/I scalable / multiview / 3D
-extensions remain in progress (see the coverage matrix below).
+coded macroblocks). The round also gated **12-/14-bit decode**
+(I_PCM sample-exact round-trips and Intra_16x16 DC-residual pictures
+byte-exact against the black-box reference decoder at both depths),
+**arbitrary slice order** (every slice-order rotation of multi-slice
+pictures decodes byte-identically — which exposed and fixed a §6.4.8
+availability defect where a not-yet-decoded neighbour counted as
+same-slice) and **redundant-coded-picture discard** (§7.4.2.2). The
+Annex F/G/H/I scalable / multiview / 3D extensions remain the
+outstanding surface (see the coverage matrix below).
 
 No external decoder source is consulted while writing this
 implementation — only the spec PDF. Conformance is verified by
