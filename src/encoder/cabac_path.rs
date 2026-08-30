@@ -1334,13 +1334,16 @@ fn quantize_intra16x16_luma(
         // §8.5.10 inverse Hadamard at reconstruct time and must stay
         // untouched here. `skip_dc=true` pins z[0] across the refine.
         if trellis && z.iter().any(|&v| v != 0) {
-            z = crate::encoder::transform::trellis_refine_4x4_ac(
+            z = crate::encoder::transform::trellis_refine_4x4_ac_dispatch(
                 &residual_4x4[raster],
                 &coeffs_4x4[raster],
                 &z,
                 qp_y,
                 lambda_q16,
                 true,
+                1,
+                crate::cabac_ctx::SliceKind::I,
+                None,
             );
         }
         ac_quant_raster[raster] = z;
@@ -1816,13 +1819,16 @@ fn encode_chroma_intra16x16_420(
     for blk in 0..4usize {
         let mut z = quantize_4x4_ac_w(&blocks[blk], qp_c, true, w4);
         if trellis && z.iter().any(|&v| v != 0) {
-            z = crate::encoder::transform::trellis_refine_4x4_ac(
+            z = crate::encoder::transform::trellis_refine_4x4_ac_dispatch(
                 &residual_4x4[blk],
                 &blocks[blk],
                 &z,
                 qp_c,
                 lambda_q16,
                 true,
+                4,
+                crate::cabac_ctx::SliceKind::I,
+                None,
             );
         }
         ac_quant[blk] = z;
@@ -1873,6 +1879,7 @@ impl Encoder {
     /// Round-30 — encode an IDR access unit using **CABAC** entropy coding.
     /// `EncoderConfig::cabac` must be `true` and `profile_idc >= 77`.
     pub fn encode_idr_cabac(&self, frame: &YuvFrame<'_>) -> EncodedIdr {
+        crate::encoder::transform::set_trellis_full(self.cfg.trellis_full);
         self.encode_idr_cabac_with_qp(frame, self.config().qp)
     }
 
@@ -2931,6 +2938,7 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedP {
+        crate::encoder::transform::set_trellis_full(self.cfg.trellis_full);
         self.encode_p_cabac_with_qp(frame, prev, frame_num, pic_order_cnt_lsb, self.config().qp)
     }
 
@@ -3281,9 +3289,16 @@ impl Encoder {
                     // bitstream shrinks.
                     if cfg.trellis_quant && q.iter().any(|&v| v != 0) {
                         let lambda_q16 = crate::encoder::transform::trellis_lambda_q16(qp_y);
-                        q = crate::encoder::transform::trellis_refine_4x4_ac(
-                            &block, &coeffs, &q, qp_y, lambda_q16,
+                        q = crate::encoder::transform::trellis_refine_4x4_ac_dispatch(
+                            &block,
+                            &coeffs,
+                            &q,
+                            qp_y,
+                            lambda_q16,
                             false, // inter — DC participates
+                            2,
+                            crate::cabac_ctx::SliceKind::P,
+                            Some(0),
                         );
                     }
                     let scan = zigzag_scan_4x4(&q);
@@ -4203,6 +4218,7 @@ impl Encoder {
         frame_num: u32,
         pic_order_cnt_lsb: u32,
     ) -> EncodedB {
+        crate::encoder::transform::set_trellis_full(self.cfg.trellis_full);
         self.encode_b_cabac_with_qp(
             frame,
             ref_l0,
@@ -6767,8 +6783,16 @@ impl Encoder {
                     // inter luma path. Mirrors the P-CABAC call above.
                     if cfg.trellis_quant && q.iter().any(|&v| v != 0) {
                         let lambda_q16 = crate::encoder::transform::trellis_lambda_q16(qp_y);
-                        q = crate::encoder::transform::trellis_refine_4x4_ac(
-                            &block, &coeffs, &q, qp_y, lambda_q16, false,
+                        q = crate::encoder::transform::trellis_refine_4x4_ac_dispatch(
+                            &block,
+                            &coeffs,
+                            &q,
+                            qp_y,
+                            lambda_q16,
+                            false,
+                            2,
+                            crate::cabac_ctx::SliceKind::B,
+                            Some(0),
                         );
                     }
                     let scan = zigzag_scan_4x4(&q);
@@ -8908,13 +8932,16 @@ fn encode_chroma_intra16x16_444(
         let raster = by * 4 + bx;
         let mut z = quantize_4x4_ac_w(&coeffs_4x4[raster], qp_c, true, w4);
         if trellis && z.iter().any(|&v| v != 0) {
-            z = crate::encoder::transform::trellis_refine_4x4_ac(
+            z = crate::encoder::transform::trellis_refine_4x4_ac_dispatch(
                 &residual_4x4[raster],
                 &coeffs_4x4[raster],
                 &z,
                 qp_c,
                 lambda_q16,
                 true,
+                2,
+                crate::cabac_ctx::SliceKind::I,
+                None,
             );
         }
         ac_quant_raster[raster] = z;

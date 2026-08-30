@@ -1450,3 +1450,434 @@ mod tests {
         assert_eq!(scan, [10, 30, 20, 50, 70, 40, 60, 80]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round-453 — full trellis RDOQ (Viterbi over the §9.3.3.1.3 residual
+// binarisation with §9.3.1.1-initialised context costs).
+// ---------------------------------------------------------------------------
+//
+// The round-49 "trellis-lite" is a greedy single pass with a flat rate
+// model. This is the full form: for every candidate last-significant
+// position the block's remaining coefficients are optimised jointly by
+// dynamic programming over the coeff_abs_level_minus1 context state
+// (eq. 9-23 / 9-24: the accumulated numDecodAbsLevelEq1 /
+// numDecodAbsLevelGt1 counts, walked in the decoder's reverse scan
+// order), each coefficient choosing among {0, |q| − 1, |q|} (q = the
+// open-loop level). Bin costs come from the slice's initial context
+// states (Tables 9-12..9-33 through `CabacContexts::init` at the block
+// QP) and the Table 9-44 rangeTabLPS probabilities:
+// cost(bin) = −log2(p(bin)) with p(LPS) = rangeLPS / range averaged
+// over the four quantised ranges. Distortion is tracked in the
+// coefficient domain (per-position quantiser step 2^qBits / MF and
+// the inverse-transform basis energy measured from the crate's own
+// §8.5.12 inverse) and the winner is re-checked in the sample domain
+// against the open-loop and trellis-lite blocks under the same rate
+// model, so the result is never worse than either.
+//
+// Informative only: the bitstream syntax is unchanged and the decoder
+// is unaffected.
+
+/// Per-slice context bit costs (in 1/16 bit) for one ctxBlockCat of the
+/// residual syntax elements.
+#[derive(Debug, Clone)]
+pub struct TrellisCtxCosts {
+    /// `significant_coeff_flag[levelListIdx]` — cost of bin 0 / bin 1.
+    sig: [[i64; 2]; 16],
+    /// `last_significant_coeff_flag[levelListIdx]` — bin 0 / bin 1.
+    last: [[i64; 2]; 16],
+    /// `coeff_abs_level_minus1` bin 0, ctxIdxInc 0..=4 — bin 0 / bin 1.
+    abs0: [[i64; 2]; 5],
+    /// `coeff_abs_level_minus1` bins > 0, ctxIdxInc 5..=9 — bin 0 / 1.
+    abs1: [[i64; 2]; 5],
+}
+
+/// Table 9-44-derived bin costs per pStateIdx: `[LPS, MPS]` in 1/16 bit.
+fn bin_cost_table_16ths() -> [[i64; 2]; 64] {
+    let mut t = [[0i64; 2]; 64];
+    for (st, row) in t.iter_mut().enumerate() {
+        // p(LPS): the rangeLPS fraction of the range, averaged over the
+        // four qCodIRangeIdx bands (range representative = band centre).
+        let mut p = 0.0f64;
+        for q in 0..4usize {
+            let r = 256.0 + 64.0 * q as f64 + 32.0;
+            p += crate::cabac::RANGE_TAB_LPS[st][q] as f64 / r;
+        }
+        p /= 4.0;
+        let p = p.clamp(1e-4, 0.5);
+        row[0] = (-(p.log2()) * 16.0).round() as i64;
+        row[1] = (-((1.0 - p).log2()) * 16.0).round() as i64;
+    }
+    t
+}
+
+impl TrellisCtxCosts {
+    /// Build the cost tables for `cat` (ctxBlockCat 1, 2 or 4 — the
+    /// 4x4 AC / luma / chroma-AC blocks the CABAC paths refine) from
+    /// the §9.3.1.1 initial states at `slice_qp`.
+    pub fn new(
+        slice_kind: crate::cabac_ctx::SliceKind,
+        cabac_init_idc: Option<u32>,
+        slice_qp: i32,
+        cat: u32,
+    ) -> Self {
+        let ctxs = crate::cabac_ctx::CabacContexts::init(slice_kind, cabac_init_idc, slice_qp)
+            .expect("context init");
+        let tab = bin_cost_table_16ths();
+        // Table 9-40 ctxBlockCatOffset for cat 0..=4.
+        let (sig_last_off, abs_off): (usize, usize) = match cat {
+            0 => (0, 0),
+            1 => (15, 10),
+            2 => (29, 20),
+            3 => (44, 30),
+            _ => (47, 39),
+        };
+        let cost = |ctx_idx: usize, bin: u32| -> i64 {
+            let st = ctxs.at(ctx_idx);
+            let mps = u32::from(st.val_mps);
+            let row = tab[st.state_idx as usize];
+            if bin == mps {
+                row[1]
+            } else {
+                row[0]
+            }
+        };
+        let mut sig = [[0i64; 2]; 16];
+        let mut last = [[0i64; 2]; 16];
+        for (i, (s, l)) in sig.iter_mut().zip(last.iter_mut()).enumerate() {
+            // Table 9-34 ctxIdxOffset 105 / 166 (frame-coded, cat < 5);
+            // §9.3.3.1.3 ctxIdxInc = levelListIdx.
+            *s = [
+                cost(105 + sig_last_off + i, 0),
+                cost(105 + sig_last_off + i, 1),
+            ];
+            *l = [
+                cost(166 + sig_last_off + i, 0),
+                cost(166 + sig_last_off + i, 1),
+            ];
+        }
+        let mut abs0 = [[0i64; 2]; 5];
+        let mut abs1 = [[0i64; 2]; 5];
+        for k in 0..5usize {
+            abs0[k] = [cost(227 + abs_off + k, 0), cost(227 + abs_off + k, 1)];
+            abs1[k] = [
+                cost(227 + abs_off + 5 + k, 0),
+                cost(227 + abs_off + 5 + k, 1),
+            ];
+        }
+        Self {
+            sig,
+            last,
+            abs0,
+            abs1,
+        }
+    }
+
+    /// Rate of `coeff_abs_level_minus1` + `coeff_sign_flag` for
+    /// `abs_level >= 1` given the eq. 9-23 / 9-24 counters.
+    fn abs_level_cost(&self, abs_level: i32, eq1: usize, gt1: usize) -> i64 {
+        let m = abs_level - 1;
+        let inc0 = if gt1 != 0 { 0 } else { (1 + eq1).min(4) };
+        let incn = gt1.min(4);
+        let mut r = if m == 0 {
+            self.abs0[inc0][0]
+        } else {
+            self.abs0[inc0][1]
+        };
+        if m > 0 {
+            // Truncated unary prefix (cMax 14): bins 1..=13 are ones for
+            // m >= 14, else m - 1 ones then a terminating zero.
+            let ones = (m - 1).min(13) as i64;
+            r += ones * self.abs1[incn][1];
+            if m < 14 {
+                r += self.abs1[incn][0];
+            } else {
+                // EG0 suffix (bypass, 1 bit per bin) for m - 14.
+                let v = (m - 14) as u32 + 1;
+                let k = 32 - v.leading_zeros() - 1;
+                r += 16 * (2 * k as i64 + 1);
+            }
+        }
+        r + 16 // coeff_sign_flag (bypass)
+    }
+}
+
+/// Cached [`TrellisCtxCosts`] keyed by (slice kind, cabac_init_idc, QP,
+/// cat) — the tables only depend on slice-level parameters.
+fn trellis_ctx_costs_cached(
+    slice_kind: crate::cabac_ctx::SliceKind,
+    cabac_init_idc: Option<u32>,
+    qp: i32,
+    cat: u32,
+) -> std::rc::Rc<TrellisCtxCosts> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    type Key = (u8, Option<u32>, i32, u32);
+    thread_local! {
+        static CACHE: RefCell<HashMap<Key, std::rc::Rc<TrellisCtxCosts>>> =
+            RefCell::new(HashMap::new());
+    }
+    let key = (slice_kind as u8, cabac_init_idc, qp, cat);
+    CACHE.with(|c| {
+        c.borrow_mut()
+            .entry(key)
+            .or_insert_with(|| {
+                std::rc::Rc::new(TrellisCtxCosts::new(slice_kind, cabac_init_idc, qp, cat))
+            })
+            .clone()
+    })
+}
+
+/// Sample-domain energy of a unit change of one dequantised
+/// coefficient at each row-major position — `g[k]` such that
+/// spatial SSD ≈ Σ g[k] · (Δw[k])² with Δw in the forward-transform
+/// (`w`) domain. Measured from the crate's §8.5.12 inverse at a large
+/// level so rounding is negligible.
+fn coefficient_energy_weights(qp: i32) -> [f64; 16] {
+    let m = qp.rem_euclid(6) as usize;
+    let mf = forward_mf_for(m);
+    let qb = q_bits(qp);
+    let mut g = [0f64; 16];
+    for k in 0..16 {
+        let mut z = [0i32; 16];
+        let level = 64i32;
+        z[k] = level;
+        let r = crate::transform::inverse_transform_4x4(&z, qp, &crate::transform::FLAT_4X4_16, 8)
+            .unwrap_or([0i32; 16]);
+        let e: f64 = r.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        // w-domain step for one level at this position.
+        let step = (1u64 << qb) as f64 / mf[k] as f64;
+        let dw = level as f64 * step;
+        g[k] = if dw > 0.0 { e / (dw * dw) } else { 0.0 };
+    }
+    g
+}
+
+/// Round-453 — full trellis RDOQ of one quantised 4x4 block (see the
+/// module notes above). Same contract as [`trellis_refine_4x4_ac`]:
+/// `residual` / `w` / `z` row-major, `skip_dc` pins `z[0]`; `cat` is
+/// the ctxBlockCat whose contexts price the block (1 = Intra16x16 AC,
+/// 2 = luma 4x4, 4 = chroma AC); `slice_kind` / `cabac_init_idc` /
+/// `slice_qp` select the §9.3.1.1 initial states.
+#[allow(clippy::too_many_arguments)]
+pub fn trellis_refine_4x4_ac_full(
+    residual: &[i32; 16],
+    w: &[i32; 16],
+    z: &[i32; 16],
+    qp: i32,
+    lambda_q16: u64,
+    skip_dc: bool,
+    cat: u32,
+    slice_kind: crate::cabac_ctx::SliceKind,
+    cabac_init_idc: Option<u32>,
+) -> [i32; 16] {
+    if lambda_q16 == 0 {
+        return *z;
+    }
+    let costs = trellis_ctx_costs_cached(slice_kind, cabac_init_idc, qp, cat);
+    let g = coefficient_energy_weights(qp);
+    let m = qp.rem_euclid(6) as usize;
+    let mf = forward_mf_for(m);
+    let qb = q_bits(qp);
+    let lam = lambda_q16 as f64;
+
+    // Coefficient list in scan order (levelListIdx order), skipping
+    // the DC slot for AC blocks.
+    let first = usize::from(skip_dc);
+    let mut raster_of: Vec<usize> = vec![0; 16];
+    for (raster, &scan) in ZIGZAG_4X4_FWD.iter().enumerate() {
+        raster_of[scan] = raster;
+    }
+    let list: Vec<usize> = (first..16).map(|s| raster_of[s]).collect();
+    let n = list.len();
+    // Per list position: |w|, sign, open-loop |q|, step, energy weight.
+    let absw: Vec<f64> = list.iter().map(|&k| (w[k] as f64).abs()).collect();
+    let q: Vec<i32> = list.iter().map(|&k| z[k].abs()).collect();
+    let step: Vec<f64> = list
+        .iter()
+        .map(|&k| (1u64 << qb) as f64 / mf[k] as f64)
+        .collect();
+    let gw: Vec<f64> = list.iter().map(|&k| g[k]).collect();
+    if q.iter().all(|&v| v == 0) {
+        return *z;
+    }
+    // Distortion of coding level `l` at list position i (scaled by 16
+    // to match `J = 16·D + λ16·R`).
+    let dist = |i: usize, l: i32| -> f64 {
+        let d = absw[i] - l as f64 * step[i];
+        16.0 * gw[i] * d * d
+    };
+    let cands = |i: usize| -> Vec<i32> {
+        let mut c = vec![0];
+        if q[i] >= 1 {
+            c.push(q[i]);
+        }
+        if q[i] >= 2 {
+            c.push(q[i] - 1);
+        }
+        c
+    };
+    // Cost of the all-zero block (cbf = 0 → nothing coded; distortion
+    // of dropping everything).
+    let mut best_j = (0..n).map(|i| dist(i, 0)).sum::<f64>();
+    let mut best_levels: Vec<i32> = vec![0; n];
+
+    // For each candidate last position L (with q[L] > 0): DP over
+    // i = L-1 .. 0 in decoder order with state (eq1, gt1) ∈ 0..=4².
+    const NS: usize = 25;
+    let idx = |eq1: usize, gt1: usize| eq1 * 5 + gt1;
+    for last in (0..n).rev() {
+        if q[last] == 0 {
+            continue;
+        }
+        // Dropped coefficients above `last`.
+        let tail_d: f64 = (last + 1..n).map(|i| dist(i, 0)).sum();
+        let mut cur = vec![(f64::INFINITY, Vec::<i32>::new()); NS];
+        for &l in &cands(last) {
+            if l == 0 {
+                continue;
+            }
+            let r = costs.sig[last][1] + costs.last[last][1] + costs.abs_level_cost(l, 0, 0) + 16;
+            // Approximate coded_block_flag = 1 as one bit.
+            let j = tail_d + dist(last, l) + lam * r as f64;
+            let eq1 = usize::from(l == 1);
+            let gt1 = usize::from(l > 1);
+            let s = idx(eq1, gt1);
+            if j < cur[s].0 {
+                let mut lv = vec![0i32; n];
+                lv[last] = l;
+                cur[s] = (j, lv);
+            }
+        }
+        for i in (0..last).rev() {
+            let mut next = vec![(f64::INFINITY, Vec::<i32>::new()); NS];
+            for (s, entry) in cur.iter().enumerate() {
+                if !entry.0.is_finite() {
+                    continue;
+                }
+                let (eq1, gt1) = (s / 5, s % 5);
+                for &l in &cands(i) {
+                    let (j, ns) = if l == 0 {
+                        (cur[s].0 + dist(i, 0) + lam * costs.sig[i][0] as f64, s)
+                    } else {
+                        let r =
+                            costs.sig[i][1] + costs.last[i][0] + costs.abs_level_cost(l, eq1, gt1);
+                        let ne = (eq1 + usize::from(l == 1)).min(4);
+                        let ng = (gt1 + usize::from(l > 1)).min(4);
+                        (cur[s].0 + dist(i, l) + lam * r as f64, idx(ne, ng))
+                    };
+                    if j < next[ns].0 {
+                        let mut lv = cur[s].1.clone();
+                        lv[i] = l;
+                        next[ns] = (j, lv);
+                    }
+                }
+            }
+            cur = next;
+        }
+        for (j, lv) in cur.into_iter() {
+            if j < best_j {
+                best_j = j;
+                best_levels = lv;
+            }
+        }
+    }
+
+    // Assemble the candidate block with the original signs.
+    let mut z_full = *z;
+    for (i, &k) in list.iter().enumerate() {
+        let l = best_levels[i];
+        z_full[k] = if w[k] < 0 { -l } else { l };
+    }
+    if skip_dc {
+        z_full[0] = z[0];
+    }
+
+    // Sample-domain re-check against the open-loop and trellis-lite
+    // blocks under the same rate model: keep the best.
+    let rate_model = |levels: &[i32; 16]| -> i64 {
+        let lv: Vec<i32> = list.iter().map(|&k| levels[k].abs()).collect();
+        let last = match lv.iter().rposition(|&v| v != 0) {
+            Some(p) => p,
+            None => return 0,
+        };
+        let (mut eq1, mut gt1) = (0usize, 0usize);
+        let mut r = 16i64;
+        for i in (0..=last).rev() {
+            let l = lv[i];
+            if l == 0 {
+                r += costs.sig[i][0];
+            } else {
+                r += costs.sig[i][1] + costs.last[i][usize::from(i == last)];
+                r += costs.abs_level_cost(l, eq1, gt1);
+                eq1 = (eq1 + usize::from(l == 1)).min(4);
+                gt1 = (gt1 + usize::from(l > 1)).min(4);
+            }
+        }
+        r
+    };
+    let spatial_j = |levels: &[i32; 16]| -> f64 {
+        let r_hat =
+            crate::transform::inverse_transform_4x4(levels, qp, &crate::transform::FLAT_4X4_16, 8)
+                .unwrap_or([0i32; 16]);
+        let mut ssd = 0f64;
+        for k in 0..16 {
+            let d = (residual[k] - r_hat[k]) as f64;
+            ssd += d * d;
+        }
+        16.0 * ssd + lam * rate_model(levels) as f64
+    };
+    let z_lite = trellis_refine_4x4_ac(residual, w, z, qp, lambda_q16, skip_dc);
+    let mut best = (*z, spatial_j(z));
+    for cand in [z_lite, z_full] {
+        let j = spatial_j(&cand);
+        if j < best.1 {
+            best = (cand, j);
+        }
+    }
+    best.0
+}
+
+thread_local! {
+    /// Round-453 — whether the CABAC paths run the full trellis
+    /// ([`trellis_refine_4x4_ac_full`]) or the round-49 lite pass.
+    /// Set by the CABAC slice entry points from
+    /// `EncoderConfig::trellis_full` (the per-block quantisers are
+    /// stateless helpers several call levels below the config).
+    static TRELLIS_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Select the trellis flavour for the current thread's CABAC encodes.
+pub fn set_trellis_full(full: bool) {
+    TRELLIS_FULL.with(|f| f.set(full));
+}
+
+/// Round-453 — CABAC-path trellis dispatch: full Viterbi RDOQ when
+/// [`set_trellis_full`] is on, else the (default) lite pass.
+#[allow(clippy::too_many_arguments)]
+pub fn trellis_refine_4x4_ac_dispatch(
+    residual: &[i32; 16],
+    w: &[i32; 16],
+    z: &[i32; 16],
+    qp: i32,
+    lambda_q16: u64,
+    skip_dc: bool,
+    cat: u32,
+    slice_kind: crate::cabac_ctx::SliceKind,
+    cabac_init_idc: Option<u32>,
+) -> [i32; 16] {
+    if TRELLIS_FULL.with(|f| f.get()) {
+        trellis_refine_4x4_ac_full(
+            residual,
+            w,
+            z,
+            qp,
+            lambda_q16,
+            skip_dc,
+            cat,
+            slice_kind,
+            cabac_init_idc,
+        )
+    } else {
+        trellis_refine_4x4_ac(residual, w, z, qp, lambda_q16, skip_dc)
+    }
+}

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 453 — **Full trellis RDOQ** (`EncoderConfig::trellis_full`,
+  `encoder::transform::trellis_refine_4x4_ac_full`): a Viterbi search
+  over the §9.3.3.1.3 residual binarisation — every candidate
+  last-significant position, per-coefficient {0, |q|−1, |q|}
+  choices, dynamic programming over the eq. 9-23 / 9-24
+  `numDecodAbsLevelEq1` / `numDecodAbsLevelGt1` context state in
+  decoder order — with bin costs from the §9.3.1.1 initial context
+  states (Tables 9-12..9-33 at the block QP) and the Table 9-44
+  rangeTabLPS probabilities, coefficient-domain distortion (quantiser
+  step 2^qBits / MF and the inverse-transform basis energy measured
+  from the crate's own §8.5.12 inverse) and a sample-domain re-check
+  against the open-loop and trellis-lite blocks. Measured on the
+  textured-motion CABAC P + B fixture over QP 20..=36: P + B payload
+  1435 → 1419 bytes (−1.1 %) at ≤ 0.1 dB, the QP-32 P slice −8 %;
+  because one QP-34 B slice grew 4 bytes against the open-loop
+  quantiser the round-49 lite pass stays the default and the full
+  search is opt-in (`integration_trellis_quant::round453_full_trellis_beats_lite_over_qp_sweep`).
+
 - Round 453 — **`recovery_point` SEI emission** (§D.1.8 / §D.2.8,
   `encoder::sei::build_recovery_point_payload`,
   `SessionConfig::recovery_point_sei`): every IDR access unit of the

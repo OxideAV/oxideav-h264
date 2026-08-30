@@ -60,6 +60,12 @@ fn make_textured_motion_frame(w: usize, h: usize, cx: i32, cy: i32) -> Vec<u8> {
 }
 
 fn encode_textured_gop(qp: i32, trellis: bool) -> (usize, usize, usize, f64, f64) {
+    encode_textured_gop_mode(qp, trellis, false)
+}
+
+/// Round-453 — `full` selects the full trellis RDOQ (opt-in) or the
+/// default round-49 lite pass.
+fn encode_textured_gop_mode(qp: i32, trellis: bool, full: bool) -> (usize, usize, usize, f64, f64) {
     let w = 64usize;
     let h = 64usize;
     // Wider motion + non-integer-pel content shift makes the post-ME
@@ -101,6 +107,7 @@ fn encode_textured_gop(qp: i32, trellis: bool) -> (usize, usize, usize, f64, f64
     cfg.max_num_ref_frames = 2;
     cfg.qp = qp;
     cfg.trellis_quant = trellis;
+    cfg.trellis_full = full;
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr_cabac(&f0);
     let p = enc.encode_p_cabac(&f1, &EncodedFrameRef::from(&idr), 1, 4);
@@ -317,5 +324,40 @@ fn round49_trellis_quant_self_roundtrip_bit_equivalent() {
     assert!(
         max_p <= 1,
         "trellis P max enc/dec luma diff {max_p} > 1 — encoder/decoder out of sync",
+    );
+}
+
+/// Round-453 — the full trellis RDOQ must not lose to the lite pass:
+/// over a QP sweep the P + B payload is at most the lite payload with
+/// recon PSNR within 0.15 dB, and at least one QP strictly saves bits.
+#[test]
+fn round453_full_trellis_beats_lite_over_qp_sweep() {
+    let mut strict_wins = 0;
+    let mut total_lite = 0usize;
+    let mut total_full = 0usize;
+    for qp in [20, 24, 28, 32, 36] {
+        let (_, p_l, b_l, pp_l, pb_l) = encode_textured_gop_mode(qp, true, false);
+        let (_, p_f, b_f, pp_f, pb_f) = encode_textured_gop_mode(qp, true, true);
+        eprintln!(
+            "QP {qp}: lite P {p_l} B {b_l} ({pp_l:.2}/{pb_l:.2} dB) → full P {p_f} B {b_f} ({pp_f:.2}/{pb_f:.2} dB)"
+        );
+        total_lite += p_l + b_l;
+        total_full += p_f + b_f;
+        assert!(
+            pp_f + 0.15 >= pp_l && pb_f + 0.15 >= pb_l,
+            "QP {qp}: full trellis PSNR drop beyond 0.15 dB",
+        );
+        if p_f + b_f < p_l + b_l {
+            strict_wins += 1;
+        }
+    }
+    eprintln!("sweep payload lite {total_lite} → full {total_full} bytes");
+    assert!(
+        total_full <= total_lite,
+        "full trellis must not grow the payload"
+    );
+    assert!(
+        strict_wins >= 1,
+        "full trellis must strictly save bits at some QP"
     );
 }

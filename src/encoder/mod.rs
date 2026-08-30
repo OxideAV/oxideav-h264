@@ -589,6 +589,17 @@ pub struct EncoderConfig {
     ///   * Wider GOPs on textured content see ~5-12 % saving on the
     ///     coded inter MBs.
     pub trellis_quant: bool,
+    /// Round-453 — run the **full trellis RDOQ**
+    /// ([`crate::encoder::transform::trellis_refine_4x4_ac_full`]:
+    /// Viterbi over the §9.3.3.1.3 residual binarisation with
+    /// §9.3.1.1-initialised context costs) on the CABAC paths instead
+    /// of the round-49 lite pass. Measured on the textured-motion
+    /// P + B fixture over QP 20..=36: 1.1 % smaller P + B payload at
+    /// ≤ 0.1 dB (QP 32 P slice −8 %), but one QP-34 B slice grew by
+    /// 4 bytes against the open-loop quantiser, so the lite pass
+    /// (which never regresses size on that sweep) stays the default:
+    /// `false`. Opt in with `true`.
+    pub trellis_full: bool,
     /// Round-148 — opt-in trellis quantisation refinement on the CABAC
     /// **IDR Intra_16x16 luma AC** path. Default `false`.
     ///
@@ -699,6 +710,7 @@ impl EncoderConfig {
             level_idc: min_level_idc_for_picture_size(width_in_mbs, height_in_mbs),
             bit_depth_chroma_minus8: 0,
             trellis_quant: true,
+            trellis_full: false,
             trellis_quant_intra: false,
             trellis_quant_intra_chroma: false,
             transform_8x8: false,
