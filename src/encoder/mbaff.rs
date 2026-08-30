@@ -641,6 +641,7 @@ fn code_mb(
         dbl = ve.enc.encode_p_mb_with_intra_fallback(
             &src,
             &prev,
+            prev.recon_y,
             vx,
             vy,
             ctx.qp_y,
@@ -883,6 +884,7 @@ pub fn encode_mbaff_sequence(cfg: &MbaffConfig, frames: &[(&[u8], &[u8], &[u8])]
                     field: FieldPicSignal::FramePicture,
                     rplm_l0: &[],
                     mmco: &[],
+                    pred_weight_table: None,
                 },
             );
         } else {

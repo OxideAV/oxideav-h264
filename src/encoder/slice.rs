@@ -336,6 +336,36 @@ pub struct PSliceHeaderConfig<'a> {
     /// Round-436 — §7.3.3.3 adaptive marking ops (Table 7-9). Empty =
     /// sliding window.
     pub mmco: &'a [EncMmcoOp],
+    /// Round-453 — §7.3.3.2 `pred_weight_table()` for P slices. MUST
+    /// be `Some` when the PPS has `weighted_pred_flag = 1` (the table
+    /// is mandatory in every P slice header then) and `None`
+    /// otherwise.
+    pub pred_weight_table: Option<ExplicitPredWeightTableL0>,
+}
+
+/// Round-453 — §7.3.3.2 explicit weighted-prediction table for a
+/// single-L0-ref P slice (`weighted_pred_flag = 1`).
+///
+/// Luma only: `luma_weight_l0_flag = 1` with the coded (weight,
+/// offset) pair when `luma` is `Some`, else `luma_weight_l0_flag = 0`
+/// (the decoder infers `2^luma_log2_weight_denom` / 0 per §7.4.3.2 —
+/// an identity weighting, the cheapest way to satisfy the mandatory
+/// table on frames where no fade was detected). Chroma weights are
+/// never coded (`chroma_weight_l0_flag = 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplicitPredWeightTableL0 {
+    /// §7.4.3.2 `luma_log2_weight_denom`, range 0..=7.
+    pub luma_log2_weight_denom: u32,
+    /// `(luma_weight_l0[0], luma_offset_l0[0])`, each in -128..=127.
+    pub luma: Option<(i32, i32)>,
+}
+
+impl ExplicitPredWeightTableL0 {
+    /// The effective §8.4.2.3.2 `(w0, o0)` after §7.4.3.2 inference.
+    pub fn effective(&self) -> (i32, i32) {
+        self.luma
+            .unwrap_or((1i32 << self.luma_log2_weight_denom, 0))
+    }
 }
 
 /// Emit the bits of a single P-slice header (non-IDR) into the supplied
@@ -371,7 +401,31 @@ pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig<'_>) {
     write_rplm_list(w, cfg.rplm_l0);
     // No list-1 loop for P-slice.
 
-    // §7.3.3.2 — pred_weight_table() absent (PPS weighted_pred_flag == 0).
+    // §7.3.3.2 — pred_weight_table(), present iff the PPS has
+    // weighted_pred_flag == 1 (round-453). Single L0 ref, luma only:
+    //   luma_log2_weight_denom     ue(v)
+    //   chroma_log2_weight_denom   ue(v)   (ChromaArrayType != 0)
+    //   luma_weight_l0_flag        u(1)
+    //   [luma_weight_l0[0] se(v), luma_offset_l0[0] se(v)]
+    //   chroma_weight_l0_flag      u(1) = 0
+    if let Some(pwt) = cfg.pred_weight_table {
+        debug_assert!(pwt.luma_log2_weight_denom <= 7);
+        w.ue(pwt.luma_log2_weight_denom);
+        // Our P writers run at ChromaArrayType 1/2/3 (never 0):
+        // chroma_log2_weight_denom mirrors luma's.
+        w.ue(pwt.luma_log2_weight_denom);
+        match pwt.luma {
+            Some((wt, off)) => {
+                debug_assert!((-128..=127).contains(&wt));
+                debug_assert!((-128..=127).contains(&off));
+                w.u(1, 1);
+                w.se(wt);
+                w.se(off);
+            }
+            None => w.u(1, 0),
+        }
+        w.u(1, 0); // chroma_weight_l0_flag = 0
+    }
 
     // §7.3.3.3 — dec_ref_pic_marking() when nal_ref_idc != 0: sliding
     // window, or the round-436 adaptive MMCO list.
@@ -737,6 +791,7 @@ mod tests {
                 field: FieldPicSignal::FrameMbsOnly,
                 rplm_l0: &[],
                 mmco: &[],
+                pred_weight_table: None,
             },
         );
         // Append a dummy bit + trailing so the parser doesn't blow up.

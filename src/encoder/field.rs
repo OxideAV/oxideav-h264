@@ -398,6 +398,7 @@ fn encode_p_slice_data(
             let dbl = enc.encode_p_mb_with_intra_fallback(
                 src,
                 prev,
+                prev.recon_y,
                 mb_x,
                 mb_y,
                 qp_y,
@@ -940,6 +941,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                         } else {
                             &[]
                         },
+                        pred_weight_table: None,
                     },
                 );
             } else {
@@ -1140,6 +1142,7 @@ fn encode_paff_b_sequence(
                         field: field_signal,
                         rplm_l0,
                         mmco: &[],
+                        pred_weight_table: None,
                     },
                 );
                 encode_p_slice_data(&field_enc, &src, &prev_ref, &mut sw)

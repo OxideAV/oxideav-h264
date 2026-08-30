@@ -3074,6 +3074,7 @@ impl Encoder {
                 field: FieldPicSignal::FrameMbsOnly,
                 rplm_l0: &[],
                 mmco: &[],
+                pred_weight_table: None,
             },
         );
         while !sw.byte_aligned() {
@@ -4156,6 +4157,7 @@ impl Encoder {
             pic_order_cnt_lsb,
             partition_mvs,
             i8x8_mb_count,
+            pred_weight_table: None,
         }
     }
 

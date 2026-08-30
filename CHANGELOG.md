@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 453 — **Explicit weighted prediction on P slices with fade
+  detection** (`EncoderConfig::explicit_weighted_pred`). The PPS
+  codes `weighted_pred_flag = 1`, every P slice header carries the
+  §7.3.3.2 `pred_weight_table()` (`ExplicitPredWeightTableL0`, luma
+  only, `chroma_weight_l0_flag = 0`), and every inter predictor —
+  P_L0_16x16, P_8x8 and P_Skip alike — goes through the §8.4.2.3.2
+  eq. 8-274 weighting before residual / skip decisions and local
+  reconstruction. Per picture the encoder least-squares-fits a
+  slice-wide `(weight, offset)` at `logWD = 5` against the reference
+  and elects it when it beats the identity weighting by ≥ 1 % SSD on
+  the co-located planes, else codes `luma_weight_l0_flag = 0`;
+  motion search runs against the weighted reference so a fade does
+  not mislead the SAD ranking. Measured on a five-frame global-fade
+  sequence at QP 26: P payload 6684 → 960 bytes (14 % of the
+  unweighted stream) at equal PSNR (37.56 → 37.55 dB), every MB
+  inter instead of the Intra_16x16 fallback. Three
+  `integration_p_weighted_pred` gates (fade, static/identity,
+  QP 44 skip-dominated) decode bit-exactly in our decoder and
+  byte-exactly in the black-box reference decoder; `EncodedP`
+  reports the coded table.
+
 - Round 453 — **MBAFF encoding** (`encoder::mbaff`,
   `encode_mbaff_sequence`). Interlaced sequences code as MBAFF frame
   pictures (`frame_mbs_only_flag = 0`,

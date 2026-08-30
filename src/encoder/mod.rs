@@ -92,6 +92,34 @@ struct MbQpTracker {
     /// active reference frame (the field MB addresses
     /// `2 * num_ref_idx_l0_active` reference fields, §8.4.2.1).
     mbaff_field_mb: bool,
+    /// Round-453 — §8.4.2.3.2 explicit weighted prediction for the
+    /// slice's single L0 reference: the effective `(w0, o0)` and
+    /// `logWD` (already §7.4.3.2-inferred). `None` = default
+    /// (§8.4.2.3.1 copy-through) prediction.
+    wp_l0: Option<WeightedPredL0>,
+}
+
+/// Round-453 — §8.4.2.3.2 single-list explicit weighting parameters.
+#[derive(Debug, Clone, Copy)]
+struct WeightedPredL0 {
+    log2_wd: u32,
+    weight: i32,
+    offset: i32,
+}
+
+impl WeightedPredL0 {
+    /// §8.4.2.3.2 eq. 8-274 — weight one L0 prediction block in place
+    /// (8-bit Clip1).
+    fn apply(&self, pred: &mut [i32]) {
+        for p in pred.iter_mut() {
+            let v = if self.log2_wd >= 1 {
+                ((*p * self.weight + (1i32 << (self.log2_wd - 1))) >> self.log2_wd) + self.offset
+            } else {
+                *p * self.weight + self.offset
+            };
+            *p = v.clamp(0, 255);
+        }
+    }
 }
 
 impl MbQpTracker {
@@ -100,6 +128,7 @@ impl MbQpTracker {
             cur,
             mbaff_flag_pending: None,
             mbaff_field_mb: false,
+            wp_l0: None,
         }
     }
 
@@ -141,7 +170,8 @@ use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::rdo::{cost_combined, lambda_ssd, ssd_16x16, ssd_4x4};
 use crate::encoder::slice::{
     write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
-    ExplicitBipredWeightTable, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    ExplicitBipredWeightTable, ExplicitPredWeightTableL0, FieldPicSignal, IdrSliceHeaderConfig,
+    PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
@@ -410,6 +440,16 @@ pub struct EncoderConfig {
     /// average `(L0 + L1 + 1) >> 1` and the PPS / slice header carry no
     /// pred_weight_table.
     pub explicit_weighted_bipred: bool,
+    /// Round-453 — §7.4.2.2 `weighted_pred_flag = 1`: P slices carry
+    /// a §7.3.3.2 `pred_weight_table()` and predict through the
+    /// §8.4.2.3.2 explicit process. Per P picture the encoder fits a
+    /// slice-wide luma `(weight, offset)` against the reference
+    /// (least squares, `logWD = 5`) and codes it when it beats the
+    /// identity weighting by at least 1% SSD on the co-located
+    /// planes (fade detection); otherwise the table codes
+    /// `luma_weight_l0_flag = 0` (identity). Chroma weights are never
+    /// coded. Default `false`.
+    pub explicit_weighted_pred: bool,
     /// Round-29 — when `true` (default) the P/B-slice encoder runs an
     /// **intra fallback** RDO trial on every coded MB: the inter MB cost
     /// `J_inter = D_inter + λ·R_inter` is compared against an Intra_16x16
@@ -622,6 +662,7 @@ impl EncoderConfig {
             direct_temporal_mv_pred: false,
             b_l0_bi_only: false,
             explicit_weighted_bipred: false,
+            explicit_weighted_pred: false,
             intra_in_inter: true,
             chroma_format_idc: 1,
             colour_plane_id: None,
@@ -1500,7 +1541,9 @@ impl Encoder {
             seq_parameter_set_id: 0,
             pic_init_qp_minus26: self.cfg.qp - 26,
             chroma_qp_index_offset: 0,
-            weighted_pred_flag: false,
+            // Round-453 — §7.4.2.2 weighted_pred_flag: P slices ship a
+            // pred_weight_table() and use §8.4.2.3.2 explicit weighting.
+            weighted_pred_flag: self.cfg.explicit_weighted_pred,
             // Round-26 — when the encoder is configured for explicit
             // weighted bipred, the PPS must signal idc=1 so subsequent
             // B-slice headers may carry pred_weight_table().
@@ -4475,6 +4518,11 @@ pub struct EncodedP {
     /// `transform_size_8x8_flag = 1` (High-profile 8x8 transform).
     /// Always 0 unless [`EncoderConfig::transform_8x8`] is set.
     pub i8x8_mb_count: u32,
+    /// Round-453 — the §7.3.3.2 `pred_weight_table()` this P slice
+    /// carried (`Some` iff `EncoderConfig::explicit_weighted_pred`);
+    /// `luma.is_some()` means a non-identity fade weighting was
+    /// elected.
+    pub pred_weight_table: Option<ExplicitPredWeightTableL0>,
 }
 
 /// Per-MB encoder-side MV / refIdx slot for the §8.4.1.3 mvp neighbour
@@ -6077,6 +6125,45 @@ impl Encoder {
         let log2_max_poc_lsb_minus4: u32 = 4;
         let chroma_qp_index_offset: i32 = 0;
 
+        // Round-453 — §8.4.2.3.2 explicit weighted prediction: fit
+        // the slice-wide luma weighting against the reference and
+        // elect it on measured SSD gain (fade detection).
+        let p_wp_table: Option<ExplicitPredWeightTableL0> = if self.cfg.explicit_weighted_pred {
+            Some(compute_explicit_p_weight(
+                frame.y,
+                prev.recon_y,
+                self.cfg.width as usize,
+                self.cfg.height as usize,
+            ))
+        } else {
+            None
+        };
+        let wp_l0 = p_wp_table.map(|t| {
+            let (weight, offset) = t.effective();
+            WeightedPredL0 {
+                log2_wd: t.luma_log2_weight_denom,
+                weight,
+                offset,
+            }
+        });
+        // Motion search runs against the WEIGHTED reference (exact at
+        // integer positions; the sub-pel refinement's interpolate-
+        // then-weight vs weight-then-interpolate difference only
+        // perturbs the search, never the coded prediction).
+        let me_plane: Vec<u8> = match wp_l0 {
+            Some(wp) => {
+                let mut v: Vec<i32> = prev.recon_y.iter().map(|&p| p as i32).collect();
+                wp.apply(&mut v);
+                v.iter().map(|&p| p as u8).collect()
+            }
+            None => Vec::new(),
+        };
+        let me_luma: &[u8] = if me_plane.is_empty() {
+            prev.recon_y
+        } else {
+            &me_plane
+        };
+
         let mut sw = BitWriter::new();
         write_p_slice_header(
             &mut sw,
@@ -6105,6 +6192,7 @@ impl Encoder {
                 field: FieldPicSignal::FrameMbsOnly,
                 rplm_l0: &[],
                 mmco: &[],
+                pred_weight_table: p_wp_table,
             },
         );
 
@@ -6135,6 +6223,7 @@ impl Encoder {
 
         // §7.4.5 decoded-QP chain: starts at SliceQP_Y (§7.4.3).
         let mut qp_tracker = MbQpTracker::new(frame_qp);
+        qp_tracker.wp_l0 = wp_l0;
         let mut want_qp = frame_qp;
 
         for mb_y in 0..height_mbs as usize {
@@ -6187,6 +6276,7 @@ impl Encoder {
                 let dbl = self.encode_p_mb_with_intra_fallback(
                     frame,
                     prev,
+                    me_luma,
                     mb_x,
                     mb_y,
                     qp_y,
@@ -6281,6 +6371,7 @@ impl Encoder {
             pic_order_cnt_lsb,
             partition_mvs,
             i8x8_mb_count,
+            pred_weight_table: p_wp_table,
         }
     }
 
@@ -6308,6 +6399,7 @@ impl Encoder {
         &self,
         frame: &YuvFrame<'_>,
         prev: &EncodedFrameRef<'_>,
+        me_luma: &[u8],
         mb_x: usize,
         mb_y: usize,
         qp_y: i32,
@@ -6338,7 +6430,7 @@ impl Encoder {
             width,
             self.cfg.width,
             self.cfg.height,
-            prev.recon_y,
+            me_luma,
             prev.width as usize,
             prev.width,
             prev.height,
@@ -6363,8 +6455,15 @@ impl Encoder {
         //      * 4:4:4 — the §8.4.2.2.1 LUMA 6-tap process on each
         //        chroma plane with mvC = mvL (eq. 8-235..8-238).
         let chroma_array_type = self.cfg.chroma_format_idc;
-        let pred_y =
+        let mut pred_y =
             build_inter_pred_luma(prev.recon_y, prev.width, prev.height, mb_x, mb_y, chosen_mv);
+        // Round-453 — §8.4.2.3.2 explicit weighting (luma; chroma
+        // keeps the default since chroma_weight_l0_flag = 0). Applies
+        // to P_Skip too: the skip decision below compares the
+        // weighted predictor.
+        if let Some(wp) = qp_tracker.wp_l0 {
+            wp.apply(&mut pred_y);
+        }
         let chroma_w = chroma_width as u32;
         let chroma_h = chroma_height as u32;
         let (pred_u, pred_v): (Vec<i32>, Vec<i32>) = match chroma_array_type {
@@ -6426,7 +6525,7 @@ impl Encoder {
                 width,
                 self.cfg.width,
                 self.cfg.height,
-                prev.recon_y,
+                me_luma,
                 prev.width as usize,
                 prev.width,
                 prev.height,
@@ -6469,6 +6568,7 @@ impl Encoder {
             return self.encode_p_mb_4mv(
                 frame,
                 prev,
+                me_luma,
                 mb_x,
                 mb_y,
                 qp_y,
@@ -7131,6 +7231,7 @@ impl Encoder {
         &self,
         frame: &YuvFrame<'_>,
         prev: &EncodedFrameRef<'_>,
+        _me_luma: &[u8],
         mb_x: usize,
         mb_y: usize,
         qp_y: i32,
@@ -7199,6 +7300,13 @@ impl Encoder {
                     pred_y[(sub_y * 8 + j) * 16 + sub_x * 8 + i] = p[j * 8 + i];
                 }
             }
+        }
+
+        // Round-453 — §8.4.2.3.2 explicit luma weighting of the
+        // composite predictor (the process is per-sample, so the
+        // per-partition assembly order is immaterial).
+        if let Some(wp) = qp_tracker.wp_l0 {
+            wp.apply(&mut pred_y);
         }
 
         // 3. Build composite per-(4x4) chroma predictor (4:2:0).
@@ -7463,6 +7571,7 @@ impl Encoder {
         &self,
         frame: &YuvFrame<'_>,
         prev: &EncodedFrameRef<'_>,
+        me_luma: &[u8],
         mb_x: usize,
         mb_y: usize,
         qp_y: i32,
@@ -7486,6 +7595,7 @@ impl Encoder {
             return self.encode_p_mb(
                 frame,
                 prev,
+                me_luma,
                 mb_x,
                 mb_y,
                 qp_y,
@@ -7534,6 +7644,7 @@ impl Encoder {
         let inter_dbl = self.encode_p_mb(
             frame,
             prev,
+            me_luma,
             mb_x,
             mb_y,
             qp_y,
@@ -8874,6 +8985,77 @@ fn compute_explicit_bipred_weights(
 ///          ((o0 + o1 + 1) >> 1))`
 /// Chroma still uses the default §8.4.2.3.1 average; our slice header
 /// emit flags chroma weights as absent so the decoder agrees.
+/// Round-453 — slice-wide §8.4.2.3.2 luma weight fit for a P slice
+/// with one L0 reference (fade detection).
+///
+/// Least-squares affine fit of the co-located planes
+/// `src ≈ a · ref + b` (no motion compensation — a fade shares
+/// spatial structure between the frames), quantised to
+/// `logWD = 5`: `w = round(a · 32)`, `o = round(b)`, both clamped to
+/// the §7.4.3.2 `-128..=127` range. The pair is elected only when the
+/// eq. 8-274 prediction (round + clip applied) beats the identity
+/// weighting by at least 1% SSD on the co-located planes; otherwise
+/// the table codes `luma_weight_l0_flag = 0` (identity).
+fn compute_explicit_p_weight(
+    src_y: &[u8],
+    ref_y: &[u8],
+    width: usize,
+    height: usize,
+) -> ExplicitPredWeightTableL0 {
+    const LOG2_WD: u32 = 5;
+    let identity = ExplicitPredWeightTableL0 {
+        luma_log2_weight_denom: LOG2_WD,
+        luma: None,
+    };
+    let n = (width * height) as f64;
+    if n == 0.0 {
+        return identity;
+    }
+    let (mut sx, mut sr, mut srr, mut sxr) = (0f64, 0f64, 0f64, 0f64);
+    for (&x, &r) in src_y.iter().zip(ref_y.iter()) {
+        let (x, r) = (x as f64, r as f64);
+        sx += x;
+        sr += r;
+        srr += r * r;
+        sxr += x * r;
+    }
+    let var_r = srr - sr * sr / n;
+    let a = if var_r.abs() < 1e-9 {
+        1.0
+    } else {
+        (sxr - sx * sr / n) / var_r
+    };
+    let b = (sx - a * sr) / n;
+    let w = ((a * (1u32 << LOG2_WD) as f64).round() as i32).clamp(-128, 127);
+    let o = (b.round() as i32).clamp(-128, 127);
+    if w == (1i32 << LOG2_WD) && o == 0 {
+        return identity;
+    }
+    let cand = WeightedPredL0 {
+        log2_wd: LOG2_WD,
+        weight: w,
+        offset: o,
+    };
+    let (mut ssd_id, mut ssd_w) = (0u64, 0u64);
+    let mut buf = [0i32; 1];
+    for (&x, &r) in src_y.iter().zip(ref_y.iter()) {
+        buf[0] = r as i32;
+        cand.apply(&mut buf);
+        let d_id = x as i64 - r as i64;
+        let d_w = x as i64 - buf[0] as i64;
+        ssd_id += (d_id * d_id) as u64;
+        ssd_w += (d_w * d_w) as u64;
+    }
+    if ssd_w * 100 <= ssd_id * 99 {
+        ExplicitPredWeightTableL0 {
+            luma_log2_weight_denom: LOG2_WD,
+            luma: Some((w, o)),
+        }
+    } else {
+        identity
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_b_predictors(
     pred: BPred16x16,
