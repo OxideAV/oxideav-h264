@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 453 — **Multi-reference P coding, long-term references, MMCO
+  and RPLM emission** (`encoder::multiref`,
+  `encode_multiref_sequence`). The P macroblock encoders now code
+  §7.3.5.1 / §7.3.5.2 `ref_idx_l0` te(v) (P_L0_16x16 and P_8x8;
+  P_Skip stays at index 0 per §8.4.1.1) against the slice's
+  `num_ref_idx_l0_active_minus1` (§7.3.3 override on
+  `PSliceHeaderConfig`), derive the §8.4.1.3 motion vector predictor
+  with the elected reference index, and stamp the §8.7.2.1 NOTE 1
+  reference-identity keys (`poc * 4`) so the deblocker separates
+  references. The driver mirrors the decoder's buffer: §8.2.4.2.1
+  RefPicList0 (short-term by descending PicNum, then long-term by
+  ascending LongTermPicNum), §8.2.5.3 sliding window, §7.4.3.3
+  `long_term_reference_flag` on the IDR, MMCO 4 + 6 long-term
+  assignment of a P picture (with an MMCO 1 eviction whenever
+  adaptive marking would overflow `max_num_ref_frames`), MMCO 2
+  unmarking, and RPLM `long_term_pic_num` splicing to index 0 — all
+  applied after the current picture is coded, as §8.2.5 orders. Per
+  MB the quarter-pel search runs on every active reference and the
+  lowest biased SAD elects the index. Four
+  `integration_multiref_encoder` gates (three active references
+  electing the two-frames-back reference on periodic content,
+  long-term IDR anchor surviving the window, MMCO mark + unmark,
+  RPLM long-term-first) decode bit-exactly in our decoder and
+  byte-exactly in the black-box reference decoder.
+
 - Round 453 — **Explicit weighted prediction on P slices with fade
   detection** (`EncoderConfig::explicit_weighted_pred`). The PPS
   codes `weighted_pred_flag = 1`, every P slice header carries the

@@ -341,6 +341,10 @@ pub struct PSliceHeaderConfig<'a> {
     /// is mandatory in every P slice header then) and `None`
     /// otherwise.
     pub pred_weight_table: Option<ExplicitPredWeightTableL0>,
+    /// Round-453 — §7.3.3 `num_ref_idx_active_override_flag`: `Some(n)`
+    /// codes the override with `num_ref_idx_l0_active_minus1 = n`;
+    /// `None` keeps the PPS default (flag 0).
+    pub num_ref_idx_l0_active_minus1: Option<u32>,
 }
 
 /// Round-453 — §7.3.3.2 explicit weighted-prediction table for a
@@ -393,9 +397,17 @@ pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig<'_>) {
     // No redundant_pic_cnt (PPS redundant_pic_cnt_present_flag == 0).
     // No direct_spatial_mv_pred_flag — P-slice (B only).
 
-    // §7.3.3 — num_ref_idx_active_override_flag for P/SP/B slices.
-    // We use the PPS default (num_ref_idx_l0_default_active_minus1 = 0).
-    w.u(1, 0);
+    // §7.3.3 — num_ref_idx_active_override_flag for P/SP/B slices:
+    // PPS default (num_ref_idx_l0_default_active_minus1 = 0) unless the
+    // caller overrides (round-453 multi-reference P).
+    match cfg.num_ref_idx_l0_active_minus1 {
+        Some(n) => {
+            debug_assert!(n <= 31);
+            w.u(1, 1);
+            w.ue(n);
+        }
+        None => w.u(1, 0),
+    }
 
     // §7.3.3.1 — ref_pic_list_modification(): list-0 only for P-slice.
     write_rplm_list(w, cfg.rplm_l0);
@@ -792,6 +804,7 @@ mod tests {
                 rplm_l0: &[],
                 mmco: &[],
                 pred_weight_table: None,
+                num_ref_idx_l0_active_minus1: None,
             },
         );
         // Append a dummy bit + trailing so the parser doesn't blow up.

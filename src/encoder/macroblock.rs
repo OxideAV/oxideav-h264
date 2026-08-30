@@ -1406,6 +1406,9 @@ pub fn emit_inter_mb_tail(
 /// `mvd_l0_*` are in **quarter-pel units** (i.e. `mv = pel * 4`), per
 /// §8.4.1.4 / §7.4.5.1.
 pub struct PL016x16McbConfig {
+    /// Round-453 — §7.3.5.1 `ref_idx_l0` (te(v)), coded when
+    /// `num_ref_idx_l0_active_minus1 > 0` (or for MBAFF field MBs).
+    pub ref_idx_l0: u32,
     /// §7.3.5 — `transform_size_8x8_flag` for the second gate: when the
     /// active PPS has `transform_8x8_mode_flag = 1` and this MB's
     /// `cbp_luma > 0`, the flag MUST be coded after
@@ -1499,7 +1502,8 @@ pub fn write_p_l0_16x16_mb_chroma(
     // (num_ref_idx_l0_active_minus1 > 0 || mbaff_field_change). Our
     // single-ref path skips it.
     if num_ref_idx_l0_active_minus1 > 0 {
-        w.te(num_ref_idx_l0_active_minus1, 0);
+        debug_assert!(cfg.ref_idx_l0 <= num_ref_idx_l0_active_minus1);
+        w.te(num_ref_idx_l0_active_minus1, cfg.ref_idx_l0);
     }
 
     // §7.3.5.1 — mvd_l0_x se(v), mvd_l0_y se(v) for the single
@@ -1551,6 +1555,9 @@ pub fn write_p_l0_16x16_mb_chroma(
 ///
 /// `mvd_l0` are in **quarter-pel units** per §7.4.5.1 / §8.4.1.4.
 pub struct P8x8AllPL08x8McbConfig {
+    /// Round-453 — §7.3.5.2 `ref_idx_l0` shared by the four PL08x8
+    /// sub-macroblock partitions (te(v) each).
+    pub ref_idx_l0: u32,
     /// §7.3.5 — when the active PPS has `transform_8x8_mode_flag = 1`
     /// and `cbp_luma > 0`, this all-PL08x8 MB passes the second gate
     /// (every sub-partition is 8x8, so `noSubMbPartSizeLessThan8x8Flag
@@ -1614,8 +1621,9 @@ pub fn write_p_8x8_all_pl08x8_mb(
     // PL08x8 has SubMbPredMode == Pred_L0, so the only gate is the
     // num_ref_idx check. Round-19 single-ref → absent.
     if num_ref_idx_l0_active_minus1 > 0 {
+        debug_assert!(cfg.ref_idx_l0 <= num_ref_idx_l0_active_minus1);
         for _ in 0..4 {
-            w.te(num_ref_idx_l0_active_minus1, 0);
+            w.te(num_ref_idx_l0_active_minus1, cfg.ref_idx_l0);
         }
     }
 

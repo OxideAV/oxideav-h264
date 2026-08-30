@@ -53,6 +53,7 @@ pub mod macroblock;
 pub mod mbaff;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod me;
+pub mod multiref;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod nal;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -97,6 +98,15 @@ struct MbQpTracker {
     /// `logWD` (already §7.4.3.2-inferred). `None` = default
     /// (§8.4.2.3.1 copy-through) prediction.
     wp_l0: Option<WeightedPredL0>,
+    /// Round-453 — §7.4.5.1 `ref_idx_l0` the current P macroblock
+    /// codes (the driver's per-MB reference election; 0 in the
+    /// single-reference paths). P_Skip is only legal at 0.
+    ref_idx_l0: i32,
+    /// Round-453 — the slice's `num_ref_idx_l0_active_minus1` (frame
+    /// units, i.e. the §7.4.3 value after any override). The te(v)
+    /// range of `ref_idx_l0` follows from it (doubled for MBAFF field
+    /// MBs).
+    num_ref_idx_l0_active_minus1_slice: u32,
 }
 
 /// Round-453 — §8.4.2.3.2 single-list explicit weighting parameters.
@@ -129,6 +139,8 @@ impl MbQpTracker {
             mbaff_flag_pending: None,
             mbaff_field_mb: false,
             wp_l0: None,
+            ref_idx_l0: 0,
+            num_ref_idx_l0_active_minus1_slice: 0,
         }
     }
 
@@ -140,11 +152,17 @@ impl MbQpTracker {
         }
     }
 
-    /// §7.3.5.1 — `num_ref_idx_l0_active_minus1` as seen by the MB
-    /// writers: 1 for MBAFF field MBs (two reference fields per
-    /// reference frame), else 0 (the single-reference default).
+    /// §7.3.5.1 / §7.4.5.1 — `num_ref_idx_l0_active_minus1` as seen
+    /// by the MB writers: the slice value, doubled-plus-one for MBAFF
+    /// field MBs (two reference fields per reference frame,
+    /// §8.4.2.1).
     fn num_ref_idx_l0_active_minus1(&self) -> u32 {
-        u32::from(self.mbaff_field_mb)
+        let n = self.num_ref_idx_l0_active_minus1_slice;
+        if self.mbaff_field_mb {
+            2 * (n + 1) - 1
+        } else {
+            n
+        }
     }
 }
 use crate::encoder::bitstream::BitWriter;
@@ -6193,6 +6211,7 @@ impl Encoder {
                 rplm_l0: &[],
                 mmco: &[],
                 pred_weight_table: p_wp_table,
+                num_ref_idx_l0_active_minus1: None,
             },
         );
 
@@ -6443,7 +6462,12 @@ impl Encoder {
         let me_16x16_sad = me.sad;
 
         // 2. Compute MVpred + skip-MV for this MB position.
-        let mvp = mvp_for_16x16(mv_grid, mb_x, mb_y, 0);
+        // Round-453 — the macroblock's reference index (driver
+        // election; 0 on the single-reference paths) and the §8.7.2.1
+        // NOTE 1 identity key of that reference picture.
+        let ref_idx = qp_tracker.ref_idx_l0;
+        let ref_key = prev.pic_order_cnt.wrapping_mul(4);
+        let mvp = mvp_for_16x16(mv_grid, mb_x, mb_y, ref_idx);
         let (skip_ref, skip_mv) = p_skip_mv(mv_grid, mb_x, mb_y);
 
         // 3. Build the inter predictor against the chosen MV.
@@ -6801,7 +6825,10 @@ impl Encoder {
         //    * cbp_luma == 0 AND cbp_chroma == 0
         //    * skip_ref_idx == 0 (always 0 for our single-ref slice)
         let _ = skip_ref;
-        let is_skip = chosen_mv == skip_mv && cbp_luma == 0 && cbp_chroma == 0;
+        // §7.4.5 — P_Skip infers refIdxL0 = 0 (§8.4.1.1), so a
+        // macroblock predicting from another reference is never
+        // skipped.
+        let is_skip = ref_idx == 0 && chosen_mv == skip_mv && cbp_luma == 0 && cbp_chroma == 0;
 
         if is_skip {
             // P_Skip: do NOT emit any MB syntax; just bump pending_skip
@@ -6871,7 +6898,7 @@ impl Encoder {
                 chroma_nonzero_4x4: 0,
                 mv_l0: [mv_t; 16],
                 ref_idx_l0: [0; 4],
-                ref_poc_l0: [0; 4],
+                ref_poc_l0: [ref_key; 4],
                 ..Default::default()
             };
         }
@@ -7041,6 +7068,7 @@ impl Encoder {
         // Emit the MB syntax — per-format chroma layout + §9.2.1.1 nC
         // with grid totals commit (round-397).
         let mb_cfg = PL016x16McbConfig {
+            ref_idx_l0: ref_idx as u32,
             transform_size_8x8_flag: if self.cfg.transform_8x8 {
                 Some(transform_size_8x8)
             } else {
@@ -7163,7 +7191,7 @@ impl Encoder {
         *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
             available: true,
             is_intra: false,
-            ref_idx_l0_8x8: [0; 4],
+            ref_idx_l0_8x8: [ref_idx; 4],
             mv_l0_8x8: [chosen_mv; 4],
         };
         let s = intra_grid.slot_mut(mb_x, mb_y);
@@ -7214,8 +7242,8 @@ impl Encoder {
             chroma_nonzero_4x4,
             transform_size_8x8_flag: transform_size_8x8,
             mv_l0: [mv_t; 16],
-            ref_idx_l0: [0; 4],
-            ref_poc_l0: [0; 4],
+            ref_idx_l0: [ref_idx as i8; 4],
+            ref_poc_l0: [ref_key; 4],
             ..Default::default()
         }
     }
@@ -7255,6 +7283,9 @@ impl Encoder {
         let chroma_w = prev.width / 2;
         let chroma_h = prev.height / 2;
         let _ = chroma_height;
+        // Round-453 — reference election + §8.7.2.1 NOTE 1 identity key.
+        let ref_idx = qp_tracker.ref_idx_l0;
+        let ref_key = prev.pic_order_cnt.wrapping_mul(4);
 
         // 1. Per-8x8 chosen MVs (in qpel) and per-partition mvds against
         //    the §8.4.1.3 within-MB-aware MVpred.
@@ -7269,7 +7300,7 @@ impl Encoder {
                 mb_x,
                 mb_y,
                 sub_idx,
-                0,
+                ref_idx,
                 inflight_avail,
                 mv_inflight,
                 ref_inflight,
@@ -7277,7 +7308,7 @@ impl Encoder {
             mvds[sub_idx] = (mvs[sub_idx].x - mvp.x, mvs[sub_idx].y - mvp.y);
             inflight_avail[sub_idx] = true;
             mv_inflight[sub_idx] = mvs[sub_idx];
-            ref_inflight[sub_idx] = 0;
+            ref_inflight[sub_idx] = ref_idx;
         }
 
         // 2. Build composite per-8x8 luma predictor.
@@ -7478,6 +7509,7 @@ impl Encoder {
 
         // 8. Emit P_8x8 syntax.
         let mb_cfg = P8x8AllPL08x8McbConfig {
+            ref_idx_l0: ref_idx as u32,
             // §7.3.5 — inside a transform_8x8_mode_flag=1 stream the
             // all-PL08x8 4MV MB codes transform_size_8x8_flag = 0 when
             // cbp_luma > 0 (this path keeps 4x4 residual coding).
@@ -7511,7 +7543,7 @@ impl Encoder {
         *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
             available: true,
             is_intra: false,
-            ref_idx_l0_8x8: [0; 4],
+            ref_idx_l0_8x8: [ref_idx; 4],
             mv_l0_8x8: mvs,
         };
         let s = intra_grid.slot_mut(mb_x, mb_y);
@@ -7545,8 +7577,8 @@ impl Encoder {
             luma_nonzero_4x4,
             chroma_nonzero_4x4: chroma_nz_mask_from_blocks(&cb_nz, &cr_nz),
             mv_l0,
-            ref_idx_l0: [0; 4],
-            ref_poc_l0: [0; 4],
+            ref_idx_l0: [ref_idx as i8; 4],
+            ref_poc_l0: [ref_key; 4],
             ..Default::default()
         }
     }

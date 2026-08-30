@@ -3075,6 +3075,7 @@ impl Encoder {
                 rplm_l0: &[],
                 mmco: &[],
                 pred_weight_table: None,
+                num_ref_idx_l0_active_minus1: None,
             },
         );
         while !sw.byte_aligned() {

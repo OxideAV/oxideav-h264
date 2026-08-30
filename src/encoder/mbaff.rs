@@ -885,6 +885,7 @@ pub fn encode_mbaff_sequence(cfg: &MbaffConfig, frames: &[(&[u8], &[u8], &[u8])]
                     rplm_l0: &[],
                     mmco: &[],
                     pred_weight_table: None,
+                    num_ref_idx_l0_active_minus1: None,
                 },
             );
         } else {

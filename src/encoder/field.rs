@@ -942,6 +942,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                             &[]
                         },
                         pred_weight_table: None,
+                        num_ref_idx_l0_active_minus1: None,
                     },
                 );
             } else {
@@ -1143,6 +1144,7 @@ fn encode_paff_b_sequence(
                         rplm_l0,
                         mmco: &[],
                         pred_weight_table: None,
+                        num_ref_idx_l0_active_minus1: None,
                     },
                 );
                 encode_p_slice_data(&field_enc, &src, &prev_ref, &mut sw)

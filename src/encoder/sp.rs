@@ -667,6 +667,7 @@ fn emit_sp_inter_mb(
     write_p_l0_16x16_mb(
         bw,
         &PL016x16McbConfig {
+            ref_idx_l0: 0,
             transform_size_8x8_flag: None,
             mvd_l0_x: 0,
             mvd_l0_y: 0,
