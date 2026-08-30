@@ -676,6 +676,7 @@ fn code_mb(
             &mut nc_grid,
             &mut intra_grid,
             0,
+            None,
         );
         dbl = trial.deblock;
         skipped = false;
@@ -814,6 +815,8 @@ pub fn encode_mbaff_sequence(cfg: &MbaffConfig, frames: &[(&[u8], &[u8], &[u8])]
         entropy_coding_mode_flag: false,
         transform_8x8_mode_flag: false,
         redundant_pic_cnt_present_flag: false,
+        slice_groups: None,
+        constrained_intra_pred_flag: false,
         pic_scaling_lists: None,
         chroma_format_idc: 1,
     });
@@ -861,6 +864,8 @@ pub fn encode_mbaff_sequence(cfg: &MbaffConfig, frames: &[(&[u8], &[u8], &[u8])]
                     nal_ref_idc: 3,
                     long_term_reference_flag: false,
                     mmco: &[],
+                    redundant_pic_cnt: None,
+                    slice_group_change_cycle: None,
                 },
             );
         } else if is_p {
@@ -886,6 +891,8 @@ pub fn encode_mbaff_sequence(cfg: &MbaffConfig, frames: &[(&[u8], &[u8], &[u8])]
                     mmco: &[],
                     pred_weight_table: None,
                     num_ref_idx_l0_active_minus1: None,
+                    redundant_pic_cnt: None,
+                    slice_group_change_cycle: None,
                 },
             );
         } else {
@@ -910,6 +917,8 @@ pub fn encode_mbaff_sequence(cfg: &MbaffConfig, frames: &[(&[u8], &[u8], &[u8])]
                     nal_ref_idc: 2,
                     long_term_reference_flag: false,
                     mmco: &[],
+                    redundant_pic_cnt: None,
+                    slice_group_change_cycle: None,
                 },
             );
         }

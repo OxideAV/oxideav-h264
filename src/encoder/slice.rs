@@ -113,6 +113,13 @@ pub struct IdrSliceHeaderConfig<'a> {
     /// long-term pair via MMCO 6). Empty = sliding window. Ignored
     /// when `idr == true`.
     pub mmco: &'a [EncMmcoOp],
+    /// Round-453 — §7.3.3 `redundant_pic_cnt` (ue(v), coded when the
+    /// PPS has `redundant_pic_cnt_present_flag = 1`; 0 = primary).
+    pub redundant_pic_cnt: Option<u32>,
+    /// Round-453 — §7.3.3 `slice_group_change_cycle` as
+    /// `(value, bits)` for slice group map types 3..=5 (eq. 7-37
+    /// bit width, computed by the caller).
+    pub slice_group_change_cycle: Option<(u32, u32)>,
 }
 
 /// Round-436 — §7.3.3.3 / Table 7-9 `memory_management_control_operation`
@@ -247,6 +254,10 @@ pub fn write_idr_i_slice_header(w: &mut BitWriter, cfg: &IdrSliceHeaderConfig<'_
     // POC type 0 branch: pic_order_cnt_lsb. No delta_pic_order_cnt_bottom
     // (bottom_field_pic_order_in_frame_present_flag == 0 in our PPS).
     w.u(cfg.poc_lsb_bits, cfg.pic_order_cnt_lsb);
+    // §7.3.3 — redundant_pic_cnt when the PPS enables it (round-453).
+    if let Some(rpc) = cfg.redundant_pic_cnt {
+        w.ue(rpc);
+    }
     // I-slice: no num_ref_idx_active_override_flag,
     // no ref_pic_list_modification, no pred_weight_table.
 
@@ -279,6 +290,11 @@ pub fn write_idr_i_slice_header(w: &mut BitWriter, cfg: &IdrSliceHeaderConfig<'_
     if cfg.disable_deblocking_filter_idc != 1 {
         w.se(cfg.slice_alpha_c0_offset_div2);
         w.se(cfg.slice_beta_offset_div2);
+    }
+    // §7.3.3 — slice_group_change_cycle u(v) for slice group map
+    // types 3..=5 (round-453 FMO).
+    if let Some((value, bits)) = cfg.slice_group_change_cycle {
+        w.u(bits, value);
     }
 }
 
@@ -345,6 +361,11 @@ pub struct PSliceHeaderConfig<'a> {
     /// codes the override with `num_ref_idx_l0_active_minus1 = n`;
     /// `None` keeps the PPS default (flag 0).
     pub num_ref_idx_l0_active_minus1: Option<u32>,
+    /// Round-453 — §7.3.3 `redundant_pic_cnt` (see
+    /// [`IdrSliceHeaderConfig::redundant_pic_cnt`]).
+    pub redundant_pic_cnt: Option<u32>,
+    /// Round-453 — §7.3.3 `slice_group_change_cycle` `(value, bits)`.
+    pub slice_group_change_cycle: Option<(u32, u32)>,
 }
 
 /// Round-453 — §7.3.3.2 explicit weighted-prediction table for a
@@ -394,7 +415,10 @@ pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig<'_>) {
     // POC type 0 branch.
     w.u(cfg.poc_lsb_bits, cfg.pic_order_cnt_lsb);
     // No delta_pic_order_cnt_bottom (PPS bottom_field_pic_order_in_frame_present_flag == 0).
-    // No redundant_pic_cnt (PPS redundant_pic_cnt_present_flag == 0).
+    // §7.3.3 — redundant_pic_cnt when the PPS enables it (round-453).
+    if let Some(rpc) = cfg.redundant_pic_cnt {
+        w.ue(rpc);
+    }
     // No direct_spatial_mv_pred_flag — P-slice (B only).
 
     // §7.3.3 — num_ref_idx_active_override_flag for P/SP/B slices:
@@ -461,6 +485,11 @@ pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig<'_>) {
     if cfg.disable_deblocking_filter_idc != 1 {
         w.se(cfg.slice_alpha_c0_offset_div2);
         w.se(cfg.slice_beta_offset_div2);
+    }
+    // §7.3.3 — slice_group_change_cycle u(v) for slice group map
+    // types 3..=5 (round-453 FMO).
+    if let Some((value, bits)) = cfg.slice_group_change_cycle {
+        w.u(bits, value);
     }
 }
 
@@ -727,6 +756,8 @@ mod tests {
                 nal_ref_idc: 3,
                 long_term_reference_flag: false,
                 mmco: &[],
+                redundant_pic_cnt: None,
+                slice_group_change_cycle: None,
             },
         );
         // Append a trivial slice_data placeholder + rbsp_trailing_bits so
@@ -805,6 +836,8 @@ mod tests {
                 mmco: &[],
                 pred_weight_table: None,
                 num_ref_idx_l0_active_minus1: None,
+                redundant_pic_cnt: None,
+                slice_group_change_cycle: None,
             },
         );
         // Append a dummy bit + trailing so the parser doesn't blow up.
@@ -942,6 +975,8 @@ mod tests {
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
             redundant_pic_cnt_present_flag: false,
+            slice_groups: None,
+            constrained_intra_pred_flag: false,
             pic_scaling_lists: None,
             chroma_format_idc: 1,
             pic_parameter_set_id: 0,

@@ -237,6 +237,9 @@ fn parse_slice_data_impl(
     let mut macroblocks: Vec<Macroblock> = Vec::new();
     let mut mb_field_decoding_flags: Vec<bool> = Vec::new();
     let mut curr_mb_addr: u32 = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
+    // §8.2.2 / §7.3.4 — FMO slice group map (round-453): NextMbAddress
+    // walks the current slice group instead of the raster successor.
+    let mb_map = crate::mb_address::slice_mb_to_slice_group_map(sps, pps, slice_header);
 
     // §9.2.1.1 — CAVLC nC neighbour grid, allocated per picture. The
     // grid is only consulted in the CAVLC path but we allocate it for
@@ -469,7 +472,8 @@ fn parse_slice_data_impl(
                     if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
                         pending_pair_flag = None;
                     }
-                    curr_mb_addr += 1;
+                    curr_mb_addr =
+                        crate::mb_address::advance_mb_addr(curr_mb_addr, mb_map.as_deref());
                     skipped = true;
                 }
             }
@@ -792,7 +796,7 @@ fn parse_slice_data_impl(
                 if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
                     pending_pair_flag = None;
                 }
-                curr_mb_addr += 1;
+                curr_mb_addr = crate::mb_address::advance_mb_addr(curr_mb_addr, mb_map.as_deref());
             }
             // §7.3.4 — in the CABAC path, update prevMbSkipped with
             // the most recent mb_skip_flag (only when read at all).
@@ -905,7 +909,8 @@ fn parse_slice_data_impl(
                     if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
                         pending_pair_flag = None;
                     }
-                    curr_mb_addr += 1;
+                    curr_mb_addr =
+                        crate::mb_address::advance_mb_addr(curr_mb_addr, mb_map.as_deref());
                 }
                 // After advancing the skip run, the CAVLC spec says:
                 //   if( mb_skip_run > 0 ) moreDataFlag = more_rbsp_data()
@@ -997,7 +1002,7 @@ fn parse_slice_data_impl(
                 pending_pair_flag = None;
             }
             prev_mb_skipped = false;
-            curr_mb_addr += 1;
+            curr_mb_addr = crate::mb_address::advance_mb_addr(curr_mb_addr, mb_map.as_deref());
             pending_skip = 0;
             if !r.more_rbsp_data() {
                 break;

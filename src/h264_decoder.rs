@@ -1634,12 +1634,14 @@ impl H264CodecDecoder {
         // `first_mb_in_slice * (1 + MbaffFrameFlag) + i` in the raster /
         // slice-group-0 walk.
         let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !header.field_pic_flag;
-        let mut curr_addr = (header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag))) as usize;
+        let mut curr_addr = header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
+        // §8.2.2 — FMO slice group map (round-453).
+        let mb_map = crate::mb_address::slice_mb_to_slice_group_map(sps, pps, header);
         for flag in sd.mb_field_decoding_flags.iter().copied() {
-            if let Some(slot) = in_progress.mb_field_flags.get_mut(curr_addr) {
+            if let Some(slot) = in_progress.mb_field_flags.get_mut(curr_addr as usize) {
                 *slot = flag;
             }
-            curr_addr = curr_addr.saturating_add(1);
+            curr_addr = crate::mb_address::advance_mb_addr(curr_addr, mb_map.as_deref());
         }
 
         // §7.4.1.2.4 — record that this slice fully reconstructed.

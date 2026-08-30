@@ -667,6 +667,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
     });
     let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
         redundant_pic_cnt_present_flag: false,
+        slice_groups: None,
+        constrained_intra_pred_flag: false,
         pic_scaling_lists: None,
         chroma_format_idc: 1,
         pic_parameter_set_id: 0,
@@ -737,6 +739,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                     nal_ref_idc: 3,
                     long_term_reference_flag: false,
                     mmco: &[],
+                    redundant_pic_cnt: None,
+                    slice_group_change_cycle: None,
                 },
             );
             let (mut ry, mut ru, mut rv, infos) = encode_i_slice_data(&frame_enc, &src, &mut sw);
@@ -800,6 +804,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                     nal_ref_idc: 2,
                     long_term_reference_flag: false,
                     mmco: &[],
+                    redundant_pic_cnt: None,
+                    slice_group_change_cycle: None,
                 },
             );
             let (mut ry, mut ru, mut rv, infos) = encode_i_slice_data(&frame_enc, &src, &mut sw);
@@ -943,6 +949,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                         },
                         pred_weight_table: None,
                         num_ref_idx_l0_active_minus1: None,
+                        redundant_pic_cnt: None,
+                        slice_group_change_cycle: None,
                     },
                 );
             } else {
@@ -967,6 +975,8 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
                         nal_ref_idc: if is_idr { 3 } else { 2 },
                         long_term_reference_flag: false,
                         mmco: &[],
+                        redundant_pic_cnt: None,
+                        slice_group_change_cycle: None,
                     },
                 );
             }
@@ -1145,6 +1155,8 @@ fn encode_paff_b_sequence(
                         mmco: &[],
                         pred_weight_table: None,
                         num_ref_idx_l0_active_minus1: None,
+                        redundant_pic_cnt: None,
+                        slice_group_change_cycle: None,
                     },
                 );
                 encode_p_slice_data(&field_enc, &src, &prev_ref, &mut sw)
@@ -1170,6 +1182,8 @@ fn encode_paff_b_sequence(
                         nal_ref_idc: if is_idr { 3 } else { 2 },
                         long_term_reference_flag: false,
                         mmco: &[],
+                        redundant_pic_cnt: None,
+                        slice_group_change_cycle: None,
                     },
                 );
                 let (ry, ru, rv, infos) = encode_i_slice_data(&field_enc, &src, &mut sw);

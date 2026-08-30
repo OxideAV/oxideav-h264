@@ -540,13 +540,9 @@ impl Decoder {
         // §A.2 — FMO is constrained to Baseline / Extended profiles, and
         // even there our §8.4 reconstruction path doesn't honour the
         // §8.2.2 MbToSliceGroupMap (it walks raster order). Reject
-        // FMO-enabled PPS activation so we don't silently mis-decode a
-        // stream that the spec restricts (and that common H.264 decoders reject
-        // outright with "FMO is not implemented"). See
-        // [`DecoderError::FmoNotSupported`] for the full citation.
-        if pps.num_slice_groups_minus1 > 0 {
-            return Err(DecoderError::FmoNotSupported(pps.num_slice_groups_minus1));
-        }
+        // Round-453 — FMO (num_slice_groups_minus1 > 0) is decoded: the
+        // slice-data walker, the reconstruction walker and the picture
+        // stamping follow the §8.2.2 MbToSliceGroupMap.
         let sps_id = pps.seq_parameter_set_id;
         let sps = self
             .sps_by_id
@@ -591,9 +587,6 @@ impl Decoder {
             .and_then(|p| p.as_ref())
             .ok_or(DecoderError::UnknownPps(pps_id))?
             .clone();
-        if pps.num_slice_groups_minus1 > 0 {
-            return Err(DecoderError::FmoNotSupported(pps.num_slice_groups_minus1));
-        }
         let sps_id = pps.seq_parameter_set_id;
         let sps = self
             .sps_by_id
@@ -1089,7 +1082,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_activating_fmo_pps_is_rejected() {
+    fn slice_activating_fmo_pps_is_accepted() {
         // §A.2 — FMO (num_slice_groups_minus1 > 0) is not honoured by
         // our §8.4 raster reconstruction. A slice that activates such a
         // PPS must be rejected at activation time so we don't emit a
@@ -1128,15 +1121,12 @@ mod tests {
             w.into_bytes()
         };
         let _ = dec.process_nal(&build_nal(8, 3, &pps_rbsp)).unwrap();
+        // Round-453 — FMO is decoded (the walkers follow the §8.2.2
+        // MbToSliceGroupMap), so the slice activates the PPS normally.
         let slice_nal = build_nal(1, 3, &build_minimal_i_slice_rbsp(0));
-        let err = dec.process_nal(&slice_nal).unwrap_err();
-        assert!(
-            matches!(err, DecoderError::FmoNotSupported(1)),
-            "expected FmoNotSupported(1), got {err:?}"
-        );
-        // Activation must NOT have committed for a rejected slice.
-        assert!(dec.active_pps_id().is_none());
-        assert!(dec.active_sps_id().is_none());
+        let res = dec.process_nal(&slice_nal);
+        assert!(res.is_ok(), "FMO slice must decode: {res:?}");
+        assert_eq!(dec.active_pps_id(), Some(0));
     }
 
     #[test]

@@ -66,6 +66,7 @@ pub mod sei;
 pub mod session;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod slice;
+pub mod slices;
 pub mod sp;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod sps;
@@ -107,6 +108,13 @@ struct MbQpTracker {
     /// range of `ref_idx_l0` follows from it (doubled for MBAFF field
     /// MBs).
     num_ref_idx_l0_active_minus1_slice: u32,
+    /// Round-453 — §6.4.11.1 intra neighbour availability override
+    /// `(top, left, top-left)` for the current MB: `Some` in
+    /// multi-slice / FMO pictures (§6.4.8 other-slice neighbours are
+    /// unavailable) and under `constrained_intra_pred_flag` (§8.3.1.2
+    /// inter neighbours are unavailable to intra prediction); `None`
+    /// keeps the raster coordinate rule.
+    intra_nb: Option<(bool, bool, bool)>,
 }
 
 /// Round-453 — §8.4.2.3.2 single-list explicit weighting parameters.
@@ -141,6 +149,7 @@ impl MbQpTracker {
             wp_l0: None,
             ref_idx_l0: 0,
             num_ref_idx_l0_active_minus1_slice: 0,
+            intra_nb: None,
         }
     }
 
@@ -174,7 +183,8 @@ use crate::encoder::intra4x4::{
     availability as i4x4_avail, predict_4x4, Intra4x4Mode, LUMA_4X4_XY as I4X4_XY,
 };
 use crate::encoder::intra_pred::{
-    predict_16x16, predict_chroma_8x8, sad_8x8, I16x16Mode, IntraChromaMode,
+    predict_16x16, predict_16x16_avail, predict_chroma_8x8_avail, sad_8x8, I16x16Mode,
+    IntraChromaMode,
 };
 use crate::encoder::macroblock::{
     write_b_16x16_mb, write_b_8x8_mixed_mb, write_i8x8_mb, write_i_nxn_mb, write_intra16x16_mb,
@@ -1553,6 +1563,8 @@ impl Encoder {
         };
         let pps_cfg = BaselinePpsConfig {
             redundant_pic_cnt_present_flag: false,
+            slice_groups: None,
+            constrained_intra_pred_flag: false,
             pic_scaling_lists: self.cfg.scaling_matrix.pic_spec(),
             chroma_format_idc: self.cfg.chroma_format_idc,
             pic_parameter_set_id: 0,
@@ -1621,6 +1633,8 @@ impl Encoder {
                 nal_ref_idc: 3,
                 long_term_reference_flag: false,
                 mmco: &[],
+                redundant_pic_cnt: None,
+                slice_group_change_cycle: None,
             },
         );
 
@@ -1929,6 +1943,7 @@ impl Encoder {
                 nc_grid,
                 intra_grid,
                 mb_qp_delta,
+                None,
             );
             let d_a = mb_ssd_luma(recon_y);
             let r_a = sw.bits_emitted() - bits_before;
@@ -2039,6 +2054,7 @@ impl Encoder {
                 nc_grid,
                 intra_grid,
                 mb_qp_delta,
+                None,
             );
             let d_a = mb_ssd_3planes_444(frame, recon_y, recon_u, recon_v, width, mb_x, mb_y);
             let r_a = sw.bits_emitted() - bits_before;
@@ -2203,6 +2219,7 @@ impl Encoder {
             nc_grid,
             intra_grid,
             mb_qp_delta,
+            None,
         );
         let snap_a = MbStateSnapshot::capture(
             recon_y,
@@ -2424,6 +2441,7 @@ impl Encoder {
         nc_grid: &mut CavlcNcGrid,
         intra_grid: &mut IntraGrid,
         mb_qp_delta: i32,
+        nb: Option<(bool, bool, bool)>,
     ) -> MbTrial {
         debug_assert!(
             matches!(self.cfg.chroma_format_idc, 0 | 1) || mb_qp_delta == 0,
@@ -2451,7 +2469,8 @@ impl Encoder {
             I16x16Mode::Dc,
             I16x16Mode::Plane,
         ] {
-            let Some(pred) = predict_16x16(mode, recon_y, width, height, mb_x, mb_y) else {
+            let Some(pred) = predict_16x16_avail(mode, recon_y, width, height, mb_x, mb_y, nb)
+            else {
                 continue;
             };
             let cost = trial_intra16x16_cost(frame, &pred, mb_x, mb_y, qp_y, width, lambda, &wq.w4);
@@ -2648,6 +2667,7 @@ impl Encoder {
                 mb_y,
                 qp_c,
                 &wq.w4,
+                nb,
             );
             let cm = chroma_block.pred_mode.as_u8();
             let ccbp = chroma_block.cbp_chroma;
@@ -3199,6 +3219,7 @@ impl Encoder {
             mb_y,
             qp_c,
             &wq.w4,
+            None,
         );
         let best_chroma_mode = chroma_block.pred_mode;
         let cbp_chroma = chroma_block.cbp_chroma;
@@ -3546,6 +3567,7 @@ impl Encoder {
             mb_y,
             qp_c,
             &wq.w4,
+            None,
         );
         let cbp_chroma = chroma_block.cbp_chroma;
         let n_chroma_blk = ChromaBlock::cb_block_count(chroma_array_type);
@@ -5355,6 +5377,7 @@ fn encode_chroma_block(
     mb_y: usize,
     qp_c: i32,
     w4: &[i32; 16],
+    nb: Option<(bool, bool, bool)>,
 ) -> ChromaBlock {
     use crate::encoder::intra_pred::{predict_chroma_8x16, sad_8x16};
     let (h_chroma, n_blk) = match chroma_array_type {
@@ -5377,8 +5400,24 @@ fn encode_chroma_block(
     ] {
         if chroma_array_type == 1 {
             let (Some(pu), Some(pv)) = (
-                predict_chroma_8x8(mode, recon_u, chroma_width, chroma_height, mb_x, mb_y),
-                predict_chroma_8x8(mode, recon_v, chroma_width, chroma_height, mb_x, mb_y),
+                predict_chroma_8x8_avail(
+                    mode,
+                    recon_u,
+                    chroma_width,
+                    chroma_height,
+                    mb_x,
+                    mb_y,
+                    nb,
+                ),
+                predict_chroma_8x8_avail(
+                    mode,
+                    recon_v,
+                    chroma_width,
+                    chroma_height,
+                    mb_x,
+                    mb_y,
+                    nb,
+                ),
             ) else {
                 continue;
             };
@@ -6212,6 +6251,8 @@ impl Encoder {
                 mmco: &[],
                 pred_weight_table: p_wp_table,
                 num_ref_idx_l0_active_minus1: None,
+                redundant_pic_cnt: None,
+                slice_group_change_cycle: None,
             },
         );
 
@@ -7874,6 +7915,7 @@ impl Encoder {
             intra_grid,
             5,
             mb_qp_delta,
+            qp_tracker.intra_nb,
         );
 
         // Update MV grid: intra MB contributes (mv=0, ref=-1) per
@@ -7944,6 +7986,7 @@ impl Encoder {
         intra_grid: &mut IntraGrid,
         mb_type_offset: u32,
         mb_qp_delta: i32,
+        nb: Option<(bool, bool, bool)>,
     ) {
         let width = self.cfg.width as usize;
         let height = self.cfg.height as usize;
@@ -7964,7 +8007,8 @@ impl Encoder {
             I16x16Mode::Dc,
             I16x16Mode::Plane,
         ] {
-            let Some(pred) = predict_16x16(mode, recon_y, width, height, mb_x, mb_y) else {
+            let Some(pred) = predict_16x16_avail(mode, recon_y, width, height, mb_x, mb_y, nb)
+            else {
                 continue;
             };
             let cost = trial_intra16x16_cost(frame, &pred, mb_x, mb_y, qp_y, width, lambda, &wq.w4);
@@ -8060,6 +8104,7 @@ impl Encoder {
             mb_y,
             qp_c,
             &wq.w4,
+            nb,
         );
         let cbp_chroma = chroma_block.cbp_chroma;
         let best_chroma_mode_u8 = chroma_block.pred_mode.as_u8();
@@ -14261,6 +14306,7 @@ impl Encoder {
             intra_grid,
             23,
             mb_qp_delta,
+            None,
         );
 
         // Update both MV grids for the intra MB.

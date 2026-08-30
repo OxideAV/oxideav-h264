@@ -174,6 +174,8 @@ pub fn sp_parameter_sets(cfg: &SpConfig) -> Vec<u8> {
     });
     let pps = build_baseline_pps_rbsp(&BaselinePpsConfig {
         redundant_pic_cnt_present_flag: false,
+        slice_groups: None,
+        constrained_intra_pred_flag: false,
         pic_parameter_set_id: 0,
         seq_parameter_set_id: 0,
         pic_init_qp_minus26: 0,

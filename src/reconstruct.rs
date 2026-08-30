@@ -725,6 +725,8 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
     // (1 + MbaffFrameFlag): in MBAFF the slice header's first_mb_in_slice
     // is in pair units so the first raw MB address is double.
     let mut curr_addr = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
+    // §8.2.2 — FMO slice group map (round-453).
+    let mb_map = crate::mb_address::slice_mb_to_slice_group_map(sps, pps, slice_header);
     let total = slice_data.macroblocks.len();
     for (idx, mb) in slice_data.macroblocks.iter().enumerate() {
         // §7.4.4 — per-MB mb_field_decoding_flag (shared within an
@@ -835,7 +837,7 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
         // group. With a single slice group (the common case) this is
         // simply curr_addr + 1 for the non-MBAFF frame path.
         if idx + 1 < total {
-            curr_addr += 1;
+            curr_addr = crate::mb_address::advance_mb_addr(curr_addr, mb_map.as_deref());
             if curr_addr as usize >= grid.info.len() {
                 break;
             }

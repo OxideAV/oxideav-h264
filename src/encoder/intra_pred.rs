@@ -67,17 +67,61 @@ pub fn predict_16x16(
     mb_x: usize,
     mb_y: usize,
 ) -> Option<[i32; 256]> {
-    let (top, left, tl) = availability(mb_x, mb_y);
+    predict_16x16_avail(mode, recon_y, width, height, mb_x, mb_y, None)
+}
+
+/// Round-453 — [`predict_16x16`] with an explicit §6.4.11.1 neighbour
+/// availability override `(top, left, top-left)`: `Some` when the
+/// picture has several slices / slice groups (§6.4.8: a macroblock in
+/// a different slice is not available) or `constrained_intra_pred_flag`
+/// excludes inter-coded neighbours (§8.3.1.2); `None` = the raster
+/// single-slice coordinate rule.
+pub fn predict_16x16_avail(
+    mode: I16x16Mode,
+    recon_y: &[u8],
+    width: usize,
+    height: usize,
+    mb_x: usize,
+    mb_y: usize,
+    avail: Option<(bool, bool, bool)>,
+) -> Option<[i32; 256]> {
+    let (top, left, tl) = avail.unwrap_or_else(|| availability(mb_x, mb_y));
     match mode {
         I16x16Mode::Vertical if !top => None,
         I16x16Mode::Horizontal if !left => None,
         I16x16Mode::Plane if !(top && left && tl) => None,
-        I16x16Mode::Vertical => Some(predict_16x16_vertical(recon_y, width, height, mb_x, mb_y)),
-        I16x16Mode::Horizontal => {
-            Some(predict_16x16_horizontal(recon_y, width, height, mb_x, mb_y))
-        }
-        I16x16Mode::Dc => Some(predict_16x16_dc(recon_y, width, height, mb_x, mb_y)),
-        I16x16Mode::Plane => Some(predict_16x16_plane(recon_y, width, height, mb_x, mb_y)),
+        I16x16Mode::Vertical => Some(predict_16x16_vertical(
+            recon_y,
+            width,
+            height,
+            mb_x,
+            mb_y,
+            (top, left, tl),
+        )),
+        I16x16Mode::Horizontal => Some(predict_16x16_horizontal(
+            recon_y,
+            width,
+            height,
+            mb_x,
+            mb_y,
+            (top, left, tl),
+        )),
+        I16x16Mode::Dc => Some(predict_16x16_dc(
+            recon_y,
+            width,
+            height,
+            mb_x,
+            mb_y,
+            (top, left, tl),
+        )),
+        I16x16Mode::Plane => Some(predict_16x16_plane(
+            recon_y,
+            width,
+            height,
+            mb_x,
+            mb_y,
+            (top, left, tl),
+        )),
     }
 }
 
@@ -99,8 +143,10 @@ fn predict_16x16_vertical(
     _height: usize,
     mb_x: usize,
     mb_y: usize,
+
+    av: (bool, bool, bool),
 ) -> [i32; 256] {
-    let (top, _left, _tl) = availability(mb_x, mb_y);
+    let (top, _left, _tl) = av;
     let mut out = [128i32; 256];
     if !top {
         return out;
@@ -122,8 +168,10 @@ fn predict_16x16_horizontal(
     _height: usize,
     mb_x: usize,
     mb_y: usize,
+
+    av: (bool, bool, bool),
 ) -> [i32; 256] {
-    let (_top, left, _tl) = availability(mb_x, mb_y);
+    let (_top, left, _tl) = av;
     let mut out = [128i32; 256];
     if !left {
         return out;
@@ -144,8 +192,10 @@ fn predict_16x16_dc(
     _height: usize,
     mb_x: usize,
     mb_y: usize,
+
+    av: (bool, bool, bool),
 ) -> [i32; 256] {
-    let (top, left, _tl) = availability(mb_x, mb_y);
+    let (top, left, _tl) = av;
     let dc = if top && left {
         let mut s_top = 0i32;
         let mut s_left = 0i32;
@@ -184,10 +234,12 @@ fn predict_16x16_plane(
     height: usize,
     mb_x: usize,
     mb_y: usize,
+
+    av: (bool, bool, bool),
 ) -> [i32; 256] {
-    let (top, left, tl) = availability(mb_x, mb_y);
+    let (top, left, tl) = av;
     if !(top && left && tl) {
-        return predict_16x16_dc(recon_y, width, height, mb_x, mb_y);
+        return predict_16x16_dc(recon_y, width, height, mb_x, mb_y, av);
     }
     // Sample fetchers for the spec's `p[x,-1]` / `p[-1,y]` / `p[-1,-1]`.
     let row_above = (mb_y * 16 - 1) * width;
@@ -245,15 +297,57 @@ pub fn predict_chroma_8x8(
     mb_x: usize,
     mb_y: usize,
 ) -> Option<[i32; 64]> {
-    let (top, left, tl) = availability(mb_x, mb_y);
+    predict_chroma_8x8_avail(mode, recon, width, height, mb_x, mb_y, None)
+}
+
+/// Round-453 — [`predict_chroma_8x8`] with the explicit neighbour
+/// availability override of [`predict_16x16_avail`].
+pub fn predict_chroma_8x8_avail(
+    mode: IntraChromaMode,
+    recon: &[u8],
+    width: usize,
+    height: usize,
+    mb_x: usize,
+    mb_y: usize,
+    avail: Option<(bool, bool, bool)>,
+) -> Option<[i32; 64]> {
+    let (top, left, tl) = avail.unwrap_or_else(|| availability(mb_x, mb_y));
     match mode {
         IntraChromaMode::Vertical if !top => None,
         IntraChromaMode::Horizontal if !left => None,
         IntraChromaMode::Plane if !(top && left && tl) => None,
-        IntraChromaMode::Dc => Some(predict_chroma_dc_8x8(recon, width, height, mb_x, mb_y)),
-        IntraChromaMode::Horizontal => Some(predict_chroma_h_8x8(recon, width, height, mb_x, mb_y)),
-        IntraChromaMode::Vertical => Some(predict_chroma_v_8x8(recon, width, height, mb_x, mb_y)),
-        IntraChromaMode::Plane => Some(predict_chroma_plane_8x8(recon, width, height, mb_x, mb_y)),
+        IntraChromaMode::Dc => Some(predict_chroma_dc_8x8(
+            recon,
+            width,
+            height,
+            mb_x,
+            mb_y,
+            (top, left, tl),
+        )),
+        IntraChromaMode::Horizontal => Some(predict_chroma_h_8x8(
+            recon,
+            width,
+            height,
+            mb_x,
+            mb_y,
+            (top, left, tl),
+        )),
+        IntraChromaMode::Vertical => Some(predict_chroma_v_8x8(
+            recon,
+            width,
+            height,
+            mb_x,
+            mb_y,
+            (top, left, tl),
+        )),
+        IntraChromaMode::Plane => Some(predict_chroma_plane_8x8(
+            recon,
+            width,
+            height,
+            mb_x,
+            mb_y,
+            (top, left, tl),
+        )),
     }
 }
 
@@ -268,8 +362,10 @@ fn predict_chroma_dc_8x8(
     _height: usize,
     mb_x: usize,
     mb_y: usize,
+
+    av: (bool, bool, bool),
 ) -> [i32; 64] {
-    let (top, left, _tl) = availability(mb_x, mb_y);
+    let (top, left, _tl) = av;
     let default = 128i32;
     let row_above = if top { (mb_y * 8 - 1) * width } else { 0 };
     let sum_top = |x_o: usize| -> i32 {
@@ -352,8 +448,10 @@ fn predict_chroma_h_8x8(
     _height: usize,
     mb_x: usize,
     mb_y: usize,
+
+    av: (bool, bool, bool),
 ) -> [i32; 64] {
-    let (_top, left, _tl) = availability(mb_x, mb_y);
+    let (_top, left, _tl) = av;
     let mut out = [128i32; 64];
     if !left {
         return out;
@@ -374,8 +472,10 @@ fn predict_chroma_v_8x8(
     _height: usize,
     mb_x: usize,
     mb_y: usize,
+
+    av: (bool, bool, bool),
 ) -> [i32; 64] {
-    let (top, _left, _tl) = availability(mb_x, mb_y);
+    let (top, _left, _tl) = av;
     let mut out = [128i32; 64];
     if !top {
         return out;
@@ -397,10 +497,12 @@ fn predict_chroma_plane_8x8(
     height: usize,
     mb_x: usize,
     mb_y: usize,
+
+    av: (bool, bool, bool),
 ) -> [i32; 64] {
-    let (top, left, tl) = availability(mb_x, mb_y);
+    let (top, left, tl) = av;
     if !(top && left && tl) {
-        return predict_chroma_dc_8x8(recon, width, height, mb_x, mb_y);
+        return predict_chroma_dc_8x8(recon, width, height, mb_x, mb_y, av);
     }
     let row_above = (mb_y * 8 - 1) * width;
     let p_top = |x: i32| -> i32 {
@@ -741,7 +843,7 @@ mod tests {
     #[test]
     fn dc_with_no_neighbours_returns_128() {
         let recon = flat_recon(64, 64, 200);
-        let pred = predict_16x16_dc(&recon, 64, 64, 0, 0);
+        let pred = predict_16x16_dc(&recon, 64, 64, 0, 0, availability(0, 0));
         assert!(pred.iter().all(|&p| p == 128));
     }
 
@@ -762,7 +864,7 @@ mod tests {
         for x in 0..64 {
             recon[15 * 64 + x] = (x * 4) as u8;
         }
-        let pred = predict_16x16_vertical(&recon, 64, 64, 0, 1);
+        let pred = predict_16x16_vertical(&recon, 64, 64, 0, 1, availability(0, 1));
         // Every column should equal the top sample; sample x=5 → 20.
         for y in 0..16 {
             assert_eq!(pred[y * 16 + 5], 20);
@@ -775,7 +877,7 @@ mod tests {
         for y in 0..64 {
             recon[y * 64 + 15] = (y * 3) as u8;
         }
-        let pred = predict_16x16_horizontal(&recon, 64, 64, 1, 0);
+        let pred = predict_16x16_horizontal(&recon, 64, 64, 1, 0, availability(1, 0));
         // Every row should equal the left sample.
         for y in 0..16 {
             for x in 0..16 {
@@ -788,7 +890,7 @@ mod tests {
     fn plane_constant_neighbours_returns_constant() {
         // All neighbour samples = 100 → plane reduces to DC = 100.
         let recon = flat_recon(64, 64, 100);
-        let pred = predict_16x16_plane(&recon, 64, 64, 1, 1);
+        let pred = predict_16x16_plane(&recon, 64, 64, 1, 1, availability(1, 1));
         // Plane: a = 16*(100+100) = 3200, b = 0, c = 0, pred = (3200+16)>>5 = 100.
         assert!(pred.iter().all(|&p| p == 100), "got {:?}", &pred[..8]);
     }
@@ -796,7 +898,7 @@ mod tests {
     #[test]
     fn chroma_dc_with_no_neighbours_returns_128() {
         let recon = flat_recon(32, 32, 200);
-        let pred = predict_chroma_dc_8x8(&recon, 32, 32, 0, 0);
+        let pred = predict_chroma_dc_8x8(&recon, 32, 32, 0, 0, availability(0, 0));
         assert!(pred.iter().all(|&p| p == 128));
     }
 
@@ -806,7 +908,7 @@ mod tests {
         for y in 0..32 {
             recon[y * 32 + 7] = (y * 2) as u8;
         }
-        let pred = predict_chroma_h_8x8(&recon, 32, 32, 1, 0);
+        let pred = predict_chroma_h_8x8(&recon, 32, 32, 1, 0, availability(1, 0));
         for y in 0..8 {
             for x in 0..8 {
                 assert_eq!(pred[y * 8 + x], ((y * 2) & 0xff) as i32);

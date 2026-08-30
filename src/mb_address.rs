@@ -430,6 +430,52 @@ pub fn next_mb_address(
 // to derive the per-MB neighbour addresses accounting for the
 // current+neighbour `mb_field_decoding_flag` combination.
 
+/// Round-453 — the §8.2.2 `MbToSliceGroupMap` for one slice, or
+/// `None` when the PPS has a single slice group (raster order).
+/// `slice_group_change_cycle` comes from the slice header (map types
+/// 3..=5).
+pub fn slice_mb_to_slice_group_map(
+    sps: &crate::sps::Sps,
+    pps: &Pps,
+    slice_header: &crate::slice_header::SliceHeader,
+) -> Option<Vec<u32>> {
+    if pps.num_slice_groups_minus1 == 0 {
+        return None;
+    }
+    let pic_width_in_mbs = sps.pic_width_in_mbs();
+    let pic_size_in_map_units = pic_width_in_mbs * sps.pic_height_in_map_units();
+    let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
+    let units = map_unit_to_slice_group_map(
+        pps,
+        pic_size_in_map_units,
+        pic_width_in_mbs,
+        slice_header.slice_group_change_cycle,
+        mbaff_frame_flag,
+    )
+    .ok()?;
+    Some(mb_to_slice_group_map(
+        &units,
+        sps.frame_mbs_only_flag,
+        mbaff_frame_flag,
+        slice_header.field_pic_flag,
+        pic_width_in_mbs,
+    ))
+}
+
+/// Round-453 — §7.3.4 `NextMbAddress(CurrMbAddr)`: raster successor
+/// without FMO, else the next macroblock of the same slice group
+/// (eq. 8-16).
+#[inline]
+pub fn advance_mb_addr(curr: u32, map: Option<&[u32]>) -> u32 {
+    match map {
+        None => curr.saturating_add(1),
+        Some(m) => {
+            let group = m.get(curr as usize).copied().unwrap_or(0);
+            next_mb_address(curr, m, group, m.len() as u32)
+        }
+    }
+}
+
 /// §6.4.10 — derive `(currMbFrameFlag, mbIsTopMbFlag)` for the MB at
 /// `curr_mb_addr` in an MBAFF frame picture.
 ///

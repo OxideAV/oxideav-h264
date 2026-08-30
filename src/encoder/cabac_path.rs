@@ -2015,6 +2015,8 @@ impl Encoder {
         });
         let pps_cfg = BaselinePpsConfig {
             redundant_pic_cnt_present_flag: false,
+            slice_groups: None,
+            constrained_intra_pred_flag: false,
             pic_scaling_lists: cfg.scaling_matrix.pic_spec(),
             chroma_format_idc: cfg.chroma_format_idc,
             pic_parameter_set_id: 0,
@@ -2058,6 +2060,8 @@ impl Encoder {
                 nal_ref_idc: 3,
                 long_term_reference_flag: false,
                 mmco: &[],
+                redundant_pic_cnt: None,
+                slice_group_change_cycle: None,
             },
         );
         // §7.3.4 — cabac_alignment_one_bit until byte aligned.
@@ -2228,7 +2232,7 @@ impl Encoder {
                     // CAVLC path.
                     let cbk = super::encode_chroma_block(
                         2, frame.u, frame.v, &recon_u, &recon_v, chroma_w, chroma_h, mb_x, mb_y,
-                        qp_c, &wq_i.w4,
+                        qp_c, &wq_i.w4, None,
                     );
                     chroma_mode = cbk.pred_mode;
                     cbp_chroma = cbk.cbp_chroma;
@@ -3076,6 +3080,8 @@ impl Encoder {
                 mmco: &[],
                 pred_weight_table: None,
                 num_ref_idx_l0_active_minus1: None,
+                redundant_pic_cnt: None,
+                slice_group_change_cycle: None,
             },
         );
         while !sw.byte_aligned() {

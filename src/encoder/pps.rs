@@ -22,7 +22,7 @@
 use crate::encoder::bitstream::BitWriter;
 
 /// Configuration for [`build_baseline_pps_rbsp`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BaselinePpsConfig {
     pub pic_parameter_set_id: u32,
     pub seq_parameter_set_id: u32,
@@ -75,6 +75,15 @@ pub struct BaselinePpsConfig {
     /// §7.3.3 `redundant_pic_cnt` (used by the redundant-coded-picture
     /// gates; ordinary streams leave it `false`).
     pub redundant_pic_cnt_present_flag: bool,
+    /// Round-453 — §7.3.2.2 flexible macroblock ordering: `Some(map)`
+    /// codes `num_slice_groups_minus1 = num_slice_groups - 1` and the
+    /// `slice_group_map_type` 0..=6 parameters (the decoder's own
+    /// [`crate::pps::SliceGroupMap`] shape, so the encoder derives the
+    /// §8.2.2 map with the decoder's code); `None` = one slice group.
+    pub slice_groups: Option<(u32, crate::pps::SliceGroupMap)>,
+    /// Round-453 — §7.4.2.2 `constrained_intra_pred_flag`: intra
+    /// macroblocks in P slices predict only from intra neighbours.
+    pub constrained_intra_pred_flag: bool,
 }
 
 /// Build a Baseline PPS RBSP body (§7.3.2.2).
@@ -88,8 +97,67 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
     w.u(1, if cfg.entropy_coding_mode_flag { 1 } else { 0 });
     // bottom_field_pic_order_in_frame_present_flag = 0.
     w.u(1, 0);
-    // num_slice_groups_minus1 = 0 (no FMO).
-    w.ue(0);
+    // §7.3.2.2 — num_slice_groups_minus1 + slice group map (FMO,
+    // round-453); 0 = single slice group.
+    match &cfg.slice_groups {
+        None => w.ue(0),
+        Some((num_groups, map)) => {
+            use crate::pps::SliceGroupMap;
+            debug_assert!((2..=8).contains(num_groups));
+            let n_minus1 = num_groups - 1;
+            w.ue(n_minus1);
+            match map {
+                SliceGroupMap::Interleaved { run_length_minus1 } => {
+                    w.ue(0);
+                    debug_assert_eq!(run_length_minus1.len() as u32, n_minus1 + 1);
+                    for &r in run_length_minus1 {
+                        w.ue(r);
+                    }
+                }
+                SliceGroupMap::Dispersed => w.ue(1),
+                SliceGroupMap::Foreground {
+                    top_left,
+                    bottom_right,
+                } => {
+                    w.ue(2);
+                    debug_assert_eq!(top_left.len() as u32, n_minus1);
+                    debug_assert_eq!(bottom_right.len() as u32, n_minus1);
+                    for (&tl, &br) in top_left.iter().zip(bottom_right.iter()) {
+                        w.ue(tl);
+                        w.ue(br);
+                    }
+                }
+                SliceGroupMap::Changing {
+                    slice_group_map_type,
+                    change_direction_flag,
+                    change_rate_minus1,
+                } => {
+                    debug_assert!((3..=5).contains(slice_group_map_type));
+                    w.ue(*slice_group_map_type);
+                    w.u(1, u32::from(*change_direction_flag));
+                    w.ue(*change_rate_minus1);
+                }
+                SliceGroupMap::Explicit {
+                    pic_size_in_map_units_minus1,
+                    slice_group_id,
+                } => {
+                    w.ue(6);
+                    w.ue(*pic_size_in_map_units_minus1);
+                    debug_assert_eq!(
+                        slice_group_id.len() as u32,
+                        pic_size_in_map_units_minus1 + 1
+                    );
+                    // §7.4.2.2 — slice_group_id[i] is u(v) with
+                    // v = Ceil(Log2(num_slice_groups_minus1 + 1)).
+                    let v = 32 - (n_minus1).leading_zeros();
+                    for &id in slice_group_id {
+                        debug_assert!(id <= n_minus1);
+                        w.u(v, id);
+                    }
+                }
+            }
+        }
+    }
 
     // num_ref_idx_l0_default_active_minus1 = 0, ditto l1.
     w.ue(0);
@@ -107,8 +175,8 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
     // deblocking_filter_control_present_flag = 1 — lets the slice
     // header carry `disable_deblocking_filter_idc` and the offsets.
     w.u(1, 1);
-    // constrained_intra_pred_flag = 0.
-    w.u(1, 0);
+    // §7.4.2.2 — constrained_intra_pred_flag (round-453).
+    w.u(1, u32::from(cfg.constrained_intra_pred_flag));
     // §7.4.2.2 — redundant_pic_cnt_present_flag (round-451:
     // caller-selectable for the redundant-coded-picture gates).
     w.u(1, u32::from(cfg.redundant_pic_cnt_present_flag));
@@ -155,6 +223,8 @@ mod tests {
     fn baseline_pps_round_trips_through_decoder_parser() {
         let cfg = BaselinePpsConfig {
             redundant_pic_cnt_present_flag: false,
+            slice_groups: None,
+            constrained_intra_pred_flag: false,
             pic_scaling_lists: None,
             chroma_format_idc: 1,
             pic_parameter_set_id: 0,

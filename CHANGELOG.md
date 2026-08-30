@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 453 — **Multi-slice, FMO, ASO, redundant-slice and
+  constrained-intra emission** (`encoder::slices`,
+  `encode_slices_sequence`) **+ FMO decoding**. The PPS writer codes
+  §7.3.2.2 `num_slice_groups_minus1` with every slice group map type
+  (0 interleaved, 1 dispersed, 2 foreground + leftover, 3..=5
+  box-out / raster / wipe with `slice_group_change_direction_flag` /
+  `slice_group_change_rate_minus1`, 6 explicit) and
+  `constrained_intra_pred_flag`; the slice header writers code
+  `redundant_pic_cnt` and `slice_group_change_cycle` (eq. 7-37
+  width). The driver derives `MbToSliceGroupMap` with the decoder's
+  own §8.2.2 code, codes each slice group's macroblocks in raster
+  order as one or more slices (`mbs_per_slice`), restarts the
+  §9.2.1.1 / §8.4.1.3 / §8.3.1.1 neighbour state per slice and hands
+  the intra predictors an explicit §6.4.8 same-slice availability
+  mask (`predict_16x16_avail` / `predict_chroma_8x8_avail` — top,
+  left and top-left resolved individually, so a mid-row slice start
+  drops only the neighbours that belong to the previous slice);
+  `constrained_intra_pred_flag = 1` additionally drops inter-coded
+  neighbours for the Intra_16x16 fallback in P slices (§8.3.1.2).
+  ASO emits a picture's slices in reverse order; redundant slices
+  re-encode every slice at QP + 6 with `redundant_pic_cnt = 1`.
+  **Decoder**: FMO streams are now decoded instead of rejected — the
+  slice-data walker, the reconstruction walker and the picture
+  stamping advance through `NextMbAddress` over the §8.2.2 map
+  (`mb_address::slice_mb_to_slice_group_map` / `advance_mb_addr`).
+  Twelve `integration_slices_encoder` gates decode bit-exactly in our
+  decoder; the raster multi-slice, constrained-intra and
+  slice-boundary streams also byte-match the black-box reference
+  decoder (which implements neither FMO nor ASO and does not discard
+  redundant slices, so those streams are pinned by our decoder).
+
 - Round 453 — **Multi-reference P coding, long-term references, MMCO
   and RPLM emission** (`encoder::multiref`,
   `encode_multiref_sequence`). The P macroblock encoders now code
