@@ -41,6 +41,7 @@ fn parameter_sets() -> Vec<u8> {
         separate_colour_plane: false,
         seq_scaling_lists: None,
         interlaced_fields: false,
+        mbaff: false,
         vui: None,
     });
     let pps = build_baseline_pps_rbsp(&BaselinePpsConfig {

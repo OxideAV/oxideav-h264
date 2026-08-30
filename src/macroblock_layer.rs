@@ -1835,7 +1835,7 @@ fn cabac_ref_idx_cond_terms(
 
 /// §6.4.13.1 eq. 6-38 — 4x4 block index from (x, y) inside an MB.
 #[inline]
-fn blk4x4_idx(x: i32, y: i32) -> u8 {
+pub(crate) fn blk4x4_idx(x: i32, y: i32) -> u8 {
     (8 * (y / 8) + 4 * (x / 8) + 2 * ((y % 8) / 4) + ((x % 8) / 4)) as u8
 }
 

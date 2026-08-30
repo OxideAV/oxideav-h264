@@ -50,6 +50,7 @@ pub mod intra4x4;
 pub mod intra_pred;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod macroblock;
+pub mod mbaff;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod me;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -80,6 +81,42 @@ struct MbQpTracker {
     /// predictor for the next `mb_qp_delta`). Initialised to
     /// SliceQP_Y (§7.4.3).
     cur: i32,
+    /// Round-453 MBAFF — §7.3.4: a pending `mb_field_decoding_flag`
+    /// that must be written right after the next `mb_skip_run` flush
+    /// (i.e. before the next coded `macroblock_layer()`), for the
+    /// top MB of a pair or for a bottom MB whose top was skipped.
+    /// `None` outside MBAFF frames and once the flag has been coded.
+    mbaff_flag_pending: Option<bool>,
+    /// Round-453 MBAFF — the current MB is a FIELD macroblock of an
+    /// MBAFF frame: §7.3.5.1 codes `ref_idx_l0` te(v) even with one
+    /// active reference frame (the field MB addresses
+    /// `2 * num_ref_idx_l0_active` reference fields, §8.4.2.1).
+    mbaff_field_mb: bool,
+}
+
+impl MbQpTracker {
+    fn new(cur: i32) -> Self {
+        Self {
+            cur,
+            mbaff_flag_pending: None,
+            mbaff_field_mb: false,
+        }
+    }
+
+    /// §7.3.4 — emit the pending `mb_field_decoding_flag` (if any) at
+    /// the position right after `mb_skip_run`.
+    fn write_pending_mbaff_flag(&mut self, sw: &mut BitWriter) {
+        if let Some(f) = self.mbaff_flag_pending.take() {
+            sw.u(1, u32::from(f));
+        }
+    }
+
+    /// §7.3.5.1 — `num_ref_idx_l0_active_minus1` as seen by the MB
+    /// writers: 1 for MBAFF field MBs (two reference fields per
+    /// reference frame), else 0 (the single-reference default).
+    fn num_ref_idx_l0_active_minus1(&self) -> u32 {
+        u32::from(self.mbaff_field_mb)
+    }
 }
 use crate::encoder::bitstream::BitWriter;
 use crate::encoder::cavlc::encode_residual_block_cavlc;
@@ -1450,6 +1487,7 @@ impl Encoder {
             bit_depth_luma_minus8: 0,
             bit_depth_chroma_minus8: 0,
             interlaced_fields: false,
+            mbaff: false,
             // Round-430 — rate-controlled sessions annotate CBR
             // streams with §E.1.1 VUI timing + §E.1.2 NAL HRD.
             vui: self.cfg.vui.clone(),
@@ -1535,7 +1573,7 @@ impl Encoder {
         // the row-modulated target. Without a row budget both stay at
         // `frame_qp`, every emitted mb_qp_delta is 0 and the bitstream
         // matches the pre-round-430 output exactly.
-        let mut qp_tracker = MbQpTracker { cur: frame_qp };
+        let mut qp_tracker = MbQpTracker::new(frame_qp);
         let mut want_qp = frame_qp;
         // §8.5.8 — chroma-QP derivation, BD-aware. `qp_bd_offset_c =
         // 6 * bit_depth_chroma_minus8` extends the eq. 8-311 qPI clamp
@@ -6096,7 +6134,7 @@ impl Encoder {
         let mut i8x8_mb_count = 0u32;
 
         // §7.4.5 decoded-QP chain: starts at SliceQP_Y (§7.4.3).
-        let mut qp_tracker = MbQpTracker { cur: frame_qp };
+        let mut qp_tracker = MbQpTracker::new(frame_qp);
         let mut want_qp = frame_qp;
 
         for mb_y in 0..height_mbs as usize {
@@ -6741,6 +6779,7 @@ impl Encoder {
         // P_L0_16x16: flush any pending skip-run, then emit the coded MB.
         sw.ue(*pending_skip);
         *pending_skip = 0;
+        qp_tracker.write_pending_mbaff_flag(sw);
 
         // mvd = chosen_mv - mvp.
         let mvd_x = chosen_mv.x - mvp.x;
@@ -6929,7 +6968,7 @@ impl Encoder {
                 crate::encoder::macroblock::write_p_l0_16x16_mb_chroma(
                     sw,
                     &mb_cfg,
-                    0,
+                    qp_tracker.num_ref_idx_l0_active_minus1(),
                     0,
                     crate::encoder::macroblock::ChromaWriteKind::Mono,
                 )
@@ -6953,7 +6992,7 @@ impl Encoder {
                 crate::encoder::macroblock::write_p_l0_16x16_mb_chroma(
                     sw,
                     &mb_cfg,
-                    0,
+                    qp_tracker.num_ref_idx_l0_active_minus1(),
                     3,
                     crate::encoder::macroblock::ChromaWriteKind::Yuv444Inter {
                         cb_levels: &cb444.levels_scan,
@@ -6978,7 +7017,7 @@ impl Encoder {
                 crate::encoder::macroblock::write_p_l0_16x16_mb_chroma(
                     sw,
                     &mb_cfg,
-                    0,
+                    qp_tracker.num_ref_idx_l0_active_minus1(),
                     2,
                     crate::encoder::macroblock::ChromaWriteKind::Yuv422 {
                         chroma_dc_cb: &u_dc8,
@@ -7004,7 +7043,7 @@ impl Encoder {
                 crate::encoder::macroblock::write_p_l0_16x16_mb_chroma(
                     sw,
                     &mb_cfg,
-                    0,
+                    qp_tracker.num_ref_idx_l0_active_minus1(),
                     1,
                     crate::encoder::macroblock::ChromaWriteKind::Yuv420 {
                         chroma_dc_cb: &u_dc_levels,
@@ -7235,6 +7274,7 @@ impl Encoder {
         // always emit the MB. Flush pending skip-run first.
         sw.ue(*pending_skip);
         *pending_skip = 0;
+        qp_tracker.write_pending_mbaff_flag(sw);
 
         // 6. Apply luma reconstruction (pred + residual or pred-only on
         //    cbp_luma=0 quadrants).
@@ -7356,7 +7396,8 @@ impl Encoder {
             chroma_ac_nc_cb: chroma_nc_cb,
             chroma_ac_nc_cr: chroma_nc_cr,
         };
-        write_p_8x8_all_pl08x8_mb(sw, &mb_cfg, 0).expect("write P_8x8 mb");
+        write_p_8x8_all_pl08x8_mb(sw, &mb_cfg, qp_tracker.num_ref_idx_l0_active_minus1())
+            .expect("write P_8x8 mb");
 
         // 9. Update mv_grid + intra_grid for subsequent MBs.
         *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
@@ -7663,6 +7704,7 @@ impl Encoder {
         // Flush any pending P_Skip run before emitting a coded MB.
         sw.ue(*pending_skip);
         *pending_skip = 0;
+        qp_tracker.write_pending_mbaff_flag(sw);
 
         // §7.3.5 — Intra_16x16 always codes the luma DC block, so
         // mb_qp_delta is always present: emit the step from the
@@ -11043,7 +11085,7 @@ impl Encoder {
         let mut pending_skip: u32 = 0;
         let mut i8x8_mb_count = 0u32;
         // §7.4.5 decoded-QP chain: starts at SliceQP_Y (§7.4.3).
-        let mut qp_tracker = MbQpTracker { cur: frame_qp };
+        let mut qp_tracker = MbQpTracker::new(frame_qp);
         let mut want_qp = frame_qp;
         for mb_y in 0..height_mbs as usize {
             // Round-443 — MB-row QP modulation, identical controller
@@ -13982,6 +14024,7 @@ impl Encoder {
         // Flush any pending B_Skip run.
         sw.ue(*pending_skip);
         *pending_skip = 0;
+        qp_tracker.write_pending_mbaff_flag(sw);
 
         // §7.3.5 — Intra_16x16 always codes mb_qp_delta (the luma DC
         // block is unconditional): emit the step from the decoder's

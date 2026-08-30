@@ -105,6 +105,12 @@ pub struct BaselineSpsConfig {
     /// is 0). `height_in_mbs` must be even. Requires `profile_idc !=
     /// 66` — §A.2.1 pins `frame_mbs_only_flag = 1` in Baseline.
     pub interlaced_fields: bool,
+    /// Round-453 — MBAFF: with `interlaced_fields = true`, emit
+    /// `mb_adaptive_frame_field_flag = 1` (§7.4.2.1.1: frame pictures
+    /// may switch between frame and field macroblock pairs per
+    /// §7.3.4 `mb_field_decoding_flag`). Ignored when
+    /// `interlaced_fields` is `false`.
+    pub mbaff: bool,
     /// Round-430 — §E.1.1 `vui_parameters()` to append (with
     /// `vui_parameters_present_flag = 1`). `None` keeps the historical
     /// `vui_parameters_present_flag = 0` emission. Used by the
@@ -129,6 +135,7 @@ impl Default for BaselineSpsConfig {
             separate_colour_plane: false,
             seq_scaling_lists: None,
             interlaced_fields: false,
+            mbaff: false,
             bit_depth_luma_minus8: 0,
             bit_depth_chroma_minus8: 0,
             vui: None,
@@ -332,8 +339,9 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
         w.ue(cfg.height_in_mbs / 2 - 1);
         // frame_mbs_only_flag = 0 (field pictures allowed).
         w.u(1, 0);
-        // mb_adaptive_frame_field_flag = 0 (PAFF, no MBAFF).
-        w.u(1, 0);
+        // mb_adaptive_frame_field_flag — 0 for PAFF-only streams,
+        // 1 when the caller codes MBAFF frame pictures (round-453).
+        w.u(1, u32::from(cfg.mbaff));
     } else {
         w.ue(cfg.height_in_mbs - 1);
         // frame_mbs_only_flag = 1 (no field/MBAFF).
@@ -551,6 +559,7 @@ mod tests {
             bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
+            mbaff: false,
             vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
@@ -596,6 +605,7 @@ mod tests {
             bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
+            mbaff: false,
             vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,
@@ -636,6 +646,7 @@ mod tests {
             bit_depth_chroma_minus8: 0,
             seq_scaling_lists: None,
             interlaced_fields: false,
+            mbaff: false,
             vui: None,
             seq_parameter_set_id: 0,
             level_idc: 30,

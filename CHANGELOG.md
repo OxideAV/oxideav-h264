@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 453 — **MBAFF encoding** (`encoder::mbaff`,
+  `encode_mbaff_sequence`). Interlaced sequences code as MBAFF frame
+  pictures (`frame_mbs_only_flag = 0`,
+  `mb_adaptive_frame_field_flag = 1`, `field_pic_flag = 0`, Main
+  profile, CAVLC 4:2:0): per-pair §7.3.4 `mb_field_decoding_flag`
+  with AllFrame / AllField / content-adaptive / checkerboard decision
+  policies, the §6.4.1 eq. 6-9/6-10 field-MB row interleave, and the
+  §8.5.6 field coefficient scan on field MBs. Neighbour derivation
+  reuses the decoder's §6.4.12.2 Table 6-4 process to resolve every
+  neighbouring sample, §9.2.1.1 `TotalCoeff` and §8.4.1.3.2 motion
+  cell (with the eq. 8-217..8-220 frame↔field MV/refIdx scaling)
+  against the real pair-interleaved picture state, then installs the
+  results as plain raster neighbours of a per-MB scratch geometry so
+  the existing frame-based macroblock encoders apply unchanged.
+  P pictures run the full P_Skip / P_L0_16x16 / P_8x8 /
+  Intra_16x16-fallback mode set; field MBs motion-compensate the
+  §8.4.2.1 same-parity field of the reference frame and code
+  §7.3.5.1 `ref_idx_l0` te(v) against the doubled field list;
+  fully-skipped pairs mirror the §7.4.4 flag inference (the driver
+  re-encodes a fully-skipped pair whose decision differs from the
+  inference). The §8.7 MBAFF deblock runs through the decoder's
+  picture-level walker (`deblock_recon_mbaff`) with per-MB field
+  flags and the NOTE 1 frame/field reference-identity keys. The SPS
+  writer gains `BaselineSpsConfig::mbaff`. Nine
+  `integration_mbaff_encoder` gates decode bit-exactly in our own
+  decoder AND byte-exactly in the black-box reference decoder across
+  I and P pictures at every pair policy, including a high-QP
+  skip-dominated stream.
+
 - Round 451 — **Redundant coded pictures are discarded**
   (§7.4.2.2 / §7.4.1.2). A slice with `redundant_pic_cnt > 0` is an
   approximation of (part of) the primary picture that a decoder may

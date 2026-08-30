@@ -51,6 +51,7 @@ fn parameter_sets(bit_depth: u32) -> Vec<u8> {
         bit_depth_luma_minus8: bit_depth - 8,
         bit_depth_chroma_minus8: bit_depth - 8,
         interlaced_fields: false,
+        mbaff: false,
         vui: None,
     });
     let pps = build_baseline_pps_rbsp(&BaselinePpsConfig {

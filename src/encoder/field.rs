@@ -329,7 +329,7 @@ fn encode_i_slice_data(
     let mut infos = vec![MbDeblockInfo::default(); (width_mbs * height_mbs) as usize];
     // Constant-QP field picture: the §7.4.5 chain never moves, but the
     // per-MB writer threads it (every delta stays 0).
-    let mut qp_tracker = super::MbQpTracker { cur: qp_y };
+    let mut qp_tracker = super::MbQpTracker::new(qp_y);
     for mb_y in 0..height_mbs as usize {
         for mb_x in 0..width_mbs as usize {
             let dbl = enc.encode_mb(
@@ -392,7 +392,7 @@ fn encode_p_slice_data(
     let mut pending_skip: u32 = 0;
     // Constant-QP field picture: the §7.4.5 chain never moves, but the
     // per-MB writers still thread it (delta stays 0).
-    let mut qp_tracker = super::MbQpTracker { cur: qp_y };
+    let mut qp_tracker = super::MbQpTracker::new(qp_y);
     for mb_y in 0..height_mbs as usize {
         for mb_x in 0..width_mbs as usize {
             let dbl = enc.encode_p_mb_with_intra_fallback(
@@ -464,7 +464,7 @@ fn encode_b_slice_data(
     let mut pending_skip: u32 = 0;
     // Field B slices run at frame-constant QP: the §7.4.5 chain stays
     // at qp_y and every emitted mb_qp_delta is 0.
-    let mut qp_tracker = crate::encoder::MbQpTracker { cur: qp_y };
+    let mut qp_tracker = crate::encoder::MbQpTracker::new(qp_y);
     for mb_y in 0..height_mbs as usize {
         for mb_x in 0..width_mbs as usize {
             let dbl = enc.encode_b_mb_with_intra_fallback(
@@ -661,6 +661,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
         bit_depth_luma_minus8: 0,
         bit_depth_chroma_minus8: 0,
         interlaced_fields: true,
+        mbaff: false,
         vui: None,
     });
     let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {

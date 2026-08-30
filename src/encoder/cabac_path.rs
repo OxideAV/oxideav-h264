@@ -1998,6 +1998,7 @@ impl Encoder {
             bit_depth_luma_minus8: 0,
             bit_depth_chroma_minus8: 0,
             interlaced_fields: false,
+            mbaff: false,
             seq_parameter_set_id: 0,
             level_idc: cfg.level_idc,
             width_in_mbs: width_mbs as u32,

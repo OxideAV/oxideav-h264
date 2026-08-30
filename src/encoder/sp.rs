@@ -169,6 +169,7 @@ pub fn sp_parameter_sets(cfg: &SpConfig) -> Vec<u8> {
         bit_depth_luma_minus8: 0,
         bit_depth_chroma_minus8: 0,
         interlaced_fields: false,
+        mbaff: false,
         vui: None,
     });
     let pps = build_baseline_pps_rbsp(&BaselinePpsConfig {

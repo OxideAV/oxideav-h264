@@ -191,6 +191,7 @@ pub fn deblock_recon_with_chroma_array_type(
         height_mbs,
         chroma_array_type,
         /* field_pic */ false,
+        None,
     )
 }
 
@@ -230,6 +231,49 @@ pub fn deblock_recon_field(
         height_mbs,
         chroma_array_type,
         /* field_pic */ true,
+        None,
+    )
+}
+
+/// Round-453 — §8.7 deblock of an **MBAFF frame** (§7.4.2.1.1
+/// `mb_adaptive_frame_field_flag = 1`, `field_pic_flag = 0`).
+/// `mb_infos` and `mb_field_flags` are indexed by the pair-interleaved
+/// macroblock address (§6.4.1: `2 * pairIdx + isBottom`), exactly as
+/// the decoder's grid is. The walker applies the MBAFF rules of
+/// §8.7.2.1 (mixedModeEdgeFlag, the field-MB top-edge double filter,
+/// the NOTE 3 field |Δmv| threshold).
+#[allow(clippy::too_many_arguments)]
+pub fn deblock_recon_mbaff(
+    width: u32,
+    height: u32,
+    chroma_width: u32,
+    chroma_height: u32,
+    recon_y: &mut [u8],
+    recon_u: &mut [u8],
+    recon_v: &mut [u8],
+    mb_infos: &[MbDeblockInfo],
+    mb_field_flags: &[bool],
+    chroma_qp_index_offset: i32,
+    width_mbs: u32,
+    height_mbs: u32,
+    chroma_array_type: u32,
+) {
+    debug_assert_eq!(mb_infos.len(), mb_field_flags.len());
+    deblock_recon_inner(
+        width,
+        height,
+        chroma_width,
+        chroma_height,
+        recon_y,
+        recon_u,
+        recon_v,
+        mb_infos,
+        chroma_qp_index_offset,
+        width_mbs,
+        height_mbs,
+        chroma_array_type,
+        /* field_pic */ false,
+        Some(mb_field_flags),
     )
 }
 
@@ -248,6 +292,7 @@ fn deblock_recon_inner(
     height_mbs: u32,
     chroma_array_type: u32,
     field_pic: bool,
+    mbaff_field_flags: Option<&[bool]>,
 ) {
     debug_assert_eq!(recon_y.len(), (width as usize) * (height as usize));
     debug_assert_eq!(
@@ -277,8 +322,11 @@ fn deblock_recon_inner(
 
     // ------- Build the MbGrid from per-MB facts. -------
     let mut grid = MbGrid::new(width_mbs, height_mbs);
+    grid.mbaff_frame_flag = mbaff_field_flags.is_some();
     for (i, info) in mb_infos.iter().enumerate() {
         let mb = &mut grid.info[i];
+        // Round-453 — §7.4.4 per-MB field flag (MBAFF frames only).
+        mb.mb_field_decoding_flag = mbaff_field_flags.is_some_and(|f| f[i]);
         // §6.4.4 — every MB the encoder produced is "available" for
         // neighbour lookups by the deblock walker.
         mb.available = true;
@@ -346,9 +394,9 @@ fn deblock_recon_inner(
         /* bit_depth_y */ 8,
         /* bit_depth_c */ 8,
         &pps,
-        /* mbaff_frame_flag */ false,
+        /* mbaff_frame_flag */ mbaff_field_flags.is_some(),
         field_pic,
-        &[], // mb_field_flags — empty in non-MBAFF
+        mbaff_field_flags.unwrap_or(&[]),
     );
 
     // ------- Copy filtered samples back to the encoder's u8 buffers. -------
