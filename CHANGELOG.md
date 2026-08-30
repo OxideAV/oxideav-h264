@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 453 — **`recovery_point` SEI emission** (§D.1.8 / §D.2.8,
+  `encoder::sei::build_recovery_point_payload`,
+  `SessionConfig::recovery_point_sei`): every IDR access unit of the
+  session leads with a payloadType-6 message (`recovery_frame_cnt =
+  0`, `exact_match_flag = 1`) next to the existing buffering_period /
+  pic_timing writers; `integration_sei_recovery_point` round-trips
+  the message through the decoder's SEI parsers and shows the stream
+  decodes identically with and without it in our decoder and the
+  black-box reference decoder.
+
 - Round 453 — **Multi-slice, FMO, ASO, redundant-slice and
   constrained-intra emission** (`encoder::slices`,
   `encode_slices_sequence`) **+ FMO decoding**. The PPS writer codes

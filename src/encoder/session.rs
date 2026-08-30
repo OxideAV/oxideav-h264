@@ -34,7 +34,8 @@ use crate::encoder::rate_control::{
     RateControlConfig, RateControlMode, RateController, RcFrameKind,
 };
 use crate::encoder::sei::{
-    build_buffering_period_payload, build_pic_timing_payload, build_sei_nal,
+    build_buffering_period_payload, build_pic_timing_payload, build_recovery_point_payload,
+    build_sei_nal,
 };
 use crate::encoder::{
     EncodedB, EncodedFrameRef, EncodedIdr, EncodedP, Encoder, EncoderConfig, YuvFrame,
@@ -74,6 +75,10 @@ pub struct SessionConfig {
     pub b_frames: u32,
     /// QP policy.
     pub rate_control: SessionRateControl,
+    /// Round-453 — attach a §D.1.8 `recovery_point` SEI
+    /// (`recovery_frame_cnt = 0`, `exact_match_flag = 1`) to every IDR
+    /// access unit, marking it as an exact random-access point.
+    pub recovery_point_sei: bool,
 }
 
 impl SessionConfig {
@@ -86,6 +91,7 @@ impl SessionConfig {
             cabac: false,
             b_frames: 0,
             rate_control: SessionRateControl::ConstantQp(qp),
+            recovery_point_sei: false,
         }
     }
 
@@ -98,6 +104,7 @@ impl SessionConfig {
             cabac: false,
             b_frames: 0,
             rate_control: SessionRateControl::Controlled(rc),
+            recovery_point_sei: false,
         }
     }
 }
@@ -612,9 +619,13 @@ impl EncoderSession {
         // == 0 sessions); IDR AUs additionally lead with a §D.1.2
         // buffering_period whose initial_cpb_removal_delay is the
         // controller's modelled CPB fill converted to 90 kHz units.
+        // Round-453 — §D.1.8 recovery_point on IDR access units.
+        let mut msgs: Vec<(u32, Vec<u8>)> = Vec::new();
+        if self.cfg.recovery_point_sei && is_idr {
+            msgs.push((6u32, build_recovery_point_payload(0, true, false, 0)));
+        }
         let sei_nal: Option<Vec<u8>> = match (&self.hrd, &self.rc) {
             (Some(hrd), Some(rc)) => {
-                let mut msgs = Vec::new();
                 if is_idr {
                     let rcfg = rc.config();
                     let arrival = match rcfg.mode {
@@ -647,6 +658,7 @@ impl EncoderSession {
                 ));
                 Some(build_sei_nal(&msgs))
             }
+            _ if !msgs.is_empty() => Some(build_sei_nal(&msgs)),
             _ => None,
         };
         let sei_bits = sei_nal.as_ref().map_or(0, |s| 8 * s.len() as u64);

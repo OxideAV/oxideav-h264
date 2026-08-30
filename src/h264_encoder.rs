@@ -278,6 +278,7 @@ impl H264CodecEncoder {
             cabac: opts.cabac,
             b_frames: opts.bframes,
             rate_control,
+            recovery_point_sei: false,
         });
 
         let mut output_params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));

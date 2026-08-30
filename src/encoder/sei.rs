@@ -73,6 +73,26 @@ pub fn build_pic_timing_payload(
     finish_sei_payload(w)
 }
 
+/// Round-453 — §D.1.8 — build a `recovery_point` payload (payloadType
+/// 6): `recovery_frame_cnt` ue(v), `exact_match_flag` u(1),
+/// `broken_link_flag` u(1), `changing_slice_group_idc` u(2). Attached
+/// to random-access pictures so a decoder starting there knows after
+/// how many frames (in output order) the output is correct.
+pub fn build_recovery_point_payload(
+    recovery_frame_cnt: u32,
+    exact_match_flag: bool,
+    broken_link_flag: bool,
+    changing_slice_group_idc: u8,
+) -> Vec<u8> {
+    debug_assert!(changing_slice_group_idc <= 2, "§D.2.8: idc in 0..=2");
+    let mut w = BitWriter::new();
+    w.ue(recovery_frame_cnt);
+    w.u(1, u32::from(exact_match_flag));
+    w.u(1, u32::from(broken_link_flag));
+    w.u(2, u32::from(changing_slice_group_idc));
+    finish_sei_payload(w)
+}
+
 /// §D.1 tail of every `sei_payload()` whose syntax is not guaranteed
 /// byte-aligned: when the writer sits mid-byte, emit the stop bit +
 /// zero padding (`bit_equal_to_one` / `bit_equal_to_zero`).
