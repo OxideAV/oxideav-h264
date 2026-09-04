@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/OxideAV/oxideav-h264/compare/v0.1.8...v0.1.9) - 2026-09-04
+
+### Other
+
+- 8x8 transform at 10/12/14-bit (§8.5.13 at QP′ past 51, §7.4.5.3.3 CAVLC split, cat-5 CABAC residual, transform_size_8x8_flag contexts, §8.5.13 bypass identity under lossless)
+- 8x8 transform in CABAC MBAFF (transform_size_8x8_flag under Table 6-4 A/B contexts, cat-5 residuals under Table 9-43 frame/field columns, §8.5.7 field 8x8 scan, §8.7 8x8-edge deblock skip)
+- CABAC at 10/12/14-bit (shared mbaff_cabac emission helpers, eq. 9-22 NumC8x8 4:2:2 DC contexts, cat 6..12 4:4:4 planes, eq. 9-5 init at negative QP); decoder: CABAC coeff_abs_level_minus1 UEG0 escape cap sized for 2^(7+BitDepth) levels; fuzz: mbaff_cabac_roundtrip + deep_roundtrip targets
+- 10/12/14-bit encoder (encoder::deep) — QP′ = QP + QpBdOffset scaling past 51, §8.5.8 chroma QP, depth-aware intra/MC/§8.7 deblock, 4:2:0/4:2:2/4:4:4, negative QP_Y; lossless qpprime_y_zero_transform_bypass (§8.5.10/8.5.11/8.5.12 identities + §8.5.15 DPCM, interop mode); fix 4:2:2 chroma DC quantiser qP,DC = qP + 3 (eq. 8-327)
+- CABAC MBAFF frame encoding (§9.3.3.1.1.2 mb_field_decoding_flag ctx, §9.3.3.1.1.1 skip ctx under §7.4.4 inference, eq. 9-12/9-15/9-16 field↔frame ref_idx/|mvd| scaling, Table 6-4 CBP/CBF probes, Table 9-34 field residual contexts + §8.5.6 field scan)
+
 ### Added
 
 - encoder: **CABAC MBAFF** frame encoding (`encoder::mbaff_cabac`, round 456) — every §9.3.3.1.1.x context increment resolved through the decoder's own §6.4.10 / §6.4.12.2 Table 6-4 neighbour machinery: `mb_field_decoding_flag` (ctxIdx 70..=72 from the neighbouring pairs), `mb_skip_flag` under the §7.4.4 pair-flag inference (a top MB's skip context is derived under the inferred flag; the pair flag rides the first coded MB and retro-patches a skipped top), eq. 9-12 `refIdxZeroFlagN` thresholds and eq. 9-15/9-16 vertical |mvd| scaling across frame/field boundaries, per-bin Table 6-4 `coded_block_pattern` probes, §6.4.11.4/.5 `coded_block_flag` block neighbours across pair boundaries, the Table 9-34 FIELD `significant_coeff_flag` / `last_significant_coeff_flag` context families (277 / 338) with the §8.5.6 field scan on field MBs, and `end_of_slice_flag` after bottom MBs only. I pictures Intra_16x16, P pictures P_Skip / P_L0_16x16 (+ optional Intra_16x16 fallback). 10 gates bit-exact in our decoder and byte-exact in a black-box reference decoder.
