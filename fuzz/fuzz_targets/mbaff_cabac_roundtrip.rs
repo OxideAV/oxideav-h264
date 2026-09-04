@@ -92,6 +92,7 @@ fuzz_target!(|data: &[u8]| {
             pair_mode,
             p_frames,
             intra_in_p,
+            transform_8x8: data[2] & 4 == 4,
         },
         &refs,
     );

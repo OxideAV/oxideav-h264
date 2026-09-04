@@ -55,7 +55,7 @@ use crate::encoder::cabac_path::{
 use crate::encoder::cabac_syntax::{
     encode_coded_block_pattern, encode_end_of_slice_flag, encode_intra_chroma_pred_mode,
     encode_mb_qp_delta, encode_mb_skip_flag, encode_mb_type_i, encode_mb_type_p, encode_mvd_lx,
-    encode_ref_idx_lx, encode_residual_block_cabac_field,
+    encode_ref_idx_lx, encode_residual_block_cabac_field, encode_transform_size_8x8_flag,
 };
 use crate::encoder::cavlc::ZZ_TO_FIELD_16;
 use crate::encoder::deblock::{
@@ -73,7 +73,10 @@ use crate::encoder::slice::{
     IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
 use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
-use crate::encoder::transform::{forward_core_4x4, quantize_4x4_w, zigzag_scan_4x4};
+use crate::encoder::transform::{
+    field_scan_8x8, forward_core_4x4, forward_core_8x8, quantize_4x4_w, quantize_8x8_w,
+    zigzag_scan_4x4, zigzag_scan_8x8,
+};
 use crate::encoder::{
     min_level_idc_for_picture_size, mvp_for_16x16, p_skip_mv, BitWriter, CavlcNcGrid,
     EncoderConfig, IntraGrid, MvGrid, MvGridSlot, ScalingMatrixMode, YuvFrame,
@@ -86,7 +89,9 @@ use crate::mb_address::{mbaff_mb_to_sample_xy, mbaff_pair_neighbour_addrs};
 use crate::mv_deriv::Mv;
 use crate::nal::NalUnitType;
 use crate::slice_data::infer_pair_field_flag;
-use crate::transform::{inverse_transform_4x4, qp_bd_offset, qp_y_to_qp_c_with_bd_offset};
+use crate::transform::{
+    inverse_transform_4x4, inverse_transform_8x8, qp_bd_offset, qp_y_to_qp_c_with_bd_offset,
+};
 
 /// Configuration for [`encode_mbaff_cabac_sequence`].
 #[derive(Debug, Clone)]
@@ -107,6 +112,14 @@ pub struct MbaffCabacConfig {
     /// intra `mb_type` prefix, `intra_chroma_pred_mode` and the
     /// Intra_16x16 residual contexts against inter MBAFF neighbours.
     pub intra_in_p: bool,
+    /// High-profile 8x8 transform (`transform_8x8_mode_flag = 1`): coded
+    /// P_L0_16x16 macroblocks of every other pair column use the §8.6.4
+    /// 8x8 transform — `transform_size_8x8_flag` under the
+    /// §9.3.3.1.1.10 Table 6-4 A/B contexts, ctxBlockCat-5 residuals
+    /// under the Table 9-43 FRAME / FIELD `significant_coeff_flag`
+    /// ctxIdxInc columns, the §8.5.7 Table 8-14 field 8x8 scan on field
+    /// MBs, and the §8.7 8x8-internal-edge deblock skip.
+    pub transform_8x8: bool,
 }
 
 /// Output of [`encode_mbaff_cabac_sequence`].
@@ -127,6 +140,8 @@ pub struct MbaffCabacEncoded {
     pub intra_mbs_in_p: usize,
     /// Fully-skipped pairs re-encoded under the §7.4.4 inferred flag.
     pub inference_reencodes: usize,
+    /// Macroblocks coded with `transform_size_8x8_flag = 1`.
+    pub mbs_8x8: usize,
 }
 
 /// One §9.3.3.1.1.2 `mb_field_decoding_flag` bin (ctxIdxOffset 70).
@@ -535,12 +550,15 @@ struct MbCtx<'a> {
     sources_field: &'a [Planes; 2],
     src_frame: YuvFrame<'a>,
     w4: [i32; 16],
+    w8: [i32; 64],
     intra_in_p: bool,
+    transform_8x8: bool,
 }
 
 struct MbOut {
     skipped: bool,
     intra_in_p: bool,
+    t8x8: bool,
 }
 
 /// Intra_16x16 candidate (prediction + quantised residual + recon
@@ -858,6 +876,7 @@ fn code_mb(
     // ------------------------------------------------------------------
     let mut skipped = false;
     let mut intra_in_p = false;
+    let mut t8x8 = false;
     let mut inter_done = false;
     if is_p {
         let refs = ctx.refs.expect("P picture without references");
@@ -919,6 +938,54 @@ fn code_mb(
             if (0..4).any(|sub| blk_has_nz[blk8 * 4 + sub]) {
                 cbp_luma |= 1 << blk8;
             }
+        }
+        // §8.6.4 8x8 transform on every other pair column (coverage
+        // policy: both `transform_size_8x8_flag` values and every
+        // frame/field neighbour combination of the §9.3.3.1.1.10
+        // context appear in one picture).
+        let use_8x8 = ctx.transform_8x8 && ((addr / 2) % w_mbs) % 2 == 0;
+        let mut luma_scan8 = [[0i32; 64]; 4];
+        let mut transform_size_8x8 = false;
+        if use_8x8 {
+            let mut cbp8: u8 = 0;
+            let mut recon8 = [0i32; 256];
+            for (blk8, scan8) in luma_scan8.iter_mut().enumerate() {
+                let (ox, oy) = ((blk8 % 2) * 8, (blk8 / 2) * 8);
+                let mut block = [0i32; 64];
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let s = src.y[(vy * 16 + oy + j) * width + vx * 16 + ox + i] as i32;
+                        block[j * 8 + i] = s - pred_y[(oy + j) * 16 + ox + i];
+                    }
+                }
+                let q = quantize_8x8_w(&forward_core_8x8(&block), qp_y, false, &ctx.w8);
+                // §8.5.7 Table 8-14 — frame zig-zag or field scan.
+                let scan = if field {
+                    field_scan_8x8(&q)
+                } else {
+                    zigzag_scan_8x8(&q)
+                };
+                if scan.iter().any(|&v| v != 0) {
+                    cbp8 |= 1 << blk8;
+                }
+                *scan8 = scan;
+                let r = inverse_transform_8x8(&q, qp_y, &ctx.w8, 8).expect("inverse 8x8");
+                for j in 0..8 {
+                    for i in 0..8 {
+                        recon8[(oy + j) * 16 + ox + i] = r[j * 8 + i];
+                    }
+                }
+            }
+            cbp_luma = cbp8;
+            recon_res_y = recon8;
+            for blk8 in 0..4usize {
+                for sub in 0..4usize {
+                    blk_has_nz[blk8 * 4 + sub] = (cbp8 >> blk8) & 1 == 1;
+                }
+            }
+            // §7.3.5 — the flag is coded (and the 8x8 residual used)
+            // only with cbp_luma > 0; otherwise the decoder infers 0.
+            transform_size_8x8 = cbp_luma > 0;
         }
         let (cb_dc, cb_ac_scan, _cbq, cb_dc_nz, cb_ac_nz, cb_res) =
             encode_chroma_inter_420(src.u, &pred_u, chroma_w, vx, vy, qp_c, w4);
@@ -1041,22 +1108,61 @@ fn code_mb(
                     cbp_luma,
                     cbp_chroma,
                 );
+                // §7.3.5 — transform_size_8x8_flag (second gate) when
+                // the PPS carries the tool and cbp_luma > 0.
+                if ctx.transform_8x8 && cbp_luma > 0 {
+                    encode_transform_size_8x8_flag(
+                        &mut cs.enc,
+                        &mut cs.ctxs,
+                        &nctx,
+                        transform_size_8x8,
+                    );
+                }
                 if cbp_luma > 0 || cbp_chroma > 0 {
                     encode_mb_qp_delta(&mut cs.enc, &mut cs.ctxs, cs.prev_qp_delta_nonzero, 0);
                 }
                 cs.prev_qp_delta_nonzero = false;
                 cur.coded_block_pattern_luma = cbp_luma;
                 cur.coded_block_pattern_chroma = cbp_chroma;
-                emit_inter_plane_cabac(
-                    cs,
-                    cab,
-                    &mut cur,
-                    addr,
-                    field,
-                    Plane::Y,
-                    &luma_scan,
-                    cbp_luma,
-                );
+                cur.transform_size_8x8_flag = transform_size_8x8;
+                t8x8 = transform_size_8x8;
+                if transform_size_8x8 {
+                    // §7.3.5.3.3 — one ctxBlockCat-5 residual per coded
+                    // quadrant; coded_block_flag is not coded at
+                    // ChromaArrayType 1 (inferred 1) and folds into the
+                    // four 4x4 slots for the neighbours' cond terms.
+                    for (blk8, scan8) in luma_scan8.iter().enumerate() {
+                        if (cbp_luma >> blk8) & 1 == 0 {
+                            continue;
+                        }
+                        let coded = encode_residual_block_cabac_field(
+                            &mut cs.enc,
+                            &mut cs.ctxs,
+                            BlockType::Luma8x8,
+                            scan8,
+                            64,
+                            None,
+                            None,
+                            true,
+                            1,
+                            field,
+                        );
+                        for sub in 0..4usize {
+                            cur.cbf_luma_4x4[blk8 * 4 + sub] = coded;
+                        }
+                    }
+                } else {
+                    emit_inter_plane_cabac(
+                        cs,
+                        cab,
+                        &mut cur,
+                        addr,
+                        field,
+                        Plane::Y,
+                        &luma_scan,
+                        cbp_luma,
+                    );
+                }
                 emit_chroma_cabac(
                     cs,
                     cab,
@@ -1091,6 +1197,7 @@ fn code_mb(
                 dbl.mv_l0 = [mv_t; 16];
                 dbl.ref_idx_l0 = [0; 4];
                 dbl.luma_nonzero_4x4 = luma_nz_mask_from_blocks(&blk_has_nz);
+                dbl.transform_size_8x8_flag = transform_size_8x8;
                 let cb_nz: [bool; 4] = std::array::from_fn(|i| {
                     cbp_chroma == 2 && cb_ac_scan[i].iter().any(|&v| v != 0)
                 });
@@ -1179,6 +1286,7 @@ fn code_mb(
     MbOut {
         skipped,
         intra_in_p,
+        t8x8,
     }
 }
 
@@ -1208,7 +1316,8 @@ pub fn encode_mbaff_cabac_sequence(
     let w4 = ScalingMatrixMode::Flat.intra_weights().w4;
 
     // Main (77): interlace + CABAC.
-    let profile_idc: u8 = 77;
+    // Main (77) — or High (100) when the 8x8 transform is in play.
+    let profile_idc: u8 = if cfg.transform_8x8 { 100 } else { 77 };
     let mk_cfg = |h: u32| {
         let mut c = EncoderConfig::new(cfg.width, h);
         c.qp = cfg.qp;
@@ -1245,7 +1354,7 @@ pub fn encode_mbaff_cabac_sequence(
         weighted_pred_flag: false,
         weighted_bipred_idc: 0,
         entropy_coding_mode_flag: true,
-        transform_8x8_mode_flag: false,
+        transform_8x8_mode_flag: cfg.transform_8x8,
         redundant_pic_cnt_present_flag: false,
         slice_groups: None,
         constrained_intra_pred_flag: false,
@@ -1265,6 +1374,7 @@ pub fn encode_mbaff_cabac_sequence(
     let mut skipped_mbs = 0usize;
     let mut intra_mbs_in_p = 0usize;
     let mut inference_reencodes = 0usize;
+    let mut mbs_8x8 = 0usize;
 
     for (k, &(fy, fu, fv)) in frames.iter().enumerate() {
         assert_eq!(fy.len(), w * frame_h);
@@ -1353,7 +1463,9 @@ pub fn encode_mbaff_cabac_sequence(
                 v: fv,
             },
             w4,
+            w8: ScalingMatrixMode::Flat.inter_weights().w8,
             intra_in_p: cfg.intra_in_p,
+            transform_8x8: cfg.transform_8x8,
         };
 
         let kind = if is_p { SliceKind::P } else { SliceKind::I };
@@ -1402,6 +1514,7 @@ pub fn encode_mbaff_cabac_sequence(
                 }
                 skipped_mbs += usize::from(t.skipped) + usize::from(b.skipped);
                 intra_mbs_in_p += usize::from(t.intra_in_p) + usize::from(b.intra_in_p);
+                mbs_8x8 += usize::from(t.t8x8) + usize::from(b.t8x8);
                 break;
             }
             // §7.3.4 — end_of_slice_flag only after the bottom MB.
@@ -1457,5 +1570,6 @@ pub fn encode_mbaff_cabac_sequence(
         skipped_mbs,
         intra_mbs_in_p,
         inference_reencodes,
+        mbs_8x8,
     }
 }

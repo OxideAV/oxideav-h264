@@ -82,6 +82,7 @@ fn encode_with(
             pair_mode,
             p_frames,
             intra_in_p,
+            transform_8x8: false,
         },
         &refs,
     )
@@ -326,6 +327,7 @@ fn mbaff_cabac_p_high_qp_skip_pairs_bit_exact() {
             pair_mode: PairMode::Checker,
             p_frames: true,
             intra_in_p: false,
+            transform_8x8: false,
         },
         &refs,
     );
@@ -333,4 +335,57 @@ fn mbaff_cabac_p_high_qp_skip_pairs_bit_exact() {
     let decoded = decode_ours(&enc.annex_b);
     assert_frames_match_recon(&enc, &decoded, "mbaff-cabac-p-skip");
     ffmpeg_check(&enc, "mbaff-cabac-p-skip");
+}
+
+fn encode_8x8(pair_mode: PairMode, qp: i32) -> MbaffCabacEncoded {
+    let frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..4).map(make_interlaced_frame).collect();
+    let refs: Vec<(&[u8], &[u8], &[u8])> = frames
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    encode_mbaff_cabac_sequence(
+        &MbaffCabacConfig {
+            width: W as u32,
+            frame_height: H as u32,
+            qp,
+            pair_mode,
+            p_frames: true,
+            intra_in_p: true,
+            transform_8x8: true,
+        },
+        &refs,
+    )
+}
+
+/// High-profile 8x8 transform inside CABAC MBAFF P pictures (checker
+/// pairs): `transform_size_8x8_flag` under the §9.3.3.1.1.10 Table 6-4
+/// A/B contexts with mixed frame/field neighbours, ctxBlockCat-5
+/// residuals under the Table 9-43 FRAME and FIELD `significant_coeff_flag`
+/// ctxIdxInc columns, the §8.5.7 field 8x8 scan on field MBs, and the
+/// §8.7 8x8-internal-edge deblock skip — all bit-exact in our decoder
+/// and byte-exact in the black-box reference decoder.
+#[test]
+fn mbaff_cabac_p_transform_8x8_checker_bit_exact() {
+    let enc = encode_8x8(PairMode::Checker, 24);
+    assert!(
+        enc.mbs_8x8 > 0,
+        "expected transform_size_8x8_flag = 1 macroblocks"
+    );
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "mbaff-cabac-p-8x8-checker");
+    ffmpeg_check(&enc, "mbaff-cabac-p-8x8-checker");
+}
+
+/// Every MB a field MB with the 8x8 transform: the Table 9-43 field
+/// column and ctxIdxOffset 436 / 451 families carry every cat-5 block.
+#[test]
+fn mbaff_cabac_p_transform_8x8_all_field_bit_exact() {
+    let enc = encode_8x8(PairMode::AllField, 24);
+    assert!(
+        enc.mbs_8x8 > 0,
+        "expected transform_size_8x8_flag = 1 macroblocks"
+    );
+    let decoded = decode_ours(&enc.annex_b);
+    assert_frames_match_recon(&enc, &decoded, "mbaff-cabac-p-8x8-allfield");
+    ffmpeg_check(&enc, "mbaff-cabac-p-8x8-allfield");
 }
