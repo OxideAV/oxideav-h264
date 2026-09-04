@@ -51,6 +51,7 @@ fn bin_trace_enabled() -> bool {
 /// The `outstanding_bits` counter implements the carry-propagation /
 /// "put_bit" mechanism described in §9.3.4.4: any bit emitted is
 /// preceded by `outstanding_bits` copies of its complement.
+#[derive(Debug, Clone)]
 pub struct CabacEncoder {
     /// §9.3.4.1 — `codIRange`, initialised to 510.
     cod_i_range: u32,

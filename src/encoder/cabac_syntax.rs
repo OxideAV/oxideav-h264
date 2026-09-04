@@ -41,7 +41,9 @@
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
-use crate::cabac_ctx::{BlockType, CabacContexts, MvdComponent, NeighbourCtx, SliceKind};
+use crate::cabac_ctx::{
+    BlockType, CabacContexts, CbpMbaffProbe, MvdComponent, NeighbourCtx, SliceKind,
+};
 use crate::encoder::cabac_engine::CabacEncoder;
 
 // ---------------------------------------------------------------------------
@@ -817,29 +819,59 @@ fn lvl_block_cat_offset(bt: BlockType) -> u32 {
     }
 }
 
-fn sig_coef_ctx_offset(bt: BlockType) -> u32 {
+/// Table 9-34 — `significant_coeff_flag` ctxIdxOffset per ctxBlockCat
+/// family, frame-coded (`field == false`) or field-coded (`field ==
+/// true`: field pictures and the field macroblocks of MBAFF frames —
+/// round-456). Mirror of the decoder's `BlockType::sig_coef_ctx_offset`.
+fn sig_coef_ctx_offset(bt: BlockType, field: bool) -> u32 {
     let cat = bt as u32;
-    match cat {
-        0..=4 => 105,
-        5 => 402,
-        6..=8 => 484,
-        9 => 660,
-        10..=12 => 528,
-        13 => 718,
-        _ => 105,
+    if field {
+        match cat {
+            0..=4 => 277,
+            5 => 436,
+            6..=8 => 776,
+            9 => 675,
+            10..=12 => 820,
+            13 => 733,
+            _ => 277,
+        }
+    } else {
+        match cat {
+            0..=4 => 105,
+            5 => 402,
+            6..=8 => 484,
+            9 => 660,
+            10..=12 => 528,
+            13 => 718,
+            _ => 105,
+        }
     }
 }
 
-fn last_coef_ctx_offset(bt: BlockType) -> u32 {
+/// Table 9-34 — `last_significant_coeff_flag` ctxIdxOffset, frame /
+/// field (see [`sig_coef_ctx_offset`]).
+fn last_coef_ctx_offset(bt: BlockType, field: bool) -> u32 {
     let cat = bt as u32;
-    match cat {
-        0..=4 => 166,
-        5 => 417,
-        6..=8 => 572,
-        9 => 690,
-        10..=12 => 616,
-        13 => 748,
-        _ => 166,
+    if field {
+        match cat {
+            0..=4 => 338,
+            5 => 451,
+            6..=8 => 864,
+            9 => 699,
+            10..=12 => 908,
+            13 => 757,
+            _ => 338,
+        }
+    } else {
+        match cat {
+            0..=4 => 166,
+            5 => 417,
+            6..=8 => 572,
+            9 => 690,
+            10..=12 => 616,
+            13 => 748,
+            _ => 166,
+        }
     }
 }
 
@@ -913,17 +945,37 @@ pub fn encode_coded_block_pattern(
             }
         };
 
+    // §9.3.3.1.1.4 under MBAFF (round-456) — the caller supplies the
+    // per-bin EXTERNAL luma probes resolved through the §6.4.12.2
+    // Table 6-4 process; the same condTermFlagN rules apply to a
+    // resolved probe (decoder mirror).
+    let cond_probe = |p: &CbpMbaffProbe| -> u32 {
+        if !p.available || p.is_i_pcm {
+            return 0;
+        }
+        if p.is_skip {
+            return 1;
+        }
+        u32::from(!p.cbp_bit_set)
+    };
+
     let mut prev_bins = [0u32; 4];
     for bin_idx in 0..4u32 {
         let bin = (cbp_luma >> bin_idx) & 1;
         let cond_a = match bin_idx {
-            0 => cond_ext(
-                neighbours.available_left,
-                neighbours.left_is_i_pcm,
-                neighbours.left_is_p_or_b_skip,
-                neighbours.left_cbp_luma,
-                1,
-            ),
+            0 | 2 => {
+                if let Some(probes) = &neighbours.cbp_luma_mbaff {
+                    cond_probe(&probes[0][bin_idx as usize])
+                } else {
+                    cond_ext(
+                        neighbours.available_left,
+                        neighbours.left_is_i_pcm,
+                        neighbours.left_is_p_or_b_skip,
+                        neighbours.left_cbp_luma,
+                        if bin_idx == 0 { 1 } else { 3 },
+                    )
+                }
+            }
             1 => {
                 let b_k = prev_bins[0];
                 if b_k != 0 {
@@ -932,13 +984,6 @@ pub fn encode_coded_block_pattern(
                     1
                 }
             }
-            2 => cond_ext(
-                neighbours.available_left,
-                neighbours.left_is_i_pcm,
-                neighbours.left_is_p_or_b_skip,
-                neighbours.left_cbp_luma,
-                3,
-            ),
             3 => {
                 let b_k = prev_bins[2];
                 if b_k != 0 {
@@ -950,20 +995,19 @@ pub fn encode_coded_block_pattern(
             _ => 0,
         };
         let cond_b = match bin_idx {
-            0 => cond_ext(
-                neighbours.available_above,
-                neighbours.above_is_i_pcm,
-                neighbours.above_is_p_or_b_skip,
-                neighbours.above_cbp_luma,
-                2,
-            ),
-            1 => cond_ext(
-                neighbours.available_above,
-                neighbours.above_is_i_pcm,
-                neighbours.above_is_p_or_b_skip,
-                neighbours.above_cbp_luma,
-                3,
-            ),
+            0 | 1 => {
+                if let Some(probes) = &neighbours.cbp_luma_mbaff {
+                    cond_probe(&probes[1][bin_idx as usize])
+                } else {
+                    cond_ext(
+                        neighbours.available_above,
+                        neighbours.above_is_i_pcm,
+                        neighbours.above_is_p_or_b_skip,
+                        neighbours.above_cbp_luma,
+                        if bin_idx == 0 { 2 } else { 3 },
+                    )
+                }
+            }
             2 => {
                 let b_k = prev_bins[0];
                 if b_k != 0 {
@@ -1169,14 +1213,10 @@ pub fn encode_significant_coeff_flag(
     num_c8x8: u32,
     flag: bool,
 ) {
-    // Ignore field-specific offsets (round-30 is frame-only).
-    let base = if field {
-        // Mirror decoder's `sig_coef_ctx_offset(true)` if needed; keep
-        // round-30 to frame.
-        unimplemented!("CABAC encode does not yet support field-coded slices");
-    } else {
-        sig_coef_ctx_offset(block_type)
-    };
+    // Table 9-34 — frame or field ctxIdxOffset family (round-456:
+    // field MBs of MBAFF frames code their residuals under the field
+    // contexts, exactly as the decoder selects them).
+    let base = sig_coef_ctx_offset(block_type, field);
     let cat_offset = sig_block_cat_offset(block_type);
     let inc = sig_coeff_inc_enc(block_type, coeff_idx, field, num_c8x8);
     let ctx_idx = (base + cat_offset + inc) as usize;
@@ -1195,10 +1235,7 @@ pub fn encode_last_significant_coeff_flag(
     num_c8x8: u32,
     flag: bool,
 ) {
-    if field {
-        unimplemented!("CABAC encode does not yet support field-coded slices");
-    }
-    let base = last_coef_ctx_offset(block_type);
+    let base = last_coef_ctx_offset(block_type, field);
     let cat_offset = sig_block_cat_offset(block_type);
     let inc = last_coeff_inc_enc(block_type, coeff_idx, num_c8x8);
     let ctx_idx = (base + cat_offset + inc) as usize;
@@ -1329,6 +1366,40 @@ pub fn encode_residual_block_cabac(
     skip_cbf: bool,
     num_c8x8: u32,
 ) -> bool {
+    encode_residual_block_cabac_field(
+        enc,
+        ctxs,
+        block_type,
+        coeffs,
+        max_num_coeff,
+        cbf_neighbour_left,
+        cbf_neighbour_above,
+        skip_cbf,
+        num_c8x8,
+        false,
+    )
+}
+
+/// [`encode_residual_block_cabac`] with an explicit frame/field
+/// selector (round-456 MBAFF): `field == true` codes the
+/// `significant_coeff_flag` / `last_significant_coeff_flag` bins under
+/// the Table 9-34 FIELD ctxIdxOffset families (and, for the 8x8
+/// ctxBlockCats, the Table 9-43 field ctxIdxInc column). `coeffs` must
+/// already be in the scan order the decoder inverse-applies for the
+/// macroblock's frame/field mode (§8.5.6 zig-zag vs field scan).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_residual_block_cabac_field(
+    enc: &mut CabacEncoder,
+    ctxs: &mut CabacContexts,
+    block_type: BlockType,
+    coeffs: &[i32],
+    max_num_coeff: u32,
+    cbf_neighbour_left: Option<bool>,
+    cbf_neighbour_above: Option<bool>,
+    skip_cbf: bool,
+    num_c8x8: u32,
+    field: bool,
+) -> bool {
     debug_assert_eq!(coeffs.len(), max_num_coeff as usize);
     let bin_before = enc.bin_count();
     let any_nz = coeffs.iter().any(|&c| c != 0);
@@ -1370,17 +1441,17 @@ pub fn encode_residual_block_cabac(
     let last_position_exclusive = max_num_coeff - 1;
     for i in 0..last_idx {
         let sig = coeffs[i as usize] != 0;
-        encode_significant_coeff_flag(enc, ctxs, block_type, i, false, num_c8x8, sig);
+        encode_significant_coeff_flag(enc, ctxs, block_type, i, field, num_c8x8, sig);
         if sig {
-            encode_last_significant_coeff_flag(enc, ctxs, block_type, i, false, num_c8x8, false);
+            encode_last_significant_coeff_flag(enc, ctxs, block_type, i, field, num_c8x8, false);
         }
     }
     // Position `last_idx` always has significant=1, last=1 (unless
     // last_idx == max_num_coeff - 1, in which case significance map
     // for the final position is implied — the spec stops the loop).
     if last_idx < last_position_exclusive {
-        encode_significant_coeff_flag(enc, ctxs, block_type, last_idx, false, num_c8x8, true);
-        encode_last_significant_coeff_flag(enc, ctxs, block_type, last_idx, false, num_c8x8, true);
+        encode_significant_coeff_flag(enc, ctxs, block_type, last_idx, field, num_c8x8, true);
+        encode_last_significant_coeff_flag(enc, ctxs, block_type, last_idx, field, num_c8x8, true);
     } else {
         // last_idx == max_num_coeff - 1. The decoder doesn't read sig/last
         // for the final position — it's implied. Nothing to emit here.

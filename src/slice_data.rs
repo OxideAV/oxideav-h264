@@ -1061,7 +1061,7 @@ fn parse_slice_data_impl(
 /// the same slice; otherwise the pair immediately ABOVE in the same
 /// slice; otherwise 0. The neighbour grid is allocated per slice, so
 /// slot `available` == "decoded earlier in this same slice".
-fn infer_pair_field_flag(
+pub(crate) fn infer_pair_field_flag(
     grid: &CabacNeighbourGrid,
     curr_mb_addr: u32,
     pic_width_in_mbs: u32,

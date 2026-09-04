@@ -1760,7 +1760,7 @@ impl CabacNeighbourGrid {
 ///   part 1: A = current MB partition 0, B = above-MB partition 3.
 ///   part 2: A = left-MB partition 3, B = current MB partition 0.
 ///   part 3: A = current MB partition 2, B = current MB partition 1.
-fn cabac_ref_idx_cond_terms(
+pub(crate) fn cabac_ref_idx_cond_terms(
     grid: &CabacNeighbourGrid,
     current_mb_addr: u32,
     current_mb: &CabacMbNeighbourInfo,
@@ -1858,7 +1858,7 @@ fn blk4x4_xy(idx: u8) -> (i32, i32) {
 /// and the vertical component applies the eq. 9-15 / 9-16 field/frame
 /// scaling (×2 when a frame MB reads a field neighbour, ÷2 when a
 /// field MB reads a frame neighbour).
-fn cabac_mvd_abs_sum(
+pub(crate) fn cabac_mvd_abs_sum(
     grid: &CabacNeighbourGrid,
     current_mb_addr: u32,
     current_mb: &CabacMbNeighbourInfo,
@@ -1952,7 +1952,7 @@ fn cabac_mvd_abs_sum(
 ///
 /// Returns `(cond_a, cond_b)` such that `ctxIdxInc = cond_a + 2 * cond_b`.
 #[allow(clippy::too_many_arguments)]
-fn cabac_cbf_cond_terms(
+pub(crate) fn cabac_cbf_cond_terms(
     grid: &CabacNeighbourGrid,
     current_mb_addr: u32,
     current_mb: &CabacMbNeighbourInfo,

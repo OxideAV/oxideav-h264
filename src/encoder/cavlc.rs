@@ -265,7 +265,8 @@ pub fn encode_run_before(
 /// `field_list[k] = zigzag_list[ZZ_TO_FIELD_16[k]]`. Derived by
 /// composing Table 8-13's two rows (verified against the decoder's
 /// `inverse_scan_4x4_field` in the tests below).
-const ZZ_TO_FIELD_16: [usize; 16] = [0, 2, 1, 3, 9, 4, 8, 10, 5, 7, 11, 14, 6, 12, 13, 15];
+pub(crate) const ZZ_TO_FIELD_16: [usize; 16] =
+    [0, 2, 1, 3, 9, 4, 8, 10, 5, 7, 11, 14, 6, 12, 13, 15];
 
 /// §7.3.5.3.1 + §9.2 — encode one `residual_block_cavlc(coeffLevel,
 /// startIdx, endIdx, maxNumCoeff)` block.

@@ -51,6 +51,7 @@ pub mod intra_pred;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod macroblock;
 pub mod mbaff;
+pub mod mbaff_cabac;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod me;
 pub mod multiref;
@@ -780,7 +781,7 @@ pub(crate) fn min_level_idc_for_picture_size(width_in_mbs: u32, height_in_mbs: u
 /// otherwise `prev_intra4x4_pred_mode_flag = 1` would mean a different
 /// mode on each side.
 #[derive(Debug, Clone, Default)]
-struct IntraGridSlot {
+pub(crate) struct IntraGridSlot {
     available: bool,
     is_i_nxn: bool,
     /// `intra_4x4_pred_modes[i]` per §6.4.3 raster-Z order. Only
@@ -797,7 +798,7 @@ struct IntraGridSlot {
 }
 
 #[derive(Debug, Clone)]
-struct IntraGrid {
+pub(crate) struct IntraGrid {
     width_mbs: usize,
     slots: Vec<IntraGridSlot>,
 }
@@ -4591,7 +4592,7 @@ pub struct EncodedP {
 /// downstream MBs reading any 8x8 see the single 16x16 MV, preserving
 /// round-16 / round-17 / round-18 behaviour exactly.
 #[derive(Debug, Clone, Copy)]
-struct MvGridSlot {
+pub(crate) struct MvGridSlot {
     /// True once this MB has been encoded (so subsequent MBs can read it).
     available: bool,
     /// True for intra-coded MBs (their mvp contribution is mv=0, ref=-1).
@@ -4627,7 +4628,7 @@ impl Default for MvGridSlot {
 }
 
 #[derive(Debug, Clone)]
-struct MvGrid {
+pub(crate) struct MvGrid {
     width_mbs: usize,
     slots: Vec<MvGridSlot>,
 }
@@ -4723,7 +4724,7 @@ fn neighbour_mvs_16x16(
 
 /// Per §8.4.1.3 + the §8.4.1.3.2 C→D substitution — derive the MVpred
 /// for a single 16x16 P_L0 partition at (mb_x, mb_y).
-fn mvp_for_16x16(grid: &MvGrid, mb_x: usize, mb_y: usize, ref_idx: i32) -> Mv {
+pub(crate) fn mvp_for_16x16(grid: &MvGrid, mb_x: usize, mb_y: usize, ref_idx: i32) -> Mv {
     let (a, b, c, d) = neighbour_mvs_16x16(grid, mb_x, mb_y);
     let inputs = MvpredInputs::from_abc(a, b, c, ref_idx, Default::default());
     crate::mv_deriv::derive_mvpred_with_d(&inputs, d)
@@ -4731,7 +4732,7 @@ fn mvp_for_16x16(grid: &MvGrid, mb_x: usize, mb_y: usize, ref_idx: i32) -> Mv {
 
 /// Per §8.4.1.2 — derive the (refIdxL0, mvL0) for a P_Skip MB at
 /// (mb_x, mb_y). With the C→D substitution.
-fn p_skip_mv(grid: &MvGrid, mb_x: usize, mb_y: usize) -> (i32, Mv) {
+pub(crate) fn p_skip_mv(grid: &MvGrid, mb_x: usize, mb_y: usize) -> (i32, Mv) {
     let (a, b, c, d) = neighbour_mvs_16x16(grid, mb_x, mb_y);
     crate::mv_deriv::derive_p_skip_mv_with_d(a, b, c, d)
 }
@@ -5188,7 +5189,7 @@ fn mb_ssd_3planes_444(
 /// Returns `(nc_cb, nc_cr)` sized for 4:2:2 (first 4 entries used at
 /// 4:2:0). The caller must have marked the current MB slot
 /// `is_available = true` beforehand (the luma-nC bookkeeping does).
-fn derive_chroma_ac_nc_and_commit_totals(
+pub(crate) fn derive_chroma_ac_nc_and_commit_totals(
     nc_grid: &mut CavlcNcGrid,
     mb_addr: u32,
     is_intra: bool,
@@ -5249,7 +5250,7 @@ fn derive_chroma_ac_nc_and_commit_totals(
 /// `cb_luma_total_coeff` / `cr_luma_total_coeff` (which stay committed
 /// for subsequent MBs — I_8x8 4:4:4 neighbours read the same arrays).
 /// AC totals are zeroed when `cbp_luma != 15` (no plane AC coded).
-fn derive_plane_nc_444_i16x16(
+pub(crate) fn derive_plane_nc_444_i16x16(
     nc_grid: &mut CavlcNcGrid,
     mb_addr: u32,
     is_cr: bool,
@@ -5293,7 +5294,7 @@ fn derive_plane_nc_444_i16x16(
 /// progressively into the grid's `cb_luma_total_coeff` /
 /// `cr_luma_total_coeff` so in-MB neighbour reads mirror the decoder's
 /// parse order. Blocks in un-coded 8x8 quadrants contribute 0.
-fn derive_plane_nc_444_inter(
+pub(crate) fn derive_plane_nc_444_inter(
     nc_grid: &mut CavlcNcGrid,
     mb_addr: u32,
     is_cr: bool,

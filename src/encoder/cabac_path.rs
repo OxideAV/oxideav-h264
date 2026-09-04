@@ -1200,7 +1200,7 @@ fn build_neighbour_ctx(grid: &CabacEncGrid, mb_x: usize, mb_y: usize) -> Neighbo
 // Per-MB encode helpers.
 // ---------------------------------------------------------------------------
 
-fn pick_intra16x16_mode(
+pub(super) fn pick_intra16x16_mode(
     frame: &YuvFrame<'_>,
     recon_y: &[u8],
     width: usize,
@@ -1237,7 +1237,7 @@ fn pick_intra16x16_mode(
     (best_mode, best_pred)
 }
 
-fn pick_chroma_mode(
+pub(super) fn pick_chroma_mode(
     frame_u: &[u8],
     frame_v: &[u8],
     recon_u: &[u8],
@@ -1284,7 +1284,7 @@ fn pick_chroma_mode(
 /// not disturbed. The refinement is bitstream-compatible — it only
 /// changes which non-zero AC levels are emitted; the decoder is
 /// unchanged.
-fn quantize_intra16x16_luma(
+pub(super) fn quantize_intra16x16_luma(
     residual: &[i32; 256],
     qp_y: i32,
     trellis: bool,
@@ -1358,7 +1358,7 @@ fn quantize_intra16x16_luma(
 
 /// Reconstruct an Intra_16x16 luma MB into `recon_y`.
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_intra16x16_luma(
+pub(super) fn reconstruct_intra16x16_luma(
     mb_x: usize,
     mb_y: usize,
     width: usize,
@@ -1757,7 +1757,7 @@ fn cbf_neighbour_8x8(
 /// bitstream-compatible — it only changes which non-zero AC levels
 /// are emitted; the decoder is unchanged.
 #[allow(clippy::type_complexity)]
-fn encode_chroma_intra16x16_420(
+pub(super) fn encode_chroma_intra16x16_420(
     frame_c: &[u8],
     recon_c: &[u8],
     chroma_w: usize,
@@ -8673,7 +8673,7 @@ fn emit_inter_chroma_residual_cabac(
     }
 }
 
-fn build_inter_pred_luma_local(
+pub(super) fn build_inter_pred_luma_local(
     ref_y: &[u8],
     ref_w: u32,
     ref_h: u32,
@@ -8726,7 +8726,7 @@ pub(super) fn build_inter_pred_chroma_local_422(
     dst
 }
 
-fn build_inter_pred_chroma_local(
+pub(super) fn build_inter_pred_chroma_local(
     ref_c: &[u8],
     ref_cw: u32,
     ref_ch: u32,
@@ -8750,7 +8750,7 @@ fn build_inter_pred_chroma_local(
 }
 
 #[allow(clippy::type_complexity)]
-fn encode_chroma_inter_420(
+pub(super) fn encode_chroma_inter_420(
     frame_c: &[u8],
     pred: &[i32; 64],
     chroma_w: usize,
@@ -8820,7 +8820,7 @@ fn encode_chroma_inter_420(
     )
 }
 
-fn chroma_residual_dc_only(dc: &[i32; 4], qp_c: i32, w4: &[i32; 16]) -> [i32; 64] {
+pub(super) fn chroma_residual_dc_only(dc: &[i32; 4], qp_c: i32, w4: &[i32; 16]) -> [i32; 64] {
     let inv_dc = inverse_hadamard_chroma_dc_420(dc, qp_c, w4, 8).unwrap();
     let mut out = [0i32; 64];
     for blk in 0..4usize {

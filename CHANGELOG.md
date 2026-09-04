@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- encoder: **CABAC MBAFF** frame encoding (`encoder::mbaff_cabac`, round 456) — every §9.3.3.1.1.x context increment resolved through the decoder's own §6.4.10 / §6.4.12.2 Table 6-4 neighbour machinery: `mb_field_decoding_flag` (ctxIdx 70..=72 from the neighbouring pairs), `mb_skip_flag` under the §7.4.4 pair-flag inference (a top MB's skip context is derived under the inferred flag; the pair flag rides the first coded MB and retro-patches a skipped top), eq. 9-12 `refIdxZeroFlagN` thresholds and eq. 9-15/9-16 vertical |mvd| scaling across frame/field boundaries, per-bin Table 6-4 `coded_block_pattern` probes, §6.4.11.4/.5 `coded_block_flag` block neighbours across pair boundaries, the Table 9-34 FIELD `significant_coeff_flag` / `last_significant_coeff_flag` context families (277 / 338) with the §8.5.6 field scan on field MBs, and `end_of_slice_flag` after bottom MBs only. I pictures Intra_16x16, P pictures P_Skip / P_L0_16x16 (+ optional Intra_16x16 fallback). 10 gates bit-exact in our decoder and byte-exact in a black-box reference decoder.
+- encoder CABAC syntax: `encode_residual_block_cabac_field` (frame/field selector) and the MBAFF `cbp_luma_mbaff` probe path in `encode_coded_block_pattern` (decoder mirror).
+
 ## [0.1.8](https://github.com/OxideAV/oxideav-h264/compare/v0.1.7...v0.1.8) - 2026-08-30
 
 ### Other

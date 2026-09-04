@@ -72,7 +72,7 @@ use crate::nal::NalUnitType;
 use crate::transform::{qp_bd_offset, qp_y_to_qp_c_with_bd_offset};
 
 /// One picture's (Y, Cb, Cr) planes.
-type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
+pub(crate) type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// Per-pair frame/field decision policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,28 +131,28 @@ pub struct MbaffEncoded {
 
 /// Per-picture MBAFF state, indexed by the pair-interleaved macroblock
 /// address (§6.4.1: `mbAddr = 2 * pairIdx + isBottom`).
-struct PicState {
-    w: usize,
-    w_mbs: usize,
+pub(crate) struct PicState {
+    pub(crate) w: usize,
+    pub(crate) w_mbs: usize,
     /// Pre-deblock reconstruction, frame geometry.
-    ry: Vec<u8>,
-    ru: Vec<u8>,
-    rv: Vec<u8>,
+    pub(crate) ry: Vec<u8>,
+    pub(crate) ru: Vec<u8>,
+    pub(crate) rv: Vec<u8>,
     /// §7.4.4 `mb_field_decoding_flag` per MB (pair-shared).
-    field: Vec<bool>,
+    pub(crate) field: Vec<bool>,
     /// MB has been coded (neighbour availability, §6.4.8).
-    avail: Vec<bool>,
+    pub(crate) avail: Vec<bool>,
     /// §9.2.1.1 CAVLC neighbour state per MB.
-    nc: Vec<CavlcMbNc>,
+    pub(crate) nc: Vec<CavlcMbNc>,
     /// §8.4.1.3.2 motion neighbour state per MB (unscaled, in the
     /// MB's own frame/field geometry).
-    mv: Vec<MvGridSlot>,
+    pub(crate) mv: Vec<MvGridSlot>,
     /// §8.7 deblock facts per MB.
-    dbl: Vec<MbDeblockInfo>,
+    pub(crate) dbl: Vec<MbDeblockInfo>,
 }
 
 impl PicState {
-    fn new(w: usize, h: usize) -> Self {
+    pub(crate) fn new(w: usize, h: usize) -> Self {
         let w_mbs = w / 16;
         let n = w_mbs * (h / 16);
         Self {
@@ -172,7 +172,7 @@ impl PicState {
     /// §6.4.12.2 — resolve neighbouring location `(xn, yn)` of MB
     /// `addr` to `(mbAddrN, xW, yW)` via the decoder's Table 6-4
     /// implementation, reading real per-MB field flags.
-    fn resolve(
+    pub(crate) fn resolve(
         &self,
         addr: usize,
         xn: i32,
@@ -227,16 +227,16 @@ impl PicState {
 }
 
 /// Scratch coordinate system for one MB-geometry (frame or field).
-struct VirtualEnc {
-    enc: Encoder,
-    h_mbs: usize,
-    vy: Vec<u8>,
-    vu: Vec<u8>,
-    vv: Vec<u8>,
+pub(crate) struct VirtualEnc {
+    pub(crate) enc: Encoder,
+    pub(crate) h_mbs: usize,
+    pub(crate) vy: Vec<u8>,
+    pub(crate) vu: Vec<u8>,
+    pub(crate) vv: Vec<u8>,
 }
 
 impl VirtualEnc {
-    fn new(cfg: EncoderConfig) -> Self {
+    pub(crate) fn new(cfg: EncoderConfig) -> Self {
         let (w, h) = (cfg.width as usize, cfg.height as usize);
         Self {
             enc: Encoder::new(cfg),
@@ -249,7 +249,7 @@ impl VirtualEnc {
 }
 
 /// Extract one parity field (4:2:0 planes) from frame-geometry planes.
-fn extract_field_planes(
+pub(crate) fn extract_field_planes(
     y: &[u8],
     u: &[u8],
     v: &[u8],
@@ -284,7 +284,7 @@ fn extract_field_planes(
 /// `(vx, vy)` in the MB grid of the corresponding [`VirtualEnc`]
 /// (frame geometry for frame MBs, half-height field geometry — MB row
 /// = pair row — for field MBs).
-fn virtual_pos(addr: usize, w_mbs: usize, field: bool) -> (usize, usize) {
+pub(crate) fn virtual_pos(addr: usize, w_mbs: usize, field: bool) -> (usize, usize) {
     let pair_idx = addr / 2;
     let bot = addr % 2;
     let vx = pair_idx % w_mbs;
@@ -312,7 +312,13 @@ fn inferred_pair_flag(st: &PicState, addr: usize) -> bool {
 /// with the §6.4.12.2-resolved neighbouring samples (top row incl.
 /// corners, left column) so the frame-based intra predictors read
 /// exactly what the decoder's Table 6-4 process yields.
-fn patch_neighbour_samples(st: &PicState, ve: &mut VirtualEnc, addr: usize, vx: usize, vy: usize) {
+pub(crate) fn patch_neighbour_samples(
+    st: &PicState,
+    ve: &mut VirtualEnc,
+    addr: usize,
+    vx: usize,
+    vy: usize,
+) {
     let w = st.w;
     let cw = w / 2;
     // Luma: (xN, yN) over the top row -1..=16 at yN = -1 and the left
@@ -358,7 +364,7 @@ fn patch_neighbour_samples(st: &PicState, ve: &mut VirtualEnc, addr: usize, vx: 
 /// (skip → 0, I_PCM → 16), §8.4.1.3.2 motion cells with the
 /// eq. 8-217..8-220 frame↔field scaling, and §6.4.8 availability.
 #[allow(clippy::too_many_arguments)]
-fn fill_neighbour_grids(
+pub(crate) fn fill_neighbour_grids(
     st: &PicState,
     addr: usize,
     field: bool,
@@ -531,7 +537,7 @@ fn fill_neighbour_grids(
 /// referenced picture: `poc*4` for a frame reference (frame MB),
 /// `poc*4 + 1 + parity` for a field reference (field MB; `ref_idx = 0`
 /// selects the same-parity field per §8.4.2.1).
-fn ref_poc_key(prev_poc: i32, field: bool, mb_parity: u32) -> i32 {
+pub(crate) fn ref_poc_key(prev_poc: i32, field: bool, mb_parity: u32) -> i32 {
     if field {
         prev_poc * 4 + 1 + mb_parity as i32
     } else {
@@ -734,7 +740,7 @@ fn code_mb(
 /// Per-pair frame/field decision for [`PairMode::Adaptive`]: compare
 /// cross-row activity in frame vs same-field arrangement over the
 /// pair's luma samples.
-fn adaptive_pair_is_field(y: &[u8], w: usize, pair_col: usize, pair_row: usize) -> bool {
+pub(crate) fn adaptive_pair_is_field(y: &[u8], w: usize, pair_col: usize, pair_row: usize) -> bool {
     let x0 = pair_col * 16;
     let y0 = pair_row * 32;
     let mut frame_cost: u64 = 0;
