@@ -69,6 +69,7 @@ fn encode(bd: u32, cf: u32, qp: i32, n: usize, deblock: bool) -> (DeepEncoded, V
             deblock,
             lossless: false,
             lossless_interop: false,
+            cabac: false,
         },
         &refs,
     );
@@ -94,6 +95,7 @@ fn encode_lossless(bd: u32, cf: u32, n: usize, interop: bool) -> (DeepEncoded, V
             deblock: true,
             lossless: true,
             lossless_interop: interop,
+            cabac: false,
         },
         &refs,
     );
@@ -327,6 +329,81 @@ fn deep_lossless_interop_reference_decoder_exact() {
     for (bd, cf) in [(10u32, 1u32), (12, 2), (14, 3)] {
         let tag = format!("lossless-interop{bd}-cf{cf}");
         let (enc, src) = encode_lossless(bd, cf, 3, true);
+        for (i, (r, s)) in enc.recon_frames.iter().zip(src.iter()).enumerate() {
+            assert!(
+                r.0 == s.0 && r.1 == s.1 && r.2 == s.2,
+                "{tag}: frame {i} not lossless"
+            );
+        }
+        assert_ours_bit_exact(&enc, &tag);
+        reference_decoder_check(&enc, cf, &tag);
+    }
+}
+
+fn encode_cabac(
+    bd: u32,
+    cf: u32,
+    qp: i32,
+    n: usize,
+    lossless: bool,
+) -> (DeepEncoded, Vec<DeepPlanes>) {
+    let frames: Vec<_> = (0..n).map(|k| source(k, bd, cf)).collect();
+    let refs: Vec<(&[u16], &[u16], &[u16])> = frames
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    let enc = encode_deep_sequence(
+        &DeepConfig {
+            width: W as u32,
+            height: H as u32,
+            bit_depth_luma: bd,
+            bit_depth_chroma: bd,
+            chroma_format_idc: cf,
+            qp,
+            p_frames: true,
+            intra_in_p: true,
+            deblock: true,
+            lossless,
+            lossless_interop: lossless,
+            cabac: true,
+        },
+        &refs,
+    );
+    (enc, frames)
+}
+
+/// CABAC at 10 / 12 / 14-bit across the chroma formats: the §9.3
+/// residual binarisation is depth-agnostic but the deep coefficient
+/// magnitudes stress the UEG0 escape, the 4:2:2 chroma DC runs under
+/// the eq. 9-22 `NumC8x8 = 2` contexts, the 4:4:4 planes under the
+/// cat 6..=12 families, and the context initialisation clips the
+/// negative slice QP per eq. 9-5. Bit-exact in our decoder, byte-exact
+/// in the black-box reference decoder.
+#[test]
+fn deep_cabac_matrix_bit_exact() {
+    for (bd, cf, qp) in [(10u32, 1u32, 22i32), (12, 2, 22), (14, 3, 22), (14, 1, -30)] {
+        let tag = format!("deep-cabac{bd}-cf{cf}-qp{qp}");
+        let (enc, src) = encode_cabac(bd, cf, qp, 3, false);
+        for (i, ((ry, _, _), (sy, _, _))) in enc.recon_frames.iter().zip(src.iter()).enumerate() {
+            let p = psnr(ry, sy, bd);
+            assert!(p > 40.0, "{tag}: frame {i} luma PSNR {p:.2}");
+        }
+        assert!(
+            enc.skipped_mbs + enc.intra_mbs_in_p < W * H / 256 * 2,
+            "{tag}: inter MBs expected"
+        );
+        assert_ours_bit_exact(&enc, &tag);
+        reference_decoder_check(&enc, cf, &tag);
+    }
+}
+
+/// CABAC + lossless (interop modes): sample-exact reconstruction with
+/// the arithmetic coder carrying raw residual magnitudes at 14-bit.
+#[test]
+fn deep_cabac_lossless_exact() {
+    for (bd, cf) in [(10u32, 1u32), (14, 2), (12, 3)] {
+        let tag = format!("deep-cabac-lossless{bd}-cf{cf}");
+        let (enc, src) = encode_cabac(bd, cf, -(6 * (bd as i32 - 8)), 2, true);
         for (i, (r, s)) in enc.recon_frames.iter().zip(src.iter()).enumerate() {
             assert!(
                 r.0 == s.0 && r.1 == s.1 && r.2 == s.2,

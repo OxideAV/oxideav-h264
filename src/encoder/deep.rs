@@ -32,7 +32,12 @@
 //! P_L0_16x16 with an optional Intra_16x16 fallback. Single slice,
 //! single reference, fixed QP.
 
+use crate::cabac_ctx::{MvdComponent, SliceKind};
 use crate::cavlc::CoeffTokenContext;
+use crate::encoder::cabac_syntax::{
+    encode_coded_block_pattern, encode_end_of_slice_flag, encode_intra_chroma_pred_mode,
+    encode_mb_qp_delta, encode_mb_skip_flag, encode_mb_type_i, encode_mb_type_p, encode_mvd_lx,
+};
 use crate::encoder::deblock::{
     chroma_nz_mask_from_blocks, deblock_recon_deep, luma_nz_mask_from_blocks, MbDeblockInfo,
 };
@@ -40,8 +45,13 @@ use crate::encoder::macroblock::{
     write_intra16x16_mb_chroma, write_intra16x16_mb_in_inter_slice_chroma,
     write_p_l0_16x16_mb_chroma, ChromaWriteKind, PL016x16McbConfig,
 };
+use crate::encoder::mbaff_cabac::{
+    emit_chroma_cabac, emit_i16_plane_cabac, emit_inter_plane_cabac, full_neighbour_ctx,
+    skip_neighbour_ctx, CabacState, Plane,
+};
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
+use crate::encoder::slice::CabacSliceParams;
 use crate::encoder::slice::{
     write_idr_i_slice_header, write_p_slice_header, FieldPicSignal, IdrSliceHeaderConfig,
     PSliceHeaderConfig,
@@ -63,6 +73,7 @@ use crate::intra_pred::{
     ChromaArrayType, Intra16x16Mode, IntraChromaMode, Neighbour4x4Availability, Samples16x16,
     SamplesChroma,
 };
+use crate::macroblock_layer::{cabac_mvd_abs_sum, CabacMbNeighbourInfo, CabacNeighbourGrid};
 use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
 use crate::mv_deriv::Mv;
 use crate::nal::NalUnitType;
@@ -130,6 +141,9 @@ pub struct DeepConfig {
     /// there while our decoder reconstructs them exactly. Ignored when
     /// `lossless` is off.
     pub lossless_interop: bool,
+    /// `entropy_coding_mode_flag = 1`: code the same macroblock
+    /// decisions with CABAC (§9.3) instead of CAVLC.
+    pub cabac: bool,
 }
 
 /// One picture's `(Y, Cb, Cr)` `u16` planes.
@@ -1301,6 +1315,184 @@ fn recon_intra(
     }
 }
 
+// ---------------------------------------------------------------------------
+// CABAC emission (round-456): the same macroblock decisions coded
+// under `entropy_coding_mode_flag = 1` through the shared helpers of
+// `encoder::mbaff_cabac` (progressive §6.4.9 neighbours).
+// ---------------------------------------------------------------------------
+
+/// Sixteen 4x4 scan lists in luma4x4BlkIdx order.
+type ScanLists = [[i32; 16]; 16];
+
+/// Intra_16x16 macroblock under CABAC (I or P slice).
+fn emit_intra_cabac(
+    g: Geom,
+    cs: &mut CabacState,
+    cab: &mut CabacNeighbourGrid,
+    mb_addr: u32,
+    cand: &IntraCand,
+    in_p_slice: bool,
+) {
+    let addr = mb_addr as usize;
+    let nctx = full_neighbour_ctx(cab, addr, false);
+    let group = match (cand.cbp_luma, cand.cbp_chroma) {
+        (0, 0) => 0u32,
+        (0, 1) => 1,
+        (0, 2) => 2,
+        (15, 0) => 3,
+        (15, 1) => 4,
+        (15, 2) => 5,
+        _ => unreachable!("Intra_16x16 cbp_luma is 0 or 15"),
+    };
+    let row = 1 + group * 4 + cand.luma_mode as u32;
+    if in_p_slice {
+        encode_mb_type_p(&mut cs.enc, &mut cs.ctxs, &nctx, 5 + row);
+    } else {
+        encode_mb_type_i(&mut cs.enc, &mut cs.ctxs, &nctx, row);
+    }
+    // §7.3.5.1 — intra_chroma_pred_mode is absent at ChromaArrayType 3.
+    if g.cf != 3 {
+        encode_intra_chroma_pred_mode(&mut cs.enc, &mut cs.ctxs, &nctx, cand.chroma_mode as u32);
+    }
+    // §7.3.5 — mb_qp_delta always present for Intra_16x16.
+    encode_mb_qp_delta(&mut cs.enc, &mut cs.ctxs, cs.prev_qp_delta_nonzero, 0);
+    cs.prev_qp_delta_nonzero = false;
+
+    let mut cur = CabacMbNeighbourInfo {
+        is_intra: true,
+        coded_block_pattern_luma: cand.cbp_luma,
+        coded_block_pattern_chroma: cand.cbp_chroma,
+        intra_chroma_pred_mode: cand.chroma_mode,
+        ..Default::default()
+    };
+    emit_i16_plane_cabac(
+        cs,
+        cab,
+        &mut cur,
+        addr,
+        false,
+        Plane::Y,
+        &cand.luma.dc_raster,
+        &cand.luma.ac_scan,
+        cand.cbp_luma,
+    );
+    match (&cand.chroma, &cand.planes444) {
+        (Some((cu, cv)), _) => {
+            let n_blk = g.ct_h / 4 * 2;
+            emit_chroma_cabac(
+                cs,
+                cab,
+                &mut cur,
+                addr,
+                false,
+                true,
+                cand.cbp_chroma,
+                &cu.dc,
+                &cv.dc,
+                &cu.ac[..n_blk],
+                &cv.ac[..n_blk],
+                g.cf,
+            );
+        }
+        (None, Some((cu, cv))) => {
+            emit_i16_plane_cabac(
+                cs,
+                cab,
+                &mut cur,
+                addr,
+                false,
+                Plane::Cb,
+                &cu.dc_raster,
+                &cu.ac_scan,
+                cand.cbp_luma,
+            );
+            emit_i16_plane_cabac(
+                cs,
+                cab,
+                &mut cur,
+                addr,
+                false,
+                Plane::Cr,
+                &cv.dc_raster,
+                &cv.ac_scan,
+                cand.cbp_luma,
+            );
+        }
+        _ => unreachable!(),
+    }
+    cur.available = true;
+    cab.mbs[addr] = cur;
+}
+
+/// P_L0_16x16 macroblock under CABAC (`mb_skip_flag = 0` already coded).
+#[allow(clippy::too_many_arguments)]
+fn emit_inter_cabac(
+    g: Geom,
+    cs: &mut CabacState,
+    cab: &mut CabacNeighbourGrid,
+    mb_addr: u32,
+    mvd: Mv,
+    cbp_luma: u8,
+    cbp_chroma: u8,
+    luma_scan: &[[i32; 16]; 16],
+    chroma: Option<(&ChromaChain, &ChromaChain)>,
+    planes444: Option<(&ScanLists, &ScanLists)>,
+) {
+    let addr = mb_addr as usize;
+    let nctx = full_neighbour_ctx(cab, addr, false);
+    encode_mb_type_p(&mut cs.enc, &mut cs.ctxs, &nctx, 0);
+    let mut cur = CabacMbNeighbourInfo {
+        ref_idx_l0: [0; 4],
+        ..Default::default()
+    };
+    let sum_x = cabac_mvd_abs_sum(cab, mb_addr, &cur, 0, MvdComponent::X, 0);
+    encode_mvd_lx(&mut cs.enc, &mut cs.ctxs, MvdComponent::X, sum_x, mvd.x);
+    let sum_y = cabac_mvd_abs_sum(cab, mb_addr, &cur, 0, MvdComponent::Y, 0);
+    encode_mvd_lx(&mut cs.enc, &mut cs.ctxs, MvdComponent::Y, sum_y, mvd.y);
+    cur.mvd_l0_x = [mvd.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16; 16];
+    cur.mvd_l0_y = [mvd.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16; 16];
+    encode_coded_block_pattern(&mut cs.enc, &mut cs.ctxs, &nctx, g.cf, cbp_luma, cbp_chroma);
+    if cbp_luma > 0 || cbp_chroma > 0 {
+        encode_mb_qp_delta(&mut cs.enc, &mut cs.ctxs, cs.prev_qp_delta_nonzero, 0);
+    }
+    cs.prev_qp_delta_nonzero = false;
+    cur.coded_block_pattern_luma = cbp_luma;
+    cur.coded_block_pattern_chroma = cbp_chroma;
+    emit_inter_plane_cabac(
+        cs,
+        cab,
+        &mut cur,
+        addr,
+        false,
+        Plane::Y,
+        luma_scan,
+        cbp_luma,
+    );
+    if let Some((cu, cv)) = chroma {
+        let n_blk = g.ct_h / 4 * 2;
+        emit_chroma_cabac(
+            cs,
+            cab,
+            &mut cur,
+            addr,
+            false,
+            false,
+            cbp_chroma,
+            &cu.dc,
+            &cv.dc,
+            &cu.ac[..n_blk],
+            &cv.ac[..n_blk],
+            g.cf,
+        );
+    }
+    if let Some((cb, cr)) = planes444 {
+        emit_inter_plane_cabac(cs, cab, &mut cur, addr, false, Plane::Cb, cb, cbp_luma);
+        emit_inter_plane_cabac(cs, cab, &mut cur, addr, false, Plane::Cr, cr, cbp_luma);
+    }
+    cur.available = true;
+    cab.mbs[addr] = cur;
+}
+
 /// Encode a >8-bit sequence. `frames` holds `u16` planes at the
 /// configured chroma format (top-to-bottom row-major).
 pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])]) -> DeepEncoded {
@@ -1394,7 +1586,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
         chroma_qp_index_offset: 0,
         weighted_pred_flag: false,
         weighted_bipred_idc: 0,
-        entropy_coding_mode_flag: false,
+        entropy_coding_mode_flag: cfg.cabac,
         transform_8x8_mode_flag: false,
         redundant_pic_cnt_present_flag: false,
         slice_groups: None,
@@ -1436,7 +1628,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                     slice_alpha_c0_offset_div2: 0,
                     slice_beta_offset_div2: 0,
                     nal_ref_idc: 2,
-                    cabac: None,
+                    cabac: cfg.cabac.then_some(CabacSliceParams { cabac_init_idc: 0 }),
                     field: FieldPicSignal::FrameMbsOnly,
                     rplm_l0: &[],
                     mmco: &[],
@@ -1474,6 +1666,18 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
             );
         }
 
+        // §7.3.4 cabac_alignment_one_bit.
+        if cfg.cabac {
+            while !sw.byte_aligned() {
+                sw.u(1, 1);
+            }
+        }
+        let kind = if is_p { SliceKind::P } else { SliceKind::I };
+        let mut cs = cfg
+            .cabac
+            .then(|| CabacState::new(kind, if is_p { Some(0) } else { None }, qp_y));
+        let mut cab = CabacNeighbourGrid::new_mbaff(w_mbs, h_mbs as u32, false);
+        let n_mbs = g.w_mbs * h_mbs;
         let mut recon = Pic::zeroed(g);
         let mut nc_grid = CavlcNcGrid::new(w_mbs, h_mbs as u32);
         let mut mv_grid = MvGrid::new(g.w_mbs, h_mbs);
@@ -1488,7 +1692,12 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                         g, &src, &recon, mb_x, mb_y, qp_y_prime, qp_c_prime, &w4, bypass,
                         allow_dpcm,
                     );
-                    emit_intra(g, &mut sw, &mut nc_grid, mb_addr, &cand, false);
+                    if let Some(cs) = cs.as_mut() {
+                        emit_intra_cabac(g, cs, &mut cab, mb_addr, &cand, false);
+                        encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
+                    } else {
+                        emit_intra(g, &mut sw, &mut nc_grid, mb_addr, &cand, false);
+                    }
                     dbl[mb_addr as usize] = recon_intra(
                         g, &mut recon, mb_x, mb_y, &cand, qp_y_prime, qp_c_prime, &w4,
                     );
@@ -1565,8 +1774,28 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                 }
                 let is_skip = mv == skip_mv && cbp_luma == 0 && cbp_chroma == 0;
                 if is_skip {
-                    pending_skip += 1;
                     skipped_mbs += 1;
+                    if let Some(cs) = cs.as_mut() {
+                        let skip_nctx = skip_neighbour_ctx(&cab, mb_addr as usize, false);
+                        encode_mb_skip_flag(
+                            &mut cs.enc,
+                            &mut cs.ctxs,
+                            SliceKind::P,
+                            &skip_nctx,
+                            true,
+                        );
+                        cs.prev_qp_delta_nonzero = false;
+                        cab.mbs[mb_addr as usize] = CabacMbNeighbourInfo {
+                            available: true,
+                            is_skip: true,
+                            ref_idx_l0: [0; 4],
+                            ref_idx_l1: [0; 4],
+                            ..Default::default()
+                        };
+                        encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
+                    } else {
+                        pending_skip += 1;
+                    }
                     mark_slot(&mut nc_grid, mb_addr, false, true);
                     *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
                         available: true,
@@ -1599,11 +1828,21 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                 } else {
                     None
                 };
-                sw.ue(pending_skip);
-                pending_skip = 0;
+                if let Some(cs) = cs.as_mut() {
+                    let skip_nctx = skip_neighbour_ctx(&cab, mb_addr as usize, false);
+                    encode_mb_skip_flag(&mut cs.enc, &mut cs.ctxs, SliceKind::P, &skip_nctx, false);
+                } else {
+                    sw.ue(pending_skip);
+                    pending_skip = 0;
+                }
                 if let Some(cand) = intra {
                     intra_mbs_in_p += 1;
-                    emit_intra(g, &mut sw, &mut nc_grid, mb_addr, &cand, true);
+                    if let Some(cs) = cs.as_mut() {
+                        emit_intra_cabac(g, cs, &mut cab, mb_addr, &cand, true);
+                        encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
+                    } else {
+                        emit_intra(g, &mut sw, &mut nc_grid, mb_addr, &cand, true);
+                    }
                     dbl[mb_addr as usize] = recon_intra(
                         g, &mut recon, mb_x, mb_y, &cand, qp_y_prime, qp_c_prime, &w4,
                     );
@@ -1684,7 +1923,23 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                             cr_ac_nc: &nc_cr,
                         }
                     };
-                    write_p_l0_16x16_mb_chroma(&mut sw, &mcfg, 0, cf, kind).expect("CAVLC P MB");
+                    if let Some(cs) = cs.as_mut() {
+                        emit_inter_cabac(
+                            g,
+                            cs,
+                            &mut cab,
+                            mb_addr,
+                            mvd,
+                            cbp_luma,
+                            cbp_chroma,
+                            &mcfg.luma_4x4_levels,
+                            Some((cu, cv)),
+                            None,
+                        );
+                    } else {
+                        write_p_l0_16x16_mb_chroma(&mut sw, &mcfg, 0, cf, kind)
+                            .expect("CAVLC P MB");
+                    }
                     if cbp_chroma == 2 {
                         if cf == 1 {
                             let cb: [bool; 4] = std::array::from_fn(|i| cu.ac_blk_nz[i]);
@@ -1740,7 +1995,23 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                         cr_nc: &cr_nc,
                         cbp_luma,
                     };
-                    write_p_l0_16x16_mb_chroma(&mut sw, &mcfg, 0, cf, kind).expect("CAVLC P MB");
+                    if let Some(cs) = cs.as_mut() {
+                        emit_inter_cabac(
+                            g,
+                            cs,
+                            &mut cab,
+                            mb_addr,
+                            mvd,
+                            cbp_luma,
+                            0,
+                            &mcfg.luma_4x4_levels,
+                            None,
+                            Some((&cb_levels, &cr_levels)),
+                        );
+                    } else {
+                        write_p_l0_16x16_mb_chroma(&mut sw, &mcfg, 0, cf, kind)
+                            .expect("CAVLC P MB");
+                    }
                     recon.store_chroma(g, false, mb_x, mb_y, &pred_u, &cu.recon);
                     recon.store_chroma(g, true, mb_x, mb_y, &pred_v, &cv.recon);
                 }
@@ -1755,6 +2026,9 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                     }
                 }
                 recon.store_luma(g, mb_x, mb_y, &pred_y, &luma_res);
+                if let Some(cs) = cs.as_mut() {
+                    encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
+                }
                 *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
                     available: true,
                     is_intra: false,
@@ -1773,16 +2047,25 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                 };
             }
         }
-        if pending_skip > 0 {
-            sw.ue(pending_skip);
-        }
-        sw.rbsp_trailing_bits();
+        let slice_rbsp = if let Some(cs) = cs {
+            let payload = cs.enc.finish();
+            debug_assert!(sw.byte_aligned());
+            let mut rbsp = sw.into_bytes();
+            rbsp.extend_from_slice(&payload);
+            rbsp
+        } else {
+            if pending_skip > 0 {
+                sw.ue(pending_skip);
+            }
+            sw.rbsp_trailing_bits();
+            sw.into_bytes()
+        };
         let (nal_type, ref_idc) = if k == 0 {
             (NalUnitType::SliceIdr, 3)
         } else {
             (NalUnitType::SliceNonIdr, 2)
         };
-        stream.extend_from_slice(&build_nal_unit(ref_idc, nal_type, &sw.into_bytes()));
+        stream.extend_from_slice(&build_nal_unit(ref_idc, nal_type, &slice_rbsp));
 
         if cfg.deblock {
             deblock_recon_deep(

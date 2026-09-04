@@ -149,12 +149,31 @@ fn encode_mb_field_decoding_flag(
     enc.encode_decision(ctxs.at_mut(ctx_idx as usize), u8::from(flag));
 }
 
+/// §6.4.3 — upper-left 4x4 unit `(bx, by)` of luma4x4BlkIdx `idx`.
+fn blk_xy(idx: usize) -> (usize, usize) {
+    let hi = idx / 4;
+    let lo = idx % 4;
+    ((hi % 2) * 2 + (lo % 2), (hi / 2) * 2 + (lo / 2))
+}
+
+// ---------------------------------------------------------------------------
+// Shared CABAC macroblock-emission helpers (round-456) — used by the
+// MBAFF driver above and by the high-bit-depth encoder
+// (`encoder::deep`). Every context increment is resolved through the
+// decoder's `CabacNeighbourGrid` (`mbaff == false` selects the §6.4.9
+// raster neighbours, `true` the §6.4.12.2 Table 6-4 process).
+// ---------------------------------------------------------------------------
+
 /// The minimal `mb_skip_flag` neighbour snapshot the decoder builds at
-/// the top of its slice-data loop (§9.3.3.1.1.1 with the §6.4.10 MBAFF
+/// the top of its slice-data loop (§9.3.3.1.1.1 with the §6.4.9 / §6.4.10
 /// mbAddrA / mbAddrB under the grid's current view of the pair flag).
-fn skip_neighbour_ctx(cab: &CabacNeighbourGrid, addr: usize) -> NeighbourCtx {
+pub(crate) fn skip_neighbour_ctx(
+    cab: &CabacNeighbourGrid,
+    addr: usize,
+    mbaff: bool,
+) -> NeighbourCtx {
     let mut n = NeighbourCtx::default();
-    let (a, b) = cab.neighbour_mb_addrs_mbaff(addr as u32, true);
+    let (a, b) = cab.neighbour_mb_addrs_mbaff(addr as u32, mbaff);
     if let Some(info) = a.and_then(|x| cab.mbs.get(x as usize)) {
         if info.available {
             n.available_left = true;
@@ -171,11 +190,15 @@ fn skip_neighbour_ctx(cab: &CabacNeighbourGrid, addr: usize) -> NeighbourCtx {
 }
 
 /// The full per-MB [`NeighbourCtx`] — mirror of the decoder's
-/// slice-data construction (MB-level facts from the Table 6-4 A / B
-/// macroblocks plus the §9.3.3.1.1.4 per-bin luma CBP probes).
-fn full_neighbour_ctx(cab: &CabacNeighbourGrid, addr: usize) -> NeighbourCtx {
+/// slice-data construction (MB-level facts from the A / B macroblocks
+/// plus, under MBAFF, the §9.3.3.1.1.4 per-bin luma CBP probes).
+pub(crate) fn full_neighbour_ctx(
+    cab: &CabacNeighbourGrid,
+    addr: usize,
+    mbaff: bool,
+) -> NeighbourCtx {
     let mut n = NeighbourCtx::default();
-    let (a, b) = cab.neighbour_mb_addrs_mbaff(addr as u32, true);
+    let (a, b) = cab.neighbour_mb_addrs_mbaff(addr as u32, mbaff);
     if let Some(info) = a.and_then(|x| cab.mbs.get(x as usize)) {
         if info.available {
             n.available_left = true;
@@ -206,6 +229,9 @@ fn full_neighbour_ctx(cab: &CabacNeighbourGrid, addr: usize) -> NeighbourCtx {
             n.above_transform_8x8 = info.transform_size_8x8_flag;
         }
     }
+    if !mbaff {
+        return n;
+    }
     // §9.3.3.1.1.4 + §6.4.11.2 — external luma CBP probes (A: bins 0 /
     // 2 at (-1, 0) / (-1, 8); B: bins 0 / 1 at (0, -1) / (8, -1)).
     let probe = |xn: i32, yn: i32| -> CbpMbaffProbe {
@@ -233,16 +259,9 @@ fn full_neighbour_ctx(cab: &CabacNeighbourGrid, addr: usize) -> NeighbourCtx {
     n
 }
 
-/// §6.4.3 — upper-left 4x4 unit `(bx, by)` of luma4x4BlkIdx `idx`.
-fn blk_xy(idx: usize) -> (usize, usize) {
-    let hi = idx / 4;
-    let lo = idx % 4;
-    ((hi % 2) * 2 + (lo % 2), (hi / 2) * 2 + (lo / 2))
-}
-
 /// §8.5.6 — a 16-entry zig-zag list re-permuted into the Table 8-13
 /// field scan for field macroblocks (identity for frame MBs).
-fn scan16(zz: &[i32; 16], field: bool) -> [i32; 16] {
+pub(crate) fn scan16(zz: &[i32; 16], field: bool) -> [i32; 16] {
     if !field {
         return *zz;
     }
@@ -255,7 +274,7 @@ fn scan16(zz: &[i32; 16], field: bool) -> [i32; 16] {
 
 /// §8.5.6 — AC-only (15-entry, slot `s` = scan position `s + 1`)
 /// zig-zag list re-permuted into the field scan for field MBs.
-fn scan15(zz_ac: &[i32; 16], field: bool) -> [i32; 15] {
+pub(crate) fn scan15(zz_ac: &[i32; 16], field: bool) -> [i32; 15] {
     let mut out = [0i32; 15];
     if field {
         for k in 1..16 {
@@ -268,16 +287,243 @@ fn scan15(zz_ac: &[i32; 16], field: bool) -> [i32; 15] {
 }
 
 /// Per-slice CABAC coding state.
-struct CabacState {
-    enc: CabacEncoder,
-    ctxs: CabacContexts,
+pub(crate) struct CabacState {
+    pub(crate) enc: CabacEncoder,
+    pub(crate) ctxs: CabacContexts,
     /// §9.3.3.1.1.5 rolling flag for the next `mb_qp_delta` bin 0.
-    prev_qp_delta_nonzero: bool,
+    pub(crate) prev_qp_delta_nonzero: bool,
     /// §7.3.4 `prevMbSkipped`.
-    prev_mb_skipped: bool,
+    pub(crate) prev_mb_skipped: bool,
     /// §7.3.4 / §7.4.4 — the pair flag once coded (`None` while the
-    /// pair has only produced skipped MBs).
-    pending_pair_flag: Option<bool>,
+    /// pair has only produced skipped MBs). MBAFF only.
+    pub(crate) pending_pair_flag: Option<bool>,
+}
+
+impl CabacState {
+    pub(crate) fn new(kind: SliceKind, cabac_init_idc: Option<u32>, slice_qp_y: i32) -> Self {
+        Self {
+            enc: CabacEncoder::new(),
+            ctxs: CabacContexts::init(kind, cabac_init_idc, slice_qp_y).expect("ctx init"),
+            prev_qp_delta_nonzero: false,
+            prev_mb_skipped: false,
+            pending_pair_flag: None,
+        }
+    }
+}
+
+/// Colour plane of a luma-like residual (0 = Y, 1 = Cb, 2 = Cr —
+/// the latter two are the ChromaArrayType 3 "coded like luma" planes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Plane {
+    Y,
+    Cb,
+    Cr,
+}
+
+/// §7.3.5.3 Intra_16x16 luma-like residual of one plane under CABAC:
+/// the 16x16 DC block (Table 9-42 cat 0 / 6 / 10) and, when
+/// `cbp_luma == 15`, the 16 AC blocks (cat 1 / 7 / 11) with the
+/// §9.3.3.1.1.9 cond terms resolved through the grid; records the
+/// coded flags into `cur` exactly as the decoder's residual walker.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_i16_plane_cabac(
+    cs: &mut CabacState,
+    cab: &CabacNeighbourGrid,
+    cur: &mut CabacMbNeighbourInfo,
+    addr: usize,
+    field: bool,
+    plane: Plane,
+    dc_raster: &[i32; 16],
+    ac_scan: &[[i32; 16]; 16],
+    cbp_luma: u8,
+) {
+    let (dc_bt, ac_bt) = match plane {
+        Plane::Y => (BlockType::Luma16x16Dc, BlockType::Luma16x16Ac),
+        Plane::Cb => (BlockType::CbIntra16x16Dc, BlockType::CbIntra16x16Ac),
+        Plane::Cr => (BlockType::CrIntra16x16Dc, BlockType::CrIntra16x16Ac),
+    };
+    let (ca, cb) = cabac_cbf_cond_terms(cab, addr as u32, cur, true, dc_bt, 0, false, 1);
+    let dc_list = scan16(&zigzag_scan_4x4(dc_raster), field);
+    let coded = encode_residual_block_cabac_field(
+        &mut cs.enc,
+        &mut cs.ctxs,
+        dc_bt,
+        &dc_list,
+        16,
+        Some(ca),
+        Some(cb),
+        false,
+        1,
+        field,
+    );
+    match plane {
+        Plane::Y => cur.cbf_luma_16x16_dc = coded,
+        Plane::Cb => cur.cbf_cb_16x16_dc = coded,
+        Plane::Cr => cur.cbf_cr_16x16_dc = coded,
+    }
+    if cbp_luma == 15 {
+        for (blk, ac_blk) in ac_scan.iter().enumerate() {
+            let (ca, cb) =
+                cabac_cbf_cond_terms(cab, addr as u32, cur, true, ac_bt, blk as u8, false, 1);
+            let list = scan15(ac_blk, field);
+            let coded = encode_residual_block_cabac_field(
+                &mut cs.enc,
+                &mut cs.ctxs,
+                ac_bt,
+                &list,
+                15,
+                Some(ca),
+                Some(cb),
+                false,
+                1,
+                field,
+            );
+            match plane {
+                Plane::Y => cur.cbf_luma_16x16_ac[blk] = coded,
+                Plane::Cb => cur.cbf_cb_16x16_ac[blk] = coded,
+                Plane::Cr => cur.cbf_cr_16x16_ac[blk] = coded,
+            }
+        }
+    }
+}
+
+/// §7.3.5.3 inter luma-like residual of one plane under CABAC: the 4x4
+/// blocks (cat 2 / 8 / 12) of every quadrant whose `cbp_luma` bit is
+/// set, full 16-entry scan lists.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_inter_plane_cabac(
+    cs: &mut CabacState,
+    cab: &CabacNeighbourGrid,
+    cur: &mut CabacMbNeighbourInfo,
+    addr: usize,
+    field: bool,
+    plane: Plane,
+    scan: &[[i32; 16]; 16],
+    cbp_luma: u8,
+) {
+    let bt = match plane {
+        Plane::Y => BlockType::Luma4x4,
+        Plane::Cb => BlockType::CbLuma4x4,
+        Plane::Cr => BlockType::CrLuma4x4,
+    };
+    for blk8 in 0..4usize {
+        if (cbp_luma >> blk8) & 1 == 0 {
+            continue;
+        }
+        for sub in 0..4usize {
+            let blk = blk8 * 4 + sub;
+            let (ca, cb) =
+                cabac_cbf_cond_terms(cab, addr as u32, cur, false, bt, blk as u8, false, 1);
+            let list = scan16(&scan[blk], field);
+            let coded = encode_residual_block_cabac_field(
+                &mut cs.enc,
+                &mut cs.ctxs,
+                bt,
+                &list,
+                16,
+                Some(ca),
+                Some(cb),
+                false,
+                1,
+                field,
+            );
+            match plane {
+                Plane::Y => cur.cbf_luma_4x4[blk] = coded,
+                Plane::Cb => cur.cbf_cb_luma_4x4[blk] = coded,
+                Plane::Cr => cur.cbf_cr_luma_4x4[blk] = coded,
+            }
+        }
+    }
+}
+
+/// §7.3.5.3 — 4:2:0 / 4:2:2 chroma DC / AC residual bins with the
+/// §9.3.3.1.1.9 cat-3 / cat-4 cond terms resolved through the grid
+/// (4:2:2: 8-coefficient DC under the eq. 9-22 `NumC8x8 = 2` contexts,
+/// 8 AC blocks); records the coded flags into `cur`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_chroma_cabac(
+    cs: &mut CabacState,
+    cab: &CabacNeighbourGrid,
+    cur: &mut CabacMbNeighbourInfo,
+    addr: usize,
+    field: bool,
+    is_intra: bool,
+    cbp_chroma: u8,
+    cb_dc: &[i32],
+    cr_dc: &[i32],
+    cb_ac: &[[i32; 16]],
+    cr_ac: &[[i32; 16]],
+    chroma_array_type: u32,
+) {
+    let num_c8x8: u32 = if chroma_array_type == 2 { 2 } else { 1 };
+    let n_dc = (4 * num_c8x8) as usize;
+    if cbp_chroma > 0 {
+        for (is_cr, dc) in [(false, cb_dc), (true, cr_dc)] {
+            let (ca, cb) = cabac_cbf_cond_terms(
+                cab,
+                addr as u32,
+                cur,
+                is_intra,
+                BlockType::ChromaDc,
+                0,
+                is_cr,
+                chroma_array_type,
+            );
+            // Chroma DC keeps its own §8.5.4 / §8.5.11 order (no field
+            // variant) — the list is emitted as built.
+            let coded = encode_residual_block_cabac_field(
+                &mut cs.enc,
+                &mut cs.ctxs,
+                BlockType::ChromaDc,
+                &dc[..n_dc],
+                n_dc as u32,
+                Some(ca),
+                Some(cb),
+                false,
+                num_c8x8,
+                field,
+            );
+            if is_cr {
+                cur.cbf_cr_dc = coded;
+            } else {
+                cur.cbf_cb_dc = coded;
+            }
+        }
+    }
+    if cbp_chroma == 2 {
+        for (is_cr, ac) in [(false, cb_ac), (true, cr_ac)] {
+            for (blk, ac_blk) in ac.iter().take(n_dc).enumerate() {
+                let (ca, cb) = cabac_cbf_cond_terms(
+                    cab,
+                    addr as u32,
+                    cur,
+                    is_intra,
+                    BlockType::ChromaAc,
+                    blk as u8,
+                    is_cr,
+                    chroma_array_type,
+                );
+                let list = scan15(ac_blk, field);
+                let coded = encode_residual_block_cabac_field(
+                    &mut cs.enc,
+                    &mut cs.ctxs,
+                    BlockType::ChromaAc,
+                    &list,
+                    15,
+                    Some(ca),
+                    Some(cb),
+                    false,
+                    num_c8x8,
+                    field,
+                );
+                if is_cr {
+                    cur.cbf_cr_ac[blk] = coded;
+                } else {
+                    cur.cbf_cb_ac[blk] = coded;
+                }
+            }
+        }
+    }
 }
 
 struct MbCtx<'a> {
@@ -448,58 +694,18 @@ fn emit_intra16x16(
     cur.coded_block_pattern_chroma = cand.cbp_chroma;
     cur.intra_chroma_pred_mode = cand.chroma_mode as u8;
 
-    // §7.3.5.3 — Intra16x16DCLevel.
-    let (ca, cb) = cabac_cbf_cond_terms(
+    emit_i16_plane_cabac(
+        cs,
         cab,
-        addr as u32,
         cur,
-        true,
-        BlockType::Luma16x16Dc,
-        0,
-        false,
-        1,
-    );
-    let dc_list = scan16(&zigzag_scan_4x4(&cand.luma_dc), field);
-    cur.cbf_luma_16x16_dc = encode_residual_block_cabac_field(
-        &mut cs.enc,
-        &mut cs.ctxs,
-        BlockType::Luma16x16Dc,
-        &dc_list,
-        16,
-        Some(ca),
-        Some(cb),
-        false,
-        1,
+        addr,
         field,
+        Plane::Y,
+        &cand.luma_dc,
+        &cand.luma_ac_scan,
+        cand.cbp_luma,
     );
-    if cand.cbp_luma == 15 {
-        for blk in 0..16usize {
-            let (ca, cb) = cabac_cbf_cond_terms(
-                cab,
-                addr as u32,
-                cur,
-                true,
-                BlockType::Luma16x16Ac,
-                blk as u8,
-                false,
-                1,
-            );
-            let list = scan15(&cand.luma_ac_scan[blk], field);
-            cur.cbf_luma_16x16_ac[blk] = encode_residual_block_cabac_field(
-                &mut cs.enc,
-                &mut cs.ctxs,
-                BlockType::Luma16x16Ac,
-                &list,
-                15,
-                Some(ca),
-                Some(cb),
-                false,
-                1,
-                field,
-            );
-        }
-    }
-    emit_chroma_420(
+    emit_chroma_cabac(
         cs,
         cab,
         cur,
@@ -511,6 +717,7 @@ fn emit_intra16x16(
         &cand.cr_dc,
         &cand.cb_ac_scan,
         &cand.cr_ac_scan,
+        1,
     );
 
     // Reconstruct into the scratch planes.
@@ -565,92 +772,6 @@ fn chroma_recon_residual(
             chroma_residual_dc_only(cr_dc, qp_c, w4),
         ),
         _ => ([0i32; 64], [0i32; 64]),
-    }
-}
-
-/// §7.3.5.3 — 4:2:0 chroma DC / AC residual bins with the
-/// §9.3.3.1.1.9 cat-3 / cat-4 cond terms resolved through the MBAFF
-/// grid; records the coded flags into `cur`.
-#[allow(clippy::too_many_arguments)]
-fn emit_chroma_420(
-    cs: &mut CabacState,
-    cab: &CabacNeighbourGrid,
-    cur: &mut CabacMbNeighbourInfo,
-    addr: usize,
-    field: bool,
-    is_intra: bool,
-    cbp_chroma: u8,
-    cb_dc: &[i32; 4],
-    cr_dc: &[i32; 4],
-    cb_ac_scan: &[[i32; 16]; 4],
-    cr_ac_scan: &[[i32; 16]; 4],
-) {
-    if cbp_chroma > 0 {
-        for (is_cr, dc) in [(false, cb_dc), (true, cr_dc)] {
-            let (ca, cb) = cabac_cbf_cond_terms(
-                cab,
-                addr as u32,
-                cur,
-                is_intra,
-                BlockType::ChromaDc,
-                0,
-                is_cr,
-                1,
-            );
-            // Chroma DC keeps its own §8.5.11 2x2 order (no field
-            // variant) — the list is emitted as built.
-            let coded = encode_residual_block_cabac_field(
-                &mut cs.enc,
-                &mut cs.ctxs,
-                BlockType::ChromaDc,
-                dc,
-                4,
-                Some(ca),
-                Some(cb),
-                false,
-                1,
-                field,
-            );
-            if is_cr {
-                cur.cbf_cr_dc = coded;
-            } else {
-                cur.cbf_cb_dc = coded;
-            }
-        }
-    }
-    if cbp_chroma == 2 {
-        for (is_cr, ac) in [(false, cb_ac_scan), (true, cr_ac_scan)] {
-            for (blk, ac_blk) in ac.iter().enumerate() {
-                let (ca, cb) = cabac_cbf_cond_terms(
-                    cab,
-                    addr as u32,
-                    cur,
-                    is_intra,
-                    BlockType::ChromaAc,
-                    blk as u8,
-                    is_cr,
-                    1,
-                );
-                let list = scan15(ac_blk, field);
-                let coded = encode_residual_block_cabac_field(
-                    &mut cs.enc,
-                    &mut cs.ctxs,
-                    BlockType::ChromaAc,
-                    &list,
-                    15,
-                    Some(ca),
-                    Some(cb),
-                    false,
-                    1,
-                    field,
-                );
-                if is_cr {
-                    cur.cbf_cr_ac[blk] = coded;
-                } else {
-                    cur.cbf_cb_ac[blk] = coded;
-                }
-            }
-        }
     }
 }
 
@@ -823,7 +944,7 @@ fn code_mb(
         };
 
         // §9.3.3.1.1.1 — mb_skip_flag under the grid's current pair view.
-        let skip_nctx = skip_neighbour_ctx(cab, addr);
+        let skip_nctx = skip_neighbour_ctx(cab, addr, true);
         encode_mb_skip_flag(&mut cs.enc, &mut cs.ctxs, SliceKind::P, &skip_nctx, is_skip);
         if is_skip {
             skipped = true;
@@ -876,7 +997,7 @@ fn code_mb(
                 }
             }
             debug_assert_eq!(cab.mbs[addr].mb_field_decoding_flag, field);
-            let nctx = full_neighbour_ctx(cab, addr);
+            let nctx = full_neighbour_ctx(cab, addr, true);
             if let Some(cand) = intra {
                 intra_in_p = true;
                 emit_intra16x16(
@@ -926,39 +1047,17 @@ fn code_mb(
                 cs.prev_qp_delta_nonzero = false;
                 cur.coded_block_pattern_luma = cbp_luma;
                 cur.coded_block_pattern_chroma = cbp_chroma;
-                // §7.3.5.3 — luma 4x4 blocks of the coded quadrants.
-                for blk8 in 0..4usize {
-                    if (cbp_luma >> blk8) & 1 == 0 {
-                        continue;
-                    }
-                    for sub in 0..4usize {
-                        let blk = blk8 * 4 + sub;
-                        let (ca, cb) = cabac_cbf_cond_terms(
-                            cab,
-                            addr as u32,
-                            &cur,
-                            false,
-                            BlockType::Luma4x4,
-                            blk as u8,
-                            false,
-                            1,
-                        );
-                        let list = scan16(&luma_scan[blk], field);
-                        cur.cbf_luma_4x4[blk] = encode_residual_block_cabac_field(
-                            &mut cs.enc,
-                            &mut cs.ctxs,
-                            BlockType::Luma4x4,
-                            &list,
-                            16,
-                            Some(ca),
-                            Some(cb),
-                            false,
-                            1,
-                            field,
-                        );
-                    }
-                }
-                emit_chroma_420(
+                emit_inter_plane_cabac(
+                    cs,
+                    cab,
+                    &mut cur,
+                    addr,
+                    field,
+                    Plane::Y,
+                    &luma_scan,
+                    cbp_luma,
+                );
+                emit_chroma_cabac(
                     cs,
                     cab,
                     &mut cur,
@@ -970,6 +1069,7 @@ fn code_mb(
                     &cr_dc,
                     &cb_ac_scan,
                     &cr_ac_scan,
+                    1,
                 );
                 // Reconstruction.
                 for j in 0..16usize {
@@ -1018,7 +1118,7 @@ fn code_mb(
             cs.pending_pair_flag = Some(field);
             cab.mbs[addr].mb_field_decoding_flag = field;
         }
-        let nctx = full_neighbour_ctx(cab, addr);
+        let nctx = full_neighbour_ctx(cab, addr, true);
         let cand = intra16x16_candidate(&src, ve, vx, vy, qp_y, qp_c, w4);
         emit_intra16x16(
             cs, cab, &mut cur, &nctx, addr, field, false, &cand, ve, vx, vy, qp_y, qp_c, w4,
@@ -1257,14 +1357,7 @@ pub fn encode_mbaff_cabac_sequence(
         };
 
         let kind = if is_p { SliceKind::P } else { SliceKind::I };
-        let mut cs = CabacState {
-            enc: CabacEncoder::new(),
-            ctxs: CabacContexts::init(kind, if is_p { Some(0) } else { None }, qp_y)
-                .expect("ctx init"),
-            prev_qp_delta_nonzero: false,
-            prev_mb_skipped: false,
-            pending_pair_flag: None,
-        };
+        let mut cs = CabacState::new(kind, if is_p { Some(0) } else { None }, qp_y);
         let n_pairs = (w_mbs * frame_h_mbs / 2) as usize;
         for pair in 0..n_pairs {
             let (pc, pr) = (pair % w_mbs as usize, pair / w_mbs as usize);

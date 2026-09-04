@@ -1,6 +1,18 @@
 # oxideav-h264 fuzz targets
 
-Three `cargo-fuzz` (libFuzzer) targets live in `fuzz_targets/`:
+Five `cargo-fuzz` (libFuzzer) targets live in `fuzz_targets/`:
+
+* `mbaff_cabac_roundtrip` (round 456) — the input bytes pick the MBAFF
+  pair policy / QP / picture structure and shape an interlaced source;
+  the CABAC MBAFF encoder (`encoder::mbaff_cabac`) must never panic,
+  our decoder must reconstruct its stream **bit-exactly** to the
+  encoder's own reconstruction (every §9.3.3.1.1.x MBAFF context
+  increment is content-driven here), and a byte-flipped copy of the
+  stream must decode panic-free.
+* `deep_roundtrip` (round 456) — same shape for the high-bit-depth
+  encoder (`encoder::deep`): 8..=14-bit, 4:2:0 / 4:2:2 / 4:4:4, QP down
+  to −QpBdOffsetY, lossless / interop modes; lossless streams must
+  reconstruct the source exactly.
 
 * `panic_free_decode` — feeds raw bytes through `H264CodecDecoder::send_packet` /
   `receive_frame` along two parallel paths (Annex-B byte stream and AVCC

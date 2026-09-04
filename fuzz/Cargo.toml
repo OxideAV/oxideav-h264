@@ -50,3 +50,15 @@ name = "sei_payload"
 path = "fuzz_targets/sei_payload.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "mbaff_cabac_roundtrip"
+path = "fuzz_targets/mbaff_cabac_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "deep_roundtrip"
+path = "fuzz_targets/deep_roundtrip.rs"
+test = false
+doc = false
