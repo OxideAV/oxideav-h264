@@ -70,6 +70,7 @@ fn encode(bd: u32, cf: u32, qp: i32, n: usize, deblock: bool) -> (DeepEncoded, V
             lossless: false,
             lossless_interop: false,
             cabac: false,
+            transform_8x8: false,
         },
         &refs,
     );
@@ -96,6 +97,7 @@ fn encode_lossless(bd: u32, cf: u32, n: usize, interop: bool) -> (DeepEncoded, V
             lossless: true,
             lossless_interop: interop,
             cabac: false,
+            transform_8x8: false,
         },
         &refs,
     );
@@ -366,6 +368,7 @@ fn encode_cabac(
             lossless,
             lossless_interop: lossless,
             cabac: true,
+            transform_8x8: false,
         },
         &refs,
     );
@@ -409,6 +412,71 @@ fn deep_cabac_lossless_exact() {
                 r.0 == s.0 && r.1 == s.1 && r.2 == s.2,
                 "{tag}: frame {i} not lossless"
             );
+        }
+        assert_ours_bit_exact(&enc, &tag);
+        reference_decoder_check(&enc, cf, &tag);
+    }
+}
+
+fn encode_8x8(
+    bd: u32,
+    cf: u32,
+    qp: i32,
+    cabac: bool,
+    lossless: bool,
+) -> (DeepEncoded, Vec<DeepPlanes>) {
+    let frames: Vec<_> = (0..3).map(|k| source(k, bd, cf)).collect();
+    let refs: Vec<(&[u16], &[u16], &[u16])> = frames
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    let enc = encode_deep_sequence(
+        &DeepConfig {
+            width: W as u32,
+            height: H as u32,
+            bit_depth_luma: bd,
+            bit_depth_chroma: bd,
+            chroma_format_idc: cf,
+            qp,
+            p_frames: true,
+            intra_in_p: true,
+            deblock: true,
+            lossless,
+            lossless_interop: lossless,
+            cabac,
+            transform_8x8: true,
+        },
+        &refs,
+    );
+    (enc, frames)
+}
+
+/// High-profile 8x8 transform at 10 / 12 / 14-bit: §8.5.13 dequant at
+/// QP′ past 51 (eq. 8-356 `<< (qP/6 − 6)` shifts), the §7.4.5.3.3
+/// four-4x4 CAVLC split and the ctxBlockCat-5 CABAC residual, the
+/// `transform_size_8x8_flag` contexts, the §8.7 8x8-edge deblock skip,
+/// and the §8.5.13 bypass identity under lossless coding.
+#[test]
+fn deep_transform_8x8_bit_exact() {
+    for (bd, cf, qp, cabac, lossless) in [
+        (12u32, 1u32, 22i32, false, false),
+        (14, 2, 22, true, false),
+        (10, 1, -12, true, true),
+        (14, 1, -36, false, true),
+    ] {
+        let tag = format!("deep-8x8-{bd}-cf{cf}-cabac{cabac}-lossless{lossless}");
+        let (enc, src) = encode_8x8(bd, cf, qp, cabac, lossless);
+        assert!(
+            enc.mbs_8x8 > 0,
+            "{tag}: expected transform_size_8x8_flag = 1 macroblocks"
+        );
+        if lossless {
+            for (i, (r, s)) in enc.recon_frames.iter().zip(src.iter()).enumerate() {
+                assert!(
+                    r.0 == s.0 && r.1 == s.1 && r.2 == s.2,
+                    "{tag}: frame {i} not lossless"
+                );
+            }
         }
         assert_ours_bit_exact(&enc, &tag);
         reference_decoder_check(&enc, cf, &tag);

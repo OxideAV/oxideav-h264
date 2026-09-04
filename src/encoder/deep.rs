@@ -32,8 +32,10 @@
 //! P_L0_16x16 with an optional Intra_16x16 fallback. Single slice,
 //! single reference, fixed QP.
 
-use crate::cabac_ctx::{MvdComponent, SliceKind};
+use crate::cabac_ctx::{BlockType, MvdComponent, SliceKind};
 use crate::cavlc::CoeffTokenContext;
+use crate::encoder::cabac_syntax::encode_residual_block_cabac_field;
+use crate::encoder::cabac_syntax::encode_transform_size_8x8_flag;
 use crate::encoder::cabac_syntax::{
     encode_coded_block_pattern, encode_end_of_slice_flag, encode_intra_chroma_pred_mode,
     encode_mb_qp_delta, encode_mb_skip_flag, encode_mb_type_i, encode_mb_type_p, encode_mvd_lx,
@@ -58,9 +60,10 @@ use crate::encoder::slice::{
 };
 use crate::encoder::sps::{build_sps_rbsp_with_bypass, BaselineSpsConfig};
 use crate::encoder::transform::{
-    forward_core_4x4, forward_hadamard_2x2, forward_hadamard_4x2, forward_hadamard_4x4,
-    quantize_4x4_ac_w, quantize_4x4_w, quantize_chroma_dc_422_w, quantize_chroma_dc_w,
-    quantize_luma_dc_w, scan_chroma_dc_422, zigzag_scan_4x4, zigzag_scan_4x4_ac,
+    forward_core_4x4, forward_core_8x8, forward_hadamard_2x2, forward_hadamard_4x2,
+    forward_hadamard_4x4, quantize_4x4_ac_w, quantize_4x4_w, quantize_8x8_w,
+    quantize_chroma_dc_422_w, quantize_chroma_dc_w, quantize_luma_dc_w, scan_chroma_dc_422,
+    zigzag_scan_4x4, zigzag_scan_4x4_ac, zigzag_scan_8x8,
 };
 use crate::encoder::{
     derive_chroma_ac_nc_and_commit_totals, derive_plane_nc_444_i16x16, derive_plane_nc_444_inter,
@@ -80,7 +83,7 @@ use crate::nal::NalUnitType;
 use crate::transform::{
     intra_bypass_dpcm, inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422,
     inverse_hadamard_luma_dc_16x16, inverse_transform_4x4, inverse_transform_4x4_dc_preserved,
-    qp_bd_offset, qp_y_to_qp_c_with_bd_offset,
+    inverse_transform_8x8, qp_bd_offset, qp_y_to_qp_c_with_bd_offset,
 };
 
 /// §6.4.3 Figure 6-10 — luma4x4BlkIdx → (bx, by) in 4-sample units.
@@ -144,6 +147,14 @@ pub struct DeepConfig {
     /// `entropy_coding_mode_flag = 1`: code the same macroblock
     /// decisions with CABAC (§9.3) instead of CAVLC.
     pub cabac: bool,
+    /// High-profile 8x8 transform (`transform_8x8_mode_flag = 1`): every
+    /// other coded P_L0_16x16 macroblock carries its luma residual
+    /// through the §8.6.4 / §8.5.13 8x8 transform at QP′ (4:2:0 and
+    /// 4:2:2; the 4:4:4 chroma-as-luma planes stay 4x4 — the option is
+    /// ignored at ChromaArrayType 3). CAVLC codes the §7.4.5.3.3
+    /// four-4x4 split, CABAC the ctxBlockCat-5 residual; under bypass
+    /// the 8x8 block is coded as the raw residual (§8.5.13 identity).
+    pub transform_8x8: bool,
 }
 
 /// One picture's `(Y, Cb, Cr)` `u16` planes.
@@ -163,6 +174,8 @@ pub struct DeepEncoded {
     pub skipped_mbs: usize,
     /// Intra_16x16 macroblocks inside P pictures.
     pub intra_mbs_in_p: usize,
+    /// Macroblocks coded with `transform_size_8x8_flag = 1`.
+    pub mbs_8x8: usize,
 }
 
 /// Picture geometry.
@@ -558,6 +571,65 @@ fn chroma_chain(
         recon_dc,
         ac_blk_nz,
     }
+}
+
+/// §8.6.4 / §8.5.13 8x8-transform inter chain at QP′ (or the §8.5.13
+/// bypass identity): four Table 8-14 zig-zag scan lists, per-quadrant
+/// CBP and the reconstructed residual.
+struct Inter8x8Chain {
+    scan: [[i32; 64]; 4],
+    cbp: u8,
+    recon: [i32; 256],
+}
+
+fn inter_chain_8x8(
+    residual: &[i32; 256],
+    qp: i32,
+    w8: &[i32; 64],
+    bd: u32,
+    bypass: bool,
+) -> Inter8x8Chain {
+    let mut scan = [[0i32; 64]; 4];
+    let mut cbp = 0u8;
+    let mut recon = [0i32; 256];
+    for (blk8, scan8) in scan.iter_mut().enumerate() {
+        let (ox, oy) = ((blk8 % 2) * 8, (blk8 / 2) * 8);
+        let mut block = [0i32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                block[j * 8 + i] = residual[(oy + j) * 16 + ox + i];
+            }
+        }
+        let (q, r) = if bypass {
+            (block, block)
+        } else {
+            let q = quantize_8x8_w(&forward_core_8x8(&block), qp, false, w8);
+            let r = inverse_transform_8x8(&q, qp, w8, bd).expect("inverse 8x8");
+            (q, r)
+        };
+        *scan8 = zigzag_scan_8x8(&q);
+        if scan8.iter().any(|&v| v != 0) {
+            cbp |= 1 << blk8;
+            for j in 0..8 {
+                for i in 0..8 {
+                    recon[(oy + j) * 16 + ox + i] = r[j * 8 + i];
+                }
+            }
+        }
+    }
+    Inter8x8Chain { scan, cbp, recon }
+}
+
+/// §7.4.5.3.3 — the four-4x4 CAVLC split of an 8x8 scan list:
+/// `lumaLevel4x4[i4][k] = lumaLevel8x8[4 * k + i4]`.
+fn split_8x8(scan8: &[i32; 64]) -> [[i32; 16]; 4] {
+    let mut out = [[0i32; 16]; 4];
+    for (i4, list) in out.iter_mut().enumerate() {
+        for (k, v) in list.iter_mut().enumerate() {
+            *v = scan8[4 * k + i4];
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1437,6 +1509,10 @@ fn emit_inter_cabac(
     luma_scan: &[[i32; 16]; 16],
     chroma: Option<(&ChromaChain, &ChromaChain)>,
     planes444: Option<(&ScanLists, &ScanLists)>,
+    // `Some((flag, scan8))` when the PPS carries `transform_8x8_mode_flag`:
+    // the flag is coded after CBP (cbp_luma > 0) and, when set, the
+    // luma residual is the four ctxBlockCat-5 lists.
+    t8x8: Option<(bool, &[[i32; 64]; 4])>,
 ) {
     let addr = mb_addr as usize;
     let nctx = full_neighbour_ctx(cab, addr, false);
@@ -1452,22 +1528,59 @@ fn emit_inter_cabac(
     cur.mvd_l0_x = [mvd.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16; 16];
     cur.mvd_l0_y = [mvd.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16; 16];
     encode_coded_block_pattern(&mut cs.enc, &mut cs.ctxs, &nctx, g.cf, cbp_luma, cbp_chroma);
+    let use_8x8 = match t8x8 {
+        Some((flag, _)) if cbp_luma > 0 => {
+            // §7.3.5 second gate — coded whenever the tool is on and
+            // cbp_luma > 0 (P_L0_16x16 has no sub-8x8 partitions).
+            encode_transform_size_8x8_flag(&mut cs.enc, &mut cs.ctxs, &nctx, flag);
+            flag
+        }
+        _ => false,
+    };
     if cbp_luma > 0 || cbp_chroma > 0 {
         encode_mb_qp_delta(&mut cs.enc, &mut cs.ctxs, cs.prev_qp_delta_nonzero, 0);
     }
     cs.prev_qp_delta_nonzero = false;
     cur.coded_block_pattern_luma = cbp_luma;
     cur.coded_block_pattern_chroma = cbp_chroma;
-    emit_inter_plane_cabac(
-        cs,
-        cab,
-        &mut cur,
-        addr,
-        false,
-        Plane::Y,
-        luma_scan,
-        cbp_luma,
-    );
+    cur.transform_size_8x8_flag = use_8x8;
+    if use_8x8 {
+        // §7.3.5.3.3 — one ctxBlockCat-5 residual per coded quadrant,
+        // coded_block_flag inferred (ChromaArrayType 1 / 2) and folded
+        // into the four 4x4 slots.
+        let scan8 = t8x8.map(|(_, s)| s).expect("8x8 lists");
+        for (blk8, list) in scan8.iter().enumerate() {
+            if (cbp_luma >> blk8) & 1 == 0 {
+                continue;
+            }
+            let coded = encode_residual_block_cabac_field(
+                &mut cs.enc,
+                &mut cs.ctxs,
+                BlockType::Luma8x8,
+                list,
+                64,
+                None,
+                None,
+                true,
+                1,
+                false,
+            );
+            for sub in 0..4usize {
+                cur.cbf_luma_4x4[blk8 * 4 + sub] = coded;
+            }
+        }
+    } else {
+        emit_inter_plane_cabac(
+            cs,
+            cab,
+            &mut cur,
+            addr,
+            false,
+            Plane::Y,
+            luma_scan,
+            cbp_luma,
+        );
+    }
     if let Some((cu, cv)) = chroma {
         let n_blk = g.ct_h / 4 * 2;
         emit_chroma_cabac(
@@ -1587,7 +1700,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
         weighted_pred_flag: false,
         weighted_bipred_idc: 0,
         entropy_coding_mode_flag: cfg.cabac,
-        transform_8x8_mode_flag: false,
+        transform_8x8_mode_flag: cfg.transform_8x8 && cf != 3,
         redundant_pic_cnt_present_flag: false,
         slice_groups: None,
         constrained_intra_pred_flag: false,
@@ -1604,6 +1717,9 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
     let mut prev_poc = 0i32;
     let mut skipped_mbs = 0usize;
     let mut intra_mbs_in_p = 0usize;
+    let mut mbs_8x8 = 0usize;
+    let w8 = ScalingMatrixMode::Flat.inter_weights().w8;
+    const EMPTY_8X8: [[i32; 64]; 4] = [[0; 64]; 4];
 
     for (k, &(fy, fu, fv)) in frames.iter().enumerate() {
         let src = Pic::from_u16(g, fy, fu, fv);
@@ -1717,11 +1833,28 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                 for i in 0..256 {
                     residual[i] = src_y[i] - pred_y[i];
                 }
-                let luma = if bypass {
+                let mut luma = if bypass {
                     inter_chain_bypass(&residual)
                 } else {
                     inter_chain(&residual, qp_y_prime, &w4, g.bd_y)
                 };
+                // §8.6.4 8x8 transform on every other MB (coverage
+                // policy: both flag values and both neighbour states
+                // of the §9.3.3.1.1.10 context in one picture).
+                let t8x8_on = cfg.transform_8x8 && cf != 3;
+                let t8x8_chain = (t8x8_on && mb_addr % 2 == 0)
+                    .then(|| inter_chain_8x8(&residual, qp_y_prime, &w8, g.bd_y, bypass));
+                if let Some(c8) = &t8x8_chain {
+                    luma.cbp = c8.cbp;
+                    luma.recon = c8.recon;
+                    for blk8 in 0..4usize {
+                        let split = split_8x8(&c8.scan[blk8]);
+                        for (sub, list) in split.iter().enumerate() {
+                            luma.scan[blk8 * 4 + sub] = *list;
+                            luma.blk_has_nz[blk8 * 4 + sub] = (c8.cbp >> blk8) & 1 == 1;
+                        }
+                    }
+                }
                 let mut cbp_luma = luma.cbp;
                 let src_u = src.chroma_tile(g, false, mb_x, mb_y);
                 let src_v = src.chroma_tile(g, true, mb_x, mb_y);
@@ -1866,9 +1999,15 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                     false,
                 );
                 let mvd = Mv::new(mv.x - mvp.x, mv.y - mvp.y);
+                // §7.3.5 — the flag is coded (and the 8x8 residual used)
+                // only with cbp_luma > 0; otherwise the decoder infers 0.
+                let flag_8x8 = t8x8_chain.is_some() && cbp_luma > 0;
+                if flag_8x8 {
+                    mbs_8x8 += 1;
+                }
                 let mut mcfg = PL016x16McbConfig {
                     ref_idx_l0: 0,
-                    transform_size_8x8_flag: None,
+                    transform_size_8x8_flag: t8x8_on.then_some(flag_8x8),
                     mvd_l0_x: mvd.x,
                     mvd_l0_y: mvd.y,
                     cbp_luma,
@@ -1935,6 +2074,12 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                             &mcfg.luma_4x4_levels,
                             Some((cu, cv)),
                             None,
+                            t8x8_on.then(|| {
+                                (
+                                    flag_8x8,
+                                    t8x8_chain.as_ref().map(|c| &c.scan).unwrap_or(&EMPTY_8X8),
+                                )
+                            }),
                         );
                     } else {
                         write_p_l0_16x16_mb_chroma(&mut sw, &mcfg, 0, cf, kind)
@@ -2007,6 +2152,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                             &mcfg.luma_4x4_levels,
                             None,
                             Some((&cb_levels, &cr_levels)),
+                            None,
                         );
                     } else {
                         write_p_l0_16x16_mb_chroma(&mut sw, &mcfg, 0, cf, kind)
@@ -2040,6 +2186,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                     qp_y,
                     luma_nonzero_4x4: luma_nz_mask_from_blocks(&blk_has_nz),
                     chroma_nonzero_4x4: chroma_nz_mask,
+                    transform_size_8x8_flag: flag_8x8,
                     mv_l0: [(mv.x as i16, mv.y as i16); 16],
                     ref_idx_l0: [0; 4],
                     ref_poc_l0: [prev_poc; 4],
@@ -2092,5 +2239,6 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
         profile_idc,
         skipped_mbs,
         intra_mbs_in_p,
+        mbs_8x8,
     }
 }

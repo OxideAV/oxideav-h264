@@ -88,6 +88,7 @@ fuzz_target!(|data: &[u8]| {
             lossless,
             lossless_interop: data[2] & 8 == 8,
             cabac: data[2] & 16 == 16,
+            transform_8x8: data[2] & 32 == 32,
         },
         &refs,
     );
