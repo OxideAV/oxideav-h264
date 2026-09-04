@@ -43,6 +43,7 @@ pub mod cabac_syntax;
 pub mod cavlc;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod deblock;
+pub mod deep;
 pub mod field;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod intra4x4;

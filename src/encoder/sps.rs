@@ -201,14 +201,26 @@ pub(crate) fn write_scaling_list_slot(
 /// *without* the NAL header byte. Wrap with `build_nal_unit` to get a
 /// complete Annex B NAL unit.
 pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
+    build_sps_rbsp_with_bypass(cfg, false)
+}
+
+/// [`build_baseline_sps_rbsp`] with the §7.3.2.1.1
+/// `qpprime_y_zero_transform_bypass_flag` selectable (round-456 —
+/// lossless coding: with the flag set and QP′Y == 0 every §8.5.10 /
+/// §8.5.11 / §8.5.12 stage is the identity and §8.5.15 DPCM applies to
+/// V/H intra prediction). Only meaningful for the High-family
+/// profiles that carry the chroma-extended SPS group; the flag is
+/// silently absent otherwise (Baseline / Main / Extended have no such
+/// syntax).
+pub fn build_sps_rbsp_with_bypass(cfg: &BaselineSpsConfig, transform_bypass: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     // §7.3.2.1.1 — profile_idc.
     debug_assert!(
-        matches!(cfg.profile_idc, 66 | 77 | 88 | 100 | 122 | 244),
-        "this writer only emits SPS bodies for profile_idc ∈ {{66, 77, 88, 100, 122, 244}} \
-         (Baseline / Main / Extended / High / High 4:2:2 / High 4:4:4 Predictive). Profile {} \
-         would require additional bit_depth_* / scaling-matrix wiring per §7.3.2.1.1.",
+        matches!(cfg.profile_idc, 66 | 77 | 88 | 100 | 110 | 122 | 244),
+        "this writer only emits SPS bodies for profile_idc ∈ {{66, 77, 88, 100, 110, 122, 244}} \
+         (Baseline / Main / Extended / High / High 10 / High 4:2:2 / High 4:4:4 Predictive). \
+         Profile {} would require additional bit_depth_* / scaling-matrix wiring per §7.3.2.1.1.",
         cfg.profile_idc,
     );
     // Round-27/28: chroma_format_idc accepted values. Round-448 adds
@@ -236,7 +248,9 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
         match cfg.chroma_format_idc {
             0 => matches!(cfg.profile_idc, 100 | 110 | 122 | 244),
             1 => true,
-            2 => cfg.profile_idc == 122,
+            // §A.2.6 High 4:2:2 (≤ 10-bit) or §A.2.7 High 4:4:4
+            // Predictive (round-456: 12-/14-bit 4:2:2 streams).
+            2 => matches!(cfg.profile_idc, 122 | 244),
             3 => cfg.profile_idc == 244,
             _ => false,
         },
@@ -292,8 +306,8 @@ pub fn build_baseline_sps_rbsp(cfg: &BaselineSpsConfig) -> Vec<u8> {
         debug_assert!(cfg.bit_depth_luma_minus8 <= 6 && cfg.bit_depth_chroma_minus8 <= 6);
         w.ue(cfg.bit_depth_luma_minus8);
         w.ue(cfg.bit_depth_chroma_minus8);
-        // qpprime_y_zero_transform_bypass_flag = 0.
-        w.u(1, 0);
+        // qpprime_y_zero_transform_bypass_flag (round-456: lossless).
+        w.u(1, u32::from(transform_bypass));
         // §7.3.2.1.1.1 — seq_scaling_matrix_present_flag. When default
         // matrices are requested, each of the 8 (12 at 4:4:4) lists is
         // present and coded as UseDefaultScalingMatrixFlag: one

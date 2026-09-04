@@ -726,6 +726,55 @@ pub fn write_intra16x16_mb_chroma(
     Ok(())
 }
 
+/// Round-456 — [`write_intra16x16_mb_in_inter_slice`] with an explicit
+/// chroma layout (ChromaArrayType 0..=3): the Intra_16x16 form inside a
+/// P (`mb_type_offset = 5`) or B (`23`) slice. Same body as
+/// [`write_intra16x16_mb_chroma`] with the §7.4.5 Table 7-13 / 7-14
+/// intra offset added to `mb_type`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_intra16x16_mb_in_inter_slice_chroma(
+    w: &mut BitWriter,
+    mb_type_offset: u32,
+    pred_mode: u8,
+    intra_chroma_pred_mode: u8,
+    cbp_luma: u8,
+    cbp_chroma: u8,
+    mb_qp_delta: i32,
+    luma_dc_levels_raster: &[i32; 16],
+    luma_ac_levels: &[[i32; 16]; 16],
+    luma_ac_nc: &[i32; 16],
+    chroma: ChromaWriteKind<'_>,
+    nc_ctx: CoeffTokenContext,
+) -> Result<(), CavlcEncodeError> {
+    debug_assert!(
+        mb_type_offset == 5 || mb_type_offset == 23,
+        "mb_type_offset must be 5 (P-slice) or 23 (B-slice); got {mb_type_offset}",
+    );
+    let raw = mb_type_offset + intra16x16_mb_type_value(pred_mode, cbp_luma, cbp_chroma);
+    w.ue(raw);
+    if !matches!(
+        chroma,
+        ChromaWriteKind::Yuv444 { .. } | ChromaWriteKind::Mono
+    ) {
+        w.ue(intra_chroma_pred_mode as u32);
+    }
+    w.se(mb_qp_delta);
+    let scan = zigzag_scan_4x4(luma_dc_levels_raster);
+    encode_residual_block_cavlc(w, nc_ctx, 16, &scan)?;
+    if cbp_luma == 15 {
+        for blk in 0..16usize {
+            encode_residual_block_cavlc(
+                w,
+                CoeffTokenContext::Numeric(luma_ac_nc[blk]),
+                15,
+                &luma_ac_levels[blk][..15],
+            )?;
+        }
+    }
+    chroma.emit(w, cbp_chroma)?;
+    Ok(())
+}
+
 /// Emit one Intra_16x16 macroblock (CAVLC, I-slice). 4:2:0 chroma layout.
 ///
 /// `nc_ctx` is the `nC` context for the luma DC residual block. With

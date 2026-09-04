@@ -226,7 +226,10 @@ fn q_bits(qp: i32) -> i32 {
 /// offsets recommended by the spec (intra: `(1<<qBits)/3`, inter:
 /// `(1<<qBits)/6`). Returns the integer level array `Z`.
 pub fn quantize_4x4(w: &[i32; 16], qp: i32, is_intra: bool) -> [i32; 16] {
-    debug_assert!((0..=51).contains(&qp));
+    debug_assert!(
+        (0..=87).contains(&qp),
+        "qP′ range 0..=51 + QpBdOffset (14-bit: 87)"
+    );
     let m = (qp.rem_euclid(6)) as usize;
     let mf = forward_mf_for(m);
     let qb = q_bits(qp);
@@ -262,7 +265,10 @@ pub fn quantize_4x4_ac(w: &[i32; 16], qp: i32, is_intra: bool) -> [i32; 16] {
 /// divides — `level = (|c| * MF * 16 / wscale + f) >> qBits`. With a
 /// flat list (all 16s) this is bit-identical to [`quantize_4x4`].
 pub fn quantize_4x4_w(w: &[i32; 16], qp: i32, is_intra: bool, wscale: &[i32; 16]) -> [i32; 16] {
-    debug_assert!((0..=51).contains(&qp));
+    debug_assert!(
+        (0..=87).contains(&qp),
+        "qP′ range 0..=51 + QpBdOffset (14-bit: 87)"
+    );
     let m = (qp.rem_euclid(6)) as usize;
     let mf = forward_mf_for(m);
     let qb = q_bits(qp);
@@ -343,7 +349,10 @@ pub fn forward_hadamard_4x4(dc: &[i32; 16]) -> [i32; 16] {
 /// rounding in §8.5.12.2, the encoder's matched right-shift is
 /// `qBits + 2 = 17 + qP/6`.
 pub fn quantize_luma_dc(coeff: &[i32; 16], qp: i32, is_intra: bool) -> [i32; 16] {
-    debug_assert!((0..=51).contains(&qp));
+    debug_assert!(
+        (0..=87).contains(&qp),
+        "qP′ range 0..=51 + QpBdOffset (14-bit: 87)"
+    );
     let m = (qp.rem_euclid(6)) as usize;
     let mf = forward_mf_for(m)[0]; // (0,0) entry
     let qb = q_bits(qp) + 2;
@@ -366,7 +375,10 @@ pub fn quantize_luma_dc(coeff: &[i32; 16], qp: i32, is_intra: bool) -> [i32; 16]
 /// scaling uses LevelScale(qP%6, 0, 0) = wscale(0,0) * normAdjust, so
 /// the forward step divides by `w00 / 16`.
 pub fn quantize_luma_dc_w(coeff: &[i32; 16], qp: i32, is_intra: bool, w00: i32) -> [i32; 16] {
-    debug_assert!((0..=51).contains(&qp));
+    debug_assert!(
+        (0..=87).contains(&qp),
+        "qP′ range 0..=51 + QpBdOffset (14-bit: 87)"
+    );
     let m = (qp.rem_euclid(6)) as usize;
     let mf = forward_mf_for(m)[0];
     let qb = q_bits(qp) + 2;
@@ -411,7 +423,10 @@ pub fn forward_hadamard_2x2(dc: &[i32; 4]) -> [i32; 4] {
 /// scaling and the inverse 4x4's final `(. + 32) >> 6`, the matched
 /// encoder right-shift is `qBits + 1`.
 pub fn quantize_chroma_dc(coeff: &[i32; 4], qp_c: i32, is_intra: bool) -> [i32; 4] {
-    debug_assert!((0..=51).contains(&qp_c));
+    debug_assert!(
+        (0..=87).contains(&qp_c),
+        "qP′ range 0..=51 + QpBdOffset (14-bit: 87)"
+    );
     let m = (qp_c.rem_euclid(6)) as usize;
     let mf = forward_mf_for(m)[0];
     let qb = q_bits(qp_c) + 1;
@@ -433,7 +448,10 @@ pub fn quantize_chroma_dc(coeff: &[i32; 4], qp_c: i32, is_intra: bool) -> [i32; 
 /// [`quantize_chroma_dc`] under a non-flat weightScale: §8.5.11.1's
 /// scaling uses LevelScale(qP%6, 0, 0) of the chroma list.
 pub fn quantize_chroma_dc_w(coeff: &[i32; 4], qp_c: i32, is_intra: bool, w00: i32) -> [i32; 4] {
-    debug_assert!((0..=51).contains(&qp_c));
+    debug_assert!(
+        (0..=87).contains(&qp_c),
+        "qP′ range 0..=51 + QpBdOffset (14-bit: 87)"
+    );
     let m = (qp_c.rem_euclid(6)) as usize;
     let mf = forward_mf_for(m)[0];
     let qb = q_bits(qp_c) + 1;
@@ -519,16 +537,32 @@ pub fn quantize_chroma_dc_422(coeff: &[i32; 8], qp_c: i32, is_intra: bool) -> [i
     quantize_chroma_dc_422_w(coeff, qp_c, is_intra, 16)
 }
 
-/// [`quantize_chroma_dc_422`] under a non-flat weightScale: the
-/// §8.5.11.2 eq. 8-328/8-329 scaling uses `LevelScale4x4(qP % 6, 0, 0)`
-/// of the chroma list, i.e. `weightScale(0, 0) * normAdjust / 16` —
-/// so the forward step divides by `w00 / 16`. With `w00 == 16` this is
-/// bit-identical to the flat quantiser.
+/// [`quantize_chroma_dc_422`] under a non-flat weightScale.
+///
+/// §8.5.11.2 dequantises the 4:2:2 chroma DC at **`qP,DC = qP + 3`**
+/// (eq. 8-327): `dcC = (f · LevelScale4x4(qP,DC % 6, 0, 0)) <<
+/// (qP,DC / 6 − 6)` (eq. 8-328), then the DC-preserved §8.5.12 core
+/// inverse divides by 64. With the unnormalised 4x2 forward / inverse
+/// Hadamard pair (DC gain 8 each way) and the core transform's DC gain
+/// of 16, a constant residual `x` round-trips as `x = 128 · x · Q ·
+/// LevelScale · 2^(qP,DC / 6) / 4096`, i.e. the forward multiplier is
+/// `Q = MF(qP,DC % 6) / 2^(16 + qP,DC / 6)` — `MF` and `qBits` both
+/// selected at `qP,DC`, with the `+1` shift of the 4:2:0 chroma DC
+/// quantiser (not `+2`). Round-456 fix: the previous forward used
+/// `MF(qP % 6) / 2^(17 + qP / 6)`, 1/√2 of the correct scale, so
+/// every 4:2:2 chroma DC reconstructed ~0.7× the intended value — the
+/// streams were legal and bit-exact but 4:2:2 chroma sat ~10 dB below
+/// luma at equal QP. The non-flat weightScale divides by `w00 / 16`;
+/// with `w00 == 16` this is bit-identical to the flat quantiser.
 pub fn quantize_chroma_dc_422_w(coeff: &[i32; 8], qp_c: i32, is_intra: bool, w00: i32) -> [i32; 8] {
-    debug_assert!((0..=51).contains(&qp_c));
-    let m = (qp_c.rem_euclid(6)) as usize;
+    debug_assert!(
+        (0..=87).contains(&qp_c),
+        "qP′ range 0..=51 + QpBdOffset (14-bit: 87)"
+    );
+    let qp_dc = qp_c + 3;
+    let m = (qp_dc.rem_euclid(6)) as usize;
     let mf = forward_mf_for(m)[0];
-    let qb = q_bits(qp_c) + 2;
+    let qb = q_bits(qp_dc) + 1;
     let f = if is_intra {
         (1i64 << qb) / 3
     } else {
@@ -1022,7 +1056,10 @@ fn q_bits_8x8(qp: i32) -> i32 {
 /// rounding offset (intra `(1<<qBits)/3`, inter `(1<<qBits)/6`).
 /// Returns the row-major integer level array `Z`.
 pub fn quantize_8x8(w: &[i32; 64], qp: i32, is_intra: bool) -> [i32; 64] {
-    debug_assert!((0..=51).contains(&qp));
+    debug_assert!(
+        (0..=87).contains(&qp),
+        "qP′ range 0..=51 + QpBdOffset (14-bit: 87)"
+    );
     let m = qp.rem_euclid(6) as usize;
     let qb = q_bits_8x8(qp);
     let f = if is_intra {
@@ -1047,7 +1084,10 @@ pub fn quantize_8x8(w: &[i32; 64], qp: i32, is_intra: bool) -> [i32; 64] {
 /// [`quantize_8x8`] under a non-flat §7.4.2.1.1.1 8x8 weightScale
 /// (row-major). Flat lists reproduce [`quantize_8x8`] bit-exactly.
 pub fn quantize_8x8_w(w: &[i32; 64], qp: i32, is_intra: bool, wscale: &[i32; 64]) -> [i32; 64] {
-    debug_assert!((0..=51).contains(&qp));
+    debug_assert!(
+        (0..=87).contains(&qp),
+        "qP′ range 0..=51 + QpBdOffset (14-bit: 87)"
+    );
     let m = qp.rem_euclid(6) as usize;
     let qb = q_bits_8x8(qp);
     let f = if is_intra {
