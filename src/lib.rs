@@ -79,6 +79,8 @@ pub mod h264_encoder;
 
 pub mod encoder;
 
+pub mod es_demux;
+
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 use oxideav_core::{CodecInfo, CodecRegistry, RuntimeContext};
 
@@ -114,7 +116,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 }
 
 /// Unified registration entry point: install the H.264 codec factories
-/// into the codec sub-registry of a [`RuntimeContext`].
+/// into the codec sub-registry of a [`RuntimeContext`], plus the raw
+/// Annex-B byte-stream demuxer ([`es_demux`], `.h264` / `.264`).
 ///
 /// This is the preferred entry point for new code — it matches the
 /// convention every sibling crate now follows. Direct callers that need
@@ -124,6 +127,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 /// [`oxideav_core::register!`] macro below.
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
+    es_demux::register(&mut ctx.containers);
 }
 
 oxideav_core::register!("h264", register);
