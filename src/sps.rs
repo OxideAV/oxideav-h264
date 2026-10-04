@@ -613,6 +613,89 @@ impl Sps {
     pub fn max_frame_num(&self) -> u32 {
         1u32 << (self.log2_max_frame_num_minus4 + 4)
     }
+
+    /// §7.4.2.1.1 eq. (7-19) .. (7-22) — `(CropUnitX, CropUnitY)`.
+    ///
+    /// * `ChromaArrayType == 0`: `CropUnitX = 1`,
+    ///   `CropUnitY = 2 − frame_mbs_only_flag`;
+    /// * otherwise: `CropUnitX = SubWidthC`,
+    ///   `CropUnitY = SubHeightC * (2 − frame_mbs_only_flag)`
+    ///   (Table 6-1: 4:2:0 → 2/2, 4:2:2 → 2/1, 4:4:4 → 1/1).
+    pub fn crop_units(&self) -> (u32, u32) {
+        let field_factor = if self.frame_mbs_only_flag { 1 } else { 2 };
+        let (sub_w, sub_h) = match self.chroma_array_type() {
+            0 => (1, 1),
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        (sub_w, sub_h * field_factor)
+    }
+
+    /// §7.4.2.1.1 — the frame cropping rectangle as luma-sample margins
+    /// of the decoded *frame*: `(left, right, top, bottom)`, i.e. the
+    /// `frame_crop_*_offset` values scaled by `CropUnitX` / `CropUnitY`.
+    /// All zero when `frame_cropping_flag == 0`. The output frame keeps
+    /// the luma samples with frame coordinates
+    /// `CropUnitX * frame_crop_left_offset ..=
+    /// PicWidthInSamplesL − (CropUnitX * frame_crop_right_offset + 1)`
+    /// horizontally and the analogous range vertically.
+    pub fn frame_crop_margins(&self) -> FrameCropMargins {
+        let Some(c) = &self.frame_cropping else {
+            return FrameCropMargins::default();
+        };
+        let (cux, cuy) = self.crop_units();
+        FrameCropMargins {
+            left: c.left.saturating_mul(cux),
+            right: c.right.saturating_mul(cux),
+            top: c.top.saturating_mul(cuy),
+            bottom: c.bottom.saturating_mul(cuy),
+        }
+    }
+
+    /// The dimensions of the cropped output frame in luma samples:
+    /// `PicWidthInSamplesL` / `FrameHeightInMbs * 16` minus the
+    /// [`Self::frame_crop_margins`].
+    pub fn cropped_dimensions(&self) -> (u32, u32) {
+        let m = self.frame_crop_margins();
+        let w = self.pic_width_in_mbs() * 16;
+        let h = self.frame_height_in_mbs() * 16;
+        (
+            w.saturating_sub(m.left.saturating_add(m.right)),
+            h.saturating_sub(m.top.saturating_add(m.bottom)),
+        )
+    }
+}
+
+/// §7.4.2.1.1 — frame cropping rectangle expressed as luma-sample
+/// margins removed from each edge of the decoded picture. See
+/// [`Sps::frame_crop_margins`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameCropMargins {
+    pub left: u32,
+    pub right: u32,
+    pub top: u32,
+    pub bottom: u32,
+}
+
+impl FrameCropMargins {
+    /// The margins as they apply to one *field* of the frame (a coded
+    /// field, or an unpaired field emitted on its own): the vertical
+    /// margins cover half as many rows. `CropUnitY` is even whenever
+    /// fields exist (`frame_mbs_only_flag == 0`), so the halving is
+    /// exact.
+    pub fn for_field(self) -> Self {
+        Self {
+            top: self.top / 2,
+            bottom: self.bottom / 2,
+            ..self
+        }
+    }
+
+    /// `true` when no sample is cropped.
+    pub fn is_empty(&self) -> bool {
+        self.left == 0 && self.right == 0 && self.top == 0 && self.bottom == 0
+    }
 }
 
 #[cfg(test)]

@@ -107,7 +107,7 @@ impl H264EsDemuxer {
             .ok_or_else(|| Error::invalid("h264 byte stream: no sequence parameter set"))?;
         let units = split_access_units(data);
         let mut params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
-        let (w, h) = display_dims(&sps);
+        let (w, h) = sps.cropped_dimensions();
         params.width = Some(w);
         params.height = Some(h);
         params.pixel_format = pixel_format(&sps);
@@ -179,29 +179,6 @@ fn split_access_units(data: &[u8]) -> Vec<Vec<u8>> {
         units.push(cur);
     }
     units
-}
-
-/// §7.4.2.1.1: the frame size after the cropping window (eqs. 7-19 ..
-/// 7-22).
-fn display_dims(sps: &Sps) -> (u32, u32) {
-    let w = sps.pic_width_in_mbs() * 16;
-    let h = sps.frame_height_in_mbs() * 16;
-    let Some(c) = &sps.frame_cropping else {
-        return (w, h);
-    };
-    let cat = sps.chroma_array_type();
-    let (sub_w, sub_h) = match cat {
-        1 => (2, 2),
-        2 => (2, 1),
-        _ => (1, 1),
-    };
-    let crop_x = if cat == 0 { 1 } else { sub_w };
-    let frame_mbs = if sps.frame_mbs_only_flag { 1 } else { 2 };
-    let crop_y = frame_mbs * if cat == 0 { 1 } else { sub_h };
-    (
-        w.saturating_sub(crop_x * (c.left + c.right)),
-        h.saturating_sub(crop_y * (c.top + c.bottom)),
-    )
 }
 
 /// The planar layout the decoder emits for this SPS.

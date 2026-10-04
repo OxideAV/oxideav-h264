@@ -60,7 +60,7 @@ use crate::ref_store::{RefPicProvider, RefPicStore};
 use crate::slice_header::{
     MmcoOp as SliceMmcoOp, RefPicListModificationOp as SliceRplmOp, SliceHeader, SliceType,
 };
-use crate::sps::Sps;
+use crate::sps::{FrameCropMargins, Sps};
 use crate::{reconstruct, slice_data};
 
 /// §7.4.1.2 / §7.4.1.2.4 — state carried forward across slices that
@@ -160,6 +160,9 @@ struct PendingField {
     field_poc: i32,
     /// Packet pts carried by whichever field opened the access unit.
     pts: Option<i64>,
+    /// §7.4.2.1.1 — the frame cropping margins of the field's SPS,
+    /// applied when the pair (or the lone field) is output.
+    crop: FrameCropMargins,
 }
 
 /// §8.1 — separate-colour-plane decode state (round 448). When the
@@ -2014,11 +2017,12 @@ impl H264CodecDecoder {
                 first_header.frame_num,
                 output_poc,
                 pts,
+                sps.frame_crop_margins(),
             );
             return Ok(());
         }
 
-        let vf = picture_to_video_frame(&pic, pts);
+        let vf = picture_to_video_frame(&pic, pts, sps.frame_crop_margins());
         let entry = OutputEntry {
             picture: vf,
             pic_order_cnt: output_poc,
@@ -2044,6 +2048,7 @@ impl H264CodecDecoder {
         frame_num: u32,
         field_poc: i32,
         pts: Option<i64>,
+        crop: FrameCropMargins,
     ) {
         if let Some(prev) = self.pending_field.take() {
             // Complete the pair only when the two fields are genuinely
@@ -2062,7 +2067,7 @@ impl H264CodecDecoder {
                 // Min(TopFieldOrderCnt, BottomFieldOrderCnt).
                 let frame_poc = prev.field_poc.min(field_poc);
                 let frame_pts = prev.pts.or(pts);
-                let vf = picture_to_video_frame(&frame, frame_pts);
+                let vf = picture_to_video_frame(&frame, frame_pts, crop);
                 let entry = OutputEntry {
                     picture: vf,
                     pic_order_cnt: frame_poc,
@@ -2083,6 +2088,7 @@ impl H264CodecDecoder {
             frame_num,
             field_poc,
             pts,
+            crop,
         });
     }
 
@@ -2091,7 +2097,9 @@ impl H264CodecDecoder {
     /// cannot be paired (sequence boundary, or a non-complementary
     /// successor field).
     fn emit_unpaired_field(&mut self, field: PendingField) {
-        let vf = picture_to_video_frame(&field.pic, field.pts);
+        // A lone field is half the frame's height: the vertical
+        // cropping margins shrink with it.
+        let vf = picture_to_video_frame(&field.pic, field.pts, field.crop.for_field());
         let entry = OutputEntry {
             picture: vf,
             pic_order_cnt: field.field_poc,
@@ -2922,9 +2930,26 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
 /// The slim `VideoFrame` shape only carries `pts` + `planes`; the pixel
 /// format / resolution / time_base live on the stream's
 /// [`CodecParameters`] (set by the decoder from the SPS).
-fn picture_to_video_frame(pic: &Picture, pts: Option<i64>) -> VideoFrame {
+fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargins) -> VideoFrame {
     let w = pic.width_in_samples as usize;
+    let h = pic.height_in_samples as usize;
     let cw = pic.chroma_width() as usize;
+
+    // §7.4.2.1.1 — the output is the cropping rectangle of the decoded
+    // picture. The margins are luma samples; the chroma margins follow
+    // from SubWidthC / SubHeightC (Table 6-1). `CropUnitX` /
+    // `CropUnitY` are multiples of the subsampling factors, so the
+    // divisions are exact. Margins are clamped so a malformed SPS can
+    // never index past the picture (the parser rejects such SPSs).
+    let left = (crop.left as usize).min(w);
+    let top = (crop.top as usize).min(h);
+    let out_w = w - left - (crop.right as usize).min(w - left);
+    let out_h = h - top - (crop.bottom as usize).min(h - top);
+    let (sub_w, sub_h) = match pic.chroma_array_type {
+        1 => (2, 2),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
 
     // Samples wider than 8-bit are stored as little-endian u16 (two
     // bytes per sample) — matches the `Yuv*P10Le` / `Yuv*P12Le` layouts
@@ -2938,45 +2963,49 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>) -> VideoFrame {
     let luma_max: i32 = (1i32 << pic.bit_depth_luma) - 1;
     let chroma_max: i32 = (1i32 << pic.bit_depth_chroma) - 1;
 
-    let luma_data: Vec<u8> = if luma_wide {
-        let mut out = Vec::with_capacity(pic.luma.len() * 2);
-        for &s in &pic.luma {
-            let v = s.clamp(0, luma_max) as u16;
-            out.extend_from_slice(&v.to_le_bytes());
+    // Pack the `rect_w` x `rect_h` window at (`x0`, `y0`) of a plane
+    // whose row stride is `src_stride` samples.
+    #[allow(clippy::too_many_arguments)]
+    fn pack(
+        src: &[i32],
+        src_stride: usize,
+        x0: usize,
+        y0: usize,
+        rect_w: usize,
+        rect_h: usize,
+        wide: bool,
+        max: i32,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(rect_w * rect_h * if wide { 2 } else { 1 });
+        for row in src.chunks(src_stride.max(1)).skip(y0).take(rect_h) {
+            let row = &row[x0.min(row.len())..(x0 + rect_w).min(row.len())];
+            if wide {
+                for &s in row {
+                    out.extend_from_slice(&(s.clamp(0, max) as u16).to_le_bytes());
+                }
+            } else {
+                out.extend(row.iter().map(|&s| s.clamp(0, 255) as u8));
+            }
         }
         out
-    } else {
-        pic.luma.iter().map(|&s| s.clamp(0, 255) as u8).collect()
-    };
-    let luma_stride = if luma_wide { w * 2 } else { w };
+    }
+
+    let luma_data = pack(&pic.luma, w, left, top, out_w, out_h, luma_wide, luma_max);
+    let luma_stride = if luma_wide { out_w * 2 } else { out_w };
     let mut planes = vec![VideoPlane {
         stride: luma_stride,
         data: luma_data,
     }];
     if pic.chroma_array_type != 0 {
-        let chroma_stride = if chroma_wide { cw * 2 } else { cw };
-        let pack_chroma = |src: &[i32]| -> Vec<u8> {
-            if chroma_wide {
-                let mut out = Vec::with_capacity(src.len() * 2);
-                for &s in src {
-                    let v = s.clamp(0, chroma_max) as u16;
-                    out.extend_from_slice(&v.to_le_bytes());
-                }
-                out
-            } else {
-                src.iter().map(|&s| s.clamp(0, 255) as u8).collect()
-            }
-        };
-        let cb = pack_chroma(&pic.cb);
-        let cr = pack_chroma(&pic.cr);
-        planes.push(VideoPlane {
-            stride: chroma_stride,
-            data: cb,
-        });
-        planes.push(VideoPlane {
-            stride: chroma_stride,
-            data: cr,
-        });
+        let (cx, cy) = (left / sub_w, top / sub_h);
+        let (ow, oh) = (out_w / sub_w, out_h / sub_h);
+        let chroma_stride = if chroma_wide { ow * 2 } else { ow };
+        for src in [&pic.cb, &pic.cr] {
+            planes.push(VideoPlane {
+                stride: chroma_stride,
+                data: pack(src, cw, cx, cy, ow, oh, chroma_wide, chroma_max),
+            });
+        }
     }
 
     VideoFrame { pts, planes }
@@ -4137,13 +4166,13 @@ mod tests {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         // Top field then bottom field of the same frame_num.
         let top = field_pic(16, 4, 30, 128, 8, 3);
-        dec.handle_field_output(top, false, 3, 8, Some(99));
+        dec.handle_field_output(top, false, 3, 8, Some(99), FrameCropMargins::default());
         // The first field alone produces no output (held pending).
         assert!(dec.ready.is_empty());
         assert!(dec.pending_field.is_some());
 
         let bottom = field_pic(16, 4, 40, 128, 10, 3);
-        dec.handle_field_output(bottom, true, 3, 10, None);
+        dec.handle_field_output(bottom, true, 3, 10, None, FrameCropMargins::default());
         // Pair completed → pending cleared, one frame queued (possibly
         // still inside the output DPB until bumped). Force a drain.
         assert!(dec.pending_field.is_none());
@@ -4173,9 +4202,9 @@ mod tests {
         // Two consecutive TOP fields (same parity) → not a pair. The
         // first must be emitted on its own, the second held pending.
         let top1 = field_pic(16, 4, 30, 128, 8, 3);
-        dec.handle_field_output(top1, false, 3, 8, None);
+        dec.handle_field_output(top1, false, 3, 8, None, FrameCropMargins::default());
         let top2 = field_pic(16, 4, 50, 128, 12, 4);
-        dec.handle_field_output(top2, false, 4, 12, None);
+        dec.handle_field_output(top2, false, 4, 12, None, FrameCropMargins::default());
         // First top field orphaned → one half-height frame queued; the
         // second top field is now pending.
         assert!(dec.pending_field.is_some());
@@ -4188,6 +4217,102 @@ mod tests {
         // Half-height (4 rows) — an unpaired field is emitted as-is.
         assert_eq!(vf.planes[0].data.len(), 16 * 4);
         assert_eq!(vf.planes[0].data[0], 30);
+    }
+
+    /// §7.4.2.1.1 — the output frame is the cropping rectangle of the
+    /// decoded picture, on every plane (4:2:0: chroma margins are half
+    /// the luma margins).
+    #[test]
+    fn output_frame_is_the_cropping_rectangle() {
+        let mut pic = Picture::new(32, 32, 1, 8, 8);
+        for (i, s) in pic.luma.iter_mut().enumerate() {
+            *s = ((i % 32) + 4 * (i / 32)) as i32;
+        }
+        for (i, s) in pic.cb.iter_mut().enumerate() {
+            *s = ((i % 16) + 16 * (i / 16)) as i32;
+        }
+        for (i, s) in pic.cr.iter_mut().enumerate() {
+            *s = 255 - ((i % 16) + 16 * (i / 16)) as i32;
+        }
+        let crop = FrameCropMargins {
+            left: 2,
+            right: 4,
+            top: 2,
+            bottom: 6,
+        };
+        let vf = picture_to_video_frame(&pic, Some(1), crop);
+        assert_eq!(vf.planes.len(), 3);
+        let (w, h) = (26usize, 24usize);
+        assert_eq!(vf.planes[0].stride, w);
+        assert_eq!(vf.planes[0].data.len(), w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let want = ((x + 2) + 4 * (y + 2)) as u8;
+                assert_eq!(vf.planes[0].data[y * w + x], want, "luma ({x},{y})");
+            }
+        }
+        let (cw, ch) = (13usize, 12usize);
+        for (plane, flip) in [(1usize, false), (2, true)] {
+            assert_eq!(vf.planes[plane].stride, cw);
+            assert_eq!(vf.planes[plane].data.len(), cw * ch);
+            for y in 0..ch {
+                for x in 0..cw {
+                    let v = (x + 1) + 16 * (y + 1);
+                    let want = if flip { 255 - v } else { v } as u8;
+                    assert_eq!(vf.planes[plane].data[y * cw + x], want, "plane {plane}");
+                }
+            }
+        }
+    }
+
+    /// A 10-bit picture keeps its two-byte samples inside the window.
+    #[test]
+    fn cropping_keeps_wide_samples_little_endian() {
+        let mut pic = Picture::new(16, 16, 0, 10, 10);
+        for (i, s) in pic.luma.iter_mut().enumerate() {
+            *s = (i as i32) * 4;
+        }
+        let crop = FrameCropMargins {
+            left: 0,
+            right: 6,
+            top: 0,
+            bottom: 2,
+        };
+        let vf = picture_to_video_frame(&pic, None, crop);
+        assert_eq!(vf.planes.len(), 1);
+        assert_eq!(vf.planes[0].stride, 20);
+        assert_eq!(vf.planes[0].data.len(), 20 * 14);
+        let row1 = &vf.planes[0].data[20..22];
+        assert_eq!(u16::from_le_bytes([row1[0], row1[1]]), 16 * 4);
+    }
+
+    /// A field pair is cropped with the frame margins; a lone field
+    /// with half the vertical margins.
+    #[test]
+    fn field_output_applies_frame_and_field_cropping() {
+        let crop = FrameCropMargins {
+            left: 0,
+            right: 2,
+            top: 0,
+            bottom: 4,
+        };
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.handle_field_output(field_pic(16, 4, 30, 128, 8, 3), false, 3, 8, None, crop);
+        dec.handle_field_output(field_pic(16, 4, 40, 128, 10, 3), true, 3, 10, None, crop);
+        // An orphan top field (next frame_num), flushed at EOF.
+        dec.handle_field_output(field_pic(16, 4, 50, 128, 12, 4), false, 4, 12, None, crop);
+        dec.flush_pending_field();
+        dec.eof = true;
+        let mut sizes = Vec::new();
+        while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+            sizes.push((
+                vf.planes[0].stride,
+                vf.planes[0].data.len() / vf.planes[0].stride,
+            ));
+            assert_eq!(vf.planes[1].stride, 7);
+        }
+        // Pair: 8 rows − 4; lone field: 4 rows − 2.
+        assert_eq!(sizes, vec![(14, 4), (14, 2)]);
     }
 
     /// Round 430 (2026-07-25 scheduled-fuzz OOM triage) — §8.2.5.2
