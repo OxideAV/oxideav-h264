@@ -427,8 +427,12 @@ pub(crate) fn emit_inter_plane_cabac(
         }
         for sub in 0..4usize {
             let blk = blk8 * 4 + sub;
+            // §9.3.3.1.1.9 — an unavailable neighbour block counts as
+            // coded when the CURRENT macroblock is intra (round 475: the
+            // I_NxN emitter shares this path with the inter MBs, whose
+            // `cur.is_intra` is false).
             let (ca, cb) =
-                cabac_cbf_cond_terms(cab, addr as u32, cur, false, bt, blk as u8, false, 1);
+                cabac_cbf_cond_terms(cab, addr as u32, cur, cur.is_intra, bt, blk as u8, false, 1);
             let list = scan16(&scan[blk], field);
             let coded = encode_residual_block_cabac_field(
                 &mut cs.enc,

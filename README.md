@@ -268,13 +268,23 @@ builder + parser + sample framing). Gates: every layout × CAVLC /
 CABAC decodes in our decoder within the lossy bound and
 byte-identically in a black-box reference decoder; lossless 4:2:2 /
 4:4:4 / 10- / 12-bit / grey exact in both; `avcC` extradata + samples
-decode identically to the Annex B stream. Measured (64x48 synthetic,
+decode identically to the Annex B stream. **Intra_4x4 at > 8 bit**
+(`intra_4x4`, default on; `DeepSession::with_intra_4x4`): §8.3.1
+block-sequential prediction at 8 / 10 / 12 / 14 bit with the §8.3.1.1
+predicted-mode coding, the §8.5.15 V / H DPCM under transform bypass
+and the §8.3.4.5 4:4:4 chroma planes, CAVLC + CABAC, competing with
+Intra_16x16 per macroblock on `Σ (SAD + mode bits · λ)` — bit-exact in
+our decoder and byte-exact in the reference decoder across 8 layouts ×
+both entropy coders, lossy and lossless; lossless 12-bit 4:4:4 shrinks
+49572 → 33308 B, lossy 10-bit 4:2:0 3588 → 3446 B at equal PSNR (QP
+26). Measured (64x48 synthetic,
 3 pictures, CAVLC, bytes / min luma PSNR): 4:2:2 8-bit 3389 B / 45.2
 dB at QP 20, 2009 B / 38.4 dB at QP 28, 1048 B / 30.8 dB at QP 36;
 4:2:0 10-bit 2429 / 45.6, 1479 / 38.2, 858 / 30.9; 4:4:4 12-bit 4970 /
 45.7, 3009 / 38.1, 1492 / 30.9. Not yet on this path: 4:0:0
-(`chroma_format_idc = 0`) coding for grey input, Intra_NxN at > 8 bit,
-B pictures and rate control for the High-family layouts.
+(`chroma_format_idc = 0`) coding for grey input, Intra_8x8 and
+Intra_NxN inside P pictures at > 8 bit, B pictures and rate control
+for the High-family layouts.
 
 | Coding tool | Scope | Notes |
 | ----------- | ----- | ----- |

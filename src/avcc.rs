@@ -560,7 +560,7 @@ mod tests {
         let long = annex_b_to_length_prefixed(&annex_b, 1, false);
         assert!(long.is_ok() || matches!(long, Err(AvccError::NalTooLong(_))));
         let mut big = vec![0, 0, 0, 1, 0x65];
-        big.extend(std::iter::repeat_n(0x11u8, 300));
+        big.extend(std::iter::repeat(0x11u8).take(300));
         assert_eq!(
             annex_b_to_length_prefixed(&big, 1, false),
             Err(AvccError::NalTooLong(301))

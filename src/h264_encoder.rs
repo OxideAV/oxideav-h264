@@ -116,6 +116,10 @@ pub struct H264EncoderOptions {
     /// Round-475 — §8.7 in-loop deblocking (default true). High-family
     /// path (the 8-bit 4:2:0 path always deblocks).
     pub deblock: bool,
+    /// Round-475 — Intra_4x4 (I_NxN) macroblocks in the I pictures of
+    /// the High-family path, competing with Intra_16x16 per macroblock
+    /// (default true). The 8-bit 4:2:0 path runs its own RDO.
+    pub intra_4x4: bool,
     /// Round-475 — packet framing: `annexb` (default: start codes,
     /// in-band SPS / PPS on every IDR, empty extradata) or `avcc`
     /// (4-byte length-prefixed NAL units without parameter sets /
@@ -145,6 +149,7 @@ impl Default for H264EncoderOptions {
             lossless: false,
             transform_8x8: false,
             deblock: true,
+            intra_4x4: true,
             format: "annexb".to_string(),
         }
     }
@@ -227,6 +232,12 @@ impl CodecOptionsStruct for H264EncoderOptions {
             help: "in-loop deblocking filter (High-family path; the 8-bit 4:2:0 path always deblocks)",
         },
         OptionField {
+            name: "intra_4x4",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "Intra_4x4 (I_NxN) macroblocks in I pictures (High-family path)",
+        },
+        OptionField {
             name: "format",
             kind: OptionKind::Enum(&["annexb", "avcc"]),
             default: OptionValue::String(String::new()),
@@ -248,6 +259,7 @@ impl CodecOptionsStruct for H264EncoderOptions {
             "lossless" => self.lossless = value.as_bool()?,
             "transform_8x8" => self.transform_8x8 = value.as_bool()?,
             "deblock" => self.deblock = value.as_bool()?,
+            "intra_4x4" => self.intra_4x4 = value.as_bool()?,
             "format" => self.format = value.as_str()?.to_string(),
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -659,7 +671,8 @@ impl H264CodecEncoder {
                         transform_8x8: opts.transform_8x8,
                     },
                     profile_idc,
-                );
+                )
+                .with_intra_4x4(opts.intra_4x4);
                 let ps = session.parameter_sets_annex_b();
                 (
                     Backend::Deep(Box::new(DeepDriver {

@@ -40,12 +40,14 @@ use crate::encoder::cabac_syntax::{
     encode_coded_block_pattern, encode_end_of_slice_flag, encode_intra_chroma_pred_mode,
     encode_mb_qp_delta, encode_mb_skip_flag, encode_mb_type_i, encode_mb_type_p, encode_mvd_lx,
 };
+use crate::encoder::cabac_syntax::{encode_prev_intra_pred_mode_flag, encode_rem_intra_pred_mode};
 use crate::encoder::deblock::{
     chroma_nz_mask_from_blocks, deblock_recon_deep, luma_nz_mask_from_blocks, MbDeblockInfo,
 };
 use crate::encoder::macroblock::{
-    write_intra16x16_mb_chroma, write_intra16x16_mb_in_inter_slice_chroma,
-    write_p_l0_16x16_mb_chroma, ChromaWriteKind, PL016x16McbConfig,
+    write_i4x4_mb_444, write_i_nxn_mb_chroma, write_intra16x16_mb_chroma,
+    write_intra16x16_mb_in_inter_slice_chroma, write_p_l0_16x16_mb_chroma, ChromaWriteKind,
+    PL016x16McbConfig,
 };
 use crate::encoder::mbaff_cabac::{
     emit_chroma_cabac, emit_i16_plane_cabac, emit_inter_plane_cabac, full_neighbour_ctx,
@@ -72,9 +74,9 @@ use crate::encoder::{
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::intra_pred::{
-    intra_16x16_mode_permitted, intra_chroma_mode_permitted, predict_16x16, predict_chroma,
-    ChromaArrayType, Intra16x16Mode, IntraChromaMode, Neighbour4x4Availability, Samples16x16,
-    SamplesChroma,
+    intra_16x16_mode_permitted, intra_chroma_mode_permitted, predict_16x16, predict_4x4,
+    predict_chroma, ChromaArrayType, Intra16x16Mode, Intra4x4Mode, IntraChromaMode,
+    Neighbour4x4Availability, Samples16x16, Samples4x4, SamplesChroma,
 };
 use crate::macroblock_layer::{cabac_mvd_abs_sum, CabacMbNeighbourInfo, CabacNeighbourGrid};
 use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
@@ -1606,6 +1608,748 @@ fn emit_inter_cabac(
     cab.mbs[addr] = cur;
 }
 
+// ---------------------------------------------------------------------------
+// Intra_4x4 (I_NxN) — round 475. §8.3.1 prediction per 4x4 block on
+// the block-sequential reconstruction, §8.3.1.1 predIntra4x4PredMode
+// coding, 4x4 residual per block (or the §8.5.15 V/H DPCM under
+// transform bypass), CAVLC and CABAC emission in I pictures.
+// ---------------------------------------------------------------------------
+
+/// Per-picture record of the Intra_4x4 modes of coded macroblocks for
+/// the §8.3.1.1 `predIntra4x4PredMode` derivation (`None`: available
+/// but not I_NxN — Intra_16x16 or inter — which predicts as DC).
+struct I4x4Grid {
+    w_mbs: usize,
+    slots: Vec<Option<Option<[u8; 16]>>>,
+}
+
+impl I4x4Grid {
+    fn new(w_mbs: usize, h_mbs: usize) -> Self {
+        Self {
+            w_mbs,
+            slots: vec![None; w_mbs * h_mbs],
+        }
+    }
+
+    fn mark(&mut self, mb_x: usize, mb_y: usize, modes: Option<[u8; 16]>) {
+        self.slots[mb_y * self.w_mbs + mb_x] = Some(modes);
+    }
+
+    /// §8.3.1.1 steps 1–4 — `predIntra4x4PredMode` for block `blk`
+    /// (luma4x4BlkIdx) of MB `(mb_x, mb_y)`; `cur` holds the modes
+    /// already decided inside the current MB. Neighbouring 4x4 blocks
+    /// per §6.4.11.4 (eq. 6-25 / 6-26 → Table 6-3 → eq. 6-38).
+    fn predicted_mode(&self, mb_x: usize, mb_y: usize, blk: usize, cur: &[u8; 16]) -> u8 {
+        let (bx, by) = LUMA_4X4_BLK[blk];
+        // (xN, yN) of A (left) and B (above), in luma samples relative
+        // to the MB origin.
+        let probe = |xn: i32, yn: i32| -> Option<Option<u8>> {
+            // Some(mode) = available (Some(Some(m)) I4x4 / Some(None)
+            // other), None = not available.
+            let xw = ((xn + 16) % 16) as usize;
+            let yw = ((yn + 16) % 16) as usize;
+            let nblk = 8 * (yw / 8) + 4 * (xw / 8) + 2 * ((yw % 8) / 4) + ((xw % 8) / 4);
+            if xn < 0 {
+                if mb_x == 0 {
+                    return None;
+                }
+                self.slots[mb_y * self.w_mbs + mb_x - 1].map(|m| m.map(|modes| modes[nblk]))
+            } else if yn < 0 {
+                if mb_y == 0 {
+                    return None;
+                }
+                self.slots[(mb_y - 1) * self.w_mbs + mb_x].map(|m| m.map(|modes| modes[nblk]))
+            } else {
+                Some(Some(cur[nblk]))
+            }
+        };
+        let a = probe(bx as i32 * 4 - 1, by as i32 * 4);
+        let b = probe(bx as i32 * 4, by as i32 * 4 - 1);
+        // dcPredModePredictedFlag — either neighbouring MB unavailable
+        // (constrained_intra_pred_flag is 0 on this path, so inter
+        // neighbours fall through to "not I4x4 / I8x8 → DC").
+        let (Some(a), Some(b)) = (a, b) else {
+            return 2;
+        };
+        let ma = a.unwrap_or(2);
+        let mb = b.unwrap_or(2);
+        ma.min(mb)
+    }
+}
+
+/// §8.3.1.2 — the neighbouring samples of 4x4 block `blk` of MB
+/// `(mb_x, mb_y)` in a plane: inside the current MB from `tile` (the
+/// block-sequential reconstruction so far), outside from `plane`
+/// (`stride` samples per row, MB tiles of 16x16). Availability per
+/// §6.4.11.4: left / top / top-left from the picture position, the
+/// top-right from the §6.4.12 Table 6-3 neighbour (mbAddrB / mbAddrC
+/// on the top row, else the in-MB block, available only when already
+/// decoded — never for blocks 3 / 7 / 11 / 13 / 15).
+#[allow(clippy::too_many_arguments)]
+fn samples_4x4(
+    plane: &[i32],
+    stride: usize,
+    w_mbs: usize,
+    tile: &[i32; 256],
+    mb_x: usize,
+    mb_y: usize,
+    blk: usize,
+) -> Samples4x4 {
+    let (bx, by) = LUMA_4X4_BLK[blk];
+    let (x0, y0) = (bx * 4, by * 4);
+    let at = |x: i32, y: i32| -> i32 {
+        if (0..16).contains(&x) && (0..16).contains(&y) {
+            tile[y as usize * 16 + x as usize]
+        } else {
+            let px = (mb_x * 16) as i32 + x;
+            let py = (mb_y * 16) as i32 + y;
+            plane[py as usize * stride + px as usize]
+        }
+    };
+    let left = x0 > 0 || mb_x > 0;
+    let top = y0 > 0 || mb_y > 0;
+    let top_left = left && top;
+    let top_right = if y0 == 0 {
+        if x0 + 4 < 16 {
+            mb_y > 0
+        } else {
+            mb_y > 0 && mb_x + 1 < w_mbs
+        }
+    } else if x0 + 4 >= 16 {
+        false
+    } else {
+        let (xw, yw) = (x0 + 4, y0 - 1);
+        let nblk = 8 * (yw / 8) + 4 * (xw / 8) + 2 * ((yw % 8) / 4) + ((xw % 8) / 4);
+        nblk < blk
+    };
+    let mut s = Samples4x4 {
+        top_left: 0,
+        top: [0; 4],
+        top_right: [0; 4],
+        left: [0; 4],
+        availability: Neighbour4x4Availability {
+            top_left,
+            top,
+            top_right,
+            left,
+        },
+    };
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    if top_left {
+        s.top_left = at(x0 - 1, y0 - 1);
+    }
+    if top {
+        for i in 0..4 {
+            s.top[i] = at(x0 + i as i32, y0 - 1);
+        }
+    }
+    if top_right {
+        for i in 0..4 {
+            s.top_right[i] = at(x0 + 4 + i as i32, y0 - 1);
+        }
+    }
+    if left {
+        for j in 0..4 {
+            s.left[j] = at(x0 - 1, y0 + j as i32);
+        }
+    }
+    s
+}
+
+/// §8.3.1.2.1 – §8.3.1.2.9 — whether `mode` may be used with the
+/// given neighbour availability.
+fn intra_4x4_mode_permitted(mode: u8, a: &Neighbour4x4Availability) -> bool {
+    match mode {
+        0 | 3 | 7 => a.top,
+        1 | 8 => a.left,
+        2 => true,
+        4..=6 => a.top && a.left && a.top_left,
+        _ => false,
+    }
+}
+
+fn intra_4x4_mode(mode: u8) -> Intra4x4Mode {
+    match mode {
+        0 => Intra4x4Mode::Vertical,
+        1 => Intra4x4Mode::Horizontal,
+        2 => Intra4x4Mode::Dc,
+        3 => Intra4x4Mode::DiagonalDownLeft,
+        4 => Intra4x4Mode::DiagonalDownRight,
+        5 => Intra4x4Mode::VerticalRight,
+        6 => Intra4x4Mode::HorizontalDown,
+        7 => Intra4x4Mode::VerticalLeft,
+        _ => Intra4x4Mode::HorizontalUp,
+    }
+}
+
+/// SAD-domain Lagrangian multiplier at QP′ (the usual
+/// `sqrt(0.85 · 2^((QP − 12) / 3))`; QP′ carries the bit-depth offset
+/// so the value scales with the sample range).
+fn lambda_sad(qp_prime: i32) -> u64 {
+    (0.85f64 * 2f64.powf((qp_prime as f64 - 12.0) / 3.0))
+        .sqrt()
+        .round()
+        .max(1.0) as u64
+}
+
+/// One 4x4 residual block coded at `qp` (intra rounding), or under
+/// transform bypass with the §8.5.15 DPCM for the vertical (0) /
+/// horizontal (1) modes: `(scan list, reconstructed residual)`.
+fn code_4x4_block(
+    residual: &[i32; 16],
+    mode: u8,
+    qp: i32,
+    w4: &[i32; 16],
+    bd: u32,
+    bypass: bool,
+) -> ([i32; 16], [i32; 16]) {
+    if bypass {
+        let hor = match mode {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        };
+        let f: Vec<i32> = match hor {
+            Some(h) => dpcm_forward(residual, 4, 4, h),
+            None => residual.to_vec(),
+        };
+        let f16: [i32; 16] = f[..].try_into().expect("16");
+        let scan = zigzag_scan_4x4(&f16);
+        let r = dpcm_recon(&f, 4, 4, hor);
+        (scan, r[..].try_into().expect("16"))
+    } else {
+        let q = quantize_4x4_w(&forward_core_4x4(residual), qp, true, w4);
+        let scan = zigzag_scan_4x4(&q);
+        let r = inverse_transform_4x4(&q, qp, w4, bd).expect("inverse 4x4");
+        (scan, r)
+    }
+}
+
+/// One plane coded block-sequentially with Intra_4x4 (luma, or a
+/// 4:4:4 chroma plane under §8.3.4.5 with the luma modes).
+struct I4x4Plane {
+    /// Reconstructed samples (prediction + residual, clipped).
+    recon: [i32; 256],
+    scan: ScanLists,
+    blk_has_nz: [bool; 16],
+}
+
+/// Predict + code one plane block by block. With `modes` given (4:4:4
+/// chroma) the modes are fixed; otherwise (`None`, luma) each block
+/// picks the permitted mode minimising `SAD + bits · λ` against the
+/// §8.3.1.1 predicted mode, and the chosen modes / prediction cost are
+/// returned.
+#[allow(clippy::too_many_arguments)]
+fn i4x4_plane(
+    src_tile: &[i32; 256],
+    plane: &[i32],
+    stride: usize,
+    w_mbs: usize,
+    mb_x: usize,
+    mb_y: usize,
+    bd: u32,
+    qp: i32,
+    w4: &[i32; 16],
+    bypass: bool,
+    modes: Option<&[u8; 16]>,
+    grid: Option<&I4x4Grid>,
+    lambda: u64,
+) -> (I4x4Plane, [u8; 16], [u8; 16], u64) {
+    let mut tile = [0i32; 256];
+    let mut out_modes = [2u8; 16];
+    let mut pred_modes = [2u8; 16];
+    let mut scan = [[0i32; 16]; 16];
+    let mut blk_has_nz = [false; 16];
+    let mut cost = 0u64;
+    for blk in 0..16usize {
+        let (bx, by) = LUMA_4X4_BLK[blk];
+        let s = samples_4x4(plane, stride, w_mbs, &tile, mb_x, mb_y, blk);
+        let mut src = [0i32; 16];
+        for j in 0..4 {
+            for i in 0..4 {
+                src[j * 4 + i] = src_tile[(by * 4 + j) * 16 + bx * 4 + i];
+            }
+        }
+        let pred_mode = grid
+            .map(|g| g.predicted_mode(mb_x, mb_y, blk, &out_modes))
+            .unwrap_or(2);
+        pred_modes[blk] = pred_mode;
+        let (mode, pred) = match modes {
+            Some(m) => {
+                let mut p = [0i32; 16];
+                predict_4x4(intra_4x4_mode(m[blk]), &s, bd, &mut p);
+                (m[blk], p)
+            }
+            None => {
+                let mut best: Option<(u64, u8, [i32; 16])> = None;
+                for mode in 0..9u8 {
+                    if !intra_4x4_mode_permitted(mode, &s.availability) {
+                        continue;
+                    }
+                    let mut p = [0i32; 16];
+                    predict_4x4(intra_4x4_mode(mode), &s, bd, &mut p);
+                    let sad: u64 = src
+                        .iter()
+                        .zip(p.iter())
+                        .map(|(a, b)| (a - b).unsigned_abs() as u64)
+                        .sum();
+                    let bits = if mode == pred_mode { 1 } else { 4 };
+                    let j = sad + bits * lambda;
+                    if best.as_ref().map_or(true, |b| j < b.0) {
+                        best = Some((j, mode, p));
+                    }
+                }
+                let (j, mode, p) = best.expect("DC is always permitted");
+                cost += j;
+                (mode, p)
+            }
+        };
+        out_modes[blk] = mode;
+        let mut residual = [0i32; 16];
+        for k in 0..16 {
+            residual[k] = src[k] - pred[k];
+        }
+        let (list, res) = code_4x4_block(&residual, mode, qp, w4, bd, bypass);
+        blk_has_nz[blk] = list.iter().any(|&v| v != 0);
+        scan[blk] = list;
+        for j in 0..4 {
+            for i in 0..4 {
+                tile[(by * 4 + j) * 16 + bx * 4 + i] = clip(pred[j * 4 + i] + res[j * 4 + i], bd);
+            }
+        }
+    }
+    (
+        I4x4Plane {
+            recon: tile,
+            scan,
+            blk_has_nz,
+        },
+        out_modes,
+        pred_modes,
+        cost,
+    )
+}
+
+/// Intra_4x4 (I_NxN) candidate for one MB.
+struct I4x4Cand {
+    modes: [u8; 16],
+    prev_flag: [bool; 16],
+    rem: [u8; 16],
+    luma: I4x4Plane,
+    cbp_luma: u8,
+    chroma_mode: u8,
+    pred_u: Vec<i32>,
+    pred_v: Vec<i32>,
+    chroma: Option<(ChromaChain, ChromaChain)>,
+    planes444: Option<(I4x4Plane, I4x4Plane)>,
+    cbp_chroma: u8,
+    /// Prediction cost `Σ (SAD + bits · λ)` over the luma blocks.
+    cost: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn intra4x4_candidate(
+    g: Geom,
+    src: &Pic,
+    recon: &Pic,
+    grid: &I4x4Grid,
+    mb_x: usize,
+    mb_y: usize,
+    qp_y: i32,
+    qp_c: i32,
+    w4: &[i32; 16],
+    bypass: bool,
+    allow_dpcm: bool,
+    lambda: u64,
+) -> I4x4Cand {
+    let src_y = src.luma_tile(g, mb_x, mb_y);
+    let (luma, modes, pred_modes, cost) = i4x4_plane(
+        &src_y,
+        &recon.y,
+        g.w,
+        g.w_mbs,
+        mb_x,
+        mb_y,
+        g.bd_y,
+        qp_y,
+        w4,
+        bypass,
+        None,
+        Some(grid),
+        lambda,
+    );
+    let mut prev_flag = [false; 16];
+    let mut rem = [0u8; 16];
+    for blk in 0..16 {
+        // §8.3.1.1 step 5 — prev flag when the mode equals the
+        // prediction; else rem = mode − (mode > pred).
+        if modes[blk] == pred_modes[blk] {
+            prev_flag[blk] = true;
+        } else {
+            rem[blk] = if modes[blk] < pred_modes[blk] {
+                modes[blk]
+            } else {
+                modes[blk] - 1
+            };
+        }
+    }
+    let mut cbp_luma = 0u8;
+    for blk8 in 0..4usize {
+        if (0..4).any(|s| luma.blk_has_nz[blk8 * 4 + s]) {
+            cbp_luma |= 1 << blk8;
+        }
+    }
+    let src_u = src.chroma_tile(g, false, mb_x, mb_y);
+    let src_v = src.chroma_tile(g, true, mb_x, mb_y);
+    let (chroma_mode, pred_u, pred_v, chroma, planes444, cbp_chroma) = match g.chroma_array_type() {
+        Some(cat) => {
+            let su = chroma_samples(&recon.u, g.cw, mb_x, mb_y, g.ct_w, g.ct_h);
+            let sv = chroma_samples(&recon.v, g.cw, mb_x, mb_y, g.ct_w, g.ct_h);
+            let (mode, pu, pv) = pick_chroma(&src_u, &src_v, &su, &sv, cat, g.bd_c, allow_dpcm);
+            let ru: Vec<i32> = src_u.iter().zip(pu.iter()).map(|(s, p)| s - p).collect();
+            let rv: Vec<i32> = src_v.iter().zip(pv.iter()).map(|(s, p)| s - p).collect();
+            let (cu, cv) = if bypass {
+                (
+                    chroma_chain_bypass(&ru, g.ct_h, Some(mode)),
+                    chroma_chain_bypass(&rv, g.ct_h, Some(mode)),
+                )
+            } else {
+                (
+                    chroma_chain(&ru, g.ct_h, qp_c, true, w4, g.bd_c),
+                    chroma_chain(&rv, g.ct_h, qp_c, true, w4, g.bd_c),
+                )
+            };
+            let cbp_chroma = if cu.ac_nz || cv.ac_nz {
+                2
+            } else if cu.dc_nz || cv.dc_nz {
+                1
+            } else {
+                0
+            };
+            (mode, pu, pv, Some((cu, cv)), None, cbp_chroma)
+        }
+        None => {
+            // §8.3.4.5 — 4:4:4: Cb / Cr predicted block by block with
+            // the luma Intra4x4PredMode on their own neighbours and
+            // coded like luma; one cbp_luma gates all three planes.
+            let su: [i32; 256] = src_u[..].try_into().expect("256");
+            let sv: [i32; 256] = src_v[..].try_into().expect("256");
+            let (cb, _, _, _) = i4x4_plane(
+                &su,
+                &recon.u,
+                g.cw,
+                g.w_mbs,
+                mb_x,
+                mb_y,
+                g.bd_c,
+                qp_c,
+                w4,
+                bypass,
+                Some(&modes),
+                None,
+                lambda,
+            );
+            let (cr, _, _, _) = i4x4_plane(
+                &sv,
+                &recon.v,
+                g.cw,
+                g.w_mbs,
+                mb_x,
+                mb_y,
+                g.bd_c,
+                qp_c,
+                w4,
+                bypass,
+                Some(&modes),
+                None,
+                lambda,
+            );
+            for blk8 in 0..4usize {
+                if (0..4).any(|s| cb.blk_has_nz[blk8 * 4 + s] || cr.blk_has_nz[blk8 * 4 + s]) {
+                    cbp_luma |= 1 << blk8;
+                }
+            }
+            (0u8, Vec::new(), Vec::new(), None, Some((cb, cr)), 0u8)
+        }
+    };
+    I4x4Cand {
+        modes,
+        prev_flag,
+        rem,
+        luma,
+        cbp_luma,
+        chroma_mode,
+        pred_u,
+        pred_v,
+        chroma,
+        planes444,
+        cbp_chroma,
+        cost,
+    }
+}
+
+/// Scan lists with the uncoded quadrants (cbp bit clear) zeroed.
+fn gate_scan(scan: &ScanLists, cbp_luma: u8) -> ScanLists {
+    let mut out = *scan;
+    for (blk, list) in out.iter_mut().enumerate() {
+        if (cbp_luma >> (blk / 4)) & 1 == 0 {
+            *list = [0; 16];
+        }
+    }
+    out
+}
+
+/// CAVLC I_NxN macroblock in an I slice.
+fn emit_i4x4(
+    g: Geom,
+    w: &mut BitWriter,
+    nc_grid: &mut CavlcNcGrid,
+    mb_addr: u32,
+    cand: &I4x4Cand,
+    emit_t8x8_zero: bool,
+) {
+    mark_slot(nc_grid, mb_addr, true, false);
+    let cbp_luma = cand.cbp_luma;
+    let levels = gate_scan(&cand.luma.scan, cbp_luma);
+    let luma_nc = luma_nc_progressive(
+        nc_grid,
+        mb_addr,
+        true,
+        &levels,
+        |blk| (cbp_luma >> (blk / 4)) & 1 == 1,
+        false,
+    );
+    match (&cand.chroma, &cand.planes444) {
+        (Some((cu, cv)), _) => {
+            let n_blk = g.ct_h / 4 * 2;
+            let (nc_cb, nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+                nc_grid,
+                mb_addr,
+                true,
+                cand.cbp_chroma,
+                &cu.ac[..n_blk],
+                &cv.ac[..n_blk],
+                g.cf,
+            );
+            let kind = if g.cf == 1 {
+                ChromaWriteKind::Yuv420 {
+                    chroma_dc_cb: cu.dc[..4].try_into().expect("4 DC"),
+                    chroma_dc_cr: cv.dc[..4].try_into().expect("4 DC"),
+                    chroma_ac_cb: cu.ac[..4].try_into().expect("4 AC"),
+                    chroma_ac_cr: cv.ac[..4].try_into().expect("4 AC"),
+                    cb_ac_nc: &nc_cb,
+                    cr_ac_nc: &nc_cr,
+                }
+            } else {
+                ChromaWriteKind::Yuv422 {
+                    chroma_dc_cb: &cu.dc,
+                    chroma_dc_cr: &cv.dc,
+                    chroma_ac_cb: &cu.ac,
+                    chroma_ac_cr: &cv.ac,
+                    cb_ac_nc: &nc_cb,
+                    cr_ac_nc: &nc_cr,
+                }
+            };
+            write_i_nxn_mb_chroma(
+                w,
+                emit_t8x8_zero,
+                &cand.prev_flag,
+                &cand.rem,
+                cand.chroma_mode,
+                cbp_luma,
+                cand.cbp_chroma,
+                0,
+                &levels,
+                &luma_nc,
+                kind,
+            )
+            .expect("CAVLC I_NxN MB");
+        }
+        (None, Some((cb, cr))) => {
+            let cb_levels = gate_scan(&cb.scan, cbp_luma);
+            let cr_levels = gate_scan(&cr.scan, cbp_luma);
+            let cb_nc = derive_plane_nc_444_inter(nc_grid, mb_addr, false, cbp_luma, &cb_levels);
+            let cr_nc = derive_plane_nc_444_inter(nc_grid, mb_addr, true, cbp_luma, &cr_levels);
+            write_i4x4_mb_444(
+                w,
+                emit_t8x8_zero,
+                &cand.prev_flag,
+                &cand.rem,
+                cbp_luma,
+                0,
+                &levels,
+                &luma_nc,
+                &cb_levels,
+                &cb_nc,
+                &cr_levels,
+                &cr_nc,
+            )
+            .expect("CAVLC I_NxN 4:4:4 MB");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// CABAC I_NxN macroblock in an I slice.
+fn emit_i4x4_cabac(
+    g: Geom,
+    cs: &mut CabacState,
+    cab: &mut CabacNeighbourGrid,
+    mb_addr: u32,
+    cand: &I4x4Cand,
+    t8x8_mode: bool,
+) {
+    let addr = mb_addr as usize;
+    let nctx = full_neighbour_ctx(cab, addr, false);
+    encode_mb_type_i(&mut cs.enc, &mut cs.ctxs, &nctx, 0);
+    if t8x8_mode {
+        // §7.3.5 — transform_size_8x8_flag right after mb_type for
+        // I_NxN when the PPS enables the tool; always 0 here.
+        encode_transform_size_8x8_flag(&mut cs.enc, &mut cs.ctxs, &nctx, false);
+    }
+    for blk in 0..16 {
+        encode_prev_intra_pred_mode_flag(&mut cs.enc, &mut cs.ctxs, cand.prev_flag[blk]);
+        if !cand.prev_flag[blk] {
+            encode_rem_intra_pred_mode(&mut cs.enc, &mut cs.ctxs, u32::from(cand.rem[blk]));
+        }
+    }
+    if g.cf != 3 {
+        encode_intra_chroma_pred_mode(&mut cs.enc, &mut cs.ctxs, &nctx, cand.chroma_mode as u32);
+    }
+    encode_coded_block_pattern(
+        &mut cs.enc,
+        &mut cs.ctxs,
+        &nctx,
+        g.cf,
+        cand.cbp_luma,
+        cand.cbp_chroma,
+    );
+    if cand.cbp_luma > 0 || cand.cbp_chroma > 0 {
+        encode_mb_qp_delta(&mut cs.enc, &mut cs.ctxs, cs.prev_qp_delta_nonzero, 0);
+    }
+    cs.prev_qp_delta_nonzero = false;
+    let mut cur = CabacMbNeighbourInfo {
+        is_intra: true,
+        is_i_nxn: true,
+        coded_block_pattern_luma: cand.cbp_luma,
+        coded_block_pattern_chroma: cand.cbp_chroma,
+        intra_chroma_pred_mode: cand.chroma_mode,
+        ..Default::default()
+    };
+    let levels = gate_scan(&cand.luma.scan, cand.cbp_luma);
+    emit_inter_plane_cabac(
+        cs,
+        cab,
+        &mut cur,
+        addr,
+        false,
+        Plane::Y,
+        &levels,
+        cand.cbp_luma,
+    );
+    match (&cand.chroma, &cand.planes444) {
+        (Some((cu, cv)), _) => {
+            let n_blk = g.ct_h / 4 * 2;
+            emit_chroma_cabac(
+                cs,
+                cab,
+                &mut cur,
+                addr,
+                false,
+                true,
+                cand.cbp_chroma,
+                &cu.dc,
+                &cv.dc,
+                &cu.ac[..n_blk],
+                &cv.ac[..n_blk],
+                g.cf,
+            );
+        }
+        (None, Some((cb, cr))) => {
+            let cb_levels = gate_scan(&cb.scan, cand.cbp_luma);
+            let cr_levels = gate_scan(&cr.scan, cand.cbp_luma);
+            emit_inter_plane_cabac(
+                cs,
+                cab,
+                &mut cur,
+                addr,
+                false,
+                Plane::Cb,
+                &cb_levels,
+                cand.cbp_luma,
+            );
+            emit_inter_plane_cabac(
+                cs,
+                cab,
+                &mut cur,
+                addr,
+                false,
+                Plane::Cr,
+                &cr_levels,
+                cand.cbp_luma,
+            );
+        }
+        _ => unreachable!(),
+    }
+    cur.available = true;
+    cab.mbs[addr] = cur;
+}
+
+/// Store an I_NxN candidate's reconstruction; returns the deblock
+/// facts. The candidate's planes were reconstructed block by block
+/// with every block's residual, so a quadrant whose cbp bit is clear
+/// has zero residual by construction.
+fn recon_i4x4(
+    g: Geom,
+    recon: &mut Pic,
+    mb_x: usize,
+    mb_y: usize,
+    cand: &I4x4Cand,
+    qp_y: i32,
+) -> MbDeblockInfo {
+    for j in 0..16 {
+        recon.y[(mb_y * 16 + j) * g.w + mb_x * 16..][..16]
+            .copy_from_slice(&cand.luma.recon[j * 16..j * 16 + 16]);
+    }
+    match (&cand.chroma, &cand.planes444) {
+        (Some((cu, cv)), _) => {
+            let pick = |c: &ChromaChain| -> Vec<i32> {
+                match cand.cbp_chroma {
+                    2 => c.recon_full.clone(),
+                    1 => c.recon_dc.clone(),
+                    _ => vec![0; c.recon_full.len()],
+                }
+            };
+            recon.store_chroma(g, false, mb_x, mb_y, &cand.pred_u, &pick(cu));
+            recon.store_chroma(g, true, mb_x, mb_y, &cand.pred_v, &pick(cv));
+        }
+        (None, Some((cb, cr))) => {
+            for j in 0..16 {
+                recon.u[(mb_y * 16 + j) * g.cw + mb_x * 16..][..16]
+                    .copy_from_slice(&cb.recon[j * 16..j * 16 + 16]);
+                recon.v[(mb_y * 16 + j) * g.cw + mb_x * 16..][..16]
+                    .copy_from_slice(&cr.recon[j * 16..j * 16 + 16]);
+            }
+        }
+        _ => unreachable!(),
+    }
+    let mut nz = cand.luma.blk_has_nz;
+    for (blk, n) in nz.iter_mut().enumerate() {
+        if (cand.cbp_luma >> (blk / 4)) & 1 == 0 {
+            *n = false;
+        }
+    }
+    MbDeblockInfo {
+        is_intra: true,
+        qp_y,
+        luma_nonzero_4x4: luma_nz_mask_from_blocks(&nz),
+        chroma_nonzero_4x4: 0,
+        ref_idx_l0: [-1; 4],
+        ref_poc_l0: [i32::MIN; 4],
+        ..Default::default()
+    }
+}
+
 /// Coding kind of one picture coded through [`DeepSession`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeepPictureKind {
@@ -1709,6 +2453,9 @@ pub struct DeepSession {
     skipped_mbs: usize,
     intra_mbs_in_p: usize,
     mbs_8x8: usize,
+    /// Round-475 — offer the Intra_4x4 (I_NxN) candidate in I pictures.
+    intra_4x4: bool,
+    i4x4_mbs: usize,
 }
 
 impl DeepSession {
@@ -1853,7 +2600,29 @@ impl DeepSession {
             skipped_mbs: 0,
             intra_mbs_in_p: 0,
             mbs_8x8: 0,
+            intra_4x4: false,
+            i4x4_mbs: 0,
         }
+    }
+
+    /// Round-475 — enable the Intra_4x4 (I_NxN) candidate in I
+    /// pictures: per macroblock the block-sequential §8.3.1 prediction
+    /// competes with Intra_16x16 on `Σ (SAD + mode bits · λ)`. Off by
+    /// default ([`encode_deep_sequence`] stays Intra_16x16-only); the
+    /// registry encoder turns it on.
+    pub fn with_intra_4x4(mut self, on: bool) -> Self {
+        self.intra_4x4 = on;
+        self
+    }
+
+    /// Whether the Intra_4x4 candidate is offered.
+    pub fn intra_4x4(&self) -> bool {
+        self.intra_4x4
+    }
+
+    /// Macroblocks coded as I_NxN so far.
+    pub fn i4x4_mbs(&self) -> usize {
+        self.i4x4_mbs
     }
 
     /// `profile_idc` signalled in the SPS.
@@ -2018,6 +2787,10 @@ impl DeepSession {
         let mut mv_grid = MvGrid::new(g.w_mbs, h_mbs);
         let mut dbl = vec![MbDeblockInfo::default(); g.w_mbs * h_mbs];
         let mut pending_skip = 0u32;
+        let mut i4_grid = I4x4Grid::new(g.w_mbs, h_mbs);
+        let lambda = lambda_sad(qp_y_prime);
+        let t8x8_mode = cfg.transform_8x8 && cf != 3;
+        let offer_i4x4 = self.intra_4x4 && !is_p;
 
         for mb_y in 0..h_mbs {
             for mb_x in 0..g.w_mbs {
@@ -2027,6 +2800,28 @@ impl DeepSession {
                         g, &src, &recon, mb_x, mb_y, qp_y_prime, qp_c_prime, &w4, bypass,
                         allow_dpcm,
                     );
+                    // Round-475 — Intra_4x4 competes on prediction cost:
+                    // `Σ (SAD + bits · λ)` over its 16 blocks against the
+                    // Intra_16x16 SAD plus its ~4 bits of mode syntax.
+                    let cand4 = offer_i4x4.then(|| {
+                        intra4x4_candidate(
+                            g, &src, &recon, &i4_grid, mb_x, mb_y, qp_y_prime, qp_c_prime, &w4,
+                            bypass, allow_dpcm, lambda,
+                        )
+                    });
+                    if let Some(c4) = cand4.filter(|c4| c4.cost < cand.sad + 4 * lambda) {
+                        if let Some(cs) = cs.as_mut() {
+                            emit_i4x4_cabac(g, cs, &mut cab, mb_addr, &c4, t8x8_mode);
+                            encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
+                        } else {
+                            emit_i4x4(g, &mut sw, &mut nc_grid, mb_addr, &c4, t8x8_mode);
+                        }
+                        dbl[mb_addr as usize] = recon_i4x4(g, &mut recon, mb_x, mb_y, &c4, qp_y);
+                        i4_grid.mark(mb_x, mb_y, Some(c4.modes));
+                        self.i4x4_mbs += 1;
+                        continue;
+                    }
+                    i4_grid.mark(mb_x, mb_y, None);
                     if let Some(cs) = cs.as_mut() {
                         emit_intra_cabac(g, cs, &mut cab, mb_addr, &cand, false);
                         encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
