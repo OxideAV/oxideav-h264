@@ -1606,126 +1606,341 @@ fn emit_inter_cabac(
     cab.mbs[addr] = cur;
 }
 
-/// Encode a >8-bit sequence. `frames` holds `u16` planes at the
-/// configured chroma format (top-to-bottom row-major).
-pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])]) -> DeepEncoded {
-    assert!(
-        cfg.width % 16 == 0 && cfg.height % 16 == 0,
-        "MB-aligned dims"
-    );
-    assert!(
-        (8..=14).contains(&cfg.bit_depth_luma) && (8..=14).contains(&cfg.bit_depth_chroma),
-        "bit depths 8..=14"
-    );
-    assert!(
-        matches!(cfg.chroma_format_idc, 1..=3),
-        "chroma_format_idc 1..=3"
-    );
-    assert!(!frames.is_empty());
-    let (w, h) = (cfg.width as usize, cfg.height as usize);
-    let cf = cfg.chroma_format_idc;
-    let (ct_w, ct_h) = match cf {
-        1 => (8, 8),
-        2 => (8, 16),
-        _ => (16, 16),
-    };
-    let g = Geom {
-        w,
-        h,
-        cw: w * ct_w / 16,
-        ch: h * ct_h / 16,
-        ct_w,
-        ct_h,
-        w_mbs: w / 16,
-        cf,
-        bd_y: cfg.bit_depth_luma,
-        bd_c: cfg.bit_depth_chroma,
-    };
-    let h_mbs = h / 16;
-    let off_y = qp_bd_offset(cfg.bit_depth_luma - 8);
-    let off_c = qp_bd_offset(cfg.bit_depth_chroma - 8);
-    assert!(
-        (-off_y..=51).contains(&cfg.qp),
-        "QP_Y must lie in −QpBdOffsetY..=51"
-    );
-    let qp_y = cfg.qp;
-    let qp_y_prime = qp_y + off_y;
-    assert!(
-        !cfg.lossless || qp_y_prime == 0,
-        "lossless coding needs QP′Y == 0, i.e. qp == −QpBdOffsetY"
-    );
-    let bypass = cfg.lossless;
-    // Under bypass the V / H intra modes invoke the §8.5.15 DPCM; the
-    // interop flag withholds them so the stream never depends on it.
-    let allow_dpcm = !(cfg.lossless && cfg.lossless_interop);
-    let qp_c_prime = qp_y_to_qp_c_with_bd_offset(qp_y, 0, off_c) + off_c;
-    let w4 = ScalingMatrixMode::Flat.intra_weights().w4;
+/// Coding kind of one picture coded through [`DeepSession`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeepPictureKind {
+    /// IDR picture (`nal_unit_type` 5, `nal_ref_idc` 3): Intra_16x16
+    /// only, resets the reference.
+    Idr,
+    /// Non-IDR intra picture (`nal_unit_type` 1 with an I slice,
+    /// `nal_ref_idc` 2): Intra_16x16 only, becomes the reference.
+    I,
+    /// P picture predicting from the previous coded picture (P_Skip /
+    /// P_L0_16x16 / optional Intra_16x16 fallback), becomes the
+    /// reference.
+    P,
+}
 
-    // §A.2 — profile by depth / chroma format.
-    let max_bd = cfg.bit_depth_luma.max(cfg.bit_depth_chroma);
-    let profile_idc: u8 = match (cf, max_bd) {
-        (1, 8..=10) => 110,
-        (2, 8..=10) => 122,
-        _ => 244,
-    };
-    let frame_num_bits = 8u32;
-    let poc_lsb_bits = 8u32;
-    let w_mbs = g.w_mbs as u32;
-    let sps = build_sps_rbsp_with_bypass(
-        &BaselineSpsConfig {
+/// One picture coded by [`DeepSession::encode_picture`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DeepPicture {
+    /// The coded slice NAL unit as an Annex B NAL (4-byte start code,
+    /// emulation prevention applied). Parameter sets are NOT included —
+    /// see [`DeepSession::parameter_sets_annex_b`].
+    pub nal: Vec<u8>,
+    /// Deblocked reconstruction (`u16` planes) — what a conforming
+    /// decoder outputs for this picture.
+    pub recon: DeepPlanes,
+    /// Coding kind the picture was coded as.
+    pub kind: DeepPictureKind,
+}
+
+/// §A.2.4 – §A.2.7 — the smallest High-family `profile_idc` whose
+/// constraints admit a `chroma_format_idc` / bit-depth / transform-
+/// bypass combination: High (100) for 4:0:0 / 4:2:0 at 8 bit, High 10
+/// (110) up to 10 bit, High 4:2:2 (122) for 4:2:2 up to 10 bit, High
+/// 4:4:4 Predictive (244) for 4:4:4, more than 10 bits, or lossless
+/// coding (`qpprime_y_zero_transform_bypass_flag` is "equal to 0 only"
+/// under 100 / 110 / 122).
+pub fn min_profile_idc(
+    chroma_format_idc: u32,
+    bit_depth_luma: u32,
+    bit_depth_chroma: u32,
+    lossless: bool,
+) -> u8 {
+    let max_bd = bit_depth_luma.max(bit_depth_chroma);
+    if lossless || chroma_format_idc == 3 || max_bd > 10 {
+        244
+    } else if chroma_format_idc == 2 {
+        122
+    } else if max_bd > 8 {
+        110
+    } else {
+        100
+    }
+}
+
+/// §A.2.4 – §A.2.7 — whether `profile_idc` (one of 100 / 110 / 122 /
+/// 244) admits the given `chroma_format_idc` / bit depths / transform-
+/// bypass flag in its sequence parameter sets.
+pub fn profile_admits(
+    profile_idc: u8,
+    chroma_format_idc: u32,
+    bit_depth_luma: u32,
+    bit_depth_chroma: u32,
+    lossless: bool,
+) -> bool {
+    let max_bd = bit_depth_luma.max(bit_depth_chroma);
+    match profile_idc {
+        100 => chroma_format_idc <= 1 && max_bd == 8 && !lossless,
+        110 => chroma_format_idc <= 1 && max_bd <= 10 && !lossless,
+        122 => chroma_format_idc <= 2 && max_bd <= 10 && !lossless,
+        244 => max_bd <= 14,
+        _ => false,
+    }
+}
+
+const EMPTY_8X8: [[i32; 64]; 4] = [[0; 64]; 4];
+
+/// Streaming driver over the high-bit-depth encoder: one SPS / PPS
+/// pair fixed at construction, then one picture per
+/// [`encode_picture`](Self::encode_picture) call in decode order with
+/// caller-supplied `frame_num` / POC / `idr_pic_id` (so a session
+/// can run any GOP cadence and keep §7.4.3's consecutive-IDR
+/// `idr_pic_id` rule). [`encode_deep_sequence`] is a thin wrapper
+/// over it.
+pub struct DeepSession {
+    cfg: DeepConfig,
+    g: Geom,
+    profile_idc: u8,
+    sps_nal: Vec<u8>,
+    pps_nal: Vec<u8>,
+    qp_y: i32,
+    qp_y_prime: i32,
+    qp_c_prime: i32,
+    bypass: bool,
+    allow_dpcm: bool,
+    disable_deblock: u32,
+    frame_num_bits: u32,
+    poc_lsb_bits: u32,
+    prev: Option<Pic>,
+    prev_poc: i32,
+    skipped_mbs: usize,
+    intra_mbs_in_p: usize,
+    mbs_8x8: usize,
+}
+
+impl DeepSession {
+    /// Create a session at the §A.2 minimum profile for the layout
+    /// ([`min_profile_idc`]). Panics on an inconsistent config
+    /// (non-mod-16 dimensions, bit depths outside 8..=14,
+    /// `chroma_format_idc` outside 1..=3, QP outside
+    /// `−QpBdOffsetY..=51`, lossless with QP′Y ≠ 0).
+    pub fn new(cfg: DeepConfig) -> Self {
+        let p = min_profile_idc(
+            cfg.chroma_format_idc,
+            cfg.bit_depth_luma,
+            cfg.bit_depth_chroma,
+            cfg.lossless,
+        );
+        Self::with_profile(cfg, p)
+    }
+
+    /// Create a session signalling an explicit `profile_idc` (100 /
+    /// 110 / 122 / 244). Panics unless [`profile_admits`] the layout.
+    pub fn with_profile(cfg: DeepConfig, profile_idc: u8) -> Self {
+        assert!(
+            cfg.width % 16 == 0 && cfg.height % 16 == 0,
+            "MB-aligned dims"
+        );
+        assert!(
+            (8..=14).contains(&cfg.bit_depth_luma) && (8..=14).contains(&cfg.bit_depth_chroma),
+            "bit depths 8..=14"
+        );
+        assert!(
+            matches!(cfg.chroma_format_idc, 1..=3),
+            "chroma_format_idc 1..=3"
+        );
+        assert!(
+            profile_admits(
+                profile_idc,
+                cfg.chroma_format_idc,
+                cfg.bit_depth_luma,
+                cfg.bit_depth_chroma,
+                cfg.lossless
+            ),
+            "profile_idc {profile_idc} does not admit chroma_format_idc {} at {}/{} bit (lossless {}) — §A.2",
+            cfg.chroma_format_idc,
+            cfg.bit_depth_luma,
+            cfg.bit_depth_chroma,
+            cfg.lossless
+        );
+        let (w, h) = (cfg.width as usize, cfg.height as usize);
+        let cf = cfg.chroma_format_idc;
+        let (ct_w, ct_h) = match cf {
+            1 => (8, 8),
+            2 => (8, 16),
+            _ => (16, 16),
+        };
+        let g = Geom {
+            w,
+            h,
+            cw: w * ct_w / 16,
+            ch: h * ct_h / 16,
+            ct_w,
+            ct_h,
+            w_mbs: w / 16,
+            cf,
+            bd_y: cfg.bit_depth_luma,
+            bd_c: cfg.bit_depth_chroma,
+        };
+        let h_mbs = h / 16;
+        let off_y = qp_bd_offset(cfg.bit_depth_luma - 8);
+        let off_c = qp_bd_offset(cfg.bit_depth_chroma - 8);
+        assert!(
+            (-off_y..=51).contains(&cfg.qp),
+            "QP_Y must lie in −QpBdOffsetY..=51"
+        );
+        let qp_y = cfg.qp;
+        let qp_y_prime = qp_y + off_y;
+        assert!(
+            !cfg.lossless || qp_y_prime == 0,
+            "lossless coding needs QP′Y == 0, i.e. qp == −QpBdOffsetY"
+        );
+        let bypass = cfg.lossless;
+        // Under bypass the V / H intra modes invoke the §8.5.15 DPCM; the
+        // interop flag withholds them so the stream never depends on it.
+        let allow_dpcm = !(cfg.lossless && cfg.lossless_interop);
+        let qp_c_prime = qp_y_to_qp_c_with_bd_offset(qp_y, 0, off_c) + off_c;
+
+        let frame_num_bits = 8u32;
+        let poc_lsb_bits = 8u32;
+        let w_mbs = g.w_mbs as u32;
+        let sps = build_sps_rbsp_with_bypass(
+            &BaselineSpsConfig {
+                seq_parameter_set_id: 0,
+                level_idc: min_level_idc_for_picture_size(w_mbs, h_mbs as u32),
+                width_in_mbs: w_mbs,
+                height_in_mbs: h_mbs as u32,
+                log2_max_frame_num_minus4: 4,
+                log2_max_poc_lsb_minus4: 4,
+                max_num_ref_frames: 1,
+                profile_idc,
+                chroma_format_idc: cf,
+                separate_colour_plane: false,
+                seq_scaling_lists: None,
+                bit_depth_luma_minus8: cfg.bit_depth_luma - 8,
+                bit_depth_chroma_minus8: cfg.bit_depth_chroma - 8,
+                interlaced_fields: false,
+                mbaff: false,
+                vui: None,
+            },
+            cfg.lossless,
+        );
+        let pps = build_baseline_pps_rbsp(&BaselinePpsConfig {
+            pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
-            level_idc: min_level_idc_for_picture_size(w_mbs, h_mbs as u32),
-            width_in_mbs: w_mbs,
-            height_in_mbs: h_mbs as u32,
-            log2_max_frame_num_minus4: 4,
-            log2_max_poc_lsb_minus4: 4,
-            max_num_ref_frames: 1,
-            profile_idc,
+            pic_init_qp_minus26: qp_y - 26,
+            chroma_qp_index_offset: 0,
+            weighted_pred_flag: false,
+            weighted_bipred_idc: 0,
+            entropy_coding_mode_flag: cfg.cabac,
+            transform_8x8_mode_flag: cfg.transform_8x8 && cf != 3,
+            redundant_pic_cnt_present_flag: false,
+            slice_groups: None,
+            constrained_intra_pred_flag: false,
+            pic_scaling_lists: None,
             chroma_format_idc: cf,
-            separate_colour_plane: false,
-            seq_scaling_lists: None,
-            bit_depth_luma_minus8: cfg.bit_depth_luma - 8,
-            bit_depth_chroma_minus8: cfg.bit_depth_chroma - 8,
-            interlaced_fields: false,
-            mbaff: false,
-            vui: None,
-        },
-        cfg.lossless,
-    );
-    let pps = build_baseline_pps_rbsp(&BaselinePpsConfig {
-        pic_parameter_set_id: 0,
-        seq_parameter_set_id: 0,
-        pic_init_qp_minus26: qp_y - 26,
-        chroma_qp_index_offset: 0,
-        weighted_pred_flag: false,
-        weighted_bipred_idc: 0,
-        entropy_coding_mode_flag: cfg.cabac,
-        transform_8x8_mode_flag: cfg.transform_8x8 && cf != 3,
-        redundant_pic_cnt_present_flag: false,
-        slice_groups: None,
-        constrained_intra_pred_flag: false,
-        pic_scaling_lists: None,
-        chroma_format_idc: cf,
-    });
-    let mut stream: Vec<u8> = Vec::new();
-    stream.extend_from_slice(&build_nal_unit(3, NalUnitType::Sps, &sps));
-    stream.extend_from_slice(&build_nal_unit(3, NalUnitType::Pps, &pps));
-    let disable_deblock: u32 = if cfg.deblock { 0 } else { 1 };
+        });
+        let disable_deblock: u32 = if cfg.deblock { 0 } else { 1 };
+        Self {
+            cfg,
+            g,
+            profile_idc,
+            sps_nal: build_nal_unit(3, NalUnitType::Sps, &sps),
+            pps_nal: build_nal_unit(3, NalUnitType::Pps, &pps),
+            qp_y,
+            qp_y_prime,
+            qp_c_prime,
+            bypass,
+            allow_dpcm,
+            disable_deblock,
+            frame_num_bits,
+            poc_lsb_bits,
+            prev: None,
+            prev_poc: 0,
+            skipped_mbs: 0,
+            intra_mbs_in_p: 0,
+            mbs_8x8: 0,
+        }
+    }
 
-    let mut recon_frames: Vec<DeepPlanes> = Vec::with_capacity(frames.len());
-    let mut prev: Option<Pic> = None;
-    let mut prev_poc = 0i32;
-    let mut skipped_mbs = 0usize;
-    let mut intra_mbs_in_p = 0usize;
-    let mut mbs_8x8 = 0usize;
-    let w8 = ScalingMatrixMode::Flat.inter_weights().w8;
-    const EMPTY_8X8: [[i32; 64]; 4] = [[0; 64]; 4];
+    /// `profile_idc` signalled in the SPS.
+    pub fn profile_idc(&self) -> u8 {
+        self.profile_idc
+    }
 
-    for (k, &(fy, fu, fv)) in frames.iter().enumerate() {
+    /// The session config.
+    pub fn config(&self) -> &DeepConfig {
+        &self.cfg
+    }
+
+    /// The SPS as an Annex B NAL unit (4-byte start code included).
+    pub fn sps_annex_b(&self) -> &[u8] {
+        &self.sps_nal
+    }
+
+    /// The PPS as an Annex B NAL unit (4-byte start code included).
+    pub fn pps_annex_b(&self) -> &[u8] {
+        &self.pps_nal
+    }
+
+    /// SPS + PPS as an Annex B byte string — what precedes the IDR
+    /// slice of an access unit carrying in-band parameter sets.
+    pub fn parameter_sets_annex_b(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(self.sps_nal.len() + self.pps_nal.len());
+        v.extend_from_slice(&self.sps_nal);
+        v.extend_from_slice(&self.pps_nal);
+        v
+    }
+
+    /// P_Skip macroblocks coded so far.
+    pub fn skipped_mbs(&self) -> usize {
+        self.skipped_mbs
+    }
+
+    /// Intra_16x16 macroblocks coded inside P pictures so far.
+    pub fn intra_mbs_in_p(&self) -> usize {
+        self.intra_mbs_in_p
+    }
+
+    /// Macroblocks coded with `transform_size_8x8_flag = 1` so far.
+    pub fn mbs_8x8(&self) -> usize {
+        self.mbs_8x8
+    }
+
+    /// Code one picture (`u16` planes at the configured chroma format,
+    /// row-major) as `kind`, with the §7.4.3 `frame_num` (masked to
+    /// the SPS's 8 bits), the picture order count (`poc` — its 8 LSBs
+    /// go into `pic_order_cnt_lsb`, the full value keys the §8.7
+    /// reference identity for deblocking) and, for IDR pictures, the
+    /// `idr_pic_id` (ignored otherwise). A `P` picture needs a
+    /// previously coded picture; the coded picture becomes the new
+    /// reference whatever its kind.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_picture(
+        &mut self,
+        fy: &[u16],
+        fu: &[u16],
+        fv: &[u16],
+        pic_kind: DeepPictureKind,
+        frame_num: u32,
+        poc: i32,
+        idr_pic_id: u32,
+    ) -> DeepPicture {
+        assert!(idr_pic_id <= 65535, "idr_pic_id out of 0..=65535 (§7.4.3)");
+        if pic_kind == DeepPictureKind::P {
+            assert!(self.prev.is_some(), "P picture without a reference");
+        }
+        let cfg = &self.cfg;
+        let g = self.g;
+        let cf = g.cf;
+        let h_mbs = g.h / 16;
+        let w_mbs = g.w_mbs as u32;
+        let qp_y = self.qp_y;
+        let qp_y_prime = self.qp_y_prime;
+        let qp_c_prime = self.qp_c_prime;
+        let bypass = self.bypass;
+        let allow_dpcm = self.allow_dpcm;
+        let disable_deblock = self.disable_deblock;
+        let frame_num_bits = self.frame_num_bits;
+        let poc_lsb_bits = self.poc_lsb_bits;
+        let w4 = ScalingMatrixMode::Flat.intra_weights().w4;
+        let w8 = ScalingMatrixMode::Flat.inter_weights().w8;
         let src = Pic::from_u16(g, fy, fu, fv);
-        let is_p = cfg.p_frames && k > 0;
-        let frame_num = (k as u32) % (1 << frame_num_bits);
-        let poc = 2 * k as i32;
+        let is_p = pic_kind == DeepPictureKind::P;
+        let frame_num = frame_num % (1 << frame_num_bits);
         let mut sw = BitWriter::new();
         if is_p {
             write_p_slice_header(
@@ -1764,7 +1979,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                     colour_plane_id: None,
                     frame_num,
                     frame_num_bits,
-                    idr_pic_id: 0,
+                    idr_pic_id,
                     pic_order_cnt_lsb: (poc as u32) % (1 << poc_lsb_bits),
                     poc_lsb_bits,
                     slice_qp_delta: 0,
@@ -1772,8 +1987,12 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                     slice_alpha_c0_offset_div2: 0,
                     slice_beta_offset_div2: 0,
                     field: FieldPicSignal::FrameMbsOnly,
-                    idr: k == 0,
-                    nal_ref_idc: if k == 0 { 3 } else { 2 },
+                    idr: pic_kind == DeepPictureKind::Idr,
+                    nal_ref_idc: if pic_kind == DeepPictureKind::Idr {
+                        3
+                    } else {
+                        2
+                    },
                     long_term_reference_flag: false,
                     mmco: &[],
                     redundant_pic_cnt: None,
@@ -1820,7 +2039,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                     dbl[mb_addr as usize].qp_y = qp_y;
                     continue;
                 }
-                let reference = prev.as_ref().expect("P picture without reference");
+                let reference = self.prev.as_ref().expect("P picture without reference");
                 let src_y = src.luma_tile(g, mb_x, mb_y);
                 let (mv, inter_sad) =
                     motion_search(&src_y, &reference.y, g.w, g.h, mb_x, mb_y, g.bd_y);
@@ -1907,7 +2126,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                 }
                 let is_skip = mv == skip_mv && cbp_luma == 0 && cbp_chroma == 0;
                 if is_skip {
-                    skipped_mbs += 1;
+                    self.skipped_mbs += 1;
                     if let Some(cs) = cs.as_mut() {
                         let skip_nctx = skip_neighbour_ctx(&cab, mb_addr as usize, false);
                         encode_mb_skip_flag(
@@ -1946,7 +2165,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                         qp_y,
                         mv_l0: [(skip_mv.x as i16, skip_mv.y as i16); 16],
                         ref_idx_l0: [0; 4],
-                        ref_poc_l0: [prev_poc; 4],
+                        ref_poc_l0: [self.prev_poc; 4],
                         ..Default::default()
                     };
                     continue;
@@ -1969,7 +2188,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                     pending_skip = 0;
                 }
                 if let Some(cand) = intra {
-                    intra_mbs_in_p += 1;
+                    self.intra_mbs_in_p += 1;
                     if let Some(cs) = cs.as_mut() {
                         emit_intra_cabac(g, cs, &mut cab, mb_addr, &cand, true);
                         encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
@@ -2003,7 +2222,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                 // only with cbp_luma > 0; otherwise the decoder infers 0.
                 let flag_8x8 = t8x8_chain.is_some() && cbp_luma > 0;
                 if flag_8x8 {
-                    mbs_8x8 += 1;
+                    self.mbs_8x8 += 1;
                 }
                 let mut mcfg = PL016x16McbConfig {
                     ref_idx_l0: 0,
@@ -2189,7 +2408,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                     transform_size_8x8_flag: flag_8x8,
                     mv_l0: [(mv.x as i16, mv.y as i16); 16],
                     ref_idx_l0: [0; 4],
-                    ref_poc_l0: [prev_poc; 4],
+                    ref_poc_l0: [self.prev_poc; 4],
                     ..Default::default()
                 };
             }
@@ -2207,12 +2426,12 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
             sw.rbsp_trailing_bits();
             sw.into_bytes()
         };
-        let (nal_type, ref_idc) = if k == 0 {
+        let (nal_type, ref_idc) = if pic_kind == DeepPictureKind::Idr {
             (NalUnitType::SliceIdr, 3)
         } else {
             (NalUnitType::SliceNonIdr, 2)
         };
-        stream.extend_from_slice(&build_nal_unit(ref_idc, nal_type, &slice_rbsp));
+        let slice_nal = build_nal_unit(ref_idc, nal_type, &slice_rbsp);
 
         if cfg.deblock {
             deblock_recon_deep(
@@ -2228,17 +2447,58 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
                 g.bd_c,
             );
         }
-        recon_frames.push(recon.to_u16());
-        prev = Some(recon);
-        prev_poc = poc;
-    }
 
+        let out = recon.to_u16();
+        self.prev = Some(recon);
+        self.prev_poc = poc;
+        DeepPicture {
+            nal: slice_nal,
+            recon: out,
+            kind: pic_kind,
+        }
+    }
+}
+
+/// Encode a >8-bit sequence. `frames` holds `u16` planes at the
+/// configured chroma format (top-to-bottom row-major). The first
+/// picture is an IDR; later pictures are P pictures
+/// (`DeepConfig::p_frames`) or non-IDR I pictures. `frame_num` counts
+/// the pictures, POC is `2 · k`, the single IDR carries
+/// `idr_pic_id = 0`. Profile: High 10 (110) for 4:2:0 up to 10 bit,
+/// High 4:2:2 (122) for 4:2:2 up to 10 bit, High 4:4:4 Predictive
+/// (244) otherwise — and always 244 for lossless coding, whose SPS
+/// transform-bypass flag §A.2.4 – §A.2.6 forbid under the lesser
+/// profiles.
+pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])]) -> DeepEncoded {
+    assert!(!frames.is_empty());
+    let max_bd = cfg.bit_depth_luma.max(cfg.bit_depth_chroma);
+    let profile_idc: u8 = match (cfg.chroma_format_idc, max_bd, cfg.lossless) {
+        (_, _, true) => 244,
+        (1, 8..=10, _) => 110,
+        (2, 8..=10, _) => 122,
+        _ => 244,
+    };
+    let mut session = DeepSession::with_profile(cfg.clone(), profile_idc);
+    let mut stream = session.parameter_sets_annex_b();
+    let mut recon_frames: Vec<DeepPlanes> = Vec::with_capacity(frames.len());
+    for (k, &(fy, fu, fv)) in frames.iter().enumerate() {
+        let kind = if k == 0 {
+            DeepPictureKind::Idr
+        } else if cfg.p_frames {
+            DeepPictureKind::P
+        } else {
+            DeepPictureKind::I
+        };
+        let pic = session.encode_picture(fy, fu, fv, kind, k as u32, 2 * k as i32, 0);
+        stream.extend_from_slice(&pic.nal);
+        recon_frames.push(pic.recon);
+    }
     DeepEncoded {
         annex_b: stream,
         recon_frames,
         profile_idc,
-        skipped_mbs,
-        intra_mbs_in_p,
-        mbs_8x8,
+        skipped_mbs: session.skipped_mbs(),
+        intra_mbs_in_p: session.intra_mbs_in_p(),
+        mbs_8x8: session.mbs_8x8(),
     }
 }

@@ -1354,6 +1354,87 @@ impl InterMbStateSnapshot {
     }
 }
 
+impl Encoder {
+    /// §7.3.2.1 / §7.3.2.2 — the SPS and PPS RBSPs this encoder's IDR
+    /// access units carry, for `cabac` (`entropy_coding_mode_flag`)
+    /// off or on. Exactly the bytes [`Self::encode_idr`] /
+    /// [`Self::encode_idr_cabac`] put in band, so a muxer can build an
+    /// out-of-band `avcC` record ([`crate::avcc`]) before the first
+    /// picture is coded. The 8x8 transform and non-flat scaling
+    /// matrices promote the signalled profile to at least High (100)
+    /// (§A.2.4 — High-profile tools). The CAVLC pairing carries the
+    /// configured weighted-prediction flags; the CABAC pairing codes
+    /// `weighted_pred_flag = 0` / `weighted_bipred_idc = 0` (the CABAC
+    /// P / B paths predict unweighted).
+    pub fn parameter_sets(&self, cabac: bool) -> (Vec<u8>, Vec<u8>) {
+        let width_mbs = self.cfg.width / 16;
+        let height_mbs = self.cfg.height / 16;
+        let profile_idc = if (self.cfg.transform_8x8 || !self.cfg.scaling_matrix.is_flat())
+            && self.cfg.profile_idc < 100
+        {
+            100
+        } else {
+            self.cfg.profile_idc
+        };
+        let sps_cfg = BaselineSpsConfig {
+            seq_parameter_set_id: 0,
+            level_idc: self.cfg.level_idc,
+            width_in_mbs: width_mbs,
+            height_in_mbs: height_mbs,
+            log2_max_frame_num_minus4: 4,
+            log2_max_poc_lsb_minus4: 4,
+            max_num_ref_frames: self.cfg.max_num_ref_frames,
+            profile_idc,
+            chroma_format_idc: self.cfg.chroma_format_idc,
+            separate_colour_plane: self.cfg.colour_plane_id.is_some(),
+            seq_scaling_lists: self.cfg.scaling_matrix.seq_spec(),
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            interlaced_fields: false,
+            mbaff: false,
+            // Round-430 — rate-controlled sessions annotate CBR
+            // streams with §E.1.1 VUI timing + §E.1.2 NAL HRD.
+            vui: self.cfg.vui.clone(),
+        };
+        let pps_cfg = BaselinePpsConfig {
+            redundant_pic_cnt_present_flag: false,
+            slice_groups: None,
+            constrained_intra_pred_flag: false,
+            pic_scaling_lists: self.cfg.scaling_matrix.pic_spec(),
+            chroma_format_idc: self.cfg.chroma_format_idc,
+            pic_parameter_set_id: 0,
+            seq_parameter_set_id: 0,
+            pic_init_qp_minus26: self.cfg.qp - 26,
+            chroma_qp_index_offset: 0,
+            // Round-453 — §7.4.2.2 weighted_pred_flag: CAVLC P slices
+            // ship a pred_weight_table() and use §8.4.2.3.2 explicit
+            // weighting. Round-26 — explicit weighted bipred needs
+            // idc=1 so B-slice headers may carry pred_weight_table().
+            weighted_pred_flag: !cabac && self.cfg.explicit_weighted_pred,
+            weighted_bipred_idc: if !cabac && self.cfg.explicit_weighted_bipred {
+                1
+            } else {
+                0
+            },
+            entropy_coding_mode_flag: cabac,
+            transform_8x8_mode_flag: self.cfg.transform_8x8,
+        };
+        (
+            build_baseline_sps_rbsp(&sps_cfg),
+            build_baseline_pps_rbsp(&pps_cfg),
+        )
+    }
+
+    /// [`Self::parameter_sets`] as Annex B NAL units (4-byte start
+    /// codes, emulation prevention applied): SPS then PPS.
+    pub fn parameter_sets_annex_b(&self, cabac: bool) -> Vec<u8> {
+        let (sps, pps) = self.parameter_sets(cabac);
+        let mut out = build_nal_unit(3, NalUnitType::Sps, &sps);
+        out.extend_from_slice(&build_nal_unit(3, NalUnitType::Pps, &pps));
+        out
+    }
+}
+
 /// Top-level encoder. Holds parameter set state but no per-picture
 /// scratch — `encode_idr` is the one entry point.
 pub struct Encoder {
@@ -1570,65 +1651,9 @@ impl Encoder {
                 "custom scaling-list values must all be in 1..=255",
             );
         }
-        // §A.2.4 — the 8x8 transform is a High-profile tool; force
-        // profile_idc to at least High (100) when it's requested so the
-        // SPS/PPS pairing is spec-conformant. Scaling matrices likewise
-        // need the §7.3.2.1.1 chroma-extended SPS group / §7.3.2.2 PPS
-        // tail, both High-family syntax.
-        let profile_idc = if (self.cfg.transform_8x8 || !self.cfg.scaling_matrix.is_flat())
-            && self.cfg.profile_idc < 100
-        {
-            100
-        } else {
-            self.cfg.profile_idc
-        };
-        // SPS / PPS bytes.
-        let sps_cfg = BaselineSpsConfig {
-            seq_parameter_set_id: 0,
-            level_idc: self.cfg.level_idc,
-            width_in_mbs: width_mbs,
-            height_in_mbs: height_mbs,
-            log2_max_frame_num_minus4: 4,
-            log2_max_poc_lsb_minus4: 4,
-            max_num_ref_frames: self.cfg.max_num_ref_frames,
-            profile_idc,
-            chroma_format_idc: self.cfg.chroma_format_idc,
-            separate_colour_plane: self.cfg.colour_plane_id.is_some(),
-            seq_scaling_lists: self.cfg.scaling_matrix.seq_spec(),
-            bit_depth_luma_minus8: 0,
-            bit_depth_chroma_minus8: 0,
-            interlaced_fields: false,
-            mbaff: false,
-            // Round-430 — rate-controlled sessions annotate CBR
-            // streams with §E.1.1 VUI timing + §E.1.2 NAL HRD.
-            vui: self.cfg.vui.clone(),
-        };
-        let pps_cfg = BaselinePpsConfig {
-            redundant_pic_cnt_present_flag: false,
-            slice_groups: None,
-            constrained_intra_pred_flag: false,
-            pic_scaling_lists: self.cfg.scaling_matrix.pic_spec(),
-            chroma_format_idc: self.cfg.chroma_format_idc,
-            pic_parameter_set_id: 0,
-            seq_parameter_set_id: 0,
-            pic_init_qp_minus26: self.cfg.qp - 26,
-            chroma_qp_index_offset: 0,
-            // Round-453 — §7.4.2.2 weighted_pred_flag: P slices ship a
-            // pred_weight_table() and use §8.4.2.3.2 explicit weighting.
-            weighted_pred_flag: self.cfg.explicit_weighted_pred,
-            // Round-26 — when the encoder is configured for explicit
-            // weighted bipred, the PPS must signal idc=1 so subsequent
-            // B-slice headers may carry pred_weight_table().
-            weighted_bipred_idc: if self.cfg.explicit_weighted_bipred {
-                1
-            } else {
-                0
-            },
-            entropy_coding_mode_flag: false,
-            transform_8x8_mode_flag: self.cfg.transform_8x8,
-        };
-        let sps_rbsp = build_baseline_sps_rbsp(&sps_cfg);
-        let pps_rbsp = build_baseline_pps_rbsp(&pps_cfg);
+        // SPS / PPS bytes — shared with the CABAC IDR path and exposed
+        // for out-of-band carriage (`avcC`) via [`Self::parameter_sets`].
+        let (sps_rbsp, pps_rbsp) = self.parameter_sets(false);
 
         let mut stream: Vec<u8> = Vec::new();
         stream.extend_from_slice(&build_nal_unit(3, NalUnitType::Sps, &sps_rbsp));
@@ -1644,10 +1669,10 @@ impl Encoder {
                 pic_parameter_set_id: 0,
                 colour_plane_id: self.cfg.colour_plane_id,
                 frame_num: 0,
-                frame_num_bits: sps_cfg.log2_max_frame_num_minus4 + 4,
+                frame_num_bits: 8,
                 idr_pic_id: self.idr_pic_id,
                 pic_order_cnt_lsb: 0,
-                poc_lsb_bits: sps_cfg.log2_max_poc_lsb_minus4 + 4,
+                poc_lsb_bits: 8,
                 // §7.4.3 — SliceQP_Y = 26 + pic_init_qp_minus26 +
                 // slice_qp_delta; the PPS carries cfg.qp, the delta
                 // moves this picture to frame_qp.
@@ -1763,8 +1788,11 @@ impl Encoder {
                 }
             }
             let qp_y = want_qp;
-            let qp_c =
-                qp_y_to_qp_c_with_bd_offset(qp_y, pps_cfg.chroma_qp_index_offset, qp_bd_offset_c);
+            let qp_c = qp_y_to_qp_c_with_bd_offset(
+                qp_y,
+                0, /* PPS chroma_qp_index_offset */
+                qp_bd_offset_c,
+            );
             for mb_x in 0..width_mbs {
                 let dbl = self.encode_mb(
                     frame,
@@ -1819,7 +1847,7 @@ impl Encoder {
                 &mut recon_u,
                 &mut recon_v,
                 &mb_deblock_infos,
-                pps_cfg.chroma_qp_index_offset,
+                0, /* PPS chroma_qp_index_offset */
                 width_mbs,
                 height_mbs,
                 self.cfg.chroma_format_idc,

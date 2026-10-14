@@ -486,14 +486,14 @@ impl H264CodecDecoder {
             pos += len;
         }
 
-        // §5.2.4.1.1 extension: only present for the High family of
-        // profile_idc values listed in the spec text. Older muxers that
-        // ship a Baseline / Main / Extended record never append these
-        // bytes, so the parse cleanly ends with the PPS list above.
-        // For 244 (High 4:4:4 Predictive) the spec extends the list of
-        // profiles that carry the extension — keep it here even though
-        // the 14496-15:2013 edition only enumerated 100/110/122/144.
-        if matches!(profile_idc, 100 | 110 | 122 | 144 | 244) {
+        // ISO/IEC 14496-15:2024 §5.3.2.1.2 — the chroma-format /
+        // bit-depth / SPS-extension trailer follows the PPS array for
+        // every AVCProfileIndication other than 66 / 77 / 88 (Baseline
+        // / Main / Extended records never append these bytes, so their
+        // parse cleanly ends with the PPS list above). Round 475 widened
+        // the earlier 100 / 110 / 122 / 144 / 244 enumeration to the
+        // 2024 rule (`avcc::AvcDecoderConfigurationRecord` mirrors it).
+        if crate::avcc::AvcDecoderConfigurationRecord::has_extension_trailer(profile_idc) {
             // Some real-world MP4 muxers truncate the extension entirely
             // even for these profiles; if we're already past the end,
             // accept the record as-is rather than hard-fail.

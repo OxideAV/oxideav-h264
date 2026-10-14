@@ -53,13 +53,11 @@ use crate::encoder::intra_pred::{
 use crate::encoder::macroblock::{b_16x8_mb_type_raw, b_8x16_mb_type_raw, BPartPred, BSubMbCell};
 use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
 use crate::encoder::nal::build_nal_unit;
-use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
 use crate::encoder::rdo::{cost_combined, lambda_ssd};
 use crate::encoder::slice::{
     write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
     CabacSliceParams, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
 };
-use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
 use crate::encoder::transform::{
     deinterleave_8x8_to_4x4, forward_core_4x4, forward_core_8x8, forward_hadamard_2x2,
     forward_hadamard_4x4, quantize_4x4_ac_w, quantize_8x8_w, quantize_chroma_dc_w,
@@ -1991,51 +1989,9 @@ impl Encoder {
         let mut chain_qp = frame_qp;
         let mut want_qp = frame_qp;
 
-        // §A.2.4 — the 8x8 transform requires High profile; scaling
-        // matrices likewise need the §7.3.2.1.1 chroma-extended SPS
-        // group / §7.3.2.2 PPS tail (High-family syntax).
-        let profile_idc =
-            if (cfg.transform_8x8 || !cfg.scaling_matrix.is_flat()) && cfg.profile_idc < 100 {
-                100
-            } else {
-                cfg.profile_idc
-            };
-        let sps = build_baseline_sps_rbsp(&BaselineSpsConfig {
-            seq_scaling_lists: cfg.scaling_matrix.seq_spec(),
-            bit_depth_luma_minus8: 0,
-            bit_depth_chroma_minus8: 0,
-            interlaced_fields: false,
-            mbaff: false,
-            seq_parameter_set_id: 0,
-            level_idc: cfg.level_idc,
-            width_in_mbs: width_mbs as u32,
-            height_in_mbs: height_mbs as u32,
-            log2_max_frame_num_minus4: 4,
-            log2_max_poc_lsb_minus4: 4,
-            max_num_ref_frames: cfg.max_num_ref_frames,
-            profile_idc,
-            chroma_format_idc: cfg.chroma_format_idc,
-            separate_colour_plane: cfg.colour_plane_id.is_some(),
-            // Round-430 — rate-controlled sessions annotate CBR
-            // streams with §E.1.1 VUI timing + §E.1.2 NAL HRD.
-            vui: cfg.vui.clone(),
-        });
-        let pps_cfg = BaselinePpsConfig {
-            redundant_pic_cnt_present_flag: false,
-            slice_groups: None,
-            constrained_intra_pred_flag: false,
-            pic_scaling_lists: cfg.scaling_matrix.pic_spec(),
-            chroma_format_idc: cfg.chroma_format_idc,
-            pic_parameter_set_id: 0,
-            seq_parameter_set_id: 0,
-            pic_init_qp_minus26: cfg.qp - 26,
-            chroma_qp_index_offset: 0,
-            weighted_pred_flag: false,
-            weighted_bipred_idc: 0,
-            entropy_coding_mode_flag: true,
-            transform_8x8_mode_flag: cfg.transform_8x8,
-        };
-        let pps = build_baseline_pps_rbsp(&pps_cfg);
+        // SPS / PPS bytes — shared with the CAVLC IDR path
+        // (`Encoder::parameter_sets`).
+        let (sps, pps) = self.parameter_sets(true);
         let mut stream: Vec<u8> = Vec::new();
         stream.extend_from_slice(&build_nal_unit(3, NalUnitType::Sps, &sps));
         stream.extend_from_slice(&build_nal_unit(3, NalUnitType::Pps, &pps));

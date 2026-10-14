@@ -73,6 +73,8 @@ pub mod transform;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod vui;
 
+pub mod avcc;
+
 pub mod h264_decoder;
 
 pub mod h264_encoder;
@@ -95,8 +97,14 @@ pub const CODEC_ID_STR: &str = "h264";
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("h264_sw")
         .with_lossy(true)
+        // Round-475 — `lossless=true` (High 4:4:4 Predictive transform
+        // bypass) on the High-family encoder path.
+        .with_lossless(true)
         .with_intra_only(false)
-        .with_max_size(8192, 8192);
+        .with_max_size(8192, 8192)
+        // Round-475 — the encoder input layouts (8 / 10 / 12-bit 4:2:0 /
+        // 4:2:2 / 4:4:4 and grey); the gateway ladder reads this list.
+        .with_pixel_formats(h264_encoder::accepted_pixel_formats().to_vec());
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)

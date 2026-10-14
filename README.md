@@ -239,6 +239,43 @@ typed option schema (`rc=auto/cqp/cbr/vbr`, `qp`, `bitrate`,
 `max_bitrate`, `buffer_size`, `gop`, `cabac`, `bframes`). Round 443
 extended rate control to **B pictures** (see the table row).
 
+**Round 475 — registry layouts, `idr_pic_id`, `avcC`.** The registry
+encoder accepts every layout the crate's High-family encoder codes:
+`Yuv420P` / `Yuv422P` / `Yuv444P` / `Gray8` at 8 bit and the
+`*P10Le` / `*P12Le` / `Gray10Le` / `Gray12Le` variants (declared on
+the registry descriptor so the Layer-2 gateway ladder sees them).
+8-bit 4:2:0 input (grey coded as 4:2:0 with constant chroma) keeps the
+Baseline / Main session — IDR / P / B, rate control, streams
+byte-identical to earlier releases (`integration_registry_bit_identity`
+pins them). Every other layout rides `encoder::deep::DeepSession`
+under the §A.2.4 – §A.2.7 minimum profile (High 100 / High 10 110 /
+High 4:2:2 122 / High 4:4:4 Predictive 244): IDR + P pictures
+(Intra_16x16, P_Skip / P_L0_16x16 / Intra_16x16 fallback), CAVLC or
+CABAC, fixed QP (`rc=cqp`; no B pictures and no rate control on this
+path), `transform_8x8`, `deblock`, and `lossless=true` (transform
+bypass at QP′Y = 0, profile 244, reconstruction equal to the source).
+`profile=auto|baseline|main|high|high10|high422|high444` picks the
+profile explicitly (one that does not admit the layout is refused; an
+explicit High-family profile routes 8-bit 4:2:0 input through the
+High-family encoder). Every IDR access unit carries a §7.4.3
+`idr_pic_id` that advances per IDR (0, 1, 2, … mod 65536), so an
+all-intra `gop=1` sequence never reads as redundant slices of one
+picture. `format=annexb` (default: start codes, in-band SPS / PPS,
+empty extradata) or `format=avcc` (4-byte length-prefixed samples
+without parameter sets / filler; `extradata` = the ISO/IEC 14496-15
+§5.3.2.1 `AVCDecoderConfigurationRecord` from the `avcc` module —
+builder + parser + sample framing). Gates: every layout × CAVLC /
+CABAC decodes in our decoder within the lossy bound and
+byte-identically in a black-box reference decoder; lossless 4:2:2 /
+4:4:4 / 10- / 12-bit / grey exact in both; `avcC` extradata + samples
+decode identically to the Annex B stream. Measured (64x48 synthetic,
+3 pictures, CAVLC, bytes / min luma PSNR): 4:2:2 8-bit 3389 B / 45.2
+dB at QP 20, 2009 B / 38.4 dB at QP 28, 1048 B / 30.8 dB at QP 36;
+4:2:0 10-bit 2429 / 45.6, 1479 / 38.2, 858 / 30.9; 4:4:4 12-bit 4970 /
+45.7, 3009 / 38.1, 1492 / 30.9. Not yet on this path: 4:0:0
+(`chroma_format_idc = 0`) coding for grey input, Intra_NxN at > 8 bit,
+B pictures and rate control for the High-family layouts.
+
 | Coding tool | Scope | Notes |
 | ----------- | ----- | ----- |
 | **Rate control (r420, B pictures r443)** | CBR + capped VBR, CAVLC + CABAC GOPs — IDR/P chains AND `I B..B P` mini-GOP structures (`SessionConfig::b_frames` / registry `bframes`, 0..=16); MB-row delta-QP on every slice kind and both entropy paths | Non-normative feedback controller (`encoder::rate_control`): complexity-times-quantiser-step model (§8.5.9 doubles-every-6 anchor) over an Annex C-style leaky-bucket CPB, per-frame QP via §7.4.3 `slice_qp_delta` (single PPS; §9.3.1.1 CABAC ctx init at the resulting SliceQP_Y), VBV hard-cap re-encode retry, §7.3.2.7 filler NALs in CBR, and `Encoder::encode_p_rate_adaptive` MB-row modulation riding §7.4.5 `mb_qp_delta` (coded-residual-only emission + skip/cbp==0 inheritance mirrored decoder-exactly, deblock chain included). Measured (80x64 synthetic matrix, post-warmup): CBR drift-corrected payload error **0.0%** across smooth / texture / scene-cut signals with channel (payload+filler) conservation 0.0%; capped-VBR payload error **≤ 1.5%**; RD check — CBR lands **on** the fixed-QP anchor curve (43.94 dB vs 43.93 dB interpolated at equal rate). Registry encoder factory (`h264_encoder`) with `rc/qp/bitrate/max_bitrate/buffer_size/gop/cabac/bframes` options. **B pictures (r443)**: the controller models three frame kinds — per-kind complexity EWMAs feed a GOP-mix-normalised budget split that conserves the per-frame budget for any structure and settles a λ-scaled QP hierarchy (equal step I/P, non-reference B a constant +2 QP); the session buffers display order and emits mini-GOPs anchor-first with truncated pre-IDR tails, `pic_timing.dpb_output_delay` covers the one-frame reorder latency, and MB-row delta-QP modulation runs on the B paths too (`encode_b_rate_adaptive` / `encode_b_cabac_rate_adaptive`). Measured (`b_frames = 2`, post-warmup): CBR payload error 2.8% CAVLC / 1.1% CABAC, capped-VBR 0.04%; mean QPs I 17.0 ≤ P 18.0 < B 20.2; the CBR B-GOP encode lands 1.2 dB ABOVE the fixed-QP B-GOP anchor curve at equal rate. All rate-controlled streams (reordering, SEI + filler included) decode byte-exactly in our decoder and a black-box reference decoder |

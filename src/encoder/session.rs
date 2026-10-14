@@ -378,6 +378,14 @@ impl EncoderSession {
         self.next_idr_pic_id
     }
 
+    /// The SPS + PPS every IDR access unit of this session carries, as
+    /// Annex B NAL units — available before the first picture so an
+    /// out-of-band `avcC` record ([`crate::avcc`]) can be built up
+    /// front.
+    pub fn parameter_sets_annex_b(&self) -> Vec<u8> {
+        self.enc.parameter_sets_annex_b(self.cfg.cabac)
+    }
+
     /// Access the rate controller (diagnostics: average bitrate, CPB
     /// fullness). `None` for constant-QP sessions.
     pub fn rate_controller(&self) -> Option<&RateController> {
