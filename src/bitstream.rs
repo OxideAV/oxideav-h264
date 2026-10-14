@@ -51,6 +51,7 @@ pub type BitResult<T> = Result<T, BitError>;
 
 pub struct BitReader<'a> {
     data: &'a [u8],
+    rbsp_stop_bit: Option<(usize, u8)>,
     /// Index of the byte holding the next bit to consume.
     byte_pos: usize,
     /// Offset of the next bit within `data[byte_pos]`. 0 = MSB.
@@ -59,8 +60,13 @@ pub struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
+        let rbsp_stop_bit = data
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map(|byte| (byte, 7 - data[byte].trailing_zeros() as u8));
         Self {
             data,
+            rbsp_stop_bit,
             byte_pos: 0,
             bit_pos: 0,
         }
@@ -153,33 +159,11 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// §7.2 `more_rbsp_data()`. Locate the rbsp_stop_one_bit (the
-    /// last `1` bit in the RBSP) and report whether the cursor is
-    /// strictly before it.
+    /// §7.2 `more_rbsp_data()`. Report whether the cursor is strictly
+    /// before the rbsp_stop_one_bit, cached from the immutable RBSP.
     pub fn more_rbsp_data(&self) -> bool {
-        if self.bits_remaining() == 0 {
-            return false;
-        }
-        let mut last_one: Option<(usize, u8)> = None;
-        for byte_idx in 0..self.data.len() {
-            let b = self.data[byte_idx];
-            if b == 0 {
-                continue;
-            }
-            for bit_idx in 0..8u8 {
-                if (b >> (7 - bit_idx)) & 1 == 1 {
-                    last_one = Some((byte_idx, bit_idx));
-                }
-            }
-        }
-        match last_one {
-            None => false,
-            Some((b, bi)) => match self.byte_pos.cmp(&b) {
-                core::cmp::Ordering::Less => true,
-                core::cmp::Ordering::Equal => self.bit_pos < bi,
-                core::cmp::Ordering::Greater => false,
-            },
-        }
+        self.rbsp_stop_bit
+            .is_some_and(|stop| self.position() < stop)
     }
 
     /// §7.3.2.11 `rbsp_trailing_bits()` — consume `rbsp_stop_one_bit`
@@ -370,6 +354,63 @@ mod tests {
         assert!(r.more_rbsp_data());
         assert_eq!(r.ue().unwrap(), 0);
         assert!(!r.more_rbsp_data());
+    }
+
+    fn more_rbsp_data_reference(reader: &BitReader<'_>) -> bool {
+        if reader.bits_remaining() == 0 {
+            return false;
+        }
+        let mut last_one = None;
+        for (byte_idx, &byte) in reader.data.iter().enumerate() {
+            for bit_idx in 0..8u8 {
+                if (byte >> (7 - bit_idx)) & 1 == 1 {
+                    last_one = Some((byte_idx, bit_idx));
+                }
+            }
+        }
+        match last_one {
+            None => false,
+            Some((byte, bit)) => match reader.byte_pos.cmp(&byte) {
+                core::cmp::Ordering::Less => true,
+                core::cmp::Ordering::Equal => reader.bit_pos < bit,
+                core::cmp::Ordering::Greater => false,
+            },
+        }
+    }
+
+    fn assert_more_rbsp_data_matches_reference(data: &[u8]) {
+        let mut reader = BitReader::new(data);
+        for position in 0..=data.len() * 8 {
+            let expected = more_rbsp_data_reference(&reader);
+            assert_eq!(reader.more_rbsp_data(), expected, "{data:?} at {position}");
+            assert_eq!(reader.more_rbsp_data(), expected, "repeated query");
+            if reader.bits_remaining() != 0 {
+                reader.u(1).unwrap();
+            }
+        }
+        assert_eq!(reader.u(1), Err(BitError::Eof));
+        assert!(!reader.more_rbsp_data());
+    }
+
+    #[test]
+    fn more_rbsp_data_matches_reference_exhaustively() {
+        for len in 0..=2 {
+            for value in 0..(1u32 << (len * 8)) {
+                let bytes = (value as u16).to_be_bytes();
+                assert_more_rbsp_data_matches_reference(&bytes[2 - len..]);
+            }
+        }
+    }
+
+    #[test]
+    fn more_rbsp_data_matches_reference_with_zero_suffixes() {
+        let mut data = [0u8; 33];
+        assert_more_rbsp_data_matches_reference(&data);
+        for position in 0..data.len() * 8 {
+            data[position / 8] = 1 << (7 - position % 8);
+            assert_more_rbsp_data_matches_reference(&data);
+            data[position / 8] = 0;
+        }
     }
 
     #[test]
