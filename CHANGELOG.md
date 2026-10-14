@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-h264/compare/v0.1.8...v0.2.0) - 2026-10-14
+
+### Other
+
+- encoder deep: Intra_4x4 (I_NxN) at 8/10/12/14-bit — §8.3.1 block-sequential prediction through the bit-depth-aware predict_4x4, §8.3.1.1 predicted-mode coding, §8.5.15 V/H DPCM under bypass, §8.3.4.5 4:4:4 planes, CAVLC + CABAC, per-MB λ·SAD election vs Intra_16x16; registry intra_4x4 option (default on); CABAC 4x4-plane emitter honours the current MB's intra flag for the §9.3.3.1.1.9 cond term; 8 layouts × CAVLC/CABAC lossy + lossless bit-exact in ours, byte-exact in the black-box reference
+- registry encoder: every High-family input layout (8-bit 4:2:2/4:4:4/grey, 10/12-bit 4:2:0/4:2:2/4:4:4/grey) via a streaming DeepSession under the §A.2 minimum or explicit profile, lossless / transform_8x8 / deblock / format=avcc options; avcc module (ISO/IEC 14496-15 §5.3.2.1 record builder + parser + sample framing); shared Encoder::parameter_sets; deep lossless signalled 244 per §A.2.5–A.2.7; both-direction gates per layout incl. black-box byte identity
+- §7.4.3 idr_pic_id — per-session counter on IDR access units (Encoder::set_idr_pic_id, session rotation, CAVLC + CABAC IDR headers); decoder-side parse gates over gop=1 / mixed / B / rate-controlled streams; 8-bit 4:2:0 registry streams pinned byte-identical
+- apply the SPS frame cropping window to output frames
+- raw Annex-B byte-stream demuxer (.h264 / .264 / .avc)
+- 8x8 transform at 10/12/14-bit (§8.5.13 at QP′ past 51, §7.4.5.3.3 CAVLC split, cat-5 CABAC residual, transform_size_8x8_flag contexts, §8.5.13 bypass identity under lossless)
+- 8x8 transform in CABAC MBAFF (transform_size_8x8_flag under Table 6-4 A/B contexts, cat-5 residuals under Table 9-43 frame/field columns, §8.5.7 field 8x8 scan, §8.7 8x8-edge deblock skip)
+- CABAC at 10/12/14-bit (shared mbaff_cabac emission helpers, eq. 9-22 NumC8x8 4:2:2 DC contexts, cat 6..12 4:4:4 planes, eq. 9-5 init at negative QP); decoder: CABAC coeff_abs_level_minus1 UEG0 escape cap sized for 2^(7+BitDepth) levels; fuzz: mbaff_cabac_roundtrip + deep_roundtrip targets
+- 10/12/14-bit encoder (encoder::deep) — QP′ = QP + QpBdOffset scaling past 51, §8.5.8 chroma QP, depth-aware intra/MC/§8.7 deblock, 4:2:0/4:2:2/4:4:4, negative QP_Y; lossless qpprime_y_zero_transform_bypass (§8.5.10/8.5.11/8.5.12 identities + §8.5.15 DPCM, interop mode); fix 4:2:2 chroma DC quantiser qP,DC = qP + 3 (eq. 8-327)
+- CABAC MBAFF frame encoding (§9.3.3.1.1.2 mb_field_decoding_flag ctx, §9.3.3.1.1.1 skip ctx under §7.4.4 inference, eq. 9-12/9-15/9-16 field↔frame ref_idx/|mvd| scaling, Table 6-4 CBP/CBF probes, Table 9-34 field residual contexts + §8.5.6 field scan)
+
 ### Added
 
 - encoder: **§7.4.3 `idr_pic_id`** (round 475) — `Encoder::set_idr_pic_id` / `with_idr_pic_id` / `idr_pic_id` on the stateless encoder (both CAVLC and CABAC IDR paths write it), and `EncoderSession` (hence the registry encoder) rotates a per-session counter in `0..=65535` per IDR access unit, so two consecutive IDR access units never share the value. Before, every IDR carried `idr_pic_id = 0` and an all-IDR stream (`gop=1`, the HEIF `avcs` image-sequence shape) read, under the §7.4.1.2.4 first-VCL-NAL test, as redundant slices of ONE picture. `integration_idr_pic_id` parses the produced streams with the crate's own slice-header parser over `gop=1` / mixed IDR-P / B mini-GOP / rate-controlled sessions (one picture out per IDR in our decoder and in a black-box reference decoder); `integration_registry_bit_identity` pins the pre-round 8-bit 4:2:0 registry streams (CAVLC / CABAC / B / CBR / VBR, single-IDR) byte-for-byte. The batch sequence encoders (`deep`, `field`, `mbaff*`, `multiref`, `slices`, `sp`, `scp`) emit exactly one IDR per sequence and are unaffected.
