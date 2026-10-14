@@ -224,6 +224,13 @@ pub struct EncoderSession {
     /// Display-order pictures buffered since the last anchor
     /// (`b_frames > 0` only; at most `b_frames` entries).
     pending: Vec<PendingFrame>,
+    /// §7.4.3 `idr_pic_id` the next IDR access unit carries. Starts at
+    /// 0 and advances by one per IDR (modulo 65536), so two consecutive
+    /// IDR access units of one session never share the value — the
+    /// rule that keeps an all-IDR stream (`gop_length == 1`) from
+    /// collapsing into redundant slices of one picture at the decoder
+    /// (§7.4.1.2.4 first-VCL-NAL detection compares `idr_pic_id`).
+    next_idr_pic_id: u32,
 }
 
 /// Round-430 — derive the §E.1.2 NAL HRD block from the rate-control
@@ -361,7 +368,14 @@ impl EncoderSession {
             next_ref_frame_num: 0,
             prev: None,
             pending: Vec::new(),
+            next_idr_pic_id: 0,
         }
+    }
+
+    /// §7.4.3 `idr_pic_id` the next IDR access unit of this session
+    /// will carry (0..=65535). Advances by one per IDR picture.
+    pub fn next_idr_pic_id(&self) -> u32 {
+        self.next_idr_pic_id
     }
 
     /// Access the rate controller (diagnostics: average bitrate, CPB
@@ -585,6 +599,14 @@ impl EncoderSession {
     ) -> (SessionFrame, Option<PrevPic>) {
         let is_idr = kind == SessionFrameKind::Idr;
         let disp_in_gop = display_idx - self.gop_start;
+        if is_idr {
+            // §7.4.3 — every IDR access unit of the session takes the
+            // next idr_pic_id; the VBV retry loop below re-encodes the
+            // SAME picture, so the value is fixed before the loop and
+            // advanced once the access unit is committed.
+            let id = self.next_idr_pic_id;
+            self.enc.set_idr_pic_id(id);
+        }
         // §7.4.3 — frame_num counts reference pictures modulo
         // MaxFrameNum (our SPS: log2_max_frame_num = 8) and resets at
         // IDR. A non-reference B carries the frame_num of the
@@ -732,6 +754,9 @@ impl EncoderSession {
 
         self.dec_in_gop += 1;
         self.encoded += 1;
+        if is_idr {
+            self.next_idr_pic_id = (self.next_idr_pic_id + 1) & 0xFFFF;
+        }
         let anchor_pic = match pic {
             AuPic::Anchor(p) => {
                 self.next_ref_frame_num = (frame_num + 1) & 0xFF;

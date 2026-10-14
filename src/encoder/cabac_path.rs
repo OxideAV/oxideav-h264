@@ -2051,7 +2051,7 @@ impl Encoder {
                 colour_plane_id: cfg.colour_plane_id,
                 frame_num: 0,
                 frame_num_bits: 8,
-                idr_pic_id: 0,
+                idr_pic_id: self.idr_pic_id(),
                 pic_order_cnt_lsb: 0,
                 poc_lsb_bits: 8,
                 slice_qp_delta: frame_qp - cfg.qp,

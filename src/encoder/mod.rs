@@ -1358,6 +1358,12 @@ impl InterMbStateSnapshot {
 /// scratch — `encode_idr` is the one entry point.
 pub struct Encoder {
     cfg: EncoderConfig,
+    /// §7.4.3 `idr_pic_id` written into the slice header of the next
+    /// IDR picture (0..=65535). The encoder is stateless per picture,
+    /// so the caller that strings IDR access units together (the
+    /// [`crate::encoder::session::EncoderSession`]) rotates it: two
+    /// consecutive IDR access units shall not share the value.
+    idr_pic_id: u32,
 }
 
 impl Encoder {
@@ -1365,6 +1371,28 @@ impl Encoder {
     /// CABAC entry points in [`crate::encoder::cabac_path`]).
     pub fn config(&self) -> &EncoderConfig {
         &self.cfg
+    }
+
+    /// §7.4.3 `idr_pic_id` the next IDR picture will carry.
+    pub fn idr_pic_id(&self) -> u32 {
+        self.idr_pic_id
+    }
+
+    /// Set the §7.4.3 `idr_pic_id` for the IDR pictures encoded from
+    /// now on (`0..=65535`; all slices of one IDR picture carry the
+    /// same value). Callers emitting consecutive IDR access units
+    /// must change it between them (§7.4.3: "the value of idr_pic_id
+    /// in the slices of the first such IDR access unit shall differ
+    /// from the idr_pic_id in the second such IDR access unit").
+    pub fn set_idr_pic_id(&mut self, idr_pic_id: u32) {
+        assert!(idr_pic_id <= 65535, "idr_pic_id out of 0..=65535 (§7.4.3)");
+        self.idr_pic_id = idr_pic_id;
+    }
+
+    /// Builder form of [`set_idr_pic_id`](Self::set_idr_pic_id).
+    pub fn with_idr_pic_id(mut self, idr_pic_id: u32) -> Self {
+        self.set_idr_pic_id(idr_pic_id);
+        self
     }
 }
 
@@ -1428,7 +1456,7 @@ impl Encoder {
                 "4:4:4 (chroma_format_idc=3) requires profile_idc=244 (High 4:4:4 Predictive)",
             );
         }
-        Self { cfg }
+        Self { cfg, idr_pic_id: 0 }
     }
 
     /// Encode the SPS + PPS + IDR access unit for one frame as an
@@ -1617,7 +1645,7 @@ impl Encoder {
                 colour_plane_id: self.cfg.colour_plane_id,
                 frame_num: 0,
                 frame_num_bits: sps_cfg.log2_max_frame_num_minus4 + 4,
-                idr_pic_id: 0,
+                idr_pic_id: self.idr_pic_id,
                 pic_order_cnt_lsb: 0,
                 poc_lsb_bits: sps_cfg.log2_max_poc_lsb_minus4 + 4,
                 // §7.4.3 — SliceQP_Y = 26 + pic_init_qp_minus26 +
