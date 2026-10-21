@@ -775,6 +775,18 @@ fn inverse_core_4x4(d: &[i32; 16]) -> [i32; 16] {
     r
 }
 
+/// [`inverse_core_4x4`] with the two common sparse cases short-cut: an
+/// all-zero block (most blocks of an inter picture) transforms to zero,
+/// and a DC-only block to the constant `(d00 + 32) >> 6` — both exactly
+/// what eqs. 8-338..8-354 give for such input.
+#[inline]
+fn inverse_core_4x4_sparse(d: &[i32; 16]) -> [i32; 16] {
+    if d[1..].iter().all(|&v| v == 0) {
+        return [(d[0] + 32) >> 6; 16];
+    }
+    inverse_core_4x4(d)
+}
+
 // ---------------------------------------------------------------------------
 // §8.5.12 — public entry points for 4x4 residual blocks.
 // ---------------------------------------------------------------------------
@@ -823,7 +835,7 @@ pub fn inverse_transform_4x4(
     // Standard path: c[0,0] participates in scaling (not an Intra_16x16
     // luma DC block / not a chroma DC block).
     let d = scale_4x4(coeffs, qp, scaling_list, false);
-    Ok(inverse_core_4x4(&d))
+    Ok(inverse_core_4x4_sparse(&d))
 }
 
 /// §8.5.12 with Intra_16x16 luma AC / chroma AC semantics: c[0,0] is a
@@ -838,7 +850,7 @@ pub fn inverse_transform_4x4_dc_preserved(
     check_qp(qp, bit_depth)?;
     check_bit_depth(bit_depth)?;
     let d = scale_4x4(coeffs, qp, scaling_list, true);
-    Ok(inverse_core_4x4(&d))
+    Ok(inverse_core_4x4_sparse(&d))
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +997,11 @@ pub fn inverse_transform_8x8(
     check_qp(qp, bit_depth)?;
     check_bit_depth(bit_depth)?;
     let d = scale_8x8(coeffs, qp, scaling_list);
+    // An all-zero block transforms to zero (eqs. 8-358..8-406 are linear
+    // and the final rounding of zero is zero).
+    if d.iter().all(|&v| v == 0) {
+        return Ok([0; 64]);
+    }
     Ok(inverse_core_8x8(&d))
 }
 
