@@ -1855,7 +1855,7 @@ impl H264CodecDecoder {
         let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
         let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !first_header.field_pic_flag;
         if deblock_enabled {
-            reconstruct::deblock_picture_full(
+            reconstruct::deblock_picture_full_threaded(
                 &mut pic,
                 &grid,
                 deblock_alpha_off,
@@ -1866,6 +1866,7 @@ impl H264CodecDecoder {
                 mbaff_frame_flag,
                 first_header.field_pic_flag,
                 &mb_field_flags,
+                self.threads,
             );
         }
 
