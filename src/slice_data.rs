@@ -248,6 +248,7 @@ fn skip_trace_enabled() -> bool {
     env_flag(&CACHED, "OXIDEAV_H264_SKIP_TRACE")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_slice_data_impl(
     rbsp: &[u8],
     bit_cursor_bytes: usize,
