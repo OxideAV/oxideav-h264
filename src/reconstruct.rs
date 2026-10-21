@@ -459,6 +459,9 @@ const MAX_PARTITION_SAMPLES: usize = 256;
 /// and MBAFF field MBs (stride 2 per eq. 6-10), and handles the MBAFF
 /// chroma origin derivation that `(mb_px / 16) * MbWidthC` breaks for
 /// field MBs whose `mb_py` is an odd pair-local offset.
+/// Samples in the largest motion-compensation partition (16x16).
+const MAX_PARTITION_SAMPLES: usize = 256;
+
 #[derive(Debug, Clone, Copy)]
 struct MbWriter {
     /// Luma MB origin x — `mb_px` from [`mb_sample_origin`].
