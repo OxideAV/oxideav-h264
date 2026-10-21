@@ -8553,13 +8553,16 @@ fn mbaff_edge_bs(
             .get(q_addr as usize)
             .copied()
             .unwrap_or(false);
-    let diff_ref_mv = !p_info.is_intra
-        && !q_info.is_intra
-        && different_ref_or_mv_luma(p_info, q_info, p_in.0, p_in.1, q_in.0, q_in.1, field_units);
     let p_blk4_z = blk4_raster_index((p_in.0 / 4) as u8, (p_in.1 / 4) as u8) as usize;
     let q_blk4_z = blk4_raster_index((q_in.0 / 4) as u8, (q_in.1 / 4) as u8) as usize;
     let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
     let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+    // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+    // neither side is intra and neither has nonzero coefficients.
+    let diff_ref_mv = !p_info.is_intra
+        && !q_info.is_intra
+        && !(p_has_nz || q_has_nz)
+        && different_ref_or_mv_luma(p_info, q_info, p_in.0, p_in.1, q_in.0, q_in.1, field_units);
     let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
         bs_pair_flags(p_addr, q_addr, true, false, mb_field_flags);
     let bs = derive_boundary_strength(BsInputs {
@@ -9523,8 +9526,19 @@ fn deblock_plane_luma(
                     } else {
                         field_pic
                     };
+                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
+                    // Consult the per-block mask set at reconstruct-time.
+                    let p_blk4_z =
+                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+                    let q_blk4_z =
+                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                    // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                    // neither side is intra and neither has nonzero coefficients.
                     let diff_ref_mv = !p_info.is_intra
                         && !q_info.is_intra
+                        && !(p_has_nz || q_has_nz)
                         && different_ref_or_mv_luma(
                             p_info,
                             q_info,
@@ -9534,14 +9548,6 @@ fn deblock_plane_luma(
                             q_in_mb_y,
                             field_units,
                         );
-                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
-                    // Consult the per-block mask set at reconstruct-time.
-                    let p_blk4_z =
-                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
-                    let q_blk4_z =
-                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
-                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                     let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
                         bs_pair_flags(p_addr, q_addr, mbaff_frame_flag, field_pic, mb_field_flags);
                     let bs = derive_boundary_strength(BsInputs {
@@ -9636,8 +9642,18 @@ fn deblock_plane_luma(
                     } else {
                         field_pic
                     };
+                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
+                    let p_blk4_z =
+                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+                    let q_blk4_z =
+                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                    // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                    // neither side is intra and neither has nonzero coefficients.
                     let diff_ref_mv = !p_info.is_intra
                         && !q_info.is_intra
+                        && !(p_has_nz || q_has_nz)
                         && different_ref_or_mv_luma(
                             p_info,
                             q_info,
@@ -9647,13 +9663,6 @@ fn deblock_plane_luma(
                             q_in_mb_y,
                             field_units,
                         );
-                    // §8.7.2.1 — per-4x4-block nonzero-coefficient test.
-                    let p_blk4_z =
-                        blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
-                    let q_blk4_z =
-                        blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
-                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                     let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
                         bs_pair_flags(p_addr, q_addr, mbaff_frame_flag, field_pic, mb_field_flags);
                     let bs = derive_boundary_strength(BsInputs {
@@ -9821,8 +9830,19 @@ fn deblock_plane_chroma(
                             } else {
                                 field_pic
                             };
+                            let p_blk4_z =
+                                blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
+                                    as usize;
+                            let q_blk4_z =
+                                blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
+                                    as usize;
+                            let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                            let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                            // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                            // neither side is intra and neither has nonzero coefficients.
                             let diff_ref_mv = !p_info.is_intra
                                 && !q_info.is_intra
+                                && !(p_has_nz || q_has_nz)
                                 && different_ref_or_mv_luma(
                                     p_info,
                                     q_info,
@@ -9832,14 +9852,6 @@ fn deblock_plane_chroma(
                                     q_in_mb_y,
                                     field_units,
                                 );
-                            let p_blk4_z =
-                                blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
-                                    as usize;
-                            let q_blk4_z =
-                                blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
-                                    as usize;
-                            let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                            let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                             let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
                                 bs_pair_flags(
                                     p_addr,
@@ -9959,8 +9971,19 @@ fn deblock_plane_chroma(
                             } else {
                                 field_pic
                             };
+                            let p_blk4_z =
+                                blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
+                                    as usize;
+                            let q_blk4_z =
+                                blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
+                                    as usize;
+                            let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                            let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                            // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                            // neither side is intra and neither has nonzero coefficients.
                             let diff_ref_mv = !p_info.is_intra
                                 && !q_info.is_intra
+                                && !(p_has_nz || q_has_nz)
                                 && different_ref_or_mv_luma(
                                     p_info,
                                     q_info,
@@ -9970,14 +9993,6 @@ fn deblock_plane_chroma(
                                     q_in_mb_y,
                                     field_units,
                                 );
-                            let p_blk4_z =
-                                blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
-                                    as usize;
-                            let q_blk4_z =
-                                blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
-                                    as usize;
-                            let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                            let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                             let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
                                 bs_pair_flags(
                                     p_addr,
@@ -10305,8 +10320,15 @@ fn derive_chroma_444_bs(
     field_units: bool,
 ) -> u8 {
     let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) = pair_flags;
+    let p_blk4_z = blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
+    let q_blk4_z = blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
+    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+    // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+    // neither side is intra and neither has nonzero coefficients.
     let diff_ref_mv = !p_info.is_intra
         && !q_info.is_intra
+        && !(p_has_nz || q_has_nz)
         && different_ref_or_mv_luma(
             p_info,
             q_info,
@@ -10316,10 +10338,6 @@ fn derive_chroma_444_bs(
             q_in_mb_y,
             field_units,
         );
-    let p_blk4_z = blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8) as usize;
-    let q_blk4_z = blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8) as usize;
-    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
     derive_boundary_strength(BsInputs {
         p_is_intra: p_info.is_intra,
         q_is_intra: q_info.is_intra,
