@@ -9414,7 +9414,6 @@ fn mv_delta_below_4(a: (i16, i16), b: (i16, i16), field_units: bool) -> bool {
     (a.0 as i32 - b.0 as i32).abs() < 4 && (a.1 as i32 - b.1 as i32).abs() < v_thresh
 }
 
-#[allow(clippy::too_many_arguments)]
 /// [`deblock_plane_luma`]'s record of a luma edge segment it did not
 /// derive a bS for.
 const BS_NOT_DERIVED: u8 = u8::MAX;
@@ -9427,6 +9426,7 @@ fn luma_bs_index(mb_w: i32, mb_x: i32, mb_y: i32, horizontal: bool, edge: i32, s
     ((((mb_y * mb_w + mb_x) * 2 + horizontal as i32) * 4 + edge) * 4 + seg) as usize
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deblock_plane_luma(
     pic: &mut Picture,
     grid: &MbGrid,
