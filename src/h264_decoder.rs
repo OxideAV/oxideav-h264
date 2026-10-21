@@ -347,6 +347,12 @@ pub struct H264CodecDecoder {
     /// `bit_depth_chroma_minus8 + 8` — only populated when the avcC
     /// record carries the §5.2.4.1.1 High-profile extension.
     avcc_bit_depth_chroma: Option<u8>,
+
+    /// Worker budget from [`Decoder::set_execution_context`]. `1`
+    /// (the default) decodes on the calling thread only; more spreads
+    /// reconstruction and deblocking over worker threads. The output is
+    /// identical for every value.
+    threads: usize,
 }
 
 impl H264CodecDecoder {
@@ -383,7 +389,14 @@ impl H264CodecDecoder {
             avcc_chroma_format: None,
             avcc_bit_depth_luma: None,
             avcc_bit_depth_chroma: None,
+            threads: 1,
         }
+    }
+
+    /// Set the worker budget (see [`Decoder::set_execution_context`]).
+    /// `0` is treated as `1`.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
     }
 
     /// §5.2.4.1.1 ISO/IEC 14496-15 — `AVCDecoderConfigurationRecord`.
@@ -1841,7 +1854,7 @@ impl H264CodecDecoder {
         let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
         let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !first_header.field_pic_flag;
         if deblock_enabled {
-            reconstruct::deblock_picture_full(
+            reconstruct::deblock_picture_full_threaded(
                 &mut pic,
                 &grid,
                 deblock_alpha_off,
@@ -1852,6 +1865,7 @@ impl H264CodecDecoder {
                 mbaff_frame_flag,
                 first_header.field_pic_flag,
                 &mb_field_flags,
+                self.threads,
             );
         }
 
@@ -2666,6 +2680,10 @@ fn slice_mmco_to_ref_mmco(op: &SliceMmcoOp) -> RefMmcoOp {
 impl Decoder for H264CodecDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.set_threads(ctx.threads);
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
