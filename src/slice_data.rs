@@ -224,6 +224,30 @@ fn skip_trace_enabled() -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+// The trace switches are read once and cached: these checks run per
+// macroblock, and a `getenv()` per call shows up in decode profiles.
+fn env_flag(cache: &'static std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cache.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+#[inline]
+fn ctx17_trace_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "OXIDEAV_H264_CTX17_TRACE")
+}
+
+#[inline]
+fn bin_trace_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "OXIDEAV_H264_BIN_TRACE")
+}
+
+#[inline]
+fn skip_trace_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "OXIDEAV_H264_SKIP_TRACE")
+}
+
 fn parse_slice_data_impl(
     rbsp: &[u8],
     bit_cursor_bytes: usize,
