@@ -8235,6 +8235,9 @@ fn deblock_picture(
         }
         return;
     }
+    // §8.7.2.1 last paragraph — chroma edges take the bS of their luma
+    // edge; the luma pass records each bS it derives for the chroma pass.
+    let mut luma_bs = vec![BS_NOT_DERIVED; (grid.width_in_mbs * grid.height_in_mbs) as usize * 32];
     deblock_plane_luma(
         pic,
         grid,
@@ -8244,6 +8247,7 @@ fn deblock_picture(
         mbaff_frame_flag,
         field_pic,
         mb_field_flags,
+        &mut luma_bs,
     );
     if pic.chroma_array_type == 1 || pic.chroma_array_type == 2 {
         deblock_plane_chroma(
@@ -8256,6 +8260,7 @@ fn deblock_picture(
             mbaff_frame_flag,
             field_pic,
             mb_field_flags,
+            &luma_bs,
         );
     } else if pic.chroma_array_type == 3 {
         // §8.7.2 eq. (8-450) — for ChromaArrayType == 3 (4:4:4) the
@@ -9386,6 +9391,18 @@ fn mv_delta_below_4(a: (i16, i16), b: (i16, i16), field_units: bool) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// [`deblock_plane_luma`]'s record of a luma edge segment it did not
+/// derive a bS for.
+const BS_NOT_DERIVED: u8 = u8::MAX;
+
+/// Index of a luma edge segment in the per-picture bS record: the MB
+/// holding the edge's q side, the direction (0 vertical, 1 horizontal),
+/// the edge (0..4, in 4-sample steps) and the 4-sample segment along it.
+#[inline]
+fn luma_bs_index(mb_w: i32, mb_x: i32, mb_y: i32, horizontal: bool, edge: i32, seg: i32) -> usize {
+    ((((mb_y * mb_w + mb_x) * 2 + horizontal as i32) * 4 + edge) * 4 + seg) as usize
+}
+
 fn deblock_plane_luma(
     pic: &mut Picture,
     grid: &MbGrid,
@@ -9395,6 +9412,7 @@ fn deblock_plane_luma(
     mbaff_frame_flag: bool,
     field_pic: bool,
     mb_field_flags: &[bool],
+    luma_bs: &mut [u8],
 ) {
     let w = pic.width_in_samples as i32;
     let h = pic.height_in_samples as i32;
@@ -9538,6 +9556,9 @@ fn deblock_plane_luma(
                         mbaff_or_field,
                         both_in_frame_mbs,
                     });
+                    if !mbaff_frame_flag {
+                        luma_bs[luma_bs_index(mb_w, mb_x, mb_y, false, edge_off, seg)] = bs;
+                    }
                     if bs == 0 {
                         continue;
                     }
@@ -9653,6 +9674,9 @@ fn deblock_plane_luma(
                         mbaff_or_field,
                         both_in_frame_mbs,
                     });
+                    if !mbaff_frame_flag {
+                        luma_bs[luma_bs_index(mb_w, mb_x, mb_y, true, edge_off, seg)] = bs;
+                    }
                     if bs == 0 {
                         continue;
                     }
@@ -9688,6 +9712,7 @@ fn deblock_plane_chroma(
     mbaff_frame_flag: bool,
     field_pic: bool,
     mb_field_flags: &[bool],
+    luma_bs: &[u8],
 ) {
     let _ = pps; // QPc derivation keeps QP_Y indirectly; handled inside.
     let cw = pic.chroma_width() as i32;
@@ -9785,78 +9810,89 @@ fn deblock_plane_chroma(
                                 (Some(p), Some(q)) if p.available && q.available => (p, q),
                                 _ => continue,
                             };
-                            let is_mb_edge = p_addr != q_addr;
-                            // §8.7.2.1 last paragraph — chroma bS inherits
-                            // from the corresponding luma edge at the
-                            // mapped luma coordinate (chroma-x *
-                            // SubWidthC, chroma-y * SubHeightC).
-                            let p_in_mb_x = (lp_x).rem_euclid(16) as u32;
-                            let p_in_mb_y = (ly).rem_euclid(16) as u32;
-                            let q_in_mb_x = (lq_x).rem_euclid(16) as u32;
-                            let q_in_mb_y = (ly).rem_euclid(16) as u32;
-                            let field_units = if mbaff_frame_flag {
-                                mb_field_flags
-                                    .get(p_addr as usize)
-                                    .copied()
-                                    .unwrap_or(false)
-                                    && mb_field_flags
-                                        .get(q_addr as usize)
+                            let recorded = if mbaff_frame_flag {
+                                BS_NOT_DERIVED
+                            } else {
+                                luma_bs[luma_bs_index(
+                                    mb_w,
+                                    mb_x,
+                                    mb_y,
+                                    false,
+                                    lq_x.rem_euclid(16) / 4,
+                                    ly.rem_euclid(16) / 4,
+                                )]
+                            };
+                            let bs = if recorded != BS_NOT_DERIVED {
+                                recorded
+                            } else {
+                                let is_mb_edge = p_addr != q_addr;
+                                // §8.7.2.1 last paragraph — chroma bS inherits
+                                // from the corresponding luma edge at the
+                                // mapped luma coordinate (chroma-x *
+                                // SubWidthC, chroma-y * SubHeightC).
+                                let p_in_mb_x = (lp_x).rem_euclid(16) as u32;
+                                let p_in_mb_y = (ly).rem_euclid(16) as u32;
+                                let q_in_mb_x = (lq_x).rem_euclid(16) as u32;
+                                let q_in_mb_y = (ly).rem_euclid(16) as u32;
+                                let field_units = if mbaff_frame_flag {
+                                    mb_field_flags
+                                        .get(p_addr as usize)
                                         .copied()
                                         .unwrap_or(false)
-                            } else {
-                                field_pic
+                                        && mb_field_flags
+                                            .get(q_addr as usize)
+                                            .copied()
+                                            .unwrap_or(false)
+                                } else {
+                                    field_pic
+                                };
+                                let p_blk4_z =
+                                    blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
+                                        as usize;
+                                let q_blk4_z =
+                                    blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
+                                        as usize;
+                                let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                                let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                                // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                                // neither side is intra and neither has nonzero coefficients.
+                                let diff_ref_mv = !p_info.is_intra
+                                    && !q_info.is_intra
+                                    && !(p_has_nz || q_has_nz)
+                                    && different_ref_or_mv_luma(
+                                        p_info,
+                                        q_info,
+                                        p_in_mb_x,
+                                        p_in_mb_y,
+                                        q_in_mb_x,
+                                        q_in_mb_y,
+                                        field_units,
+                                    );
+                                let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
+                                    bs_pair_flags(
+                                        p_addr,
+                                        q_addr,
+                                        mbaff_frame_flag,
+                                        field_pic,
+                                        mb_field_flags,
+                                    );
+                                derive_boundary_strength(BsInputs {
+                                    p_is_intra: p_info.is_intra,
+                                    q_is_intra: q_info.is_intra,
+                                    is_mb_edge,
+                                    is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
+                                    either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+                                    different_ref_or_mv: diff_ref_mv,
+                                    mixed_mode_edge,
+                                    vertical_edge: true,
+                                    mbaff_or_field,
+                                    both_in_frame_mbs,
+                                })
                             };
-                            let p_blk4_z =
-                                blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
-                                    as usize;
-                            let q_blk4_z =
-                                blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
-                                    as usize;
-                            let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                            let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
-                            // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
-                            // neither side is intra and neither has nonzero coefficients.
-                            let diff_ref_mv = !p_info.is_intra
-                                && !q_info.is_intra
-                                && !(p_has_nz || q_has_nz)
-                                && different_ref_or_mv_luma(
-                                    p_info,
-                                    q_info,
-                                    p_in_mb_x,
-                                    p_in_mb_y,
-                                    q_in_mb_x,
-                                    q_in_mb_y,
-                                    field_units,
-                                );
-                            let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
-                                bs_pair_flags(
-                                    p_addr,
-                                    q_addr,
-                                    mbaff_frame_flag,
-                                    field_pic,
-                                    mb_field_flags,
-                                );
-                            let bs = derive_boundary_strength(BsInputs {
-                                p_is_intra: p_info.is_intra,
-                                q_is_intra: q_info.is_intra,
-                                is_mb_edge,
-                                is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
-                                either_has_nonzero_coeffs: p_has_nz || q_has_nz,
-                                different_ref_or_mv: diff_ref_mv,
-                                mixed_mode_edge,
-                                vertical_edge: true,
-                                mbaff_or_field,
-                                both_in_frame_mbs,
-                            });
                             if deblock_trace_enabled() {
                                 eprintln!(
-                                    "DBL C{} Vx={edge_x} y0={y0} bs={bs} plane={plane} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={} p_nz={} q_nz={} diff_ref_mv={}",
-                                    plane,
-                                    p_info.is_intra,
-                                    q_info.is_intra,
-                                    p_has_nz,
-                                    q_has_nz,
-                                    diff_ref_mv,
+                                    "DBL C{} Vx={edge_x} y0={y0} bs={bs} plane={plane} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={}",
+                                    plane, p_info.is_intra, q_info.is_intra,
                                 );
                             }
                             if bs == 0 {
@@ -9928,67 +9964,83 @@ fn deblock_plane_chroma(
                                 (Some(p), Some(q)) if p.available && q.available => (p, q),
                                 _ => continue,
                             };
-                            let is_mb_edge = p_addr != q_addr;
-                            // §8.7.2.1 last paragraph — chroma bS inherits
-                            // from the corresponding luma edge.
-                            let p_in_mb_x = lx.rem_euclid(16) as u32;
-                            let p_in_mb_y = lp_y.rem_euclid(16) as u32;
-                            let q_in_mb_x = lx.rem_euclid(16) as u32;
-                            let q_in_mb_y = lq_y.rem_euclid(16) as u32;
-                            let field_units = if mbaff_frame_flag {
-                                mb_field_flags
-                                    .get(p_addr as usize)
-                                    .copied()
-                                    .unwrap_or(false)
-                                    && mb_field_flags
-                                        .get(q_addr as usize)
+                            let recorded = if mbaff_frame_flag {
+                                BS_NOT_DERIVED
+                            } else {
+                                luma_bs[luma_bs_index(
+                                    mb_w,
+                                    mb_x,
+                                    mb_y,
+                                    true,
+                                    lq_y.rem_euclid(16) / 4,
+                                    lx.rem_euclid(16) / 4,
+                                )]
+                            };
+                            let bs = if recorded != BS_NOT_DERIVED {
+                                recorded
+                            } else {
+                                let is_mb_edge = p_addr != q_addr;
+                                // §8.7.2.1 last paragraph — chroma bS inherits
+                                // from the corresponding luma edge.
+                                let p_in_mb_x = lx.rem_euclid(16) as u32;
+                                let p_in_mb_y = lp_y.rem_euclid(16) as u32;
+                                let q_in_mb_x = lx.rem_euclid(16) as u32;
+                                let q_in_mb_y = lq_y.rem_euclid(16) as u32;
+                                let field_units = if mbaff_frame_flag {
+                                    mb_field_flags
+                                        .get(p_addr as usize)
                                         .copied()
                                         .unwrap_or(false)
-                            } else {
-                                field_pic
+                                        && mb_field_flags
+                                            .get(q_addr as usize)
+                                            .copied()
+                                            .unwrap_or(false)
+                                } else {
+                                    field_pic
+                                };
+                                let p_blk4_z =
+                                    blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
+                                        as usize;
+                                let q_blk4_z =
+                                    blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
+                                        as usize;
+                                let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                                let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                                // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
+                                // neither side is intra and neither has nonzero coefficients.
+                                let diff_ref_mv = !p_info.is_intra
+                                    && !q_info.is_intra
+                                    && !(p_has_nz || q_has_nz)
+                                    && different_ref_or_mv_luma(
+                                        p_info,
+                                        q_info,
+                                        p_in_mb_x,
+                                        p_in_mb_y,
+                                        q_in_mb_x,
+                                        q_in_mb_y,
+                                        field_units,
+                                    );
+                                let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
+                                    bs_pair_flags(
+                                        p_addr,
+                                        q_addr,
+                                        mbaff_frame_flag,
+                                        field_pic,
+                                        mb_field_flags,
+                                    );
+                                derive_boundary_strength(BsInputs {
+                                    p_is_intra: p_info.is_intra,
+                                    q_is_intra: q_info.is_intra,
+                                    is_mb_edge,
+                                    is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
+                                    either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+                                    different_ref_or_mv: diff_ref_mv,
+                                    mixed_mode_edge,
+                                    vertical_edge: false,
+                                    mbaff_or_field,
+                                    both_in_frame_mbs,
+                                })
                             };
-                            let p_blk4_z =
-                                blk4_raster_index((p_in_mb_x / 4) as u8, (p_in_mb_y / 4) as u8)
-                                    as usize;
-                            let q_blk4_z =
-                                blk4_raster_index((q_in_mb_x / 4) as u8, (q_in_mb_y / 4) as u8)
-                                    as usize;
-                            let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                            let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
-                            // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
-                            // neither side is intra and neither has nonzero coefficients.
-                            let diff_ref_mv = !p_info.is_intra
-                                && !q_info.is_intra
-                                && !(p_has_nz || q_has_nz)
-                                && different_ref_or_mv_luma(
-                                    p_info,
-                                    q_info,
-                                    p_in_mb_x,
-                                    p_in_mb_y,
-                                    q_in_mb_x,
-                                    q_in_mb_y,
-                                    field_units,
-                                );
-                            let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
-                                bs_pair_flags(
-                                    p_addr,
-                                    q_addr,
-                                    mbaff_frame_flag,
-                                    field_pic,
-                                    mb_field_flags,
-                                );
-                            let bs = derive_boundary_strength(BsInputs {
-                                p_is_intra: p_info.is_intra,
-                                q_is_intra: q_info.is_intra,
-                                is_mb_edge,
-                                is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
-                                either_has_nonzero_coeffs: p_has_nz || q_has_nz,
-                                different_ref_or_mv: diff_ref_mv,
-                                mixed_mode_edge,
-                                vertical_edge: false,
-                                mbaff_or_field,
-                                both_in_frame_mbs,
-                            });
                             if bs == 0 {
                                 continue;
                             }
