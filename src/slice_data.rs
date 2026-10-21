@@ -200,6 +200,30 @@ pub fn parse_slice_data_partitioned(
 }
 
 #[allow(clippy::too_many_arguments)]
+// The trace switches are read once and cached: these checks run per
+// macroblock, and a `getenv()` per call shows up in decode profiles.
+fn env_flag(cache: &'static std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cache.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+#[inline]
+fn ctx17_trace_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "OXIDEAV_H264_CTX17_TRACE")
+}
+
+#[inline]
+fn bin_trace_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "OXIDEAV_H264_BIN_TRACE")
+}
+
+#[inline]
+fn skip_trace_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "OXIDEAV_H264_SKIP_TRACE")
+}
+
 fn parse_slice_data_impl(
     rbsp: &[u8],
     bit_cursor_bytes: usize,
@@ -287,7 +311,7 @@ fn parse_slice_data_impl(
             },
             slice_qp_y,
         )?;
-        if std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some() {
+        if ctx17_trace_enabled() {
             let c17 = ctxs.at(17);
             eprintln!(
                 "[CTX17] slice init: kind={:?} init_idc={} qp_y={} num_ref_l0_active_minus1={} c17=({},{})",
@@ -320,7 +344,7 @@ fn parse_slice_data_impl(
             // Debug marker for bin-level trace: emit a MB-boundary line
             // (gated on OXIDEAV_H264_BIN_TRACE) so downstream tooling can
             // slice the bin trace into MB segments.
-            if std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some() {
+            if bin_trace_enabled() {
                 let (bp_byte, bp_bit) = cabac_dec.position();
                 let bit_pos = bp_byte * 8 + bp_bit as usize;
                 eprintln!(
@@ -380,7 +404,7 @@ fn parse_slice_data_impl(
                 // decision with its neighbour condTermFlags for
                 // cross-referencing against an external reference trace.
                 // Useful when chasing CABAC state divergences at specific MBs.
-                if std::env::var_os("OXIDEAV_H264_SKIP_TRACE").is_some() {
+                if skip_trace_enabled() {
                     eprintln!(
                         "[SKIP {}] flag={} avail_L={} skip_L={} avail_A={} skip_A={}",
                         curr_mb_addr,
