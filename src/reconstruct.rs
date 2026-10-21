@@ -853,6 +853,428 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
     Ok(())
 }
 
+/// One inter macroblock of a slice whose motion is already derived
+/// (pass A of [`reconstruct_slice_no_deblock_threaded`]): everything the
+/// sample stage needs besides the parsed macroblock itself.
+struct InterMbJob {
+    /// Index into `SliceData::macroblocks`.
+    idx: usize,
+    /// MB column / row in the picture.
+    mb_x: u32,
+    mb_y: u32,
+    /// §7.4.5 QP_Y of the macroblock.
+    qp_y: i32,
+    /// The partitions with their derived (mvL0, mvL1).
+    parts: Vec<(InterPartition, Mv, Mv)>,
+}
+
+/// §8.4.1 — derive and store the motion of every partition of an inter
+/// macroblock without predicting any samples (the motion half of
+/// [`reconstruct_mb_inter`]).
+#[allow(clippy::too_many_arguments)]
+fn derive_mb_inter_motion<R: RefPicProvider>(
+    mb: &Macroblock,
+    mb_addr: u32,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    ref_pics: &R,
+    pic: &Picture,
+    grid: &mut MbGrid,
+    current_slice_id: i32,
+) -> Result<Vec<(InterPartition, Mv, Mv)>, ReconstructError> {
+    if let Some(info) = grid.get_mut(mb_addr) {
+        info.slice_id = current_slice_id;
+        info.mb_field_decoding_flag = false;
+    }
+    let partitions = derive_inter_partitions(
+        mb,
+        slice_header,
+        sps,
+        ref_pics,
+        pic,
+        mb_addr,
+        grid,
+        current_slice_id,
+    )?;
+    let mut out = Vec::with_capacity(partitions.len());
+    for part in partitions {
+        let (mv_l0, mv_l1) = derive_and_store_partition(
+            &part,
+            mb_addr,
+            slice_header,
+            ref_pics,
+            grid,
+            false,
+            current_slice_id,
+            None,
+        );
+        out.push((part, mv_l0, mv_l1));
+    }
+    Ok(out)
+}
+
+/// §8.4.2 + §8.5 — predict and reconstruct the samples of one inter
+/// macroblock whose motion is derived, into `scratch`, a one-macroblock
+/// picture (luma 16x16, chroma one MB) addressed from its origin.
+#[allow(clippy::too_many_arguments)]
+fn synth_mb_inter<R: RefPicProvider>(
+    mb: &Macroblock,
+    job: &InterMbJob,
+    chroma_array_type: u32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    ref_pics: &R,
+    curr_poc: i32,
+    scratch: &mut Picture,
+) -> Result<(), ReconstructError> {
+    let mb_px = job.mb_x as i32 * 16;
+    let mb_py = job.mb_y as i32 * 16;
+    let mut pred_luma = [0i32; 256];
+    let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
+    let mut pred_cb_store = [0i32; 256];
+    let mut pred_cr_store = [0i32; 256];
+    let n_c = (mbw_c as usize) * (mbh_c as usize);
+    let pred_cb = &mut pred_cb_store[..n_c];
+    let pred_cr = &mut pred_cr_store[..n_c];
+    for (part, mv_l0, mv_l1) in &job.parts {
+        predict_partition(
+            part,
+            *mv_l0,
+            *mv_l1,
+            mb_px,
+            mb_py,
+            chroma_array_type,
+            bit_depth_y,
+            bit_depth_c,
+            slice_header,
+            pps,
+            ref_pics,
+            curr_poc,
+            &mut pred_luma,
+            pred_cb,
+            pred_cr,
+            false,
+            None,
+        )?;
+    }
+    // The scratch picture is the macroblock itself: origin (0, 0).
+    let writer = MbWriter {
+        mb_px: 0,
+        mb_py: 0,
+        mb_field: false,
+        mbaff_frame: false,
+        pair_px: 0,
+        pair_py: 0,
+        mb_is_top: true,
+        chroma_array_type,
+    };
+    inter_residual_write(
+        mb,
+        job.qp_y,
+        chroma_array_type,
+        bit_depth_y,
+        bit_depth_c,
+        0,
+        0,
+        slice_header,
+        sps,
+        pps,
+        &writer,
+        &pred_luma,
+        pred_cb,
+        pred_cr,
+        scratch,
+        false,
+        false,
+    )
+}
+
+/// One macroblock row of the picture's sample planes, owned by one
+/// worker of the inter sample stage.
+struct MbRowBand<'a> {
+    mb_y: u32,
+    luma: &'a mut [i32],
+    cb: &'a mut [i32],
+    cr: &'a mut [i32],
+}
+
+/// Whether [`reconstruct_slice_no_deblock_threaded`] can split this
+/// slice into the motion / sample / intra passes. Excluded: MBAFF
+/// frames (field MB pairs interleave rows across two MB rows), SP / SI
+/// slices (§8.6 transform-domain inter reconstruction), FMO slice
+/// groups, and the per-MB debug traces.
+fn parallel_inter_eligible(slice_header: &SliceHeader, sps: &Sps, pps: &Pps) -> bool {
+    let mbaff = sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
+    !mbaff
+        && !matches!(slice_header.slice_type, SliceType::SP | SliceType::SI)
+        && pps.num_slice_groups_minus1 == 0
+        && !recon_debug_enabled()
+        && recon_debug_mb_target().is_none()
+}
+
+/// [`reconstruct_slice_no_deblock`] with the inter macroblocks' sample
+/// stage spread over up to `threads` workers. The output (picture and
+/// grid) is identical to the serial reconstruction.
+///
+/// The slice is reconstructed in three passes:
+///
+/// 1. in decoding order, every macroblock's QP_Y and grid record, and
+///    for inter macroblocks the §8.4.1 motion vectors and reference
+///    indices — everything a later macroblock's derivations read;
+/// 2. concurrently, by macroblock row, the §8.4.2 prediction and §8.5
+///    residual of every inter macroblock — it reads only the reference
+///    pictures and writes only its own samples;
+/// 3. in decoding order, the intra macroblocks, whose §8.3 prediction
+///    reads the (now complete) neighbouring samples.
+///
+/// With `threads <= 1`, or a slice [`parallel_inter_eligible`] rejects,
+/// this is exactly [`reconstruct_slice_no_deblock`]. If a macroblock
+/// fails, the slice stops at the first failing macroblock in decoding
+/// order like the serial path does; samples of inter macroblocks after
+/// it may already have been written.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
+    slice_data: &SliceData,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    ref_pics: &R,
+    pic: &mut Picture,
+    grid: &mut MbGrid,
+    threads: usize,
+) -> Result<(), ReconstructError> {
+    let is_intra_slice = matches!(slice_header.slice_type, SliceType::I | SliceType::SI);
+    if threads <= 1 || is_intra_slice || !parallel_inter_eligible(slice_header, sps, pps) {
+        return reconstruct_slice_no_deblock(
+            slice_data,
+            slice_header,
+            sps,
+            pps,
+            ref_pics,
+            pic,
+            grid,
+        );
+    }
+    let chroma_array_type = sps.chroma_array_type();
+    grid.mbaff_frame_flag = false;
+    let bit_depth_y = 8 + sps.bit_depth_luma_minus8;
+    let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
+    let slice_qp_y = 26 + pps.pic_init_qp_minus26 + slice_header.slice_qp_delta;
+    let mut prev_qp_y = slice_qp_y;
+    let current_slice_id = slice_header.first_mb_in_slice as i32;
+    let field_scan = slice_header.field_pic_flag;
+
+    // -------- Pass A: motion + grid, decoding order ----------------
+    let mut jobs: Vec<InterMbJob> = Vec::new();
+    let mut intra_mbs: Vec<(usize, u32, i32)> = Vec::new();
+    let mut failed: Option<(usize, ReconstructError)> = None;
+    let addrs = slice_header.first_mb_in_slice..;
+    for (curr_addr, (idx, mb)) in addrs.zip(slice_data.macroblocks.iter().enumerate()) {
+        if curr_addr as usize >= grid.info.len() {
+            break;
+        }
+        let mb_qp_y = if mb.mb_type.is_i_pcm() || mb.is_skip {
+            prev_qp_y
+        } else {
+            next_qp_y(prev_qp_y, mb.mb_qp_delta, sps.bit_depth_luma_minus8)
+        };
+        if mb.mb_type.is_intra() {
+            intra_mbs.push((idx, curr_addr, mb_qp_y));
+        } else {
+            match derive_mb_inter_motion(
+                mb,
+                curr_addr,
+                slice_header,
+                sps,
+                ref_pics,
+                pic,
+                grid,
+                current_slice_id,
+            ) {
+                Ok(parts) => {
+                    let (mb_x, mb_y) = grid.mb_xy(curr_addr);
+                    jobs.push(InterMbJob {
+                        idx,
+                        mb_x,
+                        mb_y,
+                        qp_y: mb_qp_y,
+                        parts,
+                    });
+                }
+                Err(e) => {
+                    failed = Some((idx, e));
+                    break;
+                }
+            }
+        }
+        if let Some(info) = grid.get_mut(curr_addr) {
+            info.available = true;
+            info.is_intra = mb.mb_type.is_intra();
+            info.in_sp_si_slice = false;
+            info.is_i_pcm = mb.mb_type.is_i_pcm();
+            info.is_intra_nxn = mb.mb_type.is_i_nxn();
+            info.mb_type_raw = mb.mb_type_raw;
+            info.qp_y = mb_qp_y;
+            info.cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
+            info.cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
+            info.transform_size_8x8_flag = mb.transform_size_8x8_flag;
+            info.luma_nonzero_4x4 = compute_luma_nonzero_mask(mb);
+            info.chroma_nonzero_4x4 = compute_chroma_nonzero_mask(mb, chroma_array_type);
+            if let Some(pred) = mb.mb_pred.as_ref() {
+                info.intra_chroma_pred_mode = pred.intra_chroma_pred_mode;
+            }
+            info.slice_id = current_slice_id;
+            info.mb_field_decoding_flag = false;
+        }
+        prev_qp_y = mb_qp_y;
+    }
+
+    // -------- Pass B: inter samples, by MB row, concurrently -------
+    let width = pic.width_in_samples as usize;
+    let (cw, _) = (pic.chroma_width() as usize, pic.chroma_height() as usize);
+    let (_, mbh_c) = chroma_mb_dims(chroma_array_type);
+    let mbw_c = if chroma_array_type == 0 {
+        0
+    } else {
+        cw / grid.width_in_mbs.max(1) as usize
+    };
+    let mbh_c = if chroma_array_type == 0 {
+        0
+    } else {
+        mbh_c as usize
+    };
+    let curr_poc = pic.pic_order_cnt;
+    // Jobs are in raster order: the contiguous run of each MB row.
+    let mut rows: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
+    for (i, j) in jobs.iter().enumerate() {
+        match rows.last_mut() {
+            Some((y, r)) if *y == j.mb_y => r.end = i + 1,
+            _ => rows.push((j.mb_y, i..i + 1)),
+        }
+    }
+    let mut bands: Vec<Option<MbRowBand<'_>>> = Vec::new();
+    {
+        let mut luma_rest: &mut [i32] = &mut pic.luma;
+        let mut cb_rest: &mut [i32] = &mut pic.cb;
+        let mut cr_rest: &mut [i32] = &mut pic.cr;
+        let mut consumed_rows = 0u32;
+        for (mb_y, _) in &rows {
+            let skip = (*mb_y - consumed_rows) as usize;
+            luma_rest = &mut std::mem::take(&mut luma_rest)[skip * 16 * width..];
+            cb_rest = &mut std::mem::take(&mut cb_rest)[skip * mbh_c * cw..];
+            cr_rest = &mut std::mem::take(&mut cr_rest)[skip * mbh_c * cw..];
+            let (l, lr) = std::mem::take(&mut luma_rest).split_at_mut(16 * width);
+            let (b, br) = std::mem::take(&mut cb_rest).split_at_mut(mbh_c * cw);
+            let (r, rr) = std::mem::take(&mut cr_rest).split_at_mut(mbh_c * cw);
+            luma_rest = lr;
+            cb_rest = br;
+            cr_rest = rr;
+            consumed_rows = mb_y + 1;
+            bands.push(Some(MbRowBand {
+                mb_y: *mb_y,
+                luma: l,
+                cb: b,
+                cr: r,
+            }));
+        }
+    }
+    let bands = std::sync::Mutex::new(bands);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // The first failing job (by decoding order) of each worker.
+    let errors: std::sync::Mutex<Option<(usize, ReconstructError)>> = std::sync::Mutex::new(None);
+    let workers = threads.min(rows.len());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let (bands, next, errors, rows, jobs) = (&bands, &next, &errors, &rows, &jobs);
+            let mbs = &slice_data.macroblocks;
+            scope.spawn(move || {
+                let mut scratch = Picture::new(16, 16, chroma_array_type, bit_depth_y, bit_depth_c);
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= rows.len() {
+                        break;
+                    }
+                    let band = bands.lock().unwrap_or_else(|e| e.into_inner())[k]
+                        .take()
+                        .expect("row band taken once");
+                    debug_assert_eq!(band.mb_y, rows[k].0);
+                    for job in &jobs[rows[k].1.clone()] {
+                        if let Err(e) = synth_mb_inter(
+                            &mbs[job.idx],
+                            job,
+                            chroma_array_type,
+                            bit_depth_y,
+                            bit_depth_c,
+                            slice_header,
+                            sps,
+                            pps,
+                            ref_pics,
+                            curr_poc,
+                            &mut scratch,
+                        ) {
+                            let mut slot = errors.lock().unwrap_or_else(|e| e.into_inner());
+                            if slot.as_ref().is_none_or(|(i, _)| job.idx < *i) {
+                                *slot = Some((job.idx, e));
+                            }
+                            break;
+                        }
+                        let x0 = job.mb_x as usize * 16;
+                        for y in 0..16 {
+                            band.luma[y * width + x0..y * width + x0 + 16]
+                                .copy_from_slice(&scratch.luma[y * 16..y * 16 + 16]);
+                        }
+                        let cx0 = job.mb_x as usize * mbw_c;
+                        for y in 0..mbh_c {
+                            let d = y * cw + cx0;
+                            let s = y * mbw_c;
+                            band.cb[d..d + mbw_c].copy_from_slice(&scratch.cb[s..s + mbw_c]);
+                            band.cr[d..d + mbw_c].copy_from_slice(&scratch.cr[s..s + mbw_c]);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let sample_err = errors.into_inner().unwrap_or_else(|e| e.into_inner());
+    let failed = match (failed, sample_err) {
+        (Some(a), Some(b)) => Some(if b.0 < a.0 { b } else { a }),
+        (a, b) => a.or(b),
+    };
+    let stop = failed.as_ref().map_or(usize::MAX, |(i, _)| *i);
+
+    // -------- Pass C: intra MBs, decoding order --------------------
+    for &(idx, addr, qp_y) in &intra_mbs {
+        if idx >= stop {
+            break;
+        }
+        reconstruct_mb_intra(
+            &slice_data.macroblocks[idx],
+            addr,
+            qp_y,
+            chroma_array_type,
+            bit_depth_y,
+            bit_depth_c,
+            sps,
+            pps,
+            pic,
+            grid,
+            false,
+            false,
+            current_slice_id,
+            field_scan,
+            luma_scaling_plane(sps, slice_header),
+            None,
+        )?;
+    }
+    match failed {
+        Some((_, e)) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// §8.7 picture-level deblocking filter entry point for multi-slice
 /// callers. Deferring the deblocking pass until the whole picture has
 /// been decoded means the right-/bottom-neighbour MBs of the last MB in
@@ -4419,6 +4841,50 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         );
     }
 
+    inter_residual_write(
+        mb,
+        qp_y,
+        chroma_array_type,
+        bit_depth_y,
+        bit_depth_c,
+        mb_px,
+        mb_py,
+        slice_header,
+        sps,
+        pps,
+        &writer,
+        &pred_luma,
+        &pred_cb,
+        &pred_cr,
+        pic,
+        mbaff_frame_flag && mb_field_decoding_flag,
+        inter_debug,
+    )
+}
+
+/// §8.5 — the residual stage of an inter macroblock: inverse-transform
+/// the luma / chroma residual, add it to the MB's prediction samples and
+/// write the clipped result through `writer` into `pic`.
+#[allow(clippy::too_many_arguments)]
+fn inter_residual_write(
+    mb: &Macroblock,
+    qp_y: i32,
+    chroma_array_type: u32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    mb_px: i32,
+    mb_py: i32,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    writer: &MbWriter,
+    pred_luma: &[i32; 256],
+    pred_cb: &[i32],
+    pred_cr: &[i32],
+    pic: &mut Picture,
+    mbaff_field_mb: bool,
+    inter_debug: bool,
+) -> Result<(), ReconstructError> {
     // -------- Residual add (§8.5 inverse transform) ------------------
     // P_Skip / B_Skip never carry residual; for all other inter MBs,
     // the residual walker fills in residual_luma / residual_chroma_*
@@ -4442,7 +4908,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     // it applies only to Intra_4x4/8x8/16x16 prediction modes.
     let bypass = transform_bypass_active(sps, qp_prime_y);
     // §8.5.6/§8.5.7 — field inverse scans for FIELD-coded MBs.
-    let field_scan = (mbaff_frame_flag && mb_field_decoding_flag) || slice_header.field_pic_flag;
+    let field_scan = mbaff_field_mb || slice_header.field_pic_flag;
 
     if mb.transform_size_8x8_flag {
         // §8.5.13 — 8x8 inter residual path (four 8x8 blocks).
@@ -4552,12 +5018,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             bit_depth_c,
             mb_px,
             mb_py,
-            &writer,
+            writer,
             sps,
             pps,
             cbp_chroma,
-            &pred_cb,
-            &pred_cr,
+            pred_cb,
+            pred_cr,
             pic,
             field_scan,
         )?;
@@ -4569,12 +5035,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             mb,
             qp_y,
             bit_depth_c,
-            &writer,
+            writer,
             sps,
             pps,
             cbp_luma,
-            &pred_cb,
-            &pred_cr,
+            pred_cb,
+            pred_cr,
             pic,
             field_scan,
         )?;
@@ -4800,6 +5266,57 @@ fn process_partition<R: RefPicProvider>(
     field_parity: Option<u8>,
 ) -> Result<(), ReconstructError> {
     let _ = pic; // currently unused; kept for future neighbour queries.
+    let (mv_l0, mv_l1) = derive_and_store_partition(
+        part,
+        mb_addr,
+        slice_header,
+        ref_pics,
+        grid,
+        inter_debug,
+        current_slice_id,
+        field_parity,
+    );
+    predict_partition(
+        part,
+        mv_l0,
+        mv_l1,
+        mb_px,
+        mb_py,
+        chroma_array_type,
+        bit_depth_y,
+        bit_depth_c,
+        slice_header,
+        pps,
+        ref_pics,
+        pic.pic_order_cnt,
+        pred_luma,
+        pred_cb,
+        pred_cr,
+        inter_debug,
+        field_parity,
+    )
+}
+
+/// §8.4.1 — the motion half of [`process_partition`]: derive the
+/// partition's motion vectors and store them, with its reference
+/// indices and reference-picture identities, on the MB grid.
+#[allow(clippy::too_many_arguments)]
+fn derive_and_store_partition<R: RefPicProvider>(
+    part: &InterPartition,
+    mb_addr: u32,
+    slice_header: &SliceHeader,
+    ref_pics: &R,
+    grid: &mut MbGrid,
+    inter_debug: bool,
+    current_slice_id: i32,
+    // §8.4.2.1 — `Some(parity)` when the current MB is a FIELD MB in
+    // an MBAFF frame (0 = top field / even rows, 1 = bottom field).
+    // Field MBs address individual fields of the stored frames:
+    // RefPicListX[refIdxLX / 2] supplies the frame, refIdxLX % 2
+    // selects same (0) / opposite (1) parity, and all MC runs in the
+    // half-height field geometry.
+    field_parity: Option<u8>,
+) -> (Mv, Mv) {
     // §8.4.1 — derive L0 / L1 MVpreds. For Direct / Skip we compute MVs
     // up-front via derive_p_skip_mv or a simple spatial-direct stub.
     // Everything else uses mvLX = mvpLX + mvdLX (eq. 8-174-ish in §8.4.1).
@@ -4921,6 +5438,35 @@ fn process_partition<R: RefPicProvider>(
         }
     }
 
+    (mv_l0, mv_l1)
+}
+
+/// §8.4.2 — the sample half of [`process_partition`]: motion-compensate
+/// one partition whose motion vectors are already derived (and stored
+/// on the grid) into the MB-sized prediction buffers. Reads only the
+/// reference pictures, so partitions of different macroblocks can be
+/// predicted concurrently. `curr_poc` is the current picture's order
+/// count (§8.4.2.3.3 implicit weights).
+#[allow(clippy::too_many_arguments)]
+fn predict_partition<R: RefPicProvider>(
+    part: &InterPartition,
+    mv_l0: Mv,
+    mv_l1: Mv,
+    mb_px: i32,
+    mb_py: i32,
+    chroma_array_type: u32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    slice_header: &SliceHeader,
+    pps: &Pps,
+    ref_pics: &R,
+    curr_poc: i32,
+    pred_luma: &mut [i32; 256],
+    pred_cb: &mut [i32],
+    pred_cr: &mut [i32],
+    inter_debug: bool,
+    field_parity: Option<u8>,
+) -> Result<(), ReconstructError> {
     // Predict pixels for this partition.
     // §8.4.2.1 — build predPartL0 / predPartL1 by MC from the selected
     // reference pictures, then combine per §8.4.2.3 (weighted-pred or
@@ -5072,10 +5618,10 @@ fn process_partition<R: RefPicProvider>(
 
     // §8.4.2.3.3 — derive implicit weights from POC distance when
     // implicit mode is active. The current picture's POC is in
-    // `pic.pic_order_cnt`; the two ref pictures' POCs are in their
-    // respective `Picture.pic_order_cnt` fields.
+    // `pic.pic_order_cnt` (passed in as `curr_poc`); the two ref
+    // pictures' POCs are in their respective `Picture.pic_order_cnt`
+    // fields.
     let implicit_weights = if use_implicit_bipred {
-        let curr_poc = pic.pic_order_cnt;
         // has_l0 && has_l1 guaranteed by bi_mode == Bipred above.
         // Field MBs resolve refIdx / 2 to the frame; the implicit
         // POC distances then use the frame POC (field-granular
