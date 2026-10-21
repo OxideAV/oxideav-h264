@@ -8564,9 +8564,7 @@ fn mbaff_edge_bs(
     let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
     // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
     // neither side is intra and neither has nonzero coefficients.
-    let diff_ref_mv = !p_info.is_intra
-        && !q_info.is_intra
-        && !(p_has_nz || q_has_nz)
+    let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
         && different_ref_or_mv_luma(p_info, q_info, p_in.0, p_in.1, q_in.0, q_in.1, field_units);
     let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
         bs_pair_flags(p_addr, q_addr, true, false, mb_field_flags);
@@ -9554,9 +9552,7 @@ fn deblock_plane_luma(
                     let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                     // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
                     // neither side is intra and neither has nonzero coefficients.
-                    let diff_ref_mv = !p_info.is_intra
-                        && !q_info.is_intra
-                        && !(p_has_nz || q_has_nz)
+                    let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
                         && different_ref_or_mv_luma(
                             p_info,
                             q_info,
@@ -9672,9 +9668,7 @@ fn deblock_plane_luma(
                     let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                     // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
                     // neither side is intra and neither has nonzero coefficients.
-                    let diff_ref_mv = !p_info.is_intra
-                        && !q_info.is_intra
-                        && !(p_has_nz || q_has_nz)
+                    let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
                         && different_ref_or_mv_luma(
                             p_info,
                             q_info,
@@ -9880,18 +9874,17 @@ fn deblock_plane_chroma(
                                 let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                                 // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
                                 // neither side is intra and neither has nonzero coefficients.
-                                let diff_ref_mv = !p_info.is_intra
-                                    && !q_info.is_intra
-                                    && !(p_has_nz || q_has_nz)
-                                    && different_ref_or_mv_luma(
-                                        p_info,
-                                        q_info,
-                                        p_in_mb_x,
-                                        p_in_mb_y,
-                                        q_in_mb_x,
-                                        q_in_mb_y,
-                                        field_units,
-                                    );
+                                let diff_ref_mv =
+                                    !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
+                                        && different_ref_or_mv_luma(
+                                            p_info,
+                                            q_info,
+                                            p_in_mb_x,
+                                            p_in_mb_y,
+                                            q_in_mb_x,
+                                            q_in_mb_y,
+                                            field_units,
+                                        );
                                 let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
                                     bs_pair_flags(
                                         p_addr,
@@ -10032,18 +10025,17 @@ fn deblock_plane_chroma(
                                 let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                                 // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
                                 // neither side is intra and neither has nonzero coefficients.
-                                let diff_ref_mv = !p_info.is_intra
-                                    && !q_info.is_intra
-                                    && !(p_has_nz || q_has_nz)
-                                    && different_ref_or_mv_luma(
-                                        p_info,
-                                        q_info,
-                                        p_in_mb_x,
-                                        p_in_mb_y,
-                                        q_in_mb_x,
-                                        q_in_mb_y,
-                                        field_units,
-                                    );
+                                let diff_ref_mv =
+                                    !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
+                                        && different_ref_or_mv_luma(
+                                            p_info,
+                                            q_info,
+                                            p_in_mb_x,
+                                            p_in_mb_y,
+                                            q_in_mb_x,
+                                            q_in_mb_y,
+                                            field_units,
+                                        );
                                 let (mbaff_or_field, both_in_frame_mbs, mixed_mode_edge) =
                                     bs_pair_flags(
                                         p_addr,
@@ -10378,9 +10370,7 @@ fn derive_chroma_444_bs(
     let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
     // §8.7.2.1 — the ref/mv test only decides bS = 1, reached when
     // neither side is intra and neither has nonzero coefficients.
-    let diff_ref_mv = !p_info.is_intra
-        && !q_info.is_intra
-        && !(p_has_nz || q_has_nz)
+    let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
         && different_ref_or_mv_luma(
             p_info,
             q_info,
