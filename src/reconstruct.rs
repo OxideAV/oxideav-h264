@@ -456,6 +456,9 @@ fn mb_sample_origin(
 /// and MBAFF field MBs (stride 2 per eq. 6-10), and handles the MBAFF
 /// chroma origin derivation that `(mb_px / 16) * MbWidthC` breaks for
 /// field MBs whose `mb_py` is an odd pair-local offset.
+/// Samples in the largest motion-compensation partition (16x16).
+const MAX_PARTITION_SAMPLES: usize = 256;
+
 #[derive(Debug, Clone, Copy)]
 struct MbWriter {
     /// Luma MB origin x — `mb_px` from [`mb_sample_origin`].
@@ -4958,9 +4961,12 @@ fn process_partition<R: RefPicProvider>(
         }
     };
 
-    // Allocate partition-sized scratch buffers.
-    let mut l0_buf = vec![0i32; (w as usize) * (h as usize)];
-    let mut l1_buf = vec![0i32; (w as usize) * (h as usize)];
+    // Partition-sized scratch buffers, on the stack: a partition is at
+    // most 16x16 samples.
+    let mut l0_buf_store = [0i32; MAX_PARTITION_SAMPLES];
+    let l0_buf = &mut l0_buf_store[..(w as usize) * (h as usize)];
+    let mut l1_buf_store = [0i32; MAX_PARTITION_SAMPLES];
+    let l1_buf = &mut l1_buf_store[..(w as usize) * (h as usize)];
     let has_l0 = matches!(
         part.mode,
         PartMode::L0Only | PartMode::BiPred | PartMode::Direct
@@ -4991,7 +4997,7 @@ fn process_partition<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            &mut l0_buf,
+            l0_buf,
             fld,
         )?;
     }
@@ -5016,7 +5022,7 @@ fn process_partition<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            &mut l1_buf,
+            l1_buf,
             fld,
         )?;
         if inter_debug {
@@ -5125,10 +5131,11 @@ fn process_partition<R: RefPicProvider>(
     // §8.4.2.3.3 — implicit bipred: apply eq. 8-276 with
     // `logWD = 5`, offsets = 0, and POC-derived weights.
     if let Some((w0, w1, log2_wd)) = implicit_weights {
-        let mut scratch = vec![0i32; (w as usize) * (h as usize)];
+        let mut scratch_store = [0i32; MAX_PARTITION_SAMPLES];
+        let scratch = &mut scratch_store[..(w as usize) * (h as usize)];
         weighted_pred_explicit(
-            Some(l0_buf.as_slice()),
-            Some(l1_buf.as_slice()),
+            Some(&l0_buf[..]),
+            Some(&l1_buf[..]),
             w as usize,
             w,
             h,
@@ -5143,7 +5150,7 @@ fn process_partition<R: RefPicProvider>(
             },
             log2_wd,
             bit_depth_y,
-            &mut scratch,
+            scratch,
             w as usize,
         );
         for py in 0..h as usize {
@@ -5178,14 +5185,15 @@ fn process_partition<R: RefPicProvider>(
         let w_l1 = luma_weight_entry(pwt, 1, wp_ref_l1, log2_wd);
         // Scratch partition-sized buffer so we can use the spec's
         // dst/dst_stride API directly.
-        let mut scratch = vec![0i32; (w as usize) * (h as usize)];
+        let mut scratch_store = [0i32; MAX_PARTITION_SAMPLES];
+        let scratch = &mut scratch_store[..(w as usize) * (h as usize)];
         let l0_opt = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-            Some(l0_buf.as_slice())
+            Some(&l0_buf[..])
         } else {
             None
         };
         let l1_opt = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-            Some(l1_buf.as_slice())
+            Some(&l1_buf[..])
         } else {
             None
         };
@@ -5200,7 +5208,7 @@ fn process_partition<R: RefPicProvider>(
             w_l1,
             log2_wd,
             bit_depth_y,
-            &mut scratch,
+            scratch,
             w as usize,
         );
         // Copy back into pred_luma at partition-local position.
@@ -5240,10 +5248,14 @@ fn process_partition<R: RefPicProvider>(
         let mbw_c_use = mbw_c;
         let _ = mbh_c;
 
-        let mut l0_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l0_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l1_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l1_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l0_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l0_cb = &mut l0_cb_store[..(c_w as usize) * (c_h as usize)];
+        let mut l0_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l0_cr = &mut l0_cr_store[..(c_w as usize) * (c_h as usize)];
+        let mut l1_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l1_cb = &mut l1_cb_store[..(c_w as usize) * (c_h as usize)];
+        let mut l1_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l1_cr = &mut l1_cr_store[..(c_w as usize) * (c_h as usize)];
         // §8.4.1.4 Table 8-10 — at ChromaArrayType == 1 a FIELD MB
         // referencing the OPPOSITE-parity field offsets the vertical
         // chroma MV: ref top field + current bottom → +2, ref bottom
@@ -5289,8 +5301,8 @@ fn process_partition<R: RefPicProvider>(
                 c_h,
                 chroma_array_type,
                 bit_depth_c,
-                &mut l0_cb,
-                &mut l0_cr,
+                l0_cb,
+                l0_cr,
                 fld,
             )?;
         }
@@ -5305,8 +5317,8 @@ fn process_partition<R: RefPicProvider>(
                 c_h,
                 chroma_array_type,
                 bit_depth_c,
-                &mut l1_cb,
-                &mut l1_cr,
+                l1_cb,
+                l1_cr,
                 fld,
             )?;
         }
@@ -5319,8 +5331,10 @@ fn process_partition<R: RefPicProvider>(
         // are specified for "C" replaced by L/Cb/Cr with the same
         // DistScaleFactor, and eq. 8-277 fixes logWDC = 5.
         if let Some((w0, w1, log2_wd)) = implicit_weights {
-            let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-            let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+            let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+            let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
+            let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+            let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
             let w_entry_l0 = WeightedEntry {
                 weight: w0,
                 offset: 0,
@@ -5330,8 +5344,8 @@ fn process_partition<R: RefPicProvider>(
                 offset: 0,
             };
             weighted_pred_explicit(
-                Some(l0_cb.as_slice()),
-                Some(l1_cb.as_slice()),
+                Some(&l0_cb[..]),
+                Some(&l1_cb[..]),
                 c_w as usize,
                 c_w,
                 c_h,
@@ -5340,12 +5354,12 @@ fn process_partition<R: RefPicProvider>(
                 w_entry_l1,
                 log2_wd,
                 bit_depth_c,
-                &mut scratch_cb,
+                scratch_cb,
                 c_w as usize,
             );
             weighted_pred_explicit(
-                Some(l0_cr.as_slice()),
-                Some(l1_cr.as_slice()),
+                Some(&l0_cr[..]),
+                Some(&l1_cr[..]),
                 c_w as usize,
                 c_w,
                 c_h,
@@ -5354,7 +5368,7 @@ fn process_partition<R: RefPicProvider>(
                 w_entry_l1,
                 log2_wd,
                 bit_depth_c,
-                &mut scratch_cr,
+                scratch_cr,
                 c_w as usize,
             );
             for py in 0..c_h as usize {
@@ -5380,25 +5394,27 @@ fn process_partition<R: RefPicProvider>(
                     chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd_c),
                 );
 
-                let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-                let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+                let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+                let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
+                let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+                let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
                 let cb_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(l0_cb.as_slice())
+                    Some(&l0_cb[..])
                 } else {
                     None
                 };
                 let cb_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(l1_cb.as_slice())
+                    Some(&l1_cb[..])
                 } else {
                     None
                 };
                 let cr_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(l0_cr.as_slice())
+                    Some(&l0_cr[..])
                 } else {
                     None
                 };
                 let cr_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(l1_cr.as_slice())
+                    Some(&l1_cr[..])
                 } else {
                     None
                 };
@@ -5413,7 +5429,7 @@ fn process_partition<R: RefPicProvider>(
                     w_cb_l1,
                     log2_wd_c,
                     bit_depth_c,
-                    &mut scratch_cb,
+                    scratch_cb,
                     c_w as usize,
                 );
                 weighted_pred_explicit(
@@ -5427,7 +5443,7 @@ fn process_partition<R: RefPicProvider>(
                     w_cr_l1,
                     log2_wd_c,
                     bit_depth_c,
-                    &mut scratch_cr,
+                    scratch_cr,
                     c_w as usize,
                 );
                 for py in 0..c_h as usize {
@@ -5502,10 +5518,14 @@ fn process_partition<R: RefPicProvider>(
         let c_part_x = part.x as i32;
         let c_part_y = part.y as i32;
 
-        let mut l0_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l0_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l1_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-        let mut l1_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+        let mut l0_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l0_cb = &mut l0_cb_store[..(c_w as usize) * (c_h as usize)];
+        let mut l0_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l0_cr = &mut l0_cr_store[..(c_w as usize) * (c_h as usize)];
+        let mut l1_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l1_cb = &mut l1_cb_store[..(c_w as usize) * (c_h as usize)];
+        let mut l1_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+        let l1_cr = &mut l1_cr_store[..(c_w as usize) * (c_h as usize)];
         if has_l0 {
             let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
             mc_chroma_partition_444(
@@ -5516,8 +5536,8 @@ fn process_partition<R: RefPicProvider>(
                 c_w,
                 c_h,
                 bit_depth_c,
-                &mut l0_cb,
-                &mut l0_cr,
+                l0_cb,
+                l0_cr,
                 fld,
             )?;
         }
@@ -5531,8 +5551,8 @@ fn process_partition<R: RefPicProvider>(
                 c_w,
                 c_h,
                 bit_depth_c,
-                &mut l1_cb,
-                &mut l1_cr,
+                l1_cb,
+                l1_cr,
                 fld,
             )?;
         }
@@ -5540,8 +5560,10 @@ fn process_partition<R: RefPicProvider>(
         if let Some((w0, w1, log2_wd)) = implicit_weights {
             // §8.4.2.3.3 — implicit bipred reuses the luma (w0, w1,
             // log2WD=5) triple for chroma with zero offsets.
-            let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-            let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+            let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+            let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
+            let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+            let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
             let w_entry_l0 = WeightedEntry {
                 weight: w0,
                 offset: 0,
@@ -5551,8 +5573,8 @@ fn process_partition<R: RefPicProvider>(
                 offset: 0,
             };
             weighted_pred_explicit(
-                Some(l0_cb.as_slice()),
-                Some(l1_cb.as_slice()),
+                Some(&l0_cb[..]),
+                Some(&l1_cb[..]),
                 c_w as usize,
                 c_w,
                 c_h,
@@ -5561,12 +5583,12 @@ fn process_partition<R: RefPicProvider>(
                 w_entry_l1,
                 log2_wd,
                 bit_depth_c,
-                &mut scratch_cb,
+                scratch_cb,
                 c_w as usize,
             );
             weighted_pred_explicit(
-                Some(l0_cr.as_slice()),
-                Some(l1_cr.as_slice()),
+                Some(&l0_cr[..]),
+                Some(&l1_cr[..]),
                 c_w as usize,
                 c_w,
                 c_h,
@@ -5575,7 +5597,7 @@ fn process_partition<R: RefPicProvider>(
                 w_entry_l1,
                 log2_wd,
                 bit_depth_c,
-                &mut scratch_cr,
+                scratch_cr,
                 c_w as usize,
             );
             for py in 0..c_h as usize {
@@ -5602,25 +5624,27 @@ fn process_partition<R: RefPicProvider>(
                     chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd_c),
                 );
 
-                let mut scratch_cb = vec![0i32; (c_w as usize) * (c_h as usize)];
-                let mut scratch_cr = vec![0i32; (c_w as usize) * (c_h as usize)];
+                let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
+                let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
+                let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
+                let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
                 let cb_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(l0_cb.as_slice())
+                    Some(&l0_cb[..])
                 } else {
                     None
                 };
                 let cb_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(l1_cb.as_slice())
+                    Some(&l1_cb[..])
                 } else {
                     None
                 };
                 let cr_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(l0_cr.as_slice())
+                    Some(&l0_cr[..])
                 } else {
                     None
                 };
                 let cr_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(l1_cr.as_slice())
+                    Some(&l1_cr[..])
                 } else {
                     None
                 };
@@ -5635,7 +5659,7 @@ fn process_partition<R: RefPicProvider>(
                     w_cb_l1,
                     log2_wd_c,
                     bit_depth_c,
-                    &mut scratch_cb,
+                    scratch_cb,
                     c_w as usize,
                 );
                 weighted_pred_explicit(
@@ -5649,7 +5673,7 @@ fn process_partition<R: RefPicProvider>(
                     w_cr_l1,
                     log2_wd_c,
                     bit_depth_c,
-                    &mut scratch_cr,
+                    scratch_cr,
                     c_w as usize,
                 );
                 for py in 0..c_h as usize {
