@@ -2659,4 +2659,57 @@ mod tests {
         assert_eq!(norm_adjust_8x8(0, 2, 1), 24);
         assert_eq!(norm_adjust_8x8(0, 2, 3), 24);
     }
+
+    // ------------ sparse-block short-cuts (#18) ---------------
+
+    /// Tiny LCG so the dense comparison blocks are deterministic.
+    fn lcg(seed: &mut u32) -> i32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((*seed >> 16) as i32 & 0x1fff) - 0x1000
+    }
+
+    #[test]
+    fn sparse_4x4_short_cuts_match_the_full_butterfly() {
+        // All-zero: eqs. 8-338..8-354 are linear, (0 + 32) >> 6 == 0.
+        assert_eq!(inverse_core_4x4_sparse(&[0; 16]), [0; 16]);
+        assert_eq!(
+            inverse_core_4x4_sparse(&[0; 16]),
+            inverse_core_4x4(&[0; 16])
+        );
+        // DC-only: every f_ij / h_ij equals d00, so r_ij = (d00 + 32) >> 6
+        // (the arithmetic shift makes negative DCs round towards -inf
+        // exactly as the full transform does).
+        for dc in [
+            -4096, -65, -64, -33, -32, -31, -1, 0, 1, 31, 32, 33, 63, 64, 4095,
+        ] {
+            let mut d = [0i32; 16];
+            d[0] = dc;
+            let full = inverse_core_4x4(&d);
+            assert_eq!(inverse_core_4x4_sparse(&d), full, "dc={dc}");
+            assert_eq!(full, [(dc + 32) >> 6; 16], "dc={dc}");
+        }
+        // Dense and single-AC blocks take the full path untouched.
+        let mut seed = 0x1234_5678u32;
+        for _ in 0..64 {
+            let mut d = [0i32; 16];
+            for v in d.iter_mut() {
+                *v = lcg(&mut seed);
+            }
+            assert_eq!(inverse_core_4x4_sparse(&d), inverse_core_4x4(&d));
+            let mut one_ac = [0i32; 16];
+            one_ac[0] = lcg(&mut seed);
+            one_ac[1 + (seed as usize % 15)] = lcg(&mut seed);
+            assert_eq!(inverse_core_4x4_sparse(&one_ac), inverse_core_4x4(&one_ac));
+        }
+    }
+
+    #[test]
+    fn zero_8x8_block_short_cut_matches_the_full_butterfly() {
+        assert_eq!(inverse_core_8x8(&[0; 64]), [0; 64]);
+        let flat = default_scaling_list_8x8_flat();
+        for qp in [0, 26, 51] {
+            let r = inverse_transform_8x8(&[0; 64], qp, &flat, 8).unwrap();
+            assert_eq!(r, [0; 64], "qp={qp}");
+        }
+    }
 }
