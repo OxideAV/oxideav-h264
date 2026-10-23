@@ -34,19 +34,19 @@
 use super::bitstream::BitWriter;
 use super::cavlc::encode_residual_block_cavlc;
 use super::macroblock::{
-    inter_cbp_to_codenum_420_422, intra_cbp_to_codenum_420_422, write_i_nxn_mb,
-    write_p_l0_16x16_mb, INxNMcbConfig, PL016x16McbConfig,
+    INxNMcbConfig, PL016x16McbConfig, inter_cbp_to_codenum_420_422, intra_cbp_to_codenum_420_422,
+    write_i_nxn_mb, write_p_l0_16x16_mb,
 };
 use super::nal::build_nal_unit;
-use super::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
-use super::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
+use super::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
+use super::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
 use super::transform::{zigzag_scan_4x4, zigzag_scan_4x4_ac};
 use crate::cavlc::CoeffTokenContext;
 use crate::intra_pred::{
-    predict_4x4, predict_chroma, ChromaArrayType, Intra4x4Mode, IntraChromaMode,
-    Neighbour4x4Availability, Samples4x4, SamplesChroma,
+    ChromaArrayType, Intra4x4Mode, IntraChromaMode, Neighbour4x4Availability, Samples4x4,
+    SamplesChroma, predict_4x4, predict_chroma,
 };
-use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
+use crate::macroblock_layer::{CavlcNcGrid, LumaNcKind, derive_nc_luma};
 use crate::nal::NalUnitType;
 use crate::sp_transform::{
     chroma_dc_switch_scale, chroma_pred_transform, encoder_quant_8_416, encoder_quant_8_428,
@@ -107,11 +107,7 @@ impl SpConfig {
         (self.height / 16) as usize
     }
     fn disable_deblocking_filter_idc(&self) -> u32 {
-        if self.deblock {
-            0
-        } else {
-            1
-        }
+        if self.deblock { 0 } else { 1 }
     }
 }
 
@@ -209,7 +205,7 @@ pub fn encode_ipcm_idr(cfg: &SpConfig, y: &[u8], u: &[u8], v: &[u8]) -> Vec<u8> 
     bw.u(8, 0); // frame_num (log2_max_frame_num = 8)
     bw.ue(0); // idr_pic_id
     bw.u(8, 0); // pic_order_cnt_lsb (POC type 0)
-                // §7.3.3.3 — dec_ref_pic_marking (IDR form).
+    // §7.3.3.3 — dec_ref_pic_marking (IDR form).
     bw.u(1, 0); // no_output_of_prior_pics_flag
     bw.u(1, 0); // long_term_reference_flag
     bw.se(cfg.qp - 26); // slice_qp_delta (PPS pic_init_qp_minus26 = 0)
@@ -1103,10 +1099,10 @@ pub fn encode_sp_dual_form_picture(
         false,
     );
     w_a.ue(0); // §7.3.2.9.1 slice_id
-               // §7.3.2.9.2/.3 — each partition's RBSP is one continuous
-               // bitstream: slice_id first (our PPS carries no redundant_pic_cnt
-               // and the SPS no separate colour planes), then that category's
-               // slice-data bits.
+    // §7.3.2.9.2/.3 — each partition's RBSP is one continuous
+    // bitstream: slice_id first (our PPS carries no redundant_pic_cnt
+    // and the SPS no separate colour planes), then that category's
+    // slice-data bits.
     let mut w_b = BitWriter::new();
     w_b.ue(0); // slice_id
     let mut w_c = BitWriter::new();

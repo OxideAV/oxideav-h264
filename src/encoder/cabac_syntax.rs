@@ -938,11 +938,7 @@ pub fn encode_coded_block_pattern(
                 return 1;
             }
             let bit_set = ((cbp_luma >> bit_idx_n) & 1) != 0;
-            if bit_set {
-                0
-            } else {
-                1
-            }
+            if bit_set { 0 } else { 1 }
         };
 
     // §9.3.3.1.1.4 under MBAFF (round-456) — the caller supplies the
@@ -978,19 +974,11 @@ pub fn encode_coded_block_pattern(
             }
             1 => {
                 let b_k = prev_bins[0];
-                if b_k != 0 {
-                    0
-                } else {
-                    1
-                }
+                if b_k != 0 { 0 } else { 1 }
             }
             3 => {
                 let b_k = prev_bins[2];
-                if b_k != 0 {
-                    0
-                } else {
-                    1
-                }
+                if b_k != 0 { 0 } else { 1 }
             }
             _ => 0,
         };
@@ -1010,19 +998,11 @@ pub fn encode_coded_block_pattern(
             }
             2 => {
                 let b_k = prev_bins[0];
-                if b_k != 0 {
-                    0
-                } else {
-                    1
-                }
+                if b_k != 0 { 0 } else { 1 }
             }
             3 => {
                 let b_k = prev_bins[1];
-                if b_k != 0 {
-                    0
-                } else {
-                    1
-                }
+                if b_k != 0 { 0 } else { 1 }
             }
             _ => 0,
         };
@@ -1049,11 +1029,7 @@ pub fn encode_coded_block_pattern(
                     1 => cbp_chroma != 2,
                     _ => false,
                 };
-                if zero_branch {
-                    0
-                } else {
-                    1
-                }
+                if zero_branch { 0 } else { 1 }
             };
         // binIdx 0.
         let cond_a0 = chroma_cond(
@@ -1181,11 +1157,7 @@ fn sig_coeff_inc_enc(
         3 => core::cmp::min(level_list_idx / num_c8x8.max(1), 2),
         5 | 9 | 13 => {
             let row = TBL_9_43_ENC[level_list_idx as usize];
-            if field {
-                row.1 as u32
-            } else {
-                row.0 as u32
-            }
+            if field { row.1 as u32 } else { row.0 as u32 }
         }
         _ => level_list_idx,
     }
@@ -1549,13 +1521,15 @@ mod tests {
         let bytes = enc.finish_no_trailing();
         let mut ctxs_dec = CabacContexts::init(SliceKind::P, Some(0), 26).unwrap();
         let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
-        assert!(decode_mb_skip_flag(
-            &mut dec,
-            &mut ctxs_dec,
-            SliceKind::P,
-            &NeighbourCtx::default()
-        )
-        .unwrap());
+        assert!(
+            decode_mb_skip_flag(
+                &mut dec,
+                &mut ctxs_dec,
+                SliceKind::P,
+                &NeighbourCtx::default()
+            )
+            .unwrap()
+        );
         assert_eq!(dec.decode_terminate().unwrap(), 1);
     }
 

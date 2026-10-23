@@ -3382,32 +3382,32 @@ pub fn parse_content_colour_volume(payload: &[u8]) -> Result<ContentColourVolume
     // §D.2.33 ordering: min <= avg <= max, min <= max, for whichever
     // values are present. Each pairwise constraint applies only when
     // both members of the pair are present.
-    if let (Some(min), Some(avg)) = (min_luminance_value, avg_luminance_value) {
-        if min > avg {
-            return Err(SeiError::ContentColourVolumeLuminanceOrder {
-                min: min as u64,
-                avg: avg as u64,
-                max: max_luminance_value.map_or(u64::MAX, |m| m as u64),
-            });
-        }
+    if let (Some(min), Some(avg)) = (min_luminance_value, avg_luminance_value)
+        && min > avg
+    {
+        return Err(SeiError::ContentColourVolumeLuminanceOrder {
+            min: min as u64,
+            avg: avg as u64,
+            max: max_luminance_value.map_or(u64::MAX, |m| m as u64),
+        });
     }
-    if let (Some(avg), Some(max)) = (avg_luminance_value, max_luminance_value) {
-        if avg > max {
-            return Err(SeiError::ContentColourVolumeLuminanceOrder {
-                min: min_luminance_value.map_or(0, |m| m as u64),
-                avg: avg as u64,
-                max: max as u64,
-            });
-        }
+    if let (Some(avg), Some(max)) = (avg_luminance_value, max_luminance_value)
+        && avg > max
+    {
+        return Err(SeiError::ContentColourVolumeLuminanceOrder {
+            min: min_luminance_value.map_or(0, |m| m as u64),
+            avg: avg as u64,
+            max: max as u64,
+        });
     }
-    if let (Some(min), Some(max)) = (min_luminance_value, max_luminance_value) {
-        if min > max {
-            return Err(SeiError::ContentColourVolumeLuminanceOrder {
-                min: min as u64,
-                avg: avg_luminance_value.map_or(min as u64, |a| a as u64),
-                max: max as u64,
-            });
-        }
+    if let (Some(min), Some(max)) = (min_luminance_value, max_luminance_value)
+        && min > max
+    {
+        return Err(SeiError::ContentColourVolumeLuminanceOrder {
+            min: min as u64,
+            avg: avg_luminance_value.map_or(min as u64, |a| a as u64),
+            max: max as u64,
+        });
     }
 
     Ok(ContentColourVolume {
@@ -5500,11 +5500,7 @@ fn mantissa_width_g1325(prec: u8, e: u8) -> u8 {
     } else {
         // 0 < e < 63 → e + prec − 31, clamped at 0.
         let sum = e as i32 + prec as i32 - 31;
-        if sum <= 0 {
-            0
-        } else {
-            sum as u8
-        }
+        if sum <= 0 { 0 } else { sum as u8 }
     }
 }
 
@@ -6817,21 +6813,13 @@ impl DepthGridPosition {
     /// `(1 − 2 * pos_x_sign_flag) * (pos_x_fp ÷ 2^pos_x_dp)`.
     pub fn x_to_f64(&self) -> f64 {
         let mag = (self.pos_x_fp as f64) / (1u64 << self.pos_x_dp) as f64;
-        if self.pos_x_sign {
-            -mag
-        } else {
-            mag
-        }
+        if self.pos_x_sign { -mag } else { mag }
     }
     /// Reconstruct the §H.13.2.7.1 vertical position scalar
     /// `(1 − 2 * pos_y_sign_flag) * (pos_y_fp ÷ 2^pos_y_dp)`.
     pub fn y_to_f64(&self) -> f64 {
         let mag = (self.pos_y_fp as f64) / (1u64 << self.pos_y_dp) as f64;
-        if self.pos_y_sign {
-            -mag
-        } else {
-            mag
-        }
+        if self.pos_y_sign { -mag } else { mag }
     }
 }
 
@@ -7482,7 +7470,7 @@ mod tests {
             }
         }
         // Pad to a whole byte boundary.
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         bits.chunks(8)
@@ -9597,14 +9585,14 @@ mod tests {
         fields.push((21, 6)); // exponent_ref_display_width
         fields.push((22, 6)); // exponent_ref_viewing_distance
         fields.push((1, 1)); // additional_shift_present_flag = 1
-                             // num_sample_shift_plus512 = 768 → centre + 256 samples.
+        // num_sample_shift_plus512 = 768 → centre + 256 samples.
         fields.push((768, 10));
         // Display 1: no additional shift signalled.
         fields.push((10, 6)); // exponent_ref_baseline
         fields.push((11, 6)); // exponent_ref_display_width
         fields.push((12, 6)); // exponent_ref_viewing_distance
         fields.push((0, 1)); // additional_shift_present_flag = 0
-                             // extension_flag = 0
+        // extension_flag = 0
         fields.push((0, 1));
         let payload = pack_bits(&fields);
         let info = parse_three_dimensional_reference_displays_info(&payload).unwrap();

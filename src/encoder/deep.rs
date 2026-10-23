@@ -42,25 +42,25 @@ use crate::encoder::cabac_syntax::{
 };
 use crate::encoder::cabac_syntax::{encode_prev_intra_pred_mode_flag, encode_rem_intra_pred_mode};
 use crate::encoder::deblock::{
-    chroma_nz_mask_from_blocks, deblock_recon_deep, luma_nz_mask_from_blocks, MbDeblockInfo,
+    MbDeblockInfo, chroma_nz_mask_from_blocks, deblock_recon_deep, luma_nz_mask_from_blocks,
 };
 use crate::encoder::macroblock::{
-    write_i4x4_mb_444, write_i_nxn_mb_chroma, write_intra16x16_mb_chroma,
-    write_intra16x16_mb_in_inter_slice_chroma, write_p_l0_16x16_mb_chroma, ChromaWriteKind,
-    PL016x16McbConfig,
+    ChromaWriteKind, PL016x16McbConfig, write_i_nxn_mb_chroma, write_i4x4_mb_444,
+    write_intra16x16_mb_chroma, write_intra16x16_mb_in_inter_slice_chroma,
+    write_p_l0_16x16_mb_chroma,
 };
 use crate::encoder::mbaff_cabac::{
-    emit_chroma_cabac, emit_i16_plane_cabac, emit_inter_plane_cabac, full_neighbour_ctx,
-    skip_neighbour_ctx, CabacState, Plane,
+    CabacState, Plane, emit_chroma_cabac, emit_i16_plane_cabac, emit_inter_plane_cabac,
+    full_neighbour_ctx, skip_neighbour_ctx,
 };
 use crate::encoder::nal::build_nal_unit;
-use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
+use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
 use crate::encoder::slice::CabacSliceParams;
 use crate::encoder::slice::{
-    write_idr_i_slice_header, write_p_slice_header, FieldPicSignal, IdrSliceHeaderConfig,
-    PSliceHeaderConfig,
+    FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig, write_idr_i_slice_header,
+    write_p_slice_header,
 };
-use crate::encoder::sps::{build_sps_rbsp_with_bypass, BaselineSpsConfig};
+use crate::encoder::sps::{BaselineSpsConfig, build_sps_rbsp_with_bypass};
 use crate::encoder::transform::{
     forward_core_4x4, forward_core_8x8, forward_hadamard_2x2, forward_hadamard_4x2,
     forward_hadamard_4x4, quantize_4x4_ac_w, quantize_4x4_w, quantize_8x8_w,
@@ -68,18 +68,18 @@ use crate::encoder::transform::{
     zigzag_scan_4x4, zigzag_scan_4x4_ac, zigzag_scan_8x8,
 };
 use crate::encoder::{
-    derive_chroma_ac_nc_and_commit_totals, derive_plane_nc_444_i16x16, derive_plane_nc_444_inter,
-    min_level_idc_for_picture_size, mvp_for_16x16, p_skip_mv, BitWriter, MvGrid, MvGridSlot,
-    ScalingMatrixMode,
+    BitWriter, MvGrid, MvGridSlot, ScalingMatrixMode, derive_chroma_ac_nc_and_commit_totals,
+    derive_plane_nc_444_i16x16, derive_plane_nc_444_inter, min_level_idc_for_picture_size,
+    mvp_for_16x16, p_skip_mv,
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::intra_pred::{
-    intra_16x16_mode_permitted, intra_chroma_mode_permitted, predict_16x16, predict_4x4,
-    predict_chroma, ChromaArrayType, Intra16x16Mode, Intra4x4Mode, IntraChromaMode,
-    Neighbour4x4Availability, Samples16x16, Samples4x4, SamplesChroma,
+    ChromaArrayType, Intra4x4Mode, Intra16x16Mode, IntraChromaMode, Neighbour4x4Availability,
+    Samples4x4, Samples16x16, SamplesChroma, intra_16x16_mode_permitted,
+    intra_chroma_mode_permitted, predict_4x4, predict_16x16, predict_chroma,
 };
-use crate::macroblock_layer::{cabac_mvd_abs_sum, CabacMbNeighbourInfo, CabacNeighbourGrid};
-use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
+use crate::macroblock_layer::{CabacMbNeighbourInfo, CabacNeighbourGrid, cabac_mvd_abs_sum};
+use crate::macroblock_layer::{CavlcNcGrid, LumaNcKind, derive_nc_luma};
 use crate::mv_deriv::Mv;
 use crate::nal::NalUnitType;
 use crate::transform::{
@@ -317,7 +317,7 @@ fn pick_16x16(
             .zip(pred.iter())
             .map(|(&s, &p)| (s - p).unsigned_abs() as u64)
             .sum();
-        if best.as_ref().map_or(true, |b| sad < b.2) {
+        if best.as_ref().is_none_or(|b| sad < b.2) {
             best = Some((idx, pred, sad));
         }
     }
@@ -354,7 +354,7 @@ fn pick_chroma(
             .chain(src_v.iter().zip(pv.iter()))
             .map(|(&s, &p)| (s - p).unsigned_abs() as u64)
             .sum();
-        if best.as_ref().map_or(true, |b| sad < b.3) {
+        if best.as_ref().is_none_or(|b| sad < b.3) {
             best = Some((idx, pu, pv, sad));
         }
     }
@@ -1895,7 +1895,7 @@ fn i4x4_plane(
                         .sum();
                     let bits = if mode == pred_mode { 1 } else { 4 };
                     let j = sad + bits * lambda;
-                    if best.as_ref().map_or(true, |b| j < b.0) {
+                    if best.as_ref().is_none_or(|b| j < b.0) {
                         best = Some((j, mode, p));
                     }
                 }
@@ -2478,7 +2478,7 @@ impl DeepSession {
     /// 110 / 122 / 244). Panics unless [`profile_admits`] the layout.
     pub fn with_profile(cfg: DeepConfig, profile_idc: u8) -> Self {
         assert!(
-            cfg.width % 16 == 0 && cfg.height % 16 == 0,
+            cfg.width.is_multiple_of(16) && cfg.height.is_multiple_of(16),
             "MB-aligned dims"
         );
         assert!(
@@ -2856,7 +2856,7 @@ impl DeepSession {
                 // policy: both flag values and both neighbour states
                 // of the §9.3.3.1.1.10 context in one picture).
                 let t8x8_on = cfg.transform_8x8 && cf != 3;
-                let t8x8_chain = (t8x8_on && mb_addr % 2 == 0)
+                let t8x8_chain = (t8x8_on && mb_addr.is_multiple_of(2))
                     .then(|| inter_chain_8x8(&residual, qp_y_prime, &w8, g.bd_y, bypass));
                 if let Some(c8) = &t8x8_chain {
                     luma.cbp = c8.cbp;

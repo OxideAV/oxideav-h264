@@ -11,7 +11,7 @@
 
 use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
-use oxideav_h264::encoder::deep::{encode_deep_sequence, DeepConfig, DeepEncoded, DeepPlanes};
+use oxideav_h264::encoder::deep::{DeepConfig, DeepEncoded, DeepPlanes, encode_deep_sequence};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
 const W: usize = 64;

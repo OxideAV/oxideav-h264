@@ -14,8 +14,8 @@
 //! "informative" §9.2 invertibility property that the spec relies on.
 
 use crate::cavlc::{
-    rb_table, tz_chroma_420_table, tz_chroma_422_table, tz_luma_table, CoeffTokenRow,
-    TotalZerosTable,
+    CoeffTokenRow, TotalZerosTable, rb_table, tz_chroma_420_table, tz_chroma_422_table,
+    tz_luma_table,
 };
 // Round-451 — re-exported so stream-builder tests can name the
 // coeff_token context of [`encode_residual_block_cavlc`].

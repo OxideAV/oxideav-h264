@@ -6,7 +6,7 @@
 //! reference while we develop the chunked/portable variants.
 
 use crate::inter_pred::{
-    interpolate_chroma as ip_chroma, interpolate_luma as ip_luma, InterPredResult,
+    InterPredResult, interpolate_chroma as ip_chroma, interpolate_luma as ip_luma,
 };
 
 /// §8.4.2.2.1 — luma interpolation (scalar reference).

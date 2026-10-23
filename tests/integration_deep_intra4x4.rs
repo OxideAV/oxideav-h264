@@ -29,7 +29,7 @@ fn source(cf: u32, bd: u32, n: usize) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
     let mut y = vec![0u16; W * H];
     for j in 0..H {
         for i in 0..W {
-            let diag = ((i + j + n) / 6) % 2 == 0;
+            let diag = ((i + j + n) / 6).is_multiple_of(2);
             let edge = if (i * 2 + j) % 17 < 3 { 90 } else { 0 };
             let base = if diag { 40 } else { 120 } + edge + ((i * 5 + j * 3) % 23);
             let fine = ((i * 7 + j * 11) % 3) as u32;

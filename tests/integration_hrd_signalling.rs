@@ -24,9 +24,9 @@ use oxideav_core::{CodecId, Frame, Packet, TimeBase, VideoFrame};
 use oxideav_h264::encoder::rate_control::RateControlConfig;
 use oxideav_h264::encoder::session::{EncoderSession, SessionConfig, SessionFrame};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
-use oxideav_h264::nal::{parse_nal_unit, AnnexBSplitter, NalUnitType};
+use oxideav_h264::nal::{AnnexBSplitter, NalUnitType, parse_nal_unit};
 use oxideav_h264::non_vcl::parse_sei_rbsp;
-use oxideav_h264::sei::{parse_buffering_period, parse_pic_timing, SeiContext};
+use oxideav_h264::sei::{SeiContext, parse_buffering_period, parse_pic_timing};
 use oxideav_h264::vui::VuiParameters;
 use std::process::Command;
 

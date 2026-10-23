@@ -205,7 +205,7 @@ mod tests {
         fn into_bytes(mut self) -> Vec<u8> {
             // §7.3.2.11 rbsp_trailing_bits(): stop-one-bit then zero-pad.
             self.bits.push(1);
-            while self.bits.len() % 8 != 0 {
+            while !self.bits.len().is_multiple_of(8) {
                 self.bits.push(0);
             }
             let mut out = vec![0u8; self.bits.len() / 8];

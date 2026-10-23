@@ -95,9 +95,7 @@ pub enum SubsetSpsError {
     NumApplicableOpsOutOfRange { i: usize, value: u32 },
     /// §G.7.4.2.1.4 — `applicable_op_num_target_views_minus1[i][j]` in
     /// 0..=1023.
-    #[error(
-        "applicable_op_num_target_views_minus1[{i}][{j}] out of range (got {value}, max 1023)"
-    )]
+    #[error("applicable_op_num_target_views_minus1[{i}][{j}] out of range (got {value}, max 1023)")]
     NumTargetViewsOutOfRange { i: usize, j: usize, value: u32 },
     /// §G.7.4.2.1.4 — `applicable_op_target_view_id[i][j][k]` in
     /// 0..=1023.
@@ -1568,22 +1566,22 @@ mod tests {
     /// value with one operation point targeting both views.
     fn write_two_view_mvcd_extension(w: &mut BitWriter) {
         w.ue(1); // num_views_minus1
-                 // view info loop
+        // view info loop
         w.ue(0); // view_id[0]
         w.u(1, 0); // depth_view_present_flag[0] = 0
         w.u(1, 1); // texture_view_present_flag[0] = 1
         w.ue(2); // view_id[1]
         w.u(1, 1); // depth_view_present_flag[1] = 1
         w.u(1, 1); // texture_view_present_flag[1] = 1
-                   // anchor refs: only i==1 (depth_view_present_flag[1]==1)
+        // anchor refs: only i==1 (depth_view_present_flag[1]==1)
         w.ue(1); // num_anchor_refs_l0[1]
         w.ue(0); // anchor_ref_l0[1][0]
         w.ue(0); // num_anchor_refs_l1[1]
-                 // non-anchor refs: only i==1
+        // non-anchor refs: only i==1
         w.ue(0); // num_non_anchor_refs_l0[1]
         w.ue(1); // num_non_anchor_refs_l1[1]
         w.ue(0); // non_anchor_ref_l1[1][0]
-                 // level values
+        // level values
         w.ue(0); // num_level_values_signalled_minus1
         w.u(8, 40); // level_idc[0]
         w.ue(0); // num_applicable_ops_minus1[0]
@@ -1695,7 +1693,7 @@ mod tests {
         w.ue(7); // view_id[1]
         w.u(1, 0); // depth_view_present_flag[1] = 0 ⇒ ref loops skipped
         w.u(1, 1); // texture_view_present_flag[1] = 1
-                   // (no anchor / non-anchor reference syntax)
+        // (no anchor / non-anchor reference syntax)
         w.ue(0); // num_level_values_signalled_minus1
         w.u(8, 30); // level_idc[0]
         w.ue(0); // num_applicable_ops_minus1[0]
@@ -1732,7 +1730,7 @@ mod tests {
         w.u(1, 1); // bit_equal_to_one
         write_two_view_mvcd_extension(&mut w);
         w.u(1, 1); // mvcd_vui_parameters_present_flag
-                   // mvcd_vui_parameters_extension()
+        // mvcd_vui_parameters_extension()
         w.ue(0); // vui_mvcd_num_ops_minus1
         w.u(3, 2); // vui_mvcd_temporal_id[0]
         w.ue(0); // vui_mvcd_num_target_output_views_minus1[0]
@@ -1745,7 +1743,7 @@ mod tests {
         w.u(1, 1); // vui_mvcd_fixed_frame_rate_flag[0]
         w.u(1, 0); // vui_mvcd_nal_hrd_parameters_present_flag[0]
         w.u(1, 0); // vui_mvcd_vcl_hrd_parameters_present_flag[0]
-                   // no low_delay_hrd_flag (both HRD flags 0)
+        // no low_delay_hrd_flag (both HRD flags 0)
         w.u(1, 1); // vui_mvcd_pic_struct_present_flag[0]
         w.u(1, 0); // texture_vui_parameters_present_flag
         w.u(1, 0); // additional_extension2_flag
@@ -1788,7 +1786,7 @@ mod tests {
         write_two_view_mvcd_extension(&mut w);
         w.u(1, 0); // mvcd_vui_parameters_present_flag
         w.u(1, 1); // texture_vui_parameters_present_flag
-                   // mvc_vui_parameters_extension() — one op, no timing/HRD
+        // mvc_vui_parameters_extension() — one op, no timing/HRD
         w.ue(0); // vui_mvc_num_ops_minus1
         w.u(3, 0); // vui_mvc_temporal_id[0]
         w.ue(0); // vui_mvc_num_target_output_views_minus1[0]
@@ -1839,7 +1837,7 @@ mod tests {
         w.u(6, 0); // mfc_format_idc — side-by-side base view
         w.u(1, 1); // default_grid_position_flag
         w.u(1, 1); // rpu_filter_enabled_flag
-                   // frame_mbs_only_flag == 1 ⇒ no rpu_field_processing_flag
+        // frame_mbs_only_flag == 1 ⇒ no rpu_field_processing_flag
         w.u(1, 0); // mvc_vui_parameters_present_flag
         w.u(1, 0); // additional_extension2_flag
         w.trailing();
@@ -2035,7 +2033,7 @@ mod tests {
         w.u(32, 60000); // vui_mvc_time_scale[0]
         w.u(1, 1); // vui_mvc_fixed_frame_rate_flag[0]
         w.u(1, 1); // vui_mvc_nal_hrd_parameters_present_flag[0]
-                   // §E.1.2 hrd_parameters():
+        // §E.1.2 hrd_parameters():
         w.ue(0); // cpb_cnt_minus1
         w.u(4, 1); // bit_rate_scale
         w.u(4, 2); // cpb_size_scale
@@ -2134,7 +2132,7 @@ mod tests {
         w.u(2, 1); // extended_spatial_scalability_idc == 1
         w.u(1, 0); // chroma_phase_x_plus1_flag (ChromaArrayType==1)
         w.u(2, 1); // chroma_phase_y_plus1 (ChromaArrayType==1)
-                   // ChromaArrayType > 0 ⇒ ref-layer chroma-phase fields present:
+        // ChromaArrayType > 0 ⇒ ref-layer chroma-phase fields present:
         w.u(1, 1); // seq_ref_layer_chroma_phase_x_plus1_flag
         w.u(2, 2); // seq_ref_layer_chroma_phase_y_plus1
         w.se(-3); // seq_scaled_ref_layer_left_offset
@@ -2198,11 +2196,11 @@ mod tests {
         w.u(1, 1); // direct_8x8_inference_flag
         w.u(1, 0); // frame_cropping_flag
         w.u(1, 0); // vui_parameters_present_flag
-                   // seq_parameter_set_svc_extension() — ChromaArrayType == 0:
+        // seq_parameter_set_svc_extension() — ChromaArrayType == 0:
         w.u(1, 0); // inter_layer_deblocking_filter_control_present_flag
         w.u(2, 1); // extended_spatial_scalability_idc == 1
-                   // no chroma_phase_x_plus1_flag / chroma_phase_y_plus1 coded.
-                   // ChromaArrayType == 0 ⇒ no ref-layer chroma-phase fields:
+        // no chroma_phase_x_plus1_flag / chroma_phase_y_plus1 coded.
+        // ChromaArrayType == 0 ⇒ no ref-layer chroma-phase fields:
         w.se(2); // seq_scaled_ref_layer_left_offset
         w.se(0); // seq_scaled_ref_layer_top_offset
         w.se(0); // seq_scaled_ref_layer_right_offset
@@ -2243,9 +2241,9 @@ mod tests {
         w.u(1, 0); // seq_tcoeff_level_prediction_flag
         w.u(1, 0); // slice_header_restriction_flag
         w.u(1, 1); // svc_vui_parameters_present_flag
-                   // svc_vui_parameters_extension():
+        // svc_vui_parameters_extension():
         w.ue(1); // vui_ext_num_entries_minus1 == 1 (two entries)
-                 // entry 0:
+        // entry 0:
         w.u(3, 0); // vui_ext_dependency_id
         w.u(4, 0); // vui_ext_quality_id
         w.u(3, 0); // vui_ext_temporal_id
@@ -2253,13 +2251,13 @@ mod tests {
         w.u(1, 0); // vui_ext_nal_hrd_parameters_present_flag
         w.u(1, 0); // vui_ext_vcl_hrd_parameters_present_flag
         w.u(1, 1); // vui_ext_pic_struct_present_flag
-                   // entry 1 (with NAL HRD parameters):
+        // entry 1 (with NAL HRD parameters):
         w.u(3, 1); // vui_ext_dependency_id
         w.u(4, 2); // vui_ext_quality_id
         w.u(3, 3); // vui_ext_temporal_id
         w.u(1, 0); // vui_ext_timing_info_present_flag
         w.u(1, 1); // vui_ext_nal_hrd_parameters_present_flag
-                   // hrd_parameters() — single CPB, simplest legal body:
+        // hrd_parameters() — single CPB, simplest legal body:
         w.ue(0); // cpb_cnt_minus1
         w.u(4, 1); // bit_rate_scale
         w.u(4, 1); // cpb_size_scale

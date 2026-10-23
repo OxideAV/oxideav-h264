@@ -291,7 +291,7 @@ pub fn interpolate_luma(
     if y_frac > 3 {
         return Err(InterPredError::LumaFracOutOfRange(y_frac));
     }
-    if w == 0 || h == 0 || w % 4 != 0 || h % 4 != 0 {
+    if w == 0 || h == 0 || !w.is_multiple_of(4) || !h.is_multiple_of(4) {
         return Err(InterPredError::InvalidBlockSize { w, h });
     }
     // §8.4.2.2.1 — `clip3(0, src_width-1, x)` requires `src_width >= 1`

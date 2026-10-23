@@ -242,18 +242,10 @@ fn make_mixed_128x128() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         for i in 0..w {
             let v = if i < w / 2 && j < h / 2 {
                 // Vertical bars: cycle [40, 200] every 8 cols.
-                if (i / 8) % 2 == 0 {
-                    40
-                } else {
-                    200
-                }
+                if (i / 8) % 2 == 0 { 40 } else { 200 }
             } else if i >= w / 2 && j < h / 2 {
                 // Horizontal bars.
-                if (j / 8) % 2 == 0 {
-                    40
-                } else {
-                    200
-                }
+                if (j / 8) % 2 == 0 { 40 } else { 200 }
             } else {
                 // Smooth gradient.
                 (16 + (i + j) * 200 / (w + h - 2)).clamp(0, 255)

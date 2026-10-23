@@ -50,20 +50,20 @@
 //! b_fields`]) with spatial or temporal direct derivation.
 
 use crate::encoder::deblock::{
-    deblock_recon_field, deblock_recon_with_chroma_array_type, MbDeblockInfo,
+    MbDeblockInfo, deblock_recon_field, deblock_recon_with_chroma_array_type,
 };
 use crate::encoder::nal::build_nal_unit;
-use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
+use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
 use crate::encoder::slice::{
-    write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
-    EncMmcoOp, EncRplmOp, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    BSliceHeaderConfig, EncMmcoOp, EncRplmOp, FieldPicSignal, IdrSliceHeaderConfig,
+    PSliceHeaderConfig, write_b_slice_header, write_idr_i_slice_header, write_p_slice_header,
 };
-use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
-use crate::encoder::{
-    min_level_idc_for_picture_size, EncodedFrameRef, Encoder, EncoderConfig, FrameRefPartitionMv,
-    YuvFrame,
-};
+use crate::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
 use crate::encoder::{BitWriter, CavlcNcGrid, IntraGrid, MvGrid};
+use crate::encoder::{
+    EncodedFrameRef, Encoder, EncoderConfig, FrameRefPartitionMv, YuvFrame,
+    min_level_idc_for_picture_size,
+};
 use crate::nal::NalUnitType;
 use crate::transform::{qp_bd_offset, qp_y_to_qp_c_with_bd_offset};
 
@@ -541,9 +541,9 @@ fn implicit_field_weights(curr_poc: i32, poc0: i32, poc1: i32) -> super::Weighte
 /// the module docs for the stream layout. `frames` are full-height
 /// (Y, Cb, Cr) planes, one entry per interlaced frame.
 pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) -> PaffEncoded {
-    assert!(cfg.width % 16 == 0, "width must be MB-aligned");
+    assert!(cfg.width.is_multiple_of(16), "width must be MB-aligned");
     assert!(
-        cfg.frame_height % 32 == 0,
+        cfg.frame_height.is_multiple_of(32),
         "frame height must be a multiple of 32 (each field MB-aligned)",
     );
     assert!(!frames.is_empty());
@@ -861,11 +861,7 @@ pub fn encode_paff_sequence(cfg: &PaffConfig, frames: &[(&[u8], &[u8], &[u8])]) 
             // top (the §8.2.4.2.5 "missing field is ignored" fallback
             // after frame 1's top was unmarked).
             let ref_field = if cfg.long_term_anchor && k > 0 {
-                if bottom {
-                    &anchor_bottom
-                } else {
-                    &anchor_top
-                }
+                if bottom { &anchor_bottom } else { &anchor_top }
             } else if cfg.mmco_unpair_first_top && k == 2 && !bottom {
                 &anchor_top
             } else if bottom {
@@ -1502,7 +1498,7 @@ fn encode_paff_b_sequence(
             prev_anchor = next_anchor;
             d += 2;
         }
-        if frames.len() % 2 == 0 {
+        if frames.len().is_multiple_of(2) {
             // Trailing odd display frame without a following anchor.
             anchor_fn += 1;
             let _ = encode_anchor_pair(

@@ -23,7 +23,11 @@ fn frame(n: usize) -> Frame {
     let mut v = vec![0u8; w * h / 4];
     for j in 0..h {
         for i in 0..w {
-            let m = if (i / 8 + j / 8 + n) % 3 == 0 { 60 } else { 0 };
+            let m = if (i / 8 + j / 8 + n).is_multiple_of(3) {
+                60
+            } else {
+                0
+            };
             y[j * w + i] = (30 + m + ((i * 3 + j * 2 + n * 7) % 150)) as u8;
         }
     }

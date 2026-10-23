@@ -59,31 +59,31 @@ use crate::encoder::cabac_syntax::{
 };
 use crate::encoder::cavlc::ZZ_TO_FIELD_16;
 use crate::encoder::deblock::{
-    chroma_nz_mask_from_blocks, deblock_recon_mbaff, luma_nz_mask_from_blocks, MbDeblockInfo,
+    MbDeblockInfo, chroma_nz_mask_from_blocks, deblock_recon_mbaff, luma_nz_mask_from_blocks,
 };
 use crate::encoder::mbaff::{
-    adaptive_pair_is_field, extract_field_planes, fill_neighbour_grids, patch_neighbour_samples,
-    ref_poc_key, virtual_pos, PairMode, PicState, Planes, VirtualEnc,
+    PairMode, PicState, Planes, VirtualEnc, adaptive_pair_is_field, extract_field_planes,
+    fill_neighbour_grids, patch_neighbour_samples, ref_poc_key, virtual_pos,
 };
 use crate::encoder::me::search_quarter_pel_16x16;
 use crate::encoder::nal::build_nal_unit;
-use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
+use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
 use crate::encoder::slice::{
-    write_idr_i_slice_header, write_p_slice_header, CabacSliceParams, FieldPicSignal,
-    IdrSliceHeaderConfig, PSliceHeaderConfig,
+    CabacSliceParams, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    write_idr_i_slice_header, write_p_slice_header,
 };
-use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
+use crate::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
 use crate::encoder::transform::{
     field_scan_8x8, forward_core_4x4, forward_core_8x8, quantize_4x4_w, quantize_8x8_w,
     zigzag_scan_4x4, zigzag_scan_8x8,
 };
 use crate::encoder::{
-    min_level_idc_for_picture_size, mvp_for_16x16, p_skip_mv, BitWriter, CavlcNcGrid,
-    EncoderConfig, IntraGrid, MvGrid, MvGridSlot, ScalingMatrixMode, YuvFrame,
+    BitWriter, CavlcNcGrid, EncoderConfig, IntraGrid, MvGrid, MvGridSlot, ScalingMatrixMode,
+    YuvFrame, min_level_idc_for_picture_size, mvp_for_16x16, p_skip_mv,
 };
 use crate::macroblock_layer::{
-    cabac_cbf_cond_terms, cabac_mvd_abs_sum, cabac_ref_idx_cond_terms, CabacMbNeighbourInfo,
-    CabacNeighbourGrid,
+    CabacMbNeighbourInfo, CabacNeighbourGrid, cabac_cbf_cond_terms, cabac_mvd_abs_sum,
+    cabac_ref_idx_cond_terms,
 };
 use crate::mb_address::{mbaff_mb_to_sample_xy, mbaff_pair_neighbour_addrs};
 use crate::mv_deriv::Mv;
@@ -189,17 +189,17 @@ pub(crate) fn skip_neighbour_ctx(
 ) -> NeighbourCtx {
     let mut n = NeighbourCtx::default();
     let (a, b) = cab.neighbour_mb_addrs_mbaff(addr as u32, mbaff);
-    if let Some(info) = a.and_then(|x| cab.mbs.get(x as usize)) {
-        if info.available {
-            n.available_left = true;
-            n.mb_skip_flag_left = info.is_skip;
-        }
+    if let Some(info) = a.and_then(|x| cab.mbs.get(x as usize))
+        && info.available
+    {
+        n.available_left = true;
+        n.mb_skip_flag_left = info.is_skip;
     }
-    if let Some(info) = b.and_then(|x| cab.mbs.get(x as usize)) {
-        if info.available {
-            n.available_above = true;
-            n.mb_skip_flag_above = info.is_skip;
-        }
+    if let Some(info) = b.and_then(|x| cab.mbs.get(x as usize))
+        && info.available
+    {
+        n.available_above = true;
+        n.mb_skip_flag_above = info.is_skip;
     }
     n
 }
@@ -214,35 +214,35 @@ pub(crate) fn full_neighbour_ctx(
 ) -> NeighbourCtx {
     let mut n = NeighbourCtx::default();
     let (a, b) = cab.neighbour_mb_addrs_mbaff(addr as u32, mbaff);
-    if let Some(info) = a.and_then(|x| cab.mbs.get(x as usize)) {
-        if info.available {
-            n.available_left = true;
-            n.mb_skip_flag_left = info.is_skip;
-            n.left_is_i_pcm = info.is_i_pcm;
-            n.left_is_p_or_b_skip = info.is_skip;
-            n.left_inter = !info.is_intra;
-            n.left_cbp_luma = info.coded_block_pattern_luma;
-            n.left_cbp_chroma = info.coded_block_pattern_chroma;
-            n.left_is_i_nxn = info.is_i_nxn;
-            n.left_is_b_skip_or_direct = info.is_b_skip_or_direct;
-            n.left_intra_chroma_pred_mode_nonzero = info.intra_chroma_pred_mode != 0;
-            n.left_transform_8x8 = info.transform_size_8x8_flag;
-        }
+    if let Some(info) = a.and_then(|x| cab.mbs.get(x as usize))
+        && info.available
+    {
+        n.available_left = true;
+        n.mb_skip_flag_left = info.is_skip;
+        n.left_is_i_pcm = info.is_i_pcm;
+        n.left_is_p_or_b_skip = info.is_skip;
+        n.left_inter = !info.is_intra;
+        n.left_cbp_luma = info.coded_block_pattern_luma;
+        n.left_cbp_chroma = info.coded_block_pattern_chroma;
+        n.left_is_i_nxn = info.is_i_nxn;
+        n.left_is_b_skip_or_direct = info.is_b_skip_or_direct;
+        n.left_intra_chroma_pred_mode_nonzero = info.intra_chroma_pred_mode != 0;
+        n.left_transform_8x8 = info.transform_size_8x8_flag;
     }
-    if let Some(info) = b.and_then(|x| cab.mbs.get(x as usize)) {
-        if info.available {
-            n.available_above = true;
-            n.mb_skip_flag_above = info.is_skip;
-            n.above_is_i_pcm = info.is_i_pcm;
-            n.above_is_p_or_b_skip = info.is_skip;
-            n.above_inter = !info.is_intra;
-            n.above_cbp_luma = info.coded_block_pattern_luma;
-            n.above_cbp_chroma = info.coded_block_pattern_chroma;
-            n.above_is_i_nxn = info.is_i_nxn;
-            n.above_is_b_skip_or_direct = info.is_b_skip_or_direct;
-            n.above_intra_chroma_pred_mode_nonzero = info.intra_chroma_pred_mode != 0;
-            n.above_transform_8x8 = info.transform_size_8x8_flag;
-        }
+    if let Some(info) = b.and_then(|x| cab.mbs.get(x as usize))
+        && info.available
+    {
+        n.available_above = true;
+        n.mb_skip_flag_above = info.is_skip;
+        n.above_is_i_pcm = info.is_i_pcm;
+        n.above_is_p_or_b_skip = info.is_skip;
+        n.above_inter = !info.is_intra;
+        n.above_cbp_luma = info.coded_block_pattern_luma;
+        n.above_cbp_chroma = info.coded_block_pattern_chroma;
+        n.above_is_i_nxn = info.is_i_nxn;
+        n.above_is_b_skip_or_direct = info.is_b_skip_or_direct;
+        n.above_intra_chroma_pred_mode_nonzero = info.intra_chroma_pred_mode != 0;
+        n.above_transform_8x8 = info.transform_size_8x8_flag;
     }
     if !mbaff {
         return n;
@@ -947,7 +947,7 @@ fn code_mb(
         // policy: both `transform_size_8x8_flag` values and every
         // frame/field neighbour combination of the §9.3.3.1.1.10
         // context appear in one picture).
-        let use_8x8 = ctx.transform_8x8 && ((addr / 2) % w_mbs) % 2 == 0;
+        let use_8x8 = ctx.transform_8x8 && ((addr / 2) % w_mbs).is_multiple_of(2);
         let mut luma_scan8 = [[0i32; 64]; 4];
         let mut transform_size_8x8 = false;
         if use_8x8 {
@@ -1300,9 +1300,9 @@ pub fn encode_mbaff_cabac_sequence(
     cfg: &MbaffCabacConfig,
     frames: &[(&[u8], &[u8], &[u8])],
 ) -> MbaffCabacEncoded {
-    assert!(cfg.width % 16 == 0, "width must be MB-aligned");
+    assert!(cfg.width.is_multiple_of(16), "width must be MB-aligned");
     assert!(
-        cfg.frame_height % 32 == 0,
+        cfg.frame_height.is_multiple_of(32),
         "frame height must be a multiple of 32 (MB pairs)",
     );
     assert!(!frames.is_empty());

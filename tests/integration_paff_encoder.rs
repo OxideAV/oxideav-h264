@@ -18,7 +18,7 @@
 
 use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
-use oxideav_h264::encoder::field::{encode_paff_sequence, PaffConfig, PaffEncoded};
+use oxideav_h264::encoder::field::{PaffConfig, PaffEncoded, encode_paff_sequence};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
 const W: usize = 64;
@@ -180,7 +180,7 @@ fn assert_frames_match_recon(enc: &PaffEncoded, decoded: &[oxideav_core::VideoFr
                 .data
                 .iter()
                 .zip(exp.iter())
-                .filter(|(&a, &b)| a != b)
+                .filter(|&(&a, &b)| a != b)
                 .count();
             if mismatches != 0 {
                 // Diagnostic: distinct diverging MBs (frame coords).
@@ -270,7 +270,11 @@ fn ffmpeg_check(enc: &PaffEncoded, tag: &str) {
             ("Cb", ru.as_slice(), ff_u),
             ("Cr", rv.as_slice(), ff_v),
         ] {
-            let mismatches = ours.iter().zip(ff.iter()).filter(|(&a, &b)| a != b).count();
+            let mismatches = ours
+                .iter()
+                .zip(ff.iter())
+                .filter(|&(&a, &b)| a != b)
+                .count();
             assert_eq!(
                 mismatches,
                 0,

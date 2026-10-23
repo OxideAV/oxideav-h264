@@ -336,7 +336,7 @@ pub fn predict_4x4(
         Intra4x4Mode::Vertical | Intra4x4Mode::DiagonalDownLeft | Intra4x4Mode::VerticalLeft
             if !avail.top =>
         {
-            return None
+            return None;
         }
         Intra4x4Mode::Horizontal | Intra4x4Mode::HorizontalUp if !avail.left => return None,
         Intra4x4Mode::DiagonalDownRight
@@ -430,20 +430,8 @@ fn p_ddl(top: &[i32; 8], out: &mut [i32; 16]) {
 
 // §8.3.1.2.5 — Intra_4x4_Diagonal_Down_Right (8-54..8-56).
 fn p_ddr(top: &[i32; 8], left: &[i32; 4], tl: i32, out: &mut [i32; 16]) {
-    let p_top = |x: i32| -> i32 {
-        if x == -1 {
-            tl
-        } else {
-            top[x as usize]
-        }
-    };
-    let p_left = |y: i32| -> i32 {
-        if y == -1 {
-            tl
-        } else {
-            left[y as usize]
-        }
-    };
+    let p_top = |x: i32| -> i32 { if x == -1 { tl } else { top[x as usize] } };
+    let p_left = |y: i32| -> i32 { if y == -1 { tl } else { left[y as usize] } };
     for y in 0..4i32 {
         for x in 0..4i32 {
             let v = if x > y {
@@ -460,20 +448,8 @@ fn p_ddr(top: &[i32; 8], left: &[i32; 4], tl: i32, out: &mut [i32; 16]) {
 
 // §8.3.1.2.6 — Intra_4x4_Vertical_Right (8-57..8-60).
 fn p_vr(top: &[i32; 8], left: &[i32; 4], tl: i32, out: &mut [i32; 16]) {
-    let p_top = |x: i32| -> i32 {
-        if x == -1 {
-            tl
-        } else {
-            top[x as usize]
-        }
-    };
-    let p_left = |y: i32| -> i32 {
-        if y == -1 {
-            tl
-        } else {
-            left[y as usize]
-        }
-    };
+    let p_top = |x: i32| -> i32 { if x == -1 { tl } else { top[x as usize] } };
+    let p_left = |y: i32| -> i32 { if y == -1 { tl } else { left[y as usize] } };
     for y in 0..4i32 {
         for x in 0..4i32 {
             let z_vr = 2 * x - y;
@@ -496,20 +472,8 @@ fn p_vr(top: &[i32; 8], left: &[i32; 4], tl: i32, out: &mut [i32; 16]) {
 
 // §8.3.1.2.7 — Intra_4x4_Horizontal_Down (8-61..8-64).
 fn p_hd(top: &[i32; 8], left: &[i32; 4], tl: i32, out: &mut [i32; 16]) {
-    let p_top = |x: i32| -> i32 {
-        if x == -1 {
-            tl
-        } else {
-            top[x as usize]
-        }
-    };
-    let p_left = |y: i32| -> i32 {
-        if y == -1 {
-            tl
-        } else {
-            left[y as usize]
-        }
-    };
+    let p_top = |x: i32| -> i32 { if x == -1 { tl } else { top[x as usize] } };
+    let p_left = |y: i32| -> i32 { if y == -1 { tl } else { left[y as usize] } };
     for y in 0..4i32 {
         for x in 0..4i32 {
             let z_hd = 2 * y - x;
@@ -609,17 +573,19 @@ mod tests {
         let avail = availability(0, 0, 0, 0, 4);
         assert!(predict_4x4(Intra4x4Mode::Vertical, &recon, 64, 0, 0, 0, 0, avail).is_none());
         assert!(predict_4x4(Intra4x4Mode::Horizontal, &recon, 64, 0, 0, 0, 0, avail).is_none());
-        assert!(predict_4x4(
-            Intra4x4Mode::DiagonalDownRight,
-            &recon,
-            64,
-            0,
-            0,
-            0,
-            0,
-            avail
-        )
-        .is_none());
+        assert!(
+            predict_4x4(
+                Intra4x4Mode::DiagonalDownRight,
+                &recon,
+                64,
+                0,
+                0,
+                0,
+                0,
+                avail
+            )
+            .is_none()
+        );
         assert!(predict_4x4(Intra4x4Mode::Dc, &recon, 64, 0, 0, 0, 0, avail).is_some());
     }
 

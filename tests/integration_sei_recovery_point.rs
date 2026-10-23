@@ -13,7 +13,7 @@ use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::session::{EncoderSession, SessionConfig};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
-use oxideav_h264::nal::{parse_nal_unit, AnnexBSplitter, NalUnitType};
+use oxideav_h264::nal::{AnnexBSplitter, NalUnitType, parse_nal_unit};
 use oxideav_h264::non_vcl::parse_sei_rbsp;
 use oxideav_h264::sei::parse_recovery_point;
 

@@ -32,17 +32,17 @@
 //! are Intra_16x16, P pictures use the full P mode set with the
 //! Intra_16x16 fallback.
 
-use crate::encoder::deblock::{deblock_recon_with_chroma_array_type, MbDeblockInfo};
+use crate::encoder::deblock::{MbDeblockInfo, deblock_recon_with_chroma_array_type};
 use crate::encoder::nal::build_nal_unit;
-use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
+use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
 use crate::encoder::slice::{
-    write_idr_i_slice_header, write_p_slice_header, FieldPicSignal, IdrSliceHeaderConfig,
-    PSliceHeaderConfig,
+    FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig, write_idr_i_slice_header,
+    write_p_slice_header,
 };
-use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
+use crate::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
 use crate::encoder::{
-    min_level_idc_for_picture_size, BitWriter, CavlcNcGrid, EncodedFrameRef, Encoder,
-    EncoderConfig, IntraGrid, MbQpTracker, MvGrid, YuvFrame,
+    BitWriter, CavlcNcGrid, EncodedFrameRef, Encoder, EncoderConfig, IntraGrid, MbQpTracker,
+    MvGrid, YuvFrame, min_level_idc_for_picture_size,
 };
 use crate::mb_address::{map_unit_to_slice_group_map, mb_to_slice_group_map};
 use crate::nal::NalUnitType;
@@ -108,7 +108,7 @@ pub fn encode_slices_sequence(
     cfg: &SlicesConfig,
     frames: &[(&[u8], &[u8], &[u8])],
 ) -> SlicesEncoded {
-    assert!(cfg.width % 16 == 0 && cfg.height % 16 == 0);
+    assert!(cfg.width.is_multiple_of(16) && cfg.height.is_multiple_of(16));
     assert!(!frames.is_empty());
     let w = cfg.width as usize;
     let h = cfg.height as usize;

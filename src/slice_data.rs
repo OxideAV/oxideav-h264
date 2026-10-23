@@ -44,11 +44,11 @@
 use crate::bitstream::{BitError, BitReader};
 use crate::cabac::{CabacDecoder, CabacError};
 use crate::cabac_ctx::{
-    decode_end_of_slice_flag, decode_mb_skip_flag, CabacContexts, NeighbourCtx, SliceKind,
+    CabacContexts, NeighbourCtx, SliceKind, decode_end_of_slice_flag, decode_mb_skip_flag,
 };
 use crate::macroblock_layer::{
-    parse_macroblock, parse_macroblock_dp, CabacNeighbourGrid, CavlcNcGrid, DpResidualReaders,
-    EntropyState, Macroblock, MacroblockLayerError, MbType, PcmSamples,
+    CabacNeighbourGrid, CavlcNcGrid, DpResidualReaders, EntropyState, Macroblock,
+    MacroblockLayerError, MbType, PcmSamples, parse_macroblock, parse_macroblock_dp,
 };
 use crate::mb_address::mbaff_pair_neighbour_addrs;
 use crate::pps::Pps;
@@ -289,10 +289,15 @@ fn parse_slice_data_impl(
         )?;
         if std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some() {
             let c17 = ctxs.at(17);
-            eprintln!("[CTX17] slice init: kind={:?} init_idc={} qp_y={} num_ref_l0_active_minus1={} c17=({},{})",
-                kind, slice_header.cabac_init_idc, slice_qp_y,
+            eprintln!(
+                "[CTX17] slice init: kind={:?} init_idc={} qp_y={} num_ref_l0_active_minus1={} c17=({},{})",
+                kind,
+                slice_header.cabac_init_idc,
+                slice_qp_y,
                 slice_header.num_ref_idx_l0_active_minus1,
-                c17.state_idx, c17.val_mps);
+                c17.state_idx,
+                c17.val_mps
+            );
         }
 
         // §7.3.4 — prevMbSkipped is initialised to 0; in the CABAC
@@ -353,21 +358,19 @@ fn parse_slice_data_impl(
             let mut skip_nctx = NeighbourCtx::default();
             let (skip_a_addr, skip_b_addr) =
                 cabac_nb.neighbour_mb_addrs_mbaff(curr_mb_addr, mbaff_frame_flag);
-            if let Some(a) = skip_a_addr {
-                if let Some(info) = cabac_nb.mbs.get(a as usize) {
-                    if info.available {
-                        skip_nctx.available_left = true;
-                        skip_nctx.mb_skip_flag_left = info.is_skip;
-                    }
-                }
+            if let Some(a) = skip_a_addr
+                && let Some(info) = cabac_nb.mbs.get(a as usize)
+                && info.available
+            {
+                skip_nctx.available_left = true;
+                skip_nctx.mb_skip_flag_left = info.is_skip;
             }
-            if let Some(b) = skip_b_addr {
-                if let Some(info) = cabac_nb.mbs.get(b as usize) {
-                    if info.available {
-                        skip_nctx.available_above = true;
-                        skip_nctx.mb_skip_flag_above = info.is_skip;
-                    }
-                }
+            if let Some(b) = skip_b_addr
+                && let Some(info) = cabac_nb.mbs.get(b as usize)
+                && info.available
+            {
+                skip_nctx.available_above = true;
+                skip_nctx.mb_skip_flag_above = info.is_skip;
             }
             if !slice_header.slice_type.is_intra() {
                 let mb_skip_flag =
@@ -483,7 +486,8 @@ fn parse_slice_data_impl(
                 // (CurrMbAddr % 2 == 1 && prevMbSkipped). The flag
                 // applies to both MBs of the pair.
                 if mbaff_frame_flag
-                    && (curr_mb_addr % 2 == 0 || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
+                    && (curr_mb_addr.is_multiple_of(2)
+                        || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
                 {
                     let flag = decode_mb_field_decoding_flag_cabac(
                         &mut cabac_dec,
@@ -526,39 +530,35 @@ fn parse_slice_data_impl(
                 let mut nctx = NeighbourCtx::default();
                 let (a_addr, b_addr) =
                     cabac_nb.neighbour_mb_addrs_mbaff(curr_mb_addr, mbaff_frame_flag);
-                if let Some(a) = a_addr {
-                    if let Some(info) = cabac_nb.mbs.get(a as usize) {
-                        if info.available {
-                            nctx.available_left = true;
-                            nctx.left_is_i_pcm = info.is_i_pcm;
-                            nctx.left_is_p_or_b_skip = info.is_skip;
-                            nctx.left_inter = !info.is_intra;
-                            nctx.left_cbp_luma = info.coded_block_pattern_luma;
-                            nctx.left_cbp_chroma = info.coded_block_pattern_chroma;
-                            nctx.left_is_i_nxn = info.is_i_nxn;
-                            nctx.left_is_b_skip_or_direct = info.is_b_skip_or_direct;
-                            nctx.left_intra_chroma_pred_mode_nonzero =
-                                info.intra_chroma_pred_mode != 0;
-                            nctx.left_transform_8x8 = info.transform_size_8x8_flag;
-                        }
-                    }
+                if let Some(a) = a_addr
+                    && let Some(info) = cabac_nb.mbs.get(a as usize)
+                    && info.available
+                {
+                    nctx.available_left = true;
+                    nctx.left_is_i_pcm = info.is_i_pcm;
+                    nctx.left_is_p_or_b_skip = info.is_skip;
+                    nctx.left_inter = !info.is_intra;
+                    nctx.left_cbp_luma = info.coded_block_pattern_luma;
+                    nctx.left_cbp_chroma = info.coded_block_pattern_chroma;
+                    nctx.left_is_i_nxn = info.is_i_nxn;
+                    nctx.left_is_b_skip_or_direct = info.is_b_skip_or_direct;
+                    nctx.left_intra_chroma_pred_mode_nonzero = info.intra_chroma_pred_mode != 0;
+                    nctx.left_transform_8x8 = info.transform_size_8x8_flag;
                 }
-                if let Some(b) = b_addr {
-                    if let Some(info) = cabac_nb.mbs.get(b as usize) {
-                        if info.available {
-                            nctx.available_above = true;
-                            nctx.above_is_i_pcm = info.is_i_pcm;
-                            nctx.above_is_p_or_b_skip = info.is_skip;
-                            nctx.above_inter = !info.is_intra;
-                            nctx.above_cbp_luma = info.coded_block_pattern_luma;
-                            nctx.above_cbp_chroma = info.coded_block_pattern_chroma;
-                            nctx.above_is_i_nxn = info.is_i_nxn;
-                            nctx.above_is_b_skip_or_direct = info.is_b_skip_or_direct;
-                            nctx.above_intra_chroma_pred_mode_nonzero =
-                                info.intra_chroma_pred_mode != 0;
-                            nctx.above_transform_8x8 = info.transform_size_8x8_flag;
-                        }
-                    }
+                if let Some(b) = b_addr
+                    && let Some(info) = cabac_nb.mbs.get(b as usize)
+                    && info.available
+                {
+                    nctx.available_above = true;
+                    nctx.above_is_i_pcm = info.is_i_pcm;
+                    nctx.above_is_p_or_b_skip = info.is_skip;
+                    nctx.above_inter = !info.is_intra;
+                    nctx.above_cbp_luma = info.coded_block_pattern_luma;
+                    nctx.above_cbp_chroma = info.coded_block_pattern_chroma;
+                    nctx.above_is_i_nxn = info.is_i_nxn;
+                    nctx.above_is_b_skip_or_direct = info.is_b_skip_or_direct;
+                    nctx.above_intra_chroma_pred_mode_nonzero = info.intra_chroma_pred_mode != 0;
+                    nctx.above_transform_8x8 = info.transform_size_8x8_flag;
                 }
                 if mbaff_frame_flag {
                     // §9.3.3.1.1.4 + §6.4.11.2 — resolve the per-bin
@@ -927,7 +927,7 @@ fn parse_slice_data_impl(
             // macroblock_layer() when (CurrMbAddr % 2 == 0) or
             // (CurrMbAddr % 2 == 1 && prevMbSkipped).
             if mbaff_frame_flag
-                && (curr_mb_addr % 2 == 0 || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
+                && (curr_mb_addr.is_multiple_of(2) || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
             {
                 let flag = r.u(1)? != 0;
                 pending_pair_flag = Some(flag);
@@ -947,10 +947,8 @@ fn parse_slice_data_impl(
             // §6.4.12.2 — stamp the current MB's pair flag before the
             // macroblock-layer parse so the §9.2.1.1 nC Table 6-4
             // derivations read the correct currMbFrameFlag.
-            if mbaff_frame_flag {
-                if let Some(slot) = cavlc_nc.mbs.get_mut(curr_mb_addr as usize) {
-                    slot.mb_field_decoding_flag = flag;
-                }
+            if mbaff_frame_flag && let Some(slot) = cavlc_nc.mbs.get_mut(curr_mb_addr as usize) {
+                slot.mb_field_decoding_flag = flag;
             }
             let mut entropy = EntropyState {
                 cabac: None,
@@ -1068,10 +1066,10 @@ pub(crate) fn infer_pair_field_flag(
 ) -> bool {
     let [a_top, b_top, _c, _d] = mbaff_pair_neighbour_addrs(curr_mb_addr, pic_width_in_mbs);
     for addr in [a_top, b_top].into_iter().flatten() {
-        if let Some(info) = grid.mbs.get(addr as usize) {
-            if info.available {
-                return info.mb_field_decoding_flag;
-            }
+        if let Some(info) = grid.mbs.get(addr as usize)
+            && info.available
+        {
+            return info.mb_field_decoding_flag;
         }
     }
     false
@@ -1087,10 +1085,10 @@ fn infer_pair_field_flag_cavlc(
 ) -> bool {
     let [a_top, b_top, _c, _d] = mbaff_pair_neighbour_addrs(curr_mb_addr, pic_width_in_mbs);
     for addr in [a_top, b_top].into_iter().flatten() {
-        if let Some(info) = grid.mbs.get(addr as usize) {
-            if info.is_available {
-                return info.mb_field_decoding_flag;
-            }
+        if let Some(info) = grid.mbs.get(addr as usize)
+            && info.is_available
+        {
+            return info.mb_field_decoding_flag;
         }
     }
     false
@@ -1118,11 +1116,7 @@ fn decode_mb_field_decoding_flag_cabac(
         if !info.available {
             return 0;
         }
-        if info.mb_field_decoding_flag {
-            1
-        } else {
-            0
-        }
+        if info.mb_field_decoding_flag { 1 } else { 0 }
     };
     let cond_a = cond_term(a_top);
     let cond_b = cond_term(b_top);
@@ -1415,7 +1409,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.u(1, 1); // mb_field_decoding_flag = 1 (top of pair, even addr)
         append_i_nxn_mb(&mut w); // top MB
-                                 // No mb_field_decoding_flag at the bottom (top wasn't skipped).
+        // No mb_field_decoding_flag at the bottom (top wasn't skipped).
         append_i_nxn_mb(&mut w); // bottom MB
         w.trailing();
         let bytes = w.into_bytes();
@@ -1463,7 +1457,7 @@ mod tests {
         // same flag.
         let mut w = BitWriter::new();
         w.ue(1); // mb_skip_run = 1 → top MB skipped
-                 // Now CurrMbAddr = 1 (bottom of pair), prevMbSkipped = true.
+        // Now CurrMbAddr = 1 (bottom of pair), prevMbSkipped = true.
         w.u(1, 1); // mb_field_decoding_flag = 1 (read at bottom)
         w.ue(5); // mb_type = 5 on P = I_NxN
         for _ in 0..16 {
@@ -1593,7 +1587,7 @@ mod tests {
                 assert_eq!(sd.mb_field_decoding_flags.len(), sd.macroblocks.len());
                 // Pair flag consistency: for each complete pair, both
                 // MBs should carry the same flag value.
-                for pair in sd.mb_field_decoding_flags.chunks_exact(2) {
+                for pair in sd.mb_field_decoding_flags.as_chunks::<2>().0 {
                     assert_eq!(pair[0], pair[1], "MBs in a pair share the flag");
                 }
             }
@@ -1694,8 +1688,8 @@ mod tests {
 
         let mut w = BitWriter::new();
         w.ue(25); // mb_type = 25 → I_PCM in I slices (§Table 7-11).
-                  // §7.3.5: pcm_alignment_zero_bit consumed until byte-aligned.
-                  // We're already aligned after the ue(25), but for clarity:
+        // §7.3.5: pcm_alignment_zero_bit consumed until byte-aligned.
+        // We're already aligned after the ue(25), but for clarity:
         while w.bit_pos != 0 {
             w.u(1, 0);
         }

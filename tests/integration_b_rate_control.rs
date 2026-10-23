@@ -194,7 +194,7 @@ fn b_gop_structure_and_kinds() {
     cfg.b_frames = 3;
     let (stream, infos, sources) = run_b_session(EncoderSession::new(cfg), 18);
 
-    use SessionFrameKind::{Idr, B, P};
+    use SessionFrameKind::{B, Idr, P};
     let expected: &[(SessionFrameKind, u64)] = &[
         (Idr, 0),
         (P, 4),

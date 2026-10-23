@@ -18,7 +18,7 @@
 //! is ignored.
 
 use crate::bitstream::{BitError, BitReader};
-use crate::scaling_list::{parse_scaling_list, ScalingListError};
+use crate::scaling_list::{ScalingListError, parse_scaling_list};
 use crate::sps::ScalingListEntry;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -533,7 +533,7 @@ mod tests {
         w.u(1, 1); // deblocking_filter_control_present_flag
         w.u(1, 0); // constrained_intra_pred_flag
         w.u(1, 1); // redundant_pic_cnt_present_flag
-                   // more_rbsp_data() is true → tail follows.
+        // more_rbsp_data() is true → tail follows.
         w.u(1, 1); // transform_8x8_mode_flag
         w.u(1, 0); // pic_scaling_matrix_present_flag
         w.se(-3); // second_chroma_qp_index_offset
@@ -579,10 +579,10 @@ mod tests {
         w.u(1, 0); // deblocking_filter_control_present
         w.u(1, 0); // constrained_intra_pred
         w.u(1, 0); // redundant_pic_cnt_present
-                   // Tail:
+        // Tail:
         w.u(1, 1); // transform_8x8_mode_flag
         w.u(1, 1); // pic_scaling_matrix_present_flag
-                   // Loop: 6 + 2 = 8 entries, all flags 0.
+        // Loop: 6 + 2 = 8 entries, all flags 0.
         for _ in 0..8 {
             w.u(1, 0);
         }
@@ -685,7 +685,7 @@ mod tests {
         w.ue(2); // num_slice_groups_minus1 = 2
         w.ue(6); // slice_group_map_type = 6 (explicit)
         w.ue(3); // pic_size_in_map_units_minus1 = 3
-                 // ceil_log2(3) = 2 bits per slice_group_id.
+        // ceil_log2(3) = 2 bits per slice_group_id.
         w.u(2, 0);
         w.u(2, 1);
         w.u(2, 2);

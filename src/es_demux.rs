@@ -25,7 +25,7 @@ use oxideav_core::{
     PixelFormat, ProbeData, ProbeScore, Rational, ReadSeek, Result, StreamInfo, TimeBase,
 };
 
-use crate::nal::{parse_nal_unit, AnnexBSplitter};
+use crate::nal::{AnnexBSplitter, parse_nal_unit};
 use crate::sps::Sps;
 
 /// Container name the demuxer registers under.

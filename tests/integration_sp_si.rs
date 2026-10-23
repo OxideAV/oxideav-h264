@@ -24,8 +24,8 @@
 use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::sp::{
-    encode_ipcm_idr, encode_si_picture, encode_sp_picture, encode_sp_switch_picture,
-    sp_parameter_sets, SpConfig,
+    SpConfig, encode_ipcm_idr, encode_si_picture, encode_sp_picture, encode_sp_switch_picture,
+    sp_parameter_sets,
 };
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 

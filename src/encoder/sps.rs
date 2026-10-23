@@ -188,7 +188,7 @@ pub(crate) fn write_scaling_list_slot(
             if list_idx < 6 {
                 let vals = if list_idx < 3 { &l.intra4 } else { &l.inter4 };
                 write_scaling_list_values(w, vals);
-            } else if (list_idx - 6) % 2 == 0 {
+            } else if (list_idx - 6).is_multiple_of(2) {
                 write_scaling_list_values(w, &l.intra8);
             } else {
                 write_scaling_list_values(w, &l.inter8);
@@ -344,7 +344,7 @@ pub fn build_sps_rbsp_with_bypass(cfg: &BaselineSpsConfig, transform_bypass: boo
             "interlaced_fields requires a non-Baseline profile (§A.2.1)",
         );
         debug_assert!(
-            cfg.height_in_mbs % 2 == 0,
+            cfg.height_in_mbs.is_multiple_of(2),
             "FrameHeightInMbs must be even for field coding",
         );
         // §7.4.2.1.1 eq. 7-15/7-16 — with frame_mbs_only_flag == 0 a

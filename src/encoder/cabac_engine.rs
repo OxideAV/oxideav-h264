@@ -146,9 +146,15 @@ impl CabacEncoder {
             eprintln!(
                 "[ENC {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_low={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_low={:>4}",
                 self.bin_count,
-                pre_state, pre_mps, pre_range, pre_low,
+                pre_state,
+                pre_mps,
+                pre_range,
+                pre_low,
                 bin,
-                ctx.state_idx, ctx.val_mps, self.cod_i_range, self.cod_i_low,
+                ctx.state_idx,
+                ctx.val_mps,
+                self.cod_i_range,
+                self.cod_i_low,
             );
         }
     }
@@ -182,10 +188,7 @@ impl CabacEncoder {
         if trace_on {
             eprintln!(
                 "[ENC {:>8}] BP pre_range={:>4} pre_low={:>4} bin={} post_range={:>4} post_low={:>4}",
-                self.bin_count,
-                pre_range, pre_low,
-                bin,
-                self.cod_i_range, self.cod_i_low,
+                self.bin_count, pre_range, pre_low, bin, self.cod_i_range, self.cod_i_low,
             );
         }
     }
@@ -213,10 +216,7 @@ impl CabacEncoder {
         if trace_on {
             eprintln!(
                 "[ENC {:>8}] TT pre_range={:>4} pre_low={:>4} bin={} post_range={:>4} post_low={:>4}",
-                self.bin_count,
-                pre_range, pre_low,
-                bin,
-                self.cod_i_range, self.cod_i_low,
+                self.bin_count, pre_range, pre_low, bin, self.cod_i_range, self.cod_i_low,
             );
         }
     }

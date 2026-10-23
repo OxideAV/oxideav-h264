@@ -2,7 +2,8 @@
 name = "oxideav-h264-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
+rust-version = "1.95"
 
 [package.metadata]
 cargo-fuzz = true
@@ -10,14 +11,14 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 oxideav-core = "0.1"
-# libloading is the only libavcodec interop: the ffmpeg oracle harness
+# dlsym is the only libavcodec interop: the ffmpeg oracle harness
 # `dlopen`s the system-installed libavcodec shared library at startup.
 # No `*-sys` crate, no libavcodec source pulled into the dep tree.
 # The harness skips silently when the shared library isn't installed
 # (see fuzz/src/lib.rs). Workspace policy bars vendoring libavcodec
 # source — we only inspect the public C header (<libavcodec/avcodec.h>)
 # for function signatures + struct layouts.
-libloading = "0.8"
+dlsym = "0.0.2"
 
 [dependencies.oxideav-h264]
 path = ".."

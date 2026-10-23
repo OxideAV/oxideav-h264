@@ -35,20 +35,20 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::deblock::{
-    alpha_from_index, beta_from_index, derive_boundary_strength, filter_edge, tc0_from, BsInputs,
-    EdgeSamples, FilterParams, Plane,
+    BsInputs, EdgeSamples, FilterParams, Plane, alpha_from_index, beta_from_index,
+    derive_boundary_strength, filter_edge, tc0_from,
 };
-use crate::inter_pred::{weighted_pred_explicit, BiPredMode, WeightedEntry};
+use crate::inter_pred::{BiPredMode, WeightedEntry, weighted_pred_explicit};
 use crate::intra_pred::{
-    filter_samples_8x8, predict_16x16, predict_4x4, predict_8x8, predict_chroma,
-    ChromaArrayType as IpChromaArrayType, Intra16x16Mode, Intra4x4Mode, Intra8x8Mode,
-    IntraChromaMode, Neighbour4x4Availability, Samples16x16, Samples4x4, Samples8x8, SamplesChroma,
+    ChromaArrayType as IpChromaArrayType, Intra4x4Mode, Intra8x8Mode, Intra16x16Mode,
+    IntraChromaMode, Neighbour4x4Availability, Samples4x4, Samples8x8, Samples16x16, SamplesChroma,
+    filter_samples_8x8, predict_4x4, predict_8x8, predict_16x16, predict_chroma,
 };
 use crate::macroblock_layer::{Macroblock, MbType, SubMbType};
 use crate::mb_grid::{MbGrid, MbInfo};
 use crate::mv_deriv::{
-    derive_b_spatial_direct_with_d, derive_median_mvpred, derive_mvpred_with_d,
-    derive_p_skip_mv_with_d, Mv, MvpredInputs, MvpredShape, NeighbourMv,
+    Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_b_spatial_direct_with_d,
+    derive_median_mvpred, derive_mvpred_with_d, derive_p_skip_mv_with_d,
 };
 use crate::picture::Picture;
 use crate::pps::Pps;
@@ -61,10 +61,10 @@ use crate::sp_transform::{
 };
 use crate::sps::Sps;
 use crate::transform::{
-    intra_bypass_dpcm, inverse_hadamard_chroma_dc_420, inverse_hadamard_chroma_dc_422,
-    inverse_hadamard_luma_dc_16x16, inverse_transform_4x4, inverse_transform_4x4_dc_preserved,
-    inverse_transform_8x8, qp_bd_offset, qp_y_to_qp_c_with_bd_offset, select_scaling_list_4x4,
-    select_scaling_list_8x8, TransformError,
+    TransformError, intra_bypass_dpcm, inverse_hadamard_chroma_dc_420,
+    inverse_hadamard_chroma_dc_422, inverse_hadamard_luma_dc_16x16, inverse_transform_4x4,
+    inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
+    qp_y_to_qp_c_with_bd_offset, select_scaling_list_4x4, select_scaling_list_8x8,
 };
 
 use thiserror::Error;
@@ -500,7 +500,7 @@ impl MbWriter {
             let pair_idx = mb_addr / 2;
             let pair_x = ((pair_idx % w) as i32) * 16;
             let pair_y = ((pair_idx / w) as i32) * 32;
-            let is_top = mb_addr % 2 == 0;
+            let is_top = mb_addr.is_multiple_of(2);
             (pair_x, pair_y, is_top)
         } else {
             (mb_px, mb_py, true)
@@ -521,22 +521,14 @@ impl MbWriter {
     /// pair, 1 otherwise.
     #[inline]
     fn luma_y_stride(&self) -> i32 {
-        if self.mb_field {
-            2
-        } else {
-            1
-        }
+        if self.mb_field { 2 } else { 1 }
     }
 
     /// §6.4.1 — chroma y-stride, mirror of [`luma_y_stride`] in the
     /// chroma plane.
     #[inline]
     fn chroma_y_stride(&self) -> i32 {
-        if self.mb_field {
-            2
-        } else {
-            1
-        }
+        if self.mb_field { 2 } else { 1 }
     }
 
     /// Chroma MB origin x. Derived from the luma MB origin via the
@@ -1579,7 +1571,7 @@ fn mbaff_neigh_loc_luma(grid: &MbGrid, mb_addr: u32, xn: i32, yn: i32) -> Option
         .map(|i| i.mb_field_decoding_flag)
         .unwrap_or(false);
     let curr_mb_frame_flag = !curr_field;
-    let mb_is_top = mb_addr % 2 == 0;
+    let mb_is_top = mb_addr.is_multiple_of(2);
     crate::mb_address::mbaff_neigh_location(
         xn,
         yn,
@@ -1623,7 +1615,7 @@ fn mbaff_neigh_loc_plane(
         max_w,
         max_h,
         !curr_field,
-        mb_addr % 2 == 0,
+        mb_addr.is_multiple_of(2),
         mb_addr,
         pair,
         |addr| {
@@ -1680,7 +1672,7 @@ fn mbaff_abs_chroma(
         .unwrap_or(false);
     let w = grid.width_in_mbs.max(1);
     let pair_idx = addr / 2;
-    let is_top = addr % 2 == 0;
+    let is_top = addr.is_multiple_of(2);
     let (sub_w, sub_h) = chroma_subsample(chroma_array_type);
     if sub_w == 0 || sub_h == 0 {
         return (0, 0);
@@ -1976,11 +1968,7 @@ fn derive_intra_4x4_pred_mode(
         predicted
     } else {
         let rem = pred.rem_intra4x4_pred_mode[block_idx];
-        if rem < predicted {
-            rem
-        } else {
-            rem + 1
-        }
+        if rem < predicted { rem } else { rem + 1 }
     }
 }
 
@@ -2038,11 +2026,7 @@ fn derive_intra_8x8_pred_mode(
         predicted
     } else {
         let rem = pred.rem_intra8x8_pred_mode[blk8];
-        if rem < predicted {
-            rem
-        } else {
-            rem + 1
-        }
+        if rem < predicted { rem } else { rem + 1 }
     }
 }
 
@@ -4813,9 +4797,9 @@ fn process_partition<R: RefPicProvider>(
     field_parity: Option<u8>,
 ) -> Result<(), ReconstructError> {
     let _ = pic; // currently unused; kept for future neighbour queries.
-                 // §8.4.1 — derive L0 / L1 MVpreds. For Direct / Skip we compute MVs
-                 // up-front via derive_p_skip_mv or a simple spatial-direct stub.
-                 // Everything else uses mvLX = mvpLX + mvdLX (eq. 8-174-ish in §8.4.1).
+    // §8.4.1 — derive L0 / L1 MVpreds. For Direct / Skip we compute MVs
+    // up-front via derive_p_skip_mv or a simple spatial-direct stub.
+    // Everything else uses mvLX = mvpLX + mvdLX (eq. 8-174-ish in §8.4.1).
     let (mv_l0, mv_l1) = derive_partition_mvs(part, mb_addr, grid, current_slice_id);
     if inter_debug {
         eprintln!(
@@ -4885,7 +4869,7 @@ fn process_partition<R: RefPicProvider>(
                         let idx = ref_idx.max(0) as u32;
                         match field_parity {
                             Some(par) => {
-                                let sel = if idx % 2 == 0 { par } else { 1 - par };
+                                let sel = if idx.is_multiple_of(2) { par } else { 1 - par };
                                 ref_pics
                                     .ref_pic_poc(list, idx / 2)
                                     .map(|p| p.wrapping_mul(4).wrapping_add(1 + sel as i32))
@@ -4962,7 +4946,7 @@ fn process_partition<R: RefPicProvider>(
                     .ok_or(ReconstructError::MissingRefPic { list, idx: idx / 2 })?;
                 // refIdxLX % 2: 0 → same parity as the current field
                 // MB, 1 → opposite parity.
-                let sel = if idx % 2 == 0 { par } else { 1 - par };
+                let sel = if idx.is_multiple_of(2) { par } else { 1 - par };
                 Ok((rp, Some(sel)))
             }
             None => Ok((
@@ -5185,45 +5169,45 @@ fn process_partition<R: RefPicProvider>(
         part.ref_idx_l1
     };
 
-    if use_explicit {
-        if let (Some(mode), Some(pwt)) = (bi_mode, slice_header.pred_weight_table.as_ref()) {
-            // §8.4.2.3.2 — explicit weighted sample prediction for luma.
-            let log2_wd = pwt.luma_log2_weight_denom;
-            let w_l0 = luma_weight_entry(pwt, 0, wp_ref_l0, log2_wd);
-            let w_l1 = luma_weight_entry(pwt, 1, wp_ref_l1, log2_wd);
-            // Scratch partition-sized buffer so we can use the spec's
-            // dst/dst_stride API directly.
-            let mut scratch = vec![0i32; (w as usize) * (h as usize)];
-            let l0_opt = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                Some(l0_buf.as_slice())
-            } else {
-                None
-            };
-            let l1_opt = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                Some(l1_buf.as_slice())
-            } else {
-                None
-            };
-            weighted_pred_explicit(
-                l0_opt,
-                l1_opt,
-                w as usize,
-                w,
-                h,
-                mode,
-                w_l0,
-                w_l1,
-                log2_wd,
-                bit_depth_y,
-                &mut scratch,
-                w as usize,
-            );
-            // Copy back into pred_luma at partition-local position.
-            for py in 0..h as usize {
-                for px in 0..w as usize {
-                    let dst_idx = (part.y as usize + py) * 16 + (part.x as usize + px);
-                    pred_luma[dst_idx] = scratch[py * w as usize + px];
-                }
+    if use_explicit
+        && let (Some(mode), Some(pwt)) = (bi_mode, slice_header.pred_weight_table.as_ref())
+    {
+        // §8.4.2.3.2 — explicit weighted sample prediction for luma.
+        let log2_wd = pwt.luma_log2_weight_denom;
+        let w_l0 = luma_weight_entry(pwt, 0, wp_ref_l0, log2_wd);
+        let w_l1 = luma_weight_entry(pwt, 1, wp_ref_l1, log2_wd);
+        // Scratch partition-sized buffer so we can use the spec's
+        // dst/dst_stride API directly.
+        let mut scratch = vec![0i32; (w as usize) * (h as usize)];
+        let l0_opt = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
+            Some(l0_buf.as_slice())
+        } else {
+            None
+        };
+        let l1_opt = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
+            Some(l1_buf.as_slice())
+        } else {
+            None
+        };
+        weighted_pred_explicit(
+            l0_opt,
+            l1_opt,
+            w as usize,
+            w,
+            h,
+            mode,
+            w_l0,
+            w_l1,
+            log2_wd,
+            bit_depth_y,
+            &mut scratch,
+            w as usize,
+        );
+        // Copy back into pred_luma at partition-local position.
+        for py in 0..h as usize {
+            for px in 0..w as usize {
+                let dst_idx = (part.y as usize + py) * 16 + (part.x as usize + px);
+                pred_luma[dst_idx] = scratch[py * w as usize + px];
             }
         }
     }
@@ -5233,8 +5217,8 @@ fn process_partition<R: RefPicProvider>(
     if chroma_array_type == 1 || chroma_array_type == 2 {
         let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
         let c_mb_px = mb_px / 2; // 4:2:0 and 4:2:2 both halve width.
-                                 // Field MBs: `mb_py_mc` is already in field luma rows; the
-                                 // chroma origin subsamples it exactly like the frame case.
+        // Field MBs: `mb_py_mc` is already in field luma rows; the
+        // chroma origin subsamples it exactly like the frame case.
         let c_mb_py = if chroma_array_type == 1 {
             mb_py_mc / 2
         } else {
@@ -5285,11 +5269,11 @@ fn process_partition<R: RefPicProvider>(
                         None
                     }
                 });
-                if let (Some(cur_par), Some(ref_par)) = (cur, refp) {
-                    if ref_par != cur_par {
-                        let d = if ref_par == 0 { 2 } else { -2 };
-                        return Mv::new(mv.x, mv.y + d);
-                    }
+                if let (Some(cur_par), Some(ref_par)) = (cur, refp)
+                    && ref_par != cur_par
+                {
+                    let d = if ref_par == 0 { 2 } else { -2 };
+                    return Mv::new(mv.x, mv.y + d);
                 }
             }
             mv
@@ -7023,7 +7007,7 @@ fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
             // odd (§8.4.2.1 field references in MBAFF).
             let unit = units.get(i >> 1).copied();
             let col_parity = (mb_addr_col % 2) as u8;
-            let parity = if i % 2 == 0 {
+            let parity = if i.is_multiple_of(2) {
                 col_parity
             } else {
                 1 - col_parity
@@ -7376,11 +7360,7 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
     // should fire) before the helper's step-5 fallback collapses them
     // to 0.
     fn min_positive(x: i32, y: i32) -> i32 {
-        if x >= 0 && y >= 0 {
-            x.min(y)
-        } else {
-            x.max(y)
-        }
+        if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) }
     }
     // §8.4.1.3.2 eq. 8-214..8-216 — C→D substitution when C is
     // unavailable (partition_available == false).
@@ -8114,11 +8094,11 @@ fn compute_luma_nonzero_mask(mb: &Macroblock) -> u16 {
             let mut any_nz = false;
             for sub in 0..4usize {
                 let slot = base_slot + sub;
-                if let Some(c) = mb.residual_luma.get(slot) {
-                    if c.iter().any(|v| *v != 0) {
-                        any_nz = true;
-                        break;
-                    }
+                if let Some(c) = mb.residual_luma.get(slot)
+                    && c.iter().any(|v| *v != 0)
+                {
+                    any_nz = true;
+                    break;
                 }
             }
             if any_nz {
@@ -8142,12 +8122,12 @@ fn compute_luma_nonzero_mask(mb: &Macroblock) -> u16 {
         let base_slot = set_before * 4;
         for sub in 0..4usize {
             let slot = base_slot + sub;
-            if let Some(c) = mb.residual_luma.get(slot) {
-                if c.iter().any(|v| *v != 0) {
-                    // Z-scan position of this 4x4 block.
-                    let z = quad * 4 + sub;
-                    mask |= 1 << z;
-                }
+            if let Some(c) = mb.residual_luma.get(slot)
+                && c.iter().any(|v| *v != 0)
+            {
+                // Z-scan position of this 4x4 block.
+                let z = quad * 4 + sub;
+                mask |= 1 << z;
             }
         }
     }
@@ -8372,7 +8352,7 @@ fn pixel_to_mb_addr(
     }
     let pair_top_addr = 2 * (pair_row as u32 * grid.width_in_mbs + mb_x as u32);
     let bot_addr = pair_top_addr + 1; // bottom MB of the pair
-                                      // Inspect the top MB's mb_field_decoding_flag (shared within a pair).
+    // Inspect the top MB's mb_field_decoding_flag (shared within a pair).
     let pair_field = mb_field_flags
         .get(pair_top_addr as usize)
         .copied()
@@ -9859,7 +9839,12 @@ fn deblock_plane_chroma(
                             if deblock_trace_enabled() {
                                 eprintln!(
                                     "DBL C{} Vx={edge_x} y0={y0} bs={bs} plane={plane} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={} p_nz={} q_nz={} diff_ref_mv={}",
-                                    plane, p_info.is_intra, q_info.is_intra, p_has_nz, q_has_nz, diff_ref_mv,
+                                    plane,
+                                    p_info.is_intra,
+                                    q_info.is_intra,
+                                    p_has_nz,
+                                    q_has_nz,
+                                    diff_ref_mv,
                                 );
                             }
                             if bs == 0 {
@@ -10090,13 +10075,7 @@ fn deblock_plane_chroma_444(
     // §8.7.2 — for an I_PCM macroblock the chroma edge qPz is the QPC
     // that corresponds to QPY == 0 (not the stored prev-QPY). Honour
     // this per side when deriving QPC.
-    let side_qp = |info: &MbInfo| -> i32 {
-        if info.is_i_pcm {
-            0
-        } else {
-            info.qp_y
-        }
-    };
+    let side_qp = |info: &MbInfo| -> i32 { if info.is_i_pcm { 0 } else { info.qp_y } };
 
     for plane in 0..2u8 {
         let offset = if plane == 0 { cb_offset } else { cr_offset };
@@ -11673,9 +11652,9 @@ mod tests {
         }
         let mut pred = MbPred::default();
         pred.prev_intra4x4_pred_mode_flag[0] = true; // use predicted mode
-                                                     // Without constrained_intra_pred_flag: A=inter contributes 2
-                                                     // (step 3 bullet 1 via "not Intra_4x4 or Intra_8x8"), B=6.
-                                                     // predicted = min(2, 6) = 2. With prev_flag=true → 2.
+        // Without constrained_intra_pred_flag: A=inter contributes 2
+        // (step 3 bullet 1 via "not Intra_4x4 or Intra_8x8"), B=6.
+        // predicted = min(2, 6) = 2. With prev_flag=true → 2.
         assert_eq!(derive_intra_4x4_pred_mode(&grid, 4, 0, &pred, false, -1), 2);
         // With constrained_intra_pred_flag = 1: A treated as
         // unavailable → dcPredFlag = 1 → both sides 2 → predicted = 2.
@@ -13663,8 +13642,8 @@ mod tests {
             // residual block.
             let mut first_entry = [0i32; 16];
             first_entry[0] = 4; // AC path, with scaling -> non-zero.
-                                // Fill the array with the number of entries the parser
-                                // would emit: 4 per set cbp_luma bit, placed sequentially.
+            // Fill the array with the number of entries the parser
+            // would emit: 4 per set cbp_luma bit, placed sequentially.
             let n = (cbp & 0x0F).count_ones() as usize * 4;
             let mut residual_luma = Vec::with_capacity(n);
             for i in 0..n {

@@ -23,7 +23,7 @@ use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase, VideoFrame};
 use oxideav_h264::encoder::{Encoder, EncoderConfig, YuvFrame};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
-use oxideav_h264::nal::{parse_nal_unit, AnnexBSplitter, NalUnitType};
+use oxideav_h264::nal::{AnnexBSplitter, NalUnitType, parse_nal_unit};
 
 const W: usize = 64;
 const H: usize = 64;

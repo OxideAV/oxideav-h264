@@ -179,31 +179,31 @@ impl MbQpTracker {
 use crate::encoder::bitstream::BitWriter;
 use crate::encoder::cavlc::encode_residual_block_cavlc;
 use crate::encoder::deblock::{
-    chroma_nz_mask_from_blocks, luma_nz_mask_from_blocks, MbDeblockInfo,
-};
-use crate::encoder::intra4x4::{
-    availability as i4x4_avail, predict_4x4, Intra4x4Mode, LUMA_4X4_XY as I4X4_XY,
+    MbDeblockInfo, chroma_nz_mask_from_blocks, luma_nz_mask_from_blocks,
 };
 use crate::encoder::intra_pred::{
-    predict_16x16, predict_16x16_avail, predict_chroma_8x8_avail, sad_8x8, I16x16Mode,
-    IntraChromaMode,
+    I16x16Mode, IntraChromaMode, predict_16x16, predict_16x16_avail, predict_chroma_8x8_avail,
+    sad_8x8,
+};
+use crate::encoder::intra4x4::{
+    Intra4x4Mode, LUMA_4X4_XY as I4X4_XY, availability as i4x4_avail, predict_4x4,
 };
 use crate::encoder::macroblock::{
-    write_b_16x16_mb, write_b_8x8_mixed_mb, write_i8x8_mb, write_i_nxn_mb, write_intra16x16_mb,
-    write_intra16x16_mb_in_inter_slice, write_p_8x8_all_pl08x8_mb, B16x16McbConfig,
-    B8x8MixedMcbConfig, BPartPred, BPred16x16, BSubMbCell, I16x16McbConfig, I8x8McbConfig,
-    INxNMcbConfig, P8x8AllPL08x8McbConfig, PL016x16McbConfig,
+    B8x8MixedMcbConfig, B16x16McbConfig, BPartPred, BPred16x16, BSubMbCell, I8x8McbConfig,
+    I16x16McbConfig, INxNMcbConfig, P8x8AllPL08x8McbConfig, PL016x16McbConfig,
+    write_b_8x8_mixed_mb, write_b_16x16_mb, write_i_nxn_mb, write_i8x8_mb, write_intra16x16_mb,
+    write_intra16x16_mb_in_inter_slice, write_p_8x8_all_pl08x8_mb,
 };
-use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
+use crate::encoder::me::{search_quarter_pel_8x8, search_quarter_pel_16x16};
 use crate::encoder::nal::build_nal_unit;
-use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
-use crate::encoder::rdo::{cost_combined, lambda_ssd, ssd_16x16, ssd_4x4};
+use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
+use crate::encoder::rdo::{cost_combined, lambda_ssd, ssd_4x4, ssd_16x16};
 use crate::encoder::slice::{
-    write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
-    ExplicitBipredWeightTable, ExplicitPredWeightTableL0, FieldPicSignal, IdrSliceHeaderConfig,
-    PSliceHeaderConfig,
+    BSliceHeaderConfig, ExplicitBipredWeightTable, ExplicitPredWeightTableL0, FieldPicSignal,
+    IdrSliceHeaderConfig, PSliceHeaderConfig, write_b_slice_header, write_idr_i_slice_header,
+    write_p_slice_header,
 };
-use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
+use crate::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
 use crate::encoder::transform::{
     deinterleave_8x8_to_4x4, forward_core_4x4, forward_core_8x8, forward_hadamard_2x2,
     forward_hadamard_4x4, quantize_4x4_ac_w, quantize_4x4_w, quantize_8x8_w, quantize_chroma_dc_w,
@@ -211,15 +211,15 @@ use crate::encoder::transform::{
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::intra_pred::{
-    filter_samples_8x8, predict_8x8, Intra8x8Mode, Neighbour4x4Availability, Samples8x8,
+    Intra8x8Mode, Neighbour4x4Availability, Samples8x8, filter_samples_8x8, predict_8x8,
 };
-use crate::macroblock_layer::{derive_nc_luma, CavlcNcGrid, LumaNcKind};
+use crate::macroblock_layer::{CavlcNcGrid, LumaNcKind, derive_nc_luma};
 use crate::mv_deriv::{Mv, MvpredInputs, NeighbourMv};
 use crate::nal::NalUnitType;
 use crate::transform::{
-    inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16, inverse_scan_4x4_zigzag_ac,
-    inverse_transform_4x4, inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
-    qp_y_to_qp_c_with_bd_offset, FLAT_4X4_16,
+    FLAT_4X4_16, inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
+    inverse_scan_4x4_zigzag_ac, inverse_transform_4x4, inverse_transform_4x4_dc_preserved,
+    inverse_transform_8x8, qp_bd_offset, qp_y_to_qp_c_with_bd_offset,
 };
 
 /// §6.4.3 / Figure 6-10 — luma 4x4 block scan: index 0..=15 → (x, y)
@@ -375,8 +375,8 @@ impl ScalingMatrixMode {
     /// block shape.
     pub(crate) fn intra_weights(self) -> WeightPair {
         use crate::transform::{
-            weight_scale_4x4_from_scan, weight_scale_8x8_from_scan, DEFAULT_4X4_INTRA,
-            DEFAULT_8X8_INTRA, FLAT_8X8_16,
+            DEFAULT_4X4_INTRA, DEFAULT_8X8_INTRA, FLAT_8X8_16, weight_scale_4x4_from_scan,
+            weight_scale_8x8_from_scan,
         };
         match self {
             ScalingMatrixMode::Flat => WeightPair {
@@ -399,8 +399,8 @@ impl ScalingMatrixMode {
     /// Round-391 — consumed by the P/B residual quantisers.
     pub(crate) fn inter_weights(self) -> WeightPair {
         use crate::transform::{
-            weight_scale_4x4_from_scan, weight_scale_8x8_from_scan, DEFAULT_4X4_INTER,
-            DEFAULT_8X8_INTER, FLAT_8X8_16,
+            DEFAULT_4X4_INTER, DEFAULT_8X8_INTER, FLAT_8X8_16, weight_scale_4x4_from_scan,
+            weight_scale_8x8_from_scan,
         };
         match self {
             ScalingMatrixMode::Flat => WeightPair {
@@ -1480,7 +1480,7 @@ impl Encoder {
 impl Encoder {
     pub fn new(cfg: EncoderConfig) -> Self {
         assert!(
-            cfg.width % 16 == 0 && cfg.height % 16 == 0,
+            cfg.width.is_multiple_of(16) && cfg.height.is_multiple_of(16),
             "encoder requires 16-pixel-aligned dimensions",
         );
         assert!((0..=51).contains(&cfg.qp));
@@ -1766,26 +1766,27 @@ impl Encoder {
             // Round 430 — MB-row QP modulation (IDR): identical
             // response curve to the round-420 P controller (see
             // `encode_p_impl` for the asymmetric-clamp rationale).
-            if let Some(budget) = row_budget_bits {
-                if mb_y > 0 && budget > 0 {
-                    let frac = f64::from(mb_y) / f64::from(height_mbs);
-                    let spent = sw.bits_emitted() as f64;
-                    let expected = (budget as f64 * frac).max(1.0);
-                    let ratio = spent.max(1.0) / expected;
-                    let adj = if ratio >= 1.0 {
-                        (6.0 * ratio.log2()).round() as i32
-                    } else {
-                        (3.0 * ratio.log2()).round() as i32
-                    };
-                    let mut new_want = frame_qp + adj;
-                    if new_want < frame_qp && frac < 0.6 {
-                        new_want = frame_qp;
-                    }
-                    want_qp = new_want
-                        .clamp(want_qp - 1, want_qp + 2)
-                        .clamp(frame_qp - 2, frame_qp + 6)
-                        .clamp(0, 51);
+            if let Some(budget) = row_budget_bits
+                && mb_y > 0
+                && budget > 0
+            {
+                let frac = f64::from(mb_y) / f64::from(height_mbs);
+                let spent = sw.bits_emitted() as f64;
+                let expected = (budget as f64 * frac).max(1.0);
+                let ratio = spent.max(1.0) / expected;
+                let adj = if ratio >= 1.0 {
+                    (6.0 * ratio.log2()).round() as i32
+                } else {
+                    (3.0 * ratio.log2()).round() as i32
+                };
+                let mut new_want = frame_qp + adj;
+                if new_want < frame_qp && frac < 0.6 {
+                    new_want = frame_qp;
                 }
+                want_qp = new_want
+                    .clamp(want_qp - 1, want_qp + 2)
+                    .clamp(frame_qp - 2, frame_qp + 6)
+                    .clamp(0, 51);
             }
             let qp_y = want_qp;
             let qp_c = qp_y_to_qp_c_with_bd_offset(
@@ -3076,7 +3077,7 @@ impl Encoder {
         let mut prev_flag = [false; 16];
         let mut rem = [0u8; 16];
         let mut luma_4x4_levels_scan = [[0i32; 16]; 16]; // scan-order per block
-                                                         // §8.5.9 — effective intra weightScale for this MB shape.
+        // §8.5.9 — effective intra weightScale for this MB shape.
         let wq = self.cfg.scaling_matrix.intra_weights();
         let mut luma_4x4_quant_raster = [[0i32; 16]; 16]; // raster-order quantized levels (for inverse)
         let mut blk_has_nz = [false; 16];
@@ -6370,30 +6371,31 @@ impl Encoder {
             // complexity cliff would otherwise be entered at a
             // too-fine QP), and sustained underspend is reclaimed by
             // the frame-level controller on the next picture anyway.
-            if let Some(budget) = row_budget_bits {
-                if mb_y > 0 && budget > 0 {
-                    let frac = mb_y as f64 / height_mbs as f64;
-                    let spent = sw.bits_emitted() as f64;
-                    let expected = (budget as f64 * frac).max(1.0);
-                    let ratio = spent.max(1.0) / expected;
-                    let adj = if ratio >= 1.0 {
-                        (6.0 * ratio.log2()).round() as i32
-                    } else {
-                        (3.0 * ratio.log2()).round() as i32
-                    };
-                    let mut new_want = frame_qp + adj;
-                    // Refinement below the frame QP is only trusted
-                    // once most of the slice has proven cheap — a
-                    // front-loaded saving is routinely an artefact of
-                    // a rear-loaded complexity distribution.
-                    if new_want < frame_qp && frac < 0.6 {
-                        new_want = frame_qp;
-                    }
-                    want_qp = new_want
-                        .clamp(want_qp - 1, want_qp + 2)
-                        .clamp(frame_qp - 2, frame_qp + 6)
-                        .clamp(0, 51);
+            if let Some(budget) = row_budget_bits
+                && mb_y > 0
+                && budget > 0
+            {
+                let frac = mb_y as f64 / height_mbs as f64;
+                let spent = sw.bits_emitted() as f64;
+                let expected = (budget as f64 * frac).max(1.0);
+                let ratio = spent.max(1.0) / expected;
+                let adj = if ratio >= 1.0 {
+                    (6.0 * ratio.log2()).round() as i32
+                } else {
+                    (3.0 * ratio.log2()).round() as i32
+                };
+                let mut new_want = frame_qp + adj;
+                // Refinement below the frame QP is only trusted
+                // once most of the slice has proven cheap — a
+                // front-loaded saving is routinely an artefact of
+                // a rear-loaded complexity distribution.
+                if new_want < frame_qp && frac < 0.6 {
+                    new_want = frame_qp;
                 }
+                want_qp = new_want
+                    .clamp(want_qp - 1, want_qp + 2)
+                    .clamp(frame_qp - 2, frame_qp + 6)
+                    .clamp(0, 51);
             }
             let qp_y = want_qp;
             let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, chroma_qp_index_offset, qp_bd_offset_c);
@@ -8719,13 +8721,7 @@ fn b_spatial_direct_derive(
     } else {
         c_l1
     };
-    let min_pos = |x: i32, y: i32| -> i32 {
-        if x >= 0 && y >= 0 {
-            x.min(y)
-        } else {
-            x.max(y)
-        }
-    };
+    let min_pos = |x: i32, y: i32| -> i32 { if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) } };
     let r0_minp = min_pos(a_l0.ref_idx, min_pos(b_l0.ref_idx, c_l0_eff.ref_idx));
     let r1_minp = min_pos(a_l1.ref_idx, min_pos(b_l1.ref_idx, c_l1_eff.ref_idx));
     let direct_zero = r0_minp < 0 && r1_minp < 0;
@@ -11013,11 +11009,7 @@ fn deblock_mv_arr_b(
                 for (blk, slot) in mvs.iter_mut().enumerate() {
                     let (_bx, by) = LUMA_4X4_BLK[blk];
                     *slot = if by < 2 {
-                        if used_a {
-                            mv_a_t
-                        } else {
-                            (0, 0)
-                        }
+                        if used_a { mv_a_t } else { (0, 0) }
                     } else if used_b {
                         mv_b_t
                     } else {
@@ -11037,11 +11029,7 @@ fn deblock_mv_arr_b(
                 for (blk, slot) in mvs.iter_mut().enumerate() {
                     let (bx, _by) = LUMA_4X4_BLK[blk];
                     *slot = if bx < 2 {
-                        if used_a {
-                            mv_a_t
-                        } else {
-                            (0, 0)
-                        }
+                        if used_a { mv_a_t } else { (0, 0) }
                     } else if used_b {
                         mv_b_t
                     } else {
@@ -11424,26 +11412,27 @@ impl Encoder {
             // +2 per row toward frame_qp + 6, undershoot descends one
             // step toward frame_qp - 2 and only once most of the
             // slice has proven cheap).
-            if let Some(budget) = row_budget_bits {
-                if mb_y > 0 && budget > 0 {
-                    let frac = mb_y as f64 / height_mbs as f64;
-                    let spent = sw.bits_emitted() as f64;
-                    let expected = (budget as f64 * frac).max(1.0);
-                    let ratio = spent.max(1.0) / expected;
-                    let adj = if ratio >= 1.0 {
-                        (6.0 * ratio.log2()).round() as i32
-                    } else {
-                        (3.0 * ratio.log2()).round() as i32
-                    };
-                    let mut new_want = frame_qp + adj;
-                    if new_want < frame_qp && frac < 0.6 {
-                        new_want = frame_qp;
-                    }
-                    want_qp = new_want
-                        .clamp(want_qp - 1, want_qp + 2)
-                        .clamp(frame_qp - 2, frame_qp + 6)
-                        .clamp(0, 51);
+            if let Some(budget) = row_budget_bits
+                && mb_y > 0
+                && budget > 0
+            {
+                let frac = mb_y as f64 / height_mbs as f64;
+                let spent = sw.bits_emitted() as f64;
+                let expected = (budget as f64 * frac).max(1.0);
+                let ratio = spent.max(1.0) / expected;
+                let adj = if ratio >= 1.0 {
+                    (6.0 * ratio.log2()).round() as i32
+                } else {
+                    (3.0 * ratio.log2()).round() as i32
+                };
+                let mut new_want = frame_qp + adj;
+                if new_want < frame_qp && frac < 0.6 {
+                    new_want = frame_qp;
                 }
+                want_qp = new_want
+                    .clamp(want_qp - 1, want_qp + 2)
+                    .clamp(frame_qp - 2, frame_qp + 6)
+                    .clamp(0, 51);
             }
             let qp_y = want_qp;
             let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, chroma_qp_index_offset, qp_bd_offset_c);
@@ -12824,7 +12813,7 @@ impl Encoder {
                 write_b_8x8_mixed_mb(sw, &mcfg, 0, 0).expect("write B_8x8 mixed mb");
             } else if let Some(pc) = partition_choice.as_ref() {
                 use crate::encoder::macroblock::{
-                    write_b_16x8_mb, write_b_8x16_mb, B16x8McbConfig, B8x16McbConfig,
+                    B8x16McbConfig, B16x8McbConfig, write_b_8x16_mb, write_b_16x8_mb,
                 };
                 match pc.shape {
                     PartitionShape::P16x8 => {

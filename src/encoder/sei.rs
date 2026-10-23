@@ -137,9 +137,9 @@ pub fn build_sei_nal(messages: &[(u32, Vec<u8>)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nal::{parse_nal_unit, AnnexBSplitter};
+    use crate::nal::{AnnexBSplitter, parse_nal_unit};
     use crate::non_vcl::parse_sei_rbsp;
-    use crate::sei::{parse_buffering_period, parse_pic_timing, SeiContext};
+    use crate::sei::{SeiContext, parse_buffering_period, parse_pic_timing};
 
     fn test_hrd() -> HrdParameters {
         HrdParameters {

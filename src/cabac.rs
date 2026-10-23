@@ -406,9 +406,15 @@ impl<'a> CabacDecoder<'a> {
             eprintln!(
                 "[BIN {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_offset={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_offset={:>4}",
                 self.bin_count,
-                pre_state, pre_mps, pre_range, pre_offset,
+                pre_state,
+                pre_mps,
+                pre_range,
+                pre_offset,
                 bin_val,
-                ctx.state_idx, ctx.val_mps, self.cod_i_range, self.cod_i_offset,
+                ctx.state_idx,
+                ctx.val_mps,
+                self.cod_i_range,
+                self.cod_i_offset,
             );
         }
         Ok(bin_val)
@@ -439,10 +445,7 @@ impl<'a> CabacDecoder<'a> {
         if trace_on {
             eprintln!(
                 "[BIN {:>8}] BP pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
-                self.bin_count,
-                pre_range, pre_offset,
-                bin,
-                self.cod_i_range, self.cod_i_offset,
+                self.bin_count, pre_range, pre_offset, bin, self.cod_i_range, self.cod_i_offset,
             );
         }
         Ok(bin)
@@ -476,10 +479,7 @@ impl<'a> CabacDecoder<'a> {
         if trace_on {
             eprintln!(
                 "[BIN {:>8}] TT pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
-                self.bin_count,
-                pre_range, pre_offset,
-                bin,
-                self.cod_i_range, self.cod_i_offset,
+                self.bin_count, pre_range, pre_offset, bin, self.cod_i_range, self.cod_i_offset,
             );
         }
         Ok(bin)

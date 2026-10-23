@@ -28,7 +28,7 @@
 //! decoded-frames-per-second. Per-byte throughput is also available
 //! in the Criterion report (`Throughput::Bytes`).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::{EncodedFrameRef, Encoder, EncoderConfig, YuvFrame};
@@ -40,7 +40,7 @@ use oxideav_h264::h264_decoder::H264CodecDecoder;
 /// diagonal gradient, chroma is mid-grey. Bench inputs that have any
 /// content (vs. a constant plane) keep the entropy coder honest.
 fn make_yuv420(w: usize, h: usize, phase: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    assert!(w % 16 == 0 && h % 16 == 0);
+    assert!(w.is_multiple_of(16) && h.is_multiple_of(16));
     let mut y = vec![0u8; w * h];
     for j in 0..h {
         for i in 0..w {
@@ -75,7 +75,7 @@ fn make_b_yuv420(
 
 /// 4:2:2 (`chroma_format_idc=2`) picture — chroma is `(W/2, H)`.
 fn make_yuv422(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    assert!(w % 16 == 0 && h % 16 == 0);
+    assert!(w.is_multiple_of(16) && h.is_multiple_of(16));
     let mut y = vec![0u8; w * h];
     let mut u = vec![0u8; (w / 2) * h];
     let mut v = vec![0u8; (w / 2) * h];

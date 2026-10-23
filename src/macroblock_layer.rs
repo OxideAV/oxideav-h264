@@ -41,15 +41,15 @@
 use crate::bitstream::{BitError, BitReader};
 use crate::cabac::{CabacDecoder, CabacError};
 use crate::cabac_ctx::{
-    decode_coded_block_flag, decode_coded_block_pattern, decode_coeff_abs_level_minus1,
-    decode_coeff_sign_flag, decode_intra_chroma_pred_mode, decode_last_significant_coeff_flag,
-    decode_mb_qp_delta, decode_mb_type_b, decode_mb_type_i, decode_mb_type_p, decode_mvd_lx,
+    BlockType, CabacContexts, MvdComponent, NeighbourCtx, SliceKind, decode_coded_block_flag,
+    decode_coded_block_pattern, decode_coeff_abs_level_minus1, decode_coeff_sign_flag,
+    decode_intra_chroma_pred_mode, decode_last_significant_coeff_flag, decode_mb_qp_delta,
+    decode_mb_type_b, decode_mb_type_i, decode_mb_type_p, decode_mvd_lx,
     decode_prev_intra_pred_mode_flag, decode_ref_idx_lx, decode_rem_intra_pred_mode,
-    decode_significant_coeff_flag, decode_transform_size_8x8_flag, BlockType, CabacContexts,
-    MvdComponent, NeighbourCtx, SliceKind,
+    decode_significant_coeff_flag, decode_transform_size_8x8_flag,
 };
-use crate::cavlc::{parse_residual_block_cavlc, CavlcError, CoeffTokenContext};
-use crate::mv_deriv::{neighbour_4x4_map, NeighbourSource};
+use crate::cavlc::{CavlcError, CoeffTokenContext, parse_residual_block_cavlc};
+use crate::mv_deriv::{NeighbourSource, neighbour_4x4_map};
 use crate::pps::Pps;
 use crate::slice_header::{SliceHeader, SliceType};
 use crate::sps::Sps;
@@ -144,7 +144,9 @@ pub enum MacroblockLayerError {
     /// plus 2 * MbWidthC * MbHeightC chroma samples), then rebuild the
     /// `CabacDecoder` with `CabacDecoder::new(BitReader::new(...))`
     /// positioned after the PCM payload.
-    #[error("I_PCM macroblock in CABAC mode requires slice-level reinit at byte {cabac_byte_pos} bit {cabac_bit_pos}")]
+    #[error(
+        "I_PCM macroblock in CABAC mode requires slice-level reinit at byte {cabac_byte_pos} bit {cabac_bit_pos}"
+    )]
     IPcmNeedsCabacReinit {
         cabac_byte_pos: usize,
         cabac_bit_pos: u8,
@@ -969,7 +971,7 @@ impl CavlcNcGrid {
                 max_w,
                 max_h,
                 !curr_field,
-                mb_addr % 2 == 0,
+                mb_addr.is_multiple_of(2),
                 mb_addr,
                 pair,
                 frame_flag_of,
@@ -1628,7 +1630,7 @@ impl CabacNeighbourGrid {
             .map(|m| m.mb_field_decoding_flag)
             .unwrap_or(false);
         let curr_frame = !curr_field;
-        let mb_is_top = mb_addr % 2 == 0;
+        let mb_is_top = mb_addr.is_multiple_of(2);
         let pair = crate::mb_address::mbaff_pair_neighbour_addrs(mb_addr, self.width_in_mbs);
         let frame_flag_of = |addr: u32| -> bool {
             self.mbs
@@ -1709,7 +1711,7 @@ impl CabacNeighbourGrid {
                 max_w,
                 max_h,
                 !curr_field,
-                mb_addr % 2 == 0,
+                mb_addr.is_multiple_of(2),
                 mb_addr,
                 pair,
                 frame_flag_of,
@@ -2711,7 +2713,7 @@ pub fn parse_macroblock_dp(
             _ => {
                 return Err(MacroblockLayerError::UnsupportedChromaArrayType(
                     entropy.chroma_array_type,
-                ))
+                ));
             }
         };
         // §7.3.5 — the pcm_alignment_zero_bit / pcm_sample_* elements
@@ -2733,20 +2735,19 @@ pub fn parse_macroblock_dp(
         // any CAVLC slice that mixes I_PCM with coded macroblocks the
         // moment a neighbouring nC crosses a coeff_token table
         // boundary (round-451, found by the data-partition gates).
-        if entropy.cabac.is_none() {
-            if let Some(grid) = entropy.cavlc_nc.as_deref_mut() {
-                if let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize) {
-                    slot.is_available = true;
-                    slot.is_skip = false;
-                    slot.is_intra = true;
-                    slot.is_i_pcm = true;
-                    slot.luma_total_coeff = [0; 16];
-                    slot.cb_total_coeff = [0; 8];
-                    slot.cr_total_coeff = [0; 8];
-                    slot.cb_luma_total_coeff = [0; 16];
-                    slot.cr_luma_total_coeff = [0; 16];
-                }
-            }
+        if entropy.cabac.is_none()
+            && let Some(grid) = entropy.cavlc_nc.as_deref_mut()
+            && let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize)
+        {
+            slot.is_available = true;
+            slot.is_skip = false;
+            slot.is_intra = true;
+            slot.is_i_pcm = true;
+            slot.luma_total_coeff = [0; 16];
+            slot.cb_total_coeff = [0; 8];
+            slot.cr_total_coeff = [0; 8];
+            slot.cb_luma_total_coeff = [0; 16];
+            slot.cr_luma_total_coeff = [0; 16];
         }
         return Ok(Macroblock {
             mb_type,
@@ -2997,16 +2998,16 @@ pub fn parse_macroblock_dp(
         // NEXT MB's CABAC ctxIdxInc derivations that are not covered by
         // the residual walker's cbf_* commit (CBP, intra_chroma_pred_mode,
         // transform_size_8x8_flag, I_NxN classification).
-        if let Some(grid) = entropy.cabac_nb.as_deref_mut() {
-            if let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize) {
-                slot.coded_block_pattern_luma = (cbp_total & 0x0F) as u8;
-                slot.coded_block_pattern_chroma = ((cbp_total >> 4) & 0x03) as u8;
-                slot.is_i_nxn = mb_type.is_i_nxn();
-                slot.is_b_skip_or_direct = mb_type.is_b_skip_or_direct();
-                slot.transform_size_8x8_flag = transform_size_8x8_flag;
-                if let Some(pred) = out.mb_pred.as_ref() {
-                    slot.intra_chroma_pred_mode = pred.intra_chroma_pred_mode;
-                }
+        if let Some(grid) = entropy.cabac_nb.as_deref_mut()
+            && let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize)
+        {
+            slot.coded_block_pattern_luma = (cbp_total & 0x0F) as u8;
+            slot.coded_block_pattern_chroma = ((cbp_total >> 4) & 0x03) as u8;
+            slot.is_i_nxn = mb_type.is_i_nxn();
+            slot.is_b_skip_or_direct = mb_type.is_b_skip_or_direct();
+            slot.transform_size_8x8_flag = transform_size_8x8_flag;
+            if let Some(pred) = out.mb_pred.as_ref() {
+                slot.intra_chroma_pred_mode = pred.intra_chroma_pred_mode;
             }
         }
     } else {
@@ -3039,21 +3040,21 @@ pub fn parse_macroblock_dp(
     // grid so subsequent MBs see it when computing nC. We only do this
     // on the CAVLC path (CABAC doesn't need the grid) — `cavlc_nc` is
     // `None` in CABAC mode.
-    if entropy.cabac.is_none() {
-        if let Some(grid) = entropy.cavlc_nc.as_deref_mut() {
-            let addr = entropy.current_mb_addr as usize;
-            if let Some(slot) = grid.mbs.get_mut(addr) {
-                slot.is_available = true;
-                slot.is_skip = false;
-                slot.is_intra = mb_type.is_intra();
-                slot.is_i_pcm = mb_type.is_i_pcm();
-                // I_PCM contributes nN = 16 regardless of total_coeff
-                // arrays; zero them so the `is_i_pcm` path takes over.
-                if mb_type.is_i_pcm() {
-                    slot.luma_total_coeff = [0; 16];
-                    slot.cb_total_coeff = [0; 8];
-                    slot.cr_total_coeff = [0; 8];
-                }
+    if entropy.cabac.is_none()
+        && let Some(grid) = entropy.cavlc_nc.as_deref_mut()
+    {
+        let addr = entropy.current_mb_addr as usize;
+        if let Some(slot) = grid.mbs.get_mut(addr) {
+            slot.is_available = true;
+            slot.is_skip = false;
+            slot.is_intra = mb_type.is_intra();
+            slot.is_i_pcm = mb_type.is_i_pcm();
+            // I_PCM contributes nN = 16 regardless of total_coeff
+            // arrays; zero them so the `is_i_pcm` path takes over.
+            if mb_type.is_i_pcm() {
+                slot.luma_total_coeff = [0; 16];
+                slot.cb_total_coeff = [0; 8];
+                slot.cr_total_coeff = [0; 8];
             }
         }
     }
@@ -3186,11 +3187,7 @@ fn parse_mb_pred(
                 (2, 0) => 0,
                 (2, 1) => {
                     // Need to tell 16x8 vs 8x16 apart.
-                    if mb_type.is_partitioned_16x8() {
-                        2
-                    } else {
-                        1
-                    }
+                    if mb_type.is_partitioned_16x8() { 2 } else { 1 }
                 }
                 (4, p) => p as u8,
                 _ => 0,
@@ -3314,9 +3311,18 @@ fn parse_mb_pred(
                     let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
                     let mb_y = dec.bin_count();
                     if dbg_on {
-                        eprintln!("[MBP {}] mvd_l0 part={} blk4={} sum_x={} sum_y={} mx={} (bins={}) my={} (bins={})",
-                                 entropy.current_mb_addr, part, blk4, sum_x, sum_y,
-                                 mx, mb_x - bb_mvd, my, mb_y - mb_x);
+                        eprintln!(
+                            "[MBP {}] mvd_l0 part={} blk4={} sum_x={} sum_y={} mx={} (bins={}) my={} (bins={})",
+                            entropy.current_mb_addr,
+                            part,
+                            blk4,
+                            sum_x,
+                            sum_y,
+                            mx,
+                            mb_x - bb_mvd,
+                            my,
+                            mb_y - mb_x
+                        );
                     }
                     // Propagate decoded mvd to ALL 4x4 blocks covered by
                     // this partition (so in-MB neighbour lookups see
@@ -3383,17 +3389,17 @@ fn parse_mb_pred(
         // Commit this MB's partial state to the grid. `available` stays
         // `false` until parse_macroblock completes and writes the final
         // record with all residual / CBF fields filled.
-        if let Some(grid) = entropy.cabac_nb.as_deref_mut() {
-            if let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize) {
-                // Preserve any fields already written earlier (none for a
-                // fresh MB) but populate inter-prediction state now.
-                slot.ref_idx_l0 = curr_nb.ref_idx_l0;
-                slot.ref_idx_l1 = curr_nb.ref_idx_l1;
-                slot.mvd_l0_x = curr_nb.mvd_l0_x;
-                slot.mvd_l0_y = curr_nb.mvd_l0_y;
-                slot.mvd_l1_x = curr_nb.mvd_l1_x;
-                slot.mvd_l1_y = curr_nb.mvd_l1_y;
-            }
+        if let Some(grid) = entropy.cabac_nb.as_deref_mut()
+            && let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize)
+        {
+            // Preserve any fields already written earlier (none for a
+            // fresh MB) but populate inter-prediction state now.
+            slot.ref_idx_l0 = curr_nb.ref_idx_l0;
+            slot.ref_idx_l1 = curr_nb.ref_idx_l1;
+            slot.mvd_l0_x = curr_nb.mvd_l0_x;
+            slot.mvd_l0_y = curr_nb.mvd_l0_y;
+            slot.mvd_l1_x = curr_nb.mvd_l1_x;
+            slot.mvd_l1_y = curr_nb.mvd_l1_y;
         }
     }
 
@@ -3718,15 +3724,15 @@ fn parse_sub_mb_pred(
     }
 
     // Commit sub_mb_pred's partial inter-prediction state to the grid.
-    if let Some(grid) = entropy.cabac_nb.as_deref_mut() {
-        if let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize) {
-            slot.ref_idx_l0 = curr_nb.ref_idx_l0;
-            slot.ref_idx_l1 = curr_nb.ref_idx_l1;
-            slot.mvd_l0_x = curr_nb.mvd_l0_x;
-            slot.mvd_l0_y = curr_nb.mvd_l0_y;
-            slot.mvd_l1_x = curr_nb.mvd_l1_x;
-            slot.mvd_l1_y = curr_nb.mvd_l1_y;
-        }
+    if let Some(grid) = entropy.cabac_nb.as_deref_mut()
+        && let Some(slot) = grid.mbs.get_mut(entropy.current_mb_addr as usize)
+    {
+        slot.ref_idx_l0 = curr_nb.ref_idx_l0;
+        slot.ref_idx_l1 = curr_nb.ref_idx_l1;
+        slot.mvd_l0_x = curr_nb.mvd_l0_x;
+        slot.mvd_l0_y = curr_nb.mvd_l0_y;
+        slot.mvd_l1_x = curr_nb.mvd_l1_x;
+        slot.mvd_l1_y = curr_nb.mvd_l1_y;
     }
 
     Ok(out)
@@ -3750,11 +3756,7 @@ fn sub_mb_sub_part_4x4(i: usize, sp: usize, sub: SubMbType) -> u8 {
             // 8x4: sub-part 0 covers [0,1] (top), 1 covers [2,3] (bot).
             // 4x8: sub-part 0 covers [0,2] (left), 1 covers [1,3] (right).
             if sub.is_8x4() {
-                if sp == 0 {
-                    0
-                } else {
-                    2
-                }
+                if sp == 0 { 0 } else { 2 }
             } else if sp == 0 {
                 0
             } else {
@@ -4072,7 +4074,7 @@ fn parse_residual_cavlc_only(
                         scan8[4 * i + i4x4] = c;
                     }
                 }
-                for chunk in scan8.chunks_exact(16) {
+                for chunk in scan8.as_chunks::<16>().0 {
                     let mut store = [0i32; 16];
                     store.copy_from_slice(chunk);
                     out.residual_luma.push(store);
@@ -4285,7 +4287,7 @@ fn parse_residual_cavlc_only(
                                 scan8[4 * i + i4x4] = c;
                             }
                         }
-                        for chunk in scan8.chunks_exact(16) {
+                        for chunk in scan8.as_chunks::<16>().0 {
                             let mut store = [0i32; 16];
                             store.copy_from_slice(chunk);
                             if plane_is_cr {
@@ -4335,14 +4337,14 @@ fn parse_residual_cavlc_only(
     }
 
     // Write the accumulated own-MB totals back to the grid.
-    if let Some(grid) = entropy.cavlc_nc.as_deref_mut() {
-        if let Some(slot) = grid.mbs.get_mut(current_mb_addr as usize) {
-            slot.luma_total_coeff = own_luma_totals;
-            slot.cb_total_coeff = own_cb_totals;
-            slot.cr_total_coeff = own_cr_totals;
-            slot.cb_luma_total_coeff = own_cb_luma_totals;
-            slot.cr_luma_total_coeff = own_cr_luma_totals;
-        }
+    if let Some(grid) = entropy.cavlc_nc.as_deref_mut()
+        && let Some(slot) = grid.mbs.get_mut(current_mb_addr as usize)
+    {
+        slot.luma_total_coeff = own_luma_totals;
+        slot.cb_total_coeff = own_cb_totals;
+        slot.cr_total_coeff = own_cr_totals;
+        slot.cb_luma_total_coeff = own_cb_luma_totals;
+        slot.cr_luma_total_coeff = own_cr_luma_totals;
     }
 
     Ok(())
@@ -4412,13 +4414,13 @@ fn parse_residual_block_cabac(
     let mut significant = vec![false; len];
     let span = end_idx - start_idx + 1;
     let mut num_coeff_in_scan = span; // positions 0..num_coeff_in_scan-1 remain
-                                      // `field` (parameter) — §9.3.3.1.3 / Table 9-34: FIELD-coded
-                                      // macroblocks (MBAFF field MBs / field pictures) select the field
-                                      // ctxIdxOffset column for significant_coeff_flag /
-                                      // last_significant_coeff_flag (e.g. 277/338 instead of 105/166
-                                      // for ctxBlockCat < 5).
-                                      // §7.4.5.3.3 NumC8x8 — drives the eq. (9-22) chroma-DC ctxIdxInc
-                                      // (Min(levelListIdx / NumC8x8, 2)); 2 at 4:2:2, 1 otherwise.
+    // `field` (parameter) — §9.3.3.1.3 / Table 9-34: FIELD-coded
+    // macroblocks (MBAFF field MBs / field pictures) select the field
+    // ctxIdxOffset column for significant_coeff_flag /
+    // last_significant_coeff_flag (e.g. 277/338 instead of 105/166
+    // for ctxBlockCat < 5).
+    // §7.4.5.3.3 NumC8x8 — drives the eq. (9-22) chroma-DC ctxIdxInc
+    // (Min(levelListIdx / NumC8x8, 2)); 2 at 4:2:2, 1 otherwise.
     let num_c8x8 = if chroma_array_type == 2 { 2 } else { 1 };
     let mut i: u32 = 0;
     while i + 1 < num_coeff_in_scan {
@@ -5006,42 +5008,42 @@ fn parse_residual_cabac_only(
     }
 
     // Commit this MB's final CBF state (and availability) to the grid.
-    if let Some(grid) = nb_grid {
-        if let Some(slot) = grid.mbs.get_mut(current_mb_addr as usize) {
-            slot.available = true;
-            slot.is_intra = current_is_intra;
-            slot.is_i_pcm = mb_type.is_i_pcm();
-            slot.is_skip = mb_type.is_skip();
-            slot.is_b_skip_or_direct = mb_type.is_b_skip_or_direct();
-            slot.cbf_luma_4x4 = curr_cbf.cbf_luma_4x4;
-            slot.cbf_cb_dc = curr_cbf.cbf_cb_dc;
-            slot.cbf_cr_dc = curr_cbf.cbf_cr_dc;
-            slot.cbf_cb_ac = curr_cbf.cbf_cb_ac;
-            slot.cbf_cr_ac = curr_cbf.cbf_cr_ac;
-            slot.cbf_luma_16x16_dc = curr_cbf.cbf_luma_16x16_dc;
-            slot.cbf_luma_16x16_ac = curr_cbf.cbf_luma_16x16_ac;
-            slot.cbf_cb_16x16_dc = curr_cbf.cbf_cb_16x16_dc;
-            slot.cbf_cb_16x16_ac = curr_cbf.cbf_cb_16x16_ac;
-            slot.cbf_cb_luma_4x4 = curr_cbf.cbf_cb_luma_4x4;
-            slot.cbf_cr_16x16_dc = curr_cbf.cbf_cr_16x16_dc;
-            slot.cbf_cr_16x16_ac = curr_cbf.cbf_cr_16x16_ac;
-            slot.cbf_cr_luma_4x4 = curr_cbf.cbf_cr_luma_4x4;
-            // is_i_pcm sets all CBF to 1 per §9.3.3.1.1.9.
-            if mb_type.is_i_pcm() {
-                slot.cbf_luma_4x4 = [true; 16];
-                slot.cbf_cb_dc = true;
-                slot.cbf_cr_dc = true;
-                slot.cbf_cb_ac = [true; 8];
-                slot.cbf_cr_ac = [true; 8];
-                slot.cbf_luma_16x16_dc = true;
-                slot.cbf_luma_16x16_ac = [true; 16];
-                slot.cbf_cb_16x16_dc = true;
-                slot.cbf_cb_16x16_ac = [true; 16];
-                slot.cbf_cb_luma_4x4 = [true; 16];
-                slot.cbf_cr_16x16_dc = true;
-                slot.cbf_cr_16x16_ac = [true; 16];
-                slot.cbf_cr_luma_4x4 = [true; 16];
-            }
+    if let Some(grid) = nb_grid
+        && let Some(slot) = grid.mbs.get_mut(current_mb_addr as usize)
+    {
+        slot.available = true;
+        slot.is_intra = current_is_intra;
+        slot.is_i_pcm = mb_type.is_i_pcm();
+        slot.is_skip = mb_type.is_skip();
+        slot.is_b_skip_or_direct = mb_type.is_b_skip_or_direct();
+        slot.cbf_luma_4x4 = curr_cbf.cbf_luma_4x4;
+        slot.cbf_cb_dc = curr_cbf.cbf_cb_dc;
+        slot.cbf_cr_dc = curr_cbf.cbf_cr_dc;
+        slot.cbf_cb_ac = curr_cbf.cbf_cb_ac;
+        slot.cbf_cr_ac = curr_cbf.cbf_cr_ac;
+        slot.cbf_luma_16x16_dc = curr_cbf.cbf_luma_16x16_dc;
+        slot.cbf_luma_16x16_ac = curr_cbf.cbf_luma_16x16_ac;
+        slot.cbf_cb_16x16_dc = curr_cbf.cbf_cb_16x16_dc;
+        slot.cbf_cb_16x16_ac = curr_cbf.cbf_cb_16x16_ac;
+        slot.cbf_cb_luma_4x4 = curr_cbf.cbf_cb_luma_4x4;
+        slot.cbf_cr_16x16_dc = curr_cbf.cbf_cr_16x16_dc;
+        slot.cbf_cr_16x16_ac = curr_cbf.cbf_cr_16x16_ac;
+        slot.cbf_cr_luma_4x4 = curr_cbf.cbf_cr_luma_4x4;
+        // is_i_pcm sets all CBF to 1 per §9.3.3.1.1.9.
+        if mb_type.is_i_pcm() {
+            slot.cbf_luma_4x4 = [true; 16];
+            slot.cbf_cb_dc = true;
+            slot.cbf_cr_dc = true;
+            slot.cbf_cb_ac = [true; 8];
+            slot.cbf_cr_ac = [true; 8];
+            slot.cbf_luma_16x16_dc = true;
+            slot.cbf_luma_16x16_ac = [true; 16];
+            slot.cbf_cb_16x16_dc = true;
+            slot.cbf_cb_16x16_ac = [true; 16];
+            slot.cbf_cb_luma_4x4 = [true; 16];
+            slot.cbf_cr_16x16_dc = true;
+            slot.cbf_cr_16x16_ac = [true; 16];
+            slot.cbf_cr_luma_4x4 = [true; 16];
         }
     }
 
@@ -5508,10 +5510,12 @@ mod tests {
                 assert_eq!(c, 0, "scan8[{i}] must be 0");
             }
         }
-        assert!(mb.residual_cb_luma_like[1..]
-            .iter()
-            .flatten()
-            .all(|&c| c == 0));
+        assert!(
+            mb.residual_cb_luma_like[1..]
+                .iter()
+                .flatten()
+                .all(|&c| c == 0)
+        );
 
         // Cr: coded quadrant with all-zero levels → four zero chunks.
         assert_eq!(mb.residual_cr_luma_like.len(), 4);
@@ -5606,7 +5610,7 @@ mod tests {
         //   256 u(8) luma + 64 u(8) Cb + 64 u(8) Cr.
         let mut w = BitWriter::new();
         w.ue(25); // mb_type
-                  // Align to byte.
+        // Align to byte.
         while w.bit_pos != 0 {
             w.u(1, 0);
         }
@@ -6531,7 +6535,7 @@ mod tests {
         //   (cbp=0 → no mb_qp_delta, no residual)
         let mut w = BitWriter::new();
         w.ue(0); // mb_type = P_L0_16x16
-                 // mvd x, y
+        // mvd x, y
         w.ue(0); // mvd x = 0
         w.ue(0); // mvd y = 0
         w.ue(0); // CBP inter codeNum=0 → 0
@@ -7295,8 +7299,8 @@ mod tests {
     fn cavlc_intra_16x16_444_all_zero_dc() {
         let mut w = BitWriter::new();
         w.ue(1); // mb_type = 1 → Intra_16x16_0_0_0 (pred=0, cbp_luma=0, cbp_chroma=0)
-                 // §7.3.5.1: intra_chroma_pred_mode is only read when
-                 // ChromaArrayType == 1 || 2 — NOT for 4:4:4.
+        // §7.3.5.1: intra_chroma_pred_mode is only read when
+        // ChromaArrayType == 1 || 2 — NOT for 4:4:4.
         w.se(0); // mb_qp_delta
         w.u(1, 1); // Y DC coeff_token TotalCoeff=0 (nC<2) = "1"
         w.u(1, 1); // Cb DC coeff_token TotalCoeff=0 = "1"
@@ -7347,8 +7351,8 @@ mod tests {
         let mut w = BitWriter::new();
         w.ue(13); // mb_type = 13 → Intra_16x16_0_0_15 (pred=0, cbp_luma=15, cbp_chroma=0)
         w.se(0); // mb_qp_delta
-                 // Y: DC + 16 AC. Cb: DC + 16 AC. Cr: DC + 16 AC.
-                 // Each block TotalCoeff=0 → coeff_token = "1" (nC<2 column).
+        // Y: DC + 16 AC. Cb: DC + 16 AC. Cr: DC + 16 AC.
+        // Each block TotalCoeff=0 → coeff_token = "1" (nC<2 column).
         for _ in 0..(3 * 17) {
             w.u(1, 1);
         }
@@ -7437,13 +7441,13 @@ mod tests {
 
         let mut w = BitWriter::new();
         w.ue(0); // mb_type = P_L0_16x16 (inter, one 16x16 partition)
-                 // mb_pred: since num_ref_idx_l0_active_minus1 == 0 and not MBAFF,
-                 // no ref_idx_l0 is read. MVD_l0 per component with value 0:
+        // mb_pred: since num_ref_idx_l0_active_minus1 == 0 and not MBAFF,
+        // no ref_idx_l0 is read. MVD_l0 per component with value 0:
         w.se(0); // mvd_l0[0][0][0]  (x)
         w.se(0); // mvd_l0[0][0][1]  (y)
         w.ue(0); // coded_block_pattern codeNum=0 → CBP 0 (inter)
-                 // cbp_luma == 0 AND cbp_chroma == 0 AND not Intra_16x16 →
-                 // mb_qp_delta is NOT read, residual block entirely skipped.
+        // cbp_luma == 0 AND cbp_chroma == 0 AND not Intra_16x16 →
+        // mb_qp_delta is NOT read, residual block entirely skipped.
         w.trailing();
         let bytes = w.into_bytes();
 

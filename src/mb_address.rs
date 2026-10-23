@@ -194,7 +194,7 @@ pub fn map_unit_to_slice_group_map(
                     // §8.2.2.4 box-out — eq. (8-20). num_slice_groups_minus1
                     // is required to be 1 for types 3/4/5.
                     let dir = *change_direction_flag as i32; // 0 or 1
-                                                             // Initialise: mapUnitToSliceGroupMap[i] = 1 for all i.
+                    // Initialise: mapUnitToSliceGroupMap[i] = 1 for all i.
                     for slot in out.iter_mut().take(n) {
                         *slot = 1;
                     }
@@ -484,7 +484,7 @@ pub fn advance_mb_addr(curr: u32, map: Option<&[u32]>) -> u32 {
 /// * `mbIsTopMbFlag` == `true` when the MB is the top of its pair
 ///   (`CurrMbAddr % 2 == 0`).
 pub fn mb_pair_flags(curr_mb_addr: u32, mb_field_decoding_flag: bool) -> (bool, bool) {
-    let mb_is_top = curr_mb_addr % 2 == 0;
+    let mb_is_top = curr_mb_addr.is_multiple_of(2);
     let curr_frame = !mb_field_decoding_flag;
     (curr_frame, mb_is_top)
 }
@@ -530,11 +530,7 @@ pub fn mbaff_mb_to_sample_xy(
 ///   interleaved with the pair partner — §6.4.1 note under eq. 6-10).
 #[inline]
 pub fn mbaff_y_step(mb_field_decoding_flag: bool) -> u32 {
-    if mb_field_decoding_flag {
-        2
-    } else {
-        1
-    }
+    if mb_field_decoding_flag { 2 } else { 1 }
 }
 
 /// §6.4.10 — neighbour macroblock pair addresses for the pair
@@ -924,7 +920,7 @@ pub fn mbaff_neighbour_addrs(
     mb_field_decoding_flag_grid: &[bool],
 ) -> [Option<u32>; 4] {
     let pair_neighbours = mbaff_pair_neighbour_addrs(curr_mb_addr, pic_width_in_mbs);
-    let mb_is_top = curr_mb_addr % 2 == 0;
+    let mb_is_top = curr_mb_addr.is_multiple_of(2);
     let curr_field = mb_field_decoding_flag_grid
         .get(curr_mb_addr as usize)
         .copied()
@@ -1589,7 +1585,7 @@ mod tests {
     // Helper: all-frame picture, 4 MBs wide. frame_flag_of returns true.
     fn loc_all_frame(xn: i32, yn: i32, curr_mb_addr: u32) -> Option<(u32, i32, i32)> {
         let pair = mbaff_pair_neighbour_addrs(curr_mb_addr, 4);
-        let mb_is_top = curr_mb_addr % 2 == 0;
+        let mb_is_top = curr_mb_addr.is_multiple_of(2);
         mbaff_neigh_location(xn, yn, 16, 16, true, mb_is_top, curr_mb_addr, pair, |_| {
             true
         })

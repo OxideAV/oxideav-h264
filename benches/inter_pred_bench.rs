@@ -7,7 +7,7 @@
 //! across all 16 luma fractional positions, batched 1000 blocks per
 //! iteration so loop overhead doesn't dominate.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use oxideav_h264::simd::{self, chunked, scalar};
 
 fn make_plane(w: usize, h: usize) -> Vec<i32> {

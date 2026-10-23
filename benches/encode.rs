@@ -29,7 +29,7 @@
 //! metric — it's a compression-efficiency metric and belongs to the
 //! integration tests / cross-decode oracle, not the bench.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use oxideav_h264::encoder::{EncodedFrameRef, Encoder, EncoderConfig, YuvFrame};
 
 /// Synthesize a smooth-gradient 4:2:0 picture of the given size. Same
@@ -37,7 +37,7 @@ use oxideav_h264::encoder::{EncodedFrameRef, Encoder, EncoderConfig, YuvFrame};
 /// mid-grey chroma. The gradient gives the entropy coder a non-zero
 /// residual to work on; a flat plane would collapse the bench.
 fn make_yuv420(w: usize, h: usize, phase: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    assert!(w % 16 == 0 && h % 16 == 0);
+    assert!(w.is_multiple_of(16) && h.is_multiple_of(16));
     let mut y = vec![0u8; w * h];
     for j in 0..h {
         for i in 0..w {
@@ -71,7 +71,7 @@ fn make_b_yuv420(
 
 /// 4:2:2 source — chroma is `(W/2, H)`. Mirrors decode bench.
 fn make_yuv422(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    assert!(w % 16 == 0 && h % 16 == 0);
+    assert!(w.is_multiple_of(16) && h.is_multiple_of(16));
     let mut y = vec![0u8; w * h];
     let mut u = vec![0u8; (w / 2) * h];
     let mut v = vec![0u8; (w / 2) * h];

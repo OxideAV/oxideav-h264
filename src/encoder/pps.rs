@@ -189,10 +189,10 @@ pub fn build_baseline_pps_rbsp(cfg: &BaselinePpsConfig) -> Vec<u8> {
         w.u(1, if cfg.transform_8x8_mode_flag { 1 } else { 0 });
         if let Some(spec) = &cfg.pic_scaling_lists {
             w.u(1, 1); // pic_scaling_matrix_present_flag
-                       // §7.3.2.2 loop bound: 6 + [2, 6] * transform_8x8_mode_flag
-                       // (4:2:0/4:2:2 → 2 extra 8x8 lists).
-                       // §7.3.2.2 loop bound:
-                       //   6 + ((chroma_format_idc != 3) ? 2 : 6) * transform_8x8_mode_flag
+            // §7.3.2.2 loop bound: 6 + [2, 6] * transform_8x8_mode_flag
+            // (4:2:0/4:2:2 → 2 extra 8x8 lists).
+            // §7.3.2.2 loop bound:
+            //   6 + ((chroma_format_idc != 3) ? 2 : 6) * transform_8x8_mode_flag
             let n_lists = 6 + if !cfg.transform_8x8_mode_flag {
                 0
             } else if cfg.chroma_format_idc != 3 {

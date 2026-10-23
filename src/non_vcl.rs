@@ -251,7 +251,7 @@ mod tests {
             let bits: Vec<u8> = (0..3)
                 .map(|i| (v >> (2 - i)) & 1)
                 .chain(std::iter::once(1))
-                .chain(std::iter::repeat(0).take(4))
+                .chain(std::iter::repeat_n(0, 4))
                 .collect();
             let bytes = pack_bits(&bits);
             let aud = AccessUnitDelimiter::parse(&bytes).unwrap();
@@ -298,7 +298,7 @@ mod tests {
         // payload_type=5 (user_data_unregistered), payload_size=260 = 255+5
         // → one ff_byte + 0x05. Payload = 260 bytes of 0x77.
         let mut rbsp = vec![0x05, 0xFF, 0x05];
-        rbsp.extend(std::iter::repeat(0x77).take(260));
+        rbsp.extend(std::iter::repeat_n(0x77, 260));
         rbsp.push(0x80);
         let msgs = parse_sei_rbsp(&rbsp).unwrap();
         assert_eq!(msgs.len(), 1);

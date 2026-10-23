@@ -1225,11 +1225,11 @@ pub fn deinterleave_8x8_to_4x4(scan8: &[i32; 64]) -> [[i32; 16]; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::{default_scaling_list_8x8_flat, inverse_transform_8x8};
     use crate::transform::{
-        inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16, inverse_scan_4x4_zigzag,
-        inverse_transform_4x4, FLAT_4X4_16,
+        FLAT_4X4_16, inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
+        inverse_scan_4x4_zigzag, inverse_transform_4x4,
     };
+    use crate::transform::{default_scaling_list_8x8_flat, inverse_transform_8x8};
 
     /// The forward 8x8 basis `E8` must be orthogonal: every pair of
     /// distinct rows has zero dot product (a prerequisite for the
@@ -1575,11 +1575,7 @@ impl TrellisCtxCosts {
             let st = ctxs.at(ctx_idx);
             let mps = u32::from(st.val_mps);
             let row = tab[st.state_idx as usize];
-            if bin == mps {
-                row[1]
-            } else {
-                row[0]
-            }
+            if bin == mps { row[1] } else { row[0] }
         };
         let mut sig = [[0i64; 2]; 16];
         let mut last = [[0i64; 2]; 16];

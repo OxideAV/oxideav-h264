@@ -3,7 +3,7 @@ name: Fuzz
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
 # 30-minute total budget across the 2 targets (~15 min each). The
 # `ffmpeg_oracle_decode` harness dlopens libavcodec at runtime via
-# libloading; the CI runner needs the `ffmpeg` package (which pulls
+# dlsym; the CI runner needs the `ffmpeg` package (which pulls
 # the libavcodec shared library) installed so the oracle actually
 # validates instead of silently skipping.
 

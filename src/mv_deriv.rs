@@ -592,11 +592,7 @@ pub fn derive_b_spatial_direct_with_d(
 /// Returns Min(x, y) when both are >= 0, else Max(x, y).
 #[inline]
 fn min_positive(x: i32, y: i32) -> i32 {
-    if x >= 0 && y >= 0 {
-        x.min(y)
-    } else {
-        x.max(y)
-    }
+    if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) }
 }
 
 // ---------------------------------------------------------------------------

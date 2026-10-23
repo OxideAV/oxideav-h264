@@ -54,16 +54,16 @@
 use std::collections::VecDeque;
 
 use oxideav_core::options::{
-    parse_options, CodecOptionsStruct, OptionField, OptionKind, OptionValue,
+    CodecOptionsStruct, OptionField, OptionKind, OptionValue, parse_options,
 };
 use oxideav_core::{
     CodecId, CodecParameters, Encoder as CoreEncoder, Error, Frame, Packet, PixelFormat, Result,
     TimeBase, VideoPlane,
 };
 
-use crate::avcc::{annex_b_to_length_prefixed, AvcDecoderConfigurationRecord};
+use crate::avcc::{AvcDecoderConfigurationRecord, annex_b_to_length_prefixed};
 use crate::encoder::deep::{
-    min_profile_idc, profile_admits, DeepConfig, DeepPictureKind, DeepSession,
+    DeepConfig, DeepPictureKind, DeepSession, min_profile_idc, profile_admits,
 };
 use crate::encoder::rate_control::{RateControlConfig, RateControlMode};
 use crate::encoder::session::{EncoderSession, SessionConfig, SessionRateControl};
@@ -374,7 +374,7 @@ impl DeepDriver {
     fn encode(&mut self, y: &[u16], u: &[u16], v: &[u16]) -> (Vec<u8>, bool) {
         let d = self.idx;
         self.idx += 1;
-        let is_idr = d % self.gop == 0;
+        let is_idr = d.is_multiple_of(self.gop);
         if is_idr {
             self.gop_start = d;
         }
@@ -777,7 +777,9 @@ impl H264CodecEncoder {
         let bytes = Self::packed_plane(plane, if wide { 2 * w } else { w }, h)?;
         Ok(if wide {
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|p| u16::from_le_bytes([p[0], p[1]]))
                 .collect()
         } else {

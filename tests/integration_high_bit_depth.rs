@@ -22,10 +22,10 @@ use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::bitstream::BitWriter;
 use oxideav_h264::encoder::cavlc::CoeffTokenContext;
-use oxideav_h264::encoder::macroblock::{write_intra16x16_mb, I16x16McbConfig};
+use oxideav_h264::encoder::macroblock::{I16x16McbConfig, write_intra16x16_mb};
 use oxideav_h264::encoder::nal::build_nal_unit;
-use oxideav_h264::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
-use oxideav_h264::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
+use oxideav_h264::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
+use oxideav_h264::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
 use oxideav_h264::nal::NalUnitType;
 
 const W: usize = 48;
@@ -311,7 +311,9 @@ fn deep_bit_depth_i16x16_dc_residual_matches_reference_decoder() {
         let mid = (1u32 << (bit_depth - 1)) as u16;
         let distinct = frames[0]
             .0
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .filter(|&s| s != mid)
             .count();

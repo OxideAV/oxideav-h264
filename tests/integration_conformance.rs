@@ -517,7 +517,7 @@ fn run_conformance_with_reference(
     // Segment the reference dump into frames.
     let ffmpeg_frames = if our_plane_bytes == 0 {
         0
-    } else if reference.len() % our_plane_bytes != 0 {
+    } else if !reference.len().is_multiple_of(our_plane_bytes) {
         eprintln!(
             "[{name}] WARN: reference dump len {} not a multiple of our frame size {} \
              (our geometry: {}x{}). Frame geometry likely disagrees with ffmpeg.",
@@ -578,16 +578,17 @@ fn run_conformance_with_reference(
             if first_mismatch.is_none() {
                 first_mismatch = Some(diff.clone());
                 // Optional 16×16 luma dump for the first mismatching MB.
-                if dump_first_diff_mb && !dumped_mb {
-                    if let Some((mb_addr, _, _)) = diff.first_diff_mb {
-                        eprintln!(
-                            "[{name}] OXIDEAV_H264_DUMP_FIRST_DIFF_MB: dumping luma MB #{mb_addr} for frame {}",
-                            i
-                        );
-                        dump_luma_mb("expected (ffmpeg)", theirs, mb_addr, w, h);
-                        dump_luma_mb("ours", &ours_frames[i], mb_addr, w, h);
-                        dumped_mb = true;
-                    }
+                if dump_first_diff_mb
+                    && !dumped_mb
+                    && let Some((mb_addr, _, _)) = diff.first_diff_mb
+                {
+                    eprintln!(
+                        "[{name}] OXIDEAV_H264_DUMP_FIRST_DIFF_MB: dumping luma MB #{mb_addr} for frame {}",
+                        i
+                    );
+                    dump_luma_mb("expected (ffmpeg)", theirs, mb_addr, w, h);
+                    dump_luma_mb("ours", &ours_frames[i], mb_addr, w, h);
+                    dumped_mb = true;
                 }
             }
         }
@@ -837,7 +838,9 @@ fn conformance_summary_all_streams() {
 
     // … then a one-line-per-stream summary table.
     eprintln!();
-    eprintln!("======================================= conformance summary =======================================");
+    eprintln!(
+        "======================================= conformance summary ======================================="
+    );
     eprintln!(
         "  {:<22} {:>6} {:>6} {:>7} {:>12} {:>8}  {:<30}",
         "stream",
@@ -891,7 +894,9 @@ fn conformance_summary_all_streams() {
             first_str,
         );
     }
-    eprintln!("===================================================================================================");
+    eprintln!(
+        "==================================================================================================="
+    );
 }
 
 // ------------------------------ JVT conformance vectors ----------------

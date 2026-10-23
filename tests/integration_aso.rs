@@ -19,10 +19,10 @@ use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::bitstream::BitWriter;
 use oxideav_h264::encoder::cavlc::CoeffTokenContext;
-use oxideav_h264::encoder::macroblock::{write_intra16x16_mb, I16x16McbConfig};
+use oxideav_h264::encoder::macroblock::{I16x16McbConfig, write_intra16x16_mb};
 use oxideav_h264::encoder::nal::build_nal_unit;
-use oxideav_h264::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
-use oxideav_h264::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
+use oxideav_h264::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
+use oxideav_h264::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 use oxideav_h264::nal::NalUnitType;
 

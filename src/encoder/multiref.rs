@@ -33,18 +33,18 @@
 //! Scope: 4:2:0, CAVLC, frame pictures, single slice, every picture a
 //! reference.
 
-use crate::encoder::deblock::{deblock_recon_with_chroma_array_type, MbDeblockInfo};
+use crate::encoder::deblock::{MbDeblockInfo, deblock_recon_with_chroma_array_type};
 use crate::encoder::me::search_quarter_pel_16x16;
 use crate::encoder::nal::build_nal_unit;
-use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
+use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
 use crate::encoder::slice::{
-    write_idr_i_slice_header, write_p_slice_header, EncMmcoOp, EncRplmOp, FieldPicSignal,
-    IdrSliceHeaderConfig, PSliceHeaderConfig,
+    EncMmcoOp, EncRplmOp, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    write_idr_i_slice_header, write_p_slice_header,
 };
-use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
+use crate::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
 use crate::encoder::{
-    min_level_idc_for_picture_size, BitWriter, CavlcNcGrid, EncodedFrameRef, Encoder,
-    EncoderConfig, IntraGrid, MbQpTracker, MvGrid, YuvFrame,
+    BitWriter, CavlcNcGrid, EncodedFrameRef, Encoder, EncoderConfig, IntraGrid, MbQpTracker,
+    MvGrid, YuvFrame, min_level_idc_for_picture_size,
 };
 use crate::nal::NalUnitType;
 use crate::transform::{qp_bd_offset, qp_y_to_qp_c_with_bd_offset};
@@ -129,7 +129,7 @@ pub fn encode_multiref_sequence(
     cfg: &MultiRefConfig,
     frames: &[(&[u8], &[u8], &[u8])],
 ) -> MultiRefEncoded {
-    assert!(cfg.width % 16 == 0 && cfg.height % 16 == 0);
+    assert!(cfg.width.is_multiple_of(16) && cfg.height.is_multiple_of(16));
     assert!((1..=16).contains(&cfg.num_ref_frames));
     assert!(!frames.is_empty());
     assert!(
@@ -294,14 +294,14 @@ pub fn encode_multiref_sequence(
         // ---- RefPicList0 for this P picture. ----
         let mut list = init_list0(&dpb);
         let mut rplm: Vec<EncRplmOp> = Vec::new();
-        if cfg.rplm_long_term_first_at == Some(k) {
-            if let Some(pos) = list.iter().position(|&i| !dpb[i].is_short()) {
-                let lt = list.remove(pos);
-                list.insert(0, lt);
-                // §7.3.3.1 idc 2 — long_term_pic_num = LongTermFrameIdx
-                // for frame coding (§8.2.4.1 eq. 8-30).
-                rplm.push(EncRplmOp::LongTerm(dpb[lt].long_term_idx.unwrap()));
-            }
+        if cfg.rplm_long_term_first_at == Some(k)
+            && let Some(pos) = list.iter().position(|&i| !dpb[i].is_short())
+        {
+            let lt = list.remove(pos);
+            list.insert(0, lt);
+            // §7.3.3.1 idc 2 — long_term_pic_num = LongTermFrameIdx
+            // for frame coding (§8.2.4.1 eq. 8-30).
+            rplm.push(EncRplmOp::LongTerm(dpb[lt].long_term_idx.unwrap()));
         }
         let n_active = (cfg.num_ref_frames as usize).min(list.len());
         list.truncate(n_active);

@@ -16,7 +16,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Rational, VideoFrame, VideoPlane,
 };
-use oxideav_h264::nal::{parse_nal_unit, AnnexBSplitter, NalUnitType};
+use oxideav_h264::nal::{AnnexBSplitter, NalUnitType, parse_nal_unit};
 use oxideav_h264::pps::Pps;
 use oxideav_h264::slice_header::SliceHeader;
 use oxideav_h264::sps::Sps;
@@ -31,7 +31,11 @@ fn frame(n: usize) -> Frame {
     let mut v = vec![0u8; w * h / 4];
     for j in 0..h {
         for i in 0..w {
-            let m = if (i / 8 + j / 8 + n) % 3 == 0 { 60 } else { 0 };
+            let m = if (i / 8 + j / 8 + n).is_multiple_of(3) {
+                60
+            } else {
+                0
+            };
             y[j * w + i] = (30 + m + ((i * 3 + j * 2 + n * 7) % 150)) as u8;
         }
     }

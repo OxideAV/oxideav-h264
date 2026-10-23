@@ -174,7 +174,7 @@ fn assert_bit_exact(run: &Run, tag: &str) {
                 .data
                 .iter()
                 .zip(exp.iter())
-                .filter(|(&a, &b)| a != b)
+                .filter(|&(&a, &b)| a != b)
                 .count();
             assert_eq!(
                 mism, 0,
@@ -220,7 +220,11 @@ fn ffmpeg_check(run: &Run, tag: &str) {
             ("Cr", rv.as_slice(), &yuv[base + W * H * 5 / 4..base + fb]),
         ];
         for (name, ours, ff) in planes {
-            let mism = ours.iter().zip(ff.iter()).filter(|(&a, &b)| a != b).count();
+            let mism = ours
+                .iter()
+                .zip(ff.iter())
+                .filter(|&(&a, &b)| a != b)
+                .count();
             assert_eq!(
                 mism, 0,
                 "{tag}: frame {i} plane {name}: {mism} samples differ vs reference decoder",

@@ -80,7 +80,7 @@ pub fn build_filler_nal(ff_count: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nal::{parse_nal_unit, AnnexBSplitter, NalUnitType};
+    use crate::nal::{AnnexBSplitter, NalUnitType, parse_nal_unit};
 
     #[test]
     fn header_byte_encodes_sps() {

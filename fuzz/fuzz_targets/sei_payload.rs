@@ -31,7 +31,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_h264::non_vcl::parse_sei_rbsp;
-use oxideav_h264::sei::{parse_payload, MvcViewRefCounts, SeiContext};
+use oxideav_h264::sei::{MvcViewRefCounts, SeiContext, parse_payload};
 
 /// Fixed dispatch pool. Mirrors the `match` arms in
 /// `oxideav_h264::sei::parse_payload`. The trailing entries fall through

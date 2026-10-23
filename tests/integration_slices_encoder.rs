@@ -10,7 +10,7 @@
 
 use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
-use oxideav_h264::encoder::slices::{encode_slices_sequence, SlicesConfig, SlicesEncoded};
+use oxideav_h264::encoder::slices::{SlicesConfig, SlicesEncoded, encode_slices_sequence};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 use oxideav_h264::pps::SliceGroupMap;
 
@@ -107,7 +107,7 @@ fn assert_bit_exact(enc: &SlicesEncoded, tag: &str) {
                 .data
                 .iter()
                 .zip(exp.iter())
-                .filter(|(&a, &b)| a != b)
+                .filter(|&(&a, &b)| a != b)
                 .count();
             if mism != 0 {
                 let w = plane.stride;
@@ -182,7 +182,11 @@ fn ffmpeg_check(enc: &SlicesEncoded, tag: &str) {
             ("Cr", rv.as_slice(), &yuv[base + W * H * 5 / 4..base + fb]),
         ];
         for (name, ours, ff) in planes {
-            let mism = ours.iter().zip(ff.iter()).filter(|(&a, &b)| a != b).count();
+            let mism = ours
+                .iter()
+                .zip(ff.iter())
+                .filter(|&(&a, &b)| a != b)
+                .count();
 
             assert_eq!(
                 mism, 0,

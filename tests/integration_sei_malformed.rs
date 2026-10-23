@@ -37,7 +37,7 @@
 //! contract.
 
 use oxideav_h264::non_vcl::parse_sei_rbsp;
-use oxideav_h264::sei::{parse_payload, MvcViewRefCounts, SeiContext};
+use oxideav_h264::sei::{MvcViewRefCounts, SeiContext, parse_payload};
 
 /// Mirror of `parse_payload`'s dispatch arms — 50 implemented types
 /// (round 278 adds Annex H §H.13.2.5 depth_timing type 52, completing

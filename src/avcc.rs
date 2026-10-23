@@ -27,7 +27,7 @@
 //! container crate; ISO BMFF / HEIF muxers wrap the bytes in their
 //! `avcC` box.
 
-use crate::nal::{parse_nal_unit, AnnexBSplitter};
+use crate::nal::{AnnexBSplitter, parse_nal_unit};
 use crate::sps::Sps;
 
 /// Errors from building or parsing an `avcC` record.
@@ -41,10 +41,14 @@ pub enum AvccError {
     #[error("avcC: {0}")]
     ParameterSet(String),
     /// §5.3.2.1.3 — `bit_depth_*_minus8` shall be in 0..=4.
-    #[error("avcC: bit_depth_minus8 = {0} exceeds the §5.3.2.1.3 range 0..=4 (no conforming record for >12-bit streams)")]
+    #[error(
+        "avcC: bit_depth_minus8 = {0} exceeds the §5.3.2.1.3 range 0..=4 (no conforming record for >12-bit streams)"
+    )]
     BitDepthUnrepresentable(u32),
     /// §5.3.2.1.1 — chroma format / bit depths differ between SPSs.
-    #[error("avcC: sequence parameter sets disagree on chroma_format_idc / bit depth (§5.3.2.1.1 needs one record per layout)")]
+    #[error(
+        "avcC: sequence parameter sets disagree on chroma_format_idc / bit depth (§5.3.2.1.1 needs one record per layout)"
+    )]
     MismatchedSps,
     /// `numOfSequenceParameterSets` is a 5-bit field.
     #[error("avcC: {0} SPS entries exceed the 5-bit count")]
@@ -410,7 +414,7 @@ mod tests {
     /// (constraint_set0/1), level 30, then a minimal body.
     fn sps_nal(profile: u8, compat: u8, level: u8) -> Vec<u8> {
         use crate::encoder::nal::build_nal_unit;
-        use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
+        use crate::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
         use crate::nal::NalUnitType;
         let rbsp = build_baseline_sps_rbsp(&BaselineSpsConfig {
             seq_parameter_set_id: 0,
@@ -439,7 +443,7 @@ mod tests {
 
     fn pps_nal() -> Vec<u8> {
         use crate::encoder::nal::build_nal_unit;
-        use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
+        use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
         use crate::nal::NalUnitType;
         let rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
             pic_parameter_set_id: 0,
@@ -560,7 +564,7 @@ mod tests {
         let long = annex_b_to_length_prefixed(&annex_b, 1, false);
         assert!(long.is_ok() || matches!(long, Err(AvccError::NalTooLong(_))));
         let mut big = vec![0, 0, 0, 1, 0x65];
-        big.extend(std::iter::repeat(0x11u8).take(300));
+        big.extend(std::iter::repeat_n(0x11u8, 300));
         assert_eq!(
             annex_b_to_length_prefixed(&big, 1, false),
             Err(AvccError::NalTooLong(301))

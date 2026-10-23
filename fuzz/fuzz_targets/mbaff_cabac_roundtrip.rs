@@ -16,7 +16,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::mbaff::PairMode;
-use oxideav_h264::encoder::mbaff_cabac::{encode_mbaff_cabac_sequence, MbaffCabacConfig};
+use oxideav_h264::encoder::mbaff_cabac::{MbaffCabacConfig, encode_mbaff_cabac_sequence};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
 const W: usize = 48;
@@ -65,7 +65,8 @@ fuzz_target!(|data: &[u8]| {
         for row in 0..H {
             let shift = seed[(row / 2) % seed.len()] as usize + 3 * k * (row & 1);
             for col in 0..W {
-                y[row * W + col] = seed[(col + shift + row * 7) % seed.len()].wrapping_add((row * 2) as u8);
+                y[row * W + col] =
+                    seed[(col + shift + row * 7) % seed.len()].wrapping_add((row * 2) as u8);
             }
         }
         let cw = W / 2;

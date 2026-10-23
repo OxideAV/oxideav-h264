@@ -97,7 +97,7 @@ fn round24_temporal_direct_slice_header_signals_temporal() {
     );
 
     // Pluck the B-slice NAL and parse its header.
-    use oxideav_h264::nal::{parse_nal_unit, AnnexBSplitter, NalHeader, NalUnitType};
+    use oxideav_h264::nal::{AnnexBSplitter, NalHeader, NalUnitType, parse_nal_unit};
     use oxideav_h264::pps::Pps;
     use oxideav_h264::slice_header::SliceHeader;
     use oxideav_h264::sps::Sps;
@@ -470,7 +470,7 @@ fn round24_temporal_direct_ffmpeg_interop() {
 
 #[test]
 fn round24_temporal_direct_helper_zero_mv_yields_zero_outputs() {
-    use oxideav_h264::mv_deriv::{derive_b_temporal_direct, Mv};
+    use oxideav_h264::mv_deriv::{Mv, derive_b_temporal_direct};
     // mvCol = (0, 0), arbitrary POCs. Result should be (0, 0)/(0, 0).
     let (l0, l1) = derive_b_temporal_direct(Mv::ZERO, 8, 4, 0);
     assert_eq!(l0, Mv::ZERO);
@@ -479,7 +479,7 @@ fn round24_temporal_direct_helper_zero_mv_yields_zero_outputs() {
 
 #[test]
 fn round24_temporal_direct_helper_td_zero_passthrough() {
-    use oxideav_h264::mv_deriv::{derive_b_temporal_direct, Mv};
+    use oxideav_h264::mv_deriv::{Mv, derive_b_temporal_direct};
     // td = pic1 - pic0 = 0 → eq. 8-195/8-196: mvL0 = mvCol, mvL1 = 0.
     let mv_col = Mv::new(8, -12);
     let (l0, l1) = derive_b_temporal_direct(mv_col, 4, 6, 4);
@@ -489,7 +489,7 @@ fn round24_temporal_direct_helper_td_zero_passthrough() {
 
 #[test]
 fn round24_temporal_direct_helper_symmetric_midpoint() {
-    use oxideav_h264::mv_deriv::{derive_b_temporal_direct, Mv};
+    use oxideav_h264::mv_deriv::{Mv, derive_b_temporal_direct};
     // pic0 = 0, pic1 = 8, curr = 4 (exact midpoint).
     //   td = 8, tb = 4, tx = (16384 + 4) / 8 = 2048,
     //   DSF = (4*2048 + 32) >> 6 = 128, clipped to 128.

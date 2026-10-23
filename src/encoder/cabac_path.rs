@@ -45,18 +45,18 @@ use crate::encoder::cabac_syntax::{
 };
 use crate::encoder::cavlc::encode_residual_block_cavlc;
 use crate::encoder::deblock::{
-    chroma_nz_mask_from_blocks, luma_nz_mask_from_blocks, MbDeblockInfo,
+    MbDeblockInfo, chroma_nz_mask_from_blocks, luma_nz_mask_from_blocks,
 };
 use crate::encoder::intra_pred::{
-    predict_16x16, predict_chroma_8x8, sad_8x8, I16x16Mode, IntraChromaMode,
+    I16x16Mode, IntraChromaMode, predict_16x16, predict_chroma_8x8, sad_8x8,
 };
-use crate::encoder::macroblock::{b_16x8_mb_type_raw, b_8x16_mb_type_raw, BPartPred, BSubMbCell};
-use crate::encoder::me::{search_quarter_pel_16x16, search_quarter_pel_8x8};
+use crate::encoder::macroblock::{BPartPred, BSubMbCell, b_8x16_mb_type_raw, b_16x8_mb_type_raw};
+use crate::encoder::me::{search_quarter_pel_8x8, search_quarter_pel_16x16};
 use crate::encoder::nal::build_nal_unit;
 use crate::encoder::rdo::{cost_combined, lambda_ssd};
 use crate::encoder::slice::{
-    write_b_slice_header, write_idr_i_slice_header, write_p_slice_header, BSliceHeaderConfig,
-    CabacSliceParams, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    BSliceHeaderConfig, CabacSliceParams, FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig,
+    write_b_slice_header, write_idr_i_slice_header, write_p_slice_header,
 };
 use crate::encoder::transform::{
     deinterleave_8x8_to_4x4, forward_core_4x4, forward_core_8x8, forward_hadamard_2x2,
@@ -64,26 +64,26 @@ use crate::encoder::transform::{
     quantize_luma_dc_w, zigzag_scan_4x4, zigzag_scan_4x4_ac, zigzag_scan_8x8,
 };
 use crate::encoder::{
-    best_partition_mode_b, build_b_explicit_4x4_cell_chroma, build_b_explicit_8x8_cell_luma,
-    build_b_partition_pred_chroma_16x8, build_b_partition_pred_chroma_8x16,
-    build_b_partition_pred_luma_16x8, build_b_partition_pred_luma_8x16,
-    build_inter_pred_chroma_4x4, build_inter_pred_luma_8x8, partition_sad_b_16x8,
-    partition_sad_b_8x16, pick_best_b8x8_cell, EncodedB, EncodedFrameRef, EncodedIdr, EncodedP,
-    Encoder, FrameRefPartitionMv, PartitionShape, YuvFrame,
+    EncodedB, EncodedFrameRef, EncodedIdr, EncodedP, Encoder, FrameRefPartitionMv, PartitionShape,
+    YuvFrame, best_partition_mode_b, build_b_explicit_4x4_cell_chroma,
+    build_b_explicit_8x8_cell_luma, build_b_partition_pred_chroma_8x16,
+    build_b_partition_pred_chroma_16x8, build_b_partition_pred_luma_8x16,
+    build_b_partition_pred_luma_16x8, build_inter_pred_chroma_4x4, build_inter_pred_luma_8x8,
+    partition_sad_b_8x16, partition_sad_b_16x8, pick_best_b8x8_cell,
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::mv_deriv::{
-    derive_b_spatial_direct_with_d, derive_mvpred_with_d, derive_p_skip_mv_with_d, Mv,
-    MvpredInputs, MvpredShape, NeighbourMv,
+    Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_b_spatial_direct_with_d,
+    derive_mvpred_with_d, derive_p_skip_mv_with_d,
 };
 
 // `build_inter_pred_luma` and `build_inter_pred_chroma` are private to the
 // `crate::encoder` module's `mod.rs`; we replicate them locally here.
 use crate::encoder::{
-    forward_inter_luma_8x8, gather_8x8_from_recon, inter_luma_transform_cost,
-    intra8x8_mode_available, predicted_intra8x8_mode, InterLumaForward, IntraGrid,
+    InterLumaForward, IntraGrid, forward_inter_luma_8x8, gather_8x8_from_recon,
+    inter_luma_transform_cost, intra8x8_mode_available, predicted_intra8x8_mode,
 };
-use crate::intra_pred::{filter_samples_8x8, predict_8x8, Intra8x8Mode};
+use crate::intra_pred::{Intra8x8Mode, filter_samples_8x8, predict_8x8};
 use crate::nal::NalUnitType;
 use crate::transform::{
     inverse_hadamard_chroma_dc_420, inverse_hadamard_luma_dc_16x16,
@@ -360,13 +360,7 @@ fn cabac_b_spatial_direct_derive(
     } else {
         c_l1
     };
-    let min_pos = |x: i32, y: i32| -> i32 {
-        if x >= 0 && y >= 0 {
-            x.min(y)
-        } else {
-            x.max(y)
-        }
-    };
+    let min_pos = |x: i32, y: i32| -> i32 { if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) } };
     let r0_minp = min_pos(a_l0.ref_idx, min_pos(b_l0.ref_idx, c_l0_eff.ref_idx));
     let r1_minp = min_pos(a_l1.ref_idx, min_pos(b_l1.ref_idx, c_l1_eff.ref_idx));
     let direct_zero = r0_minp < 0 && r1_minp < 0;
@@ -2061,26 +2055,27 @@ impl Encoder {
             // Round 430 — MB-row QP modulation (IDR): identical
             // response curve to `encode_p_cabac_impl` (see there for
             // the rationale on the asymmetric clamp windows).
-            if let Some(budget) = row_budget_bits {
-                if mb_y > 0 && budget > 0 {
-                    let frac = mb_y as f64 / height_mbs as f64;
-                    let spent = (sw.bits_emitted() + cabac.bits_emitted()) as f64;
-                    let expected = (budget as f64 * frac).max(1.0);
-                    let ratio = spent.max(1.0) / expected;
-                    let adj = if ratio >= 1.0 {
-                        (6.0 * ratio.log2()).round() as i32
-                    } else {
-                        (3.0 * ratio.log2()).round() as i32
-                    };
-                    let mut new_want = frame_qp + adj;
-                    if new_want < frame_qp && frac < 0.6 {
-                        new_want = frame_qp;
-                    }
-                    want_qp = new_want
-                        .clamp(want_qp - 1, want_qp + 2)
-                        .clamp(frame_qp - 2, frame_qp + 6)
-                        .clamp(0, 51);
+            if let Some(budget) = row_budget_bits
+                && mb_y > 0
+                && budget > 0
+            {
+                let frac = mb_y as f64 / height_mbs as f64;
+                let spent = (sw.bits_emitted() + cabac.bits_emitted()) as f64;
+                let expected = (budget as f64 * frac).max(1.0);
+                let ratio = spent.max(1.0) / expected;
+                let adj = if ratio >= 1.0 {
+                    (6.0 * ratio.log2()).round() as i32
+                } else {
+                    (3.0 * ratio.log2()).round() as i32
+                };
+                let mut new_want = frame_qp + adj;
+                if new_want < frame_qp && frac < 0.6 {
+                    new_want = frame_qp;
                 }
+                want_qp = new_want
+                    .clamp(want_qp - 1, want_qp + 2)
+                    .clamp(frame_qp - 2, frame_qp + 6)
+                    .clamp(0, 51);
             }
             let qp_y = want_qp;
             let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
@@ -3081,26 +3076,27 @@ impl Encoder {
             // −1 per row inside frame_qp −2..+6. Overshoot reacts
             // fast, undershoot is only trusted once 60% of the slice
             // has proven cheap.
-            if let Some(budget) = row_budget_bits {
-                if mb_y > 0 && budget > 0 {
-                    let frac = mb_y as f64 / height_mbs as f64;
-                    let spent = (sw.bits_emitted() + cabac.bits_emitted()) as f64;
-                    let expected = (budget as f64 * frac).max(1.0);
-                    let ratio = spent.max(1.0) / expected;
-                    let adj = if ratio >= 1.0 {
-                        (6.0 * ratio.log2()).round() as i32
-                    } else {
-                        (3.0 * ratio.log2()).round() as i32
-                    };
-                    let mut new_want = frame_qp + adj;
-                    if new_want < frame_qp && frac < 0.6 {
-                        new_want = frame_qp;
-                    }
-                    want_qp = new_want
-                        .clamp(want_qp - 1, want_qp + 2)
-                        .clamp(frame_qp - 2, frame_qp + 6)
-                        .clamp(0, 51);
+            if let Some(budget) = row_budget_bits
+                && mb_y > 0
+                && budget > 0
+            {
+                let frac = mb_y as f64 / height_mbs as f64;
+                let spent = (sw.bits_emitted() + cabac.bits_emitted()) as f64;
+                let expected = (budget as f64 * frac).max(1.0);
+                let ratio = spent.max(1.0) / expected;
+                let adj = if ratio >= 1.0 {
+                    (6.0 * ratio.log2()).round() as i32
+                } else {
+                    (3.0 * ratio.log2()).round() as i32
+                };
+                let mut new_want = frame_qp + adj;
+                if new_want < frame_qp && frac < 0.6 {
+                    new_want = frame_qp;
                 }
+                want_qp = new_want
+                    .clamp(want_qp - 1, want_qp + 2)
+                    .clamp(frame_qp - 2, frame_qp + 6)
+                    .clamp(0, 51);
             }
             let qp_y = want_qp;
             let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
@@ -4377,26 +4373,27 @@ impl Encoder {
             // Round 443 — MB-row QP modulation, CABAC B counterpart of
             // the round-420/430 controllers (same response curve, see
             // `encode_p_cabac_impl`).
-            if let Some(budget) = row_budget_bits {
-                if mb_y > 0 && budget > 0 {
-                    let frac = mb_y as f64 / height_mbs as f64;
-                    let spent = (sw.bits_emitted() + cabac.bits_emitted()) as f64;
-                    let expected = (budget as f64 * frac).max(1.0);
-                    let ratio = spent.max(1.0) / expected;
-                    let adj = if ratio >= 1.0 {
-                        (6.0 * ratio.log2()).round() as i32
-                    } else {
-                        (3.0 * ratio.log2()).round() as i32
-                    };
-                    let mut new_want = frame_qp + adj;
-                    if new_want < frame_qp && frac < 0.6 {
-                        new_want = frame_qp;
-                    }
-                    want_qp = new_want
-                        .clamp(want_qp - 1, want_qp + 2)
-                        .clamp(frame_qp - 2, frame_qp + 6)
-                        .clamp(0, 51);
+            if let Some(budget) = row_budget_bits
+                && mb_y > 0
+                && budget > 0
+            {
+                let frac = mb_y as f64 / height_mbs as f64;
+                let spent = (sw.bits_emitted() + cabac.bits_emitted()) as f64;
+                let expected = (budget as f64 * frac).max(1.0);
+                let ratio = spent.max(1.0) / expected;
+                let adj = if ratio >= 1.0 {
+                    (6.0 * ratio.log2()).round() as i32
+                } else {
+                    (3.0 * ratio.log2()).round() as i32
+                };
+                let mut new_want = frame_qp + adj;
+                if new_want < frame_qp && frac < 0.6 {
+                    new_want = frame_qp;
                 }
+                want_qp = new_want
+                    .clamp(want_qp - 1, want_qp + 2)
+                    .clamp(frame_qp - 2, frame_qp + 6)
+                    .clamp(0, 51);
             }
             let qp_y = want_qp;
             let qp_c = qp_y_to_qp_c_with_bd_offset(qp_y, 0, qp_bd_offset_c);
@@ -8022,11 +8019,7 @@ impl Encoder {
                         BSubMbCell::L1 => Mv::ZERO,
                     }
                 } else if let Some((_, mode_a, _, mv0_a, _, _, _)) = partition_choice {
-                    if mode_a.uses_l0() {
-                        mv0_a
-                    } else {
-                        Mv::ZERO
-                    }
+                    if mode_a.uses_l0() { mv0_a } else { Mv::ZERO }
                 } else if uses_l0_explicit_16x16 {
                     mv_l0
                 } else {
@@ -8122,11 +8115,7 @@ impl Encoder {
                             for (blk, slot) in mvs.iter_mut().enumerate() {
                                 let (_bx, by) = LUMA_4X4_BLK[blk];
                                 *slot = if by < 2 {
-                                    if used_a {
-                                        mv_a_t
-                                    } else {
-                                        (0, 0)
-                                    }
+                                    if used_a { mv_a_t } else { (0, 0) }
                                 } else if used_b {
                                     mv_b_t
                                 } else {
@@ -8146,11 +8135,7 @@ impl Encoder {
                             for (blk, slot) in mvs.iter_mut().enumerate() {
                                 let (bx, _by) = LUMA_4X4_BLK[blk];
                                 *slot = if bx < 2 {
-                                    if used_a {
-                                        mv_a_t
-                                    } else {
-                                        (0, 0)
-                                    }
+                                    if used_a { mv_a_t } else { (0, 0) }
                                 } else if used_b {
                                     mv_b_t
                                 } else {
@@ -8245,11 +8230,7 @@ impl Encoder {
                             for (blk, slot) in mvs.iter_mut().enumerate() {
                                 let (_bx, by) = LUMA_4X4_BLK[blk];
                                 *slot = if by < 2 {
-                                    if used_a {
-                                        mv_a_t
-                                    } else {
-                                        (0, 0)
-                                    }
+                                    if used_a { mv_a_t } else { (0, 0) }
                                 } else if used_b {
                                     mv_b_t
                                 } else {
@@ -8269,11 +8250,7 @@ impl Encoder {
                             for (blk, slot) in mvs.iter_mut().enumerate() {
                                 let (bx, _by) = LUMA_4X4_BLK[blk];
                                 *slot = if bx < 2 {
-                                    if used_a {
-                                        mv_a_t
-                                    } else {
-                                        (0, 0)
-                                    }
+                                    if used_a { mv_a_t } else { (0, 0) }
                                 } else if used_b {
                                     mv_b_t
                                 } else {

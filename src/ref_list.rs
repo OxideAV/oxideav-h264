@@ -1202,17 +1202,17 @@ pub fn sliding_window_marking(
     // "used for short-term reference", the current picture joins the
     // pair's marking and NO eviction takes place (the pair occupies
     // one frame slot that the first field already claimed).
-    if let Some(cur) = current_entry {
-        if cur.structure.is_field() {
-            let first_field_is_short_term_ref = dpb.iter().any(|e| {
-                e.structure.is_field()
-                    && e.frame_num == cur.frame_num
-                    && e.structure.is_bottom() != cur.structure.is_bottom()
-                    && e.is_short_term()
-            });
-            if first_field_is_short_term_ref {
-                return;
-            }
+    if let Some(cur) = current_entry
+        && cur.structure.is_field()
+    {
+        let first_field_is_short_term_ref = dpb.iter().any(|e| {
+            e.structure.is_field()
+                && e.frame_num == cur.frame_num
+                && e.structure.is_bottom() != cur.structure.is_bottom()
+                && e.is_short_term()
+        });
+        if first_field_is_short_term_ref {
+            return;
         }
     }
 
@@ -1242,8 +1242,8 @@ pub fn sliding_window_marking(
     }
     if num_short == 0 {
         return; // Nothing short-term to evict (spec's "numShortTerm > 0"
-                // precondition — a conformant stream shouldn't hit this
-                // branch, but we guard anyway).
+        // precondition — a conformant stream shouldn't hit this
+        // branch, but we guard anyway).
     }
 
     // §8.2.5.3 step 2 — the short-term unit with the smallest
@@ -1484,17 +1484,19 @@ pub fn apply_mmco(
             };
             // Pair exception — the protected field is the other parity
             // of the SAME Frame/FieldPair entry as the target …
-            if let Some((si, sp)) = spare {
-                if si == j && sp != lt_parity {
-                    continue;
-                }
+            if let Some((si, sp)) = spare
+                && si == j
+                && sp != lt_parity
+            {
+                continue;
             }
             // … or a separate coded-field entry of the same frame
             // (shared `frame_num`) as the picture gaining the index.
-            if let Some(sfn) = spare_frame_num {
-                if e.structure.is_field() && e.frame_num == sfn {
-                    continue;
-                }
+            if let Some(sfn) = spare_frame_num
+                && e.structure.is_field()
+                && e.frame_num == sfn
+            {
+                continue;
             }
             e.set_field_marking(lt_parity, RefMarking::Unused);
         }

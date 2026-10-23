@@ -424,11 +424,7 @@ pub fn encoder_quant_8_428(target: i64, qp_c: i32, weight_scale: &[i32; 16]) -> 
 pub fn chroma_dc_switch_scale(qs_c: i32, weight_scale: &[i32; 16]) -> Option<i64> {
     let ls = level_scale4x4(weight_scale, (qs_c % 6) as usize, 0, 0);
     let num = ls << (qs_c / 6);
-    if num % 32 == 0 {
-        Some(num / 32)
-    } else {
-        None
-    }
+    if num % 32 == 0 { Some(num / 32) } else { None }
 }
 
 #[cfg(test)]

@@ -229,7 +229,7 @@ mod tests {
         assert!(!res.use_default);
         let expected = {
             let mut v = vec![10, 8, 8, 12];
-            v.extend(std::iter::repeat(12).take(12));
+            v.extend(std::iter::repeat_n(12, 12));
             v
         };
         assert_eq!(res.scaling_list, expected);

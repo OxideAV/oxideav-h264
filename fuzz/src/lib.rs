@@ -19,7 +19,7 @@
 #![allow(unsafe_code)]
 
 pub mod libavcodec {
-    use libloading::{Library, Symbol};
+    use dlsym::Library;
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
@@ -54,11 +54,11 @@ pub mod libavcodec {
         static LIB: OnceLock<Option<Library>> = OnceLock::new();
         LIB.get_or_init(|| {
             for name in CANDIDATES {
-                // SAFETY: `Library::new` is documented as unsafe because
-                // the loaded library may run code at load time. We
-                // accept that risk for fuzz tooling — libavcodec is a
+                // SAFETY: `Library::open` is unsafe because the loaded
+                // library runs its initialisers at load time. We accept
+                // that risk for fuzz tooling — libavcodec is a
                 // well-behaved shared library distributed by distros.
-                if let Ok(l) = unsafe { Library::new(name) } {
+                if let Ok(l) = unsafe { Library::open(name) } {
                     return Some(l);
                 }
             }
@@ -173,6 +173,10 @@ pub mod libavcodec {
             return OracleResult::Unavailable;
         };
         unsafe {
+            // Every symbol is detached from its `Symbol` guard with
+            // `into_inner()`: the library handle lives in a `'static`
+            // `OnceLock` and is never unloaded, so the raw function
+            // pointers can never dangle.
             // Bind the decoder BY NAME, not by numeric `AVCodecID`.
             // `avcodec_find_decoder_by_name("h264")` (public API in
             // <libavcodec/codec.h>) cannot silently bind a different
@@ -182,45 +186,48 @@ pub mod libavcodec {
             // completely different codec, turning every frame our
             // decoder legitimately produced into a bogus "reject
             // parity" crash.
-            let find_decoder_by_name: Symbol<FindDecoderByNameFn> =
-                match l.get(b"avcodec_find_decoder_by_name") {
-                    Ok(s) => s,
+            let find_decoder_by_name: FindDecoderByNameFn =
+                match l.get::<FindDecoderByNameFn>(c"avcodec_find_decoder_by_name") {
+                    Ok(s) => s.into_inner(),
                     Err(_) => return OracleResult::Unavailable,
                 };
-            let alloc_context3: Symbol<AllocContext3Fn> = match l.get(b"avcodec_alloc_context3") {
-                Ok(s) => s,
+            let alloc_context3: AllocContext3Fn =
+                match l.get::<AllocContext3Fn>(c"avcodec_alloc_context3") {
+                    Ok(s) => s.into_inner(),
+                    Err(_) => return OracleResult::Unavailable,
+                };
+            let open2: Open2Fn = match l.get::<Open2Fn>(c"avcodec_open2") {
+                Ok(s) => s.into_inner(),
                 Err(_) => return OracleResult::Unavailable,
             };
-            let open2: Symbol<Open2Fn> = match l.get(b"avcodec_open2") {
-                Ok(s) => s,
+            let packet_alloc: PacketAllocFn = match l.get::<PacketAllocFn>(c"av_packet_alloc") {
+                Ok(s) => s.into_inner(),
                 Err(_) => return OracleResult::Unavailable,
             };
-            let packet_alloc: Symbol<PacketAllocFn> = match l.get(b"av_packet_alloc") {
-                Ok(s) => s,
+            let frame_alloc: FrameAllocFn = match l.get::<FrameAllocFn>(c"av_frame_alloc") {
+                Ok(s) => s.into_inner(),
                 Err(_) => return OracleResult::Unavailable,
             };
-            let frame_alloc: Symbol<FrameAllocFn> = match l.get(b"av_frame_alloc") {
-                Ok(s) => s,
+            let send_packet: SendPacketFn = match l.get::<SendPacketFn>(c"avcodec_send_packet") {
+                Ok(s) => s.into_inner(),
                 Err(_) => return OracleResult::Unavailable,
             };
-            let send_packet: Symbol<SendPacketFn> = match l.get(b"avcodec_send_packet") {
-                Ok(s) => s,
+            let receive_frame: ReceiveFrameFn =
+                match l.get::<ReceiveFrameFn>(c"avcodec_receive_frame") {
+                    Ok(s) => s.into_inner(),
+                    Err(_) => return OracleResult::Unavailable,
+                };
+            let packet_free: PacketFreeFn = match l.get::<PacketFreeFn>(c"av_packet_free") {
+                Ok(s) => s.into_inner(),
                 Err(_) => return OracleResult::Unavailable,
             };
-            let receive_frame: Symbol<ReceiveFrameFn> = match l.get(b"avcodec_receive_frame") {
-                Ok(s) => s,
+            let frame_free: FrameFreeFn = match l.get::<FrameFreeFn>(c"av_frame_free") {
+                Ok(s) => s.into_inner(),
                 Err(_) => return OracleResult::Unavailable,
             };
-            let packet_free: Symbol<PacketFreeFn> = match l.get(b"av_packet_free") {
-                Ok(s) => s,
-                Err(_) => return OracleResult::Unavailable,
-            };
-            let frame_free: Symbol<FrameFreeFn> = match l.get(b"av_frame_free") {
-                Ok(s) => s,
-                Err(_) => return OracleResult::Unavailable,
-            };
-            let free_context: Symbol<FreeContextFn> = match l.get(b"avcodec_free_context") {
-                Ok(s) => s,
+            let free_context: FreeContextFn = match l.get::<FreeContextFn>(c"avcodec_free_context")
+            {
+                Ok(s) => s.into_inner(),
                 Err(_) => return OracleResult::Unavailable,
             };
 
@@ -229,8 +236,14 @@ pub mod libavcodec {
             // both Linux and macOS; libavcodec always links libavutil).
             // Optional: when missing we simply open the decoder without
             // options.
-            let dict_set: Option<Symbol<DictSetFn>> = l.get(b"av_dict_set").ok();
-            let dict_free: Option<Symbol<DictFreeFn>> = l.get(b"av_dict_free").ok();
+            let dict_set: Option<DictSetFn> = l
+                .get::<DictSetFn>(c"av_dict_set")
+                .ok()
+                .map(|s| s.into_inner());
+            let dict_free: Option<DictFreeFn> = l
+                .get::<DictFreeFn>(c"av_dict_free")
+                .ok()
+                .map(|s| s.into_inner());
 
             let codec = find_decoder_by_name(c"h264".as_ptr());
             if codec.is_null() {

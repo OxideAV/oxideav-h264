@@ -6,7 +6,7 @@
 //! so the per-iteration cost matches the scale of a real frame
 //! (~4500 4x4 blocks for 720p in 4:2:0).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use oxideav_h264::transform::{
     default_scaling_list_4x4_flat, default_scaling_list_8x8_flat, inverse_transform_4x4,
     inverse_transform_8x8,

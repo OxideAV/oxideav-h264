@@ -466,21 +466,9 @@ fn predict_4x4_ddr(s: &Samples4x4, out: &mut [i32; 16]) {
     let t = &s.top;
     let l = &s.left;
     // Helper to fetch p[x,-1] for x in -1..=3.
-    let p_top = |x: i32| -> i32 {
-        if x == -1 {
-            tl
-        } else {
-            t[x as usize]
-        }
-    };
+    let p_top = |x: i32| -> i32 { if x == -1 { tl } else { t[x as usize] } };
     // Helper to fetch p[-1,y] for y in -1..=3.
-    let p_left = |y: i32| -> i32 {
-        if y == -1 {
-            tl
-        } else {
-            l[y as usize]
-        }
-    };
+    let p_left = |y: i32| -> i32 { if y == -1 { tl } else { l[y as usize] } };
     for y in 0..4i32 {
         for x in 0..4i32 {
             let v = if x > y {
@@ -503,20 +491,8 @@ fn predict_4x4_vr(s: &Samples4x4, out: &mut [i32; 16]) {
     let tl = s.top_left;
     let t = &s.top;
     let l = &s.left;
-    let p_top = |x: i32| -> i32 {
-        if x == -1 {
-            tl
-        } else {
-            t[x as usize]
-        }
-    };
-    let p_left = |y: i32| -> i32 {
-        if y == -1 {
-            tl
-        } else {
-            l[y as usize]
-        }
-    };
+    let p_top = |x: i32| -> i32 { if x == -1 { tl } else { t[x as usize] } };
+    let p_left = |y: i32| -> i32 { if y == -1 { tl } else { l[y as usize] } };
     for y in 0..4i32 {
         for x in 0..4i32 {
             let z_vr = 2 * x - y;
@@ -550,20 +526,8 @@ fn predict_4x4_hd(s: &Samples4x4, out: &mut [i32; 16]) {
     let tl = s.top_left;
     let t = &s.top;
     let l = &s.left;
-    let p_top = |x: i32| -> i32 {
-        if x == -1 {
-            tl
-        } else {
-            t[x as usize]
-        }
-    };
-    let p_left = |y: i32| -> i32 {
-        if y == -1 {
-            tl
-        } else {
-            l[y as usize]
-        }
-    };
+    let p_top = |x: i32| -> i32 { if x == -1 { tl } else { t[x as usize] } };
+    let p_left = |y: i32| -> i32 { if y == -1 { tl } else { l[y as usize] } };
     for y in 0..4i32 {
         for x in 0..4i32 {
             let z_hd = 2 * y - x;
@@ -852,20 +816,8 @@ fn predict_8x8_ddr(s: &Samples8x8, out: &mut [i32; 64]) {
     let tl = s.top_left;
     let t = &s.top;
     let l = &s.left;
-    let p_top = |x: i32| -> i32 {
-        if x == -1 {
-            tl
-        } else {
-            t[x as usize]
-        }
-    };
-    let p_left = |y: i32| -> i32 {
-        if y == -1 {
-            tl
-        } else {
-            l[y as usize]
-        }
-    };
+    let p_top = |x: i32| -> i32 { if x == -1 { tl } else { t[x as usize] } };
+    let p_left = |y: i32| -> i32 { if y == -1 { tl } else { l[y as usize] } };
     for y in 0..8i32 {
         for x in 0..8i32 {
             let v = if x > y {
@@ -888,20 +840,8 @@ fn predict_8x8_vr(s: &Samples8x8, out: &mut [i32; 64]) {
     let tl = s.top_left;
     let p = filtered_top_16(s);
     let l = &s.left;
-    let p_top = |x: i32| -> i32 {
-        if x == -1 {
-            tl
-        } else {
-            p[x as usize]
-        }
-    };
-    let p_left = |y: i32| -> i32 {
-        if y == -1 {
-            tl
-        } else {
-            l[y as usize]
-        }
-    };
+    let p_top = |x: i32| -> i32 { if x == -1 { tl } else { p[x as usize] } };
+    let p_left = |y: i32| -> i32 { if y == -1 { tl } else { l[y as usize] } };
     for y in 0..8i32 {
         for x in 0..8i32 {
             let z_vr = 2 * x - y;
@@ -936,20 +876,8 @@ fn predict_8x8_hd(s: &Samples8x8, out: &mut [i32; 64]) {
     let tl = s.top_left;
     let t = &s.top;
     let l = &s.left;
-    let p_top = |x: i32| -> i32 {
-        if x == -1 {
-            tl
-        } else {
-            t[x as usize]
-        }
-    };
-    let p_left = |y: i32| -> i32 {
-        if y == -1 {
-            tl
-        } else {
-            l[y as usize]
-        }
-    };
+    let p_top = |x: i32| -> i32 { if x == -1 { tl } else { t[x as usize] } };
+    let p_left = |y: i32| -> i32 { if y == -1 { tl } else { l[y as usize] } };
     for y in 0..8i32 {
         for x in 0..8i32 {
             let z_hd = 2 * y - x;
@@ -1656,20 +1584,8 @@ mod tests {
         let p_top = [10, 20, 30, 40];
         let p_left = [50, 60, 70, 80];
         let tl = 5;
-        let fetch_top = |x: i32| -> i32 {
-            if x == -1 {
-                tl
-            } else {
-                p_top[x as usize]
-            }
-        };
-        let fetch_left = |y: i32| -> i32 {
-            if y == -1 {
-                tl
-            } else {
-                p_left[y as usize]
-            }
-        };
+        let fetch_top = |x: i32| -> i32 { if x == -1 { tl } else { p_top[x as usize] } };
+        let fetch_left = |y: i32| -> i32 { if y == -1 { tl } else { p_left[y as usize] } };
 
         for y in 0..4i32 {
             for x in 0..4i32 {
@@ -1705,20 +1621,8 @@ mod tests {
         let tl = 5;
         let top = [100, 110, 120, 130];
         let left = [50, 60, 70, 80];
-        let p_top = |x: i32| -> i32 {
-            if x == -1 {
-                tl
-            } else {
-                top[x as usize]
-            }
-        };
-        let p_left = |y: i32| -> i32 {
-            if y == -1 {
-                tl
-            } else {
-                left[y as usize]
-            }
-        };
+        let p_top = |x: i32| -> i32 { if x == -1 { tl } else { top[x as usize] } };
+        let p_left = |y: i32| -> i32 { if y == -1 { tl } else { left[y as usize] } };
 
         for y in 0..4i32 {
             for x in 0..4i32 {
@@ -1759,20 +1663,8 @@ mod tests {
         let tl = 5;
         let top = [100, 110, 120, 130];
         let left = [50, 60, 70, 80];
-        let p_top = |x: i32| -> i32 {
-            if x == -1 {
-                tl
-            } else {
-                top[x as usize]
-            }
-        };
-        let p_left = |y: i32| -> i32 {
-            if y == -1 {
-                tl
-            } else {
-                left[y as usize]
-            }
-        };
+        let p_top = |x: i32| -> i32 { if x == -1 { tl } else { top[x as usize] } };
+        let p_left = |y: i32| -> i32 { if y == -1 { tl } else { left[y as usize] } };
 
         for y in 0..4i32 {
             for x in 0..4i32 {

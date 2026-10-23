@@ -28,7 +28,7 @@
 
 use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase, VideoFrame};
-use oxideav_h264::encoder::scp::{encode_scp_sequence, ScpConfig, ScpEncoded};
+use oxideav_h264::encoder::scp::{ScpConfig, ScpEncoded, encode_scp_sequence};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
 const W: usize = 80;
@@ -310,7 +310,9 @@ fn reference_decoder_check(enc: &ScpEncoded, tag: &str) {
         .status()
         .expect("spawn reference decoder");
     if !status.success() {
-        eprintln!("note {tag}: reference decoder rejected the separate-colour-plane stream; black-box gate skipped");
+        eprintln!(
+            "note {tag}: reference decoder rejected the separate-colour-plane stream; black-box gate skipped"
+        );
         if std::env::var("OXIDEAV_KEEP_STREAM").is_err() {
             let _ = std::fs::remove_dir_all(&dir);
         } else {

@@ -406,8 +406,12 @@ fn evaluate_results(case: &CorpusCase, results: Vec<FrameResult>) {
             Ok(d) => {
                 eprintln!(
                     "  frame {i}: Y {}/{} exact (max diff {}), UV {}/{} exact (max diff {}), pct={:.2}%",
-                    d.y_exact, d.y_total, d.y_max,
-                    d.uv_exact, d.uv_total, d.uv_max,
+                    d.y_exact,
+                    d.y_total,
+                    d.y_max,
+                    d.uv_exact,
+                    d.uv_total,
+                    d.uv_max,
                     d.pct()
                 );
                 agg.merge(d);

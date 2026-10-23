@@ -505,7 +505,7 @@ impl EncoderSession {
         let d = self.idx;
         self.idx += 1;
         let mut out = Vec::new();
-        if d % u64::from(self.cfg.gop_length) == 0 {
+        if d.is_multiple_of(u64::from(self.cfg.gop_length)) {
             // IDR slot. Any buffered pictures belong to the CLOSING
             // GOP: emit them first as a truncated mini-GOP (their
             // anchor is the last buffered picture — a B may never

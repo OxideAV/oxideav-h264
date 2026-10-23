@@ -12,7 +12,7 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, VideoFrame, VideoPlane,
 };
 use oxideav_h264::avcc::AvcDecoderConfigurationRecord;
-use oxideav_h264::nal::{parse_nal_unit, AnnexBSplitter, NalUnitType};
+use oxideav_h264::nal::{AnnexBSplitter, NalUnitType, parse_nal_unit};
 use oxideav_h264::sps::Sps;
 
 const W: usize = 64;
@@ -129,11 +129,7 @@ fn coded_pf(l: Layout) -> PixelFormat {
 /// minimum High-family profile.
 fn expected_profile(l: Layout, cabac: bool, lossless: bool) -> u8 {
     if l.cf == 1 && l.bd == 8 && !lossless {
-        if cabac {
-            77
-        } else {
-            66
-        }
+        if cabac { 77 } else { 66 }
     } else if lossless || l.cf == 3 || l.bd > 10 {
         244
     } else if l.cf == 2 {
@@ -151,7 +147,7 @@ fn source(l: Layout, n: usize) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
     let mut y = vec![0u16; W * H];
     for j in 0..H {
         for i in 0..W {
-            let block = if ((i + n) / 8 + j / 8) % 3 == 0 {
+            let block = if ((i + n) / 8 + j / 8).is_multiple_of(3) {
                 70
             } else {
                 0

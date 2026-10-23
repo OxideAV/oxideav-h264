@@ -2102,7 +2102,9 @@ mod tests {
         // Verbatim from Table 7-3, row Default_4x4_Intra.
         assert_eq!(
             DEFAULT_4X4_INTRA,
-            [6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42]
+            [
+                6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42
+            ]
         );
     }
 
@@ -2110,7 +2112,9 @@ mod tests {
     fn default_4x4_inter_table_7_3() {
         assert_eq!(
             DEFAULT_4X4_INTER,
-            [10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34]
+            [
+                10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34
+            ]
         );
     }
 
@@ -2614,7 +2618,7 @@ mod tests {
         assert_eq!(norm_adjust_4x4(0, 1, 1), 16); // (1,1) class
         assert_eq!(norm_adjust_4x4(0, 0, 1), 13); // other
         assert_eq!(norm_adjust_4x4(0, 2, 3), 13); // other
-                                                  // Row 5 (qP%6=5): v = [18, 29, 23].
+        // Row 5 (qP%6=5): v = [18, 29, 23].
         assert_eq!(norm_adjust_4x4(5, 0, 0), 18);
         assert_eq!(norm_adjust_4x4(5, 3, 3), 29);
         assert_eq!(norm_adjust_4x4(5, 2, 1), 23);
@@ -2633,7 +2637,7 @@ mod tests {
         assert_eq!(norm_adjust_8x8(0, 1, 0), 19); // (i%2,j%4)=(1,0)
         assert_eq!(norm_adjust_8x8(0, 0, 2), 25); // (i%4,j%4)=(0,2)
         assert_eq!(norm_adjust_8x8(0, 2, 0), 25); // (i%4,j%4)=(2,0)
-                                                  // "otherwise" class:
+        // "otherwise" class:
         assert_eq!(norm_adjust_8x8(0, 1, 2), 24);
         assert_eq!(norm_adjust_8x8(0, 2, 1), 24);
         assert_eq!(norm_adjust_8x8(0, 2, 3), 24);

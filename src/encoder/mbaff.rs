@@ -53,19 +53,19 @@
 //! the full P_Skip / P_L0_16x16 / P_8x8 / Intra_16x16-fallback mode
 //! set with real ME per MB geometry.
 
-use crate::encoder::deblock::{deblock_recon_mbaff, MbDeblockInfo};
+use crate::encoder::deblock::{MbDeblockInfo, deblock_recon_mbaff};
 use crate::encoder::nal::build_nal_unit;
-use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
+use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
 use crate::encoder::slice::{
-    write_idr_i_slice_header, write_p_slice_header, FieldPicSignal, IdrSliceHeaderConfig,
-    PSliceHeaderConfig,
+    FieldPicSignal, IdrSliceHeaderConfig, PSliceHeaderConfig, write_idr_i_slice_header,
+    write_p_slice_header,
 };
-use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
+use crate::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
 use crate::encoder::{
-    min_level_idc_for_picture_size, BitWriter, CavlcNcGrid, EncodedFrameRef, Encoder,
-    EncoderConfig, IntraGrid, MbQpTracker, MvGrid, MvGridSlot, YuvFrame,
+    BitWriter, CavlcNcGrid, EncodedFrameRef, Encoder, EncoderConfig, IntraGrid, MbQpTracker,
+    MvGrid, MvGridSlot, YuvFrame, min_level_idc_for_picture_size,
 };
-use crate::macroblock_layer::{blk4x4_idx, CavlcMbNc};
+use crate::macroblock_layer::{CavlcMbNc, blk4x4_idx};
 use crate::mb_address::{mbaff_mb_to_sample_xy, mbaff_neigh_location, mbaff_pair_neighbour_addrs};
 use crate::mv_deriv::Mv;
 use crate::nal::NalUnitType;
@@ -187,7 +187,7 @@ impl PicState {
             max_w,
             max_h,
             !self.field[addr],
-            addr % 2 == 0,
+            addr.is_multiple_of(2),
             addr as u32,
             pair,
             |a| !self.field[a as usize],
@@ -289,11 +289,7 @@ pub(crate) fn virtual_pos(addr: usize, w_mbs: usize, field: bool) -> (usize, usi
     let bot = addr % 2;
     let vx = pair_idx % w_mbs;
     let pr = pair_idx / w_mbs;
-    if field {
-        (vx, pr)
-    } else {
-        (vx, 2 * pr + bot)
-    }
+    if field { (vx, pr) } else { (vx, 2 * pr + bot) }
 }
 
 /// §7.4.4 — the inferred `mb_field_decoding_flag` for a fully-skipped
@@ -472,39 +468,39 @@ pub(crate) fn fill_neighbour_grids(
     // A (left MB in scratch coords): luma blocks (3, k) from
     // queries (-1, 4k); chroma blocks (1, k) from (-1, 4k).
     for k in 0..4i32 {
-        if let Some((n, xw, yw)) = st.resolve(addr, -1, 4 * k, 16, 16) {
-            if let Some(vaddr) = mark(nc_grid, vx as i32 - 1, vy as i32) {
-                nc_grid.mbs[vaddr].luma_total_coeff[blk4x4_idx(12, 4 * k) as usize] =
-                    effective_luma(n, xw, yw);
-            }
+        if let Some((n, xw, yw)) = st.resolve(addr, -1, 4 * k, 16, 16)
+            && let Some(vaddr) = mark(nc_grid, vx as i32 - 1, vy as i32)
+        {
+            nc_grid.mbs[vaddr].luma_total_coeff[blk4x4_idx(12, 4 * k) as usize] =
+                effective_luma(n, xw, yw);
         }
     }
     for k in 0..2i32 {
-        if let Some((n, xw, yw)) = st.resolve(addr, -1, 4 * k, 8, 8) {
-            if let Some(vaddr) = mark(nc_grid, vx as i32 - 1, vy as i32) {
-                let idx = (2 * k + 1) as usize;
-                nc_grid.mbs[vaddr].cb_total_coeff[idx] = effective_chroma(false, n, xw, yw);
-                nc_grid.mbs[vaddr].cr_total_coeff[idx] = effective_chroma(true, n, xw, yw);
-            }
+        if let Some((n, xw, yw)) = st.resolve(addr, -1, 4 * k, 8, 8)
+            && let Some(vaddr) = mark(nc_grid, vx as i32 - 1, vy as i32)
+        {
+            let idx = (2 * k + 1) as usize;
+            nc_grid.mbs[vaddr].cb_total_coeff[idx] = effective_chroma(false, n, xw, yw);
+            nc_grid.mbs[vaddr].cr_total_coeff[idx] = effective_chroma(true, n, xw, yw);
         }
     }
     // B (above MB in scratch coords): luma blocks (k, 3) from
     // (4k, -1); chroma blocks (k, 1) from (4k, -1).
     for k in 0..4i32 {
-        if let Some((n, xw, yw)) = st.resolve(addr, 4 * k, -1, 16, 16) {
-            if let Some(vaddr) = mark(nc_grid, vx as i32, vy as i32 - 1) {
-                nc_grid.mbs[vaddr].luma_total_coeff[blk4x4_idx(4 * k, 12) as usize] =
-                    effective_luma(n, xw, yw);
-            }
+        if let Some((n, xw, yw)) = st.resolve(addr, 4 * k, -1, 16, 16)
+            && let Some(vaddr) = mark(nc_grid, vx as i32, vy as i32 - 1)
+        {
+            nc_grid.mbs[vaddr].luma_total_coeff[blk4x4_idx(4 * k, 12) as usize] =
+                effective_luma(n, xw, yw);
         }
     }
     for k in 0..2i32 {
-        if let Some((n, xw, yw)) = st.resolve(addr, 4 * k, -1, 8, 8) {
-            if let Some(vaddr) = mark(nc_grid, vx as i32, vy as i32 - 1) {
-                let idx = (2 + k) as usize;
-                nc_grid.mbs[vaddr].cb_total_coeff[idx] = effective_chroma(false, n, xw, yw);
-                nc_grid.mbs[vaddr].cr_total_coeff[idx] = effective_chroma(true, n, xw, yw);
-            }
+        if let Some((n, xw, yw)) = st.resolve(addr, 4 * k, -1, 8, 8)
+            && let Some(vaddr) = mark(nc_grid, vx as i32, vy as i32 - 1)
+        {
+            let idx = (2 + k) as usize;
+            nc_grid.mbs[vaddr].cb_total_coeff[idx] = effective_chroma(false, n, xw, yw);
+            nc_grid.mbs[vaddr].cr_total_coeff[idx] = effective_chroma(true, n, xw, yw);
         }
     }
 
@@ -764,9 +760,9 @@ pub(crate) fn adaptive_pair_is_field(y: &[u8], w: usize, pair_col: usize, pair_r
 /// Encode an interlaced sequence as MBAFF frame pictures. `frames`
 /// holds frame-geometry 4:2:0 planes (top field = even rows).
 pub fn encode_mbaff_sequence(cfg: &MbaffConfig, frames: &[(&[u8], &[u8], &[u8])]) -> MbaffEncoded {
-    assert!(cfg.width % 16 == 0, "width must be MB-aligned");
+    assert!(cfg.width.is_multiple_of(16), "width must be MB-aligned");
     assert!(
-        cfg.frame_height % 32 == 0,
+        cfg.frame_height.is_multiple_of(32),
         "frame height must be a multiple of 32 (MB pairs)",
     );
     assert!(!frames.is_empty());

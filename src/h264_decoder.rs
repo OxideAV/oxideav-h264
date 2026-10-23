@@ -54,7 +54,7 @@ use crate::decoder::{Decoder as H264Driver, Event};
 use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::mb_grid::MbGrid;
 use crate::picture::Picture;
-use crate::poc::{derive_poc, PocResult, PocSlice, PocSps, PocState};
+use crate::poc::{PocResult, PocSlice, PocSps, PocState, derive_poc};
 use crate::ref_list::{self, DpbEntry, MmcoOp as RefMmcoOp, PicStructure, RefMarking, RplmOp};
 use crate::ref_store::{RefPicProvider, RefPicStore};
 use crate::slice_header::{
@@ -1085,16 +1085,17 @@ impl H264CodecDecoder {
             // with `PrevRefFrameNum` itself is the
             // second-field / non-reference-following-reference case and
             // is checked by the §7.4.1.2.4 picture-boundary logic.)
-            if !is_idr && !sps.gaps_in_frame_num_value_allowed_flag {
-                if let Some(prev) = self.prev_ref_frame_num {
-                    let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
-                    let expected = (prev + 1) % max_frame_num;
-                    if header.frame_num != prev && header.frame_num != expected {
-                        return Err(Error::invalid(format!(
-                            "h264 slice_header: frame_num {} after PrevRefFrameNum {} (§7.4.3 requires {} when gaps_in_frame_num_value_allowed_flag is 0)",
-                            header.frame_num, prev, expected
-                        )));
-                    }
+            if !is_idr
+                && !sps.gaps_in_frame_num_value_allowed_flag
+                && let Some(prev) = self.prev_ref_frame_num
+            {
+                let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
+                let expected = (prev + 1) % max_frame_num;
+                if header.frame_num != prev && header.frame_num != expected {
+                    return Err(Error::invalid(format!(
+                        "h264 slice_header: frame_num {} after PrevRefFrameNum {} (§7.4.3 requires {} when gaps_in_frame_num_value_allowed_flag is 0)",
+                        header.frame_num, prev, expected
+                    )));
                 }
             }
 

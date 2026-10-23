@@ -11,7 +11,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
-use oxideav_h264::encoder::deep::{encode_deep_sequence, DeepConfig};
+use oxideav_h264::encoder::deep::{DeepConfig, encode_deep_sequence};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
 const W: usize = 32;
@@ -65,7 +65,9 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut frames = Vec::with_capacity(n_frames);
     for k in 0..n_frames {
-        let y: Vec<u16> = (0..W * H).map(|i| sample(i + 3 * k + (i / W) * 5)).collect();
+        let y: Vec<u16> = (0..W * H)
+            .map(|i| sample(i + 3 * k + (i / W) * 5))
+            .collect();
         let u: Vec<u16> = (0..cw * ch).map(|i| sample(i * 3 + k)).collect();
         let v: Vec<u16> = (0..cw * ch).map(|i| sample(i * 7 + 2 * k)).collect();
         frames.push((y, u, v));
@@ -94,7 +96,10 @@ fuzz_target!(|data: &[u8]| {
     );
     if lossless {
         for (r, s) in enc.recon_frames.iter().zip(frames.iter()) {
-            assert!(r.0 == s.0 && r.1 == s.1 && r.2 == s.2, "lossless recon != source");
+            assert!(
+                r.0 == s.0 && r.1 == s.1 && r.2 == s.2,
+                "lossless recon != source"
+            );
         }
     }
     let decoded = decode(&enc.annex_b);
@@ -103,7 +108,11 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(vf.planes.len(), 3);
         for (plane, exp) in vf.planes.iter().zip([ry, ru, rv]) {
             let ok = if bd == 8 {
-                plane.data.iter().zip(exp.iter()).all(|(&a, &b)| a as u16 == b)
+                plane
+                    .data
+                    .iter()
+                    .zip(exp.iter())
+                    .all(|(&a, &b)| a as u16 == b)
             } else {
                 let bytes: Vec<u8> = exp.iter().flat_map(|s| s.to_le_bytes()).collect();
                 plane.data.iter().zip(bytes.iter()).all(|(a, b)| a == b)

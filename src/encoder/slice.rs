@@ -397,7 +397,7 @@ impl ExplicitPredWeightTableL0 {
 /// `BitWriter`. The writer is left at the position where `slice_data()`
 /// should begin.
 pub fn write_p_slice_header(w: &mut BitWriter, cfg: &PSliceHeaderConfig<'_>) {
-    debug_assert!(cfg.slice_type_raw % 5 == 0); // P-slice
+    debug_assert!(cfg.slice_type_raw.is_multiple_of(5)); // P-slice
     w.ue(cfg.first_mb_in_slice);
     w.ue(cfg.slice_type_raw);
     w.ue(cfg.pic_parameter_set_id);
@@ -667,7 +667,7 @@ pub fn write_b_slice_header(w: &mut BitWriter, cfg: &BSliceHeaderConfig) {
         w.se(pwt.luma_weight_l0);
         w.se(pwt.luma_offset_l0);
         w.u(1, 0); // chroma_weight_l0_flag = 0 (use default chroma weight)
-                   // L1 entry (single ref).
+        // L1 entry (single ref).
         w.u(1, 1); // luma_weight_l1_flag = 1
         w.se(pwt.luma_weight_l1);
         w.se(pwt.luma_offset_l1);
@@ -703,9 +703,9 @@ pub fn write_b_slice_header(w: &mut BitWriter, cfg: &BSliceHeaderConfig) {
 mod tests {
     use super::*;
     use crate::encoder::nal::build_nal_unit;
-    use crate::encoder::pps::{build_baseline_pps_rbsp, BaselinePpsConfig};
-    use crate::encoder::sps::{build_baseline_sps_rbsp, BaselineSpsConfig};
-    use crate::nal::{parse_nal_unit, AnnexBSplitter, NalHeader, NalUnitType};
+    use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
+    use crate::encoder::sps::{BaselineSpsConfig, build_baseline_sps_rbsp};
+    use crate::nal::{AnnexBSplitter, NalHeader, NalUnitType, parse_nal_unit};
     use crate::pps::Pps;
     use crate::slice_header::{SliceHeader, SliceType};
     use crate::sps::Sps;

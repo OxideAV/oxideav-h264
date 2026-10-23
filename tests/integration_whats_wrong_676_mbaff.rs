@@ -120,20 +120,20 @@ fn find_box_inner<'a>(buf: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
 
 /// Find the first `stco` (or `co64`) entry — the first chunk offset.
 fn first_chunk_offset(buf: &[u8]) -> Option<u64> {
-    if let Some(stco) = find_box(buf, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stco"]) {
-        if stco.len() >= 16 {
-            // FullBox (4) + entry_count (4) + first offset (4)
-            let off = u32::from_be_bytes([stco[8], stco[9], stco[10], stco[11]]);
-            return Some(off as u64);
-        }
+    if let Some(stco) = find_box(buf, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stco"])
+        && stco.len() >= 16
+    {
+        // FullBox (4) + entry_count (4) + first offset (4)
+        let off = u32::from_be_bytes([stco[8], stco[9], stco[10], stco[11]]);
+        return Some(off as u64);
     }
-    if let Some(co64) = find_box(buf, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"co64"]) {
-        if co64.len() >= 20 {
-            let off = u64::from_be_bytes([
-                co64[8], co64[9], co64[10], co64[11], co64[12], co64[13], co64[14], co64[15],
-            ]);
-            return Some(off);
-        }
+    if let Some(co64) = find_box(buf, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"co64"])
+        && co64.len() >= 20
+    {
+        let off = u64::from_be_bytes([
+            co64[8], co64[9], co64[10], co64[11], co64[12], co64[13], co64[14], co64[15],
+        ]);
+        return Some(off);
     }
     None
 }

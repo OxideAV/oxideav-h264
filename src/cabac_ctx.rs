@@ -3035,8 +3035,14 @@ pub fn decode_coded_block_flag(
     if dbg_enabled() {
         eprintln!(
             "[CABAC] cbf bt={:?} base={} cat={} inc={} ctx={} -> {}  cond_left={:?} cond_above={:?}",
-            block_type, base, cat_offset, inc, ctx_idx, bin,
-            neighbour_cbf_left, neighbour_cbf_above
+            block_type,
+            base,
+            cat_offset,
+            inc,
+            ctx_idx,
+            bin,
+            neighbour_cbf_left,
+            neighbour_cbf_above
         );
     }
     Ok(bin == 1)
@@ -3092,11 +3098,7 @@ pub fn decode_coded_block_pattern(
                 return 1;
             }
             let bit_set = ((cbp_luma >> bit_idx_n) & 1) != 0;
-            if bit_set {
-                0
-            } else {
-                1
-            }
+            if bit_set { 0 } else { 1 }
         };
 
     // §6.4.11.2 / §6.4.3 Figure 6-11 — neighbour 8x8 block of
@@ -3119,11 +3121,7 @@ pub fn decode_coded_block_pattern(
         if p.is_skip {
             return 1;
         }
-        if p.cbp_bit_set {
-            0
-        } else {
-            1
-        }
+        if p.cbp_bit_set { 0 } else { 1 }
     };
 
     for bin_idx in 0..4u32 {
@@ -3145,20 +3143,12 @@ pub fn decode_coded_block_pattern(
             1 => {
                 // Left neighbour is block 0 of the current MB.
                 let b_k = prev_bins[0];
-                if b_k != 0 {
-                    0
-                } else {
-                    1
-                }
+                if b_k != 0 { 0 } else { 1 }
             }
             3 => {
                 // Left neighbour is block 2 of the current MB.
                 let b_k = prev_bins[2];
-                if b_k != 0 {
-                    0
-                } else {
-                    1
-                }
+                if b_k != 0 { 0 } else { 1 }
             }
             _ => 0,
         };
@@ -3181,20 +3171,12 @@ pub fn decode_coded_block_pattern(
             2 => {
                 // Above neighbour is block 0 of the current MB.
                 let b_k = prev_bins[0];
-                if b_k != 0 {
-                    0
-                } else {
-                    1
-                }
+                if b_k != 0 { 0 } else { 1 }
             }
             3 => {
                 // Above neighbour is block 1 of the current MB.
                 let b_k = prev_bins[1];
-                if b_k != 0 {
-                    0
-                } else {
-                    1
-                }
+                if b_k != 0 { 0 } else { 1 }
             }
             _ => 0,
         };
@@ -3234,11 +3216,7 @@ pub fn decode_coded_block_pattern(
                     1 => cbp_chroma != 2,
                     _ => false,
                 };
-                if zero_branch {
-                    0
-                } else {
-                    1
-                }
+                if zero_branch { 0 } else { 1 }
             };
         // binIdx 0.
         let cond_a0 = chroma_cond(
@@ -3277,11 +3255,7 @@ pub fn decode_coded_block_pattern(
             );
             let inc1 = cond_a1 + 2 * cond_b1 + 4;
             let b1 = dec.decode_decision(ctxs.at_mut((CHROMA_OFFSET + inc1) as usize))?;
-            if b1 == 0 {
-                1
-            } else {
-                2
-            }
+            if b1 == 0 { 1 } else { 2 }
         }
     } else {
         0
@@ -3377,11 +3351,7 @@ fn sig_coeff_inc(block_type: BlockType, level_list_idx: u32, field: bool, num_c8
         }
         5 | 9 | 13 => {
             let row = TBL_9_43[level_list_idx as usize];
-            if field {
-                row.1 as u32
-            } else {
-                row.0 as u32
-            }
+            if field { row.1 as u32 } else { row.0 as u32 }
         }
         _ => {
             // eq. (9-21): ctxIdxInc = levelListIdx.

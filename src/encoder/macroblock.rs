@@ -28,7 +28,7 @@
 
 use crate::cavlc::CoeffTokenContext;
 use crate::encoder::bitstream::BitWriter;
-use crate::encoder::cavlc::{encode_residual_block_cavlc, CavlcEncodeError};
+use crate::encoder::cavlc::{CavlcEncodeError, encode_residual_block_cavlc};
 use crate::encoder::transform::zigzag_scan_4x4;
 
 /// §6.2 — Chroma layout selector for the macroblock writer's chroma
@@ -1404,10 +1404,10 @@ pub fn emit_inter_mb_tail(
 
     // §7.3.5 — transform_size_8x8_flag (second gate): coded when the
     // PPS has transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if let Some(flag) = transform_size_8x8_flag {
-        if cbp_luma > 0 {
-            w.u(1, if flag { 1 } else { 0 });
-        }
+    if let Some(flag) = transform_size_8x8_flag
+        && cbp_luma > 0
+    {
+        w.u(1, if flag { 1 } else { 0 });
     }
 
     // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
@@ -2460,10 +2460,10 @@ fn write_b_two_part_residuals(
 
     // §7.3.5 — transform_size_8x8_flag (second gate), present only
     // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if let Some(flag) = transform_size_8x8_flag {
-        if cbp_luma > 0 {
-            w.u(1, if flag { 1 } else { 0 });
-        }
+    if let Some(flag) = transform_size_8x8_flag
+        && cbp_luma > 0
+    {
+        w.u(1, if flag { 1 } else { 0 });
     }
 
     let needs_qp_delta = cbp_luma > 0 || cbp_chroma > 0;
@@ -2641,10 +2641,10 @@ pub fn write_b_8x8_all_direct_mb(
 
     // §7.3.5 — transform_size_8x8_flag (second gate), present only
     // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if let Some(flag) = cfg.transform_size_8x8_flag {
-        if cfg.cbp_luma > 0 {
-            w.u(1, if flag { 1 } else { 0 });
-        }
+    if let Some(flag) = cfg.transform_size_8x8_flag
+        && cfg.cbp_luma > 0
+    {
+        w.u(1, if flag { 1 } else { 0 });
     }
 
     // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).
@@ -2912,10 +2912,10 @@ pub fn write_b_8x8_mixed_mb(
 
     // §7.3.5 — transform_size_8x8_flag (second gate), present only
     // when the PPS signals transform_8x8_mode_flag = 1 and cbp_luma > 0.
-    if let Some(flag) = cfg.transform_size_8x8_flag {
-        if cfg.cbp_luma > 0 {
-            w.u(1, if flag { 1 } else { 0 });
-        }
+    if let Some(flag) = cfg.transform_size_8x8_flag
+        && cfg.cbp_luma > 0
+    {
+        w.u(1, if flag { 1 } else { 0 });
     }
 
     // §7.3.5 — mb_qp_delta is present iff (cbp_luma>0 || cbp_chroma>0).

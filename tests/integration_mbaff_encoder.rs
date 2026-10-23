@@ -17,7 +17,7 @@
 
 use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
-use oxideav_h264::encoder::mbaff::{encode_mbaff_sequence, MbaffConfig, MbaffEncoded, PairMode};
+use oxideav_h264::encoder::mbaff::{MbaffConfig, MbaffEncoded, PairMode, encode_mbaff_sequence};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
 const W: usize = 80;
@@ -106,7 +106,7 @@ fn assert_frames_match_recon(enc: &MbaffEncoded, decoded: &[oxideav_core::VideoF
                 .data
                 .iter()
                 .zip(exp.iter())
-                .filter(|(&a, &b)| a != b)
+                .filter(|&(&a, &b)| a != b)
                 .count();
             if mismatches != 0 {
                 // Diagnostic: distinct diverging MBs (frame coords).
@@ -173,7 +173,11 @@ fn ffmpeg_check(enc: &MbaffEncoded, tag: &str) {
             ("Cb", ru.as_slice(), ff_u),
             ("Cr", rv.as_slice(), ff_v),
         ] {
-            let mism = ours.iter().zip(ff.iter()).filter(|(&a, &b)| a != b).count();
+            let mism = ours
+                .iter()
+                .zip(ff.iter())
+                .filter(|&(&a, &b)| a != b)
+                .count();
             assert_eq!(
                 mism,
                 0,

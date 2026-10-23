@@ -19,7 +19,7 @@ use oxideav_core::Decoder as _;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase, VideoFrame};
 use oxideav_h264::encoder::{Encoder, EncoderConfig, ScalingMatrixMode, YuvFrame};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
-use oxideav_h264::nal::{parse_nal_unit, AnnexBSplitter, NalUnitType};
+use oxideav_h264::nal::{AnnexBSplitter, NalUnitType, parse_nal_unit};
 
 const W: usize = 64;
 const H: usize = 64;
@@ -35,11 +35,7 @@ fn make_source() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             let tex = if i >= 32 && j >= 32 {
                 (i as u32 * 37 + j as u32 * 101 + (i as u32 ^ j as u32) * 13) % 61
             } else if i < 32 && j >= 32 {
-                if (i / 4) % 2 == 0 {
-                    30
-                } else {
-                    0
-                }
+                if (i / 4) % 2 == 0 { 30 } else { 0 }
             } else {
                 0
             };

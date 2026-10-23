@@ -88,7 +88,9 @@ pub enum DecoderError {
     /// (`avc_3d_extension_flag == 1`) body. Only the MVC branch
     /// (`slice_header()` + `slice_data()`) is parsed; the Annex F SVC
     /// and Annex J 3D-AVC slice bodies are not modelled yet.
-    #[error("coded slice extension body is not MVC (svc_extension_flag/avc_3d_extension_flag set); not supported")]
+    #[error(
+        "coded slice extension body is not MVC (svc_extension_flag/avc_3d_extension_flag set); not supported"
+    )]
     SliceExtensionBodyNotMvc,
 }
 
@@ -930,12 +932,12 @@ mod tests {
         w.ue(pps_id); // pic_parameter_set_id
         w.u(4, 0); // frame_num (4 bits)
         w.u(4, 0); // pic_order_cnt_lsb (4 bits)
-                   // nal_ref_idc != 0 → dec_ref_pic_marking(): sliding window
+        // nal_ref_idc != 0 → dec_ref_pic_marking(): sliding window
         w.u(1, 0);
         w.se(0); // slice_qp_delta
-                 // No rbsp_trailing_bits here — the slice_data follows in a real
-                 // stream; for tests we just let the parser read exactly what it
-                 // needs. Append a padding byte so the reader never runs out.
+        // No rbsp_trailing_bits here — the slice_data follows in a real
+        // stream; for tests we just let the parser read exactly what it
+        // needs. Append a padding byte so the reader never runs out.
         w.u(8, 0x80);
         w.into_bytes()
     }
@@ -1333,10 +1335,10 @@ mod tests {
         w.u(1, 1); // direct_8x8_inference_flag
         w.u(1, 0); // frame_cropping_flag
         w.u(1, 0); // vui_parameters_present_flag
-                   // §7.3.2.1.3 subset_seq_parameter_set_rbsp tail (profile 128 →
-                   // MVC extension branch).
+        // §7.3.2.1.3 subset_seq_parameter_set_rbsp tail (profile 128 →
+        // MVC extension branch).
         w.u(1, 1); // bit_equal_to_one
-                   // §G.7.3.2.1.4 seq_parameter_set_mvc_extension() — two views.
+        // §G.7.3.2.1.4 seq_parameter_set_mvc_extension() — two views.
         w.ue(1); // num_views_minus1 = 1
         w.ue(0); // view_id[0]
         w.ue(2); // view_id[1]

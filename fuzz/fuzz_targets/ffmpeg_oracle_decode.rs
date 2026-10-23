@@ -51,7 +51,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase, VideoPlane};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
-use oxideav_h264::nal::{rbsp_from_nal_payload, AnnexBSplitter};
+use oxideav_h264::nal::{AnnexBSplitter, rbsp_from_nal_payload};
 use oxideav_h264::sps::Sps;
 use oxideav_h264_fuzz::libavcodec;
 
@@ -286,14 +286,13 @@ fn decode_with_ours(data: &[u8]) -> OursResult {
     // EOF, and misreading 16-bit-per-sample planes as 8-bit would fake
     // both dimensions and samples.
     for id in 0..32 {
-        if let Some(sps) = dec.stored_sps(id) {
-            if sps.bit_depth_luma_minus8 != 0
+        if let Some(sps) = dec.stored_sps(id)
+            && (sps.bit_depth_luma_minus8 != 0
                 || sps.bit_depth_chroma_minus8 != 0
                 || sps.chroma_format_idc == 0
-                || sps.separate_colour_plane_flag
-            {
-                return OursResult::Incomparable;
-            }
+                || sps.separate_colour_plane_flag)
+        {
+            return OursResult::Incomparable;
         }
     }
     if dec.decode_error_count() > 0 {
