@@ -725,7 +725,11 @@ fn parse_slice_data_impl(
                         // Contexts (pStateIdx/valMPS) are preserved
                         // per §9.3.1 (only 9.3.1.2 is invoked, not
                         // 9.3.1.1).
-                        let post_pcm_r = position_reader(rbsp, pcm_end_byte, pcm_end_bit)?;
+                        // The engine reads `remainder` (the CABAC segment from
+                        // `byte_pos`), so its position stays relative to that
+                        // segment for a later I_PCM's offset above.
+                        let post_pcm_r =
+                            position_reader(remainder, pcm_end_byte - byte_pos, pcm_end_bit)?;
                         cabac_dec = CabacDecoder::new(post_pcm_r)?;
                         // §9.3.3.1.1.5 — after I_PCM, the next MB's
                         // mb_qp_delta ctxIdxInc initial value is 0
