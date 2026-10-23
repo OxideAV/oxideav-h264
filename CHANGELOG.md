@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `BitReader::more_rbsp_data()` (§7.2) compares the cursor against the rbsp_stop_one_bit position cached once in `BitReader::new` instead of rescanning the RBSP on every call (#14, dancixx); exhaustive tests against the previous scan for every 0–2 byte input at every cursor position plus long zero suffixes. 1080p High CABAC decode 4.31 s → 3.86 s for 120 frames on the maintainer's machine, output byte-identical.
 - edition 2024, MSRV 1.95; fuzz harness loads its reference through dlsym instead of libloading
 
 ## [0.1.9](https://github.com/OxideAV/oxideav-h264/compare/v0.1.8...v0.1.9) - 2026-10-14
