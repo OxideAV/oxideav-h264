@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - edition 2024, MSRV 1.95; fuzz harness loads its reference through dlsym instead of libloading
+
 ## [0.1.9](https://github.com/OxideAV/oxideav-h264/compare/v0.1.8...v0.1.9) - 2026-10-14
 
 ### Other
