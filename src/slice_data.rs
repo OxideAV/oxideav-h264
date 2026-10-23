@@ -199,7 +199,6 @@ pub fn parse_slice_data_partitioned(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 // The trace switches are read once and cached: these checks run per
 // macroblock, and a `getenv()` per call shows up in decode profiles.
 fn env_flag(cache: &'static std::sync::OnceLock<bool>, name: &str) -> bool {

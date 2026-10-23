@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- decode hot path: the per-macroblock trace switches (`OXIDEAV_H264_BIN_TRACE` / `_SKIP_TRACE` / `_CTX17_TRACE`) are read once into `OnceLock`s instead of a `getenv()` per macroblock, and the CABAC `coeff_abs_level_minus1` debug line is formatted only when the trace is on (#15, ropoctl); output unchanged
 - `BitReader::more_rbsp_data()` (§7.2) compares the cursor against the rbsp_stop_one_bit position cached once in `BitReader::new` instead of rescanning the RBSP on every call (#14, dancixx); exhaustive tests against the previous scan for every 0–2 byte input at every cursor position plus long zero suffixes. 1080p High CABAC decode 4.31 s → 3.86 s for 120 frames on the maintainer's machine, output byte-identical.
 - edition 2024, MSRV 1.95; fuzz harness loads its reference through dlsym instead of libloading
 
