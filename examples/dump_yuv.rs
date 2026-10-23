@@ -4,17 +4,27 @@
 // the same layout a black-box reference decoder emits with
 // `-f rawvideo`, so the two files can be diffed byte-for-byte.
 //
-// Usage: dump_yuv <input.h264> <out.yuv>
+// Usage: dump_yuv <input.h264> <out.yuv> [threads]
+//
+// `threads` (default 1) is the worker budget handed to the decoder
+// through `Decoder::set_execution_context`; the output must not depend
+// on it.
 use oxideav_core::Decoder as _;
-use oxideav_core::{CodecId, Frame, Packet, TimeBase};
+use oxideav_core::{CodecId, ExecutionContext, Frame, Packet, TimeBase};
 use std::io::Write as _;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let h264 = args.next().expect("usage: dump_yuv <input.h264> <out.yuv>");
-    let out = args.next().expect("usage: dump_yuv <input.h264> <out.yuv>");
+    let out = args
+        .next()
+        .expect("usage: dump_yuv <input.h264> <out.yuv> [threads]");
+    let threads: usize = args
+        .next()
+        .map_or(1, |t| t.parse().expect("threads: integer"));
     let stream = std::fs::read(&h264).unwrap();
     let mut dec = oxideav_h264::h264_decoder::H264CodecDecoder::new(CodecId::new("h264"));
+    dec.set_execution_context(&ExecutionContext::with_threads(threads));
     let pkt = Packet::new(0, TimeBase::new(1, 25), stream).with_pts(0);
     dec.send_packet(&pkt).expect("send_packet");
     dec.flush().expect("flush");
@@ -44,5 +54,5 @@ fn main() {
             Err(e) => panic!("receive_frame after {n_frames} frames: {e:?}"),
         }
     }
-    eprintln!("dumped {n_frames} frames to {out}");
+    eprintln!("dumped {n_frames} frames to {out} (threads={threads})");
 }
