@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/OxideAV/oxideav-h264/compare/v0.1.9...v0.1.10) - 2026-10-24
+
+### Added
+
+- cache H264 RBSP stop-bit positions
+
+### Fixed
+
+- fixup for #23: CHANGELOG entry for the CABAC I_PCM re-initialisation offset
+- fixup for #22: CHANGELOG entry for the wavefront deblocking
+- fixup for #22: CHANGELOG entry for the wavefront deblocking
+- fix master: restore the gated tree of #22 after the admin rebase re-applied already-merged commits
+- fix master: drop the MAX_PARTITION_SAMPLES duplicate the admin rebase of #21 re-applied from its embedded #16 commit
+- fixup for #21: thread-invariance over the docs fixture corpus + staged JVT streams; dump_yuv thread budget; CHANGELOG
+- fixup for #18: unit tests pin the sparse short-cuts against the full butterfly; CHANGELOG entry
+- fixup for #17: CHANGELOG entry for the chroma bS reuse
+- fixup for #16: keep the MbWriter doc comment on MbWriter; CHANGELOG entry
+- fix master: drop the duplicated trace-switch helper block the admin rebase of #15 re-applied
+- fixup for #15: drop the stray too_many_arguments allow on env_flag; CHANGELOG entry
+- fixup for #14: CHANGELOG entry for the cached rbsp_stop_one_bit position
+
+### Other
+
+- MBAFF P / B decode byte-identical to a black-box reference decoder on 1080i streams ([#11](https://github.com/OxideAV/oxideav-h264/pull/11))
+- locate a CABAC I_PCM payload after an earlier one in the slice
+- filter macroblock rows in a wavefront under a thread budget
+- revert the two commits that carried #22's content under the wrong author
+- inter macroblocks of a slice reconstruct concurrently under a thread budget
+- motion-compensation partition buffers live on the stack
+- all-zero and DC-only 4x4 blocks, and all-zero 8x8 blocks, skip the butterfly
+- fold the intra / nonzero-coefficient guards of the ref/mv bS test (clippy::nonminimal_bool)
+- keep the clippy allow on deblock_plane_luma
+- chroma edges reuse the bS their luma edge derived (non-MBAFF pictures)
+- evaluate the ref/mv bS test only when it decides bS
+- motion-compensation partition buffers live on the stack
+- allow clippy::too_many_arguments on parse_slice_data_impl
+- cache the per-MB trace switches and format CABAC debug lines lazily
+- allow clippy::too_many_arguments on parse_slice_data_impl
+- cache the per-MB trace switches and format CABAC debug lines lazily
+- CHANGELOG spacing
+- edition 2024, MSRV 1.95
+
 - MBAFF P / B decode is byte-identical to a black-box reference decoder on interlaced 1080i streams (#11): (1) §8.4.2.3.2 implicit weighted bi-prediction in a field macroblock of an MBAFF frame takes currPicOrField / pic0 / pic1 as the field of the macroblock's parity and the fields of RefPicListX[refIdxLX / 2] selected by refIdxLX % 2, instead of the frame order counts; (2) §8.4.1.2.2 spatial direct colZeroFlag reads the co-located block through the §8.4.1.2.1 Table 8-6 colPic / Table 8-8 mbAddrCol, yM mapping (a frame macroblock over a field co-located pair and vice versa) with mvCol unscaled per NOTE 2, sharing one `colocated_block` derivation with temporal direct; (3) §8.3.2.1 eq. 8-72 — an Intra_8x8 frame macroblock whose left neighbour A is an Intra_4x4 field macroblock takes Intra4x4PredMode[luma8x8BlkIdxA * 4 + 3] for luma8x8BlkIdx 2 (n = 3). `integration_mbaff_inter_conformance` pins three synthetic streams (each verified to fail with only its own fix withdrawn) to the reference decoder's per-frame hashes at budgets 1 and 8; 1920x1080 TFF and BFF IBBBP streams (60 frames) and a 15-configuration 720x576 sweep (ultrafast..veryslow, CAVLC, Main, 4:2:2, 10-bit, QP 8 / 45, 4 slices, temporal direct, constrained intra) decode MD5-identical at budgets 1 and 8
 - CABAC I_PCM: the arithmetic decoder rebuilt behind an I_PCM macroblock (§9.3.1.2) reads the CABAC segment again, so its position stays relative to the segment and a later I_PCM payload in the same slice is located correctly — a second I_PCM in a CABAC slice desynchronised the rest of the slice (x264 lossless streams code noisy macroblocks as I_PCM) (#23, ropoctl); `integration_cabac_ipcm` pins a 96x64 lossless CABAC IDR picture with I_PCM in every row against the black-box reference output, and a 30-frame 640x360 x264 lossless CABAC stream now decodes byte-identical to the reference decoder
 - deblocking: with a thread budget above one a non-MBAFF picture (ChromaArrayType 0 / 1 / 2) is filtered by macroblock row in a wavefront — row r filters macroblock x once row r − 1 is past x + 1, each worker in a band of its 16 rows plus a 4-row halo (chroma alike) handed down through per-column slots, halo rows written back after every row is done; the per-macroblock luma / chroma edge walkers (`deblock_luma_mb` / `deblock_chroma_mb`) are shared with the serial raster walk (#22, ropoctl); output identical at every budget (`integration_threads` corpus)
