@@ -28,7 +28,11 @@ field-mode top edge and the NOTE 3 field |Δmv| threshold;
 `mbaff-field-pairs` BitExact gate). Round 416 closed the CAVLC MBAFF
 tail (`mbaff-field-cavlc` BitExact gate: the residual walker's
 §9.2.1.1 nC probes now route through the exact §6.4.12.2 Table 6-4
-process). §8.5.15 lossless transform-bypass
+process). Interlaced 1080i MBAFF streams with P and B pictures (TFF and
+BFF, B-pyramid, spatial and temporal direct, implicit weighted
+bi-prediction, CAVLC and CABAC, 4:2:2 and 10-bit) decode MD5-identical
+to a black-box reference decoder (`integration_mbaff_inter_conformance`).
+§8.5.15 lossless transform-bypass
 (`qpprime_y_zero_transform_bypass_flag=1`, QP′Y == 0) decodes
 losslessly — identity §8.5.10..§8.5.13 legs + V/H intra residual DPCM
 (`lossless-transform-bypass` BitExact gate). **PAFF (`field_pic_flag

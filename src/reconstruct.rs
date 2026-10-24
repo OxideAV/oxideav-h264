@@ -953,6 +953,9 @@ fn synth_mb_inter<R: RefPicProvider>(
             pps,
             ref_pics,
             curr_poc,
+            // Only frame macroblocks take this path (MBAFF frames stay
+            // serial), so the field order counts are never consulted.
+            (curr_poc, curr_poc),
             &mut pred_luma,
             pred_cb,
             pred_cr,
@@ -2363,8 +2366,9 @@ fn intra_mxm_pred_mode_for_neighbour_8x8(
         info.intra_8x8_pred_modes[blk]
     } else if mb_is_intra_4x4(info) {
         // §8.3.2.1 eq. 8-72: intraMxMPredModeN =
-        // Intra4x4PredMode[ luma8x8BlkIdxN * 4 + n ]. Non-MBAFF frame:
-        // n = 1 for A, 2 for B.
+        // Intra4x4PredMode[ luma8x8BlkIdxN * 4 + n ] (n chosen by the
+        // caller: 1 or, for the MBAFF frame-over-field A case, 3 for A;
+        // 2 for B).
         let sub_idx = blk * 4 + n_for_4x4;
         info.intra_4x4_pred_modes[sub_idx]
     } else {
@@ -2461,13 +2465,30 @@ fn derive_intra_8x8_pred_mode(
     );
     let dc_pred_flag = mb_a.is_none() || mb_b.is_none();
 
-    // Non-MBAFF frame path of §8.3.2.1 eq. 8-72: n = 1 for A, n = 2 for B.
+    // §8.3.2.1 eq. 8-72 — the Intra_4x4 sub-index n of an Intra_4x4
+    // neighbour: n = 2 for B; for A, n = 3 when MbaffFrameFlag == 1, the
+    // current macroblock is a frame macroblock, mbAddrA is a field
+    // macroblock and luma8x8BlkIdx == 2, and n = 1 otherwise.
+    let field_of = |addr: u32| {
+        grid.get(addr)
+            .map(|i| i.mb_field_decoding_flag)
+            .unwrap_or(false)
+    };
+    let n_a = if grid.mbaff_frame_flag
+        && blk8 == 2
+        && !field_of(mb_addr)
+        && na.is_some_and(|(a, _)| field_of(a))
+    {
+        3
+    } else {
+        1
+    };
     let mode_a = intra_mxm_pred_mode_for_neighbour_8x8(
         grid,
         dc_pred_flag,
         na,
         constrained_intra_pred,
-        1,
+        n_a,
         current_slice_id,
     );
     let mode_b = intra_mxm_pred_mode_for_neighbour_8x8(
@@ -5323,6 +5344,7 @@ fn process_partition<R: RefPicProvider>(
         pps,
         ref_pics,
         pic.pic_order_cnt,
+        (pic.top_field_order_cnt, pic.bottom_field_order_cnt),
         pred_luma,
         pred_cb,
         pred_cr,
@@ -5480,7 +5502,9 @@ fn derive_and_store_partition<R: RefPicProvider>(
 /// on the grid) into the MB-sized prediction buffers. Reads only the
 /// reference pictures, so partitions of different macroblocks can be
 /// predicted concurrently. `curr_poc` is the current picture's order
-/// count (§8.4.2.3.3 implicit weights).
+/// count and `curr_field_focs` its (TopFieldOrderCnt,
+/// BottomFieldOrderCnt), for the §8.4.2.3.2 implicit weights (field
+/// macroblocks of an MBAFF frame use the field of their parity).
 #[allow(clippy::too_many_arguments)]
 fn predict_partition<R: RefPicProvider>(
     part: &InterPartition,
@@ -5495,6 +5519,7 @@ fn predict_partition<R: RefPicProvider>(
     pps: &Pps,
     ref_pics: &R,
     curr_poc: i32,
+    curr_field_focs: (i32, i32),
     pred_luma: &mut [i32; 256],
     pred_cb: &mut [i32],
     pred_cr: &mut [i32],
@@ -5657,20 +5682,43 @@ fn predict_partition<R: RefPicProvider>(
     // fields.
     let implicit_weights = if use_implicit_bipred {
         // has_l0 && has_l1 guaranteed by bi_mode == Bipred above.
-        // Field MBs resolve refIdx / 2 to the frame; the implicit
-        // POC distances then use the frame POC (field-granular
-        // POCs for MBAFF B implicit weighting are a known
-        // refinement — no staged stream exercises it).
-        let (rp0, _) = resolve_ref(0, part.ref_idx_l0)?;
-        let (rp1, _) = resolve_ref(1, part.ref_idx_l1)?;
+        let (rp0, sel0) = resolve_ref(0, part.ref_idx_l0)?;
+        let (rp1, sel1) = resolve_ref(1, part.ref_idx_l1)?;
+        // §8.4.2.3.2 step 1 — for a field macroblock of a frame
+        // (field_pic_flag == 0, MBAFF), currPicOrField is the field of
+        // CurrPic with the macroblock's parity, and pic0 / pic1 are the
+        // fields of RefPicListX[refIdxLX / 2] with the same (refIdxLX % 2
+        // == 0) or opposite parity (`resolve_ref` has selected that
+        // parity as `selX`). Otherwise the frames / pictures themselves.
+        let (poc_curr, poc0, poc1) = match (field_parity, sel0, sel1) {
+            (Some(par), Some(s0), Some(s1)) => {
+                let field_foc = |list: u8, ref_idx: i8, rp: &Picture, sel: u8| {
+                    let (t, b) = ref_pics
+                        .ref_entry_unit_focs(list, (ref_idx.max(0) as u32) / 2)
+                        .unwrap_or((rp.top_field_order_cnt, rp.bottom_field_order_cnt));
+                    if sel == 0 { t } else { b }
+                };
+                let curr = if par == 0 {
+                    curr_field_focs.0
+                } else {
+                    curr_field_focs.1
+                };
+                (
+                    curr,
+                    field_foc(0, part.ref_idx_l0, rp0, s0),
+                    field_foc(1, part.ref_idx_l1, rp1, s1),
+                )
+            }
+            _ => (curr_poc, rp0.pic_order_cnt, rp1.pic_order_cnt),
+        };
         // TODO(§8.2.5): RefPicProvider doesn't expose long-term
         // marking. Assume both refs are short-term — conforming for
         // the common case where bipred uses short-term refs.
         let long_term_either = false;
         Some(implicit_bipred_weights(
-            curr_poc,
-            rp0.pic_order_cnt,
-            rp1.pic_order_cnt,
+            poc_curr,
+            poc0,
+            poc1,
             long_term_either,
         ))
     } else {
@@ -7373,47 +7421,43 @@ fn sub_mb_partitions(t: SubMbType) -> Vec<(u8, u8, u8, u8)> {
     }
 }
 
-/// §8.4.1.2.3 / §8.4.1.2.1 — derive one temporal-direct partition's
-/// `(refIdxL0, mvL0, mvL1)` for the co-located 4x4 sub-macroblock
-/// partition selected by `luma4x4_blk_idx`.
-///
-/// Implements the complete co-located derivation:
-/// * Table 8-6 colPic selection — RefPicList1[0] as decoded frame,
-///   decoded field, field of a decoded frame ("the frame containing"),
-///   or complementary field pair (parity by the eq. 8-175/8-176
-///   topAbsDiffPOC comparison for frame MBs, by `CurrMbAddr & 1` for
-///   MBAFF field MBs).
-/// * Table 8-7 PicCodingStruct + Table 8-8 mbAddrCol / yM /
-///   vertMvScale, including the AFRM variants (mbAddrCol2/3/5/6/7 with
-///   `fieldDecodingFlagX` read off the colPic's per-MB field-flag
-///   snapshot and the eq. 8-182 tie-break).
-/// * eq. 8-193/8-194 vertical mvCol scaling (Frm_To_Fld halves,
-///   Fld_To_Frm doubles).
-/// * MapColToList0 by picture IDENTITY: the colPic's reference-list
-///   snapshot names DPB unit keys + parities; the current list is
-///   searched per the One_To_One / Frm_To_Fld / Fld_To_Frm forms
-///   (field↔frame index doubling included).
-/// * eq. 8-201/8-202 tb/td on currPicOrField / pic0 / pic1 — per-FIELD
-///   order counts when the current macroblock is a field macroblock.
-///
-/// Returns `Some((ref_idx_l0, mv_l0, mv_l1))` when the co-located
-/// picture is available; `None` if the provider didn't ship motion
-/// data (caller falls back to (0, 0, 0, 0)).
-fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
-    ref_pics: &R,
+/// §8.4.1.2.1 Table 8-8 `vertMvScale`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VertMvScale {
+    OneToOne,
+    FrmToFld,
+    FldToFrm,
+}
+
+/// §8.4.1.2.1 — the co-located 4x4 sub-macroblock partition of
+/// `luma4x4BlkIdx` of the current macroblock: colPic (Table 8-6),
+/// mbAddrCol / yM / vertMvScale (Tables 8-7 / 8-8), and the unscaled
+/// mvCol / refIdxCol read from colPic (intra → (0, 0) / −1). Shared by
+/// spatial direct (§8.4.1.2.2 colZeroFlag, which uses mvCol unscaled per
+/// its NOTE 2) and temporal direct (§8.4.1.2.3, which scales mvCol[1]
+/// by `vert`).
+struct Colocated<'a> {
+    col_pic: &'a Picture,
+    col_struct: crate::picture::PicCodingStruct,
+    curr_struct: crate::picture::PicCodingStruct,
+    curr_mb_field: bool,
+    curr_mb_bottom_parity: u8,
+    curr_field_parity: u8,
+    mb_addr_col: u32,
+    vert: VertMvScale,
+    mv_col: (i16, i16),
+    ref_idx_col: i8,
+    used_l1: bool,
+}
+
+fn colocated_block<'a, R: RefPicProvider>(
+    ref_pics: &'a R,
     pic: &Picture,
     grid: &MbGrid,
     mb_addr: u32,
     luma4x4_blk_idx: usize,
-) -> Option<(i8, Mv, Mv)> {
+) -> Option<Colocated<'a>> {
     use crate::picture::PicCodingStruct as Pcs;
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum VertMvScale {
-        OneToOne,
-        FrmToFld,
-        FldToFrm,
-    }
 
     let curr_struct = pic.coding_struct;
     let w = grid.width_in_mbs;
@@ -7564,6 +7608,77 @@ fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
             (_, Some((mv, rf, _))) if rf >= 0 => (mv, rf, true),
             _ => ((0, 0), -1, false),
         }
+    };
+    Some(Colocated {
+        col_pic,
+        col_struct,
+        curr_struct,
+        curr_mb_field,
+        curr_mb_bottom_parity,
+        curr_field_parity,
+        mb_addr_col,
+        vert,
+        mv_col: mv_col_i16,
+        ref_idx_col,
+        used_l1,
+    })
+}
+
+/// §8.4.1.2.3 / §8.4.1.2.1 — derive one temporal-direct partition's
+/// `(refIdxL0, mvL0, mvL1)` for the co-located 4x4 sub-macroblock
+/// partition selected by `luma4x4_blk_idx`.
+///
+/// Implements the complete co-located derivation:
+/// * Table 8-6 colPic selection — RefPicList1[0] as decoded frame,
+///   decoded field, field of a decoded frame ("the frame containing"),
+///   or complementary field pair (parity by the eq. 8-175/8-176
+///   topAbsDiffPOC comparison for frame MBs, by `CurrMbAddr & 1` for
+///   MBAFF field MBs).
+/// * Table 8-7 PicCodingStruct + Table 8-8 mbAddrCol / yM /
+///   vertMvScale, including the AFRM variants (mbAddrCol2/3/5/6/7 with
+///   `fieldDecodingFlagX` read off the colPic's per-MB field-flag
+///   snapshot and the eq. 8-182 tie-break).
+/// * eq. 8-193/8-194 vertical mvCol scaling (Frm_To_Fld halves,
+///   Fld_To_Frm doubles).
+/// * MapColToList0 by picture IDENTITY: the colPic's reference-list
+///   snapshot names DPB unit keys + parities; the current list is
+///   searched per the One_To_One / Frm_To_Fld / Fld_To_Frm forms
+///   (field↔frame index doubling included).
+/// * eq. 8-201/8-202 tb/td on currPicOrField / pic0 / pic1 — per-FIELD
+///   order counts when the current macroblock is a field macroblock.
+///
+/// Returns `Some((ref_idx_l0, mv_l0, mv_l1))` when the co-located
+/// picture is available; `None` if the provider didn't ship motion
+/// data (caller falls back to (0, 0, 0, 0)).
+fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
+    ref_pics: &R,
+    pic: &Picture,
+    grid: &MbGrid,
+    mb_addr: u32,
+    luma4x4_blk_idx: usize,
+) -> Option<(i8, Mv, Mv)> {
+    use crate::picture::PicCodingStruct as Pcs;
+
+    let Colocated {
+        col_pic,
+        col_struct,
+        curr_struct,
+        curr_mb_field,
+        curr_mb_bottom_parity,
+        curr_field_parity,
+        mb_addr_col,
+        vert,
+        mv_col: mv_col_i16,
+        ref_idx_col,
+        used_l1,
+    } = colocated_block(ref_pics, pic, grid, mb_addr, luma4x4_blk_idx)?;
+    // §6.4.12.2-analog — `fieldDecodingFlagX` of a colPic MB.
+    let col_mb_field = |addr: u32| -> bool {
+        col_pic
+            .mb_field_flags
+            .get(addr as usize)
+            .copied()
+            .unwrap_or(false)
     };
 
     // eq. 8-193/8-194 — vertMvScale on mvCol[1] ("/" truncates toward
@@ -7923,7 +8038,7 @@ fn build_temporal_direct_sub_partitions<R: RefPicProvider>(
 fn build_spatial_direct_partitions<R: RefPicProvider>(
     sps: &Sps,
     ref_pics: &R,
-    _pic: &Picture,
+    pic: &Picture,
     mb_addr: u32,
     grid: &MbGrid,
     current_slice_id: i32,
@@ -8012,7 +8127,6 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
         .first()
         .copied()
         .unwrap_or(false);
-    let col_pic = ref_pics.ref_pic(1, 0);
 
     // Granularity inside the region: 8x8 when direct_8x8_inference_flag,
     // else 4x4.
@@ -8045,8 +8159,17 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
                 blk4_raster_index(bx4, by4) as usize
             };
 
+            // §8.4.1.2.1 — the co-located block through Table 8-6 colPic
+            // and Table 8-8 mbAddrCol / yM (a frame MB over a field pair
+            // and vice versa in MBAFF, field / frame picture pairs);
+            // §8.4.1.2.2 NOTE 2 — mvCol is compared in the co-located
+            // macroblock's own units, unscaled.
             let col_zero_flag = col_pic_is_short_term
-                && col_pic.is_some_and(|cp| is_colocated_zero_mv(cp, mb_addr, col_blk4));
+                && colocated_block(ref_pics, pic, grid, mb_addr, col_blk4).is_some_and(|c| {
+                    c.ref_idx_col == 0
+                        && (-1..=1).contains(&c.mv_col.0)
+                        && (-1..=1).contains(&c.mv_col.1)
+                });
 
             // §8.4.1.2.2 mv derivation (NOTE 3: mvLX returned from
             // §8.4.1.3 is identical for all 4x4 sub-partitions of the
@@ -8102,38 +8225,6 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
         }
     }
     partitions
-}
-
-/// §8.4.1.2.2 step 7 — colZeroFlag "small zero-like MV" check.
-///
-/// §8.4.1.2.1 rules for picking mvCol/refIdxCol from the colocated
-/// block:
-///   1. If the colocated macroblock is intra, mvCol = (0, 0),
-///      refIdxCol = -1. Then colZeroFlag is 0 (refIdxCol != 0).
-///   2. Else if predFlagL0Col == 1, (mvCol, refIdxCol) = L0 values.
-///   3. Else (predFlagL0Col == 0, predFlagL1Col == 1), (mvCol,
-///      refIdxCol) = L1 values.
-///
-/// colZeroFlag becomes 1 iff refIdxCol == 0 && |mvCol| <= 1 in both
-/// components.
-fn is_colocated_zero_mv(col_pic: &Picture, mb_addr: u32, col_blk4: usize) -> bool {
-    let l0 = col_pic.colocated_l0(mb_addr, col_blk4);
-    let l1 = col_pic.colocated_l1(mb_addr, col_blk4);
-
-    // Intra colocated: mvCol = 0, refIdxCol = -1 ⇒ colZeroFlag = 0.
-    let is_intra =
-        l0.as_ref().map(|t| t.2).unwrap_or(false) || l1.as_ref().map(|t| t.2).unwrap_or(false);
-    if is_intra {
-        return false;
-    }
-
-    // Pick L0 when its refIdx is valid; else L1; else no data.
-    let (mv, ref_idx) = match (l0, l1) {
-        (Some((mv, rf, _)), _) if rf >= 0 => (mv, rf),
-        (_, Some((mv, rf, _))) if rf >= 0 => (mv, rf),
-        _ => return false,
-    };
-    ref_idx == 0 && mv.0.abs() <= 1 && mv.1.abs() <= 1
 }
 
 /// Table 7-14 — B_L0/B_L1/B_Bi 16x16 → (mode, ref_idx_l0, ref_idx_l1).
