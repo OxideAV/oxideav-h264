@@ -42,6 +42,7 @@ pub mod mv_deriv;
 pub mod nal;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod non_vcl;
+pub(crate) mod out_shape;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod picture;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API

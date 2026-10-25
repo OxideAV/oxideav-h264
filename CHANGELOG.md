@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Decoder::output_params` / `output_params_generation` (oxideav-core
+  0.1.42), with `output_pixel_format` forwarded to it: the cropped
+  width / height, pixel format (including separate-colour-plane 4:4:4
+  and 4:0:0 `Gray*`), VUI frame rate and colour signal of the emitted
+  frames, answered from the `avcC` record right after construction and
+  re-stated with a generation bump exactly at the first frame of a new
+  shape (each queued picture carries its own description, so reorder
+  depth and the worker budget do not move the switch point). Verified
+  against ffprobe on black-box libx264 fixtures
+  (`tests/fixtures/output_params/`, `gen.sh`).
+
+### Fixed
+
+- The Annex B elementary-stream demuxer labelled separate-colour-plane
+  streams `Gray8`; it now reports the 4:4:4 layout the decoder emits,
+  and fills the stream colour signal from the VUI.
+
 ## [0.1.10](https://github.com/OxideAV/oxideav-h264/compare/v0.1.9...v0.1.10) - 2026-10-25
 
 ### Added

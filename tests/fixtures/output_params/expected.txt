@@ -1,0 +1,6 @@
+yuv420p10_64x48_50.h264 width=64 height=48 pix_fmt=yuv420p10le color_range=tv color_space=bt2020nc color_transfer=smpte2084 color_primaries=bt2020 r_frame_rate=100/1 nb_read_frames=10 
+yuv420p_70x46_25.h264 width=70 height=46 pix_fmt=yuv420p color_range=tv color_space=bt709 color_transfer=bt709 color_primaries=bt709 r_frame_rate=50/1 nb_read_frames=5 
+yuv422p10_48x32_25.h264 width=48 height=32 pix_fmt=yuv422p10le color_range=unknown color_space=unknown color_transfer=unknown color_primaries=unknown r_frame_rate=50/1 nb_read_frames=5 
+yuv422p_64x48_30.h264 width=64 height=48 pix_fmt=yuvj422p color_range=pc color_space=bt470bg color_transfer=smpte170m color_primaries=bt470bg r_frame_rate=60000/1001 nb_read_frames=6 
+yuv444p10_32x32_25.h264 width=32 height=32 pix_fmt=yuv444p10le color_range=unknown color_space=unknown color_transfer=unknown color_primaries=unknown r_frame_rate=50/1 nb_read_frames=5 
+yuv444p_48x32_24.h264 width=48 height=32 pix_fmt=yuv444p color_range=unknown color_space=unknown color_transfer=unknown color_primaries=unknown r_frame_rate=48/1 nb_read_frames=5 

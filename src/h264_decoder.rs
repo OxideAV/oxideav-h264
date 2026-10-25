@@ -55,6 +55,7 @@ use crate::decoder::{Decoder as H264Driver, Event};
 use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::frame_thread::{Deferred, FtProvider, FtRef, FtSliceWork, Pool, SharedPlanes};
 use crate::mb_grid::MbGrid;
+use crate::out_shape::{OutShape, ShapeTraits};
 use crate::picture::Picture;
 use crate::poc::{PocResult, PocSlice, PocSps, PocState, derive_poc};
 use crate::ref_list::{self, DpbEntry, MmcoOp as RefMmcoOp, PicStructure, RefMarking, RplmOp};
@@ -67,9 +68,17 @@ use crate::{reconstruct, slice_data};
 
 /// A decoded picture on its way to `receive_frame`: ready, or still
 /// being reconstructed on the frame-threading pool.
-enum OutFrame {
+enum OutPic {
     Ready(VideoFrame),
     Pending(Arc<SharedPlanes>),
+}
+
+/// A picture queued for output together with the stream-level
+/// description of its frame (what `output_params` answers once
+/// `receive_frame` has returned it).
+struct OutFrame {
+    pic: OutPic,
+    shape: OutShape,
 }
 
 /// The inputs of one §7.3.4 slice-data parse.
@@ -221,6 +230,8 @@ struct PendingField {
     /// §7.4.2.1.1 — the frame cropping margins of the field's SPS,
     /// applied when the pair (or the lone field) is output.
     crop: FrameCropMargins,
+    /// What the field's SPS fixes about the output frame.
+    traits: ShapeTraits,
 }
 
 /// §8.1 — separate-colour-plane decode state (round 448). When the
@@ -242,7 +253,7 @@ struct ScpState {
     /// siblings. The three sub-decoders run identical §8.2.1 / §C.4
     /// machinery on identical slice-header fields, so their output
     /// streams pair 1:1 in emission order.
-    queues: [VecDeque<VideoFrame>; 3],
+    queues: [VecDeque<(VideoFrame, OutShape)>; 3],
 }
 
 impl ScpState {
@@ -416,6 +427,11 @@ pub struct H264CodecDecoder {
     ft: Option<FtState>,
     /// The queued slice-data parse of the slice event being handled.
     pending_sd: Option<Arc<SdTask>>,
+    /// The description of the frame `receive_frame` returned last.
+    emitted_shape: Option<OutShape>,
+    /// `Decoder::output_params_generation` — bumped when a returned
+    /// frame's description differs from the previous frame's.
+    params_generation: u64,
 }
 
 impl H264CodecDecoder {
@@ -455,6 +471,8 @@ impl H264CodecDecoder {
             threads: 1,
             ft: None,
             pending_sd: None,
+            emitted_shape: None,
+            params_generation: 0,
         }
     }
 
@@ -948,21 +966,23 @@ impl H264CodecDecoder {
             return;
         };
         for (sub, queue) in scp.subs.iter_mut().zip(scp.queues.iter_mut()) {
-            while let Ok(Frame::Video(vf)) = sub.receive_frame() {
-                queue.push_back(vf);
+            while let Ok(shaped) = sub.receive_shaped() {
+                queue.push_back(shaped);
             }
         }
         while scp.queues.iter().all(|q| !q.is_empty()) {
-            let y = scp.queues[0].pop_front().expect("checked non-empty");
-            let cb = scp.queues[1].pop_front().expect("checked non-empty");
-            let cr = scp.queues[2].pop_front().expect("checked non-empty");
+            let (y, y_shape) = scp.queues[0].pop_front().expect("checked non-empty");
+            let (cb, _) = scp.queues[1].pop_front().expect("checked non-empty");
+            let (cr, _) = scp.queues[2].pop_front().expect("checked non-empty");
             let mut planes = y.planes;
             // Each sub-decoder emitted a single-plane monochrome frame
             // of identical geometry (all three planes share the SPS).
             planes.extend(cb.planes);
             planes.extend(cr.planes);
-            self.ready
-                .push_back(OutFrame::Ready(VideoFrame { pts: y.pts, planes }));
+            self.ready.push_back(OutFrame {
+                pic: OutPic::Ready(VideoFrame { pts: y.pts, planes }),
+                shape: y_shape.merged_planes(),
+            });
         }
         // Anti-OOM guard for NON-conforming streams: §7.4.1.2 requires
         // every access unit to carry all three colour planes, so the
@@ -2258,6 +2278,7 @@ impl H264CodecDecoder {
         // (opposite parity) and the pair is re-interleaved into a single
         // full-height output frame whose POC is the minimum of the two
         // field POCs (§8.2.1 eq. 8-1).
+        let traits = ShapeTraits::of_sps(&sps, self.scp_plane_mode);
         if first_header.field_pic_flag {
             self.handle_field_output(
                 pic,
@@ -2266,17 +2287,23 @@ impl H264CodecDecoder {
                 output_poc,
                 pts,
                 sps.frame_crop_margins(),
+                traits,
             );
             return Ok(());
         }
 
-        let out = match (&ft_planes, early_vf.take()) {
-            (Some(planes), _) => OutFrame::Pending(planes.clone()),
-            (None, Some(vf)) => OutFrame::Ready(vf),
+        // The picture's sample arrays may already have moved on (into
+        // the reference store, or to the frame-threading pool): its
+        // size is the SPS frame size (§7.4.2.1.1).
+        let shape = OutShape::of_sps(&sps, self.scp_plane_mode);
+        let pic = match (&ft_planes, early_vf.take()) {
+            (Some(planes), _) => OutPic::Pending(planes.clone()),
+            (None, Some(vf)) => OutPic::Ready(vf),
             (None, None) => {
-                OutFrame::Ready(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()))
+                OutPic::Ready(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()))
             }
         };
+        let out = OutFrame { pic, shape };
         let entry = OutputEntry {
             picture: out,
             pic_order_cnt: output_poc,
@@ -2295,6 +2322,7 @@ impl H264CodecDecoder {
     /// opposite parity), interleave the two half-height field pictures
     /// into one full-height output frame and push it to the §C.4 output
     /// DPB. Otherwise hold the field as the pending half of a pair.
+    #[allow(clippy::too_many_arguments)]
     fn handle_field_output(
         &mut self,
         pic: Picture,
@@ -2303,6 +2331,7 @@ impl H264CodecDecoder {
         field_poc: i32,
         pts: Option<i64>,
         crop: FrameCropMargins,
+        traits: ShapeTraits,
     ) {
         if let Some(prev) = self.pending_field.take() {
             // Complete the pair only when the two fields are genuinely
@@ -2322,8 +2351,12 @@ impl H264CodecDecoder {
                 let frame_poc = prev.field_poc.min(field_poc);
                 let frame_pts = prev.pts.or(pts);
                 let vf = picture_to_video_frame(&frame, frame_pts, crop);
+                let shape = traits.shape(frame.width_in_samples, frame.height_in_samples, crop);
                 let entry = OutputEntry {
-                    picture: OutFrame::Ready(vf),
+                    picture: OutFrame {
+                        pic: OutPic::Ready(vf),
+                        shape,
+                    },
                     pic_order_cnt: frame_poc,
                     frame_num,
                     needed_for_output: true,
@@ -2343,6 +2376,7 @@ impl H264CodecDecoder {
             field_poc,
             pts,
             crop,
+            traits,
         });
     }
 
@@ -2354,8 +2388,16 @@ impl H264CodecDecoder {
         // A lone field is half the frame's height: the vertical
         // cropping margins shrink with it.
         let vf = picture_to_video_frame(&field.pic, field.pts, field.crop.for_field());
+        let shape = field.traits.shape(
+            field.pic.width_in_samples,
+            field.pic.height_in_samples,
+            field.crop.for_field(),
+        );
         let entry = OutputEntry {
-            picture: OutFrame::Ready(vf),
+            picture: OutFrame {
+                pic: OutPic::Ready(vf),
+                shape,
+            },
             pic_order_cnt: field.field_poc,
             frame_num: field.frame_num,
             needed_for_output: true,
@@ -2993,28 +3035,95 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
+        let (vf, shape) = self.receive_shaped()?;
+        // The description changes together with the first frame of a
+        // new shape (never at the header announcing it: pictures of
+        // the old shape may still have been queued for output).
+        if self.emitted_shape.is_some_and(|prev| prev != shape) {
+            self.params_generation = self.params_generation.wrapping_add(1);
+        }
+        self.emitted_shape = Some(shape);
+        Ok(Frame::Video(vf))
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        let shape = self.emitted_shape.or_else(|| self.announced_shape())?;
+        Some(shape.to_params(&self.codec_id))
+    }
+
+    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.params_generation
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        // Frame threading — replay every held-back event first.
+        self.ft_pump(true);
+        self.flush_inner()
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        // Frame threading — drop held-back input, let in-flight
+        // pictures finish (nothing reads them any more).
+        if let Some(ft) = self.ft.as_mut() {
+            ft.queue.clear();
+            ft.queued_slices = 0;
+        }
+        self.pending_sd = None;
+        self.in_progress = None;
+        self.ft_shutdown();
+        self.reset_inner()
+    }
+}
+
+impl H264CodecDecoder {
+    /// The description of the output before the first frame: the
+    /// next picture already released for output, else the active SPS,
+    /// else the lowest-id SPS stored (an `avcC` record's, or one
+    /// received in band ahead of the first slice).
+    fn announced_shape(&self) -> Option<OutShape> {
+        if let Some(front) = self.ready.front() {
+            return Some(front.shape);
+        }
+        let sps = self
+            .driver
+            .active_sps()
+            .or_else(|| (0..32).find_map(|id| self.driver.sps(id)))?;
+        Some(OutShape::of_sps(sps, self.scp_plane_mode))
+    }
+
+    /// The next output frame (§C.4 order) with its description.
+    fn receive_shaped(&mut self) -> Result<(VideoFrame, OutShape)> {
         loop {
             // §C.4 — bumped / already-released pictures come out first
             // in the order the bumping process produced them. A picture
             // still being reconstructed on the pool holds the queue
             // until it is done (waited for at end of stream).
             if let Some(front) = self.ready.front() {
-                if let OutFrame::Pending(planes) = front {
+                if let OutPic::Pending(planes) = &front.pic {
                     if planes.is_done().is_none() && !self.eof {
                         return Err(Error::NeedMore);
                     }
                     let ok = planes.wait_done();
                     let frame = if ok { planes.take_output() } else { None };
+                    let shape = front.shape;
                     self.ready.pop_front();
                     return match frame {
-                        Some(vf) => Ok(Frame::Video(vf)),
+                        Some(vf) => Ok((vf, shape)),
                         None => Err(Error::invalid(
                             "h264: frame-threaded reconstruction of a picture failed",
                         )),
                     };
                 }
-                if let Some(OutFrame::Ready(vf)) = self.ready.pop_front() {
-                    return Ok(Frame::Video(vf));
+                if let Some(OutFrame {
+                    pic: OutPic::Ready(vf),
+                    shape,
+                }) = self.ready.pop_front()
+                {
+                    return Ok((vf, shape));
                 }
             }
             // Try a conservative bump on the output DPB. Per §C.4 / the
@@ -3038,25 +3147,6 @@ impl Decoder for H264CodecDecoder {
             }
             return Err(Error::NeedMore);
         }
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        // Frame threading — replay every held-back event first.
-        self.ft_pump(true);
-        self.flush_inner()
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        // Frame threading — drop held-back input, let in-flight
-        // pictures finish (nothing reads them any more).
-        if let Some(ft) = self.ft.as_mut() {
-            ft.queue.clear();
-            ft.queued_slices = 0;
-        }
-        self.pending_sd = None;
-        self.in_progress = None;
-        self.ft_shutdown();
-        self.reset_inner()
     }
 }
 
@@ -3605,7 +3695,10 @@ mod tests {
 
     fn push_entry(dec: &mut H264CodecDecoder, tag: u8, poc: i32, frame_num: u32) {
         let entry = OutputEntry {
-            picture: OutFrame::Ready(vf(tag)),
+            picture: OutFrame {
+                pic: OutPic::Ready(vf(tag)),
+                shape: ShapeTraits::default().shape(1, 1, FrameCropMargins::default()),
+            },
             pic_order_cnt: poc,
             frame_num,
             needed_for_output: true,
@@ -4718,13 +4811,29 @@ mod tests {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         // Top field then bottom field of the same frame_num.
         let top = field_pic(16, 4, 30, 128, 8, 3);
-        dec.handle_field_output(top, false, 3, 8, Some(99), FrameCropMargins::default());
+        dec.handle_field_output(
+            top,
+            false,
+            3,
+            8,
+            Some(99),
+            FrameCropMargins::default(),
+            ShapeTraits::default(),
+        );
         // The first field alone produces no output (held pending).
         assert!(dec.ready.is_empty());
         assert!(dec.pending_field.is_some());
 
         let bottom = field_pic(16, 4, 40, 128, 10, 3);
-        dec.handle_field_output(bottom, true, 3, 10, None, FrameCropMargins::default());
+        dec.handle_field_output(
+            bottom,
+            true,
+            3,
+            10,
+            None,
+            FrameCropMargins::default(),
+            ShapeTraits::default(),
+        );
         // Pair completed → pending cleared, one frame queued (possibly
         // still inside the output DPB until bumped). Force a drain.
         assert!(dec.pending_field.is_none());
@@ -4754,9 +4863,25 @@ mod tests {
         // Two consecutive TOP fields (same parity) → not a pair. The
         // first must be emitted on its own, the second held pending.
         let top1 = field_pic(16, 4, 30, 128, 8, 3);
-        dec.handle_field_output(top1, false, 3, 8, None, FrameCropMargins::default());
+        dec.handle_field_output(
+            top1,
+            false,
+            3,
+            8,
+            None,
+            FrameCropMargins::default(),
+            ShapeTraits::default(),
+        );
         let top2 = field_pic(16, 4, 50, 128, 12, 4);
-        dec.handle_field_output(top2, false, 4, 12, None, FrameCropMargins::default());
+        dec.handle_field_output(
+            top2,
+            false,
+            4,
+            12,
+            None,
+            FrameCropMargins::default(),
+            ShapeTraits::default(),
+        );
         // First top field orphaned → one half-height frame queued; the
         // second top field is now pending.
         assert!(dec.pending_field.is_some());
@@ -4849,10 +4974,34 @@ mod tests {
             bottom: 4,
         };
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.handle_field_output(field_pic(16, 4, 30, 128, 8, 3), false, 3, 8, None, crop);
-        dec.handle_field_output(field_pic(16, 4, 40, 128, 10, 3), true, 3, 10, None, crop);
+        dec.handle_field_output(
+            field_pic(16, 4, 30, 128, 8, 3),
+            false,
+            3,
+            8,
+            None,
+            crop,
+            ShapeTraits::default(),
+        );
+        dec.handle_field_output(
+            field_pic(16, 4, 40, 128, 10, 3),
+            true,
+            3,
+            10,
+            None,
+            crop,
+            ShapeTraits::default(),
+        );
         // An orphan top field (next frame_num), flushed at EOF.
-        dec.handle_field_output(field_pic(16, 4, 50, 128, 12, 4), false, 4, 12, None, crop);
+        dec.handle_field_output(
+            field_pic(16, 4, 50, 128, 12, 4),
+            false,
+            4,
+            12,
+            None,
+            crop,
+            ShapeTraits::default(),
+        );
         dec.flush_pending_field();
         dec.eof = true;
         let mut sizes = Vec::new();

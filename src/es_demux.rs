@@ -21,8 +21,8 @@
 use std::io::Read;
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, Packet,
-    PixelFormat, ProbeData, ProbeScore, Rational, ReadSeek, Result, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, Packet, ProbeData,
+    ProbeScore, Rational, ReadSeek, Result, StreamInfo, TimeBase,
 };
 
 use crate::nal::{AnnexBSplitter, parse_nal_unit};
@@ -110,7 +110,8 @@ impl H264EsDemuxer {
         let (w, h) = sps.cropped_dimensions();
         params.width = Some(w);
         params.height = Some(h);
-        params.pixel_format = pixel_format(&sps);
+        params.pixel_format = crate::out_shape::sps_pixel_format(&sps, false);
+        params.color_signal = crate::out_shape::sps_color_signal(&sps);
         let rate = frame_rate(&sps);
         params.frame_rate = Some(rate);
         let time_base = TimeBase::new(rate.den, rate.num);
@@ -179,30 +180,6 @@ fn split_access_units(data: &[u8]) -> Vec<Vec<u8>> {
         units.push(cur);
     }
     units
-}
-
-/// The planar layout the decoder emits for this SPS.
-fn pixel_format(sps: &Sps) -> Option<PixelFormat> {
-    use PixelFormat::*;
-    let luma = sps.bit_depth_luma_minus8 + 8;
-    if sps.chroma_array_type() != 0 && sps.bit_depth_chroma_minus8 + 8 != luma {
-        return None;
-    }
-    Some(match (sps.chroma_array_type(), luma) {
-        (0, 8) => Gray8,
-        (0, 10) => Gray10Le,
-        (0, 12) => Gray12Le,
-        (1, 8) => Yuv420P,
-        (2, 8) => Yuv422P,
-        (3, 8) => Yuv444P,
-        (1, 10) => Yuv420P10Le,
-        (2, 10) => Yuv422P10Le,
-        (3, 10) => Yuv444P10Le,
-        (1, 12) => Yuv420P12Le,
-        (2, 12) => Yuv422P12Le,
-        (3, 12) => Yuv444P12Le,
-        _ => return None,
-    })
 }
 
 /// §E.2.1: a frame lasts `2 * num_units_in_tick / time_scale` seconds.
