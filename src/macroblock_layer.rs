@@ -3796,15 +3796,32 @@ fn sub_mb_sub_part_4x4_range(i: usize, sp: usize, sub: SubMbType) -> Vec<u8> {
 // §7.3.5.3 — residual() walker (CAVLC-only in this pass).
 // ---------------------------------------------------------------------------
 
-fn pad_to_16(v: Vec<i32>) -> [i32; 16] {
+fn pad_to_16(v: impl AsRef<[i32]>) -> [i32; 16] {
     let mut out = [0i32; 16];
-    for (i, x) in v.into_iter().enumerate() {
-        if i >= 16 {
-            break;
-        }
-        out[i] = x;
+    for (o, &x) in out.iter_mut().zip(v.as_ref()) {
+        *o = x;
     }
     out
+}
+
+/// The coefficient levels of one residual block (at most 64), held
+/// inline instead of in a per-block heap allocation.
+struct CoeffBlock {
+    buf: [i32; 64],
+    len: usize,
+}
+
+impl std::ops::Deref for CoeffBlock {
+    type Target = [i32];
+    fn deref(&self) -> &[i32] {
+        &self.buf[..self.len]
+    }
+}
+
+impl AsRef<[i32]> for CoeffBlock {
+    fn as_ref(&self) -> &[i32] {
+        self
+    }
 }
 
 /// Count non-zero entries in a decoded residual block — this is the
@@ -4385,9 +4402,13 @@ fn parse_residual_block_cabac(
     neighbour_cbf_left: Option<bool>,
     neighbour_cbf_above: Option<bool>,
     field: bool,
-) -> McblResult<(Vec<i32>, bool)> {
-    let len = (end_idx - start_idx + 1) as usize;
-    let mut out = vec![0i32; len];
+) -> McblResult<(CoeffBlock, bool)> {
+    // Residual blocks hold at most 64 coefficients (§7.3.5.3.3).
+    let len = ((end_idx - start_idx + 1) as usize).min(64);
+    let mut out = CoeffBlock {
+        buf: [0i32; 64],
+        len,
+    };
 
     // §7.3.5.3.3 — coded_block_flag is suppressed for 8x8 blocks unless
     // we're in 4:4:4 (where 8x8 CBP semantics differ).
@@ -4411,7 +4432,7 @@ fn parse_residual_block_cabac(
     // `num_coeff` is the count of coefficients still to decode including
     // the "last" one; it starts at `end_idx - start_idx + 1` and shrinks
     // when `last_significant_coeff_flag[i]` fires.
-    let mut significant = vec![false; len];
+    let mut significant = [false; 64];
     let span = end_idx - start_idx + 1;
     let mut num_coeff_in_scan = span; // positions 0..num_coeff_in_scan-1 remain
     // `field` (parameter) — §9.3.3.1.3 / Table 9-34: FIELD-coded
@@ -4454,7 +4475,7 @@ fn parse_residual_block_cabac(
         let abs_m1 = decode_coeff_abs_level_minus1(cabac, ctxs, block_type, num_eq1, num_gt1)?;
         let sign = decode_coeff_sign_flag(cabac)?;
         let val = ((abs_m1 + 1) as i32) * if sign { -1 } else { 1 };
-        out[pos as usize] = val;
+        out.buf[pos as usize] = val;
         if abs_m1 == 0 {
             num_eq1 += 1;
         } else {
@@ -4698,7 +4719,7 @@ fn parse_residual_cabac_only(
                 field,
             )?;
             curr_cbf.cbf_cb_dc = cb_coded;
-            out.residual_chroma_dc_cb = cb_dc;
+            out.residual_chroma_dc_cb = cb_dc.to_vec();
 
             let (ca_cr, cb_cr) = if let Some(g) = grid_ref {
                 let (a, b) = cabac_cbf_cond_terms(
@@ -4728,7 +4749,7 @@ fn parse_residual_cabac_only(
                 field,
             )?;
             curr_cbf.cbf_cr_dc = cr_coded;
-            out.residual_chroma_dc_cr = cr_dc;
+            out.residual_chroma_dc_cr = cr_dc.to_vec();
         }
 
         if cbp_chroma == 2 {

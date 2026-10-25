@@ -10718,6 +10718,12 @@ fn deblock_luma_mb(
     mb_field_flags: &[bool],
     luma_bs: &mut [u8],
 ) {
+    if !mbaff_frame_flag {
+        deblock_luma_mb_frame(
+            pic, y_base, w, h, grid, mb_x, mb_y, alpha_off, beta_off, bit_depth, field_pic, luma_bs,
+        );
+        return;
+    }
     // --- 4 vertical edges of this MB, in left-to-right order ---
     for edge_off in 0..4 {
         let edge_x = mb_x * 16 + edge_off * 4;
@@ -10929,6 +10935,165 @@ fn deblock_luma_mb(
     }
 }
 
+/// [`deblock_luma_mb`] for a picture that is not an MBAFF frame: the
+/// macroblock grid is a plain raster, so the p / q macroblocks of every
+/// edge segment are the current one or its left / upper neighbour. The
+/// boundary strengths, the segments recorded in `luma_bs` and the
+/// filtering are those of the general walker; a macroblock whose 4x4
+/// blocks all carry the same motion skips the reference / motion
+/// comparison on its internal edges (it never differs there).
+#[allow(clippy::too_many_arguments)]
+fn deblock_luma_mb_frame(
+    pic: &mut Picture,
+    y_base: i32,
+    w: i32,
+    h: i32,
+    grid: &MbGrid,
+    mb_x: i32,
+    mb_y: i32,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+    field_pic: bool,
+    luma_bs: &mut [u8],
+) {
+    let mb_w = grid.width_in_mbs as i32;
+    let mb_h = grid.height_in_mbs as i32;
+    if mb_x < 0 || mb_y < 0 || mb_x >= mb_w || mb_y >= mb_h {
+        return;
+    }
+    let addr = (mb_y * mb_w + mb_x) as usize;
+    let Some(q_info) = grid.info.get(addr) else {
+        return;
+    };
+    if !q_info.available {
+        return;
+    }
+    let mut q_uniform: Option<bool> = None;
+    for vertical in [true, false] {
+        // The neighbouring macroblock across this direction's MB edge.
+        let (edge_mb, neighbour) = if vertical {
+            (
+                mb_x,
+                if mb_x > 0 {
+                    grid.info.get(addr - 1)
+                } else {
+                    None
+                },
+            )
+        } else {
+            (
+                mb_y,
+                if mb_y > 0 {
+                    grid.info.get(addr - mb_w as usize)
+                } else {
+                    None
+                },
+            )
+        };
+        for edge_off in 0..4i32 {
+            let edge = edge_mb * 16 + edge_off * 4;
+            if edge == 0 || edge >= if vertical { w } else { h } {
+                continue;
+            }
+            let is_mb_edge = edge_off == 0;
+            let p_info = if is_mb_edge {
+                match neighbour {
+                    Some(p) if p.available => p,
+                    _ => continue,
+                }
+            } else {
+                q_info
+            };
+            if !is_mb_edge && (edge_off == 1 || edge_off == 3) && q_info.transform_size_8x8_flag {
+                continue;
+            }
+            let p_off = if is_mb_edge { 3 } else { edge_off - 1 } as u32;
+            for seg in 0..4i32 {
+                let along = (if vertical { mb_y } else { mb_x }) * 16 + seg * 4;
+                if along >= if vertical { h } else { w } {
+                    break;
+                }
+                // 4x4 block coordinates (x, y) inside the p / q MBs.
+                let (pbx, pby, qbx, qby) = if vertical {
+                    (p_off, seg as u32, edge_off as u32, seg as u32)
+                } else {
+                    (seg as u32, p_off, seg as u32, edge_off as u32)
+                };
+                let p_blk4_z = blk4_raster_index(pbx as u8, pby as u8) as usize;
+                let q_blk4_z = blk4_raster_index(qbx as u8, qby as u8) as usize;
+                let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
+                    && !(!is_mb_edge && *q_uniform.get_or_insert_with(|| uniform_motion(q_info)))
+                    && different_ref_or_mv_luma(
+                        p_info,
+                        q_info,
+                        pbx * 4,
+                        pby * 4,
+                        qbx * 4,
+                        qby * 4,
+                        field_pic,
+                    );
+                let bs = derive_boundary_strength(BsInputs {
+                    p_is_intra: p_info.is_intra,
+                    q_is_intra: q_info.is_intra,
+                    is_mb_edge,
+                    is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
+                    either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+                    different_ref_or_mv: diff_ref_mv,
+                    mixed_mode_edge: false,
+                    vertical_edge: vertical,
+                    mbaff_or_field: field_pic,
+                    both_in_frame_mbs: !field_pic,
+                });
+                luma_bs[luma_bs_index(0, 0, 0, !vertical, edge_off, seg)] = bs;
+                if bs == 0 {
+                    continue;
+                }
+                if vertical {
+                    filter_vertical_edge_luma(
+                        pic,
+                        edge,
+                        along - y_base,
+                        bs,
+                        p_info.qp_y,
+                        q_info.qp_y,
+                        alpha_off,
+                        beta_off,
+                        bit_depth,
+                    );
+                } else {
+                    filter_horizontal_edge_luma(
+                        pic,
+                        along,
+                        edge - y_base,
+                        bs,
+                        p_info.qp_y,
+                        q_info.qp_y,
+                        alpha_off,
+                        beta_off,
+                        bit_depth,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// §8.7.2.1 — whether every 4x4 block of a macroblock has the same
+/// reference pictures and motion vectors, so [`different_ref_or_mv_luma`]
+/// is `false` for every edge between two of its blocks.
+fn uniform_motion(info: &MbInfo) -> bool {
+    let all_eq = |a: &[(i16, i16)]| a.iter().all(|&v| v == a[0]);
+    info.ref_idx_l0.iter().all(|&r| r == info.ref_idx_l0[0])
+        && info.ref_idx_l1.iter().all(|&r| r == info.ref_idx_l1[0])
+        && info.ref_poc_l0.iter().all(|&r| r == info.ref_poc_l0[0])
+        && info.ref_poc_l1.iter().all(|&r| r == info.ref_poc_l1[0])
+        && all_eq(&info.mv_l0)
+        && all_eq(&info.mv_l1)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn deblock_plane_chroma(
     pic: &mut Picture,
@@ -11069,6 +11234,20 @@ fn deblock_chroma_mb(
                 let lp_x = (edge_x - 1) * sub_w;
                 let lq_x = edge_x * sub_w;
                 let ly = y0 * sub_h;
+                // A luma segment recorded with bS = 0 (both sides
+                // available, nothing to filter) settles the chroma one.
+                if !mbaff_frame_flag
+                    && luma_bs[luma_bs_index(
+                        0,
+                        0,
+                        0,
+                        false,
+                        lq_x.rem_euclid(16) / 4,
+                        ly.rem_euclid(16) / 4,
+                    )] == 0
+                {
+                    continue;
+                }
                 let p_addr =
                     match pixel_to_mb_addr(grid, lp_x, ly, mbaff_frame_flag, mb_field_flags) {
                         Some(a) => a,
@@ -11203,6 +11382,18 @@ fn deblock_chroma_mb(
                 let lx = x0 * sub_w;
                 let lp_y = (edge_y - 1) * sub_h;
                 let lq_y = edge_y * sub_h;
+                if !mbaff_frame_flag
+                    && luma_bs[luma_bs_index(
+                        0,
+                        0,
+                        0,
+                        true,
+                        lq_y.rem_euclid(16) / 4,
+                        lx.rem_euclid(16) / 4,
+                    )] == 0
+                {
+                    continue;
+                }
                 let p_addr =
                     match pixel_to_mb_addr(grid, lx, lp_y, mbaff_frame_flag, mb_field_flags) {
                         Some(a) => a,
