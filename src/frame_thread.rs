@@ -215,6 +215,13 @@ pub(crate) struct Pool {
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
+// The pool's state is its task queue (behind a mutex) and the worker
+// handles; nothing a caller observes can be left half-updated by a panic
+// unwinding through the decoder, which kept the decoder unwind-safe
+// before it owned a pool.
+impl std::panic::UnwindSafe for Pool {}
+impl std::panic::RefUnwindSafe for Pool {}
+
 impl Pool {
     pub(crate) fn new(threads: usize) -> Self {
         let shared = Arc::new(PoolShared {

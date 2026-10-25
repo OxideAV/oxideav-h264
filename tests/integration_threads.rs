@@ -296,3 +296,11 @@ fn corrupted_streams_are_thread_invariant() {
         assert_tolerant_invariant(&format!("corruption case {case}"), &bytes);
     }
 }
+
+/// The decoder stays `Send` and unwind-safe with its frame-threading
+/// state (part of its public auto-trait surface).
+#[test]
+fn decoder_auto_traits() {
+    fn check<T: Send + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+    check::<H264CodecDecoder>();
+}
