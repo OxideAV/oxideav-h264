@@ -6794,10 +6794,31 @@ fn derive_partition_mvs(
     // D is consulted only for the §8.4.1.3.2 eq. 8-214..8-216 C→D
     // substitution applied inside `derive_mvpred_with_d` /
     // `derive_p_skip_mv_with_d`.
-    let (neigh_a_l0, neigh_b_l0, neigh_c_l0, neigh_d_l0) =
-        neighbour_mvs_for_list(part, mb_addr, grid, 0, current_slice_id);
-    let (neigh_a_l1, neigh_b_l1, neigh_c_l1, neigh_d_l1) =
-        neighbour_mvs_for_list(part, mb_addr, grid, 1, current_slice_id);
+    //
+    // The neighbours of a list are gathered only when that list's
+    // prediction is derived (the lookups have no side effects).
+    let p_skip = part.is_skip && part.mode == PartMode::L0Only && part.w == 16 && part.h == 16;
+    let uses_l0 = part.mode == PartMode::Direct
+        || p_skip
+        || (part.mode != PartMode::L1Only && part.ref_idx_l0 >= 0);
+    let uses_l1 =
+        part.mode == PartMode::Direct || (part.mode != PartMode::L0Only && part.ref_idx_l1 >= 0);
+    let unavailable = (
+        NeighbourMv::UNAVAILABLE,
+        NeighbourMv::UNAVAILABLE,
+        NeighbourMv::UNAVAILABLE,
+        NeighbourMv::UNAVAILABLE,
+    );
+    let (neigh_a_l0, neigh_b_l0, neigh_c_l0, neigh_d_l0) = if uses_l0 {
+        neighbour_mvs_for_list(part, mb_addr, grid, 0, current_slice_id)
+    } else {
+        unavailable
+    };
+    let (neigh_a_l1, neigh_b_l1, neigh_c_l1, neigh_d_l1) = if uses_l1 {
+        neighbour_mvs_for_list(part, mb_addr, grid, 1, current_slice_id)
+    } else {
+        unavailable
+    };
     let (mv_l0, mv_l1) = match part.mode {
         PartMode::Direct => {
             // §8.4.1.2 direct mode — for now use spatial-direct median
@@ -6837,26 +6858,25 @@ fn derive_partition_mvs(
             // apply to them. Prior to fixing this, a P_L0_16x16 whose
             // left neighbour was a P_Skip / zero-MV MB would have its
             // MVpred wrongly forced to zero. `is_skip` disambiguates.
-            let mvp_l0 =
-                if part.is_skip && part.mode == PartMode::L0Only && part.w == 16 && part.h == 16 {
-                    // P_Skip path (§8.4.1.2), with §8.4.1.3.2 C→D substitution.
-                    let (_, mv) =
-                        derive_p_skip_mv_with_d(neigh_a_l0, neigh_b_l0, neigh_c_l0, neigh_d_l0);
-                    mv
-                } else if part.mode != PartMode::L1Only && part.ref_idx_l0 >= 0 {
-                    derive_mvpred_with_d(
-                        &MvpredInputs {
-                            neighbour_a: neigh_a_l0,
-                            neighbour_b: neigh_b_l0,
-                            neighbour_c: neigh_c_l0,
-                            current_ref_idx: part.ref_idx_l0 as i32,
-                            shape: part.shape,
-                        },
-                        neigh_d_l0,
-                    )
-                } else {
-                    Mv::ZERO
-                };
+            let mvp_l0 = if p_skip {
+                // P_Skip path (§8.4.1.2), with §8.4.1.3.2 C→D substitution.
+                let (_, mv) =
+                    derive_p_skip_mv_with_d(neigh_a_l0, neigh_b_l0, neigh_c_l0, neigh_d_l0);
+                mv
+            } else if part.mode != PartMode::L1Only && part.ref_idx_l0 >= 0 {
+                derive_mvpred_with_d(
+                    &MvpredInputs {
+                        neighbour_a: neigh_a_l0,
+                        neighbour_b: neigh_b_l0,
+                        neighbour_c: neigh_c_l0,
+                        current_ref_idx: part.ref_idx_l0 as i32,
+                        shape: part.shape,
+                    },
+                    neigh_d_l0,
+                )
+            } else {
+                Mv::ZERO
+            };
             let mvp_l1 = if part.mode != PartMode::L0Only && part.ref_idx_l1 >= 0 {
                 derive_mvpred_with_d(
                     &MvpredInputs {

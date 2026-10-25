@@ -494,9 +494,13 @@ impl<'a> CabacDecoder<'a> {
     ///       codIRange  <<= 1
     ///       codIOffset  = (codIOffset << 1) | read_bits(1)
     fn renorm_d(&mut self) -> CabacResult<()> {
-        while self.cod_i_range < 256 {
-            self.cod_i_range <<= 1;
-            self.cod_i_offset = (self.cod_i_offset << 1) | self.reader.u(1)?;
+        // §9.3.3.2.2 — the doubling loop of Figure 9-6, all at once:
+        // `codIRange` (≥ 2 here) needs `shift` doublings to reach 256,
+        // consuming one bit per doubling.
+        if self.cod_i_range < 256 {
+            let shift = self.cod_i_range.leading_zeros() - 23;
+            self.cod_i_range <<= shift;
+            self.cod_i_offset = (self.cod_i_offset << shift) | self.reader.u(shift)?;
         }
         Ok(())
     }

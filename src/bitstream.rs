@@ -98,6 +98,23 @@ impl<'a> BitReader<'a> {
         if self.bits_remaining() < bits as usize {
             return Err(BitError::Eof);
         }
+        if bits == 0 {
+            return Ok(0);
+        }
+        if bits <= 25 {
+            // The bits sit in the four bytes from `byte_pos` (bit_pos
+            // + bits <= 32); bytes past the end read as zero and are
+            // never part of the result.
+            let mut word = 0u32;
+            for k in 0..4 {
+                word = (word << 8) | *self.data.get(self.byte_pos + k).unwrap_or(&0) as u32;
+            }
+            let value = (word << self.bit_pos) >> (32 - bits);
+            let pos = self.bit_pos as u32 + bits;
+            self.byte_pos += (pos / 8) as usize;
+            self.bit_pos = (pos % 8) as u8;
+            return Ok(value);
+        }
         let mut value: u32 = 0;
         for _ in 0..bits {
             value = (value << 1) | self.read_bit_unchecked() as u32;
