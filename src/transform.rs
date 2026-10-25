@@ -811,6 +811,14 @@ fn check_qp(qp: i32, bit_depth: u32) -> Result<(), TransformError> {
     }
 }
 
+/// The parameter checks every §8.5.12 / §8.5.13 entry point applies
+/// before scaling (qP range for the bit depth, supported bit depth).
+#[inline]
+pub(crate) fn check_transform_params(qp: i32, bit_depth: u32) -> Result<(), TransformError> {
+    check_qp(qp, bit_depth)?;
+    check_bit_depth(bit_depth)
+}
+
 #[inline]
 fn check_bit_depth(bit_depth: u32) -> Result<(), TransformError> {
     if !(8..=14).contains(&bit_depth) {

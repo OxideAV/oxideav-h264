@@ -53,7 +53,7 @@ use crate::mv_deriv::{
 use crate::picture::Picture;
 use crate::pps::Pps;
 use crate::ref_store::RefPicProvider;
-use crate::simd::{interpolate_chroma, interpolate_luma};
+use crate::simd::interpolate_luma;
 use crate::slice_data::SliceData;
 use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sp_transform::{
@@ -588,6 +588,27 @@ impl MbWriter {
         pic.set_luma(ax, ay, v);
     }
 
+    /// Write the macroblock's 16x16 luma samples (`samples[y * 16 + x]`)
+    /// — [`Self::set_luma`] for each sample, by row.
+    fn write_luma_mb(&self, pic: &mut Picture, samples: &[i32; 256]) {
+        let w = pic.width_in_samples as i32;
+        let h = pic.height_in_samples as i32;
+        let ys = self.luma_y_stride();
+        if self.mb_px >= 0 && self.mb_py >= 0 && self.mb_px + 16 <= w && self.mb_py + 15 * ys < h {
+            let wu = w as usize;
+            for y in 0..16usize {
+                let o = (self.mb_py as usize + y * ys as usize) * wu + self.mb_px as usize;
+                pic.luma[o..o + 16].copy_from_slice(&samples[y * 16..y * 16 + 16]);
+            }
+        } else {
+            for y in 0..16 {
+                for x in 0..16 {
+                    self.set_luma(pic, x, y, samples[(y * 16 + x) as usize]);
+                }
+            }
+        }
+    }
+
     /// Write a Cb sample at `(x_in_mb, y_in_mb)` — coordinates relative
     /// to the chroma MB origin, in chroma samples.
     #[inline]
@@ -603,6 +624,37 @@ impl MbWriter {
         let ax = self.chroma_mb_px() + x_in_mb;
         let ay = self.chroma_mb_py() + y_in_mb * self.chroma_y_stride();
         pic.set_cr(ax, ay, v);
+    }
+
+    /// Write the macroblock's `w`x`h` chroma samples of plane `plane`
+    /// (0 = Cb, 1 = Cr; `samples[y * w + x]`) — [`Self::set_cb`] /
+    /// [`Self::set_cr`] for each sample, by row.
+    fn write_chroma_mb(&self, pic: &mut Picture, plane: u8, samples: &[i32], w: usize, h: usize) {
+        let cw = pic.chroma_width() as i32;
+        let ch = pic.chroma_height() as i32;
+        let (x0, y0, ys) = (
+            self.chroma_mb_px(),
+            self.chroma_mb_py(),
+            self.chroma_y_stride(),
+        );
+        if x0 >= 0 && y0 >= 0 && x0 + w as i32 <= cw && y0 + (h as i32 - 1) * ys < ch {
+            let dst = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            for y in 0..h {
+                let o = (y0 as usize + y * ys as usize) * cw as usize + x0 as usize;
+                dst[o..o + w].copy_from_slice(&samples[y * w..y * w + w]);
+            }
+        } else {
+            for y in 0..h {
+                for x in 0..w {
+                    let v = samples[y * w + x];
+                    if plane == 0 {
+                        self.set_cb(pic, x as i32, y as i32, v);
+                    } else {
+                        self.set_cr(pic, x as i32, y as i32, v);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4965,37 +5017,45 @@ fn inter_residual_write(
     // §8.5.6/§8.5.7 — field inverse scans for FIELD-coded MBs.
     let field_scan = mbaff_field_mb || slice_header.field_pic_flag;
 
+    // The reconstructed macroblock: prediction plus residual, clipped
+    // (eq. 8-x Clip1Y of the §8.5.14 picture construction).
+    let mut out = *pred_luma;
+    // Every §8.5.12 / §8.5.13 transform call validates qP'Y / the bit
+    // depth first, whether or not the block carries coefficients.
+    if !bypass {
+        crate::transform::check_transform_params(qp_prime_y, bit_depth_y)?;
+    }
     if mb.transform_size_8x8_flag {
         // §8.5.13 — 8x8 inter residual path (four 8x8 blocks).
         // Each 8x8 is flagged by one bit of cbp_luma. The four 16-
         // entry arrays in residual_luma[blk8*4..blk8*4+4] concatenate
         // to the 8x8-zigzag-scanned coefficients (CABAC path); invert
         // the 8x8 scan (§8.5.7 / Table 8-14) before feeding into
-        // inverse_transform_8x8. See Intra_8x8 branch for the same
-        // reasoning and the CAVLC-path caveat.
+        // inverse_transform_8x8. A block without coefficients has a
+        // zero residual.
         #[allow(clippy::needless_range_loop)] // spec §8.5.13 4×8x8 walk
         for blk8 in 0..4usize {
+            if (cbp_luma >> blk8) & 1 == 0 {
+                continue;
+            }
             let (bx, by) = LUMA_8X8_XY[blk8];
-            let has_res = (cbp_luma >> blk8) & 1 == 1;
-            let coeffs = if has_res {
-                // `residual_luma` is compacted by the parser —
-                // quadrants with cbp_luma bit cleared are skipped, so
-                // index by set-bits-below-blk8 (see Intra_NxN path).
-                let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
-                let base_slot = set_before * 4;
-                let mut scan = [0i32; 64];
-                for sub in 0..4usize {
-                    let slot = base_slot + sub;
-                    if let Some(c) = mb.residual_luma.get(slot) {
-                        for (i, v) in c.iter().enumerate().take(16) {
-                            scan[sub * 16 + i] = *v;
-                        }
-                    }
+            // `residual_luma` is compacted by the parser — quadrants
+            // with cbp_luma bit cleared are skipped, so index by
+            // set-bits-below-blk8 (see Intra_NxN path).
+            let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+            let base_slot = set_before * 4;
+            let mut scan = [0i32; 64];
+            let mut any = false;
+            for sub in 0..4usize {
+                if let Some(c) = mb.residual_luma.get(base_slot + sub) {
+                    scan[sub * 16..sub * 16 + 16].copy_from_slice(c);
+                    any |= c.iter().any(|&v| v != 0);
                 }
-                inv_scan_8x8(&scan, field_scan)
-            } else {
-                [0i32; 64]
-            };
+            }
+            if !any {
+                continue;
+            }
+            let coeffs = inv_scan_8x8(&scan, field_scan);
             let residual = if bypass {
                 // §8.5.13 eq. 8-355 — r = c.
                 coeffs
@@ -5003,15 +5063,9 @@ fn inter_residual_write(
                 inverse_transform_8x8(&coeffs, qp_prime_y, &sl8, bit_depth_y)?
             };
             for y in 0..8 {
-                for x in 0..8 {
-                    let v =
-                        pred_luma[(by as usize + y) * 16 + (bx as usize + x)] + residual[y * 8 + x];
-                    writer.set_luma(
-                        pic,
-                        bx + x as i32,
-                        by + y as i32,
-                        clip_sample(v, bit_depth_y),
-                    );
+                let o = (by as usize + y) * 16 + bx as usize;
+                for (d, &r) in out[o..o + 8].iter_mut().zip(&residual[y * 8..y * 8 + 8]) {
+                    *d += r;
                 }
             }
         }
@@ -5019,24 +5073,23 @@ fn inter_residual_write(
         // §8.5.12 — 4x4 inter residual path.
         #[allow(clippy::needless_range_loop)] // spec §8.5.12 raster-Z 4x4 walk
         for blk4 in 0..16usize {
-            let (bx, by) = LUMA_4X4_XY[blk4];
             let blk8 = blk4 / 4;
-            let has_res = (cbp_luma >> blk8) & 1 == 1;
-            let coeffs_scan = if has_res {
-                // Compact index into `residual_luma` — the parser
-                // pushes 4 entries per cbp_luma bit that is set in
-                // low-bit-first order, so the array index is (number
-                // of set bits below blk8) * 4 + (blk4 % 4), not blk4.
-                let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
-                let compact_idx = set_before * 4 + (blk4 % 4);
-                mb.residual_luma
-                    .get(compact_idx)
-                    .copied()
-                    .unwrap_or([0i32; 16])
-            } else {
-                [0i32; 16]
+            if (cbp_luma >> blk8) & 1 == 0 {
+                continue;
+            }
+            // Compact index into `residual_luma` — the parser pushes 4
+            // entries per cbp_luma bit that is set in low-bit-first
+            // order, so the array index is (number of set bits below
+            // blk8) * 4 + (blk4 % 4), not blk4.
+            let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+            let Some(coeffs_scan) = mb.residual_luma.get(set_before * 4 + (blk4 % 4)) else {
+                continue;
             };
-            let coeffs = inv_scan_4x4(&coeffs_scan, field_scan);
+            if coeffs_scan.iter().all(|&v| v == 0) {
+                continue;
+            }
+            let (bx, by) = LUMA_4X4_XY[blk4];
+            let coeffs = inv_scan_4x4(coeffs_scan, field_scan);
             let residual = if bypass {
                 // §8.5.12 eq. 8-334 — r = c.
                 coeffs
@@ -5044,25 +5097,21 @@ fn inter_residual_write(
                 inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
             };
             if inter_debug {
-                eprintln!(
-                    "    RES blk4={blk4} has_res={has_res} qp'={qp_prime_y} res={:?}",
-                    residual
-                );
+                eprintln!("    RES blk4={blk4} qp'={qp_prime_y} res={:?}", residual);
             }
-            for yy in 0..4 {
-                for xx in 0..4 {
-                    let v = pred_luma[(by as usize + yy) * 16 + (bx as usize + xx)]
-                        + residual[yy * 4 + xx];
-                    writer.set_luma(
-                        pic,
-                        bx + xx as i32,
-                        by + yy as i32,
-                        clip_sample(v, bit_depth_y),
-                    );
+            for y in 0..4 {
+                let o = (by as usize + y) * 16 + bx as usize;
+                for (d, &r) in out[o..o + 4].iter_mut().zip(&residual[y * 4..y * 4 + 4]) {
+                    *d += r;
                 }
             }
         }
     }
+    let max_y = (1i32 << bit_depth_y) - 1;
+    for v in out.iter_mut() {
+        *v = (*v).clamp(0, max_y);
+    }
+    writer.write_luma_mb(pic, &out);
 
     // -------- Chroma residual + write --------------------------------
     if chroma_array_type == 1 || chroma_array_type == 2 {
@@ -5505,6 +5554,106 @@ fn derive_and_store_partition<R: RefPicProvider>(
 /// count and `curr_field_focs` its (TopFieldOrderCnt,
 /// BottomFieldOrderCnt), for the §8.4.2.3.2 implicit weights (field
 /// macroblocks of an MBAFF frame use the field of their parity).
+/// §8.4.2.3 — how a partition's predPartL0 / predPartL1 samples
+/// combine into the final prediction samples.
+#[derive(Clone, Copy)]
+enum CombineOp {
+    /// No list contributes (zero prediction).
+    Zero,
+    /// §8.4.2.3.1 single-list copy of predPartL0 / predPartL1.
+    Copy0,
+    Copy1,
+    /// §8.4.2.3.1 eq. 8-273 — default bipred average.
+    Avg,
+    /// §8.4.2.3.2 eqs. 8-274..8-276 (explicit, or the §8.4.2.3.3
+    /// implicit weights with zero offsets).
+    Weighted {
+        mode: BiPredMode,
+        w0: WeightedEntry,
+        w1: WeightedEntry,
+        log2_wd: u32,
+    },
+}
+
+impl CombineOp {
+    /// §8.4.2.3.1 — the default combine for the lists in use.
+    fn default_for(mode: Option<BiPredMode>) -> Self {
+        match mode {
+            Some(BiPredMode::Bipred) => CombineOp::Avg,
+            Some(BiPredMode::L0Only) => CombineOp::Copy0,
+            Some(BiPredMode::L1Only) => CombineOp::Copy1,
+            None => CombineOp::Zero,
+        }
+    }
+}
+
+/// Write the `w`x`h` combination of `l0` / `l1` (tightly packed,
+/// stride `w`) into `dst` at `dst_off` with row stride `dst_stride`.
+/// The weighted forms equal [`weighted_pred_explicit`].
+#[allow(clippy::too_many_arguments)]
+fn combine_partition(
+    dst: &mut [i32],
+    dst_off: usize,
+    dst_stride: usize,
+    l0: &[i32],
+    l1: &[i32],
+    w: usize,
+    h: usize,
+    op: CombineOp,
+    bit_depth: u32,
+) {
+    let max_v = (1i32 << bit_depth) - 1;
+    for y in 0..h {
+        let d = &mut dst[dst_off + y * dst_stride..dst_off + y * dst_stride + w];
+        let a = &l0[y * w..y * w + w];
+        let b = &l1[y * w..y * w + w];
+        match op {
+            CombineOp::Zero => d.fill(0),
+            CombineOp::Copy0 => d.copy_from_slice(a),
+            CombineOp::Copy1 => d.copy_from_slice(b),
+            CombineOp::Avg => {
+                for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
+                    *d = (p0 + p1 + 1) >> 1;
+                }
+            }
+            CombineOp::Weighted {
+                mode,
+                w0,
+                w1,
+                log2_wd,
+            } => match mode {
+                BiPredMode::L0Only | BiPredMode::L1Only => {
+                    let (src, e) = if mode == BiPredMode::L0Only {
+                        (a, w0)
+                    } else {
+                        (b, w1)
+                    };
+                    if log2_wd >= 1 {
+                        // Eq. 8-274 / 8-275, logWD >= 1.
+                        let round = 1i32 << (log2_wd - 1);
+                        for (d, &p) in d.iter_mut().zip(src) {
+                            *d = (((p * e.weight + round) >> log2_wd) + e.offset).clamp(0, max_v);
+                        }
+                    } else {
+                        for (d, &p) in d.iter_mut().zip(src) {
+                            *d = (p * e.weight + e.offset).clamp(0, max_v);
+                        }
+                    }
+                }
+                BiPredMode::Bipred => {
+                    // Eq. 8-276.
+                    let round = 1i32 << log2_wd;
+                    let off = (w0.offset + w1.offset + 1) >> 1;
+                    for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
+                        let sum = p0 * w0.weight + p1 * w1.weight + round;
+                        *d = ((sum >> (log2_wd + 1)) + off).clamp(0, max_v);
+                    }
+                }
+            },
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn predict_partition<R: RefPicProvider>(
     part: &InterPartition,
@@ -5725,70 +5874,6 @@ fn predict_partition<R: RefPicProvider>(
         None
     };
 
-    for py in 0..h as usize {
-        for px in 0..w as usize {
-            let dst_idx = (part.y as usize + py) * 16 + (part.x as usize + px);
-            let v = match bi_mode {
-                Some(_) if use_explicit => {
-                    // Handled in bulk below via weighted_pred_explicit;
-                    // defer by leaving the slot at 0 for now.
-                    0
-                }
-                Some(BiPredMode::Bipred) if use_implicit_bipred => {
-                    // Handled in bulk below via the implicit weighted
-                    // pred path; defer.
-                    0
-                }
-                Some(BiPredMode::Bipred) => {
-                    // Eq. 8-273 — default bipred average.
-                    (l0_buf[py * w as usize + px] + l1_buf[py * w as usize + px] + 1) >> 1
-                }
-                Some(BiPredMode::L0Only) => l0_buf[py * w as usize + px],
-                Some(BiPredMode::L1Only) => l1_buf[py * w as usize + px],
-                None => {
-                    // Neither L0 nor L1 active (e.g., B_Direct with no
-                    // usable refs) — fall back to zero prediction
-                    // per §8.4.2.3.
-                    0
-                }
-            };
-            pred_luma[dst_idx] = v;
-        }
-    }
-
-    // §8.4.2.3.3 — implicit bipred: apply eq. 8-276 with
-    // `logWD = 5`, offsets = 0, and POC-derived weights.
-    if let Some((w0, w1, log2_wd)) = implicit_weights {
-        let mut scratch_store = [0i32; MAX_PARTITION_SAMPLES];
-        let scratch = &mut scratch_store[..(w as usize) * (h as usize)];
-        weighted_pred_explicit(
-            Some(&l0_buf[..]),
-            Some(&l1_buf[..]),
-            w as usize,
-            w,
-            h,
-            BiPredMode::Bipred,
-            WeightedEntry {
-                weight: w0,
-                offset: 0,
-            },
-            WeightedEntry {
-                weight: w1,
-                offset: 0,
-            },
-            log2_wd,
-            bit_depth_y,
-            scratch,
-            w as usize,
-        );
-        for py in 0..h as usize {
-            for px in 0..w as usize {
-                let dst_idx = (part.y as usize + py) * 16 + (part.x as usize + px);
-                pred_luma[dst_idx] = scratch[py * w as usize + px];
-            }
-        }
-    }
-
     // §8.4.3 — explicit weight tables are indexed by the FRAME
     // reference index: a field MB's refIdxLX addresses the doubled
     // per-field list, so the weight lookup uses refIdxLX >> 1
@@ -5804,49 +5889,51 @@ fn predict_partition<R: RefPicProvider>(
         part.ref_idx_l1
     };
 
-    if use_explicit
-        && let (Some(mode), Some(pwt)) = (bi_mode, slice_header.pred_weight_table.as_ref())
-    {
+    // §8.4.2.3 — combine predPartL0 / predPartL1 into the MB's
+    // prediction samples at the partition position.
+    let luma_op = if use_explicit {
         // §8.4.2.3.2 — explicit weighted sample prediction for luma.
-        let log2_wd = pwt.luma_log2_weight_denom;
-        let w_l0 = luma_weight_entry(pwt, 0, wp_ref_l0, log2_wd);
-        let w_l1 = luma_weight_entry(pwt, 1, wp_ref_l1, log2_wd);
-        // Scratch partition-sized buffer so we can use the spec's
-        // dst/dst_stride API directly.
-        let mut scratch_store = [0i32; MAX_PARTITION_SAMPLES];
-        let scratch = &mut scratch_store[..(w as usize) * (h as usize)];
-        let l0_opt = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-            Some(&l0_buf[..])
-        } else {
-            None
-        };
-        let l1_opt = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-            Some(&l1_buf[..])
-        } else {
-            None
-        };
-        weighted_pred_explicit(
-            l0_opt,
-            l1_opt,
-            w as usize,
-            w,
-            h,
-            mode,
-            w_l0,
-            w_l1,
-            log2_wd,
-            bit_depth_y,
-            scratch,
-            w as usize,
-        );
-        // Copy back into pred_luma at partition-local position.
-        for py in 0..h as usize {
-            for px in 0..w as usize {
-                let dst_idx = (part.y as usize + py) * 16 + (part.x as usize + px);
-                pred_luma[dst_idx] = scratch[py * w as usize + px];
+        match (bi_mode, slice_header.pred_weight_table.as_ref()) {
+            (Some(mode), Some(pwt)) => {
+                let log2_wd = pwt.luma_log2_weight_denom;
+                CombineOp::Weighted {
+                    mode,
+                    w0: luma_weight_entry(pwt, 0, wp_ref_l0, log2_wd),
+                    w1: luma_weight_entry(pwt, 1, wp_ref_l1, log2_wd),
+                    log2_wd,
+                }
             }
+            _ => CombineOp::Zero,
         }
-    }
+    } else if let Some((w0, w1, log2_wd)) = implicit_weights {
+        // §8.4.2.3.3 — implicit bipred: eq. 8-276 with `logWD = 5`,
+        // offsets = 0, and POC-derived weights.
+        CombineOp::Weighted {
+            mode: BiPredMode::Bipred,
+            w0: WeightedEntry {
+                weight: w0,
+                offset: 0,
+            },
+            w1: WeightedEntry {
+                weight: w1,
+                offset: 0,
+            },
+            log2_wd,
+        }
+    } else {
+        CombineOp::default_for(bi_mode)
+    };
+    combine_partition(
+        pred_luma,
+        part.y as usize * 16 + part.x as usize,
+        16,
+        l0_buf,
+        l1_buf,
+        w as usize,
+        h as usize,
+        luma_op,
+        bit_depth_y,
+    );
 
     // Chroma MC. For 4:2:0, chroma MV = mv_luma / 2 in 1/4-pel units
     // at luma resolution -> 1/8-pel chroma units. §8.4.1.4 / §8.4.2.2.
@@ -5958,180 +6045,68 @@ fn predict_partition<R: RefPicProvider>(
         // reuses the luma (w0, w1, log2WD=5) triple — eq. 8-282/8-283
         // are specified for "C" replaced by L/Cb/Cr with the same
         // DistScaleFactor, and eq. 8-277 fixes logWDC = 5.
-        if let Some((w0, w1, log2_wd)) = implicit_weights {
-            let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
-            let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
-            let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
-            let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
-            let w_entry_l0 = WeightedEntry {
-                weight: w0,
-                offset: 0,
-            };
-            let w_entry_l1 = WeightedEntry {
-                weight: w1,
-                offset: 0,
-            };
-            weighted_pred_explicit(
-                Some(&l0_cb[..]),
-                Some(&l1_cb[..]),
-                c_w as usize,
-                c_w,
-                c_h,
-                BiPredMode::Bipred,
-                w_entry_l0,
-                w_entry_l1,
+        let default_op = CombineOp::default_for(bi_mode);
+        let (cb_op, cr_op) = if let Some((w0, w1, log2_wd)) = implicit_weights {
+            let op = CombineOp::Weighted {
+                mode: BiPredMode::Bipred,
+                w0: WeightedEntry {
+                    weight: w0,
+                    offset: 0,
+                },
+                w1: WeightedEntry {
+                    weight: w1,
+                    offset: 0,
+                },
                 log2_wd,
-                bit_depth_c,
-                scratch_cb,
-                c_w as usize,
-            );
-            weighted_pred_explicit(
-                Some(&l0_cr[..]),
-                Some(&l1_cr[..]),
-                c_w as usize,
-                c_w,
-                c_h,
-                BiPredMode::Bipred,
-                w_entry_l0,
-                w_entry_l1,
-                log2_wd,
-                bit_depth_c,
-                scratch_cr,
-                c_w as usize,
-            );
-            for py in 0..c_h as usize {
-                for px in 0..c_w as usize {
-                    let dst_idx =
-                        (c_part_y as usize + py) * (mbw_c_use as usize) + (c_part_x as usize + px);
-                    let idx = py * c_w as usize + px;
-                    pred_cb[dst_idx] = scratch_cb[idx];
-                    pred_cr[dst_idx] = scratch_cr[idx];
-                }
-            }
-        } else if use_explicit {
-            if let (Some(mode), Some(pwt)) = (bi_mode, slice_header.pred_weight_table.as_ref()) {
-                let log2_wd_c = pwt.chroma_log2_weight_denom;
-                // Cb: iCbCr = 0.
-                let (w_cb_l0, w_cb_l1) = (
-                    chroma_weight_entry(pwt, 0, 0, wp_ref_l0, log2_wd_c),
-                    chroma_weight_entry(pwt, 1, 0, wp_ref_l1, log2_wd_c),
-                );
-                // Cr: iCbCr = 1.
-                let (w_cr_l0, w_cr_l1) = (
-                    chroma_weight_entry(pwt, 0, 1, wp_ref_l0, log2_wd_c),
-                    chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd_c),
-                );
-
-                let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];
-                let scratch_cb = &mut scratch_cb_store[..(c_w as usize) * (c_h as usize)];
-                let mut scratch_cr_store = [0i32; MAX_PARTITION_SAMPLES];
-                let scratch_cr = &mut scratch_cr_store[..(c_w as usize) * (c_h as usize)];
-                let cb_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(&l0_cb[..])
-                } else {
-                    None
-                };
-                let cb_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(&l1_cb[..])
-                } else {
-                    None
-                };
-                let cr_l0 = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                    Some(&l0_cr[..])
-                } else {
-                    None
-                };
-                let cr_l1 = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                    Some(&l1_cr[..])
-                } else {
-                    None
-                };
-                weighted_pred_explicit(
-                    cb_l0,
-                    cb_l1,
-                    c_w as usize,
-                    c_w,
-                    c_h,
+            };
+            (op, op)
+        } else if use_explicit
+            && let (Some(mode), Some(pwt)) = (bi_mode, slice_header.pred_weight_table.as_ref())
+        {
+            let log2_wd = pwt.chroma_log2_weight_denom;
+            // Cb: iCbCr = 0; Cr: iCbCr = 1.
+            (
+                CombineOp::Weighted {
                     mode,
-                    w_cb_l0,
-                    w_cb_l1,
-                    log2_wd_c,
-                    bit_depth_c,
-                    scratch_cb,
-                    c_w as usize,
-                );
-                weighted_pred_explicit(
-                    cr_l0,
-                    cr_l1,
-                    c_w as usize,
-                    c_w,
-                    c_h,
+                    w0: chroma_weight_entry(pwt, 0, 0, wp_ref_l0, log2_wd),
+                    w1: chroma_weight_entry(pwt, 1, 0, wp_ref_l1, log2_wd),
+                    log2_wd,
+                },
+                CombineOp::Weighted {
                     mode,
-                    w_cr_l0,
-                    w_cr_l1,
-                    log2_wd_c,
-                    bit_depth_c,
-                    scratch_cr,
-                    c_w as usize,
-                );
-                for py in 0..c_h as usize {
-                    for px in 0..c_w as usize {
-                        let dst_idx = (c_part_y as usize + py) * (mbw_c_use as usize)
-                            + (c_part_x as usize + px);
-                        let idx = py * c_w as usize + px;
-                        pred_cb[dst_idx] = scratch_cb[idx];
-                        pred_cr[dst_idx] = scratch_cr[idx];
-                    }
-                }
-            } else {
-                // No pred_weight_table available; fall through to
-                // default (shouldn't happen if use_explicit is set, but
-                // be defensive).
-                for py in 0..c_h as usize {
-                    for px in 0..c_w as usize {
-                        let dst_idx = (c_part_y as usize + py) * (mbw_c_use as usize)
-                            + (c_part_x as usize + px);
-                        let idx = py * c_w as usize + px;
-                        let (vb, vr) = if has_l0 && has_l1 {
-                            (
-                                (l0_cb[idx] + l1_cb[idx] + 1) >> 1,
-                                (l0_cr[idx] + l1_cr[idx] + 1) >> 1,
-                            )
-                        } else if has_l0 {
-                            (l0_cb[idx], l0_cr[idx])
-                        } else if has_l1 {
-                            (l1_cb[idx], l1_cr[idx])
-                        } else {
-                            (0, 0)
-                        };
-                        pred_cb[dst_idx] = vb;
-                        pred_cr[dst_idx] = vr;
-                    }
-                }
-            }
+                    w0: chroma_weight_entry(pwt, 0, 1, wp_ref_l0, log2_wd),
+                    w1: chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd),
+                    log2_wd,
+                },
+            )
         } else {
-            for py in 0..c_h as usize {
-                for px in 0..c_w as usize {
-                    let dst_idx =
-                        (c_part_y as usize + py) * (mbw_c_use as usize) + (c_part_x as usize + px);
-                    let idx = py * c_w as usize + px;
-                    let (vb, vr) = if has_l0 && has_l1 {
-                        (
-                            (l0_cb[idx] + l1_cb[idx] + 1) >> 1,
-                            (l0_cr[idx] + l1_cr[idx] + 1) >> 1,
-                        )
-                    } else if has_l0 {
-                        (l0_cb[idx], l0_cr[idx])
-                    } else if has_l1 {
-                        (l1_cb[idx], l1_cr[idx])
-                    } else {
-                        (0, 0)
-                    };
-                    pred_cb[dst_idx] = vb;
-                    pred_cr[dst_idx] = vr;
-                }
-            }
-        }
+            // Default combine — also the fallback of an explicit-mode
+            // slice without a pred_weight_table.
+            (default_op, default_op)
+        };
+        let c_off = c_part_y as usize * mbw_c_use as usize + c_part_x as usize;
+        combine_partition(
+            pred_cb,
+            c_off,
+            mbw_c_use as usize,
+            l0_cb,
+            l1_cb,
+            c_w as usize,
+            c_h as usize,
+            cb_op,
+            bit_depth_c,
+        );
+        combine_partition(
+            pred_cr,
+            c_off,
+            mbw_c_use as usize,
+            l0_cr,
+            l1_cr,
+            c_w as usize,
+            c_h as usize,
+            cr_op,
+            bit_depth_c,
+        );
     } else if chroma_array_type == 3 {
         // §8.4.2.2 (ChromaArrayType == 3) — 4:4:4 chroma is
         // motion-compensated identically to luma: full-resolution
@@ -6435,11 +6410,27 @@ fn mc_luma_partition(
         });
     }
 
-    interpolate_luma(
-        src, src_stride, stride, src_h, int_x, int_y, x_frac, y_frac, w, h, bit_depth, dst,
+    if w == 0 || h == 0 || w > 16 || h > 16 || !w.is_multiple_of(4) || !h.is_multiple_of(4) {
+        return Err(ReconstructError::IntraPredOutOfBounds);
+    }
+    let plane = crate::mc::PlaneSrc::Flat {
+        data: src,
+        stride: src_stride,
+        width: stride,
+        height: src_h,
+    };
+    crate::mc::luma(
+        &plane,
+        int_x,
+        int_y,
+        x_frac,
+        y_frac,
         w as usize,
-    )
-    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+        h as usize,
+        (1i32 << bit_depth) - 1,
+        dst,
+        w as usize,
+    );
     Ok(())
 }
 
@@ -6509,38 +6500,21 @@ fn mc_chroma_partition(
         });
     }
 
-    interpolate_chroma(
-        &ref_pic.cb[row_off..],
-        src_stride,
-        cw,
-        src_h,
-        int_x,
-        int_y,
-        x_frac,
-        y_frac,
-        w,
-        h,
-        bit_depth,
-        dst_cb,
-        w as usize,
-    )
-    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
-    interpolate_chroma(
-        &ref_pic.cr[row_off..],
-        src_stride,
-        cw,
-        src_h,
-        int_x,
-        int_y,
-        x_frac,
-        y_frac,
-        w,
-        h,
-        bit_depth,
-        dst_cr,
-        w as usize,
-    )
-    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+    let _ = bit_depth;
+    if w == 0 || h == 0 || w > 16 || h > 16 {
+        return Err(ReconstructError::IntraPredOutOfBounds);
+    }
+    for (plane, dst) in [(&ref_pic.cb, dst_cb), (&ref_pic.cr, dst_cr)] {
+        let src = crate::mc::PlaneSrc::Flat {
+            data: &plane[row_off..],
+            stride: src_stride,
+            width: cw,
+            height: src_h,
+        };
+        crate::mc::chroma(
+            &src, int_x, int_y, x_frac, y_frac, w as usize, h as usize, dst, w as usize,
+        );
+    }
     Ok(())
 }
 
@@ -8524,6 +8498,20 @@ fn reconstruct_inter_chroma_residual(
         } else {
             &mb.residual_chroma_ac_cr
         };
+        let (_, mbh_c) = chroma_mb_dims(chroma_array_type);
+        let n_c = (mbw_c * mbh_c) as usize;
+        let mut out = [0i32; 128];
+        let out = &mut out[..n_c];
+        out.copy_from_slice(if plane == 0 {
+            &pred_cb[..n_c]
+        } else {
+            &pred_cr[..n_c]
+        });
+        // Every §8.5.12 call validates qP'C / the bit depth, whether or
+        // not the block carries coefficients.
+        if !bypass {
+            crate::transform::check_transform_params(qp_c, bit_depth_c)?;
+        }
         for blk in 0..n_ac {
             let dc_c = if chroma_array_type == 1 {
                 dc4.unwrap()[blk]
@@ -8535,6 +8523,11 @@ fn reconstruct_inter_chroma_residual(
             } else {
                 [0i32; 16]
             };
+            // A block with neither DC nor AC coefficients has a zero
+            // residual.
+            if dc_c == 0 && ac_scan.iter().all(|&v| v == 0) {
+                continue;
+            }
             // Chroma AC: parser slots 0..=14 are spec scan positions 1..=15.
             let mut coeffs = inv_scan_4x4_ac(&ac_scan, field_scan);
             coeffs[0] = dc_c;
@@ -8546,22 +8539,17 @@ fn reconstruct_inter_chroma_residual(
             };
             let (bx, by) = chroma_block_xy(chroma_array_type, blk);
             for yy in 0..4 {
-                for xx in 0..4 {
-                    let pidx = ((by as usize + yy) * (mbw_c as usize)) + (bx as usize + xx);
-                    let pred_v = if plane == 0 {
-                        pred_cb[pidx]
-                    } else {
-                        pred_cr[pidx]
-                    };
-                    let v = clip_sample(pred_v + residual[yy * 4 + xx], bit_depth_c);
-                    if plane == 0 {
-                        writer.set_cb(pic, bx + xx as i32, by + yy as i32, v);
-                    } else {
-                        writer.set_cr(pic, bx + xx as i32, by + yy as i32, v);
-                    }
+                let o = (by as usize + yy) * (mbw_c as usize) + bx as usize;
+                for (d, &r) in out[o..o + 4].iter_mut().zip(&residual[yy * 4..yy * 4 + 4]) {
+                    *d += r;
                 }
             }
         }
+        let max_c = (1i32 << bit_depth_c) - 1;
+        for v in out.iter_mut() {
+            *v = (*v).clamp(0, max_c);
+        }
+        writer.write_chroma_mb(pic, plane, out, mbw_c as usize, mbh_c as usize);
     }
     let _ = c_mb_px;
     let _ = c_mb_py;

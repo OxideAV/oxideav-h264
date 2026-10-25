@@ -1619,6 +1619,14 @@ impl H264CodecDecoder {
             store: &self.ref_store,
             list_0: &list0,
             list_1: &list1,
+            resolved_0: list0
+                .iter()
+                .map(|&k| self.ref_store.get_by_key(k))
+                .collect(),
+            resolved_1: list1
+                .iter()
+                .map(|&k| self.ref_store.get_by_key(k))
+                .collect(),
             list_0_pocs,
             list_0_longterm,
             list_1_longterm,
@@ -2396,6 +2404,10 @@ struct BorrowedRefProvider<'a> {
     store: &'a RefPicStore,
     list_0: &'a [u32],
     list_1: &'a [u32],
+    /// `list_0` / `list_1` resolved through `store` once at slice
+    /// setup (motion compensation looks references up per partition).
+    resolved_0: Vec<Option<&'a Picture>>,
+    resolved_1: Vec<Option<&'a Picture>>,
     /// §8.4.1.2.3 — precomputed POCs of the pictures in `list_0`,
     /// supplied to the temporal-direct MapColToList0 derivation.
     list_0_pocs: Vec<i32>,
@@ -2433,16 +2445,15 @@ struct BorrowedRefProvider<'a> {
 
 impl RefPicProvider for BorrowedRefProvider<'_> {
     fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture> {
-        let (keys, overrides) = match list {
-            0 => (self.list_0, &self.list_0_overrides),
-            1 => (self.list_1, &self.list_1_overrides),
+        let (resolved, overrides) = match list {
+            0 => (&self.resolved_0, &self.list_0_overrides),
+            1 => (&self.resolved_1, &self.list_1_overrides),
             _ => return None,
         };
         if let Some(Some(p)) = overrides.get(idx as usize) {
             return Some(p);
         }
-        let key = *keys.get(idx as usize)?;
-        self.store.get_by_key(key)
+        resolved.get(idx as usize).copied().flatten()
     }
 
     fn ref_field_parity(&self, list: u8, idx: u32) -> Option<u8> {

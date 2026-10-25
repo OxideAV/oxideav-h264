@@ -33,6 +33,7 @@ pub mod macroblock_layer;
 pub mod mb_address;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mb_grid;
+pub(crate) mod mc;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mv_deriv;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
