@@ -991,7 +991,13 @@ fn synth_mb_inter<R: RefPicProvider>(
     let n_c = (mbw_c as usize) * (mbh_c as usize);
     let pred_cb = &mut pred_cb_store[..n_c];
     let pred_cr = &mut pred_cr_store[..n_c];
-    for (part, mv_l0, mv_l1) in &job.parts {
+    let parts: &[(InterPartition, Mv, Mv)] = &job.parts;
+    let merged = (!parts.is_empty()).then(|| coalesce_partitions(parts));
+    let parts = match &merged {
+        Some((m, n)) => &m[..*n],
+        None => parts,
+    };
+    for (part, mv_l0, mv_l1) in parts {
         predict_partition(
             part,
             *mv_l0,
@@ -4900,10 +4906,33 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         None
     };
 
+    // §8.4.1 for every partition first (a partition's motion depends
+    // only on the motion of earlier ones), then §8.4.2 over the
+    // coalesced partitions.
+    let mut derived = Vec::with_capacity(partitions.len());
     for part in &partitions {
-        process_partition(
+        let (mv_l0, mv_l1) = derive_and_store_partition(
             part,
             mb_addr,
+            slice_header,
+            ref_pics,
+            grid,
+            inter_debug,
+            current_slice_id,
+            field_parity,
+        );
+        derived.push((*part, mv_l0, mv_l1));
+    }
+    let merged = (!derived.is_empty()).then(|| coalesce_partitions(&derived));
+    let to_predict = match &merged {
+        Some((m, n)) => &m[..*n],
+        None => &derived[..],
+    };
+    for (part, mv_l0, mv_l1) in to_predict {
+        predict_partition(
+            part,
+            *mv_l0,
+            *mv_l1,
             mb_px,
             mb_py,
             chroma_array_type,
@@ -4912,13 +4941,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             slice_header,
             pps,
             ref_pics,
-            grid,
-            pic,
+            pic.pic_order_cnt,
+            (pic.top_field_order_cnt, pic.bottom_field_order_cnt),
             &mut pred_luma,
             &mut pred_cb,
             &mut pred_cr,
             inter_debug,
-            current_slice_id,
             field_parity,
         )?;
     }
@@ -5339,70 +5367,111 @@ fn chroma_weight_entry(
     }
 }
 
-/// §8.4.2 — motion-compensate a single partition + write into the
-/// MB-local prediction buffers. Also records the MV/ref_idx into the
-/// grid so subsequent MBs' MVpred can see it.
-#[allow(clippy::too_many_arguments)]
-fn process_partition<R: RefPicProvider>(
-    part: &InterPartition,
-    mb_addr: u32,
-    mb_px: i32,
-    mb_py: i32,
-    chroma_array_type: u32,
-    bit_depth_y: u32,
-    bit_depth_c: u32,
-    slice_header: &SliceHeader,
-    pps: &Pps,
-    ref_pics: &R,
-    grid: &mut MbGrid,
-    pic: &Picture,
-    pred_luma: &mut [i32; 256],
-    pred_cb: &mut [i32],
-    pred_cr: &mut [i32],
-    inter_debug: bool,
-    current_slice_id: i32,
-    // §8.4.2.1 — `Some(parity)` when the current MB is a FIELD MB in
-    // an MBAFF frame (0 = top field / even rows, 1 = bottom field).
-    // Field MBs address individual fields of the stored frames:
-    // RefPicListX[refIdxLX / 2] supplies the frame, refIdxLX % 2
-    // selects same (0) / opposite (1) parity, and all MC runs in the
-    // half-height field geometry.
-    field_parity: Option<u8>,
-) -> Result<(), ReconstructError> {
-    let _ = pic; // currently unused; kept for future neighbour queries.
-    let (mv_l0, mv_l1) = derive_and_store_partition(
-        part,
-        mb_addr,
-        slice_header,
-        ref_pics,
-        grid,
-        inter_debug,
-        current_slice_id,
-        field_parity,
-    );
-    predict_partition(
-        part,
-        mv_l0,
-        mv_l1,
-        mb_px,
-        mb_py,
-        chroma_array_type,
-        bit_depth_y,
-        bit_depth_c,
-        slice_header,
-        pps,
-        ref_pics,
-        pic.pic_order_cnt,
-        (pic.top_field_order_cnt, pic.bottom_field_order_cnt),
-        pred_luma,
-        pred_cb,
-        pred_cr,
-        inter_debug,
-        field_parity,
-    )
+/// §8.4.2 — whether two partitions predict identically: the same
+/// lists in use, with the same reference indices and motion vectors.
+/// Prediction of a block depends on nothing else but its position, so
+/// such partitions may be predicted as one block.
+fn same_prediction(a: &(InterPartition, Mv, Mv), b: &(InterPartition, Mv, Mv)) -> bool {
+    let uses = |p: &InterPartition| {
+        (
+            matches!(
+                p.mode,
+                PartMode::L0Only | PartMode::BiPred | PartMode::Direct
+            ) && p.ref_idx_l0 >= 0,
+            matches!(
+                p.mode,
+                PartMode::L1Only | PartMode::BiPred | PartMode::Direct
+            ) && p.ref_idx_l1 >= 0,
+        )
+    };
+    let (a0, a1) = uses(&a.0);
+    let (b0, b1) = uses(&b.0);
+    a0 == b0
+        && a1 == b1
+        && (!a0 || (a.0.ref_idx_l0 == b.0.ref_idx_l0 && a.1 == b.1))
+        && (!a1 || (a.0.ref_idx_l1 == b.0.ref_idx_l1 && a.2 == b.2))
 }
 
-/// §8.4.1 — the motion half of [`process_partition`]: derive the
+/// The partitions of a macroblock with identically predicted
+/// neighbours merged into 16x16, 16x8 / 8x16 or 8x8 blocks (see
+/// [`same_prediction`]); the prediction samples are unchanged.
+fn coalesce_partitions(
+    parts: &[(InterPartition, Mv, Mv)],
+) -> ([(InterPartition, Mv, Mv); 16], usize) {
+    let first = parts[0];
+    let mut out = [first; 16];
+    let n_in = parts.len().min(16);
+    if n_in == 1 {
+        return (out, 1);
+    }
+    // The partition owning each 4x4 block (raster order).
+    let mut owner = [usize::MAX; 16];
+    for (i, (p, _, _)) in parts.iter().enumerate() {
+        for by in (p.y as usize / 4)..((p.y as usize + p.h as usize) / 4).min(4) {
+            for bx in (p.x as usize / 4)..((p.x as usize + p.w as usize) / 4).min(4) {
+                owner[by * 4 + bx] = i;
+            }
+        }
+    }
+    if owner.contains(&usize::MAX) {
+        out[..n_in].copy_from_slice(&parts[..n_in]);
+        return (out, n_in);
+    }
+    let same = |a: usize, b: usize| a == b || same_prediction(&parts[a], &parts[b]);
+    // Quadrant q: 4x4 blocks (qx*2 + {0,1}, qy*2 + {0,1}).
+    let quad_first = |q: usize| owner[(q / 2) * 8 + (q % 2) * 2];
+    let uniform: [bool; 4] = std::array::from_fn(|q| {
+        let base = (q / 2) * 8 + (q % 2) * 2;
+        let o = owner[base];
+        [base + 1, base + 4, base + 5]
+            .iter()
+            .all(|&b| same(o, owner[b]))
+    });
+    let block = |src: usize, x: u8, y: u8, w: u8, h: u8| {
+        let mut e = parts[src];
+        e.0.x = x;
+        e.0.y = y;
+        e.0.w = w;
+        e.0.h = h;
+        e
+    };
+    let q = [quad_first(0), quad_first(1), quad_first(2), quad_first(3)];
+    if uniform.iter().all(|&u| u) {
+        if same(q[0], q[1]) && same(q[0], q[2]) && same(q[0], q[3]) {
+            out[0] = block(q[0], 0, 0, 16, 16);
+            return (out, 1);
+        }
+        if same(q[0], q[1]) && same(q[2], q[3]) {
+            out[0] = block(q[0], 0, 0, 16, 8);
+            out[1] = block(q[2], 0, 8, 16, 8);
+            return (out, 2);
+        }
+        if same(q[0], q[2]) && same(q[1], q[3]) {
+            out[0] = block(q[0], 0, 0, 8, 16);
+            out[1] = block(q[1], 8, 0, 8, 16);
+            return (out, 2);
+        }
+    }
+    let mut n = 0;
+    for qi in 0..4 {
+        let (qx, qy) = ((qi % 2) as u8 * 8, (qi / 2) as u8 * 8);
+        if uniform[qi] {
+            out[n] = block(q[qi], qx, qy, 8, 8);
+            n += 1;
+        } else {
+            // A non-uniform quadrant is tiled by sub-8x8 partitions.
+            for e in parts {
+                if e.0.x / 8 * 8 == qx && e.0.y / 8 * 8 == qy && n < 16 {
+                    out[n] = *e;
+                    n += 1;
+                }
+            }
+        }
+    }
+    (out, n)
+}
+
+/// §8.4.1 — the motion half of an inter partition: derive the
 /// partition's motion vectors and store them, with its reference
 /// indices and reference-picture identities, on the MB grid.
 #[allow(clippy::too_many_arguments)]
@@ -5546,7 +5615,7 @@ fn derive_and_store_partition<R: RefPicProvider>(
     (mv_l0, mv_l1)
 }
 
-/// §8.4.2 — the sample half of [`process_partition`]: motion-compensate
+/// §8.4.2 — the sample half of an inter partition: motion-compensate
 /// one partition whose motion vectors are already derived (and stored
 /// on the grid) into the MB-sized prediction buffers. Reads only the
 /// reference pictures, so partitions of different macroblocks can be
@@ -5654,8 +5723,75 @@ fn combine_partition(
     }
 }
 
+/// Per-partition motion-compensation scratch (predPartL0 / predPartL1
+/// for luma and both chroma planes), kept per thread so a partition
+/// does not zero six buffers on every call.
+struct PredBufs {
+    l0: [i32; MAX_PARTITION_SAMPLES],
+    l1: [i32; MAX_PARTITION_SAMPLES],
+    chroma: [[i32; MAX_PARTITION_SAMPLES]; 4],
+}
+
+thread_local! {
+    static PRED_BUFS: std::cell::Cell<Option<Box<PredBufs>>> = const { std::cell::Cell::new(None) };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn predict_partition<R: RefPicProvider>(
+    part: &InterPartition,
+    mv_l0: Mv,
+    mv_l1: Mv,
+    mb_px: i32,
+    mb_py: i32,
+    chroma_array_type: u32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    slice_header: &SliceHeader,
+    pps: &Pps,
+    ref_pics: &R,
+    curr_poc: i32,
+    curr_field_focs: (i32, i32),
+    pred_luma: &mut [i32; 256],
+    pred_cb: &mut [i32],
+    pred_cr: &mut [i32],
+    inter_debug: bool,
+    field_parity: Option<u8>,
+) -> Result<(), ReconstructError> {
+    let mut bufs = PRED_BUFS.take().unwrap_or_else(|| {
+        Box::new(PredBufs {
+            l0: [0; MAX_PARTITION_SAMPLES],
+            l1: [0; MAX_PARTITION_SAMPLES],
+            chroma: [[0; MAX_PARTITION_SAMPLES]; 4],
+        })
+    });
+    let res = predict_partition_with(
+        &mut bufs,
+        part,
+        mv_l0,
+        mv_l1,
+        mb_px,
+        mb_py,
+        chroma_array_type,
+        bit_depth_y,
+        bit_depth_c,
+        slice_header,
+        pps,
+        ref_pics,
+        curr_poc,
+        curr_field_focs,
+        pred_luma,
+        pred_cb,
+        pred_cr,
+        inter_debug,
+        field_parity,
+    );
+    PRED_BUFS.set(Some(bufs));
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_partition_with<R: RefPicProvider>(
+    bufs: &mut PredBufs,
     part: &InterPartition,
     mv_l0: Mv,
     mv_l1: Mv,
@@ -5724,12 +5860,11 @@ fn predict_partition<R: RefPicProvider>(
             ref_pics.ref_planes(list, ref_idx.max(0) as u32)
         }
     };
-    // Partition-sized scratch buffers, on the stack: a partition is at
-    // most 16x16 samples.
-    let mut l0_buf_store = [0i32; MAX_PARTITION_SAMPLES];
-    let l0_buf = &mut l0_buf_store[..(w as usize) * (h as usize)];
-    let mut l1_buf_store = [0i32; MAX_PARTITION_SAMPLES];
-    let l1_buf = &mut l1_buf_store[..(w as usize) * (h as usize)];
+    // Partition-sized scratch buffers: a partition is at most 16x16
+    // samples. Every sample a later stage reads is written first.
+    let PredBufs { l0, l1, chroma } = bufs;
+    let l0_buf = &mut l0[..(w as usize) * (h as usize)];
+    let l1_buf = &mut l1[..(w as usize) * (h as usize)];
     let has_l0 = matches!(
         part.mode,
         PartMode::L0Only | PartMode::BiPred | PartMode::Direct
@@ -5974,14 +6109,12 @@ fn predict_partition<R: RefPicProvider>(
         let mbw_c_use = mbw_c;
         let _ = mbh_c;
 
-        let mut l0_cb_store = [0i32; MAX_PARTITION_SAMPLES];
-        let l0_cb = &mut l0_cb_store[..(c_w as usize) * (c_h as usize)];
-        let mut l0_cr_store = [0i32; MAX_PARTITION_SAMPLES];
-        let l0_cr = &mut l0_cr_store[..(c_w as usize) * (c_h as usize)];
-        let mut l1_cb_store = [0i32; MAX_PARTITION_SAMPLES];
-        let l1_cb = &mut l1_cb_store[..(c_w as usize) * (c_h as usize)];
-        let mut l1_cr_store = [0i32; MAX_PARTITION_SAMPLES];
-        let l1_cr = &mut l1_cr_store[..(c_w as usize) * (c_h as usize)];
+        let n_c = (c_w as usize) * (c_h as usize);
+        let [c0, c1, c2, c3] = chroma;
+        let l0_cb = &mut c0[..n_c];
+        let l0_cr = &mut c1[..n_c];
+        let l1_cb = &mut c2[..n_c];
+        let l1_cr = &mut c3[..n_c];
         // §8.4.1.4 Table 8-10 — at ChromaArrayType == 1 a FIELD MB
         // referencing the OPPOSITE-parity field offsets the vertical
         // chroma MV: ref top field + current bottom → +2, ref bottom

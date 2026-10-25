@@ -120,19 +120,30 @@ fn gather(
     }
 }
 
-/// `dst.copy_from_slice(src)` for the short rows of a block window,
-/// in fixed 4-sample steps (a library `memcpy` call per row costs more
-/// than the copy itself at these lengths).
+/// `dst.copy_from_slice(src)` for the short rows of a block window.
+/// The row lengths a kernel uses are dispatched to fixed-size copies,
+/// which compile to a few loads and stores (a library `memcpy` call per
+/// row costs more than the copy itself at these lengths).
 #[inline(always)]
 fn copy_short(dst: &mut [i32], src: &[i32]) {
-    let src = &src[..dst.len()];
-    let (d4, dt) = dst.as_chunks_mut::<4>();
-    let (s4, st) = src.as_chunks::<4>();
-    for (d, s) in d4.iter_mut().zip(s4) {
+    #[inline(always)]
+    fn fixed<const N: usize>(dst: &mut [i32], src: &[i32]) {
+        let d: &mut [i32; N] = (&mut dst[..N]).try_into().expect("row length");
+        let s: &[i32; N] = (&src[..N]).try_into().expect("row length");
         *d = *s;
     }
-    for (d, &s) in dt.iter_mut().zip(st) {
-        *d = s;
+    match dst.len() {
+        2 => fixed::<2>(dst, src),
+        3 => fixed::<3>(dst, src),
+        4 => fixed::<4>(dst, src),
+        5 => fixed::<5>(dst, src),
+        8 => fixed::<8>(dst, src),
+        9 => fixed::<9>(dst, src),
+        13 => fixed::<13>(dst, src),
+        16 => fixed::<16>(dst, src),
+        17 => fixed::<17>(dst, src),
+        21 => fixed::<21>(dst, src),
+        n => dst.copy_from_slice(&src[..n]),
     }
 }
 
