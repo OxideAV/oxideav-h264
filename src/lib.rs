@@ -23,6 +23,8 @@ pub mod deblock;
 pub mod decoder;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod dpb_output;
+#[doc(hidden)] // internal — frame-threading plumbing
+pub mod frame_thread;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod inter_pred;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API

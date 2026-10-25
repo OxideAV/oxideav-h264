@@ -16,6 +16,7 @@
 
 use crate::picture::Picture;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Trait the reconstruction layer consumes to fetch reference picture
 /// samples for inter prediction (§8.4.2).
@@ -107,6 +108,14 @@ pub trait RefPicProvider {
     fn ref_pair_field(&self, _list: u8, _idx: u32, _bottom: bool) -> Option<&Picture> {
         None
     }
+    /// Frame threading — the sample planes of the picture at
+    /// `(list, idx)` when it is still being reconstructed on another
+    /// thread (its [`Self::ref_pic`] then carries no samples). `None`
+    /// for an ordinary, fully reconstructed reference.
+    #[doc(hidden)] // internal — frame-threading plumbing
+    fn ref_planes(&self, _list: u8, _idx: u32) -> Option<&crate::frame_thread::SharedPlanes> {
+        None
+    }
 }
 
 /// A caller-supplied store mapping list indices to decoded pictures.
@@ -128,7 +137,7 @@ pub trait RefPicProvider {
 /// (unbounded growth — the 2026-07-25 scheduled-fuzz OOM triage
 /// surfaced it).
 pub struct RefPicStore {
-    pictures: HashMap<u32, Picture>,
+    pictures: HashMap<u32, Arc<Picture>>,
     ref_pic_list_0: Vec<u32>,
     ref_pic_list_1: Vec<u32>,
 }
@@ -150,7 +159,12 @@ impl RefPicStore {
 
     /// Insert (or replace) the picture stored at `key`.
     pub fn insert(&mut self, key: u32, pic: Picture) {
-        self.pictures.insert(key, pic);
+        self.pictures.insert(key, Arc::new(pic));
+    }
+
+    /// The shared handle of the picture stored at `key`.
+    pub(crate) fn get_arc(&self, key: u32) -> Option<Arc<Picture>> {
+        self.pictures.get(&key).cloned()
     }
 
     /// Drop every stored picture whose key is NOT in `live`.
@@ -185,7 +199,7 @@ impl RefPicStore {
 
     /// Fetch a picture directly by key.
     pub fn get_by_key(&self, key: u32) -> Option<&Picture> {
-        self.pictures.get(&key)
+        self.pictures.get(&key).map(|p| &**p)
     }
 }
 

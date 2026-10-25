@@ -908,7 +908,7 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
 /// One inter macroblock of a slice whose motion is already derived
 /// (pass A of [`reconstruct_slice_no_deblock_threaded`]): everything the
 /// sample stage needs besides the parsed macroblock itself.
-struct InterMbJob {
+pub(crate) struct InterMbJob {
     /// Index into `SliceData::macroblocks`.
     idx: usize,
     /// MB column / row in the picture.
@@ -5715,6 +5715,15 @@ fn predict_partition<R: RefPicProvider>(
         }
     };
 
+    // Frame threading — the published planes of a reference still being
+    // reconstructed on another thread (frame macroblocks only).
+    let ref_planes_for = |list: u8, ref_idx: i8| {
+        if field_parity.is_some() {
+            None
+        } else {
+            ref_pics.ref_planes(list, ref_idx.max(0) as u32)
+        }
+    };
     // Partition-sized scratch buffers, on the stack: a partition is at
     // most 16x16 samples.
     let mut l0_buf_store = [0i32; MAX_PARTITION_SAMPLES];
@@ -5753,6 +5762,7 @@ fn predict_partition<R: RefPicProvider>(
             bit_depth_y,
             l0_buf,
             fld,
+            ref_planes_for(0, part.ref_idx_l0),
         )?;
     }
     if has_l1 {
@@ -5778,6 +5788,7 @@ fn predict_partition<R: RefPicProvider>(
             bit_depth_y,
             l1_buf,
             fld,
+            ref_planes_for(1, part.ref_idx_l1),
         )?;
         if inter_debug {
             eprintln!(
@@ -6019,6 +6030,7 @@ fn predict_partition<R: RefPicProvider>(
                 l0_cb,
                 l0_cr,
                 fld,
+                ref_planes_for(0, part.ref_idx_l0),
             )?;
         }
         if has_l1 {
@@ -6035,6 +6047,7 @@ fn predict_partition<R: RefPicProvider>(
                 l1_cb,
                 l1_cr,
                 fld,
+                ref_planes_for(1, part.ref_idx_l1),
             )?;
         }
         // Combine into pred_cb / pred_cr at MB-local position.
@@ -6359,6 +6372,7 @@ fn mc_luma_partition(
     bit_depth: u32,
     dst: &mut [i32],
     field: Option<u8>,
+    planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
     // §8.4.2 — reference picture must have positive luma dims. A
     // zero-dim ref pic (e.g. uninitialised DPB slot) drives the slow-
@@ -6413,11 +6427,14 @@ fn mc_luma_partition(
     if w == 0 || h == 0 || w > 16 || h > 16 || !w.is_multiple_of(4) || !h.is_multiple_of(4) {
         return Err(ReconstructError::IntraPredOutOfBounds);
     }
-    let plane = crate::mc::PlaneSrc::Flat {
-        data: src,
-        stride: src_stride,
-        width: stride,
-        height: src_h,
+    let plane = match planes {
+        Some(p) => p.luma_src(),
+        None => crate::mc::PlaneSrc::Flat {
+            data: src,
+            stride: src_stride,
+            width: stride,
+            height: src_h,
+        },
     };
     crate::mc::luma(
         &plane,
@@ -6451,6 +6468,7 @@ fn mc_chroma_partition(
     dst_cb: &mut [i32],
     dst_cr: &mut [i32],
     field: Option<u8>,
+    planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
     // §8.4.1.4 — chroma MV derivation:
     // - 4:2:0 (ChromaArrayType == 1): mvC = mv / 2 (both components).
@@ -6504,12 +6522,18 @@ fn mc_chroma_partition(
     if w == 0 || h == 0 || w > 16 || h > 16 {
         return Err(ReconstructError::IntraPredOutOfBounds);
     }
-    for (plane, dst) in [(&ref_pic.cb, dst_cb), (&ref_pic.cr, dst_cr)] {
-        let src = crate::mc::PlaneSrc::Flat {
-            data: &plane[row_off..],
-            stride: src_stride,
-            width: cw,
-            height: src_h,
+    for (i, (plane, dst)) in [(&ref_pic.cb, dst_cb), (&ref_pic.cr, dst_cr)]
+        .into_iter()
+        .enumerate()
+    {
+        let src = match planes {
+            Some(p) => p.chroma_src(i as u8),
+            None => crate::mc::PlaneSrc::Flat {
+                data: &plane[row_off..],
+                stride: src_stride,
+                width: cw,
+                height: src_h,
+            },
         };
         crate::mc::chroma(
             &src, int_x, int_y, x_frac, y_frac, w as usize, h as usize, dst, w as usize,
@@ -12046,6 +12070,421 @@ fn filter_chroma_horizontal_cols(
 // Tests
 // -------------------------------------------------------------------------
 
+// -------------------------------------------------------------------------
+// Frame threading (see `crate::frame_thread`)
+// -------------------------------------------------------------------------
+
+/// The sample stage of one slice decoded under frame threading: its
+/// inter macroblocks with their derived motion, and its intra
+/// macroblocks, in decoding order, up to the first macroblock whose
+/// decoding failed.
+#[derive(Default)]
+pub(crate) struct FtSlicePlan {
+    pub(crate) inter: Vec<InterMbJob>,
+    /// `(index into the slice's macroblocks, mbAddr, QP_Y)`.
+    pub(crate) intra: Vec<(usize, u32, i32)>,
+}
+
+impl InterMbJob {
+    /// Macroblock row of the job.
+    pub(crate) fn mb_y(&self) -> u32 {
+        self.mb_y
+    }
+
+    /// For every reference sample read of the job's §8.4.2.2
+    /// interpolation: `(list, refIdxLX, last macroblock row band of
+    /// the reference picture it reaches)` — luma rows up to
+    /// `yIntL + partHeight + 2` (Table 8-11), chroma rows up to
+    /// `yIntC + partHeightC` (eqs. 8-268 / 8-269), clipped into the
+    /// picture.
+    pub(crate) fn ref_bands(
+        &self,
+        chroma_array_type: u32,
+        height: u32,
+        chroma_band_rows: u32,
+        mut f: impl FnMut(u8, i8, usize),
+    ) {
+        let h = height as i32;
+        let ch = if chroma_array_type == 2 { h } else { h / 2 };
+        let mb_py = self.mb_y as i32 * 16;
+        for (part, mv0, mv1) in &self.parts {
+            let uses = [
+                (
+                    0u8,
+                    part.ref_idx_l0,
+                    *mv0,
+                    matches!(
+                        part.mode,
+                        PartMode::L0Only | PartMode::BiPred | PartMode::Direct
+                    ),
+                ),
+                (
+                    1u8,
+                    part.ref_idx_l1,
+                    *mv1,
+                    matches!(
+                        part.mode,
+                        PartMode::L1Only | PartMode::BiPred | PartMode::Direct
+                    ),
+                ),
+            ];
+            for (list, ref_idx, mv, used) in uses {
+                if !used || ref_idx < 0 {
+                    continue;
+                }
+                let ly = mb_py + part.y as i32 + (mv.y >> 2) + part.h as i32 + 2;
+                let mut band = (ly.clamp(0, h - 1) / 16) as usize;
+                if chroma_array_type == 1 || chroma_array_type == 2 {
+                    let cy = if chroma_array_type == 1 {
+                        mb_py / 2 + part.y as i32 / 2 + (mv.y >> 3) + part.h as i32 / 2
+                    } else {
+                        mb_py + part.y as i32 + ((mv.y * 2) >> 3) + part.h as i32
+                    };
+                    let cb = (cy.clamp(0, ch - 1) / chroma_band_rows.max(1) as i32) as usize;
+                    band = band.max(cb);
+                }
+                f(list, ref_idx, band);
+            }
+        }
+    }
+}
+
+/// Whether a slice can be decoded under frame threading: a frame
+/// (neither a field nor MBAFF) I / P / B slice without slice groups,
+/// ChromaArrayType 0, 1 or 2 at a bit depth the transforms support.
+pub(crate) fn ft_eligible_slice(slice_header: &SliceHeader, sps: &Sps, pps: &Pps) -> bool {
+    parallel_inter_eligible(slice_header, sps, pps)
+        && !slice_header.field_pic_flag
+        && !sps.mb_adaptive_frame_field_flag
+        && !sps.separate_colour_plane_flag
+        && sps.chroma_array_type() != 3
+        && sps.bit_depth_luma_minus8 <= 6
+        && sps.bit_depth_chroma_minus8 <= 6
+}
+
+/// §8.4.2 — the checks the sample stage of an inter macroblock applies
+/// to its reference pictures, run up front so a macroblock the
+/// single-threaded decoder would reject is rejected at the same point.
+fn ft_validate_inter_refs<R: RefPicProvider>(
+    parts: &[(InterPartition, Mv, Mv)],
+    ref_pics: &R,
+    chroma_array_type: u32,
+) -> Result<(), ReconstructError> {
+    for (part, _, _) in parts {
+        let uses = [
+            (
+                0u8,
+                part.ref_idx_l0,
+                matches!(
+                    part.mode,
+                    PartMode::L0Only | PartMode::BiPred | PartMode::Direct
+                ),
+            ),
+            (
+                1u8,
+                part.ref_idx_l1,
+                matches!(
+                    part.mode,
+                    PartMode::L1Only | PartMode::BiPred | PartMode::Direct
+                ),
+            ),
+        ];
+        for (list, ref_idx, used) in uses {
+            if !used || ref_idx < 0 {
+                continue;
+            }
+            let idx = ref_idx as u32;
+            let rp = ref_pics
+                .ref_pic(list, idx)
+                .ok_or(ReconstructError::MissingRefPic { list, idx })?;
+            if rp.width_in_samples == 0 || rp.height_in_samples == 0 {
+                return Err(ReconstructError::InvalidRefDims {
+                    width: rp.width_in_samples,
+                    height: rp.height_in_samples,
+                });
+            }
+            if rp.non_existing {
+                return Err(ReconstructError::NonExistingRef);
+            }
+            if (chroma_array_type == 1 || chroma_array_type == 2)
+                && (rp.chroma_width() == 0 || rp.chroma_height() == 0)
+            {
+                return Err(ReconstructError::InvalidRefDims {
+                    width: rp.chroma_width(),
+                    height: rp.chroma_height(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Frame threading — the decoding-order part of a slice
+/// ([`ft_eligible_slice`]): every macroblock's QP_Y and grid record,
+/// the §8.4.1 motion of the inter macroblocks, and — run on `pic`,
+/// whose samples the sample stage later overwrites — the intra
+/// macroblocks, so every check the single-threaded decoder applies
+/// happens here, at the same macroblock. Returns the sample-stage plan
+/// up to the first failing macroblock, and that failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ft_motion_pass<R: RefPicProvider>(
+    slice_data: &SliceData,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    ref_pics: &R,
+    pic: &mut Picture,
+    grid: &mut MbGrid,
+) -> (FtSlicePlan, Result<(), ReconstructError>) {
+    let chroma_array_type = sps.chroma_array_type();
+    grid.mbaff_frame_flag = false;
+    let bit_depth_y = 8 + sps.bit_depth_luma_minus8;
+    let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
+    let slice_qp_y = 26 + pps.pic_init_qp_minus26 + slice_header.slice_qp_delta;
+    let mut prev_qp_y = slice_qp_y;
+    let current_slice_id = slice_header.first_mb_in_slice as i32;
+    let mut plan = FtSlicePlan::default();
+    let addrs = slice_header.first_mb_in_slice..;
+    for (curr_addr, (idx, mb)) in addrs.zip(slice_data.macroblocks.iter().enumerate()) {
+        if curr_addr as usize >= grid.info.len() {
+            break;
+        }
+        let mb_qp_y = if mb.mb_type.is_i_pcm() || mb.is_skip {
+            prev_qp_y
+        } else {
+            next_qp_y(prev_qp_y, mb.mb_qp_delta, sps.bit_depth_luma_minus8)
+        };
+        if mb.mb_type.is_intra() {
+            if let Err(e) = reconstruct_mb_intra(
+                mb,
+                curr_addr,
+                mb_qp_y,
+                chroma_array_type,
+                bit_depth_y,
+                bit_depth_c,
+                sps,
+                pps,
+                pic,
+                grid,
+                false,
+                false,
+                current_slice_id,
+                false,
+                luma_scaling_plane(sps, slice_header),
+                None,
+            ) {
+                return (plan, Err(e));
+            }
+            plan.intra.push((idx, curr_addr, mb_qp_y));
+        } else {
+            let parts = match derive_mb_inter_motion(
+                mb,
+                curr_addr,
+                slice_header,
+                sps,
+                ref_pics,
+                pic,
+                grid,
+                current_slice_id,
+            ) {
+                Ok(parts) => parts,
+                Err(e) => return (plan, Err(e)),
+            };
+            if let Err(e) = ft_validate_inter_refs(&parts, ref_pics, chroma_array_type) {
+                return (plan, Err(e));
+            }
+            let (mb_x, mb_y) = grid.mb_xy(curr_addr);
+            plan.inter.push(InterMbJob {
+                idx,
+                mb_x,
+                mb_y,
+                qp_y: mb_qp_y,
+                parts,
+            });
+        }
+        if let Some(info) = grid.get_mut(curr_addr) {
+            info.available = true;
+            info.is_intra = mb.mb_type.is_intra();
+            info.in_sp_si_slice = false;
+            info.is_i_pcm = mb.mb_type.is_i_pcm();
+            info.is_intra_nxn = mb.mb_type.is_i_nxn();
+            info.mb_type_raw = mb.mb_type_raw;
+            info.qp_y = mb_qp_y;
+            info.cbp_luma = (mb.coded_block_pattern & 0x0F) as u8;
+            info.cbp_chroma = ((mb.coded_block_pattern >> 4) & 0x03) as u8;
+            info.transform_size_8x8_flag = mb.transform_size_8x8_flag;
+            info.luma_nonzero_4x4 = compute_luma_nonzero_mask(mb);
+            info.chroma_nonzero_4x4 = compute_chroma_nonzero_mask(mb, chroma_array_type);
+            if let Some(pred) = mb.mb_pred.as_ref() {
+                info.intra_chroma_pred_mode = pred.intra_chroma_pred_mode;
+            }
+            info.slice_id = current_slice_id;
+            info.mb_field_decoding_flag = false;
+        }
+        prev_qp_y = mb_qp_y;
+    }
+    (plan, Ok(()))
+}
+
+/// Frame threading — the §8.4.2 prediction + §8.5 residual of one inter
+/// macroblock of [`ft_motion_pass`]'s plan, written into `pic`.
+/// `scratch` is a one-macroblock picture.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ft_inter_mb<R: RefPicProvider>(
+    slice_data: &SliceData,
+    job: &InterMbJob,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    ref_pics: &R,
+    scratch: &mut Picture,
+    pic: &mut Picture,
+) -> Result<(), ReconstructError> {
+    let chroma_array_type = sps.chroma_array_type();
+    synth_mb_inter(
+        &slice_data.macroblocks[job.idx],
+        job,
+        chroma_array_type,
+        8 + sps.bit_depth_luma_minus8,
+        8 + sps.bit_depth_chroma_minus8,
+        slice_header,
+        sps,
+        pps,
+        ref_pics,
+        pic.pic_order_cnt,
+        scratch,
+    )?;
+    let width = pic.width_in_samples as usize;
+    let x0 = job.mb_x as usize * 16;
+    let y0 = job.mb_y as usize * 16;
+    for y in 0..16 {
+        let o = (y0 + y) * width + x0;
+        pic.luma[o..o + 16].copy_from_slice(&scratch.luma[y * 16..y * 16 + 16]);
+    }
+    if chroma_array_type == 1 || chroma_array_type == 2 {
+        let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
+        let (mbw_c, mbh_c) = (mbw_c as usize, mbh_c as usize);
+        let cw = pic.chroma_width() as usize;
+        let cx0 = job.mb_x as usize * mbw_c;
+        let cy0 = job.mb_y as usize * mbh_c;
+        for y in 0..mbh_c {
+            let d = (cy0 + y) * cw + cx0;
+            let s = y * mbw_c;
+            pic.cb[d..d + mbw_c].copy_from_slice(&scratch.cb[s..s + mbw_c]);
+            pic.cr[d..d + mbw_c].copy_from_slice(&scratch.cr[s..s + mbw_c]);
+        }
+    }
+    Ok(())
+}
+
+/// Frame threading — the §8.3 / §8.5 reconstruction of one intra
+/// macroblock of [`ft_motion_pass`]'s plan.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ft_intra_mb(
+    slice_data: &SliceData,
+    (idx, addr, qp_y): (usize, u32, i32),
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pic: &mut Picture,
+    grid: &mut MbGrid,
+) -> Result<(), ReconstructError> {
+    reconstruct_mb_intra(
+        &slice_data.macroblocks[idx],
+        addr,
+        qp_y,
+        sps.chroma_array_type(),
+        8 + sps.bit_depth_luma_minus8,
+        8 + sps.bit_depth_chroma_minus8,
+        sps,
+        pps,
+        pic,
+        grid,
+        false,
+        false,
+        slice_header.first_mb_in_slice as i32,
+        false,
+        luma_scaling_plane(sps, slice_header),
+        None,
+    )
+}
+
+/// Frame threading — §8.7 deblocking of macroblock row `mb_y` of a
+/// frame picture (non-MBAFF, ChromaArrayType 0 / 1 / 2): the luma and
+/// chroma edges of each macroblock left to right, as the raster walk
+/// of [`deblock_picture_full`] filters them. Rows must be filtered in
+/// order, each once the row below it is reconstructed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ft_deblock_row(
+    pic: &mut Picture,
+    grid: &MbGrid,
+    mb_y: u32,
+    alpha_off: i32,
+    beta_off: i32,
+    sps: &Sps,
+    pps: &Pps,
+    mb_field_flags: &[bool],
+) {
+    if deblock_no_op_cached() {
+        return;
+    }
+    let w = pic.width_in_samples as i32;
+    let h = pic.height_in_samples as i32;
+    let bit_depth_y = 8 + sps.bit_depth_luma_minus8;
+    let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
+    let has_chroma = pic.chroma_array_type == 1 || pic.chroma_array_type == 2;
+    let (cw, ch) = (pic.chroma_width() as i32, pic.chroma_height() as i32);
+    let cb_offset = pps.chroma_qp_index_offset;
+    let cr_offset = pps
+        .extension
+        .as_ref()
+        .map(|e| e.second_chroma_qp_index_offset)
+        .unwrap_or(pps.chroma_qp_index_offset);
+    let mut bs = [BS_NOT_DERIVED; 32];
+    for x in 0..grid.width_in_mbs as i32 {
+        bs.fill(BS_NOT_DERIVED);
+        deblock_luma_mb(
+            pic,
+            0,
+            w,
+            h,
+            grid,
+            x,
+            mb_y as i32,
+            alpha_off,
+            beta_off,
+            bit_depth_y,
+            false,
+            false,
+            mb_field_flags,
+            &mut bs,
+        );
+        if has_chroma {
+            for plane in 0..2u8 {
+                deblock_chroma_mb(
+                    pic,
+                    0,
+                    cw,
+                    ch,
+                    grid,
+                    plane,
+                    x,
+                    mb_y as i32,
+                    alpha_off,
+                    beta_off,
+                    bit_depth_c,
+                    cb_offset,
+                    cr_offset,
+                    false,
+                    false,
+                    mb_field_flags,
+                    &bs,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15013,7 +15452,7 @@ mod tests {
         let (px, py) = (0i32, 0i32);
 
         let mut luma = vec![0i32; (w * h) as usize];
-        mc_luma_partition(&ref_pic, px, py, mv, w, h, 8, &mut luma, None).unwrap();
+        mc_luma_partition(&ref_pic, px, py, mv, w, h, 8, &mut luma, None, None).unwrap();
 
         let mut cb = vec![0i32; (w * h) as usize];
         let mut cr = vec![0i32; (w * h) as usize];
@@ -15158,7 +15597,7 @@ mod tests {
         let mut cb = vec![0i32; (cw * ch) as usize];
         let mut cr = vec![0i32; (cw * ch) as usize];
         mc_chroma_partition(
-            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None,
+            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None, None,
         )
         .unwrap();
 
@@ -15203,7 +15642,7 @@ mod tests {
         let mut cb = vec![0i32; (cw * ch) as usize];
         let mut cr = vec![0i32; (cw * ch) as usize];
         mc_chroma_partition(
-            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None,
+            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None, None,
         )
         .unwrap();
 

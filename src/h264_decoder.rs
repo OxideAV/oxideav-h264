@@ -43,7 +43,8 @@
 //! this decoder (via [`crate::register`]) stops the "codec not found"
 //! error on the first h264 packet.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use oxideav_core::Decoder;
 use oxideav_core::{
@@ -52,6 +53,7 @@ use oxideav_core::{
 
 use crate::decoder::{Decoder as H264Driver, Event};
 use crate::dpb_output::{DpbOutput, OutputEntry};
+use crate::frame_thread::{Deferred, FtProvider, FtRef, FtSliceWork, Pool, SharedPlanes};
 use crate::mb_grid::MbGrid;
 use crate::picture::Picture;
 use crate::poc::{PocResult, PocSlice, PocSps, PocState, derive_poc};
@@ -62,6 +64,59 @@ use crate::slice_header::{
 };
 use crate::sps::{FrameCropMargins, Sps};
 use crate::{reconstruct, slice_data};
+
+/// A decoded picture on its way to `receive_frame`: ready, or still
+/// being reconstructed on the frame-threading pool.
+enum OutFrame {
+    Ready(VideoFrame),
+    Pending(Arc<SharedPlanes>),
+}
+
+/// The inputs of one §7.3.4 slice-data parse.
+struct SdInput {
+    rbsp: Vec<u8>,
+    cursor: (usize, u8),
+    header: SliceHeader,
+    sps: Sps,
+    pps: crate::pps::Pps,
+}
+
+type SdResult = std::result::Result<slice_data::SliceData, String>;
+
+/// A slice-data parse queued on the pool when its NAL unit arrived.
+type SdTask = Deferred<SdInput, SdResult>;
+
+fn parse_sd(i: SdInput) -> SdResult {
+    slice_data::parse_slice_data(&i.rbsp, i.cursor.0, i.cursor.1, &i.header, &i.sps, &i.pps)
+        .map_err(|e| e.to_string())
+}
+
+/// An input event held back so the slice-data parses of the next few
+/// slices run ahead on the pool. Replayed in arrival order.
+enum Queued {
+    /// `send_packet` of a packet with this pts / time base.
+    Packet(Option<i64>, TimeBase),
+    Event(Box<Event>, Option<Arc<SdTask>>),
+}
+
+/// Frame-threading state (worker budget above one).
+struct FtState {
+    pool: Pool,
+    queue: VecDeque<Queued>,
+    queued_slices: usize,
+    /// The planes of reference pictures (by DPB key) reconstructed on
+    /// the pool; their `ref_store` entries carry no samples.
+    slots: HashMap<u32, Arc<SharedPlanes>>,
+    /// Pictures whose sample stage is queued or running, oldest first.
+    inflight: VecDeque<Arc<SharedPlanes>>,
+}
+
+/// A picture decoded under frame threading: the slices whose decoding
+/// order part ran on the decoder thread, awaiting the sample stage.
+#[derive(Default)]
+struct FtPicture {
+    works: Vec<FtSliceWork>,
+}
 
 /// §7.4.1.2 / §7.4.1.2.4 — state carried forward across slices that
 /// belong to the *same* primary coded picture.
@@ -140,6 +195,9 @@ struct PictureInProgress {
     /// crash-2ad9589f… (3 slices, all fail "read past end of
     /// bitstream") — see commit message for details.
     any_slice_succeeded: bool,
+    /// Frame threading — `Some` when the picture's samples are
+    /// reconstructed on the worker pool.
+    ft: Option<FtPicture>,
 }
 
 /// §C.4.4 — a decoded PAFF field awaiting its complementary field so the
@@ -249,7 +307,7 @@ pub struct H264CodecDecoder {
     /// lazily (or recreated on SPS change) from the active SPS's VUI
     /// bitstream restriction (§E.2.1), with an Annex A Table A-1
     /// fallback when the VUI block is absent.
-    output_dpb: DpbOutput<VideoFrame>,
+    output_dpb: DpbOutput<OutFrame>,
     /// Pictures that have already been "bumped" from the DPB and are
     /// waiting for `receive_frame`. This covers both:
     /// 1. entries evicted by `DpbOutput::push` when the queue is full,
@@ -259,7 +317,7 @@ pub struct H264CodecDecoder {
     ///    *before* the new sequence's first frames (§C.4).
     ///
     /// Also used to carry the `flush()` drain at EOF.
-    ready: VecDeque<VideoFrame>,
+    ready: VecDeque<OutFrame>,
     /// Packet-level pts passed on the most recent `send_packet`. We
     /// stamp the first frame produced from that packet with it.
     pending_pts: Option<i64>,
@@ -353,6 +411,11 @@ pub struct H264CodecDecoder {
     /// reconstruction and deblocking over worker threads. The output is
     /// identical for every value.
     threads: usize,
+    /// Frame-threading state, created with the first packet decoded
+    /// under a budget above one.
+    ft: Option<FtState>,
+    /// The queued slice-data parse of the slice event being handled.
+    pending_sd: Option<Arc<SdTask>>,
 }
 
 impl H264CodecDecoder {
@@ -368,7 +431,7 @@ impl H264CodecDecoder {
             last_slice: None,
             decode_errors: 0,
             eof: false,
-            output_dpb: DpbOutput::<VideoFrame>::new(16, 16),
+            output_dpb: DpbOutput::<OutFrame>::new(16, 16),
             ready: VecDeque::new(),
             pending_pts: None,
             pending_dp: None,
@@ -390,13 +453,36 @@ impl H264CodecDecoder {
             avcc_bit_depth_luma: None,
             avcc_bit_depth_chroma: None,
             threads: 1,
+            ft: None,
+            pending_sd: None,
         }
     }
 
     /// Set the worker budget (see [`Decoder::set_execution_context`]).
     /// `0` is treated as `1`.
+    ///
+    /// With a budget above one, frame pictures (neither PAFF fields nor
+    /// MBAFF, ChromaArrayType 0 / 1 / 2, no SP / SI slices or slice
+    /// groups) are frame-threaded: slice data is parsed on a pool of
+    /// `threads` workers as it arrives, the decoding-order work (§8.2
+    /// POC, reference lists and marking, §8.4.1 motion) runs on the
+    /// calling thread, and each picture's samples are reconstructed and
+    /// deblocked on the pool while later pictures start, row by row as
+    /// their references' rows complete. Frames come out in the same
+    /// order with identical samples; `receive_frame` reports
+    /// `NeedMore` while the next frame is still being reconstructed
+    /// (and waits for it after `flush`), and the per-NAL bookkeeping
+    /// ([`Self::decode_error_count`], `last_slice`) trails the input by
+    /// up to a budget's worth of slices until `flush`.
     pub fn set_threads(&mut self, threads: usize) {
-        self.threads = threads.max(1);
+        let threads = threads.max(1);
+        if threads != self.threads {
+            // Finish the work of the old budget first: replay held-back
+            // events and let in-flight pictures complete.
+            self.ft_pump(true);
+            self.ft_shutdown();
+        }
+        self.threads = threads;
     }
 
     /// §5.2.4.1.1 ISO/IEC 14496-15 — `AVCDecoderConfigurationRecord`.
@@ -875,7 +961,8 @@ impl H264CodecDecoder {
             // of identical geometry (all three planes share the SPS).
             planes.extend(cb.planes);
             planes.extend(cr.planes);
-            self.ready.push_back(VideoFrame { pts: y.pts, planes });
+            self.ready
+                .push_back(OutFrame::Ready(VideoFrame { pts: y.pts, planes }));
         }
         // Anti-OOM guard for NON-conforming streams: §7.4.1.2 requires
         // every access unit to carry all three colour planes, so the
@@ -1062,6 +1149,17 @@ impl H264CodecDecoder {
             // picture with this slice.
             self.finalize_in_progress_picture()?;
 
+            // Frame threading — reconstruct this picture's samples on
+            // the pool when it qualifies; otherwise the serial path
+            // below reads reference samples, so the pool's pictures
+            // must be complete and stored with their samples.
+            let use_ft = self.threads > 1
+                && dp.is_none()
+                && reconstruct::ft_eligible_slice(&header, &sps, &pps);
+            if !use_ft {
+                self.ft_materialize();
+            }
+
             // §7.4.3 + Annex A — `first_mb_in_slice` of the first
             // coded slice of a coded picture must be 0 when arbitrary
             // slice order (ASO) is not allowed. §A.2.1 (Baseline) and
@@ -1191,6 +1289,7 @@ impl H264CodecDecoder {
                 sps: sps.clone(),
                 pps: pps.clone(),
                 any_slice_succeeded: false,
+                ft: use_ft.then(FtPicture::default),
             });
         }
 
@@ -1230,9 +1329,28 @@ impl H264CodecDecoder {
         // Parse slice_data — common to I / P / B paths. A §7.3.2.9
         // data-partitioned slice routes its residual reads to the
         // partition-B/C payloads.
-        let sd = match &dp {
-            None => slice_data::parse_slice_data(rbsp, cursor.0, cursor.1, header, sps, pps),
-            Some((b, c)) => slice_data::parse_slice_data_partitioned(
+        // Frame threading — a continuation slice the pool cannot take
+        // (§7.3.2.9 partitioned, SP / SI, slice groups) turns the
+        // picture serial: reconstruct what the earlier slices planned
+        // right here, then carry on with the serial path.
+        let ft_picture = self.in_progress.as_ref().is_some_and(|p| p.ft.is_some());
+        let ft_slice =
+            ft_picture && dp.is_none() && reconstruct::ft_eligible_slice(header, sps, pps);
+        if ft_picture && !ft_slice {
+            self.ft_convert_in_progress();
+        }
+        // The slice-data parse queued when the NAL unit arrived (frame
+        // threading) is the same §7.3.4 parse of the same inputs.
+        let queued = self.pending_sd.take();
+        let sd = match (&dp, queued) {
+            (None, Some(task)) => task
+                .take()
+                .unwrap_or_else(|| Err("slice data parser panicked".to_string())),
+            (None, None) => {
+                slice_data::parse_slice_data(rbsp, cursor.0, cursor.1, header, sps, pps)
+                    .map_err(|e| e.to_string())
+            }
+            (Some((b, c)), _) => slice_data::parse_slice_data_partitioned(
                 rbsp,
                 cursor.0,
                 cursor.1,
@@ -1241,7 +1359,8 @@ impl H264CodecDecoder {
                 header,
                 sps,
                 pps,
-            ),
+            )
+            .map_err(|e| e.to_string()),
         }
         .map_err(|e| Error::invalid(format!("h264 slice_data: {e}")))?;
 
@@ -1641,17 +1760,50 @@ impl H264CodecDecoder {
             list_0_pair_keys: l0_pair_keys,
             list_1_pair_keys: l1_pair_keys,
         };
-        reconstruct::reconstruct_slice_no_deblock_threaded(
-            &sd,
-            header,
-            sps,
-            pps,
-            &provider,
-            &mut in_progress.pic,
-            &mut in_progress.grid,
-            self.threads,
-        )
-        .map_err(|e| Error::invalid(format!("h264 reconstruct: {e}")))?;
+        let recon = if ft_slice {
+            // Frame threading — the decoding-order part now; the sample
+            // stage later, on the pool, with owned reference handles.
+            let (plan, res) = reconstruct::ft_motion_pass(
+                &sd,
+                header,
+                sps,
+                pps,
+                &provider,
+                &mut in_progress.pic,
+                &mut in_progress.grid,
+            );
+            let ft = self.ft.as_ref().expect("frame threading active");
+            let refs = ft_provider(provider, &self.ref_store, &ft.slots);
+            let mb_field_decoding_flags = sd.mb_field_decoding_flags.clone();
+            in_progress
+                .ft
+                .as_mut()
+                .expect("frame-threaded picture")
+                .works
+                .push(FtSliceWork {
+                    sd,
+                    header: header.clone(),
+                    sps: sps.clone(),
+                    pps: pps.clone(),
+                    refs,
+                    plan,
+                });
+            res.map(|()| mb_field_decoding_flags)
+        } else {
+            reconstruct::reconstruct_slice_no_deblock_threaded(
+                &sd,
+                header,
+                sps,
+                pps,
+                &provider,
+                &mut in_progress.pic,
+                &mut in_progress.grid,
+                self.threads,
+            )
+            .map(|()| sd.mb_field_decoding_flags)
+        };
+        let mb_field_decoding_flags =
+            recon.map_err(|e| Error::invalid(format!("h264 reconstruct: {e}")))?;
 
         // §7.4.4 — copy this slice's per-MB mb_field_decoding_flag
         // values into the picture-wide array so `finalize_in_progress_picture`
@@ -1663,7 +1815,7 @@ impl H264CodecDecoder {
         let mut curr_addr = header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
         // §8.2.2 — FMO slice group map (round-453).
         let mb_map = crate::mb_address::slice_mb_to_slice_group_map(sps, pps, header);
-        for flag in sd.mb_field_decoding_flags.iter().copied() {
+        for flag in mb_field_decoding_flags.iter().copied() {
             if let Some(slot) = in_progress.mb_field_flags.get_mut(curr_addr as usize) {
                 *slot = flag;
             }
@@ -1835,6 +1987,7 @@ impl H264CodecDecoder {
             sps,
             pps,
             any_slice_succeeded: _,
+            ft,
         } = in_progress;
 
         // §8.4.1.2.3 temporal direct needs the colocated block's MVs
@@ -1843,6 +1996,45 @@ impl H264CodecDecoder {
         // forward. Idempotent: overwrites whatever was in the Picture
         // before.
         snapshot_grid_into_picture(&mut pic, &grid);
+
+        // Frame threading — the decoder keeps the picture's metadata and
+        // motion (`pic`, now without samples: its reference-store entry
+        // and the co-located picture of later B slices) while the
+        // samples, with the grid, go to the pool job that reconstructs
+        // and deblocks them.
+        let mut grid = Some(grid);
+        let ft_job = match ft {
+            Some(ftp) => {
+                let mut samples = Picture::new(
+                    0,
+                    0,
+                    pic.chroma_array_type,
+                    pic.bit_depth_luma,
+                    pic.bit_depth_chroma,
+                );
+                samples.width_in_samples = pic.width_in_samples;
+                samples.height_in_samples = pic.height_in_samples;
+                samples.pic_order_cnt = pic.pic_order_cnt;
+                samples.frame_num = pic.frame_num;
+                samples.luma = std::mem::take(&mut pic.luma);
+                samples.cb = std::mem::take(&mut pic.cb);
+                samples.cr = std::mem::take(&mut pic.cr);
+                let planes = Arc::new(SharedPlanes::new(
+                    samples.width_in_samples as usize,
+                    samples.height_in_samples as usize,
+                    samples.chroma_width() as usize,
+                    samples.chroma_height() as usize,
+                    match samples.chroma_array_type {
+                        1 => 8,
+                        2 => 16,
+                        _ => 0,
+                    },
+                ));
+                Some((ftp, samples, grid.take().expect("grid"), planes))
+            }
+            None => None,
+        };
+        let ft_planes = ft_job.as_ref().map(|j| j.3.clone());
 
         // SPS and PPS were snapshotted at the first slice's header-parse
         // time (via [`Event::Slice`]). Using the driver's current
@@ -1862,10 +2054,10 @@ impl H264CodecDecoder {
         let bit_depth_y = 8 + sps.bit_depth_luma_minus8;
         let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
         let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !first_header.field_pic_flag;
-        if deblock_enabled {
+        if deblock_enabled && let Some(grid) = grid.as_ref() {
             reconstruct::deblock_picture_full_threaded(
                 &mut pic,
-                &grid,
+                grid,
                 deblock_alpha_off,
                 deblock_beta_off,
                 bit_depth_y,
@@ -1877,6 +2069,15 @@ impl H264CodecDecoder {
                 self.threads,
             );
         }
+
+        // The output frame of a serially reconstructed frame picture,
+        // converted now so the picture itself can move into the
+        // reference store instead of being copied.
+        let mut early_vf = if ft_planes.is_none() && !first_header.field_pic_flag {
+            Some(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()))
+        } else {
+            None
+        };
 
         // §8.2.5 — decoded reference picture marking.
         let mut current_entry = DpbEntry {
@@ -1948,7 +2149,15 @@ impl H264CodecDecoder {
                 pic.frame_num = 0;
             }
 
-            self.ref_store.insert(current_entry.dpb_key, pic.clone());
+            let stored = if early_vf.is_some() {
+                std::mem::replace(&mut pic, Picture::new(0, 0, 0, 8, 8))
+            } else {
+                pic.clone()
+            };
+            self.ref_store.insert(current_entry.dpb_key, stored);
+            if let (Some(planes), Some(ft)) = (&ft_planes, self.ft.as_mut()) {
+                ft.slots.insert(current_entry.dpb_key, planes.clone());
+            }
             self.dpb_entries.push(current_entry);
             // §8.2.5 — pictures the marking pass just evicted can never
             // be referenced again; release their samples so store
@@ -2029,6 +2238,21 @@ impl H264CodecDecoder {
             poc.pic_order_cnt
         };
 
+        if let Some((ftp, samples, grid, planes)) = ft_job {
+            self.ft_spawn(
+                planes,
+                ftp,
+                samples,
+                grid,
+                deblock_enabled.then_some((deblock_alpha_off, deblock_beta_off)),
+                sps.clone(),
+                pps.clone(),
+                mb_field_flags,
+                pts,
+                sps.frame_crop_margins(),
+            );
+        }
+
         // §C.4.4 — PAFF field pairing. A field picture is not pushed to
         // the output DPB on its own; it waits for its complementary field
         // (opposite parity) and the pair is re-interleaved into a single
@@ -2046,9 +2270,15 @@ impl H264CodecDecoder {
             return Ok(());
         }
 
-        let vf = picture_to_video_frame(&pic, pts, sps.frame_crop_margins());
+        let out = match (&ft_planes, early_vf.take()) {
+            (Some(planes), _) => OutFrame::Pending(planes.clone()),
+            (None, Some(vf)) => OutFrame::Ready(vf),
+            (None, None) => {
+                OutFrame::Ready(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()))
+            }
+        };
         let entry = OutputEntry {
-            picture: vf,
+            picture: out,
             pic_order_cnt: output_poc,
             frame_num: first_header.frame_num,
             needed_for_output: true,
@@ -2093,7 +2323,7 @@ impl H264CodecDecoder {
                 let frame_pts = prev.pts.or(pts);
                 let vf = picture_to_video_frame(&frame, frame_pts, crop);
                 let entry = OutputEntry {
-                    picture: vf,
+                    picture: OutFrame::Ready(vf),
                     pic_order_cnt: frame_poc,
                     frame_num,
                     needed_for_output: true,
@@ -2125,7 +2355,7 @@ impl H264CodecDecoder {
         // cropping margins shrink with it.
         let vf = picture_to_video_frame(&field.pic, field.pts, field.crop.for_field());
         let entry = OutputEntry {
-            picture: vf,
+            picture: OutFrame::Ready(vf),
             pic_order_cnt: field.field_poc,
             frame_num: field.frame_num,
             needed_for_output: true,
@@ -2160,7 +2390,7 @@ impl H264CodecDecoder {
             // §C.4 bumping semantics — if the new cap is smaller, the
             // excess is pushed to `ready` in POC order.
             let pending = self.output_dpb.flush();
-            let mut new_dpb = DpbOutput::<VideoFrame>::new(reorder, buffering);
+            let mut new_dpb = DpbOutput::<OutFrame>::new(reorder, buffering);
             // Iterate in the POC-ascending order flush() produced.
             for e in pending {
                 if let Some(bumped) = new_dpb.push(e) {
@@ -2188,6 +2418,9 @@ impl H264CodecDecoder {
     fn prune_ref_store(&mut self) {
         let live: Vec<u32> = self.dpb_entries.iter().map(|e| e.dpb_key).collect();
         self.ref_store.retain_keys(&live);
+        if let Some(ft) = self.ft.as_mut() {
+            ft.slots.retain(|k, _| live.contains(k));
+        }
     }
 
     /// §8.2.5.2 — synthesise "non-existing" short-term reference frames
@@ -2522,6 +2755,51 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
     }
 }
 
+/// Frame threading — the owned reference lists of a slice for its
+/// sample stage on the pool: each entry's stored picture (sample-less
+/// for a picture of the pool, whose planes come along) or the
+/// slice-setup override (a re-interleaved field pair).
+fn ft_provider(
+    p: BorrowedRefProvider<'_>,
+    store: &RefPicStore,
+    slots: &HashMap<u32, Arc<SharedPlanes>>,
+) -> FtProvider {
+    let BorrowedRefProvider {
+        list_0,
+        list_1,
+        list_0_overrides,
+        list_1_overrides,
+        list_0_parities,
+        list_1_parities,
+        list_0_focs,
+        list_1_focs,
+        ..
+    } = p;
+    let resolve = |keys: &[u32], overrides: Vec<Option<Picture>>| -> Vec<Option<FtRef>> {
+        let mut overrides = overrides.into_iter();
+        keys.iter()
+            .map(|&key| match overrides.next().flatten() {
+                Some(o) => Some(FtRef {
+                    pic: Arc::new(o),
+                    planes: None,
+                }),
+                None => store.get_arc(key).map(|pic| FtRef {
+                    pic,
+                    planes: slots.get(&key).cloned(),
+                }),
+            })
+            .collect()
+    };
+    FtProvider {
+        refs: [
+            resolve(list_0, list_0_overrides),
+            resolve(list_1, list_1_overrides),
+        ],
+        parities: [list_0_parities, list_1_parities],
+        focs: [list_0_focs, list_1_focs],
+    }
+}
+
 /// Derive the `(max_num_reorder_frames, max_dec_frame_buffering)`
 /// pair for sizing [`DpbOutput`] from the active SPS.
 ///
@@ -2699,8 +2977,292 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.pending_pts = packet.pts;
-        self.pending_time_base = packet.time_base;
+        if self.threads > 1 {
+            self.ft_ensure();
+            if let Some(ft) = self.ft.as_mut() {
+                ft.queue
+                    .push_back(Queued::Packet(packet.pts, packet.time_base));
+            }
+        } else {
+            self.pending_pts = packet.pts;
+            self.pending_time_base = packet.time_base;
+        }
+        let res = self.send_packet_nals(packet);
+        self.ft_pump(false);
+        res
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        loop {
+            // §C.4 — bumped / already-released pictures come out first
+            // in the order the bumping process produced them. A picture
+            // still being reconstructed on the pool holds the queue
+            // until it is done (waited for at end of stream).
+            if let Some(front) = self.ready.front() {
+                if let OutFrame::Pending(planes) = front {
+                    if planes.is_done().is_none() && !self.eof {
+                        return Err(Error::NeedMore);
+                    }
+                    let ok = planes.wait_done();
+                    let frame = if ok { planes.take_output() } else { None };
+                    self.ready.pop_front();
+                    return match frame {
+                        Some(vf) => Ok(Frame::Video(vf)),
+                        None => Err(Error::invalid(
+                            "h264: frame-threaded reconstruction of a picture failed",
+                        )),
+                    };
+                }
+                if let Some(OutFrame::Ready(vf)) = self.ready.pop_front() {
+                    return Ok(Frame::Video(vf));
+                }
+            }
+            // Try a conservative bump on the output DPB. Per §C.4 / the
+            // `pop_ready` semantics, this only yields a picture when the
+            // queue is genuinely over capacity (mid-stream backpressure).
+            if let Some(bumped) = self.output_dpb.pop_ready() {
+                self.ready.push_back(bumped.picture);
+                continue;
+            }
+            // EOF: drain everything remaining in POC-ascending order
+            // (§C.4 "no_output_of_prior_pics_flag == 0" / end-of-stream).
+            if self.eof {
+                let drained = self.output_dpb.flush();
+                if drained.is_empty() {
+                    return Err(Error::Eof);
+                }
+                for e in drained {
+                    self.ready.push_back(e.picture);
+                }
+                continue;
+            }
+            return Err(Error::NeedMore);
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        // Frame threading — replay every held-back event first.
+        self.ft_pump(true);
+        self.flush_inner()
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        // Frame threading — drop held-back input, let in-flight
+        // pictures finish (nothing reads them any more).
+        if let Some(ft) = self.ft.as_mut() {
+            ft.queue.clear();
+            ft.queued_slices = 0;
+        }
+        self.pending_sd = None;
+        self.in_progress = None;
+        self.ft_shutdown();
+        self.reset_inner()
+    }
+}
+
+impl H264CodecDecoder {
+    /// Handle one parsed NAL event — directly, or (frame threading)
+    /// queued behind the slice-data parses running ahead on the pool.
+    fn dispatch_event(&mut self, ev: Event) {
+        if let Some(ft) = self.ft.as_mut() {
+            let task = match &ev {
+                Event::Slice {
+                    header,
+                    rbsp,
+                    slice_data_cursor,
+                    pps,
+                    sps,
+                    ..
+                } if !sps.separate_colour_plane_flag && header.redundant_pic_cnt == 0 => {
+                    ft.queued_slices += 1;
+                    Some(Deferred::spawn(
+                        &ft.pool,
+                        SdInput {
+                            rbsp: rbsp.clone(),
+                            cursor: *slice_data_cursor,
+                            header: header.clone(),
+                            sps: sps.clone(),
+                            pps: pps.clone(),
+                        },
+                        parse_sd as fn(SdInput) -> SdResult,
+                    ))
+                }
+                _ => None,
+            };
+            ft.queue.push_back(Queued::Event(Box::new(ev), task));
+            return;
+        }
+        self.handle_event_logged(ev);
+    }
+
+    fn handle_event_logged(&mut self, ev: Event) {
+        if let Err(e) = self.handle_event(ev) {
+            self.decode_errors += 1;
+            eprintln!("h264 slice skipped: {e}");
+        }
+        self.pending_sd = None;
+    }
+
+    /// Frame threading — create the worker pool for the budget.
+    fn ft_ensure(&mut self) {
+        if self.ft.is_none() && self.threads > 1 {
+            self.ft = Some(FtState {
+                pool: Pool::new(self.threads),
+                queue: VecDeque::new(),
+                queued_slices: 0,
+                slots: HashMap::new(),
+                inflight: VecDeque::new(),
+            });
+        }
+    }
+
+    /// Frame threading — replay held-back events in arrival order until
+    /// at most a budget's worth of slices is held back (`all`: every
+    /// one).
+    fn ft_pump(&mut self, all: bool) {
+        loop {
+            let Some(ft) = self.ft.as_mut() else {
+                return;
+            };
+            if !all && ft.queued_slices <= ft.pool.threads() {
+                return;
+            }
+            let Some(q) = ft.queue.pop_front() else {
+                return;
+            };
+            match q {
+                Queued::Packet(pts, tb) => {
+                    self.pending_pts = pts;
+                    self.pending_time_base = tb;
+                }
+                Queued::Event(ev, task) => {
+                    if task.is_some() {
+                        ft.queued_slices -= 1;
+                    }
+                    self.pending_sd = task;
+                    self.handle_event_logged(*ev);
+                }
+            }
+        }
+    }
+
+    /// Frame threading — wait for every in-flight picture, store the
+    /// pool's reference pictures with their samples and drop the pool.
+    fn ft_shutdown(&mut self) {
+        // A picture in progress continues serially.
+        self.ft_convert_in_progress();
+        self.ft_materialize();
+        if let Some(ft) = self.ft.as_mut() {
+            for p in ft.inflight.drain(..) {
+                p.wait_done();
+            }
+        }
+        // Pictures still queued for output keep their planes alive.
+        self.ft = None;
+    }
+
+    /// Frame threading — before a picture decodes serially: replace the
+    /// sample-less reference-store entries of the pool's pictures by
+    /// complete pictures.
+    fn ft_materialize(&mut self) {
+        let Some(ft) = self.ft.as_mut() else {
+            return;
+        };
+        for (key, planes) in ft.slots.drain() {
+            let ok = planes.wait_done();
+            let Some(shell) = self.ref_store.get_by_key(key) else {
+                continue;
+            };
+            let mut full = shell.clone();
+            let (luma, cb, cr) = planes.assemble();
+            let n_l = (full.width_in_samples * full.height_in_samples) as usize;
+            let n_c = (full.chroma_width() * full.chroma_height()) as usize;
+            if ok && luma.len() == n_l && cb.len() == n_c && cr.len() == n_c {
+                full.luma = luma;
+                full.cb = cb;
+                full.cr = cr;
+            } else {
+                full.luma = vec![0; n_l];
+                full.cb = vec![0; n_c];
+                full.cr = vec![0; n_c];
+            }
+            self.ref_store.insert(key, full);
+        }
+    }
+
+    /// Frame threading — turn the frame-threaded picture in progress
+    /// into a serially decoded one: reconstruct the samples its slices
+    /// planned so far into its picture (deblocking stays with
+    /// finalization, as for any serial picture).
+    fn ft_convert_in_progress(&mut self) {
+        let Some(ip) = self.in_progress.as_mut() else {
+            return;
+        };
+        let Some(ftp) = ip.ft.take() else {
+            return;
+        };
+        crate::frame_thread::run_pixels(&mut ip.pic, &mut ip.grid, &ftp.works, None, None);
+        self.ft_materialize();
+    }
+
+    /// Frame threading — queue the sample stage of a finalized picture.
+    #[allow(clippy::too_many_arguments)]
+    fn ft_spawn(
+        &mut self,
+        planes: Arc<SharedPlanes>,
+        ftp: FtPicture,
+        mut samples: Picture,
+        mut grid: MbGrid,
+        deblock: Option<(i32, i32)>,
+        sps: Sps,
+        pps: crate::pps::Pps,
+        mb_field_flags: Vec<bool>,
+        pts: Option<i64>,
+        crop: FrameCropMargins,
+    ) {
+        let Some(ft) = self.ft.as_mut() else {
+            planes.abort();
+            return;
+        };
+        // Bound the pictures in flight by the budget.
+        while ft.inflight.front().is_some_and(|p| p.is_done().is_some()) {
+            ft.inflight.pop_front();
+        }
+        while ft.inflight.len() >= ft.pool.threads() {
+            if let Some(p) = ft.inflight.pop_front() {
+                p.wait_done();
+            }
+        }
+        ft.inflight.push_back(planes.clone());
+        ft.pool.spawn_low(move || {
+            let job_planes = planes.clone();
+            crate::frame_thread::run_job(&job_planes, move || {
+                let db = deblock.map(|(alpha_off, beta_off)| crate::frame_thread::FtDeblock {
+                    alpha_off,
+                    beta_off,
+                    sps: &sps,
+                    pps: &pps,
+                    mb_field_flags: &mb_field_flags,
+                });
+                if crate::frame_thread::run_pixels(
+                    &mut samples,
+                    &mut grid,
+                    &ftp.works,
+                    db,
+                    Some(&planes),
+                ) {
+                    drop(ftp);
+                    drop(grid);
+                    let vf = picture_to_video_frame(&samples, pts, crop);
+                    planes.finish(Some(vf));
+                } else {
+                    planes.abort();
+                }
+            });
+        });
+    }
+
+    fn send_packet_nals(&mut self, packet: &Packet) -> Result<()> {
         let data = packet.data.clone();
         match self.length_size {
             Some(n) => {
@@ -2730,10 +3292,7 @@ impl Decoder for H264CodecDecoder {
                     // errors the caller may want to log, but we drop
                     // them for now to avoid killing the stream on one
                     // broken slice (e.g. unsupported MB type).
-                    if let Err(e) = self.handle_event(ev) {
-                        self.decode_errors += 1;
-                        eprintln!("h264 slice skipped: {e}");
-                    }
+                    self.dispatch_event(ev);
                     i += len;
                 }
                 Ok(())
@@ -2746,12 +3305,7 @@ impl Decoder for H264CodecDecoder {
                 let events: Vec<_> = self.driver.process_annex_b(&data).collect();
                 for ev in events {
                     match ev {
-                        Ok(ev) => {
-                            if let Err(e) = self.handle_event(ev) {
-                                self.decode_errors += 1;
-                                eprintln!("h264 slice skipped: {e}");
-                            }
-                        }
+                        Ok(ev) => self.dispatch_event(ev),
                         Err(e) => {
                             return Err(Error::invalid(format!("h264 NAL parse: {e}")));
                         }
@@ -2762,41 +3316,7 @@ impl Decoder for H264CodecDecoder {
         }
     }
 
-    fn receive_frame(&mut self) -> Result<Frame> {
-        // §C.4 — bumped / already-released pictures come out first in
-        // the order the bumping process produced them.
-        if let Some(vf) = self.ready.pop_front() {
-            return Ok(Frame::Video(vf));
-        }
-        // Try a conservative bump on the output DPB. Per §C.4 / the
-        // `pop_ready` semantics, this only yields a picture when the
-        // queue is genuinely over capacity (mid-stream backpressure).
-        if let Some(bumped) = self.output_dpb.pop_ready() {
-            return Ok(Frame::Video(bumped.picture));
-        }
-        // EOF: drain everything remaining in POC-ascending order
-        // (§C.4 "no_output_of_prior_pics_flag == 0" / end-of-stream).
-        // We drain once into `ready` and then hand out one by one,
-        // so subsequent receive_frame calls pull from `ready` above
-        // until exhausted.
-        if self.eof {
-            let drained = self.output_dpb.flush();
-            if drained.is_empty() {
-                return Err(Error::Eof);
-            }
-            for e in drained {
-                self.ready.push_back(e.picture);
-            }
-            // Safe to unwrap: we just confirmed non-empty drain above.
-            if let Some(vf) = self.ready.pop_front() {
-                return Ok(Frame::Video(vf));
-            }
-            return Err(Error::Eof);
-        }
-        Err(Error::NeedMore)
-    }
-
-    fn flush(&mut self) -> Result<()> {
+    fn flush_inner(&mut self) -> Result<()> {
         // §7.3.2.9 — decode any partitioned slice still waiting for
         // (possibly absent) partition-B/C payloads at EOF.
         self.flush_pending_dp_slice()?;
@@ -2822,7 +3342,7 @@ impl Decoder for H264CodecDecoder {
         Ok(())
     }
 
-    fn reset(&mut self) -> Result<()> {
+    fn reset_inner(&mut self) -> Result<()> {
         self.driver = H264Driver::new();
         self.last_slice = None;
         self.decode_errors = 0;
@@ -3085,7 +3605,7 @@ mod tests {
 
     fn push_entry(dec: &mut H264CodecDecoder, tag: u8, poc: i32, frame_num: u32) {
         let entry = OutputEntry {
-            picture: vf(tag),
+            picture: OutFrame::Ready(vf(tag)),
             pic_order_cnt: poc,
             frame_num,
             needed_for_output: true,
@@ -3124,7 +3644,7 @@ mod tests {
     #[test]
     fn reorder_with_small_dpb_matches_conservative_bumping() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(2, 3);
+        dec.output_dpb = DpbOutput::<OutFrame>::new(2, 3);
 
         push_entry(&mut dec, 10, 0, 0); // IDR
         push_entry(&mut dec, 11, 4, 1); // P
@@ -3151,7 +3671,7 @@ mod tests {
         // Cap = 5 ≥ number of pictures → nothing bumps mid-stream,
         // every picture goes through the end-of-stream flush in POC
         // order.
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(5, 5);
+        dec.output_dpb = DpbOutput::<OutFrame>::new(5, 5);
 
         // Same IPBBB decode order as above.
         push_entry(&mut dec, 10, 0, 0); // IDR
@@ -3188,7 +3708,7 @@ mod tests {
     #[test]
     fn flush_at_eof_drains_in_poc_order() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(8, 8);
+        dec.output_dpb = DpbOutput::<OutFrame>::new(8, 8);
 
         // Decode order: [POC 3, POC 1, POC 2] — nothing bumped mid-stream
         // because we stay below capacity.
@@ -3237,7 +3757,7 @@ mod tests {
     #[test]
     fn idr_drains_pending_pictures_in_poc_order() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(4, 4);
+        dec.output_dpb = DpbOutput::<OutFrame>::new(4, 4);
 
         // Sequence 1: POCs 0, 4, 2, 1 — four frames queued, none bumped.
         push_entry(&mut dec, 1, 0, 0);
@@ -3270,7 +3790,7 @@ mod tests {
     #[test]
     fn reset_clears_output_dpb_and_ready() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(2, 2);
+        dec.output_dpb = DpbOutput::<OutFrame>::new(2, 2);
         // Fill + overflow so one entry lands in `ready`.
         push_entry(&mut dec, 1, 0, 0);
         push_entry(&mut dec, 2, 1, 1);
@@ -3423,7 +3943,7 @@ mod tests {
     fn b_pyramid_emits_in_poc_order_at_level_31_720p() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         // Mirror what the production fix derives for level 3.1 720p.
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(5, 5);
+        dec.output_dpb = DpbOutput::<OutFrame>::new(5, 5);
 
         // Decode order, with (tag = display_index + 1, POC).
         push_entry(&mut dec, 1, 0, 0); // I0   display 0
@@ -3724,6 +4244,7 @@ mod tests {
             sps: test_sps(),
             pps: test_pps(),
             any_slice_succeeded: true,
+            ft: None,
         });
     }
 
