@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Annex B elementary-stream demuxer labelled separate-colour-plane
   streams `Gray8`; it now reports the 4:4:4 layout the decoder emits,
   and fills the stream colour signal from the VUI.
+- `reset()` (a seek) dropped the parameter sets of the `avcC` record, so
+  a stream without in-band SPS / PPS (the usual MP4 / Matroska case)
+  decoded nothing after a seek; they are now replayed into the reset
+  decoder.
 
 ## [0.1.10](https://github.com/OxideAV/oxideav-h264/compare/v0.1.9...v0.1.10) - 2026-10-25
 

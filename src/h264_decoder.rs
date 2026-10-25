@@ -427,6 +427,10 @@ pub struct H264CodecDecoder {
     ft: Option<FtState>,
     /// The queued slice-data parse of the slice event being handled.
     pending_sd: Option<Arc<SdTask>>,
+    /// The parameter-set NAL units of the `avcC` record, replayed into
+    /// the fresh NAL driver of a `reset` (a seek keeps the stream's
+    /// out-of-band SPS / PPS).
+    extradata_nals: Vec<Vec<u8>>,
     /// The description of the frame `receive_frame` returned last.
     emitted_shape: Option<OutShape>,
     /// `Decoder::output_params_generation` — bumped when a returned
@@ -471,6 +475,7 @@ impl H264CodecDecoder {
             threads: 1,
             ft: None,
             pending_sd: None,
+            extradata_nals: Vec::new(),
             emitted_shape: None,
             params_generation: 0,
         }
@@ -548,6 +553,7 @@ impl H264CodecDecoder {
         if extra[0] != 1 {
             return Err(Error::invalid("h264: avcC configurationVersion must be 1"));
         }
+        self.extradata_nals.clear();
         let profile_idc = extra[1];
         // Capture, even though the driver picks them up again from the
         // SPS NAL — useful for diagnostics on streams where the avcC
@@ -580,6 +586,7 @@ impl H264CodecDecoder {
                 .driver
                 .process_nal(&extra[pos..pos + len])
                 .map_err(|e| Error::invalid(format!("h264 avcC SPS: {e}")))?;
+            self.extradata_nals.push(extra[pos..pos + len].to_vec());
             pos += len;
         }
         if pos >= extra.len() {
@@ -600,6 +607,7 @@ impl H264CodecDecoder {
                 .driver
                 .process_nal(&extra[pos..pos + len])
                 .map_err(|e| Error::invalid(format!("h264 avcC PPS: {e}")))?;
+            self.extradata_nals.push(extra[pos..pos + len].to_vec());
             pos += len;
         }
 
@@ -665,6 +673,7 @@ impl H264CodecDecoder {
                     .driver
                     .process_nal(&extra[pos..pos + len])
                     .map_err(|e| Error::invalid(format!("h264 avcC SPS-Ext: {e}")))?;
+                self.extradata_nals.push(extra[pos..pos + len].to_vec());
                 pos += len;
             }
         }
@@ -3434,6 +3443,10 @@ impl H264CodecDecoder {
 
     fn reset_inner(&mut self) -> Result<()> {
         self.driver = H264Driver::new();
+        // The out-of-band parameter sets stay in force across a seek.
+        for nal in &self.extradata_nals {
+            let _ = self.driver.process_nal(nal);
+        }
         self.last_slice = None;
         self.decode_errors = 0;
         self.eof = false;

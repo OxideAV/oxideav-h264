@@ -466,3 +466,37 @@ fn separate_colour_planes_answer_yuv444() {
     assert_eq!(trace[0].0.pixel_format, Some(PixelFormat::Yuv444P));
     assert_eq!(trace[0].0.width, Some(w as u32));
 }
+
+/// `reset` (a seek) keeps the `avcC` parameter sets in force: the
+/// decoder decodes again from the next IDR without in-band SPS / PPS,
+/// and an unchanged shape keeps the generation.
+#[test]
+fn reset_keeps_the_avcc_parameter_sets() {
+    let name = "yuv420p_70x46_25.h264";
+    let (avcc, packets) = to_avcc(&fixture(name));
+    let mut params = CodecParameters::video(CodecId::new("h264"));
+    params.extradata = avcc;
+    let mut dec = make_decoder(&params).expect("make_decoder");
+    let mut trace = Vec::new();
+    for p in &packets[..3] {
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), p.clone()))
+            .expect("send");
+        drain(&mut *dec, &mut trace, name);
+    }
+    dec.reset().expect("reset");
+    let mut after = Vec::new();
+    for p in &packets {
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), p.clone()))
+            .expect("send");
+        drain(&mut *dec, &mut after, name);
+    }
+    dec.flush().expect("flush");
+    drain(&mut *dec, &mut after, name);
+    assert_eq!(
+        after.len(),
+        probe(name).frames,
+        "every frame after the seek"
+    );
+    assert!(after.iter().all(|(_, g)| *g == 0), "same shape, no bump");
+    assert_eq!(dec.output_params().and_then(|p| p.width), Some(70));
+}
