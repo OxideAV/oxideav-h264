@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/OxideAV/oxideav-h264/compare/v0.1.9...v0.1.10) - 2026-10-25
+
+### Added
+
+- cache H264 RBSP stop-bit positions
+
+### Fixed
+
+- fixup for #23: CHANGELOG entry for the CABAC I_PCM re-initialisation offset
+- fixup for #22: CHANGELOG entry for the wavefront deblocking
+- fixup for #22: CHANGELOG entry for the wavefront deblocking
+- fix master: restore the gated tree of #22 after the admin rebase re-applied already-merged commits
+- fix master: drop the MAX_PARTITION_SAMPLES duplicate the admin rebase of #21 re-applied from its embedded #16 commit
+- fixup for #21: thread-invariance over the docs fixture corpus + staged JVT streams; dump_yuv thread budget; CHANGELOG
+- fixup for #18: unit tests pin the sparse short-cuts against the full butterfly; CHANGELOG entry
+- fixup for #17: CHANGELOG entry for the chroma bS reuse
+- fixup for #16: keep the MbWriter doc comment on MbWriter; CHANGELOG entry
+- fix master: drop the duplicated trace-switch helper block the admin rebase of #15 re-applied
+- fixup for #15: drop the stray too_many_arguments allow on env_flag; CHANGELOG entry
+- fixup for #14: CHANGELOG entry for the cached rbsp_stop_one_bit position
+
+### Other
+
+- frame threading: keep H264CodecDecoder UnwindSafe / RefUnwindSafe
+- decode_bench harness and frame-threading section
+- direct raster p/q lookup outside MBAFF, uniform-motion and bS=0 shortcuts; CABAC residual blocks on the stack
+- multi-bit BitReader::u, one-shift CABAC renorm, lazy per-list MV neighbours
+- inter prediction: coalesce identically predicted partitions, per-thread MC scratch
+- frame-level threading driven by the execution-context budget
+- decode speed: window-based motion compensation, direct partition combine, residual block skipping
+- MBAFF P / B decode byte-identical to a black-box reference decoder on 1080i streams ([#11](https://github.com/OxideAV/oxideav-h264/pull/11))
+- locate a CABAC I_PCM payload after an earlier one in the slice
+- filter macroblock rows in a wavefront under a thread budget
+- revert the two commits that carried #22's content under the wrong author
+- inter macroblocks of a slice reconstruct concurrently under a thread budget
+- motion-compensation partition buffers live on the stack
+- all-zero and DC-only 4x4 blocks, and all-zero 8x8 blocks, skip the butterfly
+- fold the intra / nonzero-coefficient guards of the ref/mv bS test (clippy::nonminimal_bool)
+- keep the clippy allow on deblock_plane_luma
+- chroma edges reuse the bS their luma edge derived (non-MBAFF pictures)
+- evaluate the ref/mv bS test only when it decides bS
+- motion-compensation partition buffers live on the stack
+- allow clippy::too_many_arguments on parse_slice_data_impl
+- cache the per-MB trace switches and format CABAC debug lines lazily
+- allow clippy::too_many_arguments on parse_slice_data_impl
+- cache the per-MB trace switches and format CABAC debug lines lazily
+- CHANGELOG spacing
+- edition 2024, MSRV 1.95
+
 - deblocking / CABAC residual: outside MBAFF frames the luma edge walker addresses the p / q macroblocks directly (current, left or upper neighbour) instead of mapping every segment's samples to a macroblock address, and skips the §8.7.2.1 reference / motion comparison on the internal edges of a macroblock whose 4x4 blocks all carry the same motion (they cannot differ); the chroma walker settles a segment whose luma segment was recorded with bS = 0 before any lookup; CABAC residual blocks keep their levels and significance map on the stack instead of two heap allocations per block. Output unchanged
 - entropy / motion hot paths: `BitReader::u(n)` reads up to 25 bits from one four-byte window instead of bit by bit, and the CABAC §9.3.3.2.2 RenormD performs its doublings in one shift (count from the leading zeros of codIRange) reading all their bits at once; §8.4.1.3 mvpLX derivation gathers a list's A/B/C/D neighbours only when that list is predicted. Output unchanged
 - inter prediction: the partitions of a macroblock whose predictions are identical (same lists, reference indices and motion vectors — direct / skip quadrants, split partitions that coded the same motion) are motion-compensated as one 16x16, 16x8 / 8x16 or 8x8 block, the §8.4.1 motion of every partition being derived first; the per-partition L0/L1 scratch lives in a per-thread buffer instead of six zeroed 1 KiB stack arrays per call; window rows are copied with fixed-size moves. Output unchanged; one-thread decode of the 1080p clip a further ~10 % faster
