@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/OxideAV/oxideav-h264/compare/v0.1.10...v0.1.11) - 2026-10-25
+
+### Other
+
+- reset keeps the avcC parameter sets in force
+- :output_params + output_params_generation from the SPS / avcC
+
 ### Added
 
 - `Decoder::output_params` / `output_params_generation` (oxideav-core
