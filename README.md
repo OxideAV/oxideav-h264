@@ -356,6 +356,33 @@ Run with `cargo bench --bench decode -- --quick`
 or `cargo bench --bench encode -- --quick` for fast smokes,
 or omit `--quick` for the full Criterion report.
 
+`examples/decode_bench` times the decoder on any Annex B file the way
+a demuxer drives it (one NAL unit per packet, frames drained after
+each packet) at a given worker budget, and can dump the output for a
+framemd5 comparison:
+
+```sh
+cargo run --release --example decode_bench -- clip.h264 8 [out.yuv]
+```
+
+## Threading
+
+`Decoder::set_execution_context` with a budget above one turns on
+frame-level threading for frame pictures (no PAFF fields, no MBAFF,
+ChromaArrayType 0–2, no SP / SI slices or slice groups): slice data is
+parsed on a pool of `threads` workers as NAL units arrive, the calling
+thread runs the decoding-order work (POC, reference lists and marking,
+macroblock motion, output ordering), and each picture's sample
+reconstruction and deblocking runs on the pool, macroblock row by row,
+while later pictures that reference it start as soon as the rows their
+motion vectors reach are done. Other pictures decode serially (with the
+slice-level row threading of P / B slices and wavefront deblocking).
+The output is identical for every budget; `receive_frame` reports
+`NeedMore` while the next frame is still being reconstructed.
+
+On a 10 s 1080p30 x264 High-profile B-frame clip (this machine): one
+thread 3.8 s (was 7.4 s), 4 threads 1.1 s, 8 threads 0.77 s (≈ 390 fps).
+
 ## Profiles + features in scope
 
 The long-term target is a **complete** implementation of ITU-T Rec.
