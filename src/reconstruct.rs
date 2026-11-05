@@ -1049,7 +1049,7 @@ fn synth_mb_inter<R: RefPicProvider>(
         sps,
         pps,
         &writer,
-        &pred_luma,
+        &mut pred_luma,
         pred_cb,
         pred_cr,
         out,
@@ -5078,7 +5078,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         sps,
         pps,
         &writer,
-        &pred_luma,
+        &mut pred_luma,
         &pred_cb,
         &pred_cr,
         pic,
@@ -5103,7 +5103,7 @@ fn inter_residual_write(
     sps: &Sps,
     pps: &Pps,
     writer: &MbWriter,
-    pred_luma: &[i32; 256],
+    pred_luma: &mut [i32; 256],
     pred_cb: &[i32],
     pred_cr: &[i32],
     pic: &mut Picture,
@@ -5139,7 +5139,7 @@ fn inter_residual_write(
 
     // The reconstructed macroblock: prediction plus residual, clipped
     // (eq. 8-x Clip1Y of the §8.5.14 picture construction).
-    let mut out = *pred_luma;
+    let out = pred_luma;
     // Every §8.5.12 / §8.5.13 transform call validates qP'Y / the bit
     // depth first, whether or not the block carries coefficients.
     if !bypass {
@@ -5238,7 +5238,7 @@ fn inter_residual_write(
             *v = (*v).max(0).min(max_y);
         }
     }
-    writer.write_luma_mb(pic, &out);
+    writer.write_luma_mb(pic, out);
 
     // -------- Chroma residual + write --------------------------------
     if chroma_array_type == 1 || chroma_array_type == 2 {

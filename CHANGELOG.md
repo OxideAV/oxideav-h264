@@ -61,7 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prediction, or explicit identity weights) is motion-compensated
   straight into the macroblock's prediction, luma and both chroma
   planes; frame-threaded inter macroblocks are reconstructed straight
-  into the picture (no one-macroblock scratch copy).
+  into the picture (no one-macroblock scratch copy); the inter luma
+  residual is added in place in the prediction buffer.
 
 ### Added
 
