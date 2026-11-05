@@ -283,6 +283,12 @@ fn parse_slice_data_impl(
     // bound `mb_skip_run` and to detect MB-address overflow.
     let pic_size_in_mbs = pic_w_mbs.saturating_mul(pic_h_mbs);
     let mut cavlc_nc = CavlcNcGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag);
+    // Room for the rest of the picture's macroblocks (bounded: a
+    // malformed header must not reserve unbounded memory), so the walk
+    // does not re-allocate and move the macroblocks it collected.
+    macroblocks.reserve(
+        (pic_size_in_mbs.saturating_sub(slice_header.first_mb_in_slice) as usize).min(1 << 14),
+    );
 
     if pps.entropy_coding_mode_flag {
         // ---------------------------------------------------------

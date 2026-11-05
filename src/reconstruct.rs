@@ -62,7 +62,7 @@ use crate::sp_transform::{
 };
 use crate::sps::Sps;
 use crate::transform::{
-    TransformError, intra_bypass_dpcm, inverse_hadamard_chroma_dc_420,
+    FLAT_4X4_16, TransformError, intra_bypass_dpcm, inverse_hadamard_chroma_dc_420,
     inverse_hadamard_chroma_dc_422, inverse_hadamard_luma_dc_16x16, inverse_transform_4x4,
     inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
     qp_y_to_qp_c_with_bd_offset, select_scaling_list_4x4, select_scaling_list_8x8,
@@ -5113,8 +5113,10 @@ fn inter_residual_write(
     // 2 * iYCbCr + 1, with iYCbCr = colour_plane_id when
     // separate_colour_plane_flag == 1 and 0 otherwise.
     let luma_plane = luma_scaling_plane(sps, slice_header);
-    let sl4 = select_scaling_list_4x4(luma_plane + 3, sps, pps);
-    let sl8 = select_scaling_list_8x8(2 * luma_plane + 1, sps, pps);
+    // (Derived only when a block of the transform size carries
+    // coefficients.)
+    let mut sl4: Option<[i32; 16]> = None;
+    let mut sl8: Option<[i32; 64]> = None;
     // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY.
     let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
     let qp_prime_y = qp_y + qp_bd_offset_y;
@@ -5168,7 +5170,9 @@ fn inter_residual_write(
                 // §8.5.13 eq. 8-355 — r = c.
                 coeffs
             } else {
-                inverse_transform_8x8(&coeffs, qp_prime_y, &sl8, bit_depth_y)?
+                let sl8 = sl8
+                    .get_or_insert_with(|| select_scaling_list_8x8(2 * luma_plane + 1, sps, pps));
+                inverse_transform_8x8(&coeffs, qp_prime_y, sl8, bit_depth_y)?
             };
             for y in 0..8 {
                 let o = (by as usize + y) * 16 + bx as usize;
@@ -5202,7 +5206,9 @@ fn inter_residual_write(
                 // §8.5.12 eq. 8-334 — r = c.
                 coeffs
             } else {
-                inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
+                let sl4 =
+                    sl4.get_or_insert_with(|| select_scaling_list_4x4(luma_plane + 3, sps, pps));
+                inverse_transform_4x4(&coeffs, qp_prime_y, sl4, bit_depth_y)?
             };
             if inter_debug {
                 eprintln!("    RES blk4={blk4} qp'={qp_prime_y} res={:?}", residual);
@@ -5217,7 +5223,7 @@ fn inter_residual_write(
     }
     let max_y = (1i32 << bit_depth_y) - 1;
     for v in out.iter_mut() {
-        *v = (*v).clamp(0, max_y);
+        *v = (*v).max(0).min(max_y);
     }
     writer.write_luma_mb(pic, &out);
 
@@ -5781,11 +5787,13 @@ fn combine_partition(
                         // Eq. 8-274 / 8-275, logWD >= 1.
                         let round = 1i32 << (log2_wd - 1);
                         for (d, &p) in d.iter_mut().zip(src) {
-                            *d = (((p * e.weight + round) >> log2_wd) + e.offset).clamp(0, max_v);
+                            *d = (((p * e.weight + round) >> log2_wd) + e.offset)
+                                .max(0)
+                                .min(max_v);
                         }
                     } else {
                         for (d, &p) in d.iter_mut().zip(src) {
-                            *d = (p * e.weight + e.offset).clamp(0, max_v);
+                            *d = (p * e.weight + e.offset).max(0).min(max_v);
                         }
                     }
                 }
@@ -5795,7 +5803,7 @@ fn combine_partition(
                     let off = (w0.offset + w1.offset + 1) >> 1;
                     for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
                         let sum = p0 * w0.weight + p1 * w1.weight + round;
-                        *d = ((sum >> (log2_wd + 1)) + off).clamp(0, max_v);
+                        *d = ((sum >> (log2_wd + 1)) + off).max(0).min(max_v);
                     }
                 }
             },
@@ -8691,14 +8699,23 @@ fn reconstruct_inter_chroma_residual(
     let bypass = transform_bypass_active(sps, qp_prime_y);
 
     // §7.4.2.1.1.1 Table 7-2 — inter chroma lists: i=4 (Cb) / i=5 (Cr).
-    let sl4_cb = select_scaling_list_4x4(4, sps, pps);
-    let sl4_cr = select_scaling_list_4x4(5, sps, pps);
+    // (A macroblock without chroma coefficients needs neither list.)
+    let lists = (cbp_chroma > 0).then(|| {
+        [
+            select_scaling_list_4x4(4, sps, pps),
+            select_scaling_list_4x4(5, sps, pps),
+        ]
+    });
+    let (sl4_cb, sl4_cr) = match &lists {
+        Some([cb, cr]) => (cb, cr),
+        None => (&FLAT_4X4_16, &FLAT_4X4_16),
+    };
     let num_c8x8 = if chroma_array_type == 1 { 1 } else { 2 };
     let n_ac = 4 * num_c8x8 as usize;
 
     for plane in 0..2u8 {
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
-        let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
+        let sl4 = if plane == 0 { sl4_cb } else { sl4_cr };
         let dc_block = if plane == 0 {
             &mb.residual_chroma_dc_cb
         } else {
@@ -8793,7 +8810,7 @@ fn reconstruct_inter_chroma_residual(
         }
         let max_c = (1i32 << bit_depth_c) - 1;
         for v in out.iter_mut() {
-            *v = (*v).clamp(0, max_c);
+            *v = (*v).max(0).min(max_c);
         }
         writer.write_chroma_mb(pic, plane, out, mbw_c as usize, mbh_c as usize);
     }

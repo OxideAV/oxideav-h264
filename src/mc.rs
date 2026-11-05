@@ -108,13 +108,100 @@ fn gather(
     let width = src.width() as i32;
     let ymax = src.height() as i32 - 1;
     let inside_x = x0 >= 0 && x0 + ww as i32 <= width;
+    match *src {
+        PlaneSrc::Flat {
+            data: SamplesRef::U8(d),
+            stride,
+            ..
+        } => gather_flat(
+            d, stride, x0, y0, ww, wh, width, ymax, inside_x, out, ostride,
+        ),
+        PlaneSrc::Flat {
+            data: SamplesRef::U16(d),
+            stride,
+            ..
+        } => gather_flat(
+            d, stride, x0, y0, ww, wh, width, ymax, inside_x, out, ostride,
+        ),
+        PlaneSrc::Banded { .. } => {
+            for r in 0..wh {
+                let y = (y0 + r as i32).clamp(0, ymax) as usize;
+                let o = &mut out[r * ostride..r * ostride + ww];
+                match src.row(y) {
+                    SamplesRef::U8(row) => gather_row(row, x0, width, inside_x, o),
+                    SamplesRef::U16(row) => gather_row(row, x0, width, inside_x, o),
+                }
+            }
+        }
+    }
+}
+
+/// [`gather`] from a flat plane (`d`, rows `stride` apart).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn gather_flat<S: Sample>(
+    d: &[S],
+    stride: usize,
+    x0: i32,
+    y0: i32,
+    ww: usize,
+    wh: usize,
+    width: i32,
+    ymax: i32,
+    inside_x: bool,
+    out: &mut [i32],
+    ostride: usize,
+) {
+    if inside_x && y0 >= 0 && y0 + wh as i32 - 1 <= ymax {
+        let base = y0 as usize * stride + x0 as usize;
+        // Rows of the block lengths the kernels use as fixed-size
+        // widening copies (the row length dispatched once).
+        #[inline(always)]
+        fn rows<const N: usize, S: Sample>(
+            d: &[S],
+            base: usize,
+            stride: usize,
+            wh: usize,
+            out: &mut [i32],
+            ostride: usize,
+        ) {
+            for r in 0..wh {
+                let src: &[S; N] = d[base + r * stride..][..N].try_into().expect("row");
+                let dst: &mut [i32; N] = (&mut out[r * ostride..][..N]).try_into().expect("row");
+                for (o, v) in dst.iter_mut().zip(src) {
+                    *o = v.get();
+                }
+            }
+        }
+        match ww {
+            2 => rows::<2, S>(d, base, stride, wh, out, ostride),
+            4 => rows::<4, S>(d, base, stride, wh, out, ostride),
+            8 => rows::<8, S>(d, base, stride, wh, out, ostride),
+            9 => rows::<9, S>(d, base, stride, wh, out, ostride),
+            16 => rows::<16, S>(d, base, stride, wh, out, ostride),
+            17 => rows::<17, S>(d, base, stride, wh, out, ostride),
+            21 => rows::<21, S>(d, base, stride, wh, out, ostride),
+            _ => {
+                for r in 0..wh {
+                    copy_short(
+                        &mut out[r * ostride..r * ostride + ww],
+                        &d[base + r * stride..],
+                    );
+                }
+            }
+        }
+        return;
+    }
     for r in 0..wh {
         let y = (y0 + r as i32).clamp(0, ymax) as usize;
-        let o = &mut out[r * ostride..r * ostride + ww];
-        match src.row(y) {
-            SamplesRef::U8(row) => gather_row(row, x0, width, inside_x, o),
-            SamplesRef::U16(row) => gather_row(row, x0, width, inside_x, o),
-        }
+        let row = &d[y * stride..y * stride + width as usize];
+        gather_row(
+            row,
+            x0,
+            width,
+            inside_x,
+            &mut out[r * ostride..r * ostride + ww],
+        );
     }
 }
 
@@ -171,7 +258,9 @@ fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
 
 #[inline(always)]
 fn clip1(v: i32, max_v: i32) -> i32 {
-    v.clamp(0, max_v)
+    // (min / max rather than `clamp`: no bound-order check, so the
+    // kernels vectorise.)
+    v.max(0).min(max_v)
 }
 
 /// §8.4.2.2.1 — predict a `w`x`h` luma block (`w`, `h` ≤ 16) at the

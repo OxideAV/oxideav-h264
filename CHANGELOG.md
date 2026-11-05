@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derive theirs on the decoder thread, from that published motion).
   The decoder thread runs queued pool work while it waits for a
   picture slot.
+- The CABAC engine keeps `codIOffset` with up to 40 bits of lookahead
+  (`value = codIOffset · 2^pending + next bits`), so RenormD and bypass
+  bins only move a bit count instead of reading bit by bit; a read past
+  the end of the slice data still fails at the same bin.
+- Motion-compensation windows are gathered from 8-bit / 16-bit planes
+  with fixed-length widening row copies; sample clipping uses min / max
+  so the combine / residual loops vectorise; scaling lists are derived
+  only for blocks that carry coefficients; the slice-data parser
+  reserves room for the picture's macroblocks up front.
 
 ### Added
 
