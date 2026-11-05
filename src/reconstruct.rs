@@ -48,8 +48,8 @@ use crate::intra_pred::{
 use crate::macroblock_layer::{Macroblock, MbType, SubMbType};
 use crate::mb_grid::{MbGrid, MbInfo};
 use crate::mv_deriv::{
-    Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_b_spatial_direct_with_d,
-    derive_median_mvpred, derive_mvpred_with_d, derive_p_skip_mv_with_d,
+    Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_median_mvpred, derive_mvpred_with_d,
+    derive_p_skip_mv_with_d,
 };
 use crate::picture::Picture;
 use crate::pps::Pps;
@@ -5227,9 +5227,12 @@ fn inter_residual_write(
             }
         }
     }
-    let max_y = (1i32 << bit_depth_y) - 1;
-    for v in out.iter_mut() {
-        *v = (*v).max(0).min(max_y);
+    // Clip1Y — an 8-bit plane's store saturates to 0..=255 itself.
+    if bit_depth_y > 8 {
+        let max_y = (1i32 << bit_depth_y) - 1;
+        for v in out.iter_mut() {
+            *v = (*v).max(0).min(max_y);
+        }
     }
     writer.write_luma_mb(pic, &out);
 
@@ -5627,6 +5630,47 @@ fn derive_and_store_partition<R: RefPicProvider>(
         }
         // §7.4.5 — per 8x8 partition refIdx. Update the 8x8 quadrants
         // this partition covers.
+        let ref_key = |list: u8, ref_idx: i8| -> i32 {
+            let idx = ref_idx.max(0) as u32;
+            match field_parity {
+                Some(par) => {
+                    let sel = if idx.is_multiple_of(2) { par } else { 1 - par };
+                    ref_pics
+                        .ref_pic_poc(list, idx / 2)
+                        .map(|p| p.wrapping_mul(4).wrapping_add(1 + sel as i32))
+                        .unwrap_or(i32::MIN)
+                }
+                None => {
+                    // Round-416 PAFF — the two parity
+                    // fields of one stored FRAME share the
+                    // frame's POC but are DIFFERENT
+                    // reference pictures for the §8.7.2.1
+                    // NOTE 1 comparison; fold the resolved
+                    // field parity into the identity key
+                    // (frame refs keep the bare poc*4).
+                    let par_term = if slice_header.field_pic_flag {
+                        ref_pics
+                            .ref_field_parity(list, idx)
+                            .map(|p| 1 + p as i32)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    ref_pics
+                        .ref_pic_poc(list, idx)
+                        .map(|p| p.wrapping_mul(4).wrapping_add(par_term))
+                        .unwrap_or(i32::MIN)
+                }
+            }
+        };
+        // The identity keys are per partition (not per 8x8 quadrant).
+        let key_l0 = (part.mode != PartMode::L1Only && part.ref_idx_l0 >= 0)
+            .then(|| ref_key(0, part.ref_idx_l0));
+        let key_l1 = (matches!(
+            part.mode,
+            PartMode::L1Only | PartMode::BiPred | PartMode::Direct
+        ) && part.ref_idx_l1 >= 0)
+            .then(|| ref_key(1, part.ref_idx_l1));
         let q_x0 = part.x as usize / 8;
         let q_y0 = part.y as usize / 8;
         let q_nx = (part.w as usize).max(8) / 8;
@@ -5651,43 +5695,10 @@ fn derive_and_store_partition<R: RefPicProvider>(
                     // frame are DIFFERENT reference pictures for bS, as is
                     // the frame vs either of its fields. Encoding:
                     // frame → poc*4, field → poc*4 + 1 + parity.
-                    let ref_key = |list: u8, ref_idx: i8| -> i32 {
-                        let idx = ref_idx.max(0) as u32;
-                        match field_parity {
-                            Some(par) => {
-                                let sel = if idx.is_multiple_of(2) { par } else { 1 - par };
-                                ref_pics
-                                    .ref_pic_poc(list, idx / 2)
-                                    .map(|p| p.wrapping_mul(4).wrapping_add(1 + sel as i32))
-                                    .unwrap_or(i32::MIN)
-                            }
-                            None => {
-                                // Round-416 PAFF — the two parity
-                                // fields of one stored FRAME share the
-                                // frame's POC but are DIFFERENT
-                                // reference pictures for the §8.7.2.1
-                                // NOTE 1 comparison; fold the resolved
-                                // field parity into the identity key
-                                // (frame refs keep the bare poc*4).
-                                let par_term = if slice_header.field_pic_flag {
-                                    ref_pics
-                                        .ref_field_parity(list, idx)
-                                        .map(|p| 1 + p as i32)
-                                        .unwrap_or(0)
-                                } else {
-                                    0
-                                };
-                                ref_pics
-                                    .ref_pic_poc(list, idx)
-                                    .map(|p| p.wrapping_mul(4).wrapping_add(par_term))
-                                    .unwrap_or(i32::MIN)
-                            }
-                        }
-                    };
                     if part.mode != PartMode::L1Only {
                         info.ref_idx_l0[q_idx] = part.ref_idx_l0;
-                        if part.ref_idx_l0 >= 0 {
-                            info.ref_poc_l0[q_idx] = ref_key(0, part.ref_idx_l0);
+                        if let Some(k) = key_l0 {
+                            info.ref_poc_l0[q_idx] = k;
                         }
                     }
                     if matches!(
@@ -5695,8 +5706,8 @@ fn derive_and_store_partition<R: RefPicProvider>(
                         PartMode::L1Only | PartMode::BiPred | PartMode::Direct
                     ) {
                         info.ref_idx_l1[q_idx] = part.ref_idx_l1;
-                        if part.ref_idx_l1 >= 0 {
-                            info.ref_poc_l1[q_idx] = ref_key(1, part.ref_idx_l1);
+                        if let Some(k) = key_l1 {
+                            info.ref_poc_l1[q_idx] = k;
                         }
                     }
                 }
@@ -5737,6 +5748,31 @@ enum CombineOp {
 }
 
 impl CombineOp {
+    /// The same combine without the multiplications when the weights
+    /// are the identity: eqs. 8-274 / 8-275 with w = 2^logWD and o = 0
+    /// give the sample itself (a copy, §8.4.2.3.1), eq. 8-276 with
+    /// w0 = w1 = 2^logWD and o0 = o1 = 0 gives eq. 8-273's average.
+    fn simplified(self) -> Self {
+        match self {
+            CombineOp::Weighted {
+                mode,
+                w0,
+                w1,
+                log2_wd,
+            } => {
+                let unit = 1i32 << log2_wd;
+                let identity = |e: WeightedEntry| e.weight == unit && e.offset == 0;
+                match mode {
+                    BiPredMode::L0Only if identity(w0) => CombineOp::Copy0,
+                    BiPredMode::L1Only if identity(w1) => CombineOp::Copy1,
+                    BiPredMode::Bipred if identity(w0) && identity(w1) => CombineOp::Avg,
+                    _ => self,
+                }
+            }
+            other => other,
+        }
+    }
+
     /// §8.4.2.3.1 — the default combine for the lists in use.
     fn default_for(mode: Option<BiPredMode>) -> Self {
         match mode {
@@ -5764,6 +5800,7 @@ fn combine_partition(
     bit_depth: u32,
 ) {
     let max_v = (1i32 << bit_depth) - 1;
+    let op = op.simplified();
     for y in 0..h {
         let d = &mut dst[dst_off + y * dst_stride..dst_off + y * dst_stride + w];
         let a = &l0[y * w..y * w + w];
@@ -8317,11 +8354,6 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
     let (ref_idx_l0_final, ref_idx_l1_final, direct_zero_both) =
         spatial_direct_ref_idx([a_l0, b_l0, c_l0, d_l0], [a_l1, b_l1, c_l1, d_l1]);
 
-    // Keep the MB-level MVs from the helper for debug / symmetry —
-    // not used directly (we recompute per sub-block via
-    // `derive_median_mvpred` below).
-    let _ = derive_b_spatial_direct_with_d(a_l0, a_l1, b_l0, b_l1, c_l0, c_l1, d_l0, d_l1);
-
     // §8.4.1.2.2 step 7 — colZeroFlag requires RefPicList1[0] to be a
     // short-term reference and the colocated block to have a small
     // zero-like MV with ref_idx_l0 == 0.
@@ -8341,6 +8373,10 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
     let block_size = step as u8;
     let n_per_row = (region_size as usize) / step;
 
+    // §8.4.1.2.2 NOTE 3 — the mvLX §8.4.1.3 gives is the same for every
+    // sub-partition: derived once.
+    let mut median_l0: Option<Mv> = None;
+    let mut median_l1: Option<Mv> = None;
     let mut partitions = Vec::with_capacity(n_per_row * n_per_row);
     for by in 0..n_per_row {
         for bx in 0..n_per_row {
@@ -8391,7 +8427,9 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
             {
                 Mv::ZERO
             } else {
-                derive_median_mvpred(a_l0, b_l0, c_l0_eff, ref_idx_l0_final as i32)
+                *median_l0.get_or_insert_with(|| {
+                    derive_median_mvpred(a_l0, b_l0, c_l0_eff, ref_idx_l0_final as i32)
+                })
             };
             let mv_l1 = if direct_zero_both
                 || ref_idx_l1_final < 0
@@ -8399,7 +8437,9 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
             {
                 Mv::ZERO
             } else {
-                derive_median_mvpred(a_l1, b_l1, c_l1_eff, ref_idx_l1_final as i32)
+                *median_l1.get_or_insert_with(|| {
+                    derive_median_mvpred(a_l1, b_l1, c_l1_eff, ref_idx_l1_final as i32)
+                })
             };
 
             // Build the partition mode: if only L0 is valid we should
@@ -8814,9 +8854,12 @@ fn reconstruct_inter_chroma_residual(
                 }
             }
         }
-        let max_c = (1i32 << bit_depth_c) - 1;
-        for v in out.iter_mut() {
-            *v = (*v).max(0).min(max_c);
+        // Clip1C — an 8-bit plane's store saturates to 0..=255 itself.
+        if bit_depth_c > 8 {
+            let max_c = (1i32 << bit_depth_c) - 1;
+            for v in out.iter_mut() {
+                *v = (*v).max(0).min(max_c);
+            }
         }
         writer.write_chroma_mb(pic, plane, out, mbw_c as usize, mbh_c as usize);
     }
@@ -14814,8 +14857,8 @@ mod tests {
     /// Build a P_L0_16x16 MB with zero residual.
     fn make_p_l0_16x16(ref_idx: u32, mvd: [i32; 2]) -> Macroblock {
         let pred = MbPred {
-            ref_idx_l0: vec![ref_idx],
-            mvd_l0: vec![mvd],
+            ref_idx_l0: vec![ref_idx].into(),
+            mvd_l0: vec![mvd].into(),
             ..MbPred::default()
         };
         Macroblock {
@@ -14966,8 +15009,8 @@ mod tests {
             smp.sub_mb_type[i] = SubMbType::BDirect8x8;
             smp.ref_idx_l0[i] = 0;
             smp.ref_idx_l1[i] = 0;
-            smp.mvd_l0[i] = vec![[0, 0]];
-            smp.mvd_l1[i] = vec![[0, 0]];
+            smp.mvd_l0[i] = vec![[0, 0]].into();
+            smp.mvd_l1[i] = vec![[0, 0]].into();
         }
         let mb = Macroblock {
             mb_type: MbType::P8x8,
@@ -15092,8 +15135,8 @@ mod tests {
 
         // Build a P_L0_L0_16x8 MB with top MVD=(16,0), bottom MVD=(0,0).
         let pred = crate::macroblock_layer::MbPred {
-            ref_idx_l0: vec![0, 0],
-            mvd_l0: vec![[16, 0], [0, 0]],
+            ref_idx_l0: vec![0, 0].into(),
+            mvd_l0: vec![[16, 0], [0, 0]].into(),
             ..crate::macroblock_layer::MbPred::default()
         };
         let mb = Macroblock {
@@ -15449,10 +15492,10 @@ mod tests {
     /// indices.
     fn make_b_bi_16x16(ref_idx_l0: u32, ref_idx_l1: u32) -> Macroblock {
         let pred = MbPred {
-            ref_idx_l0: vec![ref_idx_l0],
-            ref_idx_l1: vec![ref_idx_l1],
-            mvd_l0: vec![[0, 0]],
-            mvd_l1: vec![[0, 0]],
+            ref_idx_l0: vec![ref_idx_l0].into(),
+            ref_idx_l1: vec![ref_idx_l1].into(),
+            mvd_l0: vec![[0, 0]].into(),
+            mvd_l1: vec![[0, 0]].into(),
             ..MbPred::default()
         };
         Macroblock {

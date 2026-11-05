@@ -647,6 +647,77 @@ pub struct PcmSamples {
     pub chroma_cr: Vec<u32>,
 }
 
+/// The per-partition syntax elements of one `mb_pred()` /
+/// `sub_mb_pred()` list (§7.3.5.1 / §7.3.5.2: at most four — NumMbPart
+/// or NumSubMbPart), held inline rather than on the heap. Reads as a
+/// slice of the elements pushed.
+#[derive(Clone, Copy)]
+pub struct PartList<T: Copy + Default> {
+    items: [T; 4],
+    len: u8,
+}
+
+impl<T: Copy + Default> PartList<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append `v` (a fifth element is dropped: no syntax structure has
+    /// more than four partitions).
+    pub fn push(&mut self, v: T) {
+        if (self.len as usize) < self.items.len() {
+            self.items[self.len as usize] = v;
+            self.len += 1;
+        }
+    }
+}
+
+impl<T: Copy + Default> Default for PartList<T> {
+    fn default() -> Self {
+        Self {
+            items: [T::default(); 4],
+            len: 0,
+        }
+    }
+}
+
+impl<T: Copy + Default> std::ops::Deref for PartList<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.items[..self.len as usize]
+    }
+}
+
+impl<T: Copy + Default> std::ops::DerefMut for PartList<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.items[..self.len as usize]
+    }
+}
+
+impl<T: Copy + Default + PartialEq> PartialEq for PartList<T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: Copy + Default + Eq> Eq for PartList<T> {}
+
+impl<T: Copy + Default + std::fmt::Debug> std::fmt::Debug for PartList<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: Copy + Default> From<Vec<T>> for PartList<T> {
+    fn from(v: Vec<T>) -> Self {
+        let mut l = Self::default();
+        for x in v {
+            l.push(x);
+        }
+        l
+    }
+}
+
 /// §7.3.5.1 / §7.4.5.1 — `mb_pred()` for non-sub_mb path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MbPred {
@@ -661,11 +732,11 @@ pub struct MbPred {
     pub intra_chroma_pred_mode: u8,
     /// For inter prediction: ref_idx_l0 / ref_idx_l1 for each of the
     /// `NumMbPart` partitions.
-    pub ref_idx_l0: Vec<u32>,
-    pub ref_idx_l1: Vec<u32>,
+    pub ref_idx_l0: PartList<u32>,
+    pub ref_idx_l1: PartList<u32>,
     /// MVD[mb_part][component] per partition (list 0 / list 1).
-    pub mvd_l0: Vec<[i32; 2]>,
-    pub mvd_l1: Vec<[i32; 2]>,
+    pub mvd_l0: PartList<[i32; 2]>,
+    pub mvd_l1: PartList<[i32; 2]>,
 }
 
 /// §7.3.5.2 / §7.4.5.2 — `sub_mb_pred()` payload.
@@ -677,8 +748,8 @@ pub struct SubMbPred {
     /// `mvd_lX[mbPart][subMbPart]` with mvd stored as `[x, y]`.
     /// Length 4 per partition (max case of 4x4 subdivision); shorter
     /// partitions populate only the first N entries.
-    pub mvd_l0: [Vec<[i32; 2]>; 4],
-    pub mvd_l1: [Vec<[i32; 2]>; 4],
+    pub mvd_l0: [PartList<[i32; 2]>; 4],
+    pub mvd_l1: [PartList<[i32; 2]>; 4],
 }
 
 // Required because `SubMbType` doesn't derive Default — but the fixed-

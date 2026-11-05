@@ -45,8 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Chroma deblocking of a non-MBAFF macroblock filters Cb and Cr in one
   pass over the shared bS (8 lanes for a 4:2:0 edge); the parsed
   `Macroblock` boxes its rarely present parts (`sub_mb_pred`,
-  `pcm_samples`, the 4:4:4 Cb / Cr DC blocks), 872 → ~550 bytes; the
+  `pcm_samples`, the 4:4:4 Cb / Cr DC blocks) and keeps the
+  per-partition `ref_idx` / `mvd` lists inline (`PartList`, at most
+  four entries), 872 → 440 bytes with no heap allocation for them; the
   CABAC bin trace is out of line.
+- Motion: the reference-identity key of a partition is derived once per
+  partition, spatial direct derives its median prediction once per
+  macroblock (§8.4.1.2.2 NOTE 3). Weighted prediction with identity
+  weights (w = 2^logWD, o = 0) combines as the plain copy / average it
+  equals, and 8-bit planes skip the separate Clip1 pass (their store
+  saturates).
 
 ### Added
 
