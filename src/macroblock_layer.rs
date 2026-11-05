@@ -699,9 +699,9 @@ pub struct Macroblock {
     /// `Some` for the non-sub, non-PCM path.
     pub mb_pred: Option<MbPred>,
     /// `Some` when `NumMbPart == 4` and not an I_NxN / Intra_16x16 MB.
-    pub sub_mb_pred: Option<SubMbPred>,
+    pub sub_mb_pred: Option<Box<SubMbPred>>,
     /// `Some` for I_PCM.
-    pub pcm_samples: Option<PcmSamples>,
+    pub pcm_samples: Option<Box<PcmSamples>>,
     /// Derived `CodedBlockPattern` — bits 0..=3 luma, bits 4..=5 chroma.
     /// Equal to the Intra_16x16 derived values when that mb_type, and
     /// equal to 0 on P_Skip / B_Skip.
@@ -732,10 +732,10 @@ pub struct Macroblock {
     pub residual_cr_luma_like: Vec<[i32; 16]>,
     /// §7.3.5.3 — Cb Intra16x16 DC block when ChromaArrayType == 3 and
     /// mb_type is Intra_16x16.
-    pub residual_cb_16x16_dc: Option<[i32; 16]>,
+    pub residual_cb_16x16_dc: Option<Box<[i32; 16]>>,
     /// §7.3.5.3 — Cr Intra16x16 DC block when ChromaArrayType == 3 and
     /// mb_type is Intra_16x16.
-    pub residual_cr_16x16_dc: Option<[i32; 16]>,
+    pub residual_cr_16x16_dc: Option<Box<[i32; 16]>>,
     /// True if this entry represents a P_Skip / B_Skip MB, in which
     /// case none of the residual / pred fields carry meaningful data.
     pub is_skip: bool,
@@ -2754,11 +2754,11 @@ pub fn parse_macroblock_dp(
             mb_type_raw,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb,
                 chroma_cr: cr,
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -2949,7 +2949,7 @@ pub fn parse_macroblock_dp(
         mb_type: mb_type.clone(),
         mb_type_raw,
         mb_pred,
-        sub_mb_pred,
+        sub_mb_pred: sub_mb_pred.map(Box::new),
         pcm_samples: None,
         coded_block_pattern: cbp_total,
         transform_size_8x8_flag,
@@ -4225,9 +4225,9 @@ fn parse_residual_cavlc_only(
                 );
                 let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
                 if plane_is_cr {
-                    out.residual_cr_16x16_dc = Some(pad_to_16(blk));
+                    out.residual_cr_16x16_dc = Some(Box::new(pad_to_16(blk)));
                 } else {
-                    out.residual_cb_16x16_dc = Some(pad_to_16(blk));
+                    out.residual_cb_16x16_dc = Some(Box::new(pad_to_16(blk)));
                 }
                 // §9.2.1.1 NOTE 1: DC counts do NOT contribute to nN.
             }
@@ -4873,10 +4873,10 @@ fn parse_residual_cabac_only(
                 )?;
                 if plane_is_cr {
                     curr_cbf.cbf_cr_16x16_dc = coded;
-                    out.residual_cr_16x16_dc = Some(pad_to_16(blk));
+                    out.residual_cr_16x16_dc = Some(Box::new(pad_to_16(blk)));
                 } else {
                     curr_cbf.cbf_cb_16x16_dc = coded;
-                    out.residual_cb_16x16_dc = Some(pad_to_16(blk));
+                    out.residual_cb_16x16_dc = Some(Box::new(pad_to_16(blk)));
                 }
             }
 
@@ -7352,8 +7352,8 @@ mod tests {
         assert!(mb.residual_cr_16x16_dc.is_some());
         // All 16 coefficients of each DC block are zero (TotalCoeff=0).
         assert_eq!(mb.residual_luma_dc.unwrap(), [0; 16]);
-        assert_eq!(mb.residual_cb_16x16_dc.unwrap(), [0; 16]);
-        assert_eq!(mb.residual_cr_16x16_dc.unwrap(), [0; 16]);
+        assert_eq!(*mb.residual_cb_16x16_dc.unwrap(), [0; 16]);
+        assert_eq!(*mb.residual_cr_16x16_dc.unwrap(), [0; 16]);
         // No AC blocks (cbp_luma == 0 gates all planes).
         assert!(mb.residual_luma.is_empty());
         assert!(mb.residual_cb_luma_like.is_empty());

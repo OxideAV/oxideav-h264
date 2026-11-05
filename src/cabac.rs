@@ -446,7 +446,12 @@ impl<'a> CabacDecoder<'a> {
         if self.pending < MIN_LOOKAHEAD {
             self.refill();
         }
-        let pre = (ctx.state_idx, ctx.val_mps, self.cod_i_range, self.offset());
+        let trace = bin_trace_enabled();
+        let pre = if trace {
+            (ctx.state_idx, ctx.val_mps, self.cod_i_range, self.offset())
+        } else {
+            (0, 0, 0, 0)
+        };
 
         // §9.3.3.2.1 equations (9-25) / (9-26).
         let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
@@ -473,22 +478,29 @@ impl<'a> CabacDecoder<'a> {
 
         self.renorm_d()?;
         self.bin_count = self.bin_count.wrapping_add(1);
-        if bin_trace_enabled() {
-            eprintln!(
-                "[BIN {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_offset={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_offset={:>4}",
-                self.bin_count,
-                pre.0,
-                pre.1,
-                pre.2,
-                pre.3,
-                bin_val,
-                ctx.state_idx,
-                ctx.val_mps,
-                self.cod_i_range,
-                self.offset(),
-            );
+        if trace {
+            self.trace_decision(pre, bin_val, ctx);
         }
         Ok(bin_val)
+    }
+
+    /// `OXIDEAV_H264_BIN_TRACE` line of a decision bin.
+    #[cold]
+    #[inline(never)]
+    fn trace_decision(&self, pre: (u8, u8, u32, u32), bin_val: u8, ctx: &CtxState) {
+        eprintln!(
+            "[BIN {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_offset={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_offset={:>4}",
+            self.bin_count,
+            pre.0,
+            pre.1,
+            pre.2,
+            pre.3,
+            bin_val,
+            ctx.state_idx,
+            ctx.val_mps,
+            self.cod_i_range,
+            self.offset(),
+        );
     }
 
     /// §9.3.3.2.3 — DecodeBypass. Reads one bypass bin (no context,

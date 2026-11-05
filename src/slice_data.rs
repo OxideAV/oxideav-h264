@@ -785,11 +785,11 @@ fn parse_slice_data_impl(
                             mb_type_raw: 25,
                             mb_pred: None,
                             sub_mb_pred: None,
-                            pcm_samples: Some(PcmSamples {
+                            pcm_samples: Some(Box::new(PcmSamples {
                                 luma,
                                 chroma_cb: cb,
                                 chroma_cr: cr,
-                            }),
+                            })),
                             coded_block_pattern: 0,
                             transform_size_8x8_flag: false,
                             mb_qp_delta: 0,

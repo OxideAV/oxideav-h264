@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the combine / residual loops vectorise; scaling lists are derived
   only for blocks that carry coefficients; the slice-data parser
   reserves room for the picture's macroblocks up front.
+- Chroma deblocking of a non-MBAFF macroblock filters Cb and Cr in one
+  pass over the shared bS (8 lanes for a 4:2:0 edge); the parsed
+  `Macroblock` boxes its rarely present parts (`sub_mb_pred`,
+  `pcm_samples`, the 4:4:4 Cb / Cr DC blocks), 872 → ~550 bytes; the
+  CABAC bin trace is out of line.
 
 ### Added
 

@@ -671,16 +671,16 @@ pub(crate) const EDGE_LINES: usize = 16;
 /// §8.7.2.4, so the filters below run on all lanes at once with
 /// per-lane selects — the shape the compiler vectorises.
 #[derive(Clone, Copy)]
-pub(crate) struct EdgeLines {
-    pub(crate) p: [[i32; EDGE_LINES]; 4],
-    pub(crate) q: [[i32; EDGE_LINES]; 4],
+pub(crate) struct EdgeLines<const N: usize = EDGE_LINES> {
+    pub(crate) p: [[i32; N]; 4],
+    pub(crate) q: [[i32; N]; 4],
 }
 
-impl EdgeLines {
+impl<const N: usize> EdgeLines<N> {
     pub(crate) const fn new() -> Self {
         Self {
-            p: [[0; EDGE_LINES]; 4],
-            q: [[0; EDGE_LINES]; 4],
+            p: [[0; N]; 4],
+            q: [[0; N]; 4],
         }
     }
 
@@ -776,7 +776,7 @@ pub(crate) fn edge_alpha_beta(
 
 /// tC0 of every lane (eqs. 8-461 / 8-462) from its bS.
 #[inline]
-pub(crate) fn tc0_lanes(bs: &[i32; EDGE_LINES], index_a: i32, bit_depth: u32) -> [i32; EDGE_LINES] {
+pub(crate) fn tc0_lanes<const N: usize>(bs: &[i32; N], index_a: i32, bit_depth: u32) -> [i32; N] {
     let by_bs = [
         0,
         tc0_from(1, index_a, bit_depth),
@@ -791,16 +791,16 @@ pub(crate) fn tc0_lanes(bs: &[i32; EDGE_LINES], index_a: i32, bit_depth: u32) ->
 /// lane: `bs[k]` is line k's bS (0 leaves it unchanged) and `tc0[k]`
 /// its tC0 (eqs. 8-461 / 8-462). Updates p0..p2 / q0..q2.
 #[inline]
-pub(crate) fn filter_lines_luma(
-    e: &mut EdgeLines,
-    bs: &[i32; EDGE_LINES],
-    tc0: &[i32; EDGE_LINES],
+pub(crate) fn filter_lines_luma<const N: usize>(
+    e: &mut EdgeLines<N>,
+    bs: &[i32; N],
+    tc0: &[i32; N],
     alpha: i32,
     beta: i32,
     max: i32,
 ) {
     let strong_near = (alpha >> 2) + 2;
-    for k in 0..EDGE_LINES {
+    for k in 0..N {
         let (p0, p1, p2, p3) = (e.p[0][k], e.p[1][k], e.p[2][k], e.p[3][k]);
         let (q0, q1, q2, q3) = (e.q[0][k], e.q[1][k], e.q[2][k], e.q[3][k]);
         let b = bs[k];
@@ -878,15 +878,15 @@ pub(crate) fn filter_lines_luma(
 /// 8-450): only p0 / q0 change (eqs. 8-466..8-469, 8-480, 8-487); reads
 /// p1..q1.
 #[inline]
-pub(crate) fn filter_lines_chroma(
-    e: &mut EdgeLines,
-    bs: &[i32; EDGE_LINES],
-    tc0: &[i32; EDGE_LINES],
+pub(crate) fn filter_lines_chroma<const N: usize>(
+    e: &mut EdgeLines<N>,
+    bs: &[i32; N],
+    tc0: &[i32; N],
     alpha: i32,
     beta: i32,
     max: i32,
 ) {
-    for k in 0..EDGE_LINES {
+    for k in 0..N {
         let (p0, p1) = (e.p[0][k], e.p[1][k]);
         let (q0, q1) = (e.q[0][k], e.q[1][k]);
         let b = bs[k];
@@ -1026,7 +1026,7 @@ mod tests {
             for qp_avg in [10, 20, 28, 36, 44, 51] {
                 for chroma in [false, true] {
                     for _ in 0..40 {
-                        let mut e = EdgeLines::new();
+                        let mut e = EdgeLines::<EDGE_LINES>::new();
                         let mut bs = [0i32; EDGE_LINES];
                         let mut tc0 = [0i32; EDGE_LINES];
                         let mut lines = [[0i32; 8]; EDGE_LINES];

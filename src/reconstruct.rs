@@ -3355,9 +3355,15 @@ fn reconstruct_chroma_intra_444(
 
         // (2) Inverse Hadamard on the per-plane DC.
         let dc_levels = if plane == 0 {
-            mb.residual_cb_16x16_dc.unwrap_or([0i32; 16])
+            mb.residual_cb_16x16_dc
+                .as_deref()
+                .copied()
+                .unwrap_or([0i32; 16])
         } else {
-            mb.residual_cr_16x16_dc.unwrap_or([0i32; 16])
+            mb.residual_cr_16x16_dc
+                .as_deref()
+                .copied()
+                .unwrap_or([0i32; 16])
         };
         // DC coefficients are in scan order (§8.5.6 — zig-zag or
         // field). Apply the inverse scan + Hadamard.
@@ -11242,7 +11248,7 @@ impl FrameMbEdges<'_> {
                 } else {
                     (y0 * stride + x0 + 4 * edge as usize, 1, stride)
                 };
-                let mut lines = EdgeLines::new();
+                let mut lines = EdgeLines::<EDGE_LINES>::new();
                 lines.load(buf, q0, across, along, EDGE_LINES, 4);
                 filter_lines_luma(&mut lines, &bs, &tc0, alpha, beta, self.max);
                 lines.store(buf, q0, across, along, EDGE_LINES, 3);
@@ -11380,22 +11386,24 @@ fn deblock_chroma_mb(
     luma_bs: &[u8],
 ) {
     if !mbaff_frame_flag && matches!(pic.chroma_array_type, 1 | 2) {
-        deblock_chroma_mb_frame(
-            pic,
-            y_base,
-            cw,
-            ch,
-            grid,
-            plane,
-            mb_x,
-            mb_y,
-            alpha_off,
-            beta_off,
-            bit_depth,
-            if plane == 0 { cb_offset } else { cr_offset },
-            field_pic,
-            luma_bs,
-        );
+        // Both planes at the Cb call (they are filtered independently).
+        if plane == 0 {
+            deblock_chroma_mb_frame(
+                pic,
+                y_base,
+                cw,
+                ch,
+                grid,
+                mb_x,
+                mb_y,
+                alpha_off,
+                beta_off,
+                bit_depth,
+                [cb_offset, cr_offset],
+                field_pic,
+                luma_bs,
+            );
+        }
         return;
     }
     // §7.4.2.1.1 eq. 7-6 / §8.5.8 eq. 8-311 — QpBdOffsetC = 6 *
@@ -11717,13 +11725,12 @@ fn deblock_chroma_mb_frame(
     cw: i32,
     ch: i32,
     grid: &MbGrid,
-    plane: u8,
     mb_x: i32,
     mb_y: i32,
     alpha_off: i32,
     beta_off: i32,
     bit_depth: u32,
-    qp_offset: i32,
+    qp_offsets: [i32; 2],
     field_pic: bool,
     luma_bs: &[u8],
 ) {
@@ -11744,7 +11751,6 @@ fn deblock_chroma_mb_frame(
     let max = (1i32 << bit_depth) - 1;
     let x0 = mb_x as usize * 8;
     let y0 = (mb_y * mbh_c - y_base) as usize;
-    let mut buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
     // Edge list: (horizontal, chroma edge offset, luma edge index).
     let mut edges: [(bool, i32, i32); 6] = [(false, 0, 0); 6];
     let mut n_edges = 0;
@@ -11811,29 +11817,62 @@ fn deblock_chroma_mb_frame(
         if bs.iter().all(|&b| b == 0) {
             continue;
         }
-        let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, qp_offset, qp_bd_offset_c);
-        let Some((alpha, beta, index_a)) = edge_alpha_beta(qp_avg, alpha_off, beta_off, bit_depth)
-        else {
-            continue;
-        };
-        let tc0 = tc0_lanes(&bs, index_a, bit_depth);
         let (q0, across, along) = if horizontal {
             ((y0 + off as usize) * stride + x0, stride, 1)
         } else {
             (y0 * stride + x0 + off as usize, 1, stride)
         };
-        let mut e = EdgeLines::new();
-        match &mut buf {
-            Samples::U8(v) => {
-                e.load(v, q0, across, along, lines, 2);
-                filter_lines_chroma(&mut e, &bs, &tc0, alpha, beta, max);
-                e.store(v, q0, across, along, lines, 1);
+        // Both chroma planes, each with its own QPC (§8.7.2.2).
+        for (plane, &qp_offset) in qp_offsets.iter().enumerate() {
+            let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, qp_offset, qp_bd_offset_c);
+            let Some((alpha, beta, index_a)) =
+                edge_alpha_beta(qp_avg, alpha_off, beta_off, bit_depth)
+            else {
+                continue;
+            };
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            if lines == 8 {
+                let bs8: [i32; 8] = std::array::from_fn(|k| bs[k]);
+                chroma_edge_lines(
+                    buf, &bs8, index_a, alpha, beta, bit_depth, max, q0, across, along,
+                );
+            } else {
+                chroma_edge_lines(
+                    buf, &bs, index_a, alpha, beta, bit_depth, max, q0, across, along,
+                );
             }
-            Samples::U16(v) => {
-                e.load(v, q0, across, along, lines, 2);
-                filter_lines_chroma(&mut e, &bs, &tc0, alpha, beta, max);
-                e.store(v, q0, across, along, lines, 1);
-            }
+        }
+    }
+}
+
+/// Filter `N` lines of one chroma edge of a stored plane
+/// chroma-style (see [`filter_lines_chroma`]).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn chroma_edge_lines<const N: usize>(
+    buf: &mut Samples,
+    bs: &[i32; N],
+    index_a: i32,
+    alpha: i32,
+    beta: i32,
+    bit_depth: u32,
+    max: i32,
+    q0: usize,
+    across: usize,
+    along: usize,
+) {
+    let tc0 = tc0_lanes(bs, index_a, bit_depth);
+    let mut e = EdgeLines::<N>::new();
+    match buf {
+        Samples::U8(v) => {
+            e.load(v, q0, across, along, N, 2);
+            filter_lines_chroma(&mut e, bs, &tc0, alpha, beta, max);
+            e.store(v, q0, across, along, N, 1);
+        }
+        Samples::U16(v) => {
+            e.load(v, q0, across, along, N, 2);
+            filter_lines_chroma(&mut e, bs, &tc0, alpha, beta, max);
+            e.store(v, q0, across, along, N, 1);
         }
     }
 }
@@ -13809,11 +13848,11 @@ mod tests {
             mb_type_raw: 25,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb,
                 chroma_cr: cr,
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -13950,11 +13989,11 @@ mod tests {
             mb_type_raw: 25,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb,
                 chroma_cr: cr,
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -14541,11 +14580,11 @@ mod tests {
             mb_type_raw: 25,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb.clone(),
                 chroma_cr: cr.clone(),
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -14934,7 +14973,7 @@ mod tests {
             mb_type: MbType::P8x8,
             mb_type_raw: 3,
             mb_pred: None,
-            sub_mb_pred: Some(smp),
+            sub_mb_pred: Some(Box::new(smp)),
             pcm_samples: None,
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
