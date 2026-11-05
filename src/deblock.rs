@@ -17,6 +17,8 @@
 
 #![allow(dead_code)]
 
+use crate::sample_plane::Sample;
+
 // --------------------------------------------------------------------
 // Public types
 // --------------------------------------------------------------------
@@ -522,6 +524,401 @@ fn filter_strong(samples: &mut EdgeSamples<'_>, alpha: i32, beta: i32, chroma_st
 }
 
 // --------------------------------------------------------------------
+// §8.7.2.2 .. §8.7.2.4 — one edge segment over stored samples
+// --------------------------------------------------------------------
+
+/// The constants of the §8.7.2.2 filtering of one edge segment (one
+/// bS and qPav for all its sample lines): α and β (eqs. 8-454..8-459)
+/// and, for bS < 4, tC0 (eqs. 8-461 / 8-462), derived once instead of
+/// per line.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EdgeFilter {
+    bs: u8,
+    alpha: i32,
+    beta: i32,
+    tc0: i32,
+    /// `( 1 << BitDepth ) − 1`, the Clip1 bound of eqs. 8-468 / 8-469.
+    max: i32,
+    /// `chromaStyleFilteringFlag` (eq. 8-450).
+    chroma_style: bool,
+}
+
+impl EdgeFilter {
+    /// `None` when no line of the segment can change: bS = 0, or α or
+    /// β is 0 (filterSamplesFlag, eq. 8-460, needs |p0 − q0| < α and
+    /// |p1 − p0| < β).
+    #[inline]
+    pub(crate) fn new(params: FilterParams, chroma_style: bool) -> Option<Self> {
+        if params.bs == 0 {
+            return None;
+        }
+        let index_a = clip3(0, 51, params.qp_avg + params.filter_offset_a);
+        let index_b = clip3(0, 51, params.qp_avg + params.filter_offset_b);
+        let alpha = alpha_from_index(index_a, params.bit_depth);
+        let beta = beta_from_index(index_b, params.bit_depth);
+        if alpha == 0 || beta == 0 {
+            return None;
+        }
+        Some(Self {
+            bs: params.bs,
+            alpha,
+            beta,
+            tc0: tc0_from(params.bs, index_a, params.bit_depth),
+            max: (1i32 << params.bit_depth) - 1,
+            chroma_style,
+        })
+    }
+
+    /// Filter `lines` sample lines across the edge. Line `k` has its
+    /// q0 sample at `buf[q0 + k * along]`; `qi` / `pi` sit `i * across`
+    /// after / `(i + 1) * across` before it (`across` = 1 for a
+    /// vertical edge, the row stride for a horizontal one). Every
+    /// sample the filter reads (p3..q3, or p1..q1 chroma-style) must
+    /// lie in `buf`.
+    #[inline]
+    pub(crate) fn lines<S: Sample>(
+        &self,
+        buf: &mut [S],
+        q0: usize,
+        across: usize,
+        along: usize,
+        lines: usize,
+    ) {
+        for k in 0..lines {
+            self.line(buf, q0 + k * along, across);
+        }
+    }
+
+    #[inline(always)]
+    fn line<S: Sample>(&self, buf: &mut [S], q: usize, a: usize) {
+        let p0 = buf[q - a].get();
+        let q0 = buf[q].get();
+        let p1 = buf[q - 2 * a].get();
+        let q1 = buf[q + a].get();
+        // eq. 8-460 — filterSamplesFlag.
+        if (p0 - q0).abs() >= self.alpha
+            || (p1 - p0).abs() >= self.beta
+            || (q1 - q0).abs() >= self.beta
+        {
+            return;
+        }
+        if self.chroma_style {
+            if self.bs < 4 {
+                // eqs. 8-466..8-469.
+                let tc = self.tc0 + 1;
+                let delta = clip3(-tc, tc, (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3);
+                buf[q - a] = S::put(clip3(0, self.max, p0 + delta));
+                buf[q] = S::put(clip3(0, self.max, q0 - delta));
+            } else {
+                // eqs. 8-480 / 8-487.
+                buf[q - a] = S::put((2 * p1 + p0 + q1 + 2) >> 2);
+                buf[q] = S::put((2 * q1 + q0 + p1 + 2) >> 2);
+            }
+            return;
+        }
+        let p2 = buf[q - 3 * a].get();
+        let q2 = buf[q + 2 * a].get();
+        // eqs. 8-463 / 8-464.
+        let a_p = (p2 - p0).abs();
+        let a_q = (q2 - q0).abs();
+        if self.bs < 4 {
+            // §8.7.2.3 — eqs. 8-465, 8-467..8-473.
+            let tc0 = self.tc0;
+            let tc = tc0 + i32::from(a_p < self.beta) + i32::from(a_q < self.beta);
+            let delta = clip3(-tc, tc, (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3);
+            buf[q - a] = S::put(clip3(0, self.max, p0 + delta));
+            buf[q] = S::put(clip3(0, self.max, q0 - delta));
+            let avg = (p0 + q0 + 1) >> 1;
+            if a_p < self.beta {
+                buf[q - 2 * a] = S::put(p1 + clip3(-tc0, tc0, (p2 + avg - (p1 << 1)) >> 1));
+            }
+            if a_q < self.beta {
+                buf[q + a] = S::put(q1 + clip3(-tc0, tc0, (q2 + avg - (q1 << 1)) >> 1));
+            }
+        } else {
+            // §8.7.2.4 — eqs. 8-476..8-489.
+            let near = (p0 - q0).abs() < ((self.alpha >> 2) + 2);
+            if a_p < self.beta && near {
+                let p3 = buf[q - 4 * a].get();
+                buf[q - a] = S::put((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+                buf[q - 2 * a] = S::put((p2 + p1 + p0 + q0 + 2) >> 2);
+                buf[q - 3 * a] = S::put((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+            } else {
+                buf[q - a] = S::put((2 * p1 + p0 + q1 + 2) >> 2);
+            }
+            if a_q < self.beta && near {
+                let q3 = buf[q + 3 * a].get();
+                buf[q] = S::put((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+                buf[q + a] = S::put((p0 + q0 + q1 + q2 + 2) >> 2);
+                buf[q + 2 * a] = S::put((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
+            } else {
+                buf[q] = S::put((2 * q1 + q0 + p1 + 2) >> 2);
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------
+// §8.7.2.2 .. §8.7.2.4 — a whole edge of a macroblock, line-parallel
+// --------------------------------------------------------------------
+
+/// Most sample lines one macroblock edge spans (a 16-sample luma edge).
+pub(crate) const EDGE_LINES: usize = 16;
+
+/// The samples around one edge of a macroblock, widened, one lane per
+/// sample line: `p[i][k]` / `q[i][k]` is sample p_i / q_i of line `k`
+/// (p0 / q0 adjacent to the edge). Lines are independent in §8.7.2.3 /
+/// §8.7.2.4, so the filters below run on all lanes at once with
+/// per-lane selects — the shape the compiler vectorises.
+#[derive(Clone, Copy)]
+pub(crate) struct EdgeLines {
+    pub(crate) p: [[i32; EDGE_LINES]; 4],
+    pub(crate) q: [[i32; EDGE_LINES]; 4],
+}
+
+impl EdgeLines {
+    pub(crate) const fn new() -> Self {
+        Self {
+            p: [[0; EDGE_LINES]; 4],
+            q: [[0; EDGE_LINES]; 4],
+        }
+    }
+
+    /// Load `n` lines of `depth` samples per side: line `k` has q0 at
+    /// `buf[q0 + k * along]`, `qi` / `pi` at `± across` steps.
+    #[inline]
+    #[allow(clippy::needless_range_loop)] // lanes x sample depth
+    pub(crate) fn load<S: Sample>(
+        &mut self,
+        buf: &[S],
+        q0: usize,
+        across: usize,
+        along: usize,
+        n: usize,
+        depth: usize,
+    ) {
+        if along == 1 {
+            // Horizontal edge: each p_i / q_i is a contiguous row.
+            for i in 0..depth {
+                let pr = &buf[q0 - (i + 1) * across..][..n];
+                let qr = &buf[q0 + i * across..][..n];
+                for k in 0..n {
+                    self.p[i][k] = pr[k].get();
+                    self.q[i][k] = qr[k].get();
+                }
+            }
+        } else {
+            for k in 0..n {
+                let line = &buf[q0 + k * along - depth * across..][..2 * depth * across];
+                for i in 0..depth {
+                    self.p[i][k] = line[(depth - 1 - i) * across].get();
+                    self.q[i][k] = line[(depth + i) * across].get();
+                }
+            }
+        }
+    }
+
+    /// Store samples p_0..p_{depth−1} / q_0..q_{depth−1} of `n` lines
+    /// back (the layout of [`Self::load`]).
+    #[inline]
+    #[allow(clippy::needless_range_loop)] // lanes x sample depth
+    pub(crate) fn store<S: Sample>(
+        &self,
+        buf: &mut [S],
+        q0: usize,
+        across: usize,
+        along: usize,
+        n: usize,
+        depth: usize,
+    ) {
+        if along == 1 {
+            for i in 0..depth {
+                let pr = &mut buf[q0 - (i + 1) * across..][..n];
+                for k in 0..n {
+                    pr[k] = S::put(self.p[i][k]);
+                }
+                let qr = &mut buf[q0 + i * across..][..n];
+                for k in 0..n {
+                    qr[k] = S::put(self.q[i][k]);
+                }
+            }
+        } else {
+            for k in 0..n {
+                let line = &mut buf[q0 + k * along - depth * across..][..2 * depth * across];
+                for i in 0..depth {
+                    line[(depth - 1 - i) * across] = S::put(self.p[i][k]);
+                    line[(depth + i) * across] = S::put(self.q[i][k]);
+                }
+            }
+        }
+    }
+}
+
+/// α / β of an edge (eqs. 8-454..8-459), `None` when either is 0 (no
+/// line can pass eq. 8-460).
+#[inline]
+pub(crate) fn edge_alpha_beta(
+    qp_avg: i32,
+    filter_offset_a: i32,
+    filter_offset_b: i32,
+    bit_depth: u32,
+) -> Option<(i32, i32, i32)> {
+    let index_a = clip3(0, 51, qp_avg + filter_offset_a);
+    let index_b = clip3(0, 51, qp_avg + filter_offset_b);
+    let alpha = alpha_from_index(index_a, bit_depth);
+    let beta = beta_from_index(index_b, bit_depth);
+    if alpha == 0 || beta == 0 {
+        None
+    } else {
+        Some((alpha, beta, index_a))
+    }
+}
+
+/// tC0 of every lane (eqs. 8-461 / 8-462) from its bS.
+#[inline]
+pub(crate) fn tc0_lanes(bs: &[i32; EDGE_LINES], index_a: i32, bit_depth: u32) -> [i32; EDGE_LINES] {
+    let by_bs = [
+        0,
+        tc0_from(1, index_a, bit_depth),
+        tc0_from(2, index_a, bit_depth),
+        tc0_from(3, index_a, bit_depth),
+        0,
+    ];
+    std::array::from_fn(|k| by_bs[(bs[k] as usize).min(4)])
+}
+
+/// §8.7.2.2 .. §8.7.2.4 with `chromaStyleFilteringFlag` = 0 on every
+/// lane: `bs[k]` is line k's bS (0 leaves it unchanged) and `tc0[k]`
+/// its tC0 (eqs. 8-461 / 8-462). Updates p0..p2 / q0..q2.
+#[inline]
+pub(crate) fn filter_lines_luma(
+    e: &mut EdgeLines,
+    bs: &[i32; EDGE_LINES],
+    tc0: &[i32; EDGE_LINES],
+    alpha: i32,
+    beta: i32,
+    max: i32,
+) {
+    let strong_near = (alpha >> 2) + 2;
+    for k in 0..EDGE_LINES {
+        let (p0, p1, p2, p3) = (e.p[0][k], e.p[1][k], e.p[2][k], e.p[3][k]);
+        let (q0, q1, q2, q3) = (e.q[0][k], e.q[1][k], e.q[2][k], e.q[3][k]);
+        let b = bs[k];
+        // eq. 8-460.
+        let on = (b != 0)
+            & ((p0 - q0).abs() < alpha)
+            & ((p1 - p0).abs() < beta)
+            & ((q1 - q0).abs() < beta);
+        // eqs. 8-463 / 8-464.
+        let ap = (p2 - p0).abs() < beta;
+        let aq = (q2 - q0).abs() < beta;
+        // §8.7.2.3 (bS < 4): eqs. 8-465, 8-467..8-473.
+        let t0 = tc0[k];
+        let tc = t0 + ap as i32 + aq as i32;
+        let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).max(-tc).min(tc);
+        let avg = (p0 + q0 + 1) >> 1;
+        let n_p0 = (p0 + delta).max(0).min(max);
+        let n_q0 = (q0 - delta).max(0).min(max);
+        let n_p1 = if ap {
+            p1 + ((p2 + avg - (p1 << 1)) >> 1).max(-t0).min(t0)
+        } else {
+            p1
+        };
+        let n_q1 = if aq {
+            q1 + ((q2 + avg - (q1 << 1)) >> 1).max(-t0).min(t0)
+        } else {
+            q1
+        };
+        // §8.7.2.4 (bS = 4): eqs. 8-476..8-489.
+        let near = (p0 - q0).abs() < strong_near;
+        let sp = ap & near;
+        let sq = aq & near;
+        let s_p0 = if sp {
+            (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3
+        } else {
+            (2 * p1 + p0 + q1 + 2) >> 2
+        };
+        let s_p1 = if sp { (p2 + p1 + p0 + q0 + 2) >> 2 } else { p1 };
+        let s_p2 = if sp {
+            (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3
+        } else {
+            p2
+        };
+        let s_q0 = if sq {
+            (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3
+        } else {
+            (2 * q1 + q0 + p1 + 2) >> 2
+        };
+        let s_q1 = if sq { (p0 + q0 + q1 + q2 + 2) >> 2 } else { q1 };
+        let s_q2 = if sq {
+            (2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3
+        } else {
+            q2
+        };
+        let strong = b >= 4;
+        let pick = |orig: i32, normal: i32, strong_v: i32| {
+            if !on {
+                orig
+            } else if strong {
+                strong_v
+            } else {
+                normal
+            }
+        };
+        e.p[0][k] = pick(p0, n_p0, s_p0);
+        e.p[1][k] = pick(p1, n_p1, s_p1);
+        e.p[2][k] = pick(p2, p2, s_p2);
+        e.q[0][k] = pick(q0, n_q0, s_q0);
+        e.q[1][k] = pick(q1, n_q1, s_q1);
+        e.q[2][k] = pick(q2, q2, s_q2);
+    }
+}
+
+/// [`filter_lines_luma`] with `chromaStyleFilteringFlag` = 1 (eq.
+/// 8-450): only p0 / q0 change (eqs. 8-466..8-469, 8-480, 8-487); reads
+/// p1..q1.
+#[inline]
+pub(crate) fn filter_lines_chroma(
+    e: &mut EdgeLines,
+    bs: &[i32; EDGE_LINES],
+    tc0: &[i32; EDGE_LINES],
+    alpha: i32,
+    beta: i32,
+    max: i32,
+) {
+    for k in 0..EDGE_LINES {
+        let (p0, p1) = (e.p[0][k], e.p[1][k]);
+        let (q0, q1) = (e.q[0][k], e.q[1][k]);
+        let b = bs[k];
+        let on = (b != 0)
+            & ((p0 - q0).abs() < alpha)
+            & ((p1 - p0).abs() < beta)
+            & ((q1 - q0).abs() < beta);
+        let tc = tc0[k] + 1;
+        let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).max(-tc).min(tc);
+        let n_p0 = (p0 + delta).max(0).min(max);
+        let n_q0 = (q0 - delta).max(0).min(max);
+        let s_p0 = (2 * p1 + p0 + q1 + 2) >> 2;
+        let s_q0 = (2 * q1 + q0 + p1 + 2) >> 2;
+        let strong = b >= 4;
+        e.p[0][k] = if !on {
+            p0
+        } else if strong {
+            s_p0
+        } else {
+            n_p0
+        };
+        e.q[0][k] = if !on {
+            q0
+        } else if strong {
+            s_q0
+        } else {
+            n_q0
+        };
+    }
+}
+
+// --------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------
 
@@ -562,6 +959,123 @@ mod tests {
 
     // ---------------- Table spot-checks (§8.7.2.2 / Table 8-16,
     // §8.7.2.3 / Table 8-17). ----------------
+
+    /// [`EdgeFilter`] on stored samples equals [`filter_edge`] line by
+    /// line for every bS, a sweep of qPav / offsets / bit depths and
+    /// pseudo-random sample lines, luma- and chroma-style.
+    #[test]
+    fn edge_filter_matches_per_line_filter() {
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = |m: i32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((seed >> 8) % (m as u32 + 1)) as i32
+        };
+        for bit_depth in [8u32, 10, 14] {
+            let max = (1i32 << bit_depth) - 1;
+            for bs in 0..=4u8 {
+                for qp_avg in [0, 15, 20, 28, 36, 44, 51] {
+                    for off in [-12, 0, 6] {
+                        for chroma in [false, true] {
+                            let params = FilterParams {
+                                bs,
+                                qp_avg,
+                                filter_offset_a: off,
+                                filter_offset_b: off / 2,
+                                bit_depth,
+                            };
+                            let ef = EdgeFilter::new(params, chroma);
+                            for _ in 0..64 {
+                                // A smooth-ish line so the filter fires.
+                                let base = rnd(max);
+                                let spread = rnd(24) << (bit_depth - 8);
+                                let line: [i32; 8] = std::array::from_fn(|_| {
+                                    (base + rnd(2 * spread) - spread).clamp(0, max)
+                                });
+                                let plane = if chroma { Plane::Chroma } else { Plane::Luma };
+                                let want = run_filter(plane, line, params);
+                                let mut wide: Vec<u16> = line.iter().map(|&v| v as u16).collect();
+                                if let Some(ef) = ef {
+                                    ef.lines(&mut wide, 4, 1, 8, 1);
+                                }
+                                let got: Vec<i32> = wide.iter().map(|&v| v as i32).collect();
+                                assert_eq!(
+                                    got,
+                                    want.to_vec(),
+                                    "bs {bs} qp {qp_avg} off {off} bd {bit_depth} chroma {chroma} line {line:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The line-parallel edge filters equal the per-line filter on
+    /// every lane, for mixed per-lane bS.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // lanes x sample depth
+    fn lane_filters_match_per_line_filter() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = |m: i32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((seed >> 8) % (m as u32 + 1)) as i32
+        };
+        for bit_depth in [8u32, 10, 14] {
+            let max = (1i32 << bit_depth) - 1;
+            for qp_avg in [10, 20, 28, 36, 44, 51] {
+                for chroma in [false, true] {
+                    for _ in 0..40 {
+                        let mut e = EdgeLines::new();
+                        let mut bs = [0i32; EDGE_LINES];
+                        let mut tc0 = [0i32; EDGE_LINES];
+                        let mut lines = [[0i32; 8]; EDGE_LINES];
+                        let base = rnd(max);
+                        let spread = rnd(24) << (bit_depth - 8);
+                        let Some((alpha, beta, index_a)) = edge_alpha_beta(qp_avg, 0, 0, bit_depth)
+                        else {
+                            continue;
+                        };
+                        for k in 0..EDGE_LINES {
+                            bs[k] = rnd(4);
+                            tc0[k] = tc0_from(bs[k] as u8, index_a, bit_depth);
+                            for i in 0..8 {
+                                lines[k][i] = (base + rnd(2 * spread) - spread).clamp(0, max);
+                            }
+                            for i in 0..4 {
+                                e.p[i][k] = lines[k][3 - i];
+                                e.q[i][k] = lines[k][4 + i];
+                            }
+                        }
+                        if chroma {
+                            filter_lines_chroma(&mut e, &bs, &tc0, alpha, beta, max);
+                        } else {
+                            filter_lines_luma(&mut e, &bs, &tc0, alpha, beta, max);
+                        }
+                        for k in 0..EDGE_LINES {
+                            let params = FilterParams {
+                                bs: bs[k] as u8,
+                                qp_avg,
+                                filter_offset_a: 0,
+                                filter_offset_b: 0,
+                                bit_depth,
+                            };
+                            let plane = if chroma { Plane::Chroma } else { Plane::Luma };
+                            let want = run_filter(plane, lines[k], params);
+                            let got: [i32; 8] = std::array::from_fn(|i| {
+                                if i < 4 { e.p[3 - i][k] } else { e.q[i - 4][k] }
+                            });
+                            assert_eq!(
+                                got, want,
+                                "lane {k} bs {} qp {qp_avg} bd {bit_depth} chroma {chroma}",
+                                bs[k]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn alpha_table_spotcheck() {

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Decoded pictures store samples narrow: `u8` planes for 8-bit
+  components, `u16` for BitDepth 9..=14 (`sample_plane::Samples`),
+  instead of `i32` — a quarter / half of the memory traffic of every
+  reference fetch, band publish and output copy; an 8-bit plane is
+  handed to the output frame as-is. Arithmetic stays in `i32` on the
+  per-block working buffers.
+- §8.7 deblocking of non-MBAFF pictures filters each macroblock edge
+  line-parallel (all 16 / 8 lines at once, branch-free, vectorised)
+  with α / β / tC0 derived once per edge, and derives bS with
+  whole-edge shortcuts for intra sides, a raster non-zero mask and one
+  motion comparison per edge between uniformly moving macroblocks.
+  Single-threaded 1080p High-profile decode: 17.0 → 14.1 G cycles.
+
 ### Added
 
 - `Decoder::output_params` / `output_params_generation` (oxideav-core

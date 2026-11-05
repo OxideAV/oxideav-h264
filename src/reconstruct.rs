@@ -35,8 +35,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::deblock::{
-    BsInputs, EdgeSamples, FilterParams, Plane, alpha_from_index, beta_from_index,
-    derive_boundary_strength, filter_edge, tc0_from,
+    BsInputs, EDGE_LINES, EdgeFilter, EdgeLines, EdgeSamples, FilterParams, Plane,
+    alpha_from_index, beta_from_index, derive_boundary_strength, edge_alpha_beta, filter_edge,
+    filter_lines_chroma, filter_lines_luma, tc0_from, tc0_lanes,
 };
 use crate::inter_pred::{BiPredMode, WeightedEntry, weighted_pred_explicit};
 use crate::intra_pred::{
@@ -53,7 +54,7 @@ use crate::mv_deriv::{
 use crate::picture::Picture;
 use crate::pps::Pps;
 use crate::ref_store::RefPicProvider;
-use crate::simd::interpolate_luma;
+use crate::sample_plane::{Sample, Samples, SamplesMut, SamplesRef};
 use crate::slice_data::SliceData;
 use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sp_transform::{
@@ -598,7 +599,7 @@ impl MbWriter {
             let wu = w as usize;
             for y in 0..16usize {
                 let o = (self.mb_py as usize + y * ys as usize) * wu + self.mb_px as usize;
-                pic.luma[o..o + 16].copy_from_slice(&samples[y * 16..y * 16 + 16]);
+                pic.luma.write_i32(o, &samples[y * 16..y * 16 + 16]);
             }
         } else {
             for y in 0..16 {
@@ -641,7 +642,7 @@ impl MbWriter {
             let dst = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
             for y in 0..h {
                 let o = (y0 as usize + y * ys as usize) * cw as usize + x0 as usize;
-                dst[o..o + w].copy_from_slice(&samples[y * w..y * w + w]);
+                dst.write_i32(o, &samples[y * w..y * w + w]);
             }
         } else {
             for y in 0..h {
@@ -1057,9 +1058,9 @@ fn synth_mb_inter<R: RefPicProvider>(
 /// worker of the inter sample stage.
 struct MbRowBand<'a> {
     mb_y: u32,
-    luma: &'a mut [i32],
-    cb: &'a mut [i32],
-    cr: &'a mut [i32],
+    luma: SamplesMut<'a>,
+    cb: SamplesMut<'a>,
+    cr: SamplesMut<'a>,
 }
 
 /// Whether [`reconstruct_slice_no_deblock_threaded`] can split this
@@ -1218,18 +1219,18 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
     }
     let mut bands: Vec<Option<MbRowBand<'_>>> = Vec::new();
     {
-        let mut luma_rest: &mut [i32] = &mut pic.luma;
-        let mut cb_rest: &mut [i32] = &mut pic.cb;
-        let mut cr_rest: &mut [i32] = &mut pic.cr;
+        let mut luma_rest = pic.luma.as_mut();
+        let mut cb_rest = pic.cb.as_mut();
+        let mut cr_rest = pic.cr.as_mut();
         let mut consumed_rows = 0u32;
         for (mb_y, _) in &rows {
             let skip = (*mb_y - consumed_rows) as usize;
-            luma_rest = &mut std::mem::take(&mut luma_rest)[skip * 16 * width..];
-            cb_rest = &mut std::mem::take(&mut cb_rest)[skip * mbh_c * cw..];
-            cr_rest = &mut std::mem::take(&mut cr_rest)[skip * mbh_c * cw..];
-            let (l, lr) = std::mem::take(&mut luma_rest).split_at_mut(16 * width);
-            let (b, br) = std::mem::take(&mut cb_rest).split_at_mut(mbh_c * cw);
-            let (r, rr) = std::mem::take(&mut cr_rest).split_at_mut(mbh_c * cw);
+            luma_rest = luma_rest.into_tail(skip * 16 * width);
+            cb_rest = cb_rest.into_tail(skip * mbh_c * cw);
+            cr_rest = cr_rest.into_tail(skip * mbh_c * cw);
+            let (l, lr) = luma_rest.split_at(16 * width);
+            let (b, br) = cb_rest.split_at(mbh_c * cw);
+            let (r, rr) = cr_rest.split_at(mbh_c * cw);
             luma_rest = lr;
             cb_rest = br;
             cr_rest = rr;
@@ -1258,7 +1259,7 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
                     if k >= rows.len() {
                         break;
                     }
-                    let band = bands.lock().unwrap_or_else(|e| e.into_inner())[k]
+                    let mut band = bands.lock().unwrap_or_else(|e| e.into_inner())[k]
                         .take()
                         .expect("row band taken once");
                     debug_assert_eq!(band.mb_y, rows[k].0);
@@ -1284,15 +1285,20 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
                         }
                         let x0 = job.mb_x as usize * 16;
                         for y in 0..16 {
-                            band.luma[y * width + x0..y * width + x0 + 16]
-                                .copy_from_slice(&scratch.luma[y * 16..y * 16 + 16]);
+                            band.luma
+                                .slice_mut(y * width + x0..y * width + x0 + 16)
+                                .copy_from(scratch.luma.slice(y * 16..y * 16 + 16));
                         }
                         let cx0 = job.mb_x as usize * mbw_c;
                         for y in 0..mbh_c {
                             let d = y * cw + cx0;
                             let s = y * mbw_c;
-                            band.cb[d..d + mbw_c].copy_from_slice(&scratch.cb[s..s + mbw_c]);
-                            band.cr[d..d + mbw_c].copy_from_slice(&scratch.cr[s..s + mbw_c]);
+                            band.cb
+                                .slice_mut(d..d + mbw_c)
+                                .copy_from(scratch.cb.slice(s..s + mbw_c));
+                            band.cr
+                                .slice_mut(d..d + mbw_c)
+                                .copy_from(scratch.cr.slice(s..s + mbw_c));
                         }
                     }
                 }
@@ -5884,7 +5890,9 @@ fn predict_partition_with<R: RefPicProvider>(
                 rp.height_in_samples,
                 rp.pic_order_cnt,
                 fld,
-                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+                (0..rp.luma.len().min(64))
+                    .map(|i| rp.luma.get(i) as u32)
+                    .sum::<u32>()
             );
         }
         mc_luma_partition(
@@ -5910,7 +5918,9 @@ fn predict_partition_with<R: RefPicProvider>(
                 rp.height_in_samples,
                 rp.pic_order_cnt,
                 fld,
-                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+                (0..rp.luma.len().min(64))
+                    .map(|i| rp.luma.get(i) as u32)
+                    .sum::<u32>()
             );
         }
         mc_luma_partition(
@@ -6538,14 +6548,14 @@ fn mc_luma_partition(
     // §8.4.2.1 — field view of a stored frame: rows of one parity,
     // exposed zero-copy as a doubled-stride half-height plane.
     let stride = ref_pic.width_in_samples as usize;
-    let (src, src_stride, src_h): (&[i32], usize, usize) = match field {
+    let (src, src_stride, src_h): (SamplesRef<'_>, usize, usize) = match field {
         Some(parity) => (
-            &ref_pic.luma[(parity as usize) * stride..],
+            ref_pic.luma.as_ref().slice_from((parity as usize) * stride),
             stride * 2,
             (ref_pic.height_in_samples as usize) / 2,
         ),
         None => (
-            &ref_pic.luma[..],
+            ref_pic.luma.as_ref(),
             stride,
             ref_pic.height_in_samples as usize,
         ),
@@ -6662,7 +6672,7 @@ fn mc_chroma_partition(
         let src = match planes {
             Some(p) => p.chroma_src(i as u8),
             None => crate::mc::PlaneSrc::Flat {
-                data: &plane[row_off..],
+                data: plane.as_ref().slice_from(row_off),
                 stride: src_stride,
                 width: cw,
                 height: src_h,
@@ -6732,38 +6742,29 @@ fn mc_chroma_partition_444(
 
     // §8.4.2.2.1 — luma interpolation process applied to each chroma
     // plane (the same 6-tap kernel `mc_luma_partition` drives).
-    interpolate_luma(
-        &ref_pic.cb[row_off..],
-        src_stride,
-        cw,
-        src_h,
-        int_x,
-        int_y,
-        x_frac,
-        y_frac,
-        w,
-        h,
-        bit_depth,
-        dst_cb,
-        w as usize,
-    )
-    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
-    interpolate_luma(
-        &ref_pic.cr[row_off..],
-        src_stride,
-        cw,
-        src_h,
-        int_x,
-        int_y,
-        x_frac,
-        y_frac,
-        w,
-        h,
-        bit_depth,
-        dst_cr,
-        w as usize,
-    )
-    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+    if w == 0 || h == 0 || w > 16 || h > 16 || !w.is_multiple_of(4) || !h.is_multiple_of(4) {
+        return Err(ReconstructError::IntraPredOutOfBounds);
+    }
+    for (plane, dst) in [(&ref_pic.cb, dst_cb), (&ref_pic.cr, dst_cr)] {
+        let src = crate::mc::PlaneSrc::Flat {
+            data: plane.as_ref().slice_from(row_off),
+            stride: src_stride,
+            width: cw,
+            height: src_h,
+        };
+        crate::mc::luma(
+            &src,
+            int_x,
+            int_y,
+            x_frac,
+            y_frac,
+            w as usize,
+            h as usize,
+            (1i32 << bit_depth) - 1,
+            dst,
+            w as usize,
+        );
+    }
     Ok(())
 }
 
@@ -10269,9 +10270,9 @@ fn mv_delta_below_4(a: (i16, i16), b: (i16, i16), field_units: bool) -> bool {
 /// `4 / SubHeightC` chroma rows of each chroma plane, once no later
 /// edge of its own row can change them.
 struct DeblockHalo {
-    luma: [i32; 64],
-    cb: [i32; 32],
-    cr: [i32; 32],
+    luma: Samples,
+    cb: Samples,
+    cr: Samples,
 }
 
 /// Per-row count of published [`DeblockHalo`] columns, with a condvar
@@ -10342,9 +10343,9 @@ impl RowProgress {
 
 /// One macroblock row's own sample rows of the picture.
 struct DeblockRowSink<'a> {
-    luma: &'a mut [i32],
-    cb: &'a mut [i32],
-    cr: &'a mut [i32],
+    luma: SamplesMut<'a>,
+    cb: SamplesMut<'a>,
+    cr: SamplesMut<'a>,
     luma_bs: &'a mut [u8],
 }
 
@@ -10353,9 +10354,9 @@ struct DeblockRowSink<'a> {
 /// back into the picture after every row is done.
 struct DeblockRowBack {
     row: usize,
-    luma: Vec<i32>,
-    cb: Vec<i32>,
-    cr: Vec<i32>,
+    luma: Samples,
+    cb: Samples,
+    cr: Samples,
 }
 
 /// §8.7 — deblock a non-MBAFF picture (ChromaArrayType 0, 1 or 2) by
@@ -10417,14 +10418,14 @@ fn deblock_rows_threaded(
     let mut luma_bs = vec![BS_NOT_DERIVED; mb_w * mb_h * 32];
     let mut sinks: Vec<Option<DeblockRowSink<'_>>> = Vec::with_capacity(mb_h);
     {
-        let mut l_rest: &mut [i32] = &mut pic.luma;
-        let mut b_rest: &mut [i32] = &mut pic.cb;
-        let mut r_rest: &mut [i32] = &mut pic.cr;
+        let mut l_rest = pic.luma.as_mut();
+        let mut b_rest = pic.cb.as_mut();
+        let mut r_rest = pic.cr.as_mut();
         let mut s_rest: &mut [u8] = &mut luma_bs;
         for _ in 0..mb_h {
-            let (l, lr) = std::mem::take(&mut l_rest).split_at_mut(16 * wu);
-            let (b, br) = std::mem::take(&mut b_rest).split_at_mut(mbh_c * cw);
-            let (r, rr) = std::mem::take(&mut r_rest).split_at_mut(mbh_c * cw);
+            let (l, lr) = l_rest.split_at(16 * wu);
+            let (b, br) = b_rest.split_at(mbh_c * cw);
+            let (r, rr) = r_rest.split_at(mbh_c * cw);
             let (s, sr) = std::mem::take(&mut s_rest).split_at_mut(mb_w * 32);
             l_rest = lr;
             b_rest = br;
@@ -10468,38 +10469,36 @@ fn deblock_rows_threaded(
                     if r >= mb_h {
                         break;
                     }
-                    let sink = sinks.lock().unwrap_or_else(|e| e.into_inner())[r]
+                    let mut sink = sinks.lock().unwrap_or_else(|e| e.into_inner())[r]
                         .take()
                         .expect("row sink taken once");
-                    band.luma[4 * wu..].copy_from_slice(sink.luma);
+                    band.luma.copy_from(4 * wu, sink.luma.slice(0..16 * wu));
                     if has_chroma {
-                        band.cb[halo_c * cw..(halo_c + mbh_c) * cw].copy_from_slice(sink.cb);
-                        band.cr[halo_c * cw..(halo_c + mbh_c) * cw].copy_from_slice(sink.cr);
+                        band.cb.copy_from(halo_c * cw, sink.cb.slice(0..mbh_c * cw));
+                        band.cr.copy_from(halo_c * cw, sink.cr.slice(0..mbh_c * cw));
                     }
                     let y_base = 16 * r as i32 - 4;
                     let yc_base = (mbh_c * r) as i32 - halo_c as i32;
                     let mut back = DeblockRowBack {
                         row: r,
-                        luma: vec![0; 4 * wu],
-                        cb: vec![0; halo_c * cw],
-                        cr: vec![0; halo_c * cw],
+                        luma: Samples::zeroed(4 * wu, bit_depth_y),
+                        cb: Samples::zeroed(halo_c * cw, bit_depth_c),
+                        cr: Samples::zeroed(halo_c * cw, bit_depth_c),
                     };
                     let publish = |band: &Picture, x: usize| {
                         let mut halo = DeblockHalo {
-                            luma: [0; 64],
-                            cb: [0; 32],
-                            cr: [0; 32],
+                            luma: Samples::zeroed(64, bit_depth_y),
+                            cb: Samples::zeroed(32, bit_depth_c),
+                            cr: Samples::zeroed(32, bit_depth_c),
                         };
                         for k in 0..4 {
                             let o = (16 + k) * wu + 16 * x;
-                            halo.luma[k * 16..k * 16 + 16].copy_from_slice(&band.luma[o..o + 16]);
+                            halo.luma.copy_from(k * 16, band.luma.slice(o..o + 16));
                         }
                         for k in 0..halo_c {
                             let o = (mbh_c + k) * cw + mbw_c * x;
-                            halo.cb[k * mbw_c..(k + 1) * mbw_c]
-                                .copy_from_slice(&band.cb[o..o + mbw_c]);
-                            halo.cr[k * mbw_c..(k + 1) * mbw_c]
-                                .copy_from_slice(&band.cr[o..o + mbw_c]);
+                            halo.cb.copy_from(k * mbw_c, band.cb.slice(o..o + mbw_c));
+                            halo.cr.copy_from(k * mbw_c, band.cr.slice(o..o + mbw_c));
                         }
                         let _ = halos[r * mb_w + x].set(halo);
                         // Wake the row below every few columns only.
@@ -10515,15 +10514,14 @@ fn deblock_rows_threaded(
                             let halo = halos[(r - 1) * mb_w + x].get().expect("published halo");
                             for k in 0..4 {
                                 let o = k * wu + 16 * x;
-                                band.luma[o..o + 16]
-                                    .copy_from_slice(&halo.luma[k * 16..k * 16 + 16]);
+                                band.luma.copy_from(o, halo.luma.slice(k * 16..k * 16 + 16));
                             }
                             for k in 0..halo_c {
                                 let o = k * cw + mbw_c * x;
-                                band.cb[o..o + mbw_c]
-                                    .copy_from_slice(&halo.cb[k * mbw_c..(k + 1) * mbw_c]);
-                                band.cr[o..o + mbw_c]
-                                    .copy_from_slice(&halo.cr[k * mbw_c..(k + 1) * mbw_c]);
+                                band.cb
+                                    .copy_from(o, halo.cb.slice(k * mbw_c..(k + 1) * mbw_c));
+                                band.cr
+                                    .copy_from(o, halo.cr.slice(k * mbw_c..(k + 1) * mbw_c));
                             }
                         }
                         let bs = &mut sink.luma_bs[x * 32..x * 32 + 32];
@@ -10570,12 +10568,12 @@ fn deblock_rows_threaded(
                             // Column x's halo rows are final for this row.
                             for k in 0..4 {
                                 let o = k * wu + 16 * x;
-                                back.luma[o..o + 16].copy_from_slice(&band.luma[o..o + 16]);
+                                back.luma.copy_from(o, band.luma.slice(o..o + 16));
                             }
                             for k in 0..halo_c {
                                 let o = k * cw + mbw_c * x;
-                                back.cb[o..o + mbw_c].copy_from_slice(&band.cb[o..o + mbw_c]);
-                                back.cr[o..o + mbw_c].copy_from_slice(&band.cr[o..o + mbw_c]);
+                                back.cb.copy_from(o, band.cb.slice(o..o + mbw_c));
+                                back.cr.copy_from(o, band.cr.slice(o..o + mbw_c));
                             }
                         }
                         if x >= 1 {
@@ -10583,12 +10581,12 @@ fn deblock_rows_threaded(
                         }
                     }
                     publish(&band, mb_w - 1);
-                    sink.luma.copy_from_slice(&band.luma[4 * wu..]);
+                    sink.luma.copy_from(band.luma.slice(4 * wu..20 * wu));
                     if has_chroma {
                         sink.cb
-                            .copy_from_slice(&band.cb[halo_c * cw..(halo_c + mbh_c) * cw]);
+                            .copy_from(band.cb.slice(halo_c * cw..(halo_c + mbh_c) * cw));
                         sink.cr
-                            .copy_from_slice(&band.cr[halo_c * cw..(halo_c + mbh_c) * cw]);
+                            .copy_from(band.cr.slice(halo_c * cw..(halo_c + mbh_c) * cw));
                     }
                     if r > 0 {
                         backs.lock().unwrap_or_else(|e| e.into_inner()).push(back);
@@ -10600,11 +10598,11 @@ fn deblock_rows_threaded(
     // The halo rows each row's top edges modified, over the row above.
     for back in backs.into_inner().unwrap_or_else(|e| e.into_inner()) {
         let y0 = 16 * back.row - 4;
-        pic.luma[y0 * wu..(y0 + 4) * wu].copy_from_slice(&back.luma);
+        pic.luma.copy_from(y0 * wu, back.luma.as_ref());
         if has_chroma {
             let c0 = mbh_c * back.row - halo_c;
-            pic.cb[c0 * cw..(c0 + halo_c) * cw].copy_from_slice(&back.cb);
-            pic.cr[c0 * cw..(c0 + halo_c) * cw].copy_from_slice(&back.cr);
+            pic.cb.copy_from(c0 * cw, back.cb.as_ref());
+            pic.cr.copy_from(c0 * cw, back.cr.as_ref());
         }
     }
 }
@@ -10969,6 +10967,12 @@ fn deblock_luma_mb_frame(
     if !q_info.available {
         return;
     }
+    // §8.7.2.1 — bS of every edge segment. An intra / SP / SI side
+    // settles a whole edge (bS 4 on a macroblock edge of a frame, or a
+    // vertical one of a field; 3 otherwise); else a segment takes bS 2
+    // when either 4x4 block has non-zero coefficients, else 1 when the
+    // blocks' references / motion differ, else 0.
+    let q_nz = raster_nonzero_mask(q_info.luma_nonzero_4x4);
     let mut q_uniform: Option<bool> = None;
     for vertical in [true, false] {
         // The neighbouring macroblock across this direction's MB edge.
@@ -10991,6 +10995,11 @@ fn deblock_luma_mb_frame(
                 },
             )
         };
+        // Segments of each edge inside the picture.
+        let along0 = (if vertical { mb_y } else { mb_x }) * 16;
+        let segs = ((if vertical { h } else { w }) - along0 + 3)
+            .div_euclid(4)
+            .clamp(0, 4);
         for edge_off in 0..4i32 {
             let edge = edge_mb * 16 + edge_off * 4;
             if edge == 0 || edge >= if vertical { w } else { h } {
@@ -11008,77 +11017,167 @@ fn deblock_luma_mb_frame(
             if !is_mb_edge && (edge_off == 1 || edge_off == 3) && q_info.transform_size_8x8_flag {
                 continue;
             }
-            let p_off = if is_mb_edge { 3 } else { edge_off - 1 } as u32;
-            for seg in 0..4i32 {
-                let along = (if vertical { mb_y } else { mb_x }) * 16 + seg * 4;
-                if along >= if vertical { h } else { w } {
-                    break;
+            let slot = |seg: i32| luma_bs_index(0, 0, 0, !vertical, edge_off, seg);
+            if p_info.is_intra || q_info.is_intra || p_info.in_sp_si_slice || q_info.in_sp_si_slice
+            {
+                let bs = if is_mb_edge && (!field_pic || vertical) {
+                    4
+                } else {
+                    3
+                };
+                for seg in 0..segs {
+                    luma_bs[slot(seg)] = bs;
                 }
+                continue;
+            }
+            let p_nz = if is_mb_edge {
+                raster_nonzero_mask(p_info.luma_nonzero_4x4)
+            } else {
+                q_nz
+            };
+            let p_off = if is_mb_edge { 3 } else { edge_off - 1 } as u32;
+            // Motion of an edge between two macroblocks whose 4x4
+            // blocks all move alike is the same on every segment.
+            let mut uniform_edge: Option<bool> = None;
+            let both_uniform = if is_mb_edge {
+                uniform_motion(p_info) && *q_uniform.get_or_insert_with(|| uniform_motion(q_info))
+            } else {
+                *q_uniform.get_or_insert_with(|| uniform_motion(q_info))
+            };
+            for seg in 0..segs {
                 // 4x4 block coordinates (x, y) inside the p / q MBs.
                 let (pbx, pby, qbx, qby) = if vertical {
                     (p_off, seg as u32, edge_off as u32, seg as u32)
                 } else {
                     (seg as u32, p_off, seg as u32, edge_off as u32)
                 };
-                let p_blk4_z = blk4_raster_index(pbx as u8, pby as u8) as usize;
-                let q_blk4_z = blk4_raster_index(qbx as u8, qby as u8) as usize;
-                let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
-                let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
-                    && !(!is_mb_edge && *q_uniform.get_or_insert_with(|| uniform_motion(q_info)))
-                    && different_ref_or_mv_luma(
-                        p_info,
-                        q_info,
-                        pbx * 4,
-                        pby * 4,
-                        qbx * 4,
-                        qby * 4,
-                        field_pic,
-                    );
-                let bs = derive_boundary_strength(BsInputs {
-                    p_is_intra: p_info.is_intra,
-                    q_is_intra: q_info.is_intra,
-                    is_mb_edge,
-                    is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
-                    either_has_nonzero_coeffs: p_has_nz || q_has_nz,
-                    different_ref_or_mv: diff_ref_mv,
-                    mixed_mode_edge: false,
-                    vertical_edge: vertical,
-                    mbaff_or_field: field_pic,
-                    both_in_frame_mbs: !field_pic,
-                });
-                luma_bs[luma_bs_index(0, 0, 0, !vertical, edge_off, seg)] = bs;
-                if bs == 0 {
-                    continue;
-                }
-                if vertical {
-                    filter_vertical_edge_luma(
-                        pic,
-                        edge,
-                        along - y_base,
-                        bs,
-                        p_info.qp_y,
-                        q_info.qp_y,
-                        alpha_off,
-                        beta_off,
-                        bit_depth,
-                    );
+                let nz = (p_nz >> (pby * 4 + pbx)) & 1 != 0 || (q_nz >> (qby * 4 + qbx)) & 1 != 0;
+                let bs = if nz {
+                    2
+                } else if !is_mb_edge && both_uniform {
+                    0
                 } else {
-                    filter_horizontal_edge_luma(
-                        pic,
-                        along,
-                        edge - y_base,
-                        bs,
-                        p_info.qp_y,
-                        q_info.qp_y,
-                        alpha_off,
-                        beta_off,
-                        bit_depth,
-                    );
-                }
+                    let differ = |pbx: u32, pby: u32, qbx: u32, qby: u32| {
+                        different_ref_or_mv_luma(
+                            p_info,
+                            q_info,
+                            pbx * 4,
+                            pby * 4,
+                            qbx * 4,
+                            qby * 4,
+                            field_pic,
+                        )
+                    };
+                    let d = if both_uniform {
+                        *uniform_edge.get_or_insert_with(|| differ(pbx, pby, qbx, qby))
+                    } else {
+                        differ(pbx, pby, qbx, qby)
+                    };
+                    u8::from(d)
+                };
+                luma_bs[slot(seg)] = bs;
             }
         }
     }
+    // §8.7.2 — filter the edges whose bS the walk above recorded:
+    // vertical edges left to right, then horizontal top to bottom.
+    let stride = pic.width_in_samples as usize;
+    let left_qp = (mb_x > 0).then(|| grid.info[addr - 1].qp_y);
+    let top_qp = (mb_y > 0).then(|| grid.info[addr - mb_w as usize].qp_y);
+    let edges = FrameMbEdges {
+        luma_bs,
+        q_qp: q_info.qp_y,
+        left_qp,
+        top_qp,
+        alpha_off,
+        beta_off,
+        bit_depth,
+        max: (1i32 << bit_depth) - 1,
+    };
+    let x0 = mb_x as usize * 16;
+    let y0 = (mb_y * 16 - y_base) as usize;
+    match &mut pic.luma {
+        Samples::U8(v) => edges.filter_luma(v, stride, x0, y0),
+        Samples::U16(v) => edges.filter_luma(v, stride, x0, y0),
+    }
+}
+
+/// The recorded luma bS of one macroblock of a non-MBAFF picture and
+/// the QP_Y values its edges average (§8.7.2.2 eq. 8-453), for the
+/// line-parallel edge filters.
+struct FrameMbEdges<'a> {
+    luma_bs: &'a [u8],
+    q_qp: i32,
+    /// QP_Y of the left / upper macroblock (`None` at the picture edge).
+    left_qp: Option<i32>,
+    top_qp: Option<i32>,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+    max: i32,
+}
+
+impl FrameMbEdges<'_> {
+    /// The bS of segment `seg` of edge `edge` (`horizontal` direction),
+    /// 0 when the walk did not record it.
+    #[inline]
+    fn bs(&self, horizontal: bool, edge: i32, seg: i32) -> i32 {
+        match self.luma_bs[luma_bs_index(0, 0, 0, horizontal, edge, seg)] {
+            BS_NOT_DERIVED => 0,
+            b => b as i32,
+        }
+    }
+
+    /// Luma: the macroblock's samples start at `buf[y0 * stride + x0]`.
+    fn filter_luma<S: Sample>(&self, buf: &mut [S], stride: usize, x0: usize, y0: usize) {
+        for horizontal in [false, true] {
+            for edge in 0..4i32 {
+                let mut bs = [0i32; EDGE_LINES];
+                for (k, b) in bs.iter_mut().enumerate() {
+                    *b = self.bs(horizontal, edge, k as i32 / 4);
+                }
+                if bs.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                let p_qp = match (edge, horizontal) {
+                    (0, false) => self.left_qp,
+                    (0, true) => self.top_qp,
+                    _ => Some(self.q_qp),
+                };
+                let Some(p_qp) = p_qp else { continue };
+                let qp_avg = (p_qp + self.q_qp + 1) >> 1;
+                let Some((alpha, beta, index_a)) =
+                    edge_alpha_beta(qp_avg, self.alpha_off, self.beta_off, self.bit_depth)
+                else {
+                    continue;
+                };
+                let tc0: [i32; EDGE_LINES] = tc0_lanes(&bs, index_a, self.bit_depth);
+                let (q0, across, along) = if horizontal {
+                    ((y0 + 4 * edge as usize) * stride + x0, stride, 1)
+                } else {
+                    (y0 * stride + x0 + 4 * edge as usize, 1, stride)
+                };
+                let mut lines = EdgeLines::new();
+                lines.load(buf, q0, across, along, EDGE_LINES, 4);
+                filter_lines_luma(&mut lines, &bs, &tc0, alpha, beta, self.max);
+                lines.store(buf, q0, across, along, EDGE_LINES, 3);
+            }
+        }
+    }
+}
+
+/// A macroblock's `luma_nonzero_4x4` (bit = Figure 6-10 4x4 block
+/// index) re-laid in raster order: bit `by * 4 + bx` for the 4x4 block
+/// at (`bx`, `by`).
+#[inline]
+fn raster_nonzero_mask(z: u16) -> u16 {
+    let mut r = 0u16;
+    for (blk, &(x, y)) in LUMA_4X4_XY.iter().enumerate() {
+        if (z >> blk) & 1 != 0 {
+            r |= 1 << ((y / 4) * 4 + x / 4);
+        }
+    }
+    r
 }
 
 /// §8.7.2.1 — whether every 4x4 block of a macroblock has the same
@@ -11195,6 +11294,25 @@ fn deblock_chroma_mb(
     mb_field_flags: &[bool],
     luma_bs: &[u8],
 ) {
+    if !mbaff_frame_flag && matches!(pic.chroma_array_type, 1 | 2) {
+        deblock_chroma_mb_frame(
+            pic,
+            y_base,
+            cw,
+            ch,
+            grid,
+            plane,
+            mb_x,
+            mb_y,
+            alpha_off,
+            beta_off,
+            bit_depth,
+            if plane == 0 { cb_offset } else { cr_offset },
+            field_pic,
+            luma_bs,
+        );
+        return;
+    }
     // §7.4.2.1.1 eq. 7-6 / §8.5.8 eq. 8-311 — QpBdOffsetC = 6 *
     // bit_depth_chroma_minus8. Threaded into chroma_qp_avg so the §8.7.2
     // QPC derivation runs with the extended `−QpBdOffsetC..=51` qPI
@@ -11499,6 +11617,172 @@ fn deblock_chroma_mb(
             }
         }
     }
+}
+
+/// [`deblock_chroma_mb`] for a picture that is not an MBAFF frame
+/// (ChromaArrayType 1 or 2): every chroma edge segment takes the bS of
+/// its luma segment (§8.7.2.1, last paragraph) as the macroblock's luma
+/// walk recorded it in `luma_bs`; a luma edge the walk skips because of
+/// `transform_size_8x8_flag` (a 4:2:2 chroma edge at luma rows 4 / 12)
+/// derives its bS here. The edges are filtered line-parallel.
+#[allow(clippy::too_many_arguments)]
+fn deblock_chroma_mb_frame(
+    pic: &mut Picture,
+    y_base: i32,
+    cw: i32,
+    ch: i32,
+    grid: &MbGrid,
+    plane: u8,
+    mb_x: i32,
+    mb_y: i32,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+    qp_offset: i32,
+    field_pic: bool,
+    luma_bs: &[u8],
+) {
+    let mb_w = grid.width_in_mbs as i32;
+    let mb_h = grid.height_in_mbs as i32;
+    if mb_x < 0 || mb_y < 0 || mb_x >= mb_w || mb_y >= mb_h {
+        return;
+    }
+    let addr = (mb_y * mb_w + mb_x) as usize;
+    let q_info = &grid.info[addr];
+    if !q_info.available {
+        return;
+    }
+    let qp_bd_offset_c = qp_bd_offset(bit_depth.saturating_sub(8));
+    let sub_h = if pic.chroma_array_type == 1 { 2 } else { 1 };
+    let mbh_c = 16 / sub_h;
+    let stride = pic.chroma_width() as usize;
+    let max = (1i32 << bit_depth) - 1;
+    let x0 = mb_x as usize * 8;
+    let y0 = (mb_y * mbh_c - y_base) as usize;
+    let mut buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+    // Edge list: (horizontal, chroma edge offset, luma edge index).
+    let mut edges: [(bool, i32, i32); 6] = [(false, 0, 0); 6];
+    let mut n_edges = 0;
+    for off in [0, 4] {
+        edges[n_edges] = (false, off, off * 2 / 4);
+        n_edges += 1;
+    }
+    for off in (0..mbh_c).step_by(4) {
+        edges[n_edges] = (true, off, off * sub_h / 4);
+        n_edges += 1;
+    }
+    for &(horizontal, off, luma_edge) in &edges[..n_edges] {
+        let pos = if horizontal {
+            mb_y * mbh_c + off
+        } else {
+            mb_x * 8 + off
+        };
+        if pos == 0 || pos >= if horizontal { ch } else { cw } {
+            continue;
+        }
+        let neighbour = match (off, horizontal) {
+            (0, false) => grid.info.get(addr - 1),
+            (0, true) => grid.info.get(addr - mb_w as usize),
+            _ => Some(q_info),
+        };
+        let Some(p_info) = neighbour.filter(|p| p.available) else {
+            continue;
+        };
+        let lines = if horizontal { 8 } else { mbh_c as usize };
+        let mut bs = [0i32; EDGE_LINES];
+        for (k, b) in bs.iter_mut().enumerate().take(lines) {
+            // The luma segment of chroma line k (SubWidthC = 2 across
+            // a horizontal edge, SubHeightC down a vertical one).
+            let seg = if horizontal {
+                k / 2
+            } else {
+                k * sub_h as usize / 4
+            } as i32;
+            let recorded = luma_bs[luma_bs_index(0, 0, 0, horizontal, luma_edge, seg)];
+            *b = if recorded != BS_NOT_DERIVED {
+                recorded as i32
+            } else if off != 0 {
+                // An internal luma edge skipped for the 8x8 transform.
+                let (pbx, pby, qbx, qby) = if horizontal {
+                    (
+                        seg as u32,
+                        luma_edge as u32 - 1,
+                        seg as u32,
+                        luma_edge as u32,
+                    )
+                } else {
+                    (
+                        luma_edge as u32 - 1,
+                        seg as u32,
+                        luma_edge as u32,
+                        seg as u32,
+                    )
+                };
+                internal_edge_bs(q_info, pbx, pby, qbx, qby, !horizontal, field_pic) as i32
+            } else {
+                0
+            };
+        }
+        if bs.iter().all(|&b| b == 0) {
+            continue;
+        }
+        let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, qp_offset, qp_bd_offset_c);
+        let Some((alpha, beta, index_a)) = edge_alpha_beta(qp_avg, alpha_off, beta_off, bit_depth)
+        else {
+            continue;
+        };
+        let tc0 = tc0_lanes(&bs, index_a, bit_depth);
+        let (q0, across, along) = if horizontal {
+            ((y0 + off as usize) * stride + x0, stride, 1)
+        } else {
+            (y0 * stride + x0 + off as usize, 1, stride)
+        };
+        let mut e = EdgeLines::new();
+        match &mut buf {
+            Samples::U8(v) => {
+                e.load(v, q0, across, along, lines, 2);
+                filter_lines_chroma(&mut e, &bs, &tc0, alpha, beta, max);
+                e.store(v, q0, across, along, lines, 1);
+            }
+            Samples::U16(v) => {
+                e.load(v, q0, across, along, lines, 2);
+                filter_lines_chroma(&mut e, &bs, &tc0, alpha, beta, max);
+                e.store(v, q0, across, along, lines, 1);
+            }
+        }
+    }
+}
+
+/// §8.7.2.1 — bS of a luma edge segment between the 4x4 blocks
+/// (`pbx`, `pby`) and (`qbx`, `qby`) of one macroblock of a non-MBAFF
+/// picture (an internal edge).
+fn internal_edge_bs(
+    info: &MbInfo,
+    pbx: u32,
+    pby: u32,
+    qbx: u32,
+    qby: u32,
+    vertical: bool,
+    field_pic: bool,
+) -> u8 {
+    let p_blk4 = blk4_raster_index(pbx as u8, pby as u8) as usize;
+    let q_blk4 = blk4_raster_index(qbx as u8, qby as u8) as usize;
+    let p_has_nz = (info.luma_nonzero_4x4 >> p_blk4) & 1 == 1;
+    let q_has_nz = (info.luma_nonzero_4x4 >> q_blk4) & 1 == 1;
+    let diff_ref_mv = !(info.is_intra || p_has_nz || q_has_nz)
+        && different_ref_or_mv_luma(info, info, pbx * 4, pby * 4, qbx * 4, qby * 4, field_pic);
+    derive_boundary_strength(BsInputs {
+        p_is_intra: info.is_intra,
+        q_is_intra: info.is_intra,
+        is_mb_edge: false,
+        is_sp_or_si: info.in_sp_si_slice,
+        either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+        different_ref_or_mv: diff_ref_mv,
+        mixed_mode_edge: false,
+        vertical_edge: vertical,
+        mbaff_or_field: field_pic,
+        both_in_frame_mbs: !field_pic,
+    })
 }
 
 /// §8.5.8 / §8.7.2.2 eq. 8-453 — (QPc(p) + QPc(q) + 1) >> 1 for chroma.
@@ -11831,6 +12115,22 @@ fn filter_vertical_edge_plane_luma_style(
         bit_depth,
     };
     let pic_h = pic.height_in_samples as i32;
+    let (cw, ch) = (pic.chroma_width() as i32, pic.chroma_height() as i32);
+    if edge_x >= 4 && edge_x + 4 <= cw && y0 >= 0 && y0 + 4 <= ch {
+        if let Some(ef) = EdgeFilter::new(params, false) {
+            let stride = cw as usize;
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            filter_stored_lines(
+                buf,
+                ef,
+                y0 as usize * stride + edge_x as usize,
+                1,
+                stride,
+                4,
+            );
+        }
+        return;
+    }
     for dy in 0..4 {
         let y = y0 + dy;
         if y < 0 || y >= pic_h {
@@ -11893,6 +12193,22 @@ fn filter_horizontal_edge_plane_luma_style(
         bit_depth,
     };
     let pic_w = pic.width_in_samples as i32;
+    let (cw, ch) = (pic.chroma_width() as i32, pic.chroma_height() as i32);
+    if x0 >= 0 && x0 + 4 <= cw && edge_y >= 4 && edge_y + 4 <= ch {
+        if let Some(ef) = EdgeFilter::new(params, false) {
+            let stride = cw as usize;
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            filter_stored_lines(
+                buf,
+                ef,
+                edge_y as usize * stride + x0 as usize,
+                stride,
+                1,
+                4,
+            );
+        }
+        return;
+    }
     for dx in 0..4 {
         let x = x0 + dx;
         if x < 0 || x >= pic_w {
@@ -11930,6 +12246,23 @@ fn filter_horizontal_edge_plane_luma_style(
         plane_set(pic, plane, x, edge_y, q0);
         plane_set(pic, plane, x, edge_y + 1, q1);
         plane_set(pic, plane, x, edge_y + 2, q2);
+    }
+}
+
+/// §8.7.2 — filter `lines` lines of one edge segment of a stored plane
+/// (see [`EdgeFilter::lines`]).
+#[inline]
+fn filter_stored_lines(
+    plane: &mut Samples,
+    ef: EdgeFilter,
+    q0: usize,
+    across: usize,
+    along: usize,
+    lines: usize,
+) {
+    match plane {
+        Samples::U8(v) => ef.lines(v, q0, across, along, lines),
+        Samples::U16(v) => ef.lines(v, q0, across, along, lines),
     }
 }
 
@@ -11995,39 +12328,16 @@ fn filter_vertical_edge_luma(
     // edges), we can take a contiguous &mut [i32] slice and avoid the
     // per-pixel bounds-checked accessors.
     if edge_x >= 4 && edge_x + 4 <= pic_w && y0 >= 0 && y0 + 4 <= pic_h {
-        let stride = pic_w as usize;
-        let base_x = (edge_x - 4) as usize;
-        for dy in 0..4 {
-            let y = (y0 + dy) as usize;
-            let row = &mut pic.luma[y * stride + base_x..y * stride + base_x + 8];
-            let p3 = row[0];
-            let q3 = row[7];
-            let mut p2 = row[1];
-            let mut p1 = row[2];
-            let mut p0 = row[3];
-            let mut q0 = row[4];
-            let mut q1 = row[5];
-            let mut q2 = row[6];
-            filter_edge(
-                Plane::Luma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
+        if let Some(ef) = EdgeFilter::new(params, false) {
+            let stride = pic_w as usize;
+            filter_stored_lines(
+                &mut pic.luma,
+                ef,
+                y0 as usize * stride + edge_x as usize,
+                1,
+                stride,
+                4,
             );
-            row[1] = p2;
-            row[2] = p1;
-            row[3] = p0;
-            row[4] = q0;
-            row[5] = q1;
-            row[6] = q2;
         }
         return;
     }
@@ -12101,41 +12411,16 @@ fn filter_horizontal_edge_luma(
     let pic_w = pic.width_in_samples as i32;
     let pic_h = pic.height_in_samples as i32;
     if x0 >= 0 && x0 + 4 <= pic_w && edge_y >= 4 && edge_y + 4 <= pic_h {
-        let stride = pic_w as usize;
-        // For horizontal edges, the 8 samples are in 8 different rows at
-        // the same column. We split-borrow row-by-row.
-        for dx in 0..4 {
-            let x = (x0 + dx) as usize;
-            let p3_idx = ((edge_y - 4) as usize) * stride + x;
-            let q3_idx = ((edge_y + 3) as usize) * stride + x;
-            let p3 = pic.luma[p3_idx];
-            let q3 = pic.luma[q3_idx];
-            let mut p2 = pic.luma[((edge_y - 3) as usize) * stride + x];
-            let mut p1 = pic.luma[((edge_y - 2) as usize) * stride + x];
-            let mut p0 = pic.luma[((edge_y - 1) as usize) * stride + x];
-            let mut q0 = pic.luma[((edge_y) as usize) * stride + x];
-            let mut q1 = pic.luma[((edge_y + 1) as usize) * stride + x];
-            let mut q2 = pic.luma[((edge_y + 2) as usize) * stride + x];
-            filter_edge(
-                Plane::Luma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
+        if let Some(ef) = EdgeFilter::new(params, false) {
+            let stride = pic_w as usize;
+            filter_stored_lines(
+                &mut pic.luma,
+                ef,
+                edge_y as usize * stride + x0 as usize,
+                stride,
+                1,
+                4,
             );
-            pic.luma[((edge_y - 3) as usize) * stride + x] = p2;
-            pic.luma[((edge_y - 2) as usize) * stride + x] = p1;
-            pic.luma[((edge_y - 1) as usize) * stride + x] = p0;
-            pic.luma[((edge_y) as usize) * stride + x] = q0;
-            pic.luma[((edge_y + 1) as usize) * stride + x] = q1;
-            pic.luma[((edge_y + 2) as usize) * stride + x] = q2;
         }
         return;
     }
@@ -12207,39 +12492,11 @@ fn filter_chroma_vertical_rows(
     };
     // Fast in-bounds path for the chroma edge.
     if edge_x >= 4 && edge_x + 4 <= cw && y0 >= 0 && y0 + rows <= ch {
-        let stride = cw as usize;
-        let base_x = (edge_x - 4) as usize;
-        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
-        for dy in 0..rows {
-            let y = (y0 + dy) as usize;
-            let row = &mut buf[y * stride + base_x..y * stride + base_x + 8];
-            let p3 = row[0];
-            let q3 = row[7];
-            let mut p2 = row[1];
-            let mut p1 = row[2];
-            let mut p0 = row[3];
-            let mut q0 = row[4];
-            let mut q1 = row[5];
-            let mut q2 = row[6];
-            filter_edge(
-                Plane::Chroma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            // Chroma-style filter only updates p1/p0/q0/q1.
-            row[2] = p1;
-            row[3] = p0;
-            row[4] = q0;
-            row[5] = q1;
+        if let Some(ef) = EdgeFilter::new(params, true) {
+            let stride = cw as usize;
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            let q0 = y0 as usize * stride + edge_x as usize;
+            filter_stored_lines(buf, ef, q0, 1, stride, rows as usize);
         }
         return;
     }
@@ -12324,36 +12581,11 @@ fn filter_chroma_horizontal_cols(
     };
     // Fast in-bounds path.
     if x0 >= 0 && x0 + cols <= cw && edge_y >= 4 && edge_y + 4 <= ch {
-        let stride = cw as usize;
-        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
-        for dx in 0..cols {
-            let x = (x0 + dx) as usize;
-            let p3 = buf[((edge_y - 4) as usize) * stride + x];
-            let q3 = buf[((edge_y + 3) as usize) * stride + x];
-            let mut p2 = buf[((edge_y - 3) as usize) * stride + x];
-            let mut p1 = buf[((edge_y - 2) as usize) * stride + x];
-            let mut p0 = buf[((edge_y - 1) as usize) * stride + x];
-            let mut q0 = buf[((edge_y) as usize) * stride + x];
-            let mut q1 = buf[((edge_y + 1) as usize) * stride + x];
-            let mut q2 = buf[((edge_y + 2) as usize) * stride + x];
-            filter_edge(
-                Plane::Chroma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            buf[((edge_y - 2) as usize) * stride + x] = p1;
-            buf[((edge_y - 1) as usize) * stride + x] = p0;
-            buf[((edge_y) as usize) * stride + x] = q0;
-            buf[((edge_y + 1) as usize) * stride + x] = q1;
+        if let Some(ef) = EdgeFilter::new(params, true) {
+            let stride = cw as usize;
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            let q0 = edge_y as usize * stride + x0 as usize;
+            filter_stored_lines(buf, ef, q0, stride, 1, cols as usize);
         }
         return;
     }
@@ -12703,7 +12935,8 @@ pub(crate) fn ft_inter_mb<R: RefPicProvider>(
     let y0 = job.mb_y as usize * 16;
     for y in 0..16 {
         let o = (y0 + y) * width + x0;
-        pic.luma[o..o + 16].copy_from_slice(&scratch.luma[y * 16..y * 16 + 16]);
+        pic.luma
+            .copy_from(o, scratch.luma.slice(y * 16..y * 16 + 16));
     }
     if chroma_array_type == 1 || chroma_array_type == 2 {
         let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
@@ -12714,8 +12947,8 @@ pub(crate) fn ft_inter_mb<R: RefPicProvider>(
         for y in 0..mbh_c {
             let d = (cy0 + y) * cw + cx0;
             let s = y * mbw_c;
-            pic.cb[d..d + mbw_c].copy_from_slice(&scratch.cb[s..s + mbw_c]);
-            pic.cr[d..d + mbw_c].copy_from_slice(&scratch.cr[s..s + mbw_c]);
+            pic.cb.copy_from(d, scratch.cb.slice(s..s + mbw_c));
+            pic.cr.copy_from(d, scratch.cr.slice(s..s + mbw_c));
         }
     }
     Ok(())
@@ -13905,8 +14138,8 @@ mod tests {
                 info.qp_y = 46;
             }
         }
-        let before_cb: Vec<i32> = pic.cb.clone();
-        let before_cr: Vec<i32> = pic.cr.clone();
+        let before_cb: Vec<i32> = pic.cb.to_i32_vec();
+        let before_cr: Vec<i32> = pic.cr.to_i32_vec();
         deblock_plane_chroma_444(
             &mut pic,
             &grid,
@@ -13922,11 +14155,13 @@ mod tests {
         let cw = pic.chroma_width() as usize;
         let edge_changed_cb = (0..16).any(|y| {
             let row = y * cw;
-            pic.cb[row + 15] != before_cb[row + 15] || pic.cb[row + 16] != before_cb[row + 16]
+            pic.cb.get(row + 15) != before_cb[row + 15]
+                || pic.cb.get(row + 16) != before_cb[row + 16]
         });
         let edge_changed_cr = (0..16).any(|y| {
             let row = y * cw;
-            pic.cr[row + 15] != before_cr[row + 15] || pic.cr[row + 16] != before_cr[row + 16]
+            pic.cr.get(row + 15) != before_cr[row + 15]
+                || pic.cr.get(row + 16) != before_cr[row + 16]
         });
         assert!(edge_changed_cb, "Cb chroma edge not filtered at 4:4:4");
         assert!(edge_changed_cr, "Cr chroma edge not filtered at 4:4:4");
@@ -13936,7 +14171,7 @@ mod tests {
         // edges, not the whole plane.
         let interior_unchanged = (0..16).all(|y| {
             let row = y * cw;
-            pic.cb[row + 1] == before_cb[row + 1]
+            pic.cb.get(row + 1) == before_cb[row + 1]
         });
         assert!(
             interior_unchanged,

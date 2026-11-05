@@ -56,6 +56,8 @@ pub mod ref_list;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ref_store;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod sample_plane;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod scaling_list;
 pub mod sei;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API

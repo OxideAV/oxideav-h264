@@ -231,9 +231,7 @@ mod tests {
 
     fn pic(w: u32, fill: i32) -> Picture {
         let mut p = Picture::new(w, w, 1, 8, 8);
-        for v in p.luma.iter_mut() {
-            *v = fill;
-        }
+        p.luma.fill(fill);
         p
     }
 
@@ -256,8 +254,8 @@ mod tests {
         s.insert(5, pic(16, 42));
         s.insert(7, pic(16, 99));
         s.set_list_0(vec![5, 7]);
-        assert_eq!(s.ref_pic(0, 0).unwrap().luma[0], 42);
-        assert_eq!(s.ref_pic(0, 1).unwrap().luma[0], 99);
+        assert_eq!(s.ref_pic(0, 0).unwrap().luma.get(0), 42);
+        assert_eq!(s.ref_pic(0, 1).unwrap().luma.get(0), 99);
         // Out-of-bounds index.
         assert!(s.ref_pic(0, 2).is_none());
         // Wrong list.
@@ -269,7 +267,7 @@ mod tests {
         let mut s = RefPicStore::new();
         s.insert(0, pic(16, 1));
         s.set_list_1(vec![0]);
-        assert_eq!(s.ref_pic(1, 0).unwrap().luma[0], 1);
+        assert_eq!(s.ref_pic(1, 0).unwrap().luma.get(0), 1);
     }
 
     /// Round 430 — `retain_keys` drops every picture not named live so

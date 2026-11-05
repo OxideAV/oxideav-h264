@@ -60,6 +60,7 @@ use crate::picture::Picture;
 use crate::poc::{PocResult, PocSlice, PocSps, PocState, derive_poc};
 use crate::ref_list::{self, DpbEntry, MmcoOp as RefMmcoOp, PicStructure, RefMarking, RplmOp};
 use crate::ref_store::{RefPicProvider, RefPicStore};
+use crate::sample_plane::{Samples, SamplesRef};
 use crate::slice_header::{
     MmcoOp as SliceMmcoOp, RefPicListModificationOp as SliceRplmOp, SliceHeader, SliceType,
 };
@@ -2647,15 +2648,9 @@ fn gray_picture(
     p.non_existing = true;
     let grey_y: i32 = 1 << (bit_depth_y.saturating_sub(1));
     let grey_c: i32 = 1 << (bit_depth_c.saturating_sub(1));
-    for v in p.luma.iter_mut() {
-        *v = grey_y;
-    }
-    for v in p.cb.iter_mut() {
-        *v = grey_c;
-    }
-    for v in p.cr.iter_mut() {
-        *v = grey_c;
-    }
+    p.luma.fill(grey_y);
+    p.cb.fill(grey_c);
+    p.cr.fill(grey_c);
     p
 }
 
@@ -3276,14 +3271,17 @@ impl H264CodecDecoder {
             let (luma, cb, cr) = planes.assemble();
             let n_l = (full.width_in_samples * full.height_in_samples) as usize;
             let n_c = (full.chroma_width() * full.chroma_height()) as usize;
-            if ok && luma.len() == n_l && cb.len() == n_c && cr.len() == n_c {
-                full.luma = luma;
-                full.cb = cb;
-                full.cr = cr;
+            let len_ok =
+                |p: &Option<Samples>, n: usize| p.as_ref().map_or(n == 0, |p| p.len() == n);
+            let (bd_y, bd_c) = (full.bit_depth_luma, full.bit_depth_chroma);
+            if ok && len_ok(&luma, n_l) && len_ok(&cb, n_c) && len_ok(&cr, n_c) {
+                full.luma = luma.unwrap_or_else(|| Samples::zeroed(0, bd_y));
+                full.cb = cb.unwrap_or_else(|| Samples::zeroed(0, bd_c));
+                full.cr = cr.unwrap_or_else(|| Samples::zeroed(0, bd_c));
             } else {
-                full.luma = vec![0; n_l];
-                full.cb = vec![0; n_c];
-                full.cr = vec![0; n_c];
+                full.luma = Samples::zeroed(n_l, bd_y);
+                full.cb = Samples::zeroed(n_c, bd_c);
+                full.cr = Samples::zeroed(n_c, bd_c);
             }
             self.ref_store.insert(key, full);
         }
@@ -3537,12 +3535,14 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
     // Luma: copy each field row into its parity-selected frame row.
     let wl = w as usize;
     for r in 0..field_h as usize {
-        let src = &top.luma[r * wl..r * wl + wl];
         let dst_row = 2 * r;
-        frame.luma[dst_row * wl..dst_row * wl + wl].copy_from_slice(src);
-        let src_b = &bottom.luma[r * wl..r * wl + wl];
+        frame
+            .luma
+            .copy_from(dst_row * wl, top.luma.slice(r * wl..r * wl + wl));
         let dst_row_b = 2 * r + 1;
-        frame.luma[dst_row_b * wl..dst_row_b * wl + wl].copy_from_slice(src_b);
+        frame
+            .luma
+            .copy_from(dst_row_b * wl, bottom.luma.slice(r * wl..r * wl + wl));
     }
 
     // Chroma: same interleave on each chroma plane.
@@ -3552,12 +3552,13 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
         for r in 0..cfh {
             let dst_row = 2 * r;
             let dst_row_b = 2 * r + 1;
-            frame.cb[dst_row * cw..dst_row * cw + cw].copy_from_slice(&top.cb[r * cw..r * cw + cw]);
-            frame.cb[dst_row_b * cw..dst_row_b * cw + cw]
-                .copy_from_slice(&bottom.cb[r * cw..r * cw + cw]);
-            frame.cr[dst_row * cw..dst_row * cw + cw].copy_from_slice(&top.cr[r * cw..r * cw + cw]);
-            frame.cr[dst_row_b * cw..dst_row_b * cw + cw]
-                .copy_from_slice(&bottom.cr[r * cw..r * cw + cw]);
+            let row = r * cw..r * cw + cw;
+            frame.cb.copy_from(dst_row * cw, top.cb.slice(row.clone()));
+            frame
+                .cb
+                .copy_from(dst_row_b * cw, bottom.cb.slice(row.clone()));
+            frame.cr.copy_from(dst_row * cw, top.cr.slice(row.clone()));
+            frame.cr.copy_from(dst_row_b * cw, bottom.cr.slice(row));
         }
     }
 
@@ -3621,7 +3622,7 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
     // whose row stride is `src_stride` samples.
     #[allow(clippy::too_many_arguments)]
     fn pack(
-        src: &[i32],
+        src: &Samples,
         src_stride: usize,
         x0: usize,
         y0: usize,
@@ -3630,15 +3631,43 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
         wide: bool,
         max: i32,
     ) -> Vec<u8> {
+        let stride = src_stride.max(1);
+        let rows = src.len() / stride;
+        let x1 = (x0 + rect_w).min(stride);
+        let x0 = x0.min(x1);
+        let row_range = |r: usize| r * stride + x0..r * stride + x1;
+        let rows_out = rows.saturating_sub(y0).min(rect_h);
         let mut out = Vec::with_capacity(rect_w * rect_h * if wide { 2 } else { 1 });
-        for row in src.chunks(src_stride.max(1)).skip(y0).take(rect_h) {
-            let row = &row[x0.min(row.len())..(x0 + rect_w).min(row.len())];
-            if wide {
-                for &s in row {
-                    out.extend_from_slice(&(s.clamp(0, max) as u16).to_le_bytes());
+        match src.as_ref() {
+            // An 8-bit plane stores its output bytes already: whole
+            // rows when the window spans the stride.
+            SamplesRef::U8(v) if !wide => {
+                if x0 == 0 && x1 == stride {
+                    out.extend_from_slice(&v[y0 * stride..(y0 + rows_out) * stride]);
+                } else {
+                    for r in y0..y0 + rows_out {
+                        out.extend_from_slice(&v[row_range(r)]);
+                    }
                 }
-            } else {
-                out.extend(row.iter().map(|&s| s.clamp(0, 255) as u8));
+            }
+            SamplesRef::U8(v) => {
+                for r in y0..y0 + rows_out {
+                    for &s in &v[row_range(r)] {
+                        out.extend_from_slice(&((s as i32).min(max) as u16).to_le_bytes());
+                    }
+                }
+            }
+            SamplesRef::U16(v) => {
+                for r in y0..y0 + rows_out {
+                    let row = &v[row_range(r)];
+                    if wide {
+                        for &s in row {
+                            out.extend_from_slice(&((s as i32).min(max) as u16).to_le_bytes());
+                        }
+                    } else {
+                        out.extend(row.iter().map(|&s| s.min(255) as u8));
+                    }
+                }
             }
         }
         out
@@ -4769,15 +4798,9 @@ mod tests {
     /// given POC + frame_num stamped on.
     fn field_pic(w: u32, field_h: u32, fill: i32, cfill: i32, poc: i32, frame_num: u32) -> Picture {
         let mut p = Picture::new(w, field_h, 1, 8, 8);
-        for s in p.luma.iter_mut() {
-            *s = fill;
-        }
-        for s in p.cb.iter_mut() {
-            *s = cfill;
-        }
-        for s in p.cr.iter_mut() {
-            *s = cfill;
-        }
+        p.luma.fill(fill);
+        p.cb.fill(cfill);
+        p.cr.fill(cfill);
         p.pic_order_cnt = poc;
         p.frame_num = frame_num;
         p
@@ -4800,7 +4823,7 @@ mod tests {
         for r in 0..(field_h * 2) as usize {
             let expect = if r % 2 == 0 { 10 } else { 20 };
             for c in 0..wl {
-                assert_eq!(frame.luma[r * wl + c], expect, "luma row {r}");
+                assert_eq!(frame.luma.get(r * wl + c), expect, "luma row {r}");
             }
         }
         // Chroma: 4:2:0 → half-width, half field height; interleave on
@@ -4810,8 +4833,8 @@ mod tests {
         for r in 0..(cfh * 2) {
             let expect = if r % 2 == 0 { 110 } else { 120 };
             for c in 0..cw {
-                assert_eq!(frame.cb[r * cw + c], expect, "cb row {r}");
-                assert_eq!(frame.cr[r * cw + c], expect, "cr row {r}");
+                assert_eq!(frame.cb.get(r * cw + c), expect, "cb row {r}");
+                assert_eq!(frame.cr.get(r * cw + c), expect, "cr row {r}");
             }
         }
         // §8.2.1 eq. 8-1 — frame POC = min(top, bottom) field POC.
@@ -4915,15 +4938,10 @@ mod tests {
     #[test]
     fn output_frame_is_the_cropping_rectangle() {
         let mut pic = Picture::new(32, 32, 1, 8, 8);
-        for (i, s) in pic.luma.iter_mut().enumerate() {
-            *s = ((i % 32) + 4 * (i / 32)) as i32;
-        }
-        for (i, s) in pic.cb.iter_mut().enumerate() {
-            *s = ((i % 16) + 16 * (i / 16)) as i32;
-        }
-        for (i, s) in pic.cr.iter_mut().enumerate() {
-            *s = 255 - ((i % 16) + 16 * (i / 16)) as i32;
-        }
+        pic.luma.fill_with(|i| ((i % 32) + 4 * (i / 32)) as i32);
+        pic.cb.fill_with(|i| ((i % 16) + 16 * (i / 16)) as i32);
+        pic.cr
+            .fill_with(|i| 255 - ((i % 16) + 16 * (i / 16)) as i32);
         let crop = FrameCropMargins {
             left: 2,
             right: 4,
@@ -4959,9 +4977,7 @@ mod tests {
     #[test]
     fn cropping_keeps_wide_samples_little_endian() {
         let mut pic = Picture::new(16, 16, 0, 10, 10);
-        for (i, s) in pic.luma.iter_mut().enumerate() {
-            *s = (i as i32) * 4;
-        }
+        pic.luma.fill_with(|i| (i as i32) * 4);
         let crop = FrameCropMargins {
             left: 0,
             right: 6,

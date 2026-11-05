@@ -28,6 +28,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use oxideav_core::VideoFrame;
 
 use crate::mc::PlaneSrc;
+use crate::sample_plane::Samples;
 
 /// The sample planes of a picture being reconstructed on the worker
 /// pool, published one macroblock row (16 luma rows, `MbHeightC`
@@ -40,9 +41,9 @@ pub struct SharedPlanes {
     chroma_height: usize,
     /// Chroma rows per macroblock row (0 for monochrome).
     chroma_band_rows: usize,
-    luma: Vec<OnceLock<Box<[i32]>>>,
-    cb: Vec<OnceLock<Box<[i32]>>>,
-    cr: Vec<OnceLock<Box<[i32]>>>,
+    luma: Vec<OnceLock<Samples>>,
+    cb: Vec<OnceLock<Samples>>,
+    cr: Vec<OnceLock<Samples>>,
     /// Number of bands published, or `usize::MAX` once the job failed.
     progress: Mutex<usize>,
     cond: Condvar,
@@ -104,17 +105,17 @@ impl SharedPlanes {
 
     /// Publish band `b` from the picture's planes (`luma` /
     /// `cb` / `cr` are whole row-major planes).
-    pub(crate) fn publish(&self, b: usize, luma: &[i32], cb: &[i32], cr: &[i32]) {
+    pub(crate) fn publish(&self, b: usize, luma: &Samples, cb: &Samples, cr: &Samples) {
         let w = self.width;
         let l0 = (16 * b).min(self.height);
         let l1 = (16 * b + 16).min(self.height);
-        let _ = self.luma[b].set(luma[l0 * w..l1 * w].to_vec().into_boxed_slice());
+        let _ = self.luma[b].set(luma.slice(l0 * w..l1 * w).to_plane());
         if self.chroma_band_rows > 0 {
             let cw = self.chroma_width;
             let c0 = (self.chroma_band_rows * b).min(self.chroma_height);
             let c1 = (self.chroma_band_rows * (b + 1)).min(self.chroma_height);
-            let _ = self.cb[b].set(cb[c0 * cw..c1 * cw].to_vec().into_boxed_slice());
-            let _ = self.cr[b].set(cr[c0 * cw..c1 * cw].to_vec().into_boxed_slice());
+            let _ = self.cb[b].set(cb.slice(c0 * cw..c1 * cw).to_plane());
+            let _ = self.cr[b].set(cr.slice(c0 * cw..c1 * cw).to_plane());
         }
         let mut p = self.progress.lock().unwrap_or_else(|e| e.into_inner());
         if *p != usize::MAX && *p < b + 1 {
@@ -177,12 +178,14 @@ impl SharedPlanes {
     }
 
     /// Assemble the whole picture's planes (after [`Self::wait_done`]).
-    pub(crate) fn assemble(&self) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
-        let cat = |v: &[OnceLock<Box<[i32]>>]| {
-            let mut out = Vec::new();
+    /// `None` for a plane none of whose bands was published.
+    pub(crate) fn assemble(&self) -> (Option<Samples>, Option<Samples>, Option<Samples>) {
+        let cat = |v: &[OnceLock<Samples>]| {
+            let mut out: Option<Samples> = None;
             for b in v {
                 if let Some(b) = b.get() {
-                    out.extend_from_slice(b);
+                    out.get_or_insert_with(|| b.empty_like())
+                        .extend_from(b.as_ref());
                 }
             }
             out
