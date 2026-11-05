@@ -646,7 +646,6 @@ pub(crate) fn run_pixels(
         2 => 16,
         _ => 0,
     };
-    let mut scratch = Picture::new(16, 16, cat, pic.bit_depth_luma, pic.bit_depth_chroma);
     let mut published = 0usize;
     let publish_upto = |pic: &Picture, published: &mut usize, end: usize| {
         if let Some(p) = publish {
@@ -686,7 +685,6 @@ pub(crate) fn run_pixels(
                 &w.sps,
                 &w.pps,
                 &w.refs,
-                &mut scratch,
                 pic,
             ) {
                 eprintln!("h264 frame thread: inter macroblock skipped: {e}");

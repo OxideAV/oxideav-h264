@@ -982,7 +982,11 @@ fn synth_mb_inter<R: RefPicProvider>(
     pps: &Pps,
     ref_pics: &R,
     curr_poc: i32,
-    scratch: &mut Picture,
+    // Where the macroblock is written: `out` with the macroblock's
+    // top-left luma sample at `origin` (a one-macroblock scratch picture
+    // at (0, 0), or the picture itself at the macroblock's position).
+    out: &mut Picture,
+    origin: (i32, i32),
 ) -> Result<(), ReconstructError> {
     let mb_px = job.mb_x as i32 * 16;
     let mb_py = job.mb_y as i32 * 16;
@@ -1023,14 +1027,13 @@ fn synth_mb_inter<R: RefPicProvider>(
             None,
         )?;
     }
-    // The scratch picture is the macroblock itself: origin (0, 0).
     let writer = MbWriter {
-        mb_px: 0,
-        mb_py: 0,
+        mb_px: origin.0,
+        mb_py: origin.1,
         mb_field: false,
         mbaff_frame: false,
-        pair_px: 0,
-        pair_py: 0,
+        pair_px: origin.0,
+        pair_py: origin.1,
         mb_is_top: true,
         chroma_array_type,
     };
@@ -1049,7 +1052,7 @@ fn synth_mb_inter<R: RefPicProvider>(
         &pred_luma,
         pred_cb,
         pred_cr,
-        scratch,
+        out,
         false,
         false,
     )
@@ -1277,6 +1280,7 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
                             ref_pics,
                             curr_poc,
                             &mut scratch,
+                            (0, 0),
                         ) {
                             let mut slot = errors.lock().unwrap_or_else(|e| e.into_inner());
                             if slot.as_ref().is_none_or(|(i, _)| job.idx < *i) {
@@ -6005,6 +6009,40 @@ fn predict_partition_with<R: RefPicProvider>(
         PartMode::L1Only | PartMode::BiPred | PartMode::Direct
     ) && part.ref_idx_l1 >= 0;
 
+    // §8.4.2.3 — a single-list partition whose combine is the plain
+    // copy (default prediction, or explicit identity weights) is
+    // motion-compensated straight into the macroblock's prediction.
+    let use_explicit = weighted_explicit_active(slice_header, pps);
+    let luma_copy_list: Option<u8> = {
+        let list = match (has_l0, has_l1) {
+            (true, false) => Some(0u8),
+            (false, true) => Some(1u8),
+            _ => None,
+        };
+        list.filter(|&l| {
+            !use_explicit
+                || slice_header.pred_weight_table.as_ref().is_some_and(|pwt| {
+                    let lwd = pwt.luma_log2_weight_denom;
+                    let r = if l == 0 {
+                        part.ref_idx_l0
+                    } else {
+                        part.ref_idx_l1
+                    };
+                    let r = if field_parity.is_some() && r >= 0 {
+                        r / 2
+                    } else {
+                        r
+                    };
+                    luma_weight_entry(pwt, l, r, lwd)
+                        == WeightedEntry {
+                            weight: 1 << lwd,
+                            offset: 0,
+                        }
+                })
+        })
+    };
+    let pred_off = part.y as usize * 16 + part.x as usize;
+
     if has_l0 {
         let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
         if inter_debug {
@@ -6028,7 +6066,16 @@ fn predict_partition_with<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            l0_buf,
+            if luma_copy_list == Some(0) {
+                &mut pred_luma[pred_off..]
+            } else {
+                &mut l0_buf[..]
+            },
+            if luma_copy_list == Some(0) {
+                16
+            } else {
+                w as usize
+            },
             fld,
             ref_planes_for(0, part.ref_idx_l0),
         )?;
@@ -6056,7 +6103,16 @@ fn predict_partition_with<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            l1_buf,
+            if luma_copy_list == Some(1) {
+                &mut pred_luma[pred_off..]
+            } else {
+                &mut l1_buf[..]
+            },
+            if luma_copy_list == Some(1) {
+                16
+            } else {
+                w as usize
+            },
             fld,
             ref_planes_for(1, part.ref_idx_l1),
         )?;
@@ -6088,7 +6144,6 @@ fn predict_partition_with<R: RefPicProvider>(
     //     derived from POC distance; only the bipred sub-case uses
     //     implicit weighting (single-list partitions fall through to
     //     the default copy-through).
-    let use_explicit = weighted_explicit_active(slice_header, pps);
     let bi_mode = if has_l0 && has_l1 {
         Some(BiPredMode::Bipred)
     } else if has_l0 {
@@ -6204,17 +6259,19 @@ fn predict_partition_with<R: RefPicProvider>(
     } else {
         CombineOp::default_for(bi_mode)
     };
-    combine_partition(
-        pred_luma,
-        part.y as usize * 16 + part.x as usize,
-        16,
-        l0_buf,
-        l1_buf,
-        w as usize,
-        h as usize,
-        luma_op,
-        bit_depth_y,
-    );
+    if luma_copy_list.is_none() {
+        combine_partition(
+            pred_luma,
+            pred_off,
+            16,
+            l0_buf,
+            l1_buf,
+            w as usize,
+            h as usize,
+            luma_op,
+            bit_depth_y,
+        );
+    }
 
     // Chroma MC. For 4:2:0, chroma MV = mv_luma / 2 in 1/4-pel units
     // at luma resolution -> 1/8-pel chroma units. §8.4.1.4 / §8.4.2.2.
@@ -6284,40 +6341,6 @@ fn predict_partition_with<R: RefPicProvider>(
             }
             mv
         };
-        if has_l0 {
-            let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
-            mc_chroma_partition(
-                rp,
-                c_mb_px + c_part_x,
-                c_mb_py + c_part_y,
-                chroma_mv(mv_l0, 0, part.ref_idx_l0, fld),
-                c_w,
-                c_h,
-                chroma_array_type,
-                bit_depth_c,
-                l0_cb,
-                l0_cr,
-                fld,
-                ref_planes_for(0, part.ref_idx_l0),
-            )?;
-        }
-        if has_l1 {
-            let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
-            mc_chroma_partition(
-                rp,
-                c_mb_px + c_part_x,
-                c_mb_py + c_part_y,
-                chroma_mv(mv_l1, 1, part.ref_idx_l1, fld),
-                c_w,
-                c_h,
-                chroma_array_type,
-                bit_depth_c,
-                l1_cb,
-                l1_cr,
-                fld,
-                ref_planes_for(1, part.ref_idx_l1),
-            )?;
-        }
         // Combine into pred_cb / pred_cr at MB-local position.
         // §8.4.2.3 — the same default/explicit/implicit dispatch as
         // luma applies to chroma. Explicit mode uses separate weights
@@ -6366,28 +6389,97 @@ fn predict_partition_with<R: RefPicProvider>(
             (default_op, default_op)
         };
         let c_off = c_part_y as usize * mbw_c_use as usize + c_part_x as usize;
-        combine_partition(
-            pred_cb,
-            c_off,
-            mbw_c_use as usize,
-            l0_cb,
-            l1_cb,
-            c_w as usize,
-            c_h as usize,
-            cb_op,
-            bit_depth_c,
-        );
-        combine_partition(
-            pred_cr,
-            c_off,
-            mbw_c_use as usize,
-            l0_cr,
-            l1_cr,
-            c_w as usize,
-            c_h as usize,
-            cr_op,
-            bit_depth_c,
-        );
+        // Single-list copy into both planes: motion-compensated straight
+        // into the macroblock's prediction (as for luma).
+        let chroma_copy_list = match (cb_op.simplified(), cr_op.simplified()) {
+            (CombineOp::Copy0, CombineOp::Copy0) => Some(0u8),
+            (CombineOp::Copy1, CombineOp::Copy1) => Some(1u8),
+            _ => None,
+        };
+        if has_l0 {
+            let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
+            mc_chroma_partition(
+                rp,
+                c_mb_px + c_part_x,
+                c_mb_py + c_part_y,
+                chroma_mv(mv_l0, 0, part.ref_idx_l0, fld),
+                c_w,
+                c_h,
+                chroma_array_type,
+                bit_depth_c,
+                if chroma_copy_list == Some(0) {
+                    &mut pred_cb[c_off..]
+                } else {
+                    &mut l0_cb[..]
+                },
+                if chroma_copy_list == Some(0) {
+                    &mut pred_cr[c_off..]
+                } else {
+                    &mut l0_cr[..]
+                },
+                if chroma_copy_list == Some(0) {
+                    mbw_c_use as usize
+                } else {
+                    c_w as usize
+                },
+                fld,
+                ref_planes_for(0, part.ref_idx_l0),
+            )?;
+        }
+        if has_l1 {
+            let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
+            mc_chroma_partition(
+                rp,
+                c_mb_px + c_part_x,
+                c_mb_py + c_part_y,
+                chroma_mv(mv_l1, 1, part.ref_idx_l1, fld),
+                c_w,
+                c_h,
+                chroma_array_type,
+                bit_depth_c,
+                if chroma_copy_list == Some(1) {
+                    &mut pred_cb[c_off..]
+                } else {
+                    &mut l1_cb[..]
+                },
+                if chroma_copy_list == Some(1) {
+                    &mut pred_cr[c_off..]
+                } else {
+                    &mut l1_cr[..]
+                },
+                if chroma_copy_list == Some(1) {
+                    mbw_c_use as usize
+                } else {
+                    c_w as usize
+                },
+                fld,
+                ref_planes_for(1, part.ref_idx_l1),
+            )?;
+        }
+        if chroma_copy_list.is_none() {
+            combine_partition(
+                pred_cb,
+                c_off,
+                mbw_c_use as usize,
+                l0_cb,
+                l1_cb,
+                c_w as usize,
+                c_h as usize,
+                cb_op,
+                bit_depth_c,
+            );
+            combine_partition(
+                pred_cr,
+                c_off,
+                mbw_c_use as usize,
+                l0_cr,
+                l1_cr,
+                c_w as usize,
+                c_h as usize,
+                cr_op,
+                bit_depth_c,
+            );
+        }
     } else if chroma_array_type == 3 {
         // §8.4.2.2 (ChromaArrayType == 3) — 4:4:4 chroma is
         // motion-compensated identically to luma: full-resolution
@@ -6639,6 +6731,7 @@ fn mc_luma_partition(
     h: u32,
     bit_depth: u32,
     dst: &mut [i32],
+    dst_stride: usize,
     field: Option<u8>,
     planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
@@ -6714,7 +6807,7 @@ fn mc_luma_partition(
         h as usize,
         (1i32 << bit_depth) - 1,
         dst,
-        w as usize,
+        dst_stride,
     );
     Ok(())
 }
@@ -6735,6 +6828,7 @@ fn mc_chroma_partition(
     bit_depth: u32,
     dst_cb: &mut [i32],
     dst_cr: &mut [i32],
+    dst_stride: usize,
     field: Option<u8>,
     planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
@@ -6804,7 +6898,7 @@ fn mc_chroma_partition(
             },
         };
         crate::mc::chroma(
-            &src, int_x, int_y, x_frac, y_frac, w as usize, h as usize, dst, w as usize,
+            &src, int_x, int_y, x_frac, y_frac, w as usize, h as usize, dst, dst_stride,
         );
     }
     Ok(())
@@ -13494,7 +13588,6 @@ pub(crate) fn ft_motion_stage(
 
 /// Frame threading — the §8.4.2 prediction + §8.5 residual of one inter
 /// macroblock of [`ft_motion_pass`]'s plan, written into `pic`.
-/// `scratch` is a one-macroblock picture.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ft_inter_mb<R: RefPicProvider>(
     slice_data: &SliceData,
@@ -13503,45 +13596,23 @@ pub(crate) fn ft_inter_mb<R: RefPicProvider>(
     sps: &Sps,
     pps: &Pps,
     ref_pics: &R,
-    scratch: &mut Picture,
     pic: &mut Picture,
 ) -> Result<(), ReconstructError> {
-    let chroma_array_type = sps.chroma_array_type();
+    let curr_poc = pic.pic_order_cnt;
     synth_mb_inter(
         &slice_data.macroblocks[job.idx],
         job,
-        chroma_array_type,
+        sps.chroma_array_type(),
         8 + sps.bit_depth_luma_minus8,
         8 + sps.bit_depth_chroma_minus8,
         slice_header,
         sps,
         pps,
         ref_pics,
-        pic.pic_order_cnt,
-        scratch,
-    )?;
-    let width = pic.width_in_samples as usize;
-    let x0 = job.mb_x as usize * 16;
-    let y0 = job.mb_y as usize * 16;
-    for y in 0..16 {
-        let o = (y0 + y) * width + x0;
-        pic.luma
-            .copy_from(o, scratch.luma.slice(y * 16..y * 16 + 16));
-    }
-    if chroma_array_type == 1 || chroma_array_type == 2 {
-        let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
-        let (mbw_c, mbh_c) = (mbw_c as usize, mbh_c as usize);
-        let cw = pic.chroma_width() as usize;
-        let cx0 = job.mb_x as usize * mbw_c;
-        let cy0 = job.mb_y as usize * mbh_c;
-        for y in 0..mbh_c {
-            let d = (cy0 + y) * cw + cx0;
-            let s = y * mbw_c;
-            pic.cb.copy_from(d, scratch.cb.slice(s..s + mbw_c));
-            pic.cr.copy_from(d, scratch.cr.slice(s..s + mbw_c));
-        }
-    }
-    Ok(())
+        curr_poc,
+        pic,
+        (job.mb_x as i32 * 16, job.mb_y as i32 * 16),
+    )
 }
 
 /// Frame threading — the §8.3 / §8.5 reconstruction of one intra
@@ -16622,7 +16693,10 @@ mod tests {
         let (px, py) = (0i32, 0i32);
 
         let mut luma = vec![0i32; (w * h) as usize];
-        mc_luma_partition(&ref_pic, px, py, mv, w, h, 8, &mut luma, None, None).unwrap();
+        mc_luma_partition(
+            &ref_pic, px, py, mv, w, h, 8, &mut luma, w as usize, None, None,
+        )
+        .unwrap();
 
         let mut cb = vec![0i32; (w * h) as usize];
         let mut cr = vec![0i32; (w * h) as usize];
@@ -16767,7 +16841,19 @@ mod tests {
         let mut cb = vec![0i32; (cw * ch) as usize];
         let mut cr = vec![0i32; (cw * ch) as usize];
         mc_chroma_partition(
-            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None, None,
+            &ref_pic,
+            c_part_x,
+            c_part_y,
+            mv,
+            cw,
+            ch,
+            2,
+            8,
+            &mut cb,
+            &mut cr,
+            cw as usize,
+            None,
+            None,
         )
         .unwrap();
 
@@ -16812,7 +16898,19 @@ mod tests {
         let mut cb = vec![0i32; (cw * ch) as usize];
         let mut cr = vec![0i32; (cw * ch) as usize];
         mc_chroma_partition(
-            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None, None,
+            &ref_pic,
+            c_part_x,
+            c_part_y,
+            mv,
+            cw,
+            ch,
+            2,
+            8,
+            &mut cb,
+            &mut cr,
+            cw as usize,
+            None,
+            None,
         )
         .unwrap();
 

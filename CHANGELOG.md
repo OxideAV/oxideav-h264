@@ -57,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   weights (w = 2^logWD, o = 0) combines as the plain copy / average it
   equals, and 8-bit planes skip the separate Clip1 pass (their store
   saturates).
+- A single-list partition whose combine is a plain copy (default
+  prediction, or explicit identity weights) is motion-compensated
+  straight into the macroblock's prediction, luma and both chroma
+  planes; frame-threaded inter macroblocks are reconstructed straight
+  into the picture (no one-macroblock scratch copy).
 
 ### Added
 
