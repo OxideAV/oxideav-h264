@@ -369,19 +369,39 @@ cargo run --release --example decode_bench -- clip.h264 8 [out.yuv]
 
 `Decoder::set_execution_context` with a budget above one turns on
 frame-level threading for frame pictures (no PAFF fields, no MBAFF,
-ChromaArrayType 0–2, no SP / SI slices or slice groups): slice data is
-parsed on a pool of `threads` workers as NAL units arrive, the calling
-thread runs the decoding-order work (POC, reference lists and marking,
-macroblock motion, output ordering), and each picture's sample
-reconstruction and deblocking runs on the pool, macroblock row by row,
-while later pictures that reference it start as soon as the rows their
-motion vectors reach are done. Other pictures decode serially (with the
-slice-level row threading of P / B slices and wavefront deblocking).
-The output is identical for every budget; `receive_frame` reports
-`NeedMore` while the next frame is still being reconstructed.
+ChromaArrayType 0–2, no SP / SI slices or slice groups). As NAL units
+arrive, each slice's data is parsed on a pool of `threads` workers
+together with the slice's decoding-order checks (partition structure,
+intra mode availability, the reference indices it uses), which only
+look at the slice's own macroblocks. The calling thread keeps the
+picture-level decoding order — POC, reference lists and marking, the
+check of the used reference indices against the lists, output
+ordering — and no per-macroblock work. Each picture then runs as one
+pool job: the §8.4.1 motion derivation of its P / spatial-direct B
+slices (published for the B pictures that take it as co-located
+picture; temporal-direct B slices derive theirs on the calling thread),
+then sample reconstruction and deblocking macroblock row by row, while
+later pictures that reference it start as soon as the rows their
+motion vectors reach are done. The calling thread runs queued parses
+while it waits for a picture slot. Other pictures decode serially (with
+the slice-level row threading of P / B slices and wavefront
+deblocking). The output is identical for every budget; `receive_frame`
+reports `NeedMore` while the next frame is still being reconstructed.
 
-On a 10 s 1080p30 x264 High-profile B-frame clip (this machine): one
-thread 3.8 s (was 7.4 s), 4 threads 1.1 s, 8 threads 0.77 s (≈ 390 fps).
+Samples are stored narrow (`u8` planes for 8-bit components, `u16`
+above), and non-MBAFF deblocking filters each macroblock edge
+line-parallel.
+
+10 s 1080p30 libx264 clips (`testsrc2`, preset medium), seconds, best
+of three on this machine (18 cores), before → after this round:
+
+| clip | 1 thread | 4 | 8 | 16 | peak RSS 1 / 16 threads |
+| ---- | -------- | - | - | -- | ----------------------- |
+| High, CABAC, B-frames | 3.87 → 2.62 | 1.09 → 0.65 | 0.71 → 0.41 | 0.73 → 0.27 | 530 → 59 / 768 → 566 MiB |
+| Constrained Baseline, CAVLC | 3.47 → 2.18 | 0.99 → 0.61 | 0.61 → 0.39 | 0.59 → 0.28 | 520 → 52 / 742 → 560 MiB |
+| High 10 | 4.45 → 3.46 | 1.25 → 0.89 | 0.83 → 0.54 | 0.82 → 0.34 | 555 → 92 / 696 → 703 MiB |
+
+Every output is byte-identical to `ffmpeg -f rawvideo` on these clips.
 
 ## Profiles + features in scope
 
