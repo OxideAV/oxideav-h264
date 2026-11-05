@@ -28,6 +28,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use oxideav_core::VideoFrame;
 
 use crate::mc::PlaneSrc;
+use crate::picture::MotionGrids;
 use crate::sample_plane::Samples;
 
 /// The sample planes of a picture being reconstructed on the worker
@@ -50,6 +51,9 @@ pub struct SharedPlanes {
     /// The §C.4 output frame, set when the whole picture is done.
     output: Mutex<Option<VideoFrame>>,
     done: OnceLock<bool>,
+    /// The picture's §8.4.1 motion, set once the job derived it (the
+    /// co-located motion of later B slices).
+    motion: OnceLock<Arc<MotionGrids>>,
 }
 
 impl SharedPlanes {
@@ -75,6 +79,29 @@ impl SharedPlanes {
             cond: Condvar::new(),
             output: Mutex::new(None),
             done: OnceLock::new(),
+            motion: OnceLock::new(),
+        }
+    }
+
+    /// Publish the picture's motion.
+    pub(crate) fn set_motion(&self, m: MotionGrids) {
+        let _ = self.motion.set(Arc::new(m));
+        let _g = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        self.cond.notify_all();
+    }
+
+    /// Block until the picture's motion is published; `None` when the
+    /// job producing it failed.
+    pub(crate) fn wait_motion(&self) -> Option<Arc<MotionGrids>> {
+        let mut g = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(m) = self.motion.get() {
+                return Some(m.clone());
+            }
+            if *g == usize::MAX || self.done.get().is_some() {
+                return self.motion.get().cloned();
+            }
+            g = self.cond.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -284,6 +311,24 @@ impl Pool {
         self.shared.cond.notify_one();
     }
 
+    /// Run one queued task on the calling thread (high-priority tasks
+    /// first). `false` when the queue is empty. Every task only waits
+    /// on work queued before it, which is running or done once it is
+    /// dequeued, so a waiting caller can help without deadlocking.
+    pub(crate) fn help_one(&self) -> bool {
+        let task = {
+            let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.high.pop_front().or_else(|| q.low.pop_front())
+        };
+        match task {
+            Some(t) => {
+                t();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Queue a picture job.
     pub(crate) fn spawn_low(&self, f: impl FnOnce() + Send + 'static) {
         self.push(Box::new(f), false);
@@ -406,11 +451,46 @@ pub(crate) struct FtRef {
 /// The reference lists of one slice, owned, for the sample stage on a
 /// pool worker. Mirrors what the decoder thread's provider answers for
 /// the queries §8.4.2 makes.
+/// The (top, bottom) stored fields of a complementary field pair.
+pub(crate) type FieldPair = (Arc<Picture>, Arc<Picture>);
+
 #[derive(Default)]
 pub(crate) struct FtProvider {
     pub(crate) refs: [Vec<Option<FtRef>>; 2],
     pub(crate) parities: [Vec<Option<u8>>; 2],
     pub(crate) focs: [Vec<(i32, i32)>; 2],
+    /// §8.4.1.2 metadata of the lists (as the decoder thread's provider
+    /// answers it): list-0 order counts, long-term flags, DPB keys and
+    /// frame-unit keys, and the two fields of a complementary field
+    /// pair entry.
+    pub(crate) pocs_0: Vec<i32>,
+    pub(crate) longterm: [Vec<bool>; 2],
+    pub(crate) keys: [Vec<u32>; 2],
+    pub(crate) unit_keys: [Vec<u32>; 2],
+    pub(crate) pair_fields: [Vec<Option<FieldPair>>; 2],
+}
+
+impl FtProvider {
+    /// Give `RefPicList1[ 0 ]` — the co-located picture of §8.4.1.2 —
+    /// its motion when it is a picture of the pool (waiting for its job
+    /// to derive it). `false` when that job failed.
+    pub(crate) fn resolve_colocated_motion(&mut self) -> bool {
+        let Some(Some(r)) = self.refs[1].first_mut() else {
+            return true;
+        };
+        let Some(planes) = r.planes.as_ref() else {
+            return true;
+        };
+        match planes.wait_motion() {
+            Some(m) => {
+                let mut pic = (*r.pic).clone();
+                pic.set_motion(&m);
+                r.pic = Arc::new(pic);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl RefPicProvider for FtProvider {
@@ -434,6 +514,47 @@ impl RefPicProvider for FtProvider {
     fn ref_planes(&self, list: u8, idx: u32) -> Option<&SharedPlanes> {
         let l = self.refs.get(list as usize)?;
         l.get(idx as usize)?.as_ref()?.planes.as_deref()
+    }
+
+    fn ref_list_0_pocs(&self) -> &[i32] {
+        &self.pocs_0
+    }
+
+    fn ref_list_0_longterm(&self) -> &[bool] {
+        &self.longterm[0]
+    }
+
+    fn ref_list_1_longterm(&self) -> &[bool] {
+        &self.longterm[1]
+    }
+
+    fn ref_list_0_keys(&self) -> &[u32] {
+        &self.keys[0]
+    }
+
+    fn ref_list_0_unit_keys(&self) -> &[u32] {
+        &self.unit_keys[0]
+    }
+
+    fn ref_list_0_parities(&self) -> &[Option<u8>] {
+        &self.parities[0]
+    }
+
+    fn ref_entry_identity(&self, list: u8, idx: u32) -> Option<(u32, Option<u8>, u32)> {
+        let l = list as usize;
+        let key = *self.keys.get(l)?.get(idx as usize)?;
+        let parity = self.parities[l].get(idx as usize).copied().flatten();
+        let unit = self.unit_keys[l].get(idx as usize).copied().unwrap_or(key);
+        Some((key, parity, unit))
+    }
+
+    fn ref_pair_field(&self, list: u8, idx: u32, bottom: bool) -> Option<&Picture> {
+        let (top, bot) = self
+            .pair_fields
+            .get(list as usize)?
+            .get(idx as usize)?
+            .as_ref()?;
+        Some(if bottom { bot } else { top })
     }
 }
 

@@ -282,7 +282,9 @@ impl Picture {
     /// a neighbour is available but the sample index goes off-picture.
     #[inline]
     pub fn luma_at(&self, x: i32, y: i32) -> i32 {
-        if self.width_in_samples == 0 || self.height_in_samples == 0 {
+        // A picture without samples (zero size, or a geometry-only
+        // shell) reads 0.
+        if self.luma.is_empty() {
             return 0;
         }
         let xi = clip3_i32(0, self.width_in_samples as i32 - 1, x) as usize;
@@ -295,7 +297,7 @@ impl Picture {
     pub fn cb_at(&self, x: i32, y: i32) -> i32 {
         let cw = self.chroma_width();
         let ch = self.chroma_height();
-        if cw == 0 || ch == 0 {
+        if cw == 0 || ch == 0 || self.cb.is_empty() {
             return 0;
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
@@ -308,7 +310,7 @@ impl Picture {
     pub fn cr_at(&self, x: i32, y: i32) -> i32 {
         let cw = self.chroma_width();
         let ch = self.chroma_height();
-        if cw == 0 || ch == 0 {
+        if cw == 0 || ch == 0 || self.cr.is_empty() {
             return 0;
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
@@ -408,6 +410,60 @@ impl Picture {
             .copied()
             .unwrap_or(false);
         Some((mv, ref_idx, is_intra))
+    }
+}
+
+/// §8.4.1.2 — the per-macroblock motion of a decoded picture that a
+/// later B slice's direct prediction reads when the picture is its
+/// co-located picture: the [`Picture`] fields of the same names.
+#[derive(Debug, Clone, Default)]
+pub struct MotionGrids {
+    pub mb_width_in_picture: u32,
+    pub mv_l0_grid: Vec<(i16, i16)>,
+    pub mv_l1_grid: Vec<(i16, i16)>,
+    pub ref_idx_l0_grid: Vec<i8>,
+    pub ref_idx_l1_grid: Vec<i8>,
+    pub is_intra_grid: Vec<bool>,
+    pub mb_field_flags: Vec<bool>,
+}
+
+impl MotionGrids {
+    /// Snapshot the motion a picture's macroblock grid holds.
+    pub fn from_grid(grid: &crate::mb_grid::MbGrid) -> Self {
+        let nmb = grid.info.len();
+        let mut m = MotionGrids {
+            mb_width_in_picture: grid.width_in_mbs,
+            mv_l0_grid: Vec::with_capacity(nmb * 16),
+            mv_l1_grid: Vec::with_capacity(nmb * 16),
+            ref_idx_l0_grid: Vec::with_capacity(nmb * 4),
+            ref_idx_l1_grid: Vec::with_capacity(nmb * 4),
+            is_intra_grid: Vec::with_capacity(nmb),
+            mb_field_flags: Vec::with_capacity(nmb),
+        };
+        for info in &grid.info {
+            m.mv_l0_grid.extend_from_slice(&info.mv_l0);
+            m.mv_l1_grid.extend_from_slice(&info.mv_l1);
+            m.ref_idx_l0_grid.extend_from_slice(&info.ref_idx_l0);
+            m.ref_idx_l1_grid.extend_from_slice(&info.ref_idx_l1);
+            m.is_intra_grid.push(info.is_intra);
+            // §6.4.12.2 / Table 8-8 — `fieldDecodingFlagX` of every MB,
+            // for AFRM pictures serving as colPic.
+            m.mb_field_flags.push(info.mb_field_decoding_flag);
+        }
+        m
+    }
+}
+
+impl Picture {
+    /// Install a motion snapshot (see [`MotionGrids`]).
+    pub fn set_motion(&mut self, m: &MotionGrids) {
+        self.mb_width_in_picture = m.mb_width_in_picture;
+        self.mv_l0_grid.clone_from(&m.mv_l0_grid);
+        self.mv_l1_grid.clone_from(&m.mv_l1_grid);
+        self.ref_idx_l0_grid.clone_from(&m.ref_idx_l0_grid);
+        self.ref_idx_l1_grid.clone_from(&m.ref_idx_l1_grid);
+        self.is_intra_grid.clone_from(&m.is_intra_grid);
+        self.mb_field_flags.clone_from(&m.mb_field_flags);
     }
 }
 

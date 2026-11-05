@@ -824,6 +824,7 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
                 // scaling lists of ITS colour plane (colour_plane_id).
                 luma_scaling_plane(sps, slice_header),
                 sp_si_ctx,
+                IntraPass::Samples,
             )?;
         } else {
             reconstruct_mb_inter(
@@ -1334,6 +1335,7 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
             field_scan,
             luma_scaling_plane(sps, slice_header),
             None,
+            IntraPass::Samples,
         )?;
     }
     match failed {
@@ -1642,6 +1644,10 @@ fn reconstruct_mb_intra(
     // §8.6 — Some for MBs of SP/SI slices; the SI macroblock type
     // reconstructs through §8.6.2 with QSY/QSC.
     sp_si: Option<SpSiCtx>,
+    // Only the decoding-order part: the grid bookkeeping and every
+    // check that can reject the macroblock, without predicting or
+    // writing samples (`pic` is only read).
+    dry: IntraPass,
 ) -> Result<(), ReconstructError> {
     // §6.4.1 — MB sample origin (non-MBAFF eqs. 6-3/6-4 or MBAFF eqs.
     // 6-5..6-10 depending on `mb_field_decoding_flag`).
@@ -1678,6 +1684,9 @@ fn reconstruct_mb_intra(
             let pcm = mb.pcm_samples.as_ref().ok_or_else(|| {
                 ReconstructError::UnsupportedMbType("I_PCM without samples".into())
             })?;
+            if dry == IntraPass::Checks {
+                return Ok(());
+            }
             for y in 0..16 {
                 for x in 0..16 {
                     let v = pcm.luma[(y * 16 + x) as usize] as i32;
@@ -1725,6 +1734,7 @@ fn reconstruct_mb_intra(
                 grid,
                 current_slice_id,
                 field_scan,
+                dry,
             )?;
         }
         MbType::INxN | MbType::SI => {
@@ -1756,6 +1766,7 @@ fn reconstruct_mb_intra(
                 current_slice_id,
                 field_scan,
                 si_qs,
+                dry,
             )?;
             if chroma_array_type == 3 {
                 // §8.3.4.5 — 4:4:4 I_NxN: Cb/Cr coded like luma, reusing
@@ -1792,6 +1803,7 @@ fn reconstruct_mb_intra(
                     current_slice_id,
                     field_scan,
                     si_qs,
+                    dry,
                 )?;
             }
         }
@@ -1805,6 +1817,15 @@ fn reconstruct_mb_intra(
         }
     }
     Ok(())
+}
+
+/// What [`reconstruct_mb_intra`] does: the whole §8.3 / §8.5
+/// reconstruction, or only its decoding-order part (grid bookkeeping
+/// and every check that can reject the macroblock).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IntraPass {
+    Samples,
+    Checks,
 }
 
 // -------------------------------------------------------------------------
@@ -1832,6 +1853,7 @@ fn reconstruct_intra_16x16(
     grid: &MbGrid,
     current_slice_id: i32,
     field_scan: bool,
+    dry: IntraPass,
 ) -> Result<(), ReconstructError> {
     // -------- §8.3.3 — 16x16 prediction -----------------------------
     let samples = gather_samples_16x16(
@@ -1847,6 +1869,30 @@ fn reconstruct_intra_16x16(
         ReconstructError::UnsupportedMbType(format!("Intra_16x16 pred_mode {}", pred_mode_idx))
     })?;
     require_intra_16x16_mode(mode, &samples.availability)?;
+    if dry == IntraPass::Checks {
+        let qp_prime_y = qp_y + qp_bd_offset(sps.bit_depth_luma_minus8);
+        if !transform_bypass_active(sps, qp_prime_y) {
+            crate::transform::check_transform_params(qp_prime_y, bit_depth_y)?;
+        }
+        return reconstruct_chroma_intra(
+            mb,
+            qp_y,
+            chroma_array_type,
+            bit_depth_c,
+            mb_px,
+            mb_py,
+            mb_addr,
+            writer,
+            sps,
+            pps,
+            pic,
+            grid,
+            current_slice_id,
+            field_scan,
+            None,
+            dry,
+        );
+    }
     let mut pred = [0i32; 256];
     predict_16x16(mode, &samples, bit_depth_y, &mut pred);
 
@@ -1960,6 +2006,7 @@ fn reconstruct_intra_16x16(
         current_slice_id,
         field_scan,
         None,
+        IntraPass::Samples,
     )?;
 
     Ok(())
@@ -2596,6 +2643,7 @@ fn reconstruct_intra_nxn(
     // run through §8.5.12 at qP = QSY; the output samples are
     // Clip1Y(rij) (eq. 8-434) with no second prediction add.
     si_switch_qs: Option<i32>,
+    dry: IntraPass,
 ) -> Result<(), ReconstructError> {
     let pred = mb
         .mb_pred
@@ -2679,6 +2727,15 @@ fn reconstruct_intra_nxn(
                 by,
             );
             require_intra_8x8_mode(mode, &raw.availability)?;
+            if dry == IntraPass::Checks {
+                if !bypass {
+                    crate::transform::check_transform_params(qp_prime_y, bit_depth_y)?;
+                }
+                if let Some(info) = grid.get_mut(mb_addr) {
+                    info.intra_8x8_pred_modes[blk8] = mode.as_index();
+                }
+                continue;
+            }
             let filtered = filter_samples_8x8(&raw, bit_depth_y);
             let mut pred_samples = [0i32; 64];
             predict_8x8(mode, &filtered, bit_depth_y, &mut pred_samples);
@@ -2809,6 +2866,15 @@ fn reconstruct_intra_nxn(
                 by,
             );
             require_intra_4x4_mode(mode, &samples.availability)?;
+            if dry == IntraPass::Checks && si_switch_qs.is_none() {
+                if !bypass {
+                    crate::transform::check_transform_params(qp_prime_y, bit_depth_y)?;
+                }
+                if let Some(info) = grid.get_mut(mb_addr) {
+                    info.intra_4x4_pred_modes[block_idx] = mode.as_index();
+                }
+                continue;
+            }
             let mut pred_samples = [0i32; 16];
             predict_4x4(mode, &samples, bit_depth_y, &mut pred_samples);
 
@@ -2931,6 +2997,7 @@ fn reconstruct_chroma_intra(
     // chroma prediction is re-routed through the transform-domain
     // reconstruction at QSC (derived from QSY via §8.5.8).
     si_switch_qs: Option<i32>,
+    dry: IntraPass,
 ) -> Result<(), ReconstructError> {
     // Monochrome: no chroma work to do.
     if chroma_array_type == 0 {
@@ -3041,6 +3108,13 @@ fn reconstruct_chroma_intra(
         );
         let out_len = (mbw_c as usize) * (mbh_c as usize);
         require_intra_chroma_mode(chroma_mode, &samples.availability)?;
+        if dry == IntraPass::Checks && si_switch_qs.is_none() {
+            if !bypass {
+                let qp_c = if plane == 0 { qp_cb } else { qp_cr };
+                crate::transform::check_transform_params(qp_c, bit_depth_c)?;
+            }
+            continue;
+        }
         let mut pred_samples = vec![0i32; out_len];
         predict_chroma(chroma_mode, &samples, ct, bit_depth_c, &mut pred_samples);
 
@@ -8224,47 +8298,10 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
     let (a_l1, b_l1, c_l1, d_l1) =
         neighbour_mvs_for_list(&neighbour_probe, mb_addr, grid, 1, current_slice_id);
 
-    // §8.4.1.2.2 step 4 — MinPositive chain to pick refIdxLX. This
-    // mirrors the pre-step-5 derivation inside
-    // `derive_b_spatial_direct_with_d`; we redo it here so we can
-    // observe whether BOTH refs were < 0 (i.e. directZeroPredictionFlag
-    // should fire) before the helper's step-5 fallback collapses them
-    // to 0.
-    fn min_positive(x: i32, y: i32) -> i32 {
-        if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) }
-    }
-    // §8.4.1.3.2 eq. 8-214..8-216 — C→D substitution when C is
-    // unavailable (partition_available == false).
-    let c_l0_eff = if !c_l0.partition_available && d_l0.partition_available {
-        d_l0
-    } else {
-        c_l0
-    };
-    let c_l1_eff = if !c_l1.partition_available && d_l1.partition_available {
-        d_l1
-    } else {
-        c_l1
-    };
-
-    let ref_l0_minp = min_positive(a_l0.ref_idx, min_positive(b_l0.ref_idx, c_l0_eff.ref_idx));
-    let ref_l1_minp = min_positive(a_l1.ref_idx, min_positive(b_l1.ref_idx, c_l1_eff.ref_idx));
-
-    // §8.4.1.2.2 step 5 — directZeroPredictionFlag = both refs < 0.
-    let direct_zero_both = ref_l0_minp < 0 && ref_l1_minp < 0;
-    let ref_idx_l0_final: i8 = if direct_zero_both {
-        0
-    } else if ref_l0_minp < 0 {
-        -1
-    } else {
-        ref_l0_minp as i8
-    };
-    let ref_idx_l1_final: i8 = if direct_zero_both {
-        0
-    } else if ref_l1_minp < 0 {
-        -1
-    } else {
-        ref_l1_minp as i8
-    };
+    let c_l0_eff = c_or_d(c_l0, d_l0);
+    let c_l1_eff = c_or_d(c_l1, d_l1);
+    let (ref_idx_l0_final, ref_idx_l1_final, direct_zero_both) =
+        spatial_direct_ref_idx([a_l0, b_l0, c_l0, d_l0], [a_l1, b_l1, c_l1, d_l1]);
 
     // Keep the MB-level MVs from the helper for debug / symmetry —
     // not used directly (we recompute per sub-block via
@@ -8377,6 +8414,37 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
         }
     }
     partitions
+}
+
+/// §8.4.1.3.2 eqs. 8-214..8-216 — C replaced by D when partition C
+/// is not available.
+#[inline]
+fn c_or_d(c: NeighbourMv, d: NeighbourMv) -> NeighbourMv {
+    if !c.partition_available && d.partition_available {
+        d
+    } else {
+        c
+    }
+}
+
+/// §8.4.1.2.2 steps 4 / 5 — refIdxL0 / refIdxL1 of spatial direct
+/// prediction from the macroblock's neighbours `[A, B, C, D]` per list
+/// (eq. 8-184 MinPositive chain), and directZeroPredictionFlag (both
+/// negative: both set to 0).
+fn spatial_direct_ref_idx(l0: [NeighbourMv; 4], l1: [NeighbourMv; 4]) -> (i8, i8, bool) {
+    fn min_positive(x: i32, y: i32) -> i32 {
+        if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) }
+    }
+    let pick = |n: [NeighbourMv; 4]| {
+        let c = c_or_d(n[2], n[3]);
+        min_positive(n[0].ref_idx, min_positive(n[1].ref_idx, c.ref_idx))
+    };
+    let (r0, r1) = (pick(l0), pick(l1));
+    if r0 < 0 && r1 < 0 {
+        return (0, 0, true);
+    }
+    let fin = |r: i32| if r < 0 { -1 } else { r as i8 };
+    (fin(r0), fin(r1), false)
 }
 
 /// Table 7-14 — B_L0/B_L1/B_Bi 16x16 → (mode, ref_idx_l0, ref_idx_l1).
@@ -12659,6 +12727,12 @@ pub(crate) struct FtSlicePlan {
     pub(crate) inter: Vec<InterMbJob>,
     /// `(index into the slice's macroblocks, mbAddr, QP_Y)`.
     pub(crate) intra: Vec<(usize, u32, i32)>,
+    /// Inter macroblocks whose §8.4.1 motion is still to be derived
+    /// ([`ft_motion_stage`]), as `intra`.
+    pub(crate) pending: Vec<(usize, u32, i32)>,
+    /// Number of the slice's macroblocks the decoding-order pass
+    /// accepted (all before the first failing one).
+    pub(crate) accepted: usize,
 }
 
 impl InterMbJob {
@@ -12746,7 +12820,19 @@ fn ft_validate_inter_refs<R: RefPicProvider>(
     ref_pics: &R,
     chroma_array_type: u32,
 ) -> Result<(), ReconstructError> {
-    for (part, _, _) in parts {
+    for_each_ref_use(parts.iter().map(|(p, _, _)| p), |list, idx| {
+        ft_validate_ref(ref_pics, list, idx, chroma_array_type)
+    })
+}
+
+/// Every (list, refIdxLX) the partitions predict from, in decoding
+/// order (each partition's list 0, then list 1); stops at the first
+/// error `f` returns.
+fn for_each_ref_use<'p>(
+    parts: impl Iterator<Item = &'p InterPartition>,
+    mut f: impl FnMut(u8, u32) -> Result<(), ReconstructError>,
+) -> Result<(), ReconstructError> {
+    for part in parts {
         let uses = [
             (
                 0u8,
@@ -12766,31 +12852,41 @@ fn ft_validate_inter_refs<R: RefPicProvider>(
             ),
         ];
         for (list, ref_idx, used) in uses {
-            if !used || ref_idx < 0 {
-                continue;
-            }
-            let idx = ref_idx as u32;
-            let rp = ref_pics
-                .ref_pic(list, idx)
-                .ok_or(ReconstructError::MissingRefPic { list, idx })?;
-            if rp.width_in_samples == 0 || rp.height_in_samples == 0 {
-                return Err(ReconstructError::InvalidRefDims {
-                    width: rp.width_in_samples,
-                    height: rp.height_in_samples,
-                });
-            }
-            if rp.non_existing {
-                return Err(ReconstructError::NonExistingRef);
-            }
-            if (chroma_array_type == 1 || chroma_array_type == 2)
-                && (rp.chroma_width() == 0 || rp.chroma_height() == 0)
-            {
-                return Err(ReconstructError::InvalidRefDims {
-                    width: rp.chroma_width(),
-                    height: rp.chroma_height(),
-                });
+            if used && ref_idx >= 0 {
+                f(list, ref_idx as u32)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// §8.4.2 — the checks the sample stage applies to reference picture
+/// `RefPicListX[ idx ]` (see [`ft_validate_inter_refs`]).
+pub(crate) fn ft_validate_ref<R: RefPicProvider>(
+    ref_pics: &R,
+    list: u8,
+    idx: u32,
+    chroma_array_type: u32,
+) -> Result<(), ReconstructError> {
+    let rp = ref_pics
+        .ref_pic(list, idx)
+        .ok_or(ReconstructError::MissingRefPic { list, idx })?;
+    if rp.width_in_samples == 0 || rp.height_in_samples == 0 {
+        return Err(ReconstructError::InvalidRefDims {
+            width: rp.width_in_samples,
+            height: rp.height_in_samples,
+        });
+    }
+    if rp.non_existing {
+        return Err(ReconstructError::NonExistingRef);
+    }
+    if (chroma_array_type == 1 || chroma_array_type == 2)
+        && (rp.chroma_width() == 0 || rp.chroma_height() == 0)
+    {
+        return Err(ReconstructError::InvalidRefDims {
+            width: rp.chroma_width(),
+            height: rp.chroma_height(),
+        });
     }
     Ok(())
 }
@@ -12811,6 +12907,9 @@ pub(crate) fn ft_motion_pass<R: RefPicProvider>(
     ref_pics: &R,
     pic: &mut Picture,
     grid: &mut MbGrid,
+    // `Some`: leave the §8.4.1 derivation of the inter macroblocks to
+    // [`ft_motion_stage`], checking here only what can reject them.
+    mut defer: Option<FtDefer<'_>>,
 ) -> (FtSlicePlan, Result<(), ReconstructError>) {
     let chroma_array_type = sps.chroma_array_type();
     grid.mbaff_frame_flag = false;
@@ -12848,10 +12947,31 @@ pub(crate) fn ft_motion_pass<R: RefPicProvider>(
                 false,
                 luma_scaling_plane(sps, slice_header),
                 None,
+                IntraPass::Checks,
             ) {
                 return (plan, Err(e));
             }
             plan.intra.push((idx, curr_addr, mb_qp_y));
+        } else if let Some(d) = defer.as_mut() {
+            if let Some(info) = grid.get_mut(curr_addr) {
+                info.slice_id = current_slice_id;
+                info.mb_field_decoding_flag = false;
+            }
+            if let Err(e) = ft_check_inter_mb(
+                mb,
+                curr_addr,
+                slice_header,
+                sps,
+                ref_pics,
+                pic,
+                grid,
+                current_slice_id,
+                d.refs,
+                &mut |list, ref_idx| (d.check_ref)(list, ref_idx, idx),
+            ) {
+                return (plan, Err(e));
+            }
+            plan.pending.push((idx, curr_addr, mb_qp_y));
         } else {
             let parts = match derive_mb_inter_motion(
                 mb,
@@ -12898,8 +13018,379 @@ pub(crate) fn ft_motion_pass<R: RefPicProvider>(
             info.mb_field_decoding_flag = false;
         }
         prev_qp_y = mb_qp_y;
+        plan.accepted = idx + 1;
     }
     (plan, Ok(()))
+}
+
+/// The deferred mode of [`ft_motion_pass`]: per-mbAddr reference
+/// indices the checks track (spatial direct reads its neighbours'),
+/// and the check of each reference use `(list, refIdx, macroblock
+/// index in the slice)`, in decoding order.
+pub(crate) struct FtDefer<'a> {
+    pub(crate) refs: &'a mut [[[i8; 4]; 2]],
+    pub(crate) check_ref: &'a mut dyn FnMut(u8, u32, usize) -> Result<(), ReconstructError>,
+}
+
+/// Frame threading — the decoding-order checks of one slice
+/// ([`ft_motion_pass`] in deferred mode) run where its slice data is
+/// parsed: they only look at the slice's own macroblocks (§6.4.8 makes
+/// every other slice's macroblocks unavailable), into a grid of their
+/// own. What depends on the reference lists (which picture each
+/// reference index names) is left to [`FtPrecheck::finish`].
+pub(crate) struct FtPrecheck {
+    plan: FtSlicePlan,
+    grid: MbGrid,
+    /// The macroblock at `plan.accepted` failed with this error.
+    error: Option<ReconstructError>,
+    /// Each distinct (list, refIdx) used, with the slice macroblock
+    /// index of its first use, in order of first use.
+    uses: Vec<(u8, u32, usize)>,
+}
+
+/// Whether [`ft_precheck`] applies to a slice: a frame-threading
+/// slice that is not a temporal-direct B slice.
+pub(crate) fn ft_precheck_applies(slice_header: &SliceHeader, sps: &Sps, pps: &Pps) -> bool {
+    ft_eligible_slice(slice_header, sps, pps)
+        && (slice_header.slice_type != SliceType::B || slice_header.direct_spatial_mv_pred_flag)
+}
+
+/// Run the decoding-order checks of a slice on its own (see
+/// [`FtPrecheck`]).
+pub(crate) fn ft_precheck(
+    slice_data: &SliceData,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+) -> FtPrecheck {
+    let w = sps.pic_width_in_mbs_minus1 + 1;
+    let h = (sps.pic_height_in_map_units_minus1 + 1) * if sps.frame_mbs_only_flag { 1 } else { 2 };
+    let mut grid = MbGrid::new(w, h);
+    // The intra checks read neighbouring samples' availability only.
+    let mut pic = Picture::new(0, 0, sps.chroma_array_type(), 8, 8);
+    pic.width_in_samples = w * 16;
+    pic.height_in_samples = h * 16;
+    let mut refs = vec![[[-1i8; 4]; 2]; grid.info.len()];
+    let mut uses: Vec<(u8, u32, usize)> = Vec::new();
+    let mut record = |list: u8, idx: u32, mb: usize| {
+        if !uses.iter().any(|&(l, i, _)| l == list && i == idx) {
+            uses.push((list, idx, mb));
+        }
+        Ok(())
+    };
+    let (plan, res) = ft_motion_pass(
+        slice_data,
+        slice_header,
+        sps,
+        pps,
+        &crate::ref_store::NoRefs,
+        &mut pic,
+        &mut grid,
+        Some(FtDefer {
+            refs: &mut refs,
+            check_ref: &mut record,
+        }),
+    );
+    FtPrecheck {
+        plan,
+        grid,
+        error: res.err(),
+        uses,
+    }
+}
+
+impl FtPrecheck {
+    /// Complete the checks against the slice's reference lists
+    /// `ref_pics` and fold the slice into the picture's `grid`: the
+    /// same plan, grid state and result [`ft_motion_pass`] in deferred
+    /// mode gives when run on the picture.
+    pub(crate) fn finish<R: RefPicProvider>(
+        self,
+        slice_header: &SliceHeader,
+        sps: &Sps,
+        ref_pics: &R,
+        grid: &mut MbGrid,
+    ) -> (FtSlicePlan, Result<(), ReconstructError>) {
+        let FtPrecheck {
+            mut plan,
+            grid: src,
+            mut error,
+            uses,
+        } = self;
+        let cat = sps.chroma_array_type();
+        // The first use of a reference the checks reject ends the slice
+        // there (its uses come in decoding order).
+        let mut ref_failure = false;
+        for &(list, idx, mb) in &uses {
+            if mb > plan.accepted || (mb == plan.accepted && error.is_some()) {
+                break;
+            }
+            if let Err(e) = ft_validate_ref(ref_pics, list, idx, cat) {
+                plan.accepted = mb;
+                plan.intra.retain(|&(i, _, _)| i < mb);
+                plan.pending.retain(|&(i, _, _)| i < mb);
+                error = Some(e);
+                ref_failure = true;
+                break;
+            }
+        }
+        let first = slice_header.first_mb_in_slice as usize;
+        let n = grid.info.len().min(src.info.len());
+        let end = (first + plan.accepted).min(n);
+        if first == 0
+            && end == n
+            && error.is_none()
+            && grid.width_in_mbs == src.width_in_mbs
+            && grid.info.iter().all(|i| !i.available && i.slice_id < 0)
+        {
+            *grid = src;
+        } else {
+            if first < end {
+                grid.info[first..end].clone_from_slice(&src.info[first..end]);
+            }
+            // The failing macroblock keeps what was stamped on it before
+            // the failure: by the checks for a rejected reference (an
+            // inter macroblock), all of it for any other failure.
+            if error.is_some() && end < n {
+                if ref_failure {
+                    let info = &mut grid.info[end];
+                    info.slice_id = first as i32;
+                    info.mb_field_decoding_flag = false;
+                } else {
+                    grid.info[end] = src.info[end];
+                }
+            }
+        }
+        grid.mbaff_frame_flag = false;
+        (plan, error.map_or(Ok(()), Err))
+    }
+}
+
+/// Frame threading — the checks [`derive_mb_inter_motion`] +
+/// [`ft_validate_inter_refs`] apply to an inter macroblock, without
+/// deriving motion vectors: the partition structure and every
+/// reference index the partitions use. A spatial-direct (§8.4.1.2.2)
+/// macroblock's reference indices come from its neighbours' (eq.
+/// 8-184), so `refs[mbAddr]` keeps each macroblock's per-8x8 refIdxL0 /
+/// refIdxL1 as §8.4.1 would store them. Temporal direct slices are not
+/// deferred (their reference indices follow the co-located picture's
+/// motion).
+#[allow(clippy::too_many_arguments)]
+fn ft_check_inter_mb<R: RefPicProvider>(
+    mb: &Macroblock,
+    mb_addr: u32,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    ref_pics: &R,
+    pic: &Picture,
+    grid: &MbGrid,
+    current_slice_id: i32,
+    refs: &mut [[[i8; 4]; 2]],
+    check_ref: &mut dyn FnMut(u8, u32) -> Result<(), ReconstructError>,
+) -> Result<(), ReconstructError> {
+    let direct = |part: (u8, u8, u8), r: (i8, i8)| {
+        let mode = match (r.0 >= 0, r.1 >= 0) {
+            (true, false) => PartMode::L0Only,
+            (false, true) => PartMode::L1Only,
+            _ => PartMode::Direct,
+        };
+        InterPartition {
+            x: part.0,
+            y: part.1,
+            w: part.2,
+            h: part.2,
+            mode,
+            shape: MvpredShape::Default,
+            ref_idx_l0: r.0,
+            ref_idx_l1: r.1,
+            mvd_l0: (0, 0),
+            mvd_l1: (0, 0),
+            is_skip: false,
+            precomputed_mv: None,
+        }
+    };
+    let parts: Vec<InterPartition> = match &mb.mb_type {
+        MbType::BSkip | MbType::BDirect16x16 => {
+            vec![direct(
+                (0, 0, 16),
+                light_spatial_direct_refs(grid, refs, mb_addr, current_slice_id),
+            )]
+        }
+        MbType::B8x8
+            if mb
+                .sub_mb_pred
+                .as_ref()
+                .is_some_and(|sm| sm.sub_mb_type.contains(&SubMbType::BDirect8x8)) =>
+        {
+            let sm = mb.sub_mb_pred.as_ref().expect("checked above");
+            let mut direct_refs = None;
+            let mut parts = Vec::with_capacity(4);
+            for (q, &sub_type) in sm.sub_mb_type.iter().enumerate() {
+                let (x, y) = ((q as u8 % 2) * 8, (q as u8 / 2) * 8);
+                if sub_type == SubMbType::BDirect8x8 {
+                    let r = *direct_refs.get_or_insert_with(|| {
+                        light_spatial_direct_refs(grid, refs, mb_addr, current_slice_id)
+                    });
+                    parts.push(direct((x, y, 8), r));
+                } else {
+                    let (mode, r0, r1) =
+                        b_sub_mode(sub_type, sm.ref_idx_l0[q] as i8, sm.ref_idx_l1[q] as i8);
+                    let mut p = direct((x, y, 8), (r0, r1));
+                    p.mode = mode;
+                    parts.push(p);
+                }
+            }
+            parts
+        }
+        _ => derive_inter_partitions(
+            mb,
+            slice_header,
+            sps,
+            ref_pics,
+            pic,
+            mb_addr,
+            grid,
+            current_slice_id,
+        )?,
+    };
+    for_each_ref_use(parts.iter(), check_ref)?;
+    // The per-8x8 reference indices §8.4.1 stores for the macroblock.
+    let mut r = [[-1i8; 4]; 2];
+    for p in &parts {
+        let (qx0, qy0) = (p.x as usize / 8, p.y as usize / 8);
+        let (qnx, qny) = ((p.w as usize).max(8) / 8, (p.h as usize).max(8) / 8);
+        for qy in qy0..(qy0 + qny).min(2) {
+            for qx in qx0..(qx0 + qnx).min(2) {
+                if p.mode != PartMode::L1Only {
+                    r[0][qy * 2 + qx] = p.ref_idx_l0;
+                }
+                if matches!(
+                    p.mode,
+                    PartMode::L1Only | PartMode::BiPred | PartMode::Direct
+                ) {
+                    r[1][qy * 2 + qx] = p.ref_idx_l1;
+                }
+            }
+        }
+    }
+    if let Some(slot) = refs.get_mut(mb_addr as usize) {
+        *slot = r;
+    }
+    Ok(())
+}
+
+/// §8.4.1.2.2 — the spatial-direct (refIdxL0, refIdxL1) of the
+/// macroblock at `mb_addr` (non-MBAFF raster picture) from the
+/// reference indices `refs` records for its neighbours A, B, C, D
+/// (§8.4.1.3.2 with the whole macroblock as the partition).
+fn light_spatial_direct_refs(
+    grid: &MbGrid,
+    refs: &[[[i8; 4]; 2]],
+    mb_addr: u32,
+    current_slice_id: i32,
+) -> (i8, i8) {
+    let w = grid.width_in_mbs as i32;
+    let (mb_x, mb_y) = grid.mb_xy(mb_addr);
+    let (mb_x, mb_y) = (mb_x as i32, mb_y as i32);
+    let neighbour = |dx: i32, dy: i32, quadrant: usize, list: usize| -> NeighbourMv {
+        let (nx, ny) = (mb_x + dx, mb_y + dy);
+        if nx < 0 || ny < 0 || nx >= w {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        let addr = (ny * w + nx) as u32;
+        let Some(info) = grid.get(addr) else {
+            return NeighbourMv::UNAVAILABLE;
+        };
+        if !info.available
+            || (current_slice_id >= 0 && info.slice_id >= 0 && info.slice_id != current_slice_id)
+        {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        if info.is_intra {
+            return NeighbourMv::intra_but_mb_available();
+        }
+        match refs.get(addr as usize).map(|r| r[list][quadrant]) {
+            Some(r) if r >= 0 => NeighbourMv::new(r as i32, Mv::ZERO),
+            _ => NeighbourMv::intra_but_mb_available(),
+        }
+    };
+    // A = (−1, 0), B = (0, −1), C = (16, −1), D = (−1, −1).
+    let probe = |list: usize| {
+        [
+            neighbour(-1, 0, 1, list),
+            neighbour(0, -1, 2, list),
+            neighbour(1, -1, 2, list),
+            neighbour(-1, -1, 3, list),
+        ]
+    };
+    let (r0, r1, _) = spatial_direct_ref_idx(probe(0), probe(1));
+    (r0, r1)
+}
+
+/// Frame threading — §8.4.1 for the inter macroblocks
+/// [`ft_motion_pass`] deferred: walks every slice's accepted
+/// macroblocks in decoding order (re-establishing the availability the
+/// derivation sees), derives and stores each deferred macroblock's
+/// motion and adds its job to the slice's plan. `pic` carries the
+/// current picture's order counts / coding structure; each slice's
+/// reference lists must have their co-located motion resolved.
+pub(crate) fn ft_motion_stage(
+    works: &mut [crate::frame_thread::FtSliceWork],
+    pic: &Picture,
+    grid: &mut MbGrid,
+) {
+    if works.iter().all(|w| w.plan.pending.is_empty()) {
+        return;
+    }
+    grid.mbaff_frame_flag = false;
+    for info in grid.info.iter_mut() {
+        info.available = false;
+    }
+    for w in works.iter_mut() {
+        let first = w.header.first_mb_in_slice;
+        let current_slice_id = first as i32;
+        let pending = std::mem::take(&mut w.plan.pending);
+        let mut next = pending.iter().peekable();
+        for idx in 0..w.plan.accepted {
+            let addr = first + idx as u32;
+            if let Some(&&(pidx, paddr, qp_y)) = next.peek()
+                && pidx == idx
+            {
+                next.next();
+                match derive_mb_inter_motion(
+                    &w.sd.macroblocks[idx],
+                    paddr,
+                    &w.header,
+                    &w.sps,
+                    &w.refs,
+                    pic,
+                    grid,
+                    current_slice_id,
+                ) {
+                    Ok(parts) => {
+                        let (mb_x, mb_y) = grid.mb_xy(paddr);
+                        w.plan.inter.push(InterMbJob {
+                            idx,
+                            mb_x,
+                            mb_y,
+                            qp_y,
+                            parts,
+                        });
+                    }
+                    // Checked by `ft_check_inter_mb`; a failure here
+                    // ends the slice's sample stage at this macroblock.
+                    Err(_) => {
+                        w.plan.accepted = idx;
+                        w.plan.intra.retain(|&(i, _, _)| i < idx);
+                        break;
+                    }
+                }
+            }
+            if let Some(info) = grid.get_mut(addr) {
+                info.available = true;
+            }
+        }
+    }
 }
 
 /// Frame threading — the §8.4.2 prediction + §8.5 residual of one inter
@@ -12983,6 +13474,7 @@ pub(crate) fn ft_intra_mb(
         false,
         luma_scaling_plane(sps, slice_header),
         None,
+        IntraPass::Samples,
     )
 }
 

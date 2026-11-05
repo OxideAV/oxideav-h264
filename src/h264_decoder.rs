@@ -91,14 +91,21 @@ struct SdInput {
     pps: crate::pps::Pps,
 }
 
-type SdResult = std::result::Result<slice_data::SliceData, String>;
+/// The parsed slice data, with the slice's decoding-order checks when
+/// it may decode under frame threading ([`reconstruct::FtPrecheck`]).
+type SdResult =
+    std::result::Result<(slice_data::SliceData, Option<reconstruct::FtPrecheck>), String>;
 
 /// A slice-data parse queued on the pool when its NAL unit arrived.
 type SdTask = Deferred<SdInput, SdResult>;
 
 fn parse_sd(i: SdInput) -> SdResult {
-    slice_data::parse_slice_data(&i.rbsp, i.cursor.0, i.cursor.1, &i.header, &i.sps, &i.pps)
-        .map_err(|e| e.to_string())
+    let sd =
+        slice_data::parse_slice_data(&i.rbsp, i.cursor.0, i.cursor.1, &i.header, &i.sps, &i.pps)
+            .map_err(|e| e.to_string())?;
+    let pre = reconstruct::ft_precheck_applies(&i.header, &i.sps, &i.pps)
+        .then(|| reconstruct::ft_precheck(&sd, &i.header, &i.sps, &i.pps));
+    Ok((sd, pre))
 }
 
 /// An input event held back so the slice-data parses of the next few
@@ -126,6 +133,9 @@ struct FtState {
 #[derive(Default)]
 struct FtPicture {
     works: Vec<FtSliceWork>,
+    /// Per-macroblock refIdxL0 / refIdxL1 (per 8x8) the decoding-order
+    /// checks of deferred inter macroblocks track.
+    refs: Vec<[[i8; 4]; 2]>,
 }
 
 /// §7.4.1.2 / §7.4.1.2.4 — state carried forward across slices that
@@ -1372,12 +1382,13 @@ impl H264CodecDecoder {
         // The slice-data parse queued when the NAL unit arrived (frame
         // threading) is the same §7.3.4 parse of the same inputs.
         let queued = self.pending_sd.take();
-        let sd = match (&dp, queued) {
+        let (sd, precheck) = match (&dp, queued) {
             (None, Some(task)) => task
                 .take()
                 .unwrap_or_else(|| Err("slice data parser panicked".to_string())),
             (None, None) => {
                 slice_data::parse_slice_data(rbsp, cursor.0, cursor.1, header, sps, pps)
+                    .map(|sd| (sd, None))
                     .map_err(|e| e.to_string())
             }
             (Some((b, c)), _) => slice_data::parse_slice_data_partitioned(
@@ -1390,6 +1401,7 @@ impl H264CodecDecoder {
                 sps,
                 pps,
             )
+            .map(|sd| (sd, None))
             .map_err(|e| e.to_string()),
         }
         .map_err(|e| Error::invalid(format!("h264 slice_data: {e}")))?;
@@ -1764,6 +1776,23 @@ impl H264CodecDecoder {
             in_progress.pic.ref_list_1_unit_keys = l1_unit_keys.clone();
         }
         let _ = list_1_pocs;
+        // Frame threading — the §8.4.1 motion of P and spatial-direct B
+        // slices is derived on the pool; a temporal-direct B slice
+        // derives it here, from the co-located picture's motion (which
+        // the pool derives for its own pictures).
+        let defer_motion =
+            ft_slice && (header.slice_type != SliceType::B || header.direct_spatial_mv_pred_flag);
+        if ft_slice
+            && !defer_motion
+            && let (Some(&key), Some(ft)) = (list1.first(), self.ft.as_ref())
+            && let Some(planes) = ft.slots.get(&key)
+            && let Some(m) = planes.wait_motion()
+            && let Some(shell) = self.ref_store.get_by_key(key)
+        {
+            let mut p = shell.clone();
+            p.set_motion(&m);
+            self.ref_store.insert(key, p);
+        }
         let provider = BorrowedRefProvider {
             store: &self.ref_store,
             list_0: &list0,
@@ -1793,15 +1822,35 @@ impl H264CodecDecoder {
         let recon = if ft_slice {
             // Frame threading — the decoding-order part now; the sample
             // stage later, on the pool, with owned reference handles.
-            let (plan, res) = reconstruct::ft_motion_pass(
-                &sd,
-                header,
-                sps,
-                pps,
-                &provider,
-                &mut in_progress.pic,
-                &mut in_progress.grid,
-            );
+            let (plan, res) = match precheck {
+                // The checks ran with the parse; complete them here.
+                Some(pre) if defer_motion => {
+                    pre.finish(header, sps, &provider, &mut in_progress.grid)
+                }
+                _ => {
+                    let ftp = in_progress.ft.as_mut().expect("frame-threaded picture");
+                    if ftp.refs.len() != in_progress.grid.info.len() {
+                        ftp.refs = vec![[[-1; 4]; 2]; in_progress.grid.info.len()];
+                    }
+                    let cat = sps.chroma_array_type();
+                    let mut check = |list: u8, idx: u32, _mb: usize| {
+                        reconstruct::ft_validate_ref(&provider, list, idx, cat)
+                    };
+                    reconstruct::ft_motion_pass(
+                        &sd,
+                        header,
+                        sps,
+                        pps,
+                        &provider,
+                        &mut in_progress.pic,
+                        &mut in_progress.grid,
+                        defer_motion.then_some(reconstruct::FtDefer {
+                            refs: &mut ftp.refs[..],
+                            check_ref: &mut check,
+                        }),
+                    )
+                }
+            };
             let ft = self.ft.as_ref().expect("frame threading active");
             let refs = ft_provider(provider, &self.ref_store, &ft.slots);
             let mb_field_decoding_flags = sd.mb_field_decoding_flags.clone();
@@ -2025,7 +2074,11 @@ impl H264CodecDecoder {
         // decoded MV grid into the Picture so `ref_store` carries it
         // forward. Idempotent: overwrites whatever was in the Picture
         // before.
-        snapshot_grid_into_picture(&mut pic, &grid);
+        // (A frame-threaded picture's motion is derived and published
+        // by its pool job.)
+        if ft.is_none() {
+            snapshot_grid_into_picture(&mut pic, &grid);
+        }
 
         // Frame threading — the decoder keeps the picture's metadata and
         // motion (`pic`, now without samples: its reference-store entry
@@ -2046,6 +2099,11 @@ impl H264CodecDecoder {
                 samples.height_in_samples = pic.height_in_samples;
                 samples.pic_order_cnt = pic.pic_order_cnt;
                 samples.frame_num = pic.frame_num;
+                // What the §8.4.1 derivation reads of the current picture.
+                samples.coding_struct = pic.coding_struct;
+                samples.is_bottom_field = pic.is_bottom_field;
+                samples.top_field_order_cnt = pic.top_field_order_cnt;
+                samples.bottom_field_order_cnt = pic.bottom_field_order_cnt;
                 samples.luma = std::mem::take(&mut pic.luma);
                 samples.cb = std::mem::take(&mut pic.cb);
                 samples.cr = std::mem::take(&mut pic.cr);
@@ -2819,8 +2877,23 @@ fn ft_provider(
         list_1_parities,
         list_0_focs,
         list_1_focs,
+        list_0_pocs,
+        list_0_longterm,
+        list_1_longterm,
+        list_0_unit_keys,
+        list_1_unit_keys,
+        list_0_pair_keys,
+        list_1_pair_keys,
         ..
     } = p;
+    let pairs = |keys: &[Option<(u32, u32)>]| -> Vec<Option<crate::frame_thread::FieldPair>> {
+        keys.iter()
+            .map(|k| {
+                let (t, b) = (*k)?;
+                Some((store.get_arc(t)?, store.get_arc(b)?))
+            })
+            .collect()
+    };
     let resolve = |keys: &[u32], overrides: Vec<Option<Picture>>| -> Vec<Option<FtRef>> {
         let mut overrides = overrides.into_iter();
         keys.iter()
@@ -2843,6 +2916,11 @@ fn ft_provider(
         ],
         parities: [list_0_parities, list_1_parities],
         focs: [list_0_focs, list_1_focs],
+        pocs_0: list_0_pocs,
+        longterm: [list_0_longterm, list_1_longterm],
+        keys: [list_0.to_vec(), list_1.to_vec()],
+        unit_keys: [list_0_unit_keys, list_1_unit_keys],
+        pair_fields: [pairs(&list_0_pair_keys), pairs(&list_1_pair_keys)],
     }
 }
 
@@ -3268,6 +3346,9 @@ impl H264CodecDecoder {
                 continue;
             };
             let mut full = shell.clone();
+            if let Some(m) = planes.wait_motion() {
+                full.set_motion(&m);
+            }
             let (luma, cb, cr) = planes.assemble();
             let n_l = (full.width_in_samples * full.height_in_samples) as usize;
             let n_c = (full.chroma_width() * full.chroma_height()) as usize;
@@ -3295,9 +3376,13 @@ impl H264CodecDecoder {
         let Some(ip) = self.in_progress.as_mut() else {
             return;
         };
-        let Some(ftp) = ip.ft.take() else {
+        let Some(mut ftp) = ip.ft.take() else {
             return;
         };
+        for w in ftp.works.iter_mut() {
+            w.refs.resolve_colocated_motion();
+        }
+        reconstruct::ft_motion_stage(&mut ftp.works, &ip.pic, &mut ip.grid);
         crate::frame_thread::run_pixels(&mut ip.pic, &mut ip.grid, &ftp.works, None, None);
         self.ft_materialize();
     }
@@ -3325,15 +3410,34 @@ impl H264CodecDecoder {
         while ft.inflight.front().is_some_and(|p| p.is_done().is_some()) {
             ft.inflight.pop_front();
         }
+        // The decoder thread helps with queued work while it waits.
         while ft.inflight.len() >= ft.pool.threads() {
-            if let Some(p) = ft.inflight.pop_front() {
-                p.wait_done();
+            match ft.inflight.front() {
+                Some(p) if p.is_done().is_none() => {
+                    if !ft.pool.help_one() {
+                        p.wait_done();
+                    }
+                }
+                _ => {
+                    ft.inflight.pop_front();
+                }
             }
         }
         ft.inflight.push_back(planes.clone());
         ft.pool.spawn_low(move || {
             let job_planes = planes.clone();
+            let mut ftp = ftp;
             crate::frame_thread::run_job(&job_planes, move || {
+                // §8.4.1 — the deferred motion, published for the B
+                // slices that take this picture as co-located picture.
+                for w in ftp.works.iter_mut() {
+                    if !w.refs.resolve_colocated_motion() {
+                        planes.abort();
+                        return;
+                    }
+                }
+                reconstruct::ft_motion_stage(&mut ftp.works, &samples, &mut grid);
+                planes.set_motion(crate::picture::MotionGrids::from_grid(&grid));
                 let db = deblock.map(|(alpha_off, beta_off)| crate::frame_thread::FtDeblock {
                     alpha_off,
                     beta_off,
@@ -3483,32 +3587,7 @@ impl H264CodecDecoder {
 /// slice, but the per-picture cost of the copy is tiny and it keeps
 /// the code path uniform.
 fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
-    let w = grid.width_in_mbs as usize;
-    let h = grid.height_in_mbs as usize;
-    let nmb = w * h;
-    pic.mb_width_in_picture = grid.width_in_mbs;
-    pic.mv_l0_grid = vec![(0i16, 0i16); nmb * 16];
-    pic.mv_l1_grid = vec![(0i16, 0i16); nmb * 16];
-    pic.ref_idx_l0_grid = vec![-1i8; nmb * 4];
-    pic.ref_idx_l1_grid = vec![-1i8; nmb * 4];
-    pic.is_intra_grid = vec![false; nmb];
-    // §6.4.12.2 / Table 8-8 — `fieldDecodingFlagX` of every MB, for
-    // AFRM pictures serving as colPic.
-    pic.mb_field_flags = vec![false; nmb];
-    for (addr, info) in grid.info.iter().enumerate() {
-        let base_mv = addr * 16;
-        let base_r = addr * 4;
-        for blk4 in 0..16 {
-            pic.mv_l0_grid[base_mv + blk4] = info.mv_l0[blk4];
-            pic.mv_l1_grid[base_mv + blk4] = info.mv_l1[blk4];
-        }
-        for blk8 in 0..4 {
-            pic.ref_idx_l0_grid[base_r + blk8] = info.ref_idx_l0[blk8];
-            pic.ref_idx_l1_grid[base_r + blk8] = info.ref_idx_l1[blk8];
-        }
-        pic.is_intra_grid[addr] = info.is_intra;
-        pic.mb_field_flags[addr] = info.mb_field_decoding_flag;
-    }
+    pic.set_motion(&crate::picture::MotionGrids::from_grid(grid));
 }
 
 /// §C.4.4 / §8.4.2 — re-interleave a complementary pair of half-height

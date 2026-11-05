@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole-edge shortcuts for intra sides, a raster non-zero mask and one
   motion comparison per edge between uniformly moving macroblocks.
   Single-threaded 1080p High-profile decode: 17.0 → 14.1 G cycles.
+- Frame threading takes the per-macroblock work off the decoder
+  thread: a slice's decoding-order checks (partition structure, intra
+  prediction-mode availability, every reference index a macroblock
+  uses — spatial-direct ones from the neighbours' indices) run with its
+  slice-data parse on the pool, the decoder thread only checks the
+  used reference indices against the lists; the §8.4.1 motion
+  derivation of P and spatial-direct B slices runs at the start of the
+  picture's pool job, which publishes the motion for the B pictures
+  that take it as co-located picture (temporal-direct B slices still
+  derive theirs on the decoder thread, from that published motion).
+  The decoder thread runs queued pool work while it waits for a
+  picture slot.
 
 ### Added
 
