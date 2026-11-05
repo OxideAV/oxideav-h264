@@ -126,6 +126,8 @@ struct FtState {
     slots: HashMap<u32, Arc<SharedPlanes>>,
     /// Pictures whose sample stage is queued or running, oldest first.
     inflight: VecDeque<Arc<SharedPlanes>>,
+    /// Bumped as each picture job ends.
+    finished: Arc<crate::frame_thread::JobsFinished>,
 }
 
 /// A picture decoded under frame threading: the slices whose decoding
@@ -3284,6 +3286,7 @@ impl H264CodecDecoder {
                 queued_slices: 0,
                 slots: HashMap::new(),
                 inflight: VecDeque::new(),
+                finished: Arc::default(),
             });
         }
     }
@@ -3406,27 +3409,33 @@ impl H264CodecDecoder {
             planes.abort();
             return;
         };
-        // Bound the pictures in flight by the budget.
-        while ft.inflight.front().is_some_and(|p| p.is_done().is_some()) {
-            ft.inflight.pop_front();
-        }
-        // The decoder thread helps with queued work while it waits.
-        while ft.inflight.len() >= ft.pool.threads() {
-            match ft.inflight.front() {
-                Some(p) if p.is_done().is_none() => {
-                    if !ft.pool.help_one() {
-                        p.wait_done();
-                    }
-                }
-                _ => {
-                    ft.inflight.pop_front();
-                }
+        // Bound the pictures in flight by the budget (plus two queued,
+        // so a worker that finishes finds the next picture ready): wait
+        // for any of them to finish, helping with queued parses
+        // meanwhile.
+        loop {
+            let seen = ft.finished.get();
+            ft.inflight.retain(|p| p.is_done().is_none());
+            if ft.inflight.len() < ft.pool.threads() + 2 {
+                break;
+            }
+            if !ft.pool.help_one() {
+                ft.finished.wait_past(seen);
             }
         }
         ft.inflight.push_back(planes.clone());
+        let finished = ft.finished.clone();
         ft.pool.spawn_low(move || {
             let job_planes = planes.clone();
             let mut ftp = ftp;
+            // However the job ends, it frees its slot.
+            struct Done(Arc<crate::frame_thread::JobsFinished>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.bump();
+                }
+            }
+            let _done = Done(finished);
             crate::frame_thread::run_job(&job_planes, move || {
                 // §8.4.1 — the deferred motion, published for the B
                 // slices that take this picture as co-located picture.

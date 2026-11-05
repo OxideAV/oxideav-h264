@@ -221,6 +221,35 @@ impl SharedPlanes {
     }
 }
 
+/// A count of finished picture jobs the decoder thread can wait on (it
+/// waits for any picture slot to free, not for one in particular).
+#[derive(Default)]
+pub(crate) struct JobsFinished {
+    count: Mutex<u64>,
+    cond: Condvar,
+}
+
+impl JobsFinished {
+    /// The current count.
+    pub(crate) fn get(&self) -> u64 {
+        *self.count.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a finished job.
+    pub(crate) fn bump(&self) {
+        *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.cond.notify_all();
+    }
+
+    /// Block until the count differs from `seen`.
+    pub(crate) fn wait_past(&self, seen: u64) {
+        let mut c = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        while *c == seen {
+            c = self.cond.wait(c).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 type Task = Box<dyn FnOnce() + Send>;
 
 struct PoolQueue {
@@ -311,14 +340,15 @@ impl Pool {
         self.shared.cond.notify_one();
     }
 
-    /// Run one queued task on the calling thread (high-priority tasks
-    /// first). `false` when the queue is empty. Every task only waits
-    /// on work queued before it, which is running or done once it is
-    /// dequeued, so a waiting caller can help without deadlocking.
+    /// Run one queued short (slice-data parse) task on the calling
+    /// thread; `false` when there is none. A short task waits on
+    /// nothing, and the caller is back within one parse (picture jobs
+    /// are left to the workers: a decoder thread inside one would hold
+    /// back the next pictures for its whole duration).
     pub(crate) fn help_one(&self) -> bool {
         let task = {
             let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-            q.high.pop_front().or_else(|| q.low.pop_front())
+            q.high.pop_front()
         };
         match task {
             Some(t) => {

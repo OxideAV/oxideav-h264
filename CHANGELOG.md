@@ -31,8 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picture's pool job, which publishes the motion for the B pictures
   that take it as co-located picture (temporal-direct B slices still
   derive theirs on the decoder thread, from that published motion).
-  The decoder thread runs queued pool work while it waits for a
-  picture slot.
+  While it waits for a picture slot — any in-flight picture finishing
+  frees one; the budget plus two pictures are in flight — the decoder
+  thread runs queued slice-data parses (never a picture job, which
+  would hold back the next pictures).
 - The CABAC engine keeps `codIOffset` with up to 40 bits of lookahead
   (`value = codIOffset · 2^pending + next bits`), so RenormD and bypass
   bins only move a bit count instead of reading bit by bit; a read past
