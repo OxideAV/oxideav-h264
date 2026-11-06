@@ -365,6 +365,28 @@ framemd5 comparison:
 cargo run --release --example decode_bench -- clip.h264 8 [out.yuv]
 ```
 
+## Output shape and mid-stream changes
+
+The size, pixel format, frame rate and colour signal of the decoded
+frames are stated once per stream, by `Decoder::output_params()` —
+answered from the `avcC` record or the first SPS before any frame.
+When a new active SPS changes that shape (a new coded video sequence
+at another size, cropping, chroma format or bit depth), the change is
+announced three ways that agree: `output_params()` answers the new
+shape, `output_params_generation()` moves, and `receive_frame` returns
+one `Frame::StreamParams` event carrying the new answer immediately
+before the first frame of the new shape. Every frame of the old shape
+still in the reorder queue comes out before the event, at every worker
+budget, after `reset()` and while draining after `flush()`. Callers
+that do not care skip the event (`Frame::is_stream_params`);
+`receive_arena_frame` skips it for them.
+
+The registry encoder takes the same event as a re-configuration
+request (Annex B output only): it drains the old configuration and
+starts a new coded video sequence — IDR plus the new SPS / PPS — for
+the new shape. With `format=avcc`, or for a shape the encoder cannot
+code, it returns `Error::Unsupported`.
+
 ## Threading
 
 `Decoder::set_execution_context` with a budget above one turns on

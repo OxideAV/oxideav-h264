@@ -1,0 +1,2 @@
+splice_5_shapes.h264 10:64,48,yuv420p 10:80,46,yuv420p 10:80,46,yuv420p10le 10:80,46,yuv422p 10:64,48,yuv420p 
+splice_same_shape.h264 20:64,48,yuv420p 

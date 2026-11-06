@@ -378,6 +378,13 @@ impl EncoderSession {
         self.next_idr_pic_id
     }
 
+    /// Continue the §7.4.3 `idr_pic_id` sequence of an earlier session
+    /// (a mid-stream re-configuration), so the IDR opening this one
+    /// never repeats the value of the IDR just before it.
+    pub(crate) fn set_next_idr_pic_id(&mut self, id: u32) {
+        self.next_idr_pic_id = id & 0xFFFF;
+    }
+
     /// The SPS + PPS every IDR access unit of this session carries, as
     /// Annex B NAL units — available before the first picture so an
     /// out-of-band `avcC` record ([`crate::avcc`]) can be built up

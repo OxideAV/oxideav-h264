@@ -432,6 +432,13 @@ pub struct H264CodecEncoder {
     /// `format=avcc`: length-prefixed samples without parameter sets.
     avcc: bool,
     queue: VecDeque<Packet>,
+    /// The construction parameters (options included): the base of a
+    /// mid-stream re-configuration.
+    params: CodecParameters,
+    /// Reorder mode: frames coded by earlier configurations, added to
+    /// the session's display index so `pts` keeps counting across a
+    /// re-configuration.
+    pts_base: i64,
 }
 
 /// Where a request is coded.
@@ -710,7 +717,75 @@ impl H264CodecEncoder {
             decode_index: 0,
             avcc,
             queue: VecDeque::new(),
+            params: params.clone(),
+            pts_base: 0,
         })
+    }
+
+    /// The `idr_pic_id` the next IDR of the current backend carries.
+    fn next_idr_pic_id(&self) -> u32 {
+        match &self.backend {
+            Backend::Session(s) => s.next_idr_pic_id(),
+            Backend::Deep(d) => d.next_idr_pic_id,
+        }
+    }
+
+    /// `Frame::StreamParams`: re-configure for a new input shape.
+    ///
+    /// The width / height / pixel format / frame rate the event states
+    /// replace those of the construction parameters (options kept), a
+    /// new coding path is built for them, the old one is drained (its
+    /// B-frame tail comes out first), and the next frame starts a new
+    /// coded video sequence: an IDR access unit carrying the new SPS +
+    /// PPS in band (§7.4.1.2.1 — an SPS may change content only ahead
+    /// of an IDR), whose `idr_pic_id` continues the old sequence's
+    /// (§7.4.3). `pts` / `dts` keep counting. An event that changes
+    /// nothing is a no-op.
+    ///
+    /// `format=avcc` cannot follow (its parameter sets live in the
+    /// `extradata` record, fixed for the stream): `Error::Unsupported`,
+    /// as is a shape no coding path takes (non-16-aligned size, an
+    /// unsupported layout); the encoder is unchanged then.
+    fn reconfigure(&mut self, ev: &CodecParameters) -> Result<()> {
+        let mut next = self.params.clone();
+        next.width = ev.width.or(next.width);
+        next.height = ev.height.or(next.height);
+        next.pixel_format = ev.pixel_format.or(next.pixel_format);
+        next.frame_rate = ev.frame_rate.or(next.frame_rate);
+        let cur = &self.params;
+        let input_pf = |p: &CodecParameters| p.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+        if (next.width, next.height, next.frame_rate) == (cur.width, cur.height, cur.frame_rate)
+            && input_pf(&next) == input_pf(cur)
+        {
+            return Ok(());
+        }
+        if self.avcc {
+            return Err(Error::unsupported(
+                "h264 encoder: format=avcc cannot change shape mid-stream (parameter sets are fixed in the extradata record)",
+            ));
+        }
+        let mut fresh = Self::new(&next).map_err(|e| {
+            Error::unsupported(format!(
+                "h264 encoder: cannot re-configure for {next:?}: {e}"
+            ))
+        })?;
+        // Drain the old configuration's buffered tail first.
+        self.flush()?;
+        let idr_pic_id = self.next_idr_pic_id();
+        match &mut fresh.backend {
+            Backend::Session(s) => s.set_next_idr_pic_id(idr_pic_id),
+            Backend::Deep(d) => d.next_idr_pic_id = idr_pic_id,
+        }
+        self.backend = fresh.backend;
+        self.layout = fresh.layout;
+        self.width = fresh.width;
+        self.height = fresh.height;
+        self.time_base = fresh.time_base;
+        self.reordered = fresh.reordered;
+        self.output_params = fresh.output_params;
+        self.params = next;
+        self.pts_base = self.frame_index;
+        Ok(())
     }
 
     /// Package one access unit as a packet on the queue.
@@ -741,7 +816,10 @@ impl H264CodecEncoder {
             let (pts, dts) = if self.reordered {
                 // Frame-duration units: display slot + the one-frame
                 // reorder latency vs the decode counter.
-                (sf.display_index as i64 + 1, self.decode_index)
+                (
+                    self.pts_base + sf.display_index as i64 + 1,
+                    self.decode_index,
+                )
             } else {
                 (input_pts, input_pts)
             };
@@ -800,6 +878,7 @@ impl CoreEncoder for H264CodecEncoder {
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let vf = match frame {
             Frame::Video(vf) => vf,
+            Frame::StreamParams(p) => return self.reconfigure(p),
             _ => return Err(Error::invalid("h264 encoder accepts video frames only")),
         };
         let planes = vf.image_planes();

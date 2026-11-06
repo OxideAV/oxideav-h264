@@ -76,6 +76,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth and the worker budget do not move the switch point). Verified
   against ffprobe on black-box libx264 fixtures
   (`tests/fixtures/output_params/`, `gen.sh`).
+- The in-band `Frame::StreamParams` event (oxideav-core 0.1.43):
+  `receive_frame` returns one event carrying the new `output_params()`
+  answer immediately before the first frame of a new shape — a new
+  active SPS changing the size, cropping, chroma format, bit depth, VUI
+  frame rate or colour signal, or a lone field emitted at half height —
+  exactly where the generation moves, never for the first shape. The
+  old-shape pictures still in the §C.4 reorder queue come out first, at
+  every worker budget; the same holds after `reset()` and while
+  draining after `flush()`; `receive_arena_frame` skips the event.
+  Gated on black-box libx264 splices with B-frames (64x48 → 80x46 →
+  10-bit → 4:2:2 → 64x48, and a constant-shape splice;
+  `tests/fixtures/output_params/gen_events.sh`) at 1 / 4 / 8 workers,
+  every picture bit-identical to its own segment decoded alone.
+- The registry encoder re-configures on `Frame::StreamParams` (Annex B
+  output): the old configuration's B-frame tail is drained, the next
+  frame opens a new coded video sequence (IDR with the new SPS / PPS in
+  band, §7.4.1.2.1, `idr_pic_id` continuing the old sequence's,
+  §7.4.3), `pts` / `dts` keep counting and `output_params()` describes
+  the new output; the coding path follows the new layout (8-bit 4:2:0
+  session ↔ High-family). An event that changes nothing is a no-op;
+  `format=avcc` (parameter sets fixed in the extradata record) and
+  shapes no coding path takes return `Error::Unsupported`, leaving the
+  encoder as it was.
+
+### Changed
+
+- `Frame::StreamParams` reaches the encoder as a re-configuration
+  request instead of the `Error::InvalidData` every non-video frame got
+  before.
 
 ### Fixed
 

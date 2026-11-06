@@ -274,6 +274,9 @@ fn decode_with_ours(data: &[u8]) -> OursResult {
     while frames.len() < MAX_OURS_FRAMES {
         match dec.receive_frame() {
             Ok(Frame::Video(v)) => frames.push(v),
+            // A mid-stream shape change: announced in band, the
+            // pictures around it are compared one by one.
+            Ok(f) if f.is_stream_params() => continue,
             _ => break,
         }
     }

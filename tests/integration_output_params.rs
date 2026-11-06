@@ -17,7 +17,8 @@
 //!   transfer / matrix; frame rate = half ffprobe's raw-ES tick rate);
 //! * a stream whose second coded video sequence changes size and bit
 //!   depth bumps the generation exactly once, at the first frame of the
-//!   new shape;
+//!   new shape (with the in-band `Frame::StreamParams` event right
+//!   before it — see `integration_stream_params.rs`);
 //! * the answers and generations after every frame are identical with
 //!   1 and 8 worker threads.
 
@@ -232,6 +233,13 @@ fn descs(t: &Trace) -> Vec<(Desc, u64)> {
 
 fn drain(dec: &mut dyn Decoder, trace: &mut Trace, tag: &str) {
     while let Ok(f) = dec.receive_frame() {
+        if let Some(ev) = f.stream_params() {
+            // The in-band announcement (gated in depth by
+            // integration_stream_params.rs): already the answer.
+            let p = dec.output_params().expect("answer at an event");
+            assert_eq!(Desc::of(ev), Desc::of(&p), "{tag}: event == answer");
+            continue;
+        }
         let Frame::Video(vf) = f else {
             panic!("{tag}: non-video frame")
         };
@@ -385,16 +393,25 @@ fn generation_bumps_exactly_at_the_first_frame_of_the_new_shape() {
     watch.prime(&dec, &mut stream);
     assert_eq!((stream.width, stream.height), (Some(64), Some(48)));
     let mut changes = Vec::new();
+    let mut events = Vec::new();
     let mut n = 0;
-    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+    while let Ok(f) = dec.receive_frame() {
         if watch.observe(&dec, &mut stream) {
             changes.push(n);
         }
+        if f.is_stream_params() {
+            events.push(n);
+            continue;
+        }
+        let Frame::Video(vf) = f else {
+            panic!("non-video frame")
+        };
         assert_frame_matches(&vf, &stream, "watched stream");
         n += 1;
     }
     assert_eq!(n, 10);
-    assert_eq!(changes, vec![5], "one change, at frame 5");
+    assert_eq!(changes, vec![5], "one change, before frame 5");
+    assert_eq!(events, vec![5], "one event, before frame 5");
 }
 
 /// 4:0:0 (libx264 cannot code it): the crate's own encoder. ffprobe

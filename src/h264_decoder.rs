@@ -449,6 +449,10 @@ pub struct H264CodecDecoder {
     /// `Decoder::output_params_generation` — bumped when a returned
     /// frame's description differs from the previous frame's.
     params_generation: u64,
+    /// The first frame of a new shape, held back for one
+    /// `receive_frame` call while the `Frame::StreamParams` event
+    /// announcing its shape is returned in front of it.
+    held_frame: Option<VideoFrame>,
 }
 
 impl H264CodecDecoder {
@@ -491,6 +495,7 @@ impl H264CodecDecoder {
             extradata_nals: Vec::new(),
             emitted_shape: None,
             params_generation: 0,
+            held_frame: None,
         }
     }
 
@@ -3119,14 +3124,28 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
+        if let Some(vf) = self.held_frame.take() {
+            return Ok(Frame::Video(vf));
+        }
         let (vf, shape) = self.receive_shaped()?;
         // The description changes together with the first frame of a
         // new shape (never at the header announcing it: pictures of
-        // the old shape may still have been queued for output).
-        if self.emitted_shape.is_some_and(|prev| prev != shape) {
-            self.params_generation = self.params_generation.wrapping_add(1);
-        }
+        // the old shape may still have been queued for output). Every
+        // picture carries the shape of the SPS it was decoded with, so
+        // the old-shape pictures still in the §C.4 reorder queue have
+        // all come out before this point, whatever the worker budget.
+        let changed = self.emitted_shape.is_some_and(|prev| prev != shape);
         self.emitted_shape = Some(shape);
+        if changed {
+            // Counter, answer and in-band event move together: the
+            // event is returned immediately before the frame, which is
+            // held for the next call.
+            self.params_generation = self.params_generation.wrapping_add(1);
+            self.held_frame = Some(vf);
+            return Ok(Frame::StreamParams(Box::new(
+                shape.to_params(&self.codec_id),
+            )));
+        }
         Ok(Frame::Video(vf))
     }
 
@@ -3565,6 +3584,10 @@ impl H264CodecDecoder {
         // already bumped but not yet consumed.
         self.output_dpb.reset();
         self.ready.clear();
+        // A new-shape frame held behind its already-returned event is
+        // stale too; the event's shape stays the reference the next
+        // frame is compared with (counter and answer already moved).
+        self.held_frame = None;
         self.pending_pts = None;
         self.ref_store = RefPicStore::new();
         self.dpb_entries.clear();
@@ -5122,15 +5145,32 @@ mod tests {
         dec.flush_pending_field();
         dec.eof = true;
         let mut sizes = Vec::new();
-        while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-            sizes.push((
-                vf.planes[0].stride,
-                vf.planes[0].data.len() / vf.planes[0].stride,
-            ));
-            assert_eq!(vf.planes[1].stride, 7);
+        let mut events = Vec::new();
+        while let Ok(f) = dec.receive_frame() {
+            match f {
+                Frame::Video(vf) => {
+                    sizes.push((
+                        vf.planes[0].stride,
+                        vf.planes[0].data.len() / vf.planes[0].stride,
+                    ));
+                    assert_eq!(vf.planes[1].stride, 7);
+                }
+                Frame::StreamParams(p) => {
+                    events.push((p.width, p.height, sizes.len()));
+                    let now = dec.output_params().expect("answer");
+                    assert_eq!(
+                        (p.width, p.height, p.pixel_format),
+                        (now.width, now.height, now.pixel_format)
+                    );
+                }
+                _ => panic!("unexpected frame kind"),
+            }
         }
-        // Pair: 8 rows − 4; lone field: 4 rows − 2.
+        // Pair: 8 rows − 4; lone field: 4 rows − 2 — a new output
+        // shape, announced in band right before the lone field.
         assert_eq!(sizes, vec![(14, 4), (14, 2)]);
+        assert_eq!(events, vec![(Some(14), Some(2), 1)]);
+        assert_eq!(dec.output_params_generation(), 1);
     }
 
     /// Round 430 (2026-07-25 scheduled-fuzz OOM triage) — §8.2.5.2
