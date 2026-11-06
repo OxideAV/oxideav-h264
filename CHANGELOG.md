@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/OxideAV/oxideav-h264/compare/v0.1.10...v0.1.11) - 2026-11-06
+
+### Other
+
+- :StreamParams: in-band event at every output-shape change; encoder re-configures on it
+- inter residual: add the luma residual in place in the prediction buffer
+- frame-threading layout and 1080p decode timings (1 / 4 / 8 / 16 threads)
+- decode speed: motion compensation straight into the prediction for copy partitions
+- frame threading: free a picture slot when any picture finishes, decoder thread helps with parses only
+- decode speed: inline partition lists, per-partition reference keys, identity-weight shortcut
+- decode speed: both chroma planes per deblock pass, smaller parsed macroblocks
+- decode speed: CABAC lookahead window, typed MC gather, vectorisable clipping
+- frame threading: macroblock checks with the slice parse, motion derivation in the picture job
+- decode speed: narrow sample planes (u8 / u16) and line-parallel frame deblocking
+- reset keeps the avcC parameter sets in force
+- :output_params + output_params_generation from the SPS / avcC
+
 ### Performance
 
 - Decoded pictures store samples narrow: `u8` planes for 8-bit
