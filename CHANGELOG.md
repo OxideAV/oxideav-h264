@@ -17,6 +17,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EncodedP`, `EncodedB`, `deep::DeepEncoded`, `rate_control::FramePlan`,
   `rate_control::CommitOutcome` and `session::SessionFrame`.
 
+### Fixed
+
+- Random access (#11): decoding that starts at a non-IDR picture — a
+  broadcast stream joined mid-way, which carries no IDR at all — now
+  follows D.2.8. Entry is at an intra-coded picture or at an access unit
+  carrying a recovery point SEI message (intra-refresh P pictures
+  included); references to pictures that precede the entry point are
+  inferred as all-intra mid-grey pictures (NOTE 3) instead of failing
+  the slice, and pictures preceding the recovery point in output order
+  (open-GOP leading B pictures, the refresh period of
+  `recovery_frame_cnt`) are decoded but not output. Previously one
+  leading reference B picture failed, its frame_num was never recorded
+  and every later picture was rejected: a 1920x1080 MBAFF open-GOP
+  stream cut at a non-IDR I picture output 1 of 51 frames; it now
+  decodes byte-identical to a black-box reference decoder at 1 and 8
+  threads.
+- Lost reference pictures (#11): a frame_num jump the SPS does not allow
+  is inferred as an unintentional loss (§8.2.5.2 NOTE 2) — the gap
+  process runs with concealment references (a copy of the last
+  reference frame, else mid-grey) and decoding resynchronises at the
+  next recovery point, instead of rejecting every picture until the
+  next IDR.
+
 ### Changed
 
 - API hygiene: `#[non_exhaustive]` on the enums `sei::SeiError`,

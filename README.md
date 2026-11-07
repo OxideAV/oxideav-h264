@@ -32,6 +32,17 @@ process). Interlaced 1080i MBAFF streams with P and B pictures (TFF and
 BFF, B-pyramid, spatial and temporal direct, implicit weighted
 bi-prediction, CAVLC and CABAC, 4:2:2 and 10-bit) decode MD5-identical
 to a black-box reference decoder (`integration_mbaff_inter_conformance`).
+Decoding also starts without an IDR picture, as a broadcast stream joined
+mid-way requires: at a non-IDR I picture or at an access unit carrying a
+recovery point SEI message (intra refresh), references to pictures before
+the entry point are inferred as all-intra mid-grey pictures (D.2.8 NOTE 3)
+and pictures preceding the recovery point in output order (open-GOP
+leading B pictures, the refresh period) are decoded but not output; a
+lost reference picture (a frame_num jump the SPS does not allow) is
+concealed through the §8.2.5.2 gap process and decoding resynchronises at
+the next recovery point (`integration_random_access`; a 1920x1080 MBAFF
+open-GOP stream cut at a non-IDR I picture decodes byte-identical to the
+black-box reference decoder).
 §8.5.15 lossless transform-bypass
 (`qpprime_y_zero_transform_bypass_flag=1`, QP′Y == 0) decodes
 losslessly — identity §8.5.10..§8.5.13 legs + V/H intra residual DPCM
