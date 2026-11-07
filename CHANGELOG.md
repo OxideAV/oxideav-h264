@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next recovery point, instead of rejecting every picture until the
   next IDR.
 
+### Performance
+
+- MBAFF deblocking (#11, #19): bS is derived once per pair of 4x4
+  luma blocks along an edge (and remembered across the chroma lines and
+  planes that map onto them) instead of once per sample line, and under
+  a thread budget the MBAFF walker runs by macroblock-pair row in a
+  wavefront (8 halo rows over each 32-row pair row; a row filters pair
+  x once the row above has filtered pair x + 1), output identical to
+  the serial walk. 10 s 1080i25 High CABAC libx264 clip: 37 → 61 fps
+  single-threaded, 45 → 125 fps at 8 threads; byte-identical to a
+  black-box reference decoder at every budget (also 4:2:2 10-bit,
+  bottom-field-first CAVLC and multi-slice MBAFF streams).
+
 ### Changed
 
 - API hygiene: `#[non_exhaustive]` on the enums `sei::SeiError`,

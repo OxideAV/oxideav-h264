@@ -436,6 +436,19 @@ of three on this machine (18 cores), before → after this round:
 
 Every output is byte-identical to `ffmpeg -f rawvideo` on these clips.
 
+MBAFF frames (interlaced 1080i broadcast) are not frame-threaded; their
+§8.7 deblocking runs by macroblock-pair row in a wavefront under the
+budget (a pair row starts a pair once the row above has filtered the
+pair to its upper right; 8 halo rows, since field-macroblock taps step
+two rows), and derives bS once per pair of 4x4 blocks instead of per
+sample line. 10 s 1080i25 libx264 clip (`testsrc2` re-interlaced
+top-field-first, High, CABAC, B-frames, preset medium), frames per
+second on this machine:
+
+| clip | 1 thread | 4 | 8 |
+| ---- | -------- | - | - |
+| 1080i MBAFF, before → after | 37 → 61 | 45 → 123 | 45 → 125 |
+
 ## Profiles + features in scope
 
 The long-term target is a **complete** implementation of ITU-T Rec.
