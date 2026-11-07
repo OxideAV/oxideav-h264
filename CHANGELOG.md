@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `with_*` setters for every field of `encoder::EncoderConfig` (start
+  from `EncoderConfig::new(width, height)`) and `sei::SeiContext` (start
+  from `Default`); `encoder::deep::DeepConfig::new(width, height,
+  bit_depth_luma, bit_depth_chroma, chroma_format_idc, qp)` plus `with_*`;
+  all-field `new(..)` constructors for `encoder::EncodedIdr`,
+  `EncodedP`, `EncodedB`, `deep::DeepEncoded`, `rate_control::FramePlan`,
+  `rate_control::CommitOutcome` and `session::SessionFrame`.
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on the enums `sei::SeiError`,
+  `sei::SeiPayload`, `encoder::ScalingMatrixMode`,
+  `encoder::ScalingListsSpec`, `deep::DeepPictureKind`,
+  `rate_control::RateControlMode`, `rate_control::RcFrameKind`,
+  `session::SessionRateControl`, `session::SessionFrameKind`, and on the
+  records `EncoderConfig`, `DeepConfig`, `SeiContext`,
+  `rate_control::RateControlConfig`, `session::SessionConfig` plus the
+  output records listed under Added. Tests and fuzz targets build them
+  through the constructors.
+- The stand-alone encoder drivers that only the test suite reaches —
+  `encoder::{field, mbaff, mbaff_cabac, multiref, scp, slices, sp}` — are
+  now `#[doc(hidden)]`. SEI payload syntax records, the `YuvFrame`
+  plane buffer and the borrowed `EncodedFrameRef` view stay exhaustive.
+
 ## [0.1.11](https://github.com/OxideAV/oxideav-h264/compare/v0.1.10...v0.1.11) - 2026-11-06
 
 ### Other

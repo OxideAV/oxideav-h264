@@ -117,41 +117,37 @@ fn contexts() -> Vec<(&'static str, SeiContext)> {
         ("default", SeiContext::default()),
         (
             "nal_hrd_present_24bit",
-            SeiContext {
-                initial_cpb_removal_delay_length_minus1: 23,
-                cpb_removal_delay_length_minus1: 23,
-                dpb_output_delay_length_minus1: 23,
-                time_offset_length: 24,
-                nal_hrd_cpb_cnt_minus1: Some(0),
-                vcl_hrd_cpb_cnt_minus1: None,
-                pic_struct_present_flag: true,
-                cpb_dpb_delays_present_flag: true,
-                num_slice_groups: 1,
-                pic_size_in_map_units: 0,
-                frame_mbs_only_flag: true,
-                num_depth_views: 0,
-                mvc_view_ref_counts: Vec::new(),
-            },
+            SeiContext::default()
+                .with_initial_cpb_removal_delay_length_minus1(23)
+                .with_cpb_removal_delay_length_minus1(23)
+                .with_dpb_output_delay_length_minus1(23)
+                .with_time_offset_length(24)
+                .with_nal_hrd_cpb_cnt_minus1(Some(0))
+                .with_vcl_hrd_cpb_cnt_minus1(None)
+                .with_pic_struct_present_flag(true)
+                .with_cpb_dpb_delays_present_flag(true)
+                .with_num_slice_groups(1)
+                .with_pic_size_in_map_units(0)
+                .with_frame_mbs_only_flag(true)
+                .with_num_depth_views(0)
+                .with_mvc_view_ref_counts(Vec::new()),
         ),
         (
             "vcl_hrd_present_4sched",
-            SeiContext {
-                initial_cpb_removal_delay_length_minus1: 7,
-                cpb_removal_delay_length_minus1: 7,
-                dpb_output_delay_length_minus1: 7,
-                time_offset_length: 16,
-                nal_hrd_cpb_cnt_minus1: None,
-                vcl_hrd_cpb_cnt_minus1: Some(3),
-                pic_struct_present_flag: true,
-                cpb_dpb_delays_present_flag: true,
-                num_slice_groups: 4,
-                pic_size_in_map_units: 64,
-                frame_mbs_only_flag: false,
-                num_depth_views: 2,
-                // §G.13.1.7 — two views (num_views_minus1 = 2) so the
-                // view_dependency_change anchor / non-anchor update
-                // branches read flags instead of bailing out.
-                mvc_view_ref_counts: vec![
+            SeiContext::default()
+                .with_initial_cpb_removal_delay_length_minus1(7)
+                .with_cpb_removal_delay_length_minus1(7)
+                .with_dpb_output_delay_length_minus1(7)
+                .with_time_offset_length(16)
+                .with_nal_hrd_cpb_cnt_minus1(None)
+                .with_vcl_hrd_cpb_cnt_minus1(Some(3))
+                .with_pic_struct_present_flag(true)
+                .with_cpb_dpb_delays_present_flag(true)
+                .with_num_slice_groups(4)
+                .with_pic_size_in_map_units(64)
+                .with_frame_mbs_only_flag(false)
+                .with_num_depth_views(2)
+                .with_mvc_view_ref_counts(vec![
                     MvcViewRefCounts {
                         num_anchor_refs_l0: 1,
                         num_anchor_refs_l1: 0,
@@ -164,33 +160,29 @@ fn contexts() -> Vec<(&'static str, SeiContext)> {
                         num_non_anchor_refs_l0: 0,
                         num_non_anchor_refs_l1: 2,
                     },
-                ],
-            },
+                ]),
         ),
         (
             "max_lengths_8sg",
-            SeiContext {
-                initial_cpb_removal_delay_length_minus1: 31,
-                cpb_removal_delay_length_minus1: 31,
-                dpb_output_delay_length_minus1: 31,
-                time_offset_length: 31,
-                nal_hrd_cpb_cnt_minus1: Some(31),
-                vcl_hrd_cpb_cnt_minus1: Some(31),
-                pic_struct_present_flag: true,
-                cpb_dpb_delays_present_flag: true,
-                num_slice_groups: 8,
-                pic_size_in_map_units: 256,
-                frame_mbs_only_flag: false,
-                num_depth_views: 1024,
-                // §G.13.1.7 — one view at the §G.7.4.2.1.4 per-list
-                // maximum (Min(15, num_views_minus1)) ref count.
-                mvc_view_ref_counts: vec![MvcViewRefCounts {
+            SeiContext::default()
+                .with_initial_cpb_removal_delay_length_minus1(31)
+                .with_cpb_removal_delay_length_minus1(31)
+                .with_dpb_output_delay_length_minus1(31)
+                .with_time_offset_length(31)
+                .with_nal_hrd_cpb_cnt_minus1(Some(31))
+                .with_vcl_hrd_cpb_cnt_minus1(Some(31))
+                .with_pic_struct_present_flag(true)
+                .with_cpb_dpb_delays_present_flag(true)
+                .with_num_slice_groups(8)
+                .with_pic_size_in_map_units(256)
+                .with_frame_mbs_only_flag(false)
+                .with_num_depth_views(1024)
+                .with_mvc_view_ref_counts(vec![MvcViewRefCounts {
                     num_anchor_refs_l0: 15,
                     num_anchor_refs_l1: 15,
                     num_non_anchor_refs_l0: 15,
                     num_non_anchor_refs_l1: 15,
-                }],
-            },
+                }]),
         ),
     ]
 }
@@ -299,10 +291,7 @@ fn motion_constrained_slice_group_set_unbounded_count_is_rejected() {
     // (data[0] = 0x90). Only `num_slice_groups` matters for §D.2.20
     // (the other fields gate other payload types).
     let b: u8 = 0x90;
-    let ctx = SeiContext {
-        num_slice_groups: 1 + ((b as u32) & 0x07),
-        ..SeiContext::default()
-    };
+    let ctx = SeiContext::default().with_num_slice_groups(1 + ((b as u32) & 0x07));
     // Payload type 18 = motion_constrained_slice_group_set.
     let res = parse_payload(18, PAYLOAD, &ctx);
     // Must be a deterministic Err, NOT a hang or an Ok with a billion

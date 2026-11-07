@@ -107,17 +107,15 @@ fn encode_gop(fmt: u32, transform_8x8: bool) -> Gop {
         u: &u1,
         v: &v1,
     };
-    let cfg = EncoderConfig {
-        chroma_format_idc: fmt,
-        profile_idc: match fmt {
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_chroma_format_idc(fmt)
+        .with_profile_idc(match fmt {
             3 => 244,
             2 => 122,
             _ => 66,
-        },
-        transform_8x8,
-        qp: if transform_8x8 { 20 } else { 26 },
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+        })
+        .with_transform_8x8(transform_8x8)
+        .with_qp(if transform_8x8 { 20 } else { 26 });
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr(&f0);
     let p = enc.encode_p(&f1, &EncodedFrameRef::from(&idr), 1, 2);
@@ -334,18 +332,16 @@ fn encode_gop_b(fmt: u32, transform_8x8: bool) -> GopB {
         u: &u2,
         v: &v2,
     };
-    let cfg = EncoderConfig {
-        chroma_format_idc: fmt,
-        profile_idc: match fmt {
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_chroma_format_idc(fmt)
+        .with_profile_idc(match fmt {
             3 => 244,
             2 => 122,
             _ => 77,
-        },
-        max_num_ref_frames: 2,
-        transform_8x8,
-        qp: if transform_8x8 { 20 } else { 26 },
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+        })
+        .with_max_num_ref_frames(2)
+        .with_transform_8x8(transform_8x8)
+        .with_qp(if transform_8x8 { 20 } else { 26 });
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr(&f0);
     let p = enc.encode_p(&f2, &EncodedFrameRef::from(&idr), 1, 4);
@@ -509,16 +505,14 @@ fn cavlc_b_skip_all_formats() {
             u: &u0,
             v: &v0,
         };
-        let cfg = EncoderConfig {
-            chroma_format_idc: fmt,
-            profile_idc: match fmt {
+        let cfg = EncoderConfig::new(W as u32, H as u32)
+            .with_chroma_format_idc(fmt)
+            .with_profile_idc(match fmt {
                 3 => 244,
                 2 => 122,
                 _ => 77,
-            },
-            max_num_ref_frames: 2,
-            ..EncoderConfig::new(W as u32, H as u32)
-        };
+            })
+            .with_max_num_ref_frames(2);
         let enc = Encoder::new(cfg);
         let idr = enc.encode_idr(&f0);
         let p = enc.encode_p(&f0, &EncodedFrameRef::from(&idr), 1, 4);
@@ -658,16 +652,14 @@ fn partition_fixture(fmt: u32, vertical_split: bool) -> GopB {
         u: &u2,
         v: &v2,
     };
-    let cfg = EncoderConfig {
-        chroma_format_idc: fmt,
-        profile_idc: match fmt {
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_chroma_format_idc(fmt)
+        .with_profile_idc(match fmt {
             3 => 244,
             2 => 122,
             _ => 77,
-        },
-        max_num_ref_frames: 2,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+        })
+        .with_max_num_ref_frames(2);
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr(&f0);
     let p = enc.encode_p(&f2, &EncodedFrameRef::from(&idr), 1, 4);
@@ -728,15 +720,13 @@ fn cavlc_p_skip_all_formats() {
             u: &u0,
             v: &v0,
         };
-        let cfg = EncoderConfig {
-            chroma_format_idc: fmt,
-            profile_idc: match fmt {
+        let cfg = EncoderConfig::new(W as u32, H as u32)
+            .with_chroma_format_idc(fmt)
+            .with_profile_idc(match fmt {
                 3 => 244,
                 2 => 122,
                 _ => 66,
-            },
-            ..EncoderConfig::new(W as u32, H as u32)
-        };
+            });
         let enc = Encoder::new(cfg);
         let idr = enc.encode_idr(&f0);
         // Same source again — MBs collapse to P_Skip (4:2:0 / 4:4:4

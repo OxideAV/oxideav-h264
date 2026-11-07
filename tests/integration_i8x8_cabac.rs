@@ -66,12 +66,10 @@ fn encode_i8x8_cabac() -> oxideav_h264::encoder::EncodedIdr {
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        cabac: true,
-        profile_idc: 100,
-        transform_8x8: true,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_cabac(true)
+        .with_profile_idc(100)
+        .with_transform_8x8(true);
     Encoder::new(cfg).encode_idr_cabac(&frame)
 }
 
@@ -173,11 +171,9 @@ fn i8x8_cabac_idr_without_flag_never_codes_8x8() {
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        cabac: true,
-        profile_idc: 100,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_cabac(true)
+        .with_profile_idc(100);
     let idr = Encoder::new(cfg).encode_idr_cabac(&frame);
     assert_eq!(idr.i8x8_mb_count, 0);
 }
@@ -217,13 +213,11 @@ fn i8x8_cabac_p_slice_second_gate_flag_roundtrips_bit_exact() {
         u: &u1,
         v: &v1,
     };
-    let cfg = EncoderConfig {
-        cabac: true,
-        profile_idc: 100,
-        transform_8x8: true,
-        max_num_ref_frames: 1,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_cabac(true)
+        .with_profile_idc(100)
+        .with_transform_8x8(true)
+        .with_max_num_ref_frames(1);
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr_cabac(&f0);
     let p = enc.encode_p_cabac(&f1, &EncodedFrameRef::from(&idr), 1, 2);
@@ -338,13 +332,11 @@ fn i8x8_cabac_b_slice_gop_second_gate_flag_roundtrips_bit_exact() {
         u: &u2,
         v: &v2,
     };
-    let cfg = EncoderConfig {
-        cabac: true,
-        profile_idc: 100,
-        transform_8x8: true,
-        max_num_ref_frames: 2,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_cabac(true)
+        .with_profile_idc(100)
+        .with_transform_8x8(true)
+        .with_max_num_ref_frames(2);
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr_cabac(&f0);
     let p = enc.encode_p_cabac(&f2, &EncodedFrameRef::from(&idr), 1, 4);

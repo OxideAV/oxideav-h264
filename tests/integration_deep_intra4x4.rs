@@ -118,21 +118,21 @@ fn run(
         if cabac { "cabac" } else { "cavlc" },
         if lossless { "ll" } else { "lossy" }
     );
-    let cfg = DeepConfig {
-        width: W as u32,
-        height: H as u32,
-        bit_depth_luma: bd,
-        bit_depth_chroma: bd,
-        chroma_format_idc: cf,
-        qp: if lossless { -6 * (bd as i32 - 8) } else { qp },
-        p_frames: false,
-        intra_in_p: false,
-        deblock: true,
-        lossless,
-        lossless_interop: true,
-        cabac,
-        transform_8x8: false,
-    };
+    let cfg = DeepConfig::new(
+        W as u32,
+        H as u32,
+        bd,
+        bd,
+        cf,
+        if lossless { -6 * (bd as i32 - 8) } else { qp },
+    )
+    .with_p_frames(false)
+    .with_intra_in_p(false)
+    .with_deblock(true)
+    .with_lossless(lossless)
+    .with_lossless_interop(true)
+    .with_cabac(cabac)
+    .with_transform_8x8(false);
     let frames: Vec<_> = (0..2).map(|n| source(cf, bd, n)).collect();
     let mut results = Vec::new();
     for intra_4x4 in [true, false] {

@@ -58,41 +58,15 @@ fn context_from_byte(b: u8) -> SeiContext {
     // inside the spec ranges (e.g. *_length_minus1 ≤ 31, cpb_cnt_minus1
     // ≤ 31). `default()` is one specific cell of this space; this
     // function expands it.
-    SeiContext {
-        initial_cpb_removal_delay_length_minus1: b & 0x1F,
-        cpb_removal_delay_length_minus1: (b >> 3) & 0x1F,
-        dpb_output_delay_length_minus1: (b >> 1) & 0x1F,
-        time_offset_length: (b >> 2) & 0x1F,
-        nal_hrd_cpb_cnt_minus1: if b & 0x80 != 0 {
+    SeiContext::default().with_initial_cpb_removal_delay_length_minus1(b & 0x1F).with_cpb_removal_delay_length_minus1((b >> 3) & 0x1F).with_dpb_output_delay_length_minus1((b >> 1) & 0x1F).with_time_offset_length((b >> 2) & 0x1F).with_nal_hrd_cpb_cnt_minus1(if b & 0x80 != 0 {
             Some((b & 0x1F) as u32)
         } else {
             None
-        },
-        vcl_hrd_cpb_cnt_minus1: if b & 0x40 != 0 {
+        }).with_vcl_hrd_cpb_cnt_minus1(if b & 0x40 != 0 {
             Some(((b >> 1) & 0x1F) as u32)
         } else {
             None
-        },
-        pic_struct_present_flag: b & 0x20 != 0,
-        cpb_dpb_delays_present_flag: b & 0x10 != 0,
-        // num_slice_groups in 1..=8 keeps the §D.1.20 u(v) width bounded
-        // (slice_group_id width = ceil(log2(num_slice_groups)) bits).
-        num_slice_groups: 1 + ((b as u32) & 0x07),
-        // pic_size_in_map_units small enough that the spare_pic loops
-        // can't allocate gigabytes if the dispatch lands there.
-        pic_size_in_map_units: ((b as u32) & 0x0F) * 16,
-        frame_mbs_only_flag: b & 0x08 == 0,
-        // num_depth_views in 0..=7 covers the §H.13.1.5 depth_timing
-        // unknown-rejection (0) and the per-view loop (1..). The Annex H
-        // ceiling is 1024; small values keep the per-view Vec bounded.
-        num_depth_views: ((b as u32) >> 5) & 0x07,
-        // mvc_view_ref_counts: 0..=3 views, each with per-list ref
-        // counts in 0..=3 derived from the input byte. Empty (b low
-        // bits 0) reaches the §G.13.1.7 view_dependency_change
-        // unknown-rejection; non-empty exercises the per-view flag
-        // loops. Counts stay small so the per-view flag Vecs stay
-        // bounded under fuzzing.
-        mvc_view_ref_counts: (0..((b as usize) & 0x03))
+        }).with_pic_struct_present_flag(b & 0x20 != 0).with_cpb_dpb_delays_present_flag(b & 0x10 != 0).with_num_slice_groups(1 + ((b as u32) & 0x07)).with_pic_size_in_map_units(((b as u32) & 0x0F) * 16).with_frame_mbs_only_flag(b & 0x08 == 0).with_num_depth_views(((b as u32) >> 5) & 0x07).with_mvc_view_ref_counts((0..((b as usize) & 0x03))
             .map(|i| {
                 let n = (b >> (i % 6)) & 0x03;
                 MvcViewRefCounts {
@@ -102,8 +76,7 @@ fn context_from_byte(b: u8) -> SeiContext {
                     num_non_anchor_refs_l1: (b >> 3) & 0x03,
                 }
             })
-            .collect(),
-    }
+            .collect())
 }
 
 fuzz_target!(|data: &[u8]| {

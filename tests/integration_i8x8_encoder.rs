@@ -67,10 +67,7 @@ fn encode_i8x8() -> oxideav_h264::encoder::EncodedIdr {
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        transform_8x8: true,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32).with_transform_8x8(true);
     Encoder::new(cfg).encode_idr(&frame)
 }
 
@@ -286,13 +283,9 @@ fn i8x8_p_slice_inter_8x8_transform_roundtrips_bit_exact() {
         u: &u1,
         v: &v1,
     };
-    let cfg = EncoderConfig {
-        transform_8x8: true,
-        // Keep the P MBs on the inter path so the §7.3.5 second-gate
-        // transform_size_8x8_flag coding is what's exercised.
-        intra_in_inter: false,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_transform_8x8(true)
+        .with_intra_in_inter(false);
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr(&f0);
     let p = enc.encode_p(&f1, &EncodedFrameRef::from(&idr), 1, 2);
@@ -401,13 +394,11 @@ fn i8x8_b_slice_gop_codes_second_gate_flag_and_roundtrips() {
         u: &u2,
         v: &v2,
     };
-    let cfg = EncoderConfig {
-        transform_8x8: true,
-        profile_idc: 100,
-        max_num_ref_frames: 2,
-        intra_in_inter: false,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_transform_8x8(true)
+        .with_profile_idc(100)
+        .with_max_num_ref_frames(2)
+        .with_intra_in_inter(false);
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr(&f0);
     let p = enc.encode_p(&f2, &EncodedFrameRef::from(&idr), 1, 4);
@@ -528,12 +519,10 @@ fn i8x8_422_idr_selects_8x8_and_roundtrips_bit_exact() {
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        profile_idc: 122, // High 4:2:2 — required for chroma_format_idc = 2.
-        chroma_format_idc: 2,
-        transform_8x8: true,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_profile_idc(122)
+        .with_chroma_format_idc(2)
+        .with_transform_8x8(true);
     let idr = Encoder::new(cfg).encode_idr(&frame);
     assert!(
         idr.i8x8_mb_count > 0,
@@ -580,12 +569,10 @@ fn i8x8_422_idr_reference_decoder_interop() {
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        profile_idc: 122,
-        chroma_format_idc: 2,
-        transform_8x8: true,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_profile_idc(122)
+        .with_chroma_format_idc(2)
+        .with_transform_8x8(true);
     let idr = Encoder::new(cfg).encode_idr(&frame);
     assert!(idr.i8x8_mb_count > 0);
 
@@ -667,12 +654,10 @@ fn i8x8_444_idr_mixed_rdo_roundtrips_bit_exact() {
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        profile_idc: 244, // High 4:4:4 Predictive.
-        chroma_format_idc: 3,
-        transform_8x8: true,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_profile_idc(244)
+        .with_chroma_format_idc(3)
+        .with_transform_8x8(true);
     let idr = Encoder::new(cfg).encode_idr(&frame);
     // Round-388 — the 4:4:4 + transform_8x8 path runs a per-MB
     // I_16x16-vs-Intra_8x8 RDO (J over all three full-resolution
@@ -724,12 +709,10 @@ fn i8x8_444_idr_reference_decoder_interop() {
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        profile_idc: 244,
-        chroma_format_idc: 3,
-        transform_8x8: true,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_profile_idc(244)
+        .with_chroma_format_idc(3)
+        .with_transform_8x8(true);
     let idr = Encoder::new(cfg).encode_idr(&frame);
     assert!(idr.i8x8_mb_count > 0);
 

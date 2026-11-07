@@ -31,6 +31,7 @@
 
 /// Rate-control operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RateControlMode {
     /// Constant bit rate. The Annex C CPB is fed at exactly
     /// `target_bitrate`; when the encoder underspends enough that the
@@ -47,6 +48,7 @@ pub enum RateControlMode {
 
 /// Static configuration for a [`RateController`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct RateControlConfig {
     /// Operating mode.
     pub mode: RateControlMode,
@@ -130,6 +132,7 @@ impl RateControlConfig {
 /// complexity model (EWMA of `bits * qstep`), so the controller learns
 /// the relative cost of I, P and B pictures from the stream itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RcFrameKind {
     /// IDR (or any intra) picture.
     Idr,
@@ -157,6 +160,7 @@ const NUM_KINDS: usize = 3;
 
 /// Per-frame plan returned by [`RateController::plan_frame`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct FramePlan {
     /// QP the frame should be encoded at.
     pub qp: i32,
@@ -168,8 +172,20 @@ pub struct FramePlan {
     pub max_bits: u64,
 }
 
+impl FramePlan {
+    /// Build a [`FramePlan`] from all of its fields.
+    pub fn new(qp: i32, target_bits: f64, max_bits: u64) -> Self {
+        Self {
+            qp,
+            target_bits,
+            max_bits,
+        }
+    }
+}
+
 /// Result of [`RateController::commit_frame`].
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct CommitOutcome {
     /// CBR only: number of filler bits the caller must transmit with
     /// this access unit so the CPB does not overflow. Rounding up to
@@ -181,6 +197,16 @@ pub struct CommitOutcome {
     /// would stall. The model clamps at zero and keeps going, but the
     /// caller should have honoured [`FramePlan::max_bits`].
     pub vbv_underflow: bool,
+}
+
+impl CommitOutcome {
+    /// Build a [`CommitOutcome`] from all of its fields.
+    pub fn new(filler_bits: u64, vbv_underflow: bool) -> Self {
+        Self {
+            filler_bits,
+            vbv_underflow,
+        }
+    }
 }
 
 /// §8.5.9-anchored quantiser step: doubles every 6 QP, step 1.0 at

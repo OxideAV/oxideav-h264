@@ -67,16 +67,10 @@ fn encode(mode: ScalingMatrixMode, transform_8x8: bool) -> oxideav_h264::encoder
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        scaling_matrix: mode,
-        transform_8x8,
-        // The transform_8x8 variants run at a finer QP: under the
-        // default matrices' heavier high-frequency weights the 8x8
-        // trial only wins on this content when enough texture
-        // survives quantisation (QP 26 → zero Intra_8x8 picks).
-        qp: if transform_8x8 { 18 } else { 26 },
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_scaling_matrix(mode)
+        .with_transform_8x8(transform_8x8)
+        .with_qp(if transform_8x8 { 18 } else { 26 });
     Encoder::new(cfg).encode_idr(&frame)
 }
 
@@ -313,12 +307,10 @@ fn encode_custom(
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        scaling_matrix: mode,
-        transform_8x8,
-        qp: if transform_8x8 { 18 } else { 26 },
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_scaling_matrix(mode)
+        .with_transform_8x8(transform_8x8)
+        .with_qp(if transform_8x8 { 18 } else { 26 });
     Encoder::new(cfg).encode_idr(&frame)
 }
 

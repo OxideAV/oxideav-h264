@@ -50,13 +50,11 @@ struct MonoGop {
 }
 
 fn encode_mono_gop_entropy(qp: i32, n_p: usize, cabac: bool) -> MonoGop {
-    let cfg = EncoderConfig {
-        chroma_format_idc: 0,
-        profile_idc: 100,
-        cabac,
-        qp,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_chroma_format_idc(0)
+        .with_profile_idc(100)
+        .with_cabac(cabac)
+        .with_qp(qp);
     let enc = Encoder::new(cfg);
 
     let y0 = make_luma(0);
@@ -297,15 +295,13 @@ fn mono_cabac_low_qp_reference_decoder_byte_exact() {
 // ---- B pictures at 4:0:0 (round-448 B leg) ----
 
 fn encode_mono_ibp(qp: i32, cabac: bool, temporal: bool) -> MonoGop {
-    let cfg = EncoderConfig {
-        chroma_format_idc: 0,
-        profile_idc: 100,
-        cabac,
-        qp,
-        direct_temporal_mv_pred: temporal,
-        max_num_ref_frames: 2,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_chroma_format_idc(0)
+        .with_profile_idc(100)
+        .with_cabac(cabac)
+        .with_qp(qp)
+        .with_direct_temporal_mv_pred(temporal)
+        .with_max_num_ref_frames(2);
     let enc = Encoder::new(cfg);
     let planes: Vec<Vec<u8>> = (0..3).map(make_luma).collect();
     let mk = |k: usize| YuvFrame {
@@ -398,14 +394,12 @@ fn mono_b_temporal_reference_decoder_byte_exact() {
 // ---- 8x8 transform at 4:0:0 (round-448) ----
 
 fn encode_mono_gop_t8x8(qp: i32, n_p: usize, cabac: bool) -> MonoGop {
-    let cfg = EncoderConfig {
-        chroma_format_idc: 0,
-        profile_idc: 100,
-        cabac,
-        qp,
-        transform_8x8: true,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_chroma_format_idc(0)
+        .with_profile_idc(100)
+        .with_cabac(cabac)
+        .with_qp(qp)
+        .with_transform_8x8(true);
     let enc = Encoder::new(cfg);
     let y0 = make_luma(0);
     let f0 = YuvFrame {
@@ -472,14 +466,12 @@ fn mono_transform_8x8_cabac_idr_codes_intra_8x8_mbs() {
     // macroblocks under transform_8x8 (not silently fall back to
     // I_16x16 everywhere) so the §7.3.5.3.3 blockCat-5 luma-only
     // residual path is exercised on the wire.
-    let cfg = EncoderConfig {
-        chroma_format_idc: 0,
-        profile_idc: 100,
-        cabac: true,
-        qp: 30,
-        transform_8x8: true,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_chroma_format_idc(0)
+        .with_profile_idc(100)
+        .with_cabac(true)
+        .with_qp(30)
+        .with_transform_8x8(true);
     let enc = Encoder::new(cfg);
     // Smooth low-frequency content: the 8x8 transform's coarser basis
     // wins the Lagrangian trial on gentle ramps, where 4x4 spends
@@ -535,12 +527,10 @@ fn mono_i4x4_idr_codes_i_nxn_and_roundtrips() {
     // Sharp diagonal structure at low QP: the per-block 9-mode
     // Intra_4x4 trial beats Intra_16x16 on edges, so the two-way RDO
     // genuinely codes I_NxN macroblocks (coverage pin below).
-    let cfg = EncoderConfig {
-        chroma_format_idc: 0,
-        profile_idc: 100,
-        qp: 16,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_chroma_format_idc(0)
+        .with_profile_idc(100)
+        .with_qp(16);
     let enc = Encoder::new(cfg);
     let mut y0 = vec![0u8; W * H];
     for j in 0..H {

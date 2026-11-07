@@ -110,6 +110,7 @@ const LUMA_4X4_BLK: [(usize, usize); 16] = [
 
 /// Configuration for [`encode_deep_sequence`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DeepConfig {
     /// Luma width / height in samples (multiples of 16).
     pub width: u32,
@@ -159,11 +160,132 @@ pub struct DeepConfig {
     pub transform_8x8: bool,
 }
 
+impl DeepConfig {
+    /// Build a [`DeepConfig`] from its mandatory fields; every other field
+    /// starts at its default and can be set with the `with_*` builders.
+    pub fn new(
+        width: u32,
+        height: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+        chroma_format_idc: u32,
+        qp: i32,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth_luma,
+            bit_depth_chroma,
+            chroma_format_idc,
+            qp,
+            p_frames: Default::default(),
+            intra_in_p: Default::default(),
+            deblock: Default::default(),
+            lossless: Default::default(),
+            lossless_interop: Default::default(),
+            cabac: Default::default(),
+            transform_8x8: Default::default(),
+        }
+    }
+
+    /// Set [`DeepConfig::width`].
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set [`DeepConfig::height`].
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set [`DeepConfig::bit_depth_luma`].
+    #[must_use]
+    pub fn with_bit_depth_luma(mut self, v: u32) -> Self {
+        self.bit_depth_luma = v;
+        self
+    }
+
+    /// Set [`DeepConfig::bit_depth_chroma`].
+    #[must_use]
+    pub fn with_bit_depth_chroma(mut self, v: u32) -> Self {
+        self.bit_depth_chroma = v;
+        self
+    }
+
+    /// Set [`DeepConfig::chroma_format_idc`].
+    #[must_use]
+    pub fn with_chroma_format_idc(mut self, v: u32) -> Self {
+        self.chroma_format_idc = v;
+        self
+    }
+
+    /// Set [`DeepConfig::qp`].
+    #[must_use]
+    pub fn with_qp(mut self, v: i32) -> Self {
+        self.qp = v;
+        self
+    }
+
+    /// Set [`DeepConfig::p_frames`].
+    #[must_use]
+    pub fn with_p_frames(mut self, v: bool) -> Self {
+        self.p_frames = v;
+        self
+    }
+
+    /// Set [`DeepConfig::intra_in_p`].
+    #[must_use]
+    pub fn with_intra_in_p(mut self, v: bool) -> Self {
+        self.intra_in_p = v;
+        self
+    }
+
+    /// Set [`DeepConfig::deblock`].
+    #[must_use]
+    pub fn with_deblock(mut self, v: bool) -> Self {
+        self.deblock = v;
+        self
+    }
+
+    /// Set [`DeepConfig::lossless`].
+    #[must_use]
+    pub fn with_lossless(mut self, v: bool) -> Self {
+        self.lossless = v;
+        self
+    }
+
+    /// Set [`DeepConfig::lossless_interop`].
+    #[must_use]
+    pub fn with_lossless_interop(mut self, v: bool) -> Self {
+        self.lossless_interop = v;
+        self
+    }
+
+    /// Set [`DeepConfig::cabac`].
+    #[must_use]
+    pub fn with_cabac(mut self, v: bool) -> Self {
+        self.cabac = v;
+        self
+    }
+
+    /// Set [`DeepConfig::transform_8x8`].
+    #[must_use]
+    pub fn with_transform_8x8(mut self, v: bool) -> Self {
+        self.transform_8x8 = v;
+        self
+    }
+}
+
 /// One picture's `(Y, Cb, Cr)` `u16` planes.
 pub type DeepPlanes = (Vec<u16>, Vec<u16>, Vec<u16>);
 
 /// Output of [`encode_deep_sequence`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DeepEncoded {
     /// Annex B stream: SPS, PPS, one slice NAL per frame.
     pub annex_b: Vec<u8>,
@@ -178,6 +300,27 @@ pub struct DeepEncoded {
     pub intra_mbs_in_p: usize,
     /// Macroblocks coded with `transform_size_8x8_flag = 1`.
     pub mbs_8x8: usize,
+}
+
+impl DeepEncoded {
+    /// Build a [`DeepEncoded`] from all of its fields.
+    pub fn new(
+        annex_b: Vec<u8>,
+        recon_frames: Vec<DeepPlanes>,
+        profile_idc: u8,
+        skipped_mbs: usize,
+        intra_mbs_in_p: usize,
+        mbs_8x8: usize,
+    ) -> Self {
+        Self {
+            annex_b,
+            recon_frames,
+            profile_idc,
+            skipped_mbs,
+            intra_mbs_in_p,
+            mbs_8x8,
+        }
+    }
 }
 
 /// Picture geometry.
@@ -2352,6 +2495,7 @@ fn recon_i4x4(
 
 /// Coding kind of one picture coded through [`DeepSession`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeepPictureKind {
     /// IDR picture (`nal_unit_type` 5, `nal_ref_idc` 3): Intra_16x16
     /// only, resets the reference.

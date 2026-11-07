@@ -84,12 +84,10 @@ fn encode_444(transform_8x8: bool) -> oxideav_h264::encoder::EncodedIdr {
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        profile_idc: 244, // High 4:4:4 Predictive.
-        chroma_format_idc: 3,
-        transform_8x8,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_profile_idc(244)
+        .with_chroma_format_idc(3)
+        .with_transform_8x8(transform_8x8);
     Encoder::new(cfg).encode_idr(&frame)
 }
 

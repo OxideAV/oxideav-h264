@@ -224,12 +224,12 @@ fn scp_planes_match_standalone_monochrome_decodes() {
     for plane in 0..3usize {
         // Re-encode this plane's source as a standalone monochrome
         // stream with the same QP / GOP shape…
-        let mono = Encoder::new(EncoderConfig {
-            chroma_format_idc: 0,
-            profile_idc: 100,
-            qp: 26,
-            ..EncoderConfig::new(W as u32, H as u32)
-        });
+        let mono = Encoder::new(
+            EncoderConfig::new(W as u32, H as u32)
+                .with_chroma_format_idc(0)
+                .with_profile_idc(100)
+                .with_qp(26),
+        );
         let sources: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..=2).map(make_planes).collect();
         let src = |k: usize| -> &[u8] {
             match plane {
@@ -413,13 +413,13 @@ fn scp_plane0_only_stream_is_bounded_and_errors() {
 
     const SW: usize = 32;
     const SH: usize = 32;
-    let enc = Encoder::new(EncoderConfig {
-        chroma_format_idc: 0,
-        profile_idc: 244,
-        colour_plane_id: Some(0),
-        qp: 40,
-        ..EncoderConfig::new(SW as u32, SH as u32)
-    });
+    let enc = Encoder::new(
+        EncoderConfig::new(SW as u32, SH as u32)
+            .with_chroma_format_idc(0)
+            .with_profile_idc(244)
+            .with_colour_plane_id(Some(0))
+            .with_qp(40),
+    );
     let y: Vec<u8> = (0..SW * SH).map(|i| (i % 251) as u8).collect();
     let f = YuvFrame {
         width: SW as u32,

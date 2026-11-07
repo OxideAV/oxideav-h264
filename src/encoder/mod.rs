@@ -44,6 +44,7 @@ pub mod cavlc;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod deblock;
 pub mod deep;
+#[doc(hidden)]
 pub mod field;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod intra4x4;
@@ -51,10 +52,13 @@ pub mod intra4x4;
 pub mod intra_pred;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod macroblock;
+#[doc(hidden)]
 pub mod mbaff;
+#[doc(hidden)]
 pub mod mbaff_cabac;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod me;
+#[doc(hidden)]
 pub mod multiref;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod nal;
@@ -63,12 +67,15 @@ pub mod pps;
 pub mod rate_control;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod rdo;
+#[doc(hidden)]
 pub mod scp;
 pub mod sei;
 pub mod session;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod slice;
+#[doc(hidden)]
 pub mod slices;
+#[doc(hidden)]
 pub mod sp;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod sps;
@@ -269,6 +276,7 @@ pub struct YuvFrame<'a> {
 // for a rarely-hot struct that is passed by reference everywhere.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ScalingMatrixMode {
     /// Flat lists (all 16s) — no matrices signalled. The round-1..387
     /// behaviour.
@@ -329,6 +337,7 @@ impl CustomScalingLists {
 // Same `Copy` rationale as [`ScalingMatrixMode`].
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScalingListsSpec {
     /// Every list present, coded as UseDefaultScalingMatrixFlag
     /// (`delta_scale = -8` at `j == 0`) → Table 7-3 / 7-4 defaults.
@@ -420,6 +429,7 @@ impl ScalingMatrixMode {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncoderConfig {
     pub width: u32,
     pub height: u32,
@@ -688,6 +698,169 @@ pub struct EncoderConfig {
     /// produces for a cross-parity field reference. Set by the
     /// `encoder::field` PAFF driver; leave 0 everywhere else.
     pub table_8_10_cy_offset: i32,
+}
+
+impl EncoderConfig {
+    /// Set [`EncoderConfig::width`].
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::height`].
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::qp`].
+    #[must_use]
+    pub fn with_qp(mut self, v: i32) -> Self {
+        self.qp = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::profile_idc`].
+    #[must_use]
+    pub fn with_profile_idc(mut self, v: u8) -> Self {
+        self.profile_idc = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::max_num_ref_frames`].
+    #[must_use]
+    pub fn with_max_num_ref_frames(mut self, v: u32) -> Self {
+        self.max_num_ref_frames = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::direct_temporal_mv_pred`].
+    #[must_use]
+    pub fn with_direct_temporal_mv_pred(mut self, v: bool) -> Self {
+        self.direct_temporal_mv_pred = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::b_l0_bi_only`].
+    #[must_use]
+    pub fn with_b_l0_bi_only(mut self, v: bool) -> Self {
+        self.b_l0_bi_only = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::explicit_weighted_bipred`].
+    #[must_use]
+    pub fn with_explicit_weighted_bipred(mut self, v: bool) -> Self {
+        self.explicit_weighted_bipred = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::explicit_weighted_pred`].
+    #[must_use]
+    pub fn with_explicit_weighted_pred(mut self, v: bool) -> Self {
+        self.explicit_weighted_pred = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::intra_in_inter`].
+    #[must_use]
+    pub fn with_intra_in_inter(mut self, v: bool) -> Self {
+        self.intra_in_inter = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::chroma_format_idc`].
+    #[must_use]
+    pub fn with_chroma_format_idc(mut self, v: u32) -> Self {
+        self.chroma_format_idc = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::colour_plane_id`].
+    #[must_use]
+    pub fn with_colour_plane_id(mut self, v: Option<u8>) -> Self {
+        self.colour_plane_id = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::cabac`].
+    #[must_use]
+    pub fn with_cabac(mut self, v: bool) -> Self {
+        self.cabac = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::vui`].
+    #[must_use]
+    pub fn with_vui(mut self, v: Option<crate::vui::VuiParameters>) -> Self {
+        self.vui = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::level_idc`].
+    #[must_use]
+    pub fn with_level_idc(mut self, v: u8) -> Self {
+        self.level_idc = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::bit_depth_chroma_minus8`].
+    #[must_use]
+    pub fn with_bit_depth_chroma_minus8(mut self, v: u32) -> Self {
+        self.bit_depth_chroma_minus8 = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::trellis_quant`].
+    #[must_use]
+    pub fn with_trellis_quant(mut self, v: bool) -> Self {
+        self.trellis_quant = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::trellis_full`].
+    #[must_use]
+    pub fn with_trellis_full(mut self, v: bool) -> Self {
+        self.trellis_full = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::trellis_quant_intra`].
+    #[must_use]
+    pub fn with_trellis_quant_intra(mut self, v: bool) -> Self {
+        self.trellis_quant_intra = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::trellis_quant_intra_chroma`].
+    #[must_use]
+    pub fn with_trellis_quant_intra_chroma(mut self, v: bool) -> Self {
+        self.trellis_quant_intra_chroma = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::transform_8x8`].
+    #[must_use]
+    pub fn with_transform_8x8(mut self, v: bool) -> Self {
+        self.transform_8x8 = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::scaling_matrix`].
+    #[must_use]
+    pub fn with_scaling_matrix(mut self, v: ScalingMatrixMode) -> Self {
+        self.scaling_matrix = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::table_8_10_cy_offset`].
+    #[must_use]
+    pub fn with_table_8_10_cy_offset(mut self, v: i32) -> Self {
+        self.table_8_10_cy_offset = v;
+        self
+    }
 }
 
 impl EncoderConfig {
@@ -4560,6 +4733,7 @@ impl Encoder {
 }
 
 /// Output of [`Encoder::encode_idr`].
+#[non_exhaustive]
 pub struct EncodedIdr {
     pub annex_b: Vec<u8>,
     pub recon_y: Vec<u8>,
@@ -4585,6 +4759,34 @@ pub struct EncodedIdr {
     pub i4x4_mb_count: u32,
 }
 
+impl EncodedIdr {
+    /// Build a [`EncodedIdr`] from all of its fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        annex_b: Vec<u8>,
+        recon_y: Vec<u8>,
+        recon_u: Vec<u8>,
+        recon_v: Vec<u8>,
+        recon_width: u32,
+        recon_height: u32,
+        partition_mvs: Vec<FrameRefPartitionMv>,
+        i8x8_mb_count: u32,
+        i4x4_mb_count: u32,
+    ) -> Self {
+        Self {
+            annex_b,
+            recon_y,
+            recon_u,
+            recon_v,
+            recon_width,
+            recon_height,
+            partition_mvs,
+            i8x8_mb_count,
+            i4x4_mb_count,
+        }
+    }
+}
+
 /// One 8x8 partition's per-list MV state, captured at picture-level so
 /// later B-slices can use this picture as the L1 anchor for §8.4.1.2.2
 /// spatial direct derivation (specifically the colZeroFlag step).
@@ -4608,6 +4810,7 @@ pub struct FrameRefPartitionMv {
 /// the matching reconstruction. Same layout as [`EncodedIdr`] except
 /// the bitstream contains only the slice NAL (no SPS/PPS — those were
 /// emitted by the IDR).
+#[non_exhaustive]
 pub struct EncodedP {
     pub annex_b: Vec<u8>,
     pub recon_y: Vec<u8>,
@@ -4634,6 +4837,38 @@ pub struct EncodedP {
     /// `luma.is_some()` means a non-identity fade weighting was
     /// elected.
     pub pred_weight_table: Option<ExplicitPredWeightTableL0>,
+}
+
+impl EncodedP {
+    /// Build a [`EncodedP`] from all of its fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        annex_b: Vec<u8>,
+        recon_y: Vec<u8>,
+        recon_u: Vec<u8>,
+        recon_v: Vec<u8>,
+        recon_width: u32,
+        recon_height: u32,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        partition_mvs: Vec<FrameRefPartitionMv>,
+        i8x8_mb_count: u32,
+        pred_weight_table: Option<ExplicitPredWeightTableL0>,
+    ) -> Self {
+        Self {
+            annex_b,
+            recon_y,
+            recon_u,
+            recon_v,
+            recon_width,
+            recon_height,
+            frame_num,
+            pic_order_cnt_lsb,
+            partition_mvs,
+            i8x8_mb_count,
+            pred_weight_table,
+        }
+    }
 }
 
 /// Per-MB encoder-side MV / refIdx slot for the §8.4.1.3 mvp neighbour
@@ -8882,6 +9117,7 @@ fn b_temporal_direct_derive(
 /// non-reference (`nal_ref_idc = 0`) so they do not feed any further
 /// inter-coding pass — but we publish the recon anyway for measurement
 /// (PSNR vs source) and ffmpeg-interop testing.
+#[non_exhaustive]
 pub struct EncodedB {
     pub annex_b: Vec<u8>,
     pub recon_y: Vec<u8>,
@@ -8903,6 +9139,36 @@ pub struct EncodedB {
     /// `transform_size_8x8_flag = 1` (High-profile 8x8 transform).
     /// Always 0 unless [`EncoderConfig::transform_8x8`] is set.
     pub i8x8_mb_count: u32,
+}
+
+impl EncodedB {
+    /// Build a [`EncodedB`] from all of its fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        annex_b: Vec<u8>,
+        recon_y: Vec<u8>,
+        recon_u: Vec<u8>,
+        recon_v: Vec<u8>,
+        recon_width: u32,
+        recon_height: u32,
+        frame_num: u32,
+        pic_order_cnt_lsb: u32,
+        partition_mvs: Vec<FrameRefPartitionMv>,
+        i8x8_mb_count: u32,
+    ) -> Self {
+        Self {
+            annex_b,
+            recon_y,
+            recon_u,
+            recon_v,
+            recon_width,
+            recon_height,
+            frame_num,
+            pic_order_cnt_lsb,
+            partition_mvs,
+            i8x8_mb_count,
+        }
+    }
 }
 
 impl<'a> From<&'a EncodedB> for EncodedFrameRef<'a> {

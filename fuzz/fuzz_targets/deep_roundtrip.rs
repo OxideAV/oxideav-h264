@@ -77,21 +77,7 @@ fuzz_target!(|data: &[u8]| {
         .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
         .collect();
     let enc = encode_deep_sequence(
-        &DeepConfig {
-            width: W as u32,
-            height: H as u32,
-            bit_depth_luma: bd,
-            bit_depth_chroma: bd,
-            chroma_format_idc: cf,
-            qp,
-            p_frames,
-            intra_in_p: true,
-            deblock,
-            lossless,
-            lossless_interop: data[2] & 8 == 8,
-            cabac: data[2] & 16 == 16,
-            transform_8x8: data[2] & 32 == 32,
-        },
+        &DeepConfig::new(W as u32, H as u32, bd, bd, cf, qp).with_p_frames(p_frames).with_intra_in_p(true).with_deblock(deblock).with_lossless(lossless).with_lossless_interop(data[2] & 8 == 8).with_cabac(data[2] & 16 == 16).with_transform_8x8(data[2] & 32 == 32),
         &refs,
     );
     if lossless {

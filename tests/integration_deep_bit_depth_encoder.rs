@@ -57,21 +57,14 @@ fn encode(bd: u32, cf: u32, qp: i32, n: usize, deblock: bool) -> (DeepEncoded, V
         .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
         .collect();
     let enc = encode_deep_sequence(
-        &DeepConfig {
-            width: W as u32,
-            height: H as u32,
-            bit_depth_luma: bd,
-            bit_depth_chroma: bd,
-            chroma_format_idc: cf,
-            qp,
-            p_frames: true,
-            intra_in_p: true,
-            deblock,
-            lossless: false,
-            lossless_interop: false,
-            cabac: false,
-            transform_8x8: false,
-        },
+        &DeepConfig::new(W as u32, H as u32, bd, bd, cf, qp)
+            .with_p_frames(true)
+            .with_intra_in_p(true)
+            .with_deblock(deblock)
+            .with_lossless(false)
+            .with_lossless_interop(false)
+            .with_cabac(false)
+            .with_transform_8x8(false),
         &refs,
     );
     (enc, frames)
@@ -84,21 +77,14 @@ fn encode_lossless(bd: u32, cf: u32, n: usize, interop: bool) -> (DeepEncoded, V
         .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
         .collect();
     let enc = encode_deep_sequence(
-        &DeepConfig {
-            width: W as u32,
-            height: H as u32,
-            bit_depth_luma: bd,
-            bit_depth_chroma: bd,
-            chroma_format_idc: cf,
-            qp: -(6 * (bd as i32 - 8)),
-            p_frames: true,
-            intra_in_p: true,
-            deblock: true,
-            lossless: true,
-            lossless_interop: interop,
-            cabac: false,
-            transform_8x8: false,
-        },
+        &DeepConfig::new(W as u32, H as u32, bd, bd, cf, -(6 * (bd as i32 - 8)))
+            .with_p_frames(true)
+            .with_intra_in_p(true)
+            .with_deblock(true)
+            .with_lossless(true)
+            .with_lossless_interop(interop)
+            .with_cabac(false)
+            .with_transform_8x8(false),
         &refs,
     );
     (enc, frames)
@@ -355,21 +341,14 @@ fn encode_cabac(
         .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
         .collect();
     let enc = encode_deep_sequence(
-        &DeepConfig {
-            width: W as u32,
-            height: H as u32,
-            bit_depth_luma: bd,
-            bit_depth_chroma: bd,
-            chroma_format_idc: cf,
-            qp,
-            p_frames: true,
-            intra_in_p: true,
-            deblock: true,
-            lossless,
-            lossless_interop: lossless,
-            cabac: true,
-            transform_8x8: false,
-        },
+        &DeepConfig::new(W as u32, H as u32, bd, bd, cf, qp)
+            .with_p_frames(true)
+            .with_intra_in_p(true)
+            .with_deblock(true)
+            .with_lossless(lossless)
+            .with_lossless_interop(lossless)
+            .with_cabac(true)
+            .with_transform_8x8(false),
         &refs,
     );
     (enc, frames)
@@ -431,21 +410,14 @@ fn encode_8x8(
         .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
         .collect();
     let enc = encode_deep_sequence(
-        &DeepConfig {
-            width: W as u32,
-            height: H as u32,
-            bit_depth_luma: bd,
-            bit_depth_chroma: bd,
-            chroma_format_idc: cf,
-            qp,
-            p_frames: true,
-            intra_in_p: true,
-            deblock: true,
-            lossless,
-            lossless_interop: lossless,
-            cabac,
-            transform_8x8: true,
-        },
+        &DeepConfig::new(W as u32, H as u32, bd, bd, cf, qp)
+            .with_p_frames(true)
+            .with_intra_in_p(true)
+            .with_deblock(true)
+            .with_lossless(lossless)
+            .with_lossless_interop(lossless)
+            .with_cabac(cabac)
+            .with_transform_8x8(true),
         &refs,
     );
     (enc, frames)

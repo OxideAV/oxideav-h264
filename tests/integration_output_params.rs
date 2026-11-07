@@ -423,11 +423,9 @@ fn generation_bumps_exactly_at_the_first_frame_of_the_new_shape() {
 fn monochrome_answers_gray() {
     use oxideav_h264::encoder::{Encoder, EncoderConfig, YuvFrame};
     let (w, h) = (48u32, 32u32);
-    let cfg = EncoderConfig {
-        chroma_format_idc: 0,
-        profile_idc: 100,
-        ..EncoderConfig::new(w, h)
-    };
+    let cfg = EncoderConfig::new(w, h)
+        .with_chroma_format_idc(0)
+        .with_profile_idc(100);
     let y: Vec<u8> = (0..(w * h) as usize)
         .map(|i| (i % 200) as u8 + 16)
         .collect();

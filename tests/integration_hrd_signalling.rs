@@ -112,17 +112,15 @@ fn sei_rbsps_and_first_au_types(stream: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {
 
 fn sei_ctx_from_vui(vui: &VuiParameters) -> SeiContext {
     let hrd = vui.nal_hrd_parameters.as_ref().expect("nal hrd present");
-    SeiContext {
-        initial_cpb_removal_delay_length_minus1: hrd.initial_cpb_removal_delay_length_minus1,
-        cpb_removal_delay_length_minus1: hrd.cpb_removal_delay_length_minus1,
-        dpb_output_delay_length_minus1: hrd.dpb_output_delay_length_minus1,
-        time_offset_length: hrd.time_offset_length,
-        nal_hrd_cpb_cnt_minus1: Some(hrd.cpb_cnt_minus1),
-        vcl_hrd_cpb_cnt_minus1: None,
-        pic_struct_present_flag: vui.pic_struct_present_flag,
-        cpb_dpb_delays_present_flag: true,
-        ..SeiContext::default()
-    }
+    SeiContext::default()
+        .with_initial_cpb_removal_delay_length_minus1(hrd.initial_cpb_removal_delay_length_minus1)
+        .with_cpb_removal_delay_length_minus1(hrd.cpb_removal_delay_length_minus1)
+        .with_dpb_output_delay_length_minus1(hrd.dpb_output_delay_length_minus1)
+        .with_time_offset_length(hrd.time_offset_length)
+        .with_nal_hrd_cpb_cnt_minus1(Some(hrd.cpb_cnt_minus1))
+        .with_vcl_hrd_cpb_cnt_minus1(None)
+        .with_pic_struct_present_flag(vui.pic_struct_present_flag)
+        .with_cpb_dpb_delays_present_flag(true)
 }
 
 #[test]

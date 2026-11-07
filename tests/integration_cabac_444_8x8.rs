@@ -60,13 +60,11 @@ fn encode_cabac_444_8x8() -> oxideav_h264::encoder::EncodedIdr {
         u: &u,
         v: &v,
     };
-    let cfg = EncoderConfig {
-        cabac: true,
-        profile_idc: 244,
-        chroma_format_idc: 3,
-        transform_8x8: true,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_cabac(true)
+        .with_profile_idc(244)
+        .with_chroma_format_idc(3)
+        .with_transform_8x8(true);
     Encoder::new(cfg).encode_idr_cabac(&frame)
 }
 

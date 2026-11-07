@@ -103,18 +103,16 @@ fn encode_gop(fmt: u32, transform_8x8: bool) -> Gop {
         u: &u1,
         v: &v1,
     };
-    let cfg = EncoderConfig {
-        cabac: true,
-        chroma_format_idc: fmt,
-        profile_idc: match fmt {
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_cabac(true)
+        .with_chroma_format_idc(fmt)
+        .with_profile_idc(match fmt {
             3 => 244,
             2 => 122,
             _ => 100,
-        },
-        transform_8x8,
-        qp: if transform_8x8 { 20 } else { 26 },
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+        })
+        .with_transform_8x8(transform_8x8)
+        .with_qp(if transform_8x8 { 20 } else { 26 });
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr_cabac(&f0);
     let p = enc.encode_p_cabac(&f1, &EncodedFrameRef::from(&idr), 1, 2);
@@ -330,19 +328,17 @@ fn encode_gop_b(fmt: u32, transform_8x8: bool) -> GopB {
         u: &u2,
         v: &v2,
     };
-    let cfg = EncoderConfig {
-        cabac: true,
-        chroma_format_idc: fmt,
-        profile_idc: match fmt {
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_cabac(true)
+        .with_chroma_format_idc(fmt)
+        .with_profile_idc(match fmt {
             3 => 244,
             2 => 122,
             _ => 100,
-        },
-        max_num_ref_frames: 2,
-        transform_8x8,
-        qp: if transform_8x8 { 20 } else { 26 },
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+        })
+        .with_max_num_ref_frames(2)
+        .with_transform_8x8(transform_8x8)
+        .with_qp(if transform_8x8 { 20 } else { 26 });
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr_cabac(&f0);
     let p = enc.encode_p_cabac(&f2, &EncodedFrameRef::from(&idr), 1, 4);
@@ -591,17 +587,15 @@ fn cabac_b_partitions_422_444() {
             u: &u2,
             v: &v2,
         };
-        let cfg = EncoderConfig {
-            cabac: true,
-            chroma_format_idc: fmt,
-            profile_idc: match fmt {
+        let cfg = EncoderConfig::new(W as u32, H as u32)
+            .with_cabac(true)
+            .with_chroma_format_idc(fmt)
+            .with_profile_idc(match fmt {
                 3 => 244,
                 2 => 122,
                 _ => 100,
-            },
-            max_num_ref_frames: 2,
-            ..EncoderConfig::new(W as u32, H as u32)
-        };
+            })
+            .with_max_num_ref_frames(2);
         let enc = Encoder::new(cfg);
         let idr = enc.encode_idr_cabac(&f0);
         let p = enc.encode_p_cabac(&f2, &EncodedFrameRef::from(&idr), 1, 4);
@@ -646,17 +640,15 @@ fn cabac_b_skip_all_formats() {
             u: &u0,
             v: &v0,
         };
-        let cfg = EncoderConfig {
-            cabac: true,
-            chroma_format_idc: fmt,
-            profile_idc: match fmt {
+        let cfg = EncoderConfig::new(W as u32, H as u32)
+            .with_cabac(true)
+            .with_chroma_format_idc(fmt)
+            .with_profile_idc(match fmt {
                 3 => 244,
                 2 => 122,
                 _ => 100,
-            },
-            max_num_ref_frames: 2,
-            ..EncoderConfig::new(W as u32, H as u32)
-        };
+            })
+            .with_max_num_ref_frames(2);
         let enc = Encoder::new(cfg);
         let idr = enc.encode_idr_cabac(&f0);
         let p = enc.encode_p_cabac(&f0, &EncodedFrameRef::from(&idr), 1, 4);

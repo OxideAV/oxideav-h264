@@ -44,6 +44,7 @@ use crate::vui::{HrdParameters, TimingInfo, VuiParameters};
 
 /// Rate-control selection for a session.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum SessionRateControl {
     /// Fixed QP for every picture — the historical behaviour.
     ConstantQp(i32),
@@ -53,6 +54,7 @@ pub enum SessionRateControl {
 
 /// Session configuration.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SessionConfig {
     /// Picture width in luma samples (multiple of 16).
     pub width: u32,
@@ -111,6 +113,7 @@ impl SessionConfig {
 
 /// Coding kind of one session access unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionFrameKind {
     /// IDR anchor (stream random-access point).
     Idr,
@@ -124,6 +127,7 @@ pub enum SessionFrameKind {
 /// One encoded picture as returned by [`EncoderSession::encode_frame`]
 /// / [`EncoderSession::push_frame`] (in decode order).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SessionFrame {
     /// Annex B bytes for this access unit: SPS + PPS + IDR slice on
     /// IDR frames, the P or B slice otherwise, plus any CBR filler
@@ -153,6 +157,32 @@ pub struct SessionFrame {
     /// Filler bits appended after the picture (CBR underspend), 0
     /// otherwise.
     pub filler_bits: u64,
+}
+
+impl SessionFrame {
+    /// Build a [`SessionFrame`] from all of its fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        annex_b: Vec<u8>,
+        is_idr: bool,
+        kind: SessionFrameKind,
+        display_index: u64,
+        qp: i32,
+        payload_bits: u64,
+        sei_bits: u64,
+        filler_bits: u64,
+    ) -> Self {
+        Self {
+            annex_b,
+            is_idr,
+            kind,
+            display_index,
+            qp,
+            payload_bits,
+            sei_bits,
+            filler_bits,
+        }
+    }
 }
 
 /// Retained state of the most recent reference picture.

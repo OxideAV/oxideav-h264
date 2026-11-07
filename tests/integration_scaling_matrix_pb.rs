@@ -138,14 +138,12 @@ fn encode_gop(mode: ScalingMatrixMode, transform_8x8: bool) -> Gop {
         u: &u2,
         v: &v2,
     };
-    let cfg = EncoderConfig {
-        scaling_matrix: mode,
-        transform_8x8,
-        profile_idc: 100,
-        max_num_ref_frames: 2,
-        qp: if transform_8x8 { 18 } else { 26 },
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_scaling_matrix(mode)
+        .with_transform_8x8(transform_8x8)
+        .with_profile_idc(100)
+        .with_max_num_ref_frames(2)
+        .with_qp(if transform_8x8 { 18 } else { 26 });
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr(&f0);
     let p = enc.encode_p(&f2, &EncodedFrameRef::from(&idr), 1, 4);

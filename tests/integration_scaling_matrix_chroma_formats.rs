@@ -131,20 +131,18 @@ fn encode_gop(fmt: u32, cabac: bool, mode: ScalingMatrixMode, transform_8x8: boo
         u: &u2,
         v: &v2,
     };
-    let cfg = EncoderConfig {
-        cabac,
-        chroma_format_idc: fmt,
-        profile_idc: match fmt {
+    let cfg = EncoderConfig::new(W as u32, H as u32)
+        .with_cabac(cabac)
+        .with_chroma_format_idc(fmt)
+        .with_profile_idc(match fmt {
             3 => 244,
             2 => 122,
             _ => 100,
-        },
-        max_num_ref_frames: 2,
-        transform_8x8,
-        scaling_matrix: mode,
-        qp: 24,
-        ..EncoderConfig::new(W as u32, H as u32)
-    };
+        })
+        .with_max_num_ref_frames(2)
+        .with_transform_8x8(transform_8x8)
+        .with_scaling_matrix(mode)
+        .with_qp(24);
     let enc = Encoder::new(cfg);
     let (idr, p, b) = if cabac {
         let idr = enc.encode_idr_cabac(&f0);

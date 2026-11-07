@@ -76,6 +76,7 @@ use crate::slice_header::{DecRefPicMarking, MmcoOp};
 use crate::vui::{HrdParameters, VuiError};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SeiError {
     #[error("bitstream read failed: {0}")]
     Bitstream(#[from] BitError),
@@ -915,6 +916,7 @@ pub struct MvcViewRefCounts {
 
 /// time_offset_length, etc.).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SeiContext {
     /// From VUI.nal_hrd: initial_cpb_removal_delay_length_minus1 and
     /// cpb_removal_delay_length_minus1, needed by buffering_period and
@@ -974,6 +976,99 @@ pub struct SeiContext {
     /// an empty vector is rejected with
     /// [`SeiError::ViewDependencyChangeRefCountsUnknown`].
     pub mvc_view_ref_counts: Vec<MvcViewRefCounts>,
+}
+
+impl SeiContext {
+    /// Set [`SeiContext::initial_cpb_removal_delay_length_minus1`].
+    #[must_use]
+    pub fn with_initial_cpb_removal_delay_length_minus1(mut self, v: u8) -> Self {
+        self.initial_cpb_removal_delay_length_minus1 = v;
+        self
+    }
+
+    /// Set [`SeiContext::cpb_removal_delay_length_minus1`].
+    #[must_use]
+    pub fn with_cpb_removal_delay_length_minus1(mut self, v: u8) -> Self {
+        self.cpb_removal_delay_length_minus1 = v;
+        self
+    }
+
+    /// Set [`SeiContext::dpb_output_delay_length_minus1`].
+    #[must_use]
+    pub fn with_dpb_output_delay_length_minus1(mut self, v: u8) -> Self {
+        self.dpb_output_delay_length_minus1 = v;
+        self
+    }
+
+    /// Set [`SeiContext::time_offset_length`].
+    #[must_use]
+    pub fn with_time_offset_length(mut self, v: u8) -> Self {
+        self.time_offset_length = v;
+        self
+    }
+
+    /// Set [`SeiContext::nal_hrd_cpb_cnt_minus1`].
+    #[must_use]
+    pub fn with_nal_hrd_cpb_cnt_minus1(mut self, v: Option<u32>) -> Self {
+        self.nal_hrd_cpb_cnt_minus1 = v;
+        self
+    }
+
+    /// Set [`SeiContext::vcl_hrd_cpb_cnt_minus1`].
+    #[must_use]
+    pub fn with_vcl_hrd_cpb_cnt_minus1(mut self, v: Option<u32>) -> Self {
+        self.vcl_hrd_cpb_cnt_minus1 = v;
+        self
+    }
+
+    /// Set [`SeiContext::pic_struct_present_flag`].
+    #[must_use]
+    pub fn with_pic_struct_present_flag(mut self, v: bool) -> Self {
+        self.pic_struct_present_flag = v;
+        self
+    }
+
+    /// Set [`SeiContext::cpb_dpb_delays_present_flag`].
+    #[must_use]
+    pub fn with_cpb_dpb_delays_present_flag(mut self, v: bool) -> Self {
+        self.cpb_dpb_delays_present_flag = v;
+        self
+    }
+
+    /// Set [`SeiContext::num_slice_groups`].
+    #[must_use]
+    pub fn with_num_slice_groups(mut self, v: u32) -> Self {
+        self.num_slice_groups = v;
+        self
+    }
+
+    /// Set [`SeiContext::pic_size_in_map_units`].
+    #[must_use]
+    pub fn with_pic_size_in_map_units(mut self, v: u32) -> Self {
+        self.pic_size_in_map_units = v;
+        self
+    }
+
+    /// Set [`SeiContext::frame_mbs_only_flag`].
+    #[must_use]
+    pub fn with_frame_mbs_only_flag(mut self, v: bool) -> Self {
+        self.frame_mbs_only_flag = v;
+        self
+    }
+
+    /// Set [`SeiContext::num_depth_views`].
+    #[must_use]
+    pub fn with_num_depth_views(mut self, v: u32) -> Self {
+        self.num_depth_views = v;
+        self
+    }
+
+    /// Set [`SeiContext::mvc_view_ref_counts`].
+    #[must_use]
+    pub fn with_mvc_view_ref_counts(mut self, v: Vec<MvcViewRefCounts>) -> Self {
+        self.mvc_view_ref_counts = v;
+        self
+    }
 }
 
 impl Default for SeiContext {
@@ -7201,6 +7296,7 @@ pub fn parse_depth_timing(payload: &[u8], ctx: &SeiContext) -> Result<DepthTimin
 /// Dispatch helper: given a payload_type and bytes, produce the typed
 /// payload if it's one we recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SeiPayload {
     BufferingPeriod(BufferingPeriod),
     PicTiming(PicTiming),
