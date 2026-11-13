@@ -946,8 +946,9 @@ pub fn zigzag_scan_4x4_ac(coeffs: &[i32; 16]) -> [i32; 16] {
 // The matching forward transform is the transpose of that basis, expressed
 // as the integer 8x8 matrix `E8` below (each row is one basis vector). The
 // forward core computes `W = E8 * R * E8^T`; the per-position quantizer
-// (below) folds in the `1/64` forward-domain scale and the §8.5.9 normAdjust
-// so that `inverse_transform_8x8(quantize_8x8(W))` recovers `R` to within a
+// (below) folds in the forward-domain scale, the basis-row norms of the
+// position class and the §8.5.9 normAdjust so that
+// `inverse_transform_8x8(quantize_8x8(W))` recovers `R` to within a
 // quantization step.
 //
 // `E8` is the transpose of the normative inverse basis (rows are mutually
@@ -956,8 +957,9 @@ pub fn zigzag_scan_4x4_ac(coeffs: &[i32; 16]) -> [i32; 16] {
 // re-derived from the inverse butterfly's fixed points.
 
 /// §8.6.4 — forward 8x8 integer transform matrix `E8` (row = basis
-/// vector). Even rows have L2² norm 512, odd rows 578; the per-class
-/// normalisation is absorbed by [`quantize_8x8`].
+/// vector). Rows 0 / 4 have L2² norm 512, odd rows 578, rows 2 / 6
+/// 320; the per-class normalisation is absorbed by the quantiser
+/// multipliers (`forward_mf_8x8`).
 const FORWARD_8X8_E: [[i32; 8]; 8] = [
     [8, 8, 8, 8, 8, 8, 8, 8],
     [12, 10, 6, 3, -3, -6, -10, -12],
@@ -1033,16 +1035,39 @@ fn norm_adjust_8x8_class(i: usize, j: usize) -> usize {
 
 /// Forward 8x8 quantizer multiplier `MF8x8[m][class]`.
 ///
-/// Derivation (clean-room from §8.5.13.1): the decoder dequantizes a
-/// level `Z` at position class `c` to `d = Z * 16 * V8x8[m][c] * 2^(qP/6)
-/// / 64`, and the forward core produces `W = 64 * d` for a round-trip.
-/// Hence `Z = W / (16 * V8x8[m][c] * 2^(qP/6))`. Expressed as
-/// `Z = (|W| * MF + f) >> (22 + qP/6)` this fixes
-/// `MF8x8[m][c] = round(2^18 / V8x8[m][c])`.
+/// Derivation from §8.5.13: the inverse transform (eqs. 8-358..8-406)
+/// realises `X' = B^T · D · B / 64` where row `k` of the inverse basis
+/// `B` is row `k` of [`FORWARD_8X8_E`] divided by 8, and the scaling
+/// (flat weights) gives `D = Z · 16 · V8x8[m][c] · 2^(qP/6) / 64`. The
+/// rows of `B` are orthogonal with squared norms `p = 8` (rows 0, 4),
+/// `289/32` (odd rows) and `5` (rows 2, 6), so the forward core
+/// `W = E8 · X · E8^T = 64 · B · X · B^T` inverts as
+/// `X = B^T · (W / (64 · p_i · p_j)) · B`. Equating the two,
+/// `Z = 4 · W / (V8x8[m][c] · p_i · p_j · 2^(qP/6))`; written as
+/// `Z = (|W| · MF + f) >> (22 + qP/6)`:
+///
+/// `MF8x8[m][c] = round(2^18 / V8x8[m][c] · 64 / (p_i · p_j))`.
+///
+/// The factor `64 / (p_i · p_j)` only depends on the position class:
+/// 1 (class 0), `65536/83521` (1), `64/25` (2), `256/289` (3), `8/5`
+/// (4), `2048/1445` (5). Leaving it out — one multiplier per `V8x8`
+/// entry — reconstructs the row-2 / row-6 basis functions at 39 % of
+/// their amplitude (class 2) and the odd-row ones at 127 %.
 #[inline]
 fn forward_mf_8x8(m: usize, class: usize) -> i64 {
+    /// `64 / (p_i · p_j)` per position class as `(numerator, denominator)`.
+    const CLASS_NORM: [(i64, i64); 6] = [
+        (1, 1),
+        (65_536, 83_521),
+        (64, 25),
+        (256, 289),
+        (8, 5),
+        (2_048, 1_445),
+    ];
     let v = NORM_ADJUST_8X8_V[m][class] as i64;
-    ((1i64 << 18) + v / 2) / v
+    let (num, den) = CLASS_NORM[class];
+    let den = den * v;
+    ((num << 18) + den / 2) / den
 }
 
 /// `qBits8 = 22 + qP/6` — the forward shift used by [`quantize_8x8`].
@@ -1324,6 +1349,44 @@ mod tests {
                 max_err <= 4 * step + 2,
                 "qp={qp} max_err={max_err} step={step}"
             );
+        }
+    }
+
+    /// Every one of the 64 basis functions must survive forward
+    /// transform → quantiser → normative inverse at its own amplitude:
+    /// the quantiser multiplier has to carry the basis-row norms of the
+    /// position class (rows 0 / 4, odd rows and rows 2 / 6 differ), not
+    /// just normAdjust8x8. A single multiplier per normAdjust entry
+    /// returns the (2, 2) function at 39 % and the (1, 1) one at 127 %.
+    #[test]
+    fn forward_8x8_every_basis_function_keeps_its_amplitude() {
+        let sl8 = default_scaling_list_8x8_flat();
+        for qp in [0, 7, 14, 21, 28, 35] {
+            for (i, row_i) in FORWARD_8X8_E.iter().enumerate() {
+                for (j, row_j) in FORWARD_8X8_E.iter().enumerate() {
+                    // Outer product of basis rows i and j, peak ~ ±144
+                    // (rows are in units of 1/8 of the inverse basis).
+                    let mut res = [0i32; 64];
+                    for (y, &a) in row_i.iter().enumerate() {
+                        for (x, &b) in row_j.iter().enumerate() {
+                            res[y * 8 + x] = a * b;
+                        }
+                    }
+                    let z = quantize_8x8(&forward_core_8x8(&res), qp, true);
+                    let recon = inverse_transform_8x8(&z, qp, &sl8, 8).unwrap();
+                    // Projection of the reconstruction on the input.
+                    let dot: i64 = (0..64).map(|k| recon[k] as i64 * res[k] as i64).sum();
+                    let energy: i64 = (0..64).map(|k| res[k] as i64 * res[k] as i64).sum();
+                    let gain = dot as f64 / energy as f64;
+                    // Quantisation moves the single level by at most one
+                    // step: allow that relative to the level count.
+                    let level = z.iter().map(|v| v.abs()).max().unwrap().max(1) as f64;
+                    assert!(
+                        (gain - 1.0).abs() <= 1.0 / level + 0.02,
+                        "qp {qp} basis ({i}, {j}): gain {gain:.3} at level {level}"
+                    );
+                }
+            }
         }
     }
 

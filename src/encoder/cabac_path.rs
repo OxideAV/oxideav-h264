@@ -3349,12 +3349,13 @@ impl Encoder {
                             }
                         }
                     }
-                    // §7.3.5 — with cbp_luma == 0 the second-gate flag is
-                    // not coded and the decoder infers 0; normalise so the
-                    // grid / deblock mirrors agree with the decoder.
-                    if cbp_luma == 0 {
-                        transform_size_8x8 = false;
-                    }
+                    // The flag is normalised (§7.3.5: not coded, inferred
+                    // 0, when cbp_luma == 0) only after the chroma planes
+                    // are coded: at ChromaArrayType 3 they follow the luma
+                    // transform size and can raise cbp_luma, and a flag
+                    // dropped here would send the 4x4 luma levels of a
+                    // macroblock whose reconstruction used the (all-zero)
+                    // 8x8 residual.
                 }
 
                 // Chroma residual — per-format dispatch.
