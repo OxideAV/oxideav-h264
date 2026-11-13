@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/OxideAV/oxideav-h264/compare/v0.1.12...v0.1.13) - 2026-11-13
+
+### Other
+
+- name the 4:2:0-only P modes behind the 4:0:0 inter size gap
+- encoder speed: reference windows instead of whole-plane widening, row SAD
+- :deep: Intra_8x8 at 8..=14 bit, I_NxN inside P pictures
+- 8x8 quantiser carries the basis-row norms; 4:4:4 CABAC P flag order
+- frame cropping for any picture size, 4:0:0 for grey input
+- clippy 1.100: iterate instead of range-indexing, drop a duplicated allow
+
 ### Added
 
 - Frame cropping in the encoder (§7.4.2.1.1): picture sizes that are
