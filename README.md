@@ -274,8 +274,10 @@ carriage of `Gray8` as 4:2:0 with constant chroma. Measured (160x128
 synthetic, 3 intra pictures, QP 26): 4:0:0 19 706 B vs 19 959 B as
 4:2:0 under CAVLC (−1.3 %), 17 420 vs 17 436 B under CABAC; with P / B
 pictures the 4:0:0 mode decision is narrower than the 4:2:0 one (the
-CAVLC inter paths run the Intra_16x16 fallback at 4:2:0 only) and can
-come out larger (+6 % CAVLC P, +2.5 % CABAC B on the same content). Picture sizes need not be whole macroblocks on any path
+CAVLC P path offers P_8x8 and the Intra_16x16 fallback at 4:2:0 only;
+enabling the fallback alone at 4:0:0 was measured and gains nothing)
+and can come out larger (+6 % CAVLC P, +2.5 % CABAC B on the same
+content). Picture sizes need not be whole macroblocks on any path
 (§7.4.2.1.1 cropping — see the coding-tool table). Every other layout rides `encoder::deep::DeepSession`
 under the §A.2.4 – §A.2.7 minimum profile (High 100 / High 10 110 /
 High 4:2:2 122 / High 4:4:4 Predictive 244): IDR + P pictures
