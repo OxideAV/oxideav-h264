@@ -69,6 +69,7 @@ pub mod pps;
 pub mod rate_control;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod rdo;
+pub(crate) mod refwin;
 #[doc(hidden)]
 pub mod scp;
 pub mod sei;
@@ -218,7 +219,6 @@ use crate::encoder::transform::{
     forward_hadamard_4x4, quantize_4x4_ac_w, quantize_4x4_w, quantize_8x8_w, quantize_chroma_dc_w,
     quantize_luma_dc_w, scan_8x8_for_cavlc, zigzag_scan_4x4, zigzag_scan_4x4_ac,
 };
-use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::intra_pred::{
     Intra8x8Mode, Neighbour4x4Availability, Samples8x8, filter_samples_8x8, predict_8x8,
 };
@@ -5265,10 +5265,8 @@ fn build_inter_pred_luma(
     mb_y: usize,
     mv: Mv,
 ) -> [i32; 256] {
-    // Convert ref to i32 plane.
     let stride = ref_w as usize;
     let h = ref_h as usize;
-    let ref_i32: Vec<i32> = ref_y.iter().take(stride * h).map(|&v| v as i32).collect();
 
     let mv_int_x = mv.x >> 2;
     let mv_int_y = mv.y >> 2;
@@ -5278,10 +5276,9 @@ fn build_inter_pred_luma(
     let int_y = (mb_y * 16) as i32 + mv_int_y;
 
     let mut dst = [0i32; 256];
-    interpolate_luma(
-        &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, 16, 16, 8, &mut dst, 16,
-    )
-    .expect("luma interpolation");
+    refwin::luma_from_plane(
+        ref_y, stride, stride, h, int_x, int_y, x_frac, y_frac, 16, 16, &mut dst, 16,
+    );
     dst
 }
 
@@ -5302,7 +5299,6 @@ pub(crate) fn build_inter_pred_luma_8x8(
 ) -> [i32; 64] {
     let stride = ref_w as usize;
     let h = ref_h as usize;
-    let ref_i32: Vec<i32> = ref_y.iter().take(stride * h).map(|&v| v as i32).collect();
 
     let mv_int_x = mv.x >> 2;
     let mv_int_y = mv.y >> 2;
@@ -5312,10 +5308,9 @@ pub(crate) fn build_inter_pred_luma_8x8(
     let int_y = (mb_y * 16 + sub_y * 8) as i32 + mv_int_y;
 
     let mut dst = [0i32; 64];
-    interpolate_luma(
-        &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, 8, 8, 8, &mut dst, 8,
-    )
-    .expect("luma interpolation 8x8");
+    refwin::luma_from_plane(
+        ref_y, stride, stride, h, int_x, int_y, x_frac, y_frac, 8, 8, &mut dst, 8,
+    );
     dst
 }
 
@@ -5345,18 +5340,16 @@ pub(super) fn build_chroma_rect_pred_fmt(
     }
     let stride = plane_w as usize;
     let h = plane_h as usize;
-    let ref_i32: Vec<i32> = plane.iter().take(stride * h).map(|&v| v as i32).collect();
     let mut dst = vec![0i32; rw * rh];
     if fmt == 3 {
         let int_x = cx0 as i32 + (mv.x >> 2);
         let int_y = cy0 as i32 + (mv.y >> 2);
         let x_frac = (mv.x & 3) as u8;
         let y_frac = (mv.y & 3) as u8;
-        interpolate_luma(
-            &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, rw as u32, rh as u32, 8,
-            &mut dst, rw,
-        )
-        .expect("4:4:4 luma-like chroma interpolation");
+        refwin::luma_from_plane(
+            plane, stride, stride, h, int_x, int_y, x_frac, y_frac, rw as u32, rh as u32, &mut dst,
+            rw,
+        );
     } else {
         let mv_cx = mv.x;
         let mv_cy = if fmt == 2 { mv.y * 2 } else { mv.y };
@@ -5364,11 +5357,10 @@ pub(super) fn build_chroma_rect_pred_fmt(
         let int_y = cy0 as i32 + (mv_cy >> 3);
         let x_frac = (mv_cx & 7) as u8;
         let y_frac = (mv_cy & 7) as u8;
-        interpolate_chroma(
-            &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, rw as u32, rh as u32, 8,
-            &mut dst, rw,
-        )
-        .expect("chroma rect interpolation");
+        refwin::chroma_from_plane(
+            plane, stride, stride, h, int_x, int_y, x_frac, y_frac, rw as u32, rh as u32, &mut dst,
+            rw,
+        );
     }
     dst
 }
@@ -5426,7 +5418,6 @@ pub(crate) fn build_inter_pred_chroma_4x4(
 ) -> [i32; 16] {
     let stride = ref_cw as usize;
     let h = ref_ch as usize;
-    let ref_i32: Vec<i32> = ref_c.iter().take(stride * h).map(|&v| v as i32).collect();
 
     // §8.4.1.4 — 4:2:0 chroma uses luma MV directly, with 1/8-pel
     // fractional positions (mvC = mv_luma; xFracC = mvC & 7).
@@ -5438,10 +5429,9 @@ pub(crate) fn build_inter_pred_chroma_4x4(
     let y_frac = (mv_cy & 7) as u8;
 
     let mut dst = [0i32; 16];
-    interpolate_chroma(
-        &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, 4, 4, 8, &mut dst, 4,
-    )
-    .expect("chroma interpolation 4x4");
+    refwin::chroma_from_plane(
+        ref_c, stride, stride, h, int_x, int_y, x_frac, y_frac, 4, 4, &mut dst, 4,
+    );
     dst
 }
 
@@ -5458,7 +5448,6 @@ fn build_inter_pred_chroma(
 ) -> [i32; 64] {
     let stride = ref_cw as usize;
     let h = ref_ch as usize;
-    let ref_i32: Vec<i32> = ref_c.iter().take(stride * h).map(|&v| v as i32).collect();
 
     // §8.4.1.4 / eq. 8-228..8-231 — chroma MV is luma MV (4:2:0).
     // xIntC = mb_x*8 + (mvC >> 3); xFracC = mvC & 7. mvC = mv (luma 1/4-pel).
@@ -5470,10 +5459,9 @@ fn build_inter_pred_chroma(
     let y_frac = (mv_cy & 7) as u8;
 
     let mut dst = [0i32; 64];
-    interpolate_chroma(
-        &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, 8, 8, 8, &mut dst, 8,
-    )
-    .expect("chroma interpolation");
+    refwin::chroma_from_plane(
+        ref_c, stride, stride, h, int_x, int_y, x_frac, y_frac, 8, 8, &mut dst, 8,
+    );
     dst
 }
 
@@ -10433,11 +10421,6 @@ fn build_inter_pred_luma_partition(
 ) -> Vec<i32> {
     let stride = ref_w as usize;
     let h_us = ref_h as usize;
-    let ref_i32: Vec<i32> = ref_y
-        .iter()
-        .take(stride * h_us)
-        .map(|&v| v as i32)
-        .collect();
 
     let mv_int_x = mv.x >> 2;
     let mv_int_y = mv.y >> 2;
@@ -10447,10 +10430,9 @@ fn build_inter_pred_luma_partition(
     let int_y = (mb_y * 16 + off_y) as i32 + mv_int_y;
 
     let mut dst = vec![0i32; (w * h) as usize];
-    interpolate_luma(
-        &ref_i32, stride, stride, h_us, int_x, int_y, x_frac, y_frac, w, h, 8, &mut dst, w as usize,
-    )
-    .expect("luma interpolation partition");
+    refwin::luma_from_plane(
+        ref_y, stride, stride, h_us, int_x, int_y, x_frac, y_frac, w, h, &mut dst, w as usize,
+    );
     dst
 }
 
@@ -10473,11 +10455,6 @@ fn build_inter_pred_chroma_partition(
 ) -> Vec<i32> {
     let stride = ref_cw as usize;
     let h_us = ref_ch as usize;
-    let ref_i32: Vec<i32> = ref_c
-        .iter()
-        .take(stride * h_us)
-        .map(|&v| v as i32)
-        .collect();
 
     // §8.4.1.4 — 4:2:0 chroma uses luma MV directly with 1/8-pel
     // fractional positions.
@@ -10487,8 +10464,8 @@ fn build_inter_pred_chroma_partition(
     let y_frac = (mv.y & 7) as u8;
 
     let mut dst = vec![0i32; (w_chroma * h_chroma) as usize];
-    interpolate_chroma(
-        &ref_i32,
+    refwin::chroma_from_plane(
+        ref_c,
         stride,
         stride,
         h_us,
@@ -10498,11 +10475,9 @@ fn build_inter_pred_chroma_partition(
         y_frac,
         w_chroma,
         h_chroma,
-        8,
         &mut dst,
         w_chroma as usize,
-    )
-    .expect("chroma interpolation partition");
+    );
     dst
 }
 

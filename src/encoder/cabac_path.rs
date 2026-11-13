@@ -71,7 +71,6 @@ use crate::encoder::{
     build_b_partition_pred_luma_16x8, build_inter_pred_chroma_4x4, build_inter_pred_luma_8x8,
     partition_sad_b_8x16, partition_sad_b_16x8, pick_best_b8x8_cell,
 };
-use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::mv_deriv::{
     Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_b_spatial_direct_with_d,
     derive_mvpred_with_d, derive_p_skip_mv_with_d,
@@ -8617,7 +8616,6 @@ pub(super) fn build_inter_pred_luma_local(
 ) -> [i32; 256] {
     let stride = ref_w as usize;
     let h = ref_h as usize;
-    let ref_i32: Vec<i32> = ref_y.iter().take(stride * h).map(|&v| v as i32).collect();
     let mv_int_x = mv.x >> 2;
     let mv_int_y = mv.y >> 2;
     let x_frac = (mv.x & 3) as u8;
@@ -8625,10 +8623,9 @@ pub(super) fn build_inter_pred_luma_local(
     let int_x = (mb_x * 16) as i32 + mv_int_x;
     let int_y = (mb_y * 16) as i32 + mv_int_y;
     let mut dst = [0i32; 256];
-    interpolate_luma(
-        &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, 16, 16, 8, &mut dst, 16,
-    )
-    .expect("luma interp");
+    super::refwin::luma_from_plane(
+        ref_y, stride, stride, h, int_x, int_y, x_frac, y_frac, 16, 16, &mut dst, 16,
+    );
     dst
 }
 
@@ -8645,7 +8642,6 @@ pub(super) fn build_inter_pred_chroma_local_422(
 ) -> [i32; 128] {
     let stride = ref_cw as usize;
     let h = ref_ch as usize;
-    let ref_i32: Vec<i32> = ref_c.iter().take(stride * h).map(|&v| v as i32).collect();
     let mv_cx = mv.x;
     let mv_cy = mv.y * 2;
     let int_x = (mb_x * 8) as i32 + (mv_cx >> 3);
@@ -8653,10 +8649,9 @@ pub(super) fn build_inter_pred_chroma_local_422(
     let x_frac = (mv_cx & 7) as u8;
     let y_frac = (mv_cy & 7) as u8;
     let mut dst = [0i32; 128];
-    interpolate_chroma(
-        &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, 8, 16, 8, &mut dst, 8,
-    )
-    .expect("chroma interp");
+    super::refwin::chroma_from_plane(
+        ref_c, stride, stride, h, int_x, int_y, x_frac, y_frac, 8, 16, &mut dst, 8,
+    );
     dst
 }
 
@@ -8670,16 +8665,14 @@ pub(super) fn build_inter_pred_chroma_local(
 ) -> [i32; 64] {
     let stride = ref_cw as usize;
     let h = ref_ch as usize;
-    let ref_i32: Vec<i32> = ref_c.iter().take(stride * h).map(|&v| v as i32).collect();
     let int_x = (mb_x * 8) as i32 + (mv.x >> 3);
     let int_y = (mb_y * 8) as i32 + (mv.y >> 3);
     let x_frac = (mv.x & 7) as u8;
     let y_frac = (mv.y & 7) as u8;
     let mut dst = [0i32; 64];
-    interpolate_chroma(
-        &ref_i32, stride, stride, h, int_x, int_y, x_frac, y_frac, 8, 8, 8, &mut dst, 8,
-    )
-    .expect("chroma interp");
+    super::refwin::chroma_from_plane(
+        ref_c, stride, stride, h, int_x, int_y, x_frac, y_frac, 8, 8, &mut dst, 8,
+    );
     dst
 }
 

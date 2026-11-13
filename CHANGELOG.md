@@ -53,6 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (ChromaArrayType 0 / 1 / 2): the cheapest of the three intra
   predictions is the alternative to the inter macroblock.
 
+### Performance
+
+- Encoder motion search and inter predictor builds (8-bit paths),
+  streams byte-identical: sub-pel SADs and predictors read a small
+  reference window (`encoder::refwin`, at most 26 x 26 samples fetched
+  with the picture-edge clamp) instead of widening the whole reference
+  plane to `i32` per block, and the integer full search sums fixed-size
+  `u8` rows with early termination against the best SAD. 1920x1080,
+  6 frames, QP 26: CAVLC 57.5 → 7.2 s, CABAC 27.0 → 2.2 s, CABAC with
+  two B pictures 448.6 → 6.4 s. `examples/encode_bench` times the
+  registry encoder on raw 4:2:0 input.
+
 ### Changed
 
 - Registry encoder: grey input no longer produces a 4:2:0 stream with

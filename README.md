@@ -473,6 +473,43 @@ of three on this machine (18 cores), before → after this round:
 
 Every output is byte-identical to `ffmpeg -f rawvideo` on these clips.
 
+Round 488 re-measured the High / CABAC / B-frames clip on the same
+machine under load from other builds (median of three; output
+byte-identical to the black-box decoder): 3.15 s (95 fps) at 1 thread,
+1.26 s (239 fps) at 2, 0.78 s (384 fps) at 4, 0.47 s (635 fps) at 8.
+The decoder was not changed this round.
+
+### Encoder speed
+
+`examples/encode_bench` pushes raw 4:2:0 frames through the registry
+encoder (`encode_bench clip.yuv 1920 1080 qp=26 cabac=true [out.h264]`).
+The encoder is single-threaded. Round 488 removed two kinds of waste
+from the motion search and the predictor builds, with byte-identical
+streams (MD5 of the output equal before / after on every row below):
+
+* every sub-pel SAD and every inter predictor used to widen the whole
+  reference plane to `i32` first — six 2-megapixel copies per
+  macroblock at 1080p, more in B pictures; they now read a window of
+  at most 26 x 26 samples fetched with the picture-edge clamp
+  (`encoder::refwin`), which the interpolators see exactly as they saw
+  the plane;
+* the integer full search sums absolute differences over fixed-size
+  `u8` rows (vectorised, no per-sample clamp inside the picture) and
+  stops a candidate at the first row that puts it above the best SAD
+  so far.
+
+1920x1080 `testsrc2`, 6 frames, QP 26, seconds (frames per second),
+same machine, before → after:
+
+| options | before | after |
+| ------- | ------ | ----- |
+| CAVLC (Baseline) | 57.5 (0.10) | 7.2 (0.83) |
+| `cabac=true` | 27.0 (0.22) | 2.2 (2.68) |
+| `cabac=true bframes=2` | 448.6 (0.013) | 6.4 (0.94) |
+
+What is left is the exhaustive ±16 integer search itself (two full
+searches per macroblock: 16x16 and four 8x8).
+
 MBAFF frames (interlaced 1080i broadcast) are not frame-threaded; their
 §8.7 deblocking runs by macroblock-pair row in a wavefront under the
 budget (a pair row starts a pair once the row above has filtered the

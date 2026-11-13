@@ -46,7 +46,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::encoder::bitstream::BitWriter;
-use crate::inter_pred::interpolate_luma;
+use crate::encoder::refwin::RefWindow;
 
 /// Result of motion estimation for one MB partition.
 #[derive(Debug, Clone, Copy)]
@@ -60,9 +60,64 @@ pub struct MeResult {
     pub sad: u32,
 }
 
-/// Compute SAD between a 16×16 source block and a 16×16 integer-pel
-/// reference block at `(int_x, int_y)` of the reference plane. Edges
-/// are replicated per §8.4.2.2.1.
+/// SAD between the `N`x`N` source block at `(src_x, src_y0)` and the
+/// integer-pel reference block at `(int_x, int_y)`, reference
+/// coordinates clamped into the picture (§8.4.2.2.1 edge rule).
+///
+/// The row sums run on fixed-size `u8` rows (no per-sample clamp when
+/// the block lies inside the picture horizontally), and the walk stops
+/// at the first row whose running sum exceeds `limit`: the value
+/// returned is then only a lower bound, still above `limit` — enough
+/// for a search that keeps a candidate only when its SAD does not
+/// exceed the best so far.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn sad_block<const N: usize>(
+    src_y: &[u8],
+    src_stride: usize,
+    src_x: usize,
+    src_y0: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: i32,
+    ref_h: i32,
+    int_x: i32,
+    int_y: i32,
+    limit: u32,
+) -> u32 {
+    let inside_x = int_x >= 0 && int_x + N as i32 <= ref_w;
+    let mut sad = 0u32;
+    for j in 0..N {
+        let ry = (int_y + j as i32).clamp(0, ref_h - 1) as usize;
+        let row_src: &[u8; N] = src_y[(src_y0 + j) * src_stride + src_x..][..N]
+            .try_into()
+            .expect("source row");
+        if inside_x {
+            let row_ref: &[u8; N] = ref_y[ry * ref_stride + int_x as usize..][..N]
+                .try_into()
+                .expect("reference row");
+            sad += row_src
+                .iter()
+                .zip(row_ref)
+                .map(|(&s, &r)| u32::from(s.abs_diff(r)))
+                .sum::<u32>();
+        } else {
+            let row_ref = &ref_y[ry * ref_stride..];
+            for (i, &s) in row_src.iter().enumerate() {
+                let rx = (int_x + i as i32).clamp(0, ref_w - 1) as usize;
+                sad += u32::from(s.abs_diff(row_ref[rx]));
+            }
+        }
+        if sad > limit {
+            break;
+        }
+    }
+    sad
+}
+
+/// [`sad_block`] for a 16×16 macroblock at MB position
+/// `(src_mb_x, src_mb_y)`.
+#[allow(clippy::too_many_arguments)]
 fn sad_16x16_at(
     src_y: &[u8],
     src_stride: usize,
@@ -74,21 +129,21 @@ fn sad_16x16_at(
     ref_h: i32,
     int_x: i32,
     int_y: i32,
+    limit: u32,
 ) -> u32 {
-    let mut sad = 0u32;
-    for j in 0..16i32 {
-        let ry = (int_y + j).clamp(0, ref_h - 1) as usize;
-        let row_ref = &ref_y[ry * ref_stride..ry * ref_stride + ref_stride];
-        let row_src_off = (src_mb_y * 16 + j as usize) * src_stride + src_mb_x * 16;
-        let row_src = &src_y[row_src_off..row_src_off + 16];
-        for i in 0..16i32 {
-            let rx = (int_x + i).clamp(0, ref_w - 1) as usize;
-            let s = row_src[i as usize] as i32;
-            let r = row_ref[rx] as i32;
-            sad = sad.saturating_add((s - r).unsigned_abs());
-        }
-    }
-    sad
+    sad_block::<16>(
+        src_y,
+        src_stride,
+        src_mb_x * 16,
+        src_mb_y * 16,
+        ref_y,
+        ref_stride,
+        ref_w,
+        ref_h,
+        int_x,
+        int_y,
+        limit,
+    )
 }
 
 /// Run integer-pel **full-search** motion estimation for a single 16×16
@@ -125,8 +180,11 @@ pub fn search_integer_16x16(
         for dx in -range_x..=range_x {
             let int_x = centre_x + dx;
             let int_y = centre_y + dy;
+            // A candidate above the best SAD so far cannot be kept, so
+            // its sum may stop early.
             let sad = sad_16x16_at(
                 src_y, src_stride, mb_x, mb_y, ref_y, ref_stride, ref_w_i, ref_h_i, int_x, int_y,
+                best_sad,
             );
             // Tie-break: prefer the MV with the smaller `|dx| + |dy|`
             // magnitude. With predicted MV at (0, 0), this minimises
@@ -159,10 +217,7 @@ fn sad_16x16_at_qpel(
     src_stride: usize,
     src_mb_x: usize,
     src_mb_y: usize,
-    ref_i32: &[i32],
-    ref_stride: usize,
-    ref_w: usize,
-    ref_h: usize,
+    window: &RefWindow,
     mb_x: usize,
     mb_y: usize,
     mv_qpel_x: i32,
@@ -173,10 +228,7 @@ fn sad_16x16_at_qpel(
     let x_frac = (mv_qpel_x & 3) as u8;
     let y_frac = (mv_qpel_y & 3) as u8;
     let mut pred = [0i32; 256];
-    interpolate_luma(
-        ref_i32, ref_stride, ref_w, ref_h, int_x, int_y, x_frac, y_frac, 16, 16, 8, &mut pred, 16,
-    )
-    .expect("luma interpolation");
+    window.luma(int_x, int_y, x_frac, y_frac, 16, 16, &mut pred, 16);
 
     let mut sad = 0u32;
     for j in 0..16usize {
@@ -221,14 +273,19 @@ pub fn refine_half_pel_16x16(
 ) -> MeResult {
     let _ = src_w;
     let _ = src_h;
-    let ref_w_us = ref_w as usize;
-    let ref_h_us = ref_h as usize;
-    // Promote the reference plane to i32 once for `interpolate_luma`.
-    let ref_i32: Vec<i32> = ref_y
-        .iter()
-        .take(ref_stride * ref_h_us)
-        .map(|&v| v as i32)
-        .collect();
+    // The candidates sit within one whole sample of the start MV:
+    // one reference window serves them all.
+    let window = RefWindow::for_luma(
+        ref_y,
+        ref_stride,
+        ref_w as usize,
+        ref_h as usize,
+        (mb_x * 16) as i32 + (start_mv_qpel_x >> 2),
+        (mb_y * 16) as i32 + (start_mv_qpel_y >> 2),
+        16,
+        16,
+        1,
+    );
 
     let mut best_mv_x = start_mv_qpel_x;
     let mut best_mv_y = start_mv_qpel_y;
@@ -250,8 +307,7 @@ pub fn refine_half_pel_16x16(
         let mv_x = start_mv_qpel_x + dx;
         let mv_y = start_mv_qpel_y + dy;
         let sad = sad_16x16_at_qpel(
-            src_y, src_stride, mb_x, mb_y, &ref_i32, ref_stride, ref_w_us, ref_h_us, mb_x, mb_y,
-            mv_x, mv_y,
+            src_y, src_stride, mb_x, mb_y, &window, mb_x, mb_y, mv_x, mv_y,
         );
         let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
         if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
@@ -342,14 +398,17 @@ pub fn refine_quarter_pel_16x16(
 ) -> MeResult {
     let _ = src_w;
     let _ = src_h;
-    let ref_w_us = ref_w as usize;
-    let ref_h_us = ref_h as usize;
-    // Promote the reference plane to i32 once for `interpolate_luma`.
-    let ref_i32: Vec<i32> = ref_y
-        .iter()
-        .take(ref_stride * ref_h_us)
-        .map(|&v| v as i32)
-        .collect();
+    let window = RefWindow::for_luma(
+        ref_y,
+        ref_stride,
+        ref_w as usize,
+        ref_h as usize,
+        (mb_x * 16) as i32 + (start_mv_qpel_x >> 2),
+        (mb_y * 16) as i32 + (start_mv_qpel_y >> 2),
+        16,
+        16,
+        1,
+    );
 
     let mut best_mv_x = start_mv_qpel_x;
     let mut best_mv_y = start_mv_qpel_y;
@@ -372,8 +431,7 @@ pub fn refine_quarter_pel_16x16(
         let mv_x = start_mv_qpel_x + dx;
         let mv_y = start_mv_qpel_y + dy;
         let sad = sad_16x16_at_qpel(
-            src_y, src_stride, mb_x, mb_y, &ref_i32, ref_stride, ref_w_us, ref_h_us, mb_x, mb_y,
-            mv_x, mv_y,
+            src_y, src_stride, mb_x, mb_y, &window, mb_x, mb_y, mv_x, mv_y,
         );
         let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
         if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
@@ -477,10 +535,7 @@ fn sad_8x8_at_qpel(
     src_mb_y: usize,
     sub_x: usize,
     sub_y: usize,
-    ref_i32: &[i32],
-    ref_stride: usize,
-    ref_w: usize,
-    ref_h: usize,
+    window: &RefWindow,
     mv_qpel_x: i32,
     mv_qpel_y: i32,
 ) -> u32 {
@@ -491,10 +546,7 @@ fn sad_8x8_at_qpel(
     let x_frac = (mv_qpel_x & 3) as u8;
     let y_frac = (mv_qpel_y & 3) as u8;
     let mut pred = [0i32; 64];
-    interpolate_luma(
-        ref_i32, ref_stride, ref_w, ref_h, int_x, int_y, x_frac, y_frac, 8, 8, 8, &mut pred, 8,
-    )
-    .expect("luma interpolation 8x8");
+    window.luma(int_x, int_y, x_frac, y_frac, 8, 8, &mut pred, 8);
     let mut sad = 0u32;
     let src_origin_y = src_mb_y * 16 + sub_y * 8;
     let src_origin_x = src_mb_x * 16 + sub_x * 8;
@@ -509,8 +561,9 @@ fn sad_8x8_at_qpel(
     sad
 }
 
-/// Integer-pel SAD for an 8×8 block at integer reference `(int_x, int_y)`.
-/// Edge replication via clamping.
+/// [`sad_block`] for the 8×8 sub-block `(sub_x, sub_y)` of the
+/// macroblock at `(src_mb_x, src_mb_y)`.
+#[allow(clippy::too_many_arguments)]
 fn sad_8x8_at_int(
     src_y: &[u8],
     src_stride: usize,
@@ -524,22 +577,21 @@ fn sad_8x8_at_int(
     ref_h: i32,
     int_x: i32,
     int_y: i32,
+    limit: u32,
 ) -> u32 {
-    let mut sad = 0u32;
-    let src_origin_y = src_mb_y * 16 + sub_y * 8;
-    let src_origin_x = src_mb_x * 16 + sub_x * 8;
-    for j in 0..8i32 {
-        let ry = (int_y + j).clamp(0, ref_h - 1) as usize;
-        let row_ref_off = ry * ref_stride;
-        let row_src_off = (src_origin_y + j as usize) * src_stride + src_origin_x;
-        for i in 0..8i32 {
-            let rx = (int_x + i).clamp(0, ref_w - 1) as usize;
-            let s = src_y[row_src_off + i as usize] as i32;
-            let r = ref_y[row_ref_off + rx] as i32;
-            sad = sad.saturating_add((s - r).unsigned_abs());
-        }
-    }
-    sad
+    sad_block::<8>(
+        src_y,
+        src_stride,
+        src_mb_x * 16 + sub_x * 8,
+        src_mb_y * 16 + sub_y * 8,
+        ref_y,
+        ref_stride,
+        ref_w,
+        ref_h,
+        int_x,
+        int_y,
+        limit,
+    )
 }
 
 /// §8.4.2.2.1 — Run integer + half-pel + quarter-pel ME for one **8x8**
@@ -567,8 +619,6 @@ pub fn search_quarter_pel_8x8(
 ) -> MeResult {
     let ref_w_i = ref_w as i32;
     let ref_h_i = ref_h as i32;
-    let ref_w_us = ref_w as usize;
-    let ref_h_us = ref_h as usize;
     let centre_x = (mb_x * 16 + sub_x * 8) as i32;
     let centre_y = (mb_y * 16 + sub_y * 8) as i32;
 
@@ -583,7 +633,7 @@ pub fn search_quarter_pel_8x8(
             let int_y = centre_y + dy;
             let sad = sad_8x8_at_int(
                 src_y, src_stride, mb_x, mb_y, sub_x, sub_y, ref_y, ref_stride, ref_w_i, ref_h_i,
-                int_x, int_y,
+                int_x, int_y, best_sad,
             );
             let mv_cost = (dx.unsigned_abs()) + (dy.unsigned_abs());
             if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
@@ -597,12 +647,22 @@ pub fn search_quarter_pel_8x8(
     let mut best_mv_x = best_dx * 4;
     let mut best_mv_y = best_dy * 4;
 
-    // Promote ref to i32 for the sub-pel SAD path.
-    let ref_i32: Vec<i32> = ref_y
-        .iter()
-        .take(ref_stride * ref_h_us)
-        .map(|&v| v as i32)
-        .collect();
+    // One reference window serves both refinement passes. Each pass
+    // steps from the running best (a candidate that wins moves the
+    // centre of the ones after it), so the half-pel pass can travel up
+    // to 6 quarter-samples per axis and the quarter-pel pass 3 more:
+    // integer positions within −3..=+2 of the integer winner.
+    let window = RefWindow::for_luma(
+        ref_y,
+        ref_stride,
+        ref_w as usize,
+        ref_h as usize,
+        centre_x + best_dx,
+        centre_y + best_dy,
+        8,
+        8,
+        3,
+    );
 
     // 2. Half-pel refinement.
     let mut best_mv_cost = (best_mv_x.unsigned_abs()) + (best_mv_y.unsigned_abs());
@@ -620,8 +680,7 @@ pub fn search_quarter_pel_8x8(
         let mv_x = best_mv_x + dx;
         let mv_y = best_mv_y + dy;
         let sad = sad_8x8_at_qpel(
-            src_y, src_stride, mb_x, mb_y, sub_x, sub_y, &ref_i32, ref_stride, ref_w_us, ref_h_us,
-            mv_x, mv_y,
+            src_y, src_stride, mb_x, mb_y, sub_x, sub_y, &window, mv_x, mv_y,
         );
         let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
         if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
@@ -647,8 +706,7 @@ pub fn search_quarter_pel_8x8(
         let mv_x = best_mv_x + dx;
         let mv_y = best_mv_y + dy;
         let sad = sad_8x8_at_qpel(
-            src_y, src_stride, mb_x, mb_y, sub_x, sub_y, &ref_i32, ref_stride, ref_w_us, ref_h_us,
-            mv_x, mv_y,
+            src_y, src_stride, mb_x, mb_y, sub_x, sub_y, &window, mv_x, mv_y,
         );
         let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
         if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
@@ -669,6 +727,64 @@ pub fn search_quarter_pel_8x8(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row-wise SAD equals the per-sample definition (every
+    /// reference coordinate clamped into the picture) at every block
+    /// position, inside and far outside the picture; with a limit it
+    /// either returns that exact value or stops with a partial sum
+    /// that is already above the limit.
+    #[test]
+    fn sad_block_matches_per_sample_definition() {
+        let (w, h) = (48usize, 40usize);
+        let stride = w + 5;
+        let plane = |seed: usize| -> Vec<u8> {
+            (0..stride * h)
+                .map(|k| ((k * 37 + seed * 101 + (k / stride) * 13) % 256) as u8)
+                .collect()
+        };
+        let (src, reference) = (plane(1), plane(2));
+        let naive = |n: usize, sx: usize, sy: usize, ix: i32, iy: i32| -> u32 {
+            let mut sad = 0u32;
+            for j in 0..n {
+                for i in 0..n {
+                    let rx = (ix + i as i32).clamp(0, w as i32 - 1) as usize;
+                    let ry = (iy + j as i32).clamp(0, h as i32 - 1) as usize;
+                    let s = src[(sy + j) * stride + sx + i] as i32;
+                    let r = reference[ry * stride + rx] as i32;
+                    sad += (s - r).unsigned_abs();
+                }
+            }
+            sad
+        };
+        for iy in (-30..(h as i32 + 20)).step_by(3) {
+            for ix in (-30..(w as i32 + 20)).step_by(3) {
+                let want16 = naive(16, 16, 16, ix, iy);
+                let want8 = naive(8, 24, 8, ix, iy);
+                let got16 = |limit| {
+                    sad_block::<16>(
+                        &src, stride, 16, 16, &reference, stride, w as i32, h as i32, ix, iy, limit,
+                    )
+                };
+                let got8 = |limit| {
+                    sad_block::<8>(
+                        &src, stride, 24, 8, &reference, stride, w as i32, h as i32, ix, iy, limit,
+                    )
+                };
+                assert_eq!(got16(u32::MAX), want16, "16x16 at ({ix}, {iy})");
+                assert_eq!(got8(u32::MAX), want8, "8x8 at ({ix}, {iy})");
+                // At or below the limit: exact. Above: any value above
+                // the limit (the search discards it).
+                assert_eq!(got16(want16), want16);
+                assert_eq!(got8(want8), want8);
+                for limit in [0, want16 / 3, want16.saturating_sub(1)] {
+                    if limit < want16 {
+                        let v = got16(limit);
+                        assert!(v > limit && v <= want16, "16x16 limit {limit}: {v}");
+                    }
+                }
+            }
+        }
+    }
 
     fn make_solid_frame(w: usize, h: usize, val: u8) -> Vec<u8> {
         vec![val; w * h]
