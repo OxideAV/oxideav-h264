@@ -13,7 +13,8 @@ Five `cargo-fuzz` (libFuzzer) targets live in `fuzz_targets/`:
   encoder (`encoder::deep`): 8..=14-bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4,
   picture sizes 1..=48 per axis on the crop-unit grid (padded + SPS
   cropping, round 488), QP down to −QpBdOffsetY, lossless / interop
-  modes; lossless streams must reconstruct the source exactly.
+  modes, the Intra_4x4 / Intra_8x8 candidates in I and P pictures;
+  lossless streams must reconstruct the source exactly.
 
 * `panic_free_decode` — feeds raw bytes through `H264CodecDecoder::send_packet` /
   `receive_frame` along two parallel paths (Annex-B byte stream and AVCC

@@ -3197,9 +3197,6 @@ fn recon_i8x8(
     }
 }
 
-/// Offer the I_NxN candidates inside P pictures.
-const I_NXN_IN_P: bool = false;
-
 /// The intra macroblock elected inside a P picture.
 enum IntraChoice {
     I16x16(Box<IntraCand>),
@@ -3703,8 +3700,8 @@ impl DeepSession {
         let lambda = lambda_sad(qp_y_prime);
         let t8x8_mode = cfg.transform_8x8 && cf != 3;
         // In P pictures the I_NxN writers cover ChromaArrayType 0 / 1 / 2.
-        let offer_i4x4 = self.intra_4x4 && (!is_p || (I_NXN_IN_P && cfg.intra_in_p && cf != 3));
-        let offer_i8x8 = self.intra_8x8 && t8x8_mode && (!is_p || (I_NXN_IN_P && cfg.intra_in_p));
+        let offer_i4x4 = self.intra_4x4 && (!is_p || (cfg.intra_in_p && cf != 3));
+        let offer_i8x8 = self.intra_8x8 && t8x8_mode && (!is_p || cfg.intra_in_p);
         let w8_intra = ScalingMatrixMode::Flat.intra_weights().w8;
 
         for mb_y in 0..h_mbs {
@@ -4327,5 +4324,41 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
         skipped_mbs: session.skipped_mbs(),
         intra_mbs_in_p: session.intra_mbs_in_p(),
         mbs_8x8: session.mbs_8x8(),
+    }
+}
+
+#[cfg(test)]
+mod intra8x8_tests {
+    use super::*;
+
+    /// The 8x8 residual chain is a quantiser, not a scrambler: at a
+    /// fine QP the reconstructed residual stays within a few sample
+    /// steps of the input, at every bit depth.
+    #[test]
+    fn code_8x8_block_reconstruction_error_is_bounded() {
+        let w8 = ScalingMatrixMode::Flat.intra_weights().w8;
+        for bd in [8u32, 10, 12, 14] {
+            let scale = 1i32 << (bd - 8);
+            let mut residual = [0i32; 64];
+            for (k, r) in residual.iter_mut().enumerate() {
+                let (i, j) = ((k % 8) as i32, (k / 8) as i32);
+                *r = scale * (((i * 37 + j * 91 + i * j * 13) % 121) - 60);
+            }
+            // QP′ = QP + QpBdOffset keeps the step proportional to the
+            // sample range.
+            let qp = 16 + 6 * (bd as i32 - 8);
+            let (scan, recon) = code_8x8_block(&residual, 2, qp, &w8, bd, false);
+            assert!(scan.iter().any(|&v| v != 0));
+            let worst = residual
+                .iter()
+                .zip(recon.iter())
+                .map(|(a, b)| (a - b).abs())
+                .max()
+                .unwrap();
+            assert!(
+                worst <= 6 * scale,
+                "bd {bd}: worst residual error {worst} at QP′ {qp}"
+            );
+        }
     }
 }

@@ -121,8 +121,9 @@ pub struct H264EncoderOptions {
     /// bypass at QP′Y = 0); the reconstruction equals the source
     /// sample-for-sample. High-family path; `qp` is ignored.
     pub lossless: bool,
-    /// Round-475 — High-profile 8x8 transform on P macroblocks
-    /// (4:2:0 / 4:2:2). High-family path.
+    /// Round-475 — High-profile 8x8 transform (4:0:0 / 4:2:0 / 4:2:2):
+    /// on P_L0_16x16 macroblocks and, with `intra_8x8` (round 488), as
+    /// Intra_8x8 macroblocks. High-family path.
     pub transform_8x8: bool,
     /// Round-475 — §8.7 in-loop deblocking (default true). High-family
     /// path (the 8-bit 4:2:0 path always deblocks).
@@ -131,6 +132,11 @@ pub struct H264EncoderOptions {
     /// the High-family path, competing with Intra_16x16 per macroblock
     /// (default true). The 8-bit 4:2:0 path runs its own RDO.
     pub intra_4x4: bool,
+    /// Round-488 — Intra_8x8 macroblocks (I_NxN with the 8x8 transform)
+    /// on the High-family path, competing with Intra_16x16 / Intra_4x4
+    /// per macroblock (default true). Takes effect with
+    /// `transform_8x8=true`, at 4:0:0 / 4:2:0 / 4:2:2.
+    pub intra_8x8: bool,
     /// Round-475 — packet framing: `annexb` (default: start codes,
     /// in-band SPS / PPS on every IDR, empty extradata) or `avcc`
     /// (4-byte length-prefixed NAL units without parameter sets /
@@ -161,6 +167,7 @@ impl Default for H264EncoderOptions {
             transform_8x8: false,
             deblock: true,
             intra_4x4: true,
+            intra_8x8: true,
             format: "annexb".to_string(),
         }
     }
@@ -234,7 +241,7 @@ impl CodecOptionsStruct for H264EncoderOptions {
             name: "transform_8x8",
             kind: OptionKind::Bool,
             default: OptionValue::Bool(false),
-            help: "High-profile 8x8 transform on P macroblocks (High-family path, 4:2:0 / 4:2:2)",
+            help: "High-profile 8x8 transform: P macroblocks and Intra_8x8 (High-family path, 4:0:0 / 4:2:0 / 4:2:2)",
         },
         OptionField {
             name: "deblock",
@@ -247,6 +254,12 @@ impl CodecOptionsStruct for H264EncoderOptions {
             kind: OptionKind::Bool,
             default: OptionValue::Bool(true),
             help: "Intra_4x4 (I_NxN) macroblocks in I pictures (High-family path)",
+        },
+        OptionField {
+            name: "intra_8x8",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "Intra_8x8 macroblocks (High-family path, with transform_8x8=true; 4:0:0 / 4:2:0 / 4:2:2)",
         },
         OptionField {
             name: "format",
@@ -271,6 +284,7 @@ impl CodecOptionsStruct for H264EncoderOptions {
             "transform_8x8" => self.transform_8x8 = value.as_bool()?,
             "deblock" => self.deblock = value.as_bool()?,
             "intra_4x4" => self.intra_4x4 = value.as_bool()?,
+            "intra_8x8" => self.intra_8x8 = value.as_bool()?,
             "format" => self.format = value.as_str()?.to_string(),
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -711,7 +725,8 @@ impl H264CodecEncoder {
                     },
                     profile_idc,
                 )
-                .with_intra_4x4(opts.intra_4x4);
+                .with_intra_4x4(opts.intra_4x4)
+                .with_intra_8x8(opts.intra_8x8);
                 let ps = session.parameter_sets_annex_b();
                 (
                     Backend::Deep(Box::new(DeepDriver {

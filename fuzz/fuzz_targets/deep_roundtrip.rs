@@ -5,7 +5,8 @@
 //! Input bytes pick the bit depth (8..=14), chroma format (4:0:0
 //! included), picture size (1..=48 per axis on the §7.4.2.1.1 crop-unit
 //! grid — most sizes are coded padded with an SPS cropping rectangle),
-//! QP (down to `−QpBdOffsetY`), lossless mode and shape a `u16` source. The
+//! QP (down to `−QpBdOffsetY`), lossless mode, the Intra_4x4 / Intra_8x8
+//! candidates and shape a `u16` source. The
 //! encoder must never panic, our decoder must reconstruct the stream
 //! **bit-exactly** to the encoder's recon, and in lossless mode the
 //! reconstruction must equal the source sample-for-sample. A
@@ -13,8 +14,13 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
-use oxideav_h264::encoder::deep::{DeepConfig, encode_deep_sequence};
+use oxideav_h264::encoder::deep::{DeepConfig, DeepPictureKind, DeepSession};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
+
+struct Encoded {
+    annex_b: Vec<u8>,
+    recon_frames: Vec<(Vec<u16>, Vec<u16>, Vec<u16>)>,
+}
 
 fn decode(stream: &[u8]) -> Vec<oxideav_core::VideoFrame> {
     let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
@@ -57,7 +63,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let p_frames = data[2] & 2 == 2;
     let deblock = data[2] & 4 == 4;
-    let n_frames = 1 + (data[4] % 2) as usize;
+    let n_frames = 1 + (data[4] % 3) as usize;
     let flip = u16::from_le_bytes([data[5], data[6]]) as usize;
     let seed = &data[7..];
     #[allow(non_snake_case)]
@@ -86,10 +92,35 @@ fuzz_target!(|data: &[u8]| {
         .iter()
         .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
         .collect();
-    let enc = encode_deep_sequence(
-        &DeepConfig::new(W as u32, H as u32, bd, bd, cf, qp).with_p_frames(p_frames).with_intra_in_p(true).with_deblock(deblock).with_lossless(lossless).with_lossless_interop(data[2] & 8 == 8).with_cabac(data[2] & 16 == 16).with_transform_8x8(data[2] & 32 == 32),
-        &refs,
-    );
+    let cfg = DeepConfig::new(W as u32, H as u32, bd, bd, cf, qp)
+        .with_p_frames(p_frames)
+        .with_intra_in_p(true)
+        .with_deblock(deblock)
+        .with_lossless(lossless)
+        .with_lossless_interop(data[2] & 8 == 8)
+        .with_cabac(data[2] & 16 == 16)
+        .with_transform_8x8(data[2] & 32 == 32);
+    // Intra_4x4 / Intra_8x8 candidates (I pictures and inside P
+    // pictures) ride two more option bits.
+    let mut session = DeepSession::new(cfg)
+        .with_intra_4x4(data[2] & 64 == 64)
+        .with_intra_8x8(data[2] & 128 == 128);
+    let mut enc = Encoded {
+        annex_b: session.parameter_sets_annex_b(),
+        recon_frames: Vec::new(),
+    };
+    for (k, &(fy, fu, fv)) in refs.iter().enumerate() {
+        let kind = if k == 0 {
+            DeepPictureKind::Idr
+        } else if p_frames {
+            DeepPictureKind::P
+        } else {
+            DeepPictureKind::I
+        };
+        let pic = session.encode_picture(fy, fu, fv, kind, k as u32, 2 * k as i32, 0);
+        enc.annex_b.extend_from_slice(&pic.nal);
+        enc.recon_frames.push(pic.recon);
+    }
     if lossless {
         for (r, s) in enc.recon_frames.iter().zip(frames.iter()) {
             assert!(

@@ -41,6 +41,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   QP 26: −1.3 % CAVLC). Every stream is checked against our decoder and
   a black-box decoder (`integration_gray_400`).
 
+- Intra_8x8 above 8 bit: the high-bit-depth encoder (`encoder::deep`,
+  registry option `intra_8x8`, default on, with `transform_8x8=true`)
+  codes Intra_8x8 macroblocks at 8..=14 bit and 4:0:0 / 4:2:0 / 4:2:2 —
+  §8.3.2 prediction from the filtered reference samples, §8.3.2.1
+  predicted-mode coding, the 8x8 residual at QP′ or the §8.5.15 DPCM
+  under transform bypass, CAVLC and CABAC — competing per macroblock
+  with Intra_16x16 and Intra_4x4 (`DeepSession::with_intra_8x8`,
+  `i8x8_mbs`).
+- Intra_4x4 and Intra_8x8 inside P pictures on the same path
+  (ChromaArrayType 0 / 1 / 2): the cheapest of the three intra
+  predictions is the alternative to the inter macroblock.
+
 ### Changed
 
 - Registry encoder: grey input no longer produces a 4:2:0 stream with
@@ -50,6 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- 8x8 transform quality (every encoder path with `transform_8x8`): the
+  forward 8x8 quantiser used one multiplier per normAdjust8x8 entry and
+  left out the basis-row norms of the position class, so coefficients
+  on rows / columns 2 and 6 were coded at 39 %..71 % of their value and
+  those on odd rows / columns at up to 127 % — valid streams, but 8x8
+  blocks with texture reconstructed several dB below what their QP
+  buys. The multiplier now carries the class norm (`64 / (p_i · p_j)`);
+  a per-basis-function round-trip test pins it.
+- CABAC P pictures at 4:4:4 with `transform_8x8`: when the 8x8 luma
+  trial won with an all-zero residual and a chroma plane then raised
+  the shared `coded_block_pattern` bit, the stream carried the 4x4 luma
+  levels while the encoder's reconstruction used the zero 8x8 residual
+  (encoder / decoder drift on that macroblock). The transform-size flag
+  is now settled after the chroma planes are coded.
 - Lints of the 1.100 toolchain (`needless_range_loop` on loops whose
   variable is also used elsewhere, a duplicated `allow`).
 
