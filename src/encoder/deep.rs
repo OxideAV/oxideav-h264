@@ -1882,18 +1882,18 @@ fn samples_4x4(
         s.top_left = at(x0 - 1, y0 - 1);
     }
     if top {
-        for i in 0..4 {
-            s.top[i] = at(x0 + i as i32, y0 - 1);
+        for (i, t) in s.top.iter_mut().enumerate() {
+            *t = at(x0 + i as i32, y0 - 1);
         }
     }
     if top_right {
-        for i in 0..4 {
-            s.top_right[i] = at(x0 + 4 + i as i32, y0 - 1);
+        for (i, t) in s.top_right.iter_mut().enumerate() {
+            *t = at(x0 + 4 + i as i32, y0 - 1);
         }
     }
     if left {
-        for j in 0..4 {
-            s.left[j] = at(x0 - 1, y0 + j as i32);
+        for (j, l) in s.left.iter_mut().enumerate() {
+            *l = at(x0 - 1, y0 + j as i32);
         }
     }
     s

@@ -44,8 +44,7 @@ fn pack_444(vf: &VideoFrame) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(FRAME_BYTES);
-    for p in 0..3 {
-        let plane = &vf.planes[p];
+    for plane in &vf.planes[..3] {
         if plane.stride < W {
             return None;
         }

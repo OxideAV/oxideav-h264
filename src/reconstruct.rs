@@ -15836,9 +15836,9 @@ mod tests {
 
         // MB 1's MV grid slots should all be (3, 4) — inherited from MB 0.
         let info1 = grid.get(1).unwrap();
-        for blk4 in 0..16 {
+        for (blk4, mv) in info1.mv_l0.iter().enumerate() {
             assert_eq!(
-                info1.mv_l0[blk4],
+                *mv,
                 (3i16, 4i16),
                 "MB 1's blk{blk4} MV should inherit MB 0's MV via median, \
                  NOT be forced to zero by the P_Skip zero-MV substitution",
@@ -15879,8 +15879,8 @@ mod tests {
         assert!(!info0.is_intra);
         assert_eq!(info0.ref_idx_l0, [0, 0, 0, 0]);
         // Every 4x4 block in MB 0 should carry mv = (4, 8).
-        for blk4 in 0..16 {
-            assert_eq!(info0.mv_l0[blk4], (4i16, 8i16));
+        for mv in &info0.mv_l0 {
+            assert_eq!(*mv, (4i16, 8i16));
         }
     }
 

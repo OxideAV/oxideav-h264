@@ -354,8 +354,8 @@ fn derive_type1(
         let pic_order_cnt_cycle_cnt = (abs_frame_num - 1) / cycle_len;
         let frame_num_in_cycle = ((abs_frame_num - 1) % cycle_len) as usize;
         let mut accum: i64 = pic_order_cnt_cycle_cnt * expected_delta_per_cycle;
-        for i in 0..=frame_num_in_cycle {
-            accum += sps.offset_for_ref_frame[i] as i64;
+        for &offset in &sps.offset_for_ref_frame[..=frame_num_in_cycle] {
+            accum += offset as i64;
         }
         accum
     } else {

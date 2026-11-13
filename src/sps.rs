@@ -1177,8 +1177,8 @@ mod tests {
             }
             other => panic!("expected Explicit, got {:?}", other),
         }
-        for i in 1..8 {
-            assert_eq!(lists.entries[i], ScalingListEntry::NotPresent);
+        for entry in &lists.entries[1..8] {
+            assert_eq!(*entry, ScalingListEntry::NotPresent);
         }
     }
 

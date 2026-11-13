@@ -2949,8 +2949,7 @@ pub fn parse_macroblock_dp(
     let direct_8x8_inference_flag = sps.direct_8x8_inference_flag;
     let no_sub_lt_8x8 = if let Some(sub) = sub_mb_pred.as_ref() {
         let mut flag = true;
-        for i in 0..4 {
-            let sub_t = sub.sub_mb_type[i];
+        for &sub_t in &sub.sub_mb_type {
             if matches!(sub_t, SubMbType::BDirect8x8) {
                 if !direct_8x8_inference_flag {
                     flag = false;
@@ -3589,7 +3588,7 @@ fn parse_sub_mb_pred(
     // Dispatch by slice kind (not `is_b`): a P/SP slice with `mb_type ==
     // P_8x8 / P_8x8ref0` uses the P binarisation (Table 9-37), while a B
     // slice with `mb_type == B_8x8` uses the B binarisation (Table 9-38).
-    for i in 0..4 {
+    for (i, sub_mb_type) in out.sub_mb_type.iter_mut().enumerate() {
         let raw = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
             match entropy.slice_kind {
                 crate::cabac_ctx::SliceKind::B => {
@@ -3604,7 +3603,7 @@ fn parse_sub_mb_pred(
         } else {
             r.ue()?
         };
-        out.sub_mb_type[i] = if is_b {
+        *sub_mb_type = if is_b {
             SubMbType::from_b(raw)?
         } else {
             SubMbType::from_p(raw)?
@@ -3612,7 +3611,7 @@ fn parse_sub_mb_pred(
         if dbg_on {
             eprintln!(
                 "[SUB {}] sub_mb_type[{}] raw={} -> {:?}",
-                entropy.current_mb_addr, i, raw, out.sub_mb_type[i]
+                entropy.current_mb_addr, i, raw, sub_mb_type
             );
         }
     }
@@ -5503,9 +5502,9 @@ mod tests {
         assert_eq!(mb.coded_block_pattern, 0);
         // mb_pred should have filled the 8x8 flags, not the 4x4 ones.
         let pred = mb.mb_pred.expect("mb_pred present");
-        for i in 0..4 {
+        for (i, flag) in pred.prev_intra8x8_pred_mode_flag.iter().enumerate() {
             assert!(
-                pred.prev_intra8x8_pred_mode_flag[i],
+                *flag,
                 "prev_intra8x8_pred_mode_flag[{i}] should have been parsed as 1"
             );
         }

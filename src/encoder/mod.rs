@@ -2071,7 +2071,6 @@ impl Encoder {
     /// CAVLC encode), so the comparison is calibrated. λ comes from
     /// [`rdo::lambda_ssd`].
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn encode_mb(
         &self,
         frame: &YuvFrame<'_>,
@@ -8706,13 +8705,13 @@ fn inter_luma_transform_cost(
         }
     }
     let mut trial_w = BitWriter::new();
-    for blk in 0..16usize {
+    for (blk, levels) in fwd.levels_scan.iter().enumerate() {
         if (cbp_luma >> (blk / 4)) & 1 == 1 {
             let _ = encode_residual_block_cavlc(
                 &mut trial_w,
                 CoeffTokenContext::Numeric(0),
                 16,
-                &fwd.levels_scan[blk],
+                levels,
             );
         }
     }

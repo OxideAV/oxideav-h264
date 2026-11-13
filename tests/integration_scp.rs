@@ -221,7 +221,7 @@ fn scp_planes_match_standalone_monochrome_decodes() {
     let scp_frames = decode_ours(&enc.annex_b);
     assert_eq!(scp_frames.len(), 3);
 
-    for plane in 0..3usize {
+    for plane in [0usize, 1, 2] {
         // Re-encode this plane's source as a standalone monochrome
         // stream with the same QP / GOP shape…
         let mono = Encoder::new(
