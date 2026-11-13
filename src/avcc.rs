@@ -433,6 +433,7 @@ mod tests {
             interlaced_fields: false,
             mbaff: false,
             vui: None,
+            frame_cropping: None,
         });
         let mut rbsp = rbsp;
         rbsp[1] = compat;

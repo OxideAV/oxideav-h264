@@ -1,8 +1,9 @@
 //! Round-475 — the registry encoder codes every input layout the
 //! High-family encoder (`encoder::deep`) can: 8-bit 4:2:2 / 4:4:4,
-//! 10- / 12-bit 4:2:0 / 4:2:2 / 4:4:4, grey (as 4:2:0 with constant
-//! chroma), under the §A.2.4 – §A.2.7 minimum profile, with CAVLC or
-//! CABAC, lossy or lossless, Annex B or `avcC`-framed. Both directions
+//! 10- / 12-bit 4:2:0 / 4:2:2 / 4:4:4 (grey input, coded 4:0:0, has its
+//! own suite in `integration_gray_400`), under the §A.2.4 – §A.2.7
+//! minimum profile, with CAVLC or CABAC, lossy or lossless, Annex B or
+//! `avcC`-framed. Both directions
 //! are proven per layout: our decoder reconstructs the stream within
 //! the lossy bound (exactly for `lossless=true`), and a black-box
 //! reference decoder run as an opaque process decodes the same bytes
@@ -46,12 +47,6 @@ const LAYOUTS: &[Layout] = &[
         gray: false,
     },
     Layout {
-        pf: PixelFormat::Gray8,
-        cf: 1,
-        bd: 8,
-        gray: true,
-    },
-    Layout {
         pf: PixelFormat::Yuv420P10Le,
         cf: 1,
         bd: 10,
@@ -70,12 +65,6 @@ const LAYOUTS: &[Layout] = &[
         gray: false,
     },
     Layout {
-        pf: PixelFormat::Gray10Le,
-        cf: 1,
-        bd: 10,
-        gray: true,
-    },
-    Layout {
         pf: PixelFormat::Yuv420P12Le,
         cf: 1,
         bd: 12,
@@ -92,12 +81,6 @@ const LAYOUTS: &[Layout] = &[
         cf: 3,
         bd: 12,
         gray: false,
-    },
-    Layout {
-        pf: PixelFormat::Gray12Le,
-        cf: 1,
-        bd: 12,
-        gray: true,
     },
 ];
 
@@ -462,10 +445,9 @@ fn lossless_layouts_reconstruct_exactly() {
     for &l in &[
         LAYOUTS[0], // 4:2:2 8-bit
         LAYOUTS[1], // 4:4:4 8-bit
-        LAYOUTS[3], // 4:2:0 10-bit
-        LAYOUTS[6], // grey 10-bit
-        LAYOUTS[8], // 4:2:2 12-bit
-        LAYOUTS[9], // 4:4:4 12-bit
+        LAYOUTS[2], // 4:2:0 10-bit
+        LAYOUTS[6], // 4:2:2 12-bit
+        LAYOUTS[7], // 4:4:4 12-bit
     ] {
         for cabac in [false, true] {
             let tag = format!("lossless-{:?}-{cabac}", l.pf);
@@ -575,8 +557,8 @@ fn avcc_framing_round_trips_through_extradata() {
             77,
             false,
         ),
-        (LAYOUTS[3], &[("qp", "28")], 110, true),
-        (LAYOUTS[9], &[("qp", "28"), ("cabac", "true")], 244, true),
+        (LAYOUTS[2], &[("qp", "28")], 110, true),
+        (LAYOUTS[7], &[("qp", "28"), ("cabac", "true")], 244, true),
         (LAYOUTS[0], &[("lossless", "true")], 244, true),
     ];
     for &(l, base, profile, trailer) in cases {
@@ -648,7 +630,7 @@ fn avcc_framing_round_trips_through_extradata() {
 
 #[test]
 fn rejections_are_clean_errors() {
-    let l10 = LAYOUTS[3];
+    let l10 = LAYOUTS[2];
     let l444 = LAYOUTS[1];
     let l420 = Layout {
         pf: PixelFormat::Yuv420P,

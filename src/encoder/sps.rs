@@ -11,12 +11,12 @@
 //!   neither profile 66 nor 77 is in the chroma-extended group,
 //!   §7.3.2.1.1)
 //! * `pic_order_cnt_type = 0`, `log2_max_pic_order_cnt_lsb_minus4 = 4`
-//! * `frame_mbs_only_flag = 1`, no FMO, no VUI, no cropping
+//! * `frame_mbs_only_flag = 1`, no FMO, no VUI
 //!
-//! Width/height are passed in macroblocks (16-sample units). The picture
-//! dimensions in samples must be a multiple of 16 — this round-1 path
-//! does not emit `frame_cropping`. Callers needing odd-aligned output
-//! should pad the input to a 16-multiple before encoding.
+//! Width/height are passed in macroblocks (16-sample units). A picture
+//! whose size is not a whole number of macroblocks is coded on a padded
+//! grid with [`BaselineSpsConfig::frame_cropping`] carrying the
+//! §7.4.2.1.1 cropping rectangle (see [`crate::encoder::pad`]).
 //!
 //! The returned bytes form the RBSP body that goes after the NAL header.
 //! Wrap with [`crate::encoder::nal::build_nal_unit`] using
@@ -118,6 +118,12 @@ pub struct BaselineSpsConfig {
     /// NAL HRD parameters + timing info so the Annex C buffering model
     /// is formally declared in-band.
     pub vui: Option<VuiParameters>,
+    /// §7.3.2.1.1 — when `Some`, emit `frame_cropping_flag = 1` and the
+    /// four `frame_crop_*_offset` values (in units of `CropUnitX` /
+    /// `CropUnitY`, §7.4.2.1.1 eq. 7-19..7-22 — see
+    /// [`crate::encoder::pad::crop_units`]). `None` codes
+    /// `frame_cropping_flag = 0`.
+    pub frame_cropping: Option<crate::sps::FrameCropping>,
 }
 
 impl Default for BaselineSpsConfig {
@@ -139,6 +145,7 @@ impl Default for BaselineSpsConfig {
             bit_depth_luma_minus8: 0,
             bit_depth_chroma_minus8: 0,
             vui: None,
+            frame_cropping: None,
         }
     }
 }
@@ -364,8 +371,27 @@ pub fn build_sps_rbsp_with_bypass(cfg: &BaselineSpsConfig, transform_bypass: boo
     // direct_8x8_inference_flag = 1 (recommended even for I-only —
     // some decoders verify this is set when frame_mbs_only_flag=1).
     w.u(1, 1);
-    // frame_cropping_flag = 0.
-    w.u(1, 0);
+    // §7.3.2.1.1 — frame_cropping_flag + the four offsets.
+    if let Some(c) = &cfg.frame_cropping {
+        let (cux, cuy) = super::pad::crop_units(
+            if cfg.separate_colour_plane {
+                0
+            } else {
+                cfg.chroma_format_idc
+            },
+            !cfg.interlaced_fields,
+        );
+        // §7.4.2.1.1 — the cropping rectangle keeps at least one sample.
+        debug_assert!(cux * (c.left + c.right + 1) <= 16 * cfg.width_in_mbs);
+        debug_assert!(cuy * (c.top + c.bottom + 1) <= 16 * cfg.height_in_mbs);
+        w.u(1, 1);
+        w.ue(c.left);
+        w.ue(c.right);
+        w.ue(c.top);
+        w.ue(c.bottom);
+    } else {
+        w.u(1, 0);
+    }
     // §E.1.1 — vui_parameters_present_flag + vui_parameters().
     if let Some(vui) = &cfg.vui {
         w.u(1, 1);
@@ -585,7 +611,21 @@ mod tests {
             profile_idc: 66,
             chroma_format_idc: 1,
             separate_colour_plane: false,
+            frame_cropping: None,
         };
+        // §7.4.2.1.1 — the cropping rectangle survives the round trip.
+        let cropped = BaselineSpsConfig {
+            frame_cropping: Some(crate::sps::FrameCropping {
+                left: 0,
+                right: 3,
+                top: 0,
+                bottom: 5,
+            }),
+            ..cfg.clone()
+        };
+        let c = Sps::parse(&build_baseline_sps_rbsp(&cropped)).expect("cropped SPS");
+        assert_eq!(c.frame_cropping, cropped.frame_cropping);
+        assert_eq!(c.cropped_dimensions(), (64 - 6, 64 - 10));
         let rbsp = build_baseline_sps_rbsp(&cfg);
         let sps = Sps::parse(&rbsp).expect("decoder parses our SPS");
         assert_eq!(sps.profile_idc, 66);
@@ -631,6 +671,7 @@ mod tests {
             profile_idc: 244,
             chroma_format_idc: 3,
             separate_colour_plane: false,
+            frame_cropping: None,
         };
         let rbsp = build_baseline_sps_rbsp(&cfg);
         let sps = Sps::parse(&rbsp).expect("decoder parses our 4:4:4 SPS");
@@ -672,6 +713,7 @@ mod tests {
             profile_idc: 122,
             chroma_format_idc: 2,
             separate_colour_plane: false,
+            frame_cropping: None,
         };
         let rbsp = build_baseline_sps_rbsp(&cfg);
         let sps = Sps::parse(&rbsp).expect("decoder parses our 4:2:2 SPS");

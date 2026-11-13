@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Frame cropping in the encoder (§7.4.2.1.1): picture sizes that are
+  not a whole number of macroblocks are coded on a padded grid (last
+  column / row repeated; for field and MBAFF coding the last row of
+  each field parity, on a grid of whole macroblock pairs) and the SPS
+  carries `frame_cropping_flag = 1` with `frame_crop_right_offset` /
+  `frame_crop_bottom_offset` in `CropUnitX` / `CropUnitY` units for the
+  chroma format and `frame_mbs_only_flag`. The registry encoder,
+  `EncoderSession`, `encoder::deep::DeepSession` and the PAFF / MBAFF
+  drivers take any size on the crop-unit grid (4:2:0: even width and
+  height; 4:2:2: even width; 4:4:4: any; height a multiple of 4 for
+  interlaced 4:2:0); the stateless `Encoder` gains
+  `EncoderConfig::crop_right` / `crop_bottom`. Sizes off the grid are
+  refused with a clean error. Reconstructions returned by the
+  high-bit-depth and interlaced drivers are cropped to the picture
+  size. Verified per size x layout x entropy coder against our decoder
+  and a black-box decoder (`integration_frame_cropping`).
+
+- 4:0:0 (monochrome) encoding of grey input through the registry
+  encoder: `Gray8` / `Gray10Le` / `Gray12Le` are coded with
+  `chroma_format_idc = 0` (luma only) under the §A.2 minimum
+  High-family profile (High 100 / High 10 110 / High 4:4:4 Predictive
+  244 for 12 bit and lossless) and the output layout is the grey format.
+  `Gray8` keeps the IDR / P / B session with CAVLC or CABAC and rate
+  control (`SessionConfig::monochrome` / `with_monochrome`; per-picture
+  QP without the MB-row modulation); the high-bit-depth encoder
+  (`DeepConfig::chroma_format_idc = 0`) codes luma-only Intra_16x16 /
+  Intra_4x4 / P_Skip / P_L0_16x16 with the 4x4 or 8x8 transform, CAVLC
+  and CABAC, lossy and lossless, at 8..=14 bit. Intra pictures come out
+  smaller than the former 4:2:0-with-constant-chroma carriage (160x128,
+  QP 26: −1.3 % CAVLC). Every stream is checked against our decoder and
+  a black-box decoder (`integration_gray_400`).
+
+### Changed
+
+- Registry encoder: grey input no longer produces a 4:2:0 stream with
+  constant chroma planes (`Yuv420P*` out) but a 4:0:0 stream (`Gray*`
+  out, High-family profile). `profile=baseline` / `main` keep the
+  earlier 4:2:0 carriage for `Gray8`.
+
+### Fixed
+
+- Lints of the 1.100 toolchain (`needless_range_loop` on loops whose
+  variable is also used elsewhere, a duplicated `allow`).
+
 ## [0.1.12](https://github.com/OxideAV/oxideav-h264/compare/v0.1.11...v0.1.12) - 2026-11-07
 
 ### Other

@@ -729,6 +729,7 @@ mod tests {
             profile_idc: 66,
             chroma_format_idc: 1,
             separate_colour_plane: false,
+            frame_cropping: None,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig::default());
@@ -808,6 +809,7 @@ mod tests {
             profile_idc: 66,
             chroma_format_idc: 1,
             separate_colour_plane: false,
+            frame_cropping: None,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig::default());
@@ -891,6 +893,7 @@ mod tests {
             profile_idc: 77,
             chroma_format_idc: 1,
             separate_colour_plane: false,
+            frame_cropping: None,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig::default());
@@ -971,6 +974,7 @@ mod tests {
             profile_idc: 77,
             chroma_format_idc: 1,
             separate_colour_plane: false,
+            frame_cropping: None,
         });
         let sps = Sps::parse(&sps_rbsp).unwrap();
         let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {

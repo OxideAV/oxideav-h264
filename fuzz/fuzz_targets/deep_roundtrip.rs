@@ -2,8 +2,10 @@
 
 //! Fuzz: the round-456 high-bit-depth encoder ↔ decoder round trip.
 //!
-//! Input bytes pick the bit depth (8..=14), chroma format, QP (down to
-//! `−QpBdOffsetY`), lossless mode and shape a `u16` source. The
+//! Input bytes pick the bit depth (8..=14), chroma format (4:0:0
+//! included), picture size (1..=48 per axis on the §7.4.2.1.1 crop-unit
+//! grid — most sizes are coded padded with an SPS cropping rectangle),
+//! QP (down to `−QpBdOffsetY`), lossless mode and shape a `u16` source. The
 //! encoder must never panic, our decoder must reconstruct the stream
 //! **bit-exactly** to the encoder's recon, and in lossless mode the
 //! reconstruction must equal the source sample-for-sample. A
@@ -13,9 +15,6 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::deep::{DeepConfig, encode_deep_sequence};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
-
-const W: usize = 32;
-const H: usize = 32;
 
 fn decode(stream: &[u8]) -> Vec<oxideav_core::VideoFrame> {
     let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
@@ -36,11 +35,19 @@ fn decode(stream: &[u8]) -> Vec<oxideav_core::VideoFrame> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 8 {
+    if data.len() < 10 {
         return;
     }
     let bd = 8 + (data[0] % 7) as u32; // 8..=14
-    let cf = 1 + (data[1] % 3) as u32;
+    let cf = (data[1] % 4) as u32; // 0 = 4:0:0
+    // Crop units: 2 x 2 at 4:2:0, 2 x 1 at 4:2:2, else 1 x 1.
+    let (ux, uy) = match cf {
+        1 => (2, 2),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
+    let w = (1 + (data[8] % 48) as usize).next_multiple_of(ux);
+    let h = (1 + (data[9] % 48) as usize).next_multiple_of(uy);
     let lossless = data[2] & 1 == 1;
     let off_y = 6 * (bd as i32 - 8);
     let qp = if lossless {
@@ -53,8 +60,11 @@ fuzz_target!(|data: &[u8]| {
     let n_frames = 1 + (data[4] % 2) as usize;
     let flip = u16::from_le_bytes([data[5], data[6]]) as usize;
     let seed = &data[7..];
+    #[allow(non_snake_case)]
+    let (W, H) = (w, h);
     let max = (1u32 << bd) - 1;
     let (cw, ch) = match cf {
+        0 => (0, 0),
         1 => (W / 2, H / 2),
         2 => (W / 2, H),
         _ => (W, H),
@@ -91,8 +101,14 @@ fuzz_target!(|data: &[u8]| {
     let decoded = decode(&enc.annex_b);
     assert_eq!(decoded.len(), enc.recon_frames.len(), "frame count");
     for (vf, (ry, ru, rv)) in decoded.iter().zip(enc.recon_frames.iter()) {
-        assert_eq!(vf.planes.len(), 3);
+        assert_eq!(vf.planes.len(), if cf == 0 { 1 } else { 3 });
+        assert_eq!(ry.len(), W * H, "recon at the picture size");
         for (plane, exp) in vf.planes.iter().zip([ry, ru, rv]) {
+            assert_eq!(
+                plane.data.len(),
+                exp.len() * if bd == 8 { 1 } else { 2 },
+                "decoded plane size"
+            );
             let ok = if bd == 8 {
                 plane
                     .data

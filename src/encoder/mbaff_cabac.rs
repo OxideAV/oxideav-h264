@@ -96,9 +96,11 @@ use crate::transform::{
 /// Configuration for [`encode_mbaff_cabac_sequence`].
 #[derive(Debug, Clone)]
 pub struct MbaffCabacConfig {
-    /// Luma width in samples (multiple of 16).
+    /// Luma width in samples (even; a width off the macroblock grid is
+    /// padded and restored by the §7.4.2.1.1 SPS cropping rectangle).
     pub width: u32,
-    /// Frame luma height in samples (multiple of 32).
+    /// Frame luma height in samples (multiple of 4; padded to whole
+    /// macroblock pairs and cropped like the width).
     pub frame_height: u32,
     /// Slice QP_Y (`pic_init_qp_minus26`, `slice_qp_delta = 0`).
     pub qp: i32,
@@ -1300,6 +1302,34 @@ pub fn encode_mbaff_cabac_sequence(
     cfg: &MbaffCabacConfig,
     frames: &[(&[u8], &[u8], &[u8])],
 ) -> MbaffCabacEncoded {
+    let geom = crate::encoder::pad::CodedGeometry::new(cfg.width, cfg.frame_height, 1, false)
+        .unwrap_or_else(|e| panic!("picture size {}x{}: {e}", cfg.width, cfg.frame_height));
+    if !geom.is_padded() {
+        return encode_mbaff_cabac_sequence_coded(cfg, frames, None);
+    }
+    // §7.4.2.1.1 — code the padded grid (each padded row repeats the
+    // last row of its own field); the SPS cropping restores the size.
+    let mut coded_cfg = cfg.clone();
+    coded_cfg.width = geom.coded_width;
+    coded_cfg.frame_height = geom.coded_height;
+    let padded = geom.pad_420_frames(frames);
+    let refs: Vec<(&[u8], &[u8], &[u8])> = padded
+        .iter()
+        .map(|(y, u, v)| (y.as_slice(), u.as_slice(), v.as_slice()))
+        .collect();
+    let mut enc = encode_mbaff_cabac_sequence_coded(&coded_cfg, &refs, geom.cropping.clone());
+    for f in &mut enc.recon_frames {
+        *f = geom.crop_420_frame(f);
+    }
+    enc
+}
+
+/// [`encode_mbaff_cabac_sequence`] on the coded (macroblock-pair aligned) grid.
+fn encode_mbaff_cabac_sequence_coded(
+    cfg: &MbaffCabacConfig,
+    frames: &[(&[u8], &[u8], &[u8])],
+    cropping: Option<crate::sps::FrameCropping>,
+) -> MbaffCabacEncoded {
     assert!(cfg.width.is_multiple_of(16), "width must be MB-aligned");
     assert!(
         cfg.frame_height.is_multiple_of(32),
@@ -1349,6 +1379,7 @@ pub fn encode_mbaff_cabac_sequence(
         interlaced_fields: true,
         mbaff: true,
         vui: None,
+        frame_cropping: cropping,
     });
     let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
         pic_parameter_set_id: 0,

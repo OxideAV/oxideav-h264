@@ -153,6 +153,7 @@ pub fn encode_slices_sequence(
         interlaced_fields: false,
         mbaff: false,
         vui: None,
+        frame_cropping: None,
     });
     let pps_rbsp = build_baseline_pps_rbsp(&BaselinePpsConfig {
         pic_parameter_set_id: 0,

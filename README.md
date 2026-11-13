@@ -259,10 +259,24 @@ encoder accepts every layout the crate's High-family encoder codes:
 `Yuv420P` / `Yuv422P` / `Yuv444P` / `Gray8` at 8 bit and the
 `*P10Le` / `*P12Le` / `Gray10Le` / `Gray12Le` variants (declared on
 the registry descriptor so the Layer-2 gateway ladder sees them).
-8-bit 4:2:0 input (grey coded as 4:2:0 with constant chroma) keeps the
-Baseline / Main session — IDR / P / B, rate control, streams
-byte-identical to earlier releases (`integration_registry_bit_identity`
-pins them). Every other layout rides `encoder::deep::DeepSession`
+8-bit 4:2:0 input keeps the Baseline / Main session — IDR / P / B,
+rate control, streams byte-identical to earlier releases
+(`integration_registry_bit_identity` pins them). **Grey input is coded
+4:0:0** (`chroma_format_idc = 0`: luma only, no chroma syntax — round
+488): `Gray8` through the same session under High (100, the lowest
+profile with a monochrome format) with CAVLC or CABAC, B pictures and
+rate control (per-picture QP + VBV retry; the MB-row modulation is a
+4:2:0 path); `Gray10Le` / `Gray12Le`, and `Gray8` with a High-family
+tool or `profile=high`, through `encoder::deep` (High 100 / High 10 /
+High 4:4:4 Predictive for 12 bit and lossless). The output layout is
+the grey format itself; `profile=baseline` / `main` keep the earlier
+carriage of `Gray8` as 4:2:0 with constant chroma. Measured (160x128
+synthetic, 3 intra pictures, QP 26): 4:0:0 19 706 B vs 19 959 B as
+4:2:0 under CAVLC (−1.3 %), 17 420 vs 17 436 B under CABAC; with P / B
+pictures the 4:0:0 mode decision is narrower than the 4:2:0 one (the
+CAVLC inter paths run the Intra_16x16 fallback at 4:2:0 only) and can
+come out larger (+6 % CAVLC P, +2.5 % CABAC B on the same content). Picture sizes need not be whole macroblocks on any path
+(§7.4.2.1.1 cropping — see the coding-tool table). Every other layout rides `encoder::deep::DeepSession`
 under the §A.2.4 – §A.2.7 minimum profile (High 100 / High 10 110 /
 High 4:2:2 122 / High 4:4:4 Predictive 244): IDR + P pictures
 (Intra_16x16, P_Skip / P_L0_16x16 / Intra_16x16 fallback), CAVLC or
@@ -296,10 +310,14 @@ both entropy coders, lossy and lossless; lossless 12-bit 4:4:4 shrinks
 3 pictures, CAVLC, bytes / min luma PSNR): 4:2:2 8-bit 3389 B / 45.2
 dB at QP 20, 2009 B / 38.4 dB at QP 28, 1048 B / 30.8 dB at QP 36;
 4:2:0 10-bit 2429 / 45.6, 1479 / 38.2, 858 / 30.9; 4:4:4 12-bit 4970 /
-45.7, 3009 / 38.1, 1492 / 30.9. Not yet on this path: 4:0:0
-(`chroma_format_idc = 0`) coding for grey input, Intra_8x8 and
-Intra_NxN inside P pictures at > 8 bit, B pictures and rate control
-for the High-family layouts.
+45.7, 3009 / 38.1, 1492 / 30.9. **4:0:0** (round 488):
+`chroma_format_idc = 0` at 8..=14 bit on this path — luma-only
+Intra_16x16 / Intra_4x4 / P_Skip / P_L0_16x16 (4x4 or 8x8 transform),
+CAVLC (`coded_block_pattern` through the Table 9-4 ChromaArrayType 0 / 3
+column) and CABAC (no chroma CBP bins, no `intra_chroma_pred_mode`),
+lossless included. Not yet on this path: Intra_8x8 and Intra_NxN
+inside P pictures at > 8 bit, B pictures and rate control for the
+High-family layouts.
 
 | Coding tool | Scope | Notes |
 | ----------- | ----- | ----- |
@@ -323,6 +341,7 @@ for the High-family layouts.
 | **Weighted prediction (r26 / r440 / r453)** | B explicit (`weighted_bipred_idc = 1`) + implicit (PAFF, idc 2); **P explicit (r453, `EncoderConfig::explicit_weighted_pred`)** | P: PPS `weighted_pred_flag = 1`, per-slice §7.3.3.2 `pred_weight_table()` (luma, `chroma_weight_l0_flag = 0`), §8.4.2.3.2 eq. 8-274 weighting of every inter predictor incl. P_Skip before the residual / skip decision, motion search on the weighted reference, slice-wide least-squares `(weight, offset)` at `logWD = 5` elected on ≥ 1 % co-located SSD gain (fade detection) else `luma_weight_l0_flag = 0`. Measured (five-frame global fade, QP 26): P payload 6684 → 960 bytes at equal PSNR (37.56 → 37.55 dB). 3 gates bit-exact in both decoders |
 | **Multi-reference + long-term references + MMCO + RPLM (r453)** | `encoder::multiref` — Baseline, CAVLC 4:2:0, up to 16 active references | §8.2.4.2.1 RefPicList0 (short-term by descending PicNum, long-term by ascending LongTermPicNum) mirrored from an encoder-side §8.2.5 buffer: sliding window, §7.4.3.3 `long_term_reference_flag` on the IDR, MMCO 4 + 6 long-term assignment of a P picture (with MMCO 1 eviction on overflow), MMCO 2 unmarking, RPLM `long_term_pic_num` splicing to index 0 — marking applied after the picture is coded; §7.3.3 `num_ref_idx_active_override`; per-MB quarter-pel election over every active reference. 4 gates (3 active refs electing the two-frames-back reference, long-term IDR anchor, MMCO mark + unmark, RPLM) bit-exact in both decoders |
 | **Multi-slice, FMO, ASO, redundant slices, constrained intra (r453)** | `encoder::slices` — Baseline, CAVLC 4:2:0 | §7.3.2.2 slice group map types 0..=6 in the PPS (`slice_group_change_cycle` in the headers for 3..=5), `MbToSliceGroupMap` derived with the decoder's §8.2.2 code, raster slices of `mbs_per_slice` MBs per group, per-slice neighbour-state restart + explicit §6.4.8 same-slice availability mask for the intra predictors (top / left / top-left individually), `constrained_intra_pred_flag = 1` dropping inter neighbours for the Intra_16x16 fallback in P slices, reverse-order slice emission (ASO), `redundant_pic_cnt = 1` re-encodes at QP + 6. 12 gates bit-exact in our decoder; the multi-slice / constrained-intra / slice-boundary streams also byte-exact in the black-box reference decoder (which lacks FMO and ASO and does not discard redundant slices) |
+| **Frame cropping (r488)** | every encoder path: `EncoderSession`, `encoder::deep`, the registry encoder, and the PAFF / MBAFF drivers | Any picture size on the §7.4.2.1.1 crop-unit grid (`CropUnitX` x `CropUnitY`: 2 x 2 at 4:2:0, 2 x 1 at 4:2:2, 1 x 1 at 4:4:4 / 4:0:0; `CropUnitY` doubles with `frame_mbs_only_flag = 0`) is coded on a grid padded to whole macroblocks (macroblock pairs for field / MBAFF coding) by repeating the last column and row (the last row of each field parity for interlaced coding), with `frame_cropping_flag = 1` and `frame_crop_right_offset` / `frame_crop_bottom_offset` in the SPS (`encoder::pad::CodedGeometry`). `EncoderConfig::crop_right` / `crop_bottom` for the stateless `Encoder`. `integration_frame_cropping`: 7 sizes x 4:2:0 (8 / 10 bit, Baseline / Main / High, B pictures, CBR), 5 x 4:2:2, 6 x 4:4:4 (down to 1 x 1), lossless, 6 sizes x PAFF I/P/B fields and x MBAFF CAVLC + CABAC under three pair policies — every stream outputs the requested size from our decoder and byte-identically from a black-box decoder |
 | **SEI writers (r430 / r453)** | `encoder::sei` | `buffering_period` + `pic_timing` (HRD rate-controlled sessions) and **`recovery_point` (r453, `SessionConfig::recovery_point_sei`)** on every IDR access unit (`recovery_frame_cnt = 0`, `exact_match_flag = 1`), round-tripped through the decoder's §D.1 parsers |
 
 ## Goals

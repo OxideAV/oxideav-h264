@@ -41,19 +41,21 @@ use crate::encoder::cabac_syntax::{
     encode_mb_qp_delta, encode_mb_skip_flag, encode_mb_type_i, encode_mb_type_p, encode_mvd_lx,
 };
 use crate::encoder::cabac_syntax::{encode_prev_intra_pred_mode_flag, encode_rem_intra_pred_mode};
+use crate::encoder::cavlc::encode_residual_block_cavlc;
 use crate::encoder::deblock::{
     MbDeblockInfo, chroma_nz_mask_from_blocks, deblock_recon_deep, luma_nz_mask_from_blocks,
 };
 use crate::encoder::macroblock::{
-    ChromaWriteKind, PL016x16McbConfig, write_i_nxn_mb_chroma, write_i4x4_mb_444,
-    write_intra16x16_mb_chroma, write_intra16x16_mb_in_inter_slice_chroma,
-    write_p_l0_16x16_mb_chroma,
+    ChromaWriteKind, PL016x16McbConfig, intra_cbp_to_codenum_0_3, intra_cbp_to_codenum_420_422,
+    write_i_nxn_mb_chroma, write_i4x4_mb_444, write_i4x4_mb_mono, write_intra16x16_mb_chroma,
+    write_intra16x16_mb_in_inter_slice_chroma, write_p_l0_16x16_mb_chroma,
 };
 use crate::encoder::mbaff_cabac::{
     CabacState, Plane, emit_chroma_cabac, emit_i16_plane_cabac, emit_inter_plane_cabac,
     full_neighbour_ctx, skip_neighbour_ctx,
 };
 use crate::encoder::nal::build_nal_unit;
+use crate::encoder::pad::{CodedGeometry, crop_plane};
 use crate::encoder::pps::{BaselinePpsConfig, build_baseline_pps_rbsp};
 use crate::encoder::slice::CabacSliceParams;
 use crate::encoder::slice::{
@@ -74,9 +76,10 @@ use crate::encoder::{
 };
 use crate::inter_pred::{interpolate_chroma, interpolate_luma};
 use crate::intra_pred::{
-    ChromaArrayType, Intra4x4Mode, Intra16x16Mode, IntraChromaMode, Neighbour4x4Availability,
-    Samples4x4, Samples16x16, SamplesChroma, intra_16x16_mode_permitted,
-    intra_chroma_mode_permitted, predict_4x4, predict_16x16, predict_chroma,
+    ChromaArrayType, Intra4x4Mode, Intra8x8Mode, Intra16x16Mode, IntraChromaMode,
+    Neighbour4x4Availability, Samples4x4, Samples8x8, Samples16x16, SamplesChroma,
+    filter_samples_8x8, intra_8x8_mode_permitted, intra_16x16_mode_permitted,
+    intra_chroma_mode_permitted, predict_4x4, predict_8x8, predict_16x16, predict_chroma,
 };
 use crate::macroblock_layer::{CabacMbNeighbourInfo, CabacNeighbourGrid, cabac_mvd_abs_sum};
 use crate::macroblock_layer::{CavlcNcGrid, LumaNcKind, derive_nc_luma};
@@ -112,14 +115,21 @@ const LUMA_4X4_BLK: [(usize, usize); 16] = [
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DeepConfig {
-    /// Luma width / height in samples (multiples of 16).
+    /// Luma width / height in samples. A size that is not a whole
+    /// number of macroblocks is coded on a grid padded by edge
+    /// repetition, with the §7.4.2.1.1 SPS cropping rectangle restoring
+    /// it at the decoder; width / height must be multiples of the crop
+    /// unit (2 x 2 at 4:2:0, 2 x 1 at 4:2:2, 1 x 1 at 4:4:4). Input
+    /// planes and returned reconstructions are at this size.
     pub width: u32,
     pub height: u32,
     /// §7.4.2.1.1 `BitDepthY` (8..=14).
     pub bit_depth_luma: u32,
     /// §7.4.2.1.1 `BitDepthC` (8..=14).
     pub bit_depth_chroma: u32,
-    /// `chroma_format_idc` ∈ {1, 2, 3}.
+    /// `chroma_format_idc` ∈ {0, 1, 2, 3}; 0 is monochrome (4:0:0): the
+    /// Cb / Cr input planes are empty slices, as are the returned
+    /// reconstructions', and `bit_depth_chroma` only sets the SPS field.
     pub chroma_format_idc: u32,
     /// Slice QP_Y, in `−QpBdOffsetY..=51`.
     pub qp: i32,
@@ -340,6 +350,11 @@ struct Geom {
 }
 
 impl Geom {
+    /// ChromaArrayType 0: no chroma sample arrays (4:0:0).
+    fn mono(self) -> bool {
+        self.cf == 0
+    }
+
     fn chroma_array_type(self) -> Option<ChromaArrayType> {
         match self.cf {
             1 => Some(ChromaArrayType::Yuv420),
@@ -992,6 +1007,8 @@ fn mc_luma(
 fn mc_chroma(reference: &[i32], g: Geom, mb_x: usize, mb_y: usize, mv: Mv) -> Vec<i32> {
     let mut dst = vec![0i32; g.ct_w * g.ct_h];
     match g.cf {
+        // ChromaArrayType 0 — no chroma arrays.
+        0 => {}
         3 => {
             interpolate_luma(
                 reference,
@@ -1270,6 +1287,8 @@ fn intra_candidate(
     let src_u = src.chroma_tile(g, false, mb_x, mb_y);
     let src_v = src.chroma_tile(g, true, mb_x, mb_y);
     let (chroma_mode, pred_u, pred_v, chroma, planes444, cbp_chroma) = match g.chroma_array_type() {
+        // §7.3.5 at ChromaArrayType 0 — luma only.
+        _ if g.mono() => (0u8, Vec::new(), Vec::new(), None, None, 0u8),
         Some(cat) => {
             let su = chroma_samples(&recon.u, g.cw, mb_x, mb_y, g.ct_w, g.ct_h);
             let sv = chroma_samples(&recon.v, g.cw, mb_x, mb_y, g.ct_w, g.ct_h);
@@ -1478,7 +1497,8 @@ fn emit_intra(
             };
             emit(w, kind).expect("CAVLC intra MB");
         }
-        _ => unreachable!(),
+        // ChromaArrayType 0 — no chroma syntax.
+        (None, None) => emit(w, ChromaWriteKind::Mono).expect("CAVLC intra MB"),
     }
 }
 
@@ -1515,7 +1535,7 @@ fn recon_intra(
             recon.store_chroma(g, false, mb_x, mb_y, &cand.pred_u, &ru);
             recon.store_chroma(g, true, mb_x, mb_y, &cand.pred_v, &rv);
         }
-        _ => unreachable!(),
+        (None, None) => {}
     }
     MbDeblockInfo {
         is_intra: true,
@@ -1567,8 +1587,8 @@ fn emit_intra_cabac(
     } else {
         encode_mb_type_i(&mut cs.enc, &mut cs.ctxs, &nctx, row);
     }
-    // §7.3.5.1 — intra_chroma_pred_mode is absent at ChromaArrayType 3.
-    if g.cf != 3 {
+    // §7.3.5.1 — intra_chroma_pred_mode is absent at ChromaArrayType 0 / 3.
+    if matches!(g.cf, 1 | 2) {
         encode_intra_chroma_pred_mode(&mut cs.enc, &mut cs.ctxs, &nctx, cand.chroma_mode as u32);
     }
     // §7.3.5 — mb_qp_delta always present for Intra_16x16.
@@ -1635,7 +1655,7 @@ fn emit_intra_cabac(
                 cand.cbp_luma,
             );
         }
-        _ => unreachable!(),
+        (None, None) => {}
     }
     cur.available = true;
     cab.mbs[addr] = cur;
@@ -1817,6 +1837,56 @@ impl I4x4Grid {
         let ma = a.unwrap_or(2);
         let mb = b.unwrap_or(2);
         ma.min(mb)
+    }
+
+    /// §8.3.2.1 steps 1–4 — `predIntra8x8PredMode` for 8x8 block
+    /// `blk8` of MB `(mb_x, mb_y)`. Neighbouring 8x8 blocks per
+    /// §6.4.11.2; an Intra_4x4 neighbour contributes
+    /// `Intra4x4PredMode[luma8x8BlkIdxN * 4 + n]` with `n = 1` for A
+    /// and `n = 2` for B (eq. 8-72, non-MBAFF). Intra_8x8 macroblocks
+    /// are recorded with each 8x8 mode repeated over its four 4x4
+    /// slots, so the same lookup yields `Intra8x8PredMode[
+    /// luma8x8BlkIdxN ]` for them — and the §8.3.1.1 lookup of an
+    /// Intra_8x8 neighbour (`Intra8x8PredMode[luma4x4BlkIdxN >> 2]`)
+    /// reads the right value too.
+    fn predicted_mode_8x8(&self, mb_x: usize, mb_y: usize, blk8: usize, cur: &[u8; 16]) -> u8 {
+        // (neighbouring MB offset, luma8x8BlkIdxN) for A then B.
+        let (a_outside, a_blk8) = match blk8 {
+            0 => (true, 1),
+            1 => (false, 0),
+            2 => (true, 3),
+            _ => (false, 2),
+        };
+        let (b_outside, b_blk8) = match blk8 {
+            0 => (true, 2),
+            1 => (true, 3),
+            2 => (false, 0),
+            _ => (false, 1),
+        };
+        let a = if a_outside {
+            if mb_x == 0 {
+                None
+            } else {
+                self.slots[mb_y * self.w_mbs + mb_x - 1]
+                    .map(|m| m.map(|modes| modes[a_blk8 * 4 + 1]))
+            }
+        } else {
+            Some(Some(cur[a_blk8 * 4 + 1]))
+        };
+        let b = if b_outside {
+            if mb_y == 0 {
+                None
+            } else {
+                self.slots[(mb_y - 1) * self.w_mbs + mb_x]
+                    .map(|m| m.map(|modes| modes[b_blk8 * 4 + 2]))
+            }
+        } else {
+            Some(Some(cur[b_blk8 * 4 + 2]))
+        };
+        let (Some(a), Some(b)) = (a, b) else {
+            return 2;
+        };
+        a.unwrap_or(2).min(b.unwrap_or(2))
     }
 }
 
@@ -2145,6 +2215,8 @@ fn intra4x4_candidate(
     let src_u = src.chroma_tile(g, false, mb_x, mb_y);
     let src_v = src.chroma_tile(g, true, mb_x, mb_y);
     let (chroma_mode, pred_u, pred_v, chroma, planes444, cbp_chroma) = match g.chroma_array_type() {
+        // §7.3.5 at ChromaArrayType 0 — luma only.
+        _ if g.mono() => (0u8, Vec::new(), Vec::new(), None, None, 0u8),
         Some(cat) => {
             let su = chroma_samples(&recon.u, g.cw, mb_x, mb_y, g.ct_w, g.ct_h);
             let sv = chroma_samples(&recon.v, g.cw, mb_x, mb_y, g.ct_w, g.ct_h);
@@ -2242,7 +2314,8 @@ fn gate_scan(scan: &ScanLists, cbp_luma: u8) -> ScanLists {
     out
 }
 
-/// CAVLC I_NxN macroblock in an I slice.
+/// CAVLC I_NxN (Intra_4x4) macroblock in an I slice, or — at
+/// ChromaArrayType 0 / 1 / 2 — in a P slice.
 fn emit_i4x4(
     g: Geom,
     w: &mut BitWriter,
@@ -2250,6 +2323,7 @@ fn emit_i4x4(
     mb_addr: u32,
     cand: &I4x4Cand,
     emit_t8x8_zero: bool,
+    in_p_slice: bool,
 ) {
     mark_slot(nc_grid, mb_addr, true, false);
     let cbp_luma = cand.cbp_luma;
@@ -2262,6 +2336,36 @@ fn emit_i4x4(
         |blk| (cbp_luma >> (blk / 4)) & 1 == 1,
         false,
     );
+    if in_p_slice {
+        debug_assert!(
+            cand.planes444.is_none(),
+            "I_NxN in P: ChromaArrayType 0 / 1 / 2"
+        );
+        with_chroma_kind(
+            g,
+            nc_grid,
+            mb_addr,
+            cand.chroma.as_ref(),
+            cand.cbp_chroma,
+            |kind| {
+                write_i_nxn_cavlc(
+                    w,
+                    5,
+                    emit_t8x8_zero.then_some(false),
+                    &cand.prev_flag,
+                    &cand.rem,
+                    g.cf,
+                    cand.chroma_mode,
+                    cbp_luma,
+                    cand.cbp_chroma,
+                    &levels,
+                    &luma_nc,
+                    kind,
+                )
+            },
+        );
+        return;
+    }
     match (&cand.chroma, &cand.planes444) {
         (Some((cu, cv)), _) => {
             let n_blk = g.ct_h / 4 * 2;
@@ -2329,11 +2433,23 @@ fn emit_i4x4(
             )
             .expect("CAVLC I_NxN 4:4:4 MB");
         }
-        _ => unreachable!(),
+        (None, None) => {
+            write_i4x4_mb_mono(
+                w,
+                emit_t8x8_zero,
+                &cand.prev_flag,
+                &cand.rem,
+                cbp_luma,
+                0,
+                &levels,
+                &luma_nc,
+            )
+            .expect("CAVLC I_NxN 4:0:0 MB");
+        }
     }
 }
 
-/// CABAC I_NxN macroblock in an I slice.
+/// CABAC I_NxN (Intra_4x4) macroblock in an I or a P slice.
 fn emit_i4x4_cabac(
     g: Geom,
     cs: &mut CabacState,
@@ -2341,10 +2457,16 @@ fn emit_i4x4_cabac(
     mb_addr: u32,
     cand: &I4x4Cand,
     t8x8_mode: bool,
+    in_p_slice: bool,
 ) {
     let addr = mb_addr as usize;
     let nctx = full_neighbour_ctx(cab, addr, false);
-    encode_mb_type_i(&mut cs.enc, &mut cs.ctxs, &nctx, 0);
+    if in_p_slice {
+        // Table 7-13 — intra mb_type values follow the five P types.
+        encode_mb_type_p(&mut cs.enc, &mut cs.ctxs, &nctx, 5);
+    } else {
+        encode_mb_type_i(&mut cs.enc, &mut cs.ctxs, &nctx, 0);
+    }
     if t8x8_mode {
         // §7.3.5 — transform_size_8x8_flag right after mb_type for
         // I_NxN when the PPS enables the tool; always 0 here.
@@ -2356,7 +2478,7 @@ fn emit_i4x4_cabac(
             encode_rem_intra_pred_mode(&mut cs.enc, &mut cs.ctxs, u32::from(cand.rem[blk]));
         }
     }
-    if g.cf != 3 {
+    if matches!(g.cf, 1 | 2) {
         encode_intra_chroma_pred_mode(&mut cs.enc, &mut cs.ctxs, &nctx, cand.chroma_mode as u32);
     }
     encode_coded_block_pattern(
@@ -2432,7 +2554,7 @@ fn emit_i4x4_cabac(
                 cand.cbp_luma,
             );
         }
-        _ => unreachable!(),
+        (None, None) => {}
     }
     cur.available = true;
     cab.mbs[addr] = cur;
@@ -2474,7 +2596,7 @@ fn recon_i4x4(
                     .copy_from_slice(&cr.recon[j * 16..j * 16 + 16]);
             }
         }
-        _ => unreachable!(),
+        (None, None) => {}
     }
     let mut nz = cand.luma.blk_has_nz;
     for (blk, n) in nz.iter_mut().enumerate() {
@@ -2491,6 +2613,598 @@ fn recon_i4x4(
         ref_poc_l0: [i32::MIN; 4],
         ..Default::default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Intra_8x8 (I_NxN with transform_size_8x8_flag = 1) — round 488.
+// §8.3.2 prediction per 8x8 block from the §8.3.2.2.1 filtered
+// reference samples on the block-sequential reconstruction, §8.3.2.1
+// predIntra8x8PredMode coding, §8.6.4 / §8.5.13 8x8 residual at QP′ (or
+// the §8.5.15 V / H DPCM under transform bypass), CAVLC (§7.4.5.3.3
+// four-4x4 split) and CABAC (ctxBlockCat 5) emission, at
+// ChromaArrayType 0 / 1 / 2.
+// ---------------------------------------------------------------------------
+
+/// §8.3.2.2 — the neighbouring samples of 8x8 block `blk8` of MB
+/// `(mb_x, mb_y)`: inside the current MB from `tile` (the
+/// block-sequential reconstruction so far), outside from `plane`.
+/// Availability per §6.4.11.2 with one slice per picture: the
+/// top-right of block 0 lies in mbAddrB, of block 1 in mbAddrC, of
+/// block 2 in block 1 (already decoded), of block 3 in a macroblock
+/// not yet decoded.
+fn samples_8x8(
+    plane: &[i32],
+    stride: usize,
+    w_mbs: usize,
+    tile: &[i32; 256],
+    mb_x: usize,
+    mb_y: usize,
+    blk8: usize,
+) -> Samples8x8 {
+    let (x0, y0) = ((blk8 % 2) * 8, (blk8 / 2) * 8);
+    let at = |x: i32, y: i32| -> i32 {
+        if (0..16).contains(&x) && (0..16).contains(&y) {
+            tile[y as usize * 16 + x as usize]
+        } else {
+            let px = (mb_x * 16) as i32 + x;
+            let py = (mb_y * 16) as i32 + y;
+            plane[py as usize * stride + px as usize]
+        }
+    };
+    let left = x0 > 0 || mb_x > 0;
+    let top = y0 > 0 || mb_y > 0;
+    let top_left = left && top;
+    let top_right = match blk8 {
+        0 => mb_y > 0,
+        1 => mb_y > 0 && mb_x + 1 < w_mbs,
+        2 => true,
+        _ => false,
+    };
+    let mut s = Samples8x8 {
+        top_left: 0,
+        top: [0; 8],
+        top_right: [0; 8],
+        left: [0; 8],
+        availability: Neighbour4x4Availability {
+            top_left,
+            top,
+            top_right,
+            left,
+        },
+    };
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    if top_left {
+        s.top_left = at(x0 - 1, y0 - 1);
+    }
+    if top {
+        for (i, t) in s.top.iter_mut().enumerate() {
+            *t = at(x0 + i as i32, y0 - 1);
+        }
+    }
+    if top_right {
+        for (i, t) in s.top_right.iter_mut().enumerate() {
+            *t = at(x0 + 8 + i as i32, y0 - 1);
+        }
+    }
+    if left {
+        for (j, l) in s.left.iter_mut().enumerate() {
+            *l = at(x0 - 1, y0 + j as i32);
+        }
+    }
+    s
+}
+
+/// One 8x8 residual block coded at `qp` (intra rounding), or under
+/// transform bypass with the §8.5.15 DPCM for the vertical (0) /
+/// horizontal (1) modes: `(Table 8-14 scan list, reconstructed
+/// residual)`.
+fn code_8x8_block(
+    residual: &[i32; 64],
+    mode: u8,
+    qp: i32,
+    w8: &[i32; 64],
+    bd: u32,
+    bypass: bool,
+) -> ([i32; 64], [i32; 64]) {
+    if bypass {
+        let hor = match mode {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        };
+        let f: Vec<i32> = match hor {
+            Some(h) => dpcm_forward(residual, 8, 8, h),
+            None => residual.to_vec(),
+        };
+        let f64: [i32; 64] = f[..].try_into().expect("64");
+        let r = dpcm_recon(&f, 8, 8, hor);
+        (zigzag_scan_8x8(&f64), r[..].try_into().expect("64"))
+    } else {
+        let q = quantize_8x8_w(&forward_core_8x8(residual), qp, true, w8);
+        let r = inverse_transform_8x8(&q, qp, w8, bd).expect("inverse 8x8");
+        (zigzag_scan_8x8(&q), r)
+    }
+}
+
+/// The intra chroma part shared by the I_NxN candidates at
+/// ChromaArrayType 1 / 2: `(intra_chroma_pred_mode, pred Cb, pred Cr,
+/// chains, cbp_chroma)`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn intra_chroma_420_422(
+    g: Geom,
+    cat: ChromaArrayType,
+    src: &Pic,
+    recon: &Pic,
+    mb_x: usize,
+    mb_y: usize,
+    qp_c: i32,
+    w4: &[i32; 16],
+    bypass: bool,
+    allow_dpcm: bool,
+) -> (u8, Vec<i32>, Vec<i32>, (ChromaChain, ChromaChain), u8) {
+    let src_u = src.chroma_tile(g, false, mb_x, mb_y);
+    let src_v = src.chroma_tile(g, true, mb_x, mb_y);
+    let su = chroma_samples(&recon.u, g.cw, mb_x, mb_y, g.ct_w, g.ct_h);
+    let sv = chroma_samples(&recon.v, g.cw, mb_x, mb_y, g.ct_w, g.ct_h);
+    let (mode, pu, pv) = pick_chroma(&src_u, &src_v, &su, &sv, cat, g.bd_c, allow_dpcm);
+    let ru: Vec<i32> = src_u.iter().zip(pu.iter()).map(|(s, p)| s - p).collect();
+    let rv: Vec<i32> = src_v.iter().zip(pv.iter()).map(|(s, p)| s - p).collect();
+    let (cu, cv) = if bypass {
+        (
+            chroma_chain_bypass(&ru, g.ct_h, Some(mode)),
+            chroma_chain_bypass(&rv, g.ct_h, Some(mode)),
+        )
+    } else {
+        (
+            chroma_chain(&ru, g.ct_h, qp_c, true, w4, g.bd_c),
+            chroma_chain(&rv, g.ct_h, qp_c, true, w4, g.bd_c),
+        )
+    };
+    let cbp_chroma = if cu.ac_nz || cv.ac_nz {
+        2
+    } else if cu.dc_nz || cv.dc_nz {
+        1
+    } else {
+        0
+    };
+    (mode, pu, pv, (cu, cv), cbp_chroma)
+}
+
+/// Intra_8x8 candidate for one MB (ChromaArrayType 0 / 1 / 2).
+struct I8x8Cand {
+    /// Intra8x8PredMode per 8x8 block.
+    modes: [u8; 4],
+    prev_flag: [bool; 4],
+    rem: [u8; 4],
+    /// Reconstructed luma (prediction + residual, clipped).
+    recon: [i32; 256],
+    scan8: [[i32; 64]; 4],
+    cbp_luma: u8,
+    chroma_mode: u8,
+    pred_u: Vec<i32>,
+    pred_v: Vec<i32>,
+    chroma: Option<(ChromaChain, ChromaChain)>,
+    cbp_chroma: u8,
+    /// Prediction cost `Σ (SAD + bits · λ)` over the four luma blocks.
+    cost: u64,
+}
+
+impl I8x8Cand {
+    /// The modes as the [`I4x4Grid`] records them (each 8x8 mode over
+    /// its four 4x4 slots).
+    fn grid_modes(&self) -> [u8; 16] {
+        std::array::from_fn(|blk| self.modes[blk / 4])
+    }
+
+    /// §7.4.5.3.3 — the CAVLC 4x4 lists (`blk8 * 4 + i4x4`), uncoded
+    /// quadrants zeroed.
+    fn cavlc_lists(&self) -> ScanLists {
+        let mut out = [[0i32; 16]; 16];
+        for blk8 in 0..4usize {
+            if (self.cbp_luma >> blk8) & 1 == 1 {
+                for (sub, list) in split_8x8(&self.scan8[blk8]).iter().enumerate() {
+                    out[blk8 * 4 + sub] = *list;
+                }
+            }
+        }
+        out
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn intra8x8_candidate(
+    g: Geom,
+    src: &Pic,
+    recon: &Pic,
+    grid: &I4x4Grid,
+    mb_x: usize,
+    mb_y: usize,
+    qp_y: i32,
+    qp_c: i32,
+    w4: &[i32; 16],
+    w8: &[i32; 64],
+    bypass: bool,
+    allow_dpcm: bool,
+    lambda: u64,
+) -> I8x8Cand {
+    let src_y = src.luma_tile(g, mb_x, mb_y);
+    let mut tile = [0i32; 256];
+    let mut modes = [2u8; 4];
+    let mut grid_modes = [2u8; 16];
+    let mut prev_flag = [false; 4];
+    let mut rem = [0u8; 4];
+    let mut scan8 = [[0i32; 64]; 4];
+    let mut cbp_luma = 0u8;
+    let mut cost = 0u64;
+    for blk8 in 0..4usize {
+        let (x0, y0) = ((blk8 % 2) * 8, (blk8 / 2) * 8);
+        let raw = samples_8x8(&recon.y, g.w, g.w_mbs, &tile, mb_x, mb_y, blk8);
+        // §8.3.2.2.1 — every mode predicts from the filtered samples.
+        let filtered = filter_samples_8x8(&raw, g.bd_y);
+        let mut block = [0i32; 64];
+        for j in 0..8 {
+            block[j * 8..j * 8 + 8].copy_from_slice(&src_y[(y0 + j) * 16 + x0..][..8]);
+        }
+        let pred_mode = grid.predicted_mode_8x8(mb_x, mb_y, blk8, &grid_modes);
+        let mut best: Option<(u64, u8, [i32; 64])> = None;
+        for mode in 0..9u8 {
+            let m = Intra8x8Mode::from_index(mode).expect("mode index");
+            if !intra_8x8_mode_permitted(m, &raw.availability) {
+                continue;
+            }
+            let mut p = [0i32; 64];
+            predict_8x8(m, &filtered, g.bd_y, &mut p);
+            let sad: u64 = block
+                .iter()
+                .zip(p.iter())
+                .map(|(a, b)| (a - b).unsigned_abs() as u64)
+                .sum();
+            let bits = if mode == pred_mode { 1 } else { 4 };
+            let j = sad + bits * lambda;
+            if best.as_ref().is_none_or(|b| j < b.0) {
+                best = Some((j, mode, p));
+            }
+        }
+        let (j, mode, pred) = best.expect("DC is always permitted");
+        cost += j;
+        modes[blk8] = mode;
+        for slot in &mut grid_modes[blk8 * 4..blk8 * 4 + 4] {
+            *slot = mode;
+        }
+        // §8.3.2.1 eq. 8-73.
+        if mode == pred_mode {
+            prev_flag[blk8] = true;
+        } else {
+            rem[blk8] = if mode < pred_mode { mode } else { mode - 1 };
+        }
+        let mut residual = [0i32; 64];
+        for k in 0..64 {
+            residual[k] = block[k] - pred[k];
+        }
+        let (list, res) = code_8x8_block(&residual, mode, qp_y, w8, g.bd_y, bypass);
+        if list.iter().any(|&v| v != 0) {
+            cbp_luma |= 1 << blk8;
+        }
+        scan8[blk8] = list;
+        for j in 0..8 {
+            for i in 0..8 {
+                tile[(y0 + j) * 16 + x0 + i] = clip(pred[j * 8 + i] + res[j * 8 + i], g.bd_y);
+            }
+        }
+    }
+    let (chroma_mode, pred_u, pred_v, chroma, cbp_chroma) = match g.chroma_array_type() {
+        Some(cat) if !g.mono() => {
+            let (mode, pu, pv, chains, cbp) =
+                intra_chroma_420_422(g, cat, src, recon, mb_x, mb_y, qp_c, w4, bypass, allow_dpcm);
+            (mode, pu, pv, Some(chains), cbp)
+        }
+        _ => (0u8, Vec::new(), Vec::new(), None, 0u8),
+    };
+    I8x8Cand {
+        modes,
+        prev_flag,
+        rem,
+        recon: tile,
+        scan8,
+        cbp_luma,
+        chroma_mode,
+        pred_u,
+        pred_v,
+        chroma,
+        cbp_chroma,
+        cost,
+    }
+}
+
+/// §7.3.5 — CAVLC `macroblock_layer()` of an I_NxN macroblock at
+/// ChromaArrayType 0 / 1 / 2: `mb_type` (`mb_type_raw`: 0 in an I
+/// slice, 5 in a P slice — Table 7-13), `transform_size_8x8_flag` when
+/// the PPS carries the tool, the per-block prediction-mode syntax
+/// (16 Intra_4x4 or 4 Intra_8x8 entries), `intra_chroma_pred_mode`
+/// (ChromaArrayType 1 / 2 only), `coded_block_pattern` through the
+/// Table 9-4 intra column for the chroma format, `mb_qp_delta = 0`
+/// when anything is coded, the luma 4x4 lists of the coded quadrants
+/// and the chroma residual.
+#[allow(clippy::too_many_arguments)]
+fn write_i_nxn_cavlc(
+    w: &mut BitWriter,
+    mb_type_raw: u32,
+    transform_size_8x8_flag: Option<bool>,
+    prev_flag: &[bool],
+    rem: &[u8],
+    cf: u32,
+    chroma_mode: u8,
+    cbp_luma: u8,
+    cbp_chroma: u8,
+    luma_levels: &ScanLists,
+    luma_nc: &[i32; 16],
+    chroma: ChromaWriteKind<'_>,
+) {
+    w.ue(mb_type_raw);
+    if let Some(flag) = transform_size_8x8_flag {
+        w.u(1, u32::from(flag));
+    }
+    for (&flag, &r) in prev_flag.iter().zip(rem) {
+        w.u(1, u32::from(flag));
+        if !flag {
+            w.u(3, u32::from(r));
+        }
+    }
+    let codenum = if matches!(cf, 1 | 2) {
+        w.ue(u32::from(chroma_mode));
+        intra_cbp_to_codenum_420_422(cbp_luma, cbp_chroma)
+    } else {
+        intra_cbp_to_codenum_0_3(cbp_luma)
+    };
+    w.ue(codenum);
+    if cbp_luma > 0 || cbp_chroma > 0 {
+        w.se(0);
+    }
+    for blk8 in 0..4usize {
+        if (cbp_luma >> blk8) & 1 == 1 {
+            for blk in blk8 * 4..blk8 * 4 + 4 {
+                encode_residual_block_cavlc(
+                    w,
+                    CoeffTokenContext::Numeric(luma_nc[blk]),
+                    16,
+                    &luma_levels[blk],
+                )
+                .expect("CAVLC I_NxN luma block");
+            }
+        }
+    }
+    chroma.emit(w, cbp_chroma).expect("CAVLC I_NxN chroma");
+}
+
+/// The chroma residual of an I_NxN macroblock for the CAVLC writer at
+/// ChromaArrayType 0 / 1 / 2, with the §9.2.1.1 chroma totals
+/// committed to `nc_grid`.
+fn with_chroma_kind<R>(
+    g: Geom,
+    nc_grid: &mut CavlcNcGrid,
+    mb_addr: u32,
+    chroma: Option<&(ChromaChain, ChromaChain)>,
+    cbp_chroma: u8,
+    f: impl FnOnce(ChromaWriteKind<'_>) -> R,
+) -> R {
+    let Some((cu, cv)) = chroma else {
+        return f(ChromaWriteKind::Mono);
+    };
+    let n_blk = g.ct_h / 4 * 2;
+    let (nc_cb, nc_cr) = derive_chroma_ac_nc_and_commit_totals(
+        nc_grid,
+        mb_addr,
+        true,
+        cbp_chroma,
+        &cu.ac[..n_blk],
+        &cv.ac[..n_blk],
+        g.cf,
+    );
+    if g.cf == 1 {
+        f(ChromaWriteKind::Yuv420 {
+            chroma_dc_cb: cu.dc[..4].try_into().expect("4 DC"),
+            chroma_dc_cr: cv.dc[..4].try_into().expect("4 DC"),
+            chroma_ac_cb: cu.ac[..4].try_into().expect("4 AC"),
+            chroma_ac_cr: cv.ac[..4].try_into().expect("4 AC"),
+            cb_ac_nc: &nc_cb,
+            cr_ac_nc: &nc_cr,
+        })
+    } else {
+        f(ChromaWriteKind::Yuv422 {
+            chroma_dc_cb: &cu.dc,
+            chroma_dc_cr: &cv.dc,
+            chroma_ac_cb: &cu.ac,
+            chroma_ac_cr: &cv.ac,
+            cb_ac_nc: &nc_cb,
+            cr_ac_nc: &nc_cr,
+        })
+    }
+}
+
+/// CAVLC Intra_8x8 macroblock (I or P slice).
+fn emit_i8x8(
+    g: Geom,
+    w: &mut BitWriter,
+    nc_grid: &mut CavlcNcGrid,
+    mb_addr: u32,
+    cand: &I8x8Cand,
+    in_p_slice: bool,
+) {
+    mark_slot(nc_grid, mb_addr, true, false);
+    let cbp_luma = cand.cbp_luma;
+    let levels = cand.cavlc_lists();
+    let luma_nc = luma_nc_progressive(
+        nc_grid,
+        mb_addr,
+        true,
+        &levels,
+        |blk| (cbp_luma >> (blk / 4)) & 1 == 1,
+        false,
+    );
+    with_chroma_kind(
+        g,
+        nc_grid,
+        mb_addr,
+        cand.chroma.as_ref(),
+        cand.cbp_chroma,
+        |kind| {
+            write_i_nxn_cavlc(
+                w,
+                if in_p_slice { 5 } else { 0 },
+                Some(true),
+                &cand.prev_flag,
+                &cand.rem,
+                g.cf,
+                cand.chroma_mode,
+                cbp_luma,
+                cand.cbp_chroma,
+                &levels,
+                &luma_nc,
+                kind,
+            )
+        },
+    );
+}
+
+/// CABAC Intra_8x8 macroblock (I or P slice).
+fn emit_i8x8_cabac(
+    g: Geom,
+    cs: &mut CabacState,
+    cab: &mut CabacNeighbourGrid,
+    mb_addr: u32,
+    cand: &I8x8Cand,
+    in_p_slice: bool,
+) {
+    let addr = mb_addr as usize;
+    let nctx = full_neighbour_ctx(cab, addr, false);
+    if in_p_slice {
+        encode_mb_type_p(&mut cs.enc, &mut cs.ctxs, &nctx, 5);
+    } else {
+        encode_mb_type_i(&mut cs.enc, &mut cs.ctxs, &nctx, 0);
+    }
+    // §7.3.5 — transform_size_8x8_flag right after mb_type for I_NxN.
+    encode_transform_size_8x8_flag(&mut cs.enc, &mut cs.ctxs, &nctx, true);
+    for blk8 in 0..4 {
+        encode_prev_intra_pred_mode_flag(&mut cs.enc, &mut cs.ctxs, cand.prev_flag[blk8]);
+        if !cand.prev_flag[blk8] {
+            encode_rem_intra_pred_mode(&mut cs.enc, &mut cs.ctxs, u32::from(cand.rem[blk8]));
+        }
+    }
+    if matches!(g.cf, 1 | 2) {
+        encode_intra_chroma_pred_mode(&mut cs.enc, &mut cs.ctxs, &nctx, cand.chroma_mode as u32);
+    }
+    encode_coded_block_pattern(
+        &mut cs.enc,
+        &mut cs.ctxs,
+        &nctx,
+        g.cf,
+        cand.cbp_luma,
+        cand.cbp_chroma,
+    );
+    if cand.cbp_luma > 0 || cand.cbp_chroma > 0 {
+        encode_mb_qp_delta(&mut cs.enc, &mut cs.ctxs, cs.prev_qp_delta_nonzero, 0);
+    }
+    cs.prev_qp_delta_nonzero = false;
+    let mut cur = CabacMbNeighbourInfo {
+        is_intra: true,
+        is_i_nxn: true,
+        coded_block_pattern_luma: cand.cbp_luma,
+        coded_block_pattern_chroma: cand.cbp_chroma,
+        intra_chroma_pred_mode: cand.chroma_mode,
+        transform_size_8x8_flag: true,
+        ..Default::default()
+    };
+    // §7.3.5.3.3 — one ctxBlockCat-5 residual per coded quadrant,
+    // coded_block_flag inferred (ChromaArrayType 0 / 1 / 2) and folded
+    // into the four 4x4 slots.
+    for (blk8, list) in cand.scan8.iter().enumerate() {
+        if (cand.cbp_luma >> blk8) & 1 == 0 {
+            continue;
+        }
+        let coded = encode_residual_block_cabac_field(
+            &mut cs.enc,
+            &mut cs.ctxs,
+            BlockType::Luma8x8,
+            list,
+            64,
+            None,
+            None,
+            true,
+            1,
+            false,
+        );
+        for sub in 0..4usize {
+            cur.cbf_luma_4x4[blk8 * 4 + sub] = coded;
+        }
+    }
+    if let Some((cu, cv)) = &cand.chroma {
+        let n_blk = g.ct_h / 4 * 2;
+        emit_chroma_cabac(
+            cs,
+            cab,
+            &mut cur,
+            addr,
+            false,
+            true,
+            cand.cbp_chroma,
+            &cu.dc,
+            &cv.dc,
+            &cu.ac[..n_blk],
+            &cv.ac[..n_blk],
+            g.cf,
+        );
+    }
+    cur.available = true;
+    cab.mbs[addr] = cur;
+}
+
+/// Store an Intra_8x8 candidate's reconstruction; returns the deblock
+/// facts (§8.7: `transform_size_8x8_flag` leaves the 4x4-only edges
+/// unfiltered).
+fn recon_i8x8(
+    g: Geom,
+    recon: &mut Pic,
+    mb_x: usize,
+    mb_y: usize,
+    cand: &I8x8Cand,
+    qp_y: i32,
+) -> MbDeblockInfo {
+    for j in 0..16 {
+        recon.y[(mb_y * 16 + j) * g.w + mb_x * 16..][..16]
+            .copy_from_slice(&cand.recon[j * 16..j * 16 + 16]);
+    }
+    if let Some((cu, cv)) = &cand.chroma {
+        let pick = |c: &ChromaChain| -> Vec<i32> {
+            match cand.cbp_chroma {
+                2 => c.recon_full.clone(),
+                1 => c.recon_dc.clone(),
+                _ => vec![0; c.recon_full.len()],
+            }
+        };
+        recon.store_chroma(g, false, mb_x, mb_y, &cand.pred_u, &pick(cu));
+        recon.store_chroma(g, true, mb_x, mb_y, &cand.pred_v, &pick(cv));
+    }
+    let nz: [bool; 16] = std::array::from_fn(|blk| (cand.cbp_luma >> (blk / 4)) & 1 == 1);
+    MbDeblockInfo {
+        is_intra: true,
+        qp_y,
+        luma_nonzero_4x4: luma_nz_mask_from_blocks(&nz),
+        chroma_nonzero_4x4: 0,
+        transform_size_8x8_flag: true,
+        ref_idx_l0: [-1; 4],
+        ref_poc_l0: [i32::MIN; 4],
+        ..Default::default()
+    }
+}
+
+/// Offer the I_NxN candidates inside P pictures.
+const I_NXN_IN_P: bool = false;
+
+/// The intra macroblock elected inside a P picture.
+enum IntraChoice {
+    I16x16(Box<IntraCand>),
+    I4x4(Box<I4x4Cand>),
+    I8x8(Box<I8x8Cand>),
 }
 
 /// Coding kind of one picture coded through [`DeepSession`].
@@ -2581,6 +3295,8 @@ const EMPTY_8X8: [[i32; 64]; 4] = [[0; 64]; 4];
 pub struct DeepSession {
     cfg: DeepConfig,
     g: Geom,
+    /// Coded grid + SPS cropping for `cfg.width` x `cfg.height`.
+    coded: CodedGeometry,
     profile_idc: u8,
     sps_nal: Vec<u8>,
     pps_nal: Vec<u8>,
@@ -2597,15 +3313,19 @@ pub struct DeepSession {
     skipped_mbs: usize,
     intra_mbs_in_p: usize,
     mbs_8x8: usize,
-    /// Round-475 — offer the Intra_4x4 (I_NxN) candidate in I pictures.
+    /// Round-475 — offer the Intra_4x4 (I_NxN) candidate.
     intra_4x4: bool,
     i4x4_mbs: usize,
+    /// Round-488 — offer the Intra_8x8 candidate (needs
+    /// `DeepConfig::transform_8x8`).
+    intra_8x8: bool,
+    i8x8_mbs: usize,
 }
 
 impl DeepSession {
     /// Create a session at the §A.2 minimum profile for the layout
     /// ([`min_profile_idc`]). Panics on an inconsistent config
-    /// (non-mod-16 dimensions, bit depths outside 8..=14,
+    /// (dimensions off the §7.4.2.1.1 crop unit, bit depths outside 8..=14,
     /// `chroma_format_idc` outside 1..=3, QP outside
     /// `−QpBdOffsetY..=51`, lossless with QP′Y ≠ 0).
     pub fn new(cfg: DeepConfig) -> Self {
@@ -2622,16 +3342,12 @@ impl DeepSession {
     /// 110 / 122 / 244). Panics unless [`profile_admits`] the layout.
     pub fn with_profile(cfg: DeepConfig, profile_idc: u8) -> Self {
         assert!(
-            cfg.width.is_multiple_of(16) && cfg.height.is_multiple_of(16),
-            "MB-aligned dims"
-        );
-        assert!(
             (8..=14).contains(&cfg.bit_depth_luma) && (8..=14).contains(&cfg.bit_depth_chroma),
             "bit depths 8..=14"
         );
         assert!(
-            matches!(cfg.chroma_format_idc, 1..=3),
-            "chroma_format_idc 1..=3"
+            matches!(cfg.chroma_format_idc, 0..=3),
+            "chroma_format_idc 0..=3"
         );
         assert!(
             profile_admits(
@@ -2647,9 +3363,12 @@ impl DeepSession {
             cfg.bit_depth_chroma,
             cfg.lossless
         );
-        let (w, h) = (cfg.width as usize, cfg.height as usize);
         let cf = cfg.chroma_format_idc;
+        let coded = CodedGeometry::new(cfg.width, cfg.height, cf, true)
+            .unwrap_or_else(|e| panic!("picture size {}x{}: {e}", cfg.width, cfg.height));
+        let (w, h) = (coded.coded_width as usize, coded.coded_height as usize);
         let (ct_w, ct_h) = match cf {
+            0 => (0, 0),
             1 => (8, 8),
             2 => (8, 16),
             _ => (16, 16),
@@ -2706,6 +3425,7 @@ impl DeepSession {
                 interlaced_fields: false,
                 mbaff: false,
                 vui: None,
+                frame_cropping: coded.cropping.clone(),
             },
             cfg.lossless,
         );
@@ -2728,6 +3448,7 @@ impl DeepSession {
         Self {
             cfg,
             g,
+            coded,
             profile_idc,
             sps_nal: build_nal_unit(3, NalUnitType::Sps, &sps),
             pps_nal: build_nal_unit(3, NalUnitType::Pps, &pps),
@@ -2746,17 +3467,45 @@ impl DeepSession {
             mbs_8x8: 0,
             intra_4x4: false,
             i4x4_mbs: 0,
+            intra_8x8: false,
+            i8x8_mbs: 0,
         }
     }
 
-    /// Round-475 — enable the Intra_4x4 (I_NxN) candidate in I
-    /// pictures: per macroblock the block-sequential §8.3.1 prediction
-    /// competes with Intra_16x16 on `Σ (SAD + mode bits · λ)`. Off by
-    /// default ([`encode_deep_sequence`] stays Intra_16x16-only); the
-    /// registry encoder turns it on.
+    /// Round-475 — enable the Intra_4x4 (I_NxN) candidate: per
+    /// macroblock the block-sequential §8.3.1 prediction competes with
+    /// Intra_16x16 on `Σ (SAD + mode bits · λ)` — in I pictures at
+    /// every chroma format and (round 488) as an intra alternative
+    /// inside P pictures at ChromaArrayType 0 / 1 / 2
+    /// (`DeepConfig::intra_in_p`). Off by default
+    /// ([`encode_deep_sequence`] stays Intra_16x16-only); the registry
+    /// encoder turns it on.
     pub fn with_intra_4x4(mut self, on: bool) -> Self {
         self.intra_4x4 = on;
         self
+    }
+
+    /// Round-488 — enable the Intra_8x8 candidate (I_NxN with
+    /// `transform_size_8x8_flag = 1`): §8.3.2 prediction from the
+    /// filtered reference samples and the 8x8 transform at QP′, at
+    /// every bit depth 8..=14, in I pictures and as an intra
+    /// alternative inside P pictures. Takes effect only with
+    /// [`DeepConfig::transform_8x8`] (the PPS must carry
+    /// `transform_8x8_mode_flag`) and at ChromaArrayType 0 / 1 / 2.
+    /// Off by default; the registry encoder turns it on.
+    pub fn with_intra_8x8(mut self, on: bool) -> Self {
+        self.intra_8x8 = on;
+        self
+    }
+
+    /// Whether the Intra_8x8 candidate is offered.
+    pub fn intra_8x8(&self) -> bool {
+        self.intra_8x8
+    }
+
+    /// Macroblocks coded Intra_8x8 so far.
+    pub fn i8x8_mbs(&self) -> usize {
+        self.i8x8_mbs
     }
 
     /// Whether the Intra_4x4 candidate is offered.
@@ -2851,7 +3600,26 @@ impl DeepSession {
         let poc_lsb_bits = self.poc_lsb_bits;
         let w4 = ScalingMatrixMode::Flat.intra_weights().w4;
         let w8 = ScalingMatrixMode::Flat.inter_weights().w8;
-        let src = Pic::from_u16(g, fy, fu, fv);
+        let src = if self.coded.is_padded() {
+            // §7.4.2.1.1 — code the padded grid; the SPS crops it back.
+            let (dw, dh) = (cfg.width as usize, cfg.height as usize);
+            let (dcw, dch) = (dw * g.ct_w / 16, dh * g.ct_h / 16);
+            let pad_c = |p: &[u16]| {
+                if g.mono() {
+                    Vec::new()
+                } else {
+                    self.coded.pad_plane(p, dcw, dch, g.cw, g.ch)
+                }
+            };
+            Pic::from_u16(
+                g,
+                &self.coded.pad_plane(fy, dw, dh, g.w, g.h),
+                &pad_c(fu),
+                &pad_c(fv),
+            )
+        } else {
+            Pic::from_u16(g, fy, fu, fv)
+        };
         let is_p = pic_kind == DeepPictureKind::P;
         let frame_num = frame_num % (1 << frame_num_bits);
         let mut sw = BitWriter::new();
@@ -2934,7 +3702,10 @@ impl DeepSession {
         let mut i4_grid = I4x4Grid::new(g.w_mbs, h_mbs);
         let lambda = lambda_sad(qp_y_prime);
         let t8x8_mode = cfg.transform_8x8 && cf != 3;
-        let offer_i4x4 = self.intra_4x4 && !is_p;
+        // In P pictures the I_NxN writers cover ChromaArrayType 0 / 1 / 2.
+        let offer_i4x4 = self.intra_4x4 && (!is_p || (I_NXN_IN_P && cfg.intra_in_p && cf != 3));
+        let offer_i8x8 = self.intra_8x8 && t8x8_mode && (!is_p || (I_NXN_IN_P && cfg.intra_in_p));
+        let w8_intra = ScalingMatrixMode::Flat.intra_weights().w8;
 
         for mb_y in 0..h_mbs {
             for mb_x in 0..g.w_mbs {
@@ -2944,21 +3715,43 @@ impl DeepSession {
                         g, &src, &recon, mb_x, mb_y, qp_y_prime, qp_c_prime, &w4, bypass,
                         allow_dpcm,
                     );
-                    // Round-475 — Intra_4x4 competes on prediction cost:
-                    // `Σ (SAD + bits · λ)` over its 16 blocks against the
-                    // Intra_16x16 SAD plus its ~4 bits of mode syntax.
+                    // Intra_4x4 (round 475) and Intra_8x8 (round 488)
+                    // compete on prediction cost: `Σ (SAD + bits · λ)`
+                    // over their blocks against the Intra_16x16 SAD plus
+                    // its ~4 bits of mode syntax.
                     let cand4 = offer_i4x4.then(|| {
                         intra4x4_candidate(
                             g, &src, &recon, &i4_grid, mb_x, mb_y, qp_y_prime, qp_c_prime, &w4,
                             bypass, allow_dpcm, lambda,
                         )
                     });
-                    if let Some(c4) = cand4.filter(|c4| c4.cost < cand.sad + 4 * lambda) {
+                    let cand8 = offer_i8x8.then(|| {
+                        intra8x8_candidate(
+                            g, &src, &recon, &i4_grid, mb_x, mb_y, qp_y_prime, qp_c_prime, &w4,
+                            &w8_intra, bypass, allow_dpcm, lambda,
+                        )
+                    });
+                    let cost16 = cand.sad + 4 * lambda;
+                    let cost4 = cand4.as_ref().map_or(u64::MAX, |c| c.cost);
+                    let cost8 = cand8.as_ref().map_or(u64::MAX, |c| c.cost);
+                    if let Some(c8) = cand8.filter(|_| cost8 < cost16 && cost8 <= cost4) {
                         if let Some(cs) = cs.as_mut() {
-                            emit_i4x4_cabac(g, cs, &mut cab, mb_addr, &c4, t8x8_mode);
+                            emit_i8x8_cabac(g, cs, &mut cab, mb_addr, &c8, false);
                             encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
                         } else {
-                            emit_i4x4(g, &mut sw, &mut nc_grid, mb_addr, &c4, t8x8_mode);
+                            emit_i8x8(g, &mut sw, &mut nc_grid, mb_addr, &c8, false);
+                        }
+                        dbl[mb_addr as usize] = recon_i8x8(g, &mut recon, mb_x, mb_y, &c8, qp_y);
+                        i4_grid.mark(mb_x, mb_y, Some(c8.grid_modes()));
+                        self.i8x8_mbs += 1;
+                        continue;
+                    }
+                    if let Some(c4) = cand4.filter(|_| cost4 < cost16) {
+                        if let Some(cs) = cs.as_mut() {
+                            emit_i4x4_cabac(g, cs, &mut cab, mb_addr, &c4, t8x8_mode, false);
+                            encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
+                        } else {
+                            emit_i4x4(g, &mut sw, &mut nc_grid, mb_addr, &c4, t8x8_mode, false);
                         }
                         dbl[mb_addr as usize] = recon_i4x4(g, &mut recon, mb_x, mb_y, &c4, qp_y);
                         i4_grid.mark(mb_x, mb_y, Some(c4.modes));
@@ -3029,7 +3822,9 @@ impl DeepSession {
                 let mut cbp_chroma = 0u8;
                 let mut chroma: Option<(ChromaChain, ChromaChain)> = None;
                 let mut planes444: Option<(InterChain, InterChain)> = None;
-                if cf == 3 {
+                if cf == 0 {
+                    // ChromaArrayType 0 — luma only.
+                } else if cf == 3 {
                     let ru: [i32; 256] = ru.try_into().expect("256");
                     let rv: [i32; 256] = rv.try_into().expect("256");
                     let (cu, cv) = if bypass {
@@ -3088,6 +3883,7 @@ impl DeepSession {
                         pending_skip += 1;
                     }
                     mark_slot(&mut nc_grid, mb_addr, false, true);
+                    i4_grid.mark(mb_x, mb_y, None);
                     *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
                         available: true,
                         is_intra: false,
@@ -3109,13 +3905,36 @@ impl DeepSession {
                     };
                     continue;
                 }
-                // Intra alternative.
+                // Intra alternative: Intra_16x16, and Intra_4x4 /
+                // Intra_8x8 when offered, the cheapest prediction of
+                // the three against the inter SAD.
                 let intra = if cfg.intra_in_p {
                     let cand = intra_candidate(
                         g, &src, &recon, mb_x, mb_y, qp_y_prime, qp_c_prime, &w4, bypass,
                         allow_dpcm,
                     );
-                    (cand.sad + 64 < inter_sad).then_some(cand)
+                    let cand4 = offer_i4x4.then(|| {
+                        intra4x4_candidate(
+                            g, &src, &recon, &i4_grid, mb_x, mb_y, qp_y_prime, qp_c_prime, &w4,
+                            bypass, allow_dpcm, lambda,
+                        )
+                    });
+                    let cand8 = offer_i8x8.then(|| {
+                        intra8x8_candidate(
+                            g, &src, &recon, &i4_grid, mb_x, mb_y, qp_y_prime, qp_c_prime, &w4,
+                            &w8_intra, bypass, allow_dpcm, lambda,
+                        )
+                    });
+                    let cost16 = cand.sad + 4 * lambda;
+                    let cost4 = cand4.as_ref().map_or(u64::MAX, |c| c.cost);
+                    let cost8 = cand8.as_ref().map_or(u64::MAX, |c| c.cost);
+                    if let Some(c8) = cand8.filter(|_| cost8 < cost16 && cost8 <= cost4) {
+                        (cost8 + 64 < inter_sad).then_some(IntraChoice::I8x8(Box::new(c8)))
+                    } else if let Some(c4) = cand4.filter(|_| cost4 < cost16) {
+                        (cost4 + 64 < inter_sad).then_some(IntraChoice::I4x4(Box::new(c4)))
+                    } else {
+                        (cand.sad + 64 < inter_sad).then_some(IntraChoice::I16x16(Box::new(cand)))
+                    }
                 } else {
                     None
                 };
@@ -3126,18 +3945,47 @@ impl DeepSession {
                     sw.ue(pending_skip);
                     pending_skip = 0;
                 }
-                if let Some(cand) = intra {
+                if let Some(choice) = intra {
                     self.intra_mbs_in_p += 1;
-                    if let Some(cs) = cs.as_mut() {
-                        emit_intra_cabac(g, cs, &mut cab, mb_addr, &cand, true);
-                        encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
-                    } else {
-                        emit_intra(g, &mut sw, &mut nc_grid, mb_addr, &cand, true);
+                    match choice {
+                        IntraChoice::I16x16(cand) => {
+                            if let Some(cs) = cs.as_mut() {
+                                emit_intra_cabac(g, cs, &mut cab, mb_addr, &cand, true);
+                            } else {
+                                emit_intra(g, &mut sw, &mut nc_grid, mb_addr, &cand, true);
+                            }
+                            dbl[mb_addr as usize] = recon_intra(
+                                g, &mut recon, mb_x, mb_y, &cand, qp_y_prime, qp_c_prime, &w4,
+                            );
+                            dbl[mb_addr as usize].qp_y = qp_y;
+                            i4_grid.mark(mb_x, mb_y, None);
+                        }
+                        IntraChoice::I4x4(c4) => {
+                            if let Some(cs) = cs.as_mut() {
+                                emit_i4x4_cabac(g, cs, &mut cab, mb_addr, &c4, t8x8_mode, true);
+                            } else {
+                                emit_i4x4(g, &mut sw, &mut nc_grid, mb_addr, &c4, t8x8_mode, true);
+                            }
+                            dbl[mb_addr as usize] =
+                                recon_i4x4(g, &mut recon, mb_x, mb_y, &c4, qp_y);
+                            i4_grid.mark(mb_x, mb_y, Some(c4.modes));
+                            self.i4x4_mbs += 1;
+                        }
+                        IntraChoice::I8x8(c8) => {
+                            if let Some(cs) = cs.as_mut() {
+                                emit_i8x8_cabac(g, cs, &mut cab, mb_addr, &c8, true);
+                            } else {
+                                emit_i8x8(g, &mut sw, &mut nc_grid, mb_addr, &c8, true);
+                            }
+                            dbl[mb_addr as usize] =
+                                recon_i8x8(g, &mut recon, mb_x, mb_y, &c8, qp_y);
+                            i4_grid.mark(mb_x, mb_y, Some(c8.grid_modes()));
+                            self.i8x8_mbs += 1;
+                        }
                     }
-                    dbl[mb_addr as usize] = recon_intra(
-                        g, &mut recon, mb_x, mb_y, &cand, qp_y_prime, qp_c_prime, &w4,
-                    );
-                    dbl[mb_addr as usize].qp_y = qp_y;
+                    if let Some(cs) = cs.as_mut() {
+                        encode_end_of_slice_flag(&mut cs.enc, mb_addr as usize + 1 == n_mbs);
+                    }
                     *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
                         available: true,
                         is_intra: true,
@@ -3147,6 +3995,7 @@ impl DeepSession {
                     continue;
                 }
                 // P_L0_16x16.
+                i4_grid.mark(mb_x, mb_y, None);
                 mark_slot(&mut nc_grid, mb_addr, false, false);
                 let luma_nc = luma_nc_progressive(
                     &mut nc_grid,
@@ -3318,6 +4167,29 @@ impl DeepSession {
                     }
                     recon.store_chroma(g, false, mb_x, mb_y, &pred_u, &cu.recon);
                     recon.store_chroma(g, true, mb_x, mb_y, &pred_v, &cv.recon);
+                } else if let Some(cs) = cs.as_mut() {
+                    // ChromaArrayType 0 — luma residual only.
+                    emit_inter_cabac(
+                        g,
+                        cs,
+                        &mut cab,
+                        mb_addr,
+                        mvd,
+                        cbp_luma,
+                        0,
+                        &mcfg.luma_4x4_levels,
+                        None,
+                        None,
+                        t8x8_on.then(|| {
+                            (
+                                flag_8x8,
+                                t8x8_chain.as_ref().map(|c| &c.scan).unwrap_or(&EMPTY_8X8),
+                            )
+                        }),
+                    );
+                } else {
+                    write_p_l0_16x16_mb_chroma(&mut sw, &mcfg, 0, cf, ChromaWriteKind::Mono)
+                        .expect("CAVLC P MB");
                 }
                 let mut luma_res = luma.recon;
                 for (blk, &(bx, by)) in LUMA_4X4_BLK.iter().enumerate() {
@@ -3374,8 +4246,8 @@ impl DeepSession {
 
         if cfg.deblock {
             deblock_recon_deep(
-                cfg.width,
-                cfg.height,
+                g.w as u32,
+                g.h as u32,
                 &mut recon.y,
                 &mut recon.u,
                 &mut recon.v,
@@ -3387,7 +4259,23 @@ impl DeepSession {
             );
         }
 
-        let out = recon.to_u16();
+        let mut out = recon.to_u16();
+        if self.coded.is_padded() {
+            let (dw, dh) = (cfg.width as usize, cfg.height as usize);
+            let (dcw, dch) = (dw * g.ct_w / 16, dh * g.ct_h / 16);
+            let crop_c = |p: &[u16]| {
+                if g.mono() {
+                    Vec::new()
+                } else {
+                    crop_plane(p, g.cw, dcw, dch)
+                }
+            };
+            out = (
+                crop_plane(&out.0, g.w, dw, dh),
+                crop_c(&out.1),
+                crop_c(&out.2),
+            );
+        }
         self.prev = Some(recon);
         self.prev_poc = poc;
         DeepPicture {
@@ -3403,7 +4291,7 @@ impl DeepSession {
 /// picture is an IDR; later pictures are P pictures
 /// (`DeepConfig::p_frames`) or non-IDR I pictures. `frame_num` counts
 /// the pictures, POC is `2 · k`, the single IDR carries
-/// `idr_pic_id = 0`. Profile: High 10 (110) for 4:2:0 up to 10 bit,
+/// `idr_pic_id = 0`. Profile: High 10 (110) for 4:0:0 / 4:2:0 up to 10 bit,
 /// High 4:2:2 (122) for 4:2:2 up to 10 bit, High 4:4:4 Predictive
 /// (244) otherwise — and always 244 for lossless coding, whose SPS
 /// transform-bypass flag §A.2.4 – §A.2.6 forbid under the lesser
@@ -3413,7 +4301,7 @@ pub fn encode_deep_sequence(cfg: &DeepConfig, frames: &[(&[u16], &[u16], &[u16])
     let max_bd = cfg.bit_depth_luma.max(cfg.bit_depth_chroma);
     let profile_idc: u8 = match (cfg.chroma_format_idc, max_bd, cfg.lossless) {
         (_, _, true) => 244,
-        (1, 8..=10, _) => 110,
+        (0 | 1, 8..=10, _) => 110,
         (2, 8..=10, _) => 122,
         _ => 244,
     };

@@ -63,6 +63,8 @@ pub mod multiref;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod nal;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod pad;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod pps;
 pub mod rate_control;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -254,8 +256,9 @@ const LUMA_4X4_BLK: [(usize, usize); 16] = [
 ];
 
 /// One encoded YUV frame's worth of input planes. All planes are
-/// 8-bit, row-major. Width and height must be multiples of 16 (no
-/// cropping support yet).
+/// 8-bit, row-major. Width and height are the CODED size (multiples
+/// of 16); other picture sizes are padded to it and cropped back by the
+/// SPS (`EncoderConfig::crop_right` / `crop_bottom`, `encoder::pad`).
 ///
 /// Default chroma layout is 4:2:0 — `u` / `v` length is `(W/2) *
 /// (H/2)`. When the encoder is configured for 4:2:2
@@ -698,6 +701,21 @@ pub struct EncoderConfig {
     /// produces for a cross-parity field reference. Set by the
     /// `encoder::field` PAFF driver; leave 0 everywhere else.
     pub table_8_10_cy_offset: i32,
+    /// §7.4.2.1.1 — luma columns cropped from the right edge of the
+    /// coded picture (`frame_crop_right_offset * CropUnitX`); must be a
+    /// multiple of `CropUnitX` (2 at 4:2:0 / 4:2:2, else 1) and less
+    /// than `width`. `width` / `height` stay the CODED size (multiples
+    /// of 16): a caller coding a `W x H` picture pads its planes to the
+    /// coded size (see `encoder::pad`) and sets `crop_right = width −
+    /// W`, `crop_bottom = height − H`; the decoder outputs `W x H`.
+    /// Default 0. [`session::EncoderSession`] and the registry encoder
+    /// do both steps themselves.
+    pub crop_right: u32,
+    /// §7.4.2.1.1 — luma rows cropped from the bottom edge
+    /// (`frame_crop_bottom_offset * CropUnitY`; `CropUnitY` is 2 at
+    /// 4:2:0, else 1 — this encoder codes `frame_mbs_only_flag = 1`).
+    /// Default 0.
+    pub crop_bottom: u32,
 }
 
 impl EncoderConfig {
@@ -855,6 +873,20 @@ impl EncoderConfig {
         self
     }
 
+    /// Set [`EncoderConfig::crop_right`].
+    #[must_use]
+    pub fn with_crop_right(mut self, v: u32) -> Self {
+        self.crop_right = v;
+        self
+    }
+
+    /// Set [`EncoderConfig::crop_bottom`].
+    #[must_use]
+    pub fn with_crop_bottom(mut self, v: u32) -> Self {
+        self.crop_bottom = v;
+        self
+    }
+
     /// Set [`EncoderConfig::table_8_10_cy_offset`].
     #[must_use]
     pub fn with_table_8_10_cy_offset(mut self, v: i32) -> Self {
@@ -891,6 +923,8 @@ impl EncoderConfig {
             transform_8x8: false,
             scaling_matrix: ScalingMatrixMode::default(),
             table_8_10_cy_offset: 0,
+            crop_right: 0,
+            crop_bottom: 0,
         }
     }
 }
@@ -1528,6 +1562,23 @@ impl InterMbStateSnapshot {
 }
 
 impl Encoder {
+    /// §7.4.2.1.1 — the SPS cropping offsets for the configured
+    /// `crop_right` / `crop_bottom` (in `CropUnitX` / `CropUnitY`).
+    fn frame_cropping(&self) -> Option<crate::sps::FrameCropping> {
+        let (right, bottom) = (self.cfg.crop_right, self.cfg.crop_bottom);
+        if right == 0 && bottom == 0 {
+            return None;
+        }
+        // ChromaArrayType is 0 for a separate-colour-plane encoder.
+        let (cux, cuy) = pad::crop_units(self.cfg.chroma_format_idc, true);
+        Some(crate::sps::FrameCropping {
+            left: 0,
+            right: right / cux,
+            top: 0,
+            bottom: bottom / cuy,
+        })
+    }
+
     /// §7.3.2.1 / §7.3.2.2 — the SPS and PPS RBSPs this encoder's IDR
     /// access units carry, for `cabac` (`entropy_coding_mode_flag`)
     /// off or on. Exactly the bytes [`Self::encode_idr`] /
@@ -1568,6 +1619,7 @@ impl Encoder {
             // Round-430 — rate-controlled sessions annotate CBR
             // streams with §E.1.1 VUI timing + §E.1.2 NAL HRD.
             vui: self.cfg.vui.clone(),
+            frame_cropping: self.frame_cropping(),
         };
         let pps_cfg = BaselinePpsConfig {
             redundant_pic_cnt_present_flag: false,
@@ -1657,6 +1709,17 @@ impl Encoder {
             "encoder requires 16-pixel-aligned dimensions",
         );
         assert!((0..=51).contains(&cfg.qp));
+        {
+            let (cux, cuy) = pad::crop_units(cfg.chroma_format_idc, true);
+            assert!(
+                cfg.crop_right < cfg.width.max(1)
+                    && cfg.crop_bottom < cfg.height.max(1)
+                    && cfg.crop_right.is_multiple_of(cux)
+                    && cfg.crop_bottom.is_multiple_of(cuy),
+                "crop_right / crop_bottom must be multiples of the §7.4.2.1.1 crop unit \
+                 ({cux} x {cuy}) and smaller than the coded picture",
+            );
+        }
         assert!(
             matches!(cfg.chroma_format_idc, 0..=3),
             "encoder only supports 4:0:0 (chroma_format_idc=0), 4:2:0 \

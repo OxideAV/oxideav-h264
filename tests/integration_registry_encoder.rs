@@ -204,10 +204,15 @@ fn invalid_configs_error_cleanly() {
     p.options.insert("max_bitrate", "100000");
     assert!(ctx.codecs.first_encoder(&p).is_err());
 
-    // Non-mod-16 geometry.
+    // Geometry off the 4:2:0 sampling grid (odd width); a size that
+    // merely is not a whole number of macroblocks is coded with the
+    // §7.4.2.1.1 cropping rectangle.
+    let mut p = base_params();
+    p.width = Some(101);
+    assert!(ctx.codecs.first_encoder(&p).is_err());
     let mut p = base_params();
     p.width = Some(100);
-    assert!(ctx.codecs.first_encoder(&p).is_err());
+    assert!(ctx.codecs.first_encoder(&p).is_ok());
 
     // Bad QP.
     let mut p = base_params();

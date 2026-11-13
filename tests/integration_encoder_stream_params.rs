@@ -234,9 +234,9 @@ fn unsupported_shapes_leave_the_encoder_unchanged() {
         enc.send_frame(&event(64, 48, PixelFormat::Yuv420P10Le)),
         Err(Error::Unsupported(_))
     ));
-    // Not 16-aligned.
+    // Off the 4:2:0 sampling grid (odd width).
     assert!(matches!(
-        enc.send_frame(&event(70, 46, PixelFormat::Yuv420P)),
+        enc.send_frame(&event(71, 46, PixelFormat::Yuv420P)),
         Err(Error::Unsupported(_))
     ));
     assert_eq!(enc.output_params().width, Some(64));

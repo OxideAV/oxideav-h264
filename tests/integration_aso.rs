@@ -50,6 +50,7 @@ fn parameter_sets() -> Vec<u8> {
         interlaced_fields: false,
         mbaff: false,
         vui: None,
+        frame_cropping: None,
     });
     let pps = build_baseline_pps_rbsp(&BaselinePpsConfig {
         redundant_pic_cnt_present_flag: false,
