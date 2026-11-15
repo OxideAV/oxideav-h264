@@ -46,6 +46,7 @@ pub mod deblock;
 pub mod deep;
 #[doc(hidden)]
 pub mod field;
+pub(crate) mod halfpel;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod intra4x4;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -6698,25 +6699,23 @@ impl Encoder {
         } else {
             &me_plane
         };
-        // Under a thread budget, every macroblock's motion search
-        // (16x16 and the four 8x8 cells) runs ahead of the loop.
-        let _plan = (self.cfg.threads > 1).then(|| {
-            plan::MotionPlan::install(
-                frame.y,
-                self.cfg.width as usize,
-                me_luma,
-                prev.width as usize,
-                prev.width,
-                prev.height,
-                width_mbs as usize,
-                height_mbs as usize,
-                plan::PlanSpec {
-                    range: (16, 16),
-                    cell_range: Some((16, 16)),
-                },
-                self.cfg.threads,
-            )
-        });
+        // Every macroblock's motion search (16x16 and the four 8x8
+        // cells) runs ahead of the loop, on the thread budget.
+        let _plan = plan::MotionPlan::install(
+            frame.y,
+            self.cfg.width as usize,
+            me_luma,
+            prev.width as usize,
+            prev.width,
+            prev.height,
+            width_mbs as usize,
+            height_mbs as usize,
+            plan::PlanSpec {
+                range: (16, 16),
+                cell_range: Some((16, 16)),
+            },
+            self.cfg.threads,
+        );
 
         let mut sw = BitWriter::new();
         write_p_slice_header(
@@ -11849,19 +11848,17 @@ impl Encoder {
             _ => (self.cfg.height / 2) as usize,
         };
 
-        // Under a thread budget, both lists' motion searches of every
-        // macroblock run ahead of the loop.
-        let _plans = (self.cfg.threads > 1).then(|| {
-            plan::install_b(
-                frame.y,
-                width,
-                ref_l0,
-                ref_l1,
-                width_mbs as usize,
-                height_mbs as usize,
-                self.cfg.threads,
-            )
-        });
+        // Both lists' motion searches of every macroblock run ahead of
+        // the loop, on the thread budget.
+        let _plans = plan::install_b(
+            frame.y,
+            width,
+            ref_l0,
+            ref_l1,
+            width_mbs as usize,
+            height_mbs as usize,
+            self.cfg.threads,
+        );
 
         // SPS/PPS are not re-emitted for non-IDR slices.
         let mut stream: Vec<u8> = Vec::new();

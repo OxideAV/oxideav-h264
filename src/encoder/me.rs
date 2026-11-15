@@ -46,6 +46,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::encoder::bitstream::BitWriter;
+use crate::encoder::halfpel::HalfPel;
 use crate::encoder::refwin::RefWindow;
 
 /// Result of motion estimation for one MB partition.
@@ -484,11 +485,16 @@ pub fn search_quarter_pel_16x16(
         return r;
     }
     quarter_pel_16x16_search(
-        src_y, src_stride, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, range_x, range_y,
+        src_y, src_stride, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, range_x, range_y, None,
     )
 }
 
-/// The three-stage 16x16 search itself (no plan consulted).
+/// The three-stage 16x16 search itself (no plan consulted). With
+/// half-sample planes of the reference (`hp`) the two refinement
+/// stages read their predictions from the planes; the candidates, their
+/// order and the tie-breaks are those of [`refine_half_pel_16x16`] and
+/// [`refine_quarter_pel_16x16`], and so is the result.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn quarter_pel_16x16_search(
     src_y: &[u8],
     src_stride: usize,
@@ -500,11 +506,32 @@ pub(crate) fn quarter_pel_16x16_search(
     mb_y: usize,
     range_x: i32,
     range_y: i32,
+    hp: Option<&HalfPel>,
 ) -> MeResult {
     let (src_w, src_h) = (0u32, 0u32);
-    let half_best = search_half_pel_16x16(
+    let int_best = search_integer_16x16(
         src_y, src_stride, src_w, src_h, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, range_x,
         range_y,
+    );
+    if let Some(hp) = hp
+        && let Some(r) = refine_16x16_on_planes(src_y, src_stride, hp, mb_x, mb_y, int_best)
+    {
+        return r;
+    }
+    let half_best = refine_half_pel_16x16(
+        src_y,
+        src_stride,
+        src_w,
+        src_h,
+        ref_y,
+        ref_stride,
+        ref_w,
+        ref_h,
+        mb_x,
+        mb_y,
+        int_best.mv_x,
+        int_best.mv_y,
+        int_best.sad,
     );
     refine_quarter_pel_16x16(
         src_y,
@@ -521,6 +548,60 @@ pub(crate) fn quarter_pel_16x16_search(
         half_best.mv_y,
         half_best.sad,
     )
+}
+
+/// The eight neighbours at distance `step` (quarter samples) of a
+/// refinement stage, in the order both block sizes try them.
+fn stage_offsets(step: i32) -> [(i32, i32); 8] {
+    [
+        (-step, -step),
+        (0, -step),
+        (step, -step),
+        (-step, 0),
+        (step, 0),
+        (-step, step),
+        (0, step),
+        (step, step),
+    ]
+}
+
+/// Half-sample then quarter-sample refinement of a 16x16 integer
+/// result on half-sample planes: each stage tries the eight neighbours
+/// of the stage's starting vector. `None` if a candidate reaches
+/// beyond the planes' padding.
+fn refine_16x16_on_planes(
+    src_y: &[u8],
+    src_stride: usize,
+    hp: &HalfPel,
+    mb_x: usize,
+    mb_y: usize,
+    start: MeResult,
+) -> Option<MeResult> {
+    let (ox, oy) = (mb_x * 16, mb_y * 16);
+    let mut best = start;
+    for step in [2i32, 1] {
+        let centre = best;
+        let mut best_cost = centre.mv_x.unsigned_abs() + centre.mv_y.unsigned_abs();
+        for (dx, dy) in stage_offsets(step) {
+            let (mv_x, mv_y) = (centre.mv_x + dx, centre.mv_y + dy);
+            let sad = hp.sad::<16>(
+                src_y,
+                src_stride,
+                ox,
+                oy,
+                ox as i32 + (mv_x >> 2),
+                oy as i32 + (mv_y >> 2),
+                (mv_x & 3) as u8,
+                (mv_y & 3) as u8,
+            )?;
+            let cost = mv_x.unsigned_abs() + mv_y.unsigned_abs();
+            if sad < best.sad || (sad == best.sad && cost < best_cost) {
+                best = MeResult { mv_x, mv_y, sad };
+                best_cost = cost;
+            }
+        }
+    }
+    Some(best)
 }
 
 /// Trial-encode the L0 P_L0_16x16 mb_pred syntax (mb_type + mvd_l0)
@@ -669,11 +750,12 @@ pub fn search_quarter_pel_8x8(
     }
     quarter_pel_8x8_search(
         src_y, src_stride, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, sub_x, sub_y, range_x,
-        range_y,
+        range_y, None,
     )
 }
 
-/// The three-stage 8x8 search itself (no plan consulted).
+/// The three-stage 8x8 search itself (no plan consulted); `hp` as in
+/// [`quarter_pel_16x16_search`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn quarter_pel_8x8_search(
     src_y: &[u8],
@@ -688,6 +770,7 @@ pub(crate) fn quarter_pel_8x8_search(
     sub_y: usize,
     range_x: i32,
     range_y: i32,
+    hp: Option<&HalfPel>,
 ) -> MeResult {
     let ref_w_i = ref_w as i32;
     let ref_h_i = ref_h as i32;
@@ -716,76 +799,111 @@ pub(crate) fn quarter_pel_8x8_search(
             }
         }
     }
+    refine_8x8(
+        src_y, src_stride, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, sub_x, sub_y, best_dx,
+        best_dy, best_sad, hp,
+    )
+}
+
+/// The half-sample and quarter-sample stages of the 8x8 search, from
+/// the integer winner `(best_dx, best_dy)` (whole samples) with SAD
+/// `best_sad`.
+#[allow(clippy::too_many_arguments)]
+fn refine_8x8(
+    src_y: &[u8],
+    src_stride: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+    best_dx: i32,
+    best_dy: i32,
+    mut best_sad: u32,
+    hp: Option<&HalfPel>,
+) -> MeResult {
+    let centre_x = (mb_x * 16 + sub_x * 8) as i32;
+    let centre_y = (mb_y * 16 + sub_y * 8) as i32;
     let mut best_mv_x = best_dx * 4;
     let mut best_mv_y = best_dy * 4;
 
-    // One reference window serves both refinement passes. Each pass
-    // steps from the running best (a candidate that wins moves the
-    // centre of the ones after it), so the half-pel pass can travel up
-    // to 6 quarter-samples per axis and the quarter-pel pass 3 more:
-    // integer positions within −3..=+2 of the integer winner.
-    let window = RefWindow::for_luma(
-        ref_y,
-        ref_stride,
-        ref_w as usize,
-        ref_h as usize,
-        centre_x + best_dx,
-        centre_y + best_dy,
-        8,
-        8,
-        3,
-    );
-
-    // 2. Half-pel refinement.
-    let mut best_mv_cost = (best_mv_x.unsigned_abs()) + (best_mv_y.unsigned_abs());
-    const HALF_OFFS: [(i32, i32); 8] = [
-        (-2, -2),
-        (0, -2),
-        (2, -2),
-        (-2, 0),
-        (2, 0),
-        (-2, 2),
-        (0, 2),
-        (2, 2),
-    ];
-    for &(dx, dy) in &HALF_OFFS {
-        let mv_x = best_mv_x + dx;
-        let mv_y = best_mv_y + dy;
-        let sad = sad_8x8_at_qpel(
-            src_y, src_stride, mb_x, mb_y, sub_x, sub_y, &window, mv_x, mv_y,
-        );
-        let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
-        if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
-            best_sad = sad;
-            best_mv_x = mv_x;
-            best_mv_y = mv_y;
-            best_mv_cost = mv_cost;
+    // The two refinement stages step from the running best (a
+    // candidate that wins moves the centre of the ones after it), so
+    // the half-sample stage can travel up to 6 quarter samples per axis
+    // and the quarter-sample stage 3 more: integer positions within
+    // −3..=+2 of the integer winner. Without half-sample planes one
+    // reference window serves both stages.
+    let window = if hp.is_none() {
+        Some(RefWindow::for_luma(
+            ref_y,
+            ref_stride,
+            ref_w as usize,
+            ref_h as usize,
+            centre_x + best_dx,
+            centre_y + best_dy,
+            8,
+            8,
+            3,
+        ))
+    } else {
+        None
+    };
+    let (ox, oy) = (mb_x * 16 + sub_x * 8, mb_y * 16 + sub_y * 8);
+    let qpel_sad = |mv_x: i32, mv_y: i32| -> u32 {
+        let on_planes = hp.and_then(|hp| {
+            hp.sad::<8>(
+                src_y,
+                src_stride,
+                ox,
+                oy,
+                ox as i32 + (mv_x >> 2),
+                oy as i32 + (mv_y >> 2),
+                (mv_x & 3) as u8,
+                (mv_y & 3) as u8,
+            )
+        });
+        match (on_planes, &window) {
+            (Some(sad), _) => sad,
+            (None, Some(w)) => {
+                sad_8x8_at_qpel(src_y, src_stride, mb_x, mb_y, sub_x, sub_y, w, mv_x, mv_y)
+            }
+            (None, None) => {
+                // A candidate beyond the planes' padding: its own
+                // window.
+                let w = RefWindow::for_luma(
+                    ref_y,
+                    ref_stride,
+                    ref_w as usize,
+                    ref_h as usize,
+                    ox as i32 + (mv_x >> 2),
+                    oy as i32 + (mv_y >> 2),
+                    8,
+                    8,
+                    0,
+                );
+                sad_8x8_at_qpel(src_y, src_stride, mb_x, mb_y, sub_x, sub_y, &w, mv_x, mv_y)
+            }
         }
-    }
+    };
 
-    // 3. Quarter-pel refinement.
-    const QUARTER_OFFS: [(i32, i32); 8] = [
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-        (-1, 0),
-        (1, 0),
-        (-1, 1),
-        (0, 1),
-        (1, 1),
-    ];
-    for &(dx, dy) in &QUARTER_OFFS {
-        let mv_x = best_mv_x + dx;
-        let mv_y = best_mv_y + dy;
-        let sad = sad_8x8_at_qpel(
-            src_y, src_stride, mb_x, mb_y, sub_x, sub_y, &window, mv_x, mv_y,
-        );
-        let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
-        if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
-            best_sad = sad;
-            best_mv_x = mv_x;
-            best_mv_y = mv_y;
-            best_mv_cost = mv_cost;
+    let mut best_mv_cost = (best_mv_x.unsigned_abs()) + (best_mv_y.unsigned_abs());
+    // Half-sample stage (±2 quarter samples), then quarter-sample
+    // stage (±1).
+    for step in [2i32, 1] {
+        for (dx, dy) in stage_offsets(step) {
+            let mv_x = best_mv_x + dx;
+            let mv_y = best_mv_y + dy;
+            let sad = qpel_sad(mv_x, mv_y);
+            let mv_cost = (mv_x.unsigned_abs()) + (mv_y.unsigned_abs());
+            if sad < best_sad || (sad == best_sad && mv_cost < best_mv_cost) {
+                best_sad = sad;
+                best_mv_x = mv_x;
+                best_mv_y = mv_y;
+                best_mv_cost = mv_cost;
+            }
         }
     }
 
@@ -794,6 +912,144 @@ pub(crate) fn quarter_pel_8x8_search(
         mv_y: best_mv_y,
         sad: best_sad,
     }
+}
+
+/// Integer full search of a macroblock and of its four 8x8 cells in
+/// one pass, then each one's sub-sample refinement — the results of
+/// [`quarter_pel_16x16_search`] at `range` and of
+/// [`quarter_pel_8x8_search`] at `cell_range` for the four cells
+/// (with `cell_range == None` the cells are not searched and their
+/// results are not meaningful).
+///
+/// A candidate's 16x16 SAD is the sum of its four 8x8 SADs, so one walk
+/// over the candidates serves all five searches: every candidate's four
+/// quadrant sums are computed in full (on the padded integer plane, no
+/// per-sample clamp), the macroblock's best is tracked on their total
+/// and each cell's best on its own sum while the candidate lies inside
+/// the cell range. Candidate order and tie-breaks are those of the
+/// separate searches. `None` when a candidate reaches beyond the
+/// planes' padding or the cell range exceeds the macroblock range (the
+/// caller then runs the separate searches).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn whole_and_cells_search(
+    src_y: &[u8],
+    src_stride: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    range: (i32, i32),
+    cell_range: Option<(i32, i32)>,
+    hp: &HalfPel,
+) -> Option<(MeResult, [MeResult; 4])> {
+    if range.0 < 0 || range.1 < 0 {
+        return None;
+    }
+    if let Some(c) = cell_range
+        && (c.0 > range.0 || c.1 > range.1)
+    {
+        return None;
+    }
+    // No cell search: a range no candidate lies in.
+    let with_cells = cell_range.is_some();
+    let cell_range = cell_range.unwrap_or((-1, -1));
+    let (ox, oy) = (mb_x * 16, mb_y * 16);
+    let (cols, rows) = ((2 * range.0 + 1) as usize, (2 * range.1 + 1) as usize);
+    let (g, gs) = hp.integer_block(
+        ox as i32 - range.0,
+        oy as i32 - range.1,
+        cols + 15,
+        rows + 15,
+    )?;
+    // The source macroblock, one fixed-size row at a time.
+    let src: [&[u8; 16]; 16] = std::array::from_fn(|r| {
+        src_y[(oy + r) * src_stride + ox..][..16]
+            .try_into()
+            .expect("source row")
+    });
+    // (SAD, |dx| + |dy|, dx, dy) of the best candidate so far.
+    type Best = (u32, u32, i32, i32);
+    let mut whole: Best = (u32::MAX, u32::MAX, 0, 0);
+    let mut cells: [Best; 4] = [(u32::MAX, u32::MAX, 0, 0); 4];
+    for cy in 0..rows {
+        let dy = cy as i32 - range.1;
+        let cell_row = dy.abs() <= cell_range.1;
+        for cx in 0..cols {
+            let dx = cx as i32 - range.0;
+            let base = &g[cy * gs + cx..];
+            let mut q = [0u32; 4];
+            for (half, qh) in q.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                // Per-column sums over the half's eight rows (at most
+                // 8 * 255 each), folded into the left and right cell
+                // once per half: sixteen independent lanes per row.
+                let mut cols16 = [0u16; 16];
+                for r in half * 8..half * 8 + 8 {
+                    let s = src[r];
+                    let c: &[u8; 16] = base[r * gs..][..16].try_into().expect("candidate row");
+                    for ((acc, &a), &b) in cols16.iter_mut().zip(s).zip(c) {
+                        *acc += u16::from(a.abs_diff(b));
+                    }
+                }
+                qh[0] = cols16[..8].iter().map(|&v| u32::from(v)).sum();
+                qh[1] = cols16[8..].iter().map(|&v| u32::from(v)).sum();
+            }
+            let cost = dx.unsigned_abs() + dy.unsigned_abs();
+            let total = q[0] + q[1] + q[2] + q[3];
+            if total < whole.0 || (total == whole.0 && cost < whole.1) {
+                whole = (total, cost, dx, dy);
+            }
+            if cell_row && dx.abs() <= cell_range.0 {
+                for (best, &sad) in cells.iter_mut().zip(&q) {
+                    if sad < best.0 || (sad == best.0 && cost < best.1) {
+                        *best = (sad, cost, dx, dy);
+                    }
+                }
+            }
+        }
+    }
+    let start = MeResult {
+        mv_x: whole.2 * 4,
+        mv_y: whole.3 * 4,
+        sad: whole.0,
+    };
+    let whole_result = match refine_16x16_on_planes(src_y, src_stride, hp, mb_x, mb_y, start) {
+        Some(r) => r,
+        None => {
+            let half = refine_half_pel_16x16(
+                src_y, src_stride, 0, 0, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, start.mv_x,
+                start.mv_y, start.sad,
+            );
+            refine_quarter_pel_16x16(
+                src_y, src_stride, 0, 0, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, half.mv_x,
+                half.mv_y, half.sad,
+            )
+        }
+    };
+    let cell_results = std::array::from_fn(|i| {
+        let (sad, _, dx, dy) = cells[i];
+        if !with_cells {
+            return start;
+        }
+        refine_8x8(
+            src_y,
+            src_stride,
+            ref_y,
+            ref_stride,
+            ref_w,
+            ref_h,
+            mb_x,
+            mb_y,
+            i % 2,
+            i / 2,
+            dx,
+            dy,
+            sad,
+            Some(hp),
+        )
+    });
+    Some((whole_result, cell_results))
 }
 
 #[cfg(test)]

@@ -8,6 +8,12 @@
 //! caller granted, and the loop finds each answer where it would have
 //! computed it. The coded stream does not depend on the thread count.
 //!
+//! Running the searches together also lets them share one filtering of
+//! the reference into half-sample planes ([`HalfPel`]), which the
+//! sub-sample refinement of every search reads instead of interpolating
+//! a block per candidate — so the picture encoders install a plan at
+//! every budget, one thread included.
+//!
 //! [`MotionPlan::install`] runs the searches for one (source,
 //! reference) pair and registers the results for the calling thread;
 //! the returned guard keeps both planes borrowed, so a result can
@@ -20,7 +26,10 @@
 use std::cell::RefCell;
 use std::marker::PhantomData;
 
-use crate::encoder::me::{MeResult, quarter_pel_8x8_search, quarter_pel_16x16_search};
+use crate::encoder::halfpel::HalfPel;
+use crate::encoder::me::{
+    MeResult, quarter_pel_8x8_search, quarter_pel_16x16_search, whole_and_cells_search,
+};
 
 /// One reference plane's searches for every macroblock of a picture.
 struct Layer {
@@ -90,9 +99,26 @@ impl<'a> MotionPlan<'a> {
         let n = width_mbs * height_mbs;
         let mut whole = vec![zero; n];
         let mut cells = vec![[zero; 4]; if spec.cell_range.is_some() { n } else { 0 }];
+        // The reference filtered once into half-sample planes: every
+        // refinement candidate of every search below reads them. The
+        // padding covers the integer range plus the refinement travel
+        // (up to 3 whole samples) and the filter's neighbour column.
+        let reach = spec.cell_range.map_or(spec.range, |c| {
+            (c.0.max(spec.range.0), c.1.max(spec.range.1))
+        });
+        let pad = reach.0.max(reach.1).max(0) as usize + 8;
+        let hp = HalfPel::new(
+            ref_y,
+            ref_stride,
+            ref_w as usize,
+            ref_h as usize,
+            pad,
+            threads,
+        );
+        let hp = &hp;
         let row_work = |mb_y: usize, whole_row: &mut [MeResult], cell_row: &mut [[MeResult; 4]]| {
-            for (mb_x, w) in whole_row.iter_mut().enumerate() {
-                *w = quarter_pel_16x16_search(
+            let separate_whole = |mb_x: usize| {
+                quarter_pel_16x16_search(
                     src_y,
                     src_stride,
                     ref_y,
@@ -103,27 +129,64 @@ impl<'a> MotionPlan<'a> {
                     mb_y,
                     spec.range.0,
                     spec.range.1,
-                );
-            }
-            if let Some((rx, ry)) = spec.cell_range {
-                for (mb_x, c) in cell_row.iter_mut().enumerate() {
-                    *c = std::array::from_fn(|i| {
-                        quarter_pel_8x8_search(
-                            src_y,
-                            src_stride,
-                            ref_y,
-                            ref_stride,
-                            ref_w,
-                            ref_h,
-                            mb_x,
-                            mb_y,
-                            i % 2,
-                            i / 2,
-                            rx,
-                            ry,
-                        )
-                    });
+                    Some(hp),
+                )
+            };
+            // One walk over the integer candidates serves the macroblock
+            // and its four cells (a candidate's 16x16 SAD is the sum of
+            // its four 8x8 SADs). It sums every candidate in full on the
+            // padded plane, where the separate searches clamp at the
+            // picture edge and stop a candidate at the first row that
+            // puts it out of the running; measured (1080p, user time on
+            // one thread), the walk is the faster of the two for every
+            // range pair the picture encoders use, the 16x16 search on
+            // its own included.
+            let Some(cell_range) = spec.cell_range else {
+                for (mb_x, w) in whole_row.iter_mut().enumerate() {
+                    *w = whole_and_cells_search(
+                        src_y, src_stride, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, spec.range,
+                        None, hp,
+                    )
+                    .map_or_else(|| separate_whole(mb_x), |(w, _)| w);
                 }
+                return;
+            };
+            for (mb_x, (w, c)) in whole_row.iter_mut().zip(cell_row.iter_mut()).enumerate() {
+                let together = whole_and_cells_search(
+                    src_y,
+                    src_stride,
+                    ref_y,
+                    ref_stride,
+                    ref_w,
+                    ref_h,
+                    mb_x,
+                    mb_y,
+                    spec.range,
+                    Some(cell_range),
+                    hp,
+                );
+                (*w, *c) = together.unwrap_or_else(|| {
+                    (
+                        separate_whole(mb_x),
+                        std::array::from_fn(|i| {
+                            quarter_pel_8x8_search(
+                                src_y,
+                                src_stride,
+                                ref_y,
+                                ref_stride,
+                                ref_w,
+                                ref_h,
+                                mb_x,
+                                mb_y,
+                                i % 2,
+                                i / 2,
+                                cell_range.0,
+                                cell_range.1,
+                                Some(hp),
+                            )
+                        }),
+                    )
+                });
             }
         };
         if width_mbs > 0 {
@@ -347,6 +410,7 @@ mod tests {
                     a / 4,
                     8,
                     8,
+                    None,
                 )
             })
             .collect();
@@ -399,6 +463,7 @@ mod tests {
                         cell / 2,
                         4,
                         4,
+                        None,
                     );
                     let got = search_quarter_pel_8x8(
                         &src,

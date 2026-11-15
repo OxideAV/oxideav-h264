@@ -103,6 +103,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder motion search, same streams (MD5 of the output equal before /
+  after): each P / B picture filters its reference once into
+  half-sample planes (`encoder::halfpel`: the `b`, `h` and `j` samples
+  of §8.4.2.2.1 on a padded plane) and every sub-sample candidate of
+  every search reads its prediction from them — one plane, or the
+  rounded average of two — instead of interpolating a block per
+  candidate; and one walk over the integer candidates serves the 16x16
+  search and the four 8x8 cell searches of a macroblock (a candidate's
+  16x16 SAD is the sum of its four 8x8 SADs). 1080p, 6 frames, QP 26,
+  one thread, user CPU seconds: CAVLC 8.1 → 1.6, CABAC 3.7 → 1.0,
+  CABAC + 2 B-frames 10.2 → 3.0.
+
 - Registry encoder: grey input no longer produces a 4:2:0 stream with
   constant chroma planes (`Yuv420P*` out) but a 4:0:0 stream (`Gray*`
   out, High-family profile). `profile=baseline` / `main` keep the
