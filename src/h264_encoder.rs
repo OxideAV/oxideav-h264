@@ -474,6 +474,9 @@ pub struct H264CodecEncoder {
     /// the session's display index so `pts` keeps counting across a
     /// re-configuration.
     pts_base: i64,
+    /// Worker budget from `Encoder::set_execution_context` (1 =
+    /// serial); kept across a mid-stream re-configuration.
+    threads: usize,
 }
 
 /// Where a request is coded.
@@ -766,7 +769,21 @@ impl H264CodecEncoder {
             queue: VecDeque::new(),
             params: params.clone(),
             pts_base: 0,
+            threads: 1,
         })
+    }
+
+    /// Set the worker budget (see
+    /// [`EncoderSession::set_threads`]): `1`, the default, encodes on
+    /// the calling thread; more runs each P / B picture's motion
+    /// search, and the B pictures of a mini-GOP, on worker threads.
+    /// The packets are byte-identical for every budget. The
+    /// High-family path (`encoder::deep`) is serial at every budget.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+        if let Backend::Session(s) = &mut self.backend {
+            s.set_threads(self.threads);
+        }
     }
 
     /// The `idr_pic_id` the next IDR of the current backend carries.
@@ -825,6 +842,7 @@ impl H264CodecEncoder {
             Backend::Deep(d) => d.next_idr_pic_id = idr_pic_id,
         }
         self.backend = fresh.backend;
+        self.set_threads(self.threads);
         self.layout = fresh.layout;
         self.width = fresh.width;
         self.height = fresh.height;
@@ -915,6 +933,10 @@ impl H264CodecEncoder {
 }
 
 impl CoreEncoder for H264CodecEncoder {
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.set_threads(ctx.threads);
+    }
+
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }

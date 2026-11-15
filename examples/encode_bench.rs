@@ -3,7 +3,9 @@
 // stream size.
 //
 // Usage: encode_bench <input.yuv> <width> <height> [key=value ...] [out.h264]
-// e.g.   encode_bench clip.yuv 1920 1080 qp=26 cabac=true bframes=2
+// e.g.   encode_bench clip.yuv 1920 1080 qp=26 cabac=true bframes=2 threads=4
+// (`threads=N` is the worker budget handed over through
+// `set_execution_context`; every other pair is an encoder option).
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, PixelFormat, Rational, VideoFrame, VideoPlane,
 };
@@ -22,8 +24,10 @@ fn main() {
     params.frame_rate = Some(Rational::new(30, 1));
     let mut options = oxideav_core::CodecOptions::new();
     let mut out = None;
+    let mut threads = 1usize;
     for a in args {
         match a.split_once('=') {
+            Some(("threads", v)) => threads = v.parse().expect("threads"),
             Some((k, v)) => options = options.set(k, v),
             None => out = Some(a),
         }
@@ -32,6 +36,7 @@ fn main() {
     let data = std::fs::read(&input).expect("read input");
     let frame_len = w * h * 3 / 2;
     let mut enc = oxideav_h264::h264_encoder::make_encoder(&params).expect("encoder");
+    enc.set_execution_context(&oxideav_core::ExecutionContext::with_threads(threads));
     let mut stream = Vec::new();
     let drain = |enc: &mut dyn oxideav_core::Encoder, stream: &mut Vec<u8>| loop {
         match enc.receive_packet() {

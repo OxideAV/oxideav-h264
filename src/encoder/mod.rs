@@ -64,6 +64,7 @@ pub mod multiref;
 pub mod nal;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod pad;
+pub(crate) mod plan;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod pps;
 pub mod rate_control;
@@ -716,6 +717,13 @@ pub struct EncoderConfig {
     /// 4:2:0, else 1 — this encoder codes `frame_mbs_only_flag = 1`).
     /// Default 0.
     pub crop_bottom: u32,
+    /// Worker budget for the picture encoders. `1` (the default) runs
+    /// everything on the calling thread. Above one, the motion search
+    /// of every macroblock of a P / B picture runs ahead of the
+    /// macroblock loop on that many threads
+    /// (`std::thread::scope`); the coded stream is byte-identical for
+    /// every value. `0` is treated as `1`.
+    pub threads: usize,
 }
 
 impl EncoderConfig {
@@ -893,6 +901,13 @@ impl EncoderConfig {
         self.table_8_10_cy_offset = v;
         self
     }
+
+    /// Set [`EncoderConfig::threads`].
+    #[must_use]
+    pub fn with_threads(mut self, v: usize) -> Self {
+        self.threads = v;
+        self
+    }
 }
 
 impl EncoderConfig {
@@ -923,6 +938,7 @@ impl EncoderConfig {
             transform_8x8: false,
             scaling_matrix: ScalingMatrixMode::default(),
             table_8_10_cy_offset: 0,
+            threads: 1,
             crop_right: 0,
             crop_bottom: 0,
         }
@@ -1677,6 +1693,22 @@ impl Encoder {
     /// CABAC entry points in [`crate::encoder::cabac_path`]).
     pub fn config(&self) -> &EncoderConfig {
         &self.cfg
+    }
+
+    /// Set the worker budget ([`EncoderConfig::threads`]); the coded
+    /// streams do not depend on it. `0` is treated as `1`.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.cfg.threads = threads.max(1);
+    }
+
+    /// The same encoder under another worker budget.
+    pub(crate) fn with_thread_budget(&self, threads: usize) -> Encoder {
+        let mut cfg = self.cfg.clone();
+        cfg.threads = threads.max(1);
+        Encoder {
+            cfg,
+            idr_pic_id: self.idr_pic_id,
+        }
     }
 
     /// §7.4.3 `idr_pic_id` the next IDR picture will carry.
@@ -6576,6 +6608,25 @@ impl Encoder {
         } else {
             &me_plane
         };
+        // Under a thread budget, every macroblock's motion search
+        // (16x16 and the four 8x8 cells) runs ahead of the loop.
+        let _plan = (self.cfg.threads > 1).then(|| {
+            plan::MotionPlan::install(
+                frame.y,
+                self.cfg.width as usize,
+                me_luma,
+                prev.width as usize,
+                prev.width,
+                prev.height,
+                width_mbs as usize,
+                height_mbs as usize,
+                plan::PlanSpec {
+                    range: (16, 16),
+                    cell_range: Some((16, 16)),
+                },
+                self.cfg.threads,
+            )
+        });
 
         let mut sw = BitWriter::new();
         write_p_slice_header(
@@ -11594,6 +11645,20 @@ impl Encoder {
             2 | 3 => self.cfg.height as usize,
             _ => (self.cfg.height / 2) as usize,
         };
+
+        // Under a thread budget, both lists' motion searches of every
+        // macroblock run ahead of the loop.
+        let _plans = (self.cfg.threads > 1).then(|| {
+            plan::install_b(
+                frame.y,
+                width,
+                ref_l0,
+                ref_l1,
+                width_mbs as usize,
+                height_mbs as usize,
+                self.cfg.threads,
+            )
+        });
 
         // SPS/PPS are not re-emitted for non-IDR slices.
         let mut stream: Vec<u8> = Vec::new();

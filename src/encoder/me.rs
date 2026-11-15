@@ -468,6 +468,40 @@ pub fn search_quarter_pel_16x16(
     range_x: i32,
     range_y: i32,
 ) -> MeResult {
+    let _ = (src_w, src_h);
+    // A picture-level plan may already hold this exact search.
+    if let Some(r) = crate::encoder::plan::lookup_whole(
+        src_y,
+        src_stride,
+        ref_y,
+        ref_stride,
+        ref_w,
+        ref_h,
+        mb_x,
+        mb_y,
+        (range_x, range_y),
+    ) {
+        return r;
+    }
+    quarter_pel_16x16_search(
+        src_y, src_stride, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, range_x, range_y,
+    )
+}
+
+/// The three-stage 16x16 search itself (no plan consulted).
+pub(crate) fn quarter_pel_16x16_search(
+    src_y: &[u8],
+    src_stride: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    range_x: i32,
+    range_y: i32,
+) -> MeResult {
+    let (src_w, src_h) = (0u32, 0u32);
     let half_best = search_half_pel_16x16(
         src_y, src_stride, src_w, src_h, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, range_x,
         range_y,
@@ -606,6 +640,44 @@ pub fn search_quarter_pel_8x8(
     src_stride: usize,
     _src_w: u32,
     _src_h: u32,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_w: u32,
+    ref_h: u32,
+    mb_x: usize,
+    mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+    range_x: i32,
+    range_y: i32,
+) -> MeResult {
+    // A picture-level plan may already hold this exact search.
+    if let Some(r) = crate::encoder::plan::lookup_cell(
+        src_y,
+        src_stride,
+        ref_y,
+        ref_stride,
+        ref_w,
+        ref_h,
+        mb_x,
+        mb_y,
+        sub_x,
+        sub_y,
+        (range_x, range_y),
+    ) {
+        return r;
+    }
+    quarter_pel_8x8_search(
+        src_y, src_stride, ref_y, ref_stride, ref_w, ref_h, mb_x, mb_y, sub_x, sub_y, range_x,
+        range_y,
+    )
+}
+
+/// The three-stage 8x8 search itself (no plan consulted).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quarter_pel_8x8_search(
+    src_y: &[u8],
+    src_stride: usize,
     ref_y: &[u8],
     ref_stride: usize,
     ref_w: u32,

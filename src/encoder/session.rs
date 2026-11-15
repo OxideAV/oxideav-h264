@@ -283,6 +283,8 @@ pub struct EncoderSession {
     /// collapsing into redundant slices of one picture at the decoder
     /// (§7.4.1.2.4 first-VCL-NAL detection compares `idr_pic_id`).
     next_idr_pic_id: u32,
+    /// Worker budget ([`EncoderSession::set_threads`]); 1 = serial.
+    threads: usize,
 }
 
 /// Round-430 — derive the §E.1.2 NAL HRD block from the rate-control
@@ -436,7 +438,30 @@ impl EncoderSession {
             prev: None,
             pending: Vec::new(),
             next_idr_pic_id: 0,
+            threads: 1,
         }
+    }
+
+    /// Set the worker budget. `1` (the default) encodes on the calling
+    /// thread only. Above one:
+    ///
+    /// * the motion search of every macroblock of a P / B picture runs
+    ///   ahead of the macroblock loop on the budget's threads;
+    /// * the B pictures of a mini-GOP — which reference only the two
+    ///   anchors around them, never each other — are coded side by
+    ///   side (constant-QP sessions; under rate control each picture's
+    ///   quantiser depends on the size of the one before it).
+    ///
+    /// The access units are byte-identical for every budget. `0` is
+    /// treated as `1`.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+        self.enc.set_threads(self.threads);
+    }
+
+    /// The worker budget in force.
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 
     /// §7.4.3 `idr_pic_id` the next IDR access unit of this session
@@ -519,8 +544,10 @@ impl EncoderSession {
     /// anchor (`RefPicList0[0]`) and `l1` (the mini-GOP's just-coded
     /// anchor, `RefPicList1[0]`). Rate-controlled sessions row-
     /// modulate B pictures like the anchors (round 443).
+    #[allow(clippy::too_many_arguments)]
     fn encode_b_at(
         &self,
+        enc: &Encoder,
         frame: &YuvFrame<'_>,
         l1: &PrevPic,
         frame_num: u32,
@@ -535,18 +562,14 @@ impl EncoderSession {
         let r0 = l0.as_ref();
         let r1 = l1.as_ref();
         match (self.cfg.cabac, row_budget_bits) {
-            (true, Some(budget)) => self
-                .enc
-                .encode_b_cabac_rate_adaptive(frame, &r0, &r1, frame_num, poc_lsb, qp, budget),
-            (true, None) => self
-                .enc
-                .encode_b_cabac_with_qp(frame, &r0, &r1, frame_num, poc_lsb, qp),
-            (false, Some(budget)) => self
-                .enc
-                .encode_b_rate_adaptive(frame, &r0, &r1, frame_num, poc_lsb, qp, budget),
-            (false, None) => self
-                .enc
-                .encode_b_with_qp(frame, &r0, &r1, frame_num, poc_lsb, qp),
+            (true, Some(budget)) => {
+                enc.encode_b_cabac_rate_adaptive(frame, &r0, &r1, frame_num, poc_lsb, qp, budget)
+            }
+            (true, None) => enc.encode_b_cabac_with_qp(frame, &r0, &r1, frame_num, poc_lsb, qp),
+            (false, Some(budget)) => {
+                enc.encode_b_rate_adaptive(frame, &r0, &r1, frame_num, poc_lsb, qp, budget)
+            }
+            (false, None) => enc.encode_b_with_qp(frame, &r0, &r1, frame_num, poc_lsb, qp),
         }
     }
 
@@ -617,7 +640,7 @@ impl EncoderSession {
                 u,
                 v,
             };
-            let (sf, pic) = self.encode_au(&frame, SessionFrameKind::Idr, d, None);
+            let (sf, pic) = self.encode_au(&frame, SessionFrameKind::Idr, d, None, None);
             self.prev = pic;
             out.push(sf);
         } else if self.cfg.b_frames == 0 {
@@ -628,7 +651,7 @@ impl EncoderSession {
                 u,
                 v,
             };
-            let (sf, pic) = self.encode_au(&frame, SessionFrameKind::P, d, None);
+            let (sf, pic) = self.encode_au(&frame, SessionFrameKind::P, d, None, None);
             self.prev = pic;
             out.push(sf);
         } else {
@@ -670,17 +693,56 @@ impl EncoderSession {
         let mut out = Vec::with_capacity(pend.len() + 1);
 
         let frame = anchor.as_yuv(self.geom.coded_width, self.geom.coded_height);
-        let (sf, pic) = self.encode_au(&frame, SessionFrameKind::P, anchor.display_idx, None);
+        let (sf, pic) = self.encode_au(&frame, SessionFrameKind::P, anchor.display_idx, None, None);
         out.push(sf);
         let anchor_pic = pic.expect("anchor encode returns a reference picture");
 
-        for b in &pend {
+        // The B pictures reference the two anchors only, so under a
+        // thread budget a constant-QP session codes them side by side
+        // (each one's own motion analysis shares what is left of the
+        // budget); the access units come out in the same order with
+        // the same bytes.
+        let mut coded: Vec<Option<AuPic>> = pend.iter().map(|_| None).collect();
+        if let (SessionRateControl::ConstantQp(qp), true) =
+            (self.cfg.rate_control, self.threads > 1 && pend.len() > 1)
+        {
+            let side_by_side = self.threads.min(pend.len());
+            let enc = self.enc.with_thread_budget(self.threads / side_by_side);
+            let this = &*self;
+            let (enc, anchor) = (&enc, &anchor_pic);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let work = || {
+                let mut done = Vec::new();
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(b) = pend.get(k) else { break };
+                    let frame = b.as_yuv(this.geom.coded_width, this.geom.coded_height);
+                    let (frame_num, poc_lsb) = this.au_numbers(SessionFrameKind::B, b.display_idx);
+                    let pic = this.encode_b_at(enc, &frame, anchor, frame_num, poc_lsb, qp, None);
+                    done.push((k, AuPic::B(pic)));
+                }
+                done
+            };
+            let done: Vec<(usize, AuPic)> = std::thread::scope(|s| {
+                let handles: Vec<_> = (1..side_by_side).map(|_| s.spawn(work)).collect();
+                let mut all = work();
+                for h in handles {
+                    all.extend(h.join().expect("B picture worker"));
+                }
+                all
+            });
+            for (k, pic) in done {
+                coded[k] = Some(pic);
+            }
+        }
+        for (b, pre) in pend.iter().zip(coded) {
             let frame = b.as_yuv(self.geom.coded_width, self.geom.coded_height);
             let (sf, _) = self.encode_au(
                 &frame,
                 SessionFrameKind::B,
                 b.display_idx,
                 Some(&anchor_pic),
+                pre,
             );
             out.push(sf);
         }
@@ -700,6 +762,7 @@ impl EncoderSession {
         kind: SessionFrameKind,
         display_idx: u64,
         l1: Option<&PrevPic>,
+        precoded: Option<AuPic>,
     ) -> (SessionFrame, Option<PrevPic>) {
         let is_idr = kind == SessionFrameKind::Idr;
         let disp_in_gop = display_idx - self.gop_start;
@@ -711,19 +774,7 @@ impl EncoderSession {
             let id = self.next_idr_pic_id;
             self.enc.set_idr_pic_id(id);
         }
-        // §7.4.3 — frame_num counts reference pictures modulo
-        // MaxFrameNum (our SPS: log2_max_frame_num = 8) and resets at
-        // IDR. A non-reference B carries the frame_num of the
-        // reference picture preceding it in decode order (its
-        // mini-GOP's anchor).
-        let frame_num = match kind {
-            SessionFrameKind::Idr => 0,
-            SessionFrameKind::P => self.next_ref_frame_num & 0xFF,
-            SessionFrameKind::B => self.next_ref_frame_num.wrapping_sub(1) & 0xFF,
-        };
-        // §8.2.1 — POC lsb (8 bits in our SPS), display step 2 per
-        // frame, resets at IDR.
-        let poc_lsb = ((2 * disp_in_gop) & 0xFF) as u32;
+        let (frame_num, poc_lsb) = self.au_numbers(kind, display_idx);
 
         let rc_kind = match kind {
             SessionFrameKind::Idr => RcFrameKind::Idr,
@@ -799,11 +850,12 @@ impl EncoderSession {
                     SessionRateControl::ConstantQp(q) => q,
                     SessionRateControl::Controlled(_) => unreachable!(),
                 };
-                (
-                    self.encode_pic(frame, kind, frame_num, poc_lsb, qp, None, l1),
-                    qp,
-                    0,
-                )
+                // A constant-QP picture may have been coded already
+                // (the B pictures of a mini-GOP under a thread budget).
+                let pic = precoded.unwrap_or_else(|| {
+                    self.encode_pic(frame, kind, frame_num, poc_lsb, qp, None, l1)
+                });
+                (pic, qp, 0)
             }
             Some((plan, max_qp)) => {
                 // MB-row modulation toward the controller's soft
@@ -887,6 +939,27 @@ impl EncoderSession {
         )
     }
 
+    /// §7.4.3 `frame_num` and §8.2.1 POC lsb of the access unit of
+    /// `kind` at display index `display_idx`, given the session state
+    /// at the point the access unit is coded.
+    fn au_numbers(&self, kind: SessionFrameKind, display_idx: u64) -> (u32, u32) {
+        let disp_in_gop = display_idx - self.gop_start;
+        // §7.4.3 — frame_num counts reference pictures modulo
+        // MaxFrameNum (our SPS: log2_max_frame_num = 8) and resets at
+        // IDR. A non-reference B carries the frame_num of the
+        // reference picture preceding it in decode order (its
+        // mini-GOP's anchor).
+        let frame_num = match kind {
+            SessionFrameKind::Idr => 0,
+            SessionFrameKind::P => self.next_ref_frame_num & 0xFF,
+            SessionFrameKind::B => self.next_ref_frame_num.wrapping_sub(1) & 0xFF,
+        };
+        // §8.2.1 — POC lsb (8 bits in our SPS), display step 2 per
+        // frame, resets at IDR.
+        let poc_lsb = ((2 * disp_in_gop) & 0xFF) as u32;
+        (frame_num, poc_lsb)
+    }
+
     /// Dispatch one picture encode by kind (pure — no session-state
     /// mutation, so the VBV retry loop can re-invoke it).
     #[allow(clippy::too_many_arguments)]
@@ -910,6 +983,7 @@ impl EncoderSession {
                 row_budget_bits,
             )),
             SessionFrameKind::B => AuPic::B(self.encode_b_at(
+                &self.enc,
                 frame,
                 l1.expect("B encode requires the mini-GOP anchor"),
                 frame_num,

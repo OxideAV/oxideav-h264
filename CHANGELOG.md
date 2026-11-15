@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Encoder threading under a caller-granted budget (serial by default).
+  `Encoder::set_execution_context` on the registry encoder,
+  `EncoderSession::set_threads` and `EncoderConfig::threads` /
+  `Encoder::set_threads` for the stateless picture encoders. Above one
+  thread, the motion search of every macroblock of a P / B picture
+  (16x16 and the 8x8 cells, both lists) runs ahead of the macroblock
+  loop on the budget's threads (`encoder::plan`: the searches depend
+  only on the source, the reference plane and the macroblock position),
+  and a constant-QP session codes the B pictures of a mini-GOP side by
+  side (they reference the two anchors only). Streams are
+  byte-identical at every budget (`integration_encoder_threads`: seven
+  option sets x 2 / 3 / 8 threads, plus the picture encoders).
+  `examples/encode_bench` takes `threads=N`.
+
 - Frame cropping in the encoder (§7.4.2.1.1): picture sizes that are
   not a whole number of macroblocks are coded on a padded grid (last
   column / row repeated; for field and MBAFF coding the last row of

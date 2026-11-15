@@ -1914,6 +1914,9 @@ impl Encoder {
         frame_qp: i32,
         row_budget_bits: Option<u64>,
     ) -> EncodedIdr {
+        // The quantiser's trellis mode is per-thread state: set it on
+        // whichever thread codes this picture.
+        crate::encoder::transform::set_trellis_full(self.cfg.trellis_full);
         assert!(
             (0..=51).contains(&frame_qp),
             "frame_qp {frame_qp} out of 0..=51"
@@ -2956,6 +2959,9 @@ impl Encoder {
         frame_qp: i32,
         row_budget_bits: Option<u64>,
     ) -> EncodedP {
+        // The quantiser's trellis mode is per-thread state: set it on
+        // whichever thread codes this picture.
+        crate::encoder::transform::set_trellis_full(self.cfg.trellis_full);
         assert!(
             (0..=51).contains(&frame_qp),
             "frame_qp {frame_qp} out of 0..=51"
@@ -2980,6 +2986,25 @@ impl Encoder {
         let height = cfg.height as usize;
         let width_mbs = (cfg.width / 16) as usize;
         let height_mbs = (cfg.height / 16) as usize;
+        // Under a thread budget, every macroblock's motion search
+        // runs ahead of the loop.
+        let _plan = (cfg.threads > 1).then(|| {
+            crate::encoder::plan::MotionPlan::install(
+                frame.y,
+                width,
+                prev.recon_y,
+                prev.width as usize,
+                prev.width,
+                prev.height,
+                width_mbs,
+                height_mbs,
+                crate::encoder::plan::PlanSpec {
+                    range: (16, 16),
+                    cell_range: None,
+                },
+                cfg.threads,
+            )
+        });
         // §6.2 Table 6-1 — chroma plane dimensions.
         let chroma_w = match cfg.chroma_format_idc {
             0 => 0,
@@ -4254,6 +4279,9 @@ impl Encoder {
         frame_qp: i32,
         row_budget_bits: Option<u64>,
     ) -> EncodedB {
+        // The quantiser's trellis mode is per-thread state: set it on
+        // whichever thread codes this picture.
+        crate::encoder::transform::set_trellis_full(self.cfg.trellis_full);
         assert!(
             (0..=51).contains(&frame_qp),
             "frame_qp {frame_qp} out of 0..=51"
@@ -4292,6 +4320,19 @@ impl Encoder {
         let height = cfg.height as usize;
         let width_mbs = (cfg.width / 16) as usize;
         let height_mbs = (cfg.height / 16) as usize;
+        // Under a thread budget, both lists' motion searches of every
+        // macroblock run ahead of the loop.
+        let _plans = (cfg.threads > 1).then(|| {
+            crate::encoder::plan::install_b(
+                frame.y,
+                width,
+                ref_l0,
+                ref_l1,
+                width_mbs,
+                height_mbs,
+                cfg.threads,
+            )
+        });
         // §6.2 Table 6-1 — chroma plane dimensions.
         let chroma_w = match cfg.chroma_format_idc {
             0 => 0,
