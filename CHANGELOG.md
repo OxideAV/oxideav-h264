@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `EncoderConfig::p_8x8` / `with_p_8x8` (default `true`): `false`
+  keeps P macroblocks to one motion vector.
+
+- P_8x8 in CABAC P pictures, at every chroma format (the CABAC P coder
+  knew P_Skip and P_L0_16x16 only): four P_L0_8x8 partitions with
+  per-partition §8.4.1.3 vector prediction, `mb_type` 3 / `sub_mb_type`
+  0 binarisation, the §9.3.3.1.1.7 `mvd` context sums taken per 4x4
+  block (within the macroblock and from its neighbours), per-quadrant
+  motion on the neighbour grid and in the deblocking strengths, 4x4 or
+  8x8 residual transform. The split is taken under the same thresholds
+  as the CAVLC path. Measured: the registry test content (80x64 with
+  block motion, QP 30, 7 P pictures) 3226 → 2751 bytes; 1080p
+  `testsrc2`, 12 frames, QP 26: 464 019 → 461 911 bytes at 46.55 →
+  46.56 dB. The pinned CABAC streams of
+  `integration_registry_bit_identity` are re-pinned (P / B access units
+  only).
+
 - Intra_16x16 macroblocks inside CAVLC P and B pictures at 4:0:0, 4:2:2
   and 4:4:4 (`EncoderConfig::intra_in_inter`, on by default) — the
   fallback was a 4:2:0-only mode choice. The I-slice Intra_16x16 coder,
@@ -121,6 +138,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier 4:2:0 carriage for `Gray8`.
 
 ### Fixed
+
+- CABAC B pictures, encoder-side deblocking of 16x16 macroblocks: the
+  §8.7.2.1 motion record of B_L1_16x16, B_Bi_16x16 and coded
+  B_Direct_16x16 macroblocks named list 0 only (list 1's vector and
+  reference were left out, and a list-1-only macroblock was recorded as
+  a zero-vector list-0 one), so an edge between two such macroblocks
+  could get another filter strength than a decoder derives and the
+  `EncodedB` reconstruction differ from the decoded picture by ±1..2 on
+  the two rows / columns at that edge. B pictures are not references
+  here, so no stream was affected. The record now carries the lists and
+  vectors actually used (caught by `cabac_pic_custom_gop_bit_exact`
+  once the P anchor's motion became finer).
+
+- CABAC B mode decision: a panic (`unreachable!`) when the all-direct
+  B_8x8 candidate won the 16x16 comparison — reachable once the
+  co-located picture carries per-8x8 motion, which the CABAC P coder
+  could not produce before P_8x8. The partition comparison now takes
+  that candidate's SAD (`cabac_b_after_p8x8_anchor`, four chroma
+  formats, bit-exact in both decoders).
 
 - 8x8 transform quality (every encoder path with `transform_8x8`): the
   forward 8x8 quantiser used one multiplier per normAdjust8x8 entry and

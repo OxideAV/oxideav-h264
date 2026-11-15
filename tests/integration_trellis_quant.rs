@@ -108,6 +108,11 @@ fn encode_textured_gop_mode(qp: i32, trellis: bool, full: bool) -> (usize, usize
     cfg.qp = qp;
     cfg.trellis_quant = trellis;
     cfg.trellis_full = full;
+    // The gains pinned below were measured on single-vector P
+    // macroblocks, whose residual around the moving object is what the
+    // trellis works on; with P_8x8 the object's edges are predicted and
+    // little residual is left to compare. Hold the mode set fixed.
+    cfg.p_8x8 = false;
     let enc = Encoder::new(cfg);
     let idr = enc.encode_idr_cabac(&f0);
     let p = enc.encode_p_cabac(&f1, &EncodedFrameRef::from(&idr), 1, 4);

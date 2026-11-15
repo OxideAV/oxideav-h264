@@ -725,6 +725,10 @@ pub struct EncoderConfig {
     /// (`std::thread::scope`); the coded stream is byte-identical for
     /// every value. `0` is treated as `1`.
     pub threads: usize,
+    /// Allow P_8x8 macroblocks (four P_L0_8x8 partitions, one motion
+    /// vector each) in P pictures. Default `true`; `false` keeps P
+    /// macroblocks to one vector (P_Skip / P_L0_16x16).
+    pub p_8x8: bool,
 }
 
 impl EncoderConfig {
@@ -909,6 +913,13 @@ impl EncoderConfig {
         self.threads = v;
         self
     }
+
+    /// Set [`EncoderConfig::p_8x8`].
+    #[must_use]
+    pub fn with_p_8x8(mut self, v: bool) -> Self {
+        self.p_8x8 = v;
+        self
+    }
 }
 
 impl EncoderConfig {
@@ -940,6 +951,7 @@ impl EncoderConfig {
             scaling_matrix: ScalingMatrixMode::default(),
             table_8_10_cy_offset: 0,
             threads: 1,
+            p_8x8: true,
             crop_right: 0,
             crop_bottom: 0,
         }
@@ -7119,8 +7131,9 @@ impl Encoder {
         // On smooth or lightly-quantised content the two paths converge
         // (often identical SADs) → 4MV is never picked → no regression
         // on the round 16/17/18 PSNR fixtures.
-        let try_4mv =
-            me_16x16_sad >= 1024 && (me_4mv_sad_sum as u64) * 10 < (me_16x16_sad as u64) * 7;
+        let try_4mv = self.cfg.p_8x8
+            && me_16x16_sad >= 1024
+            && (me_4mv_sad_sum as u64) * 10 < (me_16x16_sad as u64) * 7;
 
         if try_4mv && chroma_array_type == 1 {
             return self.encode_p_mb_4mv(

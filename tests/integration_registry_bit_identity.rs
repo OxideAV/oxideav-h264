@@ -8,6 +8,12 @@
 //! streams with several IDRs match on every access unit up to and
 //! including the second IDR's predecessor (the second IDR carries
 //! `idr_pic_id = 1` by design — see `integration_idr_pic_id`).
+//!
+//! Round 490 re-pinned the P / B access units of the CABAC streams: the
+//! CABAC P coder gained P_8x8 (four vectors per macroblock), a mode
+//! decision this content takes on many macroblocks — the seven P
+//! pictures of `cqp30_cabac` went from 3226 to 2751 bytes. IDR access
+//! units and every CAVLC stream are unchanged.
 
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Rational, VideoFrame, VideoPlane,
@@ -95,6 +101,13 @@ fn encode(opts: &[(&str, &str)], frames: usize) -> Vec<Packet> {
 
 fn check(name: &str, opts: &[(&str, &str)], frames: usize, pins: &[(usize, u64)]) {
     let packets = encode(opts, frames);
+    // `H264_PRINT_PINS=1 cargo test --test integration_registry_bit_identity
+    // -- --nocapture` lists the current streams in pin form.
+    if std::env::var_os("H264_PRINT_PINS").is_some() {
+        for pk in &packets {
+            eprintln!("{name}: ({}, {:#018x}),", pk.data.len(), fnv(&pk.data));
+        }
+    }
     assert_eq!(packets.len(), pins.len(), "{name}: access-unit count");
     for (i, (pk, &(len, digest))) in packets.iter().zip(pins.iter()).enumerate() {
         assert_eq!(pk.data.len(), len, "{name}: AU {i} length");
@@ -133,13 +146,13 @@ fn cqp_cabac_single_idr() {
         8,
         &[
             (498, 0xf307e374cbd227e7),
-            (422, 0xe8476f447a0b14ee),
-            (425, 0xd123c89590b8b45c),
-            (478, 0x57ddd85862c4dea4),
-            (455, 0x941e57b04dca83b1),
-            (475, 0x49c56453dca3e151),
-            (511, 0x44751ee9c582e4d2),
-            (460, 0x73bfe7a2be3ef78d),
+            (337, 0x01f6474721305042),
+            (354, 0x23f3b3c2fdaac04c),
+            (409, 0x0c35f8ce22b2041a),
+            (368, 0x8a3885d0f5a46306),
+            (402, 0x29f85f551893eef9),
+            (411, 0x8ab1c6fa02dff555),
+            (470, 0x7155cce93a3ab05d),
         ],
     );
 }
@@ -157,14 +170,14 @@ fn cqp_cabac_b_frames_single_idr() {
         9,
         &[
             (589, 0x5de34e61ae9821e9),
-            (700, 0x4047b01b6e0c65b2),
-            (415, 0x7aef62746f3cf899),
-            (458, 0xc00bd6643fe31337),
-            (744, 0x014da436360b9aca),
-            (419, 0x33ed9e40a3fb2f59),
-            (540, 0x960b74c78409bd75),
-            (767, 0xa50712939336d81d),
-            (389, 0x239377133d786181),
+            (551, 0x98c3a3d8617df17a),
+            (412, 0x0961454709ec6b21),
+            (432, 0x945786c2b82defab),
+            (604, 0x046740bed1751367),
+            (413, 0x2fe9642991d9dcb3),
+            (480, 0x9c07f677798e21b1),
+            (617, 0xa640d7ce03ae725b),
+            (366, 0x0b3877da01698a31),
         ],
     );
 }
@@ -203,15 +216,15 @@ fn vbr_cabac_b_frames_single_idr() {
         10,
         &[
             (1164, 0x6f1f70d59a12be72),
-            (1227, 0x302519b74af62046),
-            (527, 0x9395b0b40600316c),
-            (1303, 0x7de3057d4072ea77),
-            (596, 0x8c47aefc5edef33e),
-            (1411, 0xfca9f1de1cab9aab),
-            (588, 0xe48c63c7e03d010d),
-            (1354, 0x5b8d618094a35f84),
-            (607, 0x6fcbc0b4e3ad2de6),
-            (1014, 0xc6cdeae303a61ac8),
+            (933, 0xf7b2e5eed5334458),
+            (494, 0x2cee6fe9bd26c8b3),
+            (1250, 0x1fa79712bd5e1d25),
+            (651, 0x247dab31a4faffda),
+            (1206, 0xfe71288158456163),
+            (657, 0xeab11d762ca1a1c9),
+            (1279, 0x4aabb51f8735b784),
+            (739, 0x59f94ebea1549e10),
+            (954, 0x1ffecf0a339bbe96),
         ],
     );
 }
@@ -232,7 +245,10 @@ fn multi_idr_streams_match_up_to_the_second_idr() {
         &[("rc", "cqp"), ("qp", "26"), ("cabac", "true"), ("gop", "2")],
         5,
     );
+    if std::env::var_os("H264_PRINT_PINS").is_some() {
+        eprintln!("multi_idr cabac AU 1: {:#018x}", fnv(&packets[1].data));
+    }
     assert_eq!(fnv(&packets[0].data), 0x0cb5e96a2e29b263);
-    assert_eq!(fnv(&packets[1].data), 0xeb8d0bc3a1bde4aa);
+    assert_eq!(fnv(&packets[1].data), 0x06cc464260177b5b);
     assert_ne!(fnv(&packets[2].data), 0x69922236751d45c7);
 }

@@ -41,7 +41,8 @@ use crate::encoder::cabac_syntax::{
     encode_coded_block_pattern, encode_end_of_slice_flag, encode_intra_chroma_pred_mode,
     encode_mb_qp_delta, encode_mb_skip_flag, encode_mb_type_b, encode_mb_type_i, encode_mb_type_p,
     encode_mvd_lx, encode_prev_intra_pred_mode_flag, encode_rem_intra_pred_mode,
-    encode_residual_block_cabac, encode_sub_mb_type_b, encode_transform_size_8x8_flag,
+    encode_residual_block_cabac, encode_sub_mb_type_b, encode_sub_mb_type_p,
+    encode_transform_size_8x8_flag,
 };
 use crate::encoder::cavlc::encode_residual_block_cavlc;
 use crate::encoder::deblock::{
@@ -2999,7 +3000,7 @@ impl Encoder {
             height_mbs,
             crate::encoder::plan::PlanSpec {
                 range: (16, 16),
-                cell_range: None,
+                cell_range: Some((16, 16)),
             },
             cfg.threads,
         );
@@ -3149,7 +3150,7 @@ impl Encoder {
                 let (_skip_ref, skip_mv) = cabac_p_skip_mv(&grid, mb_x, mb_y);
 
                 // Build inter predictor (luma + chroma).
-                let pred_y = build_inter_pred_luma_local(
+                let mut pred_y = build_inter_pred_luma_local(
                     prev.recon_y,
                     prev.width,
                     prev.height,
@@ -3163,7 +3164,7 @@ impl Encoder {
                 //     in 1/8 units).
                 //   * 4:4:4 — the §8.4.2.2.1 LUMA 6-tap process on each
                 //     chroma plane with mvC = mvL (eq. 8-235..8-238).
-                let (pred_u, pred_v): (Vec<i32>, Vec<i32>) = match cfg.chroma_format_idc {
+                let (mut pred_u, mut pred_v): (Vec<i32>, Vec<i32>) = match cfg.chroma_format_idc {
                     // Round-448 — 4:0:0: no chroma planes to predict.
                     0 => (Vec::new(), Vec::new()),
                     3 => (
@@ -3227,6 +3228,108 @@ impl Encoder {
                         .to_vec(),
                     ),
                 };
+
+                // P_8x8 with four P_L0_8x8 partitions: one quarter-sample
+                // search per 8x8 cell; the split is taken when the four
+                // cells together predict clearly better than the single
+                // vector (the same thresholds as the CAVLC path: a 16x16
+                // SAD of at least 4 per sample, and the cells' sum under
+                // 70 % of it). The composite predictor then replaces the
+                // single-vector one; residual, reconstruction and the
+                // syntax after the prediction part are shared.
+                let me_cells: [crate::encoder::me::MeResult; 4] = std::array::from_fn(|i| {
+                    search_quarter_pel_8x8(
+                        frame.y,
+                        width,
+                        cfg.width,
+                        cfg.height,
+                        prev.recon_y,
+                        prev.width as usize,
+                        prev.width,
+                        prev.height,
+                        mb_x,
+                        mb_y,
+                        i % 2,
+                        i / 2,
+                        16,
+                        16,
+                    )
+                });
+                let cells_sad: u64 = me_cells.iter().map(|m| u64::from(m.sad)).sum();
+                let split = cfg.p_8x8 && me.sad >= 1024 && cells_sad * 10 < u64::from(me.sad) * 7;
+                // The vector of each 8x8 quadrant and, for a split
+                // macroblock, the §7.3.5.2 vector differences.
+                let mut mvs_8x8 = [chosen_mv; 4];
+                let mut mvds_8x8 = [(0i32, 0i32); 4];
+                if split {
+                    let mut decoded = [false; 4];
+                    let mut mv_inflight = [Mv::ZERO; 4];
+                    let mut ref_inflight = [-1i32; 4];
+                    let (ct_w, ct_h) = match cfg.chroma_format_idc {
+                        0 => (0usize, 0usize),
+                        2 => (8, 16),
+                        3 => (16, 16),
+                        _ => (8, 8),
+                    };
+                    let (pw, ph) = (ct_w / 2, ct_h / 2);
+                    for (sub, cell) in me_cells.iter().enumerate() {
+                        let mv = Mv::new(cell.mv_x, cell.mv_y);
+                        // §8.4.1.3 — the predictor sees the partitions
+                        // before this one.
+                        let p = cabac_mvp_for_b_8x8_partition(
+                            &grid,
+                            mb_x,
+                            mb_y,
+                            sub,
+                            0,
+                            0,
+                            decoded,
+                            mv_inflight,
+                            ref_inflight,
+                        );
+                        mvs_8x8[sub] = mv;
+                        mvds_8x8[sub] = (mv.x - p.x, mv.y - p.y);
+                        decoded[sub] = true;
+                        mv_inflight[sub] = mv;
+                        ref_inflight[sub] = 0;
+                        let (sub_x, sub_y) = (sub % 2, sub / 2);
+                        let py = crate::encoder::build_inter_pred_luma_8x8(
+                            prev.recon_y,
+                            prev.width,
+                            prev.height,
+                            mb_x,
+                            mb_y,
+                            sub_x,
+                            sub_y,
+                            mv,
+                        );
+                        for j in 0..8usize {
+                            pred_y[(sub_y * 8 + j) * 16 + sub_x * 8..][..8]
+                                .copy_from_slice(&py[j * 8..][..8]);
+                        }
+                        if cfg.chroma_format_idc != 0 {
+                            for (plane, pred) in
+                                [(prev.recon_u, &mut pred_u), (prev.recon_v, &mut pred_v)]
+                            {
+                                let pc = crate::encoder::build_chroma_rect_pred_fmt(
+                                    plane,
+                                    chroma_w as u32,
+                                    chroma_h as u32,
+                                    mb_x * ct_w + sub_x * pw,
+                                    mb_y * ct_h + sub_y * ph,
+                                    pw,
+                                    ph,
+                                    mv,
+                                    cfg.chroma_format_idc,
+                                );
+                                for j in 0..ph {
+                                    pred[(sub_y * ph + j) * ct_w + sub_x * pw..][..pw]
+                                        .copy_from_slice(&pc[j * pw..][..pw]);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Luma residual + transform + AC quantise (no DC Hadamard
                 // for inter MBs).
@@ -3513,7 +3616,7 @@ impl Encoder {
                 // is no longer trivial; many MBs on static / near-static
                 // content will still satisfy chosen_mv == skip_mv == (0, 0)
                 // and skip out, but moving content forces a mvd emit.
-                let is_skip = chosen_mv == skip_mv && cbp_luma == 0 && cbp_chroma == 0;
+                let is_skip = !split && chosen_mv == skip_mv && cbp_luma == 0 && cbp_chroma == 0;
 
                 let nb = build_neighbour_ctx(&grid, mb_x, mb_y);
 
@@ -3574,40 +3677,61 @@ impl Encoder {
                     continue;
                 }
 
-                // mb_type = P_L0_16x16 (raw 0 in P-slice Table 7-13).
-                encode_mb_type_p(&mut cabac, &mut ctxs, &nb, 0);
-
-                // mvd_l0 (single-ref → no ref_idx_l0 emit). Round-32 —
-                // mvp via §8.4.1.3 median (`cabac_mvp_for_16x16`).
-                let mvd_x = chosen_mv.x - mvp.x;
-                let mvd_y = chosen_mv.y - mvp.y;
-                // §9.3.3.1.1.7 — neighbour |mvd| sum for ctxIdxInc(bin 0)
-                // of mvd_l0_x / mvd_l0_y. For 4x4 block 0 the A neighbour
-                // is left MB block 1 (top-right of the left MB at MB-pixel
-                // (15, 0) = block (3, 0) = block index 5 → wait, idx 0
-                // top-left maps to block 1 right side. In our simplified
-                // encoder every MB has uniform MV so reading ANY 4x4 block
-                // of the left/above MB returns the same |mvd|.
-                let abs_mvd_left_x = grid
-                    .left(mb_x, mb_y)
-                    .map(|m| m.abs_mvd_l0_x[0])
-                    .unwrap_or(0);
-                let abs_mvd_above_x = grid
-                    .above(mb_x, mb_y)
-                    .map(|m| m.abs_mvd_l0_x[0])
-                    .unwrap_or(0);
-                let sum_x = abs_mvd_left_x + abs_mvd_above_x;
-                encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, sum_x, mvd_x);
-                let abs_mvd_left_y = grid
-                    .left(mb_x, mb_y)
-                    .map(|m| m.abs_mvd_l0_y[0])
-                    .unwrap_or(0);
-                let abs_mvd_above_y = grid
-                    .above(mb_x, mb_y)
-                    .map(|m| m.abs_mvd_l0_y[0])
-                    .unwrap_or(0);
-                let sum_y = abs_mvd_left_y + abs_mvd_above_y;
-                encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, sum_y, mvd_y);
+                // mb_type: P_L0_16x16 (Table 7-13 raw 0) or P_8x8 (raw 3)
+                // with four P_L0_8x8 sub-macroblocks (Table 7-17 raw 0).
+                // One reference is active, so no ref_idx_l0 is coded.
+                // §9.3.3.1.1.7 — ctxIdxInc of the first mvd bin comes
+                // from the |mvd| of the partitions to the left of and
+                // above each partition's first 4x4 block, in this
+                // macroblock (those coded so far) or its neighbours.
+                let mut abs_mvd_x = [0u32; 16];
+                let mut abs_mvd_y = [0u32; 16];
+                if split {
+                    encode_mb_type_p(&mut cabac, &mut ctxs, &nb, 3);
+                    for _ in 0..4 {
+                        encode_sub_mb_type_p(&mut cabac, &mut ctxs, 0);
+                    }
+                    for (sub, &(mvd_x, mvd_y)) in mvds_8x8.iter().enumerate() {
+                        // First 4x4 block of the 8x8 (§6.4.3 order).
+                        let blk4 = (sub * 4) as u8;
+                        let sum_x = cabac_enc_mvd_abs_sum(
+                            &grid,
+                            mb_x,
+                            mb_y,
+                            0,
+                            MvdComponent::X,
+                            blk4,
+                            &abs_mvd_x,
+                        );
+                        let sum_y = cabac_enc_mvd_abs_sum(
+                            &grid,
+                            mb_x,
+                            mb_y,
+                            0,
+                            MvdComponent::Y,
+                            blk4,
+                            &abs_mvd_y,
+                        );
+                        encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, sum_x, mvd_x);
+                        encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, sum_y, mvd_y);
+                        for k in 0..4usize {
+                            abs_mvd_x[sub * 4 + k] = mvd_x.unsigned_abs();
+                            abs_mvd_y[sub * 4 + k] = mvd_y.unsigned_abs();
+                        }
+                    }
+                } else {
+                    encode_mb_type_p(&mut cabac, &mut ctxs, &nb, 0);
+                    let mvd_x = chosen_mv.x - mvp.x;
+                    let mvd_y = chosen_mv.y - mvp.y;
+                    let sum_x =
+                        cabac_enc_mvd_abs_sum(&grid, mb_x, mb_y, 0, MvdComponent::X, 0, &abs_mvd_x);
+                    let sum_y =
+                        cabac_enc_mvd_abs_sum(&grid, mb_x, mb_y, 0, MvdComponent::Y, 0, &abs_mvd_y);
+                    encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::X, sum_x, mvd_x);
+                    encode_mvd_lx(&mut cabac, &mut ctxs, MvdComponent::Y, sum_y, mvd_y);
+                    abs_mvd_x = [mvd_x.unsigned_abs(); 16];
+                    abs_mvd_y = [mvd_y.unsigned_abs(); 16];
+                }
 
                 // coded_block_pattern (§9.3.3.1.1.4 — the chroma TU
                 // suffix is emitted only at ChromaArrayType 1 / 2).
@@ -4036,18 +4160,23 @@ impl Encoder {
                 info.cbp_luma = cbp_luma;
                 info.cbp_chroma = cbp_chroma;
                 info.transform_size_8x8 = transform_size_8x8;
-                info.abs_mvd_l0_x = [mvd_x.unsigned_abs(); 16];
-                info.abs_mvd_l0_y = [mvd_y.unsigned_abs(); 16];
+                info.abs_mvd_l0_x = abs_mvd_x;
+                info.abs_mvd_l0_y = abs_mvd_y;
                 info.ref_idx_l0_8x8 = [0; 4];
-                info.mv_l0_8x8 = [chosen_mv; 4];
+                info.mv_l0_8x8 = mvs_8x8;
                 if transform_size_8x8 {
                     i8x8_mb_count += 1;
                 }
 
-                let mv_t = (
-                    chosen_mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                    chosen_mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                );
+                // §8.7.2.1 — the vector of each 4x4 block (§6.4.3 order:
+                // four per 8x8 quadrant).
+                let mv_l0_4x4: [(i16, i16); 16] = std::array::from_fn(|blk| {
+                    let mv = mvs_8x8[blk / 4];
+                    (
+                        mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    )
+                });
                 let chroma_nonzero_4x4: u16 = match cfg.chroma_format_idc {
                     0 => 0, // no chroma at 4:0:0.
                     3 => 0, // deblock disabled at 4:4:4.
@@ -4083,7 +4212,7 @@ impl Encoder {
                     qp_y: chain_qp,
                     luma_nonzero_4x4: luma_nz_mask_from_blocks(&blk_has_nz),
                     chroma_nonzero_4x4,
-                    mv_l0: [mv_t; 16],
+                    mv_l0: mv_l0_4x4,
                     ref_idx_l0: [0; 4],
                     ref_poc_l0: [0; 4],
                     transform_size_8x8_flag: transform_size_8x8,
@@ -6272,7 +6401,8 @@ impl Encoder {
                     1 => sad_l0,
                     2 => sad_l1,
                     3 => sad_bi,
-                    _ => unreachable!(),
+                    // B_8x8 with four B_Direct_8x8 sub-macroblocks.
+                    _ => sad_direct_8x8,
                 };
                 // Per-cell qpel ME on each list (4 cells × 2 lists).
                 let mut me_l0_cells = [Mv::ZERO; 4];
@@ -8190,8 +8320,15 @@ impl Encoder {
                         }
                     }
                     (mvs, refs, pocs)
-                } else {
+                } else if uses_l0_explicit_16x16 || (is_direct && direct.ref_idx_l0 >= 0) {
+                    // B_L0 / B_Bi 16x16, or a direct macroblock whose
+                    // derivation uses list 0.
                     ([mv_l0_t; 16], [0; 4], [0; 4])
+                } else {
+                    // List 0 not used (B_L1_16x16, or direct from list
+                    // 1 only): §8.7.2.1 compares the references and
+                    // vectors actually used.
+                    ([(0, 0); 16], [-1; 4], [i32::MIN; 4])
                 };
                 let (mv_l1_arr, ref_idx_l1_arr, ref_poc_l1_arr): (
                     [(i16, i16); 16],
@@ -8305,6 +8442,15 @@ impl Encoder {
                         }
                     }
                     (mvs, refs, pocs)
+                } else if uses_l1_explicit_16x16 || (is_direct && direct.ref_idx_l1 >= 0) {
+                    // B_L1 / B_Bi 16x16, or a direct macroblock whose
+                    // derivation uses list 1.
+                    let mv = if is_direct { direct.mv_l1() } else { mv_l1 };
+                    let mv_t = (
+                        mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    );
+                    ([mv_t; 16], [0; 4], [1000; 4])
                 } else {
                     ([(0, 0); 16], [-1; 4], [i32::MIN; 4])
                 };
