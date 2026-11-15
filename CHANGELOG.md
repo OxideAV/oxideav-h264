@@ -120,6 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The decoder no longer writes to standard error when it skips a slice (`h264 slice skipped: ...`) or fails to finish the last picture at flush. Both are still counted in `decode_error_count()`; a library leaves reporting to its caller.
+
 - Encoder motion search, same streams (MD5 of the output equal before /
   after): each P / B picture filters its reference once into
   half-sample planes (`encoder::halfpel`: the `b`, `h` and `j` samples
