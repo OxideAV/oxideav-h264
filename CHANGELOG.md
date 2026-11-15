@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- P_8x8 (four P_L0_8x8 partitions) in CAVLC P pictures at 4:0:0, 4:2:2
+  and 4:4:4 — until now a 4:2:0-only mode. The composite predictor
+  (per-partition luma, and chroma per §8.4.1.4 for the format) feeds
+  the residual / reconstruction / writer path the single-vector
+  macroblock uses, so the macroblock keeps the §7.3.5 choice of 4x4 or
+  8x8 transform; `write_p_16x16_or_8x8_mb_chroma` codes either shape in
+  front of the shared tail. `integration_p8x8_chroma_formats`: three
+  formats x 4x4 / 8x8 transform x three QPs, each stream carrying P_8x8
+  macroblocks, bit-exact in our decoder and in a black-box decoder.
+
 - Encoder threading under a caller-granted budget (serial by default).
   `Encoder::set_execution_context` on the registry encoder,
   `EncoderSession::set_threads` and `EncoderConfig::threads` /

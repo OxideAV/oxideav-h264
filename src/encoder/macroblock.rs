@@ -1575,6 +1575,63 @@ pub fn write_p_l0_16x16_mb_chroma(
     )
 }
 
+/// One coded P macroblock at any chroma format: P_L0_16x16
+/// (`mvd_8x8 == None`, the vector difference of `cfg`) or P_8x8 with
+/// four PL08x8 sub-macroblocks (`mvd_8x8` = their vector differences
+/// in sub-macroblock order; the `mvd_l0_x` / `mvd_l0_y` of `cfg` are
+/// not coded). Both share the §7.3.5 tail: `coded_block_pattern`,
+/// `transform_size_8x8_flag` (a P_8x8 macroblock whose sub-macroblocks
+/// are all 8x8 passes the same gate as P_L0_16x16), `mb_qp_delta` and
+/// the residual.
+pub fn write_p_16x16_or_8x8_mb_chroma(
+    w: &mut BitWriter,
+    cfg: &PL016x16McbConfig,
+    mvd_8x8: Option<&[(i32, i32); 4]>,
+    num_ref_idx_l0_active_minus1: u32,
+    chroma_array_type: u32,
+    chroma: ChromaWriteKind<'_>,
+) -> Result<(), CavlcEncodeError> {
+    let Some(mvds) = mvd_8x8 else {
+        return write_p_l0_16x16_mb_chroma(
+            w,
+            cfg,
+            num_ref_idx_l0_active_minus1,
+            chroma_array_type,
+            chroma,
+        );
+    };
+    debug_assert!(cfg.cbp_luma <= 15);
+    debug_assert!(cfg.cbp_chroma <= 2);
+    // Table 7-13: P_8x8 is mb_type 3; Table 7-17: P_L0_8x8 is
+    // sub_mb_type 0.
+    w.ue(3);
+    for _ in 0..4 {
+        w.ue(0);
+    }
+    // §7.3.5.2 — the four ref_idx_l0, then the four mvd_l0.
+    if num_ref_idx_l0_active_minus1 > 0 {
+        debug_assert!(cfg.ref_idx_l0 <= num_ref_idx_l0_active_minus1);
+        for _ in 0..4 {
+            w.te(num_ref_idx_l0_active_minus1, cfg.ref_idx_l0);
+        }
+    }
+    for &(mvd_x, mvd_y) in mvds {
+        w.se(mvd_x);
+        w.se(mvd_y);
+    }
+    emit_inter_mb_tail(
+        w,
+        chroma_array_type,
+        cfg.cbp_luma,
+        cfg.cbp_chroma,
+        cfg.transform_size_8x8_flag,
+        cfg.mb_qp_delta,
+        &cfg.luma_4x4_levels,
+        &cfg.luma_4x4_nc,
+        chroma,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // P_8x8 (4MV: four 8x8 sub-MB partitions, each PL08x8) — round 19.
 // ---------------------------------------------------------------------------

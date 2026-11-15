@@ -6939,7 +6939,7 @@ impl Encoder {
         }
         let chroma_w = chroma_width as u32;
         let chroma_h = chroma_height as u32;
-        let (pred_u, pred_v): (Vec<i32>, Vec<i32>) = match chroma_array_type {
+        let (mut pred_u, mut pred_v): (Vec<i32>, Vec<i32>) = match chroma_array_type {
             // Round-448 — 4:0:0: no chroma planes to predict.
             0 => (Vec::new(), Vec::new()),
             3 => (
@@ -7030,14 +7030,10 @@ impl Encoder {
         // On smooth or lightly-quantised content the two paths converge
         // (often identical SADs) → 4MV is never picked → no regression
         // on the round 16/17/18 PSNR fixtures.
-        // Round-397 — the 4MV P_8x8 writer's per-4x4 chroma predictor
-        // assembly is 4:2:0-only; the 4:2:2 / 4:4:4 encoder keeps the
-        // single-MV shapes (P_Skip / P_L0_16x16).
-        let try_4mv = chroma_array_type == 1
-            && me_16x16_sad >= 1024
-            && (me_4mv_sad_sum as u64) * 10 < (me_16x16_sad as u64) * 7;
+        let try_4mv =
+            me_16x16_sad >= 1024 && (me_4mv_sad_sum as u64) * 10 < (me_16x16_sad as u64) * 7;
 
-        if try_4mv {
+        if try_4mv && chroma_array_type == 1 {
             return self.encode_p_mb_4mv(
                 frame,
                 prev,
@@ -7060,6 +7056,86 @@ impl Encoder {
                 me_4mv,
             );
         }
+
+        // 4:0:0 / 4:2:2 / 4:4:4 — the P_8x8 macroblock (four PL08x8
+        // partitions) continues through this function: the composite
+        // predictor replaces the single-MV one, and the residual,
+        // reconstruction and writer below serve both shapes (a P_8x8
+        // macroblock is never skipped, and with one MV per 8x8 it keeps
+        // the §7.3.5 choice of transform size).
+        // The four vectors and their §7.3.5.2 differences.
+        type FourMv = ([Mv; 4], [(i32, i32); 4]);
+        let four_mv: Option<FourMv> = try_4mv.then(|| {
+            let mvs: [Mv; 4] = std::array::from_fn(|i| Mv::new(me_4mv[i].mv_x, me_4mv[i].mv_y));
+            // §8.4.1.3 — each partition's predictor sees the partitions
+            // before it in the macroblock.
+            let mut mvds = [(0i32, 0i32); 4];
+            let mut inflight_avail = [false; 4];
+            let mut mv_inflight = [Mv::ZERO; 4];
+            let mut ref_inflight = [-1i32; 4];
+            for sub_idx in 0..4usize {
+                let p = mvp_for_p_8x8_partition(
+                    mv_grid,
+                    mb_x,
+                    mb_y,
+                    sub_idx,
+                    ref_idx,
+                    inflight_avail,
+                    mv_inflight,
+                    ref_inflight,
+                );
+                mvds[sub_idx] = (mvs[sub_idx].x - p.x, mvs[sub_idx].y - p.y);
+                inflight_avail[sub_idx] = true;
+                mv_inflight[sub_idx] = mvs[sub_idx];
+                ref_inflight[sub_idx] = ref_idx;
+            }
+            // Chroma tile of the macroblock and of one 8x8 partition.
+            let (ct_w, ct_h) = chroma_tile_dims(chroma_array_type);
+            let (pw, ph) = (ct_w / 2, ct_h / 2);
+            for (sub_idx, &mv) in mvs.iter().enumerate() {
+                let (sub_x, sub_y) = (sub_idx % 2, sub_idx / 2);
+                let py = build_inter_pred_luma_8x8(
+                    prev.recon_y,
+                    prev.width,
+                    prev.height,
+                    mb_x,
+                    mb_y,
+                    sub_x,
+                    sub_y,
+                    mv,
+                );
+                for j in 0..8usize {
+                    pred_y[(sub_y * 8 + j) * 16 + sub_x * 8..][..8]
+                        .copy_from_slice(&py[j * 8..][..8]);
+                }
+                if chroma_array_type != 0 {
+                    for (plane, pred) in [(prev.recon_u, &mut pred_u), (prev.recon_v, &mut pred_v)]
+                    {
+                        let pc = build_chroma_rect_pred_fmt(
+                            plane,
+                            chroma_w,
+                            chroma_h,
+                            mb_x * ct_w + sub_x * pw,
+                            mb_y * ct_h + sub_y * ph,
+                            pw,
+                            ph,
+                            mv,
+                            chroma_array_type,
+                        );
+                        for j in 0..ph {
+                            pred[(sub_y * ph + j) * ct_w + sub_x * pw..][..pw]
+                                .copy_from_slice(&pc[j * pw..][..pw]);
+                        }
+                    }
+                }
+            }
+            // §8.4.2.3.2 explicit luma weighting is per sample: apply it
+            // to the assembled predictor.
+            if let Some(wp) = qp_tracker.wp_l0 {
+                wp.apply(&mut pred_y);
+            }
+            (mvs, mvds)
+        });
 
         // 4. Compute the luma residual, transform, AC-quantize, inverse,
         //    and reconstruct. §8.5.9 — inter MBs quantise / dequantise
@@ -7277,7 +7353,11 @@ impl Encoder {
         // §7.4.5 — P_Skip infers refIdxL0 = 0 (§8.4.1.1), so a
         // macroblock predicting from another reference is never
         // skipped.
-        let is_skip = ref_idx == 0 && chosen_mv == skip_mv && cbp_luma == 0 && cbp_chroma == 0;
+        let is_skip = four_mv.is_none()
+            && ref_idx == 0
+            && chosen_mv == skip_mv
+            && cbp_luma == 0
+            && cbp_chroma == 0;
 
         if is_skip {
             // P_Skip: do NOT emit any MB syntax; just bump pending_skip
@@ -7538,13 +7618,18 @@ impl Encoder {
             chroma_ac_nc_cr: [0; 8],
         };
         let _ = luma_4x4_quant_raster; // already folded into recon_block_residual
+        let four_mvds = four_mv.as_ref().map(|(_, mvds)| mvds);
+        // The motion of the four 8x8 quadrants (one vector repeated for
+        // P_L0_16x16).
+        let mvs_8x8: [Mv; 4] = four_mv.map_or([chosen_mv; 4], |(mvs, _)| mvs);
         match chroma_array_type {
             // Round-448 — 4:0:0: luma-only P_L0_16x16 syntax; the
             // Table 9-4(b) inter CBP column applies (shared with 4:4:4).
             0 => {
-                crate::encoder::macroblock::write_p_l0_16x16_mb_chroma(
+                crate::encoder::macroblock::write_p_16x16_or_8x8_mb_chroma(
                     sw,
                     &mb_cfg,
+                    four_mvds,
                     qp_tracker.num_ref_idx_l0_active_minus1(),
                     0,
                     crate::encoder::macroblock::ChromaWriteKind::Mono,
@@ -7566,9 +7651,10 @@ impl Encoder {
                     cbp_luma,
                     &cr444.levels_scan,
                 );
-                crate::encoder::macroblock::write_p_l0_16x16_mb_chroma(
+                crate::encoder::macroblock::write_p_16x16_or_8x8_mb_chroma(
                     sw,
                     &mb_cfg,
+                    four_mvds,
                     qp_tracker.num_ref_idx_l0_active_minus1(),
                     3,
                     crate::encoder::macroblock::ChromaWriteKind::Yuv444Inter {
@@ -7591,9 +7677,10 @@ impl Encoder {
                     &v_ac8,
                     2,
                 );
-                crate::encoder::macroblock::write_p_l0_16x16_mb_chroma(
+                crate::encoder::macroblock::write_p_16x16_or_8x8_mb_chroma(
                     sw,
                     &mb_cfg,
+                    four_mvds,
                     qp_tracker.num_ref_idx_l0_active_minus1(),
                     2,
                     crate::encoder::macroblock::ChromaWriteKind::Yuv422 {
@@ -7617,9 +7704,10 @@ impl Encoder {
                     &v_ac_levels,
                     1,
                 );
-                crate::encoder::macroblock::write_p_l0_16x16_mb_chroma(
+                crate::encoder::macroblock::write_p_16x16_or_8x8_mb_chroma(
                     sw,
                     &mb_cfg,
+                    four_mvds,
                     qp_tracker.num_ref_idx_l0_active_minus1(),
                     1,
                     crate::encoder::macroblock::ChromaWriteKind::Yuv420 {
@@ -7635,13 +7723,13 @@ impl Encoder {
             }
         }
 
-        // Update mv_grid + intra_grid for subsequent MBs. P_L0_16x16
-        // → all four 8x8 partitions carry the same MV / ref_idx.
+        // Update mv_grid + intra_grid for subsequent MBs: one MV /
+        // ref_idx per 8x8 quadrant.
         *mv_grid.slot_mut(mb_x, mb_y) = MvGridSlot {
             available: true,
             is_intra: false,
             ref_idx_l0_8x8: [ref_idx; 4],
-            mv_l0_8x8: [chosen_mv; 4],
+            mv_l0_8x8: mvs_8x8,
         };
         let s = intra_grid.slot_mut(mb_x, mb_y);
         s.available = true;
@@ -7677,10 +7765,14 @@ impl Encoder {
             }
         };
 
-        let mv_t = (
-            chosen_mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-            chosen_mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-        );
+        let mv_l0: [(i16, i16); 16] = std::array::from_fn(|blk| {
+            let (bx, by) = LUMA_4X4_BLK[blk];
+            let mv = mvs_8x8[2 * (by / 2) + bx / 2];
+            (
+                mv.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                mv.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            )
+        });
         MbDeblockInfo {
             is_intra: false,
             // §7.4.5 chain: qp_tracker.cur is qp_y when this MB coded
@@ -7690,7 +7782,7 @@ impl Encoder {
             luma_nonzero_4x4,
             chroma_nonzero_4x4,
             transform_size_8x8_flag: transform_size_8x8,
-            mv_l0: [mv_t; 16],
+            mv_l0,
             ref_idx_l0: [ref_idx as i8; 4],
             ref_poc_l0: [ref_key; 4],
             ..Default::default()
