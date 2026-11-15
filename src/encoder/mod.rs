@@ -1441,7 +1441,7 @@ impl InterMbStateSnapshot {
         intra_grid: &IntraGrid,
         mv_grid: &MvGrid,
         mb_addr: usize,
-        _width_mbs: usize,
+        chroma_array_type: u32,
         pending_skip: u32,
     ) -> Self {
         Self {
@@ -1457,7 +1457,7 @@ impl InterMbStateSnapshot {
                 nc_grid,
                 intra_grid,
                 mb_addr,
-                1,
+                chroma_array_type,
             ),
             mv_l0: *mv_grid.slot(mb_x, mb_y),
             mv_l1: None,
@@ -1480,7 +1480,7 @@ impl InterMbStateSnapshot {
         mv_grid_l0: &MvGrid,
         mv_grid_l1: &MvGrid,
         mb_addr: usize,
-        _width_mbs: usize,
+        chroma_array_type: u32,
         pending_skip: u32,
     ) -> Self {
         Self {
@@ -1496,7 +1496,7 @@ impl InterMbStateSnapshot {
                 nc_grid,
                 intra_grid,
                 mb_addr,
-                1,
+                chroma_array_type,
             ),
             mv_l0: *mv_grid_l0.slot(mb_x, mb_y),
             mv_l1: Some(*mv_grid_l1.slot(mb_x, mb_y)),
@@ -2781,11 +2781,50 @@ impl Encoder {
         mb_qp_delta: i32,
         nb: Option<(bool, bool, bool)>,
     ) -> MbTrial {
-        debug_assert!(
-            matches!(self.cfg.chroma_format_idc, 0 | 1) || mb_qp_delta == 0,
-            "round-430 row modulation (non-zero mb_qp_delta) is 4:2:0/4:0:0-only; \
-             the 4:2:2 / 4:4:4 writer branches still hard-code delta 0",
-        );
+        self.encode_mb_intra16x16_at(
+            frame,
+            mb_x,
+            mb_y,
+            qp_y,
+            qp_c,
+            chroma_width,
+            chroma_height,
+            recon_y,
+            recon_u,
+            recon_v,
+            sw,
+            nc_grid,
+            intra_grid,
+            mb_qp_delta,
+            nb,
+            0,
+        )
+    }
+
+    /// [`Self::encode_mb_intra16x16`] for any slice type:
+    /// `mb_type_offset` is 0 in an I slice, 5 in a P slice (Table 7-13)
+    /// and 23 in a B slice (Table 7-14) — the macroblock layer after
+    /// `mb_type` is the same in all three.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mb_intra16x16_at(
+        &self,
+        frame: &YuvFrame<'_>,
+        mb_x: usize,
+        mb_y: usize,
+        qp_y: i32,
+        qp_c: i32,
+        chroma_width: usize,
+        chroma_height: usize,
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        sw: &mut BitWriter,
+        nc_grid: &mut CavlcNcGrid,
+        intra_grid: &mut IntraGrid,
+        mb_qp_delta: i32,
+        nb: Option<(bool, bool, bool)>,
+        mb_type_offset: u32,
+    ) -> MbTrial {
         let width = self.cfg.width as usize;
         let height = self.cfg.height as usize;
         let lambda = lambda_ssd(qp_y, true);
@@ -3103,6 +3142,52 @@ impl Encoder {
 
         // ------- Emit MB syntax -------
         let nc_dc_ctx = CoeffTokenContext::Numeric(nc_dc);
+        // The macroblock writer for an explicit chroma layout, in an I
+        // slice or (with the Table 7-13 / 7-14 offset on mb_type) in a
+        // P / B slice.
+        #[allow(clippy::too_many_arguments)]
+        let write_i16x16 = |sw: &mut BitWriter,
+                            pred_mode: u8,
+                            intra_chroma_pred_mode: u8,
+                            cbp_luma: u8,
+                            cbp_chroma: u8,
+                            mb_qp_delta: i32,
+                            dc: &[i32; 16],
+                            ac: &[[i32; 16]; 16],
+                            ac_nc: &[i32; 16],
+                            chroma: crate::encoder::macroblock::ChromaWriteKind<'_>,
+                            nc_ctx: CoeffTokenContext| {
+            if mb_type_offset == 0 {
+                crate::encoder::macroblock::write_intra16x16_mb_chroma(
+                    sw,
+                    pred_mode,
+                    intra_chroma_pred_mode,
+                    cbp_luma,
+                    cbp_chroma,
+                    mb_qp_delta,
+                    dc,
+                    ac,
+                    ac_nc,
+                    chroma,
+                    nc_ctx,
+                )
+            } else {
+                crate::encoder::macroblock::write_intra16x16_mb_in_inter_slice_chroma(
+                    sw,
+                    mb_type_offset,
+                    pred_mode,
+                    intra_chroma_pred_mode,
+                    cbp_luma,
+                    cbp_chroma,
+                    mb_qp_delta,
+                    dc,
+                    ac,
+                    ac_nc,
+                    chroma,
+                    nc_ctx,
+                )
+            }
+        };
         if chroma_array_type == 1 {
             let chroma_block = chroma_block_for_mask.as_ref().unwrap();
             let (nc_cb, nc_cr) = derive_chroma_ac_nc_and_commit_totals(
@@ -3135,12 +3220,17 @@ impl Encoder {
                 chroma_ac_nc_cb: nc_cb,
                 chroma_ac_nc_cr: nc_cr,
             };
-            write_intra16x16_mb(sw, &mb_cfg, nc_dc_ctx).expect("write Intra16x16 mb");
+            if mb_type_offset == 0 {
+                write_intra16x16_mb(sw, &mb_cfg, nc_dc_ctx).expect("write Intra16x16 mb");
+            } else {
+                write_intra16x16_mb_in_inter_slice(sw, &mb_cfg, mb_type_offset, nc_dc_ctx)
+                    .expect("write Intra16x16 mb in an inter slice");
+            }
         } else if chroma_array_type == 0 {
             // Round-448 — monochrome: luma syntax only. No
             // intra_chroma_pred_mode (§7.3.5.1), no chroma residual
             // (§7.3.5.3); `ChromaWriteKind::Mono` emits nothing.
-            crate::encoder::macroblock::write_intra16x16_mb_chroma(
+            write_i16x16(
                 sw,
                 best_luma_mode.as_u8(),
                 /* intra_chroma_pred_mode: absent at ChromaArrayType 0 */ 0,
@@ -3167,13 +3257,13 @@ impl Encoder {
                 &chroma_block.ac_cr,
                 2,
             );
-            crate::encoder::macroblock::write_intra16x16_mb_chroma(
+            write_i16x16(
                 sw,
                 best_luma_mode.as_u8(),
                 best_chroma_mode_u8,
                 cbp_luma,
                 cbp_chroma,
-                0,
+                mb_qp_delta,
                 &dc_levels,
                 &luma_ac_levels,
                 &luma_ac_nc,
@@ -3205,13 +3295,13 @@ impl Encoder {
                 derive_plane_nc_444_i16x16(nc_grid, mb_addr, false, cbp_luma, &cb_ac_scan_444);
             let (cr_dc_nc, cr_ac_nc) =
                 derive_plane_nc_444_i16x16(nc_grid, mb_addr, true, cbp_luma, &cr_ac_scan_444);
-            crate::encoder::macroblock::write_intra16x16_mb_chroma(
+            write_i16x16(
                 sw,
                 best_luma_mode.as_u8(),
                 /* intra_chroma_pred_mode: ignored for 4:4:4 */ 0,
                 cbp_luma,
                 cbp_chroma,
-                0,
+                mb_qp_delta,
                 &dc_levels,
                 &luma_ac_levels,
                 &luma_ac_nc,
@@ -8161,10 +8251,7 @@ impl Encoder {
         pending_skip: &mut u32,
         qp_tracker: &mut MbQpTracker,
     ) -> MbDeblockInfo {
-        // Round-397 — the Intra_16x16-in-inter trial body is
-        // 4:2:0-only (its chroma trial + snapshot windows are 8x8);
-        // 4:2:2 / 4:4:4 P-slices take the pure-inter path.
-        if !self.cfg.intra_in_inter || self.cfg.chroma_format_idc != 1 {
+        if !self.cfg.intra_in_inter {
             return self.encode_p_mb(
                 frame,
                 prev,
@@ -8205,7 +8292,7 @@ impl Encoder {
             intra_grid,
             mv_grid,
             mb_addr,
-            width_mbs,
+            self.cfg.chroma_format_idc,
             *pending_skip,
         );
         let pre_bits = sw.bits_emitted();
@@ -8261,7 +8348,7 @@ impl Encoder {
             intra_grid,
             mv_grid,
             mb_addr,
-            width_mbs,
+            self.cfg.chroma_format_idc,
             *pending_skip,
         );
 
@@ -8488,6 +8575,30 @@ impl Encoder {
         mb_qp_delta: i32,
         nb: Option<(bool, bool, bool)>,
     ) {
+        if self.cfg.chroma_format_idc != 1 {
+            // 4:0:0 / 4:2:2 / 4:4:4 — the I-slice Intra_16x16 coder
+            // (every chroma layout) with the slice type's mb_type
+            // offset.
+            self.encode_mb_intra16x16_at(
+                frame,
+                mb_x,
+                mb_y,
+                qp_y,
+                qp_c,
+                chroma_width,
+                chroma_height,
+                recon_y,
+                recon_u,
+                recon_v,
+                sw,
+                nc_grid,
+                intra_grid,
+                mb_qp_delta,
+                nb,
+                mb_type_offset,
+            );
+            return;
+        }
         let width = self.cfg.width as usize;
         let height = self.cfg.height as usize;
         let lambda = lambda_ssd(qp_y, true);
@@ -14566,10 +14677,7 @@ impl Encoder {
         weighted: Option<WeightedBipredLuma>,
         qp_tracker: &mut MbQpTracker,
     ) -> MbDeblockInfo {
-        // Round-397 — the Intra_16x16-in-inter trial body is
-        // 4:2:0-only (its chroma trial + snapshot windows are 8x8);
-        // 4:2:2 / 4:4:4 B-slices take the pure-inter path.
-        if !self.cfg.intra_in_inter || self.cfg.chroma_format_idc != 1 {
+        if !self.cfg.intra_in_inter {
             return self.encode_b_mb(
                 frame,
                 ref_l0,
@@ -14615,7 +14723,7 @@ impl Encoder {
             mv_grid_l0,
             mv_grid_l1,
             mb_addr,
-            width_mbs,
+            self.cfg.chroma_format_idc,
             *pending_skip,
         );
         let pre_bits = sw.bits_emitted();
@@ -14677,7 +14785,7 @@ impl Encoder {
             mv_grid_l0,
             mv_grid_l1,
             mb_addr,
-            width_mbs,
+            self.cfg.chroma_format_idc,
             *pending_skip,
         );
 

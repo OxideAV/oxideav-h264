@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Intra_16x16 macroblocks inside CAVLC P and B pictures at 4:0:0, 4:2:2
+  and 4:4:4 (`EncoderConfig::intra_in_inter`, on by default) — the
+  fallback was a 4:2:0-only mode choice. The I-slice Intra_16x16 coder,
+  which already handles every chroma layout, takes the Table 7-13 /
+  7-14 `mb_type` offset of the slice type; the trial's rollback
+  snapshots carry the format's chroma tile. `mb_qp_delta` of an
+  Intra_16x16 macroblock is now written from the QP chain at 4:2:2 /
+  4:4:4 as well (it was a literal 0 there).
+  `integration_intra_fallback_chroma_formats`: three formats x 4x4 /
+  8x8 transform x three QPs, intra macroblocks present in the P and the
+  B slice, bit-exact in our decoder and in a black-box decoder.
+
 - P_8x8 (four P_L0_8x8 partitions) in CAVLC P pictures at 4:0:0, 4:2:2
   and 4:4:4 — until now a 4:2:0-only mode. The composite predictor
   (per-partition luma, and chroma per §8.4.1.4 for the format) feeds
