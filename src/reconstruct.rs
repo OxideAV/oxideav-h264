@@ -5406,6 +5406,14 @@ fn clip3_i32(x: i32, y: i32, z: i32) -> i32 {
     }
 }
 
+/// Explicit weighted-prediction offsets are coded in 8-bit units: §8.4.2.3.2 multiplies them by
+/// `1 << (BitDepth - 8)` (the `o` of equations 8-449 to 8-451) before they are added to
+/// samples of higher bit depth, as in High 10 streams.
+fn scale_offset(mut entry: WeightedEntry, bit_depth: u32) -> WeightedEntry {
+    entry.offset <<= bit_depth - 8;
+    entry
+}
+
 /// §7.4.3.2 — look up the (weight, offset) for a luma entry in the
 /// pred_weight_table. When `ref_idx < 0` (list not used) the returned
 /// entry is irrelevant; we return a benign default. When the per-entry
@@ -6234,8 +6242,8 @@ fn predict_partition_with<R: RefPicProvider>(
                 let log2_wd = pwt.luma_log2_weight_denom;
                 CombineOp::Weighted {
                     mode,
-                    w0: luma_weight_entry(pwt, 0, wp_ref_l0, log2_wd),
-                    w1: luma_weight_entry(pwt, 1, wp_ref_l1, log2_wd),
+                    w0: scale_offset(luma_weight_entry(pwt, 0, wp_ref_l0, log2_wd), bit_depth_y),
+                    w1: scale_offset(luma_weight_entry(pwt, 1, wp_ref_l1, log2_wd), bit_depth_y),
                     log2_wd,
                 }
             }
@@ -6372,14 +6380,26 @@ fn predict_partition_with<R: RefPicProvider>(
             (
                 CombineOp::Weighted {
                     mode,
-                    w0: chroma_weight_entry(pwt, 0, 0, wp_ref_l0, log2_wd),
-                    w1: chroma_weight_entry(pwt, 1, 0, wp_ref_l1, log2_wd),
+                    w0: scale_offset(
+                        chroma_weight_entry(pwt, 0, 0, wp_ref_l0, log2_wd),
+                        bit_depth_c,
+                    ),
+                    w1: scale_offset(
+                        chroma_weight_entry(pwt, 1, 0, wp_ref_l1, log2_wd),
+                        bit_depth_c,
+                    ),
                     log2_wd,
                 },
                 CombineOp::Weighted {
                     mode,
-                    w0: chroma_weight_entry(pwt, 0, 1, wp_ref_l0, log2_wd),
-                    w1: chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd),
+                    w0: scale_offset(
+                        chroma_weight_entry(pwt, 0, 1, wp_ref_l0, log2_wd),
+                        bit_depth_c,
+                    ),
+                    w1: scale_offset(
+                        chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd),
+                        bit_depth_c,
+                    ),
                     log2_wd,
                 },
             )
@@ -6592,12 +6612,24 @@ fn predict_partition_with<R: RefPicProvider>(
                 // log2 denominator.
                 let log2_wd_c = pwt.chroma_log2_weight_denom;
                 let (w_cb_l0, w_cb_l1) = (
-                    chroma_weight_entry(pwt, 0, 0, wp_ref_l0, log2_wd_c),
-                    chroma_weight_entry(pwt, 1, 0, wp_ref_l1, log2_wd_c),
+                    scale_offset(
+                        chroma_weight_entry(pwt, 0, 0, wp_ref_l0, log2_wd_c),
+                        bit_depth_c,
+                    ),
+                    scale_offset(
+                        chroma_weight_entry(pwt, 1, 0, wp_ref_l1, log2_wd_c),
+                        bit_depth_c,
+                    ),
                 );
                 let (w_cr_l0, w_cr_l1) = (
-                    chroma_weight_entry(pwt, 0, 1, wp_ref_l0, log2_wd_c),
-                    chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd_c),
+                    scale_offset(
+                        chroma_weight_entry(pwt, 0, 1, wp_ref_l0, log2_wd_c),
+                        bit_depth_c,
+                    ),
+                    scale_offset(
+                        chroma_weight_entry(pwt, 1, 1, wp_ref_l1, log2_wd_c),
+                        bit_depth_c,
+                    ),
                 );
 
                 let mut scratch_cb_store = [0i32; MAX_PARTITION_SAMPLES];

@@ -139,6 +139,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Explicit weighted prediction at a bit depth above 8: the offsets
+  (`luma_offset_l0` / `chroma_offset_l0` and their list 1 counterparts)
+  are coded in 8-bit units, and §8.4.2.3.2 (equations 8-449 to 8-451)
+  scales them by `1 << (BitDepth - 8)` before adding them to samples.
+  They were added unscaled, so High 10, High 4:2:2 and High 4:4:4
+  streams with explicit weighted prediction decoded wrong with no
+  error reported. Offsets of 8-bit streams are unchanged.
+
 - CABAC B pictures, encoder-side deblocking of 16x16 macroblocks: the
   §8.7.2.1 motion record of B_L1_16x16, B_Bi_16x16 and coded
   B_Direct_16x16 macroblocks named list 0 only (list 1's vector and
