@@ -201,8 +201,10 @@ fn decode(stream: &[u8]) -> Vec<[Vec<i32>; 3]> {
             let plane = |i: usize| -> Vec<i32> {
                 vf.planes[i]
                     .data
-                    .chunks_exact(2)
-                    .map(|c| i32::from(u16::from_le_bytes([c[0], c[1]])))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from(u16::from_le_bytes(*c)))
                     .collect()
             };
             out.push([plane(0), plane(1), plane(2)]);
