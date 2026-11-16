@@ -388,6 +388,14 @@ pub struct H264CodecDecoder {
     /// frames for each missing `frame_num` value.
     prev_ref_frame_num: Option<u32>,
 
+    /// §7.4.1.2.1 — the picture geometry of the SPS active for the current
+    /// coded video sequence (width and frame height in macroblocks, chroma
+    /// format, luma and chroma bit depth), set by its IDR picture (or by the
+    /// stream's first picture when it does not open on one). A non-IDR
+    /// picture whose SPS gives another is refused: the active SPS changes
+    /// only at an IDR access unit. Reset with the decoder.
+    sequence_geometry: Option<(u32, u32, u32, u32, u32)>,
+
     /// D.2.8 — how decoding entered the current coded video sequence:
     /// `None` until the first picture since construction / `reset()`,
     /// `Some(false)` from an IDR picture, `Some(true)` from a non-IDR
@@ -499,6 +507,7 @@ impl H264CodecDecoder {
             prev_had_mmco5: false,
             prev_reference_top_foc: 0,
             prev_ref_frame_num: None,
+            sequence_geometry: None,
             random_access_entry: None,
             recovery_point_pending: None,
             recovery_gate: None,
@@ -1232,6 +1241,29 @@ impl H264CodecDecoder {
             // Finalize whatever was in progress before starting the new
             // picture with this slice.
             self.finalize_in_progress_picture()?;
+
+            // §7.4.1.2.1 — the SPS active for a coded video sequence changes
+            // only at an IDR access unit, so a re-sent SPS of another picture
+            // size, chroma format or bit depth takes effect at the next IDR
+            // picture. A non-IDR picture naming it would decode at the new
+            // geometry against references of the old: refuse it.
+            if matches!(nal_unit_type, 1 | 5) {
+                let geometry = (
+                    sps.pic_width_in_mbs(),
+                    sps.pic_height_in_mbs(false),
+                    sps.chroma_array_type(),
+                    sps.bit_depth_luma_minus8,
+                    sps.bit_depth_chroma_minus8,
+                );
+                match self.sequence_geometry {
+                    Some(active) if !is_idr && active != geometry => {
+                        return Err(Error::invalid(
+                            "h264 slice: a non-IDR picture's SPS gives another picture size, chroma format or bit depth than its coded video sequence's (§7.4.1.2.1: a new one takes effect at an IDR picture)",
+                        ));
+                    }
+                    _ => self.sequence_geometry = Some(geometry),
+                }
+            }
 
             // Frame threading — reconstruct this picture's samples on
             // the pool when it qualifies; otherwise the serial path
@@ -3777,6 +3809,7 @@ impl H264CodecDecoder {
         self.prev_had_mmco5 = false;
         self.prev_reference_top_foc = 0;
         self.prev_ref_frame_num = None;
+        self.sequence_geometry = None;
         self.random_access_entry = None;
         self.recovery_point_pending = None;
         self.recovery_gate = None;
