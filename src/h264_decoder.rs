@@ -320,8 +320,8 @@ pub struct H264CodecDecoder {
     #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
     pub last_slice: Option<SliceHeader>,
     /// Count of per-slice / per-picture reconstruction errors that were
-    /// swallowed to keep the stream alive (the `h264 slice skipped: …`
-    /// paths). Zero means every slice fed so far decoded cleanly; any
+    /// swallowed to keep the stream alive (skipped
+    /// slices and a final picture that failed to finish). Zero means every slice fed so far decoded cleanly; any
     /// frame emitted while this is non-zero may be partial/concealed
     /// output. Diagnostic only — see [`Self::decode_error_count`].
     decode_errors: u64,
@@ -763,8 +763,8 @@ impl H264CodecDecoder {
     }
 
     /// Number of per-slice / per-picture reconstruction errors that were
-    /// swallowed so the stream could keep decoding (the paths that log
-    /// `h264 slice skipped: …`). Zero means every slice fed so far
+    /// swallowed so the stream could keep decoding (skipped
+    /// slices; nothing is printed, reporting is left to the caller). Zero means every slice fed so far
     /// decoded cleanly; when non-zero, frames produced by this decoder
     /// instance may be partial (missing slices) rather than a faithful
     /// reconstruction. Resets with [`Decoder::reset`].
@@ -3502,9 +3502,10 @@ impl H264CodecDecoder {
     }
 
     fn handle_event_logged(&mut self, ev: Event) {
-        if let Err(e) = self.handle_event(ev) {
+        // Counted for decode_error_count() rather than printed: a library
+        // leaves reporting to its caller.
+        if self.handle_event(ev).is_err() {
             self.decode_errors += 1;
-            eprintln!("h264 slice skipped: {e}");
         }
         self.pending_sd = None;
     }
@@ -3764,9 +3765,8 @@ impl H264CodecDecoder {
         self.flush_pending_dp_slice()?;
         // §7.4.1.2 — close any picture we've been assembling so it reaches
         // the DPB + output queue before the caller drains at EOF.
-        if let Err(e) = self.finalize_in_progress_picture() {
+        if self.finalize_in_progress_picture().is_err() {
             self.decode_errors += 1;
-            eprintln!("h264 flush: final picture skipped: {e}");
         }
         // §C.4.4 — a trailing unpaired PAFF field at EOF can never gain a
         // complementary partner; emit it as a standalone half-height
