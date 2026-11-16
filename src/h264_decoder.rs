@@ -320,8 +320,8 @@ pub struct H264CodecDecoder {
     #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
     pub last_slice: Option<SliceHeader>,
     /// Count of per-slice / per-picture reconstruction errors that were
-    /// swallowed to keep the stream alive (the `h264 slice skipped: …`
-    /// paths). Zero means every slice fed so far decoded cleanly; any
+    /// swallowed to keep the stream alive (skipped
+    /// slices and a final picture that failed to finish). Zero means every slice fed so far decoded cleanly; any
     /// frame emitted while this is non-zero may be partial/concealed
     /// output. Diagnostic only — see [`Self::decode_error_count`].
     decode_errors: u64,
@@ -387,6 +387,14 @@ pub struct H264CodecDecoder {
     /// procedure inserts synthetic "non-existing" short-term reference
     /// frames for each missing `frame_num` value.
     prev_ref_frame_num: Option<u32>,
+
+    /// §7.4.1.2.1 — the picture geometry of the SPS active for the current
+    /// coded video sequence (width and frame height in macroblocks, chroma
+    /// format, luma and chroma bit depth), set by its IDR picture (or by the
+    /// stream's first picture when it does not open on one). A non-IDR
+    /// picture whose SPS gives another is refused: the active SPS changes
+    /// only at an IDR access unit. Reset with the decoder.
+    sequence_geometry: Option<(u32, u32, u32, u32, u32)>,
 
     /// D.2.8 — how decoding entered the current coded video sequence:
     /// `None` until the first picture since construction / `reset()`,
@@ -499,6 +507,7 @@ impl H264CodecDecoder {
             prev_had_mmco5: false,
             prev_reference_top_foc: 0,
             prev_ref_frame_num: None,
+            sequence_geometry: None,
             random_access_entry: None,
             recovery_point_pending: None,
             recovery_gate: None,
@@ -754,8 +763,8 @@ impl H264CodecDecoder {
     }
 
     /// Number of per-slice / per-picture reconstruction errors that were
-    /// swallowed so the stream could keep decoding (the paths that log
-    /// `h264 slice skipped: …`). Zero means every slice fed so far
+    /// swallowed so the stream could keep decoding (skipped
+    /// slices; nothing is printed, reporting is left to the caller). Zero means every slice fed so far
     /// decoded cleanly; when non-zero, frames produced by this decoder
     /// instance may be partial (missing slices) rather than a faithful
     /// reconstruction. Resets with [`Decoder::reset`].
@@ -1232,6 +1241,29 @@ impl H264CodecDecoder {
             // Finalize whatever was in progress before starting the new
             // picture with this slice.
             self.finalize_in_progress_picture()?;
+
+            // §7.4.1.2.1 — the SPS active for a coded video sequence changes
+            // only at an IDR access unit, so a re-sent SPS of another picture
+            // size, chroma format or bit depth takes effect at the next IDR
+            // picture. A non-IDR picture naming it would decode at the new
+            // geometry against references of the old: refuse it.
+            if matches!(nal_unit_type, 1 | 5) {
+                let geometry = (
+                    sps.pic_width_in_mbs(),
+                    sps.pic_height_in_mbs(false),
+                    sps.chroma_array_type(),
+                    sps.bit_depth_luma_minus8,
+                    sps.bit_depth_chroma_minus8,
+                );
+                match self.sequence_geometry {
+                    Some(active) if !is_idr && active != geometry => {
+                        return Err(Error::invalid(
+                            "h264 slice: a non-IDR picture's SPS gives another picture size, chroma format or bit depth than its coded video sequence's (§7.4.1.2.1: a new one takes effect at an IDR picture)",
+                        ));
+                    }
+                    _ => self.sequence_geometry = Some(geometry),
+                }
+            }
 
             // Frame threading — reconstruct this picture's samples on
             // the pool when it qualifies; otherwise the serial path
@@ -3470,9 +3502,10 @@ impl H264CodecDecoder {
     }
 
     fn handle_event_logged(&mut self, ev: Event) {
-        if let Err(e) = self.handle_event(ev) {
+        // Counted for decode_error_count() rather than printed: a library
+        // leaves reporting to its caller.
+        if self.handle_event(ev).is_err() {
             self.decode_errors += 1;
-            eprintln!("h264 slice skipped: {e}");
         }
         self.pending_sd = None;
     }
@@ -3732,9 +3765,8 @@ impl H264CodecDecoder {
         self.flush_pending_dp_slice()?;
         // §7.4.1.2 — close any picture we've been assembling so it reaches
         // the DPB + output queue before the caller drains at EOF.
-        if let Err(e) = self.finalize_in_progress_picture() {
+        if self.finalize_in_progress_picture().is_err() {
             self.decode_errors += 1;
-            eprintln!("h264 flush: final picture skipped: {e}");
         }
         // §C.4.4 — a trailing unpaired PAFF field at EOF can never gain a
         // complementary partner; emit it as a standalone half-height
@@ -3777,6 +3809,7 @@ impl H264CodecDecoder {
         self.prev_had_mmco5 = false;
         self.prev_reference_top_foc = 0;
         self.prev_ref_frame_num = None;
+        self.sequence_geometry = None;
         self.random_access_entry = None;
         self.recovery_point_pending = None;
         self.recovery_gate = None;
