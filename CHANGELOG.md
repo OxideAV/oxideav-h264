@@ -141,6 +141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A sequence parameter set re-sent mid-sequence with another picture size, chroma format or bit depth no longer takes effect at a non-IDR picture. §7.4.1.2.1 changes the active SPS only at an IDR access unit; the decoder replaced it at once, so the next P picture decoded at the new geometry against references of the old (a 160x96 P picture predicted from a 128x96 IDR picture). The geometry of the coded video sequence (set by its IDR picture, or by the stream's first picture when it does not open on one) is now kept, and a non-IDR picture whose SPS gives another is refused and counted as a skipped slice.
+
 - CABAC B pictures, encoder-side deblocking of 16x16 macroblocks: the
   §8.7.2.1 motion record of B_L1_16x16, B_Bi_16x16 and coded
   B_Direct_16x16 macroblocks named list 0 only (list 1's vector and
