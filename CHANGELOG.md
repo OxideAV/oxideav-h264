@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/OxideAV/oxideav-h264/compare/v0.1.12...v0.1.13) - 2026-11-17
+
+### Other
+
+- Merge master into high10-weighted-offsets (CHANGELOG: keep both entries)
+- read 16-bit samples through as_chunks (clippy chunks_exact_to_as_chunks)
+- Merge branch 'master' into silent-skipped-slices
+- Count skipped slices without printing them to stderr
+- Scale explicit weighted-prediction offsets by bit depth
+- Take a new picture size only at an IDR picture
+- P_8x8 in CABAC P pictures; B deblock motion record; p_8x8 option
+- encoder speed: half-sample planes per reference, one integer walk per macroblock
+- Intra_16x16 inside CAVLC P / B pictures at 4:0:0, 4:2:2 and 4:4:4
+- P_8x8 in CAVLC P pictures at 4:0:0, 4:2:2 and 4:4:4
+- encoder threading: motion search ahead of the macroblock loop, B pictures side by side
+- name the 4:2:0-only P modes behind the 4:0:0 inter size gap
+- encoder speed: reference windows instead of whole-plane widening, row SAD
+- :deep: Intra_8x8 at 8..=14 bit, I_NxN inside P pictures
+- 8x8 quantiser carries the basis-row norms; 4:4:4 CABAC P flag order
+- frame cropping for any picture size, 4:0:0 for grey input
+- clippy 1.100: iterate instead of range-indexing, drop a duplicated allow
+
 ### Added
 
 - `EncoderConfig::p_8x8` / `with_p_8x8` (default `true`): `false`
